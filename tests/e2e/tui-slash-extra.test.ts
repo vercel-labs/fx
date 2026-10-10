@@ -412,23 +412,17 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
       session = await TmuxSession.create({ env: { HOME: home } });
       await session.waitForComposer(10_000);
       await session.sendText("/cost");
-      const pane = await session.waitForText(
-        /Tracking has not started/,
-        5_000,
-      );
-      expect(pane).toContain("[30 days]");
+      const pane = await session.waitForText(/no usage yet/, 5_000);
+      expect(pane).toContain("[session]  24h  7d  30d");
       expect(pane).not.toMatch(/^[*✓!✗⊘i] usage/m);
-      expect(pane).toContain("tab scope");
+      expect(pane).toContain("tab period");
       expect(pane).toContain("r refresh");
       expect(pane).toContain("esc close");
       await session.sendKeys("Escape");
       await session.waitForComposer(5_000);
       await session.sendText("/usage");
-      const aliasPane = await session.waitForText(
-        /Tracking has not started/,
-        5_000,
-      );
-      expect(aliasPane).toContain("[30 days]");
+      const aliasPane = await session.waitForText(/no usage yet/, 5_000);
+      expect(aliasPane).toContain("[session]");
     },
     TIMEOUT,
   );

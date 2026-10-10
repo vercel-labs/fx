@@ -23,8 +23,8 @@ const session_log = @import("session_log.zig");
 const session_replay = @import("session_replay.zig");
 const session_projection = @import("session_projection.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
-const session_usage = @import("session_usage.zig");
-const session_usage_sidecar = @import("session_usage_sidecar.zig");
+const usage_mod = @import("usage");
+const usage_owner = @import("usage_owner.zig");
 const subagent_child_state = @import("../subagent/child_state.zig");
 const Allocator = std.mem.Allocator;
 
@@ -56,11 +56,6 @@ const summaryFromState = discovery.summaryFromState;
 const retired_latest_sessions_dir = "latest";
 const recovery_staging_dir = "recovery+staging";
 const recovery_staging_lock_file = "recovery-staging.lock";
-const usage_recovery_dir = profile_paths.usage_recovery_dir_name;
-const usage_recovery_marker_prefix = "v1 ";
-const max_usage_recovery_marker_bytes =
-    usage_recovery_marker_prefix.len + 20 + 1;
-const max_usage_recovery_sessions: usize = 512;
 const LegacyStoredSession = migration.LegacyStoredSession;
 const MigrationPreferenceSource = migration.MigrationPreferenceSource;
 const legacyToDurableState = migration.legacyToDurableState;
@@ -83,21 +78,55 @@ pub const LoadedWritableSession = store_types.LoadedWritableSession;
 pub const MigrationOptions = store_types.MigrationOptions;
 pub const ProjectionState = store_types.ProjectionState;
 
-pub const UsageRecoverySession = struct {
-    id: []u8,
-    protected_updated_at_ms: ?i64,
-    marker_modified_at_ns: i128 = 0,
+/// What usage recovery reads for a marked v1 session: its saved usage as
+/// sidecar bytes, when the session was last updated, and when its usage
+/// file last changed. Null when the session or its usage is gone.
+/// Whether the session store opens read-only, as recovery needs. A missing
+/// store is readable: nothing there can owe usage.
+pub fn usageStorageReadable(alloc: Allocator, home_path: []const u8) bool {
+    var store = Store.initReadOnlyFromHome(alloc, home_path, "/") catch |err| {
+        if (err == error.FileNotFound) return true;
+        debug_trace.logf("usage", "usage recovery storage unreadable reason={s}", .{@errorName(err)});
+        return false;
+    };
+    store.deinit(alloc);
+    return true;
+}
 
-    pub fn deinit(self: *UsageRecoverySession, alloc: Allocator) void {
-        alloc.free(self.id);
-        self.* = undefined;
+pub fn readUsageForRecovery(alloc: Allocator, home_path: []const u8, session_id: []const u8) !?usage_owner.RecoveredV1 {
+    var store = Store.initReadOnlyFromHome(alloc, home_path, "/") catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer store.deinit(alloc);
+    // A conversation session's usage needs only its metadata and sidecar;
+    // a full load would also replay its whole transcript.
+    const conversation = store.loadConversationUsageOnly(alloc, session_id) catch |err| switch (err) {
+        error.SessionNotFound => return null,
+        else => return err,
+    };
+    if (conversation) |found| {
+        var usage = found.usage;
+        defer usage.deinit(alloc);
+        return .{
+            .bytes = try usage_mod.snapshot.encodeSidecar(alloc, session_id, usage),
+            .updated_at_ms = found.updated_at_ms,
+            .modified_ns = store.usageSidecarModifiedAtNs(session_id) catch null,
+        };
     }
-};
-
-pub const UsageRecoveryCheckpoint = struct {
-    recovery_pending: bool,
-    timestamp_ms: i64,
-};
+    var state = store.loadReadOnly(alloc, session_id) catch |err| switch (err) {
+        error.SessionNotFound => return null,
+        else => return err,
+    };
+    defer state.deinit(alloc);
+    const usage = state.usage orelse return null;
+    const modified_ns = store.usageSidecarModifiedAtNs(session_id) catch null;
+    return .{
+        .bytes = try usage_mod.snapshot.encodeSidecar(alloc, session_id, usage),
+        .updated_at_ms = state.updated_at_ms,
+        .modified_ns = modified_ns,
+    };
+}
 
 pub fn imageSnapshotStorageDir(
     alloc: Allocator,
@@ -421,107 +450,6 @@ fn retainWorkspaceSummaries(alloc: Allocator, summaries: *std.ArrayList(SessionS
 }
 
 pub const default_resume_page_limit: usize = 10;
-
-fn openUsageRecoveryProfileRoot(
-    home_path: []const u8,
-) !?io_mod.VerifiedDir {
-    const zio = io_mod.getIo();
-    var home = try std.Io.Dir.openDirAbsolute(zio, home_path, .{
-        .iterate = true,
-    });
-    defer home.close(zio);
-    var profile = home.openDir(zio, profile_paths.root_dir_name, .{
-        .iterate = true,
-        .follow_symlinks = false,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        error.NotDir, error.SymLinkLoop => return error.InvalidUsageRecoveryIndex,
-        else => return err,
-    };
-    errdefer profile.close(zio);
-    const stat = try profile.stat(zio);
-    if (stat.kind != .directory or
-        stat.permissions.toMode() & 0o777 != 0o700)
-    {
-        return error.InvalidUsageRecoveryIndex;
-    }
-    return .{ .dir = profile };
-}
-
-fn openUsageRecoveryDir(
-    home_path: []const u8,
-) !?io_mod.VerifiedDir {
-    var profile = try openUsageRecoveryProfileRoot(home_path) orelse return null;
-    defer profile.close();
-    var dir = profile.dir.openDir(io_mod.getIo(), usage_recovery_dir, .{
-        .iterate = true,
-        .follow_symlinks = false,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        error.NotDir, error.SymLinkLoop => return error.InvalidUsageRecoveryIndex,
-        else => return err,
-    };
-    errdefer dir.close(io_mod.getIo());
-    const stat = try dir.stat(io_mod.getIo());
-    if (stat.kind != .directory or
-        stat.permissions.toMode() & 0o777 != 0o700)
-    {
-        return error.InvalidUsageRecoveryIndex;
-    }
-    return .{ .dir = dir };
-}
-
-pub fn validateUsageRecoveryMarker(
-    recovery: *const io_mod.VerifiedDir,
-    session_id: []const u8,
-) !?i64 {
-    var marker = recovery.dir.openFile(io_mod.getIo(), session_id, .{
-        .mode = .read_only,
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return error.UsageRecoveryMarkerNotFound,
-        else => return error.InvalidUsageRecoveryIndex,
-    };
-    defer marker.close(io_mod.getIo());
-    const stat = try marker.stat(io_mod.getIo());
-    if (stat.kind != .file or
-        stat.nlink != 1 or
-        stat.size == 0 or
-        stat.size > max_usage_recovery_marker_bytes or
-        stat.permissions.toMode() & 0o777 != 0o600)
-    {
-        return error.InvalidUsageRecoveryIndex;
-    }
-    var bytes: [max_usage_recovery_marker_bytes]u8 = undefined;
-    const marker_len: usize = @intCast(stat.size);
-    const read = marker.readPositionalAll(
-        io_mod.getIo(),
-        bytes[0..marker_len],
-        0,
-    ) catch return error.InvalidUsageRecoveryIndex;
-    if (read != marker_len) {
-        return error.InvalidUsageRecoveryIndex;
-    }
-    const marker_bytes = bytes[0..marker_len];
-    if (!std.mem.startsWith(
-        u8,
-        marker_bytes,
-        usage_recovery_marker_prefix,
-    ) or !std.mem.endsWith(u8, marker_bytes, "\n")) {
-        return error.InvalidUsageRecoveryIndex;
-    }
-    const timestamp_bytes = marker_bytes[usage_recovery_marker_prefix.len .. marker_bytes.len - 1];
-    if (timestamp_bytes.len == 0) return error.InvalidUsageRecoveryIndex;
-    const timestamp_ms = std.fmt.parseInt(
-        i64,
-        timestamp_bytes,
-        10,
-    ) catch return error.InvalidUsageRecoveryIndex;
-    if (timestamp_ms < 0) return error.InvalidUsageRecoveryIndex;
-    return timestamp_ms;
-}
 
 pub const Store = struct {
     sessions_dir: []u8,
@@ -1963,202 +1891,20 @@ pub const Store = struct {
         return ids;
     }
 
-    /// Returns a bounded page of ordinary-session IDs for derived relationship
-    /// migration only. These candidates never establish relationship truth.
-    /// Persists the unresolved marker before its matching session checkpoint.
-    /// The caller must persist the returned timestamp with that checkpoint.
-    pub fn prepareUsageRecoveryCheckpoint(
-        self: Store,
-        alloc: Allocator,
-        writable: *const LoadedWritableSession,
-        snapshot: session_usage.Snapshot,
-    ) !UsageRecoveryCheckpoint {
-        try writable.requireWritable();
-        const now_ms = @max(io_mod.milliTimestamp(), 0);
-        const timestamp_ms = if (now_ms > writable.state.updated_at_ms)
-            now_ms
-        else
-            std.math.add(
-                i64,
-                writable.state.updated_at_ms,
-                1,
-            ) catch return error.InvalidSessionFormat;
-        const recovery_pending = session_usage.needsProfileRecovery(snapshot);
-        if (recovery_pending) {
-            const durable_recovery_pending = if (writable.state.usage) |usage|
-                session_usage.needsProfileRecovery(usage)
-            else
-                false;
-            const protected_updated_at_ms = if (durable_recovery_pending)
-                writable.state.updated_at_ms
-            else
-                timestamp_ms;
-            try self.writeUsageRecoveryPending(
-                alloc,
-                writable.active_id,
-                protected_updated_at_ms,
-                !durable_recovery_pending,
-            );
-        }
-        return .{
-            .recovery_pending = recovery_pending,
-            .timestamp_ms = timestamp_ms,
-        };
-    }
-
-    /// Completes the marker transition after the matching session checkpoint
-    /// is durable.
-    pub fn finishUsageRecoveryCheckpoint(
-        self: Store,
-        session_id: []const u8,
-        checkpoint: UsageRecoveryCheckpoint,
-    ) !void {
-        if (!checkpoint.recovery_pending) {
-            try self.clearUsageRecoveryPending(session_id);
-        }
-    }
-
-    /// Records that this session has profile usage which is not yet proven
-    /// durable in the profile ledger.
-    pub fn markUsageRecoveryPending(
+    /// A conversation session's usage without its history, or null for any
+    /// other format (`session_log.loadConversationUsageOnly`).
+    pub fn loadConversationUsageOnly(
         self: Store,
         alloc: Allocator,
         session_id: []const u8,
-        protected_updated_at_ms: i64,
-    ) !void {
-        try self.writeUsageRecoveryPending(
-            alloc,
-            session_id,
-            protected_updated_at_ms,
-            true,
-        );
-    }
-
-    fn writeUsageRecoveryPending(
-        self: Store,
-        alloc: Allocator,
-        session_id: []const u8,
-        protected_updated_at_ms: i64,
-        replace_existing: bool,
-    ) !void {
+    ) !?session_log.ConversationUsage {
         try validateSessionId(session_id);
-        if (protected_updated_at_ms < 0) return error.InvalidSessionFormat;
-        if (self.canonical_root.mode != .writable) {
-            return error.SessionStoreReadOnly;
-        }
-        _ = self.canonical_root.sessions orelse
-            return error.SessionStoreUnavailable;
-        var profile = try openUsageRecoveryProfileRoot(self.home_dir) orelse
-            return error.SessionStoreUnavailable;
-        defer profile.close();
-        var recovery = try io_mod.openOrCreateVerifiedPrivateDir(
-            &profile,
-            usage_recovery_dir,
-        );
-        defer recovery.close();
-        const existing = validateUsageRecoveryMarker(
-            &recovery,
-            session_id,
-        ) catch |err| switch (err) {
-            error.UsageRecoveryMarkerNotFound => null,
-            else => return err,
-        };
-        if (!replace_existing and existing != null) return;
-        if (existing) |timestamp_ms| {
-            if (timestamp_ms == protected_updated_at_ms) return;
-        }
-        const marker_bytes = try std.fmt.allocPrint(
-            alloc,
-            "{s}{d}\n",
-            .{ usage_recovery_marker_prefix, protected_updated_at_ms },
-        );
-        defer alloc.free(marker_bytes);
-        try io_mod.durableReplaceVerified(
-            alloc,
-            &recovery,
-            session_id,
-            marker_bytes,
-        );
+        var session_dir = try self.openSessionDir(session_id);
+        defer session_dir.close();
+        return session_log.loadConversationUsageOnly(alloc, &session_dir, session_id);
     }
 
-    /// Clears a session's recovery marker only after its settled checkpoint is
-    /// durable. Missing markers are already clear.
-    pub fn clearUsageRecoveryPending(
-        self: Store,
-        session_id: []const u8,
-    ) !void {
-        try validateSessionId(session_id);
-        if (self.canonical_root.mode != .writable) {
-            return error.SessionStoreReadOnly;
-        }
-        _ = self.canonical_root.sessions orelse
-            return error.SessionStoreUnavailable;
-        var recovery = try openUsageRecoveryDir(self.home_dir) orelse return;
-        defer recovery.close();
-        _ = validateUsageRecoveryMarker(&recovery, session_id) catch |err| switch (err) {
-            error.UsageRecoveryMarkerNotFound => return,
-            else => return err,
-        };
-        recovery.dir.deleteFile(io_mod.getIo(), session_id) catch |err| switch (err) {
-            error.FileNotFound => return,
-            error.NotDir, error.SymLinkLoop => return error.InvalidUsageRecoveryIndex,
-            else => return err,
-        };
-        try io_mod.syncVerifiedDir(recovery.dir);
-    }
-
-    /// Returns the bounded durable recovery marker set. The caller owns every
-    /// entry and the list.
-    pub fn listUsageRecoverySessions(
-        self: Store,
-        alloc: Allocator,
-    ) !std.ArrayList(UsageRecoverySession) {
-        var recovery = try openUsageRecoveryDir(self.home_dir) orelse
-            return std.ArrayList(UsageRecoverySession).empty;
-        defer recovery.close();
-
-        var marked: std.ArrayList(UsageRecoverySession) = .empty;
-        errdefer {
-            for (marked.items) |*entry| entry.deinit(alloc);
-            marked.deinit(alloc);
-        }
-        var iter = recovery.dir.iterate();
-        while (try iter.next(io_mod.getIo())) |entry| {
-            if (entry.kind != .file or
-                marked.items.len == max_usage_recovery_sessions)
-            {
-                return error.InvalidUsageRecoveryIndex;
-            }
-            validateSessionId(entry.name) catch
-                return error.InvalidUsageRecoveryIndex;
-            const protected_updated_at_ms = validateUsageRecoveryMarker(
-                &recovery,
-                entry.name,
-            ) catch return error.InvalidUsageRecoveryIndex;
-            const marker_stat = try recovery.dir.statFile(
-                io_mod.getIo(),
-                entry.name,
-                .{ .follow_symlinks = false },
-            );
-            try marked.append(alloc, .{
-                .id = try alloc.dupe(u8, entry.name),
-                .protected_updated_at_ms = protected_updated_at_ms,
-                .marker_modified_at_ns = marker_stat.mtime.nanoseconds,
-            });
-        }
-        sort_utils.sort(UsageRecoverySession, marked.items, {}, struct {
-            fn lessThan(
-                _: void,
-                left: UsageRecoverySession,
-                right: UsageRecoverySession,
-            ) bool {
-                return std.mem.order(u8, left.id, right.id) == .lt;
-            }
-        }.lessThan);
-        return marked;
-    }
-
-    pub fn usageCheckpointModifiedAtNs(
+    pub fn usageSidecarModifiedAtNs(
         self: Store,
         session_id: []const u8,
     ) !?i128 {
@@ -2169,7 +1915,7 @@ pub const Store = struct {
         defer session_dir.close();
         const stat = session_dir.dir.statFile(
             io_mod.getIo(),
-            session_usage_sidecar.sidecar_file,
+            session_log.usage_sidecar_file,
             .{ .follow_symlinks = false },
         ) catch |err| switch (err) {
             error.FileNotFound => return null,
@@ -3318,7 +3064,7 @@ pub const Store = struct {
         if (recovered.usage == null) {
             if (target.state.usage) |usage| {
                 // Keep the normal new-session default when optional usage is absent.
-                recovered.usage = try session_usage.dupeSnapshotOwned(alloc, usage);
+                recovered.usage = try usage_mod.snapshot.dupe(alloc, usage);
             }
         }
 
@@ -4034,6 +3780,24 @@ fn validateRecoveredManagedChildContent(
         else => return err,
     };
     pack.deinit(alloc);
+}
+
+test "usage recovery storage is readable when absent or private, not through a symlink" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    try std.testing.expect(usageStorageReadable(alloc, home));
+
+    var store = try Store.initFromHome(alloc, home, "/");
+    store.deinit(alloc);
+    try std.testing.expect(usageStorageReadable(alloc, home));
+
+    try tmp.dir.deleteTree(std.testing.io, ".fx/sessions");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "outside", .data = "not a session directory" });
+    try tmp.dir.symLink(std.testing.io, "../outside", ".fx/sessions", .{});
+    try std.testing.expect(!usageStorageReadable(alloc, home));
 }
 
 test "recovery rejects digest-matching handles from the wrong artifact family" {
@@ -5487,9 +5251,47 @@ test "fresh session usage survives the initial durable event" {
     defer loaded.deinit(alloc);
     try std.testing.expect(loaded.usage != null);
     try std.testing.expectEqual(
-        session_usage.Availability.complete,
+        usage_mod.snapshot.Billing.complete,
         loaded.usage.?.billing,
     );
+}
+
+test "usage recovery reads a conversation session's usage without its history" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    var state = try testDurableState(alloc, "recovery-usage", ctx.workspace);
+    defer state.deinit(alloc);
+    state.updated_at_ms = 42;
+    {
+        var writable = try ctx.store.startWritableSession(alloc, state);
+        writable.deinit(alloc);
+    }
+    var full = try ctx.store.loadReadOnly(alloc, state.id);
+    defer full.deinit(alloc);
+    const want = try usage_mod.snapshot.encodeSidecar(alloc, state.id, full.usage.?);
+    defer alloc.free(want);
+
+    const recovered = (try readUsageForRecovery(alloc, ctx.home, state.id)).?;
+    defer alloc.free(recovered.bytes);
+    try std.testing.expectEqualStrings(want, recovered.bytes);
+    try std.testing.expectEqual(full.updated_at_ms, recovered.updated_at_ms);
+    try std.testing.expect(recovered.modified_ns != null);
+
+    // Without its transcript a full load fails; the usage read never opens it.
+    try tmp.dir.deleteFile(io_mod.getIo(), "home/.fx/sessions/recovery-usage/events.jsonl");
+    if (ctx.store.loadReadOnly(alloc, state.id)) |loaded| {
+        var unexpected = loaded;
+        unexpected.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    const again = (try readUsageForRecovery(alloc, ctx.home, state.id)).?;
+    defer alloc.free(again.bytes);
+    try std.testing.expectEqualStrings(want, again.bytes);
+
+    try std.testing.expectEqual(@as(?usage_owner.RecoveredV1, null), try readUsageForRecovery(alloc, ctx.home, "no-such-session"));
 }
 
 test "store start does not publish session caches" {
@@ -5794,11 +5596,11 @@ test "discarding a pristine started session permits usage checkpoints" {
     defer state.deinit(alloc);
     var writable = try ctx.store.startWritableSession(alloc, state);
 
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    const sequence = try usage.reserveInvocation();
-    usage.finishInvocation(sequence, 0, .unbilled);
-    var snapshot = try usage.snapshot(alloc);
+    const ledger = try usage_mod.Ledger.openDetached(alloc, std.testing.io, .{});
+    defer ledger.close() catch {};
+    var call = try ledger.begin(.gateway);
+    _ = try call.finish(.failed_unbilled);
+    var snapshot = try ledger.snapshot(alloc);
     defer snapshot.deinit(alloc);
     _ = try writable.appendEvent(
         alloc,

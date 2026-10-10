@@ -1,0 +1,14 @@
+data: {"type":"stream-start","warnings":[]}
+
+data: {"type":"response-metadata","id":"resp_00c66ad77d1ad74b016ac67c49252887d1bdc57ebc0c8feb0b","timestamp":"2026-10-07T17:07:21.000Z","modelId":"gpt-4.1-nano-2025-04-14"}
+
+data: {"type":"text-start","id":"msg_00c66ad77d1ad74b016ac67c496e2087d1a6b97bcb94ea0989","providerMetadata":{"openai":{"itemId":"msg_00c66ad77d1ad74b016ac67c496e2087d1a6b97bcb94ea0989"}}}
+
+data: {"type":"text-delta","id":"msg_00c66ad77d1ad74b016ac67c496e2087d1a6b97bcb94ea0989","delta":"ok"}
+
+data: {"type":"text-end","id":"msg_00c66ad77d1ad74b016ac67c496e2087d1a6b97bcb94ea0989","providerMetadata":{"openai":{"itemId":"msg_00c66ad77d1ad74b016ac67c496e2087d1a6b97bcb94ea0989"}}}
+
+data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":14,"noCache":14,"cacheRead":0,"cacheWrite":0},"outputTokens":{"total":2,"text":2,"reasoning":0},"raw":{"input_tokens":14,"input_tokens_details":{"cache_write_tokens":0,"cached_tokens":0},"output_tokens":2,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":16}},"providerMetadata":{"openai":{"responseId":"resp_00c66ad77d1ad74b016ac67c49252887d1bdc57ebc0c8feb0b","serviceTier":"default"},"gateway":{"routing":{"originalModelId":"openai/gpt-4.1-nano","resolvedProvider":"openai","fallbacksAvailable":["azure"],"planningReasoning":"System credentials planned for: openai. Total execution order: openai(system)","canonicalSlug":"openai/gpt-4.1-nano","finalProvider":"openai","modelAttemptCount":1,"modelAttempts":[{"canonicalSlug":"openai/gpt-4.1-nano","success":true,"providerAttemptCount":1,"providerAttempts":[{"provider":"openai","credentialType":"system","success":true,"startTime":1791392841029,"endTime":1791392841584,"providerRequestId":"req_6a1fcdc226cc46a6894319b9bd0e9999","statusCode":200,"providerResponseId":"resp_00c66ad77d1ad74b016ac67c49252887d1bdc57ebc0c8feb0b"}]}],"totalProviderAttemptCount":1,"affinity":{"outcome":"skipped_below_min_prefix"},"clientSessionId":"83e0ae83833c1e52440ec3021b473c28","clientSessionIdSource":"fingerprint"},"cost":"0.0000022","marketCost":"0.0000022","surchargeCost":"0.0001","gatewayCost":"0.0001022","inferenceCost":"0.0000022","inputInferenceCost":"0.0000014","outputInferenceCost":"0.0000008","providerAllowlistCost":"0.0001","generationId":"gen_01M4BNAZ8NS50TRNYFRJJESTF4"}}}
+
+DONE
+

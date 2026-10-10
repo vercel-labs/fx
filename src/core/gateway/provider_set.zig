@@ -3,11 +3,12 @@ const stream_provider = @import("../agent/stream_provider.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
-const generation_usage_provider = @import("../session/generation_usage_provider.zig");
+const usage_owner = @import("../session/usage_owner.zig");
 const gateway_provider = @import("gateway_provider.zig");
 const web_search_provider = @import("../tooling/web_search_provider.zig");
 const auto_classifier = @import("../permissions/auto_classifier.zig");
 const model_catalog = @import("model_catalog.zig");
+const usage_mod = @import("usage");
 
 const Allocator = std.mem.Allocator;
 
@@ -34,7 +35,9 @@ pub const Bundle = struct {
     cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
     model_catalog: ?model_catalog.Provider = null,
     permission_reviewer: ?auto_classifier.Provider = null,
-    deferred_usage: ?generation_usage_provider.Provider = null,
+    /// How this provider's generations are priced after the stream ends.
+    /// Null when its completions carry their own usage or none.
+    usage_lookup: ?usage_owner.Lookup = null,
     credits: ?gateway_provider.CreditsProvider = null,
     fx_search: ?web_search_provider.Provider = null,
 
@@ -72,12 +75,10 @@ pub const Set = struct {
         };
     }
 
-    pub fn deferredUsageProviders(self: Set) generation_usage_provider.Set {
-        return .{
-            .gateway = self.gateway.deferred_usage,
-            .codex = self.codex.deferred_usage,
-            .grok = self.grok.deferred_usage,
-        };
+    /// The lookup a session's usage runs with. Only the Gateway prices
+    /// generations by lookup, whichever provider the session uses.
+    pub fn usageLookup(self: Set) ?usage_owner.Lookup {
+        return self.gateway.usage_lookup;
     }
 };
 
@@ -115,6 +116,21 @@ test "provider set selects each provider's complete route" {
             return .{ .catalog = .empty };
         }
 
+        var lookup_context: u8 = 0;
+        const lookup: usage_mod.host.Lookup = .{ .context = &lookup_context, .vtable = &.{ .trusted = trusted, .fetch = fetch } };
+
+        fn trusted(_: *anyopaque, _: []const u8) bool {
+            return false;
+        }
+
+        fn fetch(_: *anyopaque, _: *const usage_mod.host.Lookup.Request, _: []u8) usage_mod.host.Lookup.FetchError!usage_mod.host.Lookup.Response {
+            return error.Transport;
+        }
+
+        fn origin() []const u8 {
+            return "https://ai-gateway.vercel.sh";
+        }
+
         fn review(
             _: ?*anyopaque,
             _: Allocator,
@@ -136,7 +152,7 @@ test "provider set selects each provider's complete route" {
         .cli_model_catalog = .{ .context = &gateway_tag, .fetch_fn = Fake.cli_catalog },
         .model_catalog = .{ .context = &gateway_tag, .fetch_fn = Fake.model_catalog_fetch },
         .permission_reviewer = .{ .context = &gateway_tag, .review_fn = Fake.review },
-        .deferred_usage = generation_usage_provider.unavailable_provider,
+        .usage_lookup = .{ .transport = Fake.lookup, .origin = Fake.origin },
     };
     const codex = Bundle{
         .agent_stream = stream_provider.Provider{
@@ -161,11 +177,12 @@ test "provider set selects each provider's complete route" {
     try std.testing.expect(providers.select(.gateway).agent_stream.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
     try std.testing.expect(providers.select(.gateway).capabilities.fx_search);
     try std.testing.expect(providers.select(.gateway).capabilities.vision_fallback);
-    try std.testing.expect(providers.select(.gateway).deferred_usage != null);
+    try std.testing.expect(providers.select(.gateway).usage_lookup != null);
+    try std.testing.expect(providers.usageLookup() != null);
     try std.testing.expectEqualStrings("vercel", providers.select(.gateway).presentation.?.slug);
     try std.testing.expectEqual(Bundle.AuthStrategy.vercel, providers.select(.gateway).auth_strategy.?);
     try std.testing.expect(!providers.select(.codex).capabilities.fx_search);
-    try std.testing.expect(providers.select(.codex).deferred_usage == null);
+    try std.testing.expect(providers.select(.codex).usage_lookup == null);
     try std.testing.expect(providers.select(.gateway).cli_model_catalog.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
     try std.testing.expect(providers.select(.codex).model_catalog.?.context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
     try std.testing.expect(providers.select(.grok).permission_reviewer.?.context.? == @as(*anyopaque, @ptrCast(&grok_tag)));

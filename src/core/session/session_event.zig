@@ -2,7 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
-const session_usage = @import("session_usage.zig");
+const usage_mod = @import("usage");
+const usage_owner = @import("usage_owner.zig");
 const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
 const context_limits = @import("../config/context_limits.zig");
@@ -717,7 +718,7 @@ pub const SessionStarted = struct {
     workspace_root: []u8,
     conversation_language: session.ConversationLanguage,
     preferences: session_codec.DurableSessionPreferences,
-    usage: ?session_usage.Snapshot = null,
+    usage: ?usage_mod.Snapshot = null,
     subagent_child: bool = false,
 
     fn deinit(self: *SessionStarted, alloc: Allocator) void {
@@ -770,7 +771,7 @@ pub const HistoryTurnCommitted = struct {
 
 pub const UsageCheckpointed = struct {
     /// Full cumulative replacement; reducers must not add it to prior usage.
-    usage: session_usage.Snapshot,
+    usage: usage_mod.Snapshot,
 
     fn deinit(self: *UsageCheckpointed, alloc: Allocator) void {
         self.usage.deinit(alloc);
@@ -1397,7 +1398,7 @@ fn applyDelta(
             next.preferences = try payload.preferences.dupe(alloc);
             errdefer next.preferences.deinit(alloc);
             next.usage = if (payload.usage) |snapshot|
-                try session_usage.dupeSnapshotOwned(alloc, snapshot)
+                try usage_mod.snapshot.dupe(alloc, snapshot)
             else
                 null;
             errdefer if (next.usage) |*usage| usage.deinit(alloc);
@@ -1485,7 +1486,7 @@ fn applyDelta(
         },
         .usage_checkpointed => |payload| {
             var current = &(state.* orelse return error.MissingSessionStarted);
-            const usage = try session_usage.dupeSnapshotOwned(alloc, payload.usage);
+            const usage = try usage_mod.snapshot.dupe(alloc, payload.usage);
             if (current.usage) |*old| old.deinit(alloc);
             current.usage = usage;
             current.updated_at_ms = envelope.timestamp_ms;
@@ -1562,7 +1563,7 @@ fn validateEnvelope(envelope: Envelope) !void {
             payload.turn,
             payload.work_id,
         ) catch return error.InvalidEventFrame,
-        .usage_checkpointed => |payload| try session_usage.validateSnapshot(payload.usage),
+        .usage_checkpointed => |payload| try usage_mod.snapshot.validate(payload.usage),
         .recovery_checkpoint_set => |payload| {
             const state = session_codec.DurableSessionState{
                 .id = @constCast("validation"),
@@ -1620,7 +1621,7 @@ fn writePayload(writer: *std.Io.Writer, event: Event) !void {
             try writePreferences(writer, payload.preferences);
             if (payload.usage) |usage| {
                 try writer.writeAll(",\"usage\":");
-                try session_usage.writeSnapshot(writer, usage);
+                try usage_mod.snapshot.writeLegacy18(writer, usage);
             }
             if (payload.subagent_child) {
                 try writer.writeAll(",\"subagent_child\":true");
@@ -1681,7 +1682,7 @@ fn writePayload(writer: *std.Io.Writer, event: Event) !void {
         },
         .usage_checkpointed => |payload| {
             try writer.writeAll("{\"usage\":");
-            try session_usage.writeSnapshot(writer, payload.usage);
+            try usage_mod.snapshot.writeLegacy18(writer, payload.usage);
             try writer.writeByte('}');
         },
         .recovery_checkpoint_set => |payload| {
@@ -1754,7 +1755,7 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
                 owned.deinit(alloc);
             }
             var usage = if (object.get("usage")) |usage_value|
-                session_usage.parseLegacySnapshotValue(alloc, usage_value) catch |err| switch (err) {
+                usage_mod.snapshot.parseLegacyValue(alloc, usage_value) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return error.InvalidEventFrame,
                 }
@@ -1850,7 +1851,7 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
         },
         .usage_checkpointed => blk: {
             const object = try exactObject(value, &.{"usage"});
-            var usage = session_usage.parseLegacySnapshotValue(
+            var usage = usage_mod.snapshot.parseLegacyValue(
                 alloc,
                 object.get("usage") orelse return error.InvalidEventFrame,
             ) catch |err| switch (err) {
@@ -2548,10 +2549,7 @@ test "single event application validates boundaries for every semantic event kin
     const initial = singleEventTestState("session-single-event-kinds");
     var state = try initial.dupe(alloc);
     defer state.deinit(alloc);
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    try usage.recordCommittedLines(7, 3);
-    var snapshot = try usage.snapshot(alloc);
+    var snapshot = try usage_owner.testSnapshot(alloc, 7, 3);
     defer snapshot.deinit(alloc);
 
     const events = [_]Envelope{
@@ -2973,8 +2971,8 @@ test "legacy cache accounting remains readable without invented totals" {
     var decoded = try decodeFrame(alloc, frame);
     defer decoded.deinit(alloc);
     const usage = decoded.event.usage_checkpointed.usage;
-    try session_usage.validateSnapshot(usage);
-    try std.testing.expectEqual(session_usage.Availability.legacy, usage.billing);
+    try usage_mod.snapshot.validate(usage);
+    try std.testing.expectEqual(usage_mod.snapshot.Billing.legacy, usage.billing);
     try std.testing.expectEqual(@as(usize, 0), usage.models.len);
     try std.testing.expectEqual(@as(usize, 0), usage.pending.len);
     try std.testing.expect(!usage.api_duration_complete);
@@ -3024,13 +3022,10 @@ test "legacy usage replacement retains framing and checksum validation" {
             try std.testing.expectEqual(@as(u64, 4), reduced.through.?.seq);
             try std.testing.expectEqual(log.written().len, reduced.bytes_consumed);
             try std.testing.expectEqual(@as(u64, 7), reduced.state.total_input_tokens);
-            try std.testing.expectEqual(session_usage.Availability.legacy, reduced.state.usage.?.billing);
+            try std.testing.expectEqual(usage_mod.snapshot.Billing.legacy, reduced.state.usage.?.billing);
             try std.testing.expect(reduced.truncate_from == null);
 
-            var known = session_usage.Usage.initFresh();
-            defer known.deinit(alloc);
-            try known.recordCommittedLines(6, 2);
-            var snapshot = try known.snapshot(alloc);
+            var snapshot = try usage_owner.testSnapshot(alloc, 6, 2);
             defer snapshot.deinit(alloc);
             const later_frame = try encodeLegacyFixtureFrame(alloc, .{
                 .log_generation = [_]u8{1} ** 16,
@@ -3044,7 +3039,7 @@ test "legacy usage replacement retains framing and checksum validation" {
             var later_source = std.Io.Reader.fixed(log.written());
             var later = try reduceJsonl(alloc, &later_source, null);
             defer later.deinit(alloc);
-            try std.testing.expectEqual(session_usage.Availability.complete, later.state.usage.?.billing);
+            try std.testing.expectEqual(usage_mod.snapshot.Billing.complete, later.state.usage.?.billing);
             try std.testing.expectEqual(@as(u64, 6), later.state.usage.?.lines_added);
             try std.testing.expectEqual(@as(u64, 5), later.through.?.seq);
         }
@@ -3053,10 +3048,7 @@ test "legacy usage replacement retains framing and checksum validation" {
 
 test "usage checkpoint event decodes a cumulative snapshot" {
     const alloc = std.testing.allocator;
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    try usage.recordCommittedLines(7, 3);
-    var snapshot = try usage.snapshot(alloc);
+    var snapshot = try usage_owner.testSnapshot(alloc, 7, 3);
     defer snapshot.deinit(alloc);
 
     var frame: std.Io.Writer.Allocating = .init(alloc);
@@ -3070,7 +3062,7 @@ test "usage checkpoint event decodes a cumulative snapshot" {
             "\"kind\":\"usage_checkpointed\"," ++
             "\"payload\":{\"usage\":",
     );
-    try session_usage.writeSnapshot(&frame.writer, snapshot);
+    try usage_mod.snapshot.writeLegacy18(&frame.writer, snapshot);
     try frame.writer.writeAll("}}\n");
 
     var decoded = try decodeFrame(alloc, frame.written());
@@ -3111,16 +3103,11 @@ test "usage checkpoint event decodes a cumulative snapshot" {
 
 test "later usage events replace snapshots while legacy turns preserve them" {
     const alloc = std.testing.allocator;
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    try usage.recordCommittedLines(1, 0);
-    var started_usage = try usage.snapshot(alloc);
+    var started_usage = try usage_owner.testSnapshot(alloc, 1, 0);
     defer started_usage.deinit(alloc);
-    try usage.recordCommittedLines(6, 0);
-    var first_checkpoint = try usage.snapshot(alloc);
+    var first_checkpoint = try usage_owner.testSnapshot(alloc, 7, 0);
     defer first_checkpoint.deinit(alloc);
-    try usage.recordCommittedLines(2, 0);
-    var second_checkpoint = try usage.snapshot(alloc);
+    var second_checkpoint = try usage_owner.testSnapshot(alloc, 9, 0);
     defer second_checkpoint.deinit(alloc);
 
     var state: ?session_codec.DurableSessionState = null;

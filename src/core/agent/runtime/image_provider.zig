@@ -3,7 +3,7 @@ const agent_stream_provider = @import("../stream_provider.zig");
 const image_attachments = @import("../../images/image_attachments.zig");
 const types = @import("../../shared/types.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
-const session_usage = @import("../../session/session_usage.zig");
+const usage_owner = @import("../../session/usage_owner.zig");
 const runtime_gateway_step = @import("gateway_step.zig");
 
 const Allocator = std.mem.Allocator;
@@ -19,8 +19,7 @@ pub const Request = struct {
     session_id: ?[]const u8 = null,
     retry_count: usize,
     cancel_flag: *std.atomic.Value(bool),
-    usage: ?*session_usage.Usage = null,
-    usage_allocator: Allocator = std.heap.c_allocator,
+    usage: ?*usage_owner.Owner = null,
     trace_ctx: debug_trace.TraceContext,
     capture_limit_bytes: usize,
     response_format: agent_stream_provider.StructuredResponseFormat,
@@ -83,7 +82,6 @@ pub fn inspect(
             .cancel_flag = request.cancel_flag,
         },
         request.usage,
-        request.usage_allocator,
     );
     defer streamed.deinit(alloc);
 

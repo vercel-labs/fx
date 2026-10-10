@@ -34,7 +34,8 @@ const session_codec = @import("../session/session_codec.zig");
 const session_store = @import("../session/session_store.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const subagent_resume_admission = @import("../subagent/resume_admission.zig");
-const usage_report = @import("../session/usage_report.zig");
+const usage_mod = @import("usage");
+const usage_owner = @import("../session/usage_owner.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const types = @import("../shared/types.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -55,7 +56,6 @@ const profile_paths = @import("../shared/profile_paths.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
-const usage_cli_runtime = @import("usage_cli_runtime.zig");
 
 const slack_install = @import("../slack/install.zig");
 const Allocator = std.mem.Allocator;
@@ -283,7 +283,7 @@ const SessionListOptions = struct {
 
 const UsageOptions = struct {
     format: output_contracts.OutputFormat = .text,
-    scope: usage_report.Scope = .days_30,
+    scope: usage_mod.Scope = .days_30,
 };
 
 const WorkspaceOptions = struct {
@@ -1864,21 +1864,25 @@ fn runNonInteractiveWithDeps(
                 );
                 return .handled_failure;
             };
-            var report = usage_cli_runtime.collect(
-                alloc,
-                home,
-                opts.scope,
-                @max(io_mod.milliTimestamp(), 0),
-            ) catch |err| {
+            // Local facts only: no credentials, no Gateway, no profile writes.
+            var profile: usage_owner.ReadOnly = undefined;
+            profile.open(alloc, home, session_adapter.usage_recovery_readers) catch |err| {
                 try writeUsageCommandFailure(alloc, deps, err, opts.format);
                 return .handled_failure;
             };
-            defer report.deinit(alloc);
-            const text = try (output_contracts.UsageSnapshot{
-                .report = &report,
-            }).render(alloc, opts.format);
-            defer alloc.free(text);
-            try writeFormattedOutput(deps, text, opts.format);
+            defer profile.deinit();
+            var view = profile.profile.view(alloc, opts.scope, @max(io_mod.milliTimestamp(), 0)) catch |err| {
+                try writeUsageCommandFailure(alloc, deps, err, opts.format);
+                return .handled_failure;
+            };
+            defer view.deinit(alloc);
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            usage_mod.render.cliOutput(&out.writer, &view, switch (opts.format) {
+                .text => .text,
+                .json => .json,
+            }) catch return error.OutOfMemory;
+            try writeStdout(deps, out.written());
             return .handled_success;
         },
         .upgrade => |rest| {
@@ -2860,7 +2864,7 @@ fn writeUsageCommandFailure(
     err: anyerror,
     format: output_contracts.OutputFormat,
 ) !void {
-    const message = usageFailureMessage(err);
+    const message = usage_mod.render.cliFailureMessage(@errorName(err));
     if (format == .json) {
         return writeJsonCommandFailure(
             alloc,
@@ -2873,16 +2877,6 @@ fn writeUsageCommandFailure(
     try writeStderr(deps, "fx usage: ");
     try writeStderr(deps, message);
     try writeStderr(deps, "\n");
-}
-
-fn usageFailureMessage(err: anyerror) []const u8 {
-    return switch (err) {
-        error.HomeNotSet => "HOME is not set",
-        error.DurablePathUnsafe,
-        error.PrivateStatePermissionsUnsupported,
-        => "local usage storage is unsafe",
-        else => "local usage data is unavailable",
-    };
 }
 
 fn writeWorkspaceCommandError(
@@ -4202,7 +4196,7 @@ test "help aliases route to help" {
 
 test "usage arguments accept only rolling periods and one JSON flag" {
     const defaults = try parseUsageArgs(&.{});
-    try std.testing.expectEqual(usage_report.Scope.days_30, defaults.scope);
+    try std.testing.expectEqual(usage_mod.Scope.days_30, defaults.scope);
     try std.testing.expectEqual(output_contracts.OutputFormat.text, defaults.format);
 
     const selected = try parseUsageArgs(&.{
@@ -4210,7 +4204,7 @@ test "usage arguments accept only rolling periods and one JSON flag" {
         @constCast("--period"),
         @constCast("7d"),
     });
-    try std.testing.expectEqual(usage_report.Scope.days_7, selected.scope);
+    try std.testing.expectEqual(usage_mod.Scope.days_7, selected.scope);
     try std.testing.expectEqual(output_contracts.OutputFormat.json, selected.format);
 
     for ([_][]const [:0]const u8{

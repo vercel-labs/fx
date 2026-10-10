@@ -16,24 +16,23 @@ const gateway_client = @import("../gateway/client.zig");
 const vercel_failure_diagnostics = @import("../gateway/vercel_failure_diagnostics.zig");
 const vercel_protocol = @import("../gateway/vercel_protocol.zig");
 const io_mod = @import("../core/shared/io.zig");
-const gateway_generation_usage = @import("../gateway/generation_usage.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
 const provider_catalog = @import("../core/auth/provider_catalog.zig");
-const credential_authority = @import("../core/auth/credential_authority.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const vercel_model_policy = @import("../gateway/vercel_model_policy.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const output_contracts = @import("../core/output/output_contracts.zig");
 const shared_types = @import("../core/shared/types.zig");
-const session_usage = @import("../core/session/session_usage.zig");
+const usage_owner = @import("../core/session/usage_owner.zig");
 const web_search_contract = @import("../core/tooling/web_search_contract.zig");
 const web_search_policy = @import("../core/tooling/web_search_policy.zig");
 const web_search_provider = @import("../core/tooling/web_search_provider.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const sort_utils = @import("../core/shared/sort_utils.zig");
+const usage_mod = @import("usage");
 
 const Allocator = std.mem.Allocator;
 const FetchGatewayGetResultFn = *const fn (Allocator, ?[]const u8, []const u8) anyerror!gateway_client.GetResult;
@@ -147,7 +146,46 @@ pub const oauth_transport_provider = oauth_transport.Provider{
     .execute_fn = executeOAuthRequest,
 };
 
-pub const generation_usage_provider = gateway_generation_usage.provider;
+/// The usage module's `/v1/generation` transport: fx's Gateway client, which
+/// owns trusted origins, the timeout, cancellation, and the E2E override.
+pub const usage_lookup: usage_mod.host.Lookup = .{ .context = &usage_lookup_context, .vtable = &usage_lookup_vtable };
+var usage_lookup_context: u8 = 0;
+const usage_lookup_vtable: usage_mod.host.Lookup.VTable = .{ .trusted = usageLookupTrusted, .fetch = usageLookupFetch };
+
+fn usageLookupTrusted(_: *anyopaque, origin: []const u8) bool {
+    return gateway_client.isTrustedGenerationOrigin(origin);
+}
+
+fn usageLookupFetch(
+    _: *anyopaque,
+    request: *const usage_mod.host.Lookup.Request,
+    body: []u8,
+) usage_mod.host.Lookup.FetchError!usage_mod.host.Lookup.Response {
+    const alloc = std.heap.c_allocator;
+    // The client only reads the flag.
+    var response = gateway_client.fetchGatewayGenerationResult(
+        alloc,
+        request.secret,
+        request.team,
+        request.origin,
+        request.generation_id,
+        @constCast(request.cancel),
+    ) catch |err| switch (err) {
+        error.Cancelled => return error.Canceled,
+        error.GatewayGenerationResponseTooLarge => return error.BodyTooLarge,
+        else => {
+            debug_trace.logf("gateway", "generation usage lookup failed reason={s}", .{@errorName(err)});
+            return error.Transport;
+        },
+    };
+    defer response.deinit(alloc);
+    if (response.status != .ok) {
+        debug_trace.logf("gateway", "generation usage lookup status={d}", .{@intFromEnum(response.status)});
+    }
+    if (response.body.len > body.len) return error.BodyTooLarge;
+    @memcpy(body[0..response.body.len], response.body);
+    return .{ .status = @intFromEnum(response.status), .body_len = response.body.len };
+}
 
 pub const agent_stream_provider = agent_stream_provider_contract.Provider{
     .stream_fn = streamAgentCompletion,
@@ -165,7 +203,7 @@ pub const provider_bundle = provider_set.Bundle{
     .cli_model_catalog = cli_model_catalog_provider,
     .model_catalog = model_catalog_provider,
     .permission_reviewer = permission_reviewer.provider,
-    .deferred_usage = generation_usage_provider,
+    .usage_lookup = .{ .transport = usage_lookup, .origin = gateway_client.generationBaseUrl },
     .credits = credits_provider,
     .fx_search = default_web_search_provider,
 };
@@ -601,6 +639,7 @@ fn streamAgentCompletion(
         .admission = request.admission,
         .on_reasoning_chunk = EventBridge.reasoning,
         .on_tool_input_chunk = EventBridge.toolInput,
+        .gateway_events = request.gateway_events,
         .provider_attempt_owner = switch (request.provider_attempt_owner) {
             .transport => .transport,
             .agent => .agent,
@@ -648,41 +687,8 @@ fn streamAgentCompletion(
     } };
     return .{ .completed = .{
         .completion = result.completion,
-        .usage = gatewayUsageOutcome(request, result.completion),
         .ownership = .owned,
     } };
-}
-
-fn gatewayUsageOutcome(
-    request: agent_stream_provider_contract.ModelRequest,
-    completion: shared_types.ModelCompletion,
-) agent_stream_provider_contract.UsageOutcome {
-    const reference = gatewayUsageReference(request, completion) orelse
-        return .{ .unavailable = .possibly_billed };
-    return if (completion.billing != null)
-        .{ .exact = .gateway }
-    else
-        .{ .deferred = reference };
-}
-
-fn gatewayUsageReference(
-    request: agent_stream_provider_contract.ModelRequest,
-    completion: shared_types.ModelCompletion,
-) ?agent_stream_provider_contract.DeferredUsageReference {
-    const generation_id = completion.generation_id orelse return null;
-    const source = request.credential.credentialSource() orelse return null;
-    return .{
-        .provider = .gateway,
-        .generation_id = generation_id,
-        .scope = gateway_client.generationBaseUrl(),
-        .tenant = request.credential.tenant(),
-        .account_id = request.credential.accountId(),
-        .credential_source = source,
-        .credential_identity = credential_authority.derive(
-            source,
-            request.credential.accountId(),
-        ),
-    };
 }
 
 const EventBridge = struct {
@@ -967,7 +973,6 @@ fn executeWebSearchProvider(
         .retry_count = inputs.gateway_retry_count,
         .chat_url = inputs.gateway_chat_url,
         .usage = inputs.usage,
-        .usage_allocator = inputs.usage_allocator,
     }, request, on_progress, progress_ctx);
 }
 
@@ -1036,6 +1041,7 @@ pub const StreamFn = *const fn (
     std.Io.Clock.Timestamp,
     *gateway_client.DeliveryCertainty,
     *std.atomic.Value(bool),
+    ?agent_stream_provider_contract.GatewayEventTap,
 ) anyerror!gateway_client.StreamResult;
 
 var default_stream_ctx: u8 = 0;
@@ -1047,8 +1053,7 @@ pub const GatewayWorkerConfig = struct {
     model: []const u8,
     retry_count: usize,
     chat_url: []const u8,
-    usage: ?*session_usage.Usage = null,
-    usage_allocator: Allocator = std.heap.c_allocator,
+    usage: ?*usage_owner.Owner = null,
     stream_ctx: *anyopaque = @ptrCast(&default_stream_ctx),
     stream_fn: StreamFn = streamGatewayWorker,
 };
@@ -1095,7 +1100,15 @@ pub fn executeGatewayWorker(
     const payload = try vercel_protocol.buildGatewayRequiredToolRequestBodyWithMaxOutputTokens(alloc, tools_json, &messages, request.max_output_tokens);
     defer alloc.free(payload);
 
-    const usage_observation = try session_usage.InvocationObservation.begin(config.usage);
+    const lease: shared_types.CredentialLease = if (config.credential_source == .host_managed)
+        .host_managed
+    else
+        .{ .direct = .{
+            .secret_bytes = config.api_key orelse "",
+            .source = config.credential_source,
+            .tenant_context = config.team,
+        } };
+    var invocation = try usage_owner.Invocation.begin(config.usage, lease);
     var delivery = gateway_client.DeliveryCertainty.init();
     const provider_tool_name = try selectedToolName(request.backend);
     var stream = config.stream_fn(
@@ -1111,66 +1124,17 @@ pub fn executeGatewayWorker(
         deadline,
         &delivery,
         @constCast(request.cancel_flag),
+        if (invocation) |*value| value.tap() else null,
     ) catch |err| {
-        try usage_observation.fail(if (delivery.load() == .possibly_sent)
-            .ambiguous_delivery
-        else
-            .unbilled);
+        if (invocation) |*value| try value.failed(err, delivery.load() == .possibly_sent);
         return err;
     };
     defer stream.deinit(alloc);
-    const usage_outcome = gatewayWorkerUsageOutcome(config, stream.completion);
-    if (stream.status == .ok) {
-        try usage_observation.complete(
-            config.usage_allocator,
-            stream.completion,
-            usage_outcome,
-        );
-    } else {
-        try usage_observation.fail(.unbilled);
-    }
-    if (!builtin.is_test and stream.status == .ok and std.meta.activeTag(usage_outcome) == .deferred) {
-        if (config.usage) |ledger| {
-            if (config.api_key) |api_key| {
-                ledger.startDeferredReconciliation(
-                    config.usage_allocator,
-                    usage_outcome.deferred,
-                    api_key,
-                );
-            } else if (config.credential_source == .host_managed) {
-                ledger.startHostManagedDeferredReconciliation(
-                    config.usage_allocator,
-                    usage_outcome.deferred,
-                );
-            }
-        }
+    if (invocation) |*value| {
+        if (stream.status == .ok) try value.completed(stream.completion) else try value.rejected();
     }
     if (stream.status != .ok) return error.GatewayRequestFailed;
     return normalizeGatewayCompletion(alloc, request, stream.completion, on_progress, progress_ctx);
-}
-
-fn gatewayWorkerUsageOutcome(
-    config: GatewayWorkerConfig,
-    completion: shared_types.ModelCompletion,
-) agent_stream_provider_contract.UsageOutcome {
-    const generation_id = completion.generation_id orelse
-        return .{ .unavailable = .possibly_billed };
-    const source = config.credential_source orelse .ai_gateway_api_key;
-    const reference = agent_stream_provider_contract.DeferredUsageReference{
-        .provider = .gateway,
-        .generation_id = generation_id,
-        .scope = gateway_client.generationBaseUrl(),
-        .tenant = config.team,
-        .credential_source = source,
-        .credential_identity = credential_authority.derive(
-            source,
-            null,
-        ),
-    };
-    return if (completion.billing != null)
-        .{ .exact = .gateway }
-    else
-        .{ .deferred = reference };
 }
 
 fn deadlineAfterMs(timeout_ms: u32) std.Io.Clock.Timestamp {
@@ -1239,6 +1203,7 @@ fn streamGatewayWorker(
     deadline: std.Io.Clock.Timestamp,
     delivery: *gateway_client.DeliveryCertainty,
     cancel_flag: *std.atomic.Value(bool),
+    gateway_events: ?agent_stream_provider_contract.GatewayEventTap,
 ) !gateway_client.StreamResult {
     return gateway_client.streamGatewayProviderToolCompletionBounded(
         alloc,
@@ -1250,6 +1215,7 @@ fn streamGatewayWorker(
             .chat_url = chat_url,
             .payload = payload,
             .delivery = delivery,
+            .gateway_events = gateway_events,
         },
         expected_provider_tool_name,
         deadline,
@@ -1656,8 +1622,9 @@ fn expectGatewayWorkerAdapterExecutes(backend: web_search_contract.SearchBackend
     const alloc = std.testing.allocator;
     var cancel_flag = std.atomic.Value(bool).init(false);
     var fake = FakeStream{};
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
+    var usage: usage_owner.Owner = .{};
+    usage.bind(alloc, .{ .host = null, .home_path = null, .lookup = null });
+    defer usage.deinit();
     var response = try executeGatewayWorker(alloc, .{
         .api_key = "key",
         .team = "team_123",
@@ -1665,7 +1632,6 @@ fn expectGatewayWorkerAdapterExecutes(backend: web_search_contract.SearchBackend
         .retry_count = 1,
         .chat_url = "https://ai-gateway.vercel.sh/v4/ai/language-model",
         .usage = &usage,
-        .usage_allocator = alloc,
         .stream_ctx = @ptrCast(&fake),
         .stream_fn = FakeStream.execute,
     }, .{
@@ -1952,6 +1918,7 @@ const FakeStream = struct {
         deadline: std.Io.Clock.Timestamp,
         delivery: *gateway_client.DeliveryCertainty,
         _: *std.atomic.Value(bool),
+        gateway_events: ?agent_stream_provider_contract.GatewayEventTap,
     ) anyerror!gateway_client.StreamResult {
         const self: *@This() = @ptrCast(@alignCast(raw_ctx));
         self.calls += 1;
@@ -1975,6 +1942,14 @@ const FakeStream = struct {
         else
             "perplexity_search";
         self.saw_expected_provider_tool = std.mem.eql(u8, expected_provider_tool_name, tool_name);
+        // The transport hands usage every event; this one names the generation.
+        if (gateway_events) |tap| {
+            var event = try std.json.parseFromSlice(std.json.Value, alloc,
+                \\{"type":"text-start","id":"t1","providerMetadata":{"gateway":{"generationId":"gen_01ARZ3NDEKTSV4RRFFQ69G5FAV"}}}
+            , .{});
+            defer event.deinit();
+            tap.observe(event.value);
+        }
         return .{
             .status = .ok,
             .completion = .{
@@ -2002,8 +1977,9 @@ test "pre-send web search failure stays unbilled" {
     const alloc = std.testing.allocator;
     var cancel_flag = std.atomic.Value(bool).init(false);
     var fake = FakeStream{ .fail_before_send = true };
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
+    var usage: usage_owner.Owner = .{};
+    usage.bind(alloc, .{ .host = null, .home_path = null, .lookup = null });
+    defer usage.deinit();
 
     try std.testing.expectError(error.AccessDenied, executeGatewayWorker(alloc, .{
         .api_key = "key",
@@ -2011,7 +1987,6 @@ test "pre-send web search failure stays unbilled" {
         .retry_count = 1,
         .chat_url = "https://ai-gateway.vercel.sh/v4/ai/language-model",
         .usage = &usage,
-        .usage_allocator = alloc,
         .stream_ctx = @ptrCast(&fake),
         .stream_fn = FakeStream.execute,
     }, .{
@@ -2022,7 +1997,7 @@ test "pre-send web search failure stays unbilled" {
 
     var snapshot = try usage.snapshot(alloc);
     defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(session_usage.Availability.complete, snapshot.billing);
+    try std.testing.expectEqual(usage_mod.snapshot.Billing.complete, snapshot.billing);
     try std.testing.expect(snapshot.api_duration_complete);
     try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
 }
@@ -2031,8 +2006,9 @@ test "possibly sent web search failure marks billing incomplete" {
     const alloc = std.testing.allocator;
     var cancel_flag = std.atomic.Value(bool).init(false);
     var fake = FakeStream{ .fail_after_send = true };
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
+    var usage: usage_owner.Owner = .{};
+    usage.bind(alloc, .{ .host = null, .home_path = null, .lookup = null });
+    defer usage.deinit();
 
     try std.testing.expectError(error.ConnectionResetByPeer, executeGatewayWorker(alloc, .{
         .api_key = "key",
@@ -2040,7 +2016,6 @@ test "possibly sent web search failure marks billing incomplete" {
         .retry_count = 1,
         .chat_url = "https://ai-gateway.vercel.sh/v4/ai/language-model",
         .usage = &usage,
-        .usage_allocator = alloc,
         .stream_ctx = @ptrCast(&fake),
         .stream_fn = FakeStream.execute,
     }, .{
@@ -2051,7 +2026,7 @@ test "possibly sent web search failure marks billing incomplete" {
 
     var snapshot = try usage.snapshot(alloc);
     defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(session_usage.Availability.incomplete, snapshot.billing);
+    try std.testing.expectEqual(usage_mod.snapshot.Billing.incomplete, snapshot.billing);
     try std.testing.expect(snapshot.api_duration_complete);
     try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
 }
@@ -3312,4 +3287,96 @@ test "gateway catalog controls are explicit ordered and bounded" {
     try std.testing.expectEqualStrings("provider/malformed", catalog.items[2].id);
     try std.testing.expectEqual(@as(usize, 0), catalog.items[2].reasoning_efforts.items.len);
     try std.testing.expect(!catalog.items[2].supports_fast_mode);
+}
+
+const UsageLookupTestServer = struct {
+    io_backend: std.Io.Threaded = .init_single_threaded,
+    server: std.Io.net.Server = undefined,
+    response: []const u8,
+    thread: ?std.Thread = null,
+    request_line: [256]u8 = undefined,
+    request_line_len: usize = 0,
+
+    fn start(self: *UsageLookupTestServer) !u16 {
+        var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        self.server = try address.listen(self.io_backend.io(), .{ .reuse_address = true });
+        self.thread = try std.Thread.spawn(.{}, serveOnce, .{self});
+        return self.server.socket.address.getPort();
+    }
+
+    fn serveOnce(self: *UsageLookupTestServer) void {
+        const zio = self.io_backend.io();
+        var stream = self.server.accept(zio) catch return;
+        defer stream.close(zio);
+        var read_buffer: [4096]u8 = undefined;
+        var reader = stream.reader(zio, &read_buffer);
+        var seen: [4]u8 = .{ 0, 0, 0, 0 };
+        var line_done = false;
+        while (true) {
+            const byte = reader.interface.takeByte() catch return;
+            if (!line_done) {
+                if (byte == '\r') line_done = true else if (self.request_line_len < self.request_line.len) {
+                    self.request_line[self.request_line_len] = byte;
+                    self.request_line_len += 1;
+                }
+            }
+            seen = .{ seen[1], seen[2], seen[3], byte };
+            if (std.mem.eql(u8, &seen, "\r\n\r\n")) break;
+        }
+        var write_buffer: [4096]u8 = undefined;
+        var writer = stream.writer(zio, &write_buffer);
+        writer.interface.writeAll(self.response) catch return;
+        writer.interface.flush() catch return;
+    }
+
+    fn stop(self: *UsageLookupTestServer) void {
+        if (self.thread) |thread| thread.join();
+        self.server.deinit(self.io_backend.io());
+    }
+};
+
+fn runUsageLookup(response: []const u8, body: []u8, cancel: bool) !usage_mod.host.Lookup.Response {
+    var server: UsageLookupTestServer = .{ .response = response };
+    const port = try server.start();
+    defer server.stop();
+    var origin_buffer: [64]u8 = undefined;
+    const origin = try std.fmt.bufPrint(&origin_buffer, "http://127.0.0.1:{d}", .{port});
+    try std.testing.expect(usage_lookup.trusted(origin));
+    var flag: std.atomic.Value(bool) = .init(cancel);
+    const request: usage_mod.host.Lookup.Request = .{
+        .origin = origin,
+        .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        .team = null,
+        .secret = "vck_fixture",
+        .cancel = &flag,
+    };
+    const result = usage_lookup.fetch(&request, body);
+    if (cancel) {
+        // Wake the server's accept so it can stop.
+        var wake: std.Io.Threaded = .init_single_threaded;
+        const address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
+        if (address.connect(wake.io(), .{ .mode = .stream })) |stream| stream.close(wake.io()) else |_| {}
+    } else {
+        try std.testing.expectStringStartsWith(server.request_line[0..server.request_line_len], "GET /v1/generation?id=gen_01ARZ3NDEKTSV4RRFFQ69G5FAV ");
+    }
+    return result;
+}
+
+test "usage lookups go through the Gateway client and map its answers" {
+    try std.testing.expect(usage_lookup.trusted("https://ai-gateway.vercel.sh"));
+    try std.testing.expect(!usage_lookup.trusted("https://example.com"));
+    try std.testing.expect(!usage_lookup.trusted("http://example.com"));
+
+    var body: [64]u8 = undefined;
+    const found = try runUsageLookup("HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":{}}", &body, false);
+    try std.testing.expectEqual(@as(u16, 200), found.status);
+    try std.testing.expectEqualStrings("{\"data\":{}}", body[0..found.body_len]);
+
+    const unauthorized = try runUsageLookup("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &body, false);
+    try std.testing.expectEqual(@as(u16, 401), unauthorized.status);
+
+    var small: [4]u8 = undefined;
+    try std.testing.expectError(error.BodyTooLarge, runUsageLookup("HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":{}}", &small, false));
+
+    try std.testing.expectError(error.Canceled, runUsageLookup("", &body, true));
 }

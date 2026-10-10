@@ -1,4 +1,6 @@
 const std = @import("std");
+const usage_mod = @import("usage");
+const usage_owner = @import("../session/usage_owner.zig");
 const credentials = @import("../auth/credentials.zig");
 const activity_status = @import("../output/activity_status.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
@@ -205,10 +207,10 @@ test "shutdown settles queued and pacer-owned finishes exactly once" {
             .consumed_provider_attempts = 1,
         };
         try app_session_runtime.Runtime(ShutdownApp).setRecoveryCheckpoint(&app, checkpoint);
-        var usage = try app.session.usage.snapshot(alloc);
+        var usage = try usage_owner.testSnapshot(alloc, 0, 0);
         defer usage.deinit(alloc);
-        var models = [_]@import("../session/session_usage.zig").ModelAggregate{.{
-            .model = @constCast("test-model"),
+        var models = [_]usage_mod.snapshot.Model{.{
+            .model = "test-model",
             .first_sequence = 1,
             .input_tokens = 7,
             .output_tokens = 11,
@@ -222,7 +224,8 @@ test "shutdown settles queued and pacer-owned finishes exactly once" {
         usage.output_tokens = 11;
         usage.next_sequence = 2;
         usage.settled_through_sequence = 1;
-        try app_session_runtime.Runtime(ShutdownApp).persistUsageCheckpoint(&app, usage);
+        const usage_host = app_session_runtime.Runtime(ShutdownApp).usageHost(&app);
+        try usage_host.persist_fn(usage_host.context, "shutdown-finish", &.{ .number = 1, .at_ms = 2, .snapshot = &usage });
 
         var ownership: Ownership = .{};
         const summary: types.TurnSummary = .{ .token_progress = .{ .input_tokens = 7, .output_tokens = 11 } };

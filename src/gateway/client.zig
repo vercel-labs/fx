@@ -1239,6 +1239,8 @@ pub const StreamRequest = struct {
     admission: ?agent_stream_provider.Admission = null,
     on_reasoning_chunk: ?StreamCallback = null,
     on_tool_input_chunk: ?StreamCallback = null,
+    /// Sees every parsed SSE event of the stream.
+    gateway_events: ?agent_stream_provider.GatewayEventTap = null,
     provider_attempt_owner: ProviderAttemptOwner = .transport,
     /// Long-lived pooled HTTP client owned by the provider runtime. When set,
     /// requests reuse pooled keep-alive connections instead of dialing per
@@ -1765,6 +1767,7 @@ fn streamGatewayCompletionCoreWithOptions(
             expected_provider_tool_name,
             request.content_capture_limit,
             active_connected_watch,
+            request.gateway_events,
         ) catch |err| {
             debug_trace.eventf("gateway", "sse_consume_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
             return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
@@ -3005,7 +3008,6 @@ fn deinitGatewayCompletion(alloc: std.mem.Allocator, completion: *types.ModelCom
     if (completion.content) |content| alloc.free(content);
     if (completion.generation_id) |id| alloc.free(id);
     if (completion.resolved_provider) |provider| alloc.free(@constCast(provider));
-    if (completion.billing) |billing| alloc.free(@constCast(billing.model));
     for (completion.tool_calls) |call| {
         alloc.free(call.id);
         alloc.free(call.name);
@@ -3308,125 +3310,6 @@ fn parseSseTokenTotal(usage_value: std.json.Value, key: []const u8) ?u64 {
     return @intCast(total_value.integer);
 }
 
-const SseBillingParseError = std.mem.Allocator.Error || error{InvalidSseBilling};
-
-fn parseSseBilling(
-    alloc: std.mem.Allocator,
-    root: std.json.Value,
-    created_at_ms: ?i64,
-    tools: []const SseToolCallAccumulator,
-) SseBillingParseError!types.ProviderBilling {
-    const timestamp = created_at_ms orelse return error.InvalidSseBilling;
-    const usage = if (root == .object)
-        root.object.get("usage") orelse return error.InvalidSseBilling
-    else
-        return error.InvalidSseBilling;
-    if (usage != .object) return error.InvalidSseBilling;
-    const input = usage.object.get("inputTokens") orelse
-        return error.InvalidSseBilling;
-    const output = usage.object.get("outputTokens") orelse
-        return error.InvalidSseBilling;
-    if (input != .object or output != .object) return error.InvalidSseBilling;
-
-    const provider_metadata = root.object.get("providerMetadata") orelse
-        return error.InvalidSseBilling;
-    if (provider_metadata != .object) return error.InvalidSseBilling;
-    const gateway = provider_metadata.object.get("gateway") orelse
-        return error.InvalidSseBilling;
-    if (gateway != .object) return error.InvalidSseBilling;
-    const routing = gateway.object.get("routing") orelse
-        return error.InvalidSseBilling;
-    if (routing != .object) return error.InvalidSseBilling;
-    const model_value = routing.object.get("canonicalSlug") orelse
-        return error.InvalidSseBilling;
-    if (model_value != .string or
-        model_value.string.len == 0 or
-        model_value.string.len > 1024)
-    {
-        return error.InvalidSseBilling;
-    }
-    for (model_value.string) |byte| {
-        if (byte < 0x21 or byte > 0x7e) return error.InvalidSseBilling;
-    }
-
-    const cost_value = gateway.object.get("cost") orelse
-        return error.InvalidSseBilling;
-    if (cost_value != .string) return error.InvalidSseBilling;
-    const total_cost = std.fmt.parseFloat(f64, cost_value.string) catch
-        return error.InvalidSseBilling;
-    if (!std.math.isFinite(total_cost) or total_cost < 0) {
-        return error.InvalidSseBilling;
-    }
-
-    var billable_web_search_calls: u64 = 0;
-    for (tools) |tool| {
-        if (tool.provenance != .provider_executed) continue;
-        if (!std.mem.eql(u8, tool.name.items, "web_search") and
-            !std.mem.endsWith(u8, tool.name.items, "_search"))
-        {
-            continue;
-        }
-        billable_web_search_calls = std.math.add(
-            u64,
-            billable_web_search_calls,
-            1,
-        ) catch return error.InvalidSseBilling;
-    }
-
-    const input_tokens = try parseBillingInteger(input.object.get("total"));
-    const output_tokens = try parseBillingInteger(output.object.get("total"));
-    const cache_read_tokens = try parseOptionalBillingInteger(
-        input.object.get("cacheRead"),
-    );
-    const cache_write_tokens = try parseOptionalBillingInteger(
-        input.object.get("cacheWrite"),
-    );
-    const reasoning_tokens = try parseOptionalNullableBillingInteger(
-        output.object.get("reasoning"),
-    );
-    if (cache_read_tokens > input_tokens or
-        cache_write_tokens > input_tokens or
-        (reasoning_tokens != null and reasoning_tokens.? > output_tokens))
-    {
-        return error.InvalidSseBilling;
-    }
-
-    return .{
-        .created_at_ms = timestamp,
-        .model = try alloc.dupe(u8, model_value.string),
-        .total_cost = total_cost,
-        .input_tokens = input_tokens,
-        .output_tokens = output_tokens,
-        .cache_read_tokens = cache_read_tokens,
-        .cache_write_tokens = cache_write_tokens,
-        .reasoning_tokens = reasoning_tokens,
-        .billable_web_search_calls = billable_web_search_calls,
-    };
-}
-
-fn parseBillingInteger(value: ?std.json.Value) error{InvalidSseBilling}!u64 {
-    const actual = value orelse return error.InvalidSseBilling;
-    if (actual != .integer or actual.integer < 0) {
-        return error.InvalidSseBilling;
-    }
-    return @intCast(actual.integer);
-}
-
-fn parseOptionalBillingInteger(
-    value: ?std.json.Value,
-) error{InvalidSseBilling}!u64 {
-    return if (value) |actual| try parseBillingInteger(actual) else 0;
-}
-
-fn parseOptionalNullableBillingInteger(
-    value: ?std.json.Value,
-) error{InvalidSseBilling}!?u64 {
-    return if (value) |actual|
-        if (actual == .null) null else try parseBillingInteger(actual)
-    else
-        null;
-}
-
 /// Extracts the gateway's resolved provider slug from finish routing
 /// metadata. Display-only: absent or malformed routing never fails the
 /// stream, it just leaves the completion without routing detail.
@@ -3462,32 +3345,19 @@ fn parseSseServiceTier(root: std.json.Value) ?types.ProviderServiceTier {
     return types.ProviderServiceTier.parse(service_tier.string);
 }
 
+/// Keeps the stream's first valid Gateway generation id.
 fn captureGenerationMetadata(
     alloc: std.mem.Allocator,
     root: std.json.Value,
     generation_id: *?[]u8,
-    invalid: *bool,
 ) !void {
-    if (root != .object) return;
+    if (root != .object or generation_id.* != null) return;
     const provider_metadata = root.object.get("providerMetadata") orelse return;
-    if (provider_metadata != .object) {
-        invalid.* = true;
-        return;
-    }
+    if (provider_metadata != .object) return;
     const gateway = provider_metadata.object.get("gateway") orelse return;
-    if (gateway != .object) {
-        invalid.* = true;
-        return;
-    }
+    if (gateway != .object) return;
     const generation_value = gateway.object.get("generationId") orelse return;
-    if (generation_value != .string or !types.validGatewayGenerationId(generation_value.string)) {
-        invalid.* = true;
-        return;
-    }
-    if (generation_id.*) |existing| {
-        if (!std.mem.eql(u8, existing, generation_value.string)) invalid.* = true;
-        return;
-    }
+    if (generation_value != .string or !types.validGatewayGenerationId(generation_value.string)) return;
     generation_id.* = try alloc.dupe(u8, generation_value.string);
 }
 
@@ -3499,7 +3369,7 @@ fn consumeSseStream(
     on_tool_start: ?ToolStartCallback,
     cancel_flag: *std.atomic.Value(bool),
 ) !types.ModelCompletion {
-    return consumeSseStreamTraced(alloc, reader, callback_ctx, on_content_chunk, on_tool_start, null, null, cancel_flag, null, null, null, null);
+    return consumeSseStreamTraced(alloc, reader, callback_ctx, on_content_chunk, on_tool_start, null, null, cancel_flag, null, null, null, null, null);
 }
 
 /// Decodes an AI Gateway SSE response from a transport-owned reader.
@@ -3516,6 +3386,7 @@ pub fn consumeGatewaySseStream(
     on_reasoning_chunk: ?StreamCallback,
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
+    gateway_events: ?agent_stream_provider.GatewayEventTap,
 ) !types.ModelCompletion {
     return consumeSseStreamTraced(
         alloc,
@@ -3530,6 +3401,7 @@ pub fn consumeGatewaySseStream(
         null,
         content_capture_limit,
         null,
+        gateway_events,
     );
 }
 
@@ -3546,6 +3418,7 @@ fn consumeSseStreamTraced(
     expected_provider_tool_name: ?[]const u8,
     content_capture_limit: ?usize,
     progress_watch: ?*ConnectedRequestWatch,
+    gateway_events: ?agent_stream_provider.GatewayEventTap,
 ) !types.ModelCompletion {
     var content_buf: std.ArrayList(u8) = .empty;
     defer content_buf.deinit(alloc);
@@ -3571,16 +3444,9 @@ fn consumeSseStreamTraced(
     var finish_usage: types.Usage = .{};
     var finish_resolved_provider: ?[]const u8 = null;
     defer if (finish_resolved_provider) |provider| alloc.free(@constCast(provider));
-    var finish_billing: ?types.ProviderBilling = null;
-    defer if (finish_billing) |billing| alloc.free(@constCast(billing.model));
     var finish_service_tier: ?types.ProviderServiceTier = null;
     var generation_id: ?[]u8 = null;
     defer if (generation_id) |id| alloc.free(id);
-    var resolved_model: ?[]u8 = null;
-    defer if (resolved_model) |model| alloc.free(model);
-    var response_timestamp_ms: ?i64 = null;
-    var response_timestamp_invalid = false;
-    var generation_metadata_invalid = false;
     var provider_result_identity_failure: ?types.ProviderResultIdentityFailure = null;
     var provider_failure_cause: ?types.ProviderFailureCause = null;
     var provider_failure_detail: ?[]u8 = null;
@@ -3630,12 +3496,12 @@ fn consumeSseStreamTraced(
             return error.InvalidGatewaySseEvent;
         };
         traceParsedSseEvent(alloc, root, json_text.len);
+        if (gateway_events) |tap| tap.observe(root);
         if (root != .object) continue;
         try captureGenerationMetadata(
             alloc,
             root,
             &generation_id,
-            &generation_metadata_invalid,
         );
 
         const type_val = root.object.get("type") orelse continue;
@@ -3645,42 +3511,6 @@ fn consumeSseStreamTraced(
         if (content_capture_limit == null) try replay.observe(root, content_buf.items.len);
 
         if (std.mem.eql(u8, event_type, "response-metadata")) {
-            if (root.object.get("timestamp")) |timestamp_value| {
-                if (timestamp_value == .string) {
-                    const timestamp = types.parseGatewayTimestamp(
-                        timestamp_value.string,
-                    ) catch null;
-                    if (timestamp) |valid_timestamp| {
-                        if (response_timestamp_ms) |existing| {
-                            if (existing != valid_timestamp) {
-                                response_timestamp_invalid = true;
-                                response_timestamp_ms = null;
-                            }
-                        } else if (!response_timestamp_invalid) {
-                            response_timestamp_ms = valid_timestamp;
-                        }
-                    } else {
-                        response_timestamp_invalid = true;
-                        response_timestamp_ms = null;
-                    }
-                } else {
-                    response_timestamp_invalid = true;
-                    response_timestamp_ms = null;
-                }
-            }
-            if (root.object.get("modelId")) |model_val| {
-                if (model_val == .string and model_val.string.len > 0 and model_val.string.len <= 128) {
-                    if (resolved_model) |existing| {
-                        if (!std.mem.eql(u8, existing, model_val.string)) {
-                            generation_metadata_invalid = true;
-                        }
-                    } else {
-                        resolved_model = try alloc.dupe(u8, model_val.string);
-                    }
-                } else {
-                    generation_metadata_invalid = true;
-                }
-            }
             if (resolved_model_trace) |trace| {
                 if (root.object.get("modelId")) |model_val| {
                     if (model_val == .string and model_val.string.len > 0) {
@@ -4014,22 +3844,6 @@ fn consumeSseStreamTraced(
             finish_usage = finish_event.usage;
             finish_resolved_provider = parseSseResolvedProvider(alloc, root);
             finish_service_tier = parseSseServiceTier(root);
-            finish_billing = parseSseBilling(
-                alloc,
-                root,
-                if (response_timestamp_invalid) null else response_timestamp_ms,
-                tool_accumulators.items,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.InvalidSseBilling => invalid: {
-                    debug_trace.logf(
-                        "sse",
-                        "stream billing ignored reason=invalid_terminal_metadata",
-                        .{},
-                    );
-                    break :invalid null;
-                },
-            };
             traceSseTermination(resolved_model_trace, "valid_finish", finish_reason_holder);
             break;
         }
@@ -4055,10 +3869,7 @@ fn consumeSseStreamTraced(
     generation_id = null;
     completion.resolved_provider = finish_resolved_provider;
     finish_resolved_provider = null;
-    completion.billing = finish_billing;
-    finish_billing = null;
     completion.service_tier = finish_service_tier;
-    completion.generation_metadata_invalid = generation_metadata_invalid;
     completion.finish_reason = finish_reason_holder;
     completion.usage = finish_usage;
 
@@ -4180,6 +3991,57 @@ test "consumeSseStream preserves provider finish_reason" {
     try std.testing.expectEqual(types.ProviderFinishReason.length, completion.finish_reason.?);
 }
 
+test "the gateway event tap sees every parsed event, so usage prices the call exactly" {
+    const usage_mod = @import("usage");
+    const payload =
+        "data: {\"type\":\"response-metadata\",\"modelId\":\"provider/resolved\"}\n\n" ++
+        "data: {\"type\":\"text-start\",\"id\":\"t1\",\"providerMetadata\":{\"gateway\":{\"generationId\":\"gen_01ARZ3NDEKTSV4RRFFQ69G5FAV\"}}}\n\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":3},\"outputTokens\":{\"total\":2}},\"providerMetadata\":{\"gateway\":{\"generationId\":\"gen_01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"gatewayCost\":\"0.0042\",\"routing\":{\"canonicalSlug\":\"provider/canonical\"}}}}\n\n" ++
+        "data: [DONE]\n\n";
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const Tap = struct {
+        call: *usage_mod.Call,
+        events: usize = 0,
+
+        fn observe(raw: *anyopaque, event: std.json.Value) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.events += 1;
+            self.call.gatewayValue(event);
+        }
+
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    const ledger = try usage_mod.Ledger.openDetached(std.testing.allocator, io_mod.getIo(), .{});
+    defer ledger.close() catch {};
+    var call = try ledger.begin(.gateway);
+    var tap: Tap = .{ .call = &call };
+
+    var completion = try consumeSseStreamTraced(
+        std.testing.allocator,
+        &reader,
+        undefined,
+        Tap.chunk,
+        null,
+        null,
+        null,
+        &cancel_flag,
+        null,
+        null,
+        null,
+        null,
+        .{ .context = &tap, .observe_fn = Tap.observe },
+    );
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+
+    try std.testing.expectEqual(@as(usize, 3), tap.events);
+    _ = try call.finish(.completed);
+    var view = try ledger.view(std.testing.allocator, .session, io_mod.milliTimestamp(), .{});
+    defer view.deinit(std.testing.allocator);
+    try std.testing.expectEqual(usage_mod.report.Completeness.complete, view.completeness);
+    try std.testing.expectEqual(@as(f64, 0.0042), view.totals.?.total_cost);
+}
+
 test "consumeSseStream captures generation identity metadata" {
     const payload =
         "data: {\"type\":\"response-metadata\",\"modelId\":\"provider/resolved\"}\n\n" ++
@@ -4205,52 +4067,6 @@ test "consumeSseStream captures generation identity metadata" {
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
         completion.generation_id.?,
     );
-    try std.testing.expect(!completion.generation_metadata_invalid);
-    try std.testing.expect(completion.billing == null);
-}
-
-test "consumeSseStream traces rejected terminal billing before fallback" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    const trace_path = try std.fs.path.join(
-        alloc,
-        &.{ root, "invalid-terminal-billing.log" },
-    );
-    defer alloc.free(trace_path);
-    debug_trace.resetForTest();
-    defer debug_trace.resetForTest();
-    try debug_trace.configureForTestWithScopes(alloc, trace_path, "sse");
-
-    const payload =
-        "data: {\"type\":\"response-metadata\",\"modelId\":\"provider/resolved\",\"timestamp\":\"2026-07-29T03:31:07.000Z\"}\n\n" ++
-        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":1},\"outputTokens\":{\"total\":2}},\"providerMetadata\":{\"gateway\":{\"cost\":\"invalid\",\"routing\":{\"canonicalSlug\":\"provider/resolved\"}}}}\n\n";
-    var reader = std.Io.Reader.fixed(payload);
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    const Noop = struct {
-        fn chunk(_: *anyopaque, _: []const u8) void {}
-    };
-    var completion = try consumeSseStream(
-        alloc,
-        &reader,
-        undefined,
-        Noop.chunk,
-        null,
-        &cancel_flag,
-    );
-    defer deinitGatewayCompletion(alloc, &completion);
-    try std.testing.expect(completion.billing == null);
-
-    debug_trace.shutdown();
-    const trace = try readTraceFileForTest(alloc, trace_path);
-    defer alloc.free(trace);
-    try std.testing.expect(std.mem.find(
-        u8,
-        trace,
-        "stream billing ignored reason=invalid_terminal_metadata",
-    ) != null);
 }
 
 test "consumeSseStream captures the resolved routing provider" {
@@ -4321,41 +4137,6 @@ test "consumeSseStream leaves missing and unknown service tiers unconfirmed" {
         defer deinitGatewayCompletion(alloc, &completion);
         try std.testing.expect(completion.service_tier == null);
     }
-}
-
-test "consumeSseStream captures exact terminal billing" {
-    const payload =
-        "data: {\"type\":\"response-metadata\",\"modelId\":\"provider/resolved\",\"timestamp\":\"2026-07-29T03:31:07.000Z\"}\n\n" ++
-        "data: {\"type\":\"tool-call\",\"toolCallId\":\"call_1\",\"toolName\":\"web_search\",\"input\":{},\"providerExecuted\":true,\"providerMetadata\":{\"gateway\":{\"generationId\":\"gen_01ARZ3NDEKTSV4RRFFQ69G5FAV\"}}}\n\n" ++
-        "data: {\"type\":\"tool-call\",\"toolCallId\":\"call_2\",\"toolName\":\"image_search\",\"input\":{},\"providerExecuted\":true}\n\n" ++
-        "data: {\"type\":\"tool-call\",\"toolCallId\":\"call_3\",\"toolName\":\"read_file\",\"input\":{},\"providerExecuted\":true}\n\n" ++
-        "data: {\"type\":\"tool-call\",\"toolCallId\":\"call_4\",\"toolName\":\"web_search\",\"input\":{}}\n\n" ++
-        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":130,\"cacheRead\":20,\"cacheWrite\":10},\"outputTokens\":{\"total\":25,\"reasoning\":5}},\"providerMetadata\":{\"gateway\":{\"generationId\":\"gen_01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"cost\":\"0.0123\",\"routing\":{\"canonicalSlug\":\"provider/canonical\"}}}}\n\n";
-    var reader = std.Io.Reader.fixed(payload);
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    const Noop = struct {
-        fn chunk(_: *anyopaque, _: []const u8) void {}
-    };
-
-    var completion = try consumeSseStream(
-        std.testing.allocator,
-        &reader,
-        undefined,
-        Noop.chunk,
-        null,
-        &cancel_flag,
-    );
-    defer deinitGatewayCompletion(std.testing.allocator, &completion);
-
-    const billing = completion.billing.?;
-    try std.testing.expectEqualStrings("provider/canonical", billing.model);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.0123), billing.total_cost, 1e-12);
-    try std.testing.expectEqual(@as(u64, 130), billing.input_tokens);
-    try std.testing.expectEqual(@as(u64, 25), billing.output_tokens);
-    try std.testing.expectEqual(@as(u64, 20), billing.cache_read_tokens);
-    try std.testing.expectEqual(@as(u64, 10), billing.cache_write_tokens);
-    try std.testing.expectEqual(@as(u64, 5), billing.reasoning_tokens.?);
-    try std.testing.expectEqual(@as(u64, 2), billing.billable_web_search_calls);
 }
 
 test "consumeSseStream surfaces finish reasoning tokens in turn usage" {

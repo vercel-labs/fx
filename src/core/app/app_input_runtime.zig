@@ -39,7 +39,7 @@ const session_commands = @import("../session/session_commands.zig");
 const session_catalog = @import("../session/session_catalog.zig");
 const session_runtime = @import("../session/session.zig");
 const session_store = @import("../session/session_store.zig");
-const usage_report = @import("../session/usage_report.zig");
+const usage_mod = @import("usage");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const file_index = @import("../workspace/file_index.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
@@ -2691,7 +2691,7 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        fn refreshUsageMenu(app: *App, scope: usage_report.Scope) !void {
+        fn refreshUsageMenu(app: *App, scope: usage_mod.Scope) !void {
             if (comptime !runtime_profile.allows(App, .profile_usage)) return;
             if (comptime @hasDecl(App, "refreshUsageMenu")) {
                 try app.refreshUsageMenu(scope);
@@ -2700,7 +2700,7 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        fn reloadUsageMenu(app: *App, scope: usage_report.Scope) !void {
+        fn reloadUsageMenu(app: *App, scope: usage_mod.Scope) !void {
             if (comptime !runtime_profile.allows(App, .profile_usage)) return;
             if (comptime @hasDecl(App, "reloadUsageMenu")) {
                 try app.reloadUsageMenu(scope);
@@ -2713,20 +2713,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn cycleUsageMenuScope(app: *App, delta: i32) !void {
             const current = app.input_runtime.usage_menu.navigationScope();
-            const next: usage_report.Scope = if (delta < 0)
-                switch (current) {
-                    .days_30 => .session,
-                    .days_7 => .days_30,
-                    .hours_24 => .days_7,
-                    .session => .hours_24,
-                }
-            else switch (current) {
-                .days_30 => .days_7,
-                .days_7 => .hours_24,
-                .hours_24 => .session,
-                .session => .days_30,
-            };
-            try refreshUsageMenu(app, next);
+            try refreshUsageMenu(app, current.cycle(if (delta < 0) .backward else .forward));
         }
 
         fn submitHelpMenuSelection(app: *App, max_input_len: usize, max_prompt_history: usize) !bool {
@@ -4022,7 +4009,7 @@ const RoutingFakeApp = struct {
 
     pub fn refreshUsageMenu(
         self: *RoutingFakeApp,
-        scope: usage_report.Scope,
+        scope: usage_mod.Scope,
     ) !void {
         self.input_runtime.usage_menu.requested_scope = scope;
     }
@@ -5363,17 +5350,15 @@ test "app_input_runtime Tab cycles usage scopes in both directions" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try app.input_runtime.usage_menu.openError(
-        alloc,
-        .days_30,
-        "usage is unavailable",
-    );
+    app.input_runtime.usage_menu.openError(alloc, .session);
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
-    try std.testing.expectEqual(usage_report.Scope.days_7, app.input_runtime.usage_menu.navigationScope());
+    try std.testing.expectEqual(usage_mod.Scope.hours_24, app.input_runtime.usage_menu.navigationScope());
 
     try feedRoutingBytes(&app, "\x1b[Z");
-    try std.testing.expectEqual(usage_report.Scope.days_30, app.input_runtime.usage_menu.navigationScope());
+    try std.testing.expectEqual(usage_mod.Scope.session, app.input_runtime.usage_menu.navigationScope());
+    try feedRoutingBytes(&app, "\x1b[Z");
+    try std.testing.expectEqual(usage_mod.Scope.days_30, app.input_runtime.usage_menu.navigationScope());
 }
 
 test "app_input_runtime Tab toggles session picker scope before autocomplete" {
@@ -8279,11 +8264,7 @@ test "app_input_runtime Ghostty Escape press closes the usage dashboard" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try app.input_runtime.usage_menu.openError(
-        alloc,
-        .days_30,
-        "usage is unavailable",
-    );
+    app.input_runtime.usage_menu.openError(alloc, .days_30);
 
     try feedRoutingBytes(&app, "\x1b[27;1:1u");
 
@@ -8294,11 +8275,7 @@ test "app_input_runtime Ghostty Escape release leaves the usage dashboard open" 
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try app.input_runtime.usage_menu.openError(
-        alloc,
-        .days_30,
-        "usage is unavailable",
-    );
+    app.input_runtime.usage_menu.openError(alloc, .days_30);
 
     try feedRoutingBytes(&app, "\x1b[27;1:3u");
 

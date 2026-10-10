@@ -1,0 +1,14 @@
+data: {"type":"stream-start","warnings":[]}
+
+data: {"type":"response-metadata","id":"82184fb5-470b-43a6-8b1c-5d451b432e7a","timestamp":"2026-10-07T17:07:22.000Z","modelId":"us.amazon.nova-micro-v1:0"}
+
+data: {"type":"text-start","id":"0"}
+
+data: {"type":"text-delta","id":"0","delta":"ok"}
+
+data: {"type":"text-end","id":"0"}
+
+data: {"type":"finish","finishReason":{"unified":"stop","raw":"end_turn"},"usage":{"inputTokens":{"total":7,"noCache":7,"cacheRead":0,"cacheWrite":0},"outputTokens":{"total":2,"text":2},"raw":{"inputTokens":7,"outputTokens":2,"totalTokens":9,"serverToolUsage":{}}},"providerMetadata":{"gateway":{"routing":{"originalModelId":"amazon/nova-micro","resolvedProvider":"bedrock","fallbacksAvailable":[],"planningReasoning":"System credentials planned for: bedrock. Total execution order: bedrock(system)","canonicalSlug":"amazon/nova-micro","finalProvider":"bedrock","modelAttemptCount":1,"modelAttempts":[{"canonicalSlug":"amazon/nova-micro","success":true,"providerAttemptCount":1,"providerAttempts":[{"provider":"bedrock","credentialType":"system","success":true,"startTime":1791392842131,"endTime":1791392842713,"providerRequestId":"82184fb5-470b-43a6-8b1c-5d451b432e7a","statusCode":200,"providerResponseId":"82184fb5-470b-43a6-8b1c-5d451b432e7a"}]}],"totalProviderAttemptCount":1,"affinity":{"outcome":"skipped_below_min_prefix"},"clientSessionId":"83e0ae83833c1e52440ec3021b473c28","clientSessionIdSource":"fingerprint"},"cost":"0.000000525","marketCost":"0.000000525","surchargeCost":"0.0001","gatewayCost":"0.000100525","inferenceCost":"0.000000525","inputInferenceCost":"0.000000245","outputInferenceCost":"0.00000028","providerAllowlistCost":"0.0001","generationId":"gen_01M4BNB0BF8G3R1V2GWBT9BV7Q"}}}
+
+DONE
+

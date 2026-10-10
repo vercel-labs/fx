@@ -6077,6 +6077,7 @@ test(
             gateway: {
               generationId: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
               cost: "0.01",
+              gatewayCost: "0.01",
               routing: { canonicalSlug: FAKE_GATEWAY_MODEL },
             },
           },
@@ -6117,9 +6118,11 @@ test(
       };
       const settingsPath = join(home, ".fx", "settings.json");
       const routes = [
-        { settings: { provider: "gateway", model: FAKE_GATEWAY_MODEL }, text: "GATEWAY_USAGE_OK" },
-        { settings: { provider: "codex", codex_model: "gpt-5.6-sol" }, text: "CODEX_USAGE_OK" },
-        { settings: { provider: "grok", grok_model: "grok-4.20" }, text: "GROK_USAGE_OK" },
+        // The fake title replies carry no generation id or cost, which would
+        // leave these totals incomplete.
+        { settings: { provider: "gateway", model: FAKE_GATEWAY_MODEL, session_titles: false }, text: "GATEWAY_USAGE_OK" },
+        { settings: { provider: "codex", codex_model: "gpt-5.6-sol", session_titles: false }, text: "CODEX_USAGE_OK" },
+        { settings: { provider: "grok", grok_model: "grok-4.20", session_titles: false }, text: "GROK_USAGE_OK" },
       ];
       for (const route of routes) {
         writeFileSync(settingsPath, JSON.stringify(route.settings) + "\n", { mode: 0o600 });
@@ -6176,7 +6179,7 @@ test(
       writeSeededChatGptLogin(home, codex.accessToken);
       writeFileSync(
         join(home, ".fx", "settings.json"),
-        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol", session_titles: false }) + "\n",
         { mode: 0o600 },
       );
       const result = await runFx(
@@ -6319,7 +6322,7 @@ test(
       writeSeededGrokLogin(home, grok.accessToken, "acct_auto_review");
       writeFileSync(
         join(home, ".fx", "settings.json"),
-        JSON.stringify({ provider: "grok", grok_model: "grok-4.20" }) + "\n",
+        JSON.stringify({ provider: "grok", grok_model: "grok-4.20", session_titles: false }) + "\n",
         { mode: 0o600 },
       );
       const result = await runFx(

@@ -1,4 +1,5 @@
 const std = @import("std");
+const usage_mod = @import("usage");
 const question_prompt = @import("../../core/agent/question_prompt.zig");
 const auth_runtime = @import("../../core/auth/auth_runtime.zig");
 const credentials = @import("../../core/auth/credentials.zig");
@@ -774,11 +775,7 @@ pub fn composeCompactCommandMenuHintRow(
             "↑↓ move  ←→ change  esc",
             "←→ esc",
         },
-        .usage => [_][]const u8{
-            "tab scope     ↑↓ model     enter expand     r refresh     esc close",
-            "tab scope  ↑↓ model  enter expand  r refresh  esc",
-            "tab ↑↓  enter  r  esc",
-        },
+        .usage => usage_mod.render.hint_variants,
         .workspace => [_][]const u8{
             "↑↓ navigate     enter use     esc close",
             "↑↓ move  enter use  esc",

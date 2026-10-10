@@ -4,7 +4,8 @@ const stream_provider = @import("../core/agent/stream_provider.zig");
 const types = @import("../core/shared/types.zig");
 const io_mod = @import("../core/shared/io.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
-const session_usage = @import("../core/session/session_usage.zig");
+const usage_owner = @import("../core/session/usage_owner.zig");
+const usage_mod = @import("usage");
 const vercel_protocol = @import("vercel_protocol.zig");
 
 const Allocator = std.mem.Allocator;
@@ -190,14 +191,17 @@ const OwnedResult = struct {
 };
 
 const ReviewAdmission = struct {
-    usage: ?*session_usage.Usage,
+    usage: ?*usage_owner.Owner,
+    credential: types.CredentialLease,
     evidence: *stream_provider.AttemptEvidence,
-    observation: ?session_usage.InvocationObservation = null,
+    admitted: bool = false,
+    invocation: ?usage_owner.Invocation = null,
 
     fn admit(raw: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        if (self.observation != null) return error.ProviderAdmissionRepeated;
-        self.observation = try session_usage.InvocationObservation.begin(self.usage);
+        if (self.admitted) return error.ProviderAdmissionRepeated;
+        self.invocation = try usage_owner.Invocation.begin(self.usage, self.credential);
+        self.admitted = true;
         self.evidence.provider_admitted = true;
     }
 };
@@ -228,21 +232,23 @@ fn sendReview(
 
     var delivery = stream_provider.DeliveryCertainty.init();
     var evidence: stream_provider.AttemptEvidence = .{};
+    const credential: types.CredentialLease = if (runtime.input.credential_source == .host_managed)
+        .host_managed
+    else
+        .{ .direct = .{
+            .secret_bytes = runtime.input.credential,
+            .source = runtime.adapter.source,
+            .account_id = runtime.input.account_id,
+            .tenant_context = runtime.input.tenant,
+        } };
     var admission = ReviewAdmission{
         .usage = runtime.input.usage,
+        .credential = credential,
         .evidence = &evidence,
     };
     var callback_context: u8 = 0;
     var result = runtime.adapter.send_fn(alloc, .{
-        .credential = if (runtime.input.credential_source == .host_managed)
-            .host_managed
-        else
-            .{ .direct = .{
-                .secret_bytes = runtime.input.credential,
-                .source = runtime.adapter.source,
-                .account_id = runtime.input.account_id,
-                .tenant_context = runtime.input.tenant,
-            } },
+        .credential = credential,
         .model = model,
         .retry_count = 1,
         .messages = &.{},
@@ -258,8 +264,9 @@ fn sendReview(
         .cancel_flag = cancel_flag,
         .provider_attempt_owner = .transport,
     }, payload) catch |err| {
-        if (admission.observation) |observation| observation.fail(
-            if (delivery.load() == .possibly_sent) .ambiguous_delivery else .unbilled,
+        if (admission.invocation) |*invocation| invocation.failed(
+            err,
+            delivery.load() == .possibly_sent,
         ) catch |usage_err| {
             debugUsageFailure("transport_failure", usage_err);
             return .permanent_failure;
@@ -281,17 +288,13 @@ fn sendReview(
     };
     var result_owned = true;
     defer if (result_owned) result.deinit(alloc);
-    const observation = admission.observation orelse {
+    if (!admission.admitted) {
         debugUsageFailure("completion", error.ProviderAdmissionMissing);
         return .permanent_failure;
-    };
-    (switch (result) {
-        .failed => observation.fail(.unbilled),
-        .completed => |completed| observation.complete(
-            runtime.input.usage_allocator,
-            completed.completion,
-            completed.usage,
-        ),
+    }
+    if (admission.invocation) |*invocation| (switch (result) {
+        .failed => invocation.rejected(),
+        .completed => |completed| invocation.completed(completed.completion),
     }) catch |err| {
         debugUsageFailure("completion", err);
         return .permanent_failure;
@@ -374,29 +377,27 @@ test "direct review exact usage settles through the session ledger" {
                 .completion = .{
                     .content = "clear",
                     .generation_id = "response-review-1",
-                    .billing = .{
+                    .subscription_usage = .{
                         .created_at_ms = 1,
                         .model = "codex/gpt-review",
-                        .total_cost = 0,
                         .input_tokens = 11,
                         .output_tokens = 3,
                         .cache_read_tokens = 0,
                         .cache_write_tokens = 0,
                         .reasoning_tokens = null,
-                        .billable_web_search_calls = 0,
                     },
                     .finish_reason = .stop,
                 },
-                .usage = .{ .exact = .codex },
             } };
         }
     };
 
     const alloc = std.testing.allocator;
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
+    var usage: usage_owner.Owner = .{};
+    usage.bind(alloc, .{ .host = null, .home_path = null, .lookup = null });
+    defer usage.deinit();
     var runtime = Runtime{
-        .input = .{ .usage = &usage, .usage_allocator = alloc },
+        .input = .{ .usage = &usage },
         .adapter = .{
             .source = .chatgpt_subscription,
             .model = "gpt-review",
@@ -438,20 +439,17 @@ test "direct review settles every post-admission outcome before projection" {
             return .{ .completed = .{
                 .completion = .{
                     .generation_id = "response-review-outcome",
-                    .billing = .{
+                    .subscription_usage = .{
                         .created_at_ms = 1,
                         .model = "codex/gpt-review",
-                        .total_cost = 0,
                         .input_tokens = 11,
                         .output_tokens = 3,
                         .cache_read_tokens = 0,
                         .cache_write_tokens = 0,
                         .reasoning_tokens = null,
-                        .billable_web_search_calls = 0,
                     },
                     .finish_reason = .stop,
                 },
-                .usage = .{ .exact = .codex },
             } };
         }
 
@@ -475,7 +473,6 @@ test "direct review settles every post-admission outcome before projection" {
             if (std.mem.eql(u8, payload, "malformed")) {
                 return .{ .completed = .{
                     .completion = .{ .finish_reason = .stop },
-                    .usage = .{ .unavailable = .possibly_billed },
                 } };
             }
             if (std.mem.eql(u8, payload, "cancel_after_completion")) {
@@ -494,7 +491,7 @@ test "direct review settles every post-admission outcome before projection" {
     const cases = [_]struct {
         payload: []const u8,
         outcome: std.meta.Tag(permission_auto_classifier.TransportOutcome),
-        billing: session_usage.Availability,
+        billing: usage_mod.snapshot.Billing,
         request_count: ?u64,
     }{
         .{ .payload = "cancelled", .outcome = .cancelled, .billing = .incomplete, .request_count = 0 },
@@ -506,10 +503,11 @@ test "direct review settles every post-admission outcome before projection" {
     };
 
     for (cases) |case| {
-        var usage = session_usage.Usage.initFresh();
-        defer usage.deinit(std.testing.allocator);
+        var usage: usage_owner.Owner = .{};
+        usage.bind(std.testing.allocator, .{ .host = null, .home_path = null, .lookup = null });
+        defer usage.deinit();
         var runtime = Runtime{
-            .input = .{ .usage = &usage, .usage_allocator = std.testing.allocator },
+            .input = .{ .usage = &usage },
             .adapter = .{
                 .source = .chatgpt_subscription,
                 .model = "gpt-review",

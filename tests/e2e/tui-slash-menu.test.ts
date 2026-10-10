@@ -211,16 +211,16 @@ async function waitForStatuslineMenu(
   throw new Error(`Timed out waiting for status line menu.\nPane:\n${latest.join("\n")}`);
 }
 
-async function waitForUsageMenu(session: TmuxSession): Promise<string[]> {
+async function waitForUsageMenu(session: TmuxSession, period = "[session]"): Promise<string[]> {
   const deadline = Date.now() + TIMEOUT;
   let latest: string[] = [];
   while (Date.now() < deadline) {
     latest = await session.capturePaneGrid();
     const pane = latest.join("\n");
     if (
-      pane.includes("[30 days]") &&
+      pane.includes(period) &&
       pane.includes("esc close") &&
-      !pane.includes("Loading usage")
+      !pane.includes("loading usage")
     ) return latest;
     await Bun.sleep(100);
   }
@@ -1875,15 +1875,19 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendText("/cost");
       let grid = await waitForUsageMenu(session);
       let pane = grid.join("\n");
-      expect(pane).toContain("Tracking has not started");
+      expect(pane).toContain("no usage yet");
       expect(pane).not.toMatch(/^[*✓!✗⊘i] usage/m);
+      // Shift+Tab wraps from the session to 30 days: tracking has not started.
+      await session.sendKeys("BTab");
+      pane = (await waitForUsageMenu(session, "[30d]")).join("\n");
+      expect(pane).toContain("no usage yet");
 
       await session.sendKeys("Escape");
       await session.waitForComposer(5_000);
       await session.sendText("/usage");
       grid = await waitForUsageMenu(session);
       pane = grid.join("\n");
-      expect(pane).toContain("[30 days]");
+      expect(pane).toContain("[session]");
 
       await session.sendKeys("Escape");
       await session.waitForComposer(5_000);
@@ -1932,10 +1936,12 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       });
       await session.waitForComposer(10_000);
       await session.sendText("/usage");
-      const pane = (await waitForUsageMenu(session)).join("\n");
-      expect(pane).not.toContain("Usage unavailable");
-      expect(pane).toContain("Partial data · some usage may be missing");
-      expect(pane).toMatch(/0 tokens/);
+      await waitForUsageMenu(session);
+      await session.sendKeys("BTab");
+      const pane = (await waitForUsageMenu(session, "[30d]")).join("\n");
+      expect(pane).not.toContain("usage unavailable");
+      expect(pane).toContain("warning: totals may be incomplete");
+      expect(pane).toContain("no priced requests yet");
 
       await session.sendKeys("Escape");
       await session.waitForComposer(5_000);
@@ -1969,7 +1975,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       });
       await session.waitForComposer(10_000);
       await session.sendText("/usage");
-      await session.waitForText("Tracking has not started", TIMEOUT);
+      await session.waitForText("no usage yet", TIMEOUT);
       await session.sendKeys("Escape");
       await session.waitForComposer(5_000);
 
@@ -2004,8 +2010,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
 
       await session.sendText("/usage");
-      const pane = await session.waitForText(/12 tokens/, TIMEOUT);
-      expect(pane).toContain("provider/a");
+      await waitForUsageMenu(session);
+      await session.sendKeys("BTab");
+      await session.waitForText(/\[30d\][\s\S]*\s12\s+1\s+provider\/a/, TIMEOUT);
 
       await session.sendKeys("Escape");
       await session.waitForComposer(5_000);
@@ -2042,8 +2049,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       });
       await session.waitForComposer(10_000);
       await session.sendText("/usage");
-      await session.waitForText(
-        "Usage unavailable · press r to retry",
+      await session.waitForText("[session]", TIMEOUT);
+      await session.sendKeys("BTab");
+      await session.waitForPane(
+        (current) => current.includes("[30d]") && current.includes("usage unavailable; press r to retry"),
         TIMEOUT,
       );
 
@@ -2080,8 +2089,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
 
       await session.sendLiteral("R");
-      const pane = await session.waitForText(/12 tokens/, TIMEOUT);
-      expect(pane).not.toContain("Usage unavailable");
+      const pane = await session.waitForText(/\[30d\][\s\S]*\s12\s+1\s+provider\/a/, TIMEOUT);
+      expect(pane).not.toContain("usage unavailable");
 
       await session.sendKeys("Escape");
       await session.waitForComposer(5_000);
@@ -2120,22 +2129,18 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       });
       await session.waitForComposer(10_000);
       await session.sendText("/usage");
-      let pane = await session.waitForText(
-        "Usage unavailable · press r to retry",
-        TIMEOUT,
-      );
-      expect(pane).toContain("[30 days]");
+      // The session's own view works while the profile ledger cannot be read.
+      let pane = await session.waitForText("no usage yet", TIMEOUT);
+      expect(pane).toContain("[session]");
+      expect(pane).toMatch(/api \S+  wall \S+  lines/);
 
-      await session.sendKeys("Left");
-      pane = await session.waitForText("[7 days]", TIMEOUT);
-      expect(pane).toContain("Usage unavailable · press r to retry");
-      await session.sendKeys("Left");
-      pane = await session.waitForText("[24 hours]", TIMEOUT);
-      expect(pane).toContain("Usage unavailable · press r to retry");
-      await session.sendKeys("Left");
-      pane = await session.waitForText("[Session]", TIMEOUT);
-      expect(pane).toMatch(/0 tokens/);
-      expect(pane).toContain("Session activity");
+      for (const period of ["[24h]", "[7d]", "[30d]"]) {
+        await session.sendKeys("Right");
+        pane = await session.waitForPane(
+          (current) => current.includes(period) && current.includes("usage unavailable; press r to retry"),
+          TIMEOUT,
+        );
+      }
 
       await session.sendKeys("Escape");
       await session.waitForComposer(5_000);
@@ -2236,35 +2241,36 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       });
       await session.waitForComposer(10_000);
       await session.sendText("/usage");
-      let pane = await session.waitForText(/137 tokens/, TIMEOUT);
-      expect(pane).toContain("[30 days]");
+      let pane = await session.waitForText("[session]", TIMEOUT);
+      pane = await session.waitForText("no usage yet", TIMEOUT);
+      expect(pane).toMatch(/api \S+  wall \S+  lines/);
 
+      // Tab walks session, 24h, 7d, 30d. 24h holds one model, so no total.
       await session.sendKeys("Tab");
-      pane = await session.waitForText("[7 days]", TIMEOUT);
-      expect(pane).toMatch(/132 tokens/);
+      pane = await session.waitForText(/\[24h\][\s\S]*\$1\.00\s+120\s+1\s+provider\/a/, TIMEOUT);
+      expect(pane).not.toMatch(/\btotal\b/);
       await session.sendKeys("Tab");
-      pane = await session.waitForText("[24 hours]", TIMEOUT);
-      expect(pane).toMatch(/120 tokens/);
+      pane = await session.waitForText(/\[7d\][\s\S]*\$1\.10\s+132\s+2\s+total/, TIMEOUT);
       await session.sendKeys("Tab");
-      pane = await session.waitForText("[Session]", TIMEOUT);
-      expect(pane).toMatch(/0 tokens/);
-      expect(pane).toContain("Session activity");
+      pane = await session.waitForText(/\[30d\][\s\S]*\$1\.11\s+137\s+3\s+total/, TIMEOUT);
+      // Left, Shift+Tab, and Right move between periods without wrapping.
+      await session.sendKeys("Left");
+      await session.waitForText("[7d]", TIMEOUT);
       await session.sendKeys("BTab");
-      await session.waitForText("[24 hours]", TIMEOUT);
+      await session.waitForText("[24h]", TIMEOUT);
       await session.sendKeys("Right");
-      await session.waitForText("[7 days]", TIMEOUT);
+      await session.waitForText(/\[7d\][\s\S]*132\s+2\s+total/, TIMEOUT);
 
       await session.sendKeys("Down");
-      pane = await session.waitForText(/❯ provider\/b/, TIMEOUT);
+      pane = await session.waitForText(/❯ \S+\s+12\s+1\s+provider\/b/, TIMEOUT);
       await session.sendKeys("Enter");
-      pane = await session.waitForText(/Input 10 · Output 2/, TIMEOUT);
-      expect(pane).toContain("Requests 1");
+      pane = await session.waitForText(/in 10  cached 1  out 2  reasoning 1/, TIMEOUT);
       await session.resizeWindow(72, 16);
-      pane = await session.waitForText(/Input 10 · Output 2/, TIMEOUT);
-      expect(pane).toMatch(/❯ provider\/b/);
+      pane = await session.waitForText(/in 10  cached 1  out 2  reasoning 1/, TIMEOUT);
+      expect(pane).toMatch(/❯ .*provider\/b/);
       await session.resizeWindow(120, 36);
-      pane = await session.waitForText(/Input 10 · Output 2/, TIMEOUT);
-      expect(pane).toMatch(/❯ provider\/b/);
+      pane = await session.waitForText(/in 10  cached 1  out 2  reasoning 1/, TIMEOUT);
+      expect(pane).toMatch(/❯ .*provider\/b/);
 
       appendFileSync(
         usagePath,
@@ -2280,16 +2286,16 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         ) + "\n",
       );
       await session.sendLiteral("R");
-      pane = await session.waitForText(/137 tokens/, TIMEOUT);
-      expect(pane).toMatch(/❯ provider\/b/);
+      pane = await session.waitForText(/137\s+3\s+total/, TIMEOUT);
+      expect(pane).toMatch(/❯ .*provider\/b/);
 
       appendFileSync(usagePath, "{\"broken\":true}\n");
       await session.sendLiteral("R");
       pane = await session.waitForText(
-        "Refresh failed · showing previous data",
+        "warning: refresh failed; showing earlier data",
         TIMEOUT,
       );
-      expect(pane).toMatch(/137 tokens/);
+      expect(pane).toMatch(/137\s+3\s+total/);
 
       await session.sendKeys("Escape");
       await session.waitForComposer(5_000);

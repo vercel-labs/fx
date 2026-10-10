@@ -1,7 +1,7 @@
 const std = @import("std");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const settings_catalog = @import("../config/settings_catalog.zig");
-const usage_menu = @import("../session/usage_menu.zig");
+const usage_dashboard = @import("usage_dashboard.zig");
 const workspace_menu = @import("../workspace/workspace_menu.zig");
 const composer_deletion = @import("composer_deletion.zig");
 const composer_insertion = @import("composer_insertion.zig");
@@ -38,7 +38,7 @@ pub const Runtime = struct {
     help_menu: command_specs.HelpMenu = .{},
     settings_menu: settings_catalog.Menu = .{},
     statusline_menu: settings_catalog.StatuslineMenu = .{},
-    usage_menu: usage_menu.State = .{},
+    usage_menu: usage_dashboard.State = .{},
     workspace_menu: workspace_menu.State = .{},
     composer_history: composer_history.State = .{},
     paste: paste_framing.State = .{},

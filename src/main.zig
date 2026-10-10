@@ -15,7 +15,6 @@ const js_host_clipboard = @import("core/hosts/js_host_clipboard.zig");
 const credentials = @import("core/auth/credentials.zig");
 const secret = @import("core/auth/secret.zig");
 const model_cache_runtime = @import("core/app/model_cache_runtime.zig");
-const usage_dashboard_runtime = @import("core/app/usage_dashboard_runtime.zig");
 const app_auth_runtime = @import("core/app/app_auth_runtime.zig");
 const app_host_config_runtime = @import("core/app/app_host_config_runtime.zig");
 const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
@@ -531,7 +530,6 @@ const App = struct {
     ),
     provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
-    usage_dashboard: usage_dashboard_runtime.Runtime = usage_dashboard_runtime.Runtime.init(std.heap.c_allocator),
     workspace_root: []u8 = &.{},
     workspace_identity: statusline_identity.Runtime = .{},
     workspace_host: WorkspaceHostRuntime = .{},
@@ -550,12 +548,9 @@ const App = struct {
     herdr: builtin_hooks.Client = .{},
     program_status: ui_program_status.Reporter = .{},
 
-    session: SessionRuntime = SessionRuntime.initWithProviders(
+    session: SessionRuntime = SessionRuntime.init(
         max_history_turns,
-        if (host_profile.generation_usage)
-            builtin_providers.native.deferredUsageProviders()
-        else
-            .{},
+        if (host_profile.generation_usage) builtin_providers.native.usageLookup() else null,
     ),
     session_persistence: app_session_runtime.Persistence = .{},
     prompt_history: PromptHistoryRuntime = .{},
@@ -626,7 +621,6 @@ const App = struct {
         var app = Self{
             .alloc = alloc,
             .auth = undefined,
-            .usage_dashboard = undefined,
             .session_persistence = undefined,
             .input_runtime = undefined,
             .session = undefined,
@@ -648,16 +642,12 @@ const App = struct {
             app_secret_store,
             auth_mode,
         );
-        usage_dashboard_runtime.Runtime.initInto(&app.usage_dashboard, std.heap.c_allocator);
         app_session_runtime.Persistence.initInto(&app.session_persistence);
         InputRuntime.initInto(&app.input_runtime);
-        SessionRuntime.initIntoWithProviders(
+        SessionRuntime.initInto(
             &app.session,
             max_history_turns,
-            if (comptime host_profile.generation_usage)
-                builtin_providers.native.deferredUsageProviders()
-            else
-                .{},
+            if (comptime host_profile.generation_usage) builtin_providers.native.usageLookup() else null,
         );
         if (comptime host_profile.js_host_workspace) {
             app.workspace_host = js_host_workspace.Runtime.init(alloc) catch |err| blk: {
@@ -904,7 +894,6 @@ const App = struct {
         };
         // The dashboard loader reads the profile usage ledger that
         // persistence flushes; stop it first.
-        self.usage_dashboard.deinit();
         InputSubmitRuntime.clearPendingSubmission(self, "shutdown");
         const resume_handoff = SessionAppRuntime.finalizePersistenceWithResumeHandoff(self);
         const shutdown_failure = self.session_persistence.shutdown_failure;
@@ -971,7 +960,6 @@ const App = struct {
         self.terminal_client.deinit();
         self.managed_executions.deinit();
         self.model_cache.deinit();
-        self.usage_dashboard.deinit();
         InputSubmitRuntime.clearPendingSubmission(self, "shutdown");
         SessionAppRuntime.finalizePersistence(self);
         shutdown_trace.mark("persistence_finalized");
@@ -1361,6 +1349,10 @@ const App = struct {
 
     pub fn startResumedSessionReconciliation(self: *App) void {
         SessionAppRuntime.startResumedSessionReconciliation(self);
+    }
+
+    pub fn usageHost(self: *App) @import("core/session/usage_owner.zig").Host {
+        return SessionAppRuntime.usageHost(self);
     }
 
     pub fn resumeSelectedSession(self: *App) !bool {
@@ -4789,7 +4781,6 @@ test {
     _ = input_submit_runtime;
     _ = @import("core/app/app_lifecycle.zig");
     _ = @import("core/app/model_cache_runtime.zig");
-    _ = @import("core/app/usage_dashboard_runtime.zig");
     _ = @import("core/app/app_process_runtime.zig");
     _ = @import("core/app/app_render_runtime.zig");
     _ = @import("core/app/input_interrupt_runtime.zig");

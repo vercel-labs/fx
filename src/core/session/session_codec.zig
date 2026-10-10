@@ -2,7 +2,7 @@ const std = @import("std");
 const image_attachments = @import("../images/image_attachments.zig");
 const image_data = @import("../images/image_data.zig");
 const session = @import("session.zig");
-const session_usage = @import("session_usage.zig");
+const usage_mod = @import("usage");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const types = @import("../shared/types.zig");
@@ -221,7 +221,7 @@ pub const DurableSessionState = struct {
     /// interrupted immediately after creation.
     subagent_child: bool = false,
     /// Null only for sessions written before durable usage accounting.
-    usage: ?session_usage.Snapshot = null,
+    usage: ?usage_mod.Snapshot = null,
     /// Active control state. It is never projected into model history and a
     /// restored checkpoint requires explicit host authority before any send.
     recovery_checkpoint: ?RecoveryCheckpoint = null,
@@ -273,7 +273,7 @@ pub const DurableSessionState = struct {
             null;
         errdefer if (last_subagent_work_id) |work_id| alloc.free(work_id);
         var usage = if (self.usage) |snapshot|
-            try session_usage.dupeSnapshotOwned(alloc, snapshot)
+            try usage_mod.snapshot.dupe(alloc, snapshot)
         else
             null;
         errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
@@ -896,7 +896,7 @@ fn validateStateWithPermissionMigration(
             }
         }
     }
-    if (state.usage) |usage| try session_usage.validateSnapshot(usage);
+    if (state.usage) |usage| try usage_mod.snapshot.validate(usage);
     if (allow_legacy_permission_state and state.permission_state.version == 1) {
         session_permission_state.validateSchema(state.permission_state, 1) catch
             return error.InvalidDurableField;
@@ -976,7 +976,7 @@ fn writeState(writer: *std.Io.Writer, state: DurableSessionState) !void {
     try writePermissionState(writer, state.permission_state);
     if (state.usage) |usage| {
         try writer.writeAll(",\"usage\":");
-        try session_usage.writeSnapshot(writer, usage);
+        try usage_mod.snapshot.writeLegacy18(writer, usage);
     }
     if (state.last_subagent_work_id) |id| {
         try writer.writeAll(",\"last_subagent_work_id\":");
@@ -1150,7 +1150,7 @@ const DecodedStateTail = struct {
     total_output_tokens: u64,
     context_history_start: usize,
     permission_state: session_permission_state.State,
-    usage: ?session_usage.Snapshot,
+    usage: ?usage_mod.Snapshot,
     last_subagent_work_id: ?[]u8,
     subagent_child: bool,
     recovery_checkpoint: ?RecoveryCheckpoint,
@@ -1210,7 +1210,7 @@ fn decodeStateTail(
     var permission_state: session_permission_state.State = .{};
     errdefer permission_state.deinit(alloc);
     var permission_state_seen = false;
-    var usage: ?session_usage.Snapshot = null;
+    var usage: ?usage_mod.Snapshot = null;
     errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
     var usage_seen = false;
     var last_subagent_work_id: ?[]u8 = null;
@@ -1247,7 +1247,7 @@ fn decodeStateTail(
             if (usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
             const parse_limit = @min(
                 limits.max_value_bytes,
-                session_usage.max_snapshot_bytes,
+                usage_mod.snapshot.max_snapshot_bytes,
             );
             const parse_buffer = try alloc.alloc(u8, parse_limit);
             defer mem_utils.free(alloc, parse_buffer);
@@ -1258,9 +1258,9 @@ fn decodeStateTail(
                 .parse_numbers = false,
             });
             usage = if (legacy_usage)
-                try session_usage.parseLegacySnapshotValue(alloc, value)
+                try usage_mod.snapshot.parseLegacyValue(alloc, value)
             else
-                try session_usage.parseSnapshotValue(alloc, value);
+                try usage_mod.snapshot.parseValue(alloc, value);
             usage_seen = true;
         } else if (std.mem.eql(u8, key, "last_subagent_work_id")) {
             if (last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
@@ -3567,20 +3567,15 @@ test "durable state round trips live history while discarding legacy authority" 
             .root_user_messages = completed_tool_names[0..],
         } },
     };
-    var usage_runtime = session_usage.Usage.initFresh();
-    defer usage_runtime.deinit(alloc);
-    const usage_sequence = try usage_runtime.reserveInvocation();
-    try usage_runtime.finishObservedInvocation(
-        alloc,
-        usage_sequence,
-        25,
-        .observed_generation,
-        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        "https://ai-gateway.vercel.sh",
-        null,
-    );
-    var usage = try usage_runtime.snapshot(alloc);
+    // A Gateway call waiting for its lookup.
+    const ledger = try usage_mod.Ledger.openDetached(alloc, std.testing.io, .{});
+    defer ledger.close() catch {};
+    var call = try ledger.begin(.gateway);
+    call.gatewayEvent("{\"type\":\"text-start\",\"id\":\"t\",\"providerMetadata\":{\"gateway\":{\"generationId\":\"gen_01ARZ3NDEKTSV4RRFFQ69G5FAV\"}}}");
+    _ = try call.finish(.completed);
+    var usage = try ledger.snapshot(alloc);
     defer usage.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), usage.pending.len);
     const state = DurableSessionState{
         .id = @constCast("1700000000000-42-session"),
         .origin_workspace_root = @constCast("/tmp/origin"),
@@ -4803,10 +4798,10 @@ fn expectStateEqual(expected: DurableSessionState, actual: DurableSessionState) 
     if (expected.usage) |expected_usage| {
         var expected_json: std.Io.Writer.Allocating = .init(std.testing.allocator);
         defer expected_json.deinit();
-        try session_usage.writeSnapshot(&expected_json.writer, expected_usage);
+        try usage_mod.snapshot.writeLegacy18(&expected_json.writer, expected_usage);
         var actual_json: std.Io.Writer.Allocating = .init(std.testing.allocator);
         defer actual_json.deinit();
-        try session_usage.writeSnapshot(&actual_json.writer, actual.usage.?);
+        try usage_mod.snapshot.writeLegacy18(&actual_json.writer, actual.usage.?);
         try std.testing.expectEqualStrings(expected_json.written(), actual_json.written());
     }
     try std.testing.expectEqual(expected.history.len, actual.history.len);

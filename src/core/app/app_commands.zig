@@ -37,9 +37,8 @@ const display_width = @import("../shared/display_width.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 const session_commands = @import("../session/session_commands.zig");
-const usage_recovery = @import("../session/usage_recovery.zig");
-const usage_dashboard_runtime = @import("usage_dashboard_runtime.zig");
-const usage_report = @import("../session/usage_report.zig");
+const usage_mod = @import("usage");
+const usage_dashboard = @import("../input/usage_dashboard.zig");
 const types = @import("../shared/types.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
@@ -1024,8 +1023,6 @@ pub fn Handlers(comptime App: type) type {
         fn commandShowUsage(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime !runtime_profile.allows(App, .profile_usage)) {
-                var usage = try app.session.usage.reportSnapshot(app.alloc);
-                defer usage.deinit(app.alloc);
                 try app.writeDomainNotice(.{
                     .topic = "usage",
                     .tone = .neutral,
@@ -1038,83 +1035,49 @@ pub fn Handlers(comptime App: type) type {
             closeHelpMenuIfPresent(app);
             app.input_runtime.settings_menu.close();
             closeInlineCommandMenusIfPresent(app);
-            if (comptime @hasField(App, "usage_dashboard")) {
-                try openUsageDashboard(app, .days_30);
-                return;
-            }
-            var usage = loadUsageSnapshot(app, .days_30) catch |err| {
-                debug_trace.logf(
-                    "usage",
-                    "usage dashboard open failed scope={s} reason={s}",
-                    .{ @tagName(usage_report.Scope.days_30), @errorName(err) },
-                );
-                try app.input_runtime.usage_menu.openError(
-                    app.alloc,
-                    .days_30,
-                    "Local usage data is unavailable",
-                );
-                app.shell.render_requests.request(.footer);
-                return;
-            };
-            errdefer usage.deinit(app.alloc);
-            app.input_runtime.usage_menu.openOwned(app.alloc, usage);
-            app.shell.render_requests.request(.footer);
+            openUsageDashboard(app, .session);
         }
 
-        pub fn refreshUsageMenu(
-            app: *App,
-            scope: usage_report.Scope,
-        ) !void {
-            if (comptime @hasField(App, "usage_dashboard")) {
-                if (scope == .session) {
-                    var usage = loadUsageSnapshot(app, scope) catch |err| {
-                        try recordUsageRefreshFailure(app, scope, err);
-                        return;
-                    };
-                    errdefer usage.deinit(app.alloc);
-                    installUsageSnapshot(app, usage);
-                    return;
-                }
-                if (try app.usage_dashboard.snapshot(app.alloc, scope)) |usage| {
-                    installUsageSnapshot(app, usage);
-                    return;
-                }
-                app.input_runtime.usage_menu.setLoadingScope(app.alloc, scope);
-                try requestUsageDashboardRefresh(app);
-                app.shell.render_requests.request(.footer);
-                return;
-            }
-            var usage = loadUsageSnapshot(app, scope) catch |err| {
-                try recordUsageRefreshFailure(app, scope, err);
-                return;
-            };
-            errdefer usage.deinit(app.alloc);
-            installUsageSnapshot(app, usage);
-        }
-
-        pub fn reloadUsageMenu(
-            app: *App,
-            scope: usage_report.Scope,
-        ) !void {
-            if (comptime !@hasField(App, "usage_dashboard")) {
-                try refreshUsageMenu(app, scope);
-                return;
-            }
+        /// Shows `scope`: the session's view at once, a rolling view from
+        /// the loader when it has one, otherwise loading.
+        pub fn refreshUsageMenu(app: *App, scope: usage_mod.Scope) !void {
             if (scope == .session) {
-                try refreshUsageMenu(app, scope);
+                const view = app.session.usage.sessionView(app.alloc, .{}) catch |err| {
+                    recordUsageRefreshFailure(app, scope, err);
+                    return;
+                };
+                installUsageView(app, .{ .owned = view });
                 return;
             }
-            app.input_runtime.usage_menu.requested_scope = scope;
-            requestUsageDashboardRefresh(app) catch |err| {
-                try recordUsageRefreshFailure(app, scope, err);
+            const loader = app.session.usage.dashboardLoader() orelse {
+                recordUsageRefreshFailure(app, scope, error.ProfileUsageUnavailable);
                 return;
             };
+            if (loader.view(scope)) |view| {
+                installUsageView(app, .{ .borrowed = view });
+                return;
+            }
+            app.input_runtime.usage_menu.setLoadingScope(app.alloc, scope);
+            _ = loader.refresh(@max(io_mod.milliTimestamp(), 0));
             app.shell.render_requests.request(.footer);
         }
 
+        /// `r`: loads `scope` again.
+        pub fn reloadUsageMenu(app: *App, scope: usage_mod.Scope) !void {
+            if (scope == .session) return refreshUsageMenu(app, scope);
+            app.input_runtime.usage_menu.requested_scope = scope;
+            const loader = app.session.usage.dashboardLoader() orelse {
+                recordUsageRefreshFailure(app, scope, error.ProfileUsageUnavailable);
+                return;
+            };
+            _ = loader.refresh(@max(io_mod.milliTimestamp(), 0));
+            app.shell.render_requests.request(.footer);
+        }
+
+        /// Installs views the loader finished. True when the dashboard changed.
         pub fn collectUsageDashboardFacts(app: *App) !bool {
-            if (comptime !@hasField(App, "usage_dashboard")) return false;
-            const transition = app.usage_dashboard.pollTransition();
+            const loader = app.session.usage.dashboardLoader() orelse return false;
+            const transition = loader.poll();
             if (transition == .none) return false;
             if (!app.input_runtime.usage_menu.active or
                 app.input_runtime.usage_menu.navigationScope() == .session)
@@ -1123,120 +1086,60 @@ pub fn Handlers(comptime App: type) type {
             }
             const scope = app.input_runtime.usage_menu.navigationScope();
             if (transition == .failed) {
-                const err = app.usage_dashboard.lastError() orelse
-                    error.ProfileUsageUnavailable;
-                try recordUsageRefreshFailure(app, scope, err);
+                recordUsageRefreshFailure(app, scope, loader.lastError() orelse error.ProfileUsageUnavailable);
                 return true;
             }
-            if (try app.usage_dashboard.snapshot(app.alloc, scope)) |usage| {
-                installUsageSnapshot(app, usage);
+            const view = loader.view(scope) orelse {
+                recordUsageRefreshFailure(app, scope, error.ProfileUsageUnavailable);
                 return true;
-            }
-            const err = app.usage_dashboard.lastError() orelse
-                error.ProfileUsageUnavailable;
-            try recordUsageRefreshFailure(app, scope, err);
+            };
+            installUsageView(app, .{ .borrowed = view });
             return true;
         }
 
-        fn openUsageDashboard(
-            app: *App,
-            scope: usage_report.Scope,
-        ) !void {
-            const cached = try app.usage_dashboard.snapshot(app.alloc, scope);
-            if (cached) |usage| {
-                app.input_runtime.usage_menu.openOwned(app.alloc, usage);
+        fn openUsageDashboard(app: *App, scope: usage_mod.Scope) void {
+            if (scope == .session) {
+                if (app.session.usage.sessionView(app.alloc, .{})) |view| {
+                    installUsageView(app, .{ .owned = view });
+                } else |err| {
+                    app.input_runtime.usage_menu.openLoading(app.alloc, scope);
+                    recordUsageRefreshFailure(app, scope, err);
+                }
+                // The rolling periods load meanwhile, ready for Tab.
+                if (app.session.usage.dashboardLoader()) |loader| _ = loader.refresh(@max(io_mod.milliTimestamp(), 0));
+                return;
+            }
+            const loader = app.session.usage.dashboardLoader() orelse {
+                app.input_runtime.usage_menu.openLoading(app.alloc, scope);
+                recordUsageRefreshFailure(app, scope, error.ProfileUsageUnavailable);
+                return;
+            };
+            if (loader.view(scope)) |cached| {
+                app.input_runtime.usage_menu.open(app.alloc, .{ .borrowed = cached });
             } else {
                 app.input_runtime.usage_menu.openLoading(app.alloc, scope);
             }
-            requestUsageDashboardRefresh(app) catch |err| {
-                try recordUsageRefreshFailure(app, scope, err);
-                return;
-            };
+            _ = loader.refresh(@max(io_mod.milliTimestamp(), 0));
             app.shell.render_requests.request(.footer);
         }
 
-        fn requestUsageDashboardRefresh(app: *App) !void {
-            const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
-            const availability = try app.session.ensureProfileUsageReadable(
-                app.alloc,
-                home,
-            );
-            if (availability == .unavailable) {
-                return app.session.profile_usage.lastError() orelse
-                    error.ProfileUsageUnavailable;
-            }
-            _ = try app.usage_dashboard.requestRefresh(
-                usage_dashboard_runtime.profileProvider(
-                    &app.session.profile_usage,
-                ),
-                home,
-                @max(io_mod.milliTimestamp(), 0),
-            );
-        }
-
-        fn installUsageSnapshot(
-            app: *App,
-            usage: usage_report.Snapshot,
-        ) void {
+        fn installUsageView(app: *App, shown: usage_dashboard.State.Shown) void {
             if (app.input_runtime.usage_menu.active) {
-                app.input_runtime.usage_menu.replaceOwned(app.alloc, usage);
+                app.input_runtime.usage_menu.replace(app.alloc, shown);
             } else {
-                app.input_runtime.usage_menu.openOwned(app.alloc, usage);
+                app.input_runtime.usage_menu.open(app.alloc, shown);
             }
             app.shell.render_requests.request(.footer);
         }
 
-        fn recordUsageRefreshFailure(
-            app: *App,
-            scope: usage_report.Scope,
-            err: anyerror,
-        ) !void {
+        fn recordUsageRefreshFailure(app: *App, scope: usage_mod.Scope, err: anyerror) void {
             debug_trace.logf(
                 "usage",
                 "usage dashboard refresh failed scope={s} reason={s}",
                 .{ @tagName(scope), @errorName(err) },
             );
-            try app.input_runtime.usage_menu.recordRefreshFailure(
-                app.alloc,
-                scope,
-                "Local usage data is unavailable",
-            );
+            app.input_runtime.usage_menu.recordRefreshFailure(scope);
             app.shell.render_requests.request(.footer);
-        }
-
-        fn loadUsageSnapshot(
-            app: *App,
-            scope: usage_report.Scope,
-        ) !usage_report.Snapshot {
-            if (scope == .session) {
-                return app.session.usage.reportSnapshot(app.alloc);
-            }
-            const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
-            const availability = try app.session.ensureProfileUsageReadable(
-                app.alloc,
-                home,
-            );
-            if (availability == .unavailable) {
-                return app.session.profile_usage.lastError() orelse
-                    error.ProfileUsageUnavailable;
-            }
-            const snapshot_time_ms = @max(io_mod.milliTimestamp(), 0);
-            var recovery = try usage_recovery.collectFromHomeConservative(
-                app.alloc,
-                home,
-            );
-            defer recovery.deinit(app.alloc);
-            return app.session.profile_usage.snapshot(
-                app.alloc,
-                scope,
-                snapshot_time_ms,
-                .{
-                    .facts = recovery.facts,
-                    .incidents = recovery.incidents,
-                    .pending = recovery.pending,
-                    .unknown_pending = recovery.unknown_pending,
-                },
-            );
         }
 
         fn commandUndoLast(ctx: *anyopaque) !void {

@@ -1,0 +1,12 @@
+{"schema_version":1,"kind":"coverage","started_at_ms":1791399023279}
+{"schema_version":1,"kind":"pending","id":"gen_01M4BNAZ8NS50TRNYFRJJESTF4","observed_at_ms":1791399023278}
+{"schema_version":1,"kind":"generation","fact":{"id":"gen_01M4BNAZ8NS50TRNYFRJJESTF4","created_at_ms":1791395423000,"model":"openai/gpt-4.1-nano","input_tokens":14,"output_tokens":2,"cache_read_tokens":0,"cache_write_tokens":0,"reasoning_tokens":0,"billable_web_search_calls":0,"total_cost":0.0000022}}
+{"schema_version":1,"kind":"pending","id":"gen_01M4BNAZXV1816PVAK719WGD3C","observed_at_ms":1791399023317}
+{"schema_version":1,"kind":"generation","fact":{"id":"gen_01M4BNAZXV1816PVAK719WGD3C","created_at_ms":1791139823000,"model":"xai/grok-4.1-fast-non-reasoning","input_tokens":678,"output_tokens":1,"cache_read_tokens":664,"cache_write_tokens":0,"reasoning_tokens":0,"billable_web_search_calls":0,"total_cost":0.0000365}}
+{"schema_version":1,"kind":"pending","id":"gen_01M4BNB0BF8G3R1V2GWBT9BV7Q","observed_at_ms":1791399023357}
+{"schema_version":1,"kind":"generation","fact":{"id":"gen_01M4BNB0BF8G3R1V2GWBT9BV7Q","created_at_ms":1789671023000,"model":"amazon/nova-micro","input_tokens":7,"output_tokens":2,"cache_read_tokens":0,"cache_write_tokens":0,"reasoning_tokens":null,"billable_web_search_calls":0,"total_cost":0.000000525}}
+{"schema_version":1,"kind":"pending","id":"gen_01M4BNCM6HSVRSKERSYR58S3CE","observed_at_ms":1791399023395}
+{"schema_version":1,"kind":"generation","fact":{"id":"gen_01M4BNCM6HSVRSKERSYR58S3CE","created_at_ms":1791392895000,"model":"anthropic/claude-haiku-4.5","input_tokens":14,"output_tokens":4,"cache_read_tokens":0,"cache_write_tokens":0,"reasoning_tokens":0,"billable_web_search_calls":0,"total_cost":0.000134}}
+{"schema_version":1,"kind":"pending","id":"gen_01M4BNAZ8NS50TRNYFRJJEST55","observed_at_ms":1791399023431}
+{"schema_version":1,"kind":"generation","fact":{"id":"gen_01M4BNAZ8NS50TRNYFRJJEST55","created_at_ms":1791391823000,"model":"openai/gpt-4.1-nano","input_tokens":14,"output_tokens":2,"cache_read_tokens":0,"cache_write_tokens":0,"reasoning_tokens":0,"billable_web_search_calls":0,"total_cost":0.0000022}}
+{"schema_version":1,"kind":"generation","fact":{"id":"gen_

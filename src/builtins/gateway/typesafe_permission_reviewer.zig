@@ -13,6 +13,8 @@ const permission_auto_classifier = @import("../../core/permissions/auto_classifi
 const types = @import("../../core/shared/types.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const usage_owner = @import("../../core/session/usage_owner.zig");
+const usage_mod = @import("usage");
 
 const Allocator = std.mem.Allocator;
 
@@ -46,6 +48,11 @@ const Config = struct {
     via_gateway: bool = false,
     /// Gateway team selector forwarded on gateway-routed requests.
     gateway_team: ?[]const u8 = null,
+    /// The session's usage. Only a Gateway-routed review is billed through
+    /// the Gateway, so only that one is recorded.
+    usage: ?*usage_owner.Owner = null,
+    credential_source: ?types.CredentialSource = null,
+    account_id: ?[]const u8 = null,
 };
 
 const Route = struct {
@@ -127,6 +134,9 @@ pub fn review(
         .cancel_flag = input.cancel_flag,
         .via_gateway = route.via_gateway,
         .gateway_team = input.tenant,
+        .usage = input.usage,
+        .credential_source = input.credential_source,
+        .account_id = input.account_id,
     };
     debug_trace.logf("permission", "event=auto_review_typesafe_selected endpoint={s} via_gateway={}", .{ config.endpoint, route.via_gateway });
     return permission_auto_classifier.Reviewer.withTransportModel(.{
@@ -361,6 +371,16 @@ fn sendReview(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
+    var invocation = usage_owner.Invocation.begin(if (config.via_gateway) config.usage else null, .{ .direct = .{
+        .secret_bytes = config.api_key,
+        .source = config.credential_source,
+        .account_id = config.account_id,
+        .tenant_context = config.gateway_team,
+    } }) catch |err| {
+        debug_trace.logf("permission", "event=auto_review_typesafe_usage result=permanent_failure phase=begin reason={s}", .{@errorName(err)});
+        return .permanent_failure;
+    };
+
     debug_trace.logf("permission", "event=auto_review_typesafe_transport_start payload_bytes={d} via_gateway={}", .{ payload.len, config.via_gateway });
     const result = client.fetch(.{
         .location = .{ .url = config.endpoint },
@@ -375,11 +395,20 @@ fn sendReview(
         .response_writer = &out.writer,
         .redirect_behavior = .unhandled,
     }) catch |err| {
+        if (invocation) |*value| value.failed(err, sentBeforeFailure(err)) catch |usage_err| {
+            debug_trace.logf("permission", "event=auto_review_typesafe_usage result=permanent_failure phase=transport_failure reason={s}", .{@errorName(usage_err)});
+            return .permanent_failure;
+        };
         if (err == error.OutOfMemory) return error.OutOfMemory;
         const outcome: permission_auto_classifier.TransportOutcome =
             if (err == error.Cancelled or cancel_flag.load(.seq_cst)) .cancelled else .transient_failure;
         debug_trace.logf("permission", "event=auto_review_typesafe_transport result={s} reason=fetch_error error={s}", .{ @tagName(outcome), @errorName(err) });
         return outcome;
+    };
+    const body = out.written();
+    if (invocation) |*value| finishReviewUsage(alloc, value, result.status, body) catch |err| {
+        debug_trace.logf("permission", "event=auto_review_typesafe_usage result=permanent_failure phase=completion reason={s}", .{@errorName(err)});
+        return .permanent_failure;
     };
     if (cancel_flag.load(.seq_cst)) return .cancelled;
 
@@ -394,7 +423,6 @@ fn sendReview(
         return outcome;
     }
 
-    const body = out.written();
     const jev = parseJevDecision(alloc, body) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Malformed => {
@@ -431,6 +459,57 @@ fn sendReview(
         .context = @ptrCast(owned),
         .deinit_fn = deinitOwnedDecision,
     } };
+}
+
+/// Ends a Gateway-routed review's usage call. A failure status is unbilled.
+/// The evaluation endpoint names its generation in `gateway.generationId`;
+/// usage reads generation ids from stream events, so it gets one in that
+/// shape and looks the debited cost up. The answer carries no receipt.
+fn finishReviewUsage(
+    alloc: Allocator,
+    invocation: *usage_owner.Invocation,
+    status: std.http.Status,
+    body: []const u8,
+) !void {
+    if (status != .ok) return invocation.rejected();
+    if (try generationEvent(alloc, body)) |event| {
+        defer alloc.free(event);
+        invocation.call.gatewayEvent(event);
+    }
+    _ = try invocation.call.finish(.completed);
+}
+
+fn generationEvent(alloc: Allocator, body: []const u8) error{OutOfMemory}!?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const gateway = parsed.value.object.get("gateway") orelse return null;
+    if (gateway != .object) return null;
+    const id = gateway.object.get("generationId") orelse return null;
+    if (id != .string) return null;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    out.writer.writeAll("{\"providerMetadata\":{\"gateway\":{\"generationId\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(id.string, .{}, &out.writer) catch return error.OutOfMemory;
+    out.writer.writeAll("}}}") catch return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
+
+/// False only when the request never left: the connection was not made.
+fn sentBeforeFailure(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectionRefused,
+        error.UnknownHostName,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        error.ConnectionTimedOut,
+        error.TlsInitializationFailed,
+        => false,
+        else => true,
+    };
 }
 
 test "request body carries policy, context, and the exact unmasked action" {
@@ -539,7 +618,10 @@ test "transport maps a loopback 500 to transient failure and cancel to cancelled
 }
 
 const FakeJevServer = struct {
-    const Mode = enum { ok, internal_error };
+    const Mode = enum { ok, ok_gateway, internal_error };
+    const ok_gateway_body =
+        \\{"model":"jev-1.13.0","answers":{"decision":{"type":"choice","choice":"clear","probabilities":{"clear":0.99,"caution":0.01},"confidence":0.98}},"usage":{"input_tokens":100,"output_tokens":10},"gateway":{"cost":"0.0000147","generationId":"gen_01ARZ3NDEKTSV4RRFFQ69G5FAV"}}
+    ;
     const ok_body =
         \\{"model":"jev-1.13.0","answers":{"decision":{"type":"choice","choice":"clear","probabilities":{"clear":0.99,"caution":0.01},"confidence":0.98}},"usage":{"input_tokens":100,"output_tokens":10}}
     ;
@@ -619,10 +701,11 @@ const FakeJevServer = struct {
         }
         const body: []const u8 = switch (self.mode) {
             .ok => ok_body,
+            .ok_gateway => ok_gateway_body,
             .internal_error => "internal error",
         };
         const status: []const u8 = switch (self.mode) {
-            .ok => "200 OK",
+            .ok, .ok_gateway => "200 OK",
             .internal_error => "500 Internal Server Error",
         };
         var response: [2048]u8 = undefined;
@@ -665,6 +748,70 @@ test "route resolution prefers TypeSafe direct and derives the gateway evaluatio
 
     try std.testing.expect(resolveRoute(null, null, "", "https://ai-gateway.vercel.sh/v4/ai/language-model", &buf) == null);
     try std.testing.expect(resolveRoute(null, null, "gw-key", "https://example.test/chat", &buf) == null);
+}
+
+fn reviewWithUsage(mode: FakeJevServer.Mode, via_gateway: bool, usage: *usage_owner.Owner) !void {
+    const alloc = std.testing.allocator;
+    var server = try FakeJevServer.initWithPath(mode, if (via_gateway) "/v4/ai/evaluation-model" else "/v1/systemone");
+    defer server.deinit();
+    try server.start();
+    var cancel = std.atomic.Value(bool).init(false);
+    var config = Config{ .api_key = "gw-key", .endpoint = server.url, .via_gateway = via_gateway, .usage = usage, .credential_source = .ai_gateway_api_key };
+    const outcome = try sendReview(@ptrCast(&config), alloc, gateway_model_id, "{}", .fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(5000) }), &cancel);
+    switch (outcome) {
+        .completion => |owned| {
+            var held = owned;
+            held.deinit(alloc);
+        },
+        else => {},
+    }
+}
+
+test "a Gateway-routed review queues its generation for a cost lookup" {
+    const alloc = std.testing.allocator;
+    var usage: usage_owner.Owner = .{};
+    usage.bind(alloc, .{ .host = null, .home_path = null, .lookup = null });
+    defer usage.deinit();
+    try reviewWithUsage(.ok_gateway, true, &usage);
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(usage_mod.snapshot.Billing.pending, snapshot.billing);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.pending.len);
+    try std.testing.expectEqualStrings("gen_01ARZ3NDEKTSV4RRFFQ69G5FAV", snapshot.pending[0].id);
+}
+
+test "a direct TypeSafe review records no Gateway usage" {
+    const alloc = std.testing.allocator;
+    var usage: usage_owner.Owner = .{};
+    usage.bind(alloc, .{ .host = null, .home_path = null, .lookup = null });
+    defer usage.deinit();
+    try reviewWithUsage(.ok_gateway, false, &usage);
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(usage_mod.snapshot.Billing.complete, snapshot.billing);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.next_sequence);
+}
+
+test "a Gateway-routed review answered with a failure status stays unbilled" {
+    const alloc = std.testing.allocator;
+    var usage: usage_owner.Owner = .{};
+    usage.bind(alloc, .{ .host = null, .home_path = null, .lookup = null });
+    defer usage.deinit();
+    try reviewWithUsage(.internal_error, true, &usage);
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(usage_mod.snapshot.Billing.complete, snapshot.billing);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.pending.len);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.incidents.len);
+}
+
+test "generation ids move from the evaluation answer into an event" {
+    const alloc = std.testing.allocator;
+    const event = (try generationEvent(alloc, FakeJevServer.ok_gateway_body)).?;
+    defer alloc.free(event);
+    try std.testing.expectEqualStrings("{\"providerMetadata\":{\"gateway\":{\"generationId\":\"gen_01ARZ3NDEKTSV4RRFFQ69G5FAV\"}}}", event);
+    try std.testing.expect((try generationEvent(alloc, FakeJevServer.ok_body)) == null);
+    try std.testing.expect((try generationEvent(alloc, "not json")) == null);
 }
 
 test "gateway transport posts to the evaluation-model endpoint with protocol headers" {

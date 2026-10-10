@@ -329,22 +329,16 @@ pub fn streamPrepared(
         } };
         owned.deinit(alloc);
     }
-    const usage_outcome: stream_provider.UsageOutcome = usage: {
-        if (completion.generation_id == null) {
-            break :usage .{ .unavailable = .possibly_billed };
-        }
-        completion.billing = try responses_protocol.buildSubscriptionBilling(
-            alloc,
-            .grok,
-            request.model,
-            @max(io_mod.milliTimestamp(), 0),
-            completion.usage,
-        ) orelse break :usage .{ .unavailable = .possibly_billed };
-        break :usage .{ .exact = .grok };
-    };
+    // The subscription reports exact usage for a call it identified.
+    if (completion.generation_id != null) completion.subscription_usage = try responses_protocol.buildSubscriptionUsage(
+        alloc,
+        .grok,
+        request.model,
+        @max(io_mod.milliTimestamp(), 0),
+        completion.usage,
+    );
     return .{ .completed = .{
         .completion = completion,
-        .usage = usage_outcome,
         .ownership = .owned,
     } };
 }

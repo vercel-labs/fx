@@ -4921,17 +4921,16 @@ fn refreshGatewayCredentialForJob(
         );
         return false;
     } orelse return false;
-    const previous_api_key = active_api_key.*;
     if (comptime !host_target.is_wasm) {
         if (deps.usage) |usage| {
             if (source == .chatgpt_subscription or source == .grok_subscription) {
-                usage.clearReconciliationCredential();
+                usage.setCredential(null);
             } else {
-                usage.refreshReconciliationCredential(
-                    deps.usage_allocator,
-                    previous_api_key,
-                    refreshed,
-                );
+                usage.setCredential(.{ .direct = .{
+                    .secret_bytes = refreshed,
+                    .source = source,
+                    .account_id = job.account_id,
+                } });
             }
         }
     }
@@ -7389,7 +7388,6 @@ fn processQueuedPromptLoop(
                         .capabilities_context = deps.ctx,
                         .capabilities_fn = deps.available_model_capabilities,
                         .usage = deps.usage,
-                        .usage_allocator = deps.usage_allocator,
                         // The request just built starts like the one sent
                         // before it, so the provider has most of it cached.
                         // After an overflow it no longer fits.
@@ -7570,7 +7568,6 @@ fn processQueuedPromptLoop(
                 arena,
                 model_request,
                 deps.usage,
-                deps.usage_allocator,
             ) catch |err| {
                 parent_turn_delivery.observeGatewayDelivery(
                     deps,
@@ -7998,7 +7995,6 @@ fn processQueuedPromptLoop(
                         arena,
                         model_request,
                         deps.usage,
-                        deps.usage_allocator,
                     );
                     pushNetworkRecord(deps, job.provider, gateway_model, replay_wait_started_ms, &stream_result);
                     parent_turn_delivery.observeGatewayDelivery(

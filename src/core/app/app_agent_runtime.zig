@@ -331,7 +331,6 @@ pub fn Runtime(comptime App: type) type {
                         .gateway_retry_count = gateway_retry_count,
                         .gateway_chat_url = gateway_chat_url,
                         .usage = &app.session.usage,
-                        .usage_allocator = app.alloc,
                     });
                     ctx.web_search_backend = app.web_search_runtime.dispatchBackend();
                 }
@@ -808,7 +807,6 @@ pub fn Runtime(comptime App: type) type {
                         .gateway_retry_count = gateway_retry_count,
                         .gateway_chat_url = gateway_chat_url,
                         .usage = &app.session.usage,
-                        .usage_allocator = app.alloc,
                     });
                     ctx.web_search_backend = app.web_search_runtime.dispatchBackend();
                 }
@@ -1129,7 +1127,6 @@ pub fn Runtime(comptime App: type) type {
                 .capabilities_context = deps.ctx,
                 .capabilities_fn = deps.available_model_capabilities,
                 .usage = deps.usage,
-                .usage_allocator = deps.usage_allocator,
             };
             const result = agent_runtime.compactContext(arena, &deps, .{
                 .operation_id = operation_id,
@@ -1174,6 +1171,9 @@ pub fn Runtime(comptime App: type) type {
         ) subagent_execution.ServiceError!subagent_execution.RunOutcome {
             const app: *App = @ptrCast(@alignCast(raw.?));
             const alloc = std.heap.c_allocator;
+            if (comptime @hasField(App, "session") and @hasField(@TypeOf(app.session), "usage")) {
+                turn.parent_usage = &app.session.usage;
+            }
             var child_projection = app.snapshotSubagentModelToolProjection(
                 alloc,
                 admission.permission_mode,

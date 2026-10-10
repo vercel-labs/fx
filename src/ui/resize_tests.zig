@@ -10,7 +10,7 @@ const diff_mod = @import("../core/output/diff.zig");
 const io_mod = @import("../core/shared/io.zig");
 const shared_theme = @import("../core/shared/theme.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
-const usage_report = @import("../core/session/usage_report.zig");
+const usage_mod = @import("usage");
 const workspace_access = @import("../core/workspace/workspace_access.zig");
 const types = @import("../core/shared/types.zig");
 const assistant_presentation = @import("../core/agent/assistant_presentation.zig");
@@ -992,10 +992,10 @@ fn expectGridContains(h: *Harness, needle: []const u8) !void {
 
 test "responsive compact menus stay inline across the VT width matrix" {
     const alloc = std.testing.allocator;
-    var models: [25]usage_report.ModelUsage = undefined;
+    var models: [25]usage_mod.report.ModelUsage = undefined;
     for (&models) |*model| {
         model.* = .{
-            .model = @constCast("provider/model"),
+            .model = "provider/model",
             .totals = .{
                 .total_tokens = 1,
                 .input_tokens = 1,
@@ -1008,7 +1008,7 @@ test "responsive compact menus stay inline across the VT width matrix" {
             },
         };
     }
-    const usage_snapshot = usage_report.Snapshot{
+    const usage_view = usage_mod.View{
         .scope = .days_30,
         .snapshot_time_ms = 100,
         .window_start_ms = 0,
@@ -1067,17 +1067,16 @@ test "responsive compact menus stay inline across the VT width matrix" {
         try expectGridContains(&h, "Workspace");
 
         ctx.statusline_menu = .{};
-        ctx.usage_menu = .{
-            .active = true,
+        ctx.usage_menu = .{ .active = true, .dashboard = .{
             .scope = .days_30,
             .selected_model = models.len - 1,
             .model_window_start = models.len - 1,
-            .snapshot = &usage_snapshot,
-        };
+            .view = &usage_view,
+        } };
         h.frame_redraw = true;
         try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
         try h.flush();
-        try expectGridContains(&h, "[30 days]");
+        try expectGridContains(&h, "[30d]");
         try std.testing.expectEqual(
             @as(usize, 20),
             try countGridOccurrences(&h, "provider/model"),

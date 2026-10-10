@@ -1,4 +1,6 @@
 const std = @import("std");
+const usage_mod = @import("usage");
+const usage_owner = @import("../core/session/usage_owner.zig");
 const managed_execution = @import("../core/execution/managed_execution.zig");
 const acp_runner = @import("../core/cli/acp_runner.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
@@ -456,7 +458,7 @@ pub fn adoptServerCredential(state: *ServerState, credential: *credentials.Crede
         active.account_id = state.account_id;
         if (comptime !host_target.is_wasm) {
             if (state.credential_source == .chatgpt_subscription or state.credential_source == .grok_subscription) {
-                active.session_rt.usage.clearReconciliationCredential();
+                active.session_rt.usage.setCredential(null);
             }
         }
     }
@@ -664,26 +666,12 @@ pub fn releaseActiveSession(state: *ServerState) !void {
     const active = if (state.active_session) |*session| session else return;
     disableSubagentHost(state);
     if (comptime !host_target.is_wasm) {
-        active.session_rt.usage.cancelReconciliation();
-        active.session_rt.usage.finishProfilePublicationsBeforeShutdown();
-        flushActiveSessionUsage(state) catch |err| {
-            if (state.cfg.provider_set.select(active.provider).deferred_usage == null) {
-                active.session_rt.usage.clearReconciliationCredential();
-            } else if (active.credential_source) |source| {
-                active.session_rt.usage.replaceProviderReconciliationCredential(
-                    state.alloc,
-                    active.provider,
-                    source,
-                    active.account_id,
-                    state.api_key,
-                );
-            } else {
-                active.session_rt.usage.clearReconciliationCredential();
-            }
+        active.session_rt.usage.settle() catch |err| {
+            // The session stays active, and its usage reopens with the
+            // session's credential.
+            setActiveUsageCredential(state, active);
             return err;
         };
-        active.session_rt.usage.configurePublicationSink(null);
-        active.session_rt.usage.configureCheckpointSink(null);
     }
     destroyActiveSession(state);
 }
@@ -692,14 +680,10 @@ fn closeActiveSession(state: *ServerState) !void {
     const active = if (state.active_session) |*session| session else return;
     disableSubagentHost(state);
     if (comptime !host_target.is_wasm) {
-        active.session_rt.usage.cancelReconciliation();
-        active.session_rt.usage.finishProfilePublicationsBeforeShutdown();
-        flushActiveSessionUsage(state) catch |err| {
+        active.session_rt.usage.settle() catch |err| {
             destroyActiveSession(state);
             return err;
         };
-        active.session_rt.usage.configurePublicationSink(null);
-        active.session_rt.usage.configureCheckpointSink(null);
     }
     destroyActiveSession(state);
 }
@@ -853,43 +837,55 @@ pub fn disableSubagentHost(state: *ServerState) void {
     }
 }
 
-fn flushActiveSessionUsage(state: *ServerState) !void {
-    const active = if (state.active_session) |*session| session else return;
-    if (active.v2) |v2| {
-        if (!active.session_rt.usage.isDirty()) return;
-        var usage_snapshot = try active.session_rt.usage.snapshot(state.alloc);
-        defer usage_snapshot.deinit(state.alloc);
-        try v2.persistUsage(usage_snapshot);
-        active.session_rt.usage.markClean(usage_snapshot);
-        return;
-    }
-    const writable = if (active.writable) |*value| value else return;
-    if (!active.session_rt.usage.isDirty()) return;
+/// The credential the active session's usage looks generations up with.
+pub fn setActiveUsageCredential(state: *ServerState, active: anytype) void {
+    if (state.cfg.provider_set.select(active.provider).usage_lookup == null) return active.session_rt.usage.setCredential(null);
+    const source = active.credential_source orelse return active.session_rt.usage.setCredential(null);
+    if (source == .host_managed) return active.session_rt.usage.setCredential(.host_managed);
+    active.session_rt.usage.setCredential(.{ .direct = .{
+        .secret_bytes = active.api_key,
+        .source = source,
+        .account_id = active.account_id,
+    } });
+}
 
-    const usage_snapshot = try active.session_rt.usage.snapshot(state.alloc);
-    defer {
-        var owned = usage_snapshot;
-        owned.deinit(state.alloc);
+/// The usage host for the active session: its checkpoints go to that
+/// session's log.
+pub fn usageHost(state: *ServerState) usage_owner.Host {
+    return .{ .context = @ptrCast(state), .current_fn = usageTarget, .persist_fn = writeUsageCheckpoint };
+}
+
+/// Read without the session's write lock: usage asks while it holds its
+/// own, and the active session changes only after its usage settled.
+fn usageTarget(context: *anyopaque) ?usage_owner.Target {
+    const state: *ServerState = @ptrCast(@alignCast(context));
+    const active = if (state.active_session) |*session| session else return null;
+    if (active.v2) |v2| return .{ .session_id = v2.id(), .marker = .v2 };
+    if (active.writable) |*writable| return .{ .session_id = writable.active_id, .marker = .v1 };
+    return null;
+}
+
+fn writeUsageCheckpoint(
+    context: *anyopaque,
+    session_id: []const u8,
+    checkpoint: *const usage_mod.host.Checkpoint,
+) anyerror!void {
+    const state: *ServerState = @ptrCast(@alignCast(context));
+    const active = if (state.active_session) |*session| session else return error.SessionPersistenceUnavailable;
+    active.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer active.session_write_mutex.unlock(io_mod.getIo());
+    if (active.v2) |v2| {
+        if (!std.mem.eql(u8, v2.id(), session_id)) return error.SessionWriterChanged;
+        return v2.persistUsage(checkpoint);
     }
-    const store = if (active.store) |*value|
-        value
-    else
-        return error.SessionPersistenceUnavailable;
-    const recovery_checkpoint = try store.prepareUsageRecoveryCheckpoint(
-        state.alloc,
-        writable,
-        usage_snapshot,
-    );
+    const writable = if (active.writable) |*value| value else return error.SessionPersistenceUnavailable;
+    if (!std.mem.eql(u8, writable.active_id, session_id)) return error.SessionWriterChanged;
+    try writable.requireWritable();
     _ = try writable.appendEvent(
         state.alloc,
-        .{ .usage_checkpointed = .{ .usage = usage_snapshot } },
-        recovery_checkpoint.timestamp_ms,
+        .{ .usage_checkpointed = .{ .usage = checkpoint.snapshot.* } },
+        try usage_owner.v1EventTime(checkpoint.at_ms, writable.state.updated_at_ms),
     );
-    try store.finishUsageRecoveryCheckpoint(
-        writable.active_id,
-        recovery_checkpoint,
-    );
-    active.session_rt.usage.markClean(usage_snapshot);
 }
 
 pub fn run(alloc: Allocator, cfg: Config) !void {
@@ -4578,70 +4574,4 @@ test "ACP rejects refreshed Codex tokens for another account" {
         null,
     ));
     try std.testing.expectEqualStrings("stale-token", state.api_key);
-}
-
-test "ACP usage flush preserves snapshot ownership on allocation failure" {
-    const alloc = std.testing.allocator;
-    var runtime: session_runtime.SessionRuntime = .{ .max_history_turns = 8 };
-    var runtime_owned = true;
-    defer if (runtime_owned) runtime.deinit(alloc);
-    try runtime.appendAssistantHistoryTurn(alloc, "question", "answer");
-    const sequence = try runtime.usage.reserveInvocation();
-    try runtime.usage.finishObservedInvocation(
-        alloc,
-        sequence,
-        1,
-        .observed_generation,
-        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        "https://ai-gateway.vercel.sh",
-        null,
-    );
-
-    var durable = try acpModelTestState(
-        alloc,
-        "acp-usage-flush",
-        "/tmp/workspace",
-    );
-    var durable_owned = true;
-    defer if (durable_owned) durable.deinit(alloc);
-    durable.usage = try runtime.usage.snapshot(alloc);
-
-    var writable: session_store.LoadedWritableSession = undefined;
-    writable.state = durable;
-    durable_owned = false;
-    var active: ActiveSessionState = undefined;
-    active.v2 = null;
-    active.writable = writable;
-    active.session_rt = runtime;
-    runtime_owned = false;
-    var state: ServerState = undefined;
-    state.active_session = active;
-    defer {
-        state.active_session.?.session_rt.deinit(alloc);
-        state.active_session.?.writable.?.state.deinit(alloc);
-    }
-
-    var counting = std.testing.FailingAllocator.init(alloc, .{});
-    {
-        var usage = try state.active_session.?.session_rt.usage.snapshot(
-            counting.allocator(),
-        );
-        defer usage.deinit(counting.allocator());
-    }
-    try std.testing.expect(counting.alloc_index > 0);
-
-    var failing = std.testing.FailingAllocator.init(
-        alloc,
-        .{ .fail_index = counting.alloc_index - 1 },
-    );
-    state.alloc = failing.allocator();
-    try std.testing.expectError(
-        error.OutOfMemory,
-        flushActiveSessionUsage(&state),
-    );
-    try std.testing.expect(failing.has_induced_failure);
-    try std.testing.expectEqual(
-        failing.allocated_bytes,
-        failing.freed_bytes,
-    );
 }

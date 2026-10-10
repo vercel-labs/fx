@@ -1,4 +1,5 @@
 const std = @import("std");
+const usage_mod = @import("usage");
 const build_options = @import("build_options");
 const jsonrpc = @import("jsonrpc.zig");
 const core_types = @import("../core/shared/types.zig");
@@ -357,23 +358,15 @@ pub fn writePromptResponseWithUsage(
 ) !void {
     try w.writeAll("{\"stopReason\":");
     try writeJsonStr(reason.jsonString(), w);
-    try w.writeAll(",\"usage\":{");
-    var first = true;
-    inline for (.{
-        .{ "inputTokens", usage.input_tokens },
-        .{ "outputTokens", usage.output_tokens },
-        .{ "cacheReadTokens", usage.cache_read_tokens },
-        .{ "cacheWriteTokens", usage.cache_write_tokens },
-        .{ "reasoningTokens", usage.reasoning_tokens },
-    }) |field| {
-        if (field[1]) |value| {
-            if (!first) try w.writeByte(',');
-            first = false;
-            try writeJsonStr(field[0], w);
-            try w.print(":{d}", .{value});
-        }
-    }
-    try w.writeAll("}}");
+    try w.writeAll(",\"usage\":");
+    try usage_mod.render.writeAcpPromptUsage(w, .{
+        .input_tokens = usage.input_tokens,
+        .output_tokens = usage.output_tokens,
+        .cache_read_tokens = usage.cache_read_tokens,
+        .cache_write_tokens = usage.cache_write_tokens,
+        .reasoning_tokens = usage.reasoning_tokens,
+    });
+    try w.writeAll("}");
 }
 
 pub fn writeAvailableCommandsUpdate(w: *std.Io.Writer, commands_json: []const u8) !void {
@@ -387,14 +380,6 @@ pub fn writeSessionInfoUpdate(w: *std.Io.Writer, title: []const u8, updated_at: 
     try writeJsonStr(title, w);
     try w.writeAll(",\"updatedAt\":");
     try writeJsonStr(updated_at, w);
-    try w.writeAll("}");
-}
-
-pub fn writeUsageUpdate(w: *std.Io.Writer, used: u64, size: u64, complete_cost: ?f64) !void {
-    try w.print("{{\"sessionUpdate\":\"usage_update\",\"used\":{d},\"size\":{d}", .{ used, size });
-    if (complete_cost) |amount| {
-        try w.print(",\"cost\":{{\"amount\":{d},\"currency\":\"USD\"}}", .{amount});
-    }
     try w.writeAll("}");
 }
 
@@ -581,17 +566,6 @@ test "writeUserMessageChunk produces valid json" {
     try writeUserMessageChunk(&out.writer, "message-2", "User says hello");
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"user_message_chunk\"") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "User says hello") != null);
-}
-
-test "writeUsageUpdate omits unproven cost" {
-    const alloc = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try writeUsageUpdate(&out.writer, 8, 128_000, null);
-    try std.testing.expectEqualStrings(
-        "{\"sessionUpdate\":\"usage_update\",\"used\":8,\"size\":128000}",
-        out.writer.buffered(),
-    );
 }
 
 test "writeSessionUpdate wraps update with sessionId" {

@@ -306,6 +306,19 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         if (@hasDecl(App, "startMcpDiscovery")) app.startMcpDiscovery();
         if (@hasDecl(App, "rebindAfterInit")) app.rebindAfterInit();
     }
+    if (comptime !cooperative and @hasField(App, "session") and
+        @hasDecl(@TypeOf(app.session), "bindUsage") and @hasDecl(App, "usageHost"))
+    {
+        // The app is at its final address only now; usage points back into
+        // it. A fresh session's wall time counts from startup, as when the
+        // session's first state took the first usage snapshot.
+        app.session.bindUsage(app.alloc, .{
+            .host = app.usageHost(),
+            .home_path = io_mod.getenv("HOME"),
+            .recovery = session_adapter.usage_recovery_readers,
+        });
+        app.session.usage.startWall();
+    }
     var app_needs_deinit = true;
     defer if (app_needs_deinit) {
         if (comptime cooperative) {
@@ -316,11 +329,6 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
             if (shutdown.failure) |err| reportShutdownFailure(deps, err);
         }
     };
-    if (comptime !cooperative and @hasField(App, "session") and
-        @hasDecl(@TypeOf(app.session), "attachProfileUsagePublisher"))
-    {
-        app.session.attachProfileUsagePublisher(app.alloc);
-    }
     if (comptime !cooperative) {
         if (resume_requested) app.startResumedSessionReconciliation();
         if (@hasDecl(App, "configureNotifications")) try app.configureNotifications();

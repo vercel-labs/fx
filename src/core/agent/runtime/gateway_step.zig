@@ -2,7 +2,8 @@ const std = @import("std");
 const agent_stream_provider = @import("../stream_provider.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const types = @import("../../shared/types.zig");
-const session_usage = @import("../../session/session_usage.zig");
+const usage_owner = @import("../../session/usage_owner.zig");
+const usage_mod = @import("usage");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const io_mod = @import("../../shared/io.zig");
 const runtime_telemetry = @import("telemetry.zig");
@@ -18,17 +19,20 @@ pub const AttemptEvidence = agent_stream_provider.AttemptEvidence;
 pub const StreamResult = agent_stream_provider.Result;
 
 const InvocationAdmission = struct {
-    usage: ?*session_usage.Usage,
+    usage: ?*usage_owner.Owner,
+    credential: types.CredentialLease,
     attempt_evidence: *AttemptEvidence,
     trace_ctx: TraceContext,
     model: []const u8,
     caller_admission: agent_stream_provider.Admission,
-    observation: ?session_usage.InvocationObservation = null,
+    admitted: bool = false,
+    invocation: ?usage_owner.Invocation = null,
 
     fn admit(raw: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        if (self.observation != null) return error.ProviderAdmissionRepeated;
-        self.observation = try session_usage.InvocationObservation.begin(self.usage);
+        if (self.admitted) return error.ProviderAdmissionRepeated;
+        self.invocation = try usage_owner.Invocation.begin(self.usage, self.credential);
+        self.admitted = true;
         if (self.caller_admission.admit_fn != null) {
             try self.caller_admission.admit();
         }
@@ -41,14 +45,18 @@ const InvocationAdmission = struct {
             .{self.model},
         );
     }
+
+    fn observe(raw: *anyopaque, event: std.json.Value) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.invocation) |*invocation| invocation.call.gatewayValue(event);
+    }
 };
 
 pub fn streamModelCompletion(
     provider: agent_stream_provider.Provider,
     alloc: Allocator,
     request_value: agent_stream_provider.ModelRequest,
-    usage: ?*session_usage.Usage,
-    usage_allocator: Allocator,
+    usage: ?*usage_owner.Owner,
 ) !StreamResult {
     if (request_value.cancel_flag.load(.seq_cst)) {
         return agent_stream_provider.failResult(error.Cancelled);
@@ -56,6 +64,7 @@ pub fn streamModelCompletion(
     const started_at_ms = io_mod.milliTimestamp();
     var admission = InvocationAdmission{
         .usage = usage,
+        .credential = request_value.credential,
         .attempt_evidence = request_value.attempt_evidence,
         .trace_ctx = request_value.trace_ctx,
         .model = request_value.model,
@@ -63,6 +72,7 @@ pub fn streamModelCompletion(
     };
     var request = request_value;
     request.admission = .{ .context = &admission, .admit_fn = InvocationAdmission.admit };
+    request.gateway_events = .{ .context = &admission, .observe_fn = InvocationAdmission.observe };
     // Only the owned result escapes. HTTP and parser scratch is released after
     // every attempt, including transport failure and cancellation.
     var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
@@ -70,42 +80,20 @@ pub fn streamModelCompletion(
     const request_alloc = scratch.allocator();
     var result = provider.stream(request_alloc, request) catch |err| {
         runtime_telemetry.recordGatewayCallMetric(request.model, started_at_ms, 0, 0, 0, 0, request.trace_ctx.turn_id, request.trace_ctx.step_id, request.trace_ctx.subagent_id, @errorName(err), "");
-        if (admission.observation) |observation| try observation.fail(
-            if (request.delivery.load() == .possibly_sent) .ambiguous_delivery else .unbilled,
+        if (admission.invocation) |*invocation| try invocation.failed(
+            err,
+            request.delivery.load() == .possibly_sent,
         );
         return err;
     };
     defer result.deinit(request_alloc);
-    const observation = admission.observation orelse
-        return agent_stream_provider.failResult(error.ProviderAdmissionMissing);
+    if (!admission.admitted) return agent_stream_provider.failResult(error.ProviderAdmissionMissing);
 
     recordProviderResultMetric(request.model, started_at_ms, result, request.trace_ctx);
-    switch (result) {
-        .failed => try observation.fail(.unbilled),
-        .completed => |completed| {
-            try observation.complete(
-                usage_allocator,
-                completed.completion,
-                completed.usage,
-            );
-            if (comptime @import("builtin").os.tag != .wasi) {
-                if (std.meta.activeTag(completed.usage) == .deferred) if (usage) |ledger| {
-                    if (request.credential.secret()) |credential| {
-                        ledger.startDeferredReconciliation(
-                            usage_allocator,
-                            completed.usage.deferred,
-                            credential,
-                        );
-                    } else if (request.credential.credentialSource() == .host_managed) {
-                        ledger.startHostManagedDeferredReconciliation(
-                            usage_allocator,
-                            completed.usage.deferred,
-                        );
-                    }
-                };
-            }
-        },
-    }
+    if (admission.invocation) |*invocation| switch (result) {
+        .failed => try invocation.rejected(),
+        .completed => |completed| try invocation.completed(completed.completion),
+    };
     return switch (result) {
         .completed => |value| if (value.ownership == .borrowed) result else try result.dupe(alloc),
         .failed => |value| if (value.ownership == .borrowed) result else try result.dupe(alloc),
@@ -203,7 +191,7 @@ test "gateway request scratch is released across success failure cancellation an
             .events = .{ .context = &fake, .emit_fn = Fake.emit },
             .cancel_flag = &cancel,
             .provider_attempt_owner = .agent,
-        }, null, std.testing.allocator);
+        }, null);
         if (fake.mode == 1) {
             try std.testing.expectError(error.ConnectionResetByPeer, result);
         } else if (fake.mode == 2) {
@@ -489,8 +477,9 @@ test "provider preflight failure does not reserve usage" {
     };
 
     const alloc = std.testing.allocator;
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
+    var usage: usage_owner.Owner = .{};
+    usage.bind(alloc, .{ .host = null, .home_path = null, .lookup = null });
+    defer usage.deinit();
     var cancel_flag = std.atomic.Value(bool).init(false);
     var delivery = DeliveryCertainty.init();
     var attempt_evidence: agent_stream_provider.AttemptEvidence = .{};
@@ -513,13 +502,12 @@ test "provider preflight failure does not reserve usage" {
             .cancel_flag = &cancel_flag,
         },
         &usage,
-        alloc,
     );
     if (result) |_| return error.TestExpectedGatewayFailure else |_| {}
 
     var snapshot = try usage.snapshot(alloc);
     defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(session_usage.Availability.complete, snapshot.billing);
+    try std.testing.expectEqual(usage_mod.snapshot.Billing.complete, snapshot.billing);
     try std.testing.expect(snapshot.api_duration_complete);
     try std.testing.expectEqual(@as(u64, 0), snapshot.settled_through_sequence);
 }
@@ -554,8 +542,9 @@ test "caller admission publishes before provider attempt is admitted" {
     };
 
     const alloc = std.testing.allocator;
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
+    var usage: usage_owner.Owner = .{};
+    usage.bind(alloc, .{ .host = null, .home_path = null, .lookup = null });
+    defer usage.deinit();
     var cancel_flag = std.atomic.Value(bool).init(false);
     var delivery = DeliveryCertainty.init();
     var attempt_evidence: AttemptEvidence = .{};
@@ -582,7 +571,6 @@ test "caller admission publishes before provider attempt is admitted" {
             .cancel_flag = &cancel_flag,
         },
         &usage,
-        alloc,
     );
     defer result.deinit(alloc);
 
@@ -620,8 +608,9 @@ test "caller admission failure settles usage and prevents request open" {
     };
 
     const alloc = std.testing.allocator;
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
+    var usage: usage_owner.Owner = .{};
+    usage.bind(alloc, .{ .host = null, .home_path = null, .lookup = null });
+    defer usage.deinit();
     var cancel_flag = std.atomic.Value(bool).init(false);
     var delivery = DeliveryCertainty.init();
     var attempt_evidence: AttemptEvidence = .{};
@@ -650,7 +639,6 @@ test "caller admission failure settles usage and prevents request open" {
                 .cancel_flag = &cancel_flag,
             },
             &usage,
-            alloc,
         ),
     );
 
@@ -659,7 +647,7 @@ test "caller admission failure settles usage and prevents request open" {
     try std.testing.expect(!attempt_evidence.provider_admitted);
     var snapshot = try usage.snapshot(alloc);
     defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(session_usage.Availability.complete, snapshot.billing);
+    try std.testing.expectEqual(usage_mod.snapshot.Billing.complete, snapshot.billing);
     try std.testing.expect(snapshot.api_duration_complete);
     try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
 }
@@ -681,8 +669,9 @@ test "possibly sent gateway failure marks billing incomplete" {
     };
 
     const alloc = std.testing.allocator;
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
+    var usage: usage_owner.Owner = .{};
+    usage.bind(alloc, .{ .host = null, .home_path = null, .lookup = null });
+    defer usage.deinit();
     var cancel_flag = std.atomic.Value(bool).init(false);
     var delivery = DeliveryCertainty.init();
     var attempt_evidence: agent_stream_provider.AttemptEvidence = .{};
@@ -706,13 +695,12 @@ test "possibly sent gateway failure marks billing incomplete" {
             .cancel_flag = &cancel_flag,
         },
         &usage,
-        alloc,
     );
     if (result) |_| return error.TestExpectedGatewayFailure else |_| {}
 
     var snapshot = try usage.snapshot(alloc);
     defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(session_usage.Availability.incomplete, snapshot.billing);
+    try std.testing.expectEqual(usage_mod.snapshot.Billing.incomplete, snapshot.billing);
     try std.testing.expect(snapshot.api_duration_complete);
     try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
 }
@@ -733,21 +721,18 @@ test "provider-local exact usage reaches session accounting" {
             return .{ .completed = .{
                 .completion = .{
                     .generation_id = "resp_provider_local",
-                    .billing = .{
+                    .subscription_usage = .{
                         .created_at_ms = 1,
                         .model = "codex/gpt-test",
-                        .total_cost = 0,
                         .input_tokens = 3,
                         .output_tokens = 1,
                         .cache_read_tokens = 0,
                         .cache_write_tokens = 0,
                         .reasoning_tokens = null,
-                        .billable_web_search_calls = 0,
                     },
                     .finish_reason = .stop,
                     .usage = .{ .input_tokens = 3, .output_tokens = 1 },
                 },
-                .usage = .{ .exact = .codex },
             } };
         }
     };
@@ -761,8 +746,9 @@ test "provider-local exact usage reaches session accounting" {
         .context = &local_provider,
         .stream_fn = LocalProvider.stream,
     };
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
+    var usage: usage_owner.Owner = .{};
+    usage.bind(alloc, .{ .host = null, .home_path = null, .lookup = null });
+    defer usage.deinit();
     var cancel_flag = std.atomic.Value(bool).init(false);
     var callback_ctx: u8 = 0;
 
@@ -792,7 +778,6 @@ test "provider-local exact usage reaches session accounting" {
             .provider_attempt_owner = .agent,
         },
         &usage,
-        alloc,
     );
     defer result.deinit(alloc);
     try std.testing.expect(std.meta.activeTag(result) == .completed);
@@ -800,7 +785,7 @@ test "provider-local exact usage reaches session accounting" {
     try std.testing.expectEqual(@as(usize, 1), local_provider.calls);
     var snapshot = try usage.snapshot(alloc);
     defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(session_usage.Availability.complete, snapshot.billing);
+    try std.testing.expectEqual(usage_mod.snapshot.Billing.complete, snapshot.billing);
     try std.testing.expect(snapshot.api_duration_complete);
     try std.testing.expectEqual(@as(u64, 2), snapshot.next_sequence);
     try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
@@ -843,9 +828,12 @@ test "selected MCP schemas replace old definitions without duplicate names" {
 }
 
 test "invalid writer at provider completion prevents delivery of executable tool calls" {
-    const Sink = struct {
+    const Host = struct {
         calls: usize = 0,
-        fn persist(raw: *anyopaque, _: session_usage.Snapshot) !void {
+        fn current(_: *anyopaque) ?usage_owner.Target {
+            return .{ .session_id = "sess-invalid-writer", .marker = .v1 };
+        }
+        fn persist(raw: *anyopaque, _: []const u8, _: *const usage_mod.host.Checkpoint) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
             if (self.calls == 2) return error.SessionPersistenceUncertain;
@@ -866,10 +854,18 @@ test "invalid writer at provider completion prevents delivery of executable tool
         fn event(_: *anyopaque, _: agent_stream_provider.Event) void {}
     };
     const alloc = std.testing.allocator;
-    var sink = Sink{};
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    usage.configureCheckpointSink(.{ .context = &sink, .allocator = alloc, .persist = Sink.persist });
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var host = Host{};
+    var usage: usage_owner.Owner = .{};
+    usage.bind(alloc, .{
+        .host = .{ .context = &host, .current_fn = Host.current, .persist_fn = Host.persist },
+        .home_path = home,
+        .lookup = null,
+    });
+    defer usage.deinit();
     var cancel = std.atomic.Value(bool).init(false);
     var delivery = DeliveryCertainty.init();
     var evidence: AttemptEvidence = .{};
@@ -892,10 +888,11 @@ test "invalid writer at provider completion prevents delivery of executable tool
             .cancel_flag = &cancel,
         },
         &usage,
-        alloc,
     ));
-    try std.testing.expectEqual(@as(usize, 2), sink.calls);
+    try std.testing.expectEqual(@as(usize, 2), host.calls);
     try std.testing.expect(evidence.provider_admitted);
-    try std.testing.expect(usage.checkpoint_mutex.tryLock());
-    usage.checkpoint_mutex.unlock(io_mod.getIo());
+    // Nothing is left locked: the session still answers.
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
 }

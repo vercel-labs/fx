@@ -17,8 +17,8 @@ const session_layout = @import("session_layout.zig");
 const session_replay = @import("session_replay.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
 const result_store = @import("result_store.zig");
-const session_usage = @import("session_usage.zig");
-const session_usage_sidecar = @import("session_usage_sidecar.zig");
+const usage_mod = @import("usage");
+const usage_owner = @import("usage_owner.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 
 const Allocator = std.mem.Allocator;
@@ -700,6 +700,243 @@ fn encodeConversationMetadataWithTitle(
     });
 }
 
+/// The v1 session's usage sidecar. Its bytes are the usage module's; this
+/// file owns where it lives and which file shapes are safe to read.
+pub const usage_sidecar_file = "usage-v2.json";
+
+/// What a session that has made no calls records. Static: copy it before
+/// handing it to anything that frees.
+const fresh_usage = usage_mod.Snapshot{
+    .billing = .complete,
+    .api_duration_complete = true,
+    .wall_duration_complete = true,
+    .code_complete = true,
+    .next_sequence = 1,
+    .settled_through_sequence = 0,
+    .api_duration_ms = 0,
+    .wall_duration_ms = 0,
+    .total_cost = 0,
+    .input_tokens = 0,
+    .output_tokens = 0,
+    .cache_read_tokens = 0,
+    .cache_write_tokens = 0,
+    .reasoning_tokens = 0,
+    .request_count = 0,
+    .billable_web_search_calls = 0,
+    .lines_added = 0,
+    .lines_removed = 0,
+    .models = &.{},
+    .pending = &.{},
+};
+
+fn writeUsageSidecar(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    snapshot: usage_mod.Snapshot,
+) !void {
+    const encoded = try usage_mod.snapshot.encodeSidecar(alloc, session_id, snapshot);
+    defer alloc.free(encoded);
+    try io_mod.durableReplaceVerified(alloc, dir, usage_sidecar_file, encoded);
+}
+
+const CapturedUsageSidecar = union(enum) {
+    missing,
+    invalid: []const u8,
+    encoded: []u8,
+
+    fn deinit(self: *CapturedUsageSidecar, alloc: Allocator) void {
+        switch (self.*) {
+            .encoded => |bytes| alloc.free(bytes),
+            .missing, .invalid => {},
+        }
+        self.* = undefined;
+    }
+};
+
+fn captureUsageSidecar(alloc: Allocator, dir: *io_mod.VerifiedDir) Allocator.Error!CapturedUsageSidecar {
+    const initial = dir.dir.statFile(io_mod.getIo(), usage_sidecar_file, .{
+        .follow_symlinks = false,
+    }) catch |err| {
+        if (err == error.FileNotFound) return .missing;
+        return .{ .invalid = @errorName(err) };
+    };
+    if (initial.kind != .file or initial.nlink != 1 or
+        initial.permissions.toMode() & 0o777 != 0o600)
+    {
+        return .{ .invalid = "unsafe_initial_shape" };
+    }
+    if (initial.size == 0) return .{ .invalid = "empty" };
+    if (initial.size > usage_mod.snapshot.max_sidecar_bytes) return .{ .invalid = "oversized" };
+
+    var file = dir.dir.openFile(io_mod.getIo(), usage_sidecar_file, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    }) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (err == error.FileNotFound) return .missing;
+        return .{ .invalid = @errorName(err) };
+    };
+    defer file.close(io_mod.getIo());
+    const verified = file.stat(io_mod.getIo()) catch |err|
+        return .{ .invalid = @errorName(err) };
+    if (verified.kind != .file or verified.nlink != 1 or
+        verified.permissions.toMode() & 0o777 != 0o600)
+    {
+        return .{ .invalid = "unsafe_verified_shape" };
+    }
+    if (verified.size != initial.size) return .{ .invalid = "changed_during_open" };
+    const bytes = io_mod.readFileToEnd(alloc, &file, usage_mod.snapshot.max_sidecar_bytes) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .{ .invalid = @errorName(err) };
+    };
+    return .{ .encoded = bytes };
+}
+
+fn loadCapturedUsageSidecar(
+    alloc: Allocator,
+    captured: CapturedUsageSidecar,
+    session_id: []const u8,
+) !?usage_mod.Snapshot {
+    const bytes = switch (captured) {
+        .missing => return null,
+        .invalid => return error.InvalidUsageSidecar,
+        .encoded => |value| value,
+    };
+    var sidecar = try usage_mod.snapshot.parseSidecar(alloc, bytes);
+    defer alloc.free(sidecar.session_id);
+    errdefer sidecar.snapshot.deinit(alloc);
+    if (!std.mem.eql(u8, sidecar.session_id, session_id)) return error.UsageSidecarSessionMismatch;
+    return sidecar.snapshot;
+}
+
+fn traceInvalidUsageSidecar(err: anyerror) void {
+    debug_trace.logf("session", "event=usage_sidecar_invalid err={s}", .{@errorName(err)});
+}
+
+/// A conversation stays usable when its usage sidecar is damaged; file
+/// access and private-path failures still prevent admission.
+fn loadConversationUsage(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    continuity_at_ms: i64,
+) !usage_mod.Snapshot {
+    var captured = try captureUsageSidecar(alloc, dir);
+    defer captured.deinit(alloc);
+    if (captured == .invalid) {
+        const reason = captured.invalid;
+        if (!std.mem.eql(u8, reason, "empty") and !std.mem.eql(u8, reason, "oversized")) {
+            return error.InvalidUsageSidecar;
+        }
+    }
+    const loaded = loadCapturedUsageSidecar(alloc, captured, session_id) catch |err| blk: {
+        if (err == error.OutOfMemory) return err;
+        traceInvalidUsageSidecar(err);
+        break :blk null;
+    };
+    if (loaded) |snapshot| return snapshot;
+    debug_trace.logf("session", "conversation accounting unavailable session={s} completeness=incomplete", .{session_id});
+    const incidents = try alloc.alloc(usage_mod.snapshot.Incident, 1);
+    incidents[0] = .{ .occurred_at_ms = @max(continuity_at_ms, 0), .completeness = .incomplete };
+    return .{
+        .billing = .incomplete,
+        .api_duration_complete = false,
+        .wall_duration_complete = false,
+        .code_complete = false,
+        .next_sequence = 1,
+        .settled_through_sequence = 0,
+        .api_duration_ms = 0,
+        .wall_duration_ms = 0,
+        .total_cost = 0,
+        .input_tokens = 0,
+        .output_tokens = 0,
+        .cache_read_tokens = 0,
+        .cache_write_tokens = 0,
+        .billable_web_search_calls = 0,
+        .lines_added = 0,
+        .lines_removed = 0,
+        .models = &.{},
+        .pending = &.{},
+        .incidents = incidents,
+    };
+}
+
+/// A conversation session's usage and the update time in its metadata.
+pub const ConversationUsage = struct {
+    usage: usage_mod.Snapshot,
+    updated_at_ms: i64,
+};
+
+/// What usage recovery reads from a marked session: the usage a full load
+/// gives and the metadata's update time, with the same metadata checks but
+/// without replaying the history. Null when the session isn't in the
+/// conversation format, so the caller loads it in full. The caller owns
+/// `usage`.
+pub fn loadConversationUsageOnly(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    expected_session_id: []const u8,
+) !?ConversationUsage {
+    const metadata_bytes = (try readConversationMetadataBytes(alloc, dir)) orelse return null;
+    defer alloc.free(metadata_bytes);
+    if (!try isConversationMetadata(alloc, metadata_bytes)) return null;
+    var metadata = try session_codec.decodeSessionMetadata(alloc, metadata_bytes);
+    defer metadata.deinit();
+    if (!std.mem.eql(u8, metadata.value.id, expected_session_id)) return error.InvalidSessionMetadata;
+    _ = session.ConversationLanguage.fromSlice(metadata.value.conversation_language) catch
+        return error.InvalidSessionMetadata;
+    if (types.ReasoningEffort.parse(metadata.value.effort) == null) return error.InvalidSessionMetadata;
+    return .{
+        .usage = try loadConversationUsage(alloc, dir, expected_session_id, metadata.value.updated_at_ms),
+        .updated_at_ms = metadata.value.updated_at_ms,
+    };
+}
+
+/// Whether only the usage sidecar is damaged, so a recovery copy may
+/// continue without it. Unsafe storage and recognized foreign formats do
+/// not authorize a lossy copy.
+fn usageSidecarRecoverable(alloc: Allocator, dir: *io_mod.VerifiedDir, session_id: []const u8) !bool {
+    var captured = try captureUsageSidecar(alloc, dir);
+    defer captured.deinit(alloc);
+    switch (captured) {
+        .missing => return false,
+        .invalid => |reason| {
+            if (std.mem.eql(u8, reason, "empty") or std.mem.eql(u8, reason, "oversized")) return true;
+            return error.InvalidUsageSidecar;
+        },
+        .encoded => {},
+    }
+    var snapshot = loadCapturedUsageSidecar(alloc, captured, session_id) catch |err| {
+        if (err == error.OutOfMemory or err == error.UsageSidecarSessionMismatch) return err;
+        var envelope = std.json.parseFromSlice(std.json.Value, alloc, captured.encoded, .{}) catch |parse_err| {
+            if (parse_err == error.OutOfMemory) return parse_err;
+            return true;
+        };
+        defer envelope.deinit();
+        if (envelope.value == .object) {
+            if (envelope.value.object.get("session_id")) |id| {
+                if (id == .string and id.string.len != 0 and !std.mem.eql(u8, id.string, session_id)) return error.UsageSidecarSessionMismatch;
+            }
+            if (envelope.value.object.get("schema_version")) |version| {
+                if (version == .integer and version.integer != 1) return error.UnsupportedUsageSidecar;
+            }
+            if (envelope.value.object.get("snapshot")) |value| {
+                if (value == .object) {
+                    if (value.object.get("schema_version")) |version| {
+                        if (version == .integer and (version.integer < 0 or !usage_mod.snapshot.supportsSchema(@intCast(version.integer)))) return error.UnsupportedUsageSidecar;
+                    }
+                }
+            }
+        }
+        return true;
+    };
+    defer if (snapshot) |*value| value.deinit(alloc);
+    return false;
+}
+
 fn writeConversationControlState(
     alloc: Allocator,
     dir: *io_mod.VerifiedDir,
@@ -718,7 +955,7 @@ fn writeConversationControlState(
         permission_bytes,
     );
     if (state.usage) |usage| {
-        try session_usage_sidecar.write(alloc, dir, state.id, usage);
+        try writeUsageSidecar(alloc, dir, state.id, usage);
     }
     try writeConversationRecoveryState(alloc, dir, state.recovery_checkpoint, conversation_seq);
 }
@@ -1247,7 +1484,7 @@ fn load_conversation_state_at_boundary(
     else
         null;
     errdefer if (last_work_id) |work_id| mem_utils.free(alloc, work_id);
-    var usage: ?session_usage.Snapshot = try session_usage_sidecar.loadConversation(
+    var usage: ?usage_mod.Snapshot = try loadConversationUsage(
         alloc,
         dir,
         expected_session_id,
@@ -1347,7 +1584,7 @@ const ConversationRecovery = struct {
 
 pub fn classify_conversation_recovery(alloc: Allocator, dir: *io_mod.VerifiedDir, session_id: []const u8) !ConversationRecovery {
     const scan = try scan_conversation_recovery(alloc, dir);
-    const usage_incomplete = try session_usage_sidecar.has_recoverable_corruption(alloc, dir, session_id);
+    const usage_incomplete = try usageSidecarRecoverable(alloc, dir, session_id);
     if (scan.complete and !usage_incomplete) return error.SessionRecoveryNotNeeded;
     return .{ .boundary = scan.boundary, .usage_incomplete = usage_incomplete };
 }
@@ -3586,14 +3823,9 @@ pub const LoadedWritableSession = struct {
             .usage_checkpointed => |payload| payload.usage,
             else => return error.InvalidConversationEvent,
         };
-        var next_usage = try session_usage.dupeSnapshotOwned(alloc, snapshot);
+        var next_usage = try usage_mod.snapshot.dupe(alloc, snapshot);
         errdefer next_usage.deinit(alloc);
-        try session_usage_sidecar.write(
-            alloc,
-            &self.log.dir,
-            self.active_id,
-            snapshot,
-        );
+        try writeUsageSidecar(alloc, &self.log.dir, self.active_id, snapshot);
         if (self.state.usage) |*prior| prior.deinit(alloc);
         self.state.usage = next_usage;
         next_usage = undefined;
@@ -4473,12 +4705,10 @@ fn createNativeSession(
     initial_state: session_codec.DurableSessionState,
     _: Options,
 ) !LoadedWritableSession {
-    var synthesized_usage: ?session_usage.Snapshot = null;
-    if (initial_state.usage == null) {
-        var fresh_usage = session_usage.Usage.initFresh();
-        defer fresh_usage.deinit(alloc);
-        synthesized_usage = try fresh_usage.snapshot(alloc);
-    }
+    var synthesized_usage: ?usage_mod.Snapshot = if (initial_state.usage == null)
+        try usage_mod.snapshot.dupe(alloc, fresh_usage)
+    else
+        null;
     defer if (synthesized_usage) |*usage| usage.deinit(alloc);
 
     var display = try session_display_metadata.deriveFromHistory(
@@ -5014,18 +5244,18 @@ test "conversation load retains history and qualifies missing or corrupt account
         var dir = try openSessionDir(&temp.root.sessions.?, initial.id, .read_only);
         defer dir.close();
         if (missing) {
-            try dir.dir.deleteFile(std.testing.io, session_usage_sidecar.sidecar_file);
+            try dir.dir.deleteFile(std.testing.io, usage_sidecar_file);
         } else {
-            try io_mod.durableReplaceVerified(alloc, &dir, session_usage_sidecar.sidecar_file, "{broken accounting");
+            try io_mod.durableReplaceVerified(alloc, &dir, usage_sidecar_file, "{broken accounting");
         }
         var restored = try temp.root.loadReadOnly(alloc, initial.id, .{});
         defer restored.deinit(alloc);
         try std.testing.expectEqualStrings("saved answer", restored.history[0].assistant.assistant);
         try std.testing.expect(restored.usage != null);
-        try std.testing.expectEqual(session_usage.Availability.incomplete, restored.usage.?.billing);
+        try std.testing.expectEqual(usage_mod.snapshot.Billing.incomplete, restored.usage.?.billing);
         try std.testing.expectEqual(@as(usize, 1), restored.usage.?.incidents.len);
         if (!missing) {
-            const retained = try readManagedFileAlloc(alloc, &dir, session_usage_sidecar.sidecar_file, 1024);
+            const retained = try readManagedFileAlloc(alloc, &dir, usage_sidecar_file, 1024);
             defer alloc.free(retained);
             try std.testing.expectEqualStrings("{broken accounting", retained);
         }
@@ -5648,9 +5878,7 @@ test "legacy import preserves published events and active recovery after metadat
     defer temp.deinit(alloc);
     var initial = try testState(alloc, "legacy-metadata-sync-failure", 10);
     defer initial.deinit(alloc);
-    var legacy_usage = session_usage.Usage.initLegacy();
-    defer legacy_usage.deinit(alloc);
-    initial.usage = try legacy_usage.snapshot(alloc);
+    initial.usage = try usage_mod.snapshot.dupe(alloc, usage_mod.snapshot.legacy_unavailable);
     const history = try alloc.alloc(session.HistoryTurn, 1);
     history[0] = try session.makeAssistantTurn(alloc, "saved request", "saved answer");
     initial.history = history;
@@ -5695,7 +5923,7 @@ test "legacy import preserves published events and active recovery after metadat
     try std.testing.expectEqual(@as(usize, 1), resumed.state.history.len);
     try std.testing.expectEqualStrings("saved answer", resumed.state.history[0].assistant.assistant);
     try std.testing.expectEqual(@as(u64, 7), resumed.state.recovery_checkpoint.?.turn_id);
-    try std.testing.expectEqual(session_usage.Availability.legacy, resumed.state.usage.?.billing);
+    try std.testing.expectEqual(usage_mod.snapshot.Billing.legacy, resumed.state.usage.?.billing);
 }
 
 test "conversation storage creates only metadata and event log" {
@@ -6313,10 +6541,7 @@ test "cache-free usage checkpoints stay outside conversation history" {
     defer temp.deinit(alloc);
     var initial = try testState(alloc, "conversation-usage", 10);
     defer initial.deinit(alloc);
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    try usage.recordCommittedLines(9, 4);
-    var snapshot = try usage.snapshot(alloc);
+    var snapshot = try usage_owner.testSnapshot(alloc, 9, 4);
     defer snapshot.deinit(alloc);
     var committed_bytes: u64 = 0;
     {

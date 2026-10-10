@@ -1,0 +1,540 @@
+{
+  "captured_at": "2026-10-07T18:50:31.833Z",
+  "fx_bin": "zig-out/bin/fx",
+  "fx_revision": "3dfcef6a6954cfd004bfa8bcc2094cb1425d12fa",
+  "fx_worktree_dirty": false,
+  "fx_version": "0.0.13",
+  "bun": "1.3.12",
+  "tmp_root": "/tmp/fx-usage-compat-Mr6VDy",
+  "fake_gateway": "http://127.0.0.1:54344",
+  "scenarios": [
+    {
+      "name": "v1_exact",
+      "sessions_v2": false,
+      "generation_status": null,
+      "hold_usage_lock": false,
+      "torn_tail_before": false,
+      "new_session_files": [
+        "sessions/ndhBQ2L-9k7W/events.jsonl",
+        "sessions/ndhBQ2L-9k7W/permissions.json",
+        "sessions/ndhBQ2L-9k7W/session.json",
+        "sessions/ndhBQ2L-9k7W/session.lock",
+        "sessions/ndhBQ2L-9k7W/usage-v2.json"
+      ]
+    },
+    {
+      "name": "v1_exact_3d",
+      "sessions_v2": false,
+      "generation_status": null,
+      "hold_usage_lock": false,
+      "torn_tail_before": false,
+      "new_session_files": [
+        "sessions/0aZCXjV8jtLF/events.jsonl",
+        "sessions/0aZCXjV8jtLF/permissions.json",
+        "sessions/0aZCXjV8jtLF/session.json",
+        "sessions/0aZCXjV8jtLF/session.lock",
+        "sessions/0aZCXjV8jtLF/usage-v2.json"
+      ]
+    },
+    {
+      "name": "v1_exact_20d",
+      "sessions_v2": false,
+      "generation_status": null,
+      "hold_usage_lock": false,
+      "torn_tail_before": false,
+      "new_session_files": [
+        "sessions/qaWhmmC6DWem/events.jsonl",
+        "sessions/qaWhmmC6DWem/permissions.json",
+        "sessions/qaWhmmC6DWem/session.json",
+        "sessions/qaWhmmC6DWem/session.lock",
+        "sessions/qaWhmmC6DWem/usage-v2.json"
+      ]
+    },
+    {
+      "name": "v1_deferred_lookup",
+      "sessions_v2": false,
+      "generation_status": 200,
+      "hold_usage_lock": false,
+      "torn_tail_before": false,
+      "new_session_files": [
+        "sessions/b2LivcbObM8o/events.jsonl",
+        "sessions/b2LivcbObM8o/permissions.json",
+        "sessions/b2LivcbObM8o/session.json",
+        "sessions/b2LivcbObM8o/session.lock",
+        "sessions/b2LivcbObM8o/usage-v2.json"
+      ]
+    },
+    {
+      "name": "v2_exact",
+      "sessions_v2": true,
+      "generation_status": null,
+      "hold_usage_lock": false,
+      "torn_tail_before": false,
+      "new_session_files": [
+        "sessions/v2/g3-UB4E541nx/lock",
+        "sessions/v2/g3-UB4E541nx/log.jsonl",
+        "sessions/v2/index.jsonl",
+        "sessions/v2/index.lock"
+      ]
+    },
+    {
+      "name": "v1_no_generation_id",
+      "sessions_v2": false,
+      "generation_status": null,
+      "hold_usage_lock": false,
+      "torn_tail_before": true,
+      "new_session_files": [
+        "sessions/FFCOeORN2Owv/events.jsonl",
+        "sessions/FFCOeORN2Owv/permissions.json",
+        "sessions/FFCOeORN2Owv/session.json",
+        "sessions/FFCOeORN2Owv/session.lock",
+        "sessions/FFCOeORN2Owv/usage-v2.json"
+      ]
+    },
+    {
+      "name": "v1_no_generation_id_lock_held",
+      "sessions_v2": false,
+      "generation_status": null,
+      "hold_usage_lock": true,
+      "torn_tail_before": false,
+      "new_session_files": [
+        "sessions/Cn0Q2_7cxZ_z/events.jsonl",
+        "sessions/Cn0Q2_7cxZ_z/permissions.json",
+        "sessions/Cn0Q2_7cxZ_z/session.json",
+        "sessions/Cn0Q2_7cxZ_z/session.lock",
+        "sessions/Cn0Q2_7cxZ_z/usage-v2.json"
+      ]
+    },
+    {
+      "name": "v1_exact_lock_held",
+      "sessions_v2": false,
+      "generation_status": null,
+      "hold_usage_lock": true,
+      "torn_tail_before": false,
+      "new_session_files": [
+        "sessions/-0mOs2ToHDxY/events.jsonl",
+        "sessions/-0mOs2ToHDxY/permissions.json",
+        "sessions/-0mOs2ToHDxY/session.json",
+        "sessions/-0mOs2ToHDxY/session.lock",
+        "sessions/-0mOs2ToHDxY/usage-v2.json"
+      ]
+    },
+    {
+      "name": "v1_lookup_401",
+      "sessions_v2": false,
+      "generation_status": 401,
+      "hold_usage_lock": false,
+      "torn_tail_before": false,
+      "new_session_files": [
+        "sessions/7elup-r3q_tk/events.jsonl",
+        "sessions/7elup-r3q_tk/permissions.json",
+        "sessions/7elup-r3q_tk/session.json",
+        "sessions/7elup-r3q_tk/session.lock",
+        "sessions/7elup-r3q_tk/usage-v2.json"
+      ]
+    },
+    {
+      "name": "v2_lookup_401",
+      "sessions_v2": true,
+      "generation_status": 401,
+      "hold_usage_lock": false,
+      "torn_tail_before": false,
+      "new_session_files": [
+        "sessions/v2/9765RiSMBar-/lock",
+        "sessions/v2/9765RiSMBar-/log.jsonl"
+      ]
+    }
+  ],
+  "runs": [
+    {
+      "label": "ask.v1_exact",
+      "argv": [
+        "ask",
+        "Reply with ok. (v1_exact)"
+      ],
+      "exit": 0
+    },
+    {
+      "label": "ask.v1_exact_3d",
+      "argv": [
+        "ask",
+        "Reply with ok. (v1_exact_3d)"
+      ],
+      "exit": 0
+    },
+    {
+      "label": "ask.v1_exact_20d",
+      "argv": [
+        "ask",
+        "Reply with ok. (v1_exact_20d)"
+      ],
+      "exit": 0
+    },
+    {
+      "label": "ask.v1_deferred_lookup",
+      "argv": [
+        "ask",
+        "Reply with ok. (v1_deferred_lookup)"
+      ],
+      "exit": 0
+    },
+    {
+      "label": "ask.v2_exact",
+      "argv": [
+        "ask",
+        "Reply with ok. (v2_exact)"
+      ],
+      "exit": 0
+    },
+    {
+      "label": "complete.usage_24h.text",
+      "argv": [
+        "usage",
+        "--period",
+        "24h"
+      ],
+      "exit": 0
+    },
+    {
+      "label": "complete.usage_24h.json",
+      "argv": [
+        "usage",
+        "--period",
+        "24h",
+        "--json"
+      ],
+      "exit": 0
+    },
+    {
+      "label": "complete.usage_7d.text",
+      "argv": [
+        "usage",
+        "--period",
+        "7d"
+      ],
+      "exit": 0
+    },
+    {
+      "label": "complete.usage_7d.json",
+      "argv": [
+        "usage",
+        "--period",
+        "7d",
+        "--json"
+      ],
+      "exit": 0
+    },
+    {
+      "label": "complete.usage_30d.text",
+      "argv": [
+        "usage",
+        "--period",
+        "30d"
+      ],
+      "exit": 0
+    },
+    {
+      "label": "complete.usage_30d.json",
+      "argv": [
+        "usage",
+        "--period",
+        "30d",
+        "--json"
+      ],
+      "exit": 0
+    },
+    {
+      "label": "torn.usage_30d.text",
+      "argv": [
+        "usage"
+      ],
+      "exit": 1
+    },
+    {
+      "label": "torn.usage_30d.json",
+      "argv": [
+        "usage",
+        "--json"
+      ],
+      "exit": 1
+    },
+    {
+      "label": "ask.v1_no_generation_id",
+      "argv": [
+        "ask",
+        "Reply with ok. (v1_no_generation_id)"
+      ],
+      "exit": 0
+    },
+    {
+      "label": "ask.v1_no_generation_id_lock_held",
+      "argv": [
+        "ask",
+        "Reply with ok. (v1_no_generation_id_lock_held)"
+      ],
+      "exit": 0
+    },
+    {
+      "label": "ask.v1_exact_lock_held",
+      "argv": [
+        "ask",
+        "Reply with ok. (v1_exact_lock_held)"
+      ],
+      "exit": 0
+    },
+    {
+      "label": "ask.v1_lookup_401",
+      "argv": [
+        "ask",
+        "Reply with ok. (v1_lookup_401)"
+      ],
+      "exit": 0
+    },
+    {
+      "label": "ask.v2_lookup_401",
+      "argv": [
+        "ask",
+        "Reply with ok. (v2_lookup_401)"
+      ],
+      "exit": 0
+    },
+    {
+      "label": "final.usage_24h.text",
+      "argv": [
+        "usage",
+        "--period",
+        "24h"
+      ],
+      "exit": 0
+    },
+    {
+      "label": "final.usage_24h.json",
+      "argv": [
+        "usage",
+        "--period",
+        "24h",
+        "--json"
+      ],
+      "exit": 0
+    },
+    {
+      "label": "final.usage_7d.text",
+      "argv": [
+        "usage",
+        "--period",
+        "7d"
+      ],
+      "exit": 0
+    },
+    {
+      "label": "final.usage_7d.json",
+      "argv": [
+        "usage",
+        "--period",
+        "7d",
+        "--json"
+      ],
+      "exit": 0
+    },
+    {
+      "label": "final.usage_30d.text",
+      "argv": [
+        "usage",
+        "--period",
+        "30d"
+      ],
+      "exit": 0
+    },
+    {
+      "label": "final.usage_30d.json",
+      "argv": [
+        "usage",
+        "--period",
+        "30d",
+        "--json"
+      ],
+      "exit": 0
+    }
+  ],
+  "env_keys": [
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "TERM",
+    "LANG",
+    "AI_GATEWAY_API_KEY",
+    "FX_GATEWAY_BASE_URL",
+    "FX_E2E_GATEWAY_CHAT_URL",
+    "FX_E2E_GATEWAY_MODELS_URL",
+    "FX_E2E_GATEWAY_CREDITS_URL",
+    "FX_E2E_UPGRADE_BASE_URL",
+    "FX_DISABLE_KEYCHAIN",
+    "FX_SKIP_ONBOARDING",
+    "FX_NO_OPEN_BROWSER",
+    "FX_SOUND",
+    "FX_SESSIONS_V2"
+  ],
+  "requests": [
+    "v1_exact GET models fake-key",
+    "v1_exact POST /v4/ai/language-model title fake-key",
+    "v1_exact POST /v4/ai/language-model completion fake-key",
+    "v1_exact_3d POST /v4/ai/language-model title fake-key",
+    "v1_exact_3d GET models fake-key",
+    "v1_exact_3d POST /v4/ai/language-model completion fake-key",
+    "v1_exact_20d POST /v4/ai/language-model title fake-key",
+    "v1_exact_20d GET models fake-key",
+    "v1_exact_20d POST /v4/ai/language-model completion fake-key",
+    "v1_deferred_lookup POST /v4/ai/language-model title fake-key",
+    "v1_deferred_lookup GET models fake-key",
+    "v1_deferred_lookup POST /v4/ai/language-model completion fake-key",
+    "v1_deferred_lookup GET /v1/generation id=gen_01M4BNCM6HSVRSKERSYR58S3CE fake-key",
+    "v2_exact GET models fake-key",
+    "v2_exact POST /v4/ai/language-model title fake-key",
+    "v2_exact POST /v4/ai/language-model completion fake-key",
+    "v1_no_generation_id POST /v4/ai/language-model title fake-key",
+    "v1_no_generation_id GET models fake-key",
+    "v1_no_generation_id POST /v4/ai/language-model completion fake-key",
+    "v1_no_generation_id_lock_held POST /v4/ai/language-model title fake-key",
+    "v1_no_generation_id_lock_held GET models fake-key",
+    "v1_no_generation_id_lock_held POST /v4/ai/language-model completion fake-key",
+    "v1_exact_lock_held GET models fake-key",
+    "v1_exact_lock_held POST /v4/ai/language-model title fake-key",
+    "v1_exact_lock_held POST /v4/ai/language-model completion fake-key",
+    "v1_lookup_401 POST /v4/ai/language-model title fake-key",
+    "v1_lookup_401 GET models fake-key",
+    "v1_lookup_401 POST /v4/ai/language-model completion fake-key",
+    "v1_lookup_401 GET /v1/generation id=gen_01M4BNAYQN549RDT01D45TGP5T fake-key",
+    "v2_lookup_401 GET models fake-key",
+    "v2_lookup_401 POST /v4/ai/language-model title fake-key",
+    "v2_lookup_401 POST /v4/ai/language-model completion fake-key",
+    "v2_lookup_401 GET /v1/generation id=gen_01M4BNAYQN549RDT01D45TGP55 fake-key"
+  ],
+  "files": [
+    "sessions/-0mOs2ToHDxY/events.jsonl",
+    "sessions/-0mOs2ToHDxY/permissions.json",
+    "sessions/-0mOs2ToHDxY/session.json",
+    "sessions/-0mOs2ToHDxY/session.lock",
+    "sessions/-0mOs2ToHDxY/usage-v2.json",
+    "sessions/0aZCXjV8jtLF/events.jsonl",
+    "sessions/0aZCXjV8jtLF/permissions.json",
+    "sessions/0aZCXjV8jtLF/session.json",
+    "sessions/0aZCXjV8jtLF/session.lock",
+    "sessions/0aZCXjV8jtLF/usage-v2.json",
+    "sessions/7elup-r3q_tk/events.jsonl",
+    "sessions/7elup-r3q_tk/permissions.json",
+    "sessions/7elup-r3q_tk/session.json",
+    "sessions/7elup-r3q_tk/session.lock",
+    "sessions/7elup-r3q_tk/usage-v2.json",
+    "sessions/Cn0Q2_7cxZ_z/events.jsonl",
+    "sessions/Cn0Q2_7cxZ_z/permissions.json",
+    "sessions/Cn0Q2_7cxZ_z/session.json",
+    "sessions/Cn0Q2_7cxZ_z/session.lock",
+    "sessions/Cn0Q2_7cxZ_z/usage-v2.json",
+    "sessions/FFCOeORN2Owv/events.jsonl",
+    "sessions/FFCOeORN2Owv/permissions.json",
+    "sessions/FFCOeORN2Owv/session.json",
+    "sessions/FFCOeORN2Owv/session.lock",
+    "sessions/FFCOeORN2Owv/usage-v2.json",
+    "sessions/b2LivcbObM8o/events.jsonl",
+    "sessions/b2LivcbObM8o/permissions.json",
+    "sessions/b2LivcbObM8o/session.json",
+    "sessions/b2LivcbObM8o/session.lock",
+    "sessions/b2LivcbObM8o/usage-v2.json",
+    "sessions/ndhBQ2L-9k7W/events.jsonl",
+    "sessions/ndhBQ2L-9k7W/permissions.json",
+    "sessions/ndhBQ2L-9k7W/session.json",
+    "sessions/ndhBQ2L-9k7W/session.lock",
+    "sessions/ndhBQ2L-9k7W/usage-v2.json",
+    "sessions/qaWhmmC6DWem/events.jsonl",
+    "sessions/qaWhmmC6DWem/permissions.json",
+    "sessions/qaWhmmC6DWem/session.json",
+    "sessions/qaWhmmC6DWem/session.lock",
+    "sessions/qaWhmmC6DWem/usage-v2.json",
+    "sessions/v2/9765RiSMBar-/lock",
+    "sessions/v2/9765RiSMBar-/log.jsonl",
+    "sessions/v2/g3-UB4E541nx/lock",
+    "sessions/v2/g3-UB4E541nx/log.jsonl",
+    "sessions/v2/index.jsonl",
+    "sessions/v2/index.lock",
+    "usage-recovery-v2/9765RiSMBar-",
+    "usage-recovery/-0mOs2ToHDxY",
+    "usage-recovery/7elup-r3q_tk",
+    "usage-recovery/Cn0Q2_7cxZ_z",
+    "usage.jsonl",
+    "usage.lock"
+  ],
+  "file_modes": [
+    "0600 sessions/-0mOs2ToHDxY/events.jsonl",
+    "0600 sessions/-0mOs2ToHDxY/permissions.json",
+    "0600 sessions/-0mOs2ToHDxY/session.json",
+    "0600 sessions/-0mOs2ToHDxY/session.lock",
+    "0600 sessions/-0mOs2ToHDxY/usage-v2.json",
+    "0600 sessions/0aZCXjV8jtLF/events.jsonl",
+    "0600 sessions/0aZCXjV8jtLF/permissions.json",
+    "0600 sessions/0aZCXjV8jtLF/session.json",
+    "0600 sessions/0aZCXjV8jtLF/session.lock",
+    "0600 sessions/0aZCXjV8jtLF/usage-v2.json",
+    "0600 sessions/7elup-r3q_tk/events.jsonl",
+    "0600 sessions/7elup-r3q_tk/permissions.json",
+    "0600 sessions/7elup-r3q_tk/session.json",
+    "0600 sessions/7elup-r3q_tk/session.lock",
+    "0600 sessions/7elup-r3q_tk/usage-v2.json",
+    "0600 sessions/Cn0Q2_7cxZ_z/events.jsonl",
+    "0600 sessions/Cn0Q2_7cxZ_z/permissions.json",
+    "0600 sessions/Cn0Q2_7cxZ_z/session.json",
+    "0600 sessions/Cn0Q2_7cxZ_z/session.lock",
+    "0600 sessions/Cn0Q2_7cxZ_z/usage-v2.json",
+    "0600 sessions/FFCOeORN2Owv/events.jsonl",
+    "0600 sessions/FFCOeORN2Owv/permissions.json",
+    "0600 sessions/FFCOeORN2Owv/session.json",
+    "0600 sessions/FFCOeORN2Owv/session.lock",
+    "0600 sessions/FFCOeORN2Owv/usage-v2.json",
+    "0600 sessions/b2LivcbObM8o/events.jsonl",
+    "0600 sessions/b2LivcbObM8o/permissions.json",
+    "0600 sessions/b2LivcbObM8o/session.json",
+    "0600 sessions/b2LivcbObM8o/session.lock",
+    "0600 sessions/b2LivcbObM8o/usage-v2.json",
+    "0600 sessions/ndhBQ2L-9k7W/events.jsonl",
+    "0600 sessions/ndhBQ2L-9k7W/permissions.json",
+    "0600 sessions/ndhBQ2L-9k7W/session.json",
+    "0600 sessions/ndhBQ2L-9k7W/session.lock",
+    "0600 sessions/ndhBQ2L-9k7W/usage-v2.json",
+    "0600 sessions/qaWhmmC6DWem/events.jsonl",
+    "0600 sessions/qaWhmmC6DWem/permissions.json",
+    "0600 sessions/qaWhmmC6DWem/session.json",
+    "0600 sessions/qaWhmmC6DWem/session.lock",
+    "0600 sessions/qaWhmmC6DWem/usage-v2.json",
+    "0600 sessions/v2/9765RiSMBar-/lock",
+    "0600 sessions/v2/9765RiSMBar-/log.jsonl",
+    "0600 sessions/v2/g3-UB4E541nx/lock",
+    "0600 sessions/v2/g3-UB4E541nx/log.jsonl",
+    "0600 sessions/v2/index.jsonl",
+    "0600 sessions/v2/index.lock",
+    "0600 usage-recovery-v2/9765RiSMBar-",
+    "0600 usage-recovery/-0mOs2ToHDxY",
+    "0600 usage-recovery/7elup-r3q_tk",
+    "0600 usage-recovery/Cn0Q2_7cxZ_z",
+    "0600 usage.jsonl",
+    "0600 usage.lock"
+  ],
+  "dir_modes": [
+    "0700 ./",
+    "0700 sessions/",
+    "0700 sessions/-0mOs2ToHDxY/",
+    "0700 sessions/0aZCXjV8jtLF/",
+    "0700 sessions/7elup-r3q_tk/",
+    "0700 sessions/Cn0Q2_7cxZ_z/",
+    "0700 sessions/FFCOeORN2Owv/",
+    "0700 sessions/b2LivcbObM8o/",
+    "0700 sessions/ndhBQ2L-9k7W/",
+    "0700 sessions/qaWhmmC6DWem/",
+    "0700 sessions/v2/",
+    "0700 sessions/v2/.tmp/",
+    "0700 sessions/v2/9765RiSMBar-/",
+    "0700 sessions/v2/9765RiSMBar-/blobs/",
+    "0700 sessions/v2/g3-UB4E541nx/",
+    "0700 sessions/v2/g3-UB4E541nx/blobs/",
+    "0700 usage-recovery/",
+    "0700 usage-recovery-v2/"
+  ]
+}

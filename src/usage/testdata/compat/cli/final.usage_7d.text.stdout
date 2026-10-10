@@ -1,0 +1,15 @@
+Usage (7 days)
+Tracking since Oct 7, 2026 (partial window).
+Known totals may be incomplete.
+Total tokens  1408
+Input         1398
+Output        10
+Cache         1328 read · 0 write
+Reasoning     0
+Requests      5
+Spend         $0.0002
+
+By model
+- xai/grok-4.1-fast-non-reasoning  1358 tokens  $0.0001
+- openai/gpt-4.1-nano  32 tokens  $0.0000
+- anthropic/claude-haiku-4.5  18 tokens  $0.0001

@@ -1,0 +1,14 @@
+data: {"type":"stream-start","warnings":[]}
+
+data: {"type":"response-metadata","id":"SHzGaoPVH7P9irgP-rPikQc"}
+
+data: {"type":"text-start","id":"0"}
+
+data: {"type":"text-delta","id":"0","delta":"ok"}
+
+data: {"type":"text-end","id":"0"}
+
+data: {"type":"finish","finishReason":{"unified":"stop","raw":"STOP"},"usage":{"inputTokens":{"total":7,"noCache":7,"cacheRead":0},"outputTokens":{"total":1,"text":1,"reasoning":0},"raw":{"promptTokenCount":7,"candidatesTokenCount":1,"totalTokenCount":8,"trafficType":"ON_DEMAND","promptTokensDetails":[{"modality":"TEXT","tokenCount":7}],"candidatesTokensDetails":[{"modality":"TEXT","tokenCount":1}]}},"providerMetadata":{"googleVertex":{"promptFeedback":null,"groundingMetadata":null,"urlContextMetadata":null,"safetyRatings":null,"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":1,"totalTokenCount":8,"trafficType":"ON_DEMAND","promptTokensDetails":[{"modality":"TEXT","tokenCount":7}],"candidatesTokensDetails":[{"modality":"TEXT","tokenCount":1}]},"finishMessage":null,"serviceTier":null},"vertex":{"promptFeedback":null,"groundingMetadata":null,"urlContextMetadata":null,"safetyRatings":null,"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":1,"totalTokenCount":8,"trafficType":"ON_DEMAND","promptTokensDetails":[{"modality":"TEXT","tokenCount":7}],"candidatesTokensDetails":[{"modality":"TEXT","tokenCount":1}]},"finishMessage":null,"serviceTier":null},"gateway":{"routing":{"originalModelId":"google/gemini-2.5-flash-lite","resolvedProvider":"vertex","fallbacksAvailable":["google"],"planningReasoning":"System credentials planned for: vertex, google. Total execution order: vertex(system)","canonicalSlug":"google/gemini-2.5-flash-lite","finalProvider":"vertex","modelAttemptCount":1,"modelAttempts":[{"canonicalSlug":"google/gemini-2.5-flash-lite","success":true,"providerAttemptCount":1,"providerAttempts":[{"provider":"vertex","credentialType":"system","success":true,"startTime":1791392840474,"endTime":1791392840916,"statusCode":200,"providerResponseId":"SHzGaoPVH7P9irgP-rPikQc"}]}],"totalProviderAttemptCount":1,"skippedProviderAttempts":[{"credentialType":"system","provider":"google","reason":"vercel_containment"}],"affinity":{"outcome":"skipped_below_min_prefix"},"clientSessionId":"83e0ae83833c1e52440ec3021b473c28","clientSessionIdSource":"fingerprint"},"cost":"0.0000011","marketCost":"0.0000011","surchargeCost":"0.0001","gatewayCost":"0.0001011","inferenceCost":"0.0000011","inputInferenceCost":"0.0000007","outputInferenceCost":"0.0000004","providerAllowlistCost":"0.0001","generationId":"gen_01M4BNAYQN549RDT01D45TGP5T"}}}
+
+DONE
+

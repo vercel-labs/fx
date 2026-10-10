@@ -61,7 +61,6 @@ const web_fetch_artifacts = @import("../session/web_fetch_artifacts.zig");
 const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
 const provider_set = @import("../gateway/provider_set.zig");
-const credential_authority = @import("../auth/credential_authority.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const test_builtin_tools = if (builtin.is_test)
@@ -316,7 +315,6 @@ pub const Context = struct {
             .reviewer_model = self.reviewer_model,
             .cancel_flag = self.cancel_flag,
             .usage = &self.session.usage,
-            .usage_allocator = self.session_allocator,
         });
     }
 };
@@ -1338,7 +1336,6 @@ fn executeVisionRequest(
         .retry_count = state.runtime.gateway_retry_count,
         .cancel_flag = state.runtime.cancel_flag,
         .usage = &state.runtime.session.usage,
-        .usage_allocator = state.runtime.session_allocator,
         .trace_ctx = .{},
         .output_limit = state.runtime.context_limits.image_adapter_output_bytes,
     };
@@ -7034,8 +7031,14 @@ const VisionGatewayFixture = struct {
         try request.admission.admit();
         request.delivery.markPossiblySent();
         if (response.status != .ok) return .{ .failed = .{ .kind = .provider_error } };
-        const credential_source = request.credential.credentialSource() orelse
-            return error.MissingCredentialSource;
+        // The transport hands usage every event; this one names the generation.
+        if (response.generation_id) |id| if (request.gateway_events) |tap| {
+            const line = try std.fmt.allocPrint(self.alloc, "{{\"type\":\"text-start\",\"id\":\"t\",\"providerMetadata\":{{\"gateway\":{{\"generationId\":\"{s}\"}}}}}}", .{id});
+            defer self.alloc.free(line);
+            var event = try std.json.parseFromSlice(std.json.Value, self.alloc, line, .{});
+            defer event.deinit();
+            tap.observe(event.value);
+        };
         return .{ .completed = .{
             .completion = .{
                 .content = response.content,
@@ -7043,17 +7046,6 @@ const VisionGatewayFixture = struct {
                 .finish_reason = .stop,
                 .usage = response.usage,
             },
-            .usage = .{ .deferred = .{
-                .provider = .gateway,
-                .generation_id = response.generation_id orelse "gen_test",
-                .scope = "https://ai-gateway.vercel.sh",
-                .tenant = request.credential.tenant(),
-                .credential_source = credential_source,
-                .credential_identity = credential_authority.derive(
-                    credential_source,
-                    request.credential.accountId(),
-                ),
-            } },
         } };
     }
 };
@@ -7601,6 +7593,7 @@ test "vision runtime resolves historical authorized images and batches twenty as
         } },
     };
     defer rt.deinit(alloc);
+    rt.session.bindUsage(alloc, .{ .host = null, .home_path = null });
     const args = try visionArgs(alloc, &requested, "Read the build state");
     defer alloc.free(args);
 
@@ -7632,6 +7625,7 @@ test "vision runtime resolves historical authorized images and batches twenty as
     try std.testing.expectEqual(@as(u64, 23), result.inner_usage.?.output_tokens);
     var usage_snapshot = try rt.session.usage.snapshot(alloc);
     defer usage_snapshot.deinit(alloc);
+    // Each of the three generations waits for its lookup.
     try std.testing.expectEqual(@as(usize, 3), usage_snapshot.pending.len);
 }
 

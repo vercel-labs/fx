@@ -6,7 +6,7 @@ const types = @import("../shared/types.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_result_errors = @import("tool_result_errors.zig");
 const model_request_budget = @import("model_request_budget.zig");
-const session_usage = @import("../session/session_usage.zig");
+const usage_owner = @import("../session/usage_owner.zig");
 const web_search_contract = @import("web_search_contract.zig");
 const web_search_policy = @import("web_search_policy.zig");
 const web_search_provider = @import("web_search_provider.zig");
@@ -40,8 +40,7 @@ pub const Config = struct {
     worker_model: []const u8 = "",
     gateway_retry_count: usize = 3,
     gateway_chat_url: []const u8 = "https://ai-gateway.vercel.sh/v4/ai/language-model",
-    usage: ?*session_usage.Usage = null,
-    usage_allocator: Allocator = std.heap.c_allocator,
+    usage: ?*usage_owner.Owner = null,
 };
 
 pub const Inputs = web_search_provider.Inputs;
@@ -54,8 +53,7 @@ const OwnedInputs = struct {
     gateway_retry_count: usize,
     gateway_chat_url: []u8,
     // The usage pointer and allocator borrow the parent session's lifetime.
-    usage: ?*session_usage.Usage,
-    usage_allocator: Allocator,
+    usage: ?*usage_owner.Owner,
 
     fn deinit(self: *OwnedInputs, alloc: Allocator) void {
         alloc.free(self.api_key);
@@ -74,7 +72,6 @@ const OwnedInputs = struct {
             .gateway_retry_count = self.gateway_retry_count,
             .gateway_chat_url = self.gateway_chat_url,
             .usage = self.usage,
-            .usage_allocator = self.usage_allocator,
         };
     }
 };
@@ -91,8 +88,7 @@ pub const Runtime = struct {
     worker_model: []const u8,
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
-    usage: ?*session_usage.Usage,
-    usage_allocator: Allocator,
+    usage: ?*usage_owner.Owner,
     config_mutex: std.Io.Mutex = .init,
     fallback_cancel_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
@@ -108,7 +104,6 @@ pub const Runtime = struct {
             .gateway_retry_count = config.gateway_retry_count,
             .gateway_chat_url = config.gateway_chat_url,
             .usage = config.usage,
-            .usage_allocator = config.usage_allocator,
         };
     }
 
@@ -124,7 +119,6 @@ pub const Runtime = struct {
         self.gateway_retry_count = inputs.gateway_retry_count;
         self.gateway_chat_url = inputs.gateway_chat_url;
         self.usage = inputs.usage;
-        self.usage_allocator = inputs.usage_allocator;
     }
 
     pub fn dispatchBackend(self: *Runtime) tool_dispatch.WebSearchBackend {
@@ -237,7 +231,6 @@ pub const Runtime = struct {
             .gateway_retry_count = self.gateway_retry_count,
             .gateway_chat_url = gateway_chat_url,
             .usage = self.usage,
-            .usage_allocator = self.usage_allocator,
         };
     }
 
@@ -848,18 +841,17 @@ test "web_search runtime updates its worker model during configuration" {
 
 test "web_search runtime preserves session usage through worker input snapshots" {
     const alloc = std.testing.allocator;
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
+    var usage: usage_owner.Owner = .{};
+    usage.bind(alloc, .{ .host = null, .home_path = null, .lookup = null });
+    defer usage.deinit();
     var runtime = Runtime.init(.{
         .usage = &usage,
-        .usage_allocator = alloc,
     });
 
     var inputs = try runtime.inputsSnapshot(alloc);
     defer inputs.deinit(alloc);
 
     try std.testing.expect(inputs.usage.? == &usage);
-    try std.testing.expect(std.meta.eql(alloc, inputs.usage_allocator));
 }
 
 test "web_search input snapshots stay coherent during parallel reconfiguration" {

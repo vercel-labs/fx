@@ -9,7 +9,7 @@ const worker_runtime = @import("../../worker_runtime.zig");
 const session_runtime = @import("../../../session/session.zig");
 const session_codec = @import("../../../session/session_codec.zig");
 const session_store = @import("../../../session/session_store.zig");
-const session_usage = @import("../../../session/session_usage.zig");
+const usage_owner = @import("../../../session/usage_owner.zig");
 const model_capabilities = @import("../../../config/model_capabilities.zig");
 const model_provider = @import("../../../config/model_provider.zig");
 const debug_trace = @import("../../../shared/debug_trace.zig");
@@ -183,23 +183,21 @@ test "processQueuedPrompt accounts exact direct-provider usage without deferred 
     const completions = [_]FakeCompletion{.{
         .content = "ok",
         .generation_id = "response-codex-1",
-        .billing = .{
+        .subscription_usage = .{
             .created_at_ms = 1,
             .model = "codex/gpt-test",
-            .total_cost = 0,
             .input_tokens = 17,
             .output_tokens = 7,
             .cache_read_tokens = 0,
             .cache_write_tokens = 0,
             .reasoning_tokens = null,
-            .billable_web_search_calls = 0,
         },
-        .exact_usage_provider = .codex,
     }};
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
+    var usage: usage_owner.Owner = .{};
+    usage.bind(alloc, .{ .host = null, .home_path = null, .lookup = null });
+    defer usage.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.usage = &usage;
     defer hooks.deinit();
@@ -208,6 +206,7 @@ test "processQueuedPrompt accounts exact direct-provider usage without deferred 
     config.provider_capabilities = .{};
     var job = fixture.job();
     job.provider = .codex;
+    job.credential_source = .chatgpt_subscription;
 
     try runFakePrompt(&gateway, &hooks, config, job);
 
@@ -604,7 +603,6 @@ fn runScriptedVision(
         .retry_count = 1,
         .cancel_flag = null,
         .usage = null,
-        .usage_allocator = alloc,
         .trace_ctx = .{},
         .output_limit = .{
             .value = .{ .bytes = output_limit_bytes },
@@ -8576,24 +8574,22 @@ test "Codex 401 replay keeps payload and semantic recovery unchanged for the cap
         .{
             .content = "Done.",
             .generation_id = "response-replay-success",
-            .billing = .{
+            .subscription_usage = .{
                 .created_at_ms = 1,
                 .model = "codex/gpt-test",
-                .total_cost = 0,
                 .input_tokens = 17,
                 .output_tokens = 7,
                 .cache_read_tokens = 0,
                 .cache_write_tokens = 0,
                 .reasoning_tokens = null,
-                .billable_web_search_calls = 0,
             },
-            .exact_usage_provider = .codex,
         },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
+    var usage: usage_owner.Owner = .{};
+    usage.bind(alloc, .{ .host = null, .home_path = null, .lookup = null });
+    defer usage.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.usage = &usage;
     hooks.credential_refresh_tokens = &.{ "stale-loaded", "fresh-token" };

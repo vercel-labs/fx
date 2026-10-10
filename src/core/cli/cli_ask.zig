@@ -54,8 +54,11 @@ const permissions = @import("../permissions/permissions.zig");
 const session_runtime = @import("../session/session.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const session_codec = @import("../session/session_codec.zig");
-const session_usage = @import("../session/session_usage.zig");
-const usage_report = @import("../session/usage_report.zig");
+const usage_owner = @import("../session/usage_owner.zig");
+const usage_mod = @import("usage");
+
+/// What a one-shot run gives a lookup due at exit, as fx always has.
+const shutdown_lookup_budget_ms: u32 = 250;
 const session_store = @import("../session/session_store.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const session_child_store = @import("../session/session_child_store.zig");
@@ -675,9 +678,9 @@ const AskContext = struct {
             .model = cfg.default_model,
             .seed_model = cfg.default_model,
             .mode_id = cfg.mode_registry.default_mode_id,
-            .session = session_runtime.SessionRuntime.initWithProviders(
+            .session = session_runtime.SessionRuntime.init(
                 cfg.max_history_turns,
-                cfg.provider_set.deferredUsageProviders(),
+                cfg.provider_set.usageLookup(),
             ),
             .web_search_runtime = web_search_runtime.Runtime.init(.{
                 .provider = cfg.provider_set.gateway.fx_search.?,
@@ -785,32 +788,16 @@ const AskContext = struct {
         self.terminal_client.deinit();
         self.workspace_access.deinit(self.alloc);
         self.worker.deinit(std.heap.c_allocator);
-        self.session.usage.finishReconciliationBeforeShutdown();
-        self.session.usage.finishProfilePublicationsBeforeShutdown();
-        self.session.usage.configurePublicationSink(null);
-        self.session.usage.configureCheckpointSink(null);
-        if (self.writable) |*writable| {
-            if (self.session.usage.isDirty()) {
-                flushAskSessionUsage(self, writable) catch |err| {
-                    debug_trace.logf(
-                        "session",
-                        "failed to flush ask session usage err={s}",
-                        .{@errorName(err)},
-                    );
-                };
-            }
-        }
-        if (self.v2) |v2| {
-            if (self.session.usage.isDirty()) {
-                flushAskSessionUsageV2(self, v2) catch |err| {
-                    debug_trace.logf(
-                        "session",
-                        "failed to flush ask session usage backend=v2 err={s}",
-                        .{@errorName(err)},
-                    );
-                };
-            }
-        }
+        // A one-shot run gives a lookup due now a bounded wait, then writes
+        // its last usage checkpoint while the session is still open.
+        self.session.usage.awaitLookups(shutdown_lookup_budget_ms);
+        self.session.usage.settle() catch |err| {
+            debug_trace.logf(
+                "session",
+                "failed to flush ask session usage err={s}",
+                .{@errorName(err)},
+            );
+        };
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
         if (self.refreshed_credential) |*credential| credential.deinit(self.alloc);
@@ -1006,17 +993,11 @@ const AskContext = struct {
             );
             updateStaleShellHandles(self, writable.state.history);
             writable.releaseHydrationHistory(self.alloc);
-            if (writable.state.usage) |usage| {
-                try self.session.usage.restore(
-                    self.alloc,
-                    usage,
-                    writable.state.created_at_ms,
-                );
-            } else {
-                self.session.usage.restoreLegacyWallDuration(
-                    writable.state.created_at_ms,
-                );
-            }
+            try self.session.usage.restore(
+                if (writable.state.usage) |*usage| usage else null,
+                writable.state.updated_at_ms,
+                writable.state.created_at_ms,
+            );
         }
 
         const session_dir = try session_store.sessionDirPath(
@@ -1132,11 +1113,11 @@ const AskContext = struct {
                 restored.permission_state orelse .{},
             );
             updateStaleShellHandles(self, restored.history);
-            if (restored.usage) |usage| {
-                try self.session.usage.restore(self.alloc, usage, restored.created_at_ms);
-            } else {
-                self.session.usage.restoreLegacyWallDuration(restored.created_at_ms);
-            }
+            try self.session.usage.restore(
+                if (restored.usage) |*usage| usage else null,
+                restored.usage_saved_at_ms,
+                restored.created_at_ms,
+            );
             if (restored.preferences) |preferences| {
                 self.v2_preferences = preferences;
                 restored.preferences = null;
@@ -1185,7 +1166,6 @@ const AskContext = struct {
                 .gateway_retry_count = self.cfg.gateway_retry_count,
                 .gateway_chat_url = self.cfg.gateway_chat_url,
                 .usage = &self.session.usage,
-                .usage_allocator = self.alloc,
             });
         }
         var tc: tool_runtime.Context = .{
@@ -1308,7 +1288,6 @@ const AskContext = struct {
             .reviewer_model = self.reviewer_model,
             .cancel_flag = self.cancelFlag(),
             .usage = &self.session.usage,
-            .usage_allocator = self.alloc,
         });
     }
 
@@ -1748,10 +1727,12 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer if (owned_resumed_model) |model| alloc.free(model);
     var ctx = AskContext.init(alloc, cfg, options.deps, startup.workspace_root);
     defer ctx.deinit();
-    if (options.save_session) {
-        _ = try ctx.session.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
-        ctx.session.attachProfileUsagePublisher(alloc);
-    }
+    // `ctx` is at its final address: usage points back into it.
+    ctx.session.bindUsage(alloc, if (options.save_session) .{
+        .host = askUsageHost(&ctx),
+        .home_path = io_mod.getenv("HOME"),
+        .recovery = session_adapter.usage_recovery_readers,
+    } else .{ .host = null, .home_path = null });
     ctx.use_process_interrupt_flag = options.deps.install_headless_interrupt;
     try ctx.checkCancellation();
     var presenter: ?ask_presentation.Runtime = null;
@@ -1882,11 +1863,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         ctx.account_id = null;
         ctx.model_catalog_access = .host_managed;
         if (comptime @import("builtin").os.tag != .wasi) {
-            if (ctx.cfg.provider_set.select(ctx.provider).deferred_usage != null) {
-                ctx.session.usage.replaceHostManagedReconciliationAuthority(
-                    ctx.alloc,
-                    ctx.provider,
-                );
+            if (ctx.cfg.provider_set.select(ctx.provider).usage_lookup != null) {
+                ctx.session.usage.setCredential(.host_managed);
             }
         }
     } else {
@@ -1923,14 +1901,13 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             credential.accountId(),
         );
         if (comptime @import("builtin").os.tag != .wasi) {
-            if (ctx.cfg.provider_set.select(ctx.provider).deferred_usage != null) {
-                ctx.session.usage.replaceProviderReconciliationCredential(
-                    alloc,
-                    ctx.provider,
-                    credential.source,
-                    credential.accountId(),
-                    credential.token,
-                );
+            if (ctx.cfg.provider_set.select(ctx.provider).usage_lookup != null) {
+                ctx.session.usage.setCredential(.{ .direct = .{
+                    .secret_bytes = credential.token,
+                    .source = credential.source,
+                    .account_id = credential.accountId(),
+                    .tenant_context = credential.gatewayTeam(),
+                } });
             }
         }
     }
@@ -2199,6 +2176,7 @@ fn maybeStartAskTitleTask(
         .account_id = ctx.account_id,
         .credential_source = ctx.credential_source,
         .stream_provider = agent_stream,
+        .usage = &ctx.session.usage,
     }) catch return null;
     task.spawn() catch |err| {
         debug_trace.logf("session", "event=title_generation result=unavailable reason=spawn err={s}", .{@errorName(err)});
@@ -2360,16 +2338,6 @@ fn finalizeFreshAuthSession(ctx: *AskContext, result: *PromptRunResult) void {
 }
 
 fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
-    ctx.session.usage.configureCheckpointSink(
-        if (ctx.writable != null or ctx.v2 != null)
-            .{
-                .context = @ptrCast(ctx),
-                .allocator = ctx.alloc,
-                .persist = persistUsageCheckpoint,
-            }
-        else
-            null,
-    );
     return .{
         .ctx = @ptrCast(ctx),
         .agent_stream_provider = ctx.agentStreamProvider(),
@@ -2423,7 +2391,6 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .record_tool_call_failed = recordToolCallFailed,
         .report_usage = reportUsage,
         .usage = &ctx.session.usage,
-        .usage_allocator = ctx.alloc,
     };
 }
 
@@ -2500,32 +2467,41 @@ fn optionalCredentialFieldEqual(left: ?[]const u8, right: ?[]const u8) bool {
     return std.mem.eql(u8, left.?, right.?);
 }
 
-fn persistUsageCheckpoint(
+fn askUsageHost(ctx: *AskContext) usage_owner.Host {
+    return .{ .context = @ptrCast(ctx), .current_fn = askUsageTarget, .persist_fn = writeUsageCheckpoint };
+}
+
+/// Read without `session_write_mutex`: usage asks while it holds its own
+/// lock, and the run never switches sessions.
+fn askUsageTarget(raw_ctx: *anyopaque) ?usage_owner.Target {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (ctx.v2) |v2| return .{ .session_id = v2.id(), .marker = .v2 };
+    if (ctx.writable) |*writable| return .{ .session_id = writable.active_id, .marker = .v1 };
+    return null;
+}
+
+fn writeUsageCheckpoint(
     raw_ctx: *anyopaque,
-    snapshot: session_usage.Snapshot,
-) !void {
+    session_id: []const u8,
+    checkpoint: *const usage_mod.host.Checkpoint,
+) anyerror!void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
-    if (ctx.v2) |v2| return v2.persistUsage(snapshot);
+    if (ctx.v2) |v2| {
+        if (!std.mem.eql(u8, v2.id(), session_id)) return error.SessionWriterChanged;
+        return v2.persistUsage(checkpoint);
+    }
     const writable = if (ctx.writable) |*value|
         value
     else
         return error.SessionPersistenceUnavailable;
-    const store = ctx.store orelse return error.SessionPersistenceUnavailable;
-    const recovery_checkpoint = try store.prepareUsageRecoveryCheckpoint(
-        ctx.alloc,
-        writable,
-        snapshot,
-    );
+    if (!std.mem.eql(u8, writable.active_id, session_id)) return error.SessionWriterChanged;
+    try writable.requireWritable();
     _ = try writable.appendEvent(
         ctx.alloc,
-        .{ .usage_checkpointed = .{ .usage = snapshot } },
-        recovery_checkpoint.timestamp_ms,
-    );
-    try store.finishUsageRecoveryCheckpoint(
-        writable.active_id,
-        recovery_checkpoint,
+        .{ .usage_checkpointed = .{ .usage = checkpoint.snapshot.* } },
+        try usage_owner.v1EventTime(checkpoint.at_ms, writable.state.updated_at_ms),
     );
 }
 
@@ -3436,28 +3412,6 @@ fn clearRecoveryCheckpoint(raw_ctx: *anyopaque) !void {
         .{ .recovery_checkpoint_cleared = .{} },
         io_mod.milliTimestamp(),
     );
-}
-
-fn flushAskSessionUsage(
-    ctx: *AskContext,
-    writable: *session_store.LoadedWritableSession,
-) !void {
-    const now_ms = io_mod.milliTimestamp();
-    var usage = try ctx.session.usage.snapshot(ctx.alloc);
-    defer usage.deinit(ctx.alloc);
-    _ = try writable.appendEvent(
-        ctx.alloc,
-        .{ .usage_checkpointed = .{ .usage = usage } },
-        now_ms,
-    );
-    ctx.session.usage.markClean(usage);
-}
-
-fn flushAskSessionUsageV2(ctx: *AskContext, v2: *session_adapter.Session) !void {
-    var usage = try ctx.session.usage.snapshot(ctx.alloc);
-    defer usage.deinit(ctx.alloc);
-    try v2.persistUsage(usage);
-    ctx.session.usage.markClean(usage);
 }
 
 fn propagateGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
@@ -4461,10 +4415,10 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
         try out.writer.writeAll("}");
     }
     try out.writer.writeAll("],\"usage\":");
-    try std.json.Stringify.value(.{
+    try usage_mod.render.writeAskUsage(&out.writer, .{
         .input_tokens = result.usage.input_tokens,
         .output_tokens = result.usage.output_tokens,
-    }, .{}, &out.writer);
+    });
     if (result.error_code) |error_code| {
         try out.writer.writeAll(",\"error\":");
         try std.json.Stringify.value(error_code, .{}, &out.writer);
@@ -8136,67 +8090,40 @@ test "saved ask settles profile publication before persistence teardown" {
     var ctx_live = true;
     defer if (ctx_live) ctx.deinit();
     try ctx.initializeSessionStores();
+    ctx.session.bindUsage(alloc, .{
+        .host = askUsageHost(&ctx),
+        .home_path = home,
+        .recovery = session_adapter.usage_recovery_readers,
+    });
     _ = agentRuntimeDeps(&ctx);
 
-    const PublicationProbe = struct {
-        allow_generation: bool = false,
-        successful_generations: usize = 0,
+    // A Gateway call whose stream prices it exactly.
+    var invocation = (try usage_owner.Invocation.begin(&ctx.session.usage, .{ .direct = .{
+        .secret_bytes = "key",
+        .source = .ai_gateway_api_key,
+    } })).?;
+    const tap = invocation.tap();
+    for ([_][]const u8{
+        \\{"type":"response-metadata","modelId":"provider/model"}
+        ,
+        \\{"type":"text-start","id":"t","providerMetadata":{"gateway":{"generationId":"gen_01ARZ3NDEKTSV4RRFFQ69G5FAV"}}}
+        ,
+        \\{"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":10,"cacheRead":1},"outputTokens":{"total":2,"reasoning":1}},"providerMetadata":{"gateway":{"generationId":"gen_01ARZ3NDEKTSV4RRFFQ69G5FAV","cost":"0.25","gatewayCost":"0.25","routing":{"canonicalSlug":"provider/model"}}}}
+        ,
+    }) |line| {
+        var event = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
+        defer event.deinit();
+        tap.observe(event.value);
+    }
+    try invocation.completed(.{ .usage = .{ .input_tokens = 10, .output_tokens = 2 } });
 
-        fn publish(
-            raw: *anyopaque,
-            event: usage_report.ProfileEvent,
-        ) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            switch (event) {
-                .generation => {
-                    if (!self.allow_generation) {
-                        return error.InjectedPublicationFailure;
-                    }
-                    self.successful_generations += 1;
-                },
-                .pending, .incident => {},
-            }
-        }
-    };
-    var publication: PublicationProbe = .{};
-    ctx.session.usage.configurePublicationSink(.{
-        .context = &publication,
-        .allocator = alloc,
-        .publish = PublicationProbe.publish,
-    });
-
-    const generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV";
-    const sequence = try ctx.session.usage.reserveInvocation();
-    try ctx.session.usage.finishObservedInvocation(
-        alloc,
-        sequence,
-        1,
-        .observed_generation,
-        generation_id,
-        "https://ai-gateway.vercel.sh",
-        null,
-    );
-    try ctx.session.usage.applyGeneration(alloc, .{
-        .id = generation_id,
-        .created_at_ms = 1,
-        .model = "provider/model",
-        .total_cost = 0.25,
-        .input_tokens = 10,
-        .output_tokens = 2,
-        .cache_read_tokens = 1,
-        .cache_write_tokens = 0,
-        .reasoning_tokens = 1,
-        .billable_web_search_calls = 0,
-    });
-    var pending = try ctx.session.usage.snapshot(alloc);
-    defer pending.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), pending.pending.len);
-    try std.testing.expectEqual(@as(usize, 1), pending.publication_backlog.len);
-
-    publication.allow_generation = true;
+    // Closing settles: the fact publishes and the last checkpoint lands
+    // while the session is still open.
     ctx.deinit();
     ctx_live = false;
-    try std.testing.expectEqual(@as(usize, 1), publication.successful_generations);
+    const profile_usage = try tmp.dir.readFileAlloc(std.testing.io, "home/.fx/usage.jsonl", alloc, .limited(1 << 20));
+    defer alloc.free(profile_usage);
+    try std.testing.expect(std.mem.find(u8, profile_usage, "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV") != null);
 
     var store = try session_store.Store.initFromHome(alloc, home, workspace);
     defer store.deinit(alloc);
@@ -8208,7 +8135,7 @@ test "saved ask settles profile publication before persistence teardown" {
     );
     defer resumed.deinit(alloc);
     const usage = resumed.state.usage orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(session_usage.Availability.complete, usage.billing);
+    try std.testing.expectEqual(usage_mod.snapshot.Billing.complete, usage.billing);
     try std.testing.expectEqual(@as(usize, 0), usage.pending.len);
     try std.testing.expectEqual(@as(usize, 0), usage.publication_backlog.len);
     try std.testing.expectEqual(@as(u64, 10), usage.input_tokens);

@@ -3374,11 +3374,11 @@ describe.skipIf(SKIP)("tui: resize", () => {
       label: "cost",
       width: 120,
       height: 36,
-      surfaceMarker: "[30 days]",
+      surfaceMarker: "[session]",
       editedInput: "x",
       async openSurface(active) {
         await active.sendText("/cost");
-        await active.waitForText("[30 days]", TIMEOUT);
+        await active.waitForText("[session]", TIMEOUT);
         await active.resizeWindow(60, 12, 500);
       },
     },

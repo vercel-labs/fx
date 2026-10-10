@@ -31,7 +31,8 @@ const session_catalog = @import("../session/session_catalog.zig");
 const session_codec = @import("../session/session_codec.zig");
 const js_host_session_store = @import("../session/js_host_session_store.zig");
 const session_event = @import("../session/session_event.zig");
-const session_usage = @import("../session/session_usage.zig");
+const usage_mod = @import("usage");
+const usage_owner = @import("../session/usage_owner.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const legacy_background_migration = @import("../session/legacy_background_migration.zig");
 const result_store = @import("../session/result_store.zig");
@@ -1128,6 +1129,15 @@ const TitleGenerationLoad = struct {
 
     fn requestStop(self: *TitleGenerationLoad) void {
         if (self.task) |task| task.cancel();
+    }
+
+    /// Ends the attempt for a closing session: its call records into that
+    /// session's usage, which settles next.
+    fn dropForClose(self: *TitleGenerationLoad) void {
+        const task = self.task orelse return;
+        debug_trace.logf("session", "event=title_generation_dropped reason=session_close session={s}", .{task.session_id});
+        task.destroy();
+        self.task = null;
     }
 
     fn start(self: *TitleGenerationLoad, task: *session_title_generation.Task) void {
@@ -2232,18 +2242,16 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasField(App, "auth") or !provider_runtime.supported(App)) return;
             if (comptime !@hasDecl(@TypeOf(app.auth), "credentialSource") or
                 !@hasDecl(@TypeOf(app.auth), "accountId") or
-                !@hasDecl(@TypeOf(app.session.usage), "replaceProviderReconciliationCredential")) return;
+                !@hasField(@TypeOf(app.session), "usage")) return;
 
             const source = app.auth.credentialSource() orelse return;
             if (!model_provider.authorizesCredential(provider_runtime.provider(app), source)) return;
             const credential = app.auth.apiKey() orelse return;
-            app.session.usage.replaceProviderReconciliationCredential(
-                app.alloc,
-                provider_runtime.provider(app),
-                source,
-                app.auth.accountId(),
-                credential,
-            );
+            app.session.usage.setCredential(.{ .direct = .{
+                .secret_bytes = credential,
+                .source = source,
+                .account_id = app.auth.accountId(),
+            } });
         }
 
         pub fn resumeSelectedSession(app: *App) !bool {
@@ -2387,15 +2395,11 @@ pub fn Runtime(comptime App: type) type {
                 state.permission_state,
             );
             updateStaleShellHandles(app, state.history);
-            if (state.usage) |usage| {
-                try app.session.usage.restore(
-                    app.alloc,
-                    usage,
-                    state.created_at_ms,
-                );
-            } else {
-                app.session.usage.restoreLegacyWallDuration(state.created_at_ms);
-            }
+            try app.session.usage.restore(
+                if (state.usage) |*usage| usage else null,
+                state.updated_at_ms,
+                state.created_at_ms,
+            );
             try replacePreferences(
                 app.alloc,
                 &app.session_persistence.session_preferences,
@@ -2917,37 +2921,46 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
-        pub fn persistUsageCheckpoint(
-            app: *App,
-            snapshot: session_usage.Snapshot,
-        ) !void {
+        /// The usage host: the durable session usage checkpoints go to.
+        pub fn usageHost(app: *App) usage_owner.Host {
+            return .{ .context = @ptrCast(app), .current_fn = usageTarget, .persist_fn = writeUsageCheckpoint };
+        }
+
+        /// Read without `write_mutex`: usage asks while it holds its own lock,
+        /// and the session only changes after usage was closed for it.
+        fn usageTarget(context: *anyopaque) ?usage_owner.Target {
+            const app: *App = @ptrCast(@alignCast(context));
+            if (comptime !@hasField(App, "session_persistence")) return null;
+            if (app.session_persistence.v2) |v2| return .{ .session_id = v2.id(), .marker = .v2 };
+            if (app.session_persistence.writable) |*loaded| return .{ .session_id = loaded.active_id, .marker = .v1 };
+            return null;
+        }
+
+        fn writeUsageCheckpoint(
+            context: *anyopaque,
+            session_id: []const u8,
+            checkpoint: *const usage_mod.host.Checkpoint,
+        ) anyerror!void {
+            const app: *App = @ptrCast(@alignCast(context));
             if (comptime !@hasField(App, "session_persistence")) {
                 return error.SessionPersistenceUnavailable;
             }
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-            if (app.session_persistence.v2) |v2| return v2.persistUsage(snapshot);
-            const store = if (app.session_persistence.store) |value|
-                value
-            else
-                return error.SessionPersistenceUnavailable;
+            if (app.session_persistence.v2) |v2| {
+                if (!std.mem.eql(u8, v2.id(), session_id)) return error.SessionWriterChanged;
+                return v2.persistUsage(checkpoint);
+            }
             const loaded = if (app.session_persistence.writable) |*value|
                 value
             else
                 return error.SessionPersistenceUnavailable;
-            const recovery_checkpoint = try store.prepareUsageRecoveryCheckpoint(
-                app.alloc,
-                loaded,
-                snapshot,
-            );
+            if (!std.mem.eql(u8, loaded.active_id, session_id)) return error.SessionWriterChanged;
+            try loaded.requireWritable();
             _ = try loaded.appendEvent(
                 app.alloc,
-                .{ .usage_checkpointed = .{ .usage = snapshot } },
-                recovery_checkpoint.timestamp_ms,
-            );
-            try store.finishUsageRecoveryCheckpoint(
-                loaded.active_id,
-                recovery_checkpoint,
+                .{ .usage_checkpointed = .{ .usage = checkpoint.snapshot.* } },
+                try usage_owner.v1EventTime(checkpoint.at_ms, loaded.state.updated_at_ms),
             );
         }
 
@@ -3688,6 +3701,7 @@ pub fn Runtime(comptime App: type) type {
                 .account_id = app.auth.accountId(),
                 .credential_source = credential.source,
                 .stream_provider = app.agentStreamProvider(),
+                .usage = &app.session.usage,
             }) catch |err| {
                 app.session_persistence.title_generation.recordSpawnFailure(session_id, title_model.?, err);
                 return;
@@ -3869,14 +3883,20 @@ pub fn Runtime(comptime App: type) type {
         /// session they append to can close (`tla/Wiring.tla`
         /// ParentOutlivesChildren).
         pub fn disableSubagentHost(app: *App) void {
-            if (app.session_persistence.subagent_host) |host| {
-                host.deinit();
-                app.session_persistence.subagent_host = null;
-            }
+            stopSubagentHost(app);
             if (app.session_persistence.v2_children) |children| {
                 children.deinit();
                 app.alloc.destroy(children);
                 app.session_persistence.v2_children = null;
+            }
+        }
+
+        /// Stops the subagent host and joins its child threads. Children
+        /// record their model calls in the parent session's usage.
+        fn stopSubagentHost(app: *App) void {
+            if (app.session_persistence.subagent_host) |host| {
+                host.deinit();
+                app.session_persistence.subagent_host = null;
             }
         }
 
@@ -3916,14 +3936,16 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn prepareResumeHandoff(app: *App) !void {
+            // Usage persists through `write_mutex`, so it settles first.
+            if (comptime @hasField(@TypeOf(app.session), "usage")) try app.session.usage.flush();
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-            if (app.session_persistence.v2) |v2| return settleV2Usage(app, v2);
+            if (app.session_persistence.v2 != null) return;
             const loaded = if (app.session_persistence.writable) |*value|
                 value
             else
                 return error.SessionPersistenceUnavailable;
-            try settleDurableState(app, loaded);
+            try loaded.requireWritable();
         }
 
         pub fn suspendToJobControl(app: *App, footer_rows: u16) !void {
@@ -3954,9 +3976,7 @@ pub fn Runtime(comptime App: type) type {
         /// waits on another process holding its lock. The session keeps
         /// unpublished usage for recovery and the next resume.
         pub fn abandonProfileLedgerForProcessExit(app: *App) void {
-            if (comptime @hasField(@TypeOf(app.session), "profile_usage")) {
-                app.session.profile_usage.abandonLedgerForProcessExit();
-            }
+            if (comptime @hasField(@TypeOf(app.session), "usage")) app.session.usage.abandon();
         }
 
         fn LiveHistorySink(comptime SinkApp: type) type {
@@ -5574,16 +5594,22 @@ pub fn Runtime(comptime App: type) type {
         fn closeWritableSessionWithResumeHandoff(app: *App) ?ResumeHandoff {
             const handoff_intent = app.session_persistence.resume_handoff_intent;
             app.session_persistence.resume_handoff_intent = .none;
-            if (comptime @hasField(@TypeOf(app.session), "usage")) {
-                app.session.usage.cancelReconciliation();
-                app.session.usage.finishProfilePublicationsBeforeShutdown();
-                app.session.usage.configureCheckpointSink(null);
+            // Subagent children and the title call record into this
+            // session's usage, so they end before it settles.
+            stopSubagentHost(app);
+            if (comptime @hasField(@TypeOf(app.session_persistence), "title_generation")) {
+                app.session_persistence.title_generation.dropForClose();
             }
+            // Usage writes its last checkpoint through `write_mutex`, so it
+            // settles before the lock.
+            const usage_settlement: anyerror!void = if (comptime @hasField(@TypeOf(app.session), "usage"))
+                app.session.usage.settle()
+            else {};
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             app.session_persistence.remember_fresh_session = false;
             discardAnyPendingCancelledCommand(app, "writable_session_close");
-            if (app.session_persistence.v2) |v2| return closeV2Session(app, v2, handoff_intent);
+            if (app.session_persistence.v2) |v2| return closeV2Session(app, v2, handoff_intent, usage_settlement);
             const loaded = if (app.session_persistence.writable) |*value|
                 value
             else
@@ -5591,7 +5617,7 @@ pub fn Runtime(comptime App: type) type {
             var resume_boundary_valid = false;
             if (handoff_intent != .none) {
                 var settlement_failed = false;
-                settleDurableState(app, loaded) catch |err| {
+                settleDurableState(loaded, usage_settlement) catch |err| {
                     settlement_failed = true;
                     recordShutdownFailure(app, err);
                     debug_trace.logf(
@@ -5602,7 +5628,7 @@ pub fn Runtime(comptime App: type) type {
                 };
                 resume_boundary_valid = !settlement_failed;
             } else {
-                settleDurableState(app, loaded) catch |err| {
+                settleDurableState(loaded, usage_settlement) catch |err| {
                     recordShutdownFailure(app, err);
                     debug_trace.logf(
                         "session",
@@ -5658,9 +5684,9 @@ pub fn Runtime(comptime App: type) type {
 
         /// Settles usage and closes; the manager ends an open turn as
         /// `closed`, and a session with no turn leaves nothing on disk (D2).
-        fn closeV2Session(app: *App, v2: *session_adapter.Session, handoff_intent: ResumeHandoffIntent) ?ResumeHandoff {
+        fn closeV2Session(app: *App, v2: *session_adapter.Session, handoff_intent: ResumeHandoffIntent, usage_settlement: anyerror!void) ?ResumeHandoff {
             var settled = true;
-            settleV2Usage(app, v2) catch |err| {
+            usage_settlement catch |err| {
                 settled = false;
                 recordShutdownFailure(app, err);
                 debug_trace.logf("session", "final persistence settlement failed session={s} err={s}", .{ v2.id(), @errorName(err) });
@@ -5684,15 +5710,6 @@ pub fn Runtime(comptime App: type) type {
             v2.close();
             app.session_persistence.v2 = null;
             return handoff;
-        }
-
-        fn settleV2Usage(app: *App, v2: *session_adapter.Session) !void {
-            if (comptime !@hasField(@TypeOf(app.session), "usage")) return;
-            if (!app.session.usage.isDirty()) return;
-            var usage = try app.session.usage.snapshot(app.alloc);
-            defer usage.deinit(app.alloc);
-            try v2.persistUsage(usage);
-            app.session.usage.markClean(usage);
         }
 
         /// A fresh interactive session that never received durable work has
@@ -5860,25 +5877,14 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
+        /// The session's state is settled when it is still writable and
+        /// usage saved its last checkpoint before the close.
         fn settleDurableState(
-            app: *App,
             loaded: *session_store.LoadedWritableSession,
+            usage_settlement: anyerror!void,
         ) !void {
             try loaded.requireWritable();
-            const usage_dirty = if (comptime @hasField(@TypeOf(app.session), "usage"))
-                app.session.usage.isDirty()
-            else
-                false;
-            if (usage_dirty) {
-                var usage = try app.session.usage.snapshot(app.alloc);
-                defer usage.deinit(app.alloc);
-                _ = try loaded.appendEvent(
-                    app.alloc,
-                    .{ .usage_checkpointed = .{ .usage = usage } },
-                    io_mod.milliTimestamp(),
-                );
-                app.session.usage.markClean(usage);
-            }
+            try usage_settlement;
         }
 
         pub fn commitContextCompaction(
@@ -5917,7 +5923,6 @@ pub fn Runtime(comptime App: type) type {
                     owner.state = next;
                     owner.revision = revision;
                     next_owned = false;
-                    if (owner.state.usage) |usage| app.session.usage.markClean(usage);
                 }
             }
             app.session.commitCompactedHistory(app.alloc, prepared);
@@ -5992,9 +5997,6 @@ pub fn Runtime(comptime App: type) type {
             owner.state = next;
             owner.revision = revision;
             next_owned = false;
-            if (comptime @hasField(@TypeOf(app.session), "usage")) {
-                if (owner.state.usage) |usage| app.session.usage.markClean(usage);
-            }
         }
 
         fn snapshotCurrentState(
@@ -6025,7 +6027,7 @@ pub fn Runtime(comptime App: type) type {
                 var value = permission_state;
                 value.deinit(app.alloc);
             }
-            const usage = try app.session.usage.snapshot(app.alloc);
+            const usage = try app.session.usage.durableSnapshot(app.alloc);
             const recovery_checkpoint = if (base_state.recovery_checkpoint) |checkpoint|
                 try checkpoint.dupe(app.alloc)
             else
@@ -6071,7 +6073,7 @@ pub fn Runtime(comptime App: type) type {
                 var value = permission_state;
                 value.deinit(app.alloc);
             }
-            const usage = try app.session.usage.snapshot(app.alloc);
+            const usage = try app.session.usage.durableSnapshot(app.alloc);
             return .{
                 .id = id,
                 .origin_workspace_root = origin,
@@ -7076,12 +7078,9 @@ fn makeJsHostTestState(
     errdefer alloc.free(workspace);
     const model = try alloc.dupe(u8, "restored/model");
     errdefer alloc.free(model);
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    const sequence = try usage.reserveInvocation();
-    usage.finishInvocation(sequence, 41, .unbilled);
-    var usage_snapshot = try usage.snapshot(alloc);
+    var usage_snapshot = try usage_owner.testSnapshot(alloc, 0, 0);
     errdefer usage_snapshot.deinit(alloc);
+    usage_snapshot.api_duration_ms = 41;
     return .{
         .id = owned_id,
         .origin_workspace_root = origin,
@@ -7116,6 +7115,7 @@ test "js-host resume restores transcript context preferences usage and revision"
     defer fake.deinit(alloc);
     var app = try TestApp.init(alloc, "/workspace");
     defer app.deinit();
+    app.session.bindUsage(alloc, .{ .host = null, .home_path = null });
     try Runtime(TestApp).configureStartupPreferences(
         &app,
         .gateway,
@@ -12285,19 +12285,10 @@ test "renameActiveSession persists the title only in session metadata" {
 }
 
 const ReconciliationOriginUsage = struct {
-    replaced_provider: ?model_provider.ProviderId = null,
     replaced_source: ?types.CredentialSource = null,
 
-    fn replaceProviderReconciliationCredential(
-        self: *@This(),
-        _: Allocator,
-        provider: model_provider.ProviderId,
-        source: types.CredentialSource,
-        _: ?[]const u8,
-        _: []const u8,
-    ) void {
-        self.replaced_provider = provider;
-        self.replaced_source = source;
+    fn setCredential(self: *@This(), lease: ?types.CredentialLease) void {
+        self.replaced_source = if (lease) |value| value.credentialSource() else null;
     }
 };
 
@@ -12329,13 +12320,12 @@ const ReconciliationOriginApp = struct {
     selected_model: std.ArrayList(u8) = .empty,
 };
 
-test "resumed sessions install provider-scoped usage reconciliation authority" {
+test "resumed sessions give usage the credential their provider accepts" {
     var chatgpt = ReconciliationOriginApp{
         .auth = .{ .source = .chatgpt_subscription },
         .selected_provider = .codex,
     };
     Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&chatgpt);
-    try std.testing.expectEqual(model_provider.ProviderId.codex, chatgpt.session.usage.replaced_provider.?);
     try std.testing.expectEqual(types.CredentialSource.chatgpt_subscription, chatgpt.session.usage.replaced_source.?);
 
     var gateway = ReconciliationOriginApp{
@@ -12343,11 +12333,10 @@ test "resumed sessions install provider-scoped usage reconciliation authority" {
         .selected_provider = .gateway,
     };
     Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&gateway);
-    try std.testing.expectEqual(model_provider.ProviderId.gateway, gateway.session.usage.replaced_provider.?);
     try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, gateway.session.usage.replaced_source.?);
 }
 
-test "resumed usage reconciliation rejects the previous provider credential" {
+test "resumed sessions give usage no credential their provider does not accept" {
     const cases = .{
         .{ model_provider.ProviderId.gateway, types.CredentialSource.chatgpt_subscription },
         .{ model_provider.ProviderId.gateway, types.CredentialSource.grok_subscription },
@@ -12360,7 +12349,6 @@ test "resumed usage reconciliation rejects the previous provider credential" {
             .selected_provider = case[0],
         };
         Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&app);
-        try std.testing.expect(app.session.usage.replaced_provider == null);
         try std.testing.expect(app.session.usage.replaced_source == null);
     }
 }

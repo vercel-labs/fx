@@ -32,7 +32,8 @@ const session_event = @import("session_event.zig");
 const result_store = @import("result_store.zig");
 const session_log = @import("session_log.zig");
 const session_codec = @import("session_codec.zig");
-const session_usage = @import("session_usage.zig");
+const usage_mod = @import("usage");
+const usage_owner = @import("usage_owner.zig");
 const session_layout = @import("session_layout.zig");
 const session_child_store = @import("session_child_store.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
@@ -53,7 +54,6 @@ pub const files_dir_name = profile_paths.session_files_dir_name;
 pub const terminal_dir_name = profile_paths.terminal_dir_name;
 /// Folder of the usage-recovery markers of v2 sessions, under `~/.fx`;
 /// v1's readers load only v1 sessions, so v2 markers live apart.
-pub const usage_markers_dir_name = "usage-recovery-v2";
 /// The profile's home folder, opened for listing: creating `~/.fx` in it
 /// syncs it, and Linux cannot sync a folder opened any other way (`O_PATH`).
 fn openHome(home: []const u8) !io_mod.VerifiedDir {
@@ -550,7 +550,9 @@ pub const Restored = struct {
     language: types.ConversationLanguage,
     preferences: ?session_codec.DurableSessionPreferences = null,
     permission_state: ?session_permission_state.State = null,
-    usage: ?session_usage.Snapshot = null,
+    usage: ?usage_mod.Snapshot = null,
+    /// When the restored usage checkpoint was written; later ones are later.
+    usage_saved_at_ms: i64 = 0,
     /// The stored title, generated or chosen by the user.
     title: ?[]u8 = null,
     created_at_ms: i64,
@@ -914,11 +916,6 @@ pub const Session = struct {
     /// A resumed session with no title: the title its first prompt gives,
     /// owned, written with its next turn end (D52).
     first_title: ?[]u8 = null,
-    /// A usage-recovery marker protects a checkpoint still waiting for the
-    /// profile ledger; it keeps its first time until nothing is pending.
-    usage_marked: bool = false,
-    /// Time of the newest usage checkpoint; each new one is later.
-    usage_at_ms: i64 = 0,
     /// A child's instructions as its `prefs` hold them (D34), owned; null
     /// for a root and for a child without any.
     instructions: ?[]u8 = null,
@@ -1698,63 +1695,13 @@ pub const Session = struct {
 
     // -- usage ---------------------------------------------------------------
 
-    /// Saves a usage checkpoint with v1's marker rules: a checkpoint that
-    /// still owes the profile ledger is covered by a marker written first
-    /// (keeping the time of the first such checkpoint), and the marker goes
-    /// once a durable checkpoint owes nothing (`tla/Wiring.tla`
-    /// UsageNeverSilent).
-    pub fn persistUsage(self: *Session, snapshot: session_usage.Snapshot) !void {
-        const now_ms = @max(io_mod.milliTimestamp(), 0);
-        const at_ms = if (now_ms > self.usage_at_ms) now_ms else try std.math.add(i64, self.usage_at_ms, 1);
-        const pending = session_usage.needsProfileRecovery(snapshot);
-        if (pending and !self.usage_marked) {
-            try self.writeUsageMarker(at_ms);
-            self.usage_marked = true;
-        }
+    /// Saves one usage checkpoint as a `set usage` event. The usage module
+    /// owns the recovery markers around it and the checkpoint's time.
+    pub fn persistUsage(self: *Session, checkpoint: *const usage_mod.host.Checkpoint) !void {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
-        const value = try encodeUsage(arena.allocator(), snapshot, at_ms);
+        const value = try checkpoint.encodeV2Value(arena.allocator());
         _ = try self.write(&.{.{ .set = .{ .key = .usage, .value = value } }});
-        self.usage_at_ms = at_ms;
-        if (pending) return;
-        // Before the first turn a `set` waits in memory, not on disk.
-        if (!self.saved()) return;
-        self.clearUsageMarker();
-        self.usage_marked = false;
-    }
-
-    fn writeUsageMarker(self: *Session, now_ms: i64) !void {
-        var dir = try self.openUsageMarkers();
-        defer dir.close();
-        var buffer: [48]u8 = undefined;
-        const content = try std.fmt.bufPrint(&buffer, "v1 {d}\n", .{now_ms});
-        // A full disk stops the turn here, before the model is asked, so it
-        // must read as one (D29) and not as a failed replace.
-        var cause: ?anyerror = null;
-        io_mod.durableReplaceVerifiedWithOps(self.alloc, &dir, self.id(), content, .{ .pre_rename_cause = &cause }) catch |err| {
-            if (cause) |stopped| if (storageCause(stopped)) |named| return named;
-            return err;
-        };
-    }
-
-    fn clearUsageMarker(self: *Session) void {
-        var dir = self.openUsageMarkers() catch |err| {
-            debug_trace.logf("session", "event=sessions_v2_usage_marker_kept session={s} err={s}", .{ self.id(), @errorName(err) });
-            return;
-        };
-        defer dir.close();
-        dir.dir.deleteFile(io_mod.getIo(), self.id()) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => debug_trace.logf("session", "event=sessions_v2_usage_marker_kept session={s} err={s}", .{ self.id(), @errorName(err) }),
-        };
-    }
-
-    fn openUsageMarkers(self: *Session) !io_mod.VerifiedDir {
-        var home = try openHome(self.store.home);
-        defer home.close();
-        var fx = try io_mod.openOrCreateVerifiedPrivateDir(&home, profile_paths.root_dir_name);
-        defer fx.close();
-        return io_mod.openOrCreateVerifiedPrivateDir(&fx, usage_markers_dir_name);
     }
 
     // -- resume --------------------------------------------------------------
@@ -1777,11 +1724,6 @@ pub const Session = struct {
         self.first_title = null;
         if (self.root and state.title == null) {
             if (try deriveTitle(sa, restored.history)) |title| self.first_title = try self.alloc.dupe(u8, title);
-        }
-        if (state.usage) |raw| {
-            const checkpoint = try decodeUsage(sa, raw);
-            self.usage_at_ms = checkpoint.at_ms;
-            self.usage_marked = session_usage.needsProfileRecovery(checkpoint.snapshot);
         }
         if (state.language != null) {
             const owned = try self.alloc.dupe(u8, restored.language.view());
@@ -2263,7 +2205,11 @@ fn settingsFrom(alloc: Allocator, sa: Allocator, state: sm.State) !Restored {
     if (state.title) |raw| restored.title = try alloc.dupe(u8, try std.json.parseFromSliceLeaky([]const u8, sa, raw, .{}));
     if (state.prefs) |raw| restored.preferences = try decodePreferences(alloc, raw);
     if (state.permissions) |raw| restored.permission_state = try session_codec.decodePermissionState(alloc, raw);
-    if (state.usage) |raw| restored.usage = (try decodeUsage(alloc, raw)).snapshot;
+    if (state.usage) |raw| {
+        const checkpoint = try decodeUsage(alloc, raw);
+        restored.usage = checkpoint.snapshot;
+        restored.usage_saved_at_ms = checkpoint.at_ms;
+    }
     return restored;
 }
 
@@ -2685,68 +2631,20 @@ fn summaryOf(alloc: Allocator, scratch: Allocator, item: sm.Summary) !session_st
 // ---------------------------------------------------------------------------
 // Usage recovery: what the profile's readers need from v2 sessions
 
-/// A v2 session's usage-recovery marker and its newest usage checkpoint,
-/// read without the session's lock. Owns everything.
-pub const MarkedUsage = struct {
-    id: []u8,
-    /// Null when the session or its checkpoint cannot be read.
-    snapshot: ?session_usage.Snapshot,
-    /// When the checkpoint was written.
-    at_ms: i64 = 0,
-    protected_updated_at_ms: ?i64,
-    marker_modified_at_ns: i128,
-
-    pub fn deinit(marked: *MarkedUsage, alloc: Allocator) void {
-        alloc.free(marked.id);
-        if (marked.snapshot) |*snapshot| snapshot.deinit(alloc);
-        marked.* = undefined;
-    }
+/// How usage recovery reads marked sessions of either format.
+pub const usage_recovery_readers: usage_owner.RecoveryReaders = .{
+    .v1 = session_store.readUsageForRecovery,
+    .v2 = readNewestUsage,
+    .storage_readable = session_store.usageStorageReadable,
 };
 
-const max_usage_markers: usize = 512;
-
-/// Every v2 usage-recovery marker under `home`, with v1's validation.
-pub fn collectMarkedUsage(alloc: Allocator, home: []const u8) !std.ArrayList(MarkedUsage) {
-    var list: std.ArrayList(MarkedUsage) = .empty;
-    errdefer {
-        for (list.items) |*entry| entry.deinit(alloc);
-        list.deinit(alloc);
-    }
-    const path = try std.fs.path.join(alloc, &.{ home, profile_paths.root_dir_name, usage_markers_dir_name });
-    defer alloc.free(path);
-    var markers = io_mod.VerifiedDir{ .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), path, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound => return list,
-        else => return err,
-    } };
-    defer markers.close();
+/// The newest `set usage` value of a v2 session, or the usage in its newest
+/// snapshot, read back from the end without the session's lock: what usage
+/// recovery reads for a marked session. Null when it has none. The caller
+/// owns the bytes.
+pub fn readNewestUsage(alloc: Allocator, home: []const u8, id: []const u8) !?[]u8 {
     var store = try Store.open(alloc, home);
     defer store.deinit(alloc);
-    var it = markers.dir.iterate();
-    while (try it.next(io_mod.getIo())) |entry| {
-        if (entry.kind != .file or list.items.len == max_usage_markers) return error.InvalidUsageRecoveryIndex;
-        const protected = session_store.validateUsageRecoveryMarker(&markers, entry.name) catch return error.InvalidUsageRecoveryIndex;
-        const stat = try markers.dir.statFile(io_mod.getIo(), entry.name, .{ .follow_symlinks = false });
-        const id = try alloc.dupe(u8, entry.name);
-        errdefer alloc.free(id);
-        const checkpoint = newestUsage(&store, alloc, id) catch |err| blk: {
-            if (err == error.OutOfMemory) return err;
-            debug_trace.logf("usage", "event=sessions_v2_usage_unreadable session={s} err={s}", .{ id, @errorName(err) });
-            break :blk null;
-        };
-        try list.append(alloc, .{
-            .id = id,
-            .snapshot = if (checkpoint) |c| c.snapshot else null,
-            .at_ms = if (checkpoint) |c| c.at_ms else 0,
-            .protected_updated_at_ms = protected,
-            .marker_modified_at_ns = stat.mtime.nanoseconds,
-        });
-    }
-    return list;
-}
-
-/// The newest `set usage`, or the usage in the newest snapshot, reading
-/// back from the end without the session's lock.
-fn newestUsage(store: *Store, alloc: Allocator, id: []const u8) !?UsageCheckpoint {
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     const sa = scratch.allocator();
@@ -2757,12 +2655,15 @@ fn newestUsage(store: *Store, alloc: Allocator, id: []const u8) !?UsageCheckpoin
         for (page.entries) |entry| {
             const body = entry.body orelse continue;
             switch (body) {
-                .set => |setting| if (setting.key == .usage) return try decodeUsage(alloc, setting.value),
+                .set => |setting| if (setting.key == .usage) return try alloc.dupe(u8, setting.value),
                 .snapshot => |snapshot| {
                     const state = try std.json.parseFromSliceLeaky(std.json.Value, sa, snapshot.state, .{});
                     if (state != .object) return error.InvalidUsageCheckpoint;
                     const usage = state.object.get("usage") orelse return null;
-                    return try decodeUsageValue(alloc, usage);
+                    var out: std.Io.Writer.Allocating = .init(alloc);
+                    errdefer out.deinit();
+                    std.json.Stringify.value(usage, .{}, &out.writer) catch return error.OutOfMemory;
+                    return try out.toOwnedSlice();
                 },
                 else => {},
             }
@@ -3092,16 +2993,16 @@ fn decodeLanguage(arena: Allocator, raw: []const u8) !types.ConversationLanguage
 }
 
 /// `{"at_ms":N,"snapshot":...}`: the snapshot as v1's usage file holds it.
-fn encodeUsage(alloc: Allocator, snapshot: session_usage.Snapshot, at_ms: i64) ![]u8 {
+fn encodeUsage(alloc: Allocator, snapshot: usage_mod.Snapshot, at_ms: i64) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     try out.writer.print("{{\"at_ms\":{d},\"snapshot\":", .{at_ms});
-    try session_usage.writeRichSnapshot(&out.writer, snapshot);
+    try usage_mod.snapshot.writeRich(&out.writer, snapshot);
     try out.writer.writeByte('}');
     return out.toOwnedSlice();
 }
 
-const UsageCheckpoint = struct { snapshot: session_usage.Snapshot, at_ms: i64 };
+const UsageCheckpoint = struct { snapshot: usage_mod.Snapshot, at_ms: i64 };
 
 fn decodeUsage(alloc: Allocator, raw: []const u8) !UsageCheckpoint {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
@@ -3114,7 +3015,7 @@ fn decodeUsageValue(alloc: Allocator, value: std.json.Value) !UsageCheckpoint {
     const at = value.object.get("at_ms") orelse return error.InvalidUsageCheckpoint;
     if (at != .integer) return error.InvalidUsageCheckpoint;
     const snapshot = value.object.get("snapshot") orelse return error.InvalidUsageCheckpoint;
-    return .{ .snapshot = try session_usage.parseSnapshotValue(alloc, snapshot), .at_ms = at.integer };
+    return .{ .snapshot = try usage_mod.snapshot.parseValue(alloc, snapshot), .at_ms = at.integer };
 }
 
 /// The title v1 derives from the first prompt of `history`, if any.
@@ -4041,24 +3942,18 @@ test "a piece above the inline limit goes to a blob and comes back whole" {
     try testing.expectEqualStrings(big, restored.history[0].assistant.assistant);
 }
 
-test "usage is durable before its marker goes, and resume restores it" {
+test "a usage checkpoint is a set event, and resume restores it with its time" {
     var t: TestHome = undefined;
     try t.init();
     defer t.deinit();
     var model = "m".*;
     const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
     try s.commitTurn(assistantTurn("q", "a"), types.ConversationLanguage.default());
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(testing.allocator);
-    var snapshot = try usage.snapshot(testing.allocator);
+    var snapshot = try usage_owner.testSnapshot(testing.allocator, 0, 0);
     defer snapshot.deinit(testing.allocator);
-    try s.persistUsage(snapshot);
+    try s.persistUsage(&.{ .number = 1, .at_ms = 42, .snapshot = &snapshot });
     const id = try testing.allocator.dupe(u8, s.id());
     defer testing.allocator.free(id);
-    // Nothing left to publish: the marker is gone.
-    var markers = try t.tmp.dir.openDir(io_mod.getIo(), ".fx/" ++ usage_markers_dir_name, .{});
-    defer markers.close(io_mod.getIo());
-    try testing.expectError(error.FileNotFound, markers.statFile(io_mod.getIo(), id, .{}));
     s.close();
 
     const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
@@ -4066,6 +3961,10 @@ test "usage is durable before its marker goes, and resume restores it" {
     var restored = try r.restore(testing.allocator);
     defer restored.deinit(testing.allocator);
     try testing.expect(restored.usage != null);
+    try testing.expectEqual(@as(i64, 42), restored.usage_saved_at_ms);
+    const newest = (try readNewestUsage(testing.allocator, t.home, id)).?;
+    defer testing.allocator.free(newest);
+    try testing.expect(std.mem.startsWith(u8, newest, "{\"at_ms\":42,\"snapshot\":"));
 }
 
 test "a usage marker that cannot be written names a storage cause (D29)" {

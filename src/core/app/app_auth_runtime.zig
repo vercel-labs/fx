@@ -2036,54 +2036,17 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Usage looks Gateway generations up with the session's current
+        /// Gateway credential; a subscription or no credential looks none up.
         fn reconcileGatewayCredential(app: *App) void {
             if (comptime !runtime_profile.allows(App, .generation_usage)) return;
-            if (comptime @hasField(App, "session") and
-                @hasField(@TypeOf(app.session), "usage"))
-            {
-                if (app.auth.gatewayCredential()) |credential| {
-                    if (gatewayCredentialSource(credential) == .host_managed) {
-                        if (comptime @hasDecl(@TypeOf(app.session.usage), "replaceHostManagedReconciliationAuthority")) {
-                            app.session.usage.replaceHostManagedReconciliationAuthority(
-                                app.alloc,
-                                provider_runtime.provider(app),
-                            );
-                        }
-                        return;
-                    }
-                    const subscription = if (comptime @hasField(@TypeOf(credential), "source"))
-                        credential.source == .chatgpt_subscription or credential.source == .grok_subscription
-                    else
-                        false;
-                    if (subscription) {
-                        app.session.usage.clearReconciliationCredential();
-                    } else {
-                        if (comptime @hasDecl(
-                            @TypeOf(app.session.usage),
-                            "replaceProviderReconciliationCredential",
-                        )) {
-                            if (optionalGatewayApiKey(credential)) |api_key| {
-                                app.session.usage.replaceProviderReconciliationCredential(
-                                    app.alloc,
-                                    .gateway,
-                                    credential.source,
-                                    null,
-                                    api_key,
-                                );
-                            }
-                        } else {
-                            if (optionalGatewayApiKey(credential)) |api_key| {
-                                app.session.usage.replaceReconciliationCredential(
-                                    app.alloc,
-                                    api_key,
-                                );
-                            }
-                        }
-                    }
-                } else {
-                    app.session.usage.clearReconciliationCredential();
-                }
-            }
+            if (comptime !@hasField(App, "session") or !@hasField(@TypeOf(app.session), "usage")) return;
+            const credential = app.auth.gatewayCredential() orelse return app.session.usage.setCredential(null);
+            if (gatewayCredentialSource(credential) == .host_managed) return app.session.usage.setCredential(.host_managed);
+            const source = gatewayCredentialSource(credential);
+            if (source == .chatgpt_subscription or source == .grok_subscription) return app.session.usage.setCredential(null);
+            const api_key = optionalGatewayApiKey(credential) orelse return;
+            app.session.usage.setCredential(.{ .direct = .{ .secret_bytes = api_key, .source = source } });
         }
 
         fn writeLoginError(app: *App, source: credentials.Source, err: anyerror) !void {
@@ -2674,18 +2637,14 @@ const TestUsage = struct {
     clear_count: usize = 0,
     last_key: ?[]const u8 = null,
 
-    fn replaceReconciliationCredential(
-        self: *TestUsage,
-        _: std.mem.Allocator,
-        api_key: []const u8,
-    ) void {
-        self.refresh_count += 1;
-        self.last_key = api_key;
-    }
-
-    fn clearReconciliationCredential(self: *TestUsage) void {
-        self.clear_count += 1;
-        self.last_key = null;
+    fn setCredential(self: *TestUsage, lease: ?types.CredentialLease) void {
+        if (lease) |value| {
+            self.refresh_count += 1;
+            self.last_key = value.secret();
+        } else {
+            self.clear_count += 1;
+            self.last_key = null;
+        }
     }
 };
 
@@ -3359,7 +3318,7 @@ test "prompt credential refresh preserves catalog for secret rotation" {
     try std.testing.expectEqual(@as(usize, 2), app.session.usage.refresh_count);
 }
 
-test "credential removal clears the reconciliation credential" {
+test "credential removal clears the usage lookup credential" {
     var app: TestApp = .{};
     app.auth.gateway_ready = false;
 

@@ -1,5 +1,5 @@
 const std = @import("std");
-const session_usage = @import("../session/session_usage.zig");
+const usage_owner = @import("../session/usage_owner.zig");
 const web_search_contract = @import("web_search_contract.zig");
 const web_search_policy = @import("web_search_policy.zig");
 const types = @import("../shared/types.zig");
@@ -13,8 +13,7 @@ pub const Inputs = struct {
     worker_model: []const u8,
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
-    usage: ?*session_usage.Usage = null,
-    usage_allocator: Allocator = std.heap.c_allocator,
+    usage: ?*usage_owner.Owner = null,
 };
 
 pub const PreferredBackendsFn = *const fn (?*anyopaque) anyerror!?[]const web_search_contract.SearchBackendId;

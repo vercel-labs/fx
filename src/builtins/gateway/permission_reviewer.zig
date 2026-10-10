@@ -1,11 +1,12 @@
 const std = @import("std");
 const gateway_client = @import("../../gateway/client.zig");
 const permission_auto_classifier = @import("../../core/permissions/auto_classifier.zig");
-const session_usage = @import("../../core/session/session_usage.zig");
+const usage_owner = @import("../../core/session/usage_owner.zig");
+const usage_mod = @import("usage");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const types = @import("../../core/shared/types.zig");
 const stream_provider = @import("../../core/agent/stream_provider.zig");
-const credential_authority = @import("../../core/auth/credential_authority.zig");
+const io_mod = @import("../../core/shared/io.zig");
 const vercel_protocol = @import("../../gateway/vercel_protocol.zig");
 const typesafe_permission_reviewer = @import("typesafe_permission_reviewer.zig");
 
@@ -26,6 +27,7 @@ const StreamFn = *const fn (
     std.Io.Clock.Timestamp,
     *gateway_client.DeliveryCertainty,
     *std.atomic.Value(bool),
+    ?stream_provider.GatewayEventTap,
 ) anyerror!gateway_client.StreamResult;
 
 var default_stream_ctx: u8 = 0;
@@ -36,8 +38,7 @@ const GatewayConfig = struct {
     team: ?[]const u8 = null,
     chat_url: []const u8,
     cancel_flag: ?*std.atomic.Value(bool) = null,
-    usage: ?*session_usage.Usage = null,
-    usage_allocator: Allocator = std.heap.c_allocator,
+    usage: ?*usage_owner.Owner = null,
     stream_ctx: *anyopaque = @ptrCast(&default_stream_ctx),
     stream_fn: StreamFn = streamGatewayReviewer,
 };
@@ -67,7 +68,6 @@ fn reviewGateway(
         .chat_url = input.endpoint,
         .cancel_flag = input.cancel_flag,
         .usage = input.usage,
-        .usage_allocator = input.usage_allocator,
     }, alloc, request, selected);
 }
 
@@ -144,7 +144,15 @@ fn sendGatewayReview(
         return .permanent_failure;
     }
 
-    const usage_observation = session_usage.InvocationObservation.begin(config.usage) catch |err| {
+    const lease: types.CredentialLease = if (config.credential_source == .host_managed)
+        .host_managed
+    else
+        .{ .direct = .{
+            .secret_bytes = config.api_key orelse "",
+            .source = config.credential_source,
+            .tenant_context = config.team,
+        } };
+    var invocation = usage_owner.Invocation.begin(config.usage, lease) catch |err| {
         debug_trace.logf(
             "permission",
             "event=auto_review_usage result=permanent_failure phase=begin reason={s}",
@@ -165,11 +173,9 @@ fn sendGatewayReview(
         deadline,
         &delivery,
         cancel_flag,
+        if (invocation) |*value| value.tap() else null,
     ) catch |err| {
-        usage_observation.fail(if (delivery.load() == .possibly_sent)
-            .ambiguous_delivery
-        else
-            .unbilled) catch |usage_err| {
+        if (invocation) |*value| value.failed(err, delivery.load() == .possibly_sent) catch |usage_err| {
             debug_trace.logf(
                 "permission",
                 "event=auto_review_usage result=permanent_failure phase=transport_failure reason={s}",
@@ -181,35 +187,16 @@ fn sendGatewayReview(
     };
     var stream_owned = true;
     defer if (stream_owned) stream.deinit(alloc);
-    const usage_outcome = usageOutcome(config, stream.completion);
-    (if (stream.status == .ok)
-        usage_observation.complete(
-            config.usage_allocator,
-            stream.completion,
-            usage_outcome,
-        )
+    if (invocation) |*value| (if (stream.status == .ok)
+        value.completed(stream.completion)
     else
-        usage_observation.fail(.unbilled)) catch |err| {
+        value.rejected()) catch |err| {
         debug_trace.logf(
             "permission",
             "event=auto_review_usage result=permanent_failure phase=completion reason={s}",
             .{@errorName(err)},
         );
         return .permanent_failure;
-    };
-    if (stream.status == .ok and std.meta.activeTag(usage_outcome) == .deferred) if (config.usage) |ledger| {
-        if (config.api_key) |api_key| {
-            ledger.startDeferredReconciliation(
-                config.usage_allocator,
-                usage_outcome.deferred,
-                api_key,
-            );
-        } else if (config.credential_source == .host_managed) {
-            ledger.startHostManagedDeferredReconciliation(
-                config.usage_allocator,
-                usage_outcome.deferred,
-            );
-        }
     };
 
     if (cancel_flag.load(.seq_cst)) {
@@ -263,30 +250,6 @@ fn sendGatewayReview(
     } };
 }
 
-fn usageOutcome(
-    config: *const GatewayConfig,
-    completion: types.ModelCompletion,
-) stream_provider.UsageOutcome {
-    const generation_id = completion.generation_id orelse
-        return .{ .unavailable = .possibly_billed };
-    const source = config.credential_source orelse .ai_gateway_api_key;
-    const reference = stream_provider.DeferredUsageReference{
-        .provider = .gateway,
-        .generation_id = generation_id,
-        .scope = gateway_client.generationBaseUrl(),
-        .tenant = config.team,
-        .credential_source = source,
-        .credential_identity = credential_authority.derive(
-            source,
-            null,
-        ),
-    };
-    return if (completion.billing != null)
-        .{ .exact = .gateway }
-    else
-        .{ .deferred = reference };
-}
-
 fn mapTransportError(
     err: anyerror,
     cancel_flag: *std.atomic.Value(bool),
@@ -329,6 +292,7 @@ fn streamGatewayReviewer(
     deadline: std.Io.Clock.Timestamp,
     delivery: *gateway_client.DeliveryCertainty,
     cancel_flag: *std.atomic.Value(bool),
+    gateway_events: ?stream_provider.GatewayEventTap,
 ) !gateway_client.StreamResult {
     return gateway_client.streamGatewayRequiredToolCompletionBounded(
         alloc,
@@ -340,6 +304,7 @@ fn streamGatewayReviewer(
             .chat_url = chat_url,
             .payload = payload,
             .delivery = delivery,
+            .gateway_events = gateway_events,
         },
         deadline,
         cancel_flag,
@@ -379,6 +344,7 @@ const FakeStream = struct {
         deadline: std.Io.Clock.Timestamp,
         delivery: *gateway_client.DeliveryCertainty,
         _: *std.atomic.Value(bool),
+        gateway_events: ?stream_provider.GatewayEventTap,
     ) anyerror!gateway_client.StreamResult {
         const self: *FakeStream = @ptrCast(@alignCast(raw_ctx));
         if (self.calls < self.deadlines.len) self.deadlines[self.calls] = deadline;
@@ -389,7 +355,7 @@ const FakeStream = struct {
         const outcome = self.outcomes[@min(self.calls, self.outcomes.len - 1)];
         self.calls += 1;
         return switch (outcome) {
-            .valid => validStream(alloc),
+            .valid => validStream(alloc, gateway_events),
             .malformed => malformedStream(alloc),
             .transient_error => error.ConnectionResetByPeer,
             .permanent_error => error.AccessDenied,
@@ -405,7 +371,15 @@ const FakeStream = struct {
     }
 };
 
-fn validStream(alloc: Allocator) !gateway_client.StreamResult {
+fn validStream(alloc: Allocator, gateway_events: ?stream_provider.GatewayEventTap) !gateway_client.StreamResult {
+    // The transport hands usage every event; this one names the generation.
+    if (gateway_events) |tap| {
+        var event = try std.json.parseFromSlice(std.json.Value, alloc,
+            \\{"type":"text-start","id":"t1","providerMetadata":{"gateway":{"generationId":"gen_01ARZ3NDEKTSV4RRFFQ69G5FAV"}}}
+        , .{});
+        defer event.deinit();
+        tap.observe(event.value);
+    }
     const generation_id = try alloc.dupe(u8, "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV");
     errdefer alloc.free(generation_id);
     const id = try alloc.dupe(u8, "review_1");
@@ -512,14 +486,14 @@ test "gateway automatic reviewer transport is single-attempt" {
 
 test "gateway automatic reviewer records its generation in session usage" {
     const alloc = std.testing.allocator;
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
+    var usage: usage_owner.Owner = .{};
+    usage.bind(alloc, .{ .host = null, .home_path = null, .lookup = null });
+    defer usage.deinit();
     var fake = FakeStream{ .outcomes = &.{.valid} };
     const config = GatewayConfig{
         .api_key = "test-key",
         .chat_url = "https://example.test/chat",
         .usage = &usage,
-        .usage_allocator = alloc,
         .stream_ctx = @ptrCast(&fake),
         .stream_fn = FakeStream.execute,
     };
@@ -529,7 +503,7 @@ test "gateway automatic reviewer records its generation in session usage" {
     var snapshot = try usage.snapshot(alloc);
     defer snapshot.deinit(alloc);
 
-    try std.testing.expectEqual(session_usage.Availability.pending, snapshot.billing);
+    try std.testing.expectEqual(usage_mod.snapshot.Billing.pending, snapshot.billing);
     try std.testing.expectEqual(@as(usize, 1), snapshot.pending.len);
     try std.testing.expectEqualStrings(
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -539,14 +513,14 @@ test "gateway automatic reviewer records its generation in session usage" {
 
 test "pre-send automatic reviewer failure stays unbilled" {
     const alloc = std.testing.allocator;
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
+    var usage: usage_owner.Owner = .{};
+    usage.bind(alloc, .{ .host = null, .home_path = null, .lookup = null });
+    defer usage.deinit();
     var fake = FakeStream{ .outcomes = &.{.permanent_error} };
     const config = GatewayConfig{
         .api_key = "test-key",
         .chat_url = "https://example.test/chat",
         .usage = &usage,
-        .usage_allocator = alloc,
         .stream_ctx = @ptrCast(&fake),
         .stream_fn = FakeStream.execute,
     };
@@ -555,21 +529,21 @@ test "pre-send automatic reviewer failure stays unbilled" {
     defer outcome.deinit(alloc);
     var snapshot = try usage.snapshot(alloc);
     defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(session_usage.Availability.complete, snapshot.billing);
+    try std.testing.expectEqual(usage_mod.snapshot.Billing.complete, snapshot.billing);
     try std.testing.expect(snapshot.api_duration_complete);
     try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
 }
 
 test "possibly sent automatic reviewer failure marks billing incomplete" {
     const alloc = std.testing.allocator;
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
+    var usage: usage_owner.Owner = .{};
+    usage.bind(alloc, .{ .host = null, .home_path = null, .lookup = null });
+    defer usage.deinit();
     var fake = FakeStream{ .outcomes = &.{.ambiguous_error} };
     const config = GatewayConfig{
         .api_key = "test-key",
         .chat_url = "https://example.test/chat",
         .usage = &usage,
-        .usage_allocator = alloc,
         .stream_ctx = @ptrCast(&fake),
         .stream_fn = FakeStream.execute,
     };
@@ -578,17 +552,21 @@ test "possibly sent automatic reviewer failure marks billing incomplete" {
     defer outcome.deinit(alloc);
     var snapshot = try usage.snapshot(alloc);
     defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(session_usage.Availability.incomplete, snapshot.billing);
+    try std.testing.expectEqual(usage_mod.snapshot.Billing.incomplete, snapshot.billing);
     try std.testing.expect(snapshot.api_duration_complete);
     // The transient failure is retried once, so two possibly-sent attempts settle.
     try std.testing.expectEqual(@as(u64, 2), snapshot.settled_through_sequence);
 }
 
 test "terminal checkpoint failure releases automatic reviewer stream" {
-    const Checkpoint = struct {
+    const Host = struct {
         calls: usize = 0,
 
-        fn persist(raw_ctx: *anyopaque, _: session_usage.Snapshot) !void {
+        fn current(_: *anyopaque) ?usage_owner.Target {
+            return .{ .session_id = "sess-reviewer", .marker = .v1 };
+        }
+
+        fn persist(raw_ctx: *anyopaque, _: []const u8, _: *const usage_mod.host.Checkpoint) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.calls += 1;
             if (self.calls == 2) return error.CheckpointRejected;
@@ -596,20 +574,23 @@ test "terminal checkpoint failure releases automatic reviewer stream" {
     };
 
     const alloc = std.testing.allocator;
-    var checkpoint = Checkpoint{};
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    usage.configureCheckpointSink(.{
-        .context = &checkpoint,
-        .allocator = alloc,
-        .persist = Checkpoint.persist,
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var checkpoint = Host{};
+    var usage: usage_owner.Owner = .{};
+    usage.bind(alloc, .{
+        .host = .{ .context = &checkpoint, .current_fn = Host.current, .persist_fn = Host.persist },
+        .home_path = home,
+        .lookup = null,
     });
+    defer usage.deinit();
     var fake = FakeStream{ .outcomes = &.{.valid} };
     const config = GatewayConfig{
         .api_key = "test-key",
         .chat_url = "https://example.test/chat",
         .usage = &usage,
-        .usage_allocator = alloc,
         .stream_ctx = @ptrCast(&fake),
         .stream_fn = FakeStream.execute,
     };

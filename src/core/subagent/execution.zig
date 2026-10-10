@@ -245,6 +245,10 @@ pub const TurnContext = struct {
         child_state.Phase,
     ) anyerror!void = null,
     live_metrics: ?*live_metrics.LiveMetrics = null,
+    /// The parent session's usage, which records this child's model calls.
+    /// Null keeps them in the child's own runtime. The host joins children
+    /// before the parent's usage settles, so the parent outlives the turn.
+    parent_usage: ?*session.usage_owner.Owner = null,
     failure_diagnostic: ?types.ModelFailureDiagnostic = null,
     committed: bool = false,
 

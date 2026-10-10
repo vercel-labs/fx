@@ -66,6 +66,7 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addImport("build_options", build_options.createModule());
     const session_manager = addSessionManager(b, exe.root_module, target, optimize, null);
+    const usage = addUsage(b, exe.root_module, target, optimize, null);
 
     b.installArtifact(exe);
 
@@ -97,9 +98,16 @@ pub fn build(b: *std.Build) void {
     const session_manager_test_step = b.step("test-session-manager", "Run the session manager's tests");
     session_manager_test_step.dependOn(&run_session_manager_tests.step);
 
+    // Tests inside the usage module do not run in exe_tests.
+    const usage_tests = b.addTest(.{ .root_module = usage });
+    const run_usage_tests = b.addRunArtifact(usage_tests);
+    const usage_test_step = b.step("test-usage", "Run the usage module's tests");
+    usage_test_step.dependOn(&run_usage_tests.step);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_session_manager_tests.step);
+    test_step.dependOn(&run_usage_tests.step);
 
     if (wasm_surface != .none) {
         addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel);
@@ -350,6 +358,7 @@ fn addWasmArtifact(
     if (surface == .core) wasm_exe.stack_size = 1024 * 1024;
     wasm_exe.root_module.addImport("build_options", wasm_options.createModule());
     _ = addSessionManager(b, wasm_exe.root_module, wasm_target, .ReleaseSmall, true);
+    _ = addUsage(b, wasm_exe.root_module, wasm_target, .ReleaseSmall, true);
 
     const install_wasm = b.addInstallArtifact(wasm_exe, .{});
     const wasm_step = b.step(name ++ "-wasm", description);
@@ -388,6 +397,7 @@ fn addNapiArtifact(
     });
     lib.root_module.addImport("build_options", napi_options.createModule());
     _ = addSessionManager(b, lib.root_module, target, .ReleaseSafe, null);
+    _ = addUsage(b, lib.root_module, target, .ReleaseSafe, null);
     const node_include = b.option(
         []const u8,
         "node-include-dir",
@@ -449,6 +459,27 @@ fn addSessionManager(
     });
     module.addImport("build_options", options.createModule());
     importer.addImport("session_manager", module);
+    return module;
+}
+
+/// The usage module, rooted at its front door. It imports only std, and a
+/// file cannot belong to two modules, so fx reaches src/usage/ only through
+/// `@import("usage")`.
+fn addUsage(
+    b: *std.Build,
+    importer: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    single_threaded: ?bool,
+) *std.Build.Module {
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/usage/usage.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .single_threaded = single_threaded,
+    });
+    importer.addImport("usage", module);
     return module;
 }
 

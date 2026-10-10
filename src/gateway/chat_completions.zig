@@ -318,7 +318,7 @@ fn send_review(raw: *anyopaque, alloc: Allocator, model: []const u8, payload: []
         .attempt_evidence = &evidence,
         .events = .{ .context = &event_context, .emit_fn = ignore_event },
         .cancel_flag = cancel,
-    }, state.input.usage, state.input.usage_allocator) catch |err| switch (err) {
+    }, state.input.usage) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Cancelled => return .cancelled,
         error.Timeout => return .timed_out,

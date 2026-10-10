@@ -7,7 +7,7 @@ const std = @import("std");
 const agent_stream_provider = @import("../stream_provider.zig");
 const runtime_gateway_step = @import("gateway_step.zig");
 const compactor = @import("../../compactor/compactor.zig");
-const session_usage = @import("../../session/session_usage.zig");
+const usage_owner = @import("../../session/usage_owner.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const model_provider = @import("../../config/model_provider.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
@@ -28,8 +28,7 @@ pub const Request = struct {
     max_output_tokens: ?u32 = null,
     /// Longest text kept; a longer reply counts as truncated.
     max_bytes: usize,
-    usage: ?*session_usage.Usage = null,
-    usage_allocator: Allocator = std.heap.c_allocator,
+    usage: ?*usage_owner.Owner = null,
     trace_ctx: debug_trace.TraceContext,
     system: []const u8,
     user: []const u8,
@@ -109,7 +108,6 @@ pub fn complete(alloc: Allocator, request: Request) Error!Outcome {
             .cooperative_pulse = request.cooperative_pulse,
         },
         request.usage,
-        request.usage_allocator,
     ) catch |err| switch (err) {
         error.Cancelled => return error.Cancelled,
         error.OutOfMemory => return error.OutOfMemory,
@@ -200,8 +198,7 @@ pub const CompactorCaller = struct {
     /// What each model accepts.
     capabilities_context: *anyopaque,
     capabilities_fn: *const fn (context: *anyopaque, model: []const u8) model_capabilities.Capabilities,
-    usage: ?*session_usage.Usage = null,
-    usage_allocator: Allocator = std.heap.c_allocator,
+    usage: ?*usage_owner.Owner = null,
     /// The request the agent was about to send. A request after the
     /// conversation repeats it unchanged before its own message. Borrowed.
     conversation: ?agent_stream_provider.RequestData = null,
@@ -262,7 +259,6 @@ pub const CompactorCaller = struct {
             .max_output_tokens = if (own) self.max_output_tokens else model_capabilities.requestOutputTokens(self.capabilities_fn(self.capabilities_context, call.model)),
             .max_bytes = call.max_bytes,
             .usage = self.usage,
-            .usage_allocator = self.usage_allocator,
             .trace_ctx = call.trace_ctx,
             .system = call.system,
             .user = call.user,

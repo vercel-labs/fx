@@ -415,9 +415,7 @@ test "schema v3 import follows the committed watermark beyond a stale manifest" 
     const generation = [_]u8{1} ** 16;
     const event_id = [_]u8{2} ** 16;
     const language = try session.ConversationLanguage.fromSlice("en");
-    var usage = @import("session_usage.zig").Usage.initFresh();
-    defer usage.deinit(alloc);
-    var usage_snapshot = try usage.snapshot(alloc);
+    var usage_snapshot = try @import("usage_owner.zig").testSnapshot(alloc, 0, 0);
     defer usage_snapshot.deinit(alloc);
     const started = try session_event.encodeLegacyFixtureFrame(alloc, .{
         .log_generation = generation,

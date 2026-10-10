@@ -5,8 +5,6 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const model_tool_schema = @import("../tooling/model_tool_schema.zig");
-const model_provider = @import("../config/model_provider.zig");
-const credential_authority = @import("../auth/credential_authority.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -213,6 +211,17 @@ pub fn validate_prompt_lanes(
     }
 }
 
+/// Sees every parsed AI Gateway SSE event of one stream, in order, so usage
+/// can keep what the Gateway billed. The event is borrowed for the call.
+pub const GatewayEventTap = struct {
+    context: *anyopaque,
+    observe_fn: *const fn (context: *anyopaque, event: std.json.Value) void,
+
+    pub fn observe(self: GatewayEventTap, event: std.json.Value) void {
+        self.observe_fn(self.context, event);
+    }
+};
+
 /// Borrowed typed request. Providers own validation, wire serialization,
 /// endpoint selection, headers, HTTP, and stream reduction.
 pub const ModelRequest = struct {
@@ -243,6 +252,8 @@ pub const ModelRequest = struct {
     attempt_evidence: *AttemptEvidence,
     events: EventSink,
     admission: Admission = .{},
+    /// Gateway transports pass every parsed SSE event here.
+    gateway_events: ?GatewayEventTap = null,
     cancel_flag: *std.atomic.Value(bool),
     provider_attempt_owner: ProviderAttemptOwner = .transport,
 
@@ -286,34 +297,9 @@ pub const FailureDiagnostics = struct {
     request_shape: ?[]u8 = null,
 };
 
-pub const DeferredUsageReference = struct {
-    provider: model_provider.ProviderId,
-    generation_id: []const u8,
-    scope: []const u8,
-    tenant: ?[]const u8 = null,
-    account_id: ?[]const u8 = null,
-    credential_source: types.CredentialSource,
-    credential_identity: ?credential_authority.Identity,
-};
-
-pub const UsageUnavailable = enum {
-    unbilled,
-    possibly_billed,
-};
-
-pub const UsageOutcome = union(enum) {
-    exact: model_provider.ProviderId,
-    deferred: DeferredUsageReference,
-    unavailable: UsageUnavailable,
-};
-
 pub const Completed = struct {
     completion: types.ModelCompletion = .{},
-    usage: UsageOutcome = .{ .unavailable = .unbilled },
     ownership: ResultOwnership = .borrowed,
-    /// Native references normally borrow completion/credential fields. Copies
-    /// escaping a request allocator own their reference strings separately.
-    usage_ownership: ResultOwnership = .borrowed,
 };
 
 pub const Failure = struct {
@@ -328,7 +314,7 @@ pub const Result = union(enum) {
     completed: Completed,
     failed: Failure,
 
-    /// Returns a fully owned copy, including deferred usage and diagnostics.
+    /// Returns a fully owned copy, including subscription usage and diagnostics.
     /// The caller releases it with deinit using the same allocator.
     pub fn dupe(self: Result, alloc: Allocator) Allocator.Error!Result {
         switch (self) {
@@ -346,30 +332,22 @@ pub const Result = union(enum) {
             .completed => |completed| {
                 var copy = Result{ .completed = completed };
                 copy.completed.ownership = .owned;
-                copy.completed.usage = .{ .unavailable = .unbilled };
-                copy.completed.usage_ownership = .owned;
                 const dst = &copy.completed.completion;
                 const src = completed.completion;
                 const strings = .{ "content", "generation_id", "resolved_provider", "provider_failure_detail", "provider_state_json" };
                 inline for (strings) |field| @field(dst, field) = null;
                 dst.tool_calls = &.{};
-                dst.billing = null;
+                dst.subscription_usage = null;
                 errdefer copy.deinit(alloc);
                 inline for (strings) |field| {
                     if (@field(src, field)) |value| @field(dst, field) = try alloc.dupe(u8, value);
                 }
                 dst.tool_calls = try types.dupeToolCallSlice(alloc, src.tool_calls);
-                if (src.billing) |billing| {
-                    var owned = billing;
-                    owned.model = try alloc.dupe(u8, billing.model);
-                    dst.billing = owned;
+                if (src.subscription_usage) |exact| {
+                    var owned = exact;
+                    owned.model = try alloc.dupe(u8, exact.model);
+                    dst.subscription_usage = owned;
                 }
-                // Publish the union only after its fallible payload is complete.
-                const usage: UsageOutcome = switch (completed.usage) {
-                    .deferred => |reference| .{ .deferred = try dupeUsageReference(alloc, reference) },
-                    else => completed.usage,
-                };
-                copy.completed.usage = usage;
                 return copy;
             },
         }
@@ -383,19 +361,10 @@ pub const Result = union(enum) {
                 if (completed.completion.content) |content| alloc.free(@constCast(content));
                 if (completed.completion.generation_id) |id| alloc.free(@constCast(id));
                 if (completed.completion.resolved_provider) |provider| alloc.free(@constCast(provider));
-                if (completed.completion.billing) |billing| alloc.free(@constCast(billing.model));
+                if (completed.completion.subscription_usage) |exact| alloc.free(@constCast(exact.model));
                 types.freeToolCallSlice(alloc, @constCast(completed.completion.tool_calls));
                 if (completed.completion.provider_failure_detail) |detail| alloc.free(@constCast(detail));
                 if (completed.completion.provider_state_json) |state| alloc.free(@constCast(state));
-                if (completed.usage_ownership == .owned) switch (completed.usage) {
-                    .deferred => |reference| {
-                        alloc.free(reference.generation_id);
-                        alloc.free(reference.scope);
-                        if (reference.tenant) |value| alloc.free(value);
-                        if (reference.account_id) |value| alloc.free(value);
-                    },
-                    else => {},
-                };
             },
             .failed => |failure| if (failure.ownership == .owned) {
                 if (failure.detail) |detail| alloc.free(detail);
@@ -406,25 +375,6 @@ pub const Result = union(enum) {
         self.* = undefined;
     }
 };
-
-fn dupeUsageReference(alloc: Allocator, source: DeferredUsageReference) Allocator.Error!DeferredUsageReference {
-    const generation_id = try alloc.dupe(u8, source.generation_id);
-    errdefer alloc.free(generation_id);
-    const scope = try alloc.dupe(u8, source.scope);
-    errdefer alloc.free(scope);
-    const tenant = if (source.tenant) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (tenant) |value| alloc.free(value);
-    const account_id = if (source.account_id) |value| try alloc.dupe(u8, value) else null;
-    return .{
-        .provider = source.provider,
-        .generation_id = generation_id,
-        .scope = scope,
-        .tenant = tenant,
-        .account_id = account_id,
-        .credential_source = source.credential_source,
-        .credential_identity = source.credential_identity,
-    };
-}
 
 test "owned stream result copies preserve service tier metadata" {
     const source = Result{ .completed = .{
@@ -441,28 +391,17 @@ test "owned stream result copies preserve service tier metadata" {
             .generation_id = "gen_1",
             .provider_failure_detail = "detail",
             .provider_state_json = "[]",
-            .billing = .{
+            .subscription_usage = .{
                 .created_at_ms = 1,
                 .model = "fixture-model",
-                .total_cost = 0,
                 .input_tokens = 3,
                 .output_tokens = 1,
                 .cache_read_tokens = 0,
                 .cache_write_tokens = 0,
                 .reasoning_tokens = null,
-                .billable_web_search_calls = 0,
             },
             .finish_reason = .tool_calls,
         },
-        .usage = .{ .deferred = .{
-            .provider = .gateway,
-            .generation_id = "gen_1",
-            .scope = "http://127.0.0.1",
-            .tenant = "team",
-            .account_id = "account",
-            .credential_source = .ai_gateway_api_key,
-            .credential_identity = null,
-        } },
     } };
     const Copy = struct {
         fn check(alloc: Allocator, original: Result) !void {
@@ -479,17 +418,12 @@ test "owned stream result copies preserve service tier metadata" {
             try std.testing.expectEqualStrings("gen_1", completion.generation_id.?);
             try std.testing.expectEqualStrings("detail", completion.provider_failure_detail.?);
             try std.testing.expectEqualStrings("[]", completion.provider_state_json.?);
-            try std.testing.expectEqualStrings("fixture-model", completion.billing.?.model);
+            try std.testing.expectEqualStrings("fixture-model", completion.subscription_usage.?.model);
             try std.testing.expectEqualStrings("call_1", completion.tool_calls[0].id);
             try std.testing.expectEqualStrings("read_file", completion.tool_calls[0].name);
             try std.testing.expectEqualStrings("{\"path\":\"file.txt\"}", completion.tool_calls[0].arguments_json);
             try std.testing.expectEqualStrings("pending_1", completion.tool_calls[0].provisional_id.?);
             try std.testing.expectEqualStrings("provider output", completion.tool_calls[0].provider_result.?);
-            const reference = copied.completed.usage.deferred;
-            try std.testing.expectEqualStrings("gen_1", reference.generation_id);
-            try std.testing.expectEqualStrings("http://127.0.0.1", reference.scope);
-            try std.testing.expectEqualStrings("team", reference.tenant.?);
-            try std.testing.expectEqualStrings("account", reference.account_id.?);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Copy.check, .{source});
@@ -604,7 +538,6 @@ test "stream provider accepts one typed request and emits ordered neutral events
             request.events.emit(.{ .reasoning_delta = "second" });
             return .{ .completed = .{
                 .completion = .{ .content = "done" },
-                .usage = .{ .exact = .gateway },
             } };
         }
     };
@@ -672,7 +605,6 @@ test "stream provider accepts one typed request and emits ordered neutral events
     try std.testing.expect(!capture.failed);
     try std.testing.expectEqualStrings("firstsecond", capture.chunks.items);
     try std.testing.expectEqualStrings("done", result.completed.completion.content.?);
-    try std.testing.expect(std.meta.activeTag(result.completed.usage) == .exact);
 }
 
 test "stream provider rejects system messages in conversation before delegation" {

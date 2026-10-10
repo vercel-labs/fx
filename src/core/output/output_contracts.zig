@@ -14,7 +14,7 @@ const session_display_metadata = @import("../session/session_display_metadata.zi
 const session_json = @import("../session/session_json.zig");
 const compactor = @import("../compactor/compactor.zig");
 const session_store = @import("../session/session_store.zig");
-const usage_report = @import("../session/usage_report.zig");
+const usage_mod = @import("usage");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const update_notes = @import("../upgrade/update_notes.zig");
@@ -56,155 +56,6 @@ pub const CommandFailureSnapshot = struct {
         return try out.toOwnedSlice();
     }
 };
-
-pub const UsageSnapshot = struct {
-    report: *const usage_report.Snapshot,
-
-    pub fn render(
-        self: UsageSnapshot,
-        alloc: Allocator,
-        format: OutputFormat,
-    ) ![]u8 {
-        return switch (format) {
-            .text => self.renderText(alloc),
-            .json => self.renderJson(alloc),
-        };
-    }
-
-    pub fn renderText(self: UsageSnapshot, alloc: Allocator) ![]u8 {
-        const report = self.report;
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-
-        try out.writer.print("Usage ({s})\n", .{report.scope.label()});
-        switch (report.coverage) {
-            .not_started => try out.writer.writeAll("Tracking has not started.\n"),
-            .partial => {
-                var date_buf: [24]u8 = undefined;
-                try out.writer.print(
-                    "Tracking since {s} (partial window).\n",
-                    .{usage_report.formatUtcDate(
-                        &date_buf,
-                        report.coverage_started_at_ms.?,
-                    )},
-                );
-            },
-            .full => {},
-        }
-        switch (report.completeness) {
-            .complete => {},
-            .pending => try out.writer.writeAll(
-                "Known totals exclude pending Gateway reconciliation.\n",
-            ),
-            .incomplete => try out.writer.writeAll(
-                "Known totals may be incomplete.\n",
-            ),
-            .legacy => try out.writer.writeAll(
-                "This session predates complete usage tracking.\n",
-            ),
-        }
-
-        const totals = report.totals orelse return try out.toOwnedSlice();
-        try out.writer.print(
-            "Total tokens  {d}\nInput         {d}\nOutput        {d}\n",
-            .{ totals.total_tokens, totals.input_tokens, totals.output_tokens },
-        );
-        try out.writer.print(
-            "Cache         {d} read · {d} write\n",
-            .{ totals.cache_read_tokens, totals.cache_write_tokens },
-        );
-        if (totals.reasoning_tokens) |reasoning| {
-            try out.writer.print("Reasoning     {d}\n", .{reasoning});
-        }
-        if (totals.request_count) |requests| {
-            try out.writer.print("Requests      {d}\n", .{requests});
-        }
-        try out.writer.print("Spend         ${d:.4}\n", .{totals.total_cost});
-
-        if (report.models.len > 0) {
-            try out.writer.writeAll("\nBy model\n");
-            for (report.models) |model| {
-                try out.writer.writeAll("- ");
-                try writeTerminalSafe(&out.writer, alloc, model.model);
-                try out.writer.print(
-                    "  {d} tokens  ${d:.4}\n",
-                    .{ model.totals.total_tokens, model.totals.total_cost },
-                );
-            }
-        }
-        return try out.toOwnedSlice();
-    }
-
-    pub fn renderJson(self: UsageSnapshot, alloc: Allocator) ![]u8 {
-        const report = self.report;
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-
-        try out.writer.writeAll("{\"kind\":\"usage\",\"schema_version\":1,\"period\":");
-        try std.json.Stringify.value(report.scope.cliValue() orelse "session", .{}, &out.writer);
-        try out.writer.print(
-            ",\"snapshot_time_ms\":{d},\"window_start_ms\":{d},\"coverage\":{{\"status\":",
-            .{ report.snapshot_time_ms, report.window_start_ms },
-        );
-        try std.json.Stringify.value(@tagName(report.coverage), .{}, &out.writer);
-        try out.writer.writeAll(",\"started_at_ms\":");
-        if (report.coverage_started_at_ms) |started_at_ms| {
-            try out.writer.print("{d}", .{started_at_ms});
-        } else {
-            try out.writer.writeAll("null");
-        }
-        try out.writer.print(
-            ",\"full_window\":{}}},\"completeness\":",
-            .{report.coverage == .full},
-        );
-        try std.json.Stringify.value(@tagName(report.completeness), .{}, &out.writer);
-        try out.writer.writeAll(",\"totals\":");
-        if (report.totals) |totals| {
-            try writeUsageTotalsJson(&out.writer, totals);
-        } else {
-            try out.writer.writeAll("null");
-        }
-        try out.writer.writeAll(",\"models\":[");
-        for (report.models, 0..) |model, index| {
-            if (index > 0) try out.writer.writeByte(',');
-            try out.writer.writeAll("{\"model\":");
-            try std.json.Stringify.value(model.model, .{}, &out.writer);
-            try out.writer.writeAll(",\"totals\":");
-            try writeUsageTotalsJson(&out.writer, model.totals);
-            try out.writer.writeByte('}');
-        }
-        try out.writer.writeAll("]}");
-        return try out.toOwnedSlice();
-    }
-};
-
-fn writeUsageTotalsJson(
-    writer: *std.Io.Writer,
-    totals: usage_report.Totals,
-) !void {
-    try writer.print(
-        "{{\"total_tokens\":{d},\"input_tokens\":{d},\"output_tokens\":{d},\"cache_read_tokens\":{d},\"cache_write_tokens\":{d},\"reasoning_tokens\":",
-        .{
-            totals.total_tokens,
-            totals.input_tokens,
-            totals.output_tokens,
-            totals.cache_read_tokens,
-            totals.cache_write_tokens,
-        },
-    );
-    if (totals.reasoning_tokens) |reasoning| {
-        try writer.print("{d}", .{reasoning});
-    } else {
-        try writer.writeAll("null");
-    }
-    try writer.writeAll(",\"request_count\":");
-    if (totals.request_count) |requests| {
-        try writer.print("{d}", .{requests});
-    } else {
-        try writer.writeAll("null");
-    }
-    try writer.print(",\"spend\":{d}}}", .{totals.total_cost});
-}
 
 pub fn workspaceErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
@@ -3254,56 +3105,6 @@ test "workspace text snapshot terminal-encodes paths" {
     try std.testing.expect(std.mem.findScalar(u8, output, '\r') == null);
 }
 
-test "usage text and JSON render the same optional and ordered facts" {
-    const alloc = std.testing.allocator;
-    var models = [_]usage_report.ModelUsage{.{
-        .model = @constCast("provider/model"),
-        .totals = .{
-            .total_tokens = 12,
-            .input_tokens = 10,
-            .output_tokens = 2,
-            .cache_read_tokens = 3,
-            .cache_write_tokens = 1,
-            .reasoning_tokens = null,
-            .request_count = 1,
-            .total_cost = 0.25,
-        },
-    }};
-    const report = usage_report.Snapshot{
-        .scope = .days_7,
-        .snapshot_time_ms = 200,
-        .window_start_ms = 100,
-        .coverage_started_at_ms = 150,
-        .coverage = .partial,
-        .completeness = .complete,
-        .totals = models[0].totals,
-        .models = &models,
-    };
-    const snapshot = UsageSnapshot{ .report = &report };
-
-    const text = try snapshot.render(alloc, .text);
-    defer alloc.free(text);
-    try std.testing.expect(std.mem.find(u8, text, "Total tokens  12") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Reasoning") == null);
-    try std.testing.expect(std.mem.find(u8, text, "provider/model") != null);
-
-    const json = try snapshot.render(alloc, .json);
-    defer alloc.free(json);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings(
-        "7d",
-        parsed.value.object.get("period").?.string,
-    );
-    try std.testing.expect(
-        parsed.value.object.get("totals").?.object.get("reasoning_tokens").? == .null,
-    );
-    try std.testing.expectEqualStrings(
-        "provider/model",
-        parsed.value.object.get("models").?.array.items[0].object.get("model").?.string,
-    );
-}
-
 pub const SlackSnapshot = struct {
     action: []const u8,
     installed: bool,
@@ -3331,7 +3132,7 @@ pub const SlackSnapshot = struct {
                     const epoch: std.time.epoch.EpochSeconds = .{ .secs = @intCast(@divFloor(expiry, std.time.ms_per_s)) };
                     const day = epoch.getDaySeconds();
                     try out.writer.print("Access expires on {s} at {d:0>2}:{d:0>2} UTC.\n", .{
-                        usage_report.formatUtcDate(&date_buf, expiry),
+                        usage_mod.report.formatUtcDate(&date_buf, expiry),
                         day.getHoursIntoDay(),
                         day.getMinutesIntoHour(),
                     });

@@ -103,6 +103,9 @@ pub const Request = struct {
     prompt_excerpt: []const u8,
     cancel_flag: *std.atomic.Value(bool),
     timeout_ms: u32 = default_timeout_ms,
+    /// The session's usage, which records the title call like any other
+    /// billed call. Null records nothing.
+    usage: ?*session.usage_owner.Owner = null,
 };
 
 /// Why a title generation attempt did not install a generated title. Static
@@ -182,11 +185,7 @@ pub fn run(alloc: Allocator, request: Request) !Outcome {
             .cancel_flag = request.cancel_flag,
             .provider_attempt_owner = .transport,
         },
-        // Cosmetic side calls stay out of the session usage ledger: a title
-        // call without generation metadata would otherwise degrade the
-        // session's billing completeness and inflate its token totals.
-        null,
-        alloc,
+        request.usage,
     ) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (request.cancel_flag.load(.seq_cst)) return .{ .unavailable = .{ .reason = .cancelled } };
@@ -235,6 +234,8 @@ pub const Task = struct {
     account_id: ?[]u8 = null,
     credential_source: ?types.CredentialSource = null,
     stream_provider: stream_provider.Provider,
+    /// Borrowed; the surface keeps it alive until the task is destroyed.
+    usage: ?*session.usage_owner.Owner = null,
     title: ?[]u8 = null,
     failure: ?anyerror = null,
     started_at_ms: i64 = 0,
@@ -253,6 +254,7 @@ pub const Task = struct {
         account_id: ?[]const u8 = null,
         credential_source: ?types.CredentialSource = null,
         stream_provider: stream_provider.Provider,
+        usage: ?*session.usage_owner.Owner = null,
     };
 
     /// Copies every input; the task owns its copies. Uses c_allocator because
@@ -282,6 +284,7 @@ pub const Task = struct {
             .account_id = account_id,
             .credential_source = init.credential_source,
             .stream_provider = init.stream_provider,
+            .usage = init.usage,
         };
         return task;
     }
@@ -346,6 +349,7 @@ pub const Task = struct {
             .session_id = self.session_id,
             .prompt_excerpt = self.prompt_excerpt,
             .cancel_flag = &self.cancel_requested,
+            .usage = self.usage,
         }) catch |err| {
             self.failure = err;
             self.status = .unavailable;
