@@ -371,10 +371,9 @@ if (childMode) {
   const agent = createFxAgent(agentOptions(process.argv[7] === "leased" ? await leasedAt(dir) : await durabilityAt(dir)));
   const session = agent.session();
   void session.prompt(`use ${tool}`, { messageId: "crash-turn" }).result.catch(() => {});
+  // A call starts only after its record lands, so the crash comes the moment
+  // the tool runs.
   await gates.get(tool).started;
-  // A safe call starts before its record lands: wait for it, so the crash
-  // comes after the log holds the call.
-  await agent[Symbol.for("libfx.durableInternals")].settled(session.id);
   console.log(JSON.stringify({ sessionId: session.id }));
   await new Promise(() => {});
 }
@@ -1171,6 +1170,21 @@ test("a session object's model and instructions reach its model requests, over t
   assert.throws(() => agent.session(first.id, { model: 5 }), /^TypeError: session model must be a model id or a model object$/);
   assert.throws(() => agent.session(first.id, { instructions: 5 }), /^TypeError: instructions must be a string or an array of strings$/);
   await agent.close();
+});
+
+test("a tool that stops being idempotent changes the tools a checkpoint names", async () => {
+  const durability = await durabilityFor();
+  const first = createFxAgent(agentOptions(durability));
+  const session = first.session();
+  assert.equal((await session.prompt("hello").result).stopReason, "end_turn");
+  await first.close();
+
+  const mismatches = [];
+  const onEvent = (event) => { if (event.type === "checkpoint.mismatch") mismatches.push(event.changed); };
+  const other = createFxAgent(agentOptions(durability, { tools: [{ ...lookup, idempotent: false }, send], onEvent }));
+  assert.equal((await other.session(session.id).prompt("lookup no longer reruns").result).stopReason, "end_turn");
+  await other.close();
+  assert.deepEqual(mismatches, [["toolSchemaHash"]]);
 });
 
 test("a checkpoint names the libfx, tools and model that saved it, and a resume with others hears so", async () => {

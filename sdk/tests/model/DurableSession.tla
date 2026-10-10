@@ -228,27 +228,20 @@ Announce(w) ==
     /\ UNCHANGED <<epoch, frozen, freezes, froze, seen>>
     /\ act' = [name |-> "Announce", w |-> w]
 
-\* The model asks for the tool. A call with effects starts only once its
-\* intent is in the chain; a safe one starts at once, its intent behind it.
+\* The model asks for the tool. The call starts only once its intent is in
+\* the chain, a safe one included: after a crash, only a recorded intent
+\* lets it run again.
 Model1(w) ==
     /\ pc[w] = "model1"
     /\ ~frozen[w]
-    /\ IF Tool = "send"
-          THEN IF Heads(w)
-                  THEN /\ progress' = "intent"
-                       /\ runs' = runs + 1
-                       /\ pc' = [pc EXCEPT ![w] = "tool"]
-                       /\ ui' = Append(ui, Line(w))
-                  ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
-                       /\ MaybeLine(w)
-                       /\ UNCHANGED <<progress, runs>>
-          ELSE /\ runs' = runs + 1
+    /\ IF Heads(w)
+          THEN /\ progress' = "intent"
+               /\ runs' = runs + 1
+               /\ pc' = [pc EXCEPT ![w] = "tool"]
                /\ ui' = Append(ui, Line(w))
-               /\ IF Heads(w)
-                     THEN /\ progress' = "intent"
-                          /\ pc' = [pc EXCEPT ![w] = "tool"]
-                     ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
-                          /\ UNCHANGED progress
+          ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
+               /\ MaybeLine(w)
+               /\ UNCHANGED <<progress, runs>>
     /\ chain' = IF Heads(w) THEN chain + 1 ELSE chain
     /\ cutoffs' = IF Heads(w) THEN 0 ELSE cutoffs
     /\ UNCHANGED <<epoch, frozen, lease, freezes, froze, seen>>
@@ -379,8 +372,8 @@ EffectsAtMostOnce == Tool = "send" => runs <= 1
 \* delivery after that does not run it again.
 HandoffsBounded == cutoffs <= MaxCutoffs
 
-\* A call with effects starts only after its intent counts in the chain.
-EffectsAfterIntent == Tool = "send" /\ runs > 0 => progress # "start"
+\* A call starts only after its intent counts in the chain.
+CallAfterIntent == runs > 0 => progress # "start"
 
 \* Only the chain's head ends the turn.
 DoneByHead == progress = "done" => \E w \in Workers : pc[w] = "done"
