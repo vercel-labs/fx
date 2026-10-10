@@ -75,6 +75,7 @@ pub const State = struct {
     tool_identities: ?[]u8 = null,
     moved_files: ?[]u8 = null,
     compaction_records: ?[]u8 = null,
+    v1_source: ?[]u8 = null,
     /// Every child spawned in this session, in first-spawn order (D22).
     children: std.ArrayList(Child) = .empty,
     last_compaction_seq: ?u64 = null,
@@ -197,7 +198,7 @@ pub const State = struct {
     }
 };
 
-const setting_fields = .{ "prefs", "title", "permissions", "usage", "workspace", "language", "client_prompt", "tool_identities", "moved_files", "compaction_records" };
+const setting_fields = .{ "prefs", "title", "permissions", "usage", "workspace", "language", "client_prompt", "tool_identities", "moved_files", "compaction_records", "v1_source" };
 
 fn optionalEql(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null or b == null) return a == null and b == null;

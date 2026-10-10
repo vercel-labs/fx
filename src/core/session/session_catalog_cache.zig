@@ -510,12 +510,17 @@ pub const ActionableSessionCatalog = struct {
     /// in this listing. Such rows are never cached, so every listing observes
     /// them afresh.
     unreplayable_ids: std.ArrayList([]u8) = .empty,
+    /// Owned ids of the sessions counted in `skipped_invalid`, which v2's
+    /// listing still shows until they are converted or refused (D59).
+    invalid_ids: std.ArrayList([]u8) = .empty,
 
     pub fn deinit(self: *ActionableSessionCatalog, alloc: Allocator) void {
         for (self.summaries.items) |*summary| summary.deinit(alloc);
         self.summaries.deinit(alloc);
         for (self.unreplayable_ids.items) |id| alloc.free(id);
         self.unreplayable_ids.deinit(alloc);
+        for (self.invalid_ids.items) |id| alloc.free(id);
+        self.invalid_ids.deinit(alloc);
         self.* = undefined;
     }
 
@@ -549,6 +554,8 @@ const CatalogWorker = struct {
     read: *CatalogRead,
     alloc: Allocator,
     entries: std.ArrayList(Entry) = .empty,
+    /// Owned ids this worker counted in `skipped_invalid`.
+    invalid: std.ArrayList([]u8) = .empty,
     failure: ?anyerror = null,
 
     fn run(self: *CatalogWorker) void {
@@ -587,6 +594,8 @@ const CatalogWorker = struct {
                     }
                     session_discovery.logDiscoveryError(.read_only_list, id, null, null, err);
                     _ = self.read.skipped_invalid.fetchAdd(1, .monotonic);
+                    try self.invalid.ensureUnusedCapacity(self.alloc, 1);
+                    self.invalid.appendAssumeCapacity(try self.alloc.dupe(u8, id));
                     continue;
                 },
             };
@@ -661,6 +670,8 @@ pub fn listActionableCatalog(
     defer for (&workers) |*worker| {
         for (worker.entries.items) |*entry| entry.deinit(worker_alloc);
         worker.entries.deinit(worker_alloc);
+        for (worker.invalid.items) |id| worker_alloc.free(id);
+        worker.invalid.deinit(worker_alloc);
     };
     var threads: [workers.len - 1]?std.Thread = @splat(null);
     errdefer {
@@ -695,6 +706,11 @@ pub fn listActionableCatalog(
     }
     var catalog: ActionableSessionCatalog = .{ .skipped_invalid = read.skipped_invalid.load(.monotonic) };
     errdefer catalog.deinit(alloc);
+    for (workers) |worker| for (worker.invalid.items) |id| {
+        if (active_id) |active| if (std.mem.eql(u8, active, id)) continue;
+        try catalog.invalid_ids.ensureUnusedCapacity(alloc, 1);
+        catalog.invalid_ids.appendAssumeCapacity(try alloc.dupe(u8, id));
+    };
     var cacheable: usize = 0;
     for (entries.items) |entry| {
         if (stop_requested.load(.acquire)) return error.Cancelled;

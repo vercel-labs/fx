@@ -459,26 +459,40 @@ pub fn decodeConversationFrame(
     alloc: Allocator,
     bytes: []const u8,
 ) !DecodedConversationFrame {
+    var parsed: DecodedConversationFrame = .{ .arena = try alloc.create(std.heap.ArenaAllocator), .value = undefined };
+    errdefer alloc.destroy(parsed.arena);
+    parsed.arena.* = .init(alloc);
+    errdefer parsed.arena.deinit();
+    parsed.value = try decodeConversationFrameLeaky(parsed.arena.allocator(), bytes, .alloc_always);
+    return parsed;
+}
+
+/// As `decodeConversationFrame`, in `arena`. With `.alloc_if_needed` the
+/// result also borrows from `bytes`, which must then outlive it.
+pub fn decodeConversationFrameLeaky(
+    arena: Allocator,
+    bytes: []const u8,
+    allocate: std.json.AllocWhen,
+) error{ InvalidConversationFrame, OutOfMemory }!ConversationEnvelope {
     if (bytes.len == 0 or bytes.len > event_frame_max_bytes or bytes[bytes.len - 1] != '\n') {
         return error.InvalidConversationFrame;
     }
-    var parsed = std.json.parseFromSlice(ConversationEnvelope, alloc, bytes, .{
-        .allocate = .alloc_always,
+    const value = std.json.parseFromSliceLeaky(ConversationEnvelope, arena, bytes, .{
+        .allocate = allocate,
         .max_value_len = event_frame_max_bytes,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidConversationFrame,
     };
-    errdefer parsed.deinit();
-    if (!supportedConversationSchema(parsed.value.schema_version) or
-        parsed.value.seq == 0 or
-        parsed.value.timestamp_ms < 0)
+    if (!supportedConversationSchema(value.schema_version) or
+        value.seq == 0 or
+        value.timestamp_ms < 0)
     {
         return error.InvalidConversationFrame;
     }
-    validateConversationEventShape(parsed.value.event, parsed.value.schema_version) catch
+    validateConversationEventShape(value.event, value.schema_version) catch
         return error.InvalidConversationFrame;
-    return parsed;
+    return value;
 }
 
 /// Appends borrowed conversational events for one canonical history turn.

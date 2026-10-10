@@ -36,7 +36,8 @@ pub const Options = struct {
     /// A snapshot follows once this many bytes were appended since the last
     /// one (D7). A `compacted` line always gets one.
     snapshot_every_bytes: u64 = default_snapshot_every_bytes,
-    /// The index is rewritten with one line per id past this size.
+    /// The index is rewritten with one line per id past this size, once at
+    /// least half its lines are stale.
     index_compact_bytes: u64 = 1 << 20,
 };
 
@@ -211,6 +212,12 @@ pub const Session = struct {
     phase: Phase,
     /// Import only (D8): keep the original timestamp of each event.
     import_ts: ?u64 = null,
+    /// Import (D59): every batch waits framed in `batch`, behind line 1,
+    /// until `publishImport` stages them all with one write and one fsync.
+    import: bool = false,
+    /// Import only, under `mutex`: its `.tmp/{id}`, made for the first blob
+    /// or at the publish, which then makes it the session's folder.
+    staged: ?storage.Dir = null,
     /// `ts` of line 1: set by an import, else by the first publish or fork,
     /// or read back on resume.
     created_ms: ?u64 = null,
@@ -250,6 +257,7 @@ pub const Session = struct {
         session.mutex.lockUncancelable(io);
         defer session.mutex.unlock(io);
         if (session.phase != .held) return false;
+        if (session.import) return true;
         for (events) |event| {
             if (event == .turn_started) return false;
         }
@@ -323,7 +331,9 @@ pub const Session = struct {
             defer session.mutex.unlock(io);
             session.observe(.mutex_acquired);
             const was_held = session.phase == .held;
-            if (ts_ms) |ts| session.import_ts = ts;
+            // An import's batches keep their own times; a host's append
+            // after the publish, and the lines after it, take the clock.
+            session.import_ts = ts_ms;
             const last = try session.appendLocked(events, &sync_through);
             session.observe(.mutex_releasing);
             break :blk Appended{
@@ -356,7 +366,7 @@ pub const Session = struct {
         };
         const ts = session.timestamp();
         switch (session.phase) {
-            .held => {
+            .held => if (session.import) try session.holdImport(bodies, ts) else {
                 // Nothing exists on disk yet, so no blob can be referenced.
                 if (hasBlobRefs(bodies)) return error.InvalidTransition;
                 if (!hasTurnStart(bodies)) {
@@ -400,6 +410,66 @@ pub const Session = struct {
             try fold.apply(gpa, &session.state, 0, .{ .seq = 2 + session.held_lines + i, .offset = 0, .body = body });
         }
         session.held_lines += bodies.len;
+    }
+
+    /// Import only: frames a batch in `batch` behind line 1, which the first
+    /// batch frames, so each line's offset is its offset in the log, and
+    /// folds it. A blob it refers to must already be staged.
+    fn holdImport(session: *Session, bodies: []const schema.Body, ts: u64) AppendError!void {
+        const gpa = session.env.gpa;
+        if (session.bounds.items.len == 0) {
+            const created = session.created_ms orelse ts;
+            try session.frameMarked(1, created, .{ .session_created = session.identity.created() });
+            session.created_ms = created;
+        }
+        if (hasBlobRefs(bodies)) {
+            const dir = session.staged orelse return error.InvalidTransition;
+            try session.checkBlobRefsIn(dir, bodies);
+        }
+        const first: usize = session.bounds.items.len;
+        const kept_bytes = session.batch.items.len;
+        errdefer {
+            session.batch.shrinkRetainingCapacity(kept_bytes);
+            session.bounds.shrinkRetainingCapacity(first);
+        }
+        for (bodies, 0..) |body, i| try session.frameMarked(first + 1 + i, ts, body);
+        for (bodies, 0..) |body, i| {
+            try fold.apply(gpa, &session.state, 0, .{
+                .seq = first + 1 + i,
+                .offset = session.bounds.items[first + i - 1],
+                .body = body,
+            });
+        }
+        session.wrote(ts);
+    }
+
+    /// Import only (D59): writes every held line through the staged publish
+    /// (one write, one fsync of the log, one rename), then a snapshot once
+    /// the log is long enough, so the first resume reads little. The
+    /// session is then live and writable under its lock.
+    pub fn publishImport(session: *Session) AppendError!void {
+        const io = session.env.s.io;
+        session.mutex.lockUncancelable(io);
+        defer session.mutex.unlock(io);
+        if (!session.import or session.phase != .held or session.bounds.items.len < 2) return error.InvalidTransition;
+        // Nothing is visible; later calls name the cause (D40).
+        const live = session.stage(null) catch |err| {
+            session.phase = .{ .failed = null };
+            if (session.fault == null) session.fault = asIoFault(err);
+            return err;
+        };
+        session.phase = .{ .live = live };
+        session.written_seq.store(io, session.state.last_seq);
+        session.setSyncFile(live.log.file, session.state.last_seq);
+        try session.maybeSnapshot(&session.phase.live, &.{}, session.updated_ms);
+    }
+
+    /// Import only: whether the batches still wait for `publishImport`.
+    pub fn awaitsPublish(session: *Session) bool {
+        const io = session.env.s.io;
+        session.mutex.lockUncancelable(io);
+        defer session.mutex.unlock(io);
+        return session.import and session.phase == .held;
     }
 
     /// The first turn: stage the session in `.tmp/{id}`, make line 1
@@ -456,19 +526,11 @@ pub const Session = struct {
     fn stage(session: *Session, source_blobs: ?storage.Dir) AppendError!Live {
         const env = session.env;
         const s = env.s;
-        const id_ = session.identity.id;
         const tmp = s.ensureDir(env.root, ".tmp") catch |io_err| return storage.ioFault(io_err);
         defer s.closeDir(tmp);
-        s.makeDir(tmp, id_) catch |err| switch (err) {
-            // A leftover from a crashed attempt with the same id (an import).
-            error.AlreadyExists => {
-                s.deleteTree(tmp, id_) catch |io_err| return storage.ioFault(io_err);
-                s.makeDir(tmp, id_) catch |io_err| return storage.ioFault(io_err);
-            },
-            else => |io_err| return storage.ioFault(io_err),
-        };
-        session.observe(.made_tmp);
-        const dir = s.openDir(tmp, id_) catch |io_err| return storage.ioFault(io_err);
+        // An import that staged blobs already has its folder.
+        const dir = if (session.staged) |staged| staged else try session.makeStaging(tmp);
+        session.staged = null;
         errdefer s.closeDir(dir);
         {
             const blobs = s.ensureDir(dir, "blobs") catch |io_err| return storage.ioFault(io_err);
@@ -494,6 +556,36 @@ pub const Session = struct {
         s.syncDir(env.root) catch |io_err| return storage.ioFault(io_err);
         session.observe(.published);
         return .{ .dir = dir, .log = log, .lock = lock };
+    }
+
+    /// Makes and opens `.tmp/{id}`, clearing a crashed attempt's leftover.
+    fn makeStaging(session: *Session, tmp: storage.Dir) AppendError!storage.Dir {
+        const s = session.env.s;
+        const id_ = session.identity.id;
+        s.makeDir(tmp, id_) catch |err| switch (err) {
+            // A leftover from a crashed attempt with the same id (an import).
+            error.AlreadyExists => {
+                s.deleteTree(tmp, id_) catch |io_err| return storage.ioFault(io_err);
+                s.makeDir(tmp, id_) catch |io_err| return storage.ioFault(io_err);
+            },
+            else => |io_err| return storage.ioFault(io_err),
+        };
+        session.observe(.made_tmp);
+        return s.openDir(tmp, id_) catch |io_err| return storage.ioFault(io_err);
+    }
+
+    /// Import only, under `mutex`: the staged folder's `blobs`, made with
+    /// the folder on first use. The caller closes it.
+    fn stagedBlobs(session: *Session) AppendError!storage.Dir {
+        const s = session.env.s;
+        const staged = session.staged orelse blk: {
+            const tmp = s.ensureDir(session.env.root, ".tmp") catch |io_err| return storage.ioFault(io_err);
+            defer s.closeDir(tmp);
+            const made = try session.makeStaging(tmp);
+            session.staged = made;
+            break :blk made;
+        };
+        return s.ensureDir(staged, "blobs") catch |io_err| return storage.ioFault(io_err);
     }
 
     /// Hard-links every blob of a fork's source (D6), copying when a link
@@ -551,7 +643,8 @@ pub const Session = struct {
             defer session.mutex.unlock(io);
             switch (session.phase) {
                 .live => |live| break :blk s.openDir(live.dir, "blobs") catch |io_err| return storage.ioFault(io_err),
-                .held => return error.InvalidTransition,
+                // An import stages its blobs before its one publish (D59).
+                .held => if (session.import) break :blk try session.stagedBlobs() else return error.InvalidTransition,
                 .failed => return session.fault orelse error.Io,
                 .closed => return error.SessionClosed,
             }
@@ -594,8 +687,14 @@ pub const Session = struct {
     /// session (`tla/Fork.tla` `RefsExist`).
     fn checkBlobRefs(session: *Session, live: *Live, bodies: []const schema.Body) AppendError!void {
         if (!hasBlobRefs(bodies)) return;
+        try session.checkBlobRefsIn(live.dir, bodies);
+    }
+
+    /// As `checkBlobRefs`, in the session folder `folder`: the live one, or
+    /// an import's staged one.
+    fn checkBlobRefsIn(session: *Session, folder: storage.Dir, bodies: []const schema.Body) AppendError!void {
         const s = session.env.s;
-        const dir = s.openDir(live.dir, "blobs") catch |io_err| return storage.ioFault(io_err);
+        const dir = s.openDir(folder, "blobs") catch |io_err| return storage.ioFault(io_err);
         defer s.closeDir(dir);
         for (bodies) |body| for (body.blobRefs()) |hash| {
             if (!schema.validBlobHash(hash)) return error.InvalidTransition;
@@ -792,6 +891,10 @@ pub const Session = struct {
                 });
                 session.held.clearAndFree(session.env.gpa);
                 session.held_lines = 0;
+                // An unpublished import's staging stays for the next
+                // attempt's publish to clear.
+                if (session.staged) |staged| session.env.s.closeDir(staged);
+                session.staged = null;
                 session.phase = .closed;
             },
             .failed => |maybe_live| {
@@ -981,7 +1084,7 @@ fn needsSync(bodies: []const schema.Body) bool {
         // that cites them comes later in the log, which keeps a prefix (D50).
         .set => |s| switch (s.key) {
             .permissions, .usage, .moved_files => return true,
-            .prefs, .title, .workspace, .language, .client_prompt, .tool_identities, .compaction_records => {},
+            .prefs, .title, .workspace, .language, .client_prompt, .tool_identities, .compaction_records, .v1_source => {},
         },
         else => {},
     };
@@ -1001,6 +1104,8 @@ pub const NewOptions = struct {
     id: ?[]const u8 = null,
     /// Import only: the original creation time, stamped on line 1.
     created_ms: ?u64 = null,
+    /// Import only (D59): hold every batch until `publishImport`.
+    import: bool = false,
 };
 
 /// A new session in memory. Nothing touches the disk until the first turn.
@@ -1021,7 +1126,7 @@ pub fn openNew(env: *const Env, options: NewOptions) error{OutOfMemory}!*Session
     });
     errdefer identity.deinit(gpa);
     const session = try gpa.create(Session);
-    session.* = .{ .env = env, .identity = identity, .phase = .held, .created_ms = options.created_ms };
+    session.* = .{ .env = env, .identity = identity, .phase = .held, .created_ms = options.created_ms, .import = options.import };
     session.observe(.opened_new);
     return session;
 }
@@ -1795,6 +1900,18 @@ pub fn purgeTrashed(env: *const Env, id_: []const u8) DeleteError!void {
     defer s.closeDir(trash);
     s.deleteTree(trash, id_) catch |io_err| return storage.ioFault(io_err);
     env.observeCatalog(id_, .purged);
+}
+
+/// Removes `.tmp/{id}`, the staging an abandoned import left (D59); a
+/// missing one is nothing to do. Never touches a published session.
+pub fn discardStaging(env: *const Env, id_: []const u8) storage.IoFault!void {
+    const s = env.s;
+    const tmp = s.openDir(env.root, ".tmp") catch |err| return switch (err) {
+        error.NotFound => {},
+        else => |io_err| storage.ioFault(io_err),
+    };
+    defer s.closeDir(tmp);
+    s.deleteTree(tmp, id_) catch |io_err| return storage.ioFault(io_err);
 }
 
 /// Whether a session with this id is open for writing anywhere.

@@ -189,8 +189,12 @@ pub const InteractiveLaunch = struct {
     requested_resume: ?ResumeTarget = null,
     upgrade_relaunch: ?UpgradeRelaunch = null,
     modifiers: LaunchModifiers = .{},
+    /// Why the session the launch resumes could not be converted from v1
+    /// (D61), for the message the launch exits with. Owned.
+    resume_refusal: ?[]u8 = null,
 
     pub fn deinit(self: *InteractiveLaunch, alloc: Allocator) void {
+        if (self.resume_refusal) |reason| alloc.free(reason);
         if (self.requested_resume) |*target| target.deinit(alloc);
         if (self.upgrade_relaunch) |*relaunch| relaunch.deinit(alloc);
         self.modifiers.deinit(alloc);
@@ -1719,6 +1723,19 @@ fn runNonInteractiveWithDeps(
             }
         },
         .sessions => |rest| {
+            if (rest.len > 0 and std.mem.eql(u8, rest[0], "convert")) {
+                const format = parseSessionConvertArgs(rest[1..]) catch |err| {
+                    try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .sessions, "sessions", err, rest);
+                    return .handled_failure;
+                };
+                // It moves v1 sessions into the experimental store, where
+                // plain fx would no longer find them.
+                if (!sessions_v2) {
+                    try writeLookupFailure(alloc, deps, "sessions", error.SessionsV2Required, format);
+                    return .handled_failure;
+                }
+                return runSessionConvert(alloc, deps, format);
+            }
             const opts = parseSessionListArgs(rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .sessions, "sessions", err, rest);
                 return .handled_failure;
@@ -3174,6 +3191,51 @@ fn runSessionListV2(alloc: Allocator, deps: RunDeps, opts: SessionListOptions) !
     return writeSessionList(alloc, deps, page, opts);
 }
 
+fn parseSessionConvertArgs(args: []const [:0]const u8) !output_contracts.OutputFormat {
+    if (args.len == 0) return .text;
+    if (args.len == 1 and std.mem.eql(u8, args[0], "--json")) return .json;
+    return error.InvalidLocalSurfaceArgs;
+}
+
+/// Why `fx sessions convert` refuses without the v2 store switched on.
+const sessions_v2_required_message = "sessions convert moves v1 sessions into the experimental v2 store and needs --sessions-v2 or FX_SESSIONS_V2=1";
+
+/// `fx sessions convert`: converts every v1 session v2 does not hold yet,
+/// and fails when it skipped any (D61).
+fn runSessionConvert(alloc: Allocator, deps: RunDeps, format: output_contracts.OutputFormat) !RunResult {
+    // Each conversion is traced (`[convert]`), as an open's is.
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
+    debug_trace.configureFromEnv(alloc, workspace_root);
+    var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
+        try writeLookupFailure(alloc, deps, "sessions", session_adapter.commandError(err), format);
+        return .handled_failure;
+    };
+    defer store.deinit(alloc);
+    var report = session_adapter.convertAll(&store, alloc) catch |err| {
+        try writeLookupFailure(alloc, deps, "sessions", session_adapter.commandError(err), format);
+        return .handled_failure;
+    };
+    defer report.deinit(alloc);
+    const skipped = try alloc.alloc(output_contracts.SessionConvertSnapshot.Skipped, report.skipped.items.len);
+    defer alloc.free(skipped);
+    for (report.skipped.items, skipped) |from, *to| to.* = .{ .id = from.id, .code = from.code, .reason = from.reason };
+    const left_out = try alloc.alloc(output_contracts.SessionConvertSnapshot.LeftOut, report.left_out.items.len);
+    defer alloc.free(left_out);
+    for (report.left_out.items, left_out) |from, *to| to.* = .{
+        .id = from.id,
+        .member = from.file.member,
+        .file = from.file.file,
+        .bytes = from.file.bytes,
+        .limit = session_adapter.ConvertReport.file_limit_bytes,
+    };
+    const snapshot: output_contracts.SessionConvertSnapshot = .{ .converted = report.converted, .busy = report.busy, .unreadable = report.unreadable, .skipped = skipped, .left_out = left_out };
+    const text = try snapshot.render(alloc, format);
+    defer alloc.free(text);
+    try writeFormattedOutput(deps, text, format);
+    return if (skipped.len == 0) .handled_success else .handled_failure;
+}
+
 /// `fx session last|{id}` on v2, read without the session's lock (D37).
 fn runSessionDetailV2(
     alloc: Allocator,
@@ -3262,6 +3324,9 @@ fn writeLookupFailure(
         },
         error.SessionMigrationUnavailable => {
             try writeStderr(deps, "fx session: session migrate converts v1 sessions and is not available with sessions v2 yet\n");
+        },
+        error.SessionsV2Required => {
+            try writeStderr(deps, "fx sessions: " ++ sessions_v2_required_message ++ "\n");
         },
         error.InvalidSessionFormat,
         error.InvalidPermissionState,
@@ -3445,6 +3510,7 @@ fn lookupFailureMessage(err: anyerror) ?[]const u8 {
         error.NoReadableSessions => "saved sessions are unreadable; run `fx doctor` for recovery guidance",
         error.SessionNotFound => "record not found",
         error.SessionMigrationUnavailable => "session migrate converts v1 sessions and is not available with sessions v2 yet",
+        error.SessionsV2Required => sessions_v2_required_message,
         error.InvalidSessionFormat,
         error.InvalidPermissionState,
         error.PermissionStateTooLarge,
@@ -3557,6 +3623,21 @@ test "session lookup failures preserve supporting-state errors in the requested 
                 defer parsed.deinit();
                 try std.testing.expectEqualStrings(case.code, parsed.value.object.get("code").?.string);
             }
+        }
+    }
+}
+
+test "sessions convert without the v2 store names the switch it needs, in text and json" {
+    for ([_]output_contracts.OutputFormat{ .text, .json }) |format| {
+        var output = CaptureOutput.init(std.testing.allocator);
+        defer output.deinit();
+        try writeLookupFailure(std.testing.allocator, output.deps(), "sessions", error.SessionsV2Required, format);
+        const body = if (format == .json) output.stdout.written() else output.stderr.written();
+        try std.testing.expect(std.mem.find(u8, body, "--sessions-v2 or FX_SESSIONS_V2=1") != null);
+        if (format == .json) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("SessionsV2Required", parsed.value.object.get("code").?.string);
         }
     }
 }

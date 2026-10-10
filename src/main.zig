@@ -720,17 +720,21 @@ const App = struct {
         app.context_limits.applyCommandLine(launch.modifiers.context_limit_overrides);
         if (comptime host_profile.durable_sessions or host_profile.js_host_sessions) {
             if (app.requested_resume != null) {
-                if (launch.upgrade_relaunch != null) {
-                    try SessionAppRuntime.resumeRequestedSessionAfterUpgrade(
+                const resumed = if (launch.upgrade_relaunch != null)
+                    SessionAppRuntime.resumeRequestedSessionAfterUpgrade(
                         &app,
                         app_version,
                         build_update_channel,
                         launch.upgrade_relaunch.?.previous_revision orelse "",
                         build_revision,
-                    );
-                } else {
-                    try SessionAppRuntime.resumeRequestedSession(&app);
-                }
+                    )
+                else
+                    SessionAppRuntime.resumeRequestedSession(&app);
+                resumed catch |err| {
+                    // Why a v1 session could not be converted, for the exit message (D61).
+                    launch.resume_refusal = SessionAppRuntime.conversionRefusal(&app, alloc, err);
+                    return err;
+                };
                 SessionAppRuntime.syncTerminalTitle(&app);
             }
         }

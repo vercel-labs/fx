@@ -1535,6 +1535,37 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// The v2 store's notice that converting a v1 session is slow, as a
+        /// dim line (D61).
+        fn conversionNotice(context: ?*anyopaque, text: []const u8) void {
+            if (comptime !@hasDecl(App, "writeDomainNotice")) return;
+            const app: *App = @ptrCast(@alignCast(context.?));
+            app.writeDomainNotice(.{ .topic = "session", .tone = .information, .body = text }, true) catch |err|
+                debug_trace.logf("convert", "action=NoticeDropped err={s}", .{@errorName(err)});
+        }
+
+        /// The reason a v1 session the startup resume refused with `err`
+        /// can't be converted (D61), for the launch's exit message, or null.
+        /// Caller owns it.
+        pub fn conversionRefusal(app: *App, alloc: Allocator, err: anyerror) ?[]u8 {
+            if (err != error.InvalidSessionFormat) return null;
+            const store = &(app.session_persistence.v2_store orelse return null);
+            const problem = store.conversionProblem() orelse return null;
+            return alloc.dupe(u8, problem) catch null;
+        }
+
+        /// Says in a notice why a session v1 holds can't be converted (D61),
+        /// on an in-app resume that `err` refused.
+        fn noteConversionProblem(app: *App, store: *const session_adapter.Store, err: anyerror) void {
+            if (comptime !@hasDecl(App, "writeDomainNotice")) return;
+            if (err != error.InvalidSessionFormat) return;
+            const problem = store.conversionProblem() orelse return;
+            var buffer: [640]u8 = undefined;
+            const body = std.fmt.bufPrint(&buffer, "This session can't be converted (InvalidSessionFormat): {s}", .{problem}) catch problem;
+            app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = body }, true) catch |write_err|
+                debug_trace.logf("convert", "action=NoticeDropped err={s}", .{@errorName(write_err)});
+        }
+
         pub fn initializePersistence(
             app: *App,
             required: bool,
@@ -1546,6 +1577,7 @@ pub fn Runtime(comptime App: type) type {
                     if (required) return err;
                     return;
                 };
+                app.session_persistence.v2_store.?.notice = .{ .context = app, .emit = conversionNotice };
                 return;
             }
             var store = session_store.Store.init(
@@ -2057,6 +2089,8 @@ pub fn Runtime(comptime App: type) type {
                     .remembered => .last_opened,
                     .id => |session_id| .{ .id = session_id },
                 };
+                // A refusal's reason is the launch's exit message
+                // (`conversionRefusal`).
                 const v2 = try session_adapter.Session.resumeSession(app.alloc, v2_store, v2_target, app.workspace_root, .app);
                 try installResumedV2Session(app, v2, notice);
                 errdefer closeWritableSession(app);
@@ -2251,7 +2285,10 @@ pub fn Runtime(comptime App: type) type {
             if (app.session_persistence.v2_store) |*v2_store| {
                 // A session open in another fx shows as busy at once, as
                 // v1's picker does (D38).
-                const v2 = try session_adapter.Session.resumeSessionWithoutWaiting(app.alloc, v2_store, .{ .id = selected_id }, app.workspace_root, .app);
+                const v2 = session_adapter.Session.resumeSessionWithoutWaiting(app.alloc, v2_store, .{ .id = selected_id }, app.workspace_root, .app) catch |err| {
+                    noteConversionProblem(app, v2_store, err);
+                    return err;
+                };
                 var v2_owned = true;
                 errdefer if (v2_owned) v2.close();
                 try app.prepareLiveSessionResume();

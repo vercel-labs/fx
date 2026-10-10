@@ -124,9 +124,12 @@ pub fn decodeRecord(arena: std.mem.Allocator, line: []const u8) error{OutOfMemor
             .updated_ms = f.req(u64, "updated") catch return null,
             .turns = f.req(u64, "turns") catch return null,
         };
-        const opened = f.req([]const u64, "opened") catch return null;
-        if (opened.len != host_count) return null;
-        @memcpy(&summary.opened_ms, opened);
+        const opened = f.raw("opened") orelse return null;
+        summary.opened_ms = plainTimes(opened) orelse blk: {
+            const times = f.req([]const u64, "opened") catch return null;
+            if (times.len != host_count) return null;
+            break :blk times[0..host_count].*;
+        };
         return .{ .put = summary };
     }
     if (std.mem.eql(u8, op, "opened")) {
@@ -142,6 +145,22 @@ pub fn decodeRecord(arena: std.mem.Allocator, line: []const u8) error{OutOfMemor
     return null;
 }
 
+/// Pure: `opened` as `encodeRecord` writes it, `[t,t,...]` with one plain
+/// unsigned number per host, read without a second JSON parse. Null for
+/// anything else, which that parse then decides, so results never differ.
+fn plainTimes(raw: []const u8) ?[host_count]u64 {
+    if (raw.len < 2 or raw[0] != '[' or raw[raw.len - 1] != ']') return null;
+    var times: [host_count]u64 = undefined;
+    var it = std.mem.splitScalar(u8, raw[1 .. raw.len - 1], ',');
+    for (&times) |*time| {
+        const digits = it.next() orelse return null;
+        if (digits.len == 0 or digits.len > 19 or (digits.len > 1 and digits[0] == '0')) return null;
+        for (digits) |c| if (c < '0' or c > '9') return null;
+        time.* = std.fmt.parseInt(u64, digits, 10) catch return null;
+    }
+    return if (it.next() == null) times else null;
+}
+
 pub const Entry = struct {
     summary: Summary,
     deleted: bool,
@@ -154,9 +173,20 @@ pub const Index = struct {
     entries: std.StringArrayHashMapUnmanaged(Entry) = .empty,
     /// Lines that failed their checksum or did not parse.
     damaged_lines: u64 = 0,
+    /// Lines folded.
+    lines: u64 = 0,
 
     pub fn deinit(index: *Index) void {
         index.arena.deinit();
+    }
+
+    /// Pure: about how large the index is with one line per id, from the
+    /// `folded_bytes` it was folded from and the share of its lines that
+    /// are still the newest of their id.
+    pub fn liveBytes(index: *const Index, folded_bytes: usize) usize {
+        if (index.lines == 0) return 0;
+        // At most `folded_bytes`, so the cast holds.
+        return @intCast(@as(u128, folded_bytes) * @min(index.entries.count(), index.lines) / index.lines);
     }
 
     /// Pure: folds index bytes. A bad line is counted and skipped; a torn
@@ -171,6 +201,7 @@ pub const Index = struct {
                 index.damaged_lines += 1;
                 continue;
             };
+            index.lines += 1;
             try index.apply(record);
         }
         return index;
@@ -256,6 +287,12 @@ pub const Rebuilt = struct { sessions: u64, swept: u64 };
 pub const IndexLock = struct {
     mutex: std.Io.Mutex = .init,
     file: ?storage.File = null,
+    /// An append folds the index to see whether to rewrite it only once it
+    /// is twice this: its size with one line per id as this manager last
+    /// folded or rewrote it, or its whole size when that fold found it too
+    /// live to rewrite; 0 until then. So each fold is paid for by as many
+    /// appended bytes.
+    baseline_bytes: std.atomic.Value(usize) = .init(0),
 
     pub fn close(lock: *IndexLock, s: storage.Storage) void {
         if (lock.file) |file| s.closeFile(file);
@@ -286,6 +323,7 @@ pub const Catalog = struct {
         defer gpa.free(bytes);
         var index = try Index.fold(gpa, bytes);
         errdefer index.deinit();
+        cat.lock.baseline_bytes.store(index.liveBytes(bytes.len), .monotonic);
         if (index.damaged_lines > 0) {
             const lock = try cat.acquireIndexLock();
             defer cat.releaseIndexLock(lock);
@@ -304,16 +342,12 @@ pub const Catalog = struct {
         var page: Page = .{ .arena = .init(gpa), .items = &.{}, .next = null };
         errdefer page.deinit();
         const arena = page.arena.allocator();
-        const candidates = try cat.sorted(arena, &index, filter);
-        var start: usize = 0;
-        if (cursor) |c| {
-            while (start < candidates.len and !isAfter(candidates[start], c)) start += 1;
-        }
+        const candidates = try sorted(arena, &index, filter, cursor);
         var items: std.ArrayList(Summary) = .empty;
-        var i = start;
+        var i: usize = 0;
         while (i < candidates.len and items.items.len < limit) : (i += 1) {
             if (!try cat.healIfGone(candidates[i].id)) continue;
-            try items.append(arena, try copySummary(arena, candidates[i]));
+            try items.append(arena, try copySummary(arena, candidates[i].*));
         }
         if (i < candidates.len and items.items.len == limit) {
             const last = items.items[items.items.len - 1];
@@ -449,13 +483,16 @@ pub const Catalog = struct {
         const end = log_mod.lastLineEnd(s, file, len) catch |io_err| return storage.ioFault(io_err);
         if (end != len) s.setLength(file, end) catch |io_err| return storage.ioFault(io_err);
         s.writeAt(file, line.items, end) catch |io_err| return storage.ioFault(io_err);
-        if (end + line.items.len > env.options.index_compact_bytes) {
-            const bytes = try cat.readIndex(gpa);
-            defer gpa.free(bytes);
-            var index = try Index.fold(gpa, bytes);
-            defer index.deinit();
-            try cat.writeFresh(&index);
-        }
+        const size = end + line.items.len;
+        if (size <= env.options.index_compact_bytes or size <= 2 * cat.lock.baseline_bytes.load(.monotonic)) return;
+        const bytes = try cat.readIndex(gpa);
+        defer gpa.free(bytes);
+        var index = try Index.fold(gpa, bytes);
+        defer index.deinit();
+        // Rewritten once at least half its lines are stale; otherwise looked
+        // at again only once it has doubled, so each fold is paid for by as
+        // many appended bytes and a live index is not rewritten every time.
+        if (bytes.len >= 2 * index.liveBytes(bytes.len)) try cat.writeFresh(&index) else cat.lock.baseline_bytes.store(bytes.len, .monotonic);
     }
 
     /// Replaces the index with one line per id, atomically: a temporary
@@ -487,6 +524,7 @@ pub const Catalog = struct {
         if (bytes.items.len > 0) s.writeAt(file, bytes.items, 0) catch |io_err| return storage.ioFault(io_err);
         s.sync(file) catch |io_err| return storage.ioFault(io_err);
         s.rename(env.root, index_tmp_name, env.root, index_name) catch |io_err| return storage.ioFault(io_err);
+        cat.lock.baseline_bytes.store(bytes.items.len, .monotonic);
         s.syncDir(env.root) catch |io_err| return storage.ioFault(io_err);
     }
 
@@ -557,20 +595,22 @@ pub const Catalog = struct {
         return false;
     }
 
-    fn sorted(cat: Catalog, arena: std.mem.Allocator, index: *const Index, filter: Filter) Error![]Summary {
-        _ = cat;
-        var out: std.ArrayList(Summary) = .empty;
-        var it = index.entries.iterator();
-        while (it.next()) |kv| {
-            const entry = kv.value_ptr;
+    /// The live roots `filter` keeps that follow `cursor`, newest first,
+    /// pointing into `index`.
+    fn sorted(arena: std.mem.Allocator, index: *const Index, filter: Filter, cursor: ?Cursor) error{OutOfMemory}![]const *const Summary {
+        var out: std.ArrayList(*const Summary) = .empty;
+        for (index.entries.values()) |*entry| {
             if (entry.deleted or entry.summary.role != .root) continue;
             switch (filter) {
                 .all => {},
                 .workspace => |w| if (!std.mem.eql(u8, entry.summary.workspace, w)) continue,
             }
-            try out.append(arena, entry.summary);
+            if (cursor) |c| if (!isAfter(entry.summary, c)) continue;
+            try out.append(arena, &entry.summary);
         }
-        std.mem.sort(Summary, out.items, {}, newerFirst);
+        // Ids are unique, so the order is total: no stable sort, which
+        // moves whole summaries, is needed.
+        std.mem.sortUnstable(*const Summary, out.items, {}, newerFirst);
         return out.items;
     }
 
@@ -614,7 +654,7 @@ fn nowMs(env: *const session_mod.Env) u64 {
     return std.math.cast(u64, std.Io.Timestamp.now(env.s.io, .real).toMilliseconds()) orelse 0;
 }
 
-fn newerFirst(_: void, a: Summary, b: Summary) bool {
+fn newerFirst(_: void, a: *const Summary, b: *const Summary) bool {
     if (a.updated_ms != b.updated_ms) return a.updated_ms > b.updated_ms;
     return std.mem.lessThan(u8, a.id, b.id);
 }
@@ -714,6 +754,37 @@ test "the fold keeps the newest put, merges open times, and a tombstone is final
     var damaged = try Index.fold(testing.allocator, out.items);
     defer damaged.deinit();
     try testing.expectEqual(@as(u64, 1), damaged.damaged_lines);
+}
+
+test "open times decode without a second parse as written, and any other spelling as JSON" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqual([host_count]u64{ 1791248460854, 0, 7, 0, 0 }, plainTimes("[1791248460854,0,7,0,0]").?);
+    for ([_][]const u8{ "[1,0,0,0]", "[1,0,0,0,0,0]", "[01,0,0,0,0]", "[1, 0,0,0,0]", "[-1,0,0,0,0]", "[1,0,0,0,]", "[]", "1" }) |raw| {
+        try testing.expect(plainTimes(raw) == null);
+    }
+    // A spelling this module never writes still decodes, through JSON.
+    var out: std.ArrayList(u8) = .empty;
+    try log_mod.appendFramed(a, &out, "{\"op\":\"put\",\"id\":\"s1\",\"role\":\"root\",\"host\":\"app\",\"workspace\":\"/w\",\"created\":1,\"updated\":2,\"turns\":1,\"opened\":[3, 0, 0, 0, 9]");
+    const put = (try decodeRecord(a, out.items)).?.put;
+    try testing.expectEqual([host_count]u64{ 3, 0, 0, 0, 9 }, put.opened_ms);
+}
+
+test "the live size is the share of folded lines still the newest of their id" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var out: std.ArrayList(u8) = .empty;
+    for (0..3) |_| try encodeRecord(a, &out, .{ .put = sample("s1", 1) });
+    try encodeRecord(a, &out, .{ .put = sample("s2", 1) });
+    var index = try Index.fold(testing.allocator, out.items);
+    defer index.deinit();
+    try testing.expectEqual(@as(u64, 4), index.lines);
+    try testing.expectEqual(out.items.len / 2, index.liveBytes(out.items.len));
+    var empty = try Index.fold(testing.allocator, "");
+    defer empty.deinit();
+    try testing.expectEqual(@as(usize, 0), empty.liveBytes(0));
 }
 
 const catalog_model_tests = struct {

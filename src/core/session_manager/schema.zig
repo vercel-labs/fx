@@ -106,8 +106,9 @@ pub const Outcome = enum { ok, failed, cancelled, interrupted, lost };
 /// side folder: its value names the blob that maps old handles to blobs,
 /// and its line lists every moved blob (D47). `compaction_records` names
 /// the blob that maps fx's compactor record names to blobs, and its line
-/// lists the map and the records it adds (D50).
-pub const SetKey = enum { prefs, title, permissions, usage, workspace, language, client_prompt, tool_identities, moved_files, compaction_records };
+/// lists the map and the records it adds (D50). `v1_source` is fx's record
+/// of the v1 session a converted one was copied from (D60).
+pub const SetKey = enum { prefs, title, permissions, usage, workspace, language, client_prompt, tool_identities, moved_files, compaction_records, v1_source };
 
 pub const ForkOrigin = struct { id: []const u8, seq: u64 };
 

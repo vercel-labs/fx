@@ -208,12 +208,13 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .sessions,
         .token = "sessions",
-        .usage = "sessions [--all] [--limit <1-100>] [--cursor <cursor>] [--json]",
+        .usage = "sessions [--all] [--limit <1-100>] [--cursor <cursor>] [--json] | sessions convert [--json]",
         .summary = "List saved sessions for the current workspace",
         .options = &.{
             .{ .flag = "--all", .description = "List saved sessions across every workspace in this profile" },
             .{ .flag = "--limit <1-100>", .description = "Set the maximum sessions returned per page" },
             .{ .flag = "--cursor <cursor>", .description = "Continue from a prior sessions result" },
+            .{ .flag = "convert", .description = "Convert every session saved in the previous format" },
             json_option,
         },
     },

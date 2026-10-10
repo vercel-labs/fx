@@ -1,5 +1,6 @@
 const std = @import("std");
 const domain = @import("domain.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const session_codec = @import("../session/session_codec.zig");
@@ -15,7 +16,7 @@ const lock_file = "children.lock";
 const owner_marker_file = "owner.json";
 const legacy_control_file = "control.json";
 const lock_deadline_ms: u64 = 2_000;
-const max_state_bytes: usize = 512 * 1024;
+pub const max_state_bytes: usize = 512 * 1024;
 pub const max_children: usize = 256;
 
 const PersistentIdentity = struct {
@@ -754,6 +755,44 @@ fn planLines(arena: Allocator, old: Registry, next: Registry) ![]session_adapter
     return lines.toOwnedSlice(arena);
 }
 
+/// The child lines that give a converted parent's v2 log the children
+/// of its v1 `registry` (D22, D56), so `registryFromChildren` rebuilds the
+/// same registry. `has_log[i]` says whether child `i` was converted too:
+/// one that was not is recorded lost (D33, D61), and work still open at
+/// v1's crash is interrupted, as v1 drops it on restart. A child that never
+/// had work has no line to write, which is traced.
+pub fn v1ImportLines(arena: Allocator, registry: Registry, has_log: []const bool) ![]session_adapter.ChildLine {
+    std.debug.assert(has_log.len == registry.children.len);
+    var lines: std.ArrayList(session_adapter.ChildLine) = .empty;
+    for (registry.children, has_log) |child, logged| {
+        const work_id = if (child.active) |active| active.id else child.last_work_id orelse {
+            debug_trace.logf("convert", "action=ChildWithoutWork session={s} child={s}", .{ registry.parent_id, child.id });
+            continue;
+        };
+        const fingerprint_bytes = if (child.active) |active| active.request_fingerprint else child.last_request_fingerprint orelse [_]u8{0} ** 32;
+        const fingerprint = try arena.dupe(u8, &std.fmt.bytesToHex(fingerprint_bytes, .lower));
+        const outcome: session_adapter.ChildOutcome = if (!logged) .lost else if (child.active != null) .interrupted else switch (child.last_outcome orelse .interrupted) {
+            .completed => .ok,
+            .failed => .failed,
+            .cancelled => .cancelled,
+            .interrupted, .lost => .interrupted,
+        };
+        const failure = if (outcome == .failed) if (child.last_failure) |value| value.view() else null else null;
+        try lines.append(arena, .{ .spawned = .{
+            .child = child.id,
+            .work_id = work_id,
+            .data = try stringifyAlloc(arena, SpawnData{ .agent = child.agentName(), .fingerprint = fingerprint }),
+        } });
+        try lines.append(arena, .{ .finished = .{
+            .child = child.id,
+            .work_id = work_id,
+            .outcome = outcome,
+            .data = if (failure) |text| try stringifyAlloc(arena, FinishData{ .failure = text }) else null,
+        } });
+    }
+    return lines.toOwnedSlice(arena);
+}
+
 fn findChild(registry: Registry, child_id: []const u8) ?Child {
     for (registry.children) |child| {
         if (std.mem.eql(u8, child.id, child_id)) return child;
@@ -950,7 +989,9 @@ fn renderActive(writer: *std.Io.Writer, active: ActiveWork) !void {
     );
 }
 
-fn parseRegistry(alloc: Allocator, bytes: []const u8, parent_id: []const u8) !Registry {
+/// A v1 registry from `children.json` bytes, as `Store.load` parses it;
+/// also read by the v1 converter. Caller owns it.
+pub fn parseRegistry(alloc: Allocator, bytes: []const u8, parent_id: []const u8) !Registry {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
     defer parsed.deinit();
     const root = try object(parsed.value);

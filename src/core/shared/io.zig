@@ -685,6 +685,24 @@ pub fn openVerifiedPrivateDirIfPresent(parent: *VerifiedDir, name: []const u8) !
     return .{ .dir = dir };
 }
 
+/// Opens an existing folder that need not be private: a real folder, never
+/// through a symlink, whatever its mode, as an old release left a profile's
+/// folders readable by others. Null when it is missing.
+pub fn openRealDirIfPresent(parent: *VerifiedDir, name: []const u8) !?VerifiedDir {
+    try validateRelativeLeaf(name);
+    var dir = parent.dir.openDir(getIo(), name, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        error.SymLinkLoop, error.NotDir => return error.DurablePathUnsafe,
+        else => return err,
+    };
+    errdefer dir.close(getIo());
+    if ((try dir.stat(getIo())).kind != .directory) return error.DurablePathUnsafe;
+    return .{ .dir = dir };
+}
+
 pub fn openOrCreateVerifiedPrivateDir(parent: *VerifiedDir, name: []const u8) !VerifiedDir {
     return openOrCreateVerifiedPrivateChild(parent.dir, name);
 }
@@ -1529,6 +1547,27 @@ test "caller-owned directory rejects unsafe private children" {
         error.DurablePathUnsafe,
         openOrCreateVerifiedPrivateDirFromDir(tmp.dir, "link"),
     );
+}
+
+test "a folder that need not be private opens whatever its mode, but never through a symlink" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var parent: VerifiedDir = .{ .dir = try tmp.dir.openDir(getIo(), ".", .{ .iterate = true, .follow_symlinks = false }) };
+    defer parent.close();
+
+    try tmp.dir.createDir(getIo(), "readable", .fromMode(0o755));
+    try tmp.dir.setFilePermissions(getIo(), "readable", .fromMode(0o755), .{});
+    var readable = (try openRealDirIfPresent(&parent, "readable")).?;
+    readable.close();
+    try std.testing.expect((try openRealDirIfPresent(&parent, "missing")) == null);
+
+    try tmp.dir.writeFile(getIo(), .{ .sub_path = "file", .data = "not a directory" });
+    try std.testing.expectError(error.DurablePathUnsafe, openRealDirIfPresent(&parent, "file"));
+    tmp.dir.symLink(getIo(), "readable", "link", .{ .is_directory = true }) catch |err| {
+        if (err == error.AccessDenied) return error.SkipZigTest;
+        return err;
+    };
+    try std.testing.expectError(error.DurablePathUnsafe, openRealDirIfPresent(&parent, "link"));
 }
 
 test "timed advisory lock returns busy after deadline" {

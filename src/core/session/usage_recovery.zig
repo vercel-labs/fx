@@ -129,8 +129,9 @@ const Collected = struct {
 };
 
 /// Whether a v1 session's durable usage checkpoint is at least as new as
-/// what its marker protects, from the files' modification times.
-fn checkpointIsNewer(
+/// what its marker protects, from the files' modification times. The v1
+/// converter carries this verdict to the v2 marker (D20).
+pub fn checkpointIsNewer(
     usage: session_usage.Snapshot,
     updated_at_ms: i64,
     checkpoint_modified_ns: ?i128,

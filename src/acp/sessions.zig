@@ -16,7 +16,6 @@ const session_codec = @import("../core/session/session_codec.zig");
 const session_display_metadata = @import("../core/session/session_display_metadata.zig");
 const session_store = @import("../core/session/session_store.zig");
 const session_adapter = @import("../core/session/session_adapter.zig");
-const session_summary_codec = @import("../core/session/session_summary_codec.zig");
 const session_store_paths = @import("../core/session/session_store_paths.zig");
 const session_child_store = @import("../core/session/session_child_store.zig");
 const legacy_background_migration = @import("../core/session/legacy_background_migration.zig");
@@ -949,6 +948,10 @@ fn handleRestoreSession(
         .message = "Session store not available",
     });
     if (backend == .v2) {
+        // Converting a v1 session can be slow; the client is told why (D61).
+        var notice: ConversionNotice = .{ .state = state, .alloc = alloc, .session_id = session_id };
+        backend.v2.notice = .{ .context = &notice, .emit = ConversionNotice.emit };
+        defer backend.v2.notice = null;
         v2 = session_adapter.Session.resumeSession(alloc, backend.v2, .{ .id = session_id }, workspace_root, .acp) catch |err|
             return handleLoadFailure(state, alloc, msg, err);
         v2_resumed = v2.?.durableState(alloc, workspace_root) catch |err|
@@ -1582,6 +1585,20 @@ test "a v2 storage fault reads as its cause, and other errors have no such messa
     try std.testing.expect(v2StorageFaultMessage("Session could not be loaded", error.SessionBusy) == null);
 }
 
+/// A v2 store's notice that converting a v1 session is slow, sent to the
+/// client as the session's agent text, as fx's other notices are.
+const ConversionNotice = struct {
+    state: *server.ServerState,
+    alloc: Allocator,
+    session_id: []const u8,
+
+    fn emit(context: ?*anyopaque, text: []const u8) void {
+        const notice: *ConversionNotice = @ptrCast(@alignCast(context.?));
+        sendAgentHistoryChunk(notice.state, notice.alloc, notice.session_id, text) catch |err|
+            debug_trace.logf("acp", "event=conversion_notice_dropped err={s}", .{@errorName(err)});
+    }
+};
+
 fn handleLoadFailure(
     state: *server.ServerState,
     alloc: Allocator,
@@ -1633,6 +1650,12 @@ fn handleLoadFailure(
         err == error.SessionPathUnsafe or
         err == error.DurablePathUnsafe)
     {
+        // A v1 session that can't be converted says why (D61).
+        if (state.sessions_v2) |*store| if (err == error.InvalidSessionFormat) if (store.conversionProblem()) |problem| {
+            const message = try std.fmt.allocPrint(alloc, "Session could not be loaded (InvalidSessionFormat): {s}", .{problem});
+            defer alloc.free(message);
+            return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = message });
+        };
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.internal_error,
             .message = "Session could not be loaded",
@@ -1690,37 +1713,15 @@ fn listV2Sessions(
     v2_store: *session_adapter.Store,
     params: ListSessionsParams,
 ) !void {
-    var cancel = std.atomic.Value(bool).init(false);
-    var summaries = session_adapter.listSummaries(v2_store, alloc, null, &cancel) catch |err| {
+    // Matched as v1 matches it: exactly, after trailing slashes.
+    const cwd = if (params.cwd) |value| session_store_paths.normalizeWorkspaceRoot(value) else null;
+    var page = session_adapter.listPage(v2_store, alloc, cwd, params.continuation, session_store.session_list_default_limit) catch |err| {
         debug_trace.logf("acp", "session operation=list outcome=failed backend=v2 error={s}", .{@errorName(err)});
         try state.writer.writeResponse(alloc, msg.id, "{\"sessions\":[]}");
         return;
     };
-    defer {
-        for (summaries.items) |*summary| summary.deinit(alloc);
-        summaries.deinit(alloc);
-    }
-    session_summary_codec.sortSummariesNewestFirst(summaries.items);
-    var page: std.ArrayList(session_store.SessionSummary) = .empty;
     defer page.deinit(alloc);
-    var has_more = false;
-    // Matched as v1 matches it: exactly, after trailing slashes.
-    const cwd = if (params.cwd) |value| session_store_paths.normalizeWorkspaceRoot(value) else null;
-    for (summaries.items) |summary| {
-        if (cwd) |root| {
-            const workspace_root = summary.workspace_root orelse continue;
-            if (!std.mem.eql(u8, workspace_root, root)) continue;
-        }
-        if (params.continuation) |continuation| {
-            if (!session_summary_codec.summaryFollowsContinuation(summary, continuation)) continue;
-        }
-        if (page.items.len == session_store.session_list_default_limit) {
-            has_more = true;
-            break;
-        }
-        try page.append(alloc, summary);
-    }
-    try writeSessionPage(state, alloc, msg, page.items, has_more);
+    try writeSessionPage(state, alloc, msg, page.summaries.items, page.has_more);
 }
 
 fn writeSessionPage(

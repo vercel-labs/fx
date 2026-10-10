@@ -1086,7 +1086,7 @@ fn projectRecoveryResult(
     return spillResultFilePresentation(alloc, dir, result_dir, projected);
 }
 
-fn loadConversationPermissionState(
+pub fn loadConversationPermissionState(
     alloc: Allocator,
     dir: *io_mod.VerifiedDir,
 ) !session_permission_state.State {
@@ -1103,7 +1103,9 @@ fn loadConversationPermissionState(
     return session_codec.decodePermissionState(alloc, bytes);
 }
 
-fn loadConversationRecoveryCheckpoint(
+/// The checkpoint `recovery.json` holds for the log's last seq, or null when
+/// it names an earlier one (v1 drops it). Caller owns the result.
+pub fn loadConversationRecoveryCheckpoint(
     alloc: Allocator,
     dir: *io_mod.VerifiedDir,
     conversation_seq: u64,
@@ -3681,7 +3683,9 @@ pub fn importLegacySnapshotState(
     );
 }
 
-fn discardEmptyLegacyFileEvidence(alloc: Allocator, history: []session.HistoryTurn) !usize {
+/// Drops file evidence an older format kept with an empty path, as v1's
+/// migration does; returns how many. Also used by the v1 converter.
+pub fn discardEmptyLegacyFileEvidence(alloc: Allocator, history: []session.HistoryTurn) !usize {
     var discarded: usize = 0;
     for (history) |*turn| {
         const execution = switch (turn.*) {

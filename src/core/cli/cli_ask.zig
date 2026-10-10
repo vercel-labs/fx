@@ -1106,11 +1106,19 @@ const AskContext = struct {
             .fast_mode = self.fast_mode,
             .ultrafast_mode = self.persisted_ultrafast_mode,
         };
+        // Converting a v1 session can be slow; stderr says why (D61).
+        store.notice = .{ .context = self, .emit = conversionNotice };
         const v2 = if (self.requested_resume) |target|
-            try session_adapter.Session.resumeSession(self.alloc, store, switch (target) {
+            session_adapter.Session.resumeSession(self.alloc, store, switch (target) {
                 .last => .last,
                 .id => |id| .{ .id = id },
-            }, self.workspace_root, .ask)
+            }, self.workspace_root, .ask) catch |err| {
+                if (store.conversionProblem()) |problem| {
+                    self.writeStderr("fx ask: the session can't be converted: ") catch {};
+                    self.writeLine(problem) catch {};
+                }
+                return err;
+            }
         else blk: {
             var permission_state = try self.session.snapshotPermissionState(self.alloc);
             defer permission_state.deinit(self.alloc);
@@ -1322,6 +1330,13 @@ const AskContext = struct {
 
     fn writeStderr(self: *AskContext, text: []const u8) !void {
         try self.deps.write_stderr(self.deps.stderr_ctx, text);
+    }
+
+    /// The store's notice that converting a v1 session is slow (D61).
+    fn conversionNotice(context: ?*anyopaque, text: []const u8) void {
+        const self: *AskContext = @ptrCast(@alignCast(context.?));
+        self.writeStderr("fx ask: ") catch return;
+        self.writeLine(text) catch {};
     }
 
     fn writeLine(self: *AskContext, text: []const u8) !void {

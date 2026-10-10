@@ -1411,6 +1411,137 @@ pub const SessionRecoverySnapshot = struct {
     }
 };
 
+/// What `fx sessions convert` did (D61): counts, then one line per session
+/// it skipped.
+pub const SessionConvertSnapshot = struct {
+    converted: usize,
+    busy: usize,
+    unreadable: usize,
+    skipped: []const Skipped,
+    /// Each side file a converted session was converted without, being
+    /// larger than the new store keeps in one file.
+    left_out: []const LeftOut = &.{},
+
+    pub const Skipped = struct {
+        id: []const u8,
+        /// `SessionBusy` or `InvalidSessionFormat`.
+        code: []const u8,
+        /// The file and the reason, for an unreadable session.
+        reason: ?[]const u8,
+    };
+
+    pub const LeftOut = struct {
+        /// The converted session.
+        id: []const u8,
+        /// The session that kept the file: `id`, or one of its subagents.
+        member: []const u8,
+        file: []const u8,
+        bytes: u64,
+        limit: u64,
+    };
+
+    pub fn render(self: SessionConvertSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    fn renderText(self: SessionConvertSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.print("converted {d}, busy {d}, unreadable {d}\n", .{ self.converted, self.busy, self.unreadable });
+        for (self.skipped) |skipped| {
+            if (skipped.reason) |reason| {
+                try out.writer.print("{s}: unreadable: {s}\n", .{ skipped.id, reason });
+            } else if (std.mem.eql(u8, skipped.code, "SessionBusy")) {
+                try out.writer.print("{s}: busy, open in another fx\n", .{skipped.id});
+            } else try out.writer.print("{s}: unreadable\n", .{skipped.id});
+        }
+        for (self.left_out) |left| {
+            try out.writer.print("{s}: converted without {s}", .{ left.id, left.file });
+            if (!std.mem.eql(u8, left.member, left.id)) try out.writer.print(" of its subagent {s}", .{left.member});
+            try out.writer.print(", which is {d} bytes, more than the {d} the new store keeps in one file\n", .{ left.bytes, left.limit });
+        }
+        return out.toOwnedSlice();
+    }
+
+    fn renderJson(self: SessionConvertSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.print("{{\"kind\":\"sessions_convert\",\"converted\":{d},\"busy\":{d},\"unreadable\":{d}", .{ self.converted, self.busy, self.unreadable });
+        // A skip fails the command; its error names the first one.
+        if (self.skipped.len > 0) {
+            try out.writer.writeAll(",\"error\":");
+            try std.json.Stringify.value(self.skipped[0].code, .{}, &out.writer);
+        }
+        try out.writer.writeAll(",\"skipped\":[");
+        for (self.skipped, 0..) |skipped, index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try out.writer.writeAll("{\"id\":");
+            try std.json.Stringify.value(skipped.id, .{}, &out.writer);
+            try out.writer.writeAll(",\"error\":");
+            try std.json.Stringify.value(skipped.code, .{}, &out.writer);
+            if (skipped.reason) |reason| {
+                try out.writer.writeAll(",\"reason\":");
+                try std.json.Stringify.value(reason, .{}, &out.writer);
+            }
+            try out.writer.writeByte('}');
+        }
+        try out.writer.writeAll("],\"left_out\":[");
+        for (self.left_out, 0..) |left, index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try std.json.Stringify.value(left, .{}, &out.writer);
+        }
+        try out.writer.writeAll("]}");
+        return out.toOwnedSlice();
+    }
+};
+
+test "fx sessions convert names each file it left out, in text and JSON" {
+    const alloc = std.testing.allocator;
+    const snapshot: SessionConvertSnapshot = .{ .converted = 1, .busy = 0, .unreadable = 0, .skipped = &.{}, .left_out = &.{
+        .{ .id = "root", .member = "root", .file = "logs/commands/replay.bin", .bytes = 600, .limit = 512 },
+        .{ .id = "root", .member = "kid", .file = "tool-results/big.txt", .bytes = 700, .limit = 512 },
+    } };
+    const text = try snapshot.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(
+        "converted 1, busy 0, unreadable 0\n" ++
+            "root: converted without logs/commands/replay.bin, which is 600 bytes, more than the 512 the new store keeps in one file\n" ++
+            "root: converted without tool-results/big.txt of its subagent kid, which is 700 bytes, more than the 512 the new store keeps in one file\n",
+        text,
+    );
+    const json = try snapshot.render(alloc, .json);
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"sessions_convert\",\"converted\":1,\"busy\":0,\"unreadable\":0,\"skipped\":[],\"left_out\":[" ++
+            "{\"id\":\"root\",\"member\":\"root\",\"file\":\"logs/commands/replay.bin\",\"bytes\":600,\"limit\":512}," ++
+            "{\"id\":\"root\",\"member\":\"kid\",\"file\":\"tool-results/big.txt\",\"bytes\":700,\"limit\":512}]}",
+        json,
+    );
+}
+
+test "fx sessions convert renders its counts and each skip as text and JSON from one snapshot" {
+    const alloc = std.testing.allocator;
+    const snapshot: SessionConvertSnapshot = .{ .converted = 2, .busy = 1, .unreadable = 1, .skipped = &.{
+        .{ .id = "held", .code = "SessionBusy", .reason = null },
+        .{ .id = "torn", .code = "InvalidSessionFormat", .reason = "events.jsonl line 3 is not valid JSON" },
+    } };
+    const text = try snapshot.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(
+        "converted 2, busy 1, unreadable 1\nheld: busy, open in another fx\ntorn: unreadable: events.jsonl line 3 is not valid JSON\n",
+        text,
+    );
+    const json = try snapshot.render(alloc, .json);
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"sessions_convert\",\"converted\":2,\"busy\":1,\"unreadable\":1,\"error\":\"SessionBusy\",\"skipped\":[{\"id\":\"held\",\"error\":\"SessionBusy\"},{\"id\":\"torn\",\"error\":\"InvalidSessionFormat\",\"reason\":\"events.jsonl line 3 is not valid JSON\"}],\"left_out\":[]}",
+        json,
+    );
+}
+
 pub const DoctorSnapshot = struct {
     workspace_root: []const u8,
     model: []const u8,

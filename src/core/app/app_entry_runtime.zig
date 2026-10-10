@@ -282,7 +282,11 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
                 return .{ .exit = 1 };
             },
             error.InvalidSessionFormat => {
-                writeStderr(deps, "fx: saved session is unreadable. Run `fx doctor`; if it is recoverable, use `fx session recover <id>`.\n");
+                if (launch.resume_refusal) |reason| {
+                    const message = std.fmt.allocPrint(alloc, "fx: this session can't be converted (InvalidSessionFormat): {s}\n", .{reason}) catch null;
+                    defer if (message) |text| alloc.free(text);
+                    writeStderr(deps, message orelse "fx: this session can't be converted (InvalidSessionFormat)\n");
+                } else writeStderr(deps, "fx: saved session is unreadable. Run `fx doctor`; if it is recoverable, use `fx session recover <id>`.\n");
                 return .{ .exit = 1 };
             },
             error.UnsupportedSessionSchema => {
