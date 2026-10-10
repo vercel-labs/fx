@@ -4,6 +4,7 @@ const command_replay_store = @import("../../core/session/command_replay_store.zi
 const session_child_store = @import("../../core/session/session_child_store.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
+const tool_args = @import("../../core/tooling/tool_args.zig");
 const compactor = @import("../../core/compactor/compactor.zig");
 
 const Allocator = std.mem.Allocator;
@@ -48,12 +49,16 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
     if (parsed.value != .object) {
         return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result arguments must be an object") };
     }
-    const args = if (parsed.value.object.get("request")) |request| blk: {
-        if (request != .object) {
-            return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"request\" must be an object") };
-        }
-        break :blk request.object;
-    } else parsed.value.object;
+    // A wrapped call carries its fields inside request, and some models send
+    // that object as its JSON text. Both describe the same request.
+    var wrapper_arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer wrapper_arena_state.deinit();
+    const args = (try tool_args.requestObject(
+        wrapper_arena_state.allocator(),
+        parsed.value.object,
+    )) orelse {
+        return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"request\" must be an object") };
+    };
     if (args.get("search")) |value| return decodeSearch(ctx.allocator, value);
     const handle_value = args.get("handle") orelse {
         return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result requires string field \"handle\"") };
@@ -330,6 +335,61 @@ test "read_tool_result decodes nested model requests" {
         .query => |query| try std.testing.expectEqualStrings("needle", query),
         .range => return error.TestUnexpectedDecodeFailure,
         .search => return error.TestUnexpectedDecodeFailure,
+    }
+}
+
+test "read_tool_result decodes a nested model request sent as JSON text" {
+    const alloc = std.testing.allocator;
+    const decoded = try decode(
+        .{ .allocator = alloc },
+        "{\"request\":\"{\\\"handle\\\":\\\"h.txt\\\",\\\"query\\\":\\\"needle\\\"}\"}",
+    );
+    const input = switch (decoded) {
+        .input => |value| value,
+        .failure => return error.TestUnexpectedDecodeFailure,
+    };
+    defer input.deinit(alloc);
+    const typed = input.as(Input);
+    try std.testing.expectEqualStrings("h.txt", typed.handle);
+    switch (typed.selector) {
+        .query => |query| try std.testing.expectEqualStrings("needle", query),
+        .range => return error.TestUnexpectedDecodeFailure,
+        .search => return error.TestUnexpectedDecodeFailure,
+    }
+
+    const searched = try decode(
+        .{ .allocator = alloc },
+        "{\"request\":\"{\\\"search\\\":[\\\"needle\\\"]}\"}",
+    );
+    const search_input = switch (searched) {
+        .input => |value| value,
+        .failure => return error.TestUnexpectedDecodeFailure,
+    };
+    defer search_input.deinit(alloc);
+    switch (search_input.as(Input).selector) {
+        .search => |phrases| try std.testing.expectEqual(@as(usize, 1), phrases.len),
+        .range => return error.TestUnexpectedDecodeFailure,
+        .query => return error.TestUnexpectedDecodeFailure,
+    }
+
+    for ([_][]const u8{
+        "{\"request\":\"needle\"}",
+        "{\"request\":\"[]\"}",
+    }) |args_json| {
+        const rejected = try decode(.{ .allocator = alloc }, args_json);
+        switch (rejected) {
+            .input => |value| {
+                value.deinit(alloc);
+                return error.TestUnexpectedResult;
+            },
+            .failure => |failure| {
+                defer alloc.free(failure);
+                try std.testing.expectEqualStrings(
+                    "read_tool_result field \"request\" must be an object",
+                    failure,
+                );
+            },
+        }
     }
 }
 

@@ -1338,8 +1338,24 @@ fn normalized_terminal_request_arguments(
     };
     defer parsed.deinit();
     if (parsed.value != .object or parsed.value.object.count() != 1) return null;
-    const request = parsed.value.object.getPtr("request") orelse return null;
-    if (request.* != .object) return null;
+    const wrapper = parsed.value.object.getPtr("request") orelse return null;
+    // Some models send the wrapped object as its JSON text. It describes the
+    // same action, so normalize it into the canonical object form.
+    var request: std.json.Value = wrapper.*;
+    if (request == .string) {
+        const decoded = std.json.parseFromSliceLeaky(
+            std.json.Value,
+            parsed.arena.allocator(),
+            request.string,
+            .{},
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        if (decoded != .object) return null;
+        request = decoded;
+    }
+    if (request != .object) return null;
     _ = try normalize_terminal_model_input(
         parsed.arena.allocator(),
         &request.object,
@@ -1347,7 +1363,7 @@ fn normalized_terminal_request_arguments(
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(request.*, .{}, &out.writer) catch return error.OutOfMemory;
+    std.json.Stringify.value(request, .{}, &out.writer) catch return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
 
@@ -2394,6 +2410,54 @@ test "terminal request normalization unwraps only exact eligible native calls" {
     }};
     const non_exact = try normalize_terminal_request_tool_calls(arena, native_registry, true, &non_exact_calls);
     try std.testing.expectEqual(non_exact_calls[0..].ptr, non_exact.ptr);
+
+    // A model that sends the wrapped object as its JSON text describes the
+    // same action and reaches execution in the canonical object form.
+    const encoded_calls = [_]ToolCall{
+        .{
+            .id = "encoded-exec",
+            .name = "terminal",
+            .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"exec\\\",\\\"command\\\":\\\"printf ok\\\"}\"}",
+        },
+        .{
+            .id = "encoded-write",
+            .name = "terminal",
+            .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"write\\\",\\\"session_id\\\":\\\"terminal-a\\\",\\\"input\\\":{\\\"text\\\":\\\"hello\\\"}}\"}",
+        },
+        .{
+            .id = "encoded-not-an-object",
+            .name = "terminal",
+            .arguments_json = "{\"request\":\"exec\"}",
+        },
+        .{
+            .id = "encoded-array",
+            .name = "terminal",
+            .arguments_json = "{\"request\":\"[]\"}",
+        },
+    };
+    const encoded = try normalize_terminal_request_tool_calls(
+        arena,
+        native_registry,
+        true,
+        &encoded_calls,
+    );
+    try std.testing.expect(encoded.ptr != encoded_calls[0..].ptr);
+    try std.testing.expectEqualStrings(
+        "{\"action\":\"exec\",\"command\":\"printf ok\"}",
+        encoded[0].arguments_json,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"text\",\"text\":\"hello\"}}",
+        encoded[1].arguments_json,
+    );
+    try std.testing.expectEqualStrings(
+        encoded_calls[2].arguments_json,
+        encoded[2].arguments_json,
+    );
+    try std.testing.expectEqualStrings(
+        encoded_calls[3].arguments_json,
+        encoded[3].arguments_json,
+    );
 
     const malformed_calls = [_]ToolCall{.{
         .id = "malformed",
