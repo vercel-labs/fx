@@ -1090,6 +1090,15 @@ pub fn Runtime(comptime App: type) type {
                 return .done;
             }
 
+            // Ctrl+P moves up in any visible list, including the model
+            // catalog it opens; it opens the catalog only when no list is
+            // visible.
+            if (resolved == .open_model_catalog and
+                try routeListNavigationShortcut(app, -1))
+            {
+                return .done;
+            }
+
             if (activeCompactCommandMenu(app)) |menu| {
                 try routeCompactCommandMenuEscapeAction(app, menu, resolved);
                 return .done;
@@ -1196,8 +1205,8 @@ pub fn Runtime(comptime App: type) type {
                 },
                 .open_model_catalog => {
                     if (comptime @hasField(App, "model_cache")) {
-                        // A second Ctrl+P backs out of the shortcut's flow
-                        // from the catalog or its inline effort and fast stages.
+                        // Visible lists already consumed Ctrl+P as Up. A stage
+                        // without a list still backs out of the shortcut's flow.
                         if (exitModelPickerShortcutIfActive(app)) return .done;
                         if (modelMenuActive(app)) {
                             _ = closeModelMenu(app, true);
@@ -1218,18 +1227,32 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn routePickerControlByte(app: *App, byte: u8) !bool {
-            if (!composerPickerSurfaceVisible(app)) return false;
             const delta = pickerControlDelta(byte) orelse return false;
-            if (!try routeVisiblePickerMove(app, delta)) return false;
+            return routeListNavigationShortcut(app, delta);
+        }
+
+        /// Moves the visible list for a control-key alias of Up or Down.
+        /// Returns false when no list is visible so the key keeps its
+        /// composer or app meaning.
+        fn routeListNavigationShortcut(app: *App, delta: i32) !bool {
+            if (!composerPickerSurfaceVisible(app)) return false;
+            if (activeCompactCommandMenu(app)) |menu| {
+                _ = moveCompactCommandMenu(app, menu, delta);
+            } else if (mcpMenuActive(app)) {
+                _ = moveMcpMenu(app, if (delta < 0) -1 else 1);
+            } else if (!try routeVisiblePickerMove(app, delta)) {
+                return false;
+            }
             app.input_runtime.vertical_navigation.reset();
             app.shell.render_requests.request(.footer);
             return true;
         }
 
+        /// Ctrl+N and Ctrl+J move down, Ctrl+P and Ctrl+K move up.
         fn pickerControlDelta(byte: u8) ?i32 {
             return switch (byte) {
-                10 => 1,
-                11 => -1,
+                10, 14 => 1,
+                11, 16 => -1,
                 else => null,
             };
         }
@@ -5188,8 +5211,8 @@ test "app_input_runtime command skills menu keeps its query on ctrl+p and ctrl-c
     try app.input_runtime.composer_history.installTextEntries(alloc, &.{"older"});
     app.skills.openMenu();
 
-    // Ctrl+P owns the model picker now; while the skills menu owns the
-    // composer it is a no-op instead of a history recall.
+    // While the skills menu is visible, Ctrl+P moves its selection up
+    // instead of opening the model picker or recalling history.
     try feedRoutingBytes(&app, "\x10");
     try std.testing.expect(app.skills.menu.active);
     try std.testing.expect(!app.model_cache.menu.active);
@@ -5201,6 +5224,44 @@ test "app_input_runtime command skills menu keeps its query on ctrl+p and ctrl-c
     try std.testing.expect(app.skills.menu.active);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqualStrings("", app.skills.menu.query());
+}
+
+test "app_input_runtime Ctrl+N and Ctrl+P move the visible slash menu like arrows" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+
+    try feedRoutingBytes(&app, "/");
+    try std.testing.expect(input_completion_runtime.CompletionRuntime(RoutingFakeApp).visibleSlashCompletionCount(&app) > 2);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.picker.slash_completion_index);
+
+    try feedRoutingBytes(&app, "\x0e\x0e");
+    try std.testing.expectEqual(@as(usize, 2), app.input_runtime.picker.slash_completion_index);
+
+    try feedRoutingBytes(&app, "\x10");
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.picker.slash_completion_index);
+    try std.testing.expect(!app.model_cache.menu.active);
+    try std.testing.expect(app.input_runtime.model_picker_draft == null);
+
+    // Ctrl+J and Ctrl+K stay aliases for Down and Up.
+    try feedRoutingBytes(&app, "\x0a");
+    try std.testing.expectEqual(@as(usize, 2), app.input_runtime.picker.slash_completion_index);
+    try feedRoutingBytes(&app, "\x0b");
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.picker.slash_completion_index);
+
+    try std.testing.expectEqualStrings("/", app.input_runtime.edit_state.input.items);
+}
+
+test "app_input_runtime Ctrl+N keeps prompt history when no list is visible" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try primeComposerHistoryForTest(RoutingFakeApp, &app, "draft");
+    try std.testing.expectEqualStrings("history entry", app.input_runtime.edit_state.input.items);
+
+    try feedRoutingBytes(&app, "\x0e");
+
+    try std.testing.expectEqualStrings("draft", app.input_runtime.edit_state.input.items);
 }
 
 test "app_input_runtime Escape closes a command skills menu and clears its temporary query" {
@@ -8999,8 +9060,8 @@ test "app_input_runtime ctrl+p catalog enter offers the effort and fast stages b
 
 test "app_input_runtime ctrl+p inline stages back out to the draft without changing the model" {
     const alloc = std.testing.allocator;
-    const Exit = enum { escape, ctrl_p, clear_line, paste_before_query };
-    for ([_]Exit{ .escape, .ctrl_p, .clear_line, .paste_before_query }) |exit| {
+    const Exit = enum { escape, clear_line, paste_before_query };
+    for ([_]Exit{ .escape, .clear_line, .paste_before_query }) |exit| {
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
         try enterRoutingShortcutEffortStage(&app, "keep me", 2);
@@ -9011,7 +9072,6 @@ test "app_input_runtime ctrl+p inline stages back out to the draft without chang
                 try Runtime(RoutingFakeApp).handleByte(&app, 0x1b, 4096, 100);
                 try Runtime(RoutingFakeApp).flushPendingEscape(&app, 0);
             },
-            .ctrl_p => try feedRoutingBytes(&app, "\x10"),
             .clear_line => try feedRoutingBytes(&app, "\x15"),
             // The paste completes at the delivery epoch, after ingress.
             .paste_before_query => {
@@ -9086,7 +9146,7 @@ test "app_input_runtime ctrl+p catalog enter failure restores the draft without 
     try std.testing.expect(app.input_runtime.model_picker_draft == null);
 }
 
-test "app_input_runtime ctrl+p toggles the model catalog closed" {
+test "app_input_runtime ctrl+p moves inside the model catalog it opened" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -9095,10 +9155,29 @@ test "app_input_runtime ctrl+p toggles the model catalog closed" {
     try feedRoutingBytes(&app, "\x10");
     try std.testing.expect(app.model_cache.menu.active);
 
+    // A second Ctrl+P is Up in the visible catalog, not a close.
     try feedRoutingBytes(&app, "\x10");
+    try std.testing.expect(app.model_cache.menu.active);
+    try std.testing.expect(app.input_runtime.model_picker_draft != null);
+
+    try Runtime(RoutingFakeApp).resolveEscape(&app, false, 1);
     try std.testing.expect(!app.model_cache.menu.active);
     try std.testing.expectEqualStrings("toggle draft", app.input_runtime.edit_state.input.items);
     try std.testing.expect(app.input_runtime.model_picker_draft == null);
+}
+
+test "app_input_runtime ctrl+p in the effort stage keeps the shortcut flow" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try enterRoutingShortcutEffortStage(&app, "keep me", 2);
+
+    try feedRoutingBytes(&app, "\x10");
+
+    try std.testing.expectEqual(picker_state.ModelPickerStage.effort, app.input_runtime.picker.model_picker_stage);
+    try std.testing.expect(app.input_runtime.model_picker_draft != null);
+    try std.testing.expectEqualStrings("test/model", app.selected_model.items);
+    try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
 }
 
 test "app_input_runtime ctrl+p model catalog keeps history navigation position" {
