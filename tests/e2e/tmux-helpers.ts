@@ -376,6 +376,7 @@ function serveFakeGateway(
   const modelRequests: FakeGatewayModelRequest[] = [];
   const generationRequests: string[] = [];
   const server = Bun.serve({
+    hostname: "127.0.0.1",
     port: 0,
     idleTimeout: 0,
     async fetch(req) {
