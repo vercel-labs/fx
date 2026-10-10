@@ -23,9 +23,10 @@ pub const ActionableContinuation = struct {
     }
 };
 
-/// Lists visible sessions from the session index, newest first, without
-/// writing anything. The index reuses fingerprint-matched rows, so a listing
-/// opens only the sessions that changed since writable flows last saved it.
+/// Lists visible sessions from the session index, newest first. It changes no
+/// session; it saves the index only after replaying a committed log. The
+/// index reuses fingerprint-matched rows, so a listing opens only the
+/// sessions that changed since the index was last saved.
 pub fn listVisiblePage(
     store: session_store.Store,
     alloc: Allocator,
@@ -34,7 +35,7 @@ pub fn listVisiblePage(
     limit: usize,
 ) !session_store.SessionListPage {
     if (limit == 0 or limit > session_store.session_list_max_limit) return error.InvalidSessionListLimit;
-    var catalog = catalog_cache.listActionableCatalog(store, alloc, null, null, null) catch |err| switch (err) {
+    var catalog = catalog_cache.listActionableCatalogReadOnly(store, alloc) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.SessionStoreUnavailable,
     };
@@ -55,7 +56,8 @@ pub fn listVisiblePage(
 
 /// Returns the newest listed session in this workspace from the index page
 /// `--resume last` reads. `--resume last` also skips a session whose stale log
-/// failed to replay in that listing, so the two can differ. Caller owns the
+/// failed to replay in that listing, and a session without resumable content
+/// that another process has open, so the two can differ. Caller owns the
 /// summary.
 pub fn latestVisibleWorkspaceSummary(
     store: session_store.Store,
