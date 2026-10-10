@@ -94,6 +94,7 @@ const permissions = @import("core/permissions/permissions.zig");
 const command_runner = @import("core/execution/command_runner.zig");
 const command_admission = @import("core/permissions/command_admission.zig");
 const permission_auto_classifier = @import("core/permissions/auto_classifier.zig");
+const permission_hook = @import("core/permissions/permission_hook.zig");
 const auto_classifier_context = @import("core/permissions/auto_classifier_context.zig");
 const agent_runtime = @import("core/agent/agent_runtime.zig");
 const assistant_presentation = @import("core/agent/assistant_presentation.zig");
@@ -593,6 +594,9 @@ const App = struct {
     /// (`review_model` setting or FX_REVIEW_MODEL). Owned; empty keeps the
     /// reviewer's compiled default.
     review_model: []u8 = &.{},
+    /// Profile `permission_hook` read at startup. Owned; null when unset or
+    /// rejected by config diagnostics.
+    permission_hook: ?permission_hook.Config = null,
     diff_entries: std.ArrayList(@import("core/output/diff.zig").DiffEntry) = .empty,
     next_diff_id: u32 = 1,
 
@@ -1012,6 +1016,7 @@ const App = struct {
         self.workspace_identity.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
         if (self.review_model.len > 0) self.alloc.free(self.review_model);
+        if (self.permission_hook) |*config| config.deinit(self.alloc);
         shutdown_trace.mark("complete");
         if (was_interactive) app_lifecycle.writeLastShutdownReport(self.alloc, &shutdown_trace);
     }
@@ -4885,6 +4890,7 @@ test {
     _ = @import("core/workspace/pathing.zig");
     _ = @import("core/workspace/current_branch.zig");
     _ = @import("core/permissions/permission_gate.zig");
+    _ = permission_hook;
     _ = @import("core/permissions/permissions.zig");
     _ = @import("core/execution/process_identity.zig");
     _ = @import("core/execution/process_provider.zig");

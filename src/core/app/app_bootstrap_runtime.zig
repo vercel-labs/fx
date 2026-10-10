@@ -568,6 +568,7 @@ pub fn Runtime(comptime App: type) type {
             app.upgrader.configure_channel(startup.update_channel);
             app.effort = startup.effort;
             if (comptime @hasField(App, "review_model")) app.review_model = startup.takeReviewModel();
+            if (comptime @hasField(App, "permission_hook")) app.permission_hook = startup.takePermissionHook();
             app.shell.setCommandOutputRenderPolicy(
                 app_render_runtime.Runtime(App).shellStyles(),
             );

@@ -269,6 +269,10 @@ pub fn Runtime(comptime App: type) type {
                 .permission_rules = permission_rules,
                 .worker = &app.worker,
                 .permission_prompter = tool_admission.workerPrompter(&app.worker),
+                .permission_hook = if (comptime @hasField(App, "permission_hook"))
+                    if (app.permission_hook) |*config| config else null
+                else
+                    null,
                 .cancel_flag = &app.worker.worker_cancel_requested,
                 .session_child_capability = child_capability,
                 .terminal_client = if (comptime @hasField(App, "terminal_client"))

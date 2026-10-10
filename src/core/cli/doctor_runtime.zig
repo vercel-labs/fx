@@ -195,6 +195,8 @@ fn configLayerRejected(
             .invalid_skill_symlink_authorities,
             => return true,
             .invalid_additional_directories,
+            .invalid_permission_hook,
+            .ignored_workspace_permission_hook,
             .ignored_project_user_only_setting,
             .legacy_workspace_preferences,
             .manual_backup_available,

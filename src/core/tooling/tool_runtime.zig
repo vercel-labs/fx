@@ -22,6 +22,7 @@ const file_mutation_contract = @import("file_mutation_contract.zig");
 const hooks = @import("../hooks/hooks.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const glob_pattern = @import("../workspace/glob_pattern.zig");
+const permission_hook = @import("../permissions/permission_hook.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const command_admission = @import("../permissions/command_admission.zig");
@@ -170,6 +171,9 @@ pub const Context = struct {
     /// prompts: it resolves by rule, automatic review, or fail-closed denial
     /// (e.g. ACP hosts prompt over JSON-RPC by setting this).
     permission_prompter: ?permission_prompter.Prompter = null,
+    /// Profile permission hook. Admission offers it only to prompters that
+    /// accept a concurrent answer, so it can race but never replace a prompt.
+    permission_hook: ?*const permission_hook.Config = null,
     cancel_flag: ?*std.atomic.Value(bool) = null,
     session: *SessionRuntime,
     session_allocator: Allocator = std.heap.c_allocator,
@@ -237,6 +241,16 @@ pub const Context = struct {
         .workspace_root = "",
     },
 
+    fn permissionHookBinding(self: Context) ?permission_hook.Binding {
+        const config = self.permission_hook orelse return null;
+        if (self.lifecycle_scope.kind != .interactive) return null;
+        return .{
+            .config = config,
+            .workspace_root = self.workspace_root,
+            .session_id = self.lifecycle_scope.session_id,
+        };
+    }
+
     /// Projects only the borrowed capabilities consumed by admission.
     pub fn admissionInput(self: Context) tool_admission.Input {
         var input: tool_admission.Input = .{
@@ -254,6 +268,7 @@ pub const Context = struct {
             .worker = self.worker,
             .mcp_review_schema_json = self.mcp_review_schema_json,
             .permission_prompter = self.permission_prompter,
+            .permission_hook = self.permissionHookBinding(),
             .advertised_dynamic_tool_names = self.advertised_dynamic_tool_names,
             .mcp_runtime = mcpRuntimeCapabilities(self),
             .context_limits = self.context_limits,
