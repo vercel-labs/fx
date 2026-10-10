@@ -7,6 +7,8 @@ pub const max_id_bytes = 64;
 pub const max_model_bytes = 1024;
 const max_url_bytes = 2048;
 const max_env_bytes = 128;
+const max_headers = 32;
+const max_header_bytes = 4096;
 const max_json_bytes = 1024 * 1024;
 
 pub const ParseError = Allocator.Error || error{
@@ -23,6 +25,7 @@ pub const ParseError = Allocator.Error || error{
     InsecureBaseUrl,
     InvalidAuth,
     InvalidEnvironmentName,
+    InvalidHeader,
     InvalidToolChoiceMode,
     InvalidModelId,
     InvalidModelMetadata,
@@ -36,6 +39,23 @@ pub const ToolChoiceMode = enum { omit, send };
 pub const Auth = union(enum) {
     none,
     bearer: []const u8,
+};
+
+/// One literal request header. Values are connection configuration rather than
+/// a credential store: credentials belong in `header_env`, where they resolve
+/// from the environment at request time. Provider error diagnostics still
+/// treat literal values as sensitive and mask them when they are long enough
+/// to be credential-shaped.
+pub const Header = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+/// One environment-backed request header: `name` is sent with the value of the
+/// `env` variable, resolved when a request is sent.
+pub const HeaderEnv = struct {
+    name: []const u8,
+    env: []const u8,
 };
 
 pub const ModelMetadata = struct {
@@ -56,6 +76,8 @@ pub const Definition = struct {
     tool_choice_mode: ToolChoiceMode = .omit,
     reviewer_model: ?[]const u8 = null,
     model_metadata: []const ModelMetadata = &.{},
+    headers: []const Header = &.{},
+    header_env: []const HeaderEnv = &.{},
 
     /// Caller owns the returned URL. base_url is already a validated API prefix.
     pub fn chat_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
@@ -85,6 +107,16 @@ pub const Definition = struct {
             .none => {},
             .bearer => |env| hash_part(&hash, env),
         }
+        for (self.headers) |header| {
+            hash_part(&hash, "header");
+            hash_part(&hash, header.name);
+            hash_part(&hash, header.value);
+        }
+        for (self.header_env) |ref| {
+            hash_part(&hash, "header-env");
+            hash_part(&hash, ref.name);
+            hash_part(&hash, ref.env);
+        }
         return hash.finalResult();
     }
 
@@ -98,6 +130,8 @@ pub const Definition = struct {
         if (self.reviewer_model) |id| alloc.free(id);
         for (self.model_metadata) |metadata| alloc.free(metadata.id);
         alloc.free(self.model_metadata);
+        free_headers(alloc, self.headers);
+        free_header_env(alloc, self.header_env);
     }
 };
 
@@ -163,7 +197,7 @@ pub const Registry = struct {
 
 fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata" });
+    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata", "headers", "header_env" });
     const protocol = try required(value, "protocol");
     if (protocol != .string or !std.mem.eql(u8, protocol.string, "openai-chat-completions")) return error.InvalidProtocol;
     const url = try required(value, "base_url");
@@ -181,6 +215,13 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
         try validate_model_id(model_value.string);
         reviewer = model_value.string;
     }
+    const headers = if (value.object.get("headers")) |header_value| try parse_headers(alloc, header_value) else &.{};
+    errdefer free_headers(alloc, headers);
+    const header_env = if (value.object.get("header_env")) |header_value| try parse_header_env(alloc, header_value) else &.{};
+    errdefer free_header_env(alloc, header_env);
+    for (headers) |header| for (header_env) |ref| {
+        if (std.ascii.eqlIgnoreCase(header.name, ref.name)) return error.InvalidHeader;
+    };
 
     const owned_id = try alloc.dupe(u8, id);
     errdefer alloc.free(owned_id);
@@ -204,6 +245,8 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
         .tool_choice_mode = mode,
         .reviewer_model = owned_reviewer,
         .model_metadata = if (value.object.get("model_metadata")) |metadata| try parse_metadata(alloc, metadata) else &.{},
+        .headers = headers,
+        .header_env = header_env,
     };
 }
 
@@ -218,12 +261,134 @@ fn parse_auth(value: std.json.Value) ParseError!Auth {
     if (!std.mem.eql(u8, kind.string, "bearer")) return error.InvalidAuth;
     const env = try required(value, "env");
     if (env != .string) return error.InvalidEnvironmentName;
-    if (env.string.len > max_env_bytes) return error.LimitExceeded;
-    if (env.string.len == 0 or (!std.ascii.isAlphabetic(env.string[0]) and env.string[0] != '_')) return error.InvalidEnvironmentName;
-    for (env.string) |byte| {
+    try validate_env_name(env.string);
+    return .{ .bearer = env.string };
+}
+
+fn parse_headers(alloc: Allocator, value: std.json.Value) ParseError![]const Header {
+    if (value != .object) return error.InvalidHeader;
+    if (value.object.count() > max_headers) return error.LimitExceeded;
+    const headers = try alloc.alloc(Header, value.object.count());
+    var initialized: usize = 0;
+    errdefer {
+        for (headers[0..initialized]) |header| {
+            alloc.free(header.name);
+            alloc.free(header.value);
+        }
+        alloc.free(headers);
+    }
+    var iterator = value.object.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value_ptr.* != .string) return error.InvalidHeader;
+        try validate_header_name(entry.key_ptr.*);
+        try validate_header_value(entry.value_ptr.string);
+        for (headers[0..initialized]) |previous| {
+            if (std.ascii.eqlIgnoreCase(previous.name, entry.key_ptr.*)) return error.InvalidHeader;
+        }
+        const owned_name = try alloc.dupe(u8, entry.key_ptr.*);
+        errdefer alloc.free(owned_name);
+        const owned_value = try alloc.dupe(u8, entry.value_ptr.string);
+        errdefer alloc.free(owned_value);
+        headers[initialized] = .{ .name = owned_name, .value = owned_value };
+        initialized += 1;
+    }
+    return headers;
+}
+
+fn parse_header_env(alloc: Allocator, value: std.json.Value) ParseError![]const HeaderEnv {
+    if (value != .object) return error.InvalidHeader;
+    if (value.object.count() > max_headers) return error.LimitExceeded;
+    const refs = try alloc.alloc(HeaderEnv, value.object.count());
+    var initialized: usize = 0;
+    errdefer {
+        for (refs[0..initialized]) |ref| {
+            alloc.free(ref.name);
+            alloc.free(ref.env);
+        }
+        alloc.free(refs);
+    }
+    var iterator = value.object.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value_ptr.* != .string) return error.InvalidHeader;
+        try validate_header_name(entry.key_ptr.*);
+        try validate_env_name(entry.value_ptr.string);
+        for (refs[0..initialized]) |previous| {
+            if (std.ascii.eqlIgnoreCase(previous.name, entry.key_ptr.*)) return error.InvalidHeader;
+        }
+        const owned_name = try alloc.dupe(u8, entry.key_ptr.*);
+        errdefer alloc.free(owned_name);
+        const owned_env = try alloc.dupe(u8, entry.value_ptr.string);
+        errdefer alloc.free(owned_env);
+        refs[initialized] = .{ .name = owned_name, .env = owned_env };
+        initialized += 1;
+    }
+    return refs;
+}
+
+fn free_headers(alloc: Allocator, headers: []const Header) void {
+    for (headers) |header| {
+        alloc.free(header.name);
+        alloc.free(header.value);
+    }
+    alloc.free(headers);
+}
+
+fn free_header_env(alloc: Allocator, refs: []const HeaderEnv) void {
+    for (refs) |ref| {
+        alloc.free(ref.name);
+        alloc.free(ref.env);
+    }
+    alloc.free(refs);
+}
+
+fn validate_header_name(name: []const u8) ParseError!void {
+    if (name.len == 0) return error.InvalidHeader;
+    if (name.len > max_header_bytes) return error.LimitExceeded;
+    for (name) |byte| {
+        if (std.ascii.isAlphanumeric(byte)) continue;
+        switch (byte) {
+            '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => {},
+            else => return error.InvalidHeader,
+        }
+    }
+    if (is_reserved_header_name(name)) return error.InvalidHeader;
+}
+
+/// Also used when an environment-backed header resolves at send time, where
+/// only the value can still be invalid.
+pub fn validate_header_value(value: []const u8) error{ LimitExceeded, InvalidHeader }!void {
+    if (value.len > max_header_bytes) return error.LimitExceeded;
+    for (value) |byte| {
+        if ((byte < 0x20 and byte != '\t') or byte == 0x7f) return error.InvalidHeader;
+    }
+}
+
+/// Names fx owns on every configured request. `authorization` is reserved so a
+/// connection header can never replace the credential path.
+fn is_reserved_header_name(name: []const u8) bool {
+    const reserved = [_][]const u8{
+        "accept",
+        "accept-encoding",
+        "authorization",
+        "connection",
+        "content-length",
+        "content-type",
+        "host",
+        "transfer-encoding",
+        "user-agent",
+    };
+    for (reserved) |candidate| {
+        if (std.ascii.eqlIgnoreCase(name, candidate)) return true;
+    }
+    return false;
+}
+
+fn validate_env_name(env: []const u8) ParseError!void {
+    if (env.len > max_env_bytes) return error.LimitExceeded;
+    if (env.len == 0 or (!std.ascii.isAlphabetic(env[0]) and env[0] != '_')) return error.InvalidEnvironmentName;
+    for (env) |byte| {
         if (!std.ascii.isAlphanumeric(byte) and byte != '_') return error.InvalidEnvironmentName;
     }
-    return .{ .bearer = env.string };
 }
 
 fn parse_metadata(alloc: Allocator, value: std.json.Value) ParseError![]const ModelMetadata {
@@ -369,7 +534,7 @@ fn hash_part(hash: *std.crypto.hash.sha2.Sha256, part: []const u8) void {
 
 const test_json =
     \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:11434/v1/","auth":{"type":"none"}},
-    \\"router":{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"bearer","env":"OPENROUTER_API_KEY"},"tool_choice_mode":"send","reviewer_model":"openai/review","model_metadata":{"openai/gpt-4.1":{"context_window":8192,"max_output_tokens":1024,"supports_tool_use":true,"supports_vision":false},"unknown":{}}}}
+    \\"router":{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"bearer","env":"OPENROUTER_API_KEY"},"tool_choice_mode":"send","reviewer_model":"openai/review","headers":{"x-opencode-session":"fx-verify-0001"},"header_env":{"HTTP-Referer":"FX_TEST_REFERER"},"model_metadata":{"openai/gpt-4.1":{"context_window":8192,"max_output_tokens":1024,"supports_tool_use":true,"supports_vision":false},"unknown":{}}}}
 ;
 
 test "configured provider owns definitions and preserves unknown metadata" {
@@ -390,6 +555,12 @@ test "configured provider owns definitions and preserves unknown metadata" {
     try std.testing.expectEqualStrings("OPENROUTER_API_KEY", router.auth.bearer);
     try std.testing.expectEqualStrings("openai/review", router.reviewer_model.?);
     try std.testing.expectEqual(ToolChoiceMode.send, router.tool_choice_mode);
+    try std.testing.expectEqual(@as(usize, 1), router.headers.len);
+    try std.testing.expectEqualStrings("x-opencode-session", router.headers[0].name);
+    try std.testing.expectEqualStrings("fx-verify-0001", router.headers[0].value);
+    try std.testing.expectEqual(@as(usize, 1), router.header_env.len);
+    try std.testing.expectEqualStrings("HTTP-Referer", router.header_env[0].name);
+    try std.testing.expectEqualStrings("FX_TEST_REFERER", router.header_env[0].env);
     const metadata = router.model("openai/gpt-4.1").?;
     try std.testing.expectEqual(@as(?u32, 8192), metadata.context_window);
     try std.testing.expectEqual(@as(?u32, 1024), metadata.max_output_tokens);
@@ -447,6 +618,47 @@ test "configured provider binding identity separates name endpoint and auth slot
     changed = original;
     changed.base_url = try validate_url("https://openrouter.ai/api/v1/");
     try std.testing.expectEqual(identity, changed.binding_identity());
+    changed = original;
+    changed.headers = &.{.{ .name = "x-opencode-session", .value = "fx-verify-0002" }};
+    try std.testing.expect(!std.mem.eql(u8, &identity, &changed.binding_identity()));
+    changed = original;
+    changed.header_env = &.{.{ .name = "HTTP-Referer", .env = "FX_TEST_OTHER_REFERER" }};
+    try std.testing.expect(!std.mem.eql(u8, &identity, &changed.binding_identity()));
+    changed = original;
+    changed.headers = &.{};
+    changed.header_env = &.{};
+    try std.testing.expect(!std.mem.eql(u8, &identity, &changed.binding_identity()));
+}
+
+test "configured provider invalid request headers fail explicitly" {
+    const cases = [_]struct { json: []const u8, err: ParseError }{
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"headers\":null}}", .err = error.InvalidHeader },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"headers\":{\"\":\"v\"}}}", .err = error.InvalidHeader },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"headers\":{\"bad name\":\"v\"}}}", .err = error.InvalidHeader },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"headers\":{\"x\":1}}}", .err = error.InvalidHeader },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"headers\":{\"x\":\"a\\nb\"}}}", .err = error.InvalidHeader },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"headers\":{\"authorization\":\"Bearer x\"}}}", .err = error.InvalidHeader },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"headers\":{\"Content-Type\":\"text/plain\"}}}", .err = error.InvalidHeader },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"headers\":{\"x\":\"v\",\"X\":\"w\"}}}", .err = error.InvalidHeader },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"header_env\":null}}", .err = error.InvalidHeader },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"header_env\":{\"x\":1}}}", .err = error.InvalidHeader },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"header_env\":{\"x-api-key\":\"1KEY\"}}}", .err = error.InvalidEnvironmentName },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"header_env\":{\"x-api-key\":\"A KEY\"}}}", .err = error.InvalidEnvironmentName },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"header_env\":{\"authorization\":\"API_KEY\"}}}", .err = error.InvalidHeader },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"headers\":{\"X-Api-Key\":\"v\"},\"header_env\":{\"x-api-key\":\"API_KEY\"}}}", .err = error.InvalidHeader },
+    };
+    for (cases) |case| try std.testing.expectError(case.err, Registry.parse_json(std.testing.allocator, case.json));
+}
+
+test "configured provider header value validation admits tab but rejects controls" {
+    try validate_header_value("plain");
+    try validate_header_value("with\ttab");
+    try validate_header_value("");
+    try std.testing.expectError(error.InvalidHeader, validate_header_value("bad\rvalue"));
+    try std.testing.expectError(error.InvalidHeader, validate_header_value("bad\nvalue"));
+    try std.testing.expectError(error.InvalidHeader, validate_header_value("bad\x00value"));
+    try std.testing.expectError(error.InvalidHeader, validate_header_value("bad\x7fvalue"));
+    try std.testing.expectError(error.LimitExceeded, validate_header_value("v" ** (max_header_bytes + 1)));
 }
 
 test "configured provider duplicate keys are rejected before Value loses evidence" {
