@@ -170,6 +170,7 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
 const StatRootFn = *const fn ([]const u8) anyerror!std.Io.File.Stat;
 const CollectDirectoryFn = *const fn (
     Allocator,
+    Allocator,
     []const u8,
     []const u8,
     []const u8,
@@ -186,6 +187,7 @@ const CollectFileFn = *const fn (
     ?glob_pattern.Pattern,
 ) anyerror!grep_search.Result;
 const CountDirectoryFn = *const fn (
+    Allocator,
     Allocator,
     []const u8,
     []const u8,
@@ -269,10 +271,10 @@ fn searchGrepRoot(
 ) tool_dispatch.DispatchError!SearchOutcome {
     return switch (root_stat.kind) {
         .directory => switch (input.mode) {
-            .count => .{ .count = ops.count_directory(arena, ctx.workspace_root, absolute_root, input.pattern, input.case_insensitive, ctx.ignored_list_entries, include_pattern) catch |err| {
+            .count => .{ .count = ops.count_directory(ctx.allocator, arena, ctx.workspace_root, absolute_root, input.pattern, input.case_insensitive, ctx.ignored_list_entries, include_pattern) catch |err| {
                 return searchFailure(ctx.allocator, absolute_root, "walk grep search root", err);
             } },
-            .matches, .files_with_matches => .{ .matches = ops.collect_directory(arena, ctx.workspace_root, absolute_root, input.pattern, input.case_insensitive, ctx.ignored_list_entries, include_pattern) catch |err| {
+            .matches, .files_with_matches => .{ .matches = ops.collect_directory(ctx.allocator, arena, ctx.workspace_root, absolute_root, input.pattern, input.case_insensitive, ctx.ignored_list_entries, include_pattern) catch |err| {
                 return searchFailure(ctx.allocator, absolute_root, "walk grep search root", err);
             } },
         },
@@ -785,6 +787,7 @@ fn namedPipeStatRoot(_: []const u8) anyerror!std.Io.File.Stat {
 }
 
 fn failingCollectDirectory(
+    _: Allocator,
     _: Allocator,
     _: []const u8,
     _: []const u8,

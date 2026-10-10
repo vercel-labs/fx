@@ -1,5 +1,7 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
+const safe_git = @import("../shell_command/safe_git.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -12,46 +14,86 @@ pub const Snapshot = struct {
     }
 };
 
+const Query = struct {
+    subcommand: safe_git.Subcommand,
+    args: []const []const u8,
+};
+
+const branch_query: Query = .{ .subcommand = .branch, .args = &.{"--show-current"} };
+const status_query: Query = .{ .subcommand = .status, .args = &.{ "--short", "--branch" } };
+const log_query: Query = .{ .subcommand = .log, .args = &.{ "--oneline", "-5" } };
+const staged_query: Query = .{ .subcommand = .diff, .args = &.{ "--stat", "--cached" } };
+const unstaged_query: Query = .{ .subcommand = .diff, .args = &.{"--stat"} };
+const inside_query: Query = .{ .subcommand = .rev_parse, .args = &.{"--is-inside-work-tree"} };
+/// Every git command the snapshot runs.
+const queries = [_]Query{ branch_query, status_query, log_query, staged_query, unstaged_query, inside_query };
+
+/// Captures the working directory's git state through safe git. When fx
+/// cannot run git safely there, every section reads as unavailable and the
+/// snapshot does not claim the directory is outside a repository, so `fx pr`
+/// still starts and its agent can inspect the files directly.
 pub fn snapshot(alloc: Allocator) !Snapshot {
-    const in_git_repo = isGitRepository(alloc);
-    const branch = try runGit(alloc, &.{ "branch", "--show-current" });
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const ready = switch (try prepareHere(arena_state.allocator())) {
+        .ready => |ready| ready,
+        .refused => return .{
+            .in_git_repo = true,
+            .text = try formatSnapshot(alloc, null, null, null, null, null),
+        },
+    };
+
+    const branch = try runGit(alloc, ready, branch_query);
     defer if (branch) |text| alloc.free(text);
-    const status = try runGit(alloc, &.{ "status", "--short", "--branch" });
+    const status = try runGit(alloc, ready, status_query);
     defer if (status) |text| alloc.free(text);
-    const log = try runGit(alloc, &.{ "log", "--oneline", "-5" });
+    const log = try runGit(alloc, ready, log_query);
     defer if (log) |text| alloc.free(text);
-    const staged = try runGit(alloc, &.{ "diff", "--stat", "--cached" });
+    const staged = try runGit(alloc, ready, staged_query);
     defer if (staged) |text| alloc.free(text);
-    const unstaged = try runGit(alloc, &.{ "diff", "--stat" });
+    const unstaged = try runGit(alloc, ready, unstaged_query);
     defer if (unstaged) |text| alloc.free(text);
 
     return .{
-        .in_git_repo = in_git_repo,
+        .in_git_repo = isGitRepository(alloc, ready),
         .text = try formatSnapshot(alloc, branch, status, log, staged, unstaged),
     };
 }
 
-fn buildGitArgv(alloc: Allocator, args: []const []const u8) !std.ArrayList([]const u8) {
-    var argv = std.ArrayList([]const u8).empty;
-    errdefer argv.deinit(alloc);
-    try argv.append(alloc, "git");
-    try argv.append(alloc, "--no-optional-locks");
-    try argv.appendSlice(alloc, args);
-    return argv;
+fn prepareHere(arena: Allocator) Allocator.Error!safe_git.Prepared {
+    const cwd = io_mod.realpathAlloc(arena, ".") catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("core", "git snapshot unavailable reason=cwd_unresolved error={s}", .{@errorName(err)});
+            return .{ .refused = .repo_config_unavailable };
+        },
+    };
+    return safe_git.prepare(arena, cwd);
 }
 
-pub fn isGitRepository(alloc: Allocator) bool {
-    const result = runGit(alloc, &.{ "rev-parse", "--is-inside-work-tree" }) catch return false;
+/// Memory belongs to `arena`.
+fn buildGitArgv(arena: Allocator, ready: safe_git.Ready, query: Query) Allocator.Error![]const []const u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    try safe_git.appendCommand(arena, &argv, ready, query.subcommand);
+    try argv.appendSlice(arena, query.args);
+    return argv.items;
+}
+
+fn isGitRepository(alloc: Allocator, ready: safe_git.Ready) bool {
+    const result = runGit(alloc, ready, inside_query) catch return false;
     defer if (result) |text| alloc.free(text);
     return if (result) |text| std.mem.eql(u8, text, "true") else false;
 }
 
-fn runGit(alloc: Allocator, args: []const []const u8) !?[]u8 {
-    var argv = try buildGitArgv(alloc, args);
-    defer argv.deinit(alloc);
+fn runGit(alloc: Allocator, ready: safe_git.Ready, query: Query) !?[]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var environment = try safe_git.environment(arena);
 
     const result = std.process.run(alloc, io_mod.getIo(), .{
-        .argv = argv.items,
+        .argv = try buildGitArgv(arena, ready, query),
+        .environ_map = &environment,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
@@ -161,21 +203,26 @@ test "snapshot formatting: populated sections preserve layout exactly" {
     , text);
 }
 
-test "git argv: read-only commands disable optional locks" {
-    var argv = try buildGitArgv(std.testing.allocator, &.{ "status", "--short", "--branch" });
-    defer argv.deinit(std.testing.allocator);
+test "git argv: every snapshot command is built by the safe-git helper" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const ready: safe_git.Ready = .{ .executable = "/usr/bin/git", .filter_names = &.{"x"} };
 
-    try std.testing.expectEqual(@as(usize, 5), argv.items.len);
-    try std.testing.expectEqualStrings("git", argv.items[0]);
-    try std.testing.expectEqualStrings("--no-optional-locks", argv.items[1]);
-    try std.testing.expectEqualStrings("status", argv.items[2]);
-    try std.testing.expectEqualStrings("--short", argv.items[3]);
-    try std.testing.expectEqualStrings("--branch", argv.items[4]);
+    for (queries) |query| {
+        var prefix: std.ArrayList([]const u8) = .empty;
+        try safe_git.appendCommand(arena, &prefix, ready, query.subcommand);
+        const argv = try buildGitArgv(arena, ready, query);
+        try std.testing.expectEqual(prefix.items.len + query.args.len, argv.len);
+        for (prefix.items, argv[0..prefix.items.len]) |want, have| try std.testing.expectEqualStrings(want, have);
+        for (query.args, argv[prefix.items.len..]) |want, have| try std.testing.expectEqualStrings(want, have);
+    }
 }
 
 test "git repository detection treats allocation failure as unavailable" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    try std.testing.expect(!isGitRepository(failing.allocator()));
+    const ready: safe_git.Ready = .{ .executable = "/usr/bin/git", .filter_names = &.{} };
+    try std.testing.expect(!isGitRepository(failing.allocator(), ready));
 }
 
 test "snapshot returns owned Git status text" {

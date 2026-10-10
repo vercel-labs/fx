@@ -837,6 +837,8 @@ pub fn Runtime(comptime App: type) type {
 
         pub const prepareFilePicker = completion_rt.prepareFilePicker;
         pub const collectFilePickerFacts = completion_rt.collectFilePickerFacts;
+        pub const holdFrameForFileListing = completion_rt.holdFrameForFileListing;
+        pub const fileListingHoldPending = completion_rt.fileListingHoldPending;
 
         pub fn handleByte(app: *App, byte: u8, max_input_len: usize, max_prompt_history: usize) !void {
             return handleTerminalByteWithLimits(
@@ -7163,30 +7165,37 @@ test "app_input_runtime file picker reuses one existing terminator and preserves
     }
 }
 
-test "app_input_runtime accepts typed directories with one synthetic slash" {
+test "app_input_runtime opens typed directories with Tab and selects them with Enter" {
     const alloc = std.testing.allocator;
     const completions = [_]file_index.Candidate{.{ .path = "src/nested", .kind = .directory }};
     const cases = [_]struct {
         input: []const u8,
         cursor: usize,
-        expected: []const u8,
-        expected_cursor: usize,
+        opened: []const u8,
+        opened_cursor: usize,
+        selected: []const u8,
+        selected_cursor: usize,
     }{
         .{
             .input = "@srcn",
             .cursor = "@srcn".len,
-            .expected = "@src/nested/",
-            .expected_cursor = "@src/nested/".len,
+            .opened = "@src/nested/",
+            .opened_cursor = "@src/nested/".len,
+            .selected = "@src/nested/ ",
+            .selected_cursor = "@src/nested/ ".len,
         },
         .{
             .input = "before @srcn tail",
             .cursor = "before @srcn".len,
-            .expected = "before @src/nested/ tail",
-            .expected_cursor = "before @src/nested/".len,
+            .opened = "before @src/nested/ tail",
+            .opened_cursor = "before @src/nested/".len,
+            .selected = "before @src/nested/ tail",
+            .selected_cursor = "before @src/nested/ ".len,
         },
     };
 
     for ([_]u8{ '\t', '\r' }) |byte| {
+        const opens = byte == '\t';
         for (cases) |case| {
             var app = try RoutingFakeApp.init(alloc);
             defer app.deinit();
@@ -7198,10 +7207,10 @@ test "app_input_runtime accepts typed directories with one synthetic slash" {
             presentRoutingFilePicker(&app);
             try Runtime(RoutingFakeApp).handleByte(&app, byte, 4096, 100);
 
-            try std.testing.expectEqualStrings(case.expected, app.input_runtime.edit_state.input.items);
-            try std.testing.expectEqual(case.expected_cursor, app.input_runtime.edit_state.cursor);
+            try std.testing.expectEqualStrings(if (opens) case.opened else case.selected, app.input_runtime.edit_state.input.items);
+            try std.testing.expectEqual(if (opens) case.opened_cursor else case.selected_cursor, app.input_runtime.edit_state.cursor);
             try std.testing.expectEqual(file_index.CandidateKind.directory, app.validated_file_completion_kind.?);
-            try std.testing.expect(app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) != null);
+            try std.testing.expectEqual(opens, app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) != null);
             try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
         }
     }

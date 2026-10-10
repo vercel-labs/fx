@@ -52,6 +52,9 @@ jobs:
       - name: Check compactor boundary
         run: ./scripts/check-compactor-boundary.sh
 
+      - name: Check indexer boundary
+        run: ./scripts/check-indexer-boundary.sh
+
       - name: Test CI and release scripts
         run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need -q
 
@@ -687,6 +690,7 @@ jobs:
           scripts=(
             benchmarks/startup.sh
             scripts/check-compactor-boundary.sh
+            scripts/check-indexer-boundary.sh
             scripts/check-public-surface.sh
             scripts/detect-macos-need.sh
             scripts/smoke-binary.sh

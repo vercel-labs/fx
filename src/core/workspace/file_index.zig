@@ -15,8 +15,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const unicode_simple_fold = @import("unicode_simple_fold.zig");
 const pathing = @import("pathing.zig");
 const workspace_access = @import("workspace_access.zig");
-const workspace_files = @import("workspace_files.zig");
-const file_index_cache = @import("file_index_cache.zig");
+const indexer = @import("../indexer/indexer.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -800,16 +799,22 @@ fn loadGeneration(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    const snapshot_path = snapshotPath(arena, roots) catch |err| return .{ .failed = .{ .stage = .discovery, .err = err } };
+    var previous = if (snapshot_path) |path|
+        indexer.loadSnapshot(alloc, path, roots) catch |err| return .{ .failed = .{ .stage = .discovery, .err = err } }
+    else
+        null;
+    defer if (previous) |*snapshot| snapshot.deinit();
+
     if (allow_cache) {
-        if (file_index_cache.load(arena, roots) catch |err| blk: {
-            if (err == error.OutOfMemory) return .{ .failed = .{ .stage = .discovery, .err = err } };
-            break :blk null;
-        }) |loaded_value| {
-            var loaded = loaded_value;
-            defer loaded.deinit(arena);
+        if (previous) |*snapshot| {
+            const candidates = candidatesFromTrees(arena, roots, snapshot.trees, stop_requested) catch |err| {
+                if (err == error.Canceled or isStopRequested(stop_requested)) return .canceled;
+                return .{ .failed = .{ .stage = .discovery, .err = err } };
+            };
             generation.from_cache = true;
             generation.fillProgressive(alloc, .{ .typed = .{
-                .candidates = loaded.candidates,
+                .candidates = candidates,
                 .indices = null,
             } }, stop_requested) catch |err| {
                 if (err == error.Canceled or isStopRequested(stop_requested)) return .canceled;
@@ -821,16 +826,27 @@ fn loadGeneration(
         }
     }
 
-    const candidates = discoverScopeCandidates(arena, roots, stop_requested) catch |err| {
+    var refreshed = refreshTrees(alloc, roots, if (previous) |*snapshot| snapshot.trees else &.{}, stop_requested) catch |err| {
         if (err == error.Canceled or isStopRequested(stop_requested)) return .canceled;
         return .{ .failed = .{ .stage = .discovery, .err = err } };
     };
+    defer refreshed.deinit(alloc);
 
-    // Persist before the fill so even a canceled publish leaves a warm cache.
-    file_index_cache.save(arena, roots, candidates) catch |err| {
-        debug_trace.logf("core", "file index cache not saved generation={d} err={s}", .{ generation.id, @errorName(err) });
+    // Persist before the fill so even a canceled publish leaves a warm
+    // snapshot. A scope with an unavailable root is not saved, so its next
+    // load scans again.
+    if (snapshot_path) |path| {
+        if (refreshed.scans.len > 0 and refreshed.trees.len == roots.len) {
+            indexer.saveSnapshot(arena, path, refreshed.trees) catch |err| {
+                debug_trace.logf("core", "file index cache not saved generation={d} err={s}", .{ generation.id, @errorName(err) });
+            };
+        }
+    }
+
+    const candidates = candidatesFromTrees(arena, roots, refreshed.trees, stop_requested) catch |err| {
+        if (err == error.Canceled or isStopRequested(stop_requested)) return .canceled;
+        return .{ .failed = .{ .stage = .discovery, .err = err } };
     };
-
     generation.fillProgressive(alloc, .{ .typed = .{
         .candidates = candidates,
         .indices = null,
@@ -840,6 +856,158 @@ fn loadGeneration(
     };
     if (isStopRequested(stop_requested)) return .canceled;
     return .ready;
+}
+
+/// `<home>/.fx/file-index/<sha256 of the roots>.idx`, one file per scope, or
+/// null without an absolute home directory.
+pub fn snapshotPath(alloc: Allocator, roots: []const []const u8) Allocator.Error!?[]const u8 {
+    const home = io_mod.getenv("HOME") orelse return null;
+    if (!std.fs.path.isAbsolute(home)) return null;
+    return try snapshotPathIn(alloc, home, roots);
+}
+
+fn snapshotPathIn(alloc: Allocator, home: []const u8, roots: []const []const u8) Allocator.Error![]const u8 {
+    const hex = std.fmt.bytesToHex(rootsDigest(roots), .lower);
+    return std.fmt.allocPrint(alloc, "{s}/.fx/file-index/{s}.idx", .{ home, &hex });
+}
+
+/// The trees for the available roots of a scope, in root order. Trees reused
+/// from a snapshot borrow its memory; `scans` owns the rest.
+const RefreshedTrees = struct {
+    trees: []indexer.Tree,
+    scans: []indexer.ScanResult,
+
+    fn deinit(self: *RefreshedTrees, alloc: Allocator) void {
+        for (self.scans) |*result| result.deinit();
+        alloc.free(self.scans);
+        alloc.free(self.trees);
+        self.* = undefined;
+    }
+};
+
+/// Reuses each saved tree that is still current and scans every other root.
+/// `previous` is empty or holds one tree per root in order. An unavailable
+/// root is left out; a scope with no available root fails.
+fn refreshTrees(
+    alloc: Allocator,
+    roots: []const []const u8,
+    previous: []const indexer.Tree,
+    stop_requested: *std.atomic.Value(bool),
+) (indexer.ScanError || error{FileNotFound})!RefreshedTrees {
+    std.debug.assert(previous.len == 0 or previous.len == roots.len);
+    var trees: std.ArrayList(indexer.Tree) = .empty;
+    defer trees.deinit(alloc);
+    var scans: std.ArrayList(indexer.ScanResult) = .empty;
+    defer {
+        for (scans.items) |*result| result.deinit();
+        scans.deinit(alloc);
+    }
+    try trees.ensureTotalCapacity(alloc, roots.len);
+    try scans.ensureTotalCapacity(alloc, roots.len);
+
+    for (roots, 0..) |root, root_index| {
+        if (isStopRequested(stop_requested)) return error.Canceled;
+        if (previous.len > 0 and indexer.isCurrent(&previous[root_index], root, &indexer.default_skipped_names, null)) {
+            debug_trace.logf("core", "file index root reused root={d} entries={d} thread={d}", .{ root_index, previous[root_index].entries.len, std.Thread.getCurrentId() });
+            trees.appendAssumeCapacity(previous[root_index]);
+            continue;
+        }
+        const result = indexer.scan(alloc, root, .{ .candidate_cap = max_indexed_files }, stop_requested) catch |err| switch (err) {
+            error.RootUnavailable => {
+                debug_trace.logf("core", "file index root discovery omitted root={d} err={s}", .{ root_index, @errorName(err) });
+                continue;
+            },
+            else => |e| return e,
+        };
+        scans.appendAssumeCapacity(result);
+        trees.appendAssumeCapacity(result.tree);
+        debug_trace.logf("core", "file index root scanned root={d} entries={d} incomplete={} thread={d}", .{ root_index, result.tree.entries.len, result.tree.incomplete, std.Thread.getCurrentId() });
+    }
+    if (trees.items.len == 0 and roots.len > 0) return error.FileNotFound;
+
+    const owned_trees = try trees.toOwnedSlice(alloc);
+    errdefer alloc.free(owned_trees);
+    return .{ .trees = owned_trees, .scans = try scans.toOwnedSlice(alloc) };
+}
+
+/// Converts trees into candidates in root order: primary-root paths stay
+/// relative, added-root paths become absolute, overlapping roots appear once,
+/// and at most `max_indexed_files` are kept. Paths may borrow tree memory.
+fn candidatesFromTrees(
+    arena: Allocator,
+    roots: []const []const u8,
+    trees: []const indexer.Tree,
+    stop_requested: *std.atomic.Value(bool),
+) (Allocator.Error || error{Canceled})![]const Candidate {
+    if (trees.len == 1 and roots.len > 0 and std.mem.eql(u8, trees[0].root, roots[0])) {
+        return primaryTreeCandidates(arena, &trees[0], stop_requested);
+    }
+    var candidates: std.ArrayList(Candidate) = .empty;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    for (trees) |*tree| {
+        const root_index: usize = if (roots.len > 0 and std.mem.eql(u8, tree.root, roots[0])) 0 else 1;
+        for (tree.entries) |entry| {
+            if (isStopRequested(stop_requested)) return error.Canceled;
+            if (candidates.items.len >= max_indexed_files) return candidates.toOwnedSlice(arena);
+            if (hasGitComponent(entry.path)) continue;
+            if (!text_utils.isTerminalSafe(entry.path)) {
+                debug_trace.logf("core", "file index omitted unsafe candidate bytes={d} kind={s}", .{ entry.path.len, @tagName(entry.kind) });
+                continue;
+            }
+            const kind: CandidateKind = switch (entry.kind) {
+                .file => .file,
+                .directory => .directory,
+            };
+            _ = try appendDiscoveredCandidate(arena, &candidates, &seen, tree.root, root_index, entry.path, kind);
+        }
+    }
+    return candidates.toOwnedSlice(arena);
+}
+
+/// The primary root alone: its entries are unique and already relative, so
+/// each one is checked once and kept as is, with no absolute path or
+/// overlap check per entry. This runs on every `@` paint.
+fn primaryTreeCandidates(
+    arena: Allocator,
+    tree: *const indexer.Tree,
+    stop_requested: *std.atomic.Value(bool),
+) (Allocator.Error || error{Canceled})![]const Candidate {
+    var candidates: std.ArrayList(Candidate) = .empty;
+    try candidates.ensureTotalCapacity(arena, @min(tree.entries.len, max_indexed_files));
+    for (tree.entries) |entry| {
+        if (isStopRequested(stop_requested)) return error.Canceled;
+        if (candidates.items.len >= max_indexed_files) break;
+        if (!isPlainRelativePath(entry.path)) continue;
+        if (!text_utils.isTerminalSafe(entry.path)) {
+            debug_trace.logf("core", "file index omitted unsafe candidate bytes={d} kind={s}", .{ entry.path.len, @tagName(entry.kind) });
+            continue;
+        }
+        const kind: CandidateKind = switch (entry.kind) {
+            .file => .file,
+            .directory => .directory,
+        };
+        const accepted = acceptedSafeCandidate(.{ .path = entry.path, .kind = kind }) orelse continue;
+        candidates.appendAssumeCapacity(accepted);
+    }
+    return candidates.toOwnedSlice(arena);
+}
+
+/// A relative `/`-separated path that stays inside its root and avoids
+/// `.git`: no empty, `.`, `..` or `.git` component.
+fn isPlainRelativePath(path: []const u8) bool {
+    var parts = std.mem.splitScalar(u8, path, '/');
+    while (parts.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..") or std.mem.eql(u8, part, ".git")) return false;
+    }
+    return true;
+}
+
+fn hasGitComponent(path: []const u8) bool {
+    var parts = std.mem.splitScalar(u8, path, '/');
+    while (parts.next()) |part| {
+        if (std.mem.eql(u8, part, ".git")) return true;
+    }
+    return false;
 }
 
 /// Publishes the loader's terminal outcome only after its caller has released
@@ -899,136 +1067,6 @@ fn rootsEqual(a: []const []const u8, b: []const []const u8) bool {
     return true;
 }
 
-fn discoverScopeCandidates(
-    alloc: Allocator,
-    roots: []const []const u8,
-    stop_requested: *std.atomic.Value(bool),
-) ![]const Candidate {
-    return discoverScopeCandidatesWithFallback(alloc, roots, stop_requested, false);
-}
-
-fn discoverScopeCandidatesWithFallback(
-    alloc: Allocator,
-    roots: []const []const u8,
-    stop_requested: *std.atomic.Value(bool),
-    force_fallback: bool,
-) ![]const Candidate {
-    if (isStopRequested(stop_requested)) return error.Canceled;
-
-    var candidates: std.ArrayList(Candidate) = .empty;
-    errdefer candidates.deinit(alloc);
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
-    defer seen.deinit(alloc);
-    var kept: usize = 0;
-    var succeeded: usize = 0;
-
-    for (roots, 0..) |root_path, root_index| {
-        if (isStopRequested(stop_requested)) return error.Canceled;
-        if (kept >= max_indexed_files) break;
-        const remaining = max_indexed_files - kept;
-
-        const discovered = workspace_files.discoverCancellable(
-            alloc,
-            root_path,
-            .{
-                .candidate_cap = remaining,
-                .force_fallback = force_fallback,
-                .include_hidden = true,
-                .include_untracked = true,
-                .sort_paths = true,
-                .git_worktree_is_authoritative = true,
-            },
-            stop_requested,
-        ) catch |err| {
-            if (err == error.Canceled or isStopRequested(stop_requested)) return error.Canceled;
-            debug_trace.logf("core", "file index root discovery omitted root={d} err={s}", .{ root_index, @errorName(err) });
-            continue;
-        };
-        succeeded += 1;
-
-        const discovered_directories: []const []const u8 = directories: {
-            const result = workspace_files.discoverDirectoriesCancellable(
-                alloc,
-                root_path,
-                .{
-                    .candidate_cap = remaining,
-                    .force_fallback = force_fallback,
-                    .include_hidden = true,
-                    .sort_paths = true,
-                    .git_worktree_is_authoritative = true,
-                },
-                stop_requested,
-            ) catch |err| {
-                if (err == error.Canceled or isStopRequested(stop_requested)) return error.Canceled;
-                debug_trace.logf("core", "file index root directory discovery omitted root={d} err={s}", .{ root_index, @errorName(err) });
-                break :directories &.{};
-            };
-            break :directories result.directories;
-        };
-
-        var root = std.Io.Dir.openDirAbsolute(io_mod.getIo(), root_path, .{}) catch |err| {
-            debug_trace.logf("core", "file index root admission omitted root={d} err={s}", .{ root_index, @errorName(err) });
-            succeeded -= 1;
-            continue;
-        };
-        defer root.close(io_mod.getIo());
-
-        var file_cursor: usize = 0;
-        var directory_cursor: usize = 0;
-        while (nextSortedDiscoveredCandidate(
-            discovered.files,
-            discovered_directories,
-            &file_cursor,
-            &directory_cursor,
-        )) |candidate| {
-            if (isStopRequested(stop_requested)) return error.Canceled;
-            if (kept >= max_indexed_files) break;
-            if (workspace_files.pathContainsIgnoredDir(&.{".git"}, candidate.path)) continue;
-            if (!text_utils.isTerminalSafe(candidate.path)) {
-                debug_trace.logf("core", "file index omitted unsafe candidate bytes={d} kind={s}", .{ candidate.path.len, @tagName(candidate.kind) });
-                continue;
-            }
-            if (candidate.kind == .file) {
-                const stat = root.statFile(io_mod.getIo(), candidate.path, .{ .follow_symlinks = false }) catch |err| {
-                    debug_trace.logf("core", "file index omitted missing candidate bytes={d} err={s}", .{ candidate.path.len, @errorName(err) });
-                    continue;
-                };
-                if (stat.kind != .file and stat.kind != .sym_link) continue;
-            }
-
-            if (try appendDiscoveredCandidate(
-                alloc,
-                &candidates,
-                &seen,
-                root_path,
-                root_index,
-                candidate.path,
-                candidate.kind,
-            )) kept += 1;
-        }
-    }
-
-    if (succeeded == 0 and roots.len > 0) return error.FileNotFound;
-    return candidates.toOwnedSlice(alloc);
-}
-
-fn nextSortedDiscoveredCandidate(
-    files: []const []const u8,
-    directories: []const []const u8,
-    file_cursor: *usize,
-    directory_cursor: *usize,
-) ?Candidate {
-    if (file_cursor.* >= files.len and directory_cursor.* >= directories.len) return null;
-    if (directory_cursor.* >= directories.len or
-        (file_cursor.* < files.len and std.mem.order(u8, files[file_cursor.*], directories[directory_cursor.*]) != .gt))
-    {
-        defer file_cursor.* += 1;
-        return .{ .path = files[file_cursor.*], .kind = .file };
-    }
-    defer directory_cursor.* += 1;
-    return .{ .path = directories[directory_cursor.*], .kind = .directory };
-}
-
 fn appendDiscoveredCandidate(
     alloc: Allocator,
     candidates: *std.ArrayList(Candidate),
@@ -1076,9 +1114,14 @@ fn acceptedRawPath(sep: u8, raw: []const u8) ?[]const u8 {
 }
 
 fn acceptedCandidate(candidate: Candidate) ?Candidate {
+    if (!text_utils.isTerminalSafe(candidate.path)) return null;
+    return acceptedSafeCandidate(candidate);
+}
+
+/// `acceptedCandidate` for a path already known to be terminal-safe.
+fn acceptedSafeCandidate(candidate: Candidate) ?Candidate {
     if (candidate.path.len == 0) return null;
     if (candidate.path.len > max_path_len) return null;
-    if (!text_utils.isTerminalSafe(candidate.path)) return null;
     if (!file_picker_path.isRepresentable(candidate.path)) return null;
     if (candidate.kind == .directory and std.fs.path.isSep(candidate.path[candidate.path.len - 1])) return null;
     return candidate;
@@ -1840,25 +1883,89 @@ test "typed candidate cap is shared across files and directories" {
     try std.testing.expectEqual(CandidateKind.directory, file_index.kindAt(max_indexed_files - 1));
 }
 
-test "sorted discovery merge retains directories at the exact shared cap" {
-    const files = try std.testing.allocator.alloc([]const u8, max_indexed_files);
-    defer std.testing.allocator.free(files);
-    @memset(files, "z-file");
-    const directories = [_][]const u8{"a-empty-directory"};
-    var file_cursor: usize = 0;
-    var directory_cursor: usize = 0;
-    var count: usize = 0;
-    var saw_directory = false;
+test "tree candidates keep a sorted directory at the exact shared cap" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const entries = try arena.alloc(indexer.Entry, max_indexed_files + 1);
+    entries[0] = .{ .path = "a-empty-directory", .kind = .directory };
+    for (entries[1..], 0..) |*entry, index| {
+        entry.* = .{ .path = try std.fmt.allocPrint(arena, "z-file-{d:0>6}", .{index}), .kind = .file };
+    }
+    const tree: indexer.Tree = .{
+        .root = "/workspace",
+        .root_inode = 1,
+        .scan_started_ns = 0,
+        .repository = false,
+        .incomplete = false,
+        .cap_reached = false,
+        .skipped_overlong = 0,
+        .skipped_names = &.{},
+        .entries = entries,
+        .folders = &.{},
+        .sources = &.{},
+    };
+    var stop_requested = std.atomic.Value(bool).init(false);
+    const candidates = try candidatesFromTrees(arena, &.{"/workspace"}, &.{tree}, &stop_requested);
+    try std.testing.expectEqual(max_indexed_files, candidates.len);
+    try std.testing.expectEqual(CandidateKind.directory, candidates[0].kind);
+    try std.testing.expectEqualStrings("z-file-099998", candidates[max_indexed_files - 1].path);
+}
 
-    while (count < max_indexed_files) : (count += 1) {
-        const candidate = nextSortedDiscoveredCandidate(files, &directories, &file_cursor, &directory_cursor).?;
-        saw_directory = saw_directory or candidate.kind == .directory;
+test "primary tree candidates keep plain paths and drop git, escaping and unsafe ones" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const entries = [_]indexer.Entry{
+        .{ .path = ".git/config", .kind = .file },
+        .{ .path = "a/../../outside", .kind = .file },
+        .{ .path = "/absolute", .kind = .file },
+        .{ .path = "a//b", .kind = .file },
+        .{ .path = "./a", .kind = .file },
+        .{ .path = "bad-\x1b[2J", .kind = .file },
+        .{ .path = "src", .kind = .directory },
+        .{ .path = "src/.gitignore", .kind = .file },
+        .{ .path = "src/main.zig", .kind = .file },
+    };
+    const tree: indexer.Tree = .{
+        .root = "/workspace",
+        .root_inode = 1,
+        .scan_started_ns = 0,
+        .repository = true,
+        .incomplete = false,
+        .cap_reached = false,
+        .skipped_overlong = 0,
+        .skipped_names = &.{},
+        .entries = &entries,
+        .folders = &.{},
+        .sources = &.{},
+    };
+    var stop_requested = std.atomic.Value(bool).init(false);
+    const candidates = try candidatesFromTrees(arena, &.{"/workspace"}, &.{tree}, &stop_requested);
+    try std.testing.expectEqual(@as(usize, 3), candidates.len);
+    try std.testing.expectEqualStrings("src", candidates[0].path);
+    try std.testing.expectEqual(CandidateKind.directory, candidates[0].kind);
+    try std.testing.expectEqualStrings("src/.gitignore", candidates[1].path);
+    try std.testing.expectEqualStrings("src/main.zig", candidates[2].path);
+}
+
+/// Scans `roots` without a snapshot and keeps the trees alive while the
+/// caller inspects candidates that borrow their memory.
+const TestScope = struct {
+    refreshed: RefreshedTrees,
+    candidates: []const Candidate,
+
+    fn init(arena: Allocator, roots: []const []const u8) !TestScope {
+        var stop_requested = std.atomic.Value(bool).init(false);
+        var refreshed = try refreshTrees(std.testing.allocator, roots, &.{}, &stop_requested);
+        errdefer refreshed.deinit(std.testing.allocator);
+        return .{ .refreshed = refreshed, .candidates = try candidatesFromTrees(arena, roots, refreshed.trees, &stop_requested) };
     }
 
-    try std.testing.expect(saw_directory);
-    try std.testing.expectEqual(max_indexed_files - 1, file_cursor);
-    try std.testing.expectEqual(@as(usize, 1), directory_cursor);
-}
+    fn deinit(self: *TestScope) void {
+        self.refreshed.deinit(std.testing.allocator);
+    }
+};
 
 test "subsequence scoring prefers basename prefix over mid-path match" {
     const path_a = "src/main.zig";
@@ -2581,9 +2688,11 @@ test "persisted file index paints a stale preview and the real scan replaces it"
     const scanned_count = first.count();
     try std.testing.expectEqual(@as(usize, 1), adoptions);
     try std.testing.expect(scanned_count >= 2);
-    var cached = (try file_index_cache.loadFrom(alloc, home, &roots)).?;
-    defer cached.deinit(alloc);
-    try std.testing.expect(cached.candidates.len > 0);
+    const snapshot_file = try snapshotPathIn(alloc, home, &roots);
+    defer alloc.free(snapshot_file);
+    var cached = (try indexer.loadSnapshot(alloc, snapshot_file, &roots)).?;
+    defer cached.deinit();
+    try std.testing.expect(cached.trees[0].entries.len > 0);
 
     // The tree changes between launches.
     {
@@ -2653,10 +2762,11 @@ test "scope discovery emits primary-relative and added-absolute paths in root or
     const shared_directory = try std.fs.path.join(alloc, &.{ shared, "nested" });
     defer alloc.free(shared_directory);
     const roots = [_][]const u8{ primary, shared };
-    var stop_requested = std.atomic.Value(bool).init(false);
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
-    const candidates = try discoverScopeCandidatesWithFallback(arena_state.allocator(), &roots, &stop_requested, true);
+    var scope = try TestScope.init(arena_state.allocator(), &roots);
+    defer scope.deinit();
+    const candidates = scope.candidates;
 
     var index = FileIndex{};
     defer index.deinit(alloc);
@@ -2715,8 +2825,9 @@ test "production scope admits tracked untracked hidden and direct directory cand
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
-    var stop_requested = std.atomic.Value(bool).init(false);
-    const candidates = try discoverScopeCandidates(arena_state.allocator(), &.{root}, &stop_requested);
+    var scope = try TestScope.init(arena_state.allocator(), &.{root});
+    defer scope.deinit();
+    const candidates = scope.candidates;
 
     try std.testing.expect(containsCandidate(candidates, "tracked.txt", .file));
     try std.testing.expect(containsCandidate(candidates, "untracked.txt", .file));
@@ -2732,7 +2843,7 @@ test "production scope admits tracked untracked hidden and direct directory cand
     try std.testing.expect(!containsCandidate(candidates, "ignored-dir", .directory));
     try std.testing.expect(containsCandidate(candidates, "empty-dir", .directory));
     for (candidates) |candidate| {
-        try std.testing.expect(!workspace_files.pathContainsIgnoredDir(&.{".git"}, candidate.path));
+        try std.testing.expect(!hasGitComponent(candidate.path));
     }
 
     var index = FileIndex{};
@@ -2761,10 +2872,11 @@ test "scope discovery deduplicates overlapping roots and tolerates one failed ro
     const missing = try std.fs.path.join(alloc, &.{ primary, "missing" });
     defer alloc.free(missing);
     const roots = [_][]const u8{ primary, nested, missing };
-    var stop_requested = std.atomic.Value(bool).init(false);
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
-    const candidates = try discoverScopeCandidatesWithFallback(arena_state.allocator(), &roots, &stop_requested, true);
+    var scope = try TestScope.init(arena_state.allocator(), &roots);
+    defer scope.deinit();
+    const candidates = scope.candidates;
 
     var index = FileIndex{};
     defer index.deinit(alloc);
@@ -3314,7 +3426,8 @@ test "initial allocation failure reports failure and a later load retries" {
     try std.testing.expectEqual(GenerationState.ready, loading.currentState());
     try std.testing.expect(index.joinThreadIfDone(alloc));
     try std.testing.expectEqual(State.ready, index.currentState());
-    try std.testing.expectEqual(@as(usize, 0), index.count());
+    try std.testing.expectEqual(@as(usize, 1), index.count());
+    try std.testing.expectEqualStrings("retry.txt", index.pathAt(0));
 }
 
 test "latest and identical refresh roots coalesce without a second loader" {
@@ -3405,7 +3518,8 @@ test "failed generation starts one queued refresh after reap" {
     try std.testing.expectEqual(GenerationState.ready, queued.currentState());
     try std.testing.expect(index.joinThreadIfDone(alloc));
     try std.testing.expect(index.active_generation.? != previous_active);
-    try std.testing.expectEqual(@as(usize, 0), index.count());
+    try std.testing.expectEqual(@as(usize, 1), index.count());
+    try std.testing.expectEqualStrings("queued.txt", index.pathAt(0));
 }
 
 test "stop before and after completion suppresses queued work" {

@@ -76,6 +76,13 @@ pub fn completeCancellable(
     var dir = std.Io.Dir.openDirAbsolute(io, resolved, .{ .iterate = true }) catch return error.PathUnavailable;
     defer dir.close(io);
 
+    // Listing a folder's contents: the folder itself is the first row, so it
+    // can be selected and not only opened.
+    const folder = listedFolder(parsed);
+    const reserved: usize = @intFromBool(folder != null);
+    const entries = out[reserved..];
+    const entry_storage = path_storage[reserved * slot_len ..];
+
     var count: usize = 0;
     var iterator = dir.iterate();
     while (true) {
@@ -96,11 +103,11 @@ pub fn completeCancellable(
         const candidate = candidate_storage[0..candidate_len];
         if (!text_utils.isTerminalSafe(candidate)) continue;
         if (!file_picker_path.isRepresentable(candidate)) continue;
-        count = insertCandidate(out, path_storage, &scores, &matcher, count, candidate, kind, score);
+        count = insertCandidate(entries, entry_storage, &scores, &matcher, count, candidate, kind, score);
     }
 
     var spans_used: usize = 0;
-    for (out[0..count]) |*result| {
+    for (entries[0..count]) |*result| {
         try checkCancellation(cancel);
         const span_count = matcher.match_spans(result.path[parsed.display_prefix.len..], match_spans[spans_used..]) catch |err| switch (err) {
             error.NoSpaceLeft => return error.NoSpaceLeft,
@@ -114,8 +121,25 @@ pub fn completeCancellable(
         result.matched_spans = spans;
         spans_used += span_count;
     }
+    if (folder) |path| {
+        const slot = pathSlot(path_storage, 0);
+        @memcpy(slot[0..path.len], path);
+        out[0] = .{ .path = slot[0..path.len], .kind = .directory, .matched_spans = &.{} };
+    }
     try checkCancellation(cancel);
-    return count;
+    return reserved + count;
+}
+
+/// The folder whose contents a query lists (`src/` lists `src`, `~` lists
+/// `~`), or null when the query names a partial entry or the root.
+fn listedFolder(parsed: ParsedQuery) ?[]const u8 {
+    if (parsed.basename_query.len != 0) return null;
+    const prefix = parsed.display_prefix;
+    if (prefix.len < 2 or !std.fs.path.isSep(prefix[prefix.len - 1])) return null;
+    const folder = prefix[0 .. prefix.len - 1];
+    if (std.fs.path.isSep(folder[folder.len - 1])) return null;
+    if (!text_utils.isTerminalSafe(folder) or !file_picker_path.isRepresentable(folder)) return null;
+    return folder;
 }
 
 fn checkCancellation(cancel: ?*const std.atomic.Value(bool)) error{Cancelled}!void {
@@ -292,15 +316,18 @@ test "path completion browses bare current and parent directories" {
     var spans: [4]file_index.MatchSpan = undefined;
     var paths: [4 * file_index.max_path_len]u8 = undefined;
 
-    try std.testing.expectEqual(@as(usize, 1), try complete(root, ".", &results, &spans, &paths));
-    try std.testing.expectEqualStrings("./local.txt", results[0].path);
-    try std.testing.expectEqual(@as(usize, 0), results[0].matched_spans.len);
-    try std.testing.expect(isCurrentCandidateKind(root, results[0].path, .file));
+    try std.testing.expectEqual(@as(usize, 2), try complete(root, ".", &results, &spans, &paths));
+    try std.testing.expectEqualStrings(".", results[0].path);
+    try std.testing.expectEqual(file_index.CandidateKind.directory, results[0].kind);
+    try std.testing.expectEqualStrings("./local.txt", results[1].path);
+    try std.testing.expectEqual(@as(usize, 0), results[1].matched_spans.len);
+    try std.testing.expect(isCurrentCandidateKind(root, results[1].path, .file));
 
-    try std.testing.expectEqual(@as(usize, 2), try complete(root, "..", &results, &spans, &paths));
-    try std.testing.expectEqualStrings("../parent.txt", results[0].path);
-    try std.testing.expectEqualStrings("../workspace", results[1].path);
-    try std.testing.expect(isCurrentCandidateKind(root, results[1].path, .directory));
+    try std.testing.expectEqual(@as(usize, 3), try complete(root, "..", &results, &spans, &paths));
+    try std.testing.expectEqualStrings("..", results[0].path);
+    try std.testing.expectEqualStrings("../parent.txt", results[1].path);
+    try std.testing.expectEqualStrings("../workspace", results[2].path);
+    try std.testing.expect(isCurrentCandidateKind(root, results[2].path, .directory));
 }
 
 test "path completion enumerates immediate entries with deterministic bounded order" {
@@ -317,15 +344,16 @@ test "path completion enumerates immediate entries with deterministic bounded or
 
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(root);
-    var results: [3]file_index.SearchResult = undefined;
-    var spans: [3]file_index.MatchSpan = undefined;
-    var paths: [3 * file_index.max_path_len]u8 = undefined;
+    var results: [4]file_index.SearchResult = undefined;
+    var spans: [4]file_index.MatchSpan = undefined;
+    var paths: [4 * file_index.max_path_len]u8 = undefined;
 
     const count = try complete(root, "./src/", &results, &spans, &paths);
-    try std.testing.expectEqual(@as(usize, 3), count);
-    try std.testing.expectEqualStrings("./src/.hidden.txt", results[0].path);
-    try std.testing.expectEqualStrings("./src/Alpha.txt", results[1].path);
-    try std.testing.expectEqualStrings("./src/beta.txt", results[2].path);
+    try std.testing.expectEqual(@as(usize, 4), count);
+    try std.testing.expectEqualStrings("./src", results[0].path);
+    try std.testing.expectEqualStrings("./src/.hidden.txt", results[1].path);
+    try std.testing.expectEqualStrings("./src/Alpha.txt", results[2].path);
+    try std.testing.expectEqualStrings("./src/beta.txt", results[3].path);
 
     const filtered_count = try complete(root, "src/al", &results, &spans, &paths);
     try std.testing.expectEqual(@as(usize, 2), filtered_count);
@@ -355,10 +383,11 @@ test "path completion resolves parent and absolute forms without recursive trave
     var spans: [8]file_index.MatchSpan = undefined;
     var paths: [8 * file_index.max_path_len]u8 = undefined;
     const parent_count = try complete(root, "../outside/", &results, &spans, &paths);
-    try std.testing.expectEqual(@as(usize, 2), parent_count);
-    try std.testing.expectEqualStrings("../outside/empty", results[0].path);
-    try std.testing.expectEqual(file_index.CandidateKind.directory, results[0].kind);
-    try std.testing.expectEqualStrings("../outside/external.txt", results[1].path);
+    try std.testing.expectEqual(@as(usize, 3), parent_count);
+    try std.testing.expectEqualStrings("../outside", results[0].path);
+    try std.testing.expectEqualStrings("../outside/empty", results[1].path);
+    try std.testing.expectEqual(file_index.CandidateKind.directory, results[1].kind);
+    try std.testing.expectEqualStrings("../outside/external.txt", results[2].path);
 
     var absolute_query_storage: [file_index.max_path_len]u8 = undefined;
     const absolute_query = try std.fmt.bufPrint(&absolute_query_storage, "{s}/ex", .{outside});
@@ -367,6 +396,41 @@ test "path completion resolves parent and absolute forms without recursive trave
     var expected_storage: [file_index.max_path_len]u8 = undefined;
     const expected = try std.fmt.bufPrint(&expected_storage, "{s}/external.txt", .{outside});
     try std.testing.expectEqualStrings(expected, results[0].path);
+}
+
+test "path completion lists a folder first so it can be selected" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "workspace/src/main.zig");
+    try writeTestFile(tmp.dir, "home/notes.txt");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var results: [4]file_index.SearchResult = undefined;
+    var spans: [4]file_index.MatchSpan = undefined;
+    var paths: [4 * file_index.max_path_len]u8 = undefined;
+
+    try std.testing.expectEqual(@as(usize, 2), try complete(root, "src/", &results, &spans, &paths));
+    try std.testing.expectEqualStrings("src", results[0].path);
+    try std.testing.expectEqual(file_index.CandidateKind.directory, results[0].kind);
+    try std.testing.expectEqual(@as(usize, 0), results[0].matched_spans.len);
+    try std.testing.expectEqualStrings("src/main.zig", results[1].path);
+    try std.testing.expect(isCurrentCandidateKind(root, results[0].path, .directory));
+
+    // A partial name lists matching entries only.
+    try std.testing.expectEqual(@as(usize, 1), try complete(root, "src/ma", &results, &spans, &paths));
+    try std.testing.expectEqualStrings("src/main.zig", results[0].path);
+
+    var cancel: std.atomic.Value(bool) = .init(false);
+    try std.testing.expectEqual(@as(usize, 2), try completeCancellable(root, home, "~", &cancel, &results, &spans, &paths));
+    try std.testing.expectEqualStrings("~", results[0].path);
+    try std.testing.expectEqualStrings("~/notes.txt", results[1].path);
+
+    // With room for one row, the folder itself is kept.
+    try std.testing.expectEqual(@as(usize, 1), try complete(root, "src/", results[0..1], &spans, paths[0..file_index.max_path_len]));
+    try std.testing.expectEqualStrings("src", results[0].path);
 }
 
 test "path completion follows listed symlinks and filters unsafe names" {

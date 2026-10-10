@@ -2,11 +2,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const glob_pattern = @import("glob_pattern.zig");
-const ignored_dirs = @import("ignored_dirs.zig");
 const io_mod = @import("../shared/io.zig");
 const pathing = @import("pathing.zig");
 const text_utils = @import("../shared/text_utils.zig");
-const workspace_files = @import("workspace_files.zig");
+const tool_files = @import("tool_files.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -17,7 +16,6 @@ pub const output_cap: usize = 200;
 pub const collection_cap: usize = 2000;
 
 const file_byte_cap: usize = 50 * 1024 * 4;
-const git_grep_stdout_limit: usize = 8 * 1024 * 1024;
 
 /// Filesystem match collected by grep search.
 pub const Match = struct {
@@ -36,7 +34,7 @@ pub const Result = struct {
     matches: []const Match,
     truncated_reason: ?TruncatedReason = null,
     candidate_count: usize = 0,
-    candidate_cap: usize = workspace_files.default_candidate_cap,
+    candidate_cap: usize = tool_files.default_candidate_cap,
     candidate_incomplete: bool = false,
     skipped_overlong: usize = 0,
 };
@@ -46,13 +44,17 @@ pub const CountResult = struct {
     matching_lines: usize = 0,
     matching_files: usize = 0,
     candidate_count: usize = 0,
-    candidate_cap: usize = workspace_files.default_candidate_cap,
+    candidate_cap: usize = tool_files.default_candidate_cap,
     candidate_incomplete: bool = false,
     skipped_overlong: usize = 0,
 };
 
-/// Collects literal line matches below a directory root. Returned slices are owned by arena.
+/// Collects literal line matches below a directory root. Returned slices are
+/// owned by `arena`, which only the calling thread uses. `scratch` must be
+/// thread-safe; it backs the listing and the content scan and is released
+/// before return, so retained memory grows with matches, not scanned bytes.
 pub fn collectDirectoryMatches(
+    scratch: Allocator,
     arena: Allocator,
     workspace_root: []const u8,
     absolute_root: []const u8,
@@ -60,10 +62,11 @@ pub fn collectDirectoryMatches(
     case_insensitive: bool,
     include: ?glob_pattern.Pattern,
 ) !Result {
-    return collectDirectoryMatchesWithIgnored(arena, workspace_root, absolute_root, pattern, case_insensitive, ignored_dirs.ignored_directory_names, include);
+    return collectDirectoryMatchesWithIgnored(scratch, arena, workspace_root, absolute_root, pattern, case_insensitive, tool_files.default_skipped_names, include);
 }
 
 pub fn collectDirectoryMatchesWithIgnored(
+    scratch: Allocator,
     arena: Allocator,
     workspace_root: []const u8,
     absolute_root: []const u8,
@@ -72,10 +75,11 @@ pub fn collectDirectoryMatchesWithIgnored(
     ignored_names: []const []const u8,
     include: ?glob_pattern.Pattern,
 ) !Result {
-    return collectDirectoryMatchesWithOptions(arena, workspace_root, absolute_root, pattern, case_insensitive, ignored_names, include, .{});
+    return collectDirectoryMatchesWithOptions(scratch, arena, workspace_root, absolute_root, pattern, case_insensitive, ignored_names, include, .{});
 }
 
 pub fn countDirectoryMatchesWithIgnored(
+    scratch: Allocator,
     arena: Allocator,
     workspace_root: []const u8,
     absolute_root: []const u8,
@@ -84,10 +88,11 @@ pub fn countDirectoryMatchesWithIgnored(
     ignored_names: []const []const u8,
     include: ?glob_pattern.Pattern,
 ) !CountResult {
-    return countDirectoryMatchesWithOptions(arena, workspace_root, absolute_root, pattern, case_insensitive, ignored_names, include, .{});
+    return countDirectoryMatchesWithOptions(scratch, arena, workspace_root, absolute_root, pattern, case_insensitive, ignored_names, include, .{});
 }
 
 fn collectDirectoryMatchesWithOptions(
+    scratch: Allocator,
     arena: Allocator,
     workspace_root: []const u8,
     absolute_root: []const u8,
@@ -95,50 +100,17 @@ fn collectDirectoryMatchesWithOptions(
     case_insensitive: bool,
     ignored_names: []const []const u8,
     include: ?glob_pattern.Pattern,
-    workspace_options: workspace_files.Options,
+    list_options: tool_files.Options,
 ) !Result {
+    const listing = try listCandidates(scratch, arena, workspace_root, absolute_root, ignored_names, list_options);
     var matches: std.ArrayList(Match) = .empty;
     errdefer matches.deinit(arena);
-
-    var truncated_reason: ?TruncatedReason = null;
-    var stats: CandidateStats = .{ .cap = workspace_options.candidate_cap };
-
-    if (!workspace_options.force_fallback and !gitIgnoresRoot(arena, absolute_root)) git: {
-        const tracked = gitGrepTrackedMatches(arena, workspace_root, absolute_root, pattern, case_insensitive, include, &matches) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            debug_trace.logf("core", "grep_files git grep fallback root={s} err={s}", .{ absolute_root, @errorName(err) });
-            break :git;
-        };
-        stats.count += tracked.candidate_count;
-        truncated_reason = tracked.truncated_reason;
-
-        if (truncated_reason == null) {
-            const untracked = workspaceFileCandidates(arena, absolute_root, ignored_names, .{
-                .candidate_cap = workspace_options.candidate_cap,
-                .git_stdout_limit = workspace_options.git_stdout_limit,
-                .only_untracked = true,
-            }) catch |err| {
-                if (err == error.OutOfMemory) return error.OutOfMemory;
-                debug_trace.logf("core", "grep_files untracked fallback skipped root={s} err={s}", .{ absolute_root, @errorName(err) });
-                return finishMatches(arena, &matches, truncated_reason, stats);
-            };
-            stats.add(untracked.result);
-            truncated_reason = try scanCandidateList(arena, workspace_root, untracked.provider_root, untracked.result.files, pattern, case_insensitive, include, &matches);
-        }
-
-        return finishMatches(arena, &matches, truncated_reason, stats);
-    }
-
-    var discovery_options = workspace_options;
-    discovery_options.include_untracked = true;
-    const candidates = try workspaceFileCandidates(arena, absolute_root, ignored_names, discovery_options);
-    stats.add(candidates.result);
-    truncated_reason = try scanCandidateList(arena, workspace_root, candidates.provider_root, candidates.result.files, pattern, case_insensitive, include, &matches);
-
-    return finishMatches(arena, &matches, truncated_reason, stats);
+    const truncated_reason = try scanCandidateList(scratch, arena, workspace_root, absolute_root, listing.files, pattern, case_insensitive, include, &matches);
+    return finishMatches(arena, &matches, truncated_reason, .fromListing(listing));
 }
 
 fn countDirectoryMatchesWithOptions(
+    scratch: Allocator,
     arena: Allocator,
     workspace_root: []const u8,
     absolute_root: []const u8,
@@ -146,60 +118,26 @@ fn countDirectoryMatchesWithOptions(
     case_insensitive: bool,
     ignored_names: []const []const u8,
     include: ?glob_pattern.Pattern,
-    workspace_options: workspace_files.Options,
+    list_options: tool_files.Options,
 ) !CountResult {
-    var count_result: CountResult = .{ .candidate_cap = workspace_options.candidate_cap };
-    var stats: CandidateStats = .{ .cap = workspace_options.candidate_cap };
-
-    if (!workspace_options.force_fallback and !gitIgnoresRoot(arena, absolute_root)) git: {
-        const tracked = gitGrepTrackedCounts(arena, workspace_root, absolute_root, pattern, case_insensitive, include) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            debug_trace.logf("core", "grep_files git grep count fallback root={s} err={s}", .{ absolute_root, @errorName(err) });
-            break :git;
-        };
-        count_result.matching_lines += tracked.matching_lines;
-        count_result.matching_files += tracked.matching_files;
-        stats.count += tracked.candidate_count;
-
-        const untracked = workspaceFileCandidates(arena, absolute_root, ignored_names, .{
-            .candidate_cap = workspace_options.candidate_cap,
-            .git_stdout_limit = workspace_options.git_stdout_limit,
-            .only_untracked = true,
-        }) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            debug_trace.logf("core", "grep_files untracked count fallback skipped root={s} err={s}", .{ absolute_root, @errorName(err) });
-            return finishCount(count_result, stats);
-        };
-        stats.add(untracked.result);
-        try countCandidateList(arena, workspace_root, untracked.provider_root, untracked.result.files, pattern, case_insensitive, include, &count_result);
-
-        return finishCount(count_result, stats);
-    }
-
-    var discovery_options = workspace_options;
-    discovery_options.include_untracked = true;
-    const candidates = try workspaceFileCandidates(arena, absolute_root, ignored_names, discovery_options);
-    stats.add(candidates.result);
-    try countCandidateList(arena, workspace_root, candidates.provider_root, candidates.result.files, pattern, case_insensitive, include, &count_result);
-
-    return finishCount(count_result, stats);
+    const listing = try listCandidates(scratch, arena, workspace_root, absolute_root, ignored_names, list_options);
+    var count_result: CountResult = .{ .candidate_cap = listing.candidate_cap };
+    try countCandidateList(scratch, workspace_root, absolute_root, listing.files, pattern, case_insensitive, include, &count_result);
+    return finishCount(count_result, .fromListing(listing));
 }
 
-fn gitIgnoresRoot(arena: Allocator, absolute_root: []const u8) bool {
-    const argv = [_][]const u8{ "git", "--no-optional-locks", "check-ignore", "-q", "--", "." };
-    const result = std.process.run(arena, io_mod.getIo(), .{
-        .argv = &argv,
-        .cwd = .{ .path = absolute_root },
-        .stdout_limit = std.Io.Limit.limited(1024),
-        .stderr_limit = std.Io.Limit.limited(1024),
-    }) catch return false;
-    defer arena.free(result.stdout);
-    defer arena.free(result.stderr);
-
-    return switch (result.term) {
-        .exited => |code| code == 0,
-        else => false,
-    };
+fn listCandidates(
+    scratch: Allocator,
+    arena: Allocator,
+    workspace_root: []const u8,
+    absolute_root: []const u8,
+    ignored_names: []const []const u8,
+    list_options: tool_files.Options,
+) !tool_files.Listing {
+    var options = list_options;
+    options.skipped_names = ignored_names;
+    options.include_hidden_in_repository = true;
+    return tool_files.list(scratch, arena, workspace_root, absolute_root, options);
 }
 
 /// Collects literal line matches from a single regular-file root.
@@ -218,7 +156,7 @@ pub fn collectRegularFileRoot(
     if (include) |include_pattern| {
         if (!include_pattern.matchesBasename(std.fs.path.basename(absolute_path))) {
             return finishMatches(arena, &matches, null, .{
-                .cap = workspace_files.default_candidate_cap,
+                .cap = tool_files.default_candidate_cap,
             });
         }
     }
@@ -227,7 +165,7 @@ pub fn collectRegularFileRoot(
 
     return finishMatches(arena, &matches, truncated_reason, .{
         .count = 1,
-        .cap = workspace_files.default_candidate_cap,
+        .cap = tool_files.default_candidate_cap,
     });
 }
 
@@ -243,7 +181,7 @@ pub fn countRegularFileRoot(
     _ = workspace_root;
     if (include) |include_pattern| {
         if (!include_pattern.matchesBasename(std.fs.path.basename(absolute_path))) {
-            return finishCount(.{}, .{ .cap = workspace_files.default_candidate_cap });
+            return finishCount(.{}, .{ .cap = tool_files.default_candidate_cap });
         }
     }
 
@@ -253,21 +191,23 @@ pub fn countRegularFileRoot(
         .matching_files = if (file_count.matching_lines > 0) 1 else 0,
     }, .{
         .count = 1,
-        .cap = workspace_files.default_candidate_cap,
+        .cap = tool_files.default_candidate_cap,
     });
 }
 
 const CandidateStats = struct {
     count: usize = 0,
-    cap: usize = workspace_files.default_candidate_cap,
+    cap: usize = tool_files.default_candidate_cap,
     incomplete: bool = false,
     skipped_overlong: usize = 0,
 
-    fn add(self: *CandidateStats, result: workspace_files.Result) void {
-        self.count += result.files.len;
-        self.cap = result.candidate_cap;
-        self.incomplete = self.incomplete or result.incomplete;
-        self.skipped_overlong += result.skipped_overlong;
+    fn fromListing(listing: tool_files.Listing) CandidateStats {
+        return .{
+            .count = listing.files.len,
+            .cap = listing.candidate_cap,
+            .incomplete = listing.incomplete,
+            .skipped_overlong = listing.skipped_overlong,
+        };
     }
 };
 
@@ -291,25 +231,10 @@ fn finishCount(result: CountResult, stats: CandidateStats) CountResult {
     return out;
 }
 
-const WorkspaceCandidates = struct {
-    result: workspace_files.Result,
-    provider_root: []const u8,
-};
-
 const CandidateFile = struct {
     display_path: []const u8,
     read_path: []const u8,
 };
-
-fn workspaceFileCandidates(arena: Allocator, absolute_root: []const u8, ignored_names: []const []const u8, options: workspace_files.Options) !WorkspaceCandidates {
-    var discover_options = options;
-    discover_options.ignored_names = ignored_names;
-
-    return .{
-        .result = try workspace_files.discover(arena, absolute_root, discover_options),
-        .provider_root = absolute_root,
-    };
-}
 
 fn candidateKind(absolute_path: []const u8) !std.Io.File.Kind {
     const stat = try std.Io.Dir.cwd().statFile(io_mod.getIo(), absolute_path, .{ .follow_symlinks = false });
@@ -345,7 +270,159 @@ fn resolveCandidateFile(
     };
 }
 
+/// Files per unit of parallel work. Workers take batches in candidate order.
+const batch_files: usize = 16;
+/// Fewer selected files than this are scanned on the calling thread.
+const parallel_min_files: usize = 64;
+const max_scan_workers: usize = 8;
+
+const ScanMode = enum { matches, count };
+
+/// One selected candidate's outcome, written only by the worker that owns its
+/// batch and read only after every worker has joined.
+const FileOutcome = struct {
+    matches: []const Match = &.{},
+    matching_lines: usize = 0,
+};
+
+/// Shared state of one parallel content scan. Merging in candidate order makes
+/// the output identical to a single-threaded scan, including where the
+/// collection cap truncates it.
+const ParallelScan = struct {
+    /// Thread-safe and temporary: candidate resolution and per-file matches.
+    work: Allocator,
+    workspace_root: []const u8,
+    provider_root: []const u8,
+    files: []const []const u8,
+    pattern: []const u8,
+    case_insensitive: bool,
+    mode: ScanMode,
+    outcomes: []FileOutcome,
+    next_batch: std.atomic.Value(usize) = .init(0),
+    stop: std.atomic.Value(bool) = .init(false),
+    mutex: std.Io.Mutex = .init,
+    /// Guarded by `mutex`: which batches are done, how many leading batches
+    /// are done, and how many matches those leading batches hold.
+    batch_done: []bool,
+    done_prefix: usize = 0,
+    prefix_matches: usize = 0,
+    out_of_memory: bool = false,
+
+    fn run(self: *ParallelScan) void {
+        while (!self.stop.load(.acquire)) {
+            const batch = self.next_batch.fetchAdd(1, .monotonic);
+            const first = batch * batch_files;
+            if (first >= self.files.len) return;
+            const last = @min(first + batch_files, self.files.len);
+            for (first..last) |index| {
+                _ = self.scanOne(index) catch {
+                    self.mutex.lockUncancelable(io_mod.getIo());
+                    self.out_of_memory = true;
+                    self.mutex.unlock(io_mod.getIo());
+                    self.stop.store(true, .release);
+                    return;
+                };
+            }
+            self.finishBatch(batch);
+        }
+    }
+
+    fn scanOne(self: *ParallelScan, index: usize) Allocator.Error!void {
+        var absolute_match_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const candidate_file = try resolveCandidateFile(self.work, self.workspace_root, self.provider_root, self.files[index], absolute_match_buf[0..]) orelse return;
+        switch (self.mode) {
+            .matches => {
+                var local: std.ArrayList(Match) = .empty;
+                _ = scanFileAt(self.work, candidate_file.display_path, candidate_file.read_path, self.pattern, self.case_insensitive, &local) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    debug_trace.logf("core", "grep_files scan skipped path={s} err={s}", .{ candidate_file.display_path, @errorName(err) });
+                    return;
+                };
+                self.outcomes[index] = .{ .matches = local.items };
+            },
+            .count => {
+                const file_count = countFileAt(candidate_file.display_path, candidate_file.read_path, self.pattern, self.case_insensitive) catch |err| {
+                    debug_trace.logf("core", "grep_files scan skipped path={s} err={s}", .{ candidate_file.display_path, @errorName(err) });
+                    return;
+                };
+                self.outcomes[index] = .{ .matching_lines = file_count.matching_lines };
+            },
+        }
+    }
+
+    /// Once the leading done batches hold the collection cap, no later file
+    /// can change the merged result, so the remaining work stops.
+    fn finishBatch(self: *ParallelScan, batch: usize) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.batch_done[batch] = true;
+        while (self.done_prefix < self.batch_done.len and self.batch_done[self.done_prefix]) : (self.done_prefix += 1) {
+            const first = self.done_prefix * batch_files;
+            for (self.outcomes[first..@min(first + batch_files, self.outcomes.len)]) |outcome| self.prefix_matches += outcome.matches.len;
+        }
+        if (self.mode == .matches and self.prefix_matches >= collection_cap) self.stop.store(true, .release);
+    }
+};
+
+fn workerCount(files: usize) usize {
+    if (builtin.single_threaded or files < parallel_min_files) return 1;
+    const cpus = std.Thread.getCpuCount() catch 1;
+    return @max(1, @min(@min(max_scan_workers, cpus), std.math.divCeil(usize, files, batch_files) catch 1));
+}
+
+/// Scans `files` with up to `max_scan_workers` threads, the calling thread
+/// included. A helper that cannot start leaves its share to the others.
+fn runParallelScan(scan: *ParallelScan) Allocator.Error!void {
+    const helpers = workerCount(scan.files.len) - 1;
+    var threads: [max_scan_workers]std.Thread = undefined;
+    var started: usize = 0;
+    if (!builtin.single_threaded) {
+        while (started < helpers) : (started += 1) {
+            threads[started] = std.Thread.spawn(.{}, ParallelScan.run, .{scan}) catch break;
+        }
+    }
+    scan.run();
+    for (threads[0..started]) |thread| thread.join();
+    if (scan.out_of_memory) return error.OutOfMemory;
+}
+
+fn selectCandidates(work: Allocator, candidates: []const []const u8, include: ?glob_pattern.Pattern) ![]const []const u8 {
+    const include_pattern = include orelse return candidates;
+    var selected: std.ArrayList([]const u8) = .empty;
+    for (candidates) |candidate| {
+        if (include_pattern.matchesPath(candidate)) try selected.append(work, candidate);
+    }
+    return selected.toOwnedSlice(work);
+}
+
+fn initParallelScan(
+    work: Allocator,
+    workspace_root: []const u8,
+    provider_root: []const u8,
+    files: []const []const u8,
+    pattern: []const u8,
+    case_insensitive: bool,
+    mode: ScanMode,
+) !ParallelScan {
+    const outcomes = try work.alloc(FileOutcome, files.len);
+    @memset(outcomes, .{});
+    const batch_done = try work.alloc(bool, std.math.divCeil(usize, files.len, batch_files) catch 0);
+    @memset(batch_done, false);
+    return .{
+        .work = work,
+        .workspace_root = workspace_root,
+        .provider_root = provider_root,
+        .files = files,
+        .pattern = pattern,
+        .case_insensitive = case_insensitive,
+        .mode = mode,
+        .outcomes = outcomes,
+        .batch_done = batch_done,
+    };
+}
+
 fn scanCandidateList(
+    scratch: Allocator,
     arena: Allocator,
     workspace_root: []const u8,
     provider_root: []const u8,
@@ -355,25 +432,25 @@ fn scanCandidateList(
     include: ?glob_pattern.Pattern,
     matches: *std.ArrayList(Match),
 ) !?TruncatedReason {
-    for (candidates) |candidate| {
-        if (include) |include_pattern| {
-            if (!include_pattern.matchesPath(candidate)) continue;
+    var work_state = std.heap.ArenaAllocator.init(scratch);
+    defer work_state.deinit();
+    const work = work_state.allocator();
+    const files = try selectCandidates(work, candidates, include);
+    var scan = try initParallelScan(work, workspace_root, provider_root, files, pattern, case_insensitive, .matches);
+    try runParallelScan(&scan);
+    for (scan.outcomes) |outcome| {
+        var retained_path: ?[]const u8 = null;
+        for (outcome.matches) |match| {
+            if (matches.items.len >= collection_cap) return .collection_cap;
+            try appendMatch(arena, matches, &retained_path, match.absolute_path, match.line_number, match.line);
+            if (matches.items.len >= collection_cap) return .collection_cap;
         }
-
-        var absolute_match_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const candidate_file = try resolveCandidateFile(arena, workspace_root, provider_root, candidate, absolute_match_buf[0..]) orelse continue;
-        const scan_result = scanFileAt(arena, candidate_file.display_path, candidate_file.read_path, pattern, case_insensitive, matches) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            debug_trace.logf("core", "grep_files scan skipped path={s} err={s}", .{ candidate_file.display_path, @errorName(err) });
-            continue;
-        };
-        if (scan_result) |reason| return reason;
     }
     return null;
 }
 
 fn countCandidateList(
-    arena: Allocator,
+    scratch: Allocator,
     workspace_root: []const u8,
     provider_root: []const u8,
     candidates: []const []const u8,
@@ -382,274 +459,22 @@ fn countCandidateList(
     include: ?glob_pattern.Pattern,
     count_result: *CountResult,
 ) !void {
-    for (candidates) |candidate| {
-        if (include) |include_pattern| {
-            if (!include_pattern.matchesPath(candidate)) continue;
-        }
-
-        var absolute_match_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const candidate_file = try resolveCandidateFile(arena, workspace_root, provider_root, candidate, absolute_match_buf[0..]) orelse continue;
-        const file_count = countFileAt(candidate_file.display_path, candidate_file.read_path, pattern, case_insensitive) catch |err| {
-            debug_trace.logf("core", "grep_files scan skipped path={s} err={s}", .{ candidate_file.display_path, @errorName(err) });
-            continue;
-        };
-        if (file_count.matching_lines == 0) continue;
+    var work_state = std.heap.ArenaAllocator.init(scratch);
+    defer work_state.deinit();
+    const work = work_state.allocator();
+    const files = try selectCandidates(work, candidates, include);
+    var scan = try initParallelScan(work, workspace_root, provider_root, files, pattern, case_insensitive, .count);
+    try runParallelScan(&scan);
+    for (scan.outcomes) |outcome| {
+        if (outcome.matching_lines == 0) continue;
         count_result.matching_files += 1;
-        count_result.matching_lines += file_count.matching_lines;
+        count_result.matching_lines += outcome.matching_lines;
     }
 }
-
-pub fn gitGrepArgvForTest() [9][]const u8 {
-    return .{ "git", "--no-optional-locks", "grep", "-n", "-I", "-F", "-z", "-e", "needle" };
-}
-
-const GitGrepMatchesResult = struct {
-    candidate_count: usize = 0,
-    truncated_reason: ?TruncatedReason = null,
-};
 
 const FileCount = struct {
     matching_lines: usize = 0,
 };
-
-fn gitGrepTrackedMatches(
-    arena: Allocator,
-    workspace_root: []const u8,
-    absolute_root: []const u8,
-    pattern: []const u8,
-    case_insensitive: bool,
-    include: ?glob_pattern.Pattern,
-    matches: *std.ArrayList(Match),
-) !GitGrepMatchesResult {
-    if (pattern.len == 0) return error.GitGrepUnsupported;
-
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(arena);
-    try argv.appendSlice(arena, &.{ "git", "--no-optional-locks", "grep", "-n", "-I", "-F", "-z" });
-    if (case_insensitive) try argv.append(arena, "-i");
-    try argv.appendSlice(arena, &.{ "-e", pattern, "--" });
-    if (safeGitIncludePathspec(include)) |pathspec| {
-        try argv.append(arena, pathspec);
-    } else {
-        try argv.append(arena, ".");
-    }
-
-    const result = std.process.run(arena, io_mod.getIo(), .{
-        .argv = argv.items,
-        .cwd = .{ .path = absolute_root },
-        .stdout_limit = std.Io.Limit.limited(git_grep_stdout_limit),
-        .stderr_limit = std.Io.Limit.limited(1024),
-    }) catch return error.GitGrepFailed;
-    defer arena.free(result.stderr);
-
-    switch (result.term) {
-        .exited => |code| {
-            if (code == 0) return parseGitGrepMatches(arena, workspace_root, absolute_root, result.stdout, include, matches);
-            arena.free(result.stdout);
-            if (code == 1) return .{};
-            return error.GitGrepFailed;
-        },
-        else => {
-            arena.free(result.stdout);
-            return error.GitGrepFailed;
-        },
-    }
-}
-
-fn gitGrepTrackedCounts(
-    arena: Allocator,
-    workspace_root: []const u8,
-    absolute_root: []const u8,
-    pattern: []const u8,
-    case_insensitive: bool,
-    include: ?glob_pattern.Pattern,
-) !CountResult {
-    if (pattern.len == 0) return error.GitGrepUnsupported;
-
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(arena);
-    try argv.appendSlice(arena, &.{ "git", "--no-optional-locks", "grep", "--count", "-I", "-F", "-z" });
-    if (case_insensitive) try argv.append(arena, "-i");
-    try argv.appendSlice(arena, &.{ "-e", pattern, "--" });
-    if (safeGitIncludePathspec(include)) |pathspec| {
-        try argv.append(arena, pathspec);
-    } else {
-        try argv.append(arena, ".");
-    }
-
-    const result = std.process.run(arena, io_mod.getIo(), .{
-        .argv = argv.items,
-        .cwd = .{ .path = absolute_root },
-        .stdout_limit = std.Io.Limit.limited(git_grep_stdout_limit),
-        .stderr_limit = std.Io.Limit.limited(1024),
-    }) catch return error.GitGrepFailed;
-    defer arena.free(result.stderr);
-
-    switch (result.term) {
-        .exited => |code| {
-            if (code == 0) return parseGitGrepCounts(arena, workspace_root, absolute_root, result.stdout, include);
-            arena.free(result.stdout);
-            if (code == 1) return .{};
-            return error.GitGrepFailed;
-        },
-        else => {
-            arena.free(result.stdout);
-            return error.GitGrepFailed;
-        },
-    }
-}
-
-fn parseGitGrepMatches(
-    arena: Allocator,
-    workspace_root: []const u8,
-    absolute_root: []const u8,
-    raw: []const u8,
-    include: ?glob_pattern.Pattern,
-    matches: *std.ArrayList(Match),
-) !GitGrepMatchesResult {
-    var result: GitGrepMatchesResult = .{};
-    var display_paths = std.StringHashMap([]const u8).init(arena);
-    defer display_paths.deinit();
-    var skipped_paths = std.StringHashMap(void).init(arena);
-    defer skipped_paths.deinit();
-
-    var index: usize = 0;
-    while (index < raw.len) {
-        const path_end = findScalarFrom(raw, index, 0) orelse break;
-        const path = raw[index..path_end];
-        const line_start = path_end + 1;
-        const line_end = findScalarFrom(raw, line_start, 0) orelse break;
-        const content_start = line_end + 1;
-        const content_end = findScalarFrom(raw, content_start, '\n') orelse raw.len;
-        index = if (content_end < raw.len) content_end + 1 else raw.len;
-
-        if (path.len == 0 or path.len > workspace_files.max_relative_path_bytes) continue;
-        if (include) |include_pattern| {
-            if (!include_pattern.matchesPath(path)) continue;
-        }
-        if (skipped_paths.contains(path)) continue;
-
-        const line_number = std.fmt.parseInt(usize, raw[line_start..line_end], 10) catch continue;
-        const line = raw[content_start..content_end];
-        if (!text_utils.isModelSafeText(line)) {
-            debug_trace.logf("core", "grep_files skipped non-text git grep line root={s} path={s}", .{ absolute_root, path });
-            try skipped_paths.put(path, {});
-            continue;
-        }
-
-        const display_path = display_paths.get(path) orelse blk: {
-            const absolute_match = try validateMatchedGitFile(arena, workspace_root, absolute_root, path) orelse {
-                try skipped_paths.put(path, {});
-                continue;
-            };
-            result.candidate_count += 1;
-            try display_paths.put(path, absolute_match);
-            break :blk absolute_match;
-        };
-
-        if (matches.items.len >= collection_cap) {
-            result.truncated_reason = .collection_cap;
-            break;
-        }
-        var retained_path: ?[]const u8 = null;
-        try appendMatch(arena, matches, &retained_path, display_path, line_number, line);
-        if (matches.items.len >= collection_cap) {
-            result.truncated_reason = .collection_cap;
-            break;
-        }
-    }
-
-    return result;
-}
-
-fn parseGitGrepCounts(
-    arena: Allocator,
-    workspace_root: []const u8,
-    absolute_root: []const u8,
-    raw: []const u8,
-    include: ?glob_pattern.Pattern,
-) !CountResult {
-    var result: CountResult = .{};
-    var skipped_paths = std.StringHashMap(void).init(arena);
-    defer skipped_paths.deinit();
-
-    var index: usize = 0;
-    while (index < raw.len) {
-        const path_end = findScalarFrom(raw, index, 0) orelse break;
-        const path = raw[index..path_end];
-        const count_start = path_end + 1;
-        const count_end = findScalarFrom(raw, count_start, '\n') orelse raw.len;
-        index = if (count_end < raw.len) count_end + 1 else raw.len;
-
-        if (path.len == 0 or path.len > workspace_files.max_relative_path_bytes) continue;
-        if (include) |include_pattern| {
-            if (!include_pattern.matchesPath(path)) continue;
-        }
-        if (skipped_paths.contains(path)) continue;
-
-        const raw_count = std.mem.trimEnd(u8, raw[count_start..count_end], "\r");
-        const line_count = std.fmt.parseInt(usize, raw_count, 10) catch continue;
-        if (line_count == 0) continue;
-        if ((try validateMatchedGitFile(arena, workspace_root, absolute_root, path)) == null) {
-            try skipped_paths.put(path, {});
-            continue;
-        }
-        result.candidate_count += 1;
-        result.matching_files += 1;
-        result.matching_lines += line_count;
-    }
-
-    return result;
-}
-
-fn validateMatchedGitFile(
-    arena: Allocator,
-    workspace_root: []const u8,
-    absolute_root: []const u8,
-    path: []const u8,
-) !?[]const u8 {
-    const absolute_match = std.fs.path.join(arena, &.{ absolute_root, path }) catch return error.OutOfMemory;
-    const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), absolute_match, .{ .follow_symlinks = false }) catch |err| {
-        debug_trace.logf("core", "grep_files scan skipped path={s} err={s}", .{ absolute_match, @errorName(err) });
-        return null;
-    };
-    if (stat.kind != .file and stat.kind != .sym_link) return null;
-    if (stat.size > file_byte_cap) {
-        logOversizedFile(absolute_match);
-        return null;
-    }
-    const resolved_match = if (stat.kind == .sym_link)
-        resolveDirectoryEntryTarget(arena, workspace_root, absolute_match, stat.kind) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            debug_trace.logf("core", "grep_files scan skipped path={s} err={s}", .{ absolute_match, @errorName(err) });
-            return null;
-        } orelse return null
-    else
-        absolute_match;
-    var content_buf: [file_byte_cap + 1]u8 = undefined;
-    if ((try readModelSafeContent(absolute_match, resolved_match, &content_buf)) == null) return null;
-    return absolute_match;
-}
-
-fn safeGitIncludePathspec(include: ?glob_pattern.Pattern) ?[]const u8 {
-    const raw = if (include) |pattern| pattern.raw else return null;
-    if (raw.len == 0 or std.mem.findScalar(u8, raw, '/') != null) return null;
-    for (raw) |ch| {
-        switch (ch) {
-            '\\', '{', '}' => return null,
-            else => {},
-        }
-    }
-    return raw;
-}
-
-fn findScalarFrom(haystack: []const u8, start: usize, needle: u8) ?usize {
-    var index = start;
-    while (index < haystack.len) : (index += 1) {
-        if (haystack[index] == needle) return index;
-    }
-    return null;
-}
 
 fn joinAbsolutePathScratch(buffer: []u8, absolute_root: []const u8, entry_path: []const u8) ![]const u8 {
     var fba = std.heap.FixedBufferAllocator.init(buffer);
@@ -845,40 +670,6 @@ fn readTrace(alloc: Allocator, trace_path: []const u8) ![]u8 {
     return reader.interface.allocRemaining(alloc, std.Io.Limit.limited(4096));
 }
 
-fn runGitForTest(alloc: Allocator, cwd: []const u8, args: []const []const u8) !void {
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(alloc);
-    try argv.append(alloc, "git");
-    try argv.appendSlice(alloc, args);
-
-    const result = std.process.run(alloc, std.testing.io, .{
-        .argv = argv.items,
-        .cwd = .{ .path = cwd },
-        .stdout_limit = .limited(4096),
-        .stderr_limit = .limited(4096),
-    }) catch return error.SkipZigTest;
-    defer alloc.free(result.stdout);
-    defer alloc.free(result.stderr);
-
-    switch (result.term) {
-        .exited => |code| if (code != 0) return error.SkipZigTest,
-        else => return error.SkipZigTest,
-    }
-}
-
-test "grep search git grep argv uses literal fixed-string flags" {
-    const argv = gitGrepArgvForTest();
-
-    try std.testing.expectEqualStrings("git", argv[0]);
-    try std.testing.expectEqualStrings("--no-optional-locks", argv[1]);
-    try std.testing.expectEqualStrings("grep", argv[2]);
-    try std.testing.expectEqualStrings("-n", argv[3]);
-    try std.testing.expectEqualStrings("-I", argv[4]);
-    try std.testing.expectEqualStrings("-F", argv[5]);
-    try std.testing.expectEqualStrings("-z", argv[6]);
-    try std.testing.expectEqualStrings("-e", argv[7]);
-}
-
 test "grep search preserves explicitly requested ignored directory roots" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -890,7 +681,7 @@ test "grep search preserves explicitly requested ignored directory roots" {
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
-    const result = try collectDirectoryMatches(arena_state.allocator(), workspace, try io_mod.dirRealpathAlloc(arena_state.allocator(), tmp.dir, "node_modules/pkg"), "needle", false, null);
+    const result = try collectDirectoryMatches(std.testing.allocator, arena_state.allocator(), workspace, try io_mod.dirRealpathAlloc(arena_state.allocator(), tmp.dir, "node_modules/pkg"), "needle", false, null);
 
     try std.testing.expectEqual(@as(usize, 1), result.matches.len);
     try std.testing.expect(result.truncated_reason == null);
@@ -928,7 +719,7 @@ test "grep search does not ignore workspace because ignored name is outside work
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
-    const result = try collectDirectoryMatches(arena_state.allocator(), workspace, workspace, "needle", false, null);
+    const result = try collectDirectoryMatches(std.testing.allocator, arena_state.allocator(), workspace, workspace, "needle", false, null);
 
     try std.testing.expectEqual(@as(usize, 1), result.matches.len);
     try std.testing.expect(result.truncated_reason == null);
@@ -946,7 +737,7 @@ test "grep search falls back to Zig scanner outside git repositories" {
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
-    const result = try collectDirectoryMatches(arena_state.allocator(), workspace, workspace, "needle", false, null);
+    const result = try collectDirectoryMatches(std.testing.allocator, arena_state.allocator(), workspace, workspace, "needle", false, null);
 
     try std.testing.expectEqual(@as(usize, 1), result.matches.len);
     try std.testing.expect(std.mem.endsWith(u8, result.matches[0].absolute_path, "src/main.zig"));
@@ -969,7 +760,7 @@ test "grep search scans untracked files after git grep tracked backend" {
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
-    const result = try collectDirectoryMatches(arena_state.allocator(), workspace, workspace, "needle", false, null);
+    const result = try collectDirectoryMatches(std.testing.allocator, arena_state.allocator(), workspace, workspace, "needle", false, null);
 
     try std.testing.expectEqual(@as(usize, 1), result.matches.len);
     try std.testing.expect(std.mem.endsWith(u8, result.matches[0].absolute_path, "untracked.txt"));
@@ -990,7 +781,7 @@ test "grep search git grep backend skips files with unsafe bytes outside matched
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
-    const result = try collectDirectoryMatches(arena_state.allocator(), workspace, workspace, "needle", false, null);
+    const result = try collectDirectoryMatches(std.testing.allocator, arena_state.allocator(), workspace, workspace, "needle", false, null);
 
     try std.testing.expectEqual(@as(usize, 0), result.matches.len);
 }
@@ -1043,7 +834,7 @@ test "grep search logs skipped per-file scan errors during directory traversal" 
     defer pattern.deinit(alloc);
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
-    const result = try collectDirectoryMatches(arena_state.allocator(), workspace, workspace, "needle", false, pattern);
+    const result = try collectDirectoryMatches(std.testing.allocator, arena_state.allocator(), workspace, workspace, "needle", false, pattern);
     try std.testing.expectEqual(@as(usize, 1), result.matches.len);
     try std.testing.expect(result.truncated_reason == null);
 
@@ -1079,7 +870,7 @@ test "grep search directory traversal skips external symlink targets with trace"
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const links_root = try io_mod.dirRealpathAlloc(arena_state.allocator(), workspace_tmp.dir, "links");
-    const result = try collectDirectoryMatches(arena_state.allocator(), workspace, links_root, "needle", false, null);
+    const result = try collectDirectoryMatches(std.testing.allocator, arena_state.allocator(), workspace, links_root, "needle", false, null);
 
     try std.testing.expectEqual(@as(usize, 1), result.matches.len);
     try std.testing.expect(std.mem.endsWith(u8, result.matches[0].absolute_path, "links/internal.txt"));
@@ -1170,7 +961,7 @@ test "grep search retained allocations scale with matches not scanned bytes" {
 
     var retained_buf: [8 * 1024]u8 = undefined;
     var retained_fba = std.heap.FixedBufferAllocator.init(&retained_buf);
-    const result = try collectDirectoryMatches(retained_fba.allocator(), workspace, workspace, "needle", false, null);
+    const result = try collectDirectoryMatches(std.testing.allocator, retained_fba.allocator(), workspace, workspace, "needle", false, null);
 
     try std.testing.expectEqual(@as(usize, 1), result.matches.len);
     try std.testing.expect(result.truncated_reason == null);
@@ -1199,7 +990,7 @@ test "grep search logs oversized files and continues directory traversal" {
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
-    const result = try collectDirectoryMatches(arena_state.allocator(), workspace, workspace, "needle", false, null);
+    const result = try collectDirectoryMatches(std.testing.allocator, arena_state.allocator(), workspace, workspace, "needle", false, null);
     try std.testing.expectEqual(@as(usize, 1), result.matches.len);
     try std.testing.expect(result.truncated_reason == null);
     try std.testing.expect(std.mem.endsWith(u8, result.matches[0].absolute_path, "good.txt"));
@@ -1257,7 +1048,7 @@ test "grep search finds match beyond former traversal cap" {
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
-    const result = try collectDirectoryMatches(arena_state.allocator(), workspace, workspace, "needle", false, null);
+    const result = try collectDirectoryMatches(std.testing.allocator, arena_state.allocator(), workspace, workspace, "needle", false, null);
 
     try std.testing.expectEqual(@as(usize, 1), result.matches.len);
     try std.testing.expect(result.truncated_reason == null);
@@ -1281,17 +1072,15 @@ test "grep_files path narrowing applies before candidate cap" {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const result = try collectDirectoryMatchesWithOptions(
+        std.testing.allocator,
         arena_state.allocator(),
         workspace,
         narrowed_root,
         "needle",
         false,
-        ignored_dirs.ignored_directory_names,
+        tool_files.default_skipped_names,
         null,
-        .{
-            .candidate_cap = 1,
-            .force_fallback = true,
-        },
+        .{ .candidate_cap = 1 },
     );
 
     try std.testing.expectEqual(@as(usize, 1), result.candidate_count);
@@ -1351,7 +1140,7 @@ test "grep search collection cap takes precedence at traversal boundary" {
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
-    const result = try collectDirectoryMatches(arena_state.allocator(), workspace, workspace, "needle", false, null);
+    const result = try collectDirectoryMatches(std.testing.allocator, arena_state.allocator(), workspace, workspace, "needle", false, null);
 
     try std.testing.expectEqual(collection_cap, result.matches.len);
     try std.testing.expectEqual(TruncatedReason.collection_cap, result.truncated_reason.?);
@@ -1366,4 +1155,61 @@ test "grep search does not import tool dispatch layer" {
 
     const forbidden = "tool_" ++ "dispatch.zig";
     try std.testing.expect(std.mem.find(u8, source, forbidden) == null);
+}
+
+fn runGitForTest(alloc: Allocator, cwd: []const u8, args: []const []const u8) !void {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(alloc);
+    try argv.append(alloc, "git");
+    try argv.appendSlice(alloc, args);
+
+    const result = std.process.run(alloc, std.testing.io, .{
+        .argv = argv.items,
+        .cwd = .{ .path = cwd },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    }) catch return error.SkipZigTest;
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| if (code != 0) return error.SkipZigTest,
+        else => return error.SkipZigTest,
+    }
+}
+
+test "grep search parallel scan matches single-threaded order and cap truncation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+
+    // 1500 files of 2 matches each exceed the collection cap, so the first
+    // 1000 files in sorted order must fill it exactly. Many more batches than
+    // workers means a premature stop would leave files unscanned.
+    const content = "needle one\nother\nneedle two\n";
+    for (0..1500) |index| {
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "many/file-{d:0>4}.txt", .{index});
+        alloc.free(try writeTempFile(alloc, &tmp, name, content));
+    }
+
+    for (0..5) |_| {
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const result = try collectDirectoryMatches(std.testing.allocator, arena_state.allocator(), workspace, workspace, "needle", false, null);
+        try std.testing.expectEqual(TruncatedReason.collection_cap, result.truncated_reason.?);
+        try std.testing.expectEqual(collection_cap, result.matches.len);
+        for (result.matches, 0..) |match, position| {
+            var want_buf: [64]u8 = undefined;
+            const want = try std.fmt.bufPrint(&want_buf, "many/file-{d:0>4}.txt", .{position / 2});
+            try std.testing.expect(std.mem.endsWith(u8, match.absolute_path, want));
+            try std.testing.expectEqual(2 * (position % 2) + 1, match.line_number);
+        }
+
+        const counted = try countDirectoryMatchesWithIgnored(std.testing.allocator, arena_state.allocator(), workspace, workspace, "needle", false, tool_files.default_skipped_names, null);
+        try std.testing.expectEqual(@as(usize, 3000), counted.matching_lines);
+        try std.testing.expectEqual(@as(usize, 1500), counted.matching_files);
+    }
 }
