@@ -387,7 +387,7 @@ pub fn resolveForProvider(
         const definition = registry.get(bound.label()).?;
         return switch (definition.auth) {
             .none => .{ .credential = .{ .token = try alloc.dupe(u8, ""), .source = .configured } },
-            .bearer => |env| .{ .credential = try loadEnvCredential(alloc, env, .configured) },
+            .bearer, .x_api_key => |env| .{ .credential = try loadEnvCredential(alloc, env, .configured) },
         };
     }
     if (provider != .gateway) {

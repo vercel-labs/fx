@@ -104,7 +104,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest) !st
     }
     switch (definition.auth) {
         .none => if (token != null) return error.UnexpectedConfiguredProviderCredential,
-        .bearer => if (token == null) return error.MissingConfiguredProviderCredential,
+        .bearer, .x_api_key => if (token == null) return error.MissingConfiguredProviderCredential,
     }
     const payload = request.prepared_request_body orelse try build(raw, alloc, request.data());
     defer if (request.prepared_request_body == null) alloc.free(payload);
@@ -127,10 +127,19 @@ fn phase_deadline(milliseconds: i64, caller: ?std.Io.Clock.Timestamp) std.Io.Clo
 }
 
 fn post(alloc: Allocator, definition: *const definitions.Definition, request: streams.ModelRequest, token: ?[]const u8, payload: []const u8) !streams.Result {
-    const url = try definition.chat_url(alloc);
+    const url = try definition.endpoint_url(alloc);
     defer alloc.free(url);
-    const authorization = if (token) |value| try std.fmt.allocPrint(alloc, "Bearer {s}", .{value}) else null;
+    // `x-api-key` and `authorization` are exclusive auth carriers on the wire.
+    const authorization = if (definition.auth == .bearer) try std.fmt.allocPrint(alloc, "Bearer {s}", .{token.?}) else null;
     defer if (authorization) |value| secret.zeroAndFree(alloc, value);
+    var request_headers: [2]std.http.Header = undefined;
+    var count: usize = 0;
+    request_headers[count] = .{ .name = "accept", .value = "text/event-stream" };
+    count += 1;
+    if (definition.auth == .x_api_key) {
+        request_headers[count] = .{ .name = "x-api-key", .value = token.? };
+        count += 1;
+    }
     var client: std.http.Client = .{ .allocator = alloc, .io = io.getIo() };
     defer client.deinit();
     var uri = try std.Uri.parse(url);
@@ -139,7 +148,7 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
         .client = &client,
         .uri = uri,
         .authorization = authorization,
-        .extra_headers = &.{.{ .name = "accept", .value = "text/event-stream" }},
+        .extra_headers = request_headers[0..count],
     };
     try request.admission.admit();
     var opened = try client_mod.openBoundedPost(alloc, request.cancel_flag, phase_deadline(30_000, request.deadline), &operation);

@@ -28,14 +28,17 @@ pub const ParseError = Allocator.Error || error{
     InvalidModelMetadata,
 };
 
-pub const Protocol = enum { @"openai-chat-completions" };
+pub const Protocol = enum { @"openai-chat-completions", @"anthropic-messages" };
 pub const ToolChoiceMode = enum { omit, send };
 
 /// Describes a credential slot, never a credential value. Resolution belongs at
 /// the effectful edge; `none` must omit Authorization rather than supply a token.
+/// `x_api_key` carries the secret in an `x-api-key` header instead of
+/// `Authorization: Bearer` for APIs that require it.
 pub const Auth = union(enum) {
     none,
     bearer: []const u8,
+    x_api_key: []const u8,
 };
 
 pub const ModelMetadata = struct {
@@ -58,8 +61,13 @@ pub const Definition = struct {
     model_metadata: []const ModelMetadata = &.{},
 
     /// Caller owns the returned URL. base_url is already a validated API prefix.
-    pub fn chat_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
-        return std.mem.concat(alloc, u8, &.{ self.base_url, "/chat/completions" });
+    /// The path is protocol-shaped: chat completions and Messages endpoints differ.
+    pub fn endpoint_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
+        const path: []const u8 = switch (self.protocol) {
+            .@"openai-chat-completions" => "/chat/completions",
+            .@"anthropic-messages" => "/messages",
+        };
+        return std.mem.concat(alloc, u8, &.{ self.base_url, path });
     }
 
     /// Borrowed metadata; absence and unspecified fields remain unknown.
@@ -83,7 +91,7 @@ pub const Definition = struct {
         hash_part(&hash, @tagName(self.auth));
         switch (self.auth) {
             .none => {},
-            .bearer => |env| hash_part(&hash, env),
+            .bearer, .x_api_key => |env| hash_part(&hash, env),
         }
         return hash.finalResult();
     }
@@ -93,7 +101,7 @@ pub const Definition = struct {
         alloc.free(self.base_url);
         switch (self.auth) {
             .none => {},
-            .bearer => |env| alloc.free(env),
+            .bearer, .x_api_key => |env| alloc.free(env),
         }
         if (self.reviewer_model) |id| alloc.free(id);
         for (self.model_metadata) |metadata| alloc.free(metadata.id);
@@ -165,7 +173,14 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
     try validate_id(id);
     try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata" });
     const protocol = try required(value, "protocol");
-    if (protocol != .string or !std.mem.eql(u8, protocol.string, "openai-chat-completions")) return error.InvalidProtocol;
+    const protocol_kind: Protocol = if (protocol != .string)
+        return error.InvalidProtocol
+    else if (std.mem.eql(u8, protocol.string, "openai-chat-completions"))
+        .@"openai-chat-completions"
+    else if (std.mem.eql(u8, protocol.string, "anthropic-messages"))
+        .@"anthropic-messages"
+    else
+        return error.InvalidProtocol;
     const url = try required(value, "base_url");
     if (url != .string) return error.InvalidBaseUrl;
     const normalized = try validate_url(url.string);
@@ -189,16 +204,17 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
     const owned_auth: Auth = switch (auth) {
         .none => .none,
         .bearer => |env| .{ .bearer = try alloc.dupe(u8, env) },
+        .x_api_key => |env| .{ .x_api_key = try alloc.dupe(u8, env) },
     };
     errdefer switch (owned_auth) {
         .none => {},
-        .bearer => |env| alloc.free(env),
+        .bearer, .x_api_key => |env| alloc.free(env),
     };
     const owned_reviewer = if (reviewer) |model_id| try alloc.dupe(u8, model_id) else null;
     errdefer if (owned_reviewer) |model_id| alloc.free(model_id);
     return .{
         .id = owned_id,
-        .protocol = .@"openai-chat-completions",
+        .protocol = protocol_kind,
         .base_url = owned_url,
         .auth = owned_auth,
         .tool_choice_mode = mode,
@@ -215,7 +231,12 @@ fn parse_auth(value: std.json.Value) ParseError!Auth {
         if (value.object.contains("env")) return error.InvalidAuth;
         return .none;
     }
-    if (!std.mem.eql(u8, kind.string, "bearer")) return error.InvalidAuth;
+    const auth_kind: Auth = if (std.mem.eql(u8, kind.string, "bearer"))
+        .{ .bearer = undefined }
+    else if (std.mem.eql(u8, kind.string, "x-api-key"))
+        .{ .x_api_key = undefined }
+    else
+        return error.InvalidAuth;
     const env = try required(value, "env");
     if (env != .string) return error.InvalidEnvironmentName;
     if (env.string.len > max_env_bytes) return error.LimitExceeded;
@@ -223,7 +244,11 @@ fn parse_auth(value: std.json.Value) ParseError!Auth {
     for (env.string) |byte| {
         if (!std.ascii.isAlphanumeric(byte) and byte != '_') return error.InvalidEnvironmentName;
     }
-    return .{ .bearer = env.string };
+    return switch (auth_kind) {
+        .bearer => .{ .bearer = env.string },
+        .x_api_key => .{ .x_api_key = env.string },
+        else => unreachable,
+    };
 }
 
 fn parse_metadata(alloc: Allocator, value: std.json.Value) ParseError![]const ModelMetadata {
@@ -383,7 +408,7 @@ test "configured provider owns definitions and preserves unknown metadata" {
     try std.testing.expectEqual(Auth.none, local.auth);
     try std.testing.expectEqual(ToolChoiceMode.omit, local.tool_choice_mode);
     try std.testing.expect(local.reviewer_model == null);
-    const chat = try local.chat_url(alloc);
+    const chat = try local.endpoint_url(alloc);
     defer alloc.free(chat);
     try std.testing.expectEqualStrings("http://localhost:11434/v1/chat/completions", chat);
     const router = registry.get("router").?;
@@ -464,7 +489,7 @@ fn test_allocations(alloc: Allocator) !void {
     var registry = try Registry.parse_json(alloc, test_json);
     defer registry.deinit(alloc);
     const definition = registry.get("router").?;
-    const chat = try definition.chat_url(alloc);
+    const chat = try definition.endpoint_url(alloc);
     defer alloc.free(chat);
     _ = definition.binding_identity();
 }

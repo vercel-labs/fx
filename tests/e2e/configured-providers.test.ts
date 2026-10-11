@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { completion, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
+import { completion as anthropicCompletion, toolUseCompletion as anthropicToolUse, createAnthropicProviderFixture as anthropicFixture } from "./fixtures/anthropic-messages";
 
 async function withReasoning(response: Response, ...deltas: Record<string, unknown>[]) {
   const prefix = deltas.map(delta => `data: ${JSON.stringify({ choices: [{ index: 0, delta }] })}\n\n`).join("");
@@ -629,6 +630,51 @@ describe("configured providers", () => {
       const missingKey = await runFx(["ask", "--json", "--no-save", "hello"], { cwd: f.workspace, env: { ...f.env, FX_PROVIDER: "remote", FX_TEST_PROVIDER_TOKEN: undefined } });
       expect(missingKey.code).not.toBe(0);
       expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  }, 25000);
+
+  test("x-api-key connection speaks the Messages protocol", async () => {
+    const f = anthropicFixture();
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      expect(result.stderr).toBe("");
+      if (result.code !== 0) throw new Error(`fx ask failed: ${result.stdout} ${result.stderr}; paths=${f.requests.map(r => r.path).join(",")}`);
+      expect(JSON.parse(result.stdout).output).toBe("local reply");
+      expect(f.requests).toHaveLength(1);
+      const request = f.requests[0];
+      expect(request.path).toBe("/v1/messages");
+      expect(request.headers["x-api-key"]).toBe(f.env.FX_TEST_PROVIDER_TOKEN);
+      expect(request.headers["anthropic-version"]).toBe("2023-06-01");
+      expect(request.headers.authorization).toBeNull();
+      const body = request.body;
+      expect(body.model).toBe("claude-test-model");
+      expect(body.stream).toBe(true);
+      expect(body.max_tokens).toBe(8192);
+      expect(typeof body.system).toBe("string");
+      expect(body.prompt).toBeUndefined();
+      const user = body.messages.find((message: any) => message.role === "user");
+      expect(Array.isArray(user.content)).toBe(true);
+      expect(user.content[0].type).toBe("text");
+    } finally { f.close(); }
+  }, 25000);
+
+  test("Messages protocol executes a tool and replays signed thinking on the continuation", async () => {
+    const f = anthropicFixture(body => body.messages.some((message: any) => message.role === "user" && message.content?.[0]?.type === "tool_result")
+      ? anthropicCompletion(body.model, "read succeeded")
+      : anthropicToolUse(body.model, "read_file", { path: "note.txt" }));
+    try {
+      writeFileSync(join(f.workspace, "note.txt"), "fixture contents");
+      const result = await runFx(["ask", "--json", "--no-save", "Read note.txt"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(JSON.parse(result.stdout).output).toBe("read succeeded");
+      expect(f.requests).toHaveLength(2);
+      const assistant = f.requests[1].body.messages.find((message: any) => message.role === "assistant");
+      expect(assistant.content[0]).toMatchObject({ type: "thinking", thinking: "Inspect it first.", signature: "sig-1" });
+      expect(assistant.content[1]).toMatchObject({ type: "tool_use", id: "toolu-local", name: "read_file", input: { path: "note.txt" } });
+      const toolResult = f.requests[1].body.messages.at(-1).content[0];
+      expect(toolResult).toMatchObject({ type: "tool_result", tool_use_id: "toolu-local" });
+      expect(JSON.stringify(toolResult.content)).toContain("fixture contents");
+      expect(f.requests.every(request => request.headers["x-api-key"] === f.env.FX_TEST_PROVIDER_TOKEN)).toBe(true);
     } finally { f.close(); }
   }, 25000);
 });
