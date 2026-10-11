@@ -66,6 +66,7 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addImport("build_options", build_options.createModule());
     const session_manager = addSessionManager(b, exe.root_module, target, optimize, null);
+    const sub_engine = addSubEngine(b, exe.root_module, target, optimize, null);
 
     b.installArtifact(exe);
 
@@ -97,9 +98,15 @@ pub fn build(b: *std.Build) void {
     const session_manager_test_step = b.step("test-session-manager", "Run the session manager's tests");
     session_manager_test_step.dependOn(&run_session_manager_tests.step);
 
+    const sub_engine_tests = b.addTest(.{ .root_module = sub_engine });
+    const run_sub_engine_tests = b.addRunArtifact(sub_engine_tests);
+    const sub_engine_test_step = b.step("test-sub-engine", "Run sub-engine's tests");
+    sub_engine_test_step.dependOn(&run_sub_engine_tests.step);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_session_manager_tests.step);
+    test_step.dependOn(&run_sub_engine_tests.step);
 
     if (wasm_surface != .none) {
         addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel);
@@ -350,6 +357,7 @@ fn addWasmArtifact(
     if (surface == .core) wasm_exe.stack_size = 1024 * 1024;
     wasm_exe.root_module.addImport("build_options", wasm_options.createModule());
     _ = addSessionManager(b, wasm_exe.root_module, wasm_target, .ReleaseSmall, true);
+    _ = addSubEngine(b, wasm_exe.root_module, wasm_target, .ReleaseSmall, true);
 
     const install_wasm = b.addInstallArtifact(wasm_exe, .{});
     const wasm_step = b.step(name ++ "-wasm", description);
@@ -388,6 +396,7 @@ fn addNapiArtifact(
     });
     lib.root_module.addImport("build_options", napi_options.createModule());
     _ = addSessionManager(b, lib.root_module, target, .ReleaseSafe, null);
+    _ = addSubEngine(b, lib.root_module, target, .ReleaseSafe, null);
     const node_include = b.option(
         []const u8,
         "node-include-dir",
@@ -449,6 +458,27 @@ fn addSessionManager(
     });
     module.addImport("build_options", options.createModule());
     importer.addImport("session_manager", module);
+    return module;
+}
+
+/// sub-engine as its own module, rooted at its API. It imports nothing but
+/// std, so no fx file is reachable from it, and fx reaches it only through
+/// `@import("sub_engine")`.
+fn addSubEngine(
+    b: *std.Build,
+    importer: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    single_threaded: ?bool,
+) *std.Build.Module {
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/sub_engine/api.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .single_threaded = single_threaded,
+    });
+    importer.addImport("sub_engine", module);
     return module;
 }
 
