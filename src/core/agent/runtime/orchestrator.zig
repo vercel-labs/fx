@@ -1339,6 +1339,22 @@ fn normalized_terminal_request_arguments(
     defer parsed.deinit();
     if (parsed.value != .object or parsed.value.object.count() != 1) return null;
     const request = parsed.value.object.getPtr("request") orelse return null;
+    // Some models serialize the nested `request` object as a JSON string
+    // instead of an object. Coerce it back so normalization and execution
+    // proceed instead of falling through to the advisory correction path.
+    if (request.* == .string) {
+        const inner = std.json.parseFromSliceLeaky(
+            std.json.Value,
+            parsed.arena.allocator(),
+            request.string,
+            .{},
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        if (inner != .object) return null;
+        request.* = inner;
+    }
     if (request.* != .object) return null;
     _ = try normalize_terminal_model_input(
         parsed.arena.allocator(),
@@ -1671,6 +1687,24 @@ test "terminal inferred model input round trips every atomic write payload" {
         defer alloc.free(normalized);
         try std.testing.expectEqualStrings(case.internal, normalized);
     }
+}
+
+test "terminal request normalization coerces a stringified request object" {
+    const alloc = std.testing.allocator;
+    // A reasoning model that serializes the nested `request` object as a JSON
+    // string must still normalize into the flattened executable form.
+    const stringified =
+        \\{"request":"{\"action\":\"run\",\"command\":\"echo hi\"}"}
+    ;
+    const normalized = (try normalized_terminal_request_arguments(
+        alloc,
+        stringified,
+    )) orelse return error.TestUnexpectedResult;
+    defer alloc.free(normalized);
+    try std.testing.expectEqualStrings(
+        "{\"action\":\"run\",\"command\":\"echo hi\"}",
+        normalized,
+    );
 }
 
 test "shell request projection wraps eligible flat objects without changing source messages" {
