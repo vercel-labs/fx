@@ -1337,15 +1337,17 @@ fn normalized_terminal_request_arguments(
         else => return null,
     };
     defer parsed.deinit();
-    if (parsed.value != .object or parsed.value.object.count() != 1) return null;
+    if (parsed.value != .object) return null;
+    const arena = parsed.arena.allocator();
     const request = parsed.value.object.getPtr("request") orelse return null;
     // Some models serialize the nested `request` object as a JSON string
     // instead of an object. Coerce it back so normalization and execution
     // proceed instead of falling through to the advisory correction path.
+    var coerced = false;
     if (request.* == .string) {
         const inner = std.json.parseFromSliceLeaky(
             std.json.Value,
-            parsed.arena.allocator(),
+            arena,
             request.string,
             .{},
         ) catch |err| switch (err) {
@@ -1354,10 +1356,24 @@ fn normalized_terminal_request_arguments(
         };
         if (inner != .object) return null;
         request.* = inner;
+        coerced = true;
     }
     if (request.* != .object) return null;
+    // A model that stringifies `request` may also emit action fields beside it;
+    // the schema keeps every action field inside `request`. Merge them in so
+    // the coerced call is complete. A field that conflicts with one already
+    // present is ambiguous, so it stays with the advisory correction path.
+    if (coerced and parsed.value.object.count() > 1) {
+        var outer = parsed.value.object.iterator();
+        while (outer.next()) |entry| {
+            const name = entry.key_ptr.*;
+            if (std.mem.eql(u8, name, "request")) continue;
+            if (request.object.contains(name)) return null;
+            try request.object.put(arena, name, entry.value_ptr.*);
+        }
+    }
     _ = try normalize_terminal_model_input(
-        parsed.arena.allocator(),
+        arena,
         &request.object,
     );
 
@@ -1705,6 +1721,34 @@ test "terminal request normalization coerces a stringified request object" {
         "{\"action\":\"run\",\"command\":\"echo hi\"}",
         normalized,
     );
+}
+
+test "terminal request normalization merges fields beside a stringified request" {
+    const alloc = std.testing.allocator;
+    // Some models stringify `request` and also emit an action field beside it.
+    // The field belongs inside `request`, so normalization merges it in.
+    const with_sibling =
+        \\{"request":"{\"action\":\"run\",\"command\":\"echo hi\"}","yield_time_ms":1000}
+    ;
+    const normalized = (try normalized_terminal_request_arguments(
+        alloc,
+        with_sibling,
+    )) orelse return error.TestUnexpectedResult;
+    defer alloc.free(normalized);
+    try std.testing.expectEqualStrings(
+        "{\"action\":\"run\",\"command\":\"echo hi\",\"yield_time_ms\":1000}",
+        normalized,
+    );
+
+    // A field that conflicts with one already inside the stringified request is
+    // ambiguous and stays with the advisory correction path.
+    const conflicting =
+        \\{"request":"{\"action\":\"run\",\"command\":\"echo hi\"}","command":"echo bye"}
+    ;
+    try std.testing.expect((try normalized_terminal_request_arguments(
+        alloc,
+        conflicting,
+    )) == null);
 }
 
 test "shell request projection wraps eligible flat objects without changing source messages" {

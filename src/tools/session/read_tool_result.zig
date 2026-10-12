@@ -49,10 +49,25 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
         return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result arguments must be an object") };
     }
     const args = if (parsed.value.object.get("request")) |request| blk: {
-        if (request != .object) {
+        // Some models serialize the nested `request` object as a JSON string
+        // instead of an object. Coerce it back so the call decodes on the
+        // first attempt instead of failing into a correction the model may
+        // not reproduce.
+        var resolved = request;
+        if (resolved == .string) {
+            resolved = std.json.parseFromSliceLeaky(
+                std.json.Value,
+                parsed.arena.allocator(),
+                resolved.string,
+                .{},
+            ) catch {
+                return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"request\" must be an object") };
+            };
+        }
+        if (resolved != .object) {
             return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"request\" must be an object") };
         }
-        break :blk request.object;
+        break :blk resolved.object;
     } else parsed.value.object;
     if (args.get("search")) |value| return decodeSearch(ctx.allocator, value);
     const handle_value = args.get("handle") orelse {
@@ -318,6 +333,28 @@ test "read_tool_result decodes nested model requests" {
     const decoded = try decode(
         .{ .allocator = alloc },
         "{\"request\":{\"handle\":\"h.txt\",\"query\":\"needle\"}}",
+    );
+    const input = switch (decoded) {
+        .input => |value| value,
+        .failure => return error.TestUnexpectedDecodeFailure,
+    };
+    defer input.deinit(alloc);
+    const typed = input.as(Input);
+    try std.testing.expectEqualStrings("h.txt", typed.handle);
+    switch (typed.selector) {
+        .query => |query| try std.testing.expectEqualStrings("needle", query),
+        .range => return error.TestUnexpectedDecodeFailure,
+        .search => return error.TestUnexpectedDecodeFailure,
+    }
+}
+
+test "read_tool_result coerces a stringified request object" {
+    const alloc = std.testing.allocator;
+    // A reasoning model that serializes the nested `request` object as a JSON
+    // string must still decode into the same input as the object form.
+    const decoded = try decode(
+        .{ .allocator = alloc },
+        "{\"request\":\"{\\\"handle\\\":\\\"h.txt\\\",\\\"query\\\":\\\"needle\\\"}\"}",
     );
     const input = switch (decoded) {
         .input => |value| value,
