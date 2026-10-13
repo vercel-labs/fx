@@ -939,7 +939,6 @@ pub const Reducer = struct {
     /// Requires finish_reason followed by [DONE]. Length/filter/refusal are
     /// explicit errors, never executable partial calls or successful tool turns.
     /// Results use stream_provider.Result.deinit with this reducer's allocator.
-    /// Observed tokens are not exact billing; no deferred lookup is invented.
     pub fn finish(self: *Reducer, cancelled: bool) Error!stream_provider.Result {
         errdefer self.phase = .closed;
         if (cancelled) return error.Cancelled;
@@ -996,7 +995,6 @@ pub const Reducer = struct {
         return .{ .completed = .{
             .completion = .{ .content = content, .tool_calls = owned_calls, .generation_id = generation_id, .finish_reason = reason, .usage = self.usage, .provider_state_json = provider_state },
             .ownership = .owned,
-            .usage = .{ .unavailable = .possibly_billed },
         } };
     }
 };
@@ -1643,8 +1641,6 @@ test "chat completions progress with omitted totals reaches enriched final usage
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(?u64, 10), result.completed.completion.usage.input_tokens);
     try std.testing.expectEqual(@as(?u64, 3), result.completed.completion.usage.output_tokens);
-    try std.testing.expect(result.completed.completion.billing == null);
-    try std.testing.expectEqual(stream_provider.UsageUnavailable.possibly_billed, result.completed.usage.unavailable);
 }
 
 test "chat completions partial final fields do not freeze carried progress observations" {
@@ -2104,7 +2100,6 @@ test "chat completions accepts matching empty terminal usage choices" {
         try std.testing.expectEqual(@as(?u64, 16), result.completed.completion.usage.input_tokens);
         try std.testing.expectEqual(@as(?u64, 6), result.completed.completion.usage.output_tokens);
         try std.testing.expectEqual(@as(usize, if (with_tools) 1 else 0), result.completed.completion.tool_calls.len);
-        try std.testing.expectEqual(stream_provider.UsageUnavailable.possibly_billed, result.completed.usage.unavailable);
     }
 }
 
@@ -2175,8 +2170,6 @@ test "chat completions owns fragmented interleaved tools and results independent
     try std.testing.expectEqualStrings("{\"path\":\"a\"}", completion.tool_calls[0].arguments_json);
     try std.testing.expectEqualStrings("{\"request\":{\"command\":\"pwd\"}}", completion.tool_calls[1].arguments_json);
     try std.testing.expectEqual(types.ToolExecutionProvenance.fx_local, completion.tool_calls[1].provenance);
-    try std.testing.expect(completion.billing == null);
-    try std.testing.expectEqual(stream_provider.UsageUnavailable.possibly_billed, result.completed.usage.unavailable);
 }
 
 test "chat completions malformed and nonobject final arguments never become tools" {
@@ -2263,7 +2256,7 @@ test "chat completions rejects malformed chunks contradictory identities and ext
     }
 }
 
-test "chat completions usage trailers preserve observations without billing" {
+test "chat completions usage trailers preserve observations" {
     const alloc = std.testing.allocator;
     var reducer = try Reducer.init(alloc, test_request(), .{});
     defer reducer.deinit();
@@ -2280,7 +2273,6 @@ test "chat completions usage trailers preserve observations without billing" {
     try std.testing.expectEqualStrings("chat-1", completion.generation_id.?);
     try std.testing.expectEqual(@as(?u64, 17), completion.usage.input_tokens);
     try std.testing.expectEqual(@as(?u64, 3), completion.usage.output_tokens);
-    try std.testing.expect(completion.billing == null);
     try std.testing.expectError(error.StreamClosed, reducer.finish(false));
     for ([_][]const u8{
         "{\"choices\":[],\"usage\":{\"prompt_tokens\":-1}}",

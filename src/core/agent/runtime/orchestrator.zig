@@ -3940,6 +3940,32 @@ fn appendRunningToolCalls(
     });
 }
 
+/// Streams one main-model completion, then has the host confirm it still
+/// owns the session, so no tool call runs in a session another process
+/// took over. A lost writer fails like the stream itself, through the same
+/// recovery path; other check failures are only traced.
+fn streamMainCompletion(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    request: agent_stream_provider.ModelRequest,
+) !runtime_gateway_step.StreamResult {
+    var result = try runtime_gateway_step.streamModelCompletion(deps.agent_stream_provider, arena, request);
+    if (result != .completed) return result;
+    const confirm = deps.confirm_session_writer orelse return result;
+    confirm(deps.ctx) catch |err| switch (err) {
+        error.SessionPersistenceUncertain,
+        error.SessionWriterChanged,
+        error.SessionWriterParked,
+        error.SessionCommitFailed,
+        => {
+            result.deinit(arena);
+            return err;
+        },
+        else => debug_trace.logf("agent", "session writer check failed err={s}", .{@errorName(err)}),
+    };
+    return result;
+}
+
 fn persistRecoveryCheckpoint(
     deps: *const AgentRuntimeDeps,
     finalization: *const TurnFinalizationGuard,
@@ -5012,20 +5038,6 @@ fn refreshGatewayCredentialForJob(
         );
         return false;
     } orelse return false;
-    const previous_api_key = active_api_key.*;
-    if (comptime !host_target.is_wasm) {
-        if (deps.usage) |usage| {
-            if (source == .chatgpt_subscription or source == .grok_subscription) {
-                usage.clearReconciliationCredential();
-            } else {
-                usage.refreshReconciliationCredential(
-                    deps.usage_allocator,
-                    previous_api_key,
-                    refreshed,
-                );
-            }
-        }
-    }
     if (owned_api_key.*) |old| secret.zeroAndFree(alloc, old);
     owned_api_key.* = refreshed;
     active_api_key.* = refreshed;
@@ -7504,8 +7516,6 @@ fn processQueuedPromptLoop(
                         .max_output_tokens = request_data.max_output_tokens,
                         .capabilities_context = deps.ctx,
                         .capabilities_fn = deps.available_model_capabilities,
-                        .usage = deps.usage,
-                        .usage_allocator = deps.usage_allocator,
                         // The request just built starts like the one sent
                         // before it, so the provider has most of it cached.
                         // After an overflow it no longer fits.
@@ -7681,13 +7691,7 @@ fn processQueuedPromptLoop(
                 .cancel_flag = config.cancel_flag,
                 .provider_attempt_owner = .agent,
             };
-            stream_result = runtime_gateway_step.streamModelCompletion(
-                deps.agent_stream_provider,
-                arena,
-                model_request,
-                deps.usage,
-                deps.usage_allocator,
-            ) catch |err| {
+            stream_result = streamMainCompletion(deps, arena, model_request) catch |err| {
                 parent_turn_delivery.observeGatewayDelivery(
                     deps,
                     overlay_arena,
@@ -8109,13 +8113,7 @@ fn processQueuedPromptLoop(
                     model_request.delivery = &replay_delivery;
                     model_request.attempt_evidence = &replay_evidence;
                     const replay_wait_started_ms = io_mod.milliTimestamp();
-                    stream_result = try runtime_gateway_step.streamModelCompletion(
-                        deps.agent_stream_provider,
-                        arena,
-                        model_request,
-                        deps.usage,
-                        deps.usage_allocator,
-                    );
+                    stream_result = try streamMainCompletion(deps, arena, model_request);
                     pushNetworkRecord(deps, job.provider, gateway_model, replay_wait_started_ms, &stream_result);
                     parent_turn_delivery.observeGatewayDelivery(
                         deps,

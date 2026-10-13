@@ -183,11 +183,6 @@ pub fn run(alloc: Allocator, request: Request) !Outcome {
             .cancel_flag = request.cancel_flag,
             .provider_attempt_owner = .transport,
         },
-        // Cosmetic side calls stay out of the session usage ledger: a title
-        // call without generation metadata would otherwise degrade the
-        // session's billing completeness and inflate its token totals.
-        null,
-        alloc,
     ) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (request.cancel_flag.load(.seq_cst)) return .{ .unavailable = .{ .reason = .cancelled } };

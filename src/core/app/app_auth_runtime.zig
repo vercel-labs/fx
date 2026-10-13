@@ -1374,7 +1374,6 @@ pub fn Runtime(comptime App: type) type {
             app.model_cache.adoptOwnedCatalog(access, &catalog);
             app.provider_selection.adoptOwned(target, &owned_model);
             if (credential) |*value| _ = app.auth.adoptCredential(app.alloc, value);
-            reconcileGatewayCredential(app);
 
             const body = try app.alloc.print(
                 "Switched to {s} with {s}.",
@@ -1789,7 +1788,6 @@ pub fn Runtime(comptime App: type) type {
             change: auth_transition.CredentialChange,
         ) void {
             if (change == .none) return;
-            reconcileGatewayCredential(app);
             if (app.auth.modelCatalogAccess().authorizationCredential() == null) return;
             if (change == .authority) app.model_cache.reset();
             if (comptime @hasDecl(App, "startModelCacheWarmup")) {
@@ -2019,60 +2017,9 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasDecl(@TypeOf(app.auth), "cancelPromptCredentialRefresh")) {
                 app.auth.cancelPromptCredentialRefresh();
             }
-            reconcileGatewayCredential(app);
             app.model_cache.reset();
             if (comptime @hasDecl(App, "startModelCacheWarmup")) {
                 app.startModelCacheWarmup();
-            }
-        }
-
-        fn reconcileGatewayCredential(app: *App) void {
-            if (comptime !runtime_profile.allows(App, .generation_usage)) return;
-            if (comptime @hasField(App, "session") and
-                @hasField(@TypeOf(app.session), "usage"))
-            {
-                if (app.auth.gatewayCredential()) |credential| {
-                    if (gatewayCredentialSource(credential) == .host_managed) {
-                        if (comptime @hasDecl(@TypeOf(app.session.usage), "replaceHostManagedReconciliationAuthority")) {
-                            app.session.usage.replaceHostManagedReconciliationAuthority(
-                                app.alloc,
-                                provider_runtime.provider(app),
-                            );
-                        }
-                        return;
-                    }
-                    const subscription = if (comptime @hasField(@TypeOf(credential), "source"))
-                        credential.source == .chatgpt_subscription or credential.source == .grok_subscription
-                    else
-                        false;
-                    if (subscription) {
-                        app.session.usage.clearReconciliationCredential();
-                    } else {
-                        if (comptime @hasDecl(
-                            @TypeOf(app.session.usage),
-                            "replaceProviderReconciliationCredential",
-                        )) {
-                            if (optionalGatewayApiKey(credential)) |api_key| {
-                                app.session.usage.replaceProviderReconciliationCredential(
-                                    app.alloc,
-                                    .gateway,
-                                    credential.source,
-                                    null,
-                                    api_key,
-                                );
-                            }
-                        } else {
-                            if (optionalGatewayApiKey(credential)) |api_key| {
-                                app.session.usage.replaceReconciliationCredential(
-                                    app.alloc,
-                                    api_key,
-                                );
-                            }
-                        }
-                    }
-                } else {
-                    app.session.usage.clearReconciliationCredential();
-                }
             }
         }
 
@@ -2659,26 +2606,6 @@ const TestGatewayCredential = struct {
     api_key: []const u8,
 };
 
-const TestUsage = struct {
-    refresh_count: usize = 0,
-    clear_count: usize = 0,
-    last_key: ?[]const u8 = null,
-
-    fn replaceReconciliationCredential(
-        self: *TestUsage,
-        _: std.mem.Allocator,
-        api_key: []const u8,
-    ) void {
-        self.refresh_count += 1;
-        self.last_key = api_key;
-    }
-
-    fn clearReconciliationCredential(self: *TestUsage) void {
-        self.clear_count += 1;
-        self.last_key = null;
-    }
-};
-
 const TestRenderRequests = struct {
     footer_requested: bool = false,
 
@@ -2735,9 +2662,6 @@ const TestApp = struct {
         }
     } = .{},
     model_cache: TestModelCache = .{},
-    session: struct {
-        usage: TestUsage = .{},
-    } = .{},
     model_cache_warmup_count: usize = 0,
     notice_write_count: usize = 0,
     transcript: std.ArrayList(u8) = .empty,
@@ -3130,11 +3054,6 @@ test "auth source changes invalidate the catalog and failed selection preserves 
     try std.testing.expectEqual(credentials.Source.stored_key, app.auth.selected_source.?);
     try std.testing.expectEqual(@as(usize, 2), app.model_cache.reset_count);
     try std.testing.expectEqual(@as(usize, 2), app.model_cache_warmup_count);
-    try std.testing.expectEqual(@as(usize, 2), app.session.usage.refresh_count);
-    try std.testing.expectEqualStrings(
-        "refreshed-key",
-        app.session.usage.last_key.?,
-    );
 
     app.auth.select_result = null;
     try std.testing.expect(!try runtime.selectCredentialSource(&app, .ai_gateway_api_key));
@@ -3338,24 +3257,12 @@ test "prompt credential refresh preserves catalog for secret rotation" {
     try std.testing.expectEqual(@as(usize, 2), app.auth.refresh_count);
     try std.testing.expectEqual(@as(usize, 0), app.model_cache.reset_count);
     try std.testing.expectEqual(@as(usize, 1), app.model_cache_warmup_count);
-    try std.testing.expectEqual(@as(usize, 1), app.session.usage.refresh_count);
 
     app.auth.refresh_change = .authority;
     try runtime.refreshFxLoginCredentialIfNeeded(&app);
     try std.testing.expectEqual(@as(usize, 3), app.auth.refresh_count);
     try std.testing.expectEqual(@as(usize, 1), app.model_cache.reset_count);
     try std.testing.expectEqual(@as(usize, 2), app.model_cache_warmup_count);
-    try std.testing.expectEqual(@as(usize, 2), app.session.usage.refresh_count);
-}
-
-test "credential removal clears the reconciliation credential" {
-    var app: TestApp = .{};
-    app.auth.gateway_ready = false;
-
-    Runtime(TestApp).applyCredentialChange(&app, true);
-
-    try std.testing.expectEqual(@as(usize, 1), app.session.usage.clear_count);
-    try std.testing.expectEqual(@as(usize, 0), app.session.usage.refresh_count);
 }
 
 test "logout result reconciles live auth and renders only sanitized notices" {

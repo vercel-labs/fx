@@ -33,7 +33,6 @@ const session_catalog = @import("../session/session_catalog.zig");
 const session_codec = @import("../session/session_codec.zig");
 const js_host_session_store = @import("../session/js_host_session_store.zig");
 const session_event = @import("../session/session_event.zig");
-const session_usage = @import("../session/session_usage.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const legacy_background_migration = @import("../session/legacy_background_migration.zig");
 const result_store = @import("../session/result_store.zig");
@@ -2233,23 +2232,8 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        pub fn startResumedSessionReconciliation(app: *App) void {
+        pub fn startResumedSessionWarmup(app: *App) void {
             if (comptime @hasDecl(App, "startModelCacheWarmup")) app.startModelCacheWarmup();
-            if (comptime !@hasField(App, "auth") or !provider_runtime.supported(App)) return;
-            if (comptime !@hasDecl(@TypeOf(app.auth), "credentialSource") or
-                !@hasDecl(@TypeOf(app.auth), "accountId") or
-                !@hasDecl(@TypeOf(app.session.usage), "replaceProviderReconciliationCredential")) return;
-
-            const source = app.auth.credentialSource() orelse return;
-            if (!model_provider.authorizesCredential(provider_runtime.provider(app), source)) return;
-            const credential = app.auth.apiKey() orelse return;
-            app.session.usage.replaceProviderReconciliationCredential(
-                app.alloc,
-                provider_runtime.provider(app),
-                source,
-                app.auth.accountId(),
-                credential,
-            );
         }
 
         pub fn resumeSelectedSession(app: *App) !bool {
@@ -2263,7 +2247,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.prepareLiveSessionResume();
                 v2_owned = false;
                 try installResumedV2Session(app, v2, .session);
-                startResumedSessionReconciliation(app);
+                startResumedSessionWarmup(app);
                 try app.finishLiveSessionResume();
                 return true;
             }
@@ -2281,7 +2265,7 @@ pub fn Runtime(comptime App: type) type {
             try app.prepareLiveSessionResume();
             loaded_owned = false;
             try installResumedSession(app, &loaded, .session);
-            startResumedSessionReconciliation(app);
+            startResumedSessionWarmup(app);
             try app.finishLiveSessionResume();
             rememberSelectedSession(app);
             return true;
@@ -2393,15 +2377,6 @@ pub fn Runtime(comptime App: type) type {
                 state.permission_state,
             );
             updateStaleShellHandles(app, state.history);
-            if (state.usage) |usage| {
-                try app.session.usage.restore(
-                    app.alloc,
-                    usage,
-                    state.created_at_ms,
-                );
-            } else {
-                app.session.usage.restoreLegacyWallDuration(state.created_at_ms);
-            }
             try replacePreferences(
                 app.alloc,
                 &app.session_persistence.session_preferences,
@@ -2922,38 +2897,15 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
-        pub fn persistUsageCheckpoint(
-            app: *App,
-            snapshot: session_usage.Snapshot,
-        ) !void {
-            if (comptime !@hasField(App, "session_persistence")) {
-                return error.SessionPersistenceUnavailable;
-            }
+        /// Fails when this process no longer owns the saved session, without
+        /// writing. Sessions v2 hold the session's lock, and an unsaved
+        /// session has no writer to lose.
+        pub fn confirmSessionWriter(app: *App) !void {
+            if (comptime !@hasField(App, "session_persistence")) return;
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-            if (app.session_persistence.v2) |v2| return v2.persistUsage(snapshot);
-            const store = if (app.session_persistence.store) |value|
-                value
-            else
-                return error.SessionPersistenceUnavailable;
-            const loaded = if (app.session_persistence.writable) |*value|
-                value
-            else
-                return error.SessionPersistenceUnavailable;
-            const recovery_checkpoint = try store.prepareUsageRecoveryCheckpoint(
-                app.alloc,
-                loaded,
-                snapshot,
-            );
-            _ = try loaded.appendEvent(
-                app.alloc,
-                .{ .usage_checkpointed = .{ .usage = snapshot } },
-                recovery_checkpoint.timestamp_ms,
-            );
-            try store.finishUsageRecoveryCheckpoint(
-                loaded.active_id,
-                recovery_checkpoint,
-            );
+            if (app.session_persistence.v2 != null) return;
+            if (app.session_persistence.writable) |*loaded| try loaded.confirmWriter();
         }
 
         pub fn setRecoveryCheckpoint(
@@ -3929,12 +3881,12 @@ pub fn Runtime(comptime App: type) type {
         pub fn prepareResumeHandoff(app: *App) !void {
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-            if (app.session_persistence.v2) |v2| return settleV2Usage(app, v2);
+            if (app.session_persistence.v2 != null) return;
             const loaded = if (app.session_persistence.writable) |*value|
                 value
             else
                 return error.SessionPersistenceUnavailable;
-            try settleDurableState(app, loaded);
+            try loaded.requireWritable();
         }
 
         pub fn suspendToJobControl(app: *App, footer_rows: u16) !void {
@@ -3959,15 +3911,6 @@ pub fn Runtime(comptime App: type) type {
         pub fn requestPersistenceShutdown(app: *App) void {
             app.session_persistence.session_picker_load.requestStop();
             app.session_persistence.title_generation.requestStop();
-        }
-
-        /// Exit publishes nothing to the profile usage ledger, so it never
-        /// waits on another process holding its lock. The session keeps
-        /// unpublished usage for recovery and the next resume.
-        pub fn abandonProfileLedgerForProcessExit(app: *App) void {
-            if (comptime @hasField(@TypeOf(app.session), "profile_usage")) {
-                app.session.profile_usage.abandonLedgerForProcessExit();
-            }
         }
 
         fn LiveHistorySink(comptime SinkApp: type) type {
@@ -5582,11 +5525,6 @@ pub fn Runtime(comptime App: type) type {
         fn closeWritableSessionWithResumeHandoff(app: *App) ?ResumeHandoff {
             const handoff_intent = app.session_persistence.resume_handoff_intent;
             app.session_persistence.resume_handoff_intent = .none;
-            if (comptime @hasField(@TypeOf(app.session), "usage")) {
-                app.session.usage.cancelReconciliation();
-                app.session.usage.finishProfilePublicationsBeforeShutdown();
-                app.session.usage.configureCheckpointSink(null);
-            }
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             app.session_persistence.remember_fresh_session = false;
@@ -5599,7 +5537,7 @@ pub fn Runtime(comptime App: type) type {
             var resume_boundary_valid = false;
             if (handoff_intent != .none) {
                 var settlement_failed = false;
-                settleDurableState(app, loaded) catch |err| {
+                loaded.requireWritable() catch |err| {
                     settlement_failed = true;
                     recordShutdownFailure(app, err);
                     debug_trace.logf(
@@ -5610,7 +5548,7 @@ pub fn Runtime(comptime App: type) type {
                 };
                 resume_boundary_valid = !settlement_failed;
             } else {
-                settleDurableState(app, loaded) catch |err| {
+                loaded.requireWritable() catch |err| {
                     recordShutdownFailure(app, err);
                     debug_trace.logf(
                         "session",
@@ -5664,16 +5602,10 @@ pub fn Runtime(comptime App: type) type {
             return handoff;
         }
 
-        /// Settles usage and closes; the manager ends an open turn as
-        /// `closed`, and a session with no turn leaves nothing on disk (D2).
+        /// Closes; the manager ends an open turn as `closed`, and a session
+        /// with no turn leaves nothing on disk (D2).
         fn closeV2Session(app: *App, v2: *session_adapter.Session, handoff_intent: ResumeHandoffIntent) ?ResumeHandoff {
-            var settled = true;
-            settleV2Usage(app, v2) catch |err| {
-                settled = false;
-                recordShutdownFailure(app, err);
-                debug_trace.logf("session", "final persistence settlement failed session={s} err={s}", .{ v2.id(), @errorName(err) });
-            };
-            const create_handoff = settled and shouldCreateResumeHandoff(.{
+            const create_handoff = shouldCreateResumeHandoff(.{
                 .intent = handoff_intent,
                 .has_writable_session = true,
                 .is_pristine = !v2.saved(),
@@ -5692,15 +5624,6 @@ pub fn Runtime(comptime App: type) type {
             v2.close();
             app.session_persistence.v2 = null;
             return handoff;
-        }
-
-        fn settleV2Usage(app: *App, v2: *session_adapter.Session) !void {
-            if (comptime !@hasField(@TypeOf(app.session), "usage")) return;
-            if (!app.session.usage.isDirty()) return;
-            var usage = try app.session.usage.snapshot(app.alloc);
-            defer usage.deinit(app.alloc);
-            try v2.persistUsage(usage);
-            app.session.usage.markClean(usage);
         }
 
         /// A fresh interactive session that never received durable work has
@@ -5868,27 +5791,6 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
-        fn settleDurableState(
-            app: *App,
-            loaded: *session_store.LoadedWritableSession,
-        ) !void {
-            try loaded.requireWritable();
-            const usage_dirty = if (comptime @hasField(@TypeOf(app.session), "usage"))
-                app.session.usage.isDirty()
-            else
-                false;
-            if (usage_dirty) {
-                var usage = try app.session.usage.snapshot(app.alloc);
-                defer usage.deinit(app.alloc);
-                _ = try loaded.appendEvent(
-                    app.alloc,
-                    .{ .usage_checkpointed = .{ .usage = usage } },
-                    io_mod.milliTimestamp(),
-                );
-                app.session.usage.markClean(usage);
-            }
-        }
-
         pub fn commitContextCompaction(
             app: *App,
             summary: types.CompactedSummaryHistoryTurn,
@@ -5925,7 +5827,6 @@ pub fn Runtime(comptime App: type) type {
                     owner.state = next;
                     owner.revision = revision;
                     next_owned = false;
-                    if (owner.state.usage) |usage| app.session.usage.markClean(usage);
                 }
             }
             app.session.commitCompactedHistory(app.alloc, prepared);
@@ -6000,9 +5901,6 @@ pub fn Runtime(comptime App: type) type {
             owner.state = next;
             owner.revision = revision;
             next_owned = false;
-            if (comptime @hasField(@TypeOf(app.session), "usage")) {
-                if (owner.state.usage) |usage| app.session.usage.markClean(usage);
-            }
         }
 
         fn snapshotCurrentState(
@@ -6033,7 +5931,6 @@ pub fn Runtime(comptime App: type) type {
                 var value = permission_state;
                 value.deinit(app.alloc);
             }
-            const usage = try app.session.usage.snapshot(app.alloc);
             const recovery_checkpoint = if (base_state.recovery_checkpoint) |checkpoint|
                 try checkpoint.dupe(app.alloc)
             else
@@ -6051,7 +5948,6 @@ pub fn Runtime(comptime App: type) type {
                 .total_input_tokens = app.total_input_tokens,
                 .total_output_tokens = app.total_output_tokens,
                 .permission_state = permission_state,
-                .usage = usage,
                 .recovery_checkpoint = recovery_checkpoint,
             };
         }
@@ -6079,7 +5975,6 @@ pub fn Runtime(comptime App: type) type {
                 var value = permission_state;
                 value.deinit(app.alloc);
             }
-            const usage = try app.session.usage.snapshot(app.alloc);
             return .{
                 .id = id,
                 .origin_workspace_root = origin,
@@ -6092,7 +5987,6 @@ pub fn Runtime(comptime App: type) type {
                 .total_input_tokens = 0,
                 .total_output_tokens = 0,
                 .permission_state = permission_state,
-                .usage = usage,
             };
         }
 
@@ -7082,12 +6976,6 @@ fn makeJsHostTestState(
     errdefer alloc.free(workspace);
     const model = try alloc.dupe(u8, "restored/model");
     errdefer alloc.free(model);
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    const sequence = try usage.reserveInvocation();
-    usage.finishInvocation(sequence, 41, .unbilled);
-    var usage_snapshot = try usage.snapshot(alloc);
-    errdefer usage_snapshot.deinit(alloc);
     return .{
         .id = owned_id,
         .origin_workspace_root = origin,
@@ -7102,13 +6990,12 @@ fn makeJsHostTestState(
         },
         .history = history,
         .context_history_start = 0,
-        .usage = usage_snapshot,
         .total_input_tokens = 17,
         .total_output_tokens = 23,
     };
 }
 
-test "js-host resume restores transcript context preferences usage and revision" {
+test "js-host resume restores transcript context preferences and revision" {
     const alloc = std.testing.allocator;
     var fake = FakeJsHostSessionStore{
         .state = try makeJsHostTestState(
@@ -7152,9 +7039,6 @@ test "js-host resume restores transcript context preferences usage and revision"
     try std.testing.expect(!Runtime(TestApp).fastModeModelBound(&app));
     try std.testing.expectEqual(@as(u64, 17), app.total_input_tokens);
     try std.testing.expectEqual(@as(u64, 23), app.total_output_tokens);
-    var restored_usage = try app.session.usage.snapshot(alloc);
-    defer restored_usage.deinit(alloc);
-    try std.testing.expectEqual(@as(u64, 41), restored_usage.api_duration_ms);
     try std.testing.expectEqualStrings(
         "restored-session",
         app.session_persistence.js_host_session.?.state.id,
@@ -12288,87 +12172,6 @@ test "renameActiveSession persists the title only in session metadata" {
             .{},
         ),
     );
-}
-
-const ReconciliationOriginUsage = struct {
-    replaced_provider: ?model_provider.ProviderId = null,
-    replaced_source: ?types.CredentialSource = null,
-
-    pub fn replaceProviderReconciliationCredential(
-        self: *@This(),
-        _: Allocator,
-        provider: model_provider.ProviderId,
-        source: types.CredentialSource,
-        _: ?[]const u8,
-        _: []const u8,
-    ) void {
-        self.replaced_provider = provider;
-        self.replaced_source = source;
-    }
-};
-
-const ReconciliationOriginAuth = struct {
-    source: types.CredentialSource,
-
-    pub fn credentialSource(self: *const @This()) ?types.CredentialSource {
-        return self.source;
-    }
-
-    fn apiKey(_: *const @This()) ?[]const u8 {
-        return "origin-bound-token";
-    }
-
-    pub fn accountId(_: *const @This()) ?[]const u8 {
-        return null;
-    }
-
-    fn gatewayTeam(_: *const @This()) ?[]const u8 {
-        return null;
-    }
-};
-
-const ReconciliationOriginApp = struct {
-    alloc: Allocator = std.testing.allocator,
-    auth: ReconciliationOriginAuth,
-    session: struct { usage: ReconciliationOriginUsage = .{} } = .{},
-    selected_provider: model_provider.ProviderId,
-    selected_model: std.ArrayList(u8) = .empty,
-};
-
-test "resumed sessions install provider-scoped usage reconciliation authority" {
-    var chatgpt = ReconciliationOriginApp{
-        .auth = .{ .source = .chatgpt_subscription },
-        .selected_provider = .codex,
-    };
-    Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&chatgpt);
-    try std.testing.expectEqual(model_provider.ProviderId.codex, chatgpt.session.usage.replaced_provider.?);
-    try std.testing.expectEqual(types.CredentialSource.chatgpt_subscription, chatgpt.session.usage.replaced_source.?);
-
-    var gateway = ReconciliationOriginApp{
-        .auth = .{ .source = .ai_gateway_api_key },
-        .selected_provider = .gateway,
-    };
-    Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&gateway);
-    try std.testing.expectEqual(model_provider.ProviderId.gateway, gateway.session.usage.replaced_provider.?);
-    try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, gateway.session.usage.replaced_source.?);
-}
-
-test "resumed usage reconciliation rejects the previous provider credential" {
-    const cases = .{
-        .{ model_provider.ProviderId.gateway, types.CredentialSource.chatgpt_subscription },
-        .{ model_provider.ProviderId.gateway, types.CredentialSource.grok_subscription },
-        .{ model_provider.ProviderId.codex, types.CredentialSource.fx_login },
-        .{ model_provider.ProviderId.grok, types.CredentialSource.fx_login },
-    };
-    inline for (cases) |case| {
-        var app = ReconciliationOriginApp{
-            .auth = .{ .source = case[1] },
-            .selected_provider = case[0],
-        };
-        Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&app);
-        try std.testing.expect(app.session.usage.replaced_provider == null);
-        try std.testing.expect(app.session.usage.replaced_source == null);
-    }
 }
 
 test "ensureCachedSessionTitle derives from the first prompt and then freezes" {

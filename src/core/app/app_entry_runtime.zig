@@ -318,13 +318,8 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
             if (shutdown.failure) |err| reportShutdownFailure(deps, err);
         }
     };
-    if (comptime !cooperative and @hasField(App, "session") and
-        @hasDecl(@TypeOf(app.session), "attachProfileUsagePublisher"))
-    {
-        app.session.attachProfileUsagePublisher(app.alloc);
-    }
     if (comptime !cooperative) {
-        if (resume_requested) app.startResumedSessionReconciliation();
+        if (resume_requested) app.startResumedSessionWarmup();
         if (@hasDecl(App, "configureNotifications")) try app.configureNotifications();
         if (@hasDecl(App, "playStartupSound")) app.playStartupSound();
         if (@hasDecl(App, "startAutoUpgrade")) app.startAutoUpgrade();
@@ -869,7 +864,7 @@ const TestApp = struct {
         appendTestEvent("terminal-release");
     }
 
-    fn startResumedSessionReconciliation(_: *TestApp) void {
+    fn startResumedSessionWarmup(_: *TestApp) void {
         appendTestEvent("resume-reconciliation");
     }
 

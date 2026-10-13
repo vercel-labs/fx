@@ -10,23 +10,15 @@ const language_script = @import("../shared/language_script.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const image_attachments = @import("../images/image_attachments.zig");
-const generation_usage_provider = @import("generation_usage_provider.zig");
 const compactor = @import("../compactor/compactor.zig");
 const web_fetch_artifacts = @import("web_fetch_artifacts.zig");
 const command_replay_store = @import("command_replay_store.zig");
 const session_child_store = @import("session_child_store.zig");
-pub const session_usage = @import("session_usage.zig");
-pub const profile_usage_runtime = @import("profile_usage_runtime.zig");
 const command_contract = @import("../execution/command_contract.zig");
 const managed_execution = @import("../execution/managed_execution.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const Allocator = std.mem.Allocator;
-
-test {
-    _ = session_usage;
-    _ = profile_usage_runtime;
-}
 
 const compact_continuation_preamble = "This session is being continued from earlier compacted context. The summary below covers the earlier portion of the conversation.\n\n";
 const compact_recent_messages_note = "Recent conversation turns are preserved verbatim.";
@@ -1675,8 +1667,6 @@ pub const SessionRuntime = struct {
     web_fetch_artifacts: WebFetchArtifactState = .none,
     language_lock: std.Io.Mutex = .init,
     conversation_language: ConversationLanguage = ConversationLanguage.default(),
-    usage: session_usage.Usage = session_usage.Usage.initFresh(),
-    profile_usage: profile_usage_runtime.Runtime = .{},
     permission_state_lock: std.Io.Mutex = .init,
     permission_state: session_permission_state.State = .{},
     /// Count limit for owned model-context snapshots; canonical history is not truncated.
@@ -1690,87 +1680,29 @@ pub const SessionRuntime = struct {
     /// first agent turn of the resumed session, so no lock is required.
     has_stale_shell_handles: bool = false,
 
-    pub fn init(
-        max_history_turns: usize,
-        provider: generation_usage_provider.Provider,
-    ) SessionRuntime {
-        return .{
-            .usage = session_usage.Usage.initFreshWithProvider(provider),
-            .max_history_turns = max_history_turns,
-        };
+    pub fn init(max_history_turns: usize) SessionRuntime {
+        return .{ .max_history_turns = max_history_turns };
     }
 
-    pub fn initWithProviders(
-        max_history_turns: usize,
-        providers: generation_usage_provider.Set,
-    ) SessionRuntime {
-        return .{
-            .usage = session_usage.Usage.initFreshWithProviders(providers),
-            .max_history_turns = max_history_turns,
-        };
-    }
-
-    pub fn initIntoWithProviders(
-        self: *SessionRuntime,
-        max_history_turns: usize,
-        providers: generation_usage_provider.Set,
-    ) void {
+    /// `init` in place, for a runtime too large to build on the stack.
+    pub fn initInto(self: *SessionRuntime, max_history_turns: usize) void {
         const session_runtime_info = @typeInfo(SessionRuntime).@"struct";
         inline for (session_runtime_info.field_names, session_runtime_info.field_types, session_runtime_info.field_attrs) |field_name, field_type, field_attrs| {
-            if (comptime std.mem.eql(u8, field_name, "usage") or
-                std.mem.eql(u8, field_name, "max_history_turns")) continue;
+            if (comptime std.mem.eql(u8, field_name, "max_history_turns")) continue;
             @field(self.*, field_name) = field_attrs.defaultValue(field_type).?;
         }
-        self.usage.initIntoFreshWithProviders(providers);
         self.max_history_turns = max_history_turns;
     }
 
     pub fn deinit(self: *SessionRuntime, alloc: Allocator) void {
         self.clearWebFetchArtifacts();
-        self.usage.configurePublicationSink(null);
-        self.usage.configureCheckpointSink(null);
-        self.usage.deinit(alloc);
-        self.profile_usage.deinit(alloc);
         self.permission_state.deinit(alloc);
         self.agent.deinit(alloc);
         self.context_notice_hashes.deinit(alloc);
     }
 
-    pub fn initializeProfileUsage(
-        self: *SessionRuntime,
-        alloc: Allocator,
-        home_path: ?[]const u8,
-    ) !profile_usage_runtime.InitializeOutcome {
-        self.usage.configurePublicationSink(null);
-        return self.profile_usage.initialize(alloc, home_path);
-    }
-
-    /// Attaches callbacks only after the host has placed SessionRuntime at its
-    /// final address.
-    pub fn attachProfileUsagePublisher(
-        self: *SessionRuntime,
-        alloc: Allocator,
-    ) void {
-        self.usage.configurePublicationSink(
-            if (self.profile_usage.isAvailable())
-                self.profile_usage.publisherSink(alloc)
-            else
-                null,
-        );
-    }
-
-    pub fn ensureProfileUsageReadable(
-        self: *SessionRuntime,
-        alloc: Allocator,
-        home_path: ?[]const u8,
-    ) !profile_usage_runtime.InitializeOutcome {
-        if (self.profile_usage.isAvailable()) return .available;
-        return self.initializeProfileUsage(alloc, home_path);
-    }
-
     pub fn reset(self: *SessionRuntime, alloc: Allocator) void {
         self.clearWebFetchArtifacts();
-        self.usage.resetFresh(alloc);
         self.clearPermissionState(alloc);
         self.clearHistory(alloc);
         self.clearContextNotices();
@@ -1780,7 +1712,6 @@ pub const SessionRuntime = struct {
 
     pub fn restore(self: *SessionRuntime, alloc: Allocator, language: ConversationLanguage, history: []const HistoryTurn) !void {
         self.clearWebFetchArtifacts();
-        self.usage.resetLegacy(alloc);
         self.clearPermissionState(alloc);
         self.clearHistory(alloc);
         self.clearContextNotices();
@@ -2098,16 +2029,11 @@ pub const SessionRuntime = struct {
     }
 };
 
-test "session initIntoWithProviders preserves runtime defaults without copying usage scratch arrays" {
+test "session initInto preserves runtime defaults" {
     var actual: SessionRuntime = undefined;
     @memset(std.mem.asBytes(&actual), 0xa5);
-    actual.initIntoWithProviders(17, .{});
-
-    var expected = SessionRuntime.initWithProviders(17, .{});
-    @memset(std.mem.asBytes(&expected.usage.active_sequences), 0xa5);
-    @memset(std.mem.asBytes(&expected.usage.incidents), 0xa5);
-
-    try std.testing.expectEqualDeep(expected, actual);
+    actual.initInto(17);
+    try std.testing.expectEqualDeep(SessionRuntime.init(17), actual);
 }
 
 fn appendHistoryCopies(
@@ -2271,129 +2197,6 @@ pub fn makeAssistantTurn(alloc: Allocator, user_text: []const u8, assistant_text
         .user = .{ .text = user_copy, .images = &.{} },
         .assistant = assistant_copy,
     } };
-}
-
-test "unavailable profile usage keeps reconciled generation pending in host runtime" {
-    const alloc = std.testing.allocator;
-    const Checkpoint = struct {
-        calls: usize = 0,
-
-        fn persist(raw: *anyopaque, _: session_usage.Snapshot) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.calls += 1;
-        }
-    };
-
-    var checkpoint = Checkpoint{};
-    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
-    defer runtime.deinit(alloc);
-    try std.testing.expectEqual(
-        profile_usage_runtime.InitializeOutcome.unavailable,
-        try runtime.initializeProfileUsage(alloc, null),
-    );
-    runtime.attachProfileUsagePublisher(alloc);
-    runtime.usage.configureCheckpointSink(.{
-        .context = &checkpoint,
-        .allocator = alloc,
-        .persist = Checkpoint.persist,
-    });
-
-    const sequence = try runtime.usage.reserveInvocation();
-    try runtime.usage.finishObservedInvocation(
-        alloc,
-        sequence,
-        1,
-        .observed_generation,
-        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        "https://ai-gateway.vercel.sh",
-        null,
-    );
-    try runtime.usage.applyGeneration(alloc, .{
-        .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        .created_at_ms = 1000,
-        .model = "provider/model",
-        .total_cost = 0.25,
-        .input_tokens = 10,
-        .output_tokens = 2,
-        .cache_read_tokens = 1,
-        .cache_write_tokens = 0,
-        .reasoning_tokens = 1,
-        .billable_web_search_calls = 0,
-    });
-
-    var snapshot = try runtime.usage.snapshot(alloc);
-    defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(session_usage.Availability.pending, snapshot.billing);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.pending.len);
-    try std.testing.expectEqual(@as(u64, 0), snapshot.input_tokens);
-    try std.testing.expectEqual(@as(usize, 1), checkpoint.calls);
-}
-
-test "readable profile usage does not attach publishers or flush recovery" {
-    const alloc = std.testing.allocator;
-    const Checkpoint = struct {
-        calls: usize = 0,
-
-        fn persist(raw: *anyopaque, _: session_usage.Snapshot) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.calls += 1;
-        }
-    };
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(home);
-
-    var checkpoint = Checkpoint{};
-    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
-    defer runtime.deinit(alloc);
-    try std.testing.expectEqual(
-        profile_usage_runtime.InitializeOutcome.available,
-        try runtime.initializeProfileUsage(alloc, home),
-    );
-    runtime.usage.configureCheckpointSink(.{
-        .context = &checkpoint,
-        .allocator = alloc,
-        .persist = Checkpoint.persist,
-    });
-
-    const sequence = try runtime.usage.reserveInvocation();
-    try runtime.usage.finishObservedInvocation(
-        alloc,
-        sequence,
-        1,
-        .observed_generation,
-        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        "https://ai-gateway.vercel.sh",
-        null,
-    );
-    try runtime.usage.applyGeneration(alloc, .{
-        .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        .created_at_ms = 1000,
-        .model = "provider/model",
-        .total_cost = 0.25,
-        .input_tokens = 10,
-        .output_tokens = 2,
-        .cache_read_tokens = 1,
-        .cache_write_tokens = 0,
-        .reasoning_tokens = 1,
-        .billable_web_search_calls = 0,
-    });
-
-    const checkpoint_calls = checkpoint.calls;
-    try std.testing.expectEqual(
-        profile_usage_runtime.InitializeOutcome.available,
-        try runtime.ensureProfileUsageReadable(alloc, home),
-    );
-    var saved = try runtime.usage.snapshot(alloc);
-    defer saved.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), saved.publication_backlog.len);
-    try std.testing.expectEqual(checkpoint_calls, checkpoint.calls);
-    try std.testing.expectError(
-        error.FileNotFound,
-        tmp.dir.access(io_mod.getIo(), ".fx/usage.jsonl", .{}),
-    );
 }
 
 test "appendAssistantTurnWithExecution transfers memory and clears the source" {

@@ -205,24 +205,6 @@ test "shutdown settles queued and pacer-owned finishes exactly once" {
             .consumed_provider_attempts = 1,
         };
         try app_session_runtime.Runtime(ShutdownApp).setRecoveryCheckpoint(&app, checkpoint);
-        var usage = try app.session.usage.snapshot(alloc);
-        defer usage.deinit(alloc);
-        var models = [_]@import("../session/session_usage.zig").ModelAggregate{.{
-            .model = @constCast("test-model"),
-            .first_sequence = 1,
-            .input_tokens = 7,
-            .output_tokens = 11,
-            .reasoning_tokens = usage.reasoning_tokens,
-            .request_count = usage.request_count,
-        }};
-        const empty_models = usage.models;
-        usage.models = &models;
-        defer usage.models = empty_models;
-        usage.input_tokens = 7;
-        usage.output_tokens = 11;
-        usage.next_sequence = 2;
-        usage.settled_through_sequence = 1;
-        try app_session_runtime.Runtime(ShutdownApp).persistUsageCheckpoint(&app, usage);
 
         var ownership: Ownership = .{};
         const summary: types.TurnSummary = .{ .token_progress = .{ .input_tokens = 7, .output_tokens = 11 } };
@@ -270,10 +252,6 @@ test "shutdown settles queued and pacer-owned finishes exactly once" {
         try std.testing.expectEqualDeep(summary, types.historyTurnSummary(loaded.history[0]).?);
         try std.testing.expectEqualStrings("later answer", loaded.history[1].assistant.assistant);
         try std.testing.expect(loaded.recovery_checkpoint == null);
-        try std.testing.expectEqual(@as(u64, 7), loaded.usage.?.input_tokens);
-        try std.testing.expectEqual(@as(u64, 11), loaded.usage.?.output_tokens);
-        try std.testing.expectEqual(@as(u64, 2), loaded.usage.?.next_sequence);
-        try std.testing.expectEqual(@as(u64, 1), loaded.usage.?.settled_through_sequence);
     }
 }
 

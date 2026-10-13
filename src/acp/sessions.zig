@@ -101,10 +101,7 @@ pub fn handleNewLibfxSession(
     const model = try alloc.dupe(u8, state.selected_model);
     var model_owned = true;
     defer if (model_owned) alloc.free(model);
-    var session_rt = session_runtime.SessionRuntime.initWithProviders(
-        state.cfg.max_history_turns,
-        state.cfg.provider_set.deferredUsageProviders(),
-    );
+    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns);
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
 
@@ -148,10 +145,7 @@ pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *
     const model = try alloc.dupe(u8, durable.preferences.model);
     var model_owned = true;
     defer if (model_owned) alloc.free(model);
-    var session_rt = session_runtime.SessionRuntime.initWithProviders(
-        state.cfg.max_history_turns,
-        state.cfg.provider_set.deferredUsageProviders(),
-    );
+    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns);
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
     const revision = js_host_session_store.commit(alloc, durable, null) catch
@@ -217,9 +211,6 @@ pub fn commitWasmSessionLocked(alloc: Allocator, session: *server.ActiveSessionS
     next.preferences.effort = session.effort;
     next.preferences.fast_mode = session.fast_mode;
     // Ultrafast keeps its durable baseline, not the process-local request.
-    const usage = try session.session_rt.usage.snapshot(alloc);
-    if (next.usage) |*old| old.deinit(alloc);
-    next.usage = usage;
 
     const revision = try js_host_session_store.commit(alloc, next, session.wasm_revision);
     if (session.wasm_revision) |old| alloc.free(old);
@@ -305,7 +296,7 @@ test "ACP ultrafast WASM saves preserve baselines and failed preference writes r
         .first_call_tool_choice = .auto,
         .permission_mode = .ask,
         .permission_rules = .{},
-        .session_rt = session_runtime.SessionRuntime.initWithProviders(4, state.cfg.provider_set.deferredUsageProviders()),
+        .session_rt = session_runtime.SessionRuntime.init(4),
         .cancel_flag = .init(false),
         .pending_prompt_id = null,
     };
@@ -469,24 +460,9 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     defer if (model_owned) alloc.free(model_copy);
     const session_dir = try session_store.sessionDirPath(alloc, store.sessions_dir, writable.active_id);
     defer alloc.free(session_dir);
-    var session_rt = session_runtime.SessionRuntime.initWithProviders(
-        state.cfg.max_history_turns,
-        state.cfg.provider_set.deferredUsageProviders(),
-    );
+    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns);
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
-    _ = try session_rt.initializeProfileUsage(alloc, io_mod.homeDir());
-    if (writable.state.usage) |usage| {
-        try session_rt.usage.restore(
-            alloc,
-            usage,
-            writable.state.created_at_ms,
-        );
-    } else {
-        session_rt.usage.restoreLegacyWallDuration(
-            writable.state.created_at_ms,
-        );
-    }
     writable.releaseHydrationHistory(alloc);
     session_rt.configureWebFetchArtifacts(alloc, session_dir);
     server.cancelAndReapActivePrompt(state);
@@ -587,14 +563,9 @@ fn startV2Session(
     const model_copy = try alloc.dupe(u8, state.selected_model);
     var model_owned = true;
     defer if (model_owned) alloc.free(model_copy);
-    var session_rt = session_runtime.SessionRuntime.initWithProviders(
-        state.cfg.max_history_turns,
-        state.cfg.provider_set.deferredUsageProviders(),
-    );
+    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns);
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
-    _ = try session_rt.initializeProfileUsage(alloc, io_mod.homeDir());
-    session_rt.usage.restoreLegacyWallDuration(io_mod.milliTimestamp());
     session_rt.configureWebFetchArtifactBlobs(alloc, try v2.childCapability(), v2.id());
     server.cancelAndReapActivePrompt(state);
     activateSession(state, null, .{
@@ -717,7 +688,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     const model_copy = try alloc.dupe(u8, loaded.state.preferences.model);
     var model_owned = true;
     defer if (model_owned) alloc.free(model_copy);
-    var session_rt = session_runtime.SessionRuntime.initWithProviders(state.cfg.max_history_turns, state.cfg.provider_set.deferredUsageProviders());
+    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns);
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
     try session_rt.restoreWithPermissionState(
@@ -726,7 +697,6 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
         loaded.state.history,
         loaded.state.permission_state,
     );
-    if (loaded.state.usage) |usage| try session_rt.usage.restore(alloc, usage, loaded.state.created_at_ms);
 
     try server.releaseActiveSession(state);
     const start = server.loadStartingMode(state, alloc);
@@ -1035,30 +1005,15 @@ fn handleRestoreSession(
     var model_owned = true;
     defer if (model_owned) alloc.free(model_copy);
 
-    var session_rt = session_runtime.SessionRuntime.initWithProviders(
-        state.cfg.max_history_turns,
-        state.cfg.provider_set.deferredUsageProviders(),
-    );
+    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns);
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
-    _ = try session_rt.initializeProfileUsage(alloc, io_mod.homeDir());
     try session_rt.restoreWithPermissionState(
         alloc,
         durable.conversation_language,
         durable.history,
         durable.permission_state,
     );
-    if (durable.usage) |usage| {
-        try session_rt.usage.restore(
-            alloc,
-            usage,
-            durable.created_at_ms,
-        );
-    } else {
-        session_rt.usage.restoreLegacyWallDuration(
-            durable.created_at_ms,
-        );
-    }
     // A v2 session's downloads are its blobs (D44); v1 keeps them in its folder.
     const session_dir: ?[]u8 = if (v2 != null) null else try session_store.sessionDirPath(alloc, store.?.sessions_dir, session_id);
     defer if (session_dir) |path| alloc.free(path);
@@ -1552,20 +1507,6 @@ fn activateSession(
         .pending_prompt_id = null,
     };
     server.enableSubagentHost(state);
-    state.active_session.?.session_rt.attachProfileUsagePublisher(state.alloc);
-    if (state.cfg.provider_set.select(activation.provider).deferred_usage == null) {
-        state.active_session.?.session_rt.usage.clearReconciliationCredential();
-    } else if (state.credential_source) |source| {
-        state.active_session.?.session_rt.usage.replaceProviderReconciliationCredential(
-            state.alloc,
-            activation.provider,
-            source,
-            state.account_id,
-            state.api_key,
-        );
-    } else {
-        state.active_session.?.session_rt.usage.clearReconciliationCredential();
-    }
     if (state.active_session.?.writable) |*writable| {
         if (writable.childCapability()) |capability| {
             _ = legacy_background_migration.migrate(
@@ -2288,7 +2229,8 @@ pub fn sendActiveSessionInfoUpdate(state: *server.ServerState, alloc: Allocator)
 
 pub fn sendActiveSessionUsageUpdate(state: *server.ServerState, alloc: Allocator) !void {
     const active = if (state.active_session) |*session| session else return;
-    const usage = active.session_rt.usage.liveContextSnapshot() orelse return;
+    const used = active.context_used.load(.acquire);
+    if (used == 0) return;
     const provider_bundle = state.cfg.provider_set.select(active.provider);
     const capabilities = state.capability_resolver.available(
         active.model,
@@ -2301,12 +2243,7 @@ pub fn sendActiveSessionUsageUpdate(state: *server.ServerState, alloc: Allocator
     try out.writer.writeAll("{\"sessionId\":");
     try writeJsonStr(active.session_id, &out.writer);
     try out.writer.writeAll(",\"update\":");
-    try acp_types.writeUsageUpdate(
-        &out.writer,
-        usage.used,
-        context_window,
-        usage.complete_cost,
-    );
+    try acp_types.writeUsageUpdate(&out.writer, used, context_window);
     try out.writer.writeAll("}");
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
@@ -3403,15 +3340,6 @@ test "ACP new and loaded sessions provide a writable subagent host" {
             "review",
         );
         try std.testing.expectEqualStrings("review", new_active.mode);
-        try std.testing.expect(new_writable.state.usage != null);
-        try std.testing.expect(
-            new_active.session_rt.usage.generation_usage_providers.select(.gateway).?.lookup_fn ==
-                state.cfg.provider_set.deferredUsageProviders().select(.gateway).?.lookup_fn,
-        );
-        io_mod.sleep(10 * std.time.ns_per_ms);
-        var live_usage = try new_active.session_rt.usage.snapshot(alloc);
-        defer live_usage.deinit(alloc);
-        try std.testing.expect(live_usage.wall_duration_ms > 0);
         try std.testing.expect(state.subagent_store != null);
         try std.testing.expect(state.subagent_host != null);
 
@@ -3451,13 +3379,8 @@ test "ACP new and loaded sessions provide a writable subagent host" {
             test_session_mode_registry.default_mode_id,
             loaded_active.mode,
         );
-        try std.testing.expect(loaded_writable.state.usage != null);
         try std.testing.expect(state.subagent_store != null);
         try std.testing.expect(state.subagent_host != null);
-        try std.testing.expect(
-            loaded_active.session_rt.usage.generation_usage_providers.select(.gateway).?.lookup_fn ==
-                state.cfg.provider_set.deferredUsageProviders().select(.gateway).?.lookup_fn,
-        );
 
         try capture.sync(io_mod.getIo());
     }

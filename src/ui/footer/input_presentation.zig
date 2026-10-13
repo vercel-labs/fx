@@ -783,10 +783,26 @@ pub fn composeCompactCommandMenuHintRow(
             "↑↓ move  ←→ change  esc",
             "←→ esc",
         },
-        .usage => [_][]const u8{
-            "tab scope     ↑↓ model     enter expand     r refresh     esc close",
-            "tab scope  ↑↓ model  enter expand  r refresh  esc",
-            "tab ↑↓  enter  r  esc",
+        .usage => |usage_menu| if (!render_input.usageShowsTables(usage_menu)) [_][]const u8{
+            "esc close",
+            "esc close",
+            "esc",
+        } else if (render_input.usageCodexHasPeriods(usage_menu)) [_][]const u8{
+            "tab period     r refresh     esc close",
+            "tab period  r refresh  esc",
+            "tab  r  esc",
+        } else if (render_input.usageIsPlan(usage_menu)) [_][]const u8{
+            "r refresh     esc close",
+            "r refresh  esc",
+            "r  esc",
+        } else if (usage_menu.detail) [_][]const u8{
+            "↑↓ next model     esc back     r refresh",
+            "↑↓ model  esc back  r refresh",
+            "↑↓  esc  r",
+        } else [_][]const u8{
+            "↑↓ model     enter detail     tab period     r refresh     esc close",
+            "↑↓ model  enter detail  tab period  r refresh  esc",
+            "↑↓  enter  tab  r  esc",
         },
         .workspace => [_][]const u8{
             "↑↓ navigate     enter use     esc close",

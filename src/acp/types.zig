@@ -409,12 +409,8 @@ pub fn writeSessionInfoUpdate(w: *std.Io.Writer, title: []const u8, updated_at: 
     try w.writeAll("}");
 }
 
-pub fn writeUsageUpdate(w: *std.Io.Writer, used: u64, size: u64, complete_cost: ?f64) !void {
-    try w.print("{{\"sessionUpdate\":\"usage_update\",\"used\":{d},\"size\":{d}", .{ used, size });
-    if (complete_cost) |amount| {
-        try w.print(",\"cost\":{{\"amount\":{d},\"currency\":\"USD\"}}", .{amount});
-    }
-    try w.writeAll("}");
+pub fn writeUsageUpdate(w: *std.Io.Writer, used: u64, size: u64) !void {
+    try w.print("{{\"sessionUpdate\":\"usage_update\",\"used\":{d},\"size\":{d}}}", .{ used, size });
 }
 
 test "writeAgentMessageChunk produces valid json" {
@@ -602,11 +598,11 @@ test "writeUserMessageChunk produces valid json" {
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "User says hello") != null);
 }
 
-test "writeUsageUpdate omits unproven cost" {
+test "writeUsageUpdate reports context used and size" {
     const alloc = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeUsageUpdate(&out.writer, 8, 128_000, null);
+    try writeUsageUpdate(&out.writer, 8, 128_000);
     try std.testing.expectEqualStrings(
         "{\"sessionUpdate\":\"usage_update\",\"used\":8,\"size\":128000}",
         out.writer.buffered(),

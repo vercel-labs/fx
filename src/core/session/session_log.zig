@@ -18,8 +18,6 @@ const session_layout = @import("session_layout.zig");
 const session_replay = @import("session_replay.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
 const result_store = @import("result_store.zig");
-const session_usage = @import("session_usage.zig");
-const session_usage_sidecar = @import("session_usage_sidecar.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
@@ -541,16 +539,21 @@ pub const ConversationWriter = struct {
         if (self.failure) |err| return err;
         const next_bytes = std.math.add(u64, self.committed_bytes, bytes.len) catch
             return error.ConversationSizeOverflow;
-        if (try self.file.length(io_mod.getIo()) != self.committed_bytes) {
-            self.failure = error.SessionWriterChanged;
-            debug_trace.logf("session", "conversation writer changed outside ownership offset={d}", .{self.committed_bytes});
-            return error.SessionWriterChanged;
-        }
+        try self.confirmUnchanged();
         self.file.writePositionalAll(io_mod.getIo(), bytes, self.committed_bytes) catch |err| {
             return self.rollbackAppend(err);
         };
         self.syncAppend() catch |err| return self.rollbackAppend(err);
         self.committed_bytes = next_bytes;
+    }
+
+    /// Fails, and stays failed, once the log no longer ends where this
+    /// writer last committed: another writer changed it.
+    fn confirmUnchanged(self: *ConversationWriter) !void {
+        if (try self.file.length(io_mod.getIo()) == self.committed_bytes) return;
+        self.failure = error.SessionWriterChanged;
+        debug_trace.logf("session", "conversation writer changed outside ownership offset={d}", .{self.committed_bytes});
+        return error.SessionWriterChanged;
     }
 
     fn syncAppend(self: *ConversationWriter) !void {
@@ -719,9 +722,6 @@ fn writeConversationControlState(
         permission_state_file,
         permission_bytes,
     );
-    if (state.usage) |usage| {
-        try session_usage_sidecar.write(alloc, dir, state.id, usage);
-    }
     try writeConversationRecoveryState(alloc, dir, state.recovery_checkpoint, conversation_seq);
 }
 
@@ -1248,13 +1248,6 @@ fn load_conversation_state_at_boundary(
     else
         null;
     errdefer if (last_work_id) |work_id| mem_utils.free(alloc, work_id);
-    var usage: ?session_usage.Snapshot = try session_usage_sidecar.loadConversation(
-        alloc,
-        dir,
-        expected_session_id,
-        metadata.value.updated_at_ms,
-    );
-    errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
     var permission_state = try loadConversationPermissionState(alloc, dir);
     errdefer permission_state.deinit(alloc);
     var recovery_checkpoint = if (recovery == null)
@@ -1305,7 +1298,6 @@ fn load_conversation_state_at_boundary(
         .total_output_tokens = 0,
         .permission_state = permission_state,
         .last_subagent_work_id = last_work_id,
-        .usage = usage,
         .recovery_checkpoint = recovery_checkpoint,
         .subagent_child = metadata.value.subagent_child,
     };
@@ -1343,14 +1335,12 @@ fn find_conversation_recovery_boundary(alloc: Allocator, dir: *io_mod.VerifiedDi
 
 const ConversationRecovery = struct {
     boundary: ConversationRecoveryBoundary,
-    usage_incomplete: bool,
 };
 
-pub fn classify_conversation_recovery(alloc: Allocator, dir: *io_mod.VerifiedDir, session_id: []const u8) !ConversationRecovery {
+pub fn classify_conversation_recovery(alloc: Allocator, dir: *io_mod.VerifiedDir, _: []const u8) !ConversationRecovery {
     const scan = try scan_conversation_recovery(alloc, dir);
-    const usage_incomplete = try session_usage_sidecar.has_recoverable_corruption(alloc, dir, session_id);
-    if (scan.complete and !usage_incomplete) return error.SessionRecoveryNotNeeded;
-    return .{ .boundary = scan.boundary, .usage_incomplete = usage_incomplete };
+    if (scan.complete) return error.SessionRecoveryNotNeeded;
+    return .{ .boundary = scan.boundary };
 }
 
 /// Reads only. The existing transition validator remains the record authority.
@@ -3108,7 +3098,6 @@ pub const SessionUpdate = union(enum) {
     preferences_changed: session_event.PreferencesChanged,
     workspace_rebound: session_event.WorkspaceRebound,
     history_turn_committed: session_event.HistoryTurnCommitted,
-    usage_checkpointed: session_event.UsageCheckpointed,
     recovery_checkpoint_set: session_event.RecoveryCheckpointSet,
     recovery_checkpoint_cleared: session_event.RecoveryCheckpointCleared,
 };
@@ -3236,6 +3225,13 @@ pub const LoadedWritableSession = struct {
     pub fn requireWritable(self: *const LoadedWritableSession) !void {
         if (self.log.isParked()) return error.SessionWriterParked;
         if (self.conversation_writer.failure) |err| return err;
+    }
+
+    /// `requireWritable`, plus the check a write makes that no other writer
+    /// changed the log, without writing.
+    pub fn confirmWriter(self: *LoadedWritableSession) !void {
+        try self.requireWritable();
+        try self.conversation_writer.confirmUnchanged();
     }
 
     fn recordWriteFailure(self: *LoadedWritableSession, err: anyerror) anyerror {
@@ -3369,11 +3365,6 @@ pub const LoadedWritableSession = struct {
                 timestamp_ms,
             ),
             .preferences_changed, .workspace_rebound => self.appendConversationMetadataEvent(
-                alloc,
-                event,
-                timestamp_ms,
-            ),
-            .usage_checkpointed => self.appendConversationUsageEvent(
                 alloc,
                 event,
                 timestamp_ms,
@@ -3574,31 +3565,6 @@ pub const LoadedWritableSession = struct {
         }
         self.state.updated_at_ms = timestamp_ms;
         self.freshly_started = false;
-        return self.position;
-    }
-
-    fn appendConversationUsageEvent(
-        self: *LoadedWritableSession,
-        alloc: Allocator,
-        event: SessionUpdate,
-        timestamp_ms: i64,
-    ) !CommitPosition {
-        const snapshot = switch (event) {
-            .usage_checkpointed => |payload| payload.usage,
-            else => return error.InvalidConversationEvent,
-        };
-        var next_usage = try session_usage.dupeSnapshotOwned(alloc, snapshot);
-        errdefer next_usage.deinit(alloc);
-        try session_usage_sidecar.write(
-            alloc,
-            &self.log.dir,
-            self.active_id,
-            snapshot,
-        );
-        if (self.state.usage) |*prior| prior.deinit(alloc);
-        self.state.usage = next_usage;
-        next_usage = undefined;
-        self.state.updated_at_ms = timestamp_ms;
         return self.position;
     }
 
@@ -4477,14 +4443,6 @@ fn createNativeSession(
     initial_state: session_codec.DurableSessionState,
     _: Options,
 ) !LoadedWritableSession {
-    var synthesized_usage: ?session_usage.Snapshot = null;
-    if (initial_state.usage == null) {
-        var fresh_usage = session_usage.Usage.initFresh();
-        defer fresh_usage.deinit(alloc);
-        synthesized_usage = try fresh_usage.snapshot(alloc);
-    }
-    defer if (synthesized_usage) |*usage| usage.deinit(alloc);
-
     var display = try session_display_metadata.deriveFromHistory(
         alloc,
         initial_state.history,
@@ -4519,10 +4477,6 @@ fn createNativeSession(
 
     var state = try initial_state.dupe(alloc);
     errdefer state.deinit(alloc);
-    if (state.usage == null) {
-        state.usage = synthesized_usage;
-        synthesized_usage = null;
-    }
     try writeConversationControlState(alloc, &writable.dir, state, conversation_writer.last_seq);
     const persisted_state = (try loadConversationStateIfPresent(
         alloc,
@@ -4708,6 +4662,28 @@ test "conversation writer appends one durable line per event" {
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, bytes, "\n"));
     try std.testing.expect(std.mem.find(u8, bytes, "commit.pending") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "state_replacement") == null);
+}
+
+test "conversation writer confirms ownership without writing and latches a change" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "events.jsonl", .{ .read = true });
+    var writer = try ConversationWriter.init(alloc, file);
+    defer writer.deinit();
+    const turn: types.HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("accepted request") },
+        .assistant = @constCast("accepted answer"),
+    } };
+    try writer.appendHistoryTurn(alloc, 1, turn);
+    const owned_bytes = try file.length(std.testing.io);
+    try writer.confirmUnchanged();
+    try std.testing.expectEqual(owned_bytes, try file.length(std.testing.io));
+
+    try file.writePositionalAll(std.testing.io, "{}\n", writer.committed_bytes);
+    try std.testing.expectError(error.SessionWriterChanged, writer.confirmUnchanged());
+    try std.testing.expectError(error.SessionWriterChanged, writer.appendHistoryTurn(alloc, 2, turn));
+    try std.testing.expectEqual(owned_bytes + 3, try file.length(std.testing.io));
 }
 
 test "conversation writer preserves a suffix written outside its ownership" {
@@ -5004,9 +4980,9 @@ test "first commit never persists the fallback placeholder as a title" {
     }
 }
 
-test "conversation load retains history and qualifies missing or corrupt accounting" {
+test "an old session's usage file, readable or broken, is left alone and does not affect loading" {
     const alloc = std.testing.allocator;
-    for ([_]bool{ false, true }) |missing| {
+    for ([_]bool{ false, true }) |readable| {
         var temp = try TempRoot.init(alloc);
         defer temp.deinit(alloc);
         var initial = try testState(alloc, "accounting-recovery", 10);
@@ -5017,22 +4993,17 @@ test "conversation load retains history and qualifies missing or corrupt account
         loaded.deinit(alloc);
         var dir = try openSessionDir(&temp.root.sessions.?, initial.id, .read_only);
         defer dir.close();
-        if (missing) {
-            try dir.dir.deleteFile(std.testing.io, session_usage_sidecar.sidecar_file);
-        } else {
-            try io_mod.durableReplaceVerified(alloc, &dir, session_usage_sidecar.sidecar_file, "{broken accounting");
-        }
+        // Sessions saved before /usage read provider reports kept their
+        // usage in this file.
+        const old_usage_file = "usage-v2.json";
+        const contents = if (readable) "{\"schema_version\":2}" else "{broken accounting";
+        try io_mod.durableReplaceVerified(alloc, &dir, old_usage_file, contents);
         var restored = try temp.root.loadReadOnly(alloc, initial.id, .{});
         defer restored.deinit(alloc);
         try std.testing.expectEqualStrings("saved answer", restored.history[0].assistant.assistant);
-        try std.testing.expect(restored.usage != null);
-        try std.testing.expectEqual(session_usage.Availability.incomplete, restored.usage.?.billing);
-        try std.testing.expectEqual(@as(usize, 1), restored.usage.?.incidents.len);
-        if (!missing) {
-            const retained = try readManagedFileAlloc(alloc, &dir, session_usage_sidecar.sidecar_file, 1024);
-            defer alloc.free(retained);
-            try std.testing.expectEqualStrings("{broken accounting", retained);
-        }
+        const retained = try readManagedFileAlloc(alloc, &dir, old_usage_file, 1024);
+        defer alloc.free(retained);
+        try std.testing.expectEqualStrings(contents, retained);
     }
 }
 
@@ -5652,9 +5623,6 @@ test "legacy import preserves published events and active recovery after metadat
     defer temp.deinit(alloc);
     var initial = try testState(alloc, "legacy-metadata-sync-failure", 10);
     defer initial.deinit(alloc);
-    var legacy_usage = session_usage.Usage.initLegacy();
-    defer legacy_usage.deinit(alloc);
-    initial.usage = try legacy_usage.snapshot(alloc);
     const history = try alloc.alloc(session.HistoryTurn, 1);
     history[0] = try session.makeAssistantTurn(alloc, "saved request", "saved answer");
     initial.history = history;
@@ -5699,7 +5667,6 @@ test "legacy import preserves published events and active recovery after metadat
     try std.testing.expectEqual(@as(usize, 1), resumed.state.history.len);
     try std.testing.expectEqualStrings("saved answer", resumed.state.history[0].assistant.assistant);
     try std.testing.expectEqual(@as(u64, 7), resumed.state.recovery_checkpoint.?.turn_id);
-    try std.testing.expectEqual(session_usage.Availability.legacy, resumed.state.usage.?.billing);
 }
 
 test "conversation storage creates only metadata and event log" {
@@ -5765,12 +5732,12 @@ test "root starts a cache-free conversation session" {
         if (std.mem.eql(u8, entry.name, "usage-v2.json")) saw_usage = true;
         if (std.mem.eql(u8, entry.name, owner_live_file)) saw_owner_live = true;
     }
-    try std.testing.expectEqual(@as(usize, 6), count);
+    try std.testing.expectEqual(@as(usize, 5), count);
     try std.testing.expect(saw_events);
     try std.testing.expect(saw_metadata);
     try std.testing.expect(saw_writer_lock);
     try std.testing.expect(saw_permissions);
-    try std.testing.expect(saw_usage);
+    try std.testing.expect(!saw_usage);
     try std.testing.expect(saw_owner_live);
 }
 
@@ -5902,7 +5869,7 @@ test "conversation writer appends without duplicating live history" {
     var count: usize = 0;
     var iterator = loaded.log.dir.dir.iterate();
     while (try iterator.next(std.testing.io)) |_| count += 1;
-    try std.testing.expectEqual(@as(usize, 6), count);
+    try std.testing.expectEqual(@as(usize, 5), count);
 }
 
 test "cache-free conversation session resumes from metadata and JSONL" {
@@ -6308,39 +6275,6 @@ test "cache-free metadata changes rewrite metadata without conversation records"
     defer resumed.deinit(alloc);
     try std.testing.expectEqualStrings("updated/model", resumed.preferences.model);
     try std.testing.expect(resumed.preferences.fast_mode);
-}
-
-test "cache-free usage checkpoints stay outside conversation history" {
-    const alloc = std.testing.allocator;
-    var temp = try TempRoot.init(alloc);
-    defer temp.deinit(alloc);
-    var initial = try testState(alloc, "conversation-usage", 10);
-    defer initial.deinit(alloc);
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    try usage.recordCommittedLines(9, 4);
-    var snapshot = try usage.snapshot(alloc);
-    defer snapshot.deinit(alloc);
-    var committed_bytes: u64 = 0;
-    {
-        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
-        defer loaded.deinit(alloc);
-        committed_bytes = loaded.conversation_writer.committed_bytes;
-        _ = try loaded.appendEvent(alloc, .{
-            .usage_checkpointed = .{ .usage = snapshot },
-        }, 20);
-        try std.testing.expectEqual(
-            committed_bytes,
-            loaded.conversation_writer.committed_bytes,
-        );
-        try std.testing.expect(loaded.freshly_started);
-    }
-
-    var resumed = try temp.root.loadReadOnly(alloc, initial.id, .{});
-    defer resumed.deinit(alloc);
-    try std.testing.expectEqual(@as(u64, 9), resumed.usage.?.lines_added);
-    try std.testing.expectEqual(@as(u64, 4), resumed.usage.?.lines_removed);
-    try std.testing.expectEqual(@as(usize, 0), resumed.history.len);
 }
 
 test "cache-free recovery checkpoint resumes and clears independently" {

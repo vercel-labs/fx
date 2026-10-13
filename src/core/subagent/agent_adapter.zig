@@ -466,8 +466,6 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .refresh_gateway_credential = refreshGatewayCredential,
         .format_tool_execution_error = formatToolExecutionError,
         .report_usage = reportUsage,
-        .usage = &context.turn.sessionRuntime().usage,
-        .usage_allocator = context.turn.alloc,
     };
 }
 

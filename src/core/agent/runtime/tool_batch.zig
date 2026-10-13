@@ -326,24 +326,6 @@ pub fn processCommittedFileResult(
         return error.InvalidCommittedFileExecutionResult;
     }
     const handoff = execution.committed_file_handoff orelse unreachable;
-    if (hooks.usage) |usage| {
-        usage.recordCommittedLines(
-            handoff.preview.additions,
-            handoff.preview.deletions,
-        ) catch |err| {
-            debug_trace.logf(
-                "session",
-                "usage code accounting failed additions={d} deletions={d} reason={s}",
-                .{
-                    handoff.preview.additions,
-                    handoff.preview.deletions,
-                    @errorName(err),
-                },
-            );
-            usage.markCodeIncomplete();
-        };
-        if (!usage.persistCheckpoint()) usage.markCodeIncomplete();
-    }
     const committed_contract_degraded =
         execution.status != .success or
         !execution.tool_result_memory_prepared or

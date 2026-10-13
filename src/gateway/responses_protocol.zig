@@ -2565,57 +2565,6 @@ fn nestedUnsignedField(value: ?std.json.Value, key: []const u8) ?u64 {
     return unsignedField(object.object, key);
 }
 
-/// Builds exact subscription metrics from a provider-neutral Responses usage
-/// projection. The caller owns `model` in the returned value.
-pub fn buildSubscriptionBilling(
-    alloc: std.mem.Allocator,
-    provider: model_provider.ProviderId,
-    model: []const u8,
-    created_at_ms: i64,
-    usage: types.Usage,
-) !?types.ProviderBilling {
-    if (provider == .gateway or created_at_ms < 0) return null;
-    const input_tokens = usage.input_tokens orelse return null;
-    const output_tokens = usage.output_tokens orelse return null;
-    const qualified_model = try alloc.print(
-        "{s}/{s}",
-        .{ @tagName(provider), model },
-    );
-    return .{
-        .created_at_ms = created_at_ms,
-        .model = qualified_model,
-        .total_cost = 0,
-        .input_tokens = input_tokens,
-        .output_tokens = output_tokens,
-        .cache_read_tokens = boundedOptionalCounter(
-            usage.cache_read_tokens,
-            input_tokens,
-            @as(u64, 0),
-        ),
-        .cache_write_tokens = boundedOptionalCounter(
-            usage.cache_write_tokens,
-            input_tokens,
-            @as(u64, 0),
-        ),
-        .reasoning_tokens = boundedOptionalCounter(
-            usage.reasoning_tokens,
-            output_tokens,
-            @as(?u64, null),
-        ),
-        .billable_web_search_calls = 0,
-    };
-}
-
-fn boundedOptionalCounter(
-    value: ?u64,
-    parent_total: u64,
-    fallback: anytype,
-) @TypeOf(fallback) {
-    const count = value orelse return fallback;
-    if (count > parent_total) return fallback;
-    return count;
-}
-
 fn stringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const value = object.get(key) orelse return null;
     if (value != .string) return null;
@@ -2743,52 +2692,4 @@ test "Responses usage projection retains optional cached and reasoning detail" {
     try std.testing.expectEqual(@as(?u64, 5), usage.cache_read_tokens);
     try std.testing.expectEqual(@as(?u64, 2), usage.cache_write_tokens);
     try std.testing.expectEqual(@as(?u64, 3), usage.reasoning_tokens);
-}
-
-test "Responses protocol owns one subscription billing projection" {
-    const alloc = std.testing.allocator;
-    const billing = (try buildSubscriptionBilling(
-        alloc,
-        .codex,
-        "gpt-test",
-        42,
-        .{
-            .input_tokens = 17,
-            .output_tokens = 7,
-            .cache_read_tokens = 5,
-            .cache_write_tokens = 2,
-            .reasoning_tokens = 3,
-        },
-    )).?;
-    defer alloc.free(@constCast(billing.model));
-    try std.testing.expectEqualStrings("codex/gpt-test", billing.model);
-    try std.testing.expectEqual(@as(u64, 5), billing.cache_read_tokens);
-    try std.testing.expectEqual(@as(u64, 2), billing.cache_write_tokens);
-    try std.testing.expectEqual(@as(?u64, 3), billing.reasoning_tokens);
-
-    const bounded = (try buildSubscriptionBilling(
-        alloc,
-        .grok,
-        "grok-test",
-        43,
-        .{
-            .input_tokens = 10,
-            .output_tokens = 4,
-            .cache_read_tokens = 11,
-            .cache_write_tokens = 12,
-            .reasoning_tokens = 5,
-        },
-    )).?;
-    defer alloc.free(@constCast(bounded.model));
-    try std.testing.expectEqual(@as(u64, 0), bounded.cache_read_tokens);
-    try std.testing.expectEqual(@as(u64, 0), bounded.cache_write_tokens);
-    try std.testing.expectEqual(@as(?u64, null), bounded.reasoning_tokens);
-
-    try std.testing.expect((try buildSubscriptionBilling(
-        alloc,
-        .codex,
-        "gpt-test",
-        44,
-        .{ .input_tokens = 10 },
-    )) == null);
 }

@@ -3,7 +3,6 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const image_data = @import("../images/image_data.zig");
 const session = @import("session.zig");
-const session_usage = @import("session_usage.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const types = @import("../shared/types.zig");
@@ -221,8 +220,6 @@ pub const DurableSessionState = struct {
     /// keeps the session private even if owner sidecar publication is
     /// interrupted immediately after creation.
     subagent_child: bool = false,
-    /// Null only for sessions written before durable usage accounting.
-    usage: ?session_usage.Snapshot = null,
     /// Active control state. It is never projected into model history and a
     /// restored checkpoint requires explicit host authority before any send.
     recovery_checkpoint: ?RecoveryCheckpoint = null,
@@ -235,7 +232,6 @@ pub const DurableSessionState = struct {
         session.freeHistoryTurnSlice(alloc, self.history);
         self.permission_state.deinit(alloc);
         if (self.last_subagent_work_id) |id| alloc.free(id);
-        if (self.usage) |*usage| usage.deinit(alloc);
         if (self.recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
         self.* = undefined;
     }
@@ -273,11 +269,6 @@ pub const DurableSessionState = struct {
         else
             null;
         errdefer if (last_subagent_work_id) |work_id| alloc.free(work_id);
-        var usage = if (self.usage) |snapshot|
-            try session_usage.dupeSnapshotOwned(alloc, snapshot)
-        else
-            null;
-        errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
         const recovery_checkpoint = if (self.recovery_checkpoint) |checkpoint|
             try checkpoint.dupe(alloc)
         else
@@ -302,7 +293,6 @@ pub const DurableSessionState = struct {
             .permission_state = permission_state,
             .last_subagent_work_id = last_subagent_work_id,
             .subagent_child = self.subagent_child,
-            .usage = usage,
             .recovery_checkpoint = recovery_checkpoint,
         };
     }
@@ -535,18 +525,9 @@ pub fn encodeState(state: DurableSessionState, writer: *std.Io.Writer) !EncodeSu
     };
 }
 
+/// Reads a persisted state, old or new. Caller owns the state.
 pub fn decodeState(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimits) !DurableSessionState {
-    return decodeStateWithUsageContract(alloc, source, limits, false);
-}
-
-/// Reads an old persisted state without requiring modern cache-token totals.
-/// Caller owns the state; all non-usage validation remains unchanged.
-pub fn decodeLegacyState(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimits) !DurableSessionState {
-    return decodeStateWithUsageContract(alloc, source, limits, true);
-}
-
-fn decodeStateWithUsageContract(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimits, legacy_usage: bool) !DurableSessionState {
-    return decodeStateImpl(alloc, source, limits, legacy_usage) catch |err| switch (err) {
+    return decodeStateImpl(alloc, source, limits) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidDurableField => return error.InvalidDurableField,
         error.InvalidDurableBytes => return error.InvalidDurableBytes,
@@ -897,7 +878,6 @@ fn validateStateWithPermissionMigration(
             }
         }
     }
-    if (state.usage) |usage| try session_usage.validateSnapshot(usage);
     if (allow_legacy_permission_state and state.permission_state.version == 1) {
         session_permission_state.validateSchema(state.permission_state, 1) catch
             return error.InvalidDurableField;
@@ -975,10 +955,6 @@ fn writeState(writer: *std.Io.Writer, state: DurableSessionState) !void {
     });
     try writer.writeAll(",\"permission_state\":");
     try writePermissionState(writer, state.permission_state);
-    if (state.usage) |usage| {
-        try writer.writeAll(",\"usage\":");
-        try session_usage.writeSnapshot(writer, usage);
-    }
     if (state.last_subagent_work_id) |id| {
         try writer.writeAll(",\"last_subagent_work_id\":");
         try writeJsonString(writer, id);
@@ -1179,7 +1155,6 @@ const DecodedStateTail = struct {
     total_output_tokens: u64,
     context_history_start: usize,
     permission_state: session_permission_state.State,
-    usage: ?session_usage.Snapshot,
     last_subagent_work_id: ?[]u8,
     subagent_child: bool,
     recovery_checkpoint: ?RecoveryCheckpoint,
@@ -1187,7 +1162,6 @@ const DecodedStateTail = struct {
     fn deinit(self: *DecodedStateTail, alloc: Allocator) void {
         if (self.recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
         if (self.last_subagent_work_id) |work_id| mem_utils.free(alloc, work_id);
-        if (self.usage) |*snapshot| snapshot.deinit(alloc);
         self.permission_state.deinit(alloc);
         self.* = undefined;
     }
@@ -1228,7 +1202,6 @@ fn decodeStateTail(
     alloc: Allocator,
     json_reader: *std.json.Reader,
     limits: DecodeLimits,
-    legacy_usage: bool,
 ) !DecodedStateTail {
     try expectKey(json_reader, alloc, "total_input_tokens");
     const total_input_tokens = try readU64(json_reader, alloc);
@@ -1239,8 +1212,6 @@ fn decodeStateTail(
     var permission_state: session_permission_state.State = .{};
     errdefer permission_state.deinit(alloc);
     var permission_state_seen = false;
-    var usage: ?session_usage.Snapshot = null;
-    errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
     var usage_seen = false;
     var last_subagent_work_id: ?[]u8 = null;
     errdefer if (last_subagent_work_id) |work_id| mem_utils.free(alloc, work_id);
@@ -1273,23 +1244,10 @@ fn decodeStateTail(
             permission_state = try parsePermissionState(alloc, value);
             permission_state_seen = true;
         } else if (std.mem.eql(u8, key, "usage")) {
+            // Sessions saved before /usage read provider reports kept their
+            // own usage here. It is skipped, in the place it always had.
             if (usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
-            const parse_limit = @min(
-                limits.max_value_bytes,
-                session_usage.max_snapshot_bytes,
-            );
-            const parse_buffer = try alloc.alloc(u8, parse_limit);
-            defer mem_utils.free(alloc, parse_buffer);
-            var fixed = std.heap.FixedBufferAllocator.init(parse_buffer);
-            const value = try std.json.Value.jsonParse(fixed.allocator(), json_reader, .{
-                .max_value_len = parse_limit,
-                .allocate = .alloc_always,
-                .parse_numbers = false,
-            });
-            usage = if (legacy_usage)
-                try session_usage.parseLegacySnapshotValue(alloc, value)
-            else
-                try session_usage.parseSnapshotValue(alloc, value);
+            try json_reader.skipValue();
             usage_seen = true;
         } else if (std.mem.eql(u8, key, "last_subagent_work_id")) {
             if (last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
@@ -1318,14 +1276,13 @@ fn decodeStateTail(
         .total_output_tokens = total_output_tokens,
         .context_history_start = context_history_start,
         .permission_state = permission_state,
-        .usage = usage,
         .last_subagent_work_id = last_subagent_work_id,
         .subagent_child = subagent_child,
         .recovery_checkpoint = recovery_checkpoint,
     };
 }
 
-fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimits, legacy_usage: bool) !DurableSessionState {
+fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimits) !DurableSessionState {
     var json_reader = std.json.Reader.init(alloc, source);
     defer json_reader.deinit();
 
@@ -1365,7 +1322,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
 
     const history = try decodeHistory(alloc, &json_reader, limits);
     errdefer session.freeHistoryTurnSlice(alloc, history);
-    var tail = try decodeStateTail(alloc, &json_reader, limits, legacy_usage);
+    var tail = try decodeStateTail(alloc, &json_reader, limits);
     errdefer tail.deinit(alloc);
     const state = DurableSessionState{
         .id = id,
@@ -1382,7 +1339,6 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
         .permission_state = tail.permission_state,
         .last_subagent_work_id = tail.last_subagent_work_id,
         .subagent_child = tail.subagent_child,
-        .usage = tail.usage,
         .recovery_checkpoint = tail.recovery_checkpoint,
     };
     try validateStateWithPermissionMigration(state, true);
@@ -3695,20 +3651,6 @@ test "durable state round trips live history while discarding legacy authority" 
             .root_user_messages = completed_tool_names[0..],
         } },
     };
-    var usage_runtime = session_usage.Usage.initFresh();
-    defer usage_runtime.deinit(alloc);
-    const usage_sequence = try usage_runtime.reserveInvocation();
-    try usage_runtime.finishObservedInvocation(
-        alloc,
-        usage_sequence,
-        25,
-        .observed_generation,
-        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        "https://ai-gateway.vercel.sh",
-        null,
-    );
-    var usage = try usage_runtime.snapshot(alloc);
-    defer usage.deinit(alloc);
     const state = DurableSessionState{
         .id = @constCast("1700000000000-42-session"),
         .origin_workspace_root = @constCast("/tmp/origin"),
@@ -3727,7 +3669,6 @@ test "durable state round trips live history while discarding legacy authority" 
         .total_output_tokens = 567,
         .last_subagent_work_id = @constCast("work-17"),
         .subagent_child = true,
-        .usage = usage,
     };
 
     var first: std.Io.Writer.Allocating = .init(alloc);
@@ -4927,16 +4868,6 @@ fn expectStateEqual(expected: DurableSessionState, actual: DurableSessionState) 
     if (expected.last_subagent_work_id) |work_id| {
         try std.testing.expectEqualStrings(work_id, actual.last_subagent_work_id.?);
     }
-    try std.testing.expectEqual(expected.usage != null, actual.usage != null);
-    if (expected.usage) |expected_usage| {
-        var expected_json: std.Io.Writer.Allocating = .init(std.testing.allocator);
-        defer expected_json.deinit();
-        try session_usage.writeSnapshot(&expected_json.writer, expected_usage);
-        var actual_json: std.Io.Writer.Allocating = .init(std.testing.allocator);
-        defer actual_json.deinit();
-        try session_usage.writeSnapshot(&actual_json.writer, actual.usage.?);
-        try std.testing.expectEqualStrings(expected_json.written(), actual_json.written());
-    }
     try std.testing.expectEqual(expected.history.len, actual.history.len);
     for (expected.history, actual.history) |expected_turn, actual_turn| {
         try expectHistoryTurnEqual(expected_turn, actual_turn);
@@ -5534,7 +5465,7 @@ test "permission state schema two round trips before activation" {
     try std.testing.expectEqual(session_permission_state.StateDecision.deny, session_permission_state.decide(decoded, key));
 }
 
-test "durable state usage remains strict and releases partial allocations" {
+test "an old session's usage field is skipped in its place, and the rest loads" {
     const alloc = std.testing.allocator;
     const state_json =
         \\{"id":"usage-state","origin_workspace_root":"/workspace","workspace_root":"/workspace","created_at_ms":1,"updated_at_ms":2,
@@ -5549,14 +5480,24 @@ test "durable state usage remains strict and releases partial allocations" {
             var source = std.Io.Reader.fixed(bytes);
             var decoded = try decodeState(a, &source, .{});
             defer decoded.deinit(a);
-            try std.testing.expectEqual(@as(u64, 10), decoded.usage.?.input_tokens);
             try std.testing.expectEqualStrings("legacy-work", decoded.last_subagent_work_id.?);
         }
     }.check, .{state_json});
-    const incompatible = try std.mem.replaceOwned(u8, alloc, state_json, "\"cache_read_tokens\":2", "\"cache_read_tokens\":11");
-    defer alloc.free(incompatible);
-    var strict_source = std.Io.Reader.fixed(incompatible);
-    try std.testing.expectError(error.InvalidSessionFormat, decodeState(alloc, &strict_source, .{}));
+
+    // A new save leaves the field out.
+    var source = std.Io.Reader.fixed(state_json);
+    var decoded = try decodeState(alloc, &source, .{});
+    defer decoded.deinit(alloc);
+    var saved: std.Io.Writer.Allocating = .init(alloc);
+    defer saved.deinit();
+    _ = try encodeState(decoded, &saved.writer);
+    try std.testing.expect(std.mem.find(u8, saved.written(), "\"usage\"") == null);
+
+    // The field still has to be where it always was.
+    const misplaced = try std.mem.replaceOwned(u8, alloc, state_json, "\"last_subagent_work_id\":\"legacy-work\"}", "\"last_subagent_work_id\":\"legacy-work\",\"usage\":null}");
+    defer alloc.free(misplaced);
+    var misplaced_source = std.Io.Reader.fixed(misplaced);
+    try std.testing.expectError(error.InvalidSessionFormat, decodeState(alloc, &misplaced_source, .{}));
 }
 
 test "durable session optional fields handle fuzzed ownership paths" {

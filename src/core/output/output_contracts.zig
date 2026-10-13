@@ -14,7 +14,7 @@ const session_display_metadata = @import("../session/session_display_metadata.zi
 const session_json = @import("../session/session_json.zig");
 const compactor = @import("../compactor/compactor.zig");
 const session_store = @import("../session/session_store.zig");
-const usage_report = @import("../session/usage_report.zig");
+const usage = @import("../../usage/usage.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const update_notes = @import("../upgrade/update_notes.zig");
@@ -59,7 +59,9 @@ pub const CommandFailureSnapshot = struct {
 };
 
 pub const UsageSnapshot = struct {
-    report: *const usage_report.Snapshot,
+    snapshot: *const usage.Snapshot,
+    /// The period the totals and model rows cover.
+    period: usage.Period = .month,
 
     pub fn render(
         self: UsageSnapshot,
@@ -73,100 +75,203 @@ pub const UsageSnapshot = struct {
     }
 
     pub fn renderText(self: UsageSnapshot, alloc: Allocator) ![]u8 {
-        const report = self.report;
+        const s = self.snapshot;
+        if (s.scope == .codex) return self.renderCodexText(alloc);
+        if (s.scope == .grok) return self.renderGrokText(alloc);
+        const v = s.of(self.period);
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
-        try out.writer.print("Usage ({s})\n", .{report.scope.label()});
-        switch (report.coverage) {
-            .not_started => try out.writer.writeAll("Tracking has not started.\n"),
-            .partial => {
-                var date_buf: [24]u8 = undefined;
-                try out.writer.print(
-                    "Tracking since {s} (partial window).\n",
-                    .{usage_report.formatUtcDate(
-                        &date_buf,
-                        report.coverage_started_at_ms.?,
-                    )},
-                );
-            },
-            .full => {},
+        try out.writer.print("Usage ({s}, UTC) from AI Gateway", .{v.period.label()});
+        if (v.fetched_at_ms) |ms| {
+            const minutes: u64 = @intCast(@mod(@divFloor(ms, std.time.ms_per_min), 24 * 60));
+            try out.writer.print(", updated {d:0>2}:{d:0>2} UTC", .{ minutes / 60, minutes % 60 });
         }
-        switch (report.completeness) {
-            .complete => {},
-            .pending => try out.writer.writeAll(
-                "Known totals exclude pending Gateway reconciliation.\n",
-            ),
-            .incomplete => try out.writer.writeAll(
-                "Known totals may be incomplete.\n",
-            ),
-            .legacy => try out.writer.writeAll(
-                "This session predates complete usage tracking.\n",
-            ),
+        try out.writer.writeByte('\n');
+        switch (s.status) {
+            .ready, .fetching => {},
+            .failed => |f| try writeUsageFailure(&out.writer, f, "AI Gateway"),
+            .unavailable => |u| try out.writer.print("{s}\n", .{switch (u) {
+                .no_gateway_sign_in => "Usage needs an AI Gateway sign-in: run fx login or set an API key.",
+                .no_team => "Usage needs a team: run fx login and pick one.",
+                .unsupported_provider => "Usage isn't shown for this provider yet; it reads AI Gateway.",
+                .refresh_needed => "The sign-in needs a refresh: send a message in fx, then run fx usage again.",
+            }}),
         }
-
-        const totals = report.totals orelse return try out.toOwnedSlice();
+        if (v.budget) |b| {
+            try out.writer.print("Budget        ${d:.2} of ${d:.2}{s}\n", .{ b.spent, b.limit, switch (b.period) {
+                .daily => " today",
+                .weekly => " this week",
+                .monthly => " this month",
+                .none => "",
+            } });
+        }
+        const t = v.totals;
+        try out.writer.print("Spend         ${d:.4}\nRequests      {d}\n", .{ t.total_cost, t.request_count });
         try out.writer.print(
-            "Total tokens  {d}\nInput         {d}\nOutput        {d}\n",
-            .{ totals.total_tokens, totals.input_tokens, totals.output_tokens },
+            "Tokens        {d} (input {d} · output {d} · cache read {d} · cache write {d} · reasoning {d})\n",
+            .{ t.totalTokens(), t.input_tokens, t.output_tokens, t.cache_read_tokens, t.cache_write_tokens, t.reasoning_tokens },
         );
-        try out.writer.print(
-            "Cache         {d} read · {d} write\n",
-            .{ totals.cache_read_tokens, totals.cache_write_tokens },
-        );
-        if (totals.reasoning_tokens) |reasoning| {
-            try out.writer.print("Reasoning     {d}\n", .{reasoning});
-        }
-        if (totals.request_count) |requests| {
-            try out.writer.print("Requests      {d}\n", .{requests});
-        }
-        try out.writer.print("Spend         ${d:.4}\n", .{totals.total_cost});
-
-        if (report.models.len > 0) {
+        if (v.models.len > 0) {
             try out.writer.writeAll("\nBy model\n");
-            for (report.models) |model| {
+            for (v.models) |model| {
                 try out.writer.writeAll("- ");
                 try writeTerminalSafe(&out.writer, alloc, model.model);
-                try out.writer.print(
-                    "  {d} tokens  ${d:.4}\n",
-                    .{ model.totals.total_tokens, model.totals.total_cost },
-                );
+                try out.writer.print("  ${d:.4}  {d} requests  {d} tokens\n", .{
+                    model.totals.total_cost,
+                    model.totals.request_count,
+                    model.totals.totalTokens(),
+                });
             }
         }
         return try out.toOwnedSlice();
     }
 
-    pub fn renderJson(self: UsageSnapshot, alloc: Allocator) ![]u8 {
-        const report = self.report;
+    /// A ChatGPT plan through Codex: the plan, credits and each limit window.
+    fn renderCodexText(self: UsageSnapshot, alloc: Allocator) ![]u8 {
+        const s = self.snapshot;
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
-        try out.writer.writeAll("{\"kind\":\"usage\",\"schema_version\":1,\"period\":");
-        try std.json.Stringify.value(report.scope.cliValue() orelse "session", .{}, &out.writer);
-        try out.writer.print(
-            ",\"snapshot_time_ms\":{d},\"window_start_ms\":{d},\"coverage\":{{\"status\":",
-            .{ report.snapshot_time_ms, report.window_start_ms },
-        );
-        try std.json.Stringify.value(@tagName(report.coverage), .{}, &out.writer);
-        try out.writer.writeAll(",\"started_at_ms\":");
-        if (report.coverage_started_at_ms) |started_at_ms| {
-            try out.writer.print("{d}", .{started_at_ms});
-        } else {
-            try out.writer.writeAll("null");
+        const profile: ?usage.codex.Profile = if (s.codex_usage) |u| u.profile else null;
+        try out.writer.writeAll("Codex usage from ChatGPT");
+        if (profile) |p| if (p.name) |name| {
+            try out.writer.writeAll(" for ");
+            try writeTerminalSafe(&out.writer, alloc, name);
+        };
+        if (s.fetchedAtMs()) |ms| try writeUtcClock(&out.writer, ", updated ", ms);
+        try out.writer.writeByte('\n');
+        switch (s.status) {
+            .ready => {},
+            .fetching => if (s.codex_usage == null) try out.writer.writeAll("Fetching usage from ChatGPT.\n"),
+            .failed => |f| try writeUsageFailure(&out.writer, f, "ChatGPT"),
+            .unavailable => {},
         }
-        try out.writer.print(
-            ",\"full_window\":{}}},\"completeness\":",
-            .{report.coverage == .full},
-        );
-        try std.json.Stringify.value(@tagName(report.completeness), .{}, &out.writer);
+        const u = s.codex_usage orelse return try out.toOwnedSlice();
+        if (profile) |p| try writeCodexProfileText(&out.writer, alloc, s, p);
+        if (s.codexBreakdown() != null) try writeCodexSharesText(&out.writer, alloc, s, self.period);
+        try out.writer.writeAll("Plan          ");
+        try writeTerminalSafe(&out.writer, alloc, u.plan);
+        try out.writer.writeAll("\nCredits       ");
+        if (u.credits) |c| {
+            if (c.unlimited) {
+                try out.writer.writeAll("unlimited");
+            } else if (c.balance) |b| {
+                try writeTerminalSafe(&out.writer, alloc, b);
+            } else {
+                try out.writer.writeAll(if (c.has_credits) "yes" else "none");
+            }
+        } else try out.writer.writeAll("-");
+        try out.writer.print("\nSpend limit   {s}\n", .{if (u.spend_limit_reached) "reached" else "not reached"});
+        if (!u.hasWindows()) {
+            try out.writer.writeAll("Limits        none on this plan\n");
+            return try out.toOwnedSlice();
+        }
+        try out.writer.writeAll("\nLimits\n");
+        for (u.limits) |limit| {
+            for ([_]?usage.codex.Window{ limit.primary, limit.secondary }) |maybe| {
+                const w = maybe orelse continue;
+                try out.writer.writeAll("- ");
+                try writeTerminalSafe(&out.writer, alloc, limit.name);
+                try out.writer.print(" ({d}h window): {d:.0}% used", .{ @divFloor(w.window_seconds, 3600), w.used_percent });
+                if (w.resets_at_ms) |at| try writeUtcClock(&out.writer, ", resets ", at);
+                try out.writer.writeByte('\n');
+            }
+        }
+        return try out.toOwnedSlice();
+    }
+
+    /// A Grok plan: its allowance this period, by product, and its credits.
+    fn renderGrokText(self: UsageSnapshot, alloc: Allocator) ![]u8 {
+        const s = self.snapshot;
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+
+        try out.writer.writeAll("Grok usage from xAI");
+        if (s.fetchedAtMs()) |ms| try writeUtcClock(&out.writer, ", updated ", ms);
+        try out.writer.writeByte('\n');
+        switch (s.status) {
+            .ready => {},
+            .fetching => if (s.grok_usage == null) try out.writer.writeAll("Fetching usage from Grok.\n"),
+            .failed => |f| try writeUsageFailure(&out.writer, f, "Grok"),
+            .unavailable => {},
+        }
+        const u = s.grok_usage orelse return try out.toOwnedSlice();
+        try out.writer.writeAll("Plan          ");
+        if (u.plan()) |plan| try writeTerminalSafe(&out.writer, alloc, plan) else try out.writer.writeAll("-");
+        try out.writer.writeByte('\n');
+        if (u.settings) |settings| if (settings.usage_url) |url| {
+            try out.writer.writeAll("Usage page    ");
+            try writeTerminalSafe(&out.writer, alloc, url);
+            try out.writer.writeAll(" (managed by your team)\n");
+        };
+        if (!u.hasBilling()) {
+            try out.writer.writeAll("Billing       none reported for this plan\n");
+            return try out.toOwnedSlice();
+        }
+        if (u.used_percent) |used| {
+            try out.writer.print("Used          {d:.0}% of the {s} allowance", .{ @floor(used), if (u.period) |p| @tagName(p) else "plan's" });
+            if (u.resets_at_ms) |at| {
+                var date_buf: [24]u8 = undefined;
+                try out.writer.print(", resets {s}", .{formatUtcDate(&date_buf, at)});
+                try writeUtcClock(&out.writer, " ", at);
+            }
+            try out.writer.writeByte('\n');
+        }
+        for (u.products, 0..) |product, i| {
+            try out.writer.writeAll(if (i == 0) "By product    " else ", ");
+            try writeTerminalSafe(&out.writer, alloc, product.name);
+            try out.writer.print(" {d:.1}%", .{product.used_percent});
+        }
+        if (u.products.len > 0) try out.writer.writeByte('\n');
+        try out.writer.writeAll("Credits       ");
+        if ((u.prepaid_cents orelse 1) == 0) try out.writer.writeAll("none") else try writeOptionalCents(&out.writer, u.prepaid_cents);
+        try out.writer.writeAll("\nPay as you go ");
+        const turned_off = if (u.settings) |settings| (if (settings.on_demand_enabled) |on| !on else false) else false;
+        if (turned_off or (u.on_demand_cap_cents orelse 0) == 0) {
+            try out.writer.writeAll("off");
+        } else {
+            try writeOptionalCents(&out.writer, u.on_demand_used_cents orelse 0);
+            try out.writer.writeAll(" of ");
+            try writeOptionalCents(&out.writer, u.on_demand_cap_cents);
+            try out.writer.writeAll(" this month");
+        }
+        try out.writer.writeByte('\n');
+        return try out.toOwnedSlice();
+    }
+
+    pub fn renderJson(self: UsageSnapshot, alloc: Allocator) ![]u8 {
+        const s = self.snapshot;
+        const v = s.of(self.period);
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+
+        try out.writer.print("{{\"kind\":\"usage\",\"schema_version\":2,\"source\":\"{s}\",\"period\":", .{switch (s.scope orelse .member) {
+            .codex => "chatgpt",
+            .grok => "grok",
+            .member, .api_key => "ai_gateway",
+        }});
+        try std.json.Stringify.value(v.period.label(), .{}, &out.writer);
+        try out.writer.writeAll(",\"status\":");
+        try std.json.Stringify.value(@tagName(s.status), .{}, &out.writer);
+        try out.writer.writeAll(",\"reason\":");
+        switch (s.status) {
+            .failed => |f| try std.json.Stringify.value(@tagName(f), .{}, &out.writer),
+            .unavailable => |u| try std.json.Stringify.value(@tagName(u), .{}, &out.writer),
+            .ready, .fetching => try out.writer.writeAll("null"),
+        }
+        try out.writer.writeAll(",\"fetched_at_ms\":");
+        if (s.fetchedAtMs()) |ms| try out.writer.print("{d}", .{ms}) else try out.writer.writeAll("null");
+        try out.writer.writeAll(",\"budget\":");
+        if (v.budget) |b| {
+            try out.writer.print("{{\"limit\":{d},\"spent\":{d},\"period\":", .{ b.limit, b.spent });
+            try std.json.Stringify.value(@tagName(b.period), .{}, &out.writer);
+            try out.writer.writeByte('}');
+        } else try out.writer.writeAll("null");
         try out.writer.writeAll(",\"totals\":");
-        if (report.totals) |totals| {
-            try writeUsageTotalsJson(&out.writer, totals);
-        } else {
-            try out.writer.writeAll("null");
-        }
+        try writeUsageTotalsJson(&out.writer, v.totals);
         try out.writer.writeAll(",\"models\":[");
-        for (report.models, 0..) |model, index| {
+        for (v.models, 0..) |model, index| {
             if (index > 0) try out.writer.writeByte(',');
             try out.writer.writeAll("{\"model\":");
             try std.json.Stringify.value(model.model, .{}, &out.writer);
@@ -174,37 +279,129 @@ pub const UsageSnapshot = struct {
             try writeUsageTotalsJson(&out.writer, model.totals);
             try out.writer.writeByte('}');
         }
-        try out.writer.writeAll("]}");
+        try out.writer.writeAll("],\"codex\":");
+        try std.json.Stringify.value(s.codex_usage, .{}, &out.writer);
+        try out.writer.writeAll(",\"grok\":");
+        try std.json.Stringify.value(s.grok_usage, .{}, &out.writer);
+        try out.writer.writeByte('}');
         return try out.toOwnedSlice();
     }
 };
 
-fn writeUsageTotalsJson(
-    writer: *std.Io.Writer,
-    totals: usage_report.Totals,
-) !void {
+/// Tokens by period, then records, habits and the most used plugins and
+/// skills. Missing numbers read `-`.
+fn writeCodexProfileText(writer: *std.Io.Writer, alloc: Allocator, s: *const usage.Snapshot, p: usage.codex.Profile) !void {
+    try writer.writeAll("Tokens        ");
+    const periods = [_]struct { value: ?u64, label: []const u8 }{
+        .{ .value = s.codexTokens(.today), .label = "today" },
+        .{ .value = s.codexTokens(.days_7), .label = "7d" },
+        .{ .value = s.codexTokens(.month), .label = "month" },
+        .{ .value = p.lifetime_tokens, .label = "lifetime" },
+    };
+    for (periods, 0..) |period, i| {
+        if (i > 0) try writer.writeAll(", ");
+        try writeOptionalCount(writer, period.value);
+        try writer.print(" {s}", .{period.label});
+    }
+    try writer.writeAll("\nRecord        peak day ");
+    try writeOptionalCount(writer, p.peak_day_tokens);
+    try writer.writeAll(" tokens, longest chat ");
+    if (p.longest_turn_seconds) |sec| try writer.print("{d}h {d}m", .{ sec / 3600, sec % 3600 / 60 }) else try writer.writeAll("-");
+    try writer.writeAll(", streak ");
+    try writeOptionalCount(writer, p.streak_days);
+    try writer.writeAll(" days (best ");
+    try writeOptionalCount(writer, p.best_streak_days);
+    try writer.writeAll("), ");
+    try writeOptionalCount(writer, p.chats);
+    try writer.writeAll(" chats\nHabits        fast mode ");
+    if (p.fast_mode_percent) |pct| try writer.print("{d:.0}%", .{pct}) else try writer.writeAll("-");
+    try writer.writeAll(", reasoning ");
+    if (p.reasoning) |r| try writeTerminalSafe(writer, alloc, r) else try writer.writeAll("-");
+    if (p.reasoning_percent) |pct| try writer.print(" ({d:.0}%)", .{pct});
+    try writer.writeByte('\n');
+}
+
+/// Each model's and surface's share of `period`, largest first.
+fn writeCodexSharesText(writer: *std.Io.Writer, alloc: Allocator, s: *const usage.Snapshot, period: usage.Period) !void {
+    var buf: [usage.codex.max_shares]usage.codex.Share = undefined;
+    inline for (.{ "model", "surface" }) |what| {
+        const shares = if (comptime std.mem.eql(u8, what, "model")) s.codexModelShares(period, &buf) else s.codexSurfaceShares(period, &buf);
+        try writer.print("Share by {s} ({s}): ", .{ what, period.label() });
+        if (shares.len == 0) try writer.writeAll("none");
+        for (shares, 0..) |share, i| {
+            if (i > 0) try writer.writeAll(", ");
+            try writeTerminalSafe(writer, alloc, share.name);
+            if (share.speed.len > 0) {
+                try writer.writeByte(' ');
+                try writeTerminalSafe(writer, alloc, share.speed);
+            }
+            var share_buf: [8]u8 = undefined;
+            try writer.print(" {s}", .{usage.codex.formatShare(&share_buf, share.percent)});
+        }
+        try writer.writeByte('\n');
+    }
+}
+
+fn writeOptionalCount(writer: *std.Io.Writer, value: ?u64) !void {
+    if (value) |v| try writer.print("{d}", .{v}) else try writer.writeAll("-");
+}
+
+/// `<prefix>08:14 UTC` for a timestamp in milliseconds.
+fn writeUtcClock(writer: *std.Io.Writer, prefix: []const u8, ms: i64) !void {
+    const minutes: u64 = @intCast(@mod(@divFloor(ms, std.time.ms_per_min), 24 * 60));
+    try writer.print("{s}{d:0>2}:{d:0>2} UTC", .{ prefix, minutes / 60, minutes % 60 });
+}
+
+/// `Oct 11, 2026` for a timestamp in milliseconds, or `Unknown`.
+fn formatUtcDate(buf: *[24]u8, timestamp_ms: i64) []const u8 {
+    if (timestamp_ms < 0) return "Unknown";
+    const seconds: u64 = @intCast(@divFloor(timestamp_ms, std.time.ms_per_s));
+    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = seconds };
+    const year_day = epoch_seconds.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    const month = months[month_day.month.numeric() - 1];
+    return std.mem.print(buf, "{s} {d}, {d}", .{ month, month_day.day_index + 1, year_day.year }) catch "Unknown";
+}
+
+/// `Refresh failed: <why>.`, naming the service the numbers come from.
+fn writeUsageFailure(writer: *std.Io.Writer, failure: usage.Failure, service: []const u8) !void {
+    try writer.writeAll("Refresh failed: ");
+    switch (failure) {
+        .network => try writer.print("couldn't reach {s}", .{service}),
+        .refused => try writer.print("{s} refused this sign-in", .{service}),
+        .not_available => try writer.writeAll(if (std.mem.eql(u8, service, "AI Gateway"))
+            "usage reports aren't available for this team"
+        else
+            "usage isn't available for this plan"),
+        .rate_limited => try writer.writeAll("rate limited, try again shortly"),
+        .server => try writer.print("{s} error", .{service}),
+        .bad_response => try writer.print("unexpected {s} response", .{service}),
+        .cache => try writer.writeAll("couldn't save the usage cache"),
+    }
+    try writer.writeAll(".\n");
+}
+
+/// `$12.50` for an amount in US cents, or `-`.
+fn writeOptionalCents(writer: *std.Io.Writer, value: ?i64) !void {
+    const cents: u64 = @intCast(@max(value orelse return writer.writeAll("-"), 0));
+    try writer.print("${d}.{d:0>2}", .{ cents / 100, cents % 100 });
+}
+
+fn writeUsageTotalsJson(writer: *std.Io.Writer, totals: usage.report.Totals) !void {
     try writer.print(
-        "{{\"total_tokens\":{d},\"input_tokens\":{d},\"output_tokens\":{d},\"cache_read_tokens\":{d},\"cache_write_tokens\":{d},\"reasoning_tokens\":",
+        "{{\"total_tokens\":{d},\"input_tokens\":{d},\"output_tokens\":{d},\"cache_read_tokens\":{d},\"cache_write_tokens\":{d},\"reasoning_tokens\":{d},\"request_count\":{d},\"spend\":{d}}}",
         .{
-            totals.total_tokens,
+            totals.totalTokens(),
             totals.input_tokens,
             totals.output_tokens,
             totals.cache_read_tokens,
             totals.cache_write_tokens,
+            totals.reasoning_tokens,
+            totals.request_count,
+            totals.total_cost,
         },
     );
-    if (totals.reasoning_tokens) |reasoning| {
-        try writer.print("{d}", .{reasoning});
-    } else {
-        try writer.writeAll("null");
-    }
-    try writer.writeAll(",\"request_count\":");
-    if (totals.request_count) |requests| {
-        try writer.print("{d}", .{requests});
-    } else {
-        try writer.writeAll("null");
-    }
-    try writer.print(",\"spend\":{d}}}", .{totals.total_cost});
 }
 
 pub fn workspaceErrorMessage(err: anyerror) ?[]const u8 {
@@ -1375,37 +1572,33 @@ pub const SessionRecoverySnapshot = struct {
         self: SessionRecoverySnapshot,
         alloc: Allocator,
     ) ![]u8 {
-        const usage_warning = if (self.result.usage_incomplete) "warning: historical usage is incomplete because the source accounting data is corrupt\n" else "";
         if (self.result.status == .indeterminate) {
             return alloc.print(
-                "[session recovery] could not confirm target {s}\nsource: {s} (unchanged)\n{s}resolve: fx --resume {s}\ninspect: fx doctor\n",
+                "[session recovery] could not confirm target {s}\nsource: {s} (unchanged)\nresolve: fx --resume {s}\ninspect: fx doctor\n",
                 .{
                     self.result.recovered_session_id,
                     self.result.source_session_id,
-                    usage_warning,
                     self.result.recovered_session_id,
                 },
             );
         }
         if (self.result.status == .recovered_with_unverified_artifacts) {
             return alloc.print(
-                "[session recovery] copied {s} to {s}\nhistory_turns: {d}\nwarning: legacy command artifacts could not be authenticated\n{s}resume: fx --resume {s}\n",
+                "[session recovery] copied {s} to {s}\nhistory_turns: {d}\nwarning: legacy command artifacts could not be authenticated\nresume: fx --resume {s}\n",
                 .{
                     self.result.source_session_id,
                     self.result.recovered_session_id,
                     self.result.history_len,
-                    usage_warning,
                     self.result.recovered_session_id,
                 },
             );
         }
         return alloc.print(
-            "[session recovery] copied {s} to {s}\nhistory_turns: {d}\n{s}resume: fx --resume {s}\n",
+            "[session recovery] copied {s} to {s}\nhistory_turns: {d}\nresume: fx --resume {s}\n",
             .{
                 self.result.source_session_id,
                 self.result.recovered_session_id,
                 self.result.history_len,
-                usage_warning,
                 self.result.recovered_session_id,
             },
         );
@@ -1441,7 +1634,6 @@ pub const SessionRecoverySnapshot = struct {
             ",\"history_turns\":{d}",
             .{self.result.history_len},
         );
-        if (self.result.usage_incomplete) try out.writer.writeAll(",\"usage_incomplete\":true");
         try out.writer.writeByte('}');
         return try out.toOwnedSlice();
     }
@@ -2905,24 +3097,6 @@ test "core session migration snapshot text and json stay stable" {
     );
 }
 
-test "core session recovery keeps incomplete accounting visible for every result" {
-    inline for (.{ .recovered, .recovered_with_unverified_artifacts, .indeterminate }) |status| {
-        const snapshot: SessionRecoverySnapshot = .{ .result = .{
-            .source_session_id = @constCast("source"),
-            .recovered_session_id = @constCast("copy"),
-            .history_len = 1,
-            .usage_incomplete = true,
-            .status = status,
-        } };
-        const text = try snapshot.renderText(std.testing.allocator);
-        defer std.testing.allocator.free(text);
-        try std.testing.expect(std.mem.find(u8, text, "historical usage is incomplete") != null);
-        const json = try snapshot.renderJson(std.testing.allocator);
-        defer std.testing.allocator.free(json);
-        try std.testing.expect(std.mem.find(u8, json, "\"usage_incomplete\":true") != null);
-    }
-}
-
 test "core session recovery snapshot text and json stay stable" {
     const result = session_store.SessionRecoveryResult{
         .source_session_id = @constCast("source-session"),
@@ -3304,54 +3478,209 @@ test "workspace text snapshot terminal-encodes paths" {
     try std.testing.expect(std.mem.findScalar(u8, output, '\r') == null);
 }
 
-test "usage text and JSON render the same optional and ordered facts" {
+test "usage text and JSON render the same AI Gateway facts" {
     const alloc = std.testing.allocator;
-    var models = [_]usage_report.ModelUsage{.{
-        .model = @constCast("provider/model"),
-        .totals = .{
-            .total_tokens = 12,
-            .input_tokens = 10,
-            .output_tokens = 2,
-            .cache_read_tokens = 3,
-            .cache_write_tokens = 1,
-            .reasoning_tokens = null,
-            .request_count = 1,
-            .total_cost = 0.25,
-        },
-    }};
-    const report = usage_report.Snapshot{
-        .scope = .days_7,
-        .snapshot_time_ms = 200,
-        .window_start_ms = 100,
-        .coverage_started_at_ms = 150,
-        .coverage = .partial,
-        .completeness = .complete,
-        .totals = models[0].totals,
-        .models = &models,
+    const models = [_]usage.report.ModelRow{
+        .{ .model = "anthropic/claude-opus-5.5", .totals = .{ .request_count = 3, .input_tokens = 10, .output_tokens = 5, .total_cost = 1.5 } },
     };
-    const snapshot = UsageSnapshot{ .report = &report };
+    var views: [usage.Period.all.len]usage.View = undefined;
+    for (&views, usage.Period.all) |*v, period| {
+        v.* = .{
+            .arena = std.heap.ArenaAllocator.init(alloc),
+            .period = period,
+            .models = &models,
+            .totals = models[0].totals,
+            .today_current = true,
+            .finished_current = true,
+            .fetched_at_ms = 20737 * std.time.ms_per_day + 8 * std.time.ms_per_hour + 14 * std.time.ms_per_min,
+            .budget = .{ .limit = 100, .spent = 25, .period = .monthly },
+        };
+    }
+    var snapshot: usage.Snapshot = .{
+        .arena = std.heap.ArenaAllocator.init(alloc),
+        .views = views,
+        .status = .{ .failed = .rate_limited },
+        .label = "",
+        .now_ms = 0,
+    };
+    defer snapshot.deinit();
+    const contract: UsageSnapshot = .{ .snapshot = &snapshot, .period = .days_7 };
 
-    const text = try snapshot.render(alloc, .text);
+    const text = try contract.render(alloc, .text);
     defer alloc.free(text);
-    try std.testing.expect(std.mem.find(u8, text, "Total tokens  12") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Reasoning") == null);
-    try std.testing.expect(std.mem.find(u8, text, "provider/model") != null);
+    try std.testing.expect(std.mem.startsWith(u8, text, "Usage (7d, UTC) from AI Gateway, updated 08:14 UTC\nRefresh failed: rate limited, try again shortly.\nBudget        $25.00 of $100.00 this month\n"));
+    try std.testing.expect(std.mem.find(u8, text, "- anthropic/claude-opus-5.5  $1.5000  3 requests  15 tokens") != null);
 
-    const json = try snapshot.render(alloc, .json);
+    const json = try contract.render(alloc, .json);
     defer alloc.free(json);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
     defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("7d", root.get("period").?.string);
+    try std.testing.expectEqualStrings("failed", root.get("status").?.string);
+    try std.testing.expectEqualStrings("rate_limited", root.get("reason").?.string);
+    try std.testing.expectEqual(@as(i64, 3), root.get("totals").?.object.get("request_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 15), root.get("models").?.array.items[0].object.get("totals").?.object.get("total_tokens").?.integer);
+    try std.testing.expectEqualStrings("monthly", root.get("budget").?.object.get("period").?.string);
+    try std.testing.expect(root.get("codex").? == .null);
+    try std.testing.expectEqualStrings("ai_gateway", root.get("source").?.string);
+}
+
+test "usage text and JSON render a Grok plan's allowance and credits" {
+    const alloc = std.testing.allocator;
+    var views: [usage.Period.all.len]usage.View = undefined;
+    for (&views, usage.Period.all) |*v, period| {
+        v.* = .{
+            .arena = std.heap.ArenaAllocator.init(alloc),
+            .period = period,
+            .models = &.{},
+            .totals = .{},
+            .today_current = false,
+            .finished_current = false,
+            .fetched_at_ms = null,
+            .budget = null,
+        };
+    }
+    const at = 20737 * std.time.ms_per_day + 8 * std.time.ms_per_hour + 14 * std.time.ms_per_min;
+    var snapshot: usage.Snapshot = .{
+        .arena = std.heap.ArenaAllocator.init(alloc),
+        .views = views,
+        .status = .ready,
+        .label = "grok (xAI)",
+        .now_ms = at,
+        .scope = .grok,
+        .grok_usage = .{
+            .used_percent = 42.7,
+            .period = .weekly,
+            .resets_at_ms = 20741 * std.time.ms_per_day,
+            .products = &.{.{ .name = "grok build", .used_percent = 61.2 }},
+            .prepaid_cents = 0,
+            .on_demand_used_cents = 300,
+            .on_demand_cap_cents = 10000,
+            .settings = .{ .plan = "SuperGrok" },
+        },
+        .grok_at_ms = at,
+    };
+    defer snapshot.deinit();
+
+    const text = try (UsageSnapshot{ .snapshot = &snapshot }).render(alloc, .text);
+    defer alloc.free(text);
     try std.testing.expectEqualStrings(
-        "7d",
-        parsed.value.object.get("period").?.string,
+        "Grok usage from xAI, updated 08:14 UTC\n" ++
+            "Plan          SuperGrok\n" ++
+            "Used          42% of the weekly allowance, resets Oct 15, 2026 00:00 UTC\n" ++
+            "By product    grok build 61.2%\n" ++
+            "Credits       none\n" ++
+            "Pay as you go $3.00 of $100.00 this month\n",
+        text,
     );
-    try std.testing.expect(
-        parsed.value.object.get("totals").?.object.get("reasoning_tokens").? == .null,
-    );
+
+    var failed = snapshot;
+    failed.status = .{ .failed = .network };
+    const failed_text = try (UsageSnapshot{ .snapshot = &failed }).render(alloc, .text);
+    defer alloc.free(failed_text);
+    try std.testing.expect(std.mem.find(u8, failed_text, "Refresh failed: couldn't reach Grok.\n") != null);
+
+    const json = try (UsageSnapshot{ .snapshot = &snapshot }).render(alloc, .json);
+    defer alloc.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("grok", root.get("source").?.string);
+    try std.testing.expect(root.get("codex").? == .null);
+    const grok = root.get("grok").?.object;
+    try std.testing.expectEqual(@as(f64, 42.7), grok.get("used_percent").?.float);
+    try std.testing.expectEqualStrings("weekly", grok.get("period").?.string);
+    try std.testing.expectEqualStrings("SuperGrok", grok.get("settings").?.object.get("plan").?.string);
+}
+
+test "usage text and JSON render a Codex plan's limits" {
+    const alloc = std.testing.allocator;
+    var views: [usage.Period.all.len]usage.View = undefined;
+    for (&views, usage.Period.all) |*v, period| {
+        v.* = .{
+            .arena = std.heap.ArenaAllocator.init(alloc),
+            .period = period,
+            .models = &.{},
+            .totals = .{},
+            .today_current = false,
+            .finished_current = false,
+            .fetched_at_ms = null,
+            .budget = null,
+        };
+    }
+    const at = 20737 * std.time.ms_per_day + 8 * std.time.ms_per_hour + 14 * std.time.ms_per_min;
+    var snapshot: usage.Snapshot = .{
+        .arena = std.heap.ArenaAllocator.init(alloc),
+        .views = views,
+        .status = .ready,
+        .label = "codex (ChatGPT)",
+        .now_ms = at,
+        .scope = .codex,
+        .codex_usage = .{
+            .plan = "plus",
+            .limits = &.{.{ .name = "codex", .primary = .{ .used_percent = 42, .window_seconds = 18000, .resets_at_ms = at + 2 * std.time.ms_per_hour } }},
+            .credits = .{ .has_credits = false, .unlimited = false },
+        },
+        .codex_at_ms = at,
+    };
+    defer snapshot.deinit();
+    const contract: UsageSnapshot = .{ .snapshot = &snapshot };
+
+    // With activity: tokens by period, records, habits, and shares by model
+    // and surface for the period asked for.
+    var with_profile = snapshot;
+    var limits = snapshot.codex_usage.?;
+    limits.profile = .{
+        .name = "samdoe",
+        .as_of_day = 20737,
+        .lifetime_tokens = 315686778511,
+        .peak_day_tokens = 11594630891,
+        .longest_turn_seconds = 110473,
+        .streak_days = 132,
+        .best_streak_days = 132,
+        .chats = 11374,
+        .fast_mode_percent = 66.5,
+        .reasoning = "xhigh",
+        .reasoning_percent = 85.1,
+        .days = &.{ .{ .day = 20736, .tokens = 52293426 }, .{ .day = 20737, .tokens = 39877412 } },
+    };
+    limits.breakdown = .{ .days = &.{.{
+        .day = 20737,
+        .models = &.{ .{ .model = "gpt-6.1-sol", .speed = "fast", .value = 3 }, .{ .model = "gpt-6.1-sol", .speed = "standard", .value = 1 } },
+        .surfaces = &.{.{ .surface = "desktop_app", .value = 4 }},
+    }} };
+    with_profile.codex_usage = limits;
+    const profile_text = try (UsageSnapshot{ .snapshot = &with_profile }).render(alloc, .text);
+    defer alloc.free(profile_text);
     try std.testing.expectEqualStrings(
-        "provider/model",
-        parsed.value.object.get("models").?.array.items[0].object.get("model").?.string,
+        "Codex usage from ChatGPT for samdoe, updated 08:14 UTC\n" ++
+            "Tokens        39877412 today, 92170838 7d, 92170838 month, 315686778511 lifetime\n" ++
+            "Record        peak day 11594630891 tokens, longest chat 30h 41m, streak 132 days (best 132), 11374 chats\n" ++
+            "Habits        fast mode 67%, reasoning xhigh (85%)\n" ++
+            "Share by model (month): gpt-6.1-sol fast 75.0%, gpt-6.1-sol standard 25.0%\n" ++
+            "Share by surface (month): desktop app 100.0%\n" ++
+            "Plan          plus\nCredits       none\nSpend limit   not reached\n\nLimits\n- codex (5h window): 42% used, resets 10:14 UTC\n",
+        profile_text,
     );
+
+    const text = try contract.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(
+        "Codex usage from ChatGPT, updated 08:14 UTC\nPlan          plus\nCredits       none\nSpend limit   not reached\n\nLimits\n- codex (5h window): 42% used, resets 10:14 UTC\n",
+        text,
+    );
+
+    const json = try contract.render(alloc, .json);
+    defer alloc.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("chatgpt", root.get("source").?.string);
+    try std.testing.expectEqual(@as(i64, at), root.get("fetched_at_ms").?.integer);
+    const codex = root.get("codex").?.object;
+    try std.testing.expectEqualStrings("plus", codex.get("plan").?.string);
+    try std.testing.expectEqual(@as(i64, 18000), codex.get("limits").?.array.items[0].object.get("primary").?.object.get("window_seconds").?.integer);
 }
 
 pub const SlackSnapshot = struct {
@@ -3381,7 +3710,7 @@ pub const SlackSnapshot = struct {
                     const epoch: std.time.epoch.EpochSeconds = .{ .secs = @intCast(@divFloor(expiry, std.time.ms_per_s)) };
                     const day = epoch.getDaySeconds();
                     try out.writer.print("Access expires on {s} at {d:0>2}:{d:0>2} UTC.\n", .{
-                        usage_report.formatUtcDate(&date_buf, expiry),
+                        formatUtcDate(&date_buf, expiry),
                         day.getHoursIntoDay(),
                         day.getMinutesIntoHour(),
                     });

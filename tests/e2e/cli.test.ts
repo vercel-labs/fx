@@ -32,6 +32,22 @@ import {
   fakeGatewaySse,
   startFakeGateway,
 } from "./tmux-helpers";
+import {
+  codexBreakdownBody,
+  codexProfileBody,
+  codexUsageBody,
+  DAY_MS,
+  grokBillingBody,
+  grokSettingsBody,
+  type ReportRow,
+  USAGE_NOW_MS,
+  usageEnv,
+  usageFake,
+  utcDate,
+  writeChatGptLogin,
+  writeGrokLogin,
+  writeUsageClock,
+} from "./usage-fakes";
 
 const TIMEOUT = 15_000;
 const NO_GATEWAY_AUTH = {
@@ -1284,331 +1300,277 @@ describe("cli: status", () => {
 });
 
 describe("cli: usage", () => {
-  test(
-    "fx usage reads rolling local facts without credentials or profile mutation",
-    async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-usage-"));
-      try {
-        const home = join(root, "home");
-        const fxDir = join(home, ".fx");
-        mkdirSync(fxDir, { recursive: true, mode: 0o700 });
-        chmodSync(fxDir, 0o700);
-        const now = Date.now();
-        const records = [
-          {
-            schema_version: 1,
-            kind: "coverage",
-            started_at_ms: now - 40 * 24 * 60 * 60 * 1000,
-          },
-          {
-            schema_version: 1,
-            kind: "generation",
-            fact: {
-              id: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-              created_at_ms: now - 60 * 60 * 1000,
-              model: "provider/a",
-              input_tokens: 15,
-              output_tokens: 3,
-              cache_read_tokens: 5,
-              cache_write_tokens: 1,
-              reasoning_tokens: 2,
-              total_cost: 0.25,
-            },
-          },
-          {
-            schema_version: 1,
-            kind: "generation",
-            fact: {
-              id: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW",
-              created_at_ms: now - 2 * 24 * 60 * 60 * 1000,
-              model: "provider/b",
-              input_tokens: 10,
-              output_tokens: 2,
-              cache_read_tokens: 0,
-              cache_write_tokens: 0,
-              reasoning_tokens: null,
-              total_cost: 0.1,
-            },
-          },
-        ];
-        const usagePath = join(fxDir, "usage.jsonl");
-        writeFileSync(
-          usagePath,
-          records.map((record) => JSON.stringify(record)).join("\n") + "\n",
-          { mode: 0o600 },
-        );
-        chmodSync(usagePath, 0o600);
-        const before = readFileSync(usagePath, "utf8");
-        const entriesBefore = readdirSync(fxDir).sort();
-        const env = {
-          ...NO_GATEWAY_AUTH,
-          HOME: realpathSync(home),
-          FX_DISABLE_KEYCHAIN: "1",
-        };
+  const today = utcDate(USAGE_NOW_MS);
+  const reportRow = (start: string, end: string): ReportRow[] => {
+    if (start === today) {
+      return [{ model: "provider/a", request_count: 2, input_tokens: 10, output_tokens: 5, total_cost: 0.5 }];
+    }
+    if (end !== utcDate(USAGE_NOW_MS - DAY_MS)) return [];
+    // The month's finished days add a second model on top of the week's.
+    return start === "2026-10-01"
+      ? [
+        { model: "provider/b", request_count: 4, input_tokens: 40, output_tokens: 8, total_cost: 2 },
+        { model: "provider/a", request_count: 1, input_tokens: 4, output_tokens: 1, total_cost: 0.25 },
+      ]
+      : [{ model: "provider/a", request_count: 1, input_tokens: 4, output_tokens: 1, total_cost: 0.25 }];
+  };
 
+  function usageFixture(prefix: string, options: Parameters<typeof usageFake>[0] = {}) {
+    const root = mkdtempSync(join(tmpdir(), prefix));
+    const home = join(root, "home");
+    mkdirSync(home);
+    const clock = join(root, "clock");
+    writeUsageClock(clock, USAGE_NOW_MS);
+    const fake = usageFake({ report: reportRow, ...options });
+    const gateway = startFakeGateway([], { usage: fake.handler });
+    const env = {
+      ...NO_GATEWAY_AUTH,
+      ...usageEnv(gateway.baseUrl, clock),
+      HOME: realpathSync(home),
+    };
+    return {
+      root,
+      home,
+      clock,
+      fake,
+      gateway,
+      env,
+      stop() {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      },
+    };
+  }
+
+  test(
+    "fx usage without a sign-in says so, reads nothing, and leaves the profile alone",
+    async () => {
+      const fixture = usageFixture("fx-e2e-usage-none-");
+      try {
+        const text = await runFx(["usage"], { env: fixture.env });
+        expect(text.code).toBe(1);
+        expect(text.stdout).toContain("Usage needs an AI Gateway sign-in: run fx login or set an API key.");
+        const json = await runFx(["usage", "--json"], { env: fixture.env });
+        expect(json.code).toBe(1);
+        expect(JSON.parse(json.stdout)).toMatchObject({
+          kind: "usage",
+          schema_version: 2,
+          source: "ai_gateway",
+          status: "unavailable",
+          reason: "no_gateway_sign_in",
+        });
+        expect(fixture.fake.requests).toEqual([]);
+        expect(readdirSync(fixture.home)).toEqual([]);
+      } finally {
+        fixture.stop();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx usage reads an API key's spend from AI Gateway and fetches finished days once a day",
+    async () => {
+      const fixture = usageFixture("fx-e2e-usage-key-");
+      const env = { ...fixture.env, AI_GATEWAY_API_KEY: "e2e-usage-key" };
+      try {
+        const month = await runFx(["usage", "--json"], { env });
+        expect(month.code).toBe(0);
+        expect(month.stderr).toBe("");
+        const report = JSON.parse(month.stdout);
+        expect(report).toMatchObject({
+          source: "ai_gateway",
+          period: "month",
+          status: "ready",
+          reason: null,
+          budget: null,
+          totals: { request_count: 7, input_tokens: 54, output_tokens: 14 },
+        });
+        expect(report.totals.spend).toBeCloseTo(2.75, 6);
+        expect(report.models.map((row: { model: string }) => row.model)).toEqual(["provider/b", "provider/a"]);
+        expect(fixture.fake.reportRanges()).toEqual([
+          `${today}..${today}`,
+          "2026-10-06..2026-10-11",
+          "2026-10-01..2026-10-11",
+        ]);
+        for (const request of fixture.fake.requests) {
+          expect(request.authorization).toBe("Bearer e2e-usage-key");
+          expect(request.query.get("api_key_id")).toBe("self");
+          expect(request.query.get("group_by")).toBe("model");
+        }
+
+        // Later the same day only today is read again; the cache answers the rest.
+        const week = await runFx(["usage", "--period", "7d"], { env });
+        expect(week.code).toBe(0);
+        expect(week.stderr).toBe("");
+        expect(week.stdout).toContain("Usage (7d, UTC) from AI Gateway");
+        expect(week.stdout).toContain("Requests      3");
+        expect(week.stdout).toContain("- provider/a  $0.7500  3 requests  20 tokens");
+        expect(fixture.fake.reportRanges().slice(3)).toEqual([`${today}..${today}`]);
+
+        // A new UTC day reads its finished days again.
+        writeUsageClock(fixture.clock, USAGE_NOW_MS + DAY_MS);
+        const next = await runFx(["usage", "--json", "--period", "today"], { env });
+        expect(next.code).toBe(0);
+        expect(fixture.fake.reportRanges().slice(4)).toEqual([
+          "2026-10-13..2026-10-13",
+          "2026-10-07..2026-10-12",
+          "2026-10-01..2026-10-12",
+        ]);
+        const output = month.stdout + week.stdout + next.stdout;
+        expect(output).not.toContain("e2e-usage-key");
+      } finally {
+        fixture.stop();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx usage with fx login reads the member's team spend and budget",
+    async () => {
+      const fixture = usageFixture("fx-e2e-usage-member-", {
+        budget: {
+          users: [{ budget: { limitAmount: 50, currentSpend: 12, refreshPeriod: "monthly" } }],
+        },
+      });
+      writeSeededFxAuth(fixture.home, "team_e2e", fixture.gateway.baseUrl);
+      const env = { ...fixture.env, FX_E2E_OAUTH_ISSUER_URL: fixture.gateway.baseUrl };
+      try {
+        const json = await runFx(["usage", "--json"], { env });
+        expect(json.code).toBe(0);
+        expect(json.stderr).toBe("");
+        expect(JSON.parse(json.stdout)).toMatchObject({
+          status: "ready",
+          budget: { limit: 50, spent: 12, period: "monthly" },
+        });
+        const reports = fixture.fake.requests.filter((request) => request.path === "/v1/report");
+        expect(reports).toHaveLength(3);
+        for (const request of reports) {
+          expect(request.authorization).toBe(`Bearer ${SEEDED_GATEWAY_TOKEN}`);
+          expect(request.team).toBe("team_e2e");
+          expect(request.query.get("metered_scope")).toBe("user");
+        }
+        const budget = fixture.fake.requests.find((request) => request.path === "/ai-gateway/usage-report");
+        expect(budget?.query.get("teamId")).toBe("team_e2e");
+        expect(budget?.query.get("scope")).toBe("user");
+
+        const text = await runFx(["usage"], { env });
+        expect(text.code).toBe(0);
+        expect(text.stdout).toContain("Budget        $12.00 of $50.00 this month");
+        expect(text.stdout).not.toContain(SEEDED_GATEWAY_TOKEN);
+      } finally {
+        fixture.stop();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx usage keeps the last numbers when AI Gateway refuses the sign-in",
+    async () => {
+      let refuse = false;
+      const fixture = usageFixture("fx-e2e-usage-refused-", {
+        report: (start, end) =>
+          refuse ? new Response("unauthorized", { status: 401 }) : reportRow(start, end),
+      });
+      const env = { ...fixture.env, AI_GATEWAY_API_KEY: "e2e-usage-key" };
+      try {
+        expect((await runFx(["usage", "--json"], { env })).code).toBe(0);
+        refuse = true;
+        // Past the one-minute floor, so the second process fetches again.
+        writeUsageClock(fixture.clock, USAGE_NOW_MS + 2 * 60 * 1000);
+        const json = await runFx(["usage", "--json"], { env });
+        expect(json.code).toBe(1);
+        const report = JSON.parse(json.stdout);
+        expect(report).toMatchObject({ status: "failed", reason: "refused" });
+        expect(report.totals.request_count).toBe(7);
+        const text = await runFx(["usage"], { env });
+        expect(text.stdout).toContain("Refresh failed: AI Gateway refused this sign-in.");
+        expect(text.stdout).toContain("Requests      7");
+      } finally {
+        fixture.stop();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx usage with Codex reads the ChatGPT plan's limits and activity",
+    async () => {
+      const fixture = usageFixture("fx-e2e-usage-codex-", {
+        codex: {
+          usage: codexUsageBody(),
+          profile: codexProfileBody(),
+          breakdown: codexBreakdownBody(),
+        },
+      });
+      writeChatGptLogin(fixture.home, "acct_e2e");
+      const env = { ...fixture.env, FX_PROVIDER: "codex", FX_MODEL: "gpt-5.6-sol" };
+      try {
+        const text = await runFx(["usage", "--period", "today"], { env });
+        expect(text.code).toBe(0);
+        expect(text.stderr).toBe("");
+        expect(text.stdout).toContain("Codex usage from ChatGPT for samdoe, updated 15:30 UTC");
+        expect(text.stdout).toContain("Tokens        40000 today, 100000 7d, 100000 month, 9000000 lifetime");
+        expect(text.stdout).toContain("Share by model (today): gpt-e2e-large fast 70.0%, gpt-e2e-small standard 30.0%");
+        expect(text.stdout).toContain("Plan          pro");
+        expect(text.stdout).toContain("Credits       12.40");
+        expect(text.stdout).toContain("- codex (5h window): 42% used, resets 17:30 UTC");
+        expect(text.stdout).toContain("- codex (168h window): 18% used");
+        const paths = fixture.fake.requests.map((request) => request.path).sort();
+        expect(paths).toEqual([
+          "/backend-api/wham/profiles/me",
+          "/backend-api/wham/usage",
+          "/backend-api/wham/usage/daily-token-usage-breakdown",
+        ]);
+        for (const request of fixture.fake.requests) {
+          expect(request.chatgptAccount).toBe("acct_e2e");
+          expect(request.authorization?.startsWith("Bearer header.")).toBe(true);
+        }
+        expect(fixture.fake.reportRanges()).toEqual([]);
+
+        const json = await runFx(["usage", "--json"], { env });
+        expect(JSON.parse(json.stdout)).toMatchObject({
+          source: "chatgpt",
+          status: "ready",
+          codex: { plan: "pro" },
+        });
+      } finally {
+        fixture.stop();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx usage with Grok reads the plan's allowance and credits",
+    async () => {
+      const fixture = usageFixture("fx-e2e-usage-grok-", {
+        grok: { billing: grokBillingBody(), settings: grokSettingsBody() },
+      });
+      writeGrokLogin(fixture.home, "acct_grok_e2e");
+      const env = { ...fixture.env, FX_PROVIDER: "grok", FX_MODEL: "grok-4.20" };
+      try {
         const text = await runFx(["usage"], { env });
         expect(text.code).toBe(0);
         expect(text.stderr).toBe("");
-        expect(text.stdout).toContain("Usage (30 days)");
-        expect(text.stdout).toContain("Total tokens  30");
-        expect(text.stdout.indexOf("provider/a")).toBeLessThan(
-          text.stdout.indexOf("provider/b"),
-        );
-
-        const json = await runFx(
-          ["usage", "--json", "--period", "24h"],
-          { env },
-        );
-        expect(json.code).toBe(0);
-        expect(json.stderr).toBe("");
-        const report = JSON.parse(json.stdout);
-        expect(report).toMatchObject({
-          kind: "usage",
-          schema_version: 1,
-          period: "24h",
-          completeness: "complete",
-          totals: {
-            total_tokens: 18,
-            input_tokens: 15,
-            output_tokens: 3,
-            request_count: 1,
-          },
-        });
-        expect(report.models.map((model: { model: string }) => model.model))
-          .toEqual(["provider/a"]);
-        expect(readFileSync(usagePath, "utf8")).toBe(before);
-        expect(readdirSync(fxDir).sort()).toEqual(entriesBefore);
-      } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "fx usage preserves known totals when the ledger is incomplete",
-    async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-usage-incomplete-"));
-      try {
-        const home = join(root, "home");
-        const fxDir = join(home, ".fx");
-        mkdirSync(fxDir, { recursive: true, mode: 0o700 });
-        const now = Date.now();
-        const records = [
-          {
-            schema_version: 1,
-            kind: "coverage",
-            started_at_ms: now - 40 * 24 * 60 * 60 * 1000,
-          },
-          {
-            schema_version: 1,
-            kind: "generation",
-            fact: {
-              id: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-              created_at_ms: now - 2,
-              model: "provider/model",
-              input_tokens: 4,
-              output_tokens: 2,
-              cache_read_tokens: 0,
-              cache_write_tokens: 0,
-              reasoning_tokens: 1,
-              total_cost: 0.01,
-            },
-          },
-          {
-            schema_version: 1,
-            kind: "incident",
-            occurred_at_ms: now - 1,
-            completeness: "incomplete",
-          },
-        ];
-        writeFileSync(
-          join(fxDir, "usage.jsonl"),
-          records.map((record) => JSON.stringify(record)).join("\n") + "\n",
-          { mode: 0o600 },
-        );
-        writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
-        const env = {
-          ...NO_GATEWAY_AUTH,
-          HOME: realpathSync(home),
-          FX_DISABLE_KEYCHAIN: "1",
-        };
-
-        const text = await runFx(["usage"], { env });
-        expect(text.code).toBe(0);
-        expect(text.stdout).toContain("Known totals may be incomplete.");
-        expect(text.stdout).toContain("Total tokens  6");
+        expect(text.stdout).toContain("Grok usage from xAI, updated 15:30 UTC");
+        expect(text.stdout).toContain("Plan          SuperGrok Heavy");
+        expect(text.stdout).toContain("Used          63% of the weekly allowance, resets Oct 14, 2026 20:30 UTC");
+        expect(text.stdout).toContain("Credits       $12.50");
+        expect(text.stdout).toContain("Pay as you go $3.00 of $100.00 this month");
+        expect(fixture.fake.requests.map((request) => request.path).sort()).toEqual(["/billing", "/settings"]);
+        for (const request of fixture.fake.requests) {
+          expect(request.grokUser).toBe("acct_grok_e2e");
+        }
+        expect(fixture.fake.requests.find((request) => request.path === "/billing")?.query.get("format"))
+          .toBe("credits");
 
         const json = await runFx(["usage", "--json"], { env });
-        expect(json.code).toBe(0);
-        expect(JSON.parse(json.stdout)).toMatchObject({
-          completeness: "incomplete",
-          totals: { total_tokens: 6, spend: 0.01 },
-        });
+        expect(JSON.parse(json.stdout)).toMatchObject({ source: "grok", status: "ready" });
       } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "fx usage distinguishes empty, invalid, corrupt, and unsafe local state",
-    async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-usage-states-"));
-      try {
-        const home = realpathSync(root);
-        const env = { ...NO_GATEWAY_AUTH, HOME: home, FX_DISABLE_KEYCHAIN: "1" };
-        const empty = await runFx(["usage", "--json"], { env });
-        expect(empty.code).toBe(0);
-        expect(JSON.parse(empty.stdout)).toMatchObject({
-          coverage: { status: "not_started" },
-          totals: null,
-        });
-        expect(existsSync(join(home, ".fx"))).toBe(false);
-
-        const invalid = await runFx(
-          ["usage", "--period", "session", "--json"],
-          { env },
-        );
-        expect(invalid.code).toBe(1);
-        expect(JSON.parse(invalid.stdout)).toMatchObject({
-          kind: "usage",
-          code: "InvalidUsageArgs",
-        });
-
-        const fxDir = join(home, ".fx");
-        mkdirSync(fxDir, { mode: 0o700 });
-        chmodSync(fxDir, 0o700);
-        writeFileSync(
-          join(fxDir, "usage.jsonl"),
-          `${JSON.stringify({
-            schema_version: 1,
-            kind: "coverage",
-            started_at_ms: Date.now() - 1,
-          })}\n`,
-          { mode: 0o600 },
-        );
-        if (platform() !== "win32") {
-          chmodSync(fxDir, 0o755);
-          const entries = readdirSync(fxDir);
-          const unsafeDirectory = await runFx(["usage", "--json"], { env });
-          expect(unsafeDirectory.code).toBe(1);
-          expect(JSON.parse(unsafeDirectory.stdout)).toMatchObject({
-            kind: "usage",
-            code: "PrivateStatePermissionsUnsupported",
-          });
-          expect(lstatSync(fxDir).mode & 0o777).toBe(0o755);
-          expect(readdirSync(fxDir)).toEqual(entries);
-          chmodSync(fxDir, 0o700);
-        }
-        writeFileSync(join(fxDir, "usage.jsonl"), "{\"broken\":true}\n", {
-          mode: 0o600,
-        });
-        writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
-        const corrupt = await runFx(["usage", "--json"], { env });
-        expect(corrupt.code).toBe(1);
-        expect(JSON.parse(corrupt.stdout)).toMatchObject({
-          kind: "usage",
-          code: "InvalidUsageStore",
-        });
-
-        if (platform() !== "win32") {
-          rmSync(join(fxDir, "usage.jsonl"));
-          const fifo = spawnSync("mkfifo", [join(fxDir, "usage.jsonl")]);
-          expect(fifo.status).toBe(0);
-          const special = await runFx(["usage", "--json"], { env });
-          expect(special.code).toBe(1);
-          expect(JSON.parse(special.stdout)).toMatchObject({
-            kind: "usage",
-            code: "DurablePathUnsafe",
-          });
-
-          rmSync(join(fxDir, "usage.jsonl"));
-          const socketPath = join(fxDir, "usage.jsonl");
-          const server = createServer();
-          await new Promise<void>((resolve, reject) => {
-            server.once("error", reject);
-            server.listen(socketPath, () => {
-              server.off("error", reject);
-              resolve();
-            });
-          });
-          try {
-            const socket = await runFx(["usage", "--json"], { env });
-            expect(socket.code).toBe(1);
-            expect(JSON.parse(socket.stdout)).toMatchObject({
-              kind: "usage",
-              code: "DurablePathUnsafe",
-            });
-          } finally {
-            await new Promise<void>((resolve) => server.close(() => resolve()));
-          }
-        }
-      } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "fx usage preserves known totals but fails closed when recovery storage is unsafe",
-    async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-usage-recovery-"));
-      try {
-        const home = join(root, "home");
-        const fxDir = join(home, ".fx");
-        mkdirSync(fxDir, { recursive: true, mode: 0o700 });
-        chmodSync(fxDir, 0o700);
-        writeFileSync(
-          join(fxDir, "usage.jsonl"),
-          [
-            {
-              schema_version: 1,
-              kind: "coverage",
-              started_at_ms: Date.now() - 40 * 24 * 60 * 60 * 1000,
-            },
-            {
-              schema_version: 1,
-              kind: "generation",
-              fact: {
-                id: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-                created_at_ms: Date.now() - 1,
-                model: "provider/model",
-                input_tokens: 4,
-                output_tokens: 2,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-                reasoning_tokens: 1,
-                total_cost: 0.01,
-              },
-            },
-          ].map((record) => JSON.stringify(record)).join("\n") + "\n",
-          { mode: 0o600 },
-        );
-        writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
-        const outside = join(root, "outside");
-        writeFileSync(outside, "not a session directory");
-        symlinkSync(outside, join(fxDir, "sessions"));
-
-        const result = await runFx(["usage", "--json"], {
-          env: {
-            ...NO_GATEWAY_AUTH,
-            HOME: realpathSync(home),
-            FX_DISABLE_KEYCHAIN: "1",
-          },
-        });
-        expect(result.code).toBe(0);
-        expect(result.stderr).toBe("");
-        expect(JSON.parse(result.stdout)).toMatchObject({
-          kind: "usage",
-          coverage: { status: "full" },
-          completeness: "incomplete",
-          totals: { total_tokens: 6, spend: 0.01 },
-        });
-      } finally {
-        rmSync(root, { recursive: true, force: true });
+        fixture.stop();
       }
     },
     TIMEOUT,

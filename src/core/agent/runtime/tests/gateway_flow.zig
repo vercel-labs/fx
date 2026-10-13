@@ -10,7 +10,6 @@ const worker_runtime = @import("../../worker_runtime.zig");
 const session_runtime = @import("../../../session/session.zig");
 const session_codec = @import("../../../session/session_codec.zig");
 const session_store = @import("../../../session/session_store.zig");
-const session_usage = @import("../../../session/session_usage.zig");
 const model_capabilities = @import("../../../config/model_capabilities.zig");
 const model_provider = @import("../../../config/model_provider.zig");
 const debug_trace = @import("../../../shared/debug_trace.zig");
@@ -178,46 +177,6 @@ test "processQueuedPrompt projects lifecycle session identity to the provider" {
         "session-provider-123",
         gateway.request_session_ids.items[0].?,
     );
-}
-
-test "processQueuedPrompt accounts exact direct-provider usage without deferred capability" {
-    const alloc = std.testing.allocator;
-    const completions = [_]FakeCompletion{.{
-        .content = "ok",
-        .generation_id = "response-codex-1",
-        .billing = .{
-            .created_at_ms = 1,
-            .model = "codex/gpt-test",
-            .total_cost = 0,
-            .input_tokens = 17,
-            .output_tokens = 7,
-            .cache_read_tokens = 0,
-            .cache_write_tokens = 0,
-            .reasoning_tokens = null,
-            .billable_web_search_calls = 0,
-        },
-        .exact_usage_provider = .codex,
-    }};
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.usage = &usage;
-    defer hooks.deinit();
-    var fixture = PromptFixture{};
-    var config = fixture.config();
-    config.provider_capabilities = .{};
-    var job = fixture.job();
-    job.provider = .codex;
-
-    try runFakePrompt(&gateway, &hooks, config, job);
-
-    var snapshot = try usage.snapshot(alloc);
-    defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(@as(u64, 17), snapshot.input_tokens);
-    try std.testing.expectEqual(@as(u64, 7), snapshot.output_tokens);
-    try std.testing.expectEqual(@as(?u64, 1), snapshot.request_count);
 }
 
 test "terminal assistant completion continues with steering admitted during the response" {
@@ -604,8 +563,6 @@ fn runScriptedVision(
         .gateway_team = null,
         .retry_count = 1,
         .cancel_flag = null,
-        .usage = null,
-        .usage_allocator = alloc,
         .trace_ctx = .{},
         .output_limit = .{
             .value = .{ .bytes = output_limit_bytes },
@@ -8574,26 +8531,11 @@ test "Codex 401 replay keeps payload and semantic recovery unchanged for the cap
         .{
             .content = "Done.",
             .generation_id = "response-replay-success",
-            .billing = .{
-                .created_at_ms = 1,
-                .model = "codex/gpt-test",
-                .total_cost = 0,
-                .input_tokens = 17,
-                .output_tokens = 7,
-                .cache_read_tokens = 0,
-                .cache_write_tokens = 0,
-                .reasoning_tokens = null,
-                .billable_web_search_calls = 0,
-            },
-            .exact_usage_provider = .codex,
         },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
     var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.usage = &usage;
     hooks.credential_refresh_tokens = &.{ "stale-loaded", "fresh-token" };
     hooks.enable_recovery_checkpoint = true;
     defer hooks.deinit();
@@ -8612,13 +8554,44 @@ test "Codex 401 replay keeps payload and semantic recovery unchanged for the cap
     try std.testing.expectEqualStrings("acct-a", hooks.last_credential_refresh_expected_account.?);
     try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_count);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
-    var usage_snapshot = try usage.snapshot(alloc);
-    defer usage_snapshot.deinit(alloc);
-    try std.testing.expectEqual(@as(u64, 17), usage_snapshot.input_tokens);
-    try std.testing.expectEqual(@as(u64, 7), usage_snapshot.output_tokens);
-    try std.testing.expectEqual(@as(?u64, 1), usage_snapshot.request_count);
-    try std.testing.expectEqual(@as(u64, 3), usage_snapshot.next_sequence);
-    try std.testing.expectEqual(@as(u64, 2), usage_snapshot.settled_through_sequence);
+}
+
+test "a lost session writer stops the turn before the completion's tool calls run" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &.{toolCall("unsaved-tool", "read_file", "{\"path\":\"a.txt\"}")} },
+        .{ .content = "never requested" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.session_writer_error = error.SessionWriterParked;
+    var fixture = PromptFixture{};
+
+    try std.testing.expectError(error.SessionWriterParked, runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()));
+    try std.testing.expectEqual(@as(usize, 1), hooks.session_writer_checks);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+}
+
+test "a session writer check that fails for another reason does not stop the turn" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &.{toolCall("saved-tool", "read_file", "{\"path\":\"a.txt\"}")} },
+        .{ .content = "Done." },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.session_writer_error = error.AccessDenied;
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    try std.testing.expectEqual(@as(usize, 2), hooks.session_writer_checks);
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
 }
 
 test "Codex 401 account change makes no second provider request" {

@@ -316,8 +316,6 @@ pub const Context = struct {
             .endpoint = self.gateway_chat_url,
             .reviewer_model = self.reviewer_model,
             .cancel_flag = self.cancel_flag,
-            .usage = &self.session.usage,
-            .usage_allocator = self.session_allocator,
         });
     }
 };
@@ -1338,8 +1336,6 @@ fn executeVisionRequest(
         .session_id = state.runtime.lifecycle_scope.session_id,
         .retry_count = state.runtime.gateway_retry_count,
         .cancel_flag = state.runtime.cancel_flag,
-        .usage = &state.runtime.session.usage,
-        .usage_allocator = state.runtime.session_allocator,
         .trace_ctx = .{},
         .output_limit = state.runtime.context_limits.image_adapter_output_bytes,
     };
@@ -7023,8 +7019,7 @@ const VisionGatewayFixture = struct {
         try request.admission.admit();
         request.delivery.markPossiblySent();
         if (response.status != .ok) return .{ .failed = .{ .kind = .provider_error } };
-        const credential_source = request.credential.credentialSource() orelse
-            return error.MissingCredentialSource;
+        if (request.credential.credentialSource() == null) return error.MissingCredentialSource;
         return .{ .completed = .{
             .completion = .{
                 .content = response.content,
@@ -7032,17 +7027,6 @@ const VisionGatewayFixture = struct {
                 .finish_reason = .stop,
                 .usage = response.usage,
             },
-            .usage = .{ .deferred = .{
-                .provider = .gateway,
-                .generation_id = response.generation_id orelse "gen_test",
-                .scope = "https://ai-gateway.vercel.sh",
-                .tenant = request.credential.tenant(),
-                .credential_source = credential_source,
-                .credential_identity = credential_authority.derive(
-                    credential_source,
-                    request.credential.accountId(),
-                ),
-            } },
         } };
     }
 };
@@ -7619,9 +7603,6 @@ test "vision runtime resolves historical authorized images and batches twenty as
     }
     try std.testing.expectEqual(@as(u64, 18), result.inner_usage.?.input_tokens);
     try std.testing.expectEqual(@as(u64, 23), result.inner_usage.?.output_tokens);
-    var usage_snapshot = try rt.session.usage.snapshot(alloc);
-    defer usage_snapshot.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 3), usage_snapshot.pending.len);
 }
 
 test "vision runtime rejects unauthorized ids before filesystem or provider access" {

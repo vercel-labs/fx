@@ -1706,6 +1706,10 @@ pub const GatewayCredential = struct {
     api_key: ?[]const u8,
     gateway_team: ?[]const u8,
     source: credentials.Source,
+    /// The fx login account, when the credential carries one.
+    account: ?[]const u8 = null,
+    /// The fx login team's slug, for display.
+    team_slug: ?[]const u8 = null,
 };
 
 pub const ProviderCredentialSelection = union(enum) {
@@ -1878,6 +1882,8 @@ pub const Runtime = struct {
             .api_key = credential.token,
             .gateway_team = credential.gatewayTeam(),
             .source = credential.source,
+            .account = credential.account_id,
+            .team_slug = credential.team_slug,
         };
     }
 

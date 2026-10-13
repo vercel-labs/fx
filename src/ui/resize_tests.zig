@@ -11,7 +11,7 @@ const diff_mod = @import("../core/output/diff.zig");
 const io_mod = @import("../core/shared/io.zig");
 const shared_theme = @import("../core/shared/theme.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
-const usage_report = @import("../core/session/usage_report.zig");
+const usage = @import("../usage/usage.zig");
 const workspace_access = @import("../core/workspace/workspace_access.zig");
 const types = @import("../core/shared/types.zig");
 const assistant_presentation = @import("../core/agent/assistant_presentation.zig");
@@ -994,41 +994,34 @@ fn expectGridContains(h: *Harness, needle: []const u8) !void {
 
 test "responsive compact menus stay inline across the VT width matrix" {
     const alloc = std.testing.allocator;
-    var models: [25]usage_report.ModelUsage = undefined;
+    var models: [25]usage.report.ModelRow = undefined;
     for (&models) |*model| {
         model.* = .{
-            .model = @constCast("provider/model"),
-            .totals = .{
-                .total_tokens = 1,
-                .input_tokens = 1,
-                .output_tokens = 0,
-                .cache_read_tokens = 0,
-                .cache_write_tokens = 0,
-                .reasoning_tokens = null,
-                .request_count = 1,
-                .total_cost = 0.0001,
-            },
+            .model = "provider/model",
+            .totals = .{ .request_count = 1, .input_tokens = 1, .total_cost = 0.0001 },
         };
     }
-    const usage_snapshot = usage_report.Snapshot{
-        .scope = .days_30,
-        .snapshot_time_ms = 100,
-        .window_start_ms = 0,
-        .coverage_started_at_ms = 0,
-        .coverage = .full,
-        .completeness = .complete,
-        .totals = .{
-            .total_tokens = 25,
-            .input_tokens = 25,
-            .output_tokens = 0,
-            .cache_read_tokens = 0,
-            .cache_write_tokens = 0,
-            .reasoning_tokens = null,
-            .request_count = 25,
-            .total_cost = 0.0025,
-        },
-        .models = &models,
+    var usage_views: [usage.Period.all.len]usage.View = undefined;
+    for (&usage_views, usage.Period.all) |*v, period| {
+        v.* = .{
+            .arena = std.heap.ArenaAllocator.init(alloc),
+            .period = period,
+            .models = &models,
+            .totals = .{ .request_count = 25, .input_tokens = 25, .total_cost = 0.0025 },
+            .today_current = true,
+            .finished_current = true,
+            .fetched_at_ms = 0,
+            .budget = null,
+        };
+    }
+    var usage_snapshot: usage.Snapshot = .{
+        .arena = std.heap.ArenaAllocator.init(alloc),
+        .views = usage_views,
+        .status = .ready,
+        .label = "team (fx login)",
+        .now_ms = 0,
     };
+    defer usage_snapshot.deinit();
     var entries = [_]workspace_access.Entry{.{
         .path = @constCast("/workspace/long-additional-directory"),
         .saved = true,
@@ -1071,7 +1064,7 @@ test "responsive compact menus stay inline across the VT width matrix" {
         ctx.statusline_menu = .{};
         ctx.usage_menu = .{
             .active = true,
-            .scope = .days_30,
+            .period = .month,
             .selected_model = models.len - 1,
             .model_window_start = models.len - 1,
             .snapshot = &usage_snapshot,
@@ -1079,9 +1072,9 @@ test "responsive compact menus stay inline across the VT width matrix" {
         h.frame_redraw = true;
         try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
         try h.flush();
-        try expectGridContains(&h, "[30 days]");
+        try expectGridContains(&h, "model (month)");
         try std.testing.expectEqual(
-            @as(usize, 20),
+            @as(usize, 10),
             try countGridOccurrences(&h, "provider/model"),
         );
 

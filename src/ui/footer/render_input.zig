@@ -12,7 +12,7 @@ const mcp_runtime = @import("../../core/mcp/mcp_runtime.zig");
 const picker_state = @import("../../core/input/picker_state.zig");
 const session_catalog = @import("../../core/session/session_catalog.zig");
 const session_store = @import("../../core/session/session_store.zig");
-const usage_report = @import("../../core/session/usage_report.zig");
+const usage_presentation = @import("usage_presentation.zig");
 const command_specs = @import("../../core/slash_commands/command_specs.zig");
 const settings_catalog = @import("../../core/config/settings_catalog.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
@@ -296,27 +296,21 @@ pub fn statuslineMenuProjection(
     };
 }
 
-pub const UsageMenuProjection = struct {
-    active: bool = false,
-    scope: usage_report.Scope = .days_30,
-    selected_model: usize = 0,
-    expanded_model: ?usize = null,
-    model_window_start: usize = 0,
-    snapshot: ?*const usage_report.Snapshot = null,
-    refresh_error: ?[]const u8 = null,
-};
+pub const UsageMenuProjection = usage_presentation.Projection;
+pub const usageShowsTables = usage_presentation.showsTables;
+pub const usageIsPlan = usage_presentation.isPlan;
+pub const usageCodexHasPeriods = usage_presentation.codexHasPeriods;
 
 pub fn usageMenuProjection(
     menu: *const usage_menu.State,
 ) UsageMenuProjection {
     return .{
         .active = menu.active,
-        .scope = menu.scope(),
+        .period = menu.period,
         .selected_model = menu.selected_model,
-        .expanded_model = menu.expanded_model,
         .model_window_start = menu.model_window_start,
+        .detail = menu.detail,
         .snapshot = if (menu.snapshot) |*snapshot| snapshot else null,
-        .refresh_error = menu.refresh_error,
     };
 }
 

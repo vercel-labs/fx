@@ -223,9 +223,6 @@ pub fn loadSchemaV3ReadOnly(
     {
         return error.InvalidSessionFormat;
     }
-    if (replayed.state.usage) |usage| if (usage.billing == .legacy) {
-        @import("../shared/debug_trace.zig").logf("session", "legacy usage unavailable session_id={s} source_schema=3", .{session_id});
-    };
     if (try replayed.state.archive_legacy_recovery(alloc)) {
         @import("../shared/debug_trace.zig").logf("session", "legacy recovery archived session_id={s} reason=unverifiable_route_authority", .{session_id});
     }
@@ -416,10 +413,6 @@ test "schema v3 import follows the committed watermark beyond a stale manifest" 
     const generation: [16]u8 = @splat(1);
     const event_id: [16]u8 = @splat(2);
     const language = try session.ConversationLanguage.fromSlice("en");
-    var usage = @import("session_usage.zig").Usage.initFresh();
-    defer usage.deinit(alloc);
-    var usage_snapshot = try usage.snapshot(alloc);
-    defer usage_snapshot.deinit(alloc);
     const started = try session_event.encodeLegacyFixtureFrame(alloc, .{
         .log_generation = generation,
         .seq = 1,
@@ -432,7 +425,6 @@ test "schema v3 import follows the committed watermark beyond a stale manifest" 
             .workspace_root = @constCast("/workspace"),
             .conversation_language = language,
             .preferences = .{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false },
-            .usage = usage_snapshot,
         } },
     });
     defer alloc.free(started);

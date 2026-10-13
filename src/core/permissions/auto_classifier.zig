@@ -5,7 +5,6 @@ const diff_mod = @import("../output/diff.zig");
 const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const io_mod = @import("../shared/io.zig");
 const permissions = @import("permissions.zig");
-const session_usage = @import("../session/session_usage.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 
@@ -325,8 +324,6 @@ pub const ProviderInput = struct {
     /// FX_REVIEW_MODEL). Empty means the provider's compiled default.
     reviewer_model: []const u8 = "",
     cancel_flag: ?*std.atomic.Value(bool) = null,
-    usage: ?*session_usage.Usage = null,
-    usage_allocator: std.mem.Allocator = std.heap.c_allocator,
 };
 
 pub const ProviderFn = *const fn (

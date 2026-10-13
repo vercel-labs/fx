@@ -508,14 +508,6 @@ pub fn Runtime(comptime App: type) type {
                         startup.prompt_history_store_allowed,
                     )) == .unavailable;
             }
-            if (comptime @hasField(App, "session") and
-                @hasDecl(@TypeOf(app.session), "initializeProfileUsage"))
-            {
-                _ = try app.session.initializeProfileUsage(
-                    app.alloc,
-                    shared_io.homeDir(),
-                );
-            }
 
             var selected_model = startup.takeSelectedModel();
             defer if (selected_model.len > 0) app.alloc.free(selected_model);

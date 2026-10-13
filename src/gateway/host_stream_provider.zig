@@ -202,7 +202,6 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     signalConsumed(transport, opened.handle, request, completion);
     return .{ .completed = .{
         .completion = completion,
-        .usage = gatewayUsageOutcome(request, completion),
         .ownership = .owned,
     } };
 }
@@ -455,38 +454,6 @@ fn buildRequest(
 ) anyerror![]u8 {
     const context: *ProviderContext = @ptrCast(@alignCast(raw.?));
     return context.build_fn(alloc, request);
-}
-
-fn gatewayUsageOutcome(
-    request: stream_provider.ModelRequest,
-    completion: @import("../core/shared/types.zig").ModelCompletion,
-) stream_provider.UsageOutcome {
-    const reference = gatewayUsageReference(request, completion) orelse
-        return .{ .unavailable = .possibly_billed };
-    return if (completion.billing != null)
-        .{ .exact = .gateway }
-    else
-        .{ .deferred = reference };
-}
-
-fn gatewayUsageReference(
-    request: stream_provider.ModelRequest,
-    completion: @import("../core/shared/types.zig").ModelCompletion,
-) ?stream_provider.DeferredUsageReference {
-    const generation_id = completion.generation_id orelse return null;
-    const source = request.credential.credentialSource() orelse return null;
-    return .{
-        .provider = .gateway,
-        .generation_id = generation_id,
-        .scope = gateway_client.generationBaseUrl(),
-        .tenant = request.credential.tenant(),
-        .account_id = request.credential.accountId(),
-        .credential_source = source,
-        .credential_identity = credential_authority.derive(
-            source,
-            request.credential.accountId(),
-        ),
-    };
 }
 
 const EventBridge = struct {

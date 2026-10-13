@@ -331,8 +331,6 @@ pub fn Runtime(comptime App: type) type {
                         .worker_model = provider_runtime.model(app),
                         .gateway_retry_count = gateway_retry_count,
                         .gateway_chat_url = gateway_chat_url,
-                        .usage = &app.session.usage,
-                        .usage_allocator = app.alloc,
                     });
                     ctx.web_search_backend = app.web_search_runtime.dispatchBackend();
                 }
@@ -808,8 +806,6 @@ pub fn Runtime(comptime App: type) type {
                         .worker_model = provider_runtime.model(app),
                         .gateway_retry_count = gateway_retry_count,
                         .gateway_chat_url = gateway_chat_url,
-                        .usage = &app.session.usage,
-                        .usage_allocator = app.alloc,
                     });
                     ctx.web_search_backend = app.web_search_runtime.dispatchBackend();
                 }
@@ -1138,8 +1134,6 @@ pub fn Runtime(comptime App: type) type {
                 .max_output_tokens = model_capabilities.requestOutputTokens(capabilities),
                 .capabilities_context = deps.ctx,
                 .capabilities_fn = deps.available_model_capabilities,
-                .usage = deps.usage,
-                .usage_allocator = deps.usage_allocator,
             };
             const result = agent_runtime.compactContext(arena, &deps, .{
                 .operation_id = operation_id,

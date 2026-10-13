@@ -34,7 +34,6 @@ const session_codec = @import("../session/session_codec.zig");
 const session_store = @import("../session/session_store.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const subagent_resume_admission = @import("../subagent/resume_admission.zig");
-const usage_report = @import("../session/usage_report.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const types = @import("../shared/types.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -57,7 +56,8 @@ const profile_paths = @import("../shared/profile_paths.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
-const usage_cli_runtime = @import("usage_cli_runtime.zig");
+const usage = @import("../../usage/usage.zig");
+const usage_host = @import("../app/usage_host.zig");
 
 const slack_install = @import("../slack/install.zig");
 const Allocator = std.mem.Allocator;
@@ -287,7 +287,7 @@ const SessionListOptions = struct {
 
 const UsageOptions = struct {
     format: output_contracts.OutputFormat = .text,
-    scope: usage_report.Scope = .days_30,
+    period: usage.Period = .month,
 };
 
 const WorkspaceOptions = struct {
@@ -1874,31 +1874,53 @@ fn runNonInteractiveWithDeps(
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .usage, "usage", err, rest);
                 return .handled_failure;
             };
-            const home = deps.getenv(deps.env_ctx, "HOME") orelse {
-                try writeUsageCommandFailure(
-                    alloc,
-                    deps,
-                    error.HomeNotSet,
-                    opts.format,
-                );
+            // A relative $HOME counts as unset, as everywhere else in fx.
+            const home = deps.getenv(deps.env_ctx, "HOME") orelse "";
+            if (!std.Io.Dir.path.isAbsolute(home)) {
+                try writeUsageCommandFailure(alloc, deps, error.HomeNotSet, opts.format);
                 return .handled_failure;
-            };
-            var report = usage_cli_runtime.collect(
-                alloc,
-                home,
-                opts.scope,
-                @max(io_mod.milliTimestamp(), 0),
-            ) catch |err| {
+            }
+            var startup = (if (cfg.auth_mode == .host_managed)
+                deps.load_startup_state_with_auth_mode(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.secret_store,
+                    cfg.default_model,
+                    cfg.default_agent_step_limit,
+                    cfg.auth_mode,
+                )
+            else
+                deps.load_startup_state(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.secret_store,
+                    cfg.default_model,
+                    cfg.default_agent_step_limit,
+                )) catch |err| {
                 try writeUsageCommandFailure(alloc, deps, err, opts.format);
                 return .handled_failure;
             };
-            defer report.deinit(alloc);
-            const text = try (output_contracts.UsageSnapshot{
-                .report = &report,
-            }).render(alloc, opts.format);
+            defer startup.deinit(alloc);
+
+            var dashboard = usage.Dashboard.init(alloc, usage_host.host(home));
+            defer dashboard.deinit();
+            var label_buf: usage_host.LabelBuffer = undefined;
+            if (startup.credential) |c| {
+                if (usage_host.fromCredential(c, &label_buf)) |credential| {
+                    dashboard.open(credential);
+                } else {
+                    dashboard.openUnavailable(.unsupported_provider);
+                }
+            } else {
+                dashboard.openUnavailable(.no_gateway_sign_in);
+            }
+            dashboard.waitForFetch();
+            var snapshot = try dashboard.snapshot(alloc);
+            defer snapshot.deinit();
+            const text = try (output_contracts.UsageSnapshot{ .snapshot = &snapshot, .period = opts.period }).render(alloc, opts.format);
             defer alloc.free(text);
             try writeFormattedOutput(deps, text, opts.format);
-            return .handled_success;
+            return if (snapshot.status == .ready) .handled_success else .handled_failure;
         },
         .upgrade => |rest| {
             const upgrade_runtime = @import("../upgrade/upgrade_runtime.zig");
@@ -2986,8 +3008,8 @@ fn usageFailureMessage(err: anyerror) []const u8 {
         error.HomeNotSet => "HOME is not set",
         error.DurablePathUnsafe,
         error.PrivateStatePermissionsUnsupported,
-        => "local usage storage is unsafe",
-        else => "local usage data is unavailable",
+        => "the ~/.fx folder is unsafe",
+        else => "couldn't load the fx profile",
     };
 }
 
@@ -3935,12 +3957,12 @@ fn parseUsageArgs(args: []const [:0]const u8) !UsageOptions {
             if (period_seen or index + 1 >= args.len) return error.InvalidUsageArgs;
             period_seen = true;
             index += 1;
-            options.scope = if (std.mem.eql(u8, args[index], "24h"))
-                .hours_24
+            options.period = if (std.mem.eql(u8, args[index], "today"))
+                .today
             else if (std.mem.eql(u8, args[index], "7d"))
                 .days_7
-            else if (std.mem.eql(u8, args[index], "30d"))
-                .days_30
+            else if (std.mem.eql(u8, args[index], "month"))
+                .month
             else
                 return error.InvalidUsageArgs;
             continue;
@@ -4308,9 +4330,9 @@ test "help aliases route to help" {
     try std.testing.expectEqual(Command.help, parse(command_catalog, &.{@constCast("-h")}));
 }
 
-test "usage arguments accept only rolling periods and one JSON flag" {
+test "usage arguments accept today, 7d or 30d and one JSON flag" {
     const defaults = try parseUsageArgs(&.{});
-    try std.testing.expectEqual(usage_report.Scope.days_30, defaults.scope);
+    try std.testing.expectEqual(usage.Period.month, defaults.period);
     try std.testing.expectEqual(output_contracts.OutputFormat.text, defaults.format);
 
     const selected = try parseUsageArgs(&.{
@@ -4318,13 +4340,15 @@ test "usage arguments accept only rolling periods and one JSON flag" {
         @constCast("--period"),
         @constCast("7d"),
     });
-    try std.testing.expectEqual(usage_report.Scope.days_7, selected.scope);
+    try std.testing.expectEqual(usage.Period.days_7, selected.period);
+    try std.testing.expectEqual(usage.Period.today, (try parseUsageArgs(&.{ @constCast("--period"), @constCast("today") })).period);
     try std.testing.expectEqual(output_contracts.OutputFormat.json, selected.format);
 
     for ([_][]const [:0]const u8{
         &.{@constCast("--period")},
         &.{ @constCast("--period"), @constCast("session") },
-        &.{ @constCast("--period"), @constCast("24h"), @constCast("--period"), @constCast("7d") },
+        &.{ @constCast("--period"), @constCast("24h") },
+        &.{ @constCast("--period"), @constCast("today"), @constCast("--period"), @constCast("7d") },
         &.{ @constCast("--json"), @constCast("--json") },
         &.{@constCast("30d")},
     }) |invalid| {

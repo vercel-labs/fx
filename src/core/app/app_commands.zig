@@ -39,9 +39,8 @@ const text_utils = @import("../shared/text_utils.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 const session_commands = @import("../session/session_commands.zig");
 const web_picker_runtime = @import("web_picker_runtime.zig");
-const usage_recovery = @import("../session/usage_recovery.zig");
-const usage_dashboard_runtime = @import("usage_dashboard_runtime.zig");
-const usage_report = @import("../session/usage_report.zig");
+const usage = @import("../../usage/usage.zig");
+const usage_host = @import("usage_host.zig");
 const types = @import("../shared/types.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
@@ -1063,13 +1062,11 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandShowUsage(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            if (comptime !runtime_profile.allows(App, .profile_usage)) {
-                var usage = try app.session.usage.reportSnapshot(app.alloc);
-                defer usage.deinit(app.alloc);
+            if (comptime !@hasField(App, "usage_dashboard")) {
                 try app.writeDomainNotice(.{
                     .topic = "usage",
                     .tone = .neutral,
-                    .body = "Durable profile usage is unavailable in this host; active session usage remains in memory.",
+                    .body = "Usage is not available in this host.",
                 }, true);
                 return;
             }
@@ -1078,205 +1075,58 @@ pub fn Handlers(comptime App: type) type {
             closeHelpMenuIfPresent(app);
             app.input_runtime.settings_menu.close();
             closeInlineCommandMenusIfPresent(app);
-            if (comptime @hasField(App, "usage_dashboard")) {
-                try openUsageDashboard(app, .days_30);
-                return;
+            var label_buf: usage_host.LabelBuffer = undefined;
+            if (usage_host.credential(&app.auth, &label_buf)) |credential| {
+                app.usage_dashboard.open(credential);
+            } else {
+                app.usage_dashboard.openUnavailable(usage_host.missingReason(&app.auth));
             }
-            var usage = loadUsageSnapshot(app, .days_30) catch |err| {
-                debug_trace.logf(
-                    "usage",
-                    "usage dashboard open failed scope={s} reason={s}",
-                    .{ @tagName(usage_report.Scope.days_30), @errorName(err) },
-                );
-                try app.input_runtime.usage_menu.openError(
-                    app.alloc,
-                    .days_30,
-                    "Local usage data is unavailable",
-                );
-                app.shell.render_requests.request(.footer);
-                return;
-            };
-            errdefer usage.deinit(app.alloc);
-            app.input_runtime.usage_menu.openOwned(app.alloc, usage);
-            app.shell.render_requests.request(.footer);
+            try installUsageSnapshot(app);
         }
 
-        pub fn refreshUsageMenu(
-            app: *App,
-            scope: usage_report.Scope,
-        ) !void {
-            if (comptime @hasField(App, "usage_dashboard")) {
-                if (scope == .session) {
-                    var usage = loadUsageSnapshot(app, scope) catch |err| {
-                        try recordUsageRefreshFailure(app, scope, err);
-                        return;
-                    };
-                    errdefer usage.deinit(app.alloc);
-                    installUsageSnapshot(app, usage);
-                    return;
-                }
-                if (try app.usage_dashboard.snapshot(app.alloc, scope)) |usage| {
-                    installUsageSnapshot(app, usage);
-                    return;
-                }
-                app.input_runtime.usage_menu.setLoadingScope(app.alloc, scope);
-                try requestUsageDashboardRefresh(app);
-                app.shell.render_requests.request(.footer);
-                return;
-            }
-            var usage = loadUsageSnapshot(app, scope) catch |err| {
-                try recordUsageRefreshFailure(app, scope, err);
-                return;
-            };
-            errdefer usage.deinit(app.alloc);
-            installUsageSnapshot(app, usage);
+        /// Tab and ←→: lists `period` in the model table; never fetches.
+        pub fn refreshUsageMenu(app: *App, period: usage.Period) !void {
+            if (comptime !@hasField(App, "usage_dashboard")) return;
+            if (app.input_runtime.usage_menu.setPeriod(period)) app.shell.render_requests.request(.footer);
         }
 
-        pub fn reloadUsageMenu(
-            app: *App,
-            scope: usage_report.Scope,
-        ) !void {
-            if (comptime !@hasField(App, "usage_dashboard")) {
-                try refreshUsageMenu(app, scope);
-                return;
-            }
-            if (scope == .session) {
-                try refreshUsageMenu(app, scope);
-                return;
-            }
-            app.input_runtime.usage_menu.requested_scope = scope;
-            requestUsageDashboardRefresh(app) catch |err| {
-                try recordUsageRefreshFailure(app, scope, err);
-                return;
-            };
-            app.shell.render_requests.request(.footer);
+        /// `r`: fetches unless a fetch is already running, then redraws.
+        pub fn reloadUsageMenu(app: *App, period: usage.Period) !void {
+            if (comptime !@hasField(App, "usage_dashboard")) return;
+            _ = period;
+            _ = app.usage_dashboard.refresh();
+            try installUsageSnapshot(app);
         }
 
+        /// Runs on every event-loop pass while `/usage` is open: starts the
+        /// periodic refresh when due, and redraws when the dashboard changed
+        /// or the minute turned ("updated 2m ago", and today at midnight).
         pub fn collectUsageDashboardFacts(app: *App) !bool {
             if (comptime !@hasField(App, "usage_dashboard")) return false;
-            const transition = app.usage_dashboard.pollTransition();
-            if (transition == .none) return false;
-            if (!app.input_runtime.usage_menu.active or
-                app.input_runtime.usage_menu.navigationScope() == .session)
-            {
-                return false;
-            }
-            const scope = app.input_runtime.usage_menu.navigationScope();
-            if (transition == .failed) {
-                const err = app.usage_dashboard.lastError() orelse
-                    error.ProfileUsageUnavailable;
-                try recordUsageRefreshFailure(app, scope, err);
-                return true;
-            }
-            if (try app.usage_dashboard.snapshot(app.alloc, scope)) |usage| {
-                installUsageSnapshot(app, usage);
-                return true;
-            }
-            const err = app.usage_dashboard.lastError() orelse
-                error.ProfileUsageUnavailable;
-            try recordUsageRefreshFailure(app, scope, err);
+            const menu = &app.input_runtime.usage_menu;
+            if (!menu.active) return false;
+            app.usage_dashboard.tick();
+            const changed = app.usage_dashboard.generationCount() != menu.generation;
+            const shown_minute = if (menu.snapshot) |*s| @divFloor(s.now_ms, std.time.ms_per_min) else 0;
+            const minute_turned = @divFloor(app.usage_dashboard.nowMs(), std.time.ms_per_min) != shown_minute;
+            if (!changed and !minute_turned) return false;
+            try installUsageSnapshot(app);
             return true;
         }
 
-        fn openUsageDashboard(
-            app: *App,
-            scope: usage_report.Scope,
-        ) !void {
-            const cached = try app.usage_dashboard.snapshot(app.alloc, scope);
-            if (cached) |usage| {
-                app.input_runtime.usage_menu.openOwned(app.alloc, usage);
-            } else {
-                app.input_runtime.usage_menu.openLoading(app.alloc, scope);
-            }
-            requestUsageDashboardRefresh(app) catch |err| {
-                try recordUsageRefreshFailure(app, scope, err);
-                return;
-            };
+        pub fn closeUsageMenu(app: *App) void {
+            app.input_runtime.usage_menu.close();
+            if (comptime @hasField(App, "usage_dashboard")) app.usage_dashboard.close();
+        }
+
+        fn installUsageSnapshot(app: *App) !void {
+            // Read the generation first, so a fetch finishing in between
+            // still triggers a redraw.
+            const generation = app.usage_dashboard.generationCount();
+            const snapshot = try app.usage_dashboard.snapshot(app.alloc);
+            const menu = &app.input_runtime.usage_menu;
+            if (menu.active) menu.replace(snapshot, generation) else menu.open(snapshot, generation);
             app.shell.render_requests.request(.footer);
-        }
-
-        fn requestUsageDashboardRefresh(app: *App) !void {
-            const home = io_mod.homeDir() orelse return error.HomeNotSet;
-            const availability = try app.session.ensureProfileUsageReadable(
-                app.alloc,
-                home,
-            );
-            if (availability == .unavailable) {
-                return app.session.profile_usage.lastError() orelse
-                    error.ProfileUsageUnavailable;
-            }
-            _ = try app.usage_dashboard.requestRefresh(
-                usage_dashboard_runtime.profileProvider(
-                    &app.session.profile_usage,
-                ),
-                home,
-                @max(io_mod.milliTimestamp(), 0),
-            );
-        }
-
-        fn installUsageSnapshot(
-            app: *App,
-            usage: usage_report.Snapshot,
-        ) void {
-            if (app.input_runtime.usage_menu.active) {
-                app.input_runtime.usage_menu.replaceOwned(app.alloc, usage);
-            } else {
-                app.input_runtime.usage_menu.openOwned(app.alloc, usage);
-            }
-            app.shell.render_requests.request(.footer);
-        }
-
-        fn recordUsageRefreshFailure(
-            app: *App,
-            scope: usage_report.Scope,
-            err: anyerror,
-        ) !void {
-            debug_trace.logf(
-                "usage",
-                "usage dashboard refresh failed scope={s} reason={s}",
-                .{ @tagName(scope), @errorName(err) },
-            );
-            try app.input_runtime.usage_menu.recordRefreshFailure(
-                app.alloc,
-                scope,
-                "Local usage data is unavailable",
-            );
-            app.shell.render_requests.request(.footer);
-        }
-
-        fn loadUsageSnapshot(
-            app: *App,
-            scope: usage_report.Scope,
-        ) !usage_report.Snapshot {
-            if (scope == .session) {
-                return app.session.usage.reportSnapshot(app.alloc);
-            }
-            const home = io_mod.homeDir() orelse return error.HomeNotSet;
-            const availability = try app.session.ensureProfileUsageReadable(
-                app.alloc,
-                home,
-            );
-            if (availability == .unavailable) {
-                return app.session.profile_usage.lastError() orelse
-                    error.ProfileUsageUnavailable;
-            }
-            const snapshot_time_ms = @max(io_mod.milliTimestamp(), 0);
-            var recovery = try usage_recovery.collectFromHomeConservative(
-                app.alloc,
-                home,
-            );
-            defer recovery.deinit(app.alloc);
-            return app.session.profile_usage.snapshot(
-                app.alloc,
-                scope,
-                snapshot_time_ms,
-                .{
-                    .facts = recovery.facts,
-                    .incidents = recovery.incidents,
-                    .pending = recovery.pending,
-                    .unknown_pending = recovery.unknown_pending,
-                },
-            );
         }
 
         fn commandUndoLast(ctx: *anyopaque) !void {
@@ -2001,7 +1851,7 @@ pub fn Handlers(comptime App: type) type {
             if (comptime !@hasField(App, "input_runtime")) return;
             const InputRuntime = @TypeOf(app.input_runtime);
             if (comptime @hasField(InputRuntime, "statusline_menu")) app.input_runtime.statusline_menu.close();
-            if (comptime @hasField(InputRuntime, "usage_menu")) app.input_runtime.usage_menu.close(app.alloc);
+            if (comptime @hasField(InputRuntime, "usage_menu")) closeUsageMenu(app);
             if (comptime @hasField(InputRuntime, "workspace_menu")) app.input_runtime.workspace_menu.close();
         }
 
@@ -2399,13 +2249,7 @@ fn writeCurrentStateSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem
         try writer.print("tokens_total: {d}->{d}\n", .{ app.total_input_tokens, app.total_output_tokens });
     }
     if (comptime @hasField(App, "total_web_search_requests")) {
-        var usage = try app.session.usage.snapshot(alloc);
-        defer usage.deinit(alloc);
-        try writeSearchUsageSummary(
-            writer,
-            app.total_web_search_requests,
-            usage.billable_web_search_calls,
-        );
+        try writer.print("web_search_requests_total: {d}\n", .{app.total_web_search_requests});
     }
     try writeAuthStateSummary(writer, app);
     try writeProcessSummary(writer, alloc);
@@ -3307,11 +3151,6 @@ fn providerToolStatusLabel(status: ?types.PersistedToolStatus) []const u8 {
         .success => "ok",
         .failure => "err",
     } else "pending";
-}
-
-fn writeSearchUsageSummary(writer: *std.Io.Writer, observed: u64, billed: u64) !void {
-    try writer.print("web_search_requests_total: {d} (observed)\n", .{observed});
-    try writer.print("billable_web_search_calls: {d} (billed)\n", .{billed});
 }
 
 noinline fn writeToolCallsSummary(
@@ -5193,19 +5032,6 @@ test "trace provider tool projection keeps the most recent bounded calls" {
     try std.testing.expectEqual(diagnostics.tool_call_ring_capacity, count);
     try std.testing.expectEqualStrings("middle", summaries[0].call_id);
     try std.testing.expectEqualStrings("newest", summaries[count - 1].call_id);
-}
-
-test "trace labels observed and billed search usage independently" {
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-
-    try writeSearchUsageSummary(&out.writer, 3, 1);
-
-    try std.testing.expectEqualStrings(
-        "web_search_requests_total: 3 (observed)\n" ++
-            "billable_web_search_calls: 1 (billed)\n",
-        out.written(),
-    );
 }
 
 test "trace renders web search request count without content" {

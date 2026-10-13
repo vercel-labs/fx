@@ -66,7 +66,7 @@ pub const Runtime = struct {
     pub fn deinit(self: *Runtime, alloc: Allocator) void {
         input_reset.resetPendingTextScalarWithTrace(&self.text_scalar, "shutdown");
         self.paste.deinit(alloc);
-        self.usage_menu.close(alloc);
+        self.usage_menu.close();
         self.edit_state.deinit(alloc);
         self.picker.deinit(alloc);
         self.composer_history.deinit(alloc);

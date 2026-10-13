@@ -3371,14 +3371,14 @@ describe.skipIf(SKIP)("tui: resize", () => {
     },
     {
       issue: "FXC-125",
-      label: "cost",
+      label: "usage",
       width: 120,
       height: 36,
-      surfaceMarker: "[30 days]",
+      surfaceMarker: "not signed in to AI Gateway",
       editedInput: "x",
       async openSurface(active) {
-        await active.sendText("/cost");
-        await active.waitForText("[30 days]", TIMEOUT);
+        await active.sendText("/usage");
+        await active.waitForText("not signed in to AI Gateway", TIMEOUT);
         await active.resizeWindow(60, 12, 500);
       },
     },

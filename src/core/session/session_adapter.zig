@@ -33,7 +33,6 @@ const session_event = @import("session_event.zig");
 const result_store = @import("result_store.zig");
 const session_log = @import("session_log.zig");
 const session_codec = @import("session_codec.zig");
-const session_usage = @import("session_usage.zig");
 const session_layout = @import("session_layout.zig");
 const session_child_store = @import("session_child_store.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
@@ -53,9 +52,6 @@ const PieceKind = std.meta.Tag(Event);
 pub const files_dir_name = profile_paths.session_files_dir_name;
 /// Folder of v2 sessions' hosted terminal state, under `~/.fx` (D45).
 pub const terminal_dir_name = profile_paths.terminal_dir_name;
-/// Folder of the usage-recovery markers of v2 sessions, under `~/.fx`;
-/// v1's readers load only v1 sessions, so v2 markers live apart.
-pub const usage_markers_dir_name = "usage-recovery-v2";
 /// The profile's home folder, opened for listing: creating `~/.fx` in it
 /// syncs it, and Linux cannot sync a folder opened any other way (`O_PATH`).
 fn openHome(home: []const u8) !io_mod.VerifiedDir {
@@ -177,10 +173,18 @@ pub const Store = struct {
     }
 
     /// `~/.fx/{name}`, or null when nothing has made it yet.
+    /// Every caller is about to change the folder, so an existing `~/.fx` is
+    /// made `0700` as every other fx writer makes it: one made by hand or an
+    /// install script keeps the default mode, and refusing it would refuse
+    /// every resume.
     fn openProfileFolder(store: *Store, name: []const u8) !?io_mod.VerifiedDir {
         var home = try openHome(store.home);
         defer home.close();
-        var fx = try io_mod.openVerifiedPrivateDirIfPresent(&home, profile_paths.root_dir_name) orelse return null;
+        _ = home.dir.statFile(io_mod.getIo(), profile_paths.root_dir_name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        var fx = try io_mod.openOrCreateVerifiedPrivateDir(&home, profile_paths.root_dir_name);
         defer fx.close();
         return io_mod.openVerifiedPrivateDirIfPresent(&fx, name);
     }
@@ -552,7 +556,6 @@ pub const Restored = struct {
     language: types.ConversationLanguage,
     preferences: ?session_codec.DurableSessionPreferences = null,
     permission_state: ?session_permission_state.State = null,
-    usage: ?session_usage.Snapshot = null,
     /// The stored title, generated or chosen by the user.
     title: ?[]u8 = null,
     created_at_ms: i64,
@@ -563,7 +566,6 @@ pub const Restored = struct {
         if (restored.title) |value| alloc.free(value);
         if (restored.preferences) |*value| value.deinit(alloc);
         if (restored.permission_state) |*value| value.deinit(alloc);
-        if (restored.usage) |*value| value.deinit(alloc);
         restored.* = undefined;
     }
 };
@@ -916,11 +918,6 @@ pub const Session = struct {
     /// A resumed session with no title: the title its first prompt gives,
     /// owned, written with its next turn end (D52).
     first_title: ?[]u8 = null,
-    /// A usage-recovery marker protects a checkpoint still waiting for the
-    /// profile ledger; it keeps its first time until nothing is pending.
-    usage_marked: bool = false,
-    /// Time of the newest usage checkpoint; each new one is later.
-    usage_at_ms: i64 = 0,
     /// A child's instructions as its `prefs` hold them (D34), owned; null
     /// for a root and for a child without any.
     instructions: ?[]u8 = null,
@@ -1217,8 +1214,10 @@ pub const Session = struct {
         self.startedTurn();
     }
 
-    /// Opens a subagent child's turn as its work starts: a child streams
-    /// nothing, and its tools may store bodies before the commit (D44).
+    /// Opens the turn as its work starts. A subagent child streams nothing,
+    /// and its tools may store bodies before the commit (D44); an ACP prompt
+    /// opens it before the model is asked, so a disk that cannot take the
+    /// turn fails the prompt first.
     pub fn beginTurn(self: *Session) !void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -1698,67 +1697,6 @@ pub const Session = struct {
         return true;
     }
 
-    // -- usage ---------------------------------------------------------------
-
-    /// Saves a usage checkpoint with v1's marker rules: a checkpoint that
-    /// still owes the profile ledger is covered by a marker written first
-    /// (keeping the time of the first such checkpoint), and the marker goes
-    /// once a durable checkpoint owes nothing (`tla/Wiring.tla`
-    /// UsageNeverSilent).
-    pub fn persistUsage(self: *Session, snapshot: session_usage.Snapshot) !void {
-        const now_ms = @max(io_mod.milliTimestamp(), 0);
-        const at_ms = if (now_ms > self.usage_at_ms) now_ms else try std.math.add(i64, self.usage_at_ms, 1);
-        const pending = session_usage.needsProfileRecovery(snapshot);
-        if (pending and !self.usage_marked) {
-            try self.writeUsageMarker(at_ms);
-            self.usage_marked = true;
-        }
-        var arena = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena.deinit();
-        const value = try encodeUsage(arena.allocator(), snapshot, at_ms);
-        _ = try self.write(&.{.{ .set = .{ .key = .usage, .value = value } }});
-        self.usage_at_ms = at_ms;
-        if (pending) return;
-        // Before the first turn a `set` waits in memory, not on disk.
-        if (!self.saved()) return;
-        self.clearUsageMarker();
-        self.usage_marked = false;
-    }
-
-    fn writeUsageMarker(self: *Session, now_ms: i64) !void {
-        var dir = try self.openUsageMarkers();
-        defer dir.close();
-        var buffer: [48]u8 = undefined;
-        const content = try std.mem.print(&buffer, "v1 {d}\n", .{now_ms});
-        // A full disk stops the turn here, before the model is asked, so it
-        // must read as one (D29) and not as a failed replace.
-        var cause: ?anyerror = null;
-        io_mod.durableReplaceVerifiedWithOps(self.alloc, &dir, self.id(), content, .{ .pre_rename_cause = &cause }) catch |err| {
-            if (cause) |stopped| if (storageCause(stopped)) |named| return named;
-            return err;
-        };
-    }
-
-    fn clearUsageMarker(self: *Session) void {
-        var dir = self.openUsageMarkers() catch |err| {
-            debug_trace.logf("session", "event=sessions_v2_usage_marker_kept session={s} err={s}", .{ self.id(), @errorName(err) });
-            return;
-        };
-        defer dir.close();
-        dir.dir.deleteFile(io_mod.getIo(), self.id()) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => debug_trace.logf("session", "event=sessions_v2_usage_marker_kept session={s} err={s}", .{ self.id(), @errorName(err) }),
-        };
-    }
-
-    fn openUsageMarkers(self: *Session) !io_mod.VerifiedDir {
-        var home = try openHome(self.store.home);
-        defer home.close();
-        var fx = try io_mod.openOrCreateVerifiedPrivateDir(&home, profile_paths.root_dir_name);
-        defer fx.close();
-        return io_mod.openOrCreateVerifiedPrivateDir(&fx, usage_markers_dir_name);
-    }
-
     // -- resume --------------------------------------------------------------
 
     /// Rebuilds fx's history and settings from the open log (`restoreFrom`),
@@ -1779,11 +1717,6 @@ pub const Session = struct {
         self.first_title = null;
         if (self.root and state.title == null) {
             if (try deriveTitle(sa, restored.history)) |title| self.first_title = try self.alloc.dupe(u8, title);
-        }
-        if (state.usage) |raw| {
-            const checkpoint = try decodeUsage(sa, raw);
-            self.usage_at_ms = checkpoint.at_ms;
-            self.usage_marked = session_usage.needsProfileRecovery(checkpoint.snapshot);
         }
         if (state.language != null) {
             const owned = try self.alloc.dupe(u8, restored.language.view());
@@ -2265,7 +2198,6 @@ fn settingsFrom(alloc: Allocator, sa: Allocator, state: sm.State) !Restored {
     if (state.title) |raw| restored.title = try alloc.dupe(u8, try std.json.parseFromSliceLeaky([]const u8, sa, raw, .{}));
     if (state.prefs) |raw| restored.preferences = try decodePreferences(alloc, raw);
     if (state.permissions) |raw| restored.permission_state = try session_codec.decodePermissionState(alloc, raw);
-    if (state.usage) |raw| restored.usage = (try decodeUsage(alloc, raw)).snapshot;
     return restored;
 }
 
@@ -2357,13 +2289,11 @@ fn resumedOf(alloc: Allocator, restored: *Restored, id: []const u8, workspace: [
             .total_input_tokens = 0,
             .total_output_tokens = 0,
             .permission_state = restored.permission_state orelse .{},
-            .usage = restored.usage,
         },
         .title = restored.title,
     };
     restored.history = &.{};
     restored.permission_state = null;
-    restored.usage = null;
     restored.title = null;
     return resumed;
 }
@@ -2684,95 +2614,6 @@ fn summaryOf(alloc: Allocator, scratch: Allocator, item: sm.Summary) !session_st
     };
 }
 
-// ---------------------------------------------------------------------------
-// Usage recovery: what the profile's readers need from v2 sessions
-
-/// A v2 session's usage-recovery marker and its newest usage checkpoint,
-/// read without the session's lock. Owns everything.
-pub const MarkedUsage = struct {
-    id: []u8,
-    /// Null when the session or its checkpoint cannot be read.
-    snapshot: ?session_usage.Snapshot,
-    /// When the checkpoint was written.
-    at_ms: i64 = 0,
-    protected_updated_at_ms: ?i64,
-    marker_modified_at_ns: i128,
-
-    pub fn deinit(marked: *MarkedUsage, alloc: Allocator) void {
-        alloc.free(marked.id);
-        if (marked.snapshot) |*snapshot| snapshot.deinit(alloc);
-        marked.* = undefined;
-    }
-};
-
-const max_usage_markers: usize = 512;
-
-/// Every v2 usage-recovery marker under `home`, with v1's validation.
-pub fn collectMarkedUsage(alloc: Allocator, home: []const u8) !std.ArrayList(MarkedUsage) {
-    var list: std.ArrayList(MarkedUsage) = .empty;
-    errdefer {
-        for (list.items) |*entry| entry.deinit(alloc);
-        list.deinit(alloc);
-    }
-    const path = try std.Io.Dir.path.join(alloc, &.{ home, profile_paths.root_dir_name, usage_markers_dir_name });
-    defer alloc.free(path);
-    var markers = io_mod.VerifiedDir{ .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), path, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound => return list,
-        else => return err,
-    } };
-    defer markers.close();
-    var store = try Store.open(alloc, home);
-    defer store.deinit(alloc);
-    var it = markers.dir.iterate();
-    while (try it.next(io_mod.getIo())) |entry| {
-        if (entry.kind != .file or list.items.len == max_usage_markers) return error.InvalidUsageRecoveryIndex;
-        const protected = session_store.validateUsageRecoveryMarker(&markers, entry.name) catch return error.InvalidUsageRecoveryIndex;
-        const stat = try markers.dir.statFile(io_mod.getIo(), entry.name, .{ .follow_symlinks = false });
-        const id = try alloc.dupe(u8, entry.name);
-        errdefer alloc.free(id);
-        const checkpoint = newestUsage(&store, alloc, id) catch |err| blk: {
-            if (err == error.OutOfMemory) return err;
-            debug_trace.logf("usage", "event=sessions_v2_usage_unreadable session={s} err={s}", .{ id, @errorName(err) });
-            break :blk null;
-        };
-        try list.append(alloc, .{
-            .id = id,
-            .snapshot = if (checkpoint) |c| c.snapshot else null,
-            .at_ms = if (checkpoint) |c| c.at_ms else 0,
-            .protected_updated_at_ms = protected,
-            .marker_modified_at_ns = stat.mtime.nanoseconds,
-        });
-    }
-    return list;
-}
-
-/// The newest `set usage`, or the usage in the newest snapshot, reading
-/// back from the end without the session's lock.
-fn newestUsage(store: *Store, alloc: Allocator, id: []const u8) !?UsageCheckpoint {
-    var scratch = std.heap.ArenaAllocator.init(alloc);
-    defer scratch.deinit();
-    const sa = scratch.allocator();
-    var from: sm.From = .end;
-    while (true) {
-        var page = try store.manager.read(sa, id, from, .backward, replay_page_lines);
-        defer page.deinit();
-        for (page.entries) |entry| {
-            const body = entry.body orelse continue;
-            switch (body) {
-                .set => |setting| if (setting.key == .usage) return try decodeUsage(alloc, setting.value),
-                .snapshot => |snapshot| {
-                    const state = try std.json.parseFromSliceLeaky(std.json.Value, sa, snapshot.state, .{});
-                    if (state != .object) return error.InvalidUsageCheckpoint;
-                    const usage = state.object.get("usage") orelse return null;
-                    return try decodeUsageValue(alloc, usage);
-                },
-                else => {},
-            }
-        }
-        from = .{ .at = page.next orelse return null };
-    }
-}
-
 /// v1's error names for a failed resume, so every host reports the same
 /// error whichever backend is on.
 /// Whether a failed write may still have reached the log: after any I/O
@@ -2785,18 +2626,6 @@ pub fn writeMayHaveLanded(err: anyerror) bool {
 }
 
 const ResumeError = error{ SessionNotFound, NoSavedSessions, NoRememberedSession, SessionBusy, InvalidSessionFormat, UnsupportedSessionFormat } || sm.OpenError;
-
-/// The storage causes a host names (D29), from an OS error; null for any
-/// other error.
-fn storageCause(err: anyerror) ?error{ NoSpaceLeft, AccessDenied, ReadOnlyFileSystem, FileTooBig } {
-    return switch (err) {
-        error.NoSpaceLeft => error.NoSpaceLeft,
-        error.AccessDenied, error.PermissionDenied => error.AccessDenied,
-        error.ReadOnlyFileSystem => error.ReadOnlyFileSystem,
-        error.FileTooBig => error.FileTooBig,
-        else => null,
-    };
-}
 
 fn resumeError(err: sm.OpenError, target: Target) ResumeError {
     return switch (err) {
@@ -3091,32 +2920,6 @@ fn decodeInstructions(alloc: Allocator, raw: []const u8) !?[]u8 {
 fn decodeLanguage(arena: Allocator, raw: []const u8) !types.ConversationLanguage {
     const tag = try std.json.parseFromSliceLeaky([]const u8, arena, raw, .{});
     return session_codec.parseConversationLanguage(tag);
-}
-
-/// `{"at_ms":N,"snapshot":...}`: the snapshot as v1's usage file holds it.
-fn encodeUsage(alloc: Allocator, snapshot: session_usage.Snapshot, at_ms: i64) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    try out.writer.print("{{\"at_ms\":{d},\"snapshot\":", .{at_ms});
-    try session_usage.writeRichSnapshot(&out.writer, snapshot);
-    try out.writer.writeByte('}');
-    return out.toOwnedSlice();
-}
-
-const UsageCheckpoint = struct { snapshot: session_usage.Snapshot, at_ms: i64 };
-
-fn decodeUsage(alloc: Allocator, raw: []const u8) !UsageCheckpoint {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
-    defer parsed.deinit();
-    return decodeUsageValue(alloc, parsed.value);
-}
-
-fn decodeUsageValue(alloc: Allocator, value: std.json.Value) !UsageCheckpoint {
-    if (value != .object) return error.InvalidUsageCheckpoint;
-    const at = value.object.get("at_ms") orelse return error.InvalidUsageCheckpoint;
-    if (at != .integer) return error.InvalidUsageCheckpoint;
-    const snapshot = value.object.get("snapshot") orelse return error.InvalidUsageCheckpoint;
-    return .{ .snapshot = try session_usage.parseSnapshotValue(alloc, snapshot), .at_ms = at.integer };
 }
 
 /// The title v1 derives from the first prompt of `history`, if any.
@@ -4043,45 +3846,6 @@ test "a piece above the inline limit goes to a blob and comes back whole" {
     try testing.expectEqualStrings(big, restored.history[0].assistant.assistant);
 }
 
-test "usage is durable before its marker goes, and resume restores it" {
-    var t: TestHome = undefined;
-    try t.init();
-    defer t.deinit();
-    var model = "m".*;
-    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
-    try s.commitTurn(assistantTurn("q", "a"), types.ConversationLanguage.default());
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(testing.allocator);
-    var snapshot = try usage.snapshot(testing.allocator);
-    defer snapshot.deinit(testing.allocator);
-    try s.persistUsage(snapshot);
-    const id = try testing.allocator.dupe(u8, s.id());
-    defer testing.allocator.free(id);
-    // Nothing left to publish: the marker is gone.
-    var markers = try t.tmp.dir.openDir(io_mod.getIo(), ".fx/" ++ usage_markers_dir_name, .{});
-    defer markers.close(io_mod.getIo());
-    try testing.expectError(error.FileNotFound, markers.statFile(io_mod.getIo(), id, .{}));
-    s.close();
-
-    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
-    defer r.close();
-    var restored = try r.restore(testing.allocator);
-    defer restored.deinit(testing.allocator);
-    try testing.expect(restored.usage != null);
-}
-
-test "a usage marker that cannot be written names a storage cause (D29)" {
-    // The real write is proven on a full disk end to end; opening the
-    // markers folder makes it private again, so a unit test cannot block it.
-    const Cause = ?error{ NoSpaceLeft, AccessDenied, ReadOnlyFileSystem, FileTooBig };
-    try testing.expectEqual(@as(Cause, error.NoSpaceLeft), storageCause(error.NoSpaceLeft));
-    try testing.expectEqual(@as(Cause, error.AccessDenied), storageCause(error.AccessDenied));
-    try testing.expectEqual(@as(Cause, error.AccessDenied), storageCause(error.PermissionDenied));
-    try testing.expectEqual(@as(Cause, error.ReadOnlyFileSystem), storageCause(error.ReadOnlyFileSystem));
-    try testing.expectEqual(@as(Cause, error.FileTooBig), storageCause(error.FileTooBig));
-    try testing.expectEqual(@as(Cause, null), storageCause(error.InputOutput));
-}
-
 test "a failed resume reports v1's error names" {
     var t: TestHome = undefined;
     try t.init();
@@ -4386,6 +4150,24 @@ test "recover copies the folders outside the manager, never a link, and says whe
     defer copied.deinit(testing.allocator);
     try testing.expectEqualStrings("q", copied.state.history[0].assistant.user.text);
     try testing.expectError(error.SessionNotFound, recover(&t.store, testing.allocator, "NoSuchSession1"));
+}
+
+test "a resume makes a hand-made ~/.fx private instead of refusing the session" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    try OldSideFolder.commitTurn(&t, s);
+    s.close();
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), ".fx", .fromMode(0o755), .{});
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    r.close();
+    const stat = try t.tmp.dir.statFile(io_mod.getIo(), ".fx", .{ .follow_symlinks = false });
+    try testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
 }
 
 /// The side folder an older v2 session kept (D27), with one body of each

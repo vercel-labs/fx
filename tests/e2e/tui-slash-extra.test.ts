@@ -406,34 +406,6 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
   );
 
   test(
-    "/usage and /cost open the same compact local usage dashboard",
-    async () => {
-      const home = mkdtempSync(join(tmpdir(), "fx-usage-empty-home-"));
-      session = await TmuxSession.create({ env: { HOME: home } });
-      await session.waitForComposer(10_000);
-      await session.sendText("/cost");
-      const pane = await session.waitForText(
-        /Tracking has not started/,
-        5_000,
-      );
-      expect(pane).toContain("[30 days]");
-      expect(pane).not.toMatch(/^[*✓!✗⊘i] usage/m);
-      expect(pane).toContain("tab scope");
-      expect(pane).toContain("r refresh");
-      expect(pane).toContain("esc close");
-      await session.sendKeys("Escape");
-      await session.waitForComposer(5_000);
-      await session.sendText("/usage");
-      const aliasPane = await session.waitForText(
-        /Tracking has not started/,
-        5_000,
-      );
-      expect(aliasPane).toContain("[30 days]");
-    },
-    TIMEOUT,
-  );
-
-  test(
     "/credits shows credit info",
     async () => {
       session = await launchAndWait();

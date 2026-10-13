@@ -1,135 +1,76 @@
-const std = @import("std");
-const usage_report = @import("usage_report.zig");
+//! Navigation state of the `/usage` dashboard. The numbers come from
+//! `usage.Dashboard`; this only remembers which period the model table
+//! lists, the selected model, and whether its detail screen is open.
 
-const Allocator = std.mem.Allocator;
+const std = @import("std");
+const usage = @import("../../usage/usage.zig");
 
 pub const State = struct {
     active: bool = false,
-    requested_scope: usage_report.Scope = .days_30,
+    /// The period the model table lists. Kept across opens.
+    period: usage.Period = .month,
     selected_model: usize = 0,
-    expanded_model: ?usize = null,
     model_window_start: usize = 0,
-    snapshot: ?usage_report.Snapshot = null,
-    refresh_error: ?[]u8 = null,
+    /// Whether the selected model's detail screen is open.
+    detail: bool = false,
+    snapshot: ?usage.Snapshot = null,
+    /// The dashboard generation `snapshot` was built from.
+    generation: u64 = 0,
 
-    /// Takes ownership of `snapshot`; the caller must not deinitialize it.
-    pub fn openOwned(
-        self: *State,
-        alloc: Allocator,
-        snapshot: usage_report.Snapshot,
-    ) void {
-        self.close(alloc);
+    /// Takes ownership of `snapshot`.
+    pub fn open(self: *State, snapshot: usage.Snapshot, generation: u64) void {
+        if (self.snapshot) |*old| old.deinit();
         self.* = .{
             .active = true,
-            .requested_scope = snapshot.scope,
+            .period = self.period,
             .snapshot = snapshot,
+            .generation = generation,
         };
     }
 
-    pub fn openError(
-        self: *State,
-        alloc: Allocator,
-        scope_value: usage_report.Scope,
-        message: []const u8,
-    ) Allocator.Error!void {
-        self.close(alloc);
-        self.* = .{
-            .active = true,
-            .requested_scope = scope_value,
-            .refresh_error = try alloc.dupe(u8, message),
-        };
-    }
-
-    pub fn openLoading(
-        self: *State,
-        alloc: Allocator,
-        scope_value: usage_report.Scope,
-    ) void {
-        self.close(alloc);
-        self.* = .{
-            .active = true,
-            .requested_scope = scope_value,
-        };
-    }
-
-    pub fn setLoadingScope(
-        self: *State,
-        alloc: Allocator,
-        scope_value: usage_report.Scope,
-    ) void {
-        if (self.snapshot) |*snapshot| snapshot.deinit(alloc);
-        if (self.refresh_error) |message| alloc.free(message);
-        self.snapshot = null;
-        self.refresh_error = null;
-        self.requested_scope = scope_value;
-        self.selected_model = 0;
-        self.expanded_model = null;
-        self.model_window_start = 0;
-    }
-
-    pub fn close(self: *State, alloc: Allocator) void {
-        if (self.snapshot) |*snapshot| snapshot.deinit(alloc);
-        if (self.refresh_error) |message| alloc.free(message);
-        self.* = .{};
-    }
-
-    /// Replaces the frozen snapshot while retaining selection and expansion by
-    /// model identifier when that model still exists.
-    pub fn replaceOwned(
-        self: *State,
-        alloc: Allocator,
-        snapshot: usage_report.Snapshot,
-    ) void {
-        const old_selected = if (self.snapshot) |old|
-            if (old.models.len > 0)
-                old.models[@min(self.selected_model, old.models.len - 1)].model
-            else
-                null
-        else
-            null;
-        const old_expanded = if (self.snapshot) |old|
-            if (self.expanded_model) |index|
-                if (index < old.models.len) old.models[index].model else null
-            else
-                null
-        else
-            null;
-
-        const selected = findModel(snapshot.models, old_selected) orelse
-            @min(self.selected_model, snapshot.models.len -| 1);
-        const expanded = findModel(snapshot.models, old_expanded);
-        if (self.snapshot) |*old| old.deinit(alloc);
-        if (self.refresh_error) |message| alloc.free(message);
+    /// Replaces the snapshot, keeping the selected model by name when it is
+    /// still listed. Takes ownership of `snapshot`.
+    pub fn replace(self: *State, snapshot: usage.Snapshot, generation: u64) void {
+        const old_selected = self.selectedModelName();
+        const models = snapshot.of(self.period).models;
+        const found = findModel(models, old_selected);
+        const selected = found orelse @min(self.selected_model, models.len -| 1);
+        // Codex has no selection; its list keeps its scroll position.
+        const keeps_scroll = snapshot.scope == .codex;
+        // Look the name up before the old snapshot is freed.
+        if (self.snapshot) |*old| old.deinit();
         self.snapshot = snapshot;
-        self.requested_scope = snapshot.scope;
+        self.generation = generation;
         self.selected_model = selected;
-        self.expanded_model = expanded;
-        self.refresh_error = null;
-        self.model_window_start = @min(self.model_window_start, selected);
+        if (!keeps_scroll) self.model_window_start = @min(self.model_window_start, selected);
+        // A detail screen whose model left the list goes back to the table.
+        if (found == null) self.detail = false;
     }
 
-    pub fn recordRefreshFailure(
-        self: *State,
-        alloc: Allocator,
-        attempted_scope: usage_report.Scope,
-        message: []const u8,
-    ) Allocator.Error!void {
-        const owned = try alloc.dupe(u8, message);
-        if (self.refresh_error) |old| alloc.free(old);
-        self.refresh_error = owned;
-        self.requested_scope = attempted_scope;
+    pub fn close(self: *State) void {
+        if (self.snapshot) |*old| old.deinit();
+        self.* = .{ .period = self.period };
     }
 
-    pub fn moveModel(
-        self: *State,
-        delta: i32,
-        visible_model_rows: usize,
-    ) bool {
+    /// Lists `period` in the model table. Each period lists other models,
+    /// so the selection starts over. Returns whether anything changed.
+    pub fn setPeriod(self: *State, period: usage.Period) bool {
+        if (!self.active or self.detail or period == self.period) return false;
+        self.period = period;
+        self.selected_model = 0;
+        self.model_window_start = 0;
+        return true;
+    }
+
+    /// ↑↓ in the table or on a detail screen (the next model's details).
+    /// The Codex list has no selection, so ↑↓ scrolls it.
+    pub fn moveModel(self: *State, delta: i32, visible_model_rows: usize) bool {
         if (!self.active or delta == 0) return false;
-        const snapshot = self.snapshot orelse return false;
-        if (snapshot.models.len == 0) return false;
+        if (self.snapshot) |*s| if (s.scope == .codex) return self.scrollCodex(s, delta, visible_model_rows);
+        const models = self.listedModels();
+        if (models.len == 0) return false;
         const next = if (delta > 0)
-            @min(self.selected_model +| 1, snapshot.models.len - 1)
+            @min(self.selected_model +| 1, models.len - 1)
         else
             self.selected_model -| 1;
         if (next == self.selected_model) return false;
@@ -138,22 +79,38 @@ pub const State = struct {
         return true;
     }
 
-    pub fn toggleExpanded(self: *State, visible_model_rows: usize) bool {
-        if (!self.active) return false;
-        const snapshot = self.snapshot orelse return false;
-        if (snapshot.models.len == 0) return false;
-        const selected = @min(self.selected_model, snapshot.models.len - 1);
-        self.expanded_model = if (self.expanded_model == selected) null else selected;
-        self.keepSelectionVisible(visible_model_rows);
+    /// Enter: the selected model's detail screen.
+    pub fn openDetail(self: *State) bool {
+        if (!self.active or self.detail or self.listedModels().len == 0) return false;
+        self.detail = true;
         return true;
     }
 
-    pub fn scope(self: *const State) usage_report.Scope {
-        return if (self.snapshot) |snapshot| snapshot.scope else self.requested_scope;
+    /// Esc on a detail screen: back to the table.
+    pub fn closeDetail(self: *State) bool {
+        if (!self.detail) return false;
+        self.detail = false;
+        return true;
     }
 
-    pub fn navigationScope(self: *const State) usage_report.Scope {
-        return self.requested_scope;
+    pub fn listedModels(self: *const State) []const usage.report.ModelRow {
+        return if (self.snapshot) |*s| s.of(self.period).models else &.{};
+    }
+
+    pub fn selectedModelName(self: *const State) ?[]const u8 {
+        const list = self.listedModels();
+        return if (self.selected_model < list.len) list[self.selected_model].model else null;
+    }
+
+    fn scrollCodex(self: *State, snapshot: *const usage.Snapshot, delta: i32, visible_model_rows: usize) bool {
+        var buf: [usage.codex.max_shares]usage.codex.Share = undefined;
+        const total = snapshot.codexModelShares(self.period, &buf).len;
+        const last_start = total -| @max(visible_model_rows, 1);
+        const start = @min(self.model_window_start, last_start);
+        const next = if (delta > 0) @min(start +| 1, last_start) else start -| 1;
+        if (next == self.model_window_start) return false;
+        self.model_window_start = next;
+        return true;
     }
 
     fn keepSelectionVisible(self: *State, visible_model_rows: usize) void {
@@ -166,10 +123,7 @@ pub const State = struct {
     }
 };
 
-fn findModel(
-    models: []const usage_report.ModelUsage,
-    target: ?[]const u8,
-) ?usize {
+fn findModel(models: []const usage.report.ModelRow, target: ?[]const u8) ?usize {
     const name = target orelse return null;
     for (models, 0..) |model, index| {
         if (std.mem.eql(u8, model.model, name)) return index;
@@ -177,185 +131,116 @@ fn findModel(
     return null;
 }
 
-test "usage menu owns snapshots and preserves model identity on refresh" {
+/// A snapshot whose every period lists `names`, highest cost first.
+fn testSnapshot(names: []const []const u8) !usage.Snapshot {
     const alloc = std.testing.allocator;
-    var models = try alloc.alloc(usage_report.ModelUsage, 2);
-    models[0] = .{
-        .model = try alloc.dupe(u8, "provider/a"),
-        .totals = testTotals(10),
-    };
-    models[1] = .{
-        .model = try alloc.dupe(u8, "provider/b"),
-        .totals = testTotals(5),
-    };
-    var snapshot = usage_report.Snapshot{
-        .scope = .days_30,
-        .snapshot_time_ms = 100,
-        .window_start_ms = 0,
-        .coverage_started_at_ms = 0,
-        .coverage = .full,
-        .completeness = .complete,
-        .totals = testTotals(15),
-        .models = models,
-    };
-    errdefer snapshot.deinit(alloc);
-
-    var menu = State{};
-    menu.openOwned(alloc, snapshot);
-    defer menu.close(alloc);
-
-    try std.testing.expect(menu.active);
-    try std.testing.expect(menu.moveModel(1, 16));
-    try std.testing.expect(menu.toggleExpanded(16));
-
-    var replacement_models = try alloc.alloc(usage_report.ModelUsage, 2);
-    replacement_models[0] = .{
-        .model = try alloc.dupe(u8, "provider/b"),
-        .totals = testTotals(20),
-    };
-    replacement_models[1] = .{
-        .model = try alloc.dupe(u8, "provider/c"),
-        .totals = testTotals(1),
-    };
-    menu.replaceOwned(alloc, .{
-        .scope = .hours_24,
-        .snapshot_time_ms = 200,
-        .window_start_ms = 100,
-        .coverage_started_at_ms = 0,
-        .coverage = .full,
-        .completeness = .complete,
-        .totals = testTotals(21),
-        .models = replacement_models,
-    });
-    try std.testing.expectEqual(@as(usize, 0), menu.selected_model);
-    try std.testing.expectEqual(@as(?usize, 0), menu.expanded_model);
-    try std.testing.expectEqual(usage_report.Scope.hours_24, menu.scope());
-}
-
-test "usage menu advances failed scopes while retaining its last snapshot" {
-    const alloc = std.testing.allocator;
-    var menu = State{};
-    defer menu.close(alloc);
-
-    try menu.openError(alloc, .days_30, "unavailable");
-    try menu.recordRefreshFailure(alloc, .days_7, "unavailable");
-    try std.testing.expectEqual(usage_report.Scope.days_7, menu.scope());
-    try std.testing.expectEqual(usage_report.Scope.days_7, menu.navigationScope());
-    try menu.recordRefreshFailure(alloc, .hours_24, "unavailable");
-    try std.testing.expectEqual(usage_report.Scope.hours_24, menu.scope());
-    try std.testing.expectEqual(usage_report.Scope.hours_24, menu.navigationScope());
-
-    const models = try alloc.alloc(usage_report.ModelUsage, 0);
-    menu.replaceOwned(alloc, .{
-        .scope = .days_30,
-        .snapshot_time_ms = 100,
-        .window_start_ms = 0,
-        .coverage_started_at_ms = 0,
-        .coverage = .full,
-        .completeness = .complete,
-        .totals = testTotals(0),
-        .models = models,
-    });
-    try menu.recordRefreshFailure(
-        alloc,
-        menu.navigationScope().previous(),
-        "unavailable",
-    );
-    try std.testing.expectEqual(usage_report.Scope.days_30, menu.scope());
-    try std.testing.expectEqual(usage_report.Scope.days_7, menu.navigationScope());
-    try menu.recordRefreshFailure(
-        alloc,
-        menu.navigationScope().previous(),
-        "unavailable",
-    );
-    try std.testing.expectEqual(usage_report.Scope.days_30, menu.scope());
-    try std.testing.expectEqual(usage_report.Scope.hours_24, menu.navigationScope());
-    const session_scope = menu.navigationScope().previous();
-    try std.testing.expectEqual(usage_report.Scope.session, session_scope);
-    const session_models = try alloc.alloc(usage_report.ModelUsage, 0);
-    menu.replaceOwned(alloc, .{
-        .scope = session_scope,
-        .snapshot_time_ms = 200,
-        .window_start_ms = 100,
-        .coverage_started_at_ms = 100,
-        .coverage = .full,
-        .completeness = .complete,
-        .totals = testTotals(0),
-        .models = session_models,
-    });
-    try std.testing.expectEqual(usage_report.Scope.session, menu.scope());
-    try std.testing.expectEqual(usage_report.Scope.session, menu.navigationScope());
-}
-
-test "usage menu can publish a loading scope before data arrives" {
-    const alloc = std.testing.allocator;
-    var menu = State{};
-    defer menu.close(alloc);
-
-    menu.openLoading(alloc, .days_30);
-    try std.testing.expect(menu.active);
-    try std.testing.expectEqual(usage_report.Scope.days_30, menu.navigationScope());
-    try std.testing.expect(menu.snapshot == null);
-    try std.testing.expect(menu.refresh_error == null);
-
-    menu.setLoadingScope(alloc, .days_7);
-    try std.testing.expectEqual(usage_report.Scope.days_7, menu.navigationScope());
-}
-
-test "usage menu keeps session model selection inside the rendered viewport" {
-    const alloc = std.testing.allocator;
-    const models = try alloc.alloc(usage_report.ModelUsage, 13);
-    for (models, 0..) |*model, index| {
-        model.* = .{
-            .model = try alloc.print("provider/model-{d}", .{index}),
-            .totals = testTotals(index + 1),
+    var views: [usage.Period.all.len]usage.View = undefined;
+    for (usage.Period.all, 0..) |period, p| {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        const rows = try arena.allocator().alloc(usage.report.ModelRow, names.len);
+        for (rows, names, 0..) |*row, name, i| {
+            row.* = .{ .model = try arena.allocator().dupe(u8, name), .totals = .{ .total_cost = @floatFromInt(10 - i) } };
+        }
+        views[p] = .{
+            .arena = arena,
+            .period = period,
+            .models = rows,
+            .totals = .{},
+            .today_current = true,
+            .finished_current = true,
+            .fetched_at_ms = 0,
+            .budget = null,
         };
     }
-    var snapshot = usage_report.Snapshot{
-        .scope = .session,
-        .snapshot_time_ms = 100,
-        .window_start_ms = 0,
-        .coverage_started_at_ms = 0,
-        .coverage = .full,
-        .completeness = .complete,
-        .totals = testTotals(91),
-        .models = models,
-        .session_activity = .{
-            .api_duration_complete = true,
-            .wall_duration_complete = true,
-            .code_complete = true,
-            .api_duration_ms = 1,
-            .wall_duration_ms = 2,
-            .lines_added = 3,
-            .lines_removed = 4,
-        },
+    return .{
+        .arena = std.heap.ArenaAllocator.init(alloc),
+        .views = views,
+        .status = .ready,
+        .label = "",
+        .now_ms = 0,
     };
-    errdefer snapshot.deinit(alloc);
-
-    var menu = State{};
-    menu.openOwned(alloc, snapshot);
-    defer menu.close(alloc);
-
-    for (0..12) |_| try std.testing.expect(menu.moveModel(1, 32));
-    try std.testing.expectEqual(@as(usize, 12), menu.selected_model);
-    try std.testing.expectEqual(@as(usize, 0), menu.model_window_start);
-
-    try std.testing.expect(menu.toggleExpanded(32));
-    try std.testing.expectEqual(@as(usize, 0), menu.model_window_start);
-    try std.testing.expect(menu.moveModel(-1, 32));
-    try std.testing.expectEqual(@as(usize, 11), menu.selected_model);
-    try std.testing.expectEqual(@as(usize, 0), menu.model_window_start);
 }
 
-fn testTotals(tokens: u64) usage_report.Totals {
-    return .{
-        .total_tokens = tokens,
-        .input_tokens = tokens,
-        .output_tokens = 0,
-        .cache_read_tokens = 0,
-        .cache_write_tokens = 0,
-        .reasoning_tokens = null,
-        .request_count = 1,
-        .total_cost = 0,
-    };
+test "a refresh keeps the selected model by name" {
+    var state: State = .{};
+    defer state.close();
+    state.open(try testSnapshot(&.{ "a", "b", "c" }), 1);
+    try std.testing.expectEqual(usage.Period.month, state.period);
+    try std.testing.expect(state.moveModel(1, 5));
+    try std.testing.expect(state.openDetail());
+    state.replace(try testSnapshot(&.{ "c", "b" }), 2);
+    try std.testing.expectEqual(@as(usize, 1), state.selected_model);
+    try std.testing.expect(state.detail);
+    // The detail screen's model left the list: back to the table.
+    state.replace(try testSnapshot(&.{"z"}), 3);
+    try std.testing.expectEqual(@as(usize, 0), state.selected_model);
+    try std.testing.expect(!state.detail);
+}
+
+test "Tab changes the listed period only from the table" {
+    var state: State = .{};
+    defer state.close();
+    state.open(try testSnapshot(&.{ "a", "b" }), 1);
+    _ = state.moveModel(1, 5);
+    try std.testing.expect(state.setPeriod(.today));
+    try std.testing.expectEqual(@as(usize, 0), state.selected_model);
+    try std.testing.expect(!state.setPeriod(.today));
+    try std.testing.expect(state.openDetail());
+    try std.testing.expect(!state.setPeriod(.days_7));
+    try std.testing.expect(state.closeDetail());
+    try std.testing.expect(!state.closeDetail());
+    state.close();
+    // The period survives closing and reopening.
+    state.open(try testSnapshot(&.{"a"}), 2);
+    try std.testing.expectEqual(usage.Period.today, state.period);
+}
+
+/// A Codex snapshot whose month lists five models, largest first.
+fn codexTestSnapshot() !usage.Snapshot {
+    var snapshot = try testSnapshot(&.{});
+    snapshot.scope = .codex;
+    snapshot.codex_usage = .{ .plan = "plus", .breakdown = .{ .days = &.{.{ .day = 0, .models = &.{
+        .{ .model = "a", .speed = "fast", .value = 5 },
+        .{ .model = "b", .speed = "fast", .value = 4 },
+        .{ .model = "c", .speed = "fast", .value = 3 },
+        .{ .model = "d", .speed = "fast", .value = 2 },
+        .{ .model = "e", .speed = "fast", .value = 1 },
+    } }} } };
+    return snapshot;
+}
+
+test "the Codex model list scrolls with ↑↓ and keeps its place on refresh" {
+    var state: State = .{};
+    defer state.close();
+    state.open(try codexTestSnapshot(), 1);
+    // Three of five rows fit: the window moves down twice, then stops.
+    try std.testing.expect(state.moveModel(1, 3));
+    try std.testing.expect(state.moveModel(1, 3));
+    try std.testing.expect(!state.moveModel(1, 3));
+    try std.testing.expectEqual(@as(usize, 2), state.model_window_start);
+    try std.testing.expectEqual(@as(usize, 0), state.selected_model);
+    // A refresh keeps the scroll position.
+    state.replace(try codexTestSnapshot(), 2);
+    try std.testing.expectEqual(@as(usize, 2), state.model_window_start);
+    try std.testing.expect(state.moveModel(-1, 3));
+    try std.testing.expect(state.moveModel(-1, 3));
+    try std.testing.expect(!state.moveModel(-1, 3));
+    // A list that fits does not scroll, and Enter opens nothing.
+    try std.testing.expect(!state.moveModel(1, 5));
+    try std.testing.expect(!state.openDetail());
+}
+
+test "selection stays inside the visible model rows" {
+    var state: State = .{};
+    defer state.close();
+    state.open(try testSnapshot(&.{ "a", "b", "c", "d" }), 1);
+    _ = state.moveModel(1, 2);
+    _ = state.moveModel(1, 2);
+    try std.testing.expectEqual(@as(usize, 2), state.selected_model);
+    try std.testing.expectEqual(@as(usize, 1), state.model_window_start);
+    try std.testing.expect(!state.moveModel(1, 2) or state.selected_model == 3);
+    state.close();
+    try std.testing.expect(!state.active);
+    try std.testing.expect(!state.moveModel(1, 2));
+    try std.testing.expect(!state.openDetail());
 }

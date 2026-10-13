@@ -4,7 +4,6 @@ const stream_provider = @import("../core/agent/stream_provider.zig");
 const types = @import("../core/shared/types.zig");
 const io_mod = @import("../core/shared/io.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
-const session_usage = @import("../core/session/session_usage.zig");
 const vercel_protocol = @import("vercel_protocol.zig");
 
 const Allocator = std.mem.Allocator;
@@ -189,15 +188,15 @@ const OwnedResult = struct {
     result: stream_provider.Result,
 };
 
+/// The provider admits the review exactly once, before it can be sent.
 const ReviewAdmission = struct {
-    usage: ?*session_usage.Usage,
     evidence: *stream_provider.AttemptEvidence,
-    observation: ?session_usage.InvocationObservation = null,
+    admitted: bool = false,
 
     fn admit(raw: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        if (self.observation != null) return error.ProviderAdmissionRepeated;
-        self.observation = try session_usage.InvocationObservation.begin(self.usage);
+        if (self.admitted) return error.ProviderAdmissionRepeated;
+        self.admitted = true;
         self.evidence.provider_admitted = true;
     }
 };
@@ -229,7 +228,6 @@ fn sendReview(
     var delivery = stream_provider.DeliveryCertainty.init();
     var evidence: stream_provider.AttemptEvidence = .{};
     var admission = ReviewAdmission{
-        .usage = runtime.input.usage,
         .evidence = &evidence,
     };
     var callback_context: u8 = 0;
@@ -258,12 +256,6 @@ fn sendReview(
         .cancel_flag = cancel_flag,
         .provider_attempt_owner = .transport,
     }, payload) catch |err| {
-        if (admission.observation) |observation| observation.fail(
-            if (delivery.load() == .possibly_sent) .ambiguous_delivery else .unbilled,
-        ) catch |usage_err| {
-            debugUsageFailure("transport_failure", usage_err);
-            return .permanent_failure;
-        };
         if (err == error.OutOfMemory) return error.OutOfMemory;
         const outcome: permission_auto_classifier.TransportOutcome =
             if (err == error.Cancelled or cancel_flag.load(.seq_cst))
@@ -281,21 +273,14 @@ fn sendReview(
     };
     var result_owned = true;
     defer if (result_owned) result.deinit(alloc);
-    const observation = admission.observation orelse {
-        debugUsageFailure("completion", error.ProviderAdmissionMissing);
+    if (!admission.admitted) {
+        debug_trace.logf(
+            "permission",
+            "event=auto_review_transport result=permanent_failure reason={s}",
+            .{@errorName(error.ProviderAdmissionMissing)},
+        );
         return .permanent_failure;
-    };
-    (switch (result) {
-        .failed => observation.fail(.unbilled),
-        .completed => |completed| observation.complete(
-            runtime.input.usage_allocator,
-            completed.completion,
-            completed.usage,
-        ),
-    }) catch |err| {
-        debugUsageFailure("completion", err);
-        return .permanent_failure;
-    };
+    }
     if (cancel_flag.load(.seq_cst)) return .cancelled;
     if (std.meta.activeTag(result) == .failed) {
         const outcome: permission_auto_classifier.TransportOutcome = switch (result.failed.kind) {
@@ -347,86 +332,7 @@ fn sendReview(
     } };
 }
 
-fn debugUsageFailure(phase: []const u8, err: anyerror) void {
-    debug_trace.logf(
-        "permission",
-        "event=auto_review_usage result=permanent_failure phase={s} reason={s}",
-        .{ phase, @errorName(err) },
-    );
-}
-
-test "direct review exact usage settles through the session ledger" {
-    const Fake = struct {
-        fn validate(_: Allocator, _: permission_auto_classifier.ProviderInput) !void {}
-
-        fn build(_: Allocator, _: stream_provider.RequestData) ![]u8 {
-            return error.TestUnexpectedBuild;
-        }
-
-        fn send(
-            _: Allocator,
-            request: stream_provider.ModelRequest,
-            _: []const u8,
-        ) !stream_provider.Result {
-            try request.admission.admit();
-            request.delivery.markPossiblySent();
-            return .{ .completed = .{
-                .completion = .{
-                    .content = "clear",
-                    .generation_id = "response-review-1",
-                    .billing = .{
-                        .created_at_ms = 1,
-                        .model = "codex/gpt-review",
-                        .total_cost = 0,
-                        .input_tokens = 11,
-                        .output_tokens = 3,
-                        .cache_read_tokens = 0,
-                        .cache_write_tokens = 0,
-                        .reasoning_tokens = null,
-                        .billable_web_search_calls = 0,
-                    },
-                    .finish_reason = .stop,
-                },
-                .usage = .{ .exact = .codex },
-            } };
-        }
-    };
-
-    const alloc = std.testing.allocator;
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    var runtime = Runtime{
-        .input = .{ .usage = &usage, .usage_allocator = alloc },
-        .adapter = .{
-            .source = .chatgpt_subscription,
-            .model = "gpt-review",
-            .validate_fn = Fake.validate,
-            .build_fn = Fake.build,
-            .send_fn = Fake.send,
-        },
-    };
-    var cancelled = std.atomic.Value(bool).init(false);
-    var outcome = try sendReview(
-        &runtime,
-        alloc,
-        "gpt-review",
-        "{}",
-        std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
-            .clock = .awake,
-            .raw = .fromSeconds(5),
-        }),
-        &cancelled,
-    );
-    defer if (outcome == .completion) outcome.completion.deinit(alloc);
-
-    var snapshot = try usage.snapshot(alloc);
-    defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(@as(u64, 11), snapshot.input_tokens);
-    try std.testing.expectEqual(@as(u64, 3), snapshot.output_tokens);
-    try std.testing.expectEqual(@as(?u64, 1), snapshot.request_count);
-}
-
-test "direct review settles every post-admission outcome before projection" {
+test "direct review maps every post-admission outcome" {
     const Fake = struct {
         fn validate(_: Allocator, _: permission_auto_classifier.ProviderInput) !void {}
 
@@ -438,20 +344,8 @@ test "direct review settles every post-admission outcome before projection" {
             return .{ .completed = .{
                 .completion = .{
                     .generation_id = "response-review-outcome",
-                    .billing = .{
-                        .created_at_ms = 1,
-                        .model = "codex/gpt-review",
-                        .total_cost = 0,
-                        .input_tokens = 11,
-                        .output_tokens = 3,
-                        .cache_read_tokens = 0,
-                        .cache_write_tokens = 0,
-                        .reasoning_tokens = null,
-                        .billable_web_search_calls = 0,
-                    },
                     .finish_reason = .stop,
                 },
-                .usage = .{ .exact = .codex },
             } };
         }
 
@@ -475,7 +369,6 @@ test "direct review settles every post-admission outcome before projection" {
             if (std.mem.eql(u8, payload, "malformed")) {
                 return .{ .completed = .{
                     .completion = .{ .finish_reason = .stop },
-                    .usage = .{ .unavailable = .possibly_billed },
                 } };
             }
             if (std.mem.eql(u8, payload, "cancel_after_completion")) {
@@ -494,22 +387,18 @@ test "direct review settles every post-admission outcome before projection" {
     const cases = [_]struct {
         payload: []const u8,
         outcome: std.meta.Tag(permission_auto_classifier.TransportOutcome),
-        billing: session_usage.Availability,
-        request_count: ?u64,
     }{
-        .{ .payload = "cancelled", .outcome = .cancelled, .billing = .incomplete, .request_count = 0 },
-        .{ .payload = "timed_out", .outcome = .timed_out, .billing = .incomplete, .request_count = 0 },
-        .{ .payload = "provider_failure", .outcome = .permanent_failure, .billing = .complete, .request_count = 0 },
-        .{ .payload = "malformed", .outcome = .completion, .billing = .incomplete, .request_count = 0 },
-        .{ .payload = "cancel_after_completion", .outcome = .cancelled, .billing = .complete, .request_count = 1 },
-        .{ .payload = "provider_error", .outcome = .transient_failure, .billing = .complete, .request_count = 1 },
+        .{ .payload = "cancelled", .outcome = .cancelled },
+        .{ .payload = "timed_out", .outcome = .timed_out },
+        .{ .payload = "provider_failure", .outcome = .permanent_failure },
+        .{ .payload = "malformed", .outcome = .completion },
+        .{ .payload = "cancel_after_completion", .outcome = .cancelled },
+        .{ .payload = "provider_error", .outcome = .transient_failure },
     };
 
     for (cases) |case| {
-        var usage = session_usage.Usage.initFresh();
-        defer usage.deinit(std.testing.allocator);
         var runtime = Runtime{
-            .input = .{ .usage = &usage, .usage_allocator = std.testing.allocator },
+            .input = .{},
             .adapter = .{
                 .source = .chatgpt_subscription,
                 .model = "gpt-review",
@@ -532,13 +421,5 @@ test "direct review settles every post-admission outcome before projection" {
         );
         defer if (outcome == .completion) outcome.completion.deinit(std.testing.allocator);
         try std.testing.expectEqual(case.outcome, std.meta.activeTag(outcome));
-
-        var snapshot = try usage.snapshot(std.testing.allocator);
-        defer snapshot.deinit(std.testing.allocator);
-        try std.testing.expectEqual(case.billing, snapshot.billing);
-        try std.testing.expectEqual(case.request_count, snapshot.request_count);
-        try std.testing.expectEqual(@as(u64, 2), snapshot.next_sequence);
-        try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
-        try std.testing.expectEqual(@as(usize, 0), snapshot.pending.len);
     }
 }

@@ -35,7 +35,6 @@ const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_model_contract = @import("../subagent/model_contract.zig");
 const result_store = @import("../session/result_store.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
-const session_usage = @import("../session/session_usage.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
@@ -376,28 +375,15 @@ pub fn Bindings(comptime App: type) type {
                 .record_tool_call_failed = agentRecordToolCallFailed,
                 .report_usage = agentReportUsage,
                 .report_inner_tool_usage = agentReportInnerToolUsage,
-                .usage_allocator = app.alloc,
                 .diff_marker_styles = .{
                     .added = ui_render.diff_added_marker_style,
                     .removed = ui_render.diff_removed_marker_style,
                 },
             };
-            if (comptime @hasField(@TypeOf(app.session), "usage")) {
-                deps.usage = &app.session.usage;
-                if (comptime @hasField(App, "session_persistence") and
-                    @hasField(@TypeOf(app.session_persistence), "writable"))
-                {
-                    app.session.usage.configureCheckpointSink(
-                        if (app.session_persistence.writable != null or app.session_persistence.v2 != null)
-                            .{
-                                .context = @ptrCast(app),
-                                .allocator = app.alloc,
-                                .persist = agentPersistUsageCheckpoint,
-                            }
-                        else
-                            null,
-                    );
-                }
+            if (comptime @hasField(App, "session_persistence") and
+                @hasField(@TypeOf(app.session_persistence), "writable"))
+            {
+                deps.confirm_session_writer = agentConfirmSessionWriter;
             }
             if (comptime @hasDecl(App, "releaseAgentTerminalLease")) {
                 deps.release_agent_terminal_lease = agentReleaseTerminalLease;
@@ -1233,12 +1219,9 @@ pub fn Bindings(comptime App: type) type {
             try app_session_runtime.Runtime(App).appendTurnPiece(app, progress);
         }
 
-        fn agentPersistUsageCheckpoint(
-            ctx: *anyopaque,
-            snapshot: session_usage.Snapshot,
-        ) !void {
+        fn agentConfirmSessionWriter(ctx: *anyopaque) anyerror!void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try app_session_runtime.Runtime(App).persistUsageCheckpoint(app, snapshot);
+            try app_session_runtime.Runtime(App).confirmSessionWriter(app);
         }
 
         fn agentPropagateGrant(ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) !void {

@@ -34,7 +34,7 @@
   { "file": "tui-command-permissions.test.ts", "weight": 153 },
   { "file": "tui-compaction-activity.test.ts", "weight": 90 },
   { "file": "tui-composer-edit-contracts.test.ts", "weight": 168 },
-  { "file": "tui-cost.test.ts", "weight": 16 },
+  { "file": "tui-usage.test.ts", "weight": 16 },
   { "file": "tui-decision-prompts.test.ts", "weight": 174 },
   { "file": "tui-direct-write-audit.test.ts", "weight": 2 },
   { "file": "tui-file-picker.test.ts", "weight": 100 },
