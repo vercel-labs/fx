@@ -251,8 +251,7 @@ pub fn healthFailureForState(
         .needs_auth => {
             const safe_name = try terminalSafeOwned(alloc, name, 256);
             defer alloc.free(safe_name);
-            return @as(?[]u8, try std.fmt.allocPrint(
-                alloc,
+            return @as(?[]u8, try alloc.print(
                 "Authentication is required or the saved credentials lack access; run /mcp auth {s} --open and check server permissions.",
                 .{safe_name},
             ));

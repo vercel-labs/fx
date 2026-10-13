@@ -217,7 +217,7 @@ fn expectDecodeFailure(args_json: []const u8, code: []const u8) !void {
         },
         .failure => |message| {
             defer alloc.free(message);
-            const needle = try std.fmt.allocPrint(alloc, "\"error_code\":\"{s}\"", .{code});
+            const needle = try alloc.print("\"error_code\":\"{s}\"", .{code});
             defer alloc.free(needle);
             try std.testing.expect(std.mem.find(u8, message, needle) != null);
         },

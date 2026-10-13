@@ -151,9 +151,7 @@ fn streamCompletion(
     request: stream_provider.ModelRequest,
 ) !stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
-    if (request.credential.credentialSource() != .chatgpt_subscription and
-        request.credential.credentialSource() != .host_managed)
-    {
+    if (!acceptsCredential(request.credential)) {
         return stream_provider.failResult(error.CodexSubscriptionCredentialRequired);
     }
     try validateModel(request.model);
@@ -191,22 +189,68 @@ const PreparedStreamOperation = struct {
     }
 };
 
-const RequestAuthHeaders = struct {
+/// True for the credentials a Codex request may use: a ChatGPT subscription,
+/// or a host that authorizes the request itself.
+pub fn acceptsCredential(lease: stream_provider.CredentialLease) bool {
+    const source = lease.credentialSource() orelse return false;
+    return source == .chatgpt_subscription or source == .host_managed;
+}
+
+/// The Responses endpoint, or a loopback test endpoint from the environment.
+/// Borrowed; static or environment-owned.
+pub fn responsesEndpoint() error{InvalidE2EOpenAICodexEndpoint}![]const u8 {
+    const override = io_mod.getenv(e2e_endpoint_env) orelse return endpoint;
+    if (!gateway_client.isLoopbackHttpUrl(override)) return error.InvalidE2EOpenAICodexEndpoint;
+    return override;
+}
+
+pub const max_extra_headers = 6;
+
+/// Writes the Codex headers other than authorization and content type into
+/// `buf` and returns the used prefix. Values are borrowed from the arguments.
+pub fn extraHeaders(
+    buf: *[max_extra_headers]std.http.Header,
+    account_id: ?[]const u8,
+    session_id: ?[]const u8,
+) []std.http.Header {
+    var count: usize = 0;
+    if (account_id) |value| {
+        buf[count] = .{ .name = "chatgpt-account-id", .value = value };
+        count += 1;
+    }
+    buf[count] = .{ .name = "originator", .value = "fx" };
+    count += 1;
+    buf[count] = .{ .name = "OpenAI-Beta", .value = "responses=experimental" };
+    count += 1;
+    buf[count] = .{ .name = "accept", .value = "text/event-stream" };
+    count += 1;
+    if (session_id) |value| if (value.len > 0) {
+        buf[count] = .{ .name = "session-id", .value = value };
+        count += 1;
+        buf[count] = .{ .name = "x-client-request-id", .value = value };
+        count += 1;
+    };
+    return buf[0..count];
+}
+
+pub const RequestAuthHeaders = struct {
     authorization: ?[]u8 = null,
     account_id: ?[]u8 = null,
 
-    fn deinit(self: *RequestAuthHeaders, alloc: Allocator) void {
+    pub fn deinit(self: *RequestAuthHeaders, alloc: Allocator) void {
         if (self.authorization) |value| secret.zeroAndFree(alloc, value);
         if (self.account_id) |value| alloc.free(value);
         self.* = .{};
     }
 };
 
-fn requestAuthHeaders(alloc: Allocator, auth: stream_provider.CredentialLease) !RequestAuthHeaders {
+/// Authorization for a direct ChatGPT credential; empty for a host-managed one,
+/// whose host adds its own. The caller owns the result.
+pub fn requestAuthHeaders(alloc: Allocator, auth: stream_provider.CredentialLease) !RequestAuthHeaders {
     return switch (auth) {
         .host_managed => .{},
         .direct => |direct| blk: {
-            const authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{direct.secret_bytes});
+            const authorization = try alloc.print("Bearer {s}", .{direct.secret_bytes});
             errdefer secret.zeroAndFree(alloc, authorization);
             const account_id = if (direct.account_id) |account|
                 try alloc.dupe(u8, account)
@@ -232,32 +276,11 @@ pub fn streamPrepared(
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
     var auth_headers = try requestAuthHeaders(alloc, request.credential);
     defer auth_headers.deinit(alloc);
-    const request_endpoint = if (io_mod.getenv(e2e_endpoint_env)) |override| endpoint: {
-        if (!gateway_client.isLoopbackHttpUrl(override)) {
-            return stream_provider.failResult(error.InvalidE2EOpenAICodexEndpoint);
-        }
-        break :endpoint override;
-    } else endpoint;
+    const request_endpoint = responsesEndpoint() catch |err| return stream_provider.failResult(err);
     const uri = try std.Uri.parse(request_endpoint);
 
-    var extra_headers_buf: [7]std.http.Header = undefined;
-    var extra_count: usize = 0;
-    if (auth_headers.account_id) |account_id| {
-        extra_headers_buf[extra_count] = .{ .name = "chatgpt-account-id", .value = account_id };
-        extra_count += 1;
-    }
-    extra_headers_buf[extra_count] = .{ .name = "originator", .value = "fx" };
-    extra_count += 1;
-    extra_headers_buf[extra_count] = .{ .name = "OpenAI-Beta", .value = "responses=experimental" };
-    extra_count += 1;
-    extra_headers_buf[extra_count] = .{ .name = "accept", .value = "text/event-stream" };
-    extra_count += 1;
-    if (request.session_id) |session_id| if (session_id.len > 0) {
-        extra_headers_buf[extra_count] = .{ .name = "session-id", .value = session_id };
-        extra_count += 1;
-        extra_headers_buf[extra_count] = .{ .name = "x-client-request-id", .value = session_id };
-        extra_count += 1;
-    };
+    var extra_headers_buf: [max_extra_headers]std.http.Header = undefined;
+    const extra_headers = extraHeaders(&extra_headers_buf, auth_headers.account_id, request.session_id);
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
@@ -265,7 +288,7 @@ pub fn streamPrepared(
         .client = &client,
         .uri = uri,
         .authorization = auth_headers.authorization,
-        .extra_headers = extra_headers_buf[0..extra_count],
+        .extra_headers = extra_headers,
     };
     const connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
@@ -311,7 +334,16 @@ pub fn streamPrepared(
     }
 
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
-    const reader = response.reader(&transfer_buffer);
+    return completeFromStream(alloc, request, response.reader(&transfer_buffer));
+}
+
+/// Parses one successful Codex event stream into a completion with its
+/// subscription usage. The result owns the completion.
+pub fn completeFromStream(
+    alloc: Allocator,
+    request: stream_provider.ModelRequest,
+    reader: *std.Io.Reader,
+) !stream_provider.Result {
     var events = request.events;
     var completion = try consumeSse(
         alloc,
@@ -374,7 +406,7 @@ const EventBridge = struct {
     }
 };
 
-fn failureKind(status: std.http.Status) stream_provider.FailureKind {
+pub fn failureKind(status: std.http.Status) stream_provider.FailureKind {
     return switch (status) {
         .bad_request => .invalid_request,
         .unauthorized => .unauthorized,
@@ -680,14 +712,20 @@ test "OpenAI Codex SSE maps text reasoning tools and usage" {
         content: std.ArrayList(u8) = .empty,
         reasoning: std.ArrayList(u8) = .empty,
         saw_read_file: bool = false,
+        /// A chunk that could not be kept; the test reports it.
+        append_error: ?std.mem.Allocator.Error = null,
 
         fn contentChunk(raw: *anyopaque, chunk: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.content.appendSlice(std.testing.allocator, chunk) catch unreachable;
+            self.content.appendSlice(std.testing.allocator, chunk) catch |err| {
+                self.append_error = err;
+            };
         }
         fn reasoningChunk(raw: *anyopaque, chunk: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.reasoning.appendSlice(std.testing.allocator, chunk) catch unreachable;
+            self.reasoning.appendSlice(std.testing.allocator, chunk) catch |err| {
+                self.append_error = err;
+            };
         }
         fn toolStart(raw: *anyopaque, _: []const u8, name: []const u8, _: ?[]const u8, _: ?[]const u8) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -714,6 +752,7 @@ test "OpenAI Codex SSE maps text reasoning tools and usage" {
         types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));
         if (completion.provider_state_json) |value| std.testing.allocator.free(@constCast(value));
     }
+    if (capture.append_error) |err| return err;
     try std.testing.expectEqualStrings("hello", capture.content.items);
     try std.testing.expectEqualStrings("thinking", capture.reasoning.items);
     try std.testing.expect(capture.saw_read_file);

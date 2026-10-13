@@ -1,5 +1,6 @@
 const std = @import("std");
 const command_lex = @import("command_lex.zig");
+const safe_git = @import("safe_git.zig");
 
 const max_command_bytes = 8 * 1024;
 const max_ls_operands = 64;
@@ -258,6 +259,8 @@ pub const ApprovalReason = enum {
     command_owned_input,
     unknown_command,
     planning_failure,
+    /// fx could not apply its git safety settings in this directory.
+    unsafe_git,
 };
 
 pub const EnvironmentProfile = enum {
@@ -308,6 +311,41 @@ pub fn plan(
     background: bool,
     target_os: std.Target.Os.Tag,
 ) std.mem.Allocator.Error!Admission {
+    return planWithGit(alloc, command, resolved_cwd, background, target_os, .prepare);
+}
+
+/// How git stages learn whether safe git can run: prepared in the command's
+/// directory, or fixed by a test.
+const GitSource = union(enum) {
+    prepare,
+    fixed: safe_git.Prepared,
+};
+
+const GitResolver = struct {
+    source: GitSource,
+    cwd: []const u8,
+    prepared: ?safe_git.Prepared = null,
+
+    /// Prepares at most once per plan, and only for a supported git stage.
+    fn get(self: *GitResolver, arena: std.mem.Allocator) std.mem.Allocator.Error!safe_git.Prepared {
+        if (self.prepared) |prepared| return prepared;
+        const prepared = switch (self.source) {
+            .prepare => try safe_git.prepare(arena, self.cwd),
+            .fixed => |fixed| fixed,
+        };
+        self.prepared = prepared;
+        return prepared;
+    }
+};
+
+fn planWithGit(
+    alloc: std.mem.Allocator,
+    command: []const u8,
+    resolved_cwd: []const u8,
+    background: bool,
+    target_os: std.Target.Os.Tag,
+    git_source: GitSource,
+) std.mem.Allocator.Error!Admission {
     if (background) return .{ .approval_required = .background_process };
     if (target_os != .macos and target_os != .linux) {
         return .{ .approval_required = .unsupported_platform };
@@ -333,6 +371,7 @@ pub fn plan(
         return .{ .approval_required = .process_or_system };
     }
 
+    var git: GitResolver = .{ .source = git_source, .cwd = resolved_cwd };
     var planned: std.ArrayList(TemporaryStage) = .empty;
     for (segments) |segment| {
         if (segment.text.len == 0) return .{ .approval_required = .unsupported_shell };
@@ -341,7 +380,7 @@ pub fn plan(
             error.OutOfMemory => return error.OutOfMemory,
             else => return .{ .approval_required = .unsupported_shell },
         };
-        const parsed = try parseStage(scratch, argv.tokens, target_os);
+        const parsed = try parseStage(scratch, argv.tokens, target_os, &git);
         switch (parsed) {
             .approval_required => |reason| return .{ .approval_required = reason },
             .direct => |stage| try planned.append(scratch, stage),
@@ -422,6 +461,7 @@ fn parseStage(
     alloc: std.mem.Allocator,
     tokens: []const command_lex.ArgvToken,
     target_os: std.Target.Os.Tag,
+    git: *GitResolver,
 ) std.mem.Allocator.Error!StageAdmission {
     var words: std.ArrayList([]const u8) = .empty;
     var index: usize = 0;
@@ -440,7 +480,7 @@ fn parseStage(
         return .{ .approval_required = .dynamic_shell };
     }
 
-    const family = try planFamily(alloc, words.items, target_os);
+    const family = try planFamily(alloc, words.items, target_os, git);
     return switch (family) {
         .approval_required => |reason| .{ .approval_required = reason },
         .direct => |stage| .{ .direct = .{
@@ -465,6 +505,7 @@ fn planFamily(
     alloc: std.mem.Allocator,
     words: []const []const u8,
     target_os: std.Target.Os.Tag,
+    git: *GitResolver,
 ) std.mem.Allocator.Error!StageAdmission {
     const command = words[0];
     if (isFilesystemMutation(command)) return .{ .approval_required = .filesystem_write };
@@ -478,7 +519,7 @@ fn planFamily(
     if (std.mem.eql(u8, command, "head")) return planHeadOrTail(alloc, words, "/usr/bin/head");
     if (std.mem.eql(u8, command, "tail")) return planHeadOrTail(alloc, words, "/usr/bin/tail");
     if (std.mem.eql(u8, command, "grep")) return planGrep(alloc, words);
-    if (std.mem.eql(u8, command, "git")) return planGit(alloc, words);
+    if (std.mem.eql(u8, command, "git")) return planGit(alloc, words, git);
     return .{ .approval_required = .unknown_command };
 }
 
@@ -723,31 +764,32 @@ fn planGrep(
 fn planGit(
     alloc: std.mem.Allocator,
     words: []const []const u8,
+    git: *GitResolver,
 ) std.mem.Allocator.Error!StageAdmission {
     if (words.len < 2) return .{ .approval_required = .command_owned_input };
-    if (std.mem.eql(u8, words[1], "status")) return planGitStatus(alloc, words[2..]);
-    if (std.mem.eql(u8, words[1], "diff")) return planGitDiff(alloc, words[2..]);
-    if (std.mem.eql(u8, words[1], "log")) return planGitLog(alloc, words[2..]);
-    return .{ .approval_required = .command_owned_input };
+    const subcommand: safe_git.Subcommand = if (std.mem.eql(u8, words[1], "status"))
+        .status
+    else if (std.mem.eql(u8, words[1], "diff"))
+        .diff
+    else if (std.mem.eql(u8, words[1], "log"))
+        .log
+    else
+        return .{ .approval_required = .command_owned_input };
+    const ready = switch (try git.get(alloc)) {
+        .ready => |ready| ready,
+        .refused => return .{ .approval_required = .unsafe_git },
+    };
+    return switch (subcommand) {
+        .status => planGitStatus(alloc, ready, words[2..]),
+        .diff => planGitDiff(alloc, ready, words[2..]),
+        .log => planGitLog(alloc, ready, words[2..]),
+        .branch, .rev_parse => unreachable,
+    };
 }
 
-fn appendGitPrelude(
-    alloc: std.mem.Allocator,
-    argv: *std.ArrayList([]const u8),
-) std.mem.Allocator.Error!void {
-    try argv.appendSlice(alloc, &.{
-        "/usr/bin/git",
-        "--no-pager",
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-c",
-        "core.fsmonitor=false",
-    });
-}
-
-fn directGit(argv: []const []const u8) StageAdmission {
+fn directGit(ready: safe_git.Ready, argv: []const []const u8) StageAdmission {
     return .{ .direct = .{
-        .executable = "/usr/bin/git",
+        .executable = ready.executable,
         .argv = argv,
         .environment_profile = .git_read_only,
     } };
@@ -755,11 +797,11 @@ fn directGit(argv: []const []const u8) StageAdmission {
 
 fn planGitStatus(
     alloc: std.mem.Allocator,
+    ready: safe_git.Ready,
     arguments: []const []const u8,
 ) std.mem.Allocator.Error!StageAdmission {
     var argv: std.ArrayList([]const u8) = .empty;
-    try appendGitPrelude(alloc, &argv);
-    try argv.appendSlice(alloc, &.{ "status", "--ignore-submodules=all" });
+    try safe_git.appendCommand(alloc, &argv, ready, .status);
     for (arguments) |argument| {
         const canonical = if (std.mem.eql(u8, argument, "-s"))
             "--short"
@@ -777,16 +819,17 @@ fn planGitStatus(
             return .{ .approval_required = .unsupported_argument };
         try argv.append(alloc, canonical);
     }
-    return directGit(try argv.toOwnedSlice(alloc));
+    return directGit(ready, try argv.toOwnedSlice(alloc));
 }
 
 fn planGitDiff(
     alloc: std.mem.Allocator,
+    ready: safe_git.Ready,
     arguments: []const []const u8,
 ) std.mem.Allocator.Error!StageAdmission {
     var argv: std.ArrayList([]const u8) = .empty;
-    try appendGitPrelude(alloc, &argv);
-    try argv.appendSlice(alloc, &.{ "diff", "--no-ext-diff", "--no-textconv", "--color=never" });
+    try safe_git.appendCommand(alloc, &argv, ready, .diff);
+    try argv.append(alloc, "--color=never");
 
     var index: usize = 0;
     while (index < arguments.len and !std.mem.eql(u8, arguments[index], "--")) : (index += 1) {
@@ -811,16 +854,17 @@ fn planGitDiff(
     }
     try argv.append(alloc, "--");
     try argv.appendSlice(alloc, operands);
-    return directGit(try argv.toOwnedSlice(alloc));
+    return directGit(ready, try argv.toOwnedSlice(alloc));
 }
 
 fn planGitLog(
     alloc: std.mem.Allocator,
+    ready: safe_git.Ready,
     arguments: []const []const u8,
 ) std.mem.Allocator.Error!StageAdmission {
     var argv: std.ArrayList([]const u8) = .empty;
-    try appendGitPrelude(alloc, &argv);
-    try argv.appendSlice(alloc, &.{ "log", "--no-ext-diff", "--no-textconv", "--color=never", "--max-count=100" });
+    try safe_git.appendCommand(alloc, &argv, ready, .log);
+    try argv.appendSlice(alloc, &.{ "--color=never", "--max-count=100" });
 
     var index: usize = 0;
     while (index < arguments.len and !std.mem.eql(u8, arguments[index], "--")) : (index += 1) {
@@ -860,7 +904,7 @@ fn planGitLog(
     }
     try argv.append(alloc, "--");
     try argv.appendSlice(alloc, operands);
-    return directGit(try argv.toOwnedSlice(alloc));
+    return directGit(ready, try argv.toOwnedSlice(alloc));
 }
 
 fn boundedDecimal(value: []const u8, maximum: usize) bool {
@@ -978,13 +1022,18 @@ test "planner canonicalizes pwd to a fixed physical path" {
     }
 }
 
+/// Planner tests use a fixed safe-git result, so they do not depend on the
+/// host's git. `safe_git.zig` tests the real preparation.
+const test_git: GitSource = .{ .fixed = .{ .ready = .{ .executable = "/usr/bin/git", .filter_names = &.{} } } };
+
 fn expectDirect(command: []const u8, target_os: std.Target.Os.Tag) !Admission {
-    const admission = try plan(
+    const admission = try planWithGit(
         std.testing.allocator,
         command,
         "/workspace",
         false,
         target_os,
+        test_git,
     );
     if (admission == .approval_required) {
         std.debug.print(
@@ -1004,12 +1053,23 @@ fn expectApproval(
     target_os: std.Target.Os.Tag,
     expected: ApprovalReason,
 ) !void {
-    var admission = try plan(
+    return expectApprovalWithGit(command, background, target_os, expected, test_git);
+}
+
+fn expectApprovalWithGit(
+    command: []const u8,
+    background: bool,
+    target_os: std.Target.Os.Tag,
+    expected: ApprovalReason,
+    git_source: GitSource,
+) !void {
+    var admission = try planWithGit(
         std.testing.allocator,
         command,
         "/workspace",
         background,
         target_os,
+        git_source,
     );
     defer admission.deinit(std.testing.allocator);
 
@@ -1304,19 +1364,46 @@ test "planner pins read-only git inspection to hardened argv and environment" {
     const expected = [_][]const u8{
         "/usr/bin/git",
         "--no-pager",
+        "--no-optional-locks",
+        "-c",
+        "core.fsmonitor=false",
         "-c",
         "core.hooksPath=/dev/null",
         "-c",
-        "core.fsmonitor=false",
+        "log.showSignature=false",
         "diff",
         "--no-ext-diff",
         "--no-textconv",
+        "--ignore-submodules=all",
         "--color=never",
         "--name-only",
         "--",
         "src",
     };
     try expectArgv(&expected, stage.argv);
+}
+
+test "planner blanks repository filters and falls back to review when safe git refuses" {
+    const with_filter: GitSource = .{ .fixed = .{ .ready = .{ .executable = "/usr/bin/git", .filter_names = &.{"evil"} } } };
+    var admission = try planWithGit(std.testing.allocator, "git status --short", "/workspace", false, .linux, with_filter);
+    defer admission.deinit(std.testing.allocator);
+    const argv = admission.direct_read_only.stages[0].argv;
+    for ([_][]const u8{ "filter.evil.clean=", "filter.evil.smudge=", "filter.evil.process=" }) |override| {
+        for (argv, 0..) |arg, index| {
+            if (std.mem.eql(u8, arg, override)) {
+                try std.testing.expectEqualStrings("-c", argv[index - 1]);
+                break;
+            }
+        } else return error.TestExpectedFilterOverride;
+    }
+
+    const refused: GitSource = .{ .fixed = .{ .refused = .repository_mismatch } };
+    for ([_][]const u8{ "git status", "git diff --stat", "git log --oneline -n 5", "git status --short | wc -l" }) |command| {
+        try expectApprovalWithGit(command, false, .linux, .unsafe_git, refused);
+    }
+    // Subcommands that are never auto-run keep their own reason.
+    try expectApprovalWithGit("git push origin HEAD", false, .linux, .command_owned_input, refused);
+    try expectApprovalWithGit("git status --ignored", false, .linux, .unsupported_argument, test_git);
 }
 
 test "planner limits bounded readers to pipeline input" {
@@ -1363,7 +1450,7 @@ test "planner target policies use reviewed absolute executables and argv" {
             defer admission.deinit(std.testing.allocator);
             const direct = admission.direct_read_only;
             for (direct.stages) |stage| {
-                try std.testing.expect(std.fs.path.isAbsolute(stage.executable));
+                try std.testing.expect(std.Io.Dir.path.isAbsolute(stage.executable));
                 try std.testing.expectEqualStrings(stage.executable, stage.argv[0]);
                 try std.testing.expectEqual(EnvironmentProfile.basic_read_only, stage.environment_profile);
                 for (stage.argv) |arg| {
@@ -1552,7 +1639,7 @@ test "planner preserves accepted printf argv exactly" {
 
 test "planner native printf forms match shell-visible execution" {
     const builtin = @import("builtin");
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     const commands = [_][]const u8{
         "printf x",
@@ -1563,13 +1650,13 @@ test "planner native printf forms match shell-visible execution" {
         "printf '%s' 'caf\u{00e9}'",
     };
     for (commands) |command| {
-        try expectNativePrintfEquivalent(command, builtin.os.tag);
+        try expectNativePrintfEquivalent(command, builtin.target.os.tag);
     }
 }
 
 test "planner generated native printf matrix matches shell bytes status and stderr" {
     const builtin = @import("builtin");
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     const data_classes = [_][]const u8{
@@ -1589,27 +1676,27 @@ test "planner generated native printf matrix matches shell bytes status and stde
     }) |format| {
         const command = try buildPrintfCommand(alloc, format, &.{});
         defer alloc.free(command);
-        try expectNativePrintfEquivalent(command, builtin.os.tag);
+        try expectNativePrintfEquivalent(command, builtin.target.os.tag);
     }
     for ([_][]const u8{ "%s", "prefix:%s", "%s:suffix", "a\\n%%:%s" }) |format| {
         for (data_classes) |data| {
             const command = try buildPrintfCommand(alloc, format, &.{data});
             defer alloc.free(command);
-            try expectNativePrintfEquivalent(command, builtin.os.tag);
+            try expectNativePrintfEquivalent(command, builtin.target.os.tag);
         }
     }
     for (data_classes) |first| {
         for (data_classes) |second| {
             const command = try buildPrintfCommand(alloc, "%s:%s", &.{ first, second });
             defer alloc.free(command);
-            try expectNativePrintfEquivalent(command, builtin.os.tag);
+            try expectNativePrintfEquivalent(command, builtin.target.os.tag);
         }
     }
 }
 
 test "planner native ls policy preserves reviewed target behavior" {
     const builtin = @import("builtin");
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1651,7 +1738,7 @@ test "planner native ls policy preserves reviewed target behavior" {
         .{ .command = "ls missing", .succeeds = false },
     };
     for (cases) |case| {
-        var admission = try expectDirect(case.command, builtin.os.tag);
+        var admission = try expectDirect(case.command, builtin.target.os.tag);
         defer admission.deinit(alloc);
         const stage = admission.direct_read_only.stages[0];
         const result = try std.process.run(alloc, std.testing.io, .{
@@ -1675,7 +1762,7 @@ test "planner native ls policy preserves reviewed target behavior" {
         }
     }
 
-    var hostile_failure = try expectDirect("ls '\x1bmissing'", builtin.os.tag);
+    var hostile_failure = try expectDirect("ls '\x1bmissing'", builtin.target.os.tag);
     defer hostile_failure.deinit(alloc);
     const hostile_failure_result = try std.process.run(alloc, std.testing.io, .{
         .argv = hostile_failure.direct_read_only.stages[0].argv,
@@ -1688,7 +1775,7 @@ test "planner native ls policy preserves reviewed target behavior" {
     try std.testing.expect(hostile_failure_result.stderr.len > 0);
     try std.testing.expect(std.mem.findScalar(u8, hostile_failure_result.stderr, 0x1b) == null);
 
-    var bare = try expectDirect("ls", builtin.os.tag);
+    var bare = try expectDirect("ls", builtin.target.os.tag);
     defer bare.deinit(alloc);
     const bare_result = try std.process.run(alloc, std.testing.io, .{
         .argv = bare.direct_read_only.stages[0].argv,
@@ -1704,7 +1791,7 @@ test "planner native ls policy preserves reviewed target behavior" {
         try std.testing.expect(std.mem.find(u8, bare_result.stdout, entry) != null);
     }
 
-    var numeric = try expectDirect("ls -l file", builtin.os.tag);
+    var numeric = try expectDirect("ls -l file", builtin.target.os.tag);
     defer numeric.deinit(alloc);
     const numeric_stage = numeric.direct_read_only.stages[0];
     const expected_numeric_argv = [_][]const u8{ "/bin/ls", "-q", "-n", "--", "file" };
@@ -1736,7 +1823,7 @@ test "planner bounds ls operands at sixty four" {
     try accepted.appendSlice(std.testing.allocator, "ls");
     for (0..64) |index| {
         var buffer: [32]u8 = undefined;
-        const operand = try std.fmt.bufPrint(&buffer, " path-{d}", .{index});
+        const operand = try std.mem.print(&buffer, " path-{d}", .{index});
         try accepted.appendSlice(std.testing.allocator, operand);
     }
 

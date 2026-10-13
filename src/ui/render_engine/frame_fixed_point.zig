@@ -97,9 +97,9 @@ const FixedPointTestContext = struct {
     inline_advance_rows: u16 = 0,
     prepared_occupied_rows: ?u16 = null,
     resolved_occupied_rows: ?u16 = null,
-    candidate_tops: [8]u16 = [_]u16{0} ** 8,
-    candidate_transcript_rows: [8]u16 = [_]u16{0} ** 8,
-    resolved_inline_rows: [8]u32 = [_]u32{0} ** 8,
+    candidate_tops: [8]u16 = @splat(0),
+    candidate_transcript_rows: [8]u16 = @splat(0),
+    resolved_inline_rows: [8]u32 = @splat(0),
     calls: usize = 0,
     resolution_calls: usize = 0,
 

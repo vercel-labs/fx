@@ -32,8 +32,7 @@ pub fn appendModelHandleNotice(
     handle: []const u8,
 ) ![]u8 {
     if (handle.len > max_public_handle_bytes) return error.InvalidReplayHandle;
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "{s}{s}{s}{s}",
         .{ model_output, model_handle_prefix, handle, model_handle_suffix },
     );
@@ -165,10 +164,10 @@ pub const EphemeralStore = struct {
         alloc: Allocator,
         stem: []const u8,
     ) !OpenSpool {
-        if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
             return error.EphemeralReplayUnavailable;
         }
-        const handle = try std.fmt.allocPrint(alloc, "{s}.bin", .{stem});
+        const handle = try alloc.print("{s}.bin", .{stem});
         errdefer alloc.free(handle);
         var writer_file = try createUnlinkedFile(alloc, self.temp_dir, stem);
         errdefer writer_file.close(io_mod.getIo());
@@ -215,12 +214,12 @@ pub const EphemeralStore = struct {
 /// A private temporary file in `temp_dir`, open for reading and writing and
 /// already unlinked, so it goes when its last handle closes.
 fn createUnlinkedFile(alloc: Allocator, temp_dir: []const u8, stem: []const u8) !std.Io.File {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.EphemeralReplayUnavailable;
     }
-    const temp_name = try std.fmt.allocPrint(alloc, ".{s}.tmp", .{stem});
+    const temp_name = try alloc.print(".{s}.tmp", .{stem});
     defer alloc.free(temp_name);
-    const temp_path = try std.fs.path.join(alloc, &.{ temp_dir, temp_name });
+    const temp_path = try std.Io.Dir.path.join(alloc, &.{ temp_dir, temp_name });
     defer alloc.free(temp_path);
     var file = std.Io.Dir.createFileAbsolute(io_mod.getIo(), temp_path, .{
         .read = true,
@@ -241,7 +240,7 @@ fn createUnlinkedFile(alloc: Allocator, temp_dir: []const u8, stem: []const u8) 
 const blob_spool_dir = "/tmp";
 
 fn duplicateFile(file: std.Io.File) !std.Io.File {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.EphemeralReplayUnavailable;
     }
     const duplicated = std.c.fcntl(file.handle, std.c.F.DUPFD_CLOEXEC, @as(std.c.fd_t, 0));
@@ -388,7 +387,7 @@ pub const Capture = struct {
             self.digest_started = true;
         }
         var header: [frame_header_bytes]u8 = undefined;
-        header[0] = @intFromEnum(stream);
+        header[0] = @backingInt(stream);
         std.mem.writeInt(u64, header[1..], @intCast(bytes.len), .little);
         self.content_hasher.update(&header);
         self.content_hasher.update(bytes);
@@ -401,7 +400,7 @@ pub const Capture = struct {
         bytes: []const u8,
     ) !void {
         var header: [frame_header_bytes]u8 = undefined;
-        header[0] = @intFromEnum(stream);
+        header[0] = @backingInt(stream);
         const payload_len = std.math.cast(u64, bytes.len) orelse
             return error.ReplayFrameTooLarge;
         std.mem.writeInt(u64, header[1..], payload_len, .little);
@@ -878,8 +877,7 @@ fn randomReplayStem(alloc: Allocator) ![]u8 {
     var random: [16]u8 = undefined;
     try std.Io.randomSecure(io_mod.getIo(), &random);
     const random_hex = std.fmt.bytesToHex(random, .lower);
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "fx-command-replay-{s}",
         .{&random_hex},
     );
@@ -893,7 +891,7 @@ fn createSpoolWithStem(
     return switch (backing) {
         .ephemeral => |store| store.createSpoolWithStem(alloc, stem),
         .blobs => blk: {
-            const handle = try std.fmt.allocPrint(alloc, "{s}.bin", .{stem});
+            const handle = try alloc.print("{s}.bin", .{stem});
             errdefer alloc.free(handle);
             break :blk .{
                 .file = .{ .ephemeral = try createUnlinkedFile(alloc, blob_spool_dir, stem) },
@@ -902,7 +900,7 @@ fn createSpoolWithStem(
             };
         },
         .saved => |capability| blk: {
-            const handle = try std.fmt.allocPrint(alloc, "{s}.bin", .{stem});
+            const handle = try alloc.print("{s}.bin", .{stem});
             errdefer alloc.free(handle);
             const file = capability.createExclusiveFile(
                 alloc,
@@ -1216,8 +1214,7 @@ fn projectedOutput(
     );
     defer encoded.deinit(alloc);
     const stream_name = @tagName(stream);
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "[{s}]\n{s}\n[/{s}]\n",
         .{ stream_name, encoded.bytes, stream_name },
     );
@@ -1351,8 +1348,7 @@ fn readAgentPage(
 
     const response_start = page_start orelse @min(requested_start, projected_offset);
     const response_end = try std.math.add(usize, response_start, page.items.len);
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "<command_output handle=\"{s}\" start_byte=\"{d}\" end_byte=\"{d}\" total_bytes=\"{d}\">\n{s}</command_output>",
         .{ handle, response_start + 1, response_end, projected_offset, page.items },
     );
@@ -1410,8 +1406,7 @@ fn searchAgentQuery(
         if (match_count >= 50 or matches.items.len >= max_response_bytes) break;
     }
     if (match_count == 0) try matches.appendSlice(alloc, "(no matches)\n");
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "<command_output_query handle=\"{s}\">\nquery: {f}\n{s}</command_output_query>",
         .{ handle, std.json.fmt(trimmed_query, .{}), matches.items },
     );
@@ -1484,7 +1479,7 @@ test "command replay capture spills without losing callback order" {
         .available => |value| value,
         .unavailable => return error.TestExpectedReplay,
     };
-    const replay_path = try std.fs.path.join(
+    const replay_path = try std.Io.Dir.path.join(
         alloc,
         &.{ "logs", "commands", descriptor.handle },
     );
@@ -1595,7 +1590,7 @@ test "a v2 session keeps a replay as one blob named by its hash, spooled or inli
     small.releaseRetained(capture_alloc);
 
     // A name this session never stored is not found.
-    try std.testing.expectError(error.ResultHandleNotFound, Reader.openHandle(alloc, &capability, "fx-command-replay-" ++ "0" ** 64 ++ ".bin"));
+    try std.testing.expectError(error.ResultHandleNotFound, Reader.openHandle(alloc, &capability, "fx-command-replay-" ++ text_utils.repeat("0", 64) ++ ".bin"));
     // Every store's blobs share the session: the same blob under a
     // web-fetch download's `.bin` handle is not a replay.
     const foreign = try std.mem.concat(alloc, u8, &.{ "artifact-", handle["fx-command-replay-".len..] });
@@ -1983,7 +1978,7 @@ test "saved command replay pages and searches beyond eight mebibytes with bounde
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const capture = try Capture.create(arena, 1024, &capability);
-    var chunk = [_]u8{'x'} ** 8192;
+    var chunk: [8192]u8 = @splat('x');
     chunk[chunk.len - 1] = '\n';
     for (0..1025) |_| try capture.appendAcceptedRequired(arena, .stdout, &chunk);
     try capture.appendAcceptedRequired(arena, .stderr, "TAIL-SENTINEL-9MIB\n");
@@ -2063,7 +2058,7 @@ test "command replay reader rejects descriptor and frame corruption" {
     );
 
     const empty_handle = "fx-command-replay-empty-frame.bin";
-    var empty_replay = [_]u8{0} ** (replay_magic.len + frame_header_bytes);
+    var empty_replay: [replay_magic.len + frame_header_bytes]u8 = @splat(0);
     @memcpy(empty_replay[0..replay_magic.len], replay_magic);
     var empty_file = try capability.createExclusiveFile(
         alloc,

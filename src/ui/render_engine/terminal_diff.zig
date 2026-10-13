@@ -3612,7 +3612,7 @@ test "reset replay uses materialized append rows as the complete write expectati
     while (row_index <= movement.post_movement.rows) : (row_index += 1) {
         row.clearRetainingCapacity();
         try movement.post_movement.rowTextTrimmed(row_index, &row);
-        try std.testing.expect(std.mem.indexOf(u8, row.items, "STALE") == null);
+        try std.testing.expect(std.mem.find(u8, row.items, "STALE") == null);
     }
     try std.testing.expect(movement.scroll_rows.materialized_scroll_rows > 0);
     try std.testing.expectEqual(@as(u16, 0), movement.scroll_rows.alignment_scroll_rows);
@@ -3666,7 +3666,7 @@ test "reset replay permits an empty document append" {
     while (row_index <= movement.post_movement.rows) : (row_index += 1) {
         row.clearRetainingCapacity();
         try movement.post_movement.rowTextTrimmed(row_index, &row);
-        try std.testing.expect(std.mem.indexOf(u8, row.items, "STALE") == null);
+        try std.testing.expect(std.mem.find(u8, row.items, "STALE") == null);
     }
 }
 

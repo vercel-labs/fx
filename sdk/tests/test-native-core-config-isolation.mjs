@@ -5,7 +5,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent } from "../node.js";
+import { createFxEngine } from "../node.js";
 
 const marker = "LIBFX_EXPLICIT_HOST_INSTRUCTIONS";
 const workspaceMarker = "LIBFX_WORKSPACE_CONTEXT_MUST_NOT_LOAD";
@@ -54,7 +54,7 @@ const addon = resolve(process.argv[2] || resolve(scriptDir, "../../zig-out/lib/l
 let agent;
 try {
   process.chdir(processWorkspace);
-  agent = await createFxAgent({
+  agent = await createFxEngine({
     nativeAddon: addon,
     backend: "native",
     fetch(input, init) {

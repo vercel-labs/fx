@@ -67,7 +67,7 @@ pub fn prepare(state: *const server.ServerState, alloc: Allocator, params_raw: ?
     const cwd = parsed.value.object.get("cwd") orelse return null;
     if (cwd == .null) return null;
     if (cwd != .string) return error.InvalidCwd;
-    if (!std.fs.path.isAbsolute(cwd.string)) return error.CwdNotAbsolute;
+    if (!std.Io.Dir.path.isAbsolute(cwd.string)) return error.CwdNotAbsolute;
 
     const root = io_mod.realpathAlloc(alloc, cwd.string) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,

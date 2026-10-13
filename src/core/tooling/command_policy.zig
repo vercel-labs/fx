@@ -278,7 +278,7 @@ fn parse_su_command_argument(command: []const u8, start: usize) ?[]const u8 {
 }
 
 fn git_destructive_effect(command_name: []const u8, rest: []const u8) ?DestructiveEffect {
-    if (!std.mem.eql(u8, std.fs.path.basename(command_name), "git")) return null;
+    if (!std.mem.eql(u8, std.Io.Dir.path.basename(command_name), "git")) return null;
 
     const sub = git_subcommand(rest) orelse return null;
     const args = git_effect_args(sub.text, rest[sub.end..]);
@@ -468,7 +468,7 @@ fn git_global_flag(option: []const u8) bool {
 }
 
 fn file_removal_effect(command_name: []const u8, rest: []const u8) ?DestructiveEffect {
-    const executable = std.fs.path.basename(command_name);
+    const executable = std.Io.Dir.path.basename(command_name);
     if (!(std.mem.eql(u8, executable, "rm") or
         std.mem.eql(u8, executable, "rmdir") or
         std.mem.eql(u8, executable, "unlink") or

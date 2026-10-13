@@ -46,7 +46,7 @@ jobs:
         id: zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.16.0"
+          version: "0.17.0"
           cache-key: bench-ReleaseSafe
 
       - name: Build (ReleaseSafe)
@@ -105,7 +105,7 @@ jobs:
         id: zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.16.0"
+          version: "0.17.0"
           cache-key: bench-ReleaseSafe
 
       - name: Build (ReleaseSafe)
@@ -139,7 +139,7 @@ jobs:
       - name: Setup Zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.16.0"
+          version: "0.17.0"
           cache-key: bench-ReleaseSafe
 
       - name: Build (ReleaseSafe)
@@ -176,7 +176,7 @@ jobs:
         id: zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.16.0"
+          version: "0.17.0"
           cache-key: bench-ReleaseSafe
 
       - name: Setup Node

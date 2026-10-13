@@ -223,7 +223,7 @@ fn parseAuthority(authority: []const u8) Error!ParsedAuthority {
         };
     }
 
-    const colon = std.mem.lastIndexOfScalar(u8, authority, ':') orelse authority.len;
+    const colon = std.mem.findScalarLast(u8, authority, ':') orelse authority.len;
     if (colon == 0) return error.MissingHost;
     const host = authority[0..colon];
     const port = if (colon == authority.len) null else try parsePort(authority[colon + 1 ..]);
@@ -405,7 +405,7 @@ fn normalizePathQuery(alloc: Allocator, path_query: []const u8) ![]u8 {
         if (std.ascii.isWhitespace(char)) return error.RequestTargetWhitespace;
     }
     if (path_query.len == 0) return alloc.dupe(u8, "/");
-    if (path_query[0] == '?') return std.fmt.allocPrint(alloc, "/{s}", .{path_query});
+    if (path_query[0] == '?') return alloc.print("/{s}", .{path_query});
     return alloc.dupe(u8, path_query);
 }
 
@@ -413,14 +413,14 @@ fn formatRetrievalUrl(alloc: Allocator, scheme: Scheme, host: []const u8, explic
     const host_text = try hostForUrl(alloc, host);
     defer alloc.free(host_text);
     if (explicit_port) |port| {
-        return std.fmt.allocPrint(alloc, "{s}://{s}:{d}{s}", .{ scheme.text(), host_text, port, path_query });
+        return alloc.print("{s}://{s}:{d}{s}", .{ scheme.text(), host_text, port, path_query });
     }
-    return std.fmt.allocPrint(alloc, "{s}://{s}{s}", .{ scheme.text(), host_text, path_query });
+    return alloc.print("{s}://{s}{s}", .{ scheme.text(), host_text, path_query });
 }
 
 fn hostForUrl(alloc: Allocator, canonical_host: []const u8) ![]u8 {
     if (std.mem.findScalar(u8, canonical_host, ':') == null) return alloc.dupe(u8, canonical_host);
-    return std.fmt.allocPrint(alloc, "[{s}]", .{canonical_host});
+    return alloc.print("[{s}]", .{canonical_host});
 }
 
 fn absoluteRedirectUrl(alloc: Allocator, current: ValidatedUrl, location: []const u8) Error![]u8 {
@@ -431,7 +431,7 @@ fn absoluteRedirectUrl(alloc: Allocator, current: ValidatedUrl, location: []cons
         return alloc.dupe(u8, without_fragment);
     }
     if (std.mem.startsWith(u8, without_fragment, "//")) {
-        return std.fmt.allocPrint(alloc, "{s}:{s}", .{ current.scheme.text(), without_fragment });
+        return alloc.print("{s}:{s}", .{ current.scheme.text(), without_fragment });
     }
     if (hasUnsupportedAbsoluteScheme(without_fragment)) return error.UnsupportedScheme;
 
@@ -454,17 +454,17 @@ fn hasUnsupportedAbsoluteScheme(value: []const u8) bool {
 fn mergeRelativePath(alloc: Allocator, current_path_query: []const u8, relative: []const u8) ![]u8 {
     const current_path_end = std.mem.findScalar(u8, current_path_query, '?') orelse current_path_query.len;
     const current_path = current_path_query[0..current_path_end];
-    const base_end = if (std.mem.lastIndexOfScalar(u8, current_path, '/')) |slash| slash + 1 else 0;
+    const base_end = if (std.mem.findScalarLast(u8, current_path, '/')) |slash| slash + 1 else 0;
     const query_start = std.mem.findScalar(u8, relative, '?') orelse relative.len;
     const relative_path = relative[0..query_start];
     const relative_query = relative[query_start..];
 
-    const joined = try std.fmt.allocPrint(alloc, "{s}{s}", .{ current_path[0..base_end], relative_path });
+    const joined = try alloc.print("{s}{s}", .{ current_path[0..base_end], relative_path });
     defer alloc.free(joined);
 
     const normalized_path = try removeDotSegments(alloc, joined);
     defer alloc.free(normalized_path);
-    return std.fmt.allocPrint(alloc, "{s}{s}", .{ normalized_path, relative_query });
+    return alloc.print("{s}{s}", .{ normalized_path, relative_query });
 }
 
 fn removeDotSegments(alloc: Allocator, path: []const u8) ![]u8 {
@@ -650,12 +650,12 @@ test "web_fetch rejects public and private ipv4 mapped ipv6 literals" {
     };
 
     for (mapped) |embedded| {
-        const literal = try std.fmt.allocPrint(alloc, "::ffff:{s}", .{embedded});
+        const literal = try alloc.print("::ffff:{s}", .{embedded});
         defer alloc.free(literal);
         const address = try std.Io.net.IpAddress.parse(literal, 443);
         try std.testing.expect(!isPublicAddress(address));
 
-        const url = try std.fmt.allocPrint(alloc, "https://[{s}]/", .{literal});
+        const url = try alloc.print("https://[{s}]/", .{literal});
         defer alloc.free(url);
         try std.testing.expectError(error.NonPublicAddress, normalize(alloc, url));
     }

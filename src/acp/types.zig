@@ -34,6 +34,12 @@ pub fn fxMetaBool(object: std.json.ObjectMap, key: []const u8) ?bool {
     return if (value == .bool) value.bool else null;
 }
 
+/// Returns `_meta.fx.<key>` when it is a JSON integer.
+pub fn fxMetaInteger(object: std.json.ObjectMap, key: []const u8) ?i64 {
+    const value = fxMetaField(object, key) orelse return null;
+    return if (value == .integer) value.integer else null;
+}
+
 pub fn writeModelRecoveryInfoUpdate(
     writer: *std.Io.Writer,
     status: ?core_types.RouteRecoveryStatus,
@@ -92,6 +98,9 @@ pub const StopReason = enum {
     max_model_turns,
     refused,
     cancelled,
+    /// The host gave the turn a time to stop at, and it stopped before its
+    /// next model request with the turn kept open for a later resume.
+    yielded,
 
     pub fn jsonString(self: StopReason) []const u8 {
         return switch (self) {
@@ -100,6 +109,7 @@ pub const StopReason = enum {
             .max_model_turns => "max_model_turns",
             .refused => "refused",
             .cancelled => "cancelled",
+            .yielded => "yielded",
         };
     }
 };
@@ -160,6 +170,23 @@ pub fn writeAgentMessageChunk(w: *std.Io.Writer, message_id: []const u8, text: [
     try w.writeAll(",\"content\":{\"type\":\"text\",\"text\":");
     try writeJsonStr(text, w);
     try w.writeAll("}}");
+}
+
+/// ACP v1 Session Notice: shown to the user, never part of the session's
+/// history. Only for a client that advertised `session.notices`.
+pub fn writeNotice(w: *std.Io.Writer, severity: []const u8, title: []const u8) !void {
+    try w.writeAll("{\"sessionUpdate\":\"notice\",\"severity\":");
+    try writeJsonStr(severity, w);
+    try w.writeAll(",\"title\":");
+    try writeJsonStr(title, w);
+    try w.writeByte('}');
+}
+
+test "writeNotice writes an ACP v1 notice update" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeNotice(&out.writer, "info", "A \"quoted\" title");
+    try std.testing.expectEqualStrings("{\"sessionUpdate\":\"notice\",\"severity\":\"info\",\"title\":\"A \\\"quoted\\\" title\"}", out.written());
 }
 
 pub fn writeAgentThoughtChunk(w: *std.Io.Writer, text: []const u8) !void {
@@ -278,6 +305,8 @@ pub const AgentCapabilities = struct {
     system_prompt: bool = false,
     /// Serves `type: "acp"` MCP servers over this connection.
     mcp_over_acp: bool = false,
+    /// Speaks MCP's HTTP+SSE transport (2024-11-05), which MCP-v2 doesn't.
+    mcp_sse: bool = true,
 };
 
 pub fn writeInitializeResponse(w: *std.Io.Writer, capabilities: AgentCapabilities) !void {
@@ -289,7 +318,7 @@ pub fn writeInitializeResponse(w: *std.Io.Writer, capabilities: AgentCapabilitie
     try w.print("\"promptCapabilities\":{{\"image\":{s},\"audio\":false,\"embeddedContext\":true}},", .{if (capabilities.image_prompts) "true" else "false"});
     try w.print("\"mcpCapabilities\":{{\"http\":{s},\"sse\":{s},\"acp\":{s}}},", .{
         mcp_servers,
-        mcp_servers,
+        if (capabilities.mcp_servers and capabilities.mcp_sse) "true" else "false",
         if (capabilities.mcp_over_acp) "true" else "false",
     });
     try w.writeAll("\"sessionCapabilities\":{\"list\":{},\"resume\":{},\"close\":{}");
@@ -446,6 +475,7 @@ test "StopReason jsonString values" {
     try std.testing.expectEqualStrings("end_turn", StopReason.end_turn.jsonString());
     try std.testing.expectEqualStrings("cancelled", StopReason.cancelled.jsonString());
     try std.testing.expectEqualStrings("max_output_tokens", StopReason.max_output_tokens.jsonString());
+    try std.testing.expectEqualStrings("yielded", StopReason.yielded.jsonString());
 }
 
 test "ToolCallKind jsonString values" {

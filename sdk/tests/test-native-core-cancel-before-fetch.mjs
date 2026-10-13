@@ -3,7 +3,7 @@ import { strict as assert } from "node:assert";
 import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent } from "../node.js";
+import { createFxEngine } from "../node.js";
 
 const require = createRequire(import.meta.url);
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
@@ -100,7 +100,7 @@ const delayedAddon = {
     return request;
   },
 };
-const agent = await createFxAgent({
+const agent = await createFxEngine({
   backend: "native",
   nativeAddon: delayedAddon,
   apiKey: "late-cancel-key",

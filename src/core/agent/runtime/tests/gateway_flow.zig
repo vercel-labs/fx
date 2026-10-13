@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../../shared/testing_allocator.zig");
 const agent_stream_provider = @import("../../stream_provider.zig");
 const builtin_tools = @import("../../../../builtins/tools.zig");
 const types = @import("../../../shared/types.zig");
@@ -28,6 +29,7 @@ const prompt_context = @import("../prompt_context.zig");
 const runtime_orchestrator = @import("../orchestrator.zig");
 
 const test_support = @import("support.zig");
+const text_utils = @import("../../../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const HistoryTurn = types.HistoryTurn;
@@ -454,7 +456,7 @@ fn writeTestImagePath(alloc: Allocator, tmp: *std.testing.TmpDir) ![]u8 {
 fn testSnapshotDir(alloc: Allocator, tmp: *std.testing.TmpDir) ![]u8 {
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    return std.fs.path.join(alloc, &.{ root, "snapshots" });
+    return std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
 }
 
 fn testCapturedImage(
@@ -542,8 +544,7 @@ fn oversizedVisionProviderResult(alloc: Allocator, summary_bytes: usize) ![]u8 {
     const summary = try alloc.alloc(u8, summary_bytes);
     defer alloc.free(summary);
     @memset(summary, 'a');
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "{{\"images\":[{{\"image_id\":1,\"status\":\"ok\",\"summary\":\"{s}\",\"visible_text\":[],\"details\":[]}}]}}",
         .{summary},
     );
@@ -734,8 +735,7 @@ test "fake gateway rejects assistant prefill and unexpected tail continuations" 
         error.TestAssistantPrefillRequest,
         check(alloc, "{\"prompt\":[{\"role\":\"user\",\"content\":[]},{\"role\":\"assistant\",\"content\":[]}]}", true),
     );
-    const continued = try std.fmt.allocPrint(
-        alloc,
+    const continued = try alloc.print(
         "{{\"prompt\":[{{\"role\":\"assistant\",\"content\":[]}},{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}]}}",
         .{runtime_orchestrator.assistant_tail_continuation_prompt},
     );
@@ -1004,7 +1004,7 @@ test "processQueuedPrompt delivers dense under-budget Vision evidence unchanged"
     const persisted = hooks.history_turns.items[0].assistant.execution.tool_steps[0].tool_results[0];
     try std.testing.expectEqual(types.PersistedToolStatus.success, persisted.status);
     try std.testing.expectEqual(@as(usize, 40), std.mem.count(u8, persisted.output, "visible item "));
-    try std.testing.expect(std.mem.find(u8, persisted.output, "x" ** 5000) != null);
+    try std.testing.expect(std.mem.find(u8, persisted.output, text_utils.repeat("x", 5000)) != null);
     try expectGatewayToolResultOutput(&gateway, 2, "call_vision_dense_evidence", persisted.output);
     try expectBodyNotContains(&gateway, 2, image_path);
 }
@@ -1490,7 +1490,7 @@ test "processQueuedPrompt keeps corrupt twenty-image members inside their origin
         try std.testing.expectEqual(expected[1], countNeedle(gateway.request_bodies.items[2], "\"type\":\"file\""));
         try std.testing.expectEqual(expected[2], countNeedle(gateway.request_bodies.items[3], "\"type\":\"file\""));
         var invalid_marker: [32]u8 = undefined;
-        const marker = try std.fmt.bufPrint(
+        const marker = try std.mem.print(
             &invalid_marker,
             "image_id={d}",
             .{corrupt_index + 1},
@@ -2051,10 +2051,10 @@ test "processQueuedPrompt recovers from Vision capacity failure with a narrower 
     try std.testing.expectEqual(@as(usize, 1), countNeedle(gateway.request_bodies.items[3], "\"type\":\"file\""));
     try expectBodyContains(&gateway, 2, "output_limit_exceeded");
     try expectBodyContains(&gateway, 2, "narrower focus or fewer images");
-    try expectBodyNotContains(&gateway, 2, "a" ** 1024);
+    try expectBodyNotContains(&gateway, 2, text_utils.repeat("a", 1024));
     try expectBodyContains(&gateway, 4, "narrow validated evidence");
     try expectBodyContains(&gateway, 4, "READY");
-    try expectBodyNotContains(&gateway, 4, "a" ** 1024);
+    try expectBodyNotContains(&gateway, 4, text_utils.repeat("a", 1024));
     const execution = hooks.history_turns.items[0].assistant.execution;
     try std.testing.expectEqual(@as(usize, 2), execution.tool_steps.len);
     try std.testing.expectEqual(types.PersistedToolStatus.failure, execution.tool_steps[0].tool_results[0].status);
@@ -2231,8 +2231,7 @@ test "vision does not retry a provider response over the output limit" {
 
     try std.testing.expectEqual(@as(usize, 1), script.calls);
     try std.testing.expect(std.mem.find(u8, result.model_output, "output_limit_exceeded") != null);
-    const expected_message = try std.fmt.allocPrint(
-        alloc,
+    const expected_message = try alloc.print(
         "Vision produced {d} bytes; the configured budget is 1024 bytes.",
         .{oversized.len},
     );
@@ -2304,7 +2303,7 @@ test "vision propagates cancellation raised on either provider attempt" {
 }
 
 test "vision surfaces allocation failure on either provider attempt" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const image_path = try writeTestImagePath(alloc, &tmp);
@@ -2568,7 +2567,7 @@ test "processQueuedPrompt routes images natively only when vision and file input
         const image = try testCapturedImage(alloc, &tmp, image_path, 1);
         defer types.freeImageAttachment(alloc, image);
         var images = [_]types.ImageAttachment{image};
-        const model = try std.fmt.allocPrint(alloc, "test/{s}", .{entry.label});
+        const model = try alloc.print("test/{s}", .{entry.label});
         defer alloc.free(model);
         const capability_overrides = [_]ModelCapabilityOverride{.{
             .model = model,
@@ -2774,7 +2773,7 @@ test "processQueuedPrompt traces selected live controls without request payloads
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "provider-options-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "provider-options-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -3169,7 +3168,7 @@ test "processQueuedPrompt semantically compacts history at eighty percent and co
         .truncated = true,
     }};
     var restored_steps = [_]types.ToolExecutionStep{.{
-        .assistant = @constCast("AUTO_HISTORY_ASSISTANT_SENTINEL\n" ++ ("h" ** 150_000)),
+        .assistant = @constCast("AUTO_HISTORY_ASSISTANT_SENTINEL\n" ++ text_utils.repeat("h", 150_000)),
         .tool_calls = &restored_calls,
         .tool_results = &restored_results,
     }};
@@ -3290,7 +3289,7 @@ test "processQueuedPrompt delivers steering queued during in-turn compaction wit
     var history = [_]HistoryTurn{
         .{ .assistant = .{
             .user = .{ .text = @constCast("COMPACT_STEER_HISTORY_USER") },
-            .assistant = @constCast("COMPACT_STEER_HISTORY_ASSISTANT\n" ++ ("h" ** 150_000)),
+            .assistant = @constCast("COMPACT_STEER_HISTORY_ASSISTANT\n" ++ text_utils.repeat("h", 150_000)),
             .execution = .{ .tool_steps = &restored_steps },
         } },
         .{ .assistant = .{
@@ -3344,14 +3343,14 @@ fn compactBehindSystemPrompt(comptime system_bytes: usize) !usize {
     hooks.available_capability_overrides = &overrides;
     var fixture = PromptFixture{};
     var config = fixture.config();
-    config.system_prompt = "i" ** system_bytes;
+    config.system_prompt = text_utils.repeat("i", system_bytes);
     var job = fixture.job();
     job.model = @constCast(model);
-    var old_steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast("OLD_BUDGET_FACT " ++ ("h" ** 380_000)) }};
+    var old_steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast("OLD_BUDGET_FACT " ++ text_utils.repeat("h", 380_000)) }};
     var history = [_]HistoryTurn{
         .{ .assistant = .{ .user = .{ .text = @constCast("older") }, .assistant = @constCast("older done"), .execution = .{ .tool_steps = &old_steps } } },
-        .{ .assistant = .{ .user = .{ .text = @constCast("middle") }, .assistant = @constCast("MIDDLE_BUDGET_FACT " ++ ("m" ** 8_000)) } },
-        .{ .assistant = .{ .user = .{ .text = @constCast("recent") }, .assistant = @constCast("RECENT_BUDGET_FACT " ++ ("r" ** 8_000)) } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("middle") }, .assistant = @constCast("MIDDLE_BUDGET_FACT " ++ text_utils.repeat("m", 8_000)) } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("recent") }, .assistant = @constCast("RECENT_BUDGET_FACT " ++ text_utils.repeat("r", 8_000)) } },
     };
     job.history = &history;
     try runFakePrompt(&gateway, &hooks, config, job);
@@ -3394,7 +3393,7 @@ test "compaction remeasures its rebuilt continuation after calibrated preflight"
     var completions: [6]FakeCompletion = undefined;
     for (ids, 0..) |id, index| {
         calls[index] = .{toolCall(id, "read_file", "{\"path\":\"fixture.txt\"}")};
-        states[index] = try std.fmt.allocPrint(alloc, "[{{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{{\"openai\":{{\"reasoningEncryptedContent\":\"{s}\"}}}}}},{{\"type\":\"tool-call\",\"toolCallId\":\"{s}\"}}]", .{ "r" ** 200_000, id });
+        states[index] = try alloc.print("[{{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{{\"openai\":{{\"reasoningEncryptedContent\":\"{s}\"}}}}}},{{\"type\":\"tool-call\",\"toolCallId\":\"{s}\"}}]", .{ text_utils.repeat("r", 200_000), id });
         initialized += 1;
         completions[index] = .{ .tool_calls = &calls[index], .provider_state_json = states[index], .usage = .{ .input_tokens = inputs[index] } };
     }
@@ -3430,7 +3429,7 @@ test "compaction can summarize the newest exchange when fixed context prevents r
         defer tmp.cleanup();
         const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
         defer alloc.free(result_dir);
-        const calls = [_]ToolCall{toolCall("completed-large-write", "write_file", "{\"path\":\"large.txt\",\"content\":\"" ++ ("x" ** 68_000) ++ "\"}")};
+        const calls = [_]ToolCall{toolCall("completed-large-write", "write_file", "{\"path\":\"large.txt\",\"content\":\"" ++ text_utils.repeat("x", 68_000) ++ "\"}")};
         var gateway = FakeGateway.init(alloc, &.{
             .{ .tool_calls = &calls },
             .{ .content = "The large write completed. Do not repeat it." },
@@ -3446,7 +3445,7 @@ test "compaction can summarize the newest exchange when fixed context prevents r
         hooks.exec_plans = &.{.{ .result = .{ .model_output = "Write completed." } }};
         var fixture = PromptFixture{};
         var config = fixture.config();
-        config.system_prompt = "i" ** 16_000;
+        config.system_prompt = text_utils.repeat("i", 16_000);
         config.tool_result_dir = result_dir;
         var job = fixture.job();
         job.model = @constCast(model);
@@ -3456,7 +3455,7 @@ test "compaction can summarize the newest exchange when fixed context prevents r
         try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
         try expectBodyContains(&gateway, 1, "[Tool call T1: write_file]");
         try expectBodyContains(&gateway, 2, "compacted_conversation");
-        try expectBodyNotContains(&gateway, 2, "x" ** 68_000);
+        try expectBodyNotContains(&gateway, 2, text_utils.repeat("x", 68_000));
         try std.testing.expectEqual(@as(usize, 1), hooks.successful_effect_count.load(.seq_cst));
     }
 }
@@ -3743,7 +3742,7 @@ test "cancelled automatic compaction is retried by the next prompt" {
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.tool_result_dir = result_dir;
-    var old_steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast("CANCELLED_AUTO_HISTORY_ASSISTANT\n" ++ ("h" ** 150_000)) }};
+    var old_steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast("CANCELLED_AUTO_HISTORY_ASSISTANT\n" ++ text_utils.repeat("h", 150_000)) }};
     var history = [_]HistoryTurn{
         .{ .assistant = .{
             .user = .{ .text = @constCast("CANCELLED_AUTO_HISTORY_USER") },
@@ -3814,9 +3813,9 @@ test "retained context automatic compaction archives oversized parallel results 
     defer tmp.cleanup();
     const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(result_dir);
-    const old_text = "OLDER_HISTORY_SENTINEL " ++ ("o" ** 52_000);
-    const result_a = "RECENT_EXACT_A\n" ++ ("a" ** 13_000);
-    const result_b = "RECENT_EXACT_B\n" ++ ("b" ** 13_000);
+    const old_text = "OLDER_HISTORY_SENTINEL " ++ text_utils.repeat("o", 52_000);
+    const result_a = "RECENT_EXACT_A\n" ++ text_utils.repeat("a", 13_000);
+    const result_b = "RECENT_EXACT_B\n" ++ text_utils.repeat("b", 13_000);
     var old_steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast(old_text) }};
     const history = [_]HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("previous work") },
@@ -3863,8 +3862,8 @@ test "retained context automatic compaction archives oversized parallel results 
     try expectBodyContains(&gateway, 1, "RECENT_EXACT_B");
     try expectBodyContains(&gateway, 2, "compacted_conversation");
     try expectBodyContains(&gateway, 2, "Search them by text, or open one by its ID");
-    try expectBodyNotContains(&gateway, 2, "a" ** 13_000);
-    try expectBodyNotContains(&gateway, 2, "b" ** 13_000);
+    try expectBodyNotContains(&gateway, 2, text_utils.repeat("a", 13_000));
+    try expectBodyNotContains(&gateway, 2, text_utils.repeat("b", 13_000));
     try expectBodyNotContains(&gateway, 2, "OLDER_HISTORY_SENTINEL");
     try std.testing.expectEqual(@as(usize, 2), hooks.successful_effect_count.load(.seq_cst));
     const completed = hooks.history_turns.items[hooks.history_turns.items.len - 1].assistant;
@@ -3891,8 +3890,8 @@ test "retained context compaction preserves recovered historical replay" {
     defer tmp.cleanup();
     const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(result_dir);
-    const old_text = "OLDER_HISTORY_SENTINEL " ++ ("o" ** 52_000);
-    const recent_result = "RECENT_RECOVERED_RESULT\n" ++ ("r" ** 1_000);
+    const old_text = "OLDER_HISTORY_SENTINEL " ++ text_utils.repeat("o", 52_000);
+    const recent_result = "RECENT_RECOVERED_RESULT\n" ++ text_utils.repeat("r", 1_000);
     const model = "provider/retained-recovery";
     const state = "[{\"type\":\"reasoning\",\"text\":\"retained_reasoning\"},{\"type\":\"text\",\"offset\":0,\"length\":42,\"providerOptions\":{\"fixture\":{\"id\":\"discarded_text\"}}}]";
     var calls = [_]ToolCall{toolCall("old_read", "read_file", "{\"path\":\"a.txt\"}")};
@@ -3946,7 +3945,7 @@ test "retained context compaction preserves recovered historical replay" {
 
 test "compaction summarizes an oversized only recent exchange without repeating it" {
     const alloc = std.testing.allocator;
-    const original_result = "RECENT_ONLY\n" ++ ("r" ** 10_000);
+    const original_result = "RECENT_ONLY\n" ++ text_utils.repeat("r", 10_000);
     var gateway = FakeGateway.init(alloc, &.{
         .{ .tool_calls = &.{toolCall("recent-only", "read_file", "{\"path\":\"large.txt\"}")} },
         .{ .content = "Turn in progress\nIn between: The read completed with RECENT_ONLY." },
@@ -3968,7 +3967,7 @@ test "compaction summarizes an oversized only recent exchange without repeating 
     try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
     try expectBodyContains(&gateway, 1, "user prompt");
     try expectBodyContains(&gateway, 2, "RECENT_ONLY");
-    try expectBodyNotContains(&gateway, 2, "r" ** 10_000);
+    try expectBodyNotContains(&gateway, 2, text_utils.repeat("r", 10_000));
     try expectBodyContains(&gateway, 2, "compacted_conversation");
     // The current request stays as the live user message and is not copied
     // into the compacted user messages as well.
@@ -3990,7 +3989,7 @@ test "automatic compaction summarizes a newest exchange larger than the input wi
     defer tmp.cleanup();
     const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(result_dir);
-    const arguments = "{\"path\":\"large.txt\",\"content\":\"" ++ ("x" ** 40_000) ++ "\"}";
+    const arguments = "{\"path\":\"large.txt\",\"content\":\"" ++ text_utils.repeat("x", 40_000) ++ "\"}";
     var gateway = FakeGateway.init(alloc, &.{
         .{ .tool_calls = &.{toolCall("oversized-newest", "write_file", arguments)} },
         .{ .content = "The large file was written successfully. Do not repeat the write." },
@@ -4014,7 +4013,7 @@ test "automatic compaction summarizes a newest exchange larger than the input wi
     try expectBodyContains(&gateway, 1, "[Tool call T1: write_file]");
     try expectBodyContains(&gateway, 1, "[Tool result T1: write_file]");
     try expectBodyContains(&gateway, 2, "compacted_conversation");
-    try expectBodyNotContains(&gateway, 2, "x" ** 40_000);
+    try expectBodyNotContains(&gateway, 2, text_utils.repeat("x", 40_000));
     try std.testing.expectEqual(@as(usize, 1), hooks.successful_effect_count.load(.seq_cst));
     try std.testing.expectEqualStrings("Continued after the large write.", hooks.finish_assistant_text.?);
 }
@@ -4044,7 +4043,7 @@ test "interruption after automatic compaction retains the recent and new executi
     hooks.available_capability_overrides = &overrides;
     hooks.permission_decisions = &.{ .once, .once };
     hooks.exec_plans = &.{
-        .{ .result = .{ .model_output = "x" ** (10 * 1024) } },
+        .{ .result = .{ .model_output = text_utils.repeat("x", 10 * 1024) } },
         .{ .result = .{ .model_output = "later result" } },
     };
     var fixture = PromptFixture{};
@@ -4055,7 +4054,7 @@ test "interruption after automatic compaction retains the recent and new executi
 
     var history = [_]HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("earlier work") },
-        .assistant = @constCast("o" ** 40_000),
+        .assistant = @constCast(text_utils.repeat("o", 40_000)),
     } }};
     job.history = &history;
 
@@ -4066,7 +4065,7 @@ test "interruption after automatic compaction retains the recent and new executi
     const interrupted = hooks.history_turns.items[1].interrupted;
     try std.testing.expectEqual(@as(usize, 1), interrupted.execution.tool_steps.len);
     try std.testing.expectEqualStrings("after-checkpoint", interrupted.execution.tool_steps[0].tool_calls[0].id);
-    try std.testing.expectEqualStrings("x" ** (10 * 1024), hooks.compaction_prefixes.items[0].?.assistant.execution.tool_steps[0].tool_results[0].output);
+    try std.testing.expectEqualStrings(text_utils.repeat("x", 10 * 1024), hooks.compaction_prefixes.items[0].?.assistant.execution.tool_steps[0].tool_results[0].output);
     try std.testing.expectEqual(@as(usize, 2), interrupted.execution.files.len);
     try std.testing.expectEqual(@as(usize, 2), hooks.successful_effect_count.load(.seq_cst));
     try std.testing.expectEqualStrings("before-checkpoint", hooks.compaction_prefixes.items[0].?.assistant.execution.tool_steps[0].tool_calls[0].id);
@@ -4099,7 +4098,7 @@ test "context overflow after automatic compaction retries with new execution" {
     hooks.available_capability_overrides = &overrides;
     hooks.permission_decisions = &.{ .once, .once };
     hooks.exec_plans = &.{
-        .{ .result = .{ .model_output = "x" ** (10 * 1024) } },
+        .{ .result = .{ .model_output = text_utils.repeat("x", 10 * 1024) } },
         .{ .result = .{ .model_output = "later result" } },
     };
     var fixture = PromptFixture{};
@@ -4110,7 +4109,7 @@ test "context overflow after automatic compaction retries with new execution" {
 
     var history = [_]HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("earlier work") },
-        .assistant = @constCast("o" ** 40_000),
+        .assistant = @constCast(text_utils.repeat("o", 40_000)),
     } }};
     job.history = &history;
 
@@ -4151,7 +4150,7 @@ test "compaction summarizes a truncated result that has no saved copy" {
     defer hooks.deinit();
     hooks.permission_decisions = &.{.once};
     hooks.exec_plans = &.{.{ .result = .{
-        .model_output = "ineligible result\n" ++ ("x" ** (70 * 1024)),
+        .model_output = "ineligible result\n" ++ text_utils.repeat("x", 70 * 1024),
     } }};
     var fixture = PromptFixture{};
     var job = fixture.job();
@@ -4163,7 +4162,7 @@ test "compaction summarizes a truncated result that has no saved copy" {
     try expectBodyContains(&gateway, 1, "ineligible result");
     try expectBodyContains(&gateway, 1, "The tool calls will not be available later");
     try expectBodyContains(&gateway, 2, "compacted_conversation");
-    try expectBodyNotContains(&gateway, 2, "x" ** 1024);
+    try expectBodyNotContains(&gateway, 2, text_utils.repeat("x", 1024));
     try expectBodyNotContains(&gateway, 2, "read_tool_result");
     try std.testing.expectEqualStrings("Done after compaction.", hooks.finish_assistant_text.?);
     try std.testing.expectEqual(@as(usize, 1), hooks.successful_effect_count.load(.seq_cst));
@@ -4176,7 +4175,7 @@ test "processQueuedPrompt resolves catalog capabilities for opaque effort" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "portable-reasoning-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "portable-reasoning-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -4222,7 +4221,7 @@ test "processQueuedPrompt traces why stale controls are omitted" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "stale-controls-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "stale-controls-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -4828,11 +4827,11 @@ test "processQueuedPrompt places transient overlay before history and current pr
 
     try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
     const body = gateway.request_bodies.items[0];
-    const system_idx = std.mem.indexOf(u8, body, "system") orelse return error.TestExpectedEqual;
-    const static_idx = std.mem.indexOf(u8, body, "static project context unique") orelse return error.TestExpectedEqual;
-    const history_idx = std.mem.indexOf(u8, body, "past background prompt") orelse return error.TestExpectedEqual;
-    const current_idx = std.mem.indexOf(u8, body, "is it still running") orelse return error.TestExpectedEqual;
-    const runtime_idx = std.mem.indexOf(u8, body, "runtime tail context unique") orelse return error.TestExpectedEqual;
+    const system_idx = std.mem.find(u8, body, "system") orelse return error.TestExpectedEqual;
+    const static_idx = std.mem.find(u8, body, "static project context unique") orelse return error.TestExpectedEqual;
+    const history_idx = std.mem.find(u8, body, "past background prompt") orelse return error.TestExpectedEqual;
+    const current_idx = std.mem.find(u8, body, "is it still running") orelse return error.TestExpectedEqual;
+    const runtime_idx = std.mem.find(u8, body, "runtime tail context unique") orelse return error.TestExpectedEqual;
     try std.testing.expect(system_idx < static_idx);
     try std.testing.expect(static_idx < runtime_idx);
     try std.testing.expect(runtime_idx < history_idx);
@@ -4899,7 +4898,7 @@ test "processQueuedPrompt retains complete skill content without granting ordina
         hooks.tool_registry = builtin_tools.registry;
         const result: runtime_tool_contracts.ToolExecutionResult = .{
             .model_content_kind = case.kind,
-            .model_output = "SKILL START\n" ++ ("required instruction\n" ** 1400) ++ "COMPLETE_SKILL_TAIL",
+            .model_output = "SKILL START\n" ++ text_utils.repeat("required instruction\n", 1400) ++ "COMPLETE_SKILL_TAIL",
         };
         hooks.exec_plans = &.{ .{ .result = result }, .{ .result = result } };
         var fixture = PromptFixture{};
@@ -5090,7 +5089,7 @@ test "processQueuedPrompt skill catalog is invariant under harmless request expa
         .{ .name = "alpha", .description = "Unrelated instructions", .path = "/tmp/skills/alpha", .source = .global_fx },
         .{ .name = "release", .description = "Release the package", .path = "/tmp/skills/release", .source = .global_fx },
     };
-    const prompts = [_][]const u8{ "Release the package", "Release the package." ++ (" Keep existing behavior unchanged." ** 24) };
+    const prompts = [_][]const u8{ "Release the package", "Release the package." ++ text_utils.repeat(" Keep existing behavior unchanged.", 24) };
     var first: ?[]u8 = null;
     defer if (first) |value| alloc.free(value);
     for (prompts) |prompt| {
@@ -5122,7 +5121,7 @@ test "processQueuedPrompt skill catalog is invariant under harmless request expa
 test "processQueuedPrompt prepares each origin skill catalog with its supplied model and workspace" {
     const alloc = std.testing.allocator;
     const Skill = @import("../../../skills/skill_runtime.zig").Skill;
-    const description = "Instruction detail. " ** 50;
+    const description = text_utils.repeat("Instruction detail. ", 50);
     const names = [_][]const u8{ "alpha", "beta", "gamma", "delta" };
     const cases = [_]struct { model: []const u8, workspace: []const u8, context_window: u32, child: bool }{
         .{ .model = "fixture/parent-model", .workspace = "/tmp/parent-workspace", .context_window = 64_000, .child = false },
@@ -5137,7 +5136,7 @@ test "processQueuedPrompt prepares each origin skill catalog with its supplied m
             skill.* = .{
                 .name = name,
                 .description = description,
-                .path = try std.fs.path.join(scratch.allocator(), &.{ case.workspace, "skills", name }),
+                .path = try std.Io.Dir.path.join(scratch.allocator(), &.{ case.workspace, "skills", name }),
                 .source = .workspace_shared,
             };
         }
@@ -5166,7 +5165,7 @@ test "processQueuedPrompt prepares each origin skill catalog with its supplied m
         try std.testing.expect(std.mem.find(u8, catalog, "<available_skills>") != null);
         try std.testing.expect(catalog.len <= @as(usize, case.context_window) * 2 / 100 * 4);
         for (names) |name| {
-            const entry = try std.fmt.allocPrint(scratch.allocator(), "- {s}: ", .{name});
+            const entry = try scratch.allocator().print("- {s}: ", .{name});
             try std.testing.expect(std.mem.find(u8, catalog, entry) != null);
         }
         try std.testing.expect(std.mem.find(u8, catalog, case.workspace) != null);
@@ -5210,7 +5209,7 @@ test "processQueuedPrompt keeps supplied system prompt components in stable orde
     }};
     config.skill_catalog = .{ .skills = &skills };
     config.context_limits.skill_catalog_bytes = .{ .value = .{ .bytes = 1024 }, .source = .command_line };
-    config.host_instructions = "host guidance-order instructions\n" ++ ("Required host instruction.\n" ** 80);
+    config.host_instructions = "host guidance-order instructions\n" ++ text_utils.repeat("Required host instruction.\n", 80);
     config.model_prompt_overlay = "model guidance-order overlay";
     var job = fixture.job();
     job.history = history[0..];
@@ -5520,9 +5519,9 @@ test "processQueuedPrompt keeps completed history before the final current user 
     try expectGatewayPromptTextCount(&gateway, 0, "runtime context structural needle", 1);
     try expectGatewayPromptTextCount(&gateway, 0, "current structural prompt needle", 1);
     const body = gateway.request_bodies.items[0];
-    const history_idx = std.mem.indexOf(u8, body, "prior assistant structural needle") orelse return error.TestExpectedEqual;
-    const runtime_idx = std.mem.indexOf(u8, body, "runtime context structural needle") orelse return error.TestExpectedEqual;
-    const current_idx = std.mem.indexOf(u8, body, "current structural prompt needle") orelse return error.TestExpectedEqual;
+    const history_idx = std.mem.find(u8, body, "prior assistant structural needle") orelse return error.TestExpectedEqual;
+    const runtime_idx = std.mem.find(u8, body, "runtime context structural needle") orelse return error.TestExpectedEqual;
+    const current_idx = std.mem.find(u8, body, "current structural prompt needle") orelse return error.TestExpectedEqual;
     try std.testing.expect(runtime_idx < history_idx);
     try std.testing.expect(history_idx < current_idx);
     try expectGatewayPromptFinalUserText(&gateway, 0, "current structural prompt needle");
@@ -5738,8 +5737,7 @@ test "processQueuedPrompt does not language-retry a tool-bearing response" {
 test "processQueuedPrompt discards prose replay without losing reasoning or tool metadata" {
     const alloc = std.testing.allocator;
     const prose = "我会先检查锁文件和依赖清单。";
-    const state = try std.fmt.allocPrint(
-        alloc,
+    const state = try alloc.print(
         "[{{\"type\":\"reasoning\",\"text\":\"retained_reasoning\"}},{{\"type\":\"text\",\"offset\":0,\"length\":{d},\"providerOptions\":{{\"fixture\":{{\"id\":\"discarded_text\"}}}}}},{{\"type\":\"tool-call\",\"toolCallId\":\"call_read\",\"providerOptions\":{{\"fixture\":{{\"id\":\"retained_tool\"}}}}}}]",
         .{prose.len},
     );
@@ -6613,7 +6611,7 @@ test "processQueuedPrompt retries replay-safe ReadFailed before success" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "read-failed-retry-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "read-failed-retry-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -8821,7 +8819,7 @@ test "processQueuedPrompt trace records history shape returned tool calls and wa
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "agent-loop-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "agent-loop-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -8880,7 +8878,7 @@ test "processQueuedPrompt assigns trace lineage to subagent runs" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "subagent-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "subagent-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -8918,7 +8916,7 @@ test "processQueuedPrompt trace emits one canonical result for tool execution er
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "tool-error-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "tool-error-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();

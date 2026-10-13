@@ -223,7 +223,7 @@ fn questionInteractionHint(
     // footer chrome; a lone question needs no counter.
     if (projection.entry_count > 1) {
         var counter_buf: [32]u8 = undefined;
-        const counter = std.fmt.bufPrint(
+        const counter = std.mem.print(
             &counter_buf,
             "Question {d} of {d}",
             .{ projection.current_index + 1, projection.entry_count },
@@ -542,8 +542,10 @@ pub fn composeHintRow(
         ""
     else if (danger_text.len > 0)
         danger_text
+    else if (ctx.upgrade_status.len > 0)
+        ctx.upgrade_status
     else
-        ctx.upgrade_status;
+        ctx.mcp_status;
     const right_width = display_width.visibleWidth(right_text);
     const danger_visible = danger_text.len > 0 and right_text.ptr == danger_text.ptr;
     const left_width: u16 = if (!danger_visible and right_width > 0 and width_usize > right_width)
@@ -607,6 +609,30 @@ pub fn composeResumeMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bo
     return composeCatalogMenuHintRow(alloc, width, ctrl_c_pending, .scope);
 }
 
+/// fx's hint line: the widest of `variants` that fits, or the warning that
+/// a second Ctrl+C exits.
+pub fn composeVariantHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool, variants: []const []const u8) !std.ArrayList(u8) {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    if (ctrl_c_pending) {
+        try row.appendSlice(alloc, ui_render.statusline_style);
+        try row_text.appendClipped(alloc, &row, "press ctrl+c again to exit", width);
+        try row.appendSlice(alloc, ui_render.reset_style);
+        return row;
+    }
+    var hint = variants[variants.len - 1];
+    for (variants) |candidate| {
+        if (display_width.visibleWidth(candidate) <= width) {
+            hint = candidate;
+            break;
+        }
+    }
+    try row.appendSlice(alloc, ui_render.dim_style);
+    try row_text.appendClipped(alloc, &row, hint, width);
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
+}
+
 pub fn composeMcpMenuHintRow(
     alloc: Allocator,
     width: u16,
@@ -614,14 +640,6 @@ pub fn composeMcpMenuHintRow(
     projection: render_input.McpMenuProjection,
 ) !std.ArrayList(u8) {
     const state = projection.state;
-    if (ctrl_c_pending) {
-        var warning: std.ArrayList(u8) = .empty;
-        errdefer warning.deinit(alloc);
-        try warning.appendSlice(alloc, ui_render.statusline_style);
-        try row_text.appendClipped(alloc, &warning, "press ctrl+c again to exit", width);
-        try warning.appendSlice(alloc, ui_render.reset_style);
-        return warning;
-    }
 
     const root_variants = [_][]const u8{
         "↑↓ move  tab section  enter inspect  s add Slack  a add  r reload  c help  esc close",
@@ -681,20 +699,7 @@ pub fn composeMcpMenuHintRow(
         .details => details_variants,
         .confirm => confirm_variants,
     };
-    var hint = variants[variants.len - 1];
-    for (variants) |candidate| {
-        if (display_width.visibleWidth(candidate) <= width) {
-            hint = candidate;
-            break;
-        }
-    }
-
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendClipped(alloc, &row, hint, width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
+    return composeVariantHintRow(alloc, width, ctrl_c_pending, &variants);
 }
 
 pub fn composeHelpMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool) !std.ArrayList(u8) {
@@ -1180,7 +1185,7 @@ test "composeVisibleInputRows avoids clear-to-eol after full-width input" {
     var full = try composeVisibleInputRows(alloc, full_source, full_window);
     defer full.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), full.rows.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, full.rows.items[0].items, "\x1b[K") == null);
+    try std.testing.expect(std.mem.find(u8, full.rows.items[0].items, "\x1b[K") == null);
 
     const short_source = visual_layout.Source{
         .input = "1234",
@@ -1192,7 +1197,7 @@ test "composeVisibleInputRows avoids clear-to-eol after full-width input" {
     var short = try composeVisibleInputRows(alloc, short_source, short_window);
     defer short.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), short.rows.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, short.rows.items[0].items, "\x1b[K") != null);
+    try std.testing.expect(std.mem.find(u8, short.rows.items[0].items, "\x1b[K") != null);
 }
 
 test "composeVisibleInputRows paints selected input without changing visible width" {
@@ -1330,7 +1335,7 @@ test "footer raw geometry windows capped input around the cursor" {
     const alloc = std.testing.allocator;
     var input = InputRuntime{};
     defer input.deinit(alloc);
-    try input.edit_state.input.appendSlice(alloc, "x" ** 5000);
+    try input.edit_state.input.appendSlice(alloc, text_utils.repeat("x", 5000));
     input.edit_state.cursor = input.edit_state.input.items.len;
     const geometry = measureRawInputGeometry(testRenderContext(&input), 80, 8, true, false, false, false);
     try std.testing.expect(geometry.summary.total_rows > geometry.window.row_count);

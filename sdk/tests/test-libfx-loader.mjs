@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
-  createFxAgent,
+  createFxEngine,
   createFxTerminal,
   fxSdkApiVersion,
   libfxApiVersion,
@@ -15,10 +15,10 @@ import {
 } from "../node.js";
 import * as browser from "../browser.js";
 
-assert.equal(libfxApiVersion, 2);
+assert.equal(libfxApiVersion, 3);
 assert.equal(fxSdkApiVersion, 2);
-assert.equal(browser.libfxApiVersion, 2);
-assert.equal(typeof browser.createFxAgent, "function");
+assert.equal(browser.libfxApiVersion, 3);
+assert.equal(typeof browser.createFxEngine, "function");
 assert.equal(typeof browser.createFxTerminal, "function");
 assert.equal(typeof browser.listModels, "function");
 assert.equal(typeof listModels, "function");
@@ -28,15 +28,15 @@ const realNativeAddon = resolve(scriptDir, "../../zig-out/lib/libfx.node");
 const dir = await mkdtemp(resolve(tmpdir(), "libfx-loader-"));
 const nativePath = resolve(dir, "native.mjs");
 await writeFile(nativePath, `
-  export const libfxApiVersion = 2;
+  export const libfxApiVersion = 3;
   export async function createFxTerminal(options) { return { backend: "native-terminal", options }; }
 `);
 const nativeUrl = pathToFileURL(nativePath);
 
 const highLevelAgentPath = resolve(dir, "high-level-agent.mjs");
 await writeFile(highLevelAgentPath, `
-  export const libfxApiVersion = 2;
-  export function createFxAgent() { throw new Error("high-level createFxAgent invoked"); }
+  export const libfxApiVersion = 3;
+  export function createFxEngine() { throw new Error("high-level createFxEngine invoked"); }
 `);
 
 // Complete the fixture directory before a runtime caches its module-resolution entries.
@@ -48,7 +48,7 @@ await writeFile(coreOnlyPath, `
 const incompatiblePath = resolve(dir, "incompatible.mjs");
 await writeFile(incompatiblePath, `
   export const libfxApiVersion = 4;
-  export async function createFxAgent() {}
+  export async function createFxEngine() {}
 `);
 const versionFixtures = [
   ["missing-version", `
@@ -70,18 +70,18 @@ await writeFile(matchingVersionPath, `
   }
 `);
 await assert.rejects(
-  createFxAgent({
+  createFxEngine({
     backend: "native",
     nativeAddon: pathToFileURL(highLevelAgentPath),
     apiKey: "loader-key",
   }),
   (error) => error?.code === "LIBFX_NATIVE_UNAVAILABLE" &&
     error.message.includes("createCore") &&
-    !String(error.cause).includes("high-level createFxAgent invoked"),
+    !String(error.cause).includes("high-level createFxEngine invoked"),
 );
 
 await assert.rejects(
-  createFxAgent({
+  createFxEngine({
     backend: "native",
     nativeAddon: {
       libfxApiVersion: 4,
@@ -101,13 +101,13 @@ for (const gatewayChatUrl of [
   "file:///tmp/socket",
 ]) {
   await assert.rejects(
-    createFxAgent({ backend: "native", nativeAddon: realNativeAddon, apiKey: "loader-key", gatewayChatUrl }),
+    createFxEngine({ backend: "native", nativeAddon: realNativeAddon, apiKey: "loader-key", gatewayChatUrl }),
     TypeError,
   );
 }
 
 await assert.rejects(
-  createFxAgent({
+  createFxEngine({
     nativeAddon: nativeUrl,
     apiKey: "loader-key",
     env: { FX_MODEL: "legacy/model" },
@@ -115,11 +115,11 @@ await assert.rejects(
   (error) => error instanceof TypeError && error.message.includes("apiKey") && error.message.includes("model"),
 );
 await assert.rejects(
-  browser.createFxAgent({ apiKey: "loader-key", env: { FX_MODEL: "legacy/model" } }),
+  browser.createFxEngine({ apiKey: "loader-key", env: { FX_MODEL: "legacy/model" } }),
   (error) => error instanceof TypeError && error.message.includes("apiKey") && error.message.includes("model"),
 );
 await assert.rejects(
-  createFxAgent({ nativeAddon: nativeUrl, apiKey: "loader-key", env: undefined }),
+  createFxEngine({ nativeAddon: nativeUrl, apiKey: "loader-key", env: undefined }),
   (error) => error instanceof TypeError && error.message.includes("apiKey") && error.message.includes("model"),
 );
 
@@ -133,7 +133,7 @@ for (const [options, errorType, message] of [
   [{ apiKey: "loader-key", model: "x".repeat(1_025) }, RangeError, "1024"],
 ]) {
   await assert.rejects(
-    createFxAgent({ backend: "native", nativeAddon: realNativeAddon, ...options }),
+    createFxEngine({ backend: "native", nativeAddon: realNativeAddon, ...options }),
     (error) => error instanceof errorType && error.message.includes(message),
   );
 }
@@ -149,16 +149,16 @@ try {
   Object.defineProperty(WebAssembly, "Suspending", { configurable: true, value: undefined });
   Object.defineProperty(WebAssembly, "promising", { configurable: true, value: undefined });
   await assert.rejects(
-    createFxAgent({ nativeAddon: nativeUrl, backend: "wasm", apiKey: "loader-key" }),
+    createFxEngine({ nativeAddon: nativeUrl, backend: "wasm", apiKey: "loader-key" }),
     (error) => error?.code === "LIBFX_JSPI_REQUIRED" &&
       error.message.includes("--experimental-wasm-jspi"),
   );
   await assert.rejects(
-    createFxAgent({ nativeAddon: realNativeAddon, apiKey: "loader-key", instructions: "x".repeat(65_537) }),
+    createFxEngine({ nativeAddon: realNativeAddon, apiKey: "loader-key", instructions: "x".repeat(65_537) }),
     (error) => error instanceof RangeError && error.message.includes("65536"),
   );
   await assert.rejects(
-    createFxAgent({
+    createFxEngine({
       nativeAddon: realNativeAddon,
       checkpoint: new Uint8Array([1, 2, 3]),
       apiKey: "loader-checkpoint-key",
@@ -177,7 +177,7 @@ await assert.rejects(
 );
 
 await assert.rejects(
-  createFxAgent({ nativeAddon: pathToFileURL(incompatiblePath), backend: "native", apiKey: "loader-key" }),
+  createFxEngine({ nativeAddon: pathToFileURL(incompatiblePath), backend: "native", apiKey: "loader-key" }),
   (error) => error?.code === "LIBFX_NATIVE_UNAVAILABLE" &&
     error.message.includes("incompatible"),
 );
@@ -185,7 +185,7 @@ await assert.rejects(
 for (const [name] of versionFixtures) {
   const modulePath = resolve(dir, `${name}.mjs`);
   await assert.rejects(
-    createFxAgent({ nativeAddon: pathToFileURL(modulePath), backend: "native", apiKey: "loader-key" }),
+    createFxEngine({ nativeAddon: pathToFileURL(modulePath), backend: "native", apiKey: "loader-key" }),
     (error) => error?.code === "LIBFX_NATIVE_UNAVAILABLE" &&
       error.message.includes("incompatible") &&
       !String(error.cause).includes("createCore invoked"),
@@ -194,7 +194,7 @@ for (const [name] of versionFixtures) {
 }
 
 await assert.rejects(
-  createFxAgent({ nativeAddon: pathToFileURL(matchingVersionPath), backend: "native", apiKey: "loader-key" }),
+  createFxEngine({ nativeAddon: pathToFileURL(matchingVersionPath), backend: "native", apiKey: "loader-key" }),
   (error) => error?.code === "MATCHING_VERSION_INVOKED",
   "matching v3 low-level addon must reach createCore",
 );
@@ -216,7 +216,7 @@ const brokenReaderAddon = {
   },
 };
 try {
-  await assert.rejects(createFxAgent({ backend: "native", nativeAddon: brokenReaderAddon, apiKey: "loader-key" }));
+  await assert.rejects(createFxEngine({ backend: "native", nativeAddon: brokenReaderAddon, apiKey: "loader-key" }));
   assert.ok(failedCoreDestroyed, "failed readiness adoption must still destroy the native runtime");
 } finally {
   if (failedCore) addon.destroyCore(failedCore);

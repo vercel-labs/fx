@@ -232,17 +232,23 @@ fn optionalBytesEqual(left: ?[]const u8, right: ?[]const u8) bool {
 }
 
 pub fn binding(runtime_generation: u64, server: *const McpServer, tool: McpTool) tool_mcp_runtime.Binding {
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update(&catalog_state.digestTools(&.{tool}));
-    catalog_state.hashOptionalField(&hasher, server.instructions);
-    var definition_digest: [32]u8 = undefined;
-    hasher.final(&definition_digest);
     return .{
         .runtime_generation = runtime_generation,
         .connection_generation = server.connection_generation,
         .catalog_generation = server.catalog_generation,
         .auth_generation = server.auth_generation.load(.acquire),
         .authority_id = server.authority_id.load(.acquire),
-        .definition_digest = definition_digest,
+        .definition_digest = definitionDigest(tool, server.instructions),
     };
+}
+
+/// What a binding's definition is: the tool as advertised, with the server's
+/// instructions that its selected schema carries.
+pub fn definitionDigest(tool: McpTool, instructions: ?[]const u8) [32]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(&catalog_state.digestTools(&.{tool}));
+    catalog_state.hashOptionalField(&hasher, instructions);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
 }

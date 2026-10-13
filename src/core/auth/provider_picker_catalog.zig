@@ -81,8 +81,8 @@ pub fn keySourceAnnotation(source: KeySource, current: bool) []const u8 {
 }
 
 pub fn parseKeySource(value: []const u8) ?KeySource {
-    inline for (@typeInfo(KeySource).@"enum".fields) |field| {
-        const source = @field(KeySource, field.name);
+    inline for (@typeInfo(KeySource).@"enum".field_names) |field_name| {
+        const source = @field(KeySource, field_name);
         if (std.ascii.eqlIgnoreCase(value, keySourceSlug(source))) return source;
     }
     return null;
@@ -149,7 +149,7 @@ test "provider options expose the catalog slugs the composer accepts" {
     try std.testing.expectEqualStrings("vercel", buf[0]);
     for (buf[0..count]) |slug| {
         try std.testing.expect(provider_catalog.parse(slug) != null);
-        try std.testing.expect(std.mem.indexOfScalar(u8, slug, ' ') == null);
+        try std.testing.expect(std.mem.findScalar(u8, slug, ' ') == null);
     }
 }
 
@@ -163,7 +163,7 @@ test "method slugs round trip and stay single tokens" {
     for ([_]Method{ .oauth, .api_key }) |method| {
         const slug = methodSlug(method);
         try std.testing.expectEqual(method, parseMethod(slug).?);
-        try std.testing.expect(std.mem.indexOfScalar(u8, slug, ' ') == null);
+        try std.testing.expect(std.mem.findScalar(u8, slug, ' ') == null);
     }
     try std.testing.expect(parseMethod("nope") == null);
 }
@@ -190,8 +190,8 @@ test "key field shows a placeholder when empty and one bullet per byte" {
 }
 
 test "key source slugs round trip and map to their credentials" {
-    inline for (@typeInfo(KeySource).@"enum".fields) |field| {
-        const source = @field(KeySource, field.name);
+    inline for (@typeInfo(KeySource).@"enum".field_names) |field_name| {
+        const source = @field(KeySource, field_name);
         try std.testing.expectEqual(source, parseKeySource(keySourceSlug(source)).?);
     }
     try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, keySourceCredential(.env).?);

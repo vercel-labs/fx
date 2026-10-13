@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("../../shared/types.zig");
+const text_utils = @import("../../shared/text_utils.zig");
 const session_codec = @import("../../session/session_codec.zig");
 
 const Allocator = std.mem.Allocator;
@@ -24,21 +25,78 @@ pub const Error = Allocator.Error || error{
     UnsupportedCheckpointVersion,
 };
 
+/// What a checkpoint records about the agent that saved it, so a resume can
+/// tell when it continues with another libfx, other tools, or another model.
+/// Each field is the host's opaque text, at most `max_meta_field_bytes`;
+/// empty when it gave none. Older checkpoints carry none, and readers that
+/// predate it ignore it.
+pub const Meta = struct {
+    libfx_version: []const u8 = "",
+    tool_schema_hash: []const u8 = "",
+    model: []const u8 = "",
+
+    pub fn isEmpty(self: Meta) bool {
+        return self.libfx_version.len == 0 and self.tool_schema_hash.len == 0 and self.model.len == 0;
+    }
+
+    pub fn fits(self: Meta) bool {
+        return self.libfx_version.len <= max_meta_field_bytes and
+            self.tool_schema_hash.len <= max_meta_field_bytes and
+            self.model.len <= max_meta_field_bytes;
+    }
+
+    /// A copy owned by `alloc`, for `free`.
+    pub fn dupe(self: Meta, alloc: Allocator) Allocator.Error!Meta {
+        const libfx_version = try alloc.dupe(u8, self.libfx_version);
+        errdefer alloc.free(libfx_version);
+        const tool_schema_hash = try alloc.dupe(u8, self.tool_schema_hash);
+        errdefer alloc.free(tool_schema_hash);
+        return .{ .libfx_version = libfx_version, .tool_schema_hash = tool_schema_hash, .model = try alloc.dupe(u8, self.model) };
+    }
+
+    /// Frees a `Meta` that `dupe` or `decode` returned.
+    pub fn free(self: Meta, alloc: Allocator) void {
+        alloc.free(self.libfx_version);
+        alloc.free(self.tool_schema_hash);
+        alloc.free(self.model);
+    }
+
+    /// Writes it as the JSON object `fromJson` reads.
+    pub fn writeJson(self: Meta, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.writeAll("{\"libfxVersion\":");
+        try std.json.Stringify.value(self.libfx_version, .{}, writer);
+        try writer.writeAll(",\"toolSchemaHash\":");
+        try std.json.Stringify.value(self.tool_schema_hash, .{}, writer);
+        try writer.writeAll(",\"model\":");
+        try std.json.Stringify.value(self.model, .{}, writer);
+        try writer.writeByte('}');
+    }
+};
+/// As long as the longest model id a host may give.
+pub const max_meta_field_bytes: usize = 1024;
+
 pub const Decoded = struct {
     history: []types.HistoryTurn,
     usage: types.Usage,
+    /// Owned by the decoding allocator.
+    meta: Meta,
 
     pub fn deinit(self: *Decoded, alloc: Allocator) void {
         types.freeHistoryTurnSlice(alloc, self.history);
+        self.meta.free(alloc);
         self.* = undefined;
     }
 };
 
+/// `meta` is recorded when any of its fields is set; each must fit
+/// `max_meta_field_bytes`.
 pub fn encode(
     alloc: Allocator,
     history: []const types.HistoryTurn,
     usage: types.Usage,
+    meta: Meta,
 ) Error![]u8 {
+    std.debug.assert(meta.fits());
     if (history.len > max_history_turns) return error.CheckpointTooLarge;
     const payload_limit = max_checkpoint_bytes - header_bytes;
     var json: std.Io.Writer.Allocating = .init(alloc);
@@ -63,6 +121,10 @@ pub fn encode(
     }
     json.writer.writeAll("],\"usage\":") catch return error.OutOfMemory;
     std.json.Stringify.value(usage, .{}, &json.writer) catch return error.OutOfMemory;
+    if (!meta.isEmpty()) {
+        json.writer.writeAll(",\"meta\":") catch return error.OutOfMemory;
+        meta.writeJson(&json.writer) catch return error.OutOfMemory;
+    }
     json.writer.writeByte('}') catch return error.OutOfMemory;
     const payload_len = payloadBytes(json.written().len, blob_section_bytes);
     if (payload_len > payload_limit) return error.CheckpointTooLarge;
@@ -193,7 +255,28 @@ fn decodeJson(alloc: Allocator, json: []const u8, image_blobs: ?*session_codec.I
     }
     const usage = std.json.parseFromValueLeaky(types.Usage, alloc, usage_value, .{}) catch
         return error.InvalidCheckpoint;
-    return .{ .history = history, .usage = usage };
+    const meta = try decodeMeta(alloc, parsed.value.object.get("meta"));
+    return .{ .history = history, .usage = usage, .meta = meta };
+}
+
+fn decodeMeta(alloc: Allocator, value: ?std.json.Value) Error!Meta {
+    const borrowed = if (value) |found| metaFromJson(found) catch return error.InvalidCheckpoint else Meta{};
+    return borrowed.dupe(alloc);
+}
+
+/// Reads the object `Meta.writeJson` writes; fields it does not know are
+/// left alone. The result borrows from `value`.
+pub fn metaFromJson(value: std.json.Value) error{InvalidMeta}!Meta {
+    if (value != .object) return error.InvalidMeta;
+    var meta: Meta = .{};
+    inline for (.{ .{ "libfxVersion", "libfx_version" }, .{ "toolSchemaHash", "tool_schema_hash" }, .{ "model", "model" } }) |field| {
+        if (value.object.get(field[0])) |text| {
+            if (text != .string) return error.InvalidMeta;
+            @field(meta, field[1]) = text.string;
+        }
+    }
+    if (!meta.fits()) return error.InvalidMeta;
+    return meta;
 }
 
 test "kernel checkpoint round trips history and usage" {
@@ -202,7 +285,7 @@ test "kernel checkpoint round trips history and usage" {
         .user = .{ .text = @constCast("hello") },
         .assistant = @constCast("world"),
     } }};
-    const bytes = try encode(alloc, &history, .{ .input_tokens = 3, .output_tokens = 2 });
+    const bytes = try encode(alloc, &history, .{ .input_tokens = 3, .output_tokens = 2 }, .{});
     defer alloc.free(bytes);
     var decoded = try decode(alloc, bytes);
     defer decoded.deinit(alloc);
@@ -210,6 +293,46 @@ test "kernel checkpoint round trips history and usage" {
     try std.testing.expectEqualStrings("hello", decoded.history[0].assistant.user.text);
     try std.testing.expectEqualStrings("world", decoded.history[0].assistant.assistant);
     try std.testing.expectEqual(@as(?u64, 3), decoded.usage.input_tokens);
+}
+
+test "kernel checkpoint carries the saving agent's libfx, tools and model" {
+    const alloc = std.testing.allocator;
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("hello") },
+        .assistant = @constCast("world"),
+    } }};
+    const meta: Meta = .{ .libfx_version = "2", .tool_schema_hash = "1a2b3c4d", .model = "provider/model" };
+    const bytes = try encode(alloc, &history, .{}, meta);
+    defer alloc.free(bytes);
+    var decoded = try decode(alloc, bytes);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualStrings("2", decoded.meta.libfx_version);
+    try std.testing.expectEqualStrings("1a2b3c4d", decoded.meta.tool_schema_hash);
+    try std.testing.expectEqualStrings("provider/model", decoded.meta.model);
+    try std.testing.expectEqualStrings("world", decoded.history[0].assistant.assistant);
+
+    // A checkpoint saved without it, as older ones were, decodes with none.
+    const bare = try encode(alloc, &history, .{}, .{});
+    defer alloc.free(bare);
+    try std.testing.expect(std.mem.find(u8, bare, "\"meta\"") == null);
+    var plain = try decode(alloc, bare);
+    defer plain.deinit(alloc);
+    try std.testing.expect(plain.meta.isEmpty());
+}
+
+test "kernel checkpoint refuses meta that is not short text" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{
+        "{\"history\":[],\"usage\":{},\"meta\":7}",
+        "{\"history\":[],\"usage\":{},\"meta\":{\"model\":7}}",
+        "{\"history\":[],\"usage\":{},\"meta\":{\"model\":\"" ++ text_utils.repeat("m", max_meta_field_bytes + 1) ++ "\"}}",
+    };
+    for (cases) |json| try std.testing.expectError(error.InvalidCheckpoint, decodeJson(alloc, json, null));
+    // Fields it does not know are left alone.
+    var decoded = try decodeJson(alloc, "{\"history\":[],\"usage\":{},\"meta\":{\"model\":\"m\",\"later\":1}}", null);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualStrings("m", decoded.meta.model);
+    try std.testing.expectEqualStrings("", decoded.meta.libfx_version);
 }
 
 test "kernel checkpoint reports invalid presentation authority" {
@@ -239,7 +362,7 @@ test "kernel checkpoint reports invalid presentation authority" {
         .assistant = @constCast("edited"),
         .execution = .{ .tool_steps = &steps },
     } }};
-    try std.testing.expectError(error.InvalidCheckpoint, encode(alloc, &history, .{}));
+    try std.testing.expectError(error.InvalidCheckpoint, encode(alloc, &history, .{}, .{}));
 }
 
 test "kernel checkpoint round trips inline prompt images" {
@@ -259,7 +382,7 @@ test "kernel checkpoint round trips inline prompt images" {
         .user = .{ .text = @constCast("look [Image #5]"), .images = &images },
         .assistant = @constCast("a red square"),
     } }};
-    const bytes = try encode(alloc, &history, .{});
+    const bytes = try encode(alloc, &history, .{}, .{});
     defer alloc.free(bytes);
 
     var decoded = try decode(alloc, bytes);
@@ -287,12 +410,12 @@ test "kernel checkpoint bound applies to history carrying inline images" {
         .user = .{ .text = @constCast("[Image #1]"), .images = &images },
         .assistant = @constCast("done"),
     } }};
-    try std.testing.expectError(error.CheckpointTooLarge, encode(alloc, &history, .{}));
+    try std.testing.expectError(error.CheckpointTooLarge, encode(alloc, &history, .{}, .{}));
 }
 
 test "kernel checkpoint rejects corruption and unsupported versions" {
     const alloc = std.testing.allocator;
-    const bytes = try encode(alloc, &.{}, .{});
+    const bytes = try encode(alloc, &.{}, .{}, .{});
     defer alloc.free(bytes);
 
     const corrupt = try alloc.dupe(u8, bytes);
@@ -342,7 +465,7 @@ test "kernel checkpoint stores inline image bytes raw beside the JSON" {
     const png = "\x89PNG\r\n\x1a\nraw-checkpoint-bytes";
     var fixture: TestImageHistory = undefined;
     fixture.init(png);
-    const bytes = try encode(alloc, &fixture.history, .{});
+    const bytes = try encode(alloc, &fixture.history, .{}, .{});
     defer alloc.free(bytes);
 
     try std.testing.expectEqual(version, std.mem.readInt(u16, bytes[4..6], .little));
@@ -388,7 +511,7 @@ test "kernel checkpoint rejects malformed blob sections" {
     const alloc = std.testing.allocator;
     var fixture: TestImageHistory = undefined;
     fixture.init("\x89PNG\r\n\x1a\nblob-section");
-    const bytes = try encode(alloc, &fixture.history, .{});
+    const bytes = try encode(alloc, &fixture.history, .{}, .{});
     defer alloc.free(bytes);
 
     const dangling = try alloc.dupe(u8, bytes);
@@ -419,7 +542,7 @@ test "kernel checkpoint requires each image blob once, in order" {
     var second: TestImageHistory = undefined;
     second.init("\x89PNG\r\n\x1a\nsecond-blob");
     const history = [_]types.HistoryTurn{ first.history[0], second.history[0] };
-    const bytes = try encode(alloc, &history, .{});
+    const bytes = try encode(alloc, &history, .{}, .{});
     defer alloc.free(bytes);
     var decoded = try decode(alloc, bytes);
     defer decoded.deinit(alloc);

@@ -12,7 +12,7 @@ pub fn endpoint_alloc(alloc: std.mem.Allocator) ![]u8 {
             if (!std.mem.startsWith(u8, origin, "http://127.0.0.1:")) return error.InvalidSlackTestOrigin;
             const port = std.fmt.parseInt(u16, origin[17..], 10) catch return error.InvalidSlackTestOrigin;
             if (port < 1024) return error.InvalidSlackTestOrigin;
-            return std.fmt.allocPrint(alloc, "{s}/mcp", .{origin});
+            return alloc.print("{s}/mcp", .{origin});
         }
     }
     return alloc.dupe(u8, endpoint);

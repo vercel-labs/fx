@@ -65,15 +65,49 @@ fn runUpdates(harness: *Harness, alloc: std.mem.Allocator, count: usize) !void {
     for (0..count) |index| try harness.update(alloc, index);
 }
 
-fn measureP95(io: std.Io, harness: *Harness, alloc: std.mem.Allocator) !u64 {
-    var samples: [samples_per_batch]u64 = undefined;
-    for (&samples, 0..) |*sample, index| {
-        const started = std.Io.Timestamp.now(io, .awake).nanoseconds;
+/// Times one update with the monotonic clock. Tests pass their own clock.
+const Clock = struct {
+    io: std.Io,
+
+    fn time(self: Clock, harness: *Harness, alloc: std.mem.Allocator, index: usize) !u64 {
+        const started = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
         try harness.update(alloc, index);
-        sample.* = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds - started);
+        return @intCast(std.Io.Timestamp.now(self.io, .awake).nanoseconds - started);
     }
-    std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+};
+
+fn p95(samples: []u64) u64 {
+    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
     return samples[94];
+}
+
+fn measureP95(clock: anytype, harness: *Harness, alloc: std.mem.Allocator) !u64 {
+    var samples: [samples_per_batch]u64 = undefined;
+    for (&samples, 0..) |*sample, index| sample.* = try clock.time(harness, alloc, index);
+    return p95(&samples);
+}
+
+/// Times updates on both harnesses in alternation within one window, so a
+/// slowdown during the window, such as a move to a slower CPU core, affects
+/// both sets of samples alike.
+fn measurePairedP95(
+    clock: anytype,
+    first: *Harness,
+    second: *Harness,
+    alloc: std.mem.Allocator,
+) ![2]u64 {
+    var first_samples: [samples_per_batch]u64 = undefined;
+    var second_samples: [samples_per_batch]u64 = undefined;
+    for (&first_samples, &second_samples, 0..) |*first_sample, *second_sample, index| {
+        if (index % 2 == 0) {
+            first_sample.* = try clock.time(first, alloc, index);
+            second_sample.* = try clock.time(second, alloc, index);
+        } else {
+            second_sample.* = try clock.time(second, alloc, index);
+            first_sample.* = try clock.time(first, alloc, index);
+        }
+    }
+    return .{ p95(&first_samples), p95(&second_samples) };
 }
 
 fn ratio(numerator: u64, denominator: u64) u64 {
@@ -93,23 +127,28 @@ fn comparisonRatio(io: std.Io, alloc: std.mem.Allocator, reverse: bool) !u64 {
 
     var baseline_p95: u64 = undefined;
     var candidate_p95: u64 = undefined;
+    const clock: Clock = .{ .io = io };
     if (reverse) {
-        candidate_p95 = try measureP95(io, &candidate, alloc);
-        baseline_p95 = try measureP95(io, &baseline, alloc);
+        candidate_p95 = try measureP95(clock, &candidate, alloc);
+        baseline_p95 = try measureP95(clock, &baseline, alloc);
     } else {
-        baseline_p95 = try measureP95(io, &baseline, alloc);
-        candidate_p95 = try measureP95(io, &candidate, alloc);
+        baseline_p95 = try measureP95(clock, &baseline, alloc);
+        candidate_p95 = try measureP95(clock, &candidate, alloc);
     }
     return ratio(candidate_p95, baseline_p95);
 }
+/// Measures a fresh fixture and one with 5,000 more updates of history in
+/// the same window, so the ratio reflects the history and not a change in
+/// CPU speed between two separate windows.
 fn measure_growth(io: std.Io, alloc: std.mem.Allocator) !GrowthObservation {
-    var candidate = try Harness.init(alloc, .candidate);
-    defer candidate.transcript.deinit(alloc);
-    try runUpdates(&candidate, alloc, 200);
-    const initial = try measureP95(io, &candidate, alloc);
-    try runUpdates(&candidate, alloc, 5_000);
-    const final = try measureP95(io, &candidate, alloc);
-    return GrowthObservation.capture(&candidate, initial, final);
+    var fresh = try Harness.init(alloc, .candidate);
+    defer fresh.transcript.deinit(alloc);
+    var grown = try Harness.init(alloc, .candidate);
+    defer grown.transcript.deinit(alloc);
+    try runUpdates(&fresh, alloc, 200);
+    try runUpdates(&grown, alloc, 5_200);
+    const initial, const final = try measurePairedP95(Clock{ .io = io }, &fresh, &grown, alloc);
+    return GrowthObservation.capture(&grown, initial, final);
 }
 
 const Gate = struct {
@@ -250,6 +289,30 @@ test "growth observation checks the warmed activity fixture" {
         .activity_kind = .read,
     } });
     try std.testing.expect(!GrowthObservation.capture(&harness, 500, 1_500).valid_work());
+}
+
+test "paired growth measurement cancels a slowdown during the window" {
+    const SlowingClock = struct {
+        calls: usize = 0,
+
+        fn time(self: *@This(), harness: *Harness, alloc: std.mem.Allocator, index: usize) !u64 {
+            try harness.update(alloc, index);
+            self.calls += 1;
+            // The machine runs 2.5 times slower for the second half of the window.
+            return if (self.calls > samples_per_batch) 2_500 else 1_000;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var fresh = try Harness.init(alloc, .candidate);
+    defer fresh.transcript.deinit(alloc);
+    var grown = try Harness.init(alloc, .candidate);
+    defer grown.transcript.deinit(alloc);
+    try runUpdates(&grown, alloc, 5_000);
+
+    var clock: SlowingClock = .{};
+    const initial, const final = try measurePairedP95(&clock, &fresh, &grown, alloc);
+    try std.testing.expectEqual(@as(usize, 2 * samples_per_batch), clock.calls);
+    try std.testing.expectEqual(@as(u64, ratio_scale), ratio(final, initial));
 }
 
 test "evaluating growth ratios preserves original timing evidence" {

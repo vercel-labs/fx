@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
@@ -7,6 +8,7 @@ const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
 const context_limits = @import("../config/context_limits.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -87,10 +89,10 @@ pub const ConversationToolResult = struct {
 
     pub fn jsonStringify(self: ConversationToolResult, writer: *std.json.Stringify) !void {
         try writer.beginObject();
-        inline for (std.meta.fields(ConversationToolResult)) |field| {
-            if (!std.mem.eql(u8, field.name, "review_feedback") or self.review_feedback) {
-                try writer.objectField(field.name);
-                try writer.write(@field(self, field.name));
+        inline for (@typeInfo(ConversationToolResult).@"struct".field_names) |field_name| {
+            if (!std.mem.eql(u8, field_name, "review_feedback") or self.review_feedback) {
+                try writer.objectField(field_name);
+                try writer.write(@field(self, field_name));
             }
         }
         try writer.endObject();
@@ -945,7 +947,7 @@ pub fn decodeFrame(alloc: Allocator, line: []const u8) !Envelope {
     if (line.len == 0 or line[line.len - 1] != '\n') {
         return failEnvelope(error.InvalidEventFrame);
     }
-    if (std.mem.indexOfScalar(u8, line[0 .. line.len - 1], '\n') != null) {
+    if (std.mem.findScalar(u8, line[0 .. line.len - 1], '\n') != null) {
         return failEnvelope(error.InvalidEventFrame);
     }
 
@@ -1226,11 +1228,7 @@ const ReplacementStateReader = struct {
         start: StateReplacementStarted,
     ) !void {
         if (start.encoded_bytes == 0 or start.chunk_count == 0 or
-            start.chunk_count != std.math.divCeil(
-                u64,
-                start.encoded_bytes,
-                raw_state_chunk_bytes,
-            ) catch return error.InvalidReplacement)
+            start.chunk_count != @divCeil(start.encoded_bytes, @as(u64, raw_state_chunk_bytes)))
         {
             return error.InvalidReplacement;
         }
@@ -1934,7 +1932,7 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
 }
 
 test "replacement chunk decoding uses only decoded storage" {
-    const json = "{\"replacement_id\":\"" ++ "ab" ** 16 ++ "\",\"chunk_index\":0,\"raw_bytes\":1,\"chunk_sha256\":\"" ++ "00" ** 32 ++ "\",\"base64\":\"/w==\"}";
+    const json = "{\"replacement_id\":\"" ++ text_utils.repeat("ab", 16) ++ "\",\"chunk_index\":0,\"raw_bytes\":1,\"chunk_sha256\":\"" ++ text_utils.repeat("00", 32) ++ "\",\"base64\":\"/w==\"}";
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
     var storage: [1]u8 = undefined;
@@ -2099,7 +2097,7 @@ fn sha256(bytes: []const u8) Digest {
 }
 
 test "session event kind contract contains exactly ten stable variants" {
-    try std.testing.expectEqual(@as(usize, 10), @typeInfo(Kind).@"enum".fields.len);
+    try std.testing.expectEqual(@as(usize, 10), @typeInfo(Kind).@"enum".field_names.len);
     try std.testing.expectEqualStrings("session_started", @tagName(Kind.session_started));
     try std.testing.expectEqualStrings("preferences_changed", @tagName(Kind.preferences_changed));
     try std.testing.expectEqualStrings("workspace_rebound", @tagName(Kind.workspace_rebound));
@@ -2536,7 +2534,7 @@ test "single event application preserves caller-owned state on allocation failur
         }
     };
     try std.testing.checkAllAllocationFailures(
-        alloc,
+        testing_allocator.no_resize,
         AllocationCheck.run,
         .{ line, generation },
     );
@@ -2884,7 +2882,7 @@ test "history event provenance rejects conflicts and malformed IDs" {
     persisted_conflict.event.history_turn_committed.turn.assistant.user.work_id = @constCast("work-a");
     const encoded = try encodeLegacyFixtureFrame(std.testing.allocator, persisted_conflict);
     defer std.testing.allocator.free(encoded);
-    const final_id = std.mem.lastIndexOf(u8, encoded, "work-a") orelse
+    const final_id = std.mem.findLast(u8, encoded, "work-a") orelse
         return error.TestExpectedEqual;
     encoded[final_id + "work-".len] = 'b';
     try std.testing.expectError(
@@ -2957,7 +2955,7 @@ fn checkHistoryProvenanceReplayAllocationFailures(alloc: Allocator) !void {
 
 test "history provenance replay frees every partial allocation" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkHistoryProvenanceReplayAllocationFailures,
         .{},
     );
@@ -2990,7 +2988,7 @@ test "legacy usage replacement retains framing and checksum validation" {
     const state_json = "{" ++ common ++ ",\"history\":[],\"total_input_tokens\":7,\"total_output_tokens\":3,\"usage\":" ++ usage_json ++ "}";
     const started = "{\"schema_version\":1,\"log_generation\":\"01010101010101010101010101010101\",\"seq\":1,\"event_id\":\"01010101010101010101010101010101\",\"timestamp_ms\":1,\"kind\":\"session_started\",\"payload\":{" ++
         "\"id\":\"legacy-replacement\",\"created_at_ms\":1,\"origin_workspace_root\":\"/workspace\",\"workspace_root\":\"/workspace\",\"conversation_language\":\"en\",\"preferences\":{\"model\":\"test/model\",\"effort\":\"auto\",\"fast_mode\":false},\"usage\":" ++ usage_json ++ "}}\n";
-    const replacement_id = [_]u8{9} ** 16;
+    const replacement_id: [16]u8 = @splat(9);
     const digest = sha256(state_json);
     for ([_]bool{ false, true }) |corrupt| {
         var declared_digest = digest;
@@ -3005,9 +3003,9 @@ test "legacy usage replacement retains framing and checksum validation" {
         try log.writer.writeAll(started);
         for (transaction, 2..) |event, seq| {
             const frame = try encodeLegacyFixtureFrame(alloc, .{
-                .log_generation = [_]u8{1} ** 16,
+                .log_generation = @as([16]u8, @splat(1)),
                 .seq = seq,
-                .event_id = [_]u8{@intCast(seq)} ** 16,
+                .event_id = @as([16]u8, @splat(@intCast(seq))),
                 .timestamp_ms = 2,
                 .event = event,
             });
@@ -3033,9 +3031,9 @@ test "legacy usage replacement retains framing and checksum validation" {
             var snapshot = try known.snapshot(alloc);
             defer snapshot.deinit(alloc);
             const later_frame = try encodeLegacyFixtureFrame(alloc, .{
-                .log_generation = [_]u8{1} ** 16,
+                .log_generation = @as([16]u8, @splat(1)),
                 .seq = 5,
-                .event_id = [_]u8{5} ** 16,
+                .event_id = @as([16]u8, @splat(5)),
                 .timestamp_ms = 3,
                 .event = .{ .usage_checkpointed = .{ .usage = snapshot } },
             });
@@ -3381,7 +3379,7 @@ test "conversation cancellation provenance preserves ordinary frame bytes" {
     );
     for ([_]u8{ 1, 2, 3 }) |version| {
         for (std.enums.values(session.InterruptedTerminalReason)) |reason| {
-            const old = try std.fmt.allocPrint(alloc, "{{\"schema_version\":{d},\"seq\":1,\"timestamp_ms\":1,\"event\":{{\"interrupted\":{{\"reason\":\"{s}\"}}}}}}\n", .{ version, @tagName(reason) });
+            const old = try alloc.print("{{\"schema_version\":{d},\"seq\":1,\"timestamp_ms\":1,\"event\":{{\"interrupted\":{{\"reason\":\"{s}\"}}}}}}\n", .{ version, @tagName(reason) });
             defer alloc.free(old);
             var decoded = try decodeConversationFrame(alloc, old);
             defer decoded.deinit();
@@ -3425,14 +3423,14 @@ test "conversation cancellation provenance roundtrips history projection with ow
         }
     };
     for (std.enums.values(types.CancellationOrigin)) |origin| {
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{origin});
+        try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Case.run, .{origin});
     }
 }
 
 test "conversation cancellation provenance rejects invalid values and retains strict unknown fields" {
     const alloc = std.testing.allocator;
     for ([_][]const u8{ "\"turn\"", "\"compaction\"", "\"unknown\"", "null", "1", "true", "[]", "{}", "\"compaction\",\"future_field\":true" }, 0..) |origin, i| {
-        const bytes = try std.fmt.allocPrint(alloc, "{{\"schema_version\":2,\"seq\":1,\"timestamp_ms\":1,\"event\":{{\"interrupted\":{{\"reason\":\"cancelled\",\"partial_text\":\"partial\",\"cancellation_origin\":{s}}}}}}}\n", .{origin});
+        const bytes = try alloc.print("{{\"schema_version\":2,\"seq\":1,\"timestamp_ms\":1,\"event\":{{\"interrupted\":{{\"reason\":\"cancelled\",\"partial_text\":\"partial\",\"cancellation_origin\":{s}}}}}}}\n", .{origin});
         defer alloc.free(bytes);
         if (i < 2) {
             var decoded = try decodeConversationFrame(alloc, bytes);
@@ -3518,8 +3516,7 @@ test "review feedback conversation metadata rejects invalid provenance and unkno
         .{ .status = "failure", .native = false, .marker = "true,\"unknown_feedback\":true" },
     };
     for (cases) |case| {
-        const frame = try std.fmt.allocPrint(
-            alloc,
+        const frame = try alloc.print(
             "{{\"schema_version\":2,\"seq\":1,\"timestamp_ms\":1,\"event\":{{\"tool_result\":{{\"call_id\":\"call-review\",\"tool_name\":\"shell\",\"status\":\"{s}\",\"artifact_ref\":\"result.txt\",\"stored_bytes\":0,\"completeness\":\"complete\",\"provider_native\":{},\"review_feedback\":{s}}}}}}}\n",
             .{ case.status, case.native, case.marker },
         );
@@ -3547,8 +3544,7 @@ test "review feedback conversation metadata rejects invalid provenance and unkno
 test "review feedback conversation metadata defaults old records and omits false" {
     const alloc = std.testing.allocator;
     for ([_]u8{ 1, 2 }) |version| {
-        const frame = try std.fmt.allocPrint(
-            alloc,
+        const frame = try alloc.print(
             "{{\"schema_version\":{d},\"seq\":1,\"timestamp_ms\":1,\"event\":{{\"tool_result\":{{\"call_id\":\"call-review\",\"tool_name\":\"shell\",\"status\":\"failure\",\"artifact_ref\":\"result.txt\",\"stored_bytes\":0,\"completeness\":\"complete\",\"preview\":\"Security review held this action.\"}}}}}}\n",
             .{version},
         );
@@ -3654,8 +3650,8 @@ test "conversation frame rejects a wrongly typed diff content handle" {
 
 test "conversation frame rejects an oversized diff content handle" {
     const alloc = std.testing.allocator;
-    const oversized = "diff-0123456789abcdef-0123456789abcdef.json" ++ ("x" ** 300);
-    const frame = try std.fmt.allocPrint(alloc, "{{\"schema_version\":3,\"seq\":1,\"timestamp_ms\":1,\"event\":{{\"tool_result\":{{\"call_id\":\"call-edit\",\"tool_name\":\"edit_file\",\"status\":\"success\",\"artifact_ref\":\"result.txt\",\"stored_bytes\":0,\"completeness\":\"complete\",\"committed_file_presentation\":{{\"path\":\"src/a.zig\",\"kind\":\"edited\",\"lines\":[],\"additions\":1,\"deletions\":1,\"truncated\":false,\"previous_content\":null,\"after_content\":null,\"lifecycle_id\":null,\"content_handle\":\"{s}\"}}}}}}}}}}\n", .{oversized});
+    const oversized = "diff-0123456789abcdef-0123456789abcdef.json" ++ text_utils.repeat("x", 300);
+    const frame = try alloc.print("{{\"schema_version\":3,\"seq\":1,\"timestamp_ms\":1,\"event\":{{\"tool_result\":{{\"call_id\":\"call-edit\",\"tool_name\":\"edit_file\",\"status\":\"success\",\"artifact_ref\":\"result.txt\",\"stored_bytes\":0,\"completeness\":\"complete\",\"committed_file_presentation\":{{\"path\":\"src/a.zig\",\"kind\":\"edited\",\"lines\":[],\"additions\":1,\"deletions\":1,\"truncated\":false,\"previous_content\":null,\"after_content\":null,\"lifecycle_id\":null,\"content_handle\":\"{s}\"}}}}}}}}}}\n", .{oversized});
     defer alloc.free(frame);
     try std.testing.expectError(error.InvalidConversationFrame, decodeConversationFrame(alloc, frame));
 }

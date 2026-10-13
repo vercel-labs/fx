@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -20,6 +21,7 @@ const result_store = @import("result_store.zig");
 const session_usage = @import("session_usage.zig");
 const session_usage_sidecar = @import("session_usage_sidecar.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const Identifier = session_event.Identifier;
@@ -755,8 +757,7 @@ fn writeConversationRecoveryState(
             else => return err,
         };
         defer alloc.free(recovery_bytes);
-        const bound_bytes = try std.fmt.allocPrint(
-            alloc,
+        const bound_bytes = try alloc.print(
             "{{\"conversation_seq\":{d},\"checkpoint\":{s}}}\n",
             .{ conversation_seq, recovery_bytes },
         );
@@ -791,7 +792,7 @@ fn clearRecoveryAsked(dir: *io_mod.VerifiedDir) void {
 /// Advisory like owner.live: write failures degrade to a single suppression
 /// instead of blocking the resume.
 pub fn markRecoveryAsked(alloc: Allocator, dir: *io_mod.VerifiedDir) void {
-    const body = std.fmt.allocPrint(alloc, "{{\"asked_at_ms\":{d}}}\n", .{io_mod.milliTimestamp()}) catch |err| {
+    const body = alloc.print("{{\"asked_at_ms\":{d}}}\n", .{io_mod.milliTimestamp()}) catch |err| {
         debug_trace.logf("session", "recovery ask marker allocation failed err={s}", .{@errorName(err)});
         return;
     };
@@ -854,7 +855,7 @@ fn spillResultFilePresentation(
             return result;
         };
         defer alloc.free(base);
-        result_dir.* = try std.fs.path.join(alloc, &.{ base, "tool-results" });
+        result_dir.* = try std.Io.Dir.path.join(alloc, &.{ base, "tool-results" });
     }
     const handle = result_store.storeDiffContent(
         alloc,
@@ -1055,7 +1056,7 @@ fn projectRecoveryResult(
                 return projected;
             };
             defer alloc.free(base);
-            result_dir.* = try std.fs.path.join(alloc, &.{ base, "tool-results" });
+            result_dir.* = try std.Io.Dir.path.join(alloc, &.{ base, "tool-results" });
         }
         const handle = result_store.storeLargeResult(
             alloc,
@@ -1543,7 +1544,7 @@ test "conversation recovery rejects checkpoint cuts inside tool batches" {
         "{\"schema_version\":1,\"seq\":6,\"timestamp_ms\":1,\"event\":{\"turn_completed\":{}}}\n";
     for ([_]u64{ 1, 2, 3, 4, 5, 6 }) |coverage| {
         for ([_][]const u8{ "", "invalid\n" }) |tail| {
-            const bytes = try std.fmt.allocPrint(alloc, "{s}{{\"schema_version\":1,\"seq\":7,\"timestamp_ms\":1,\"event\":{{\"context_checkpoint\":{{\"covers_through_seq\":{d},\"summary\":\"checkpoint\"}}}}}}\n{s}", .{ prefix, coverage, tail });
+            const bytes = try alloc.print("{s}{{\"schema_version\":1,\"seq\":7,\"timestamp_ms\":1,\"event\":{{\"context_checkpoint\":{{\"covers_through_seq\":{d},\"summary\":\"checkpoint\"}}}}}}\n{s}", .{ prefix, coverage, tail });
             defer alloc.free(bytes);
             try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .data = bytes, .flags = .{ .permissions = private_file_permissions } });
             if (coverage >= 2 and coverage <= 4) {
@@ -1570,7 +1571,7 @@ test "conversation recovery allocation failures do not become corruption" {
         "{\"schema_version\":1,\"seq\":4,\"timestamp_ms\":1,\"event\":{\"context_checkpoint\":{\"covers_through_seq\":1,\"summary\":\"retained fact\"}}}\n" ++
         "{\"schema_version\":1,\"seq\":5,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"pending\"}}}\n" ++
         "{\"schema_version\":1,\"seq\":6,\"timestamp_ms\":1,\"event\":{\"tool_call\":{\"call_id\":\"call1\",\"tool_name\":\"shell\",\"arguments_json\":\"{}\"}}}\ninvalid\n" });
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn check(alloc: Allocator, source: *io_mod.VerifiedDir) !void {
             const boundary = try find_conversation_recovery_boundary(alloc, source);
             try std.testing.expectEqual(@as(u64, 4), boundary.seq);
@@ -1591,7 +1592,7 @@ test "conversation recovery state preserves allocation errors and contains inval
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .flags = .{ .permissions = private_file_permissions }, .data = prefix ++ "invalid\n" });
     const boundary = try find_conversation_recovery_boundary(alloc, &dir);
     try std.testing.expectError(error.SessionRecoveryBoundaryInvalid, load_conversation_recovery_state(alloc, &dir, "wrong-id", boundary));
-    try std.testing.checkAllAllocationFailures(alloc, struct {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn check(a: Allocator, source: *io_mod.VerifiedDir, cut: ConversationRecoveryBoundary) !void {
             var state = try load_conversation_recovery_state(a, source, "recovery-source", cut);
             defer state.deinit(a);
@@ -2896,7 +2897,7 @@ fn projectConversationImageLocators(
 ) !void {
     for (images) |*image| {
         const snapshot_path = image.snapshot_path orelse continue;
-        if (!std.fs.path.isAbsolute(snapshot_path)) continue;
+        if (!std.Io.Dir.path.isAbsolute(snapshot_path)) continue;
         var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const projected = try session.projectSnapshotLocator(
             &buffer,
@@ -3158,7 +3159,7 @@ pub const WritableSessionDir = struct {
             debug_trace.logf("session", "owner liveness probe failed id={s} err={s}", .{ self.session_id, @errorName(err) });
             break :blk false;
         };
-        const body = std.fmt.allocPrint(alloc, "{{\"pid\":{d},\"opened_at_ms\":{d}}}\n", .{
+        const body = alloc.print("{{\"pid\":{d},\"opened_at_ms\":{d}}}\n", .{
             std.c.getpid(),
             io_mod.milliTimestamp(),
         }) catch |err| {
@@ -3963,7 +3964,7 @@ pub const Root = struct {
                 if (mode == .read_only) {
                     return .{
                         .sessions = null,
-                        .display_root = try std.fs.path.join(
+                        .display_root = try std.Io.Dir.path.join(
                             alloc,
                             &.{ home_path, profile_paths.root_dir_name, profile_paths.sessions_dir_name },
                         ),
@@ -3988,7 +3989,7 @@ pub const Root = struct {
                 if (mode == .read_only) {
                     return .{
                         .sessions = null,
-                        .display_root = try std.fs.path.join(
+                        .display_root = try std.Io.Dir.path.join(
                             alloc,
                             &.{ home_path, profile_paths.root_dir_name, profile_paths.sessions_dir_name },
                         ),
@@ -4025,7 +4026,7 @@ pub const Root = struct {
                 if (mode == .read_only) {
                     return .{
                         .sessions = null,
-                        .display_root = try std.fs.path.join(
+                        .display_root = try std.Io.Dir.path.join(
                             alloc,
                             &.{ home_path, profile_paths.root_dir_name, profile_paths.sessions_dir_name },
                         ),
@@ -4079,7 +4080,7 @@ pub const Root = struct {
 
         const random = randomIdentifier();
         const suffix = std.fmt.bytesToHex(random, .lower);
-        const staging_name = try std.fmt.allocPrint(alloc, "creating+{s}", .{suffix});
+        const staging_name = try alloc.print("creating+{s}", .{suffix});
         defer alloc.free(staging_name);
         sessions.dir.createDir(
             io_mod.getIo(),
@@ -4276,17 +4277,20 @@ pub const Root = struct {
 };
 
 fn publishSessionDirectory(parent: std.Io.Dir, staging: []const u8, target: []const u8) !void {
-    if (comptime @import("builtin").os.tag != .macos) {
+    if (comptime @import("builtin").target.os.tag != .macos) {
         return parent.renamePreserve(staging, parent, target, io_mod.getIo());
     }
-    // Zig 0.16's Darwin preserve-rename uses hard links, which cannot publish directories.
+    // Zig 0.16's Darwin preserve-rename used hard links, which cannot publish
+    // directories. Zig 0.17 calls renameatx_np as this does, but treats
+    // ENOTEMPTY as a programmer bug: a panic in Debug builds and
+    // error.Unexpected otherwise. fx keeps its own error mapping.
     const Darwin = struct {
         extern "c" fn renameatx_np(c_int, [*:0]const u8, c_int, [*:0]const u8, c_uint) c_int;
     };
     var staging_buffer: [256]u8 = undefined;
     var target_buffer: [256]u8 = undefined;
-    const staging_z = try std.fmt.bufPrintZ(&staging_buffer, "{s}", .{staging});
-    const target_z = try std.fmt.bufPrintZ(&target_buffer, "{s}", .{target});
+    const staging_z = try std.mem.printSentinel(&staging_buffer, "{s}", .{staging}, 0);
+    const target_z = try std.mem.printSentinel(&target_buffer, "{s}", .{target}, 0);
     while (true) {
         try io_mod.getIo().checkCancel();
         const err = std.posix.errno(Darwin.renameatx_np(parent.handle, staging_z, parent.handle, target_z, 0x4));
@@ -4306,7 +4310,7 @@ fn publishSessionDirectory(parent: std.Io.Dir, staging: []const u8, target: []co
 fn validateLeaf(name: []const u8) !void {
     if (name.len == 0 or std.mem.eql(u8, name, ".") or
         std.mem.eql(u8, name, "..") or
-        std.mem.indexOfAny(u8, name, "/\\") != null)
+        std.mem.findAny(u8, name, "/\\") != null)
     {
         return error.SessionPathUnsafe;
     }
@@ -4464,7 +4468,7 @@ fn randomIdentifier() Identifier {
 
 fn watermarkName(alloc: Allocator, generation: Identifier) ![]u8 {
     const hex = std.fmt.bytesToHex(generation, .lower);
-    return std.fmt.allocPrint(alloc, "commit.{s}.json", .{hex});
+    return alloc.print("commit.{s}.json", .{hex});
 }
 
 fn createNativeSession(
@@ -4855,7 +4859,7 @@ test "parked session refuses history and control mutations" {
 }
 
 test "writable resume releases ownership when metadata allocation fails" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var temp = try TempRoot.init(alloc);
     defer temp.deinit(alloc);
     var initial = try testState(alloc, "resume-allocation", 10);
@@ -4877,7 +4881,7 @@ test "writable resume degrades before rename and blocks post-rename uncertainty"
     var initial = try testState(alloc, "resume-compaction-policy", 10);
     defer initial.deinit(alloc);
     var started = try temp.root.startConversationSession(alloc, initial, .{});
-    const fat = "RESUME_COMPACTION_INLINE_0123456789abcdef\n" ** 128;
+    const fat = text_utils.repeat("RESUME_COMPACTION_INLINE_0123456789abcdef\n", 128);
     _ = try started.conversation_writer.append(alloc, 11, .{ .user = .{ .text = "seed" } });
     _ = try started.conversation_writer.append(alloc, 12, .{ .tool_call = .{
         .call_id = "call-edit",
@@ -5393,8 +5397,8 @@ test "legacy import spills committed file snapshots before publishing events" {
     var initial = try testState(alloc, "legacy-diff-spill-import", 20);
     defer initial.deinit(alloc);
 
-    const previous = "LEGACY_PREVIOUS_SNAPSHOT_0123456789abcdef\n" ** 180;
-    const after = "LEGACY_AFTER_SNAPSHOT_0123456789abcdef\n" ** 180;
+    const previous = text_utils.repeat("LEGACY_PREVIOUS_SNAPSHOT_0123456789abcdef\n", 180);
+    const after = text_utils.repeat("LEGACY_AFTER_SNAPSHOT_0123456789abcdef\n", 180);
     var calls = [_]types.ToolCall{.{
         .id = "legacy-edit",
         .name = "edit_file",
@@ -5573,7 +5577,7 @@ test "legacy import file projection cleans up allocation failures" {
             try std.testing.expectEqualStrings("retained.txt", history[0].assistant.execution.files[0].path);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Check.run, .{});
 }
 
 test "legacy import preserves the active retained tail and complete archive" {
@@ -5843,7 +5847,7 @@ test "root session creation never replaces a racing target" {
 }
 
 test "root session creation allocation failures leave no published state" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var temp = try TempRoot.init(alloc);
     defer temp.deinit(alloc);
     var initial = try testState(alloc, "allocation-session", 10);
@@ -6138,8 +6142,7 @@ fn checkStandaloneSteering(checkpoint: bool) !void {
 test "legacy steering prefix records retain their original boundary" {
     const alloc = std.testing.allocator;
     for ([_]u8{ 1, 2 }) |schema_version| {
-        const bytes = try std.fmt.allocPrint(
-            alloc,
+        const bytes = try alloc.print(
             "{{\"schema_version\":{d},\"seq\":2,\"timestamp_ms\":10,\"event\":{{\"assistant\":{{\"text\":\"legacy prefix\"}}}}}}\n",
             .{schema_version},
         );
@@ -6167,7 +6170,7 @@ test "legacy steering prefix records retain their original boundary" {
 }
 
 test "takeExecution frees provider replay on allocation failure" {
-    for ([_]bool{ false, true }) |standalone_response| try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+    for ([_]bool{ false, true }) |standalone_response| try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn run(alloc: Allocator, standalone: bool) !void {
             var builder = ConversationTurnBuilder.init(alloc);
             defer builder.deinit();
@@ -6593,7 +6596,7 @@ test "tool-result spill keeps an over-cap checkpoint persistable and resumable" 
     var calls: [result_count]types.ToolCall = undefined;
     var results: [result_count]types.PersistedToolResult = undefined;
     for (&calls, &results, 0..) |*call, *result, index| {
-        const id = try std.fmt.allocPrint(alloc, "call-big-{d}", .{index});
+        const id = try alloc.print("call-big-{d}", .{index});
         call.* = .{ .id = id, .name = "command", .arguments_json = "{}" };
         result.* = .{
             .tool_call_id = id,
@@ -6729,7 +6732,7 @@ test "committed edit diff snapshots spill out of the conversation log" {
     // The artifact resolves back to the exact snapshots.
     const session_base = try io_mod.dirRealpathAlloc(alloc, resumed.log.dir.dir, ".");
     defer alloc.free(session_base);
-    const result_dir = try std.fs.path.join(alloc, &.{ session_base, "tool-results" });
+    const result_dir = try std.Io.Dir.path.join(alloc, &.{ session_base, "tool-results" });
     defer alloc.free(result_dir);
     var capability = try session_child_store.SessionChildCapability.initLegacyRoute(
         alloc,
@@ -6750,7 +6753,7 @@ test "committed edit diff snapshots spill out of the conversation log" {
 }
 
 test "committed edit spill projection propagates allocation failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{
@@ -6758,7 +6761,7 @@ test "committed edit spill projection propagates allocation failure" {
         .follow_symlinks = false,
     }) };
     defer dir.close();
-    const content = "snapshot-content-0123456789abcdef\n" ** 180;
+    const content = text_utils.repeat("snapshot-content-0123456789abcdef\n", 180);
     const result = types.PersistedToolResult{
         .tool_call_id = @constCast("call-edit"),
         .tool_name = @constCast("edit_file"),
@@ -6787,7 +6790,7 @@ test "committed edit spill projection propagates allocation failure" {
 }
 
 test "recovery checkpoint output spill propagates allocation failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{
@@ -6795,7 +6798,7 @@ test "recovery checkpoint output spill propagates allocation failure" {
         .follow_symlinks = false,
     }) };
     defer dir.close();
-    const output = "checkpoint-output-0123456789abcdef\n" ** 180;
+    const output = text_utils.repeat("checkpoint-output-0123456789abcdef\n", 180);
     const result = types.PersistedToolResult{
         .tool_call_id = @constCast("call-shell"),
         .tool_name = @constCast("shell"),
@@ -6818,7 +6821,7 @@ test "native session seed returns the persisted diff snapshot representation" {
     defer temp.deinit(alloc);
     var initial = try testState(alloc, "native-seed-diff-spill", 10);
     defer initial.deinit(alloc);
-    const content = "native-seed-snapshot-0123456789abcdef\n" ** 180;
+    const content = text_utils.repeat("native-seed-snapshot-0123456789abcdef\n", 180);
     var calls = [_]types.ToolCall{.{
         .id = "seed-edit",
         .name = "edit_file",
@@ -7008,7 +7011,7 @@ test "recovery checkpoint spills diff snapshots into the result store" {
         try std.testing.expect(presentation.previous_content == null);
         const session_base = try io_mod.dirRealpathAlloc(alloc, resumed.log.dir.dir, ".");
         defer alloc.free(session_base);
-        const result_dir = try std.fs.path.join(alloc, &.{ session_base, "tool-results" });
+        const result_dir = try std.Io.Dir.path.join(alloc, &.{ session_base, "tool-results" });
         defer alloc.free(result_dir);
         var capability = try session_child_store.SessionChildCapability.initLegacyRoute(
             alloc,
@@ -7068,7 +7071,7 @@ test "recovery checkpoint spill failure keeps the result inline" {
     defer loaded.deinit(alloc);
 
     // Block the result store: tool-results exists as a regular file.
-    const session_path = try std.fs.path.join(alloc, &.{ temp.home, ".fx", "sessions", initial.id });
+    const session_path = try std.Io.Dir.path.join(alloc, &.{ temp.home, ".fx", "sessions", initial.id });
     defer alloc.free(session_path);
     var session_dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), session_path, .{});
     defer session_dir.close(io_mod.getIo());
@@ -7182,7 +7185,7 @@ fn dupeHistory(alloc: Allocator, history: []const session.HistoryTurn) ![]sessio
 fn cacheFileExists(alloc: Allocator, temp: *TempRoot, session_id: []const u8) !bool {
     const sessions = try profile_paths.sessionsDir(alloc, temp.home);
     defer alloc.free(sessions);
-    const path = try std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ sessions, session_id, history_snapshot.file_name });
+    const path = try alloc.print("{s}/{s}/{s}", .{ sessions, session_id, history_snapshot.file_name });
     defer alloc.free(path);
     var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| switch (err) {
         error.FileNotFound => return false,
@@ -7195,7 +7198,7 @@ fn cacheFileExists(alloc: Allocator, temp: *TempRoot, session_id: []const u8) !b
 fn cacheFileSize(alloc: Allocator, temp: *TempRoot, session_id: []const u8) !u64 {
     const sessions = try profile_paths.sessionsDir(alloc, temp.home);
     defer alloc.free(sessions);
-    const path = try std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ sessions, session_id, history_snapshot.file_name });
+    const path = try alloc.print("{s}/{s}/{s}", .{ sessions, session_id, history_snapshot.file_name });
     defer alloc.free(path);
     var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
     defer file.close(io_mod.getIo());
@@ -7205,7 +7208,7 @@ fn cacheFileSize(alloc: Allocator, temp: *TempRoot, session_id: []const u8) !u64
 fn deleteCacheFileForTest(alloc: Allocator, temp: *TempRoot, session_id: []const u8) !void {
     const sessions = try profile_paths.sessionsDir(alloc, temp.home);
     defer alloc.free(sessions);
-    const path = try std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ sessions, session_id, history_snapshot.file_name });
+    const path = try alloc.print("{s}/{s}/{s}", .{ sessions, session_id, history_snapshot.file_name });
     defer alloc.free(path);
     try std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), path);
 }
@@ -7267,7 +7270,7 @@ test "history snapshot cache builds on writable resume and replays identically" 
     {
         const sessions = try profile_paths.sessionsDir(alloc, temp.home);
         defer alloc.free(sessions);
-        const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ sessions, id });
+        const path = try alloc.print("{s}/{s}", .{ sessions, id });
         defer alloc.free(path);
         var dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), path, .{});
         defer dir.close(io_mod.getIo());
@@ -7335,7 +7338,7 @@ test "history snapshot resume reads cached content over a middle-rewritten log" 
     {
         const sessions = try profile_paths.sessionsDir(alloc, temp.home);
         defer alloc.free(sessions);
-        const path = try std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ sessions, id, "events.jsonl" });
+        const path = try alloc.print("{s}/{s}/{s}", .{ sessions, id, "events.jsonl" });
         defer alloc.free(path);
         var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{ .mode = .read_write });
         defer file.close(io_mod.getIo());
@@ -7371,7 +7374,7 @@ test "history snapshot tolerates torn cache tails and spliced log growth" {
     {
         const sessions = try profile_paths.sessionsDir(alloc, temp.home);
         defer alloc.free(sessions);
-        const path = try std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ sessions, id, history_snapshot.file_name });
+        const path = try alloc.print("{s}/{s}/{s}", .{ sessions, id, history_snapshot.file_name });
         defer alloc.free(path);
         var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{ .mode = .read_write });
         defer file.close(io_mod.getIo());
@@ -7415,7 +7418,7 @@ test "history snapshot tolerates torn cache tails and spliced log growth" {
     {
         const sessions = try profile_paths.sessionsDir(alloc, temp.home);
         defer alloc.free(sessions);
-        const path = try std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ sessions, id, history_snapshot.file_name });
+        const path = try alloc.print("{s}/{s}/{s}", .{ sessions, id, history_snapshot.file_name });
         defer alloc.free(path);
         var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{ .mode = .read_write });
         defer file.close(io_mod.getIo());
@@ -8005,7 +8008,7 @@ fn checkCompleteSkillReplayArtifact(artifact: enum { intact, missing, mismatched
     const runtime_memory = @import("../agent/runtime/execution_memory.zig");
     const execution_memory = @import("../agent/execution_memory.zig");
     const full_output = "<skill_content name=\"workflow\" location=\"/skills/workflow\" resource=\"SKILL.md\" complete=\"true\">\n" ++
-        ("required instruction\n" ** 1200) ++ "COMPLETE_SKILL_TAIL\n</skill_content>";
+        text_utils.repeat("required instruction\n", 1200) ++ "COMPLETE_SKILL_TAIL\n</skill_content>";
     var temp = try TempRoot.init(alloc);
     defer temp.deinit(alloc);
     var initial = try testState(alloc, "complete-skill-replay", 10);

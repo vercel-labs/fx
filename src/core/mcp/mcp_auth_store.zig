@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const mcp_auth = @import("mcp_auth.zig");
 const native_keychain = @import("../hosts/native_keychain.zig");
@@ -110,13 +111,13 @@ fn storageBackend(
     cancel_flag: ?*const std.atomic.Value(bool),
 ) !StorageBackend {
     const disabled = native_keychain.isDisabled();
-    const available = if (builtin.os.tag == .macos and !disabled) blk: {
+    const available = if (builtin.target.os.tag == .macos and !disabled) blk: {
         break :blk if (cancel_flag) |flag|
             try native_keychain.userDefaultKeychainAvailableCancellable(alloc, flag)
         else
             try native_keychain.userDefaultKeychainAvailable(alloc);
     } else false;
-    return selectStorageBackend(builtin.os.tag, disabled, available);
+    return selectStorageBackend(builtin.target.os.tag, disabled, available);
 }
 
 fn selectReadDecision(
@@ -265,6 +266,22 @@ fn loadControlled(
     return if (matched) |entry| try entry.credentials.clone(alloc) else null;
 }
 
+/// Every login this store kept, for MCP-v2 to take over once: from the
+/// Keychain when `keychain`, else from the file. The caller holds the
+/// credential directory's lock, which both stores share, and `dir` is that
+/// directory; nothing here takes the lock again.
+pub fn eachLocked(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    keychain: bool,
+    context: anytype,
+    comptime each: fn (@TypeOf(context), server: []const u8, credentials: *const mcp_auth.Credentials) Allocator.Error!void,
+) !void {
+    var store = try loadStoreControlled(alloc, dir, if (keychain) .macos_keychain else .profile_file, native_keychain_backend, null);
+    defer store.deinit(alloc);
+    for (store.credentials.items) |*entry| try each(context, entry.server_identity, &entry.credentials);
+}
+
 pub fn status(
     alloc: Allocator,
     server_identity: []const u8,
@@ -372,7 +389,7 @@ fn openOrCreateLockedDir() !LockedDir {
 fn openOrCreateLockedDirControlled(
     cancel_flag: ?*const std.atomic.Value(bool),
 ) !LockedDir {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var home_dir = io_mod.VerifiedDir{
         .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
     };
@@ -411,7 +428,7 @@ fn openExistingLockedDir() !?LockedDir {
 fn openExistingLockedDirControlled(
     cancel_flag: ?*const std.atomic.Value(bool),
 ) !?LockedDir {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var home_dir = io_mod.VerifiedDir{
         .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{
             .iterate = true,
@@ -1038,7 +1055,7 @@ fn checkCredentialStoreIsolationAllocationFailures(alloc: Allocator) !void {
 
 test "credential store isolation cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkCredentialStoreIsolationAllocationFailures,
         .{},
     );

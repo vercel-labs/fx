@@ -27,7 +27,7 @@ pub const State = enum(u8) {
 };
 
 pub const RelaunchRequest = struct {
-    executable_path_buf: [std.fs.max_path_bytes]u8 = undefined,
+    executable_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined,
     executable_path_len: usize = 0,
     previous_revision_buf: [update_target.max_revision_bytes]u8 = undefined,
     previous_revision_len: u8 = 0,
@@ -43,7 +43,7 @@ pub const RelaunchRequest = struct {
 };
 
 pub fn shouldEnableForCurrentExecutable() bool {
-    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var exe_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const n = std.process.executablePath(io_mod.getIo(), &exe_buf) catch return true;
     return !isDevelopmentBuildPath(exe_buf[0..n]);
 }
@@ -54,7 +54,7 @@ pub fn isDevelopmentBuildPath(path: []const u8) bool {
 }
 
 pub const AutoUpgrade = struct {
-    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(State.idle)),
+    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@backingInt(State.idle)),
     should_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     stopped: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     render_dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -127,7 +127,7 @@ pub const AutoUpgrade = struct {
     }
 
     pub fn getState(self: *const AutoUpgrade) State {
-        return @enumFromInt(self.state.load(.acquire));
+        return @fromBackingInt(@intCast(self.state.load(.acquire)));
     }
 
     fn transferControl(self: *AutoUpgrade) helpers.TransferControl {
@@ -138,7 +138,7 @@ pub const AutoUpgrade = struct {
     }
 
     pub fn requestRelaunch(self: *AutoUpgrade, executable_path: []const u8) !void {
-        if (executable_path.len > std.fs.max_path_bytes) return error.NameTooLong;
+        if (executable_path.len > std.Io.Dir.max_path_bytes) return error.NameTooLong;
         var request = RelaunchRequest{
             .executable_path_len = executable_path.len,
         };
@@ -170,7 +170,7 @@ pub const AutoUpgrade = struct {
             .downloading => {
                 var ver_buf: [32]u8 = undefined;
                 const ver = self.getLatestVersion(&ver_buf);
-                return std.fmt.bufPrint(buf, "upgrading to {s}...", .{ver}) catch "";
+                return std.mem.print(buf, "upgrading to {s}...", .{ver}) catch "";
             },
             .ready => return "update ready: ctrl+g to reload",
             .failed => return "upgrade failed",
@@ -193,7 +193,7 @@ pub const AutoUpgrade = struct {
     }
 
     fn setState(self: *AutoUpgrade, state: State) void {
-        const next = @intFromEnum(state);
+        const next = @backingInt(state);
         const previous = self.state.swap(next, .acq_rel);
         if (previous != next) self.markRenderDirty();
     }
@@ -290,16 +290,16 @@ pub const AutoUpgrade = struct {
         var rand_buf: [8]u8 = undefined;
         io_mod.getIo().random(&rand_buf);
         const rand_hex = std.fmt.bytesToHex(rand_buf, .lower);
-        const tmp_dir = std.fmt.allocPrint(alloc, "{s}/" ++ download_dir_prefix ++ "{s}", .{ tmp_base, rand_hex }) catch return error.AllocFailed;
+        const tmp_dir = alloc.print("{s}/" ++ download_dir_prefix ++ "{s}", .{ tmp_base, rand_hex }) catch return error.AllocFailed;
         defer alloc.free(tmp_dir);
         defer std.Io.Dir.cwd().deleteTree(io_mod.getIo(), tmp_dir) catch {};
 
         std.Io.Dir.createDirAbsolute(io_mod.getIo(), tmp_dir, .default_dir) catch return error.ExtractionFailed;
 
-        const archive_path = std.fmt.allocPrint(alloc, "{s}/fx.tar.gz", .{tmp_dir}) catch return error.AllocFailed;
+        const archive_path = alloc.print("{s}/fx.tar.gz", .{tmp_dir}) catch return error.AllocFailed;
         defer alloc.free(archive_path);
 
-        const archive_url = std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz", .{ cdn_base, target.artifactRef(), helpers.platform }) catch return error.AllocFailed;
+        const archive_url = alloc.print("{s}/{s}/fx-{s}.tar.gz", .{ cdn_base, target.artifactRef(), helpers.platform }) catch return error.AllocFailed;
         defer alloc.free(archive_url);
 
         helpers.downloadFileStreaming(&client, archive_url, archive_path, self.transferControl()) catch |err| return switch (err) {
@@ -309,7 +309,7 @@ pub const AutoUpgrade = struct {
 
         if (self.should_stop.load(.acquire)) return error.Cancelled;
 
-        const checksum_url = std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz.sha256", .{ cdn_base, target.artifactRef(), helpers.platform }) catch return error.AllocFailed;
+        const checksum_url = alloc.print("{s}/{s}/fx-{s}.tar.gz.sha256", .{ cdn_base, target.artifactRef(), helpers.platform }) catch return error.AllocFailed;
         defer alloc.free(checksum_url);
 
         helpers.verifyChecksum(&client, archive_path, checksum_url, self.transferControl()) catch |err| return switch (err) {
@@ -321,10 +321,10 @@ pub const AutoUpgrade = struct {
 
         helpers.extractTarGz(alloc, archive_path, tmp_dir) catch return error.ExtractionFailed;
 
-        const extracted_bin = std.fmt.allocPrint(alloc, "{s}/fx", .{tmp_dir}) catch return error.AllocFailed;
+        const extracted_bin = alloc.print("{s}/fx", .{tmp_dir}) catch return error.AllocFailed;
         defer alloc.free(extracted_bin);
 
-        var self_exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var self_exe_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const self_exe = helpers.currentExecutablePath(&self_exe_buf) catch return error.SelfExeNotFound;
         try self.installUnlessStopped(alloc, extracted_bin, self_exe);
     }
@@ -358,7 +358,7 @@ pub const AutoUpgrade = struct {
 /// ended mid-download, such as an interactive exit that did not join the
 /// upgrade thread.
 fn sweepStaleDownloadDirs(tmp_base: []const u8, now_ns: i128) void {
-    if (!std.fs.path.isAbsolute(tmp_base)) return;
+    if (!std.Io.Dir.path.isAbsolute(tmp_base)) return;
     const zio = io_mod.getIo();
     var dir = std.Io.Dir.openDirAbsolute(zio, tmp_base, .{ .iterate = true }) catch return;
     defer dir.close(zio);
@@ -518,7 +518,7 @@ test "setLatestVersion stores normalized version" {
 test "relaunch request owns its path and previous revision and is consumed once" {
     var au = AutoUpgrade{};
     var path = [_]u8{ '/', 't', 'm', 'p', '/', 'f', 'x' };
-    var revision = [_]u8{'1'} ** 40;
+    var revision: [40]u8 = @splat('1');
     au.configure_channel(.dev);
     au.setPreviousRevision(&revision);
     try au.requestRelaunch(&path);

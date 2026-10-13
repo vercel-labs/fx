@@ -17,6 +17,7 @@
 //   writeTranscriptClassified
 
 const std = @import("std");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const shared_theme = @import("../../core/shared/theme.zig");
 const io_mod = @import("../../core/shared/io.zig");
@@ -671,7 +672,7 @@ fn trimEntryRetainedBytes(alloc: Allocator, entry: *TranscriptEntry, target: usi
             const start = retainedTextStart(e.segments.text.items, target);
             if (start == 0) return null;
             const remaining = e.segments.text.items.len - start;
-            std.mem.copyForwards(u8, e.segments.text.items[0..remaining], e.segments.text.items[start..]);
+            @memmove(e.segments.text.items[0..remaining], e.segments.text.items[start..]);
             e.segments.text.items.len = remaining;
             return start;
         },
@@ -2170,12 +2171,37 @@ fn commitAuthoritativeRecordedMutationStateFromEntry(
     rewrite_mode: TranscriptSourceRewriteMode,
     dirty_entry_id: ?u32,
 ) !void {
+    return commitAuthoritativeRecordedMutationStateKeepingSource(
+        self,
+        shadow,
+        alloc,
+        reason,
+        rewrite_mode,
+        dirty_entry_id,
+        null,
+    );
+}
+
+/// Commits like `commitAuthoritativeRecordedMutationStateFromEntry`. When
+/// `kept` is set and the commit neither trimmed nor rebased the published
+/// prefix, the caller receives ownership of the source prepared for the
+/// committed entries instead of it being discarded.
+fn commitAuthoritativeRecordedMutationStateKeepingSource(
+    self: anytype,
+    shadow: anytype,
+    alloc: Allocator,
+    reason: []const u8,
+    rewrite_mode: TranscriptSourceRewriteMode,
+    dirty_entry_id: ?u32,
+    kept: ?*?source_preparation.TranscriptPreparationSource,
+) !void {
     var authoritative_source = try source_preparation.prepareTranscriptSource(
         shadow,
         alloc,
         null,
     );
-    defer authoritative_source.deinit(alloc);
+    var source_kept = false;
+    defer if (!source_kept) authoritative_source.deinit(alloc);
     const prefix_trims = if (comptime @hasField(@TypeOf(shadow.*), "retention_prefix_trims"))
         if (shadow.retention_prefix_trims) |trims| trims.items else &.{}
     else
@@ -2191,6 +2217,12 @@ fn commitAuthoritativeRecordedMutationStateFromEntry(
         authoritative_source.bytes,
         dirty_entry_id,
     );
+    if (kept) |out| {
+        if (!rebased and prefix_trims.len == 0) {
+            out.* = authoritative_source;
+            source_kept = true;
+        }
+    }
 }
 
 fn commitMutationStateWithReconciliationSource(
@@ -2829,14 +2861,29 @@ pub fn writeUserPromptCard(
         skill_tokens,
     );
 
-    try commitAuthoritativeRecordedMutationStateFromEntry(
+    const Runtime = @TypeOf(self.*);
+    const reuses_source = comptime @hasDecl(Runtime, "adoptCommittedTranscriptSource");
+    const revision_before: u64 = if (comptime reuses_source) self.full_transcript_content_revision else 0;
+    var committed_source: ?source_preparation.TranscriptPreparationSource = null;
+    try commitAuthoritativeRecordedMutationStateKeepingSource(
         self,
         &shadow,
         alloc,
         "atomic_user_prompt_append",
         .preserve_same_epoch,
         if (admission.retention_changed) null else admission.entry_id,
+        if (comptime reuses_source) &committed_source else null,
     );
+    if (committed_source) |source| {
+        if (comptime reuses_source) {
+            // The frame that shows the card can reuse this source instead of
+            // rendering every entry again.
+            self.adoptCommittedTranscriptSource(alloc, source, revision_before);
+        } else {
+            var unused = source;
+            unused.deinit(alloc);
+        }
+    }
     self.forgetShimmer();
     return admission.entry_id;
 }
@@ -3158,7 +3205,7 @@ fn streamAssistantChunkUncommitted(
 }
 
 test "rewrite publication compatible append and same geometry status retain fast allocation cost" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     const Runtime = @import("runtime.zig").TranscriptRuntime;
     for ([_]bool{ false, true }) |status_update| {
         var runtime = Runtime{
@@ -3259,7 +3306,7 @@ test "rewrite publication retirement allocation failures preserve the old receip
 }
 
 fn checkRewritePublicationContinuation(command: bool, retire: bool) !void {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     const Runtime = @import("runtime.zig").TranscriptRuntime;
     var runtime = Runtime{
         .layout = .{ .cols = 40, .rows = 12, .content_bottom = 8, .divider_top_row = 9, .input_row = 10, .divider_bottom_row = 11, .hint_row = 12 },
@@ -3356,7 +3403,7 @@ fn checkRewritePublicationContinuation(command: bool, retire: bool) !void {
 }
 
 test "rewrite publication recovering partial trim is atomic across allocation failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     const Runtime = @import("runtime.zig").TranscriptRuntime;
     var runtime = Runtime{
         .layout = .{ .cols = 40, .rows = 12, .content_bottom = 8, .divider_top_row = 9, .input_row = 10, .divider_bottom_row = 11, .hint_row = 12 },
@@ -3796,11 +3843,12 @@ fn retintTokens(
 
 const theme_retint_field_count: usize = blk: {
     var count: usize = 0;
-    for (@typeInfo(shared_theme.Theme).@"struct".fields) |field| {
-        if (field.type == []const u8 and !std.mem.eql(u8, field.name, "name")) count += 1;
+    const theme_info = @typeInfo(shared_theme.Theme).@"struct";
+    for (theme_info.field_names, theme_info.field_types) |field_name, field_type| {
+        if (field_type == []const u8 and !std.mem.eql(u8, field_name, "name")) count += 1;
     }
-    for (@typeInfo(shared_theme.SyntaxPalette).@"struct".fields) |field| {
-        if (field.type == []const u8) count += 1;
+    for (@typeInfo(shared_theme.SyntaxPalette).@"struct".field_types) |field_type| {
+        if (field_type == []const u8) count += 1;
     }
     break :blk count;
 };
@@ -3809,15 +3857,17 @@ const theme_retint_field_count: usize = blk: {
 /// expand another copy of duplicate detection and token insertion.
 noinline fn themeRetintField(theme: *const shared_theme.Theme, index: usize) []const u8 {
     comptime var field_index: usize = 0;
-    inline for (@typeInfo(shared_theme.Theme).@"struct".fields) |field| {
-        if (comptime field.type == []const u8 and !std.mem.eql(u8, field.name, "name")) {
-            if (index == field_index) return @field(theme.*, field.name);
+    const theme_info = @typeInfo(shared_theme.Theme).@"struct";
+    inline for (theme_info.field_names, theme_info.field_types) |field_name, field_type| {
+        if (comptime field_type == []const u8 and !std.mem.eql(u8, field_name, "name")) {
+            if (index == field_index) return @field(theme.*, field_name);
             field_index += 1;
         }
     }
-    inline for (@typeInfo(shared_theme.SyntaxPalette).@"struct".fields) |field| {
-        if (comptime field.type == []const u8) {
-            if (index == field_index) return @field(theme.syntax, field.name);
+    const syntax_palette_info = @typeInfo(shared_theme.SyntaxPalette).@"struct";
+    inline for (syntax_palette_info.field_names, syntax_palette_info.field_types) |field_name, field_type| {
+        if (comptime field_type == []const u8) {
+            if (index == field_index) return @field(theme.syntax, field_name);
             field_index += 1;
         }
     }
@@ -4069,7 +4119,7 @@ pub fn appendCappedWithinCapacity(
         debug_trace.logf("transcript_cap", "trimmed {d} leading bytes before append (prior_len={d} text.len={d} cap={d})", .{ cut, list.items.len, text.len, cap });
 
         const remaining = list.items.len - cut;
-        std.mem.copyForwards(u8, list.items[0..remaining], list.items[cut..]);
+        @memmove(list.items[0..remaining], list.items[cut..]);
         list.items.len = remaining;
 
         if (replaceable_last_line.*) {

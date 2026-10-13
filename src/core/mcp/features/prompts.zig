@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const common = @import("common.zig");
 const catalog_freshness = @import("../catalog_freshness.zig");
 const mrtr = @import("../mrtr.zig");
@@ -740,7 +741,7 @@ fn checkPromptCatalogAllocationFailures(alloc: Allocator) !void {
 
 test "prompt catalog construction is allocation failure safe" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkPromptCatalogAllocationFailures,
         .{},
     );

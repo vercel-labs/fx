@@ -94,7 +94,7 @@ test "local executor keeps route-specific foreground result limits" {
         .command_ctx = .{
             .command = "",
             .resolved_cwd = "",
-            .target_os = @import("builtin").os.tag,
+            .target_os = @import("builtin").target.os.tag,
         },
         .reason = .process_or_system,
         .source = .interactive_once,
@@ -114,7 +114,7 @@ test "local executor runs an approved shell command with its admitted context" {
         .command_ctx = .{
             .command = "printf local-executor",
             .resolved_cwd = "/tmp",
-            .target_os = @import("builtin").os.tag,
+            .target_os = @import("builtin").target.os.tag,
         },
         .reason = .process_or_system,
         .source = .interactive_once,

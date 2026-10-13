@@ -67,7 +67,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: "0.16.0"
+          version: "0.17.0"
           use-cache: false
 
       - name: Test signing and release routing
@@ -91,7 +91,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: "0.16.0"
+          version: "0.17.0"
           use-cache: false
 
       # Both E2E shards run this binary on other runners, so build for the
@@ -147,7 +147,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: "0.16.0"
+          version: "0.17.0"
           use-cache: false
 
       - name: Setup Bun

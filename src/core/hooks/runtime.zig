@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const definitions = @import("definitions.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -727,7 +728,7 @@ test "empty views dispatch without allocation" {
     const views = [_]RuntimeView{ runtime.freeze(), RuntimeView.empty() };
 
     for (views) |view| {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
         try std.testing.expect(!view.hasPreToolUse());
         try std.testing.expect(!view.hasStop());
         try std.testing.expect(!view.hasPostTurnEnd());
@@ -927,7 +928,7 @@ const ErrorHandler = struct {
 };
 
 test "PreToolUse maps handler errors and allocation failure without leaking prior rewrites" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     for ([_]bool{ false, true }) |cancelled| {
         var handler = ErrorHandler{ .cancelled = cancelled };
         var runtime = Runtime.init(alloc);
@@ -1035,7 +1036,7 @@ test "Stop returns the first owned continuation and honors can_continue" {
 }
 
 test "Stop fails open on handler errors, output limits, and copy failures" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
 
     for ([_]bool{ false, true }) |cancelled| {
         var error_handler = ErrorHandler{ .cancelled = cancelled };

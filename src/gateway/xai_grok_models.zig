@@ -14,7 +14,7 @@ const version_lookup = @import("provider_versions.zig");
 const max_catalog_models: usize = 128;
 pub const title_model = "grok-4.5";
 const max_model_id_bytes: usize = 256;
-const max_catalog_bytes: usize = 1024 * 1024;
+pub const max_catalog_bytes: usize = 1024 * 1024;
 const fetch_timeout_ms: i64 = 30_000;
 const default_models_endpoint = "https://cli-chat-proxy.grok.com/v1/models";
 const default_modalities_endpoint = "https://api.x.ai/v1/language-models";
@@ -130,10 +130,20 @@ fn fetchCatalogForProvider(
     defer if (modalities_response) |*metadata| metadata.deinit(alloc);
     const modalities_json = if (modalities_response) |metadata| blk: {
         if (metadata.status == .ok) break :blk @as(?[]const u8, metadata.body);
-        debug_trace.logf("catalog", "Grok modality enrichment unavailable status={d}", .{@intFromEnum(metadata.status)});
+        debug_trace.logf("catalog", "Grok modality enrichment unavailable status={d}", .{@backingInt(metadata.status)});
         break :blk null;
     } else null;
-    const catalog = parseCatalog(alloc, response.body, modalities_json) catch |err| {
+    return catalogFromBodies(alloc, response.body, modalities_json);
+}
+
+/// The catalog from the subscription proxy's model list and, when available,
+/// xAI's modality metadata. The result owns its catalog.
+pub fn catalogFromBodies(
+    alloc: std.mem.Allocator,
+    subscription_json: []const u8,
+    modalities_json: ?[]const u8,
+) std.mem.Allocator.Error!model_catalog.ProviderResult {
+    const catalog = parseCatalog(alloc, subscription_json, modalities_json) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } };
     };
@@ -196,7 +206,7 @@ const FetchOperation = struct {
             .accept_encoding = .omit,
         };
         if (self.credential) |credential| {
-            auth_header = try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{credential});
+            auth_header = try self.alloc.print("Bearer {s}", .{credential});
             headers.authorization = .{ .override = auth_header.? };
         }
         const body_buffer = try self.alloc.alloc(u8, max_catalog_bytes + 1);
@@ -267,7 +277,8 @@ fn fetchCatalogResponse(
     );
 }
 
-fn modelsUrl(alloc: std.mem.Allocator) ![]u8 {
+/// The subscription model list, or a loopback test endpoint. Caller owns it.
+pub fn modelsUrl(alloc: std.mem.Allocator) ![]u8 {
     const base = io_mod.getenv(e2e_models_endpoint_env) orelse default_models_endpoint;
     if (io_mod.getenv(e2e_models_endpoint_env) != null and !gateway_client.isLoopbackHttpUrl(base)) {
         return error.InvalidE2EGrokModelsEndpoint;
@@ -275,7 +286,8 @@ fn modelsUrl(alloc: std.mem.Allocator) ![]u8 {
     return alloc.dupe(u8, base);
 }
 
-fn modalitiesUrl(alloc: std.mem.Allocator) ![]u8 {
+/// xAI's modality metadata, or a loopback test endpoint. Caller owns it.
+pub fn modalitiesUrl(alloc: std.mem.Allocator) ![]u8 {
     const base = io_mod.getenv(e2e_modalities_endpoint_env) orelse default_modalities_endpoint;
     if (io_mod.getenv(e2e_modalities_endpoint_env) != null and !gateway_client.isLoopbackHttpUrl(base)) {
         return error.InvalidE2EGrokModalitiesEndpoint;
@@ -520,7 +532,7 @@ test "Grok catalog retains subscription models without losing provider capabilit
         \\{"models":[{"id":"current-a","input_modalities":["text","image"],"output_modalities":["text"]},{"id":"current-b","input_modalities":["text"],"output_modalities":["text"]}]}
     ;
     for (orders, 0..) |rows, unmatched_index| {
-        const subscription = try std.fmt.allocPrint(alloc, "{{\"data\":[{s},{s},{s}]}}", .{ rows[0], rows[1], rows[2] });
+        const subscription = try alloc.print("{{\"data\":[{s},{s},{s}]}}", .{ rows[0], rows[1], rows[2] });
         defer alloc.free(subscription);
         var catalog = try parseCatalog(alloc, subscription, modalities);
         defer model_catalog.freeModelCatalog(alloc, &catalog);
@@ -863,7 +875,7 @@ const CatalogEndpointEnvironment = struct {
 };
 
 fn catalogFixtureUrl(alloc: std.mem.Allocator, fixture: *CatalogBodyFixture, path: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/{s}", .{ fixture.port(), path });
+    return alloc.print("http://127.0.0.1:{d}/{s}", .{ fixture.port(), path });
 }
 
 fn expectCatalogProviderFailure(
@@ -887,8 +899,7 @@ fn fetchCatalogFixture(body: []const u8) !FetchResponse {
     var fixture = try CatalogBodyFixture.init(body);
     defer fixture.deinit();
     try fixture.start();
-    const url = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const url = try std.testing.allocator.print(
         "http://127.0.0.1:{d}/models",
         .{fixture.port()},
     );

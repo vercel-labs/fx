@@ -74,22 +74,34 @@ function log(message) {
   }
 }
 
-function hasModernMetadata(message) {
-  const meta = message.params?._meta;
-  const capabilities = meta?.["io.modelcontextprotocol/clientCapabilities"];
-  const advertiseElicitation = ["tools/call", "resources/read", "prompts/get"]
-    .includes(message.method);
-  const expectedCapabilities = advertiseElicitation && expectedElicitation === "form"
+// By default the elicitation capability must appear only on requests that
+// can elicit, as v1 sends it. FX_MCP_SPEC_CLIENT=1 also accepts a client that
+// declares the same capabilities on every request, as the spec allows.
+const specClient = process.env.FX_MCP_SPEC_CLIENT === "1";
+
+function elicitationCapabilities() {
+  return expectedElicitation === "form"
     ? { elicitation: { form: {} } }
-    : advertiseElicitation && expectedElicitation === "url"
+    : expectedElicitation === "url"
       ? { elicitation: { url: {} } }
-      : advertiseElicitation && expectedElicitation === "both"
+      : expectedElicitation === "both"
         ? { elicitation: { form: {}, url: {} } }
         : {};
+}
+
+function hasModernMetadata(message) {
+  const meta = message.params?._meta;
+  const capabilities = JSON.stringify(meta?.["io.modelcontextprotocol/clientCapabilities"]);
+  const advertiseElicitation = ["tools/call", "resources/read", "prompts/get"]
+    .includes(message.method);
+  const declared = JSON.stringify(elicitationCapabilities());
+  const capabilitiesMatch = advertiseElicitation
+    ? capabilities === declared
+    : capabilities === "{}" || (specClient && capabilities === declared);
   return meta?.["io.modelcontextprotocol/protocolVersion"] === protocolVersion &&
     meta?.["io.modelcontextprotocol/clientInfo"]?.name === "fx" &&
     typeof meta?.["io.modelcontextprotocol/clientInfo"]?.version === "string" &&
-    JSON.stringify(capabilities) === JSON.stringify(expectedCapabilities);
+    capabilitiesMatch;
 }
 
 function invalidMetadata(message) {
@@ -782,7 +794,8 @@ function handle(message) {
                 params,
               },
             },
-            requestState: { fixture: "opaque" },
+            // The spec's requestState is a string; v1 also takes an object.
+            requestState: specClient ? "opaque" : { fixture: "opaque" },
           },
         });
         return;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const edit_history = @import("edit_history.zig");
 const editor_state = @import("editor_state.zig");
@@ -207,7 +208,7 @@ test "line continuation no-op only resets vertical navigation" {
 }
 
 test "line continuation history allocation failure preserves the primary edit" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var fixture: Fixture = .{};
     defer fixture.deinit(alloc);
 

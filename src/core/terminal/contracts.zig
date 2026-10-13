@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const session_layout = @import("../session/session_layout.zig");
 const types = @import("../shared/types.zig");
 
@@ -446,7 +447,7 @@ pub const ActionRequest = union(enum) {
         switch (self) {
             .start => |request| {
                 if (!valid_bounded_text(request.cwd, max_authority_text_bytes) or
-                    !std.fs.path.isAbsolute(request.cwd))
+                    !std.Io.Dir.path.isAbsolute(request.cwd))
                 {
                     return error.InvalidCwd;
                 }
@@ -1393,7 +1394,7 @@ pub const OwnerCatalogPrincipal = struct {
         try validate_authority_text(self.profile_user);
         try validate_session_id(self.durable_session_id);
         try validate_authority_text(self.workspace_root);
-        if (!std.fs.path.isAbsolute(self.workspace_root)) {
+        if (!std.Io.Dir.path.isAbsolute(self.workspace_root)) {
             return error.InvalidPrincipal;
         }
     }
@@ -1640,7 +1641,7 @@ pub const RepeatedProbeAuthority = struct {
     pub fn validate(self: RepeatedProbeAuthority) !void {
         if (!valid_bounded_text(self.command, max_command_bytes) or
             !valid_bounded_text(self.cwd, max_authority_text_bytes) or
-            !std.fs.path.isAbsolute(self.cwd))
+            !std.Io.Dir.path.isAbsolute(self.cwd))
         {
             return error.InvalidProbeAuthority;
         }
@@ -2530,7 +2531,7 @@ fn check_owned_action_request_allocation_failures(alloc: Allocator) !void {
 
 test "owned action request cleans every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_owned_action_request_allocation_failures,
         .{},
     );
@@ -2767,7 +2768,7 @@ fn check_owned_render_snapshot_allocation_failures(alloc: Allocator) !void {
 
 test "owned render snapshots clean every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_owned_render_snapshot_allocation_failures,
         .{},
     );
@@ -3041,7 +3042,7 @@ fn check_owned_result_allocation_failures(alloc: Allocator) !void {
 
 test "owned results clean every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_owned_result_allocation_failures,
         .{},
     );
@@ -3059,7 +3060,7 @@ fn test_principal() Principal {
 }
 
 fn test_proof() HolderProof {
-    return .{ .bytes = [_]u8{1} ** 32 };
+    return .{ .bytes = @as([32]u8, @splat(1)) };
 }
 
 test "authority wire encoding excludes host-authenticated process ownership" {
@@ -3073,7 +3074,7 @@ test "authority wire encoding excludes host-authenticated process ownership" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try std.json.Stringify.value(claim, .{}, &output.writer);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         output.written(),
         "process_owner",

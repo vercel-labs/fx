@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const types = @import("../core/shared/types.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
@@ -9,6 +10,7 @@ const sse = @import("sse.zig");
 const configured_provider = @import("../core/config/configured_provider.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
+const text_utils = @import("../core/shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -263,7 +265,7 @@ test "chat completions error masking survives JSON and recovery decoding" {
     const duplicate = try redact_error_detail(alloc, "{\"error\":{\"message\":\"alpha\\/beta\"},\"alpha/beta\":0,\"alpha\\/beta\":1}", "alpha/beta");
     defer alloc.free(duplicate);
     try std.testing.expectEqualStrings("Provider error details could not be decoded", duplicate);
-    const nested = "[" ** 65 ++ "0" ++ "]" ** 65;
+    const nested = text_utils.repeat("[", 65) ++ "0" ++ text_utils.repeat("]", 65);
     const bounded = try redact_error_detail(alloc, nested, "alpha");
     defer alloc.free(bounded);
     try std.testing.expectEqualStrings("Provider error details exceeded the nesting limit", bounded);
@@ -280,7 +282,7 @@ test "chat completions error masking releases partial allocations" {
             defer alloc.free(plain);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
 }
 
 fn validate_arguments(alloc: Allocator, text: []const u8) Error!void {
@@ -485,9 +487,9 @@ fn write_user_content_parts(
 /// assistant tool-call message they answer.
 fn write_tool_image_follow_up(writer: *std.Io.Writer, alloc: Allocator, tool_names: []const []const u8, images: []const types.ToolImage) !void {
     const label = if (tool_names.len == 1)
-        try std.fmt.allocPrint(alloc, "The tool \"{s}\" returned {d} image(s).", .{ tool_names[0], images.len })
+        try alloc.print("The tool \"{s}\" returned {d} image(s).", .{ tool_names[0], images.len })
     else
-        try std.fmt.allocPrint(alloc, "Tool results returned {d} image(s).", .{images.len});
+        try alloc.print("Tool results returned {d} image(s).", .{images.len});
     defer alloc.free(label);
     try writer.writeAll("{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
     try std.json.Stringify.value(label, .{}, writer);
@@ -1122,7 +1124,7 @@ test "chat completions reasoning fields survive a completed response" {
         var reducer = try Reducer.init(alloc, test_request(), .{});
         defer reducer.deinit();
         for ([_][]const u8{ "think ", "carefully" }) |fragment| {
-            const chunk = try std.fmt.allocPrint(alloc, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"{s}\":\"{s}\"}}}}]}}", .{ field, fragment });
+            const chunk = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{{\"{s}\":\"{s}\"}}}}]}}", .{ field, fragment });
             defer alloc.free(chunk);
             try test_accept(&reducer, chunk);
         }
@@ -1244,7 +1246,7 @@ test "chat completions replay-only assistant supports silent-tool continuation a
         }
     };
     try Probe.run(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
 }
 
 test "chat completions stripped replay-only rows are omitted without changing canonical history" {
@@ -1302,7 +1304,7 @@ test "chat completions replay-only input rejects missing malformed over-limit or
         .{ .raw = "{\"reasoning\":[],\"_tool_call_ids\":[]}", .failure = error.InvalidProviderState },
         .{ .raw = "{\"reasoning\":\"text\",\"_tool_call_ids\":[\"missing-call\"]}", .failure = error.InvalidProviderState },
         .{ .raw = "{\"reasoning\":\"text\",\"_tool_call_ids\":[],\"role\":\"system\"}", .failure = error.InvalidProviderState },
-        .{ .raw = "{\"reasoning_details\":[" ++ "{\"nested\":" ** 64 ++ "0" ++ "}" ** 64 ++ "],\"_tool_call_ids\":[]}", .failure = error.JsonTooDeep },
+        .{ .raw = "{\"reasoning_details\":[" ++ text_utils.repeat("{\"nested\":", 64) ++ "0" ++ text_utils.repeat("}", 64) ++ "],\"_tool_call_ids\":[]}", .failure = error.JsonTooDeep },
         .{ .raw = oversized, .failure = error.ReplayTooLarge },
     }) |case| {
         request.messages = &.{.{ .role = .assistant, .provider_replay = .{
@@ -1403,7 +1405,7 @@ test "chat completions recovered replay rejects injection malformed associations
         try std.testing.expectError(error.InvalidProviderState, build_request(alloc, request, .{ .provider = &provider }));
         try std.testing.expectError(error.InvalidProviderState, project_replay(alloc, replay, &.{}, true, true));
     }
-    const deep = "{\"reasoning_details\":[" ++ "{\"nested\":" ** 64 ++ "0" ++ "}" ** 64 ++ "],\"_tool_call_ids\":[]}";
+    const deep = "{\"reasoning_details\":[" ++ text_utils.repeat("{\"nested\":", 64) ++ "0" ++ text_utils.repeat("}", 64) ++ "],\"_tool_call_ids\":[]}";
     try std.testing.expectError(error.JsonTooDeep, parse_replay(alloc, deep));
     const oversized = try alloc.alloc(u8, types.ProviderReplay.max_bytes + 1);
     defer alloc.free(oversized);
@@ -1423,7 +1425,7 @@ test "chat completions replay accepts exactly the byte and nesting limits" {
     var parsed = try parse_replay(alloc, raw);
     defer parsed.deinit();
     try std.testing.expectEqual(raw.len - prefix.len - suffix.len, parsed.value.object.get("reasoning").?.string.len);
-    const deepest = "{\"reasoning_details\":[" ++ "{\"nested\":" ** 62 ++ "0" ++ "}" ** 62 ++ "],\"_tool_call_ids\":[]}";
+    const deepest = "{\"reasoning_details\":[" ++ text_utils.repeat("{\"nested\":", 62) ++ "0" ++ text_utils.repeat("}", 62) ++ "],\"_tool_call_ids\":[]}";
     var nested = try parse_replay(alloc, deepest);
     defer nested.deinit();
 }
@@ -1433,7 +1435,7 @@ test "chat completions reasoning rejects malformed deltas and enforces aggregate
     for ([_][]const u8{ "\"reasoning\":{}", "\"reasoning_content\":1", "\"reasoning_details\":{}", "\"reasoning_details\":[null]", "\"reasoning_details\":[[]]" }) |field| {
         var reducer = try Reducer.init(alloc, test_request(), .{});
         defer reducer.deinit();
-        const chunk = try std.fmt.allocPrint(alloc, "{{\"choices\":[{{\"index\":0,\"delta\":{{{s}}}}}]}}", .{field});
+        const chunk = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{{{s}}}}}]}}", .{field});
         defer alloc.free(chunk);
         try std.testing.expectError(error.InvalidChunk, reducer.accept(chunk, false));
         try std.testing.expectError(error.StreamClosed, reducer.finish(false));
@@ -1486,7 +1488,7 @@ test "chat completions reasoning replay releases all partial allocations" {
             defer alloc.free(stripped);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
 }
 
 test "chat completions reasoning presentation checks cancellation before content from the same event" {
@@ -1550,7 +1552,7 @@ test "chat completions progress usage can finalize in a trailer but cannot decre
         defer invalid.deinit();
         try test_accept(&invalid, progress);
         if (final) try test_accept(&invalid, test_stop);
-        const chunk = try std.fmt.allocPrint(alloc, "{{\"choices\":{s},\"usage\":{s}}}", .{ if (final) "[]" else "[{\"index\":0,\"delta\":{}}]", case.usage });
+        const chunk = try alloc.print("{{\"choices\":{s},\"usage\":{s}}}", .{ if (final) "[]" else "[{\"index\":0,\"delta\":{}}]", case.usage });
         defer alloc.free(chunk);
         try std.testing.expectError(case.failure, invalid.accept(chunk, false));
     };
@@ -1564,7 +1566,7 @@ test "chat completions progress usage can finalize in a trailer but cannot decre
 
 fn test_usage_snapshot(reducer: *Reducer, usage: []const u8) Error!void {
     const choices = if (reducer.phase == .finished) "[]" else "[{\"index\":0,\"delta\":{}}]";
-    const chunk = try std.fmt.allocPrint(reducer.alloc, "{{\"choices\":{s},\"usage\":{s}}}", .{ choices, usage });
+    const chunk = try reducer.alloc.print("{{\"choices\":{s},\"usage\":{s}}}", .{ choices, usage });
     defer reducer.alloc.free(chunk);
     try test_accept(reducer, chunk);
 }
@@ -1576,7 +1578,7 @@ test "chat completions final usage allows optional total metadata in either orde
     for ([_]bool{ false, true }) |total_first| {
         var reducer = try Reducer.init(alloc, test_request(), .{});
         defer reducer.deinit();
-        const terminal = try std.fmt.allocPrint(alloc, "{{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{s}}}", .{if (total_first) with_total else counts});
+        const terminal = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{s}}}", .{if (total_first) with_total else counts});
         defer alloc.free(terminal);
         try test_accept(&reducer, terminal);
         try test_usage_snapshot(&reducer, if (total_first) counts else with_total);
@@ -1748,7 +1750,7 @@ test "chat completions opaque number preservation does not relax index or usage 
     for ([_][]const u8{ "-1", "0.0", "1e0", "9223372036854775808", "\"0\"", "null" }) |number| {
         var reducer = try Reducer.init(alloc, test_request(), .{});
         defer reducer.deinit();
-        const chunk = try std.fmt.allocPrint(alloc, "{{\"choices\":[{{\"index\":{s},\"delta\":{{}}}}]}}", .{number});
+        const chunk = try alloc.print("{{\"choices\":[{{\"index\":{s},\"delta\":{{}}}}]}}", .{number});
         defer alloc.free(chunk);
         try std.testing.expectError(error.InvalidChunk, reducer.accept(chunk, false));
     }
@@ -1756,7 +1758,7 @@ test "chat completions opaque number preservation does not relax index or usage 
         var reducer = try Reducer.init(alloc, test_request(), .{});
         defer reducer.deinit();
         try test_accept(&reducer, test_stop);
-        const chunk = try std.fmt.allocPrint(alloc, "{{\"choices\":[],\"usage\":{{\"completion_tokens\":{s}}}}}", .{number});
+        const chunk = try alloc.print("{{\"choices\":[],\"usage\":{{\"completion_tokens\":{s}}}}}", .{number});
         defer alloc.free(chunk);
         try std.testing.expectError(error.InvalidChunk, reducer.accept(chunk, false));
     }
@@ -1820,7 +1822,7 @@ test "chat completions nested builtin additional and dynamic tool wire" {
 
 test "chat completions bounds dynamic schema traversal before serialization" {
     const alloc = std.testing.allocator;
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"items\":" ** 65 ++ "{}" ++ "}" ** 65, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, text_utils.repeat("{\"items\":", 65) ++ "{}" ++ text_utils.repeat("}", 65), .{});
     defer parsed.deinit();
     var request = test_request();
     request.tools.selected_dynamic = &.{.{ .name = "deep", .description = "Deep schema.", .input_schema = parsed.value }};
@@ -1997,7 +1999,7 @@ test "chat completions serializes user message images as content parts" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const abs = try io_mod.dirRealpathAlloc(arena, tmp.dir, "pixel.png");
-    const snapshot_dir = std.fs.path.dirname(abs).?;
+    const snapshot_dir = std.Io.Dir.path.dirname(abs).?;
     var attachment: types.ImageAttachment = .{
         .id = 1,
         .path = try arena.dupe(u8, abs),
@@ -2093,7 +2095,7 @@ test "chat completions accepts matching empty terminal usage choices" {
         defer reducer.deinit();
         try test_accept(&reducer, if (with_tools) test_call else test_text);
         try test_accept(&reducer, if (with_tools) test_tools_finish else test_stop);
-        const trailer = try std.fmt.allocPrint(alloc, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"\"}},\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":16,\"completion_tokens\":6,\"total_tokens\":22}}}}", .{if (with_tools) "tool_calls" else "stop"});
+        const trailer = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"\"}},\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":16,\"completion_tokens\":6,\"total_tokens\":22}}}}", .{if (with_tools) "tool_calls" else "stop"});
         defer alloc.free(trailer);
         try std.testing.expect((try reducer.accept(trailer, false)).content == null);
         try test_accept(&reducer, "[DONE]");
@@ -2120,7 +2122,7 @@ test "chat completions terminal usage cannot introduce content tools or a differ
         var reducer = try Reducer.init(alloc, test_tool_request(), .{});
         defer reducer.deinit();
         try test_accept(&reducer, test_stop);
-        const trailer = try std.fmt.allocPrint(alloc, "{{\"choices\":[{{\"index\":0,\"delta\":{s},\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":16,\"completion_tokens\":6,\"total_tokens\":22}}}}", .{ case.delta, case.reason });
+        const trailer = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{s},\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":16,\"completion_tokens\":6,\"total_tokens\":22}}}}", .{ case.delta, case.reason });
         defer alloc.free(trailer);
         try std.testing.expectError(error.InconsistentFinishReason, reducer.accept(trailer, false));
         try std.testing.expectError(error.StreamClosed, reducer.finish(false));
@@ -2145,7 +2147,7 @@ test "chat completions repeated terminal choices reject invalid or conflicting u
         defer reducer.deinit();
         try test_accept(&reducer, test_stop);
         if (case.seed_usage) try test_accept(&reducer, "{\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}");
-        const trailer = try std.fmt.allocPrint(alloc, "{{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{s}}}", .{case.usage});
+        const trailer = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{s}}}", .{case.usage});
         defer alloc.free(trailer);
         try std.testing.expectError(case.expected, reducer.accept(trailer, false));
         try std.testing.expectError(error.StreamClosed, reducer.finish(false));
@@ -2214,7 +2216,7 @@ test "chat completions terminal evidence and finish reasons are strict" {
         var reducer = try Reducer.init(alloc, test_tool_request(), .{});
         defer reducer.deinit();
         try test_accept(&reducer, test_call);
-        const terminal = try std.fmt.allocPrint(alloc, "{{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{s}\"}}]}}", .{case.reason});
+        const terminal = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{s}\"}}]}}", .{case.reason});
         defer alloc.free(terminal);
         try std.testing.expectError(case.failure, test_finish(&reducer, terminal));
     }
@@ -2311,11 +2313,11 @@ test "chat completions stream framing handles chunks trailers truncation and wir
         try std.testing.expectError(error.IncompleteStream, consume_stream(alloc, &source, test_request(), .{}, null, &cancelled));
     }
     {
-        var source = std.Io.Reader.fixed(": comment\n" ** 20);
+        var source = std.Io.Reader.fixed(text_utils.repeat(": comment\n", 20));
         try std.testing.expectError(error.EventTooLarge, consume_stream(alloc, &source, test_request(), .{ .event_bytes = 30 }, null, &cancelled));
     }
     {
-        var source = std.Io.Reader.fixed(": comment\n\n" ** 20);
+        var source = std.Io.Reader.fixed(text_utils.repeat(": comment\n\n", 20));
         try std.testing.expectError(error.StreamTooLarge, consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = 30 }, null, &cancelled));
     }
     {
@@ -2340,7 +2342,7 @@ test "chat completions reducer caps events content identities arguments tools an
         .{ .limits = .{ .content_bytes = 4 }, .chunk = test_text, .failure = error.ContentTooLarge },
         .{ .limits = .{ .arguments_bytes = 2 }, .chunk = test_call, .failure = error.ArgumentsTooLarge },
         .{ .limits = .{ .tool_calls = 0 }, .chunk = test_call, .failure = error.TooManyTools },
-        .{ .limits = .{}, .chunk = "[" ** 65 ++ "]" ** 65, .failure = error.JsonTooDeep },
+        .{ .limits = .{}, .chunk = text_utils.repeat("[", 65) ++ text_utils.repeat("]", 65), .failure = error.JsonTooDeep },
     }) |case| {
         var reducer = try Reducer.init(alloc, test_tool_request(), case.limits);
         defer reducer.deinit();
@@ -2397,7 +2399,7 @@ fn test_allocation_paths(alloc: Allocator) !void {
 }
 
 test "chat completions allocation failure cleanup covers serialization framing reduction and result transfer" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, test_allocation_paths, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, test_allocation_paths, .{});
 }
 
 test "chat completions name fragments preserve repeated bytes and shared prefixes" {
@@ -2433,12 +2435,12 @@ test "chat completions accepts empty name fragments without losing arguments" {
 test "chat completions accepts echoed models up to the request model limit" {
     const alloc = std.testing.allocator;
     var request = test_request();
-    request.model = "m" ** configured_provider.max_model_bytes;
+    request.model = text_utils.repeat("m", configured_provider.max_model_bytes);
     const body = try build_request(alloc, request, .{});
     defer alloc.free(body);
     var reducer = try Reducer.init(alloc, request, .{});
     defer reducer.deinit();
-    const chunk = try std.fmt.allocPrint(alloc, "{{\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"ok\"}},\"finish_reason\":\"stop\"}}]}}", .{request.model});
+    const chunk = try alloc.print("{{\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"ok\"}},\"finish_reason\":\"stop\"}}]}}", .{request.model});
     defer alloc.free(chunk);
     try test_accept(&reducer, chunk);
     try test_accept(&reducer, "[DONE]");
@@ -2450,11 +2452,11 @@ test "chat completions accepts echoed models up to the request model limit" {
 test "chat completions model bounds and serializer ignore external cancellation state" {
     const alloc = std.testing.allocator;
     var request = test_request();
-    for ([_][]const u8{ " leading", "trailing ", "bad\xff", "m" ** (configured_provider.max_model_bytes + 1) }) |invalid| {
+    for ([_][]const u8{ " leading", "trailing ", "bad\xff", text_utils.repeat("m", configured_provider.max_model_bytes + 1) }) |invalid| {
         request.model = invalid;
         try std.testing.expectError(error.InvalidModel, build_request(alloc, request, .{}));
     }
-    request.model = "m" ** configured_provider.max_model_bytes;
+    request.model = text_utils.repeat("m", configured_provider.max_model_bytes);
     var cancelled = std.atomic.Value(bool).init(false);
     request.budget = .{ .cancel_flag = &cancelled };
     const before = try build_request(alloc, request, .{});

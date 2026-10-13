@@ -82,7 +82,7 @@ const PositiveParse = union(enum) {
 fn parseOptionalPositive(alloc: Allocator, object: std.json.ObjectMap, key: []const u8) tool_dispatch.DispatchError!PositiveParse {
     const value = object.get(key) orelse return .missing;
     if (value != .integer or value.integer < 1) {
-        return .{ .failure = try std.fmt.allocPrint(alloc, "read_file field \"{s}\" must be a positive integer", .{key}) };
+        return .{ .failure = try alloc.print("read_file field \"{s}\" must be a positive integer", .{key}) };
     }
     return .{ .value = @intCast(value.integer) };
 }
@@ -158,8 +158,7 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
         tool_dispatch.reportToolResultMemory(ctx, .{
             .model_view_covers_full_file = false,
         });
-        return .{ .success = try std.fmt.allocPrint(
-            ctx.allocator,
+        return .{ .success = try ctx.allocator.print(
             "<path>{s}</path>\n<content>binary or non-utf8 file omitted ({d} bytes)</content>",
             .{ rel, stat.size },
         ) };
@@ -250,8 +249,7 @@ fn imageToolResult(
             "the image exceeds the 5 MiB encoded attach limit"
         else
             "the image exceeds 8000 pixels per side";
-        return .{ .success = try std.fmt.allocPrint(
-            ctx.allocator,
+        return .{ .success = try ctx.allocator.print(
             "<path>{s}</path>\n<content>image not attached: {s} ({d} bytes); {s}. Use an available image tool to save a smaller copy to a new file, then read_file the copy. If no image tool is available, ask the user before installing one.</content>",
             .{ rel, mime_type, file_size, reason },
         ) };
@@ -562,7 +560,7 @@ test "read_file reads workspace-relative path" {
     }
     const workspace = try workspaceRoot(alloc, tmp);
     defer alloc.free(workspace);
-    const args = try std.fmt.allocPrint(alloc, "{{\"path\":\"{s}\"}}", .{"notes/today.txt"});
+    const args = try alloc.print("{{\"path\":\"{s}\"}}", .{"notes/today.txt"});
     defer alloc.free(args);
 
     const result = try dispatchReadFileInWorkspace(alloc, workspace, args);
@@ -587,13 +585,13 @@ test "read_file external absolute path preserves absolute display" {
     defer alloc.free(workspace);
     const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external.txt");
     defer alloc.free(external);
-    const args = try std.fmt.allocPrint(alloc, "{{\"path\":\"{s}\"}}", .{external});
+    const args = try alloc.print("{{\"path\":\"{s}\"}}", .{external});
     defer alloc.free(args);
 
     const result = try dispatchReadFileInWorkspace(alloc, workspace, args);
     defer result.deinit(std.testing.allocator);
 
-    const expected = try std.fmt.allocPrint(alloc, "<path>{s}</path>\n<content>\n1\toutside\n</content>", .{external});
+    const expected = try alloc.print("<path>{s}</path>\n<content>\n1\toutside\n</content>", .{external});
     defer alloc.free(expected);
     try std.testing.expectEqual(.success, result.status);
     try std.testing.expectEqualStrings(expected, result.body);
@@ -657,14 +655,14 @@ test "read_file trims leading and trailing whitespace" {
     }
     const path = try tmpPath(std.testing.allocator, tmp, "file.txt");
     defer std.testing.allocator.free(path);
-    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"  {s}  \"}}", .{path});
+    const args = try std.testing.allocator.print("{{\"path\":\"  {s}  \"}}", .{path});
     defer std.testing.allocator.free(args);
 
     const result = try dispatchReadFile(std.testing.allocator, args);
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(.success, result.status);
-    const expected = try std.fmt.allocPrint(std.testing.allocator, "<path>{s}</path>\n<content>\n1\thello\n</content>", .{path});
+    const expected = try std.testing.allocator.print("<path>{s}</path>\n<content>\n1\thello\n</content>", .{path});
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, result.body);
 }
@@ -679,14 +677,14 @@ test "read_file honors line range fields and uses active output shape" {
     }
     const path = try tmpPath(std.testing.allocator, tmp, "file.txt");
     defer std.testing.allocator.free(path);
-    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\",\"start_line\":2,\"line_count\":2}}", .{path});
+    const args = try std.testing.allocator.print("{{\"path\":\"{s}\",\"start_line\":2,\"line_count\":2}}", .{path});
     defer std.testing.allocator.free(args);
 
     const result = try dispatchReadFile(std.testing.allocator, args);
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(.success, result.status);
-    const expected = try std.fmt.allocPrint(std.testing.allocator, "<path>{s}</path>\n<content>\n2\ttwo\n3\tthree\n... [showing 2 of 3 lines; use start_line/line_count to read more.]\n</content>", .{path});
+    const expected = try std.testing.allocator.print("<path>{s}</path>\n<content>\n2\ttwo\n3\tthree\n... [showing 2 of 3 lines; use start_line/line_count to read more.]\n</content>", .{path});
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, result.body);
 }
@@ -701,7 +699,7 @@ test "read_file omits binary content using active success output" {
     }
     const path = try tmpPath(std.testing.allocator, tmp, "binary.txt");
     defer std.testing.allocator.free(path);
-    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    const args = try std.testing.allocator.print("{{\"path\":\"{s}\"}}", .{path});
     defer std.testing.allocator.free(args);
 
     const result = try dispatchReadFile(std.testing.allocator, args);
@@ -731,7 +729,7 @@ test "read_file attaches a png image to the tool result" {
     try writeTestImage(tmp.dir, "pixel.png", test_png_base64);
     const path = try tmpPath(std.testing.allocator, tmp, "pixel.png");
     defer std.testing.allocator.free(path);
-    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    const args = try std.testing.allocator.print("{{\"path\":\"{s}\"}}", .{path});
     defer std.testing.allocator.free(args);
 
     const result = try dispatchReadFile(std.testing.allocator, args);
@@ -751,7 +749,7 @@ test "read_file detects images by magic bytes regardless of extension" {
     try writeTestImage(tmp.dir, "pixel.bin", test_png_base64);
     const path = try tmpPath(std.testing.allocator, tmp, "pixel.bin");
     defer std.testing.allocator.free(path);
-    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    const args = try std.testing.allocator.print("{{\"path\":\"{s}\"}}", .{path});
     defer std.testing.allocator.free(args);
 
     const result = try dispatchReadFile(std.testing.allocator, args);
@@ -780,7 +778,7 @@ test "read_file reports images over the attach limit without pixels" {
     }
     const path = try tmpPath(std.testing.allocator, tmp, "big.png");
     defer std.testing.allocator.free(path);
-    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    const args = try std.testing.allocator.print("{{\"path\":\"{s}\"}}", .{path});
     defer std.testing.allocator.free(args);
 
     const result = try dispatchReadFile(std.testing.allocator, args);
@@ -802,7 +800,7 @@ test "read_file attaches a PNG within the single request limit unchanged" {
     try writeTestPngHeader(tmp.dir, "frame.png", 3420, 2224);
     const path = try tmpPath(std.testing.allocator, tmp, "frame.png");
     defer std.testing.allocator.free(path);
-    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    const args = try std.testing.allocator.print("{{\"path\":\"{s}\"}}", .{path});
     defer std.testing.allocator.free(args);
 
     const result = try dispatchReadFile(std.testing.allocator, args);
@@ -819,7 +817,7 @@ test "read_file attaches a JPEG that fits the single request limit" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "photo.jpg", .data = &image_data.testJpeg(4032, 3024) });
     const path = try tmpPath(std.testing.allocator, tmp, "photo.jpg");
     defer std.testing.allocator.free(path);
-    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    const args = try std.testing.allocator.print("{{\"path\":\"{s}\"}}", .{path});
     defer std.testing.allocator.free(args);
 
     const result = try dispatchReadFile(std.testing.allocator, args);
@@ -843,7 +841,7 @@ test "read_file keeps a byte-oversized PNG at its source path" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "padded.png", .data = padded });
     const path = try tmpPath(alloc, tmp, "padded.png");
     defer alloc.free(path);
-    const args = try std.fmt.allocPrint(alloc, "{{\"path\":\"{s}\"}}", .{path});
+    const args = try alloc.print("{{\"path\":\"{s}\"}}", .{path});
     defer alloc.free(args);
 
     const result = try dispatchReadFile(alloc, args);
@@ -862,7 +860,7 @@ test "read_file attaches an image exactly at the model pixel limit" {
     try writeTestPngHeader(tmp.dir, "edge.png", image_data.max_single_image_dimension, image_data.max_single_image_dimension);
     const path = try tmpPath(std.testing.allocator, tmp, "edge.png");
     defer std.testing.allocator.free(path);
-    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    const args = try std.testing.allocator.print("{{\"path\":\"{s}\"}}", .{path});
     defer std.testing.allocator.free(args);
 
     const result = try dispatchReadFile(std.testing.allocator, args);
@@ -879,7 +877,7 @@ test "read_file gives an actionable path for an image over 8000 pixels" {
     try writeTestPngHeader(tmp.dir, "huge.png", 8001, 1);
     const path = try tmpPath(std.testing.allocator, tmp, "huge.png");
     defer std.testing.allocator.free(path);
-    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    const args = try std.testing.allocator.print("{{\"path\":\"{s}\"}}", .{path});
     defer std.testing.allocator.free(args);
     const result = try dispatchReadFile(std.testing.allocator, args);
     defer result.deinit(std.testing.allocator);
@@ -899,14 +897,14 @@ test "read_file reports start_line beyond file length" {
     }
     const path = try tmpPath(std.testing.allocator, tmp, "file.txt");
     defer std.testing.allocator.free(path);
-    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\",\"start_line\":5}}", .{path});
+    const args = try std.testing.allocator.print("{{\"path\":\"{s}\",\"start_line\":5}}", .{path});
     defer std.testing.allocator.free(args);
 
     const result = try dispatchReadFile(std.testing.allocator, args);
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(.success, result.status);
-    const expected = try std.fmt.allocPrint(std.testing.allocator, "<path>{s}</path>\n<content>\n... [start_line 5 is beyond end of file; total lines 2]\n</content>", .{path});
+    const expected = try std.testing.allocator.print("<path>{s}</path>\n<content>\n... [start_line 5 is beyond end of file; total lines 2]\n</content>", .{path});
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, result.body);
     try std.testing.expect(!result.tool_result_memory.?.model_view_covers_full_file.?);
@@ -921,14 +919,14 @@ test "read_file reports empty file as success" {
     }
     const path = try tmpPath(std.testing.allocator, tmp, "empty.txt");
     defer std.testing.allocator.free(path);
-    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    const args = try std.testing.allocator.print("{{\"path\":\"{s}\"}}", .{path});
     defer std.testing.allocator.free(args);
 
     const result = try dispatchReadFile(std.testing.allocator, args);
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(.success, result.status);
-    const expected = try std.fmt.allocPrint(std.testing.allocator, "<path>{s}</path>\n<content>\n</content>", .{path});
+    const expected = try std.testing.allocator.print("<path>{s}</path>\n<content>\n</content>", .{path});
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, result.body);
 }
@@ -946,7 +944,7 @@ test "read_file reports capped snapshots for oversized text files" {
     }
     const path = try tmpPath(std.testing.allocator, tmp, "large.txt");
     defer std.testing.allocator.free(path);
-    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    const args = try std.testing.allocator.print("{{\"path\":\"{s}\"}}", .{path});
     defer std.testing.allocator.free(args);
 
     const result = try dispatchReadFile(std.testing.allocator, args);
@@ -966,7 +964,7 @@ test "read_file sparse oversized files use active byte cap" {
     }
     const path = try tmpPath(std.testing.allocator, tmp, "too-large.txt");
     defer std.testing.allocator.free(path);
-    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    const args = try std.testing.allocator.print("{{\"path\":\"{s}\"}}", .{path});
     defer std.testing.allocator.free(args);
 
     const result = try dispatchReadFile(std.testing.allocator, args);
@@ -1010,7 +1008,7 @@ test "read_file records display-truncated reads with complete snapshot when poss
     }
     const path = try tmpPath(alloc, tmp, "between-caps.txt");
     defer alloc.free(path);
-    const args = try std.fmt.allocPrint(alloc, "{{\"path\":\"{s}\"}}", .{path});
+    const args = try alloc.print("{{\"path\":\"{s}\"}}", .{path});
     defer alloc.free(args);
     var tracker = read_tracker.ReadTracker.init(alloc);
     defer tracker.deinit();
@@ -1038,7 +1036,7 @@ test "read_file records full coverage for files within both caps" {
     }
     const path = try tmpPath(alloc, tmp, "small.txt");
     defer alloc.free(path);
-    const args = try std.fmt.allocPrint(alloc, "{{\"path\":\"{s}\"}}", .{path});
+    const args = try alloc.print("{{\"path\":\"{s}\"}}", .{path});
     defer alloc.free(args);
     var tracker = read_tracker.ReadTracker.init(alloc);
     defer tracker.deinit();
@@ -1087,7 +1085,7 @@ test "read_file records full-file hash for successful full read" {
     }
     const path = try tmpPath(alloc, tmp, "file.txt");
     defer alloc.free(path);
-    const args = try std.fmt.allocPrint(alloc, "{{\"path\":\"{s}\"}}", .{path});
+    const args = try alloc.print("{{\"path\":\"{s}\"}}", .{path});
     defer alloc.free(args);
     var tracker = read_tracker.ReadTracker.init(alloc);
     defer tracker.deinit();
@@ -1113,7 +1111,7 @@ test "read_file line range fields narrow model view but preserve full snapshot" 
     }
     const path = try tmpPath(alloc, tmp, "file.txt");
     defer alloc.free(path);
-    const args = try std.fmt.allocPrint(alloc, "{{\"path\":\"{s}\",\"start_line\":2,\"line_count\":1}}", .{path});
+    const args = try alloc.print("{{\"path\":\"{s}\",\"start_line\":2,\"line_count\":1}}", .{path});
     defer alloc.free(args);
     var tracker = read_tracker.ReadTracker.init(alloc);
     defer tracker.deinit();
@@ -1141,7 +1139,7 @@ test "read_file records capped default reads as truncated model view" {
     }
     const path = try tmpPath(alloc, tmp, "long.txt");
     defer alloc.free(path);
-    const args = try std.fmt.allocPrint(alloc, "{{\"path\":\"{s}\"}}", .{path});
+    const args = try alloc.print("{{\"path\":\"{s}\"}}", .{path});
     defer alloc.free(args);
     var tracker = read_tracker.ReadTracker.init(alloc);
     defer tracker.deinit();
@@ -1173,7 +1171,7 @@ test "read_file records exact default cap as full" {
     }
     const path = try tmpPath(alloc, tmp, "exact.txt");
     defer alloc.free(path);
-    const args = try std.fmt.allocPrint(alloc, "{{\"path\":\"{s}\"}}", .{path});
+    const args = try alloc.print("{{\"path\":\"{s}\"}}", .{path});
     defer alloc.free(args);
     var tracker = read_tracker.ReadTracker.init(alloc);
     defer tracker.deinit();
@@ -1199,7 +1197,7 @@ test "read_file preserves complete snapshot for truncated model view" {
     }
     const path = try tmpPath(alloc, tmp, "long.txt");
     defer alloc.free(path);
-    const read_args = try std.fmt.allocPrint(alloc, "{{\"path\":\"{s}\"}}", .{path});
+    const read_args = try alloc.print("{{\"path\":\"{s}\"}}", .{path});
     defer alloc.free(read_args);
     var tracker = read_tracker.ReadTracker.init(alloc);
     defer tracker.deinit();
@@ -1230,9 +1228,9 @@ test "read_file records empty and beyond-end successes" {
     defer alloc.free(empty_path);
     const file_path = try tmpPath(alloc, tmp, "file.txt");
     defer alloc.free(file_path);
-    const empty_args = try std.fmt.allocPrint(alloc, "{{\"path\":\"{s}\"}}", .{empty_path});
+    const empty_args = try alloc.print("{{\"path\":\"{s}\"}}", .{empty_path});
     defer alloc.free(empty_args);
-    const beyond_args = try std.fmt.allocPrint(alloc, "{{\"path\":\"{s}\",\"start_line\":5}}", .{file_path});
+    const beyond_args = try alloc.print("{{\"path\":\"{s}\",\"start_line\":5}}", .{file_path});
     defer alloc.free(beyond_args);
     var tracker = read_tracker.ReadTracker.init(alloc);
     defer tracker.deinit();

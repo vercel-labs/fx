@@ -938,7 +938,7 @@ fn inspectTail(file: std.Io.File) !TailBoundary {
             start,
         );
         if (read_count != read_len) return error.UsageWriteFailed;
-        if (std.mem.lastIndexOfScalar(u8, buffer[0..read_count], '\n')) |newline| {
+        if (std.mem.findScalarLast(u8, buffer[0..read_count], '\n')) |newline| {
             return .{
                 .length = start + newline + 1,
                 .incomplete = true,

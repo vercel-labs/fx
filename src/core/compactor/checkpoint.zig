@@ -769,7 +769,7 @@ test "older checkpoints yield their exact users from the named state file" {
     const state = "{\"version\":1,\"summary\":\"Earlier work.\",\"users\":[\"okay so you saying that if 2 GB exeeds then what happens ? \",\"yes\"],\"archives\":[]}";
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(state, &digest, .{});
-    const summary = try std.fmt.allocPrint(arena, "{s}\n## Conversation summary\n> fx-compaction-state-v1 result-state-1-2.txt {d} {x}\n> Task state:\n", .{ legacy_handoff_open, state.len, digest });
+    const summary = try arena.print("{s}\n## Conversation summary\n> fx-compaction-state-v1 result-state-1-2.txt {d} {x}\n> Task state:\n", .{ legacy_handoff_open, state.len, digest });
     const ref = legacyStateRef(summary).?;
     try testing.expectEqualStrings("result-state-1-2.txt", ref.handle);
     const payload = (try parseLegacyState(arena, ref, state)).?;

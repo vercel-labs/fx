@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const secret = @import("../auth/secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -427,16 +428,17 @@ pub const Usage = struct {
         self: *Usage,
         providers: generation_usage.Set,
     ) void {
-        inline for (std.meta.fields(Usage)) |field| {
-            if (comptime std.mem.eql(u8, field.name, "active_sequences") or
-                std.mem.eql(u8, field.name, "incidents") or
-                std.mem.eql(u8, field.name, "billing") or
-                std.mem.eql(u8, field.name, "api_duration_complete") or
-                std.mem.eql(u8, field.name, "wall_duration_complete") or
-                std.mem.eql(u8, field.name, "code_complete") or
-                std.mem.eql(u8, field.name, "reasoning_tokens") or
-                std.mem.eql(u8, field.name, "request_count")) continue;
-            @field(self.*, field.name) = field.defaultValue().?;
+        const usage_info = @typeInfo(Usage).@"struct";
+        inline for (usage_info.field_names, usage_info.field_types, usage_info.field_attrs) |field_name, field_type, field_attrs| {
+            if (comptime std.mem.eql(u8, field_name, "active_sequences") or
+                std.mem.eql(u8, field_name, "incidents") or
+                std.mem.eql(u8, field_name, "billing") or
+                std.mem.eql(u8, field_name, "api_duration_complete") or
+                std.mem.eql(u8, field_name, "wall_duration_complete") or
+                std.mem.eql(u8, field_name, "code_complete") or
+                std.mem.eql(u8, field_name, "reasoning_tokens") or
+                std.mem.eql(u8, field_name, "request_count")) continue;
+            @field(self.*, field_name) = field_attrs.defaultValue(field_type).?;
         }
         self.billing = .complete;
         self.api_duration_complete = true;
@@ -1358,7 +1360,7 @@ pub const Usage = struct {
     /// only updates the profile-level usage ledger. Tests keep the legacy
     /// synchronous flush so assertions stay deterministic.
     fn scheduleProfilePublicationDrain(self: *Usage) void {
-        if (builtin.is_test or comptime builtin.os.tag == .wasi) {
+        if (builtin.is_test or comptime builtin.target.os.tag == .wasi) {
             self.flushProfilePublications();
             return;
         }
@@ -1392,7 +1394,7 @@ pub const Usage = struct {
     /// Stops the background profile-publication drain, joining any live worker.
     /// A later schedule starts a fresh worker.
     fn stopPublicationDrain(self: *Usage) void {
-        if (builtin.is_test or comptime builtin.os.tag == .wasi) return;
+        if (builtin.is_test or comptime builtin.target.os.tag == .wasi) return;
         self.publication_drain_cancel.store(true, .seq_cst);
         self.publication_drain_mutex.lockUncancelable(io_mod.getIo());
         defer self.publication_drain_mutex.unlock(io_mod.getIo());
@@ -1520,8 +1522,7 @@ pub const Usage = struct {
             }
         } else return;
         if (index + 1 < self.incident_count) {
-            std.mem.copyForwards(
-                usage_report.Incident,
+            @memmove(
                 self.incidents[index .. self.incident_count - 1],
                 self.incidents[index + 1 .. self.incident_count],
             );
@@ -1831,8 +1832,7 @@ pub const Usage = struct {
         self.pending = .fromOwnedSlice(copied.pending);
         self.publication_backlog = .fromOwnedSlice(copied.publication_backlog);
         self.incident_count = copied.incidents.len;
-        std.mem.copyForwards(
-            usage_report.Incident,
+        @memmove(
             self.incidents[0..self.incident_count],
             copied.incidents,
         );
@@ -2579,8 +2579,7 @@ pub fn appendIncidentOwned(
         snapshot.incidents.len + 1,
     );
     if (snapshot.incidents.len > 0) {
-        std.mem.copyForwards(
-            usage_report.Incident,
+        @memmove(
             next[0..snapshot.incidents.len],
             snapshot.incidents,
         );
@@ -4344,7 +4343,7 @@ test "incident overflow retains the newest incomplete boundary" {
 }
 
 test "usage snapshot parsing releases every partial allocation" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var usage = Usage.initFresh();
     defer usage.deinit(alloc);
 
@@ -4613,9 +4612,9 @@ test "legacy usage compatibility releases rejected and unavailable allocations" 
             try std.testing.expectEqual(Availability.legacy, snapshot.billing);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ parsed.value, false });
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Check.run, .{ parsed.value, false });
     parsed.value.object.getPtr("input_tokens").?.* = .{ .integer = 9 };
-    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ parsed.value, true });
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Check.run, .{ parsed.value, true });
 }
 
 test "usage deduplicates terminal and generation callbacks" {
@@ -4869,7 +4868,7 @@ test "active invocation capacity fails before provider admission" {
 }
 
 test "generation allocation failure marks billing incomplete before snapshot" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var usage = Usage.initFresh();
     defer usage.deinit(alloc);
     const sequence = try usage.reserveInvocation();
@@ -5432,13 +5431,13 @@ test "usage keeps more than sixteen exact resolved models" {
     const suffixes = "ABCDEFGHJKMNPQRST";
     for (suffixes, 0..) |suffix, index| {
         var id_buf: [30]u8 = undefined;
-        const id = try std.fmt.bufPrint(
+        const id = try std.mem.print(
             &id_buf,
             "gen_01ARZ3NDEKTSV4RRFFQ69G5FA{c}",
             .{suffix},
         );
         var model_buf: [64]u8 = undefined;
-        const model = try std.fmt.bufPrint(&model_buf, "provider/model-{d}", .{index});
+        const model = try std.mem.print(&model_buf, "provider/model-{d}", .{index});
         const sequence = try usage.reserveInvocation();
         try usage.finishObservedInvocation(
             alloc,
@@ -5504,7 +5503,7 @@ test "sixteenth pending generation is the capacity boundary" {
 
     for (suffixes[0..max_pending_generations]) |suffix| {
         var id_buf: [30]u8 = undefined;
-        const id = try std.fmt.bufPrint(
+        const id = try std.mem.print(
             &id_buf,
             "gen_01ARZ3NDEKTSV4RRFFQ69G5FA{c}",
             .{suffix},
@@ -5530,7 +5529,7 @@ test "sixteenth pending generation is the capacity boundary" {
     );
 
     var overflow_id_buf: [30]u8 = undefined;
-    const overflow_id = try std.fmt.bufPrint(
+    const overflow_id = try std.mem.print(
         &overflow_id_buf,
         "gen_01ARZ3NDEKTSV4RRFFQ69G5FA{c}",
         .{suffixes[max_pending_generations]},

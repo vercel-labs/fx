@@ -24,7 +24,7 @@ pub fn generateSessionId(alloc: Allocator) ![]u8 {
 pub fn sessionJsonPath(alloc: Allocator, sessions_dir: []const u8, session_id: []const u8) ![]u8 {
     const session_dir = try sessionDirPath(alloc, sessions_dir, session_id);
     defer alloc.free(session_dir);
-    return std.fs.path.join(alloc, &.{ session_dir, "session.json" });
+    return std.Io.Dir.path.join(alloc, &.{ session_dir, "session.json" });
 }
 
 /// Strips trailing slashes from a workspace root (keeping at least one char), so

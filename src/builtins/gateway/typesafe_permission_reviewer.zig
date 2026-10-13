@@ -293,8 +293,7 @@ fn decisionArgumentsJson(alloc: Allocator, jev: JevDecision) Allocator.Error![]u
         decision: []const u8,
         rationale: []const u8,
     };
-    const rationale = try std.fmt.allocPrint(
-        alloc,
+    const rationale = try alloc.print(
         "jev choice={s} p_clear={d:.3} p_caution={d:.3} confidence={d:.3} input_tokens={d} output_tokens={d}",
         .{
             jev.decision,
@@ -340,7 +339,7 @@ fn sendReview(
     if (cancel_flag.load(.seq_cst)) return .cancelled;
     if (config.api_key.len == 0 or config.endpoint.len == 0) return .permanent_failure;
 
-    const auth_header = std.fmt.allocPrint(alloc, "Bearer {s}", .{config.api_key}) catch |err| return err;
+    const auth_header = alloc.print("Bearer {s}", .{config.api_key}) catch |err| return err;
     defer alloc.free(auth_header);
 
     var extra_buf: [3]std.http.Header = undefined;
@@ -383,7 +382,7 @@ fn sendReview(
     };
     if (cancel_flag.load(.seq_cst)) return .cancelled;
 
-    const status_code: u16 = @intFromEnum(result.status);
+    const status_code: u16 = @backingInt(result.status);
     if (result.status != .ok) {
         const outcome: permission_auto_classifier.TransportOutcome =
             if (status_code == 408 or status_code == 425 or status_code == 429 or status_code >= 500)
@@ -568,7 +567,7 @@ const FakeJevServer = struct {
         const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
         self.server = try address.listen(self.io_backend.io(), .{ .reuse_address = true });
         errdefer self.server.deinit(self.io_backend.io());
-        self.url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}{s}", .{ self.server.socket.address.getPort(), path });
+        self.url = try std.testing.allocator.print("http://127.0.0.1:{d}{s}", .{ self.server.socket.address.getPort(), path });
         return self;
     }
 
@@ -626,7 +625,7 @@ const FakeJevServer = struct {
             .internal_error => "500 Internal Server Error",
         };
         var response: [2048]u8 = undefined;
-        const written = try std.fmt.bufPrint(&response, "HTTP/1.1 {s}\r\ncontent-type: application/json\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n{s}", .{ status, body.len, body });
+        const written = try std.mem.print(&response, "HTTP/1.1 {s}\r\ncontent-type: application/json\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n{s}", .{ status, body.len, body });
         var write_buffer: [4096]u8 = undefined;
         var writer = stream.writer(zio, &write_buffer);
         try writer.interface.writeAll(written);

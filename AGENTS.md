@@ -18,34 +18,33 @@ If you cannot run the binary in your environment, say so explicitly and ask the 
 
 ### Always use the built binary in this repo
 
-When running fx for verification, **always use the freshly-built binary at** **`./zig-out/bin/fx`** from this checkout. Never run `fx` from `PATH`, never rely on whatever is at `~/.fx/bin/fx`, and never assume an installed copy reflects your change.
+When running fx for verification, **always use the freshly-built binary at** **`./zig-out/bin/fx`** from this checkout. Never run `fx` from `PATH`, never rely on the installed copy at `~/.local/bin/fx`, and never assume an installed copy reflects your change.
 
-* The user may have an older `fx` on their PATH (e.g. installed via `fx upgrade` or the CDN install script). Running that one will not exercise your edits.
+* The user may have an older `fx` on their PATH (e.g. installed via `fx upgrade` or the install script). Running that one will not exercise your edits.
 
-* `zig build` writes to `zig-out/bin/fx`. That is the only binary that contains your latest change.
-
-* When a user reports "still not working" after you believe you fixed something, do not assume they are running the wrong binary. Assume your fix is incomplete and investigate further. If you genuinely suspect a PATH mismatch, ask — do not silently copy binaries into `~/.fx/bin/`.
+* When a user reports "still not working" after you believe you fixed something, do not assume they are running the wrong binary. Assume your fix is incomplete and investigate further. If you genuinely suspect a PATH mismatch, ask — do not silently copy binaries onto their `PATH`.
 
 * In any shell invocation — tmux, direct run, scripts — reference fx as `/Users/<you>/path/to/repo/zig-out/bin/fx` (absolute) or `./zig-out/bin/fx` (when cwd is the repo root). Bare `fx` is always wrong for dev verification.
 
 ## Language and Toolchain
 
-This project is written in **Zig 0.16+**. There is no Node.js runtime, no `package.json` at the root, and no JavaScript build step for the main binary.
+This project is written in **Zig 0.17+**. There is no Node.js runtime, no `package.json` at the root, and no JavaScript build step for the main binary.
 
 Build and test commands:
 
 ```bash
-zig build          # build the binary
-zig build test     # run all unit tests
-zig build run      # build and run
-zig fmt src/       # format all source files
+zig build              # build the binary
+zig build test         # run all unit tests
+zig build run          # build and run
+zig fmt src/           # format all source files
+zig fmt --check src/   # the formatting check CI runs
 ```
 
 The test suites under `tests/` use Bun but are separate from the Zig codebase. See **Testing** below.
 
 ## Code Style
 
-* Format all Zig source with `zig fmt` before committing. The canonical check is `zig fmt src/`.
+* Format all Zig source with `zig fmt src/` before committing.
 
 * Do not use emojis in code, output, or documentation. Unicode symbols (e.g. checkmark, arrow) are acceptable.
 
@@ -55,9 +54,11 @@ The test suites under `tests/` use Bun but are separate from the Zig codebase. S
 
 * CLI flags use kebab-case (e.g. `--no-save`, `--json`). Never use camelCase for flags.
 
-* Prefer `snake_case` for all Zig identifiers. Types use `PascalCase` per Zig convention.
+* Follow Zig naming: `camelCase` for functions, `snake_case` for variables, fields, and file names, and `PascalCase` for types.
 
 * Keep `pub` surface area minimal. Only mark declarations `pub` when they are used outside the file.
+
+* Never commit personal home-directory paths, real team IDs, internal team slugs, or personal project slugs. `scripts/check-public-surface.sh` rejects them in CI. Use `/Users/example/` in fixtures.
 
 ## Architecture
 
@@ -69,6 +70,12 @@ Key rules:
 
 * `src/core/compactor/` owns context compaction. Outside code imports only its front door, `compactor.zig`, and the compactor imports only shared basics and model configuration; its caller hands in the model caller, the record store, and the session's projection of saved turns into chat messages. `scripts/check-compactor-boundary.sh` enforces this in CI.
 
+* `src/core/indexer/` is the native workspace indexer. It reads git's ignore rules, repository layout, and git config as data and never starts a process, so a repository's configuration cannot make it run a program. Outside code imports only its front door, `indexer.zig`, and the indexer imports only the standard library, its own files, `io.zig`, and `debug_trace.zig`. `@`-completion, `glob_files`, and `grep_files` list files only through it and never start a process. `scripts/check-indexer-boundary.sh` enforces this in CI.
+
+* `src/core/shell_command/safe_git.zig` runs git for the `fx pr` and `fx issue` snapshot and for the agent's direct read-only `git status`, `git diff`, and `git log` when the command does not use the user's own shell environment. It turns off every program a repository's own config can name and refuses to run when git would use a different repository than the one fx read. In `auto` mode a git command it refuses is returned to the agent without running. Commands that run in a shell use git with the repository's full config: git in the shell tool's default `user` environment, and the routine commands `auto` mode runs without review, such as `git status` with other flags, `git fetch`, or `npm test`.
+
+* `src/mcp/` is the MCP-v2 engine. `FX_MCP_ENGINE=v2` selects it in place of the default v1 client in `src/core/mcp/`. Its files import only `std` and each other, and the host passes in `std.Io` and every other service through `src/mcp/host.zig`. fx connects to it through `src/core/mcp_host/`.
+
 * `src/tools/` owns built-in tool implementations. Generic tool contracts and dispatch live in `src/core/tooling/`. Default tool specs are centralized in `src/core/tooling/tool_specs.zig` or `src/builtins/tools.zig`, not in individual tool files.
 
 * `src/ui/` owns terminal rendering, event loop, input, transcript. It must not own product state.
@@ -76,6 +83,8 @@ Key rules:
 * `src/gateway/` owns provider transport. It must not absorb product-state logic.
 
 * `src/acp/` owns the ACP (Agent Client Protocol) JSON-RPC 2.0 server.
+
+* `src/wasm_core_main.zig`, `src/wasm_term_main.zig`, and `src/napi_core_main.zig` are the libfx SDK entry points. Read `sdk/AGENTS.md` before changing them or anything under `sdk/`.
 
 ### Adding a Feature
 
@@ -109,9 +118,12 @@ its stale corpus entry. Normal PR CI loads the corpus and rejects missing,
 duplicate, stale, or unclassified files without running the expensive PGSO
 qualification.
 
+Every root E2E file also needs a weight in `tests/e2e/ci-shard-weights.json`.
+CI fails on a missing or stale entry.
+
 ### Adding a Command
 
-1. Add the spec to `src/core/slash_commands/command_specs.zig`
+1. Add the command kind in `src/core/slash_commands/command_specs.zig` and its spec, including usage, summary, and options, in `src/builtins/commands.zig`
 2. Add dispatch wiring in `src/core/cli/cli_surface.zig`
 3. Add a snapshot type if it has structured output
 4. Render text and JSON from the same snapshot via `src/core/output/output_contracts.zig`
@@ -130,15 +142,15 @@ Config precedence (highest wins):
 4. `<workspace>/.fx.json` (committed project defaults)
 5. Built-in defaults
 
-Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, `context`, `provider_order`, and `provider_strict`. Profile-owned keys such as `provider`, `providers`, `models`, `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `auto_compact_percent`, `permission_mode`, `web`, `credential_source`, `permission`, and `skill_symlink_authorities` are ignored from project config before their values are parsed.
+Project `.fx.json` accepts only repo-safe defaults: `max_agent_steps`, `max_tool_result_bytes`, `context`, `provider_order`, and `provider_strict`, parsed by `parseProjectSafeFields` in `src/core/config/config_runtime.zig`. The project layer never parses profile-owned keys, such as provider and model selection, permissions, and interface preferences.
 
-Runtime state lives under `~/.fx/sessions/<session-id>/` (`session.json`, `background/`, `subagent/`, `logs/`). Sessions are global and portable across workspaces. Each session tracks its `workspace_root`, which updates when resumed in a different workspace. A subagent child is an internal ordinary session with its own history. Its parent owns one bounded `subagent/children.json` registry, and the child carries only an immutable owner marker. Child sessions stay out of ordinary session discovery and cannot be resumed directly. A first `subagent.message` creates a named persistent child in that parent; later messages continue it, and optional instructions replace only its child-specific system overlay.
+Runtime state lives under `~/.fx/sessions/<session-id>/` (`session.json`, `background/`, `subagent/`, `logs/`). Sessions are global and portable across workspaces. Each session tracks its `workspace_root`, which updates when resumed in a different workspace. Subagent children are internal sessions registered in their parent's `subagent/children.json`. They stay out of session discovery and cannot be resumed directly.
 
 ## Permissions
 
 Security is permission-first. All sensitive tool behavior must integrate with `src/core/permissions/permissions.zig`.
 
-* `permission_mode` controls baseline (`ask`, `auto`, or `full-access`; `yolo` remains an alias). Full access bypasses fx permission policy and uses an effective sandbox of `none` without rewriting saved sandbox configuration
+* `permission_mode` controls baseline (`ask`, `auto`, or `full-access`; `yolo` remains an alias). Full access bypasses fx permission policy
 
 * Configured denies are evaluated before saved-session rules; an exact saved-session deny can narrow a configured allow, while an exact saved-session allow can satisfy an unresolved configured ask
 
@@ -158,41 +170,33 @@ Do not bypass the permission system for new tools.
 
 ## Zig-Specific Patterns
 
-### Memory
+### Memory and Errors
 
 * Allocators are passed explicitly. Never use a global allocator.
-
-* Free what you allocate. Use `defer` for cleanup at the call site.
 
 * Prefer `ArenaAllocator` for request-scoped work that can be freed in bulk.
 
 * When a function returns allocated memory, document who owns it (caller or callee).
 
-### Error Handling
-
 * Return errors rather than panicking. `@panic` is for programmer bugs, not runtime conditions.
-
-* Use `errdefer` to clean up partial state on error paths.
-
-* Prefer specific error sets over `anyerror` when the set is bounded.
 
 ### Strings and JSON
 
-* Zig strings are `[]const u8`. There is no implicit null termination.
+* Zig 0.17 removed the `**` operator. Fill arrays with `@splat` and build repeated comptime strings with `text_utils.repeat` from `src/core/shared/text_utils.zig`.
 
 * For JSON serialization, use `std.json.Stringify.value` with an allocating writer (`std.Io.Writer.Allocating`).
 
 * For JSON string escaping (writing raw JSON), use the project's `writeJsonStr` helper in `src/acp/jsonrpc.zig` rather than assuming `std.json.encodeJsonString` exists.
 
-* Zig 0.16 uses `std.Io.File.stdin()` / `.stdout()` / `.stderr()`, not `std.io.getStdIn()`.
+* Zig 0.17 uses `std.Io.File.stdin()` / `.stdout()` / `.stderr()`, not `std.io.getStdIn()`.
 
-### I/O (Zig 0.16 "Juicy Main")
+### I/O ("Juicy Main")
 
 * `main` uses `pub fn main(init: std.process.Init) !void` signature.
 
 * All I/O goes through `std.Io`, passed explicitly or via the project's `src/core/shared/io.zig` helper (`io_mod.getIo()`).
 
-* File operations use `std.Io.Dir` and `std.Io.File` (not `std.fs`). Most methods require an `io` parameter.
+* File operations use `std.Io.Dir` and `std.Io.File`. Most methods require an `io` parameter. Everything left in `std.fs` is deprecated: use `std.Io.Dir.path` for path manipulation and `std.Io.Dir.max_path_bytes` for path buffers.
 
 * Environment variables: use `io_mod.getenv(key)` (returns `?[]const u8`), not `std.process.getEnvVarOwned`.
 
@@ -208,9 +212,29 @@ Do not bypass the permission system for new tools.
 
 * HTTP: `std.http.Client` requires `.io = io_mod.getIo()` in its initializer.
 
-* `std.mem` renames: `trimLeft` is `trimStart`, `trimRight` is `trimEnd`, `indexOf` is `find`, `indexOfScalar` is `findScalar`.
-
 * `ArrayList(T)` initializes with `.empty` (not `.{}`).
+
+### Zig 0.17 Standard Library
+
+fx does not use declarations that Zig 0.17 deprecates. They still compile, so check new code against this list:
+
+* Format with `alloc.print(fmt, args)` and `std.mem.print(buf, fmt, args)`, not `std.fmt.allocPrint` or `std.fmt.bufPrint`.
+
+* Search with the `std.mem.find` family (`find`, `findScalar`, `findAny`, `findLast`, `findScalarLast`, and their `Pos` variants), not `indexOf` or `lastIndexOf`. Trim with `trimStart` and `trimEnd`.
+
+* Copy overlapping slices with `@memmove(dest, src)`, not `std.mem.copyForwards` or `copyBackwards`. Both slices must have the same length.
+
+* Resolve paths with `std.Io.Dir.path.resolveAlloc` and `relativeAlloc`.
+
+* Read the target from `builtin.target.os`, `builtin.target.cpu`, and `builtin.target.abi`, and the optimization mode from `builtin.optimize` (`.debug`, `.safe`, `.fast`, `.small`). Gate safety-only work on `builtin.optimize.runtimeSafety()`. Language types live in `std.lang`, not `std.builtin`.
+
+* Use `std.ArrayList`, `std.array_hash_map.String` and `.Auto`, and `std.bit_set.Dynamic` and `.Static`, not the `Unmanaged` or `BitSet` aliases. Read the last list item with `last()`.
+
+* Convert enums with `@backingInt` and `@fromBackingInt`. Divide rounding up with `@divCeil`.
+
+* `@hasDecl` only finds `pub` declarations, so a declaration that a duck-typed caller probes for must be `pub`.
+
+* Decode one UTF-8 sequence with `display_width.decodeUtf8Sequence` from `src/core/shared/display_width.zig`, not `std.unicode.utf8Decode`.
 
 ### Testing
 
@@ -218,11 +242,11 @@ Do not bypass the permission system for new tools.
 
 * Run the narrowest relevant tests while developing. The complete `zig build test` suite runs in ReleaseSafe in **CI** after the feature branch is pushed, and it must pass before the draft PR is marked ready.
 
-* Use `std.testing.expect`, `std.testing.expectEqual`, `std.testing.expectEqualStrings` for assertions.
-
 * In test blocks, use `std.testing.io` for the `Io` parameter. `io_mod.getIo()` automatically returns `std.testing.io` in test builds.
 
 * Use `io_mod.dirRealpathAlloc(alloc, dir, sub_path)` to resolve paths within `std.testing.tmpDir()`.
+
+* Back `std.testing.checkAllAllocationFailures`, hand-written `FailingAllocator` sweeps, and allocation-count comparisons with `testing_allocator.no_resize` from `src/core/shared/testing_allocator.zig`. `std.testing.allocator` may grow an allocation in place on one run and not the next, which changes the allocation sequence and makes those tests flaky.
 
 ## Testing (TypeScript)
 
@@ -278,13 +302,13 @@ Do not run the complete deterministic test suite locally as the default developm
 
 After the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. Linux is the gate for every change because most fx behavior is identical on every platform:
 
-* `.github/workflows/ci.yml` runs on Linux x86_64. It checks formatting, the PGSO corpus, the public surface, and the compactor boundary, then runs the ReleaseSafe unit tests. It builds fx once, smoke-tests it, and shares that binary with four duration-balanced E2E shards and the MCP conformance baseline. Checked-in weights assign every E2E file to exactly one shard, and files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one retry after its tmux server is reset. A file that passes only on retry gets a warning annotation; investigate it as a possible race. The SDK jobs build WASM and the Node-API addons once and run the complete package qualification. `Build & Test` passes only when the unit tests and every SDK job pass, because Publish libfx relies on that result instead of qualifying the package again.
+* `.github/workflows/ci.yml` runs on Linux x86_64. It checks formatting, the PGSO corpus, the public surface, and the compactor and indexer boundaries, runs the ReleaseSafe unit tests, runs the E2E files in four weighted shards plus the MCP conformance baseline, and qualifies the SDK packages. A failed E2E file is retried once. A file that passes only on retry gets a warning annotation; investigate it as a possible race. `Build & Test` fails when any SDK job fails.
 * `.github/workflows/binary-size.yml` builds each release target on its native runner, reports the size change, and smoke-tests every target's binary. See **Binary Size Observability**.
 * `.github/workflows/bench.yml` enforces the startup latency budget. See **Benchmarks**.
 
 Linux jobs install Zig through `.github/actions/setup-zig`, which restores the Zig cache that runs on `main` save with `.github/actions/save-zig-cache`. Pull requests never save a Zig cache through these actions, so they cannot push `main`'s entries out of the repository's cache quota. The PGSO workflow keeps its own cache through `.github/actions/setup-pgso`.
 
-macOS runs only when a change can behave differently there. `.github/workflows/macos.yml` uses `scripts/detect-macos-need.sh` to check the diff. The macOS arm64 unit tests and the E2E files in `tests/e2e/macos-platform-tests.json` run when the change touches a Zig file with a macOS, BSD, or Linux code path, `build.zig`, the macOS signing script, the native SDK addon, a listed E2E file, a shared E2E helper that reads the platform, or the macOS checks themselves. A Linux-only branch counts because macOS takes its other path; a Windows-only branch does not. The listed E2E files run in two weighted shards that share one macOS build. Native SDK addon changes also build and load the addon on macOS. If the detector cannot read the change, the `macOS arm64` check fails instead of passing. To request macOS for any other change, add the `ci:macos` label or run `gh workflow run macos.yml --ref <branch>`. The label needs triage access and the dispatch needs write access, so an outside contributor asks in the PR and a maintainer starts the run. When the change does not need macOS, the `macOS arm64` check passes without starting a macOS runner. Every E2E file that branches on `process.platform` or `platform()` being `darwin` or `linux` must appear in `tests/e2e/macos-platform-tests.json`, and `tests/e2e/ci-shards.test.ts` enforces that.
+macOS runs only when `scripts/detect-macos-need.sh` finds a change that can behave differently there, such as a Zig file with a macOS, BSD, or Linux code path, `build.zig`, the macOS signing script, the native SDK addon, or a platform E2E file. If the detector cannot read the change, the `macOS arm64` check fails instead of passing. When the change does not need macOS, the check passes without starting a macOS runner. To request macOS for any other change, add the `ci:macos` label or run `gh workflow run macos.yml --ref <branch>`. The label needs triage access and the dispatch needs write access, so an outside contributor asks in the PR and a maintainer starts the run. Every E2E file that branches on `process.platform` or `platform()` being `darwin` or `linux` must appear in `tests/e2e/macos-platform-tests.json`, and `tests/e2e/ci-shards.test.ts` enforces that.
 
 The macOS arm64 PGSO workflow runs on a pull request only when the PGSO pipeline changes: `scripts/pgso/` other than `corpus.json`, the `setup-pgso` action, or `.github/workflows/pgso-macos-arm64.yml`. To qualify any other change, run `gh workflow run pgso-macos-arm64.yml --ref <branch>`. The stable release always runs it.
 
@@ -294,7 +318,7 @@ A CI result is valid only when it belongs to the exact current commit and `Build
 
 ## Reproducing Render Bugs
 
-fx's rendering is inline by default and deliberately emits a small ANSI subset. Three owner classes are the narrow exceptions, and each takes the alternate buffer exclusively through `AlternateScreenOwner` in `src/ui/shell_runtime.zig`: interactive permission review, the full-transcript screen, and catalog menus. Only one class may own the buffer at a time, and each must leave it and restore the main grid, composer, cursor, paste, mouse, focus, and keyboard modes when it closes. Transcript rendering, question prompts, command-output expansion, and subagent delegation remain inline. Three tools exist for reproducing and regression-proofing render bugs:
+fx's rendering is inline by default and deliberately emits a small ANSI subset. Three owner classes are the narrow exceptions, and each takes the alternate buffer exclusively through `AlternateScreenOwner` in `src/ui/shell_runtime.zig`: interactive file-approval review, the full-transcript screen, and catalog menus. Only one class may own the buffer at a time, and each must leave it and restore the main grid, composer, cursor, paste, mouse, focus, and keyboard modes when it closes. Transcript rendering, question prompts, command-output expansion, and subagent delegation remain inline. Three tools exist for reproducing and regression-proofing render bugs:
 
 ### tmux (live TTY repros)
 
@@ -344,7 +368,7 @@ Startup latency benchmarks live in `benchmarks/` and run in CI via `.github/work
 ./benchmarks/startup.sh --quick    # quick run (20 iterations)
 ```
 
-The CI workflow builds a ReleaseSafe binary, measures six CLI paths with hyperfine, and enforces per-command latency budgets. PRs that exceed a budget fail the check. On `main`, results are uploaded to Vercel Blob for historical tracking.
+The `Startup Latency` job builds a ReleaseSafe binary, measures six CLI paths with hyperfine, and enforces per-command latency budgets. The same job runs `tests/e2e/tui-performance.test.ts` as the interactive terminal performance gate. A PR that exceeds either fails the check.
 
 The long-turn memory and libfx runtime benchmarks run only on request. Start them with `gh workflow run bench.yml --ref <branch> -f long_turn_memory=true` or `-f libfx_runtime=true`.
 
@@ -352,29 +376,15 @@ The startup benchmark uses `FX_BENCH=1`, an environment variable that runs throu
 
 To measure the interactive launch up to the first frame, use `benchmarks/first_frame.py`. It drives fx on a pseudo-terminal and interleaves several `--binary` arguments for before-and-after comparisons.
 
-Current raw wall-clock contract:
-
-* Linux CI: 2ms for every command
-* Non-Linux local runs: informational raw means
-
-The Linux CI runner is the authoritative product budget. Local macOS process
-and dynamic-loader floors vary enough to exceed 2ms independently of fx, so
-local runs report raw means without assigning a substitute product budget. The
-process baseline is diagnostic only and is never subtracted.
+The budget is 2ms of raw wall-clock time for every command on the Linux CI runner, which is the authoritative product budget. Local macOS runs report raw means only, because process and dynamic-loader overhead there can exceed 2ms independently of fx. The process baseline is diagnostic only and is never subtracted.
 
 When adding features, consider their impact on startup latency. The `fx help` path is the baseline cold-start benchmark.
 
 ## Binary Size Observability
 
-Every pull request runs `.github/workflows/binary-size.yml` across Linux x86_64,
-Linux arm64, macOS x86_64, and macOS arm64. Each matrix job builds the pull
-request merge commit and its base commit as stripped ReleaseSafe binaries on
-the same native runner, then reports the exact byte and MiB delta plus ELF or
-Mach-O section changes. The base binary is cached by base commit, so later
-pushes to the same pull request reuse it until the base branch moves. Every job
-also smoke-tests the pull request binary with `scripts/smoke-binary.sh`. These
-are release-style builds, and the Linux arm64 and macOS binaries run nowhere
-else on a pull request.
+Every pull request runs `.github/workflows/binary-size.yml`, which builds each
+release target and its base commit on native runners, reports the size change,
+and smoke-tests the pull request binary with `scripts/smoke-binary.sh`.
 
 Each platform check is informational. An increase of at least 52,429 bytes
 (0.050000 MiB) emits a warning and retains that platform's binaries for
@@ -385,11 +395,21 @@ ceiling and performance gates.
 
 ## Documentation
 
-When adding or changing user-facing features, update **all** relevant files:
+When adding or changing user-facing behavior, update the documentation this repository owns in the same change:
 
-1. `--help` output via command specs in `src/core/slash_commands/command_specs.zig`
-2. `README.md` — feature descriptions, usage examples
-3. `CONTRIBUTING.md` — if build steps, config, or collaboration rules change
+1. `--help` output via command specs in `src/builtins/commands.zig`
+2. `sdk/README.md` if libfx's supported public behavior or setup changes, as `sdk/AGENTS.md` describes
+3. `CONTRIBUTING.md` if build steps, development setup, or collaboration rules change
+
+The user manual at fx.sh/docs is built from a private repository. When a change makes a page wrong or incomplete, updating the manual is part of the change:
+
+* If you are a member of the `vercel-labs` organization on GitHub, you can fetch the private repository behind fx.sh. When you can push to it, update the page there in a companion pull request and link it from this one. A page's source is `apps/marketing/app/(site)/(docs)/docs/<path>/page.mdx`, where `<path>` is the part of its URL after `fx.sh/docs/`.
+
+* If you can't push to that repository, add a `## Docs` section to the PR description with the exact change each affected page needs, as `CONTRIBUTING.md` describes, so a maintainer can make it.
+
+Do not move feature descriptions, option lists, or usage examples into `README.md` in place of the manual.
+
+`README.md` is a short introduction that links to fx.sh/docs. Change it only when one of its statements becomes false, such as a command, flag, path, or link it names, or when a change adds a capability as broad as the ones in its feature list. A single new option, command, or environment variable belongs in `--help` and the manual, not in `README.md`.
 
 Do not document intended behavior as if it already exists.
 
@@ -404,8 +424,7 @@ To prepare a release:
 1. Create a branch (e.g. `prepare-v0.3.0`)
 2. Bump `pub const version` in `src/main.zig`
 3. Write the changelog entry in `CHANGELOG.md` at the top, under a new `## <version>` heading, wrapped in `<!-- release:start -->` and `<!-- release:end -->` markers. Remove the markers from the previous release entry so only the new release has them.
-4. Update `README.md` install example version
-5. Open a PR and merge to `main`
+4. Open a PR and merge to `main`
 
 When the PR merges, CI compares the version tag to what exists in git. If the tag is missing, it cross-compiles all platform binaries, creates the git tag, and publishes a GitHub Release with the binaries attached. The release body is extracted from the content between the `<!-- release:start -->` and `<!-- release:end -->` markers in `CHANGELOG.md`.
 
@@ -416,8 +435,9 @@ The changelog is public product copy. Describe observable user behavior, not the
 Public changelog entries must:
 
 * Spell the product name `fx`. Preserve different casing only when it is part of an exact code identifier such as `FX_MODEL`.
+* Open with a short bold summary of the release.
 * Use only relevant sections from `### Breaking Changes`, `### New Features`, `### Improvements`, `### Bug Fixes`, and `### Security`. Omit empty sections.
-* Bold a short feature or fix name, then describe the user-visible change after a colon.
+* Write each bullet as one or two plain sentences on a single line. Lead with the concrete change, then say what happens now. Do not add a bold `**Label:**` prefix.
 * Omit pull request numbers, issue numbers, commit hashes, contributor names, and author attribution.
 * Omit internal details such as repository moves, website or marketing work, CDN layout, CI workflows, test fixtures, branch history, and implementation-only refactors. Translate relevant work into its public user outcome or leave it out.
 * Avoid forcing every merged change into the notes. A change without a public user outcome does not need a bullet.
@@ -428,19 +448,24 @@ Only the current release should have markers; remove `<!-- release:start -->` an
 ## 0.3.0
 
 <!-- release:start -->
+
+**`fx sessions` can now list saved sessions from every workspace.**
+
 ### New Features
 
-- **Interactive terminal startup:** Start an interactive shell when the `terminal` tool receives an empty command
+- `fx sessions --all` lists saved sessions across every workspace in the profile.
 <!-- release:end -->
 
 ## 0.2.5
 
+**The active conversation now stays in view.**
+
 ### Improvements
 
-- **Inline rendering:** Keep the active conversation visible in terminal scrollback
+- The active conversation stays visible in terminal scrollback.
 ```
 
-Do not add a `### Contributors` section or tracker references. Use descriptive section names.
+Do not add a `### Contributors` section or tracker references.
 
 Do not create version tags manually. Do not change `build.zig.zon` version (it is a placeholder).
 
@@ -450,8 +475,6 @@ The canonical repository is `vercel-labs/fx` on GitHub. All URLs, links, and ref
 
 ## What Not To Do
 
-* Do not grow `main.zig` with leaf feature logic
-
 * Do not add hidden product state that only exists in the live shell
 
 * Do not add a second execution path for the same feature without a clear reason
@@ -459,19 +482,3 @@ The canonical repository is `vercel-labs/fx` on GitHub. All URLs, links, and ref
 * Do not commit generated state from `.fx/`, `.zig-cache/`, or `zig-out/`
 
 * Do not add dependencies outside the Zig standard library without discussion
-
-* Do not use `@import` with runtime-computed paths — Zig imports are comptime only
-
-* Do not ignore `zig fmt` failures
-
-* Do not create git tags manually (the release workflow owns tag creation)
-
-* Do not report work as ready without running the binary. See **Declaring Work Ready**.
-
-## Before Marking a PR Ready
-
-1. Run `zig fmt --check src/` and the focused tests for the changed path.
-2. Build and exercise the change locally with `./zig-out/bin/fx`.
-3. Push a clean checkpoint commit and open a draft PR immediately.
-4. Require **CI**, including the **macOS arm64** check, and the final ship gate to pass on the exact current commit.
-5. Update docs if behavior changed.

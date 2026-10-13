@@ -91,7 +91,7 @@ pub const Mutation = struct {
 
 pub fn load(alloc: Allocator) !?Session {
     if (comptime host_target.is_wasm) return null;
-    const home = io_mod.getenv("HOME") orelse return null;
+    const home = io_mod.homeDir() orelse return null;
     var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| {
         debug_trace.logf("auth", "ChatGPT session load failed step=open_home err={s}", .{@errorName(err)});
         if (err == error.FileNotFound) return null;
@@ -154,7 +154,7 @@ pub fn saveNewSession(alloc: Allocator, session: Session) !void {
 
 pub fn beginExistingMutation() !?Mutation {
     if (comptime host_target.is_wasm) return null;
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var home_dir = io_mod.VerifiedDir{
         .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| return session_presence.storageError(auth_file_name, err),
     };
@@ -168,7 +168,7 @@ pub fn beginExistingMutation() !?Mutation {
 }
 
 fn beginMutation() !Mutation {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var home_dir = io_mod.VerifiedDir{
         .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| return session_presence.storageError(auth_file_name, err),
     };

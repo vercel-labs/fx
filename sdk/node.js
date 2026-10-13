@@ -2,15 +2,20 @@ import { access, readFile } from "node:fs/promises";
 import { closeSync } from "node:fs";
 import { createRequire } from "node:module";
 import { Socket } from "node:net";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { CoreOutput } from "./core-output.js";
 import { loadModule, withModuleFailure } from "./wasm-module.js";
 import { fetchCleanupAction, cleanupTimeoutMs, cleanupByteLimit } from "./fetch-cleanup.js";
+import { createDurableAgentFactory, memory, wakeHandler } from "./durable.js";
+import { fxHarness } from "./fx-harness.js";
 import {
-  createFxAgent as createWasmAgent,
+  createFxEngine as createWasmAgent,
   createFxTerminal as createWasmTerminal,
+  createMemoryPersistence,
+  FxFencedError,
+  FxJournalVersionError,
   encodeXtermKeyEvent,
   fxSdkApiVersion,
   listModels,
@@ -19,8 +24,8 @@ import {
   xtermAdapter,
 } from "./fx-sdk.js";
 
-export { encodeXtermKeyEvent, fxSdkApiVersion, listModels, supportsJspi, xtermAdapter };
-export const libfxApiVersion = 2;
+export { createMemoryPersistence, encodeXtermKeyEvent, FxFencedError, FxJournalVersionError, fxSdkApiVersion, listModels, memory, supportsJspi, wakeHandler, xtermAdapter };
+export const libfxApiVersion = 3;
 const nativeCoreApiVersion = 4;
 
 const fetchOperationStale = 0;
@@ -347,14 +352,22 @@ export async function getBackendInfo(value = {}) {
 }
 
 function createNativeCoreRuntime(addon, options) {
-  const { apiKey, model, effort, fast, ultrafast, gatewayChatUrl } = options;
+  const { apiKey, providerName: provider, customProvider, model, effort, fast, ultrafast, gatewayChatUrl } = options;
   if (ultrafast !== undefined && addon.supportsUltrafast !== true) {
     const error = new Error("native addon does not support the ultrafast option");
     error.code = "LIBFX_NATIVE_CAPABILITY_UNAVAILABLE";
     throw error;
   }
+  const capability = customProvider ? "supportsConfiguredProvider" : { codex: "supportsCodex", grok: "supportsGrok" }[provider];
+  if (capability && addon[capability] !== true) {
+    const error = new Error(`native addon does not support the ${provider} provider`);
+    error.code = "LIBFX_NATIVE_CAPABILITY_UNAVAILABLE";
+    throw error;
+  }
   const core = addon.createCore({
-    apiKey,
+    ...(apiKey === undefined ? {} : { apiKey }),
+    ...(provider === undefined ? {} : { provider }),
+    ...(customProvider === undefined ? {} : { configuredProviders: customProvider.json }),
     home: options.home ?? homedir(),
     workspaceRoot: options.workspaceRoot ?? process.cwd(),
     ...(model === undefined ? {} : { model }),
@@ -644,7 +657,12 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
   return wasmFactory({ ...runtimeOptions, wasm: await wasmInput(wasmSource) });
 }
 
-export async function createFxAgent(options = {}) {
+/**
+ * One fx session on the native core, or on WebAssembly when the native
+ * addon is unavailable, with no durability of its own. `createFxAgent`
+ * runs durable sessions on these.
+ */
+export async function createFxEngine(options = {}) {
   return createWithFallback(
     "agent",
     "createCore",
@@ -653,6 +671,54 @@ export async function createFxAgent(options = {}) {
     options,
   );
 }
+
+// The durability a session gets when the caller names none: Vercel's World
+// on Vercel, otherwise files in the temporary directory. Each is its own
+// module, loaded only here: a bundler copies the file the URL names and
+// leaves the import itself to Node.
+// Agents created without a durability share one for each place sessions
+// live, as agents passed one durability do, so they can send each other's
+// prompts on.
+const environments = new Map();
+function environmentDurability() {
+  const dir = process.env.VERCEL ? null : process.env.FX_SESSIONS_DIR || resolve(tmpdir(), "libfx", "sessions");
+  const key = dir ?? "vercel";
+  if (!environments.has(key)) {
+    environments.set(key, chooseEnvironmentDurability(dir).catch((error) => {
+      environments.delete(key);
+      throw error;
+    }));
+  }
+  return environments.get(key);
+}
+
+async function chooseEnvironmentDurability(dir) {
+  const load = (asset) => import(/* webpackIgnore: true */ /* turbopackIgnore: true */ (asset.protocol === "" ? bundledAssetUrl(asset) : asset).href);
+  if (dir === null) {
+    const { vercel } = await load(new URL("./durable/vercel.mjs", import.meta.url));
+    return vercel();
+  }
+  const { local } = await load(new URL("./durable/local.mjs", import.meta.url));
+  return local({ dir });
+}
+
+/**
+ * An agent whose sessions survive crashes, timeouts and redeployments. It
+ * does no I/O until a session is used.
+ */
+export const createFxAgent = createDurableAgentFactory({
+  name: "createFxAgent",
+  label: "fx agent",
+  defaultDurability: environmentDurability,
+  harness: fxHarness({
+    createEngine: createFxEngine,
+    // An explicit key, then the durability's own credential, such as a
+    // Vercel deployment's OIDC token, then the one in the environment.
+    defaultApiKey: async (durability) => process.env.AI_GATEWAY_API_KEY ||
+      (await Promise.resolve(durability?.gatewayKey?.()).catch(() => undefined)) ||
+      process.env.VERCEL_OIDC_TOKEN || undefined,
+  }),
+});
 
 export function createFxTerminal(options = {}) {
   return createWithFallback("terminal", "createFxTerminal", createWasmTerminal, defaultTermWasm, options);

@@ -9,7 +9,7 @@ const terminal_session_id_random_bytes: usize = 16;
 
 pub fn sessionDirPath(alloc: Allocator, sessions_dir: []const u8, session_id: []const u8) ![]u8 {
     try validateSessionId(session_id);
-    return std.fs.path.join(alloc, &.{ sessions_dir, session_id });
+    return std.Io.Dir.path.join(alloc, &.{ sessions_dir, session_id });
 }
 
 /// The sessions v2 root inside the v1 sessions folder. No v1 id can take

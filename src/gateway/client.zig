@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const secret = @import("../core/auth/secret.zig");
@@ -11,6 +12,7 @@ const types = @import("../core/shared/types.zig");
 const atomic_value = @import("../core/mcp/atomic_value.zig");
 const json_comparison = @import("../core/shared/json_comparison.zig");
 const sse = @import("sse.zig");
+const text_utils = @import("../core/shared/text_utils.zig");
 
 pub fn isRetryableGatewayError(err: anyerror) bool {
     return err == error.HttpConnectionClosing or
@@ -318,14 +320,12 @@ const GenerationLookupOperation = struct {
     generation_id: []const u8,
 
     fn run(self: *@This()) !GetResult {
-        const path = try std.fmt.allocPrint(
-            self.alloc,
+        const path = try self.alloc.print(
             "/v1/generation?id={s}",
             .{self.generation_id},
         );
         defer self.alloc.free(path);
-        const url = try std.fmt.allocPrint(
-            self.alloc,
+        const url = try self.alloc.print(
             "{s}{s}",
             .{ self.gateway_origin, path },
         );
@@ -344,7 +344,7 @@ const GenerationLookupOperation = struct {
             .user_agent = .{ .override = user_agent },
         };
         if (self.api_key) |api_key| {
-            auth_header = try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{api_key});
+            auth_header = try self.alloc.print("Bearer {s}", .{api_key});
             headers.authorization = .{ .override = auth_header.? };
         }
         var extra_headers_buf: [1]std.http.Header = undefined;
@@ -376,7 +376,7 @@ const GenerationLookupOperation = struct {
 };
 
 fn fetchGatewayGet(alloc: std.mem.Allocator, api_key: ?[]const u8, gateway_team: ?[]const u8, path: []const u8, e2e_url_env: []const u8) !GetResult {
-    const default_url = try std.fmt.allocPrint(alloc, "{s}{s}", .{ gatewayBaseUrl(), path });
+    const default_url = try alloc.print("{s}{s}", .{ gatewayBaseUrl(), path });
     defer alloc.free(default_url);
 
     return fetchGatewayGetAtUrl(alloc, api_key, gateway_team, default_url, e2e_url_env);
@@ -394,7 +394,7 @@ fn fetchGatewayGetAtUrl(alloc: std.mem.Allocator, api_key: ?[]const u8, gateway_
     var headers: std.http.Client.Request.Headers = .{};
     headers.user_agent = .{ .override = user_agent };
     if (api_key) |key| {
-        auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{key});
+        auth_header = try alloc.print("Bearer {s}", .{key});
         headers.authorization = .{ .override = auth_header.? };
     }
     var extra_headers_buf: [1]std.http.Header = undefined;
@@ -475,7 +475,7 @@ fn runCancellableGatewayJsonFetch(
 
     const Event = union(enum) {
         request: anyerror!GatewayJsonResult,
-        cancelled: anyerror!void,
+        watch: anyerror!BoundedRequestWatch.Outcome,
     };
     const Runner = struct {
         fn run(value: *GatewayJsonFetchOperation) anyerror!GatewayJsonResult {
@@ -483,32 +483,34 @@ fn runCancellableGatewayJsonFetch(
         }
     };
     const Cleanup = struct {
-        fn drain(result_alloc: std.mem.Allocator, select: *std.Io.Select(Event)) void {
+        fn drain(result_alloc: std.mem.Allocator, select: *std.Io.Select(Event), watch: *BoundedRequestWatch) void {
+            watch.stopped.set(select.io);
             while (select.cancel()) |item| switch (item) {
                 .request => |request_result| {
                     var late_result = request_result catch continue;
                     late_result.deinit(result_alloc);
                 },
-                .cancelled => {},
+                .watch => {},
             };
         }
     };
 
+    var watch: BoundedRequestWatch = .{};
     var select_buffer: [2]Event = undefined;
     var select: std.Io.Select(Event) = .init(io_mod.getIo(), &select_buffer);
-    select.concurrent(.cancelled, waitForBoundedCancellation, .{cancel_flag}) catch |err| return err;
+    select.concurrent(.watch, BoundedRequestWatch.run, .{ &watch, cancel_flag, null }) catch |err| return err;
     select.concurrent(.request, Runner.run, .{operation}) catch |err| {
-        select.cancelDiscard();
+        watch.finish(&select);
         return err;
     };
 
     const event = select.await() catch |err| {
-        Cleanup.drain(alloc, &select);
+        Cleanup.drain(alloc, &select, &watch);
         return err;
     };
     switch (event) {
         .request => |request_result| {
-            Cleanup.drain(alloc, &select);
+            watch.finish(&select);
             if (cancel_flag.load(.seq_cst)) {
                 var result = request_result catch return error.Cancelled;
                 result.deinit(alloc);
@@ -516,12 +518,9 @@ fn runCancellableGatewayJsonFetch(
             }
             return request_result;
         },
-        .cancelled => |cancel_result| {
-            cancel_result catch |err| {
-                Cleanup.drain(alloc, &select);
-                return err;
-            };
-            Cleanup.drain(alloc, &select);
+        .watch => |watch_result| {
+            Cleanup.drain(alloc, &select, &watch);
+            _ = try watch_result;
             return error.Cancelled;
         },
     }
@@ -548,7 +547,7 @@ fn fetchGatewayJsonAtUrlCore(
     headers.accept_encoding = .omit;
     headers.user_agent = .{ .override = user_agent };
     if (api_key) |key| {
-        auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{key});
+        auth_header = try alloc.print("Bearer {s}", .{key});
         headers.authorization = .{ .override = auth_header.? };
     }
     var extra_headers_buf: [1]std.http.Header = undefined;
@@ -654,7 +653,7 @@ pub fn postGatewayCompletion(
         var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
         defer client.deinit();
 
-        const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{api_key});
+        const auth_header = try alloc.print("Bearer {s}", .{api_key});
         defer secret.zeroAndFree(alloc, auth_header);
 
         const extra_headers = [_]std.http.Header{
@@ -693,7 +692,7 @@ pub fn postGatewayCompletion(
 
         if (isRetryableGatewayStatus(result.status) and attempt + 1 < retry_count) {
             const delay_ns = retryBackoffDelayNs(attempt);
-            debug_trace.logf("stream", "retrying status={d} attempt={d} delay_ms={d}", .{ @intFromEnum(result.status), attempt + 1, delay_ns / std.time.ns_per_ms });
+            debug_trace.logf("stream", "retrying status={d} attempt={d} delay_ms={d}", .{ @backingInt(result.status), attempt + 1, delay_ns / std.time.ns_per_ms });
             io_mod.sleep(delay_ns);
             continue;
         }
@@ -1038,17 +1037,17 @@ fn openGatewayRequestBounded(
 
     const Event = union(enum) {
         request: anyerror!std.http.Client.Request,
-        cancelled: anyerror!void,
-        deadline: anyerror!void,
+        watch: anyerror!BoundedRequestWatch.Outcome,
     };
     const Cleanup = struct {
-        fn drain(select: *std.Io.Select(Event)) void {
+        fn drain(select: *std.Io.Select(Event), watch: *BoundedRequestWatch) void {
+            watch.stopped.set(select.io);
             while (select.cancel()) |item| switch (item) {
                 .request => |request_result| {
                     var late_request = request_result catch continue;
                     late_request.deinit();
                 },
-                .cancelled, .deadline => {},
+                .watch => {},
             };
         }
     };
@@ -1059,58 +1058,42 @@ fn openGatewayRequestBounded(
         .options = options,
         .request_open_override = request_open_override,
     };
-    var select_buffer: [3]Event = undefined;
+    var watch: BoundedRequestWatch = .{};
+    var select_buffer: [2]Event = undefined;
     var select: std.Io.Select(Event) = .init(io_mod.getIo(), &select_buffer);
-    select.concurrent(.cancelled, waitForBoundedCancellation, .{cancel_flag}) catch |err| return err;
-    select.concurrent(.deadline, waitForBoundedDeadline, .{epoch.deadline}) catch |err| {
-        select.cancelDiscard();
-        return err;
-    };
+    select.concurrent(.watch, BoundedRequestWatch.run, .{ &watch, cancel_flag, epoch.deadline }) catch |err| return err;
     select.concurrent(.request, RequestOpenOperation.run, .{&operation}) catch |err| {
-        select.cancelDiscard();
+        watch.finish(&select);
         return err;
     };
 
-    while (true) {
-        const event = select.await() catch |err| {
-            Cleanup.drain(&select);
-            return err;
-        };
-        switch (event) {
-            .request => |request_result| {
-                Cleanup.drain(&select);
-                if (cancel_flag.load(.seq_cst)) {
-                    var cancelled_request = request_result catch return error.Cancelled;
-                    cancelled_request.deinit();
-                    return error.Cancelled;
-                }
-
-                var owned_request = request_result catch |request_err| return request_err;
-                const result_now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
-                if (!std.Io.Clock.Timestamp.compare(result_now, .lt, epoch.deadline)) {
-                    owned_request.deinit();
-                    return error.ConnectionSetupTimedOut;
-                }
-                return owned_request;
-            },
-            .cancelled => |cancelled_result| {
-                cancelled_result catch |err| {
-                    Cleanup.drain(&select);
-                    return err;
-                };
-                Cleanup.drain(&select);
+    const event = select.await() catch |err| {
+        Cleanup.drain(&select, &watch);
+        return err;
+    };
+    switch (event) {
+        .request => |request_result| {
+            watch.finish(&select);
+            if (cancel_flag.load(.seq_cst)) {
+                var cancelled_request = request_result catch return error.Cancelled;
+                cancelled_request.deinit();
                 return error.Cancelled;
-            },
-            .deadline => |deadline_result| {
-                deadline_result catch |err| {
-                    Cleanup.drain(&select);
-                    return err;
-                };
-                Cleanup.drain(&select);
-                if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+            }
+
+            var owned_request = request_result catch |request_err| return request_err;
+            const result_now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+            if (!std.Io.Clock.Timestamp.compare(result_now, .lt, epoch.deadline)) {
+                owned_request.deinit();
                 return error.ConnectionSetupTimedOut;
-            },
-        }
+            }
+            return owned_request;
+        },
+        .watch => |watch_result| {
+            Cleanup.drain(&select, &watch);
+            const outcome = try watch_result;
+            if (outcome == .cancelled or cancel_flag.load(.seq_cst)) return error.Cancelled;
+            return error.ConnectionSetupTimedOut;
+        },
     }
 }
 
@@ -1540,7 +1523,7 @@ fn streamGatewayCompletionCoreWithOptions(
         .user_agent = .{ .override = user_agent },
     };
     if (request.api_key) |api_key| {
-        auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{api_key});
+        auth_header = try alloc.print("Bearer {s}", .{api_key});
         request_headers.authorization = .{ .override = auth_header.? };
     }
 
@@ -1741,19 +1724,19 @@ fn streamGatewayCompletionCoreWithOptions(
         if (active_connected_watch) |watch| {
             if (watch.commit_response_head()) |err| return @as(anyerror!StreamResult, err);
         }
-        debug_trace.eventf("gateway", "after_receive_head", trace_ctx, "attempt={d} status={d}", .{ attempt + 1, @intFromEnum(response.head.status) });
+        debug_trace.eventf("gateway", "after_receive_head", trace_ctx, "attempt={d} status={d}", .{ attempt + 1, @backingInt(response.head.status) });
         const resolved_model_seen_in_head = traceResolvedModelHeader(response.head, model, trace_ctx);
 
         if (response.head.status != .ok) {
             const status = response.head.status;
-            if (@intFromEnum(status) >= 500) delivery_ambiguous = true;
+            if (@backingInt(status) >= 500) delivery_ambiguous = true;
             const retry_after_seconds = retryAfterSeconds(response.head);
             const retry_delay_ns = if (request.provider_attempt_owner == .transport and
                 isRetryableGatewayStatus(status) and attempt + 1 < retry_count)
                 retryDelayNsForResponse(response.head, attempt)
             else
                 null;
-            debug_trace.logf("stream", "http status={d} attempt={d}", .{ @intFromEnum(status), attempt + 1 });
+            debug_trace.logf("stream", "http status={d} attempt={d}", .{ @backingInt(status), attempt + 1 });
             var err_out: std.Io.Writer.Allocating = .init(alloc);
             defer err_out.deinit();
             var err_buf: [4096]u8 = undefined;
@@ -1763,7 +1746,7 @@ fn streamGatewayCompletionCoreWithOptions(
             if (retry_delay_ns) |delay_ns| {
                 debug_trace.eventf("gateway", "http_status_retry", trace_ctx, "attempt={d} status={d} delay_ms={d}", .{
                     attempt + 1,
-                    @intFromEnum(status),
+                    @backingInt(status),
                     delay_ns / std.time.ns_per_ms,
                 });
                 try sleepGatewayRetry(delay_ns, cancel_flag);
@@ -2049,8 +2032,7 @@ pub fn runBoundedHttpOperation(
 
     const Event = union(enum) {
         request: anyerror!Result,
-        cancelled: anyerror!void,
-        deadline: anyerror!void,
+        watch: anyerror!BoundedRequestWatch.Outcome,
     };
     const Operation = @TypeOf(operation);
     const Runner = struct {
@@ -2059,38 +2041,36 @@ pub fn runBoundedHttpOperation(
         }
     };
     const Cleanup = struct {
-        fn drain(result_alloc: std.mem.Allocator, select: *std.Io.Select(Event)) void {
+        fn drain(result_alloc: std.mem.Allocator, select: *std.Io.Select(Event), watch: *BoundedRequestWatch) void {
+            watch.stopped.set(select.io);
             while (select.cancel()) |item| switch (item) {
                 .request => |request_result| {
                     var late_result = request_result catch continue;
                     late_result.deinit(result_alloc);
                 },
-                .cancelled, .deadline => {},
+                .watch => {},
             };
         }
     };
 
-    var select_buffer: [3]Event = undefined;
+    var watch: BoundedRequestWatch = .{};
+    var select_buffer: [2]Event = undefined;
     var select: std.Io.Select(Event) = .init(zio, &select_buffer);
-    select.concurrent(.cancelled, waitForBoundedCancellation, .{cancel_flag}) catch |err| {
-        return err;
-    };
-    select.concurrent(.deadline, waitForBoundedDeadline, .{deadline}) catch |err| {
-        select.cancelDiscard();
+    select.concurrent(.watch, BoundedRequestWatch.run, .{ &watch, cancel_flag, deadline }) catch |err| {
         return err;
     };
     select.concurrent(.request, Runner.run, .{operation}) catch |err| {
-        select.cancelDiscard();
+        watch.finish(&select);
         return err;
     };
 
     const event = select.await() catch |err| {
-        Cleanup.drain(alloc, &select);
+        Cleanup.drain(alloc, &select, &watch);
         return err;
     };
     switch (event) {
         .request => |request_result| {
-            Cleanup.drain(alloc, &select);
+            watch.finish(&select);
             if (cancel_flag.load(.seq_cst)) {
                 debug_trace.logf("stream", "bounded termination cause=cancellation phase=request_result", .{});
                 var owned_result = request_result catch return error.Cancelled;
@@ -2099,21 +2079,13 @@ pub fn runBoundedHttpOperation(
             }
             return request_result;
         },
-        .cancelled => |cancel_result| {
-            cancel_result catch |err| {
-                Cleanup.drain(alloc, &select);
-                return err;
-            };
-            Cleanup.drain(alloc, &select);
-            debug_trace.logf("stream", "bounded termination cause=cancellation phase=control", .{});
-            return error.Cancelled;
-        },
-        .deadline => |deadline_result| {
-            deadline_result catch |err| {
-                Cleanup.drain(alloc, &select);
-                return err;
-            };
-            Cleanup.drain(alloc, &select);
+        .watch => |watch_result| {
+            Cleanup.drain(alloc, &select, &watch);
+            const outcome = try watch_result;
+            if (outcome == .cancelled) {
+                debug_trace.logf("stream", "bounded termination cause=cancellation phase=control", .{});
+                return error.Cancelled;
+            }
             if (cancel_flag.load(.seq_cst)) {
                 debug_trace.logf("stream", "bounded termination cause=cancellation phase=deadline_cleanup", .{});
                 return error.Cancelled;
@@ -2124,15 +2096,50 @@ pub fn runBoundedHttpOperation(
     }
 }
 
-fn waitForBoundedCancellation(cancel_flag: *std.atomic.Value(bool)) anyerror!void {
-    while (!cancel_flag.load(.seq_cst)) {
-        try io_mod.getIo().sleep(.fromMilliseconds(5), .awake);
-    }
-}
+/// Watches one bounded request for cancellation and its deadline. The request
+/// owner stops it with `finish` instead of cancelling it: in Zig 0.17 a cancel
+/// can interrupt whatever task the watch's worker thread runs next, and an
+/// interrupted connect then fails with ISCONN.
+const BoundedRequestWatch = struct {
+    stopped: std.Io.Event = .unset,
 
-fn waitForBoundedDeadline(deadline: std.Io.Clock.Timestamp) anyerror!void {
-    try deadline.wait(io_mod.getIo());
-}
+    const Outcome = enum { stopped, cancelled, deadline };
+
+    fn run(
+        watch: *BoundedRequestWatch,
+        cancel_flag: *std.atomic.Value(bool),
+        deadline: ?std.Io.Clock.Timestamp,
+    ) anyerror!Outcome {
+        const zio = io_mod.getIo();
+        while (true) {
+            if (cancel_flag.load(.seq_cst)) return .cancelled;
+            if (deadline) |limit| {
+                const now = std.Io.Clock.Timestamp.now(zio, .awake);
+                if (!std.Io.Clock.Timestamp.compare(now, .lt, limit)) return .deadline;
+            }
+            watch.stopped.waitTimeout(zio, .{ .duration = .{
+                .raw = .fromMilliseconds(5),
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                error.Timeout => continue,
+                else => |e| return e,
+            };
+            return .stopped;
+        }
+    }
+
+    /// Stops the watch and waits for its event, then releases the select.
+    /// Call only when the watch event is the one still outstanding.
+    fn finish(watch: *BoundedRequestWatch, select: anytype) void {
+        watch.stopped.set(select.io);
+        const event = select.queue.getOneUncancelable(select.io) catch |err| switch (err) {
+            // Only Select.cancel closes the queue, so nothing is outstanding.
+            error.Closed => return,
+        };
+        std.debug.assert(event == .watch);
+        std.debug.assert(select.cancel() == null);
+    }
+};
 
 const GatewayCancelWatcher = struct {
     fn run(
@@ -3071,7 +3078,7 @@ fn replaceProviderFailureMessage(
     current: *?[]u8,
     text: []const u8,
 ) !void {
-    const combined = try std.fmt.allocPrint(alloc, "provider_error: {s}", .{text});
+    const combined = try alloc.print("provider_error: {s}", .{text});
     defer alloc.free(combined);
     try replaceProviderFailureDetail(alloc, current, combined);
 }
@@ -3132,7 +3139,7 @@ fn captureProviderFailureObject(
     const message = if (object.get("message")) |value| jsonValueString(value) else null;
     if (code) |code_text| {
         if (message) |message_text| {
-            const combined = try std.fmt.allocPrint(alloc, "{s}: {s}", .{ code_text, message_text });
+            const combined = try alloc.print("{s}: {s}", .{ code_text, message_text });
             defer alloc.free(combined);
             try replaceProviderFailureDetail(alloc, current, combined);
             return true;
@@ -4118,7 +4125,7 @@ fn readTraceFileForTest(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
 
 test "SSE text capture keeps arena capacity proportional to the retained response" {
     const alloc = std.testing.allocator;
-    const chunk = "x" ** 256;
+    const chunk = text_utils.repeat("x", 256);
     const chunk_count = 2048;
     const output_bytes = chunk.len * chunk_count;
     var wire: std.Io.Writer.Allocating = .init(alloc);
@@ -4169,7 +4176,7 @@ test "provider framing rejects malformed Gateway JSON" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const path = try std.fs.path.join(alloc, &.{ root, "malformed-sse.log" });
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, "malformed-sse.log" });
     defer alloc.free(path);
     debug_trace.resetForTest();
     defer debug_trace.resetForTest();
@@ -4245,7 +4252,7 @@ test "consumeSseStream traces rejected terminal billing before fallback" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(
+    const trace_path = try std.Io.Dir.path.join(
         alloc,
         &.{ root, "invalid-terminal-billing.log" },
     );
@@ -4672,7 +4679,7 @@ test "consumeSseStream traces every terminal cause" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "sse-terminal-causes.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "sse-terminal-causes.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -4820,8 +4827,7 @@ test "Gateway replay preserves restarted reasoning and text segments" {
 test "Gateway replay rejects late deltas without a segment restart" {
     const alloc = std.testing.allocator;
     for ([_][]const u8{ "reasoning", "text" }) |kind| {
-        const payload = try std.fmt.allocPrint(
-            alloc,
+        const payload = try alloc.print(
             "data: {{\"type\":\"{s}-start\",\"id\":\"0\"}}\n\n" ++
                 "data: {{\"type\":\"{s}-end\",\"id\":\"0\"}}\n\n" ++
                 "data: {{\"type\":\"{s}-delta\",\"id\":\"0\",\"delta\":\"\"}}\n\n",
@@ -4864,7 +4870,7 @@ test "Gateway replay assembly is allocation-safe and rejects incomplete metadata
             try std.testing.expect(std.mem.find(u8, output, "second") != null);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Check.run, .{});
     var replay = GatewayReplayBuilder{ .alloc = std.testing.allocator };
     defer replay.deinit();
     const incomplete = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"type\":\"reasoning-start\",\"id\":\"r\",\"providerMetadata\":{\"anthropic\":{\"signature\":\"partial\"}}}", .{});
@@ -4880,7 +4886,7 @@ test "consumeSseStream traces every SSE event with keyless metadata" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "reasoning-sse.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "reasoning-sse.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -4969,7 +4975,7 @@ test "consumeSseStream keyless tracing handles oversized CRLF payloads" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "oversized-reasoning-sse.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "oversized-reasoning-sse.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -5237,8 +5243,7 @@ test "consumeSseStream preserves valid serialized scalar roots" {
         try event.writer.writeAll("{\"type\":\"tool-call\",\"toolCallId\":\"c1\",\"toolName\":\"dynamic_tool\",\"input\":");
         try std.json.Stringify.value(input, .{}, &event.writer);
         try event.writer.writeAll("}");
-        const payload = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const payload = try std.testing.allocator.print(
             "data: {s}\n\ndata: {{\"type\":\"finish\",\"finishReason\":{{\"unified\":\"tool-calls\"}}}}\n\n",
             .{event.written()},
         );
@@ -5276,8 +5281,7 @@ test "consumeSseStream replaces malformed trailing or duplicate-key serialized f
         try std.json.Stringify.value(case.input, .{}, &event.writer);
         try event.writer.writeAll("}");
 
-        const payload = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const payload = try std.testing.allocator.print(
             "data: {s}\n\ndata: {{\"type\":\"finish\",\"finishReason\":{{\"unified\":\"tool-calls\"}}}}\n\n",
             .{event.written()},
         );
@@ -5329,8 +5333,7 @@ test "consumeSseStream absent outer input uses exact-id ended fallback for compa
     };
 
     for (final_names) |final_name| {
-        const payload = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const payload = try std.testing.allocator.print(
             "data: {{\"type\":\"tool-input-start\",\"id\":\"c1\",\"toolName\":\"read_file\"}}\n\n" ++
                 "data: {{\"type\":\"tool-input-delta\",\"id\":\"c1\",\"delta\":\"{{\\\"path\\\":\\\"README.md\\\"}}\"}}\n\n" ++
                 "data: {{\"type\":\"tool-input-end\",\"id\":\"c1\"}}\n\n" ++
@@ -5365,8 +5368,7 @@ test "consumeSseStream present unsupported final input does not use streamed fal
     };
 
     for (final_inputs) |final_input| {
-        const payload = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const payload = try std.testing.allocator.print(
             "data: {{\"type\":\"tool-input-start\",\"id\":\"c1\",\"toolName\":\"read_file\"}}\n\n" ++
                 "data: {{\"type\":\"tool-input-delta\",\"id\":\"c1\",\"delta\":\"{{\\\"path\\\":\\\"SHOULD_NOT_SURVIVE\\\"}}\"}}\n\n" ++
                 "data: {{\"type\":\"tool-input-end\",\"id\":\"c1\"}}\n\n" ++
@@ -5417,8 +5419,7 @@ test "consumeSseStream rejects absent outer input without exact ended fallback" 
     };
 
     for (cases) |case| {
-        const payload = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const payload = try std.testing.allocator.print(
             "{s}data: {{\"type\":\"tool-call\",\"toolCallId\":\"{s}\"}}\n\n" ++
                 "data: {{\"type\":\"finish\",\"finishReason\":{{\"unified\":\"tool-calls\"}}}}\n\n",
             .{ case.streamed_events, case.call_id },
@@ -5512,7 +5513,7 @@ test "consumeSseStream traces malformed argument metadata without source bytes" 
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "argument-integrity.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "argument-integrity.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -5525,8 +5526,7 @@ test "consumeSseStream traces malformed argument metadata without source bytes" 
     try event.writer.writeAll("{\"type\":\"tool-call\",\"toolCallId\":\"c1\",\"toolName\":\"ask_user_question\",\"input\":");
     try std.json.Stringify.value(sentinel, .{}, &event.writer);
     try event.writer.writeAll("}");
-    const payload = try std.fmt.allocPrint(
-        alloc,
+    const payload = try alloc.print(
         "data: {s}\n\ndata: {{\"type\":\"finish\",\"finishReason\":{{\"unified\":\"tool-calls\"}}}}\n\n",
         .{event.written()},
     );
@@ -5594,8 +5594,7 @@ test "consumeSseStream preserves final identity states without recency aliases" 
     };
 
     for (cases) |case| {
-        const payload = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const payload = try std.testing.allocator.print(
             "data: {{\"type\":\"tool-input-start\",\"id\":\"provisional_1\",\"toolName\":\"read_file\"}}\n\n" ++
                 "data: {{\"type\":\"tool-call\",\"toolName\":\"read_file\",\"input\":{{\"path\":\"README.md\"}}{s}}}\n\n" ++
                 "data: [DONE]\n\n",
@@ -5815,8 +5814,7 @@ test "consumeSseStream observes complete skill arguments before finish even with
     };
     const alloc = std.testing.allocator;
     for (cases) |case| {
-        const payload = try std.fmt.allocPrint(
-            alloc,
+        const payload = try alloc.print(
             "data: {{\"type\":\"tool-input-start\",\"id\":\"skill_1\",\"toolName\":\"skill\"}}\n\n" ++
                 "data: {{\"type\":\"tool-input-end\",\"id\":\"skill_1\"}}\n\n" ++
                 "data: {{\"type\":\"tool-call\",\"toolCallId\":\"skill_1\",\"toolName\":\"skill\",\"input\":{s}}}\n\n",
@@ -5842,7 +5840,7 @@ test "consumeSseStream ignores conflicting and late stream events without mutati
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "stream-state-anomalies.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "stream-state-anomalies.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -5946,8 +5944,7 @@ test "consumeSseStream rejects a final tool name that conflicts with streamed id
     };
 
     for (final_inputs) |final_input| {
-        const payload = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const payload = try std.testing.allocator.print(
             "data: {{\"type\":\"tool-input-start\",\"id\":\"A\",\"toolName\":\"read_file\"}}\n\n" ++
                 "data: {{\"type\":\"tool-input-delta\",\"id\":\"A\",\"delta\":\"{{\\\"path\\\":\\\"victim.txt\\\"}}\"}}\n\n" ++
                 "data: {{\"type\":\"tool-input-end\",\"id\":\"A\"}}\n\n" ++
@@ -6078,8 +6075,7 @@ test "consumeSseStream records malformed provider result correlation identity" {
     };
 
     for (cases) |case| {
-        const payload = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const payload = try std.testing.allocator.print(
             "data: {{\"type\":\"tool-call\",\"toolCallId\":\"call_1\",\"toolName\":\"parallel_search\",\"input\":{{}},\"providerExecuted\":true}}\n\n" ++
                 "data: {{\"type\":\"tool-result\",\"result\":{{\"results\":[]}}{s}}}\n\n" ++
                 "data: [DONE]\n\n",
@@ -6270,8 +6266,7 @@ test "consumeSseStream rejects malformed and late provider result events" {
     };
 
     for (cases) |case| {
-        const payload = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const payload = try std.testing.allocator.print(
             "data: {{\"type\":\"tool-call\",\"toolCallId\":\"call_1\",\"toolName\":\"parallel_search\",\"input\":{{}},\"providerExecuted\":true}}\n\n" ++
                 "{s}" ++
                 "data: [DONE]\n\n",
@@ -6457,7 +6452,7 @@ fn checkConsumeSseAllocationFailures(alloc: std.mem.Allocator) !void {
 
 test "consumeSseStream frees all response state across allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkConsumeSseAllocationFailures,
         .{},
     );
@@ -6536,7 +6531,7 @@ test "consumeSseStream preview failure is metadata-only and non-fatal" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "preview-failure.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "preview-failure.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -6570,7 +6565,7 @@ test "consumeSseStream unfiltered trace excludes all payload keys and values" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "unfiltered-sse-privacy.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "unfiltered-sse-privacy.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -7117,7 +7112,7 @@ const LoopbackGatewayFixture = struct {
                 try readLoopbackGatewayRequest(zio, stream, self);
                 self.markStage();
                 var frame_buf: [512]u8 = undefined;
-                const partial = try std.fmt.bufPrint(
+                const partial = try std.mem.print(
                     &frame_buf,
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{x}\r\n{s}\r\n",
                     .{ keep_alive_sse_payload.len, keep_alive_sse_payload },
@@ -7130,7 +7125,7 @@ const LoopbackGatewayFixture = struct {
                 try readLoopbackGatewayRequest(zio, stream, self);
                 self.markStage();
                 var frame_buf: [512]u8 = undefined;
-                const partial = try std.fmt.bufPrint(
+                const partial = try std.mem.print(
                     &frame_buf,
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{x}\r\n{s}\r\n",
                     .{ keep_alive_sse_payload.len, keep_alive_sse_payload },
@@ -7248,8 +7243,7 @@ const ConnectionSetupHarness = struct {
     fn init(mode: LoopbackGatewayMode, use_tls: bool) !ConnectionSetupHarness {
         var fixture = try LoopbackGatewayFixture.init(mode, 500);
         errdefer fixture.deinit();
-        const url = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const url = try std.testing.allocator.print(
             "{s}://127.0.0.1:{d}/chat",
             .{ if (use_tls) "https" else "http", fixture.port() },
         );
@@ -7689,7 +7683,7 @@ test "gateway setup trace distinguishes attempt limits from retries used" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "gateway-attempts.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "gateway-attempts.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -8106,8 +8100,7 @@ test "direct gateway cancellation before admission opens no connection" {
     try fixture.start();
     try std.testing.expect(fixture.waitForAcceptStart(5000));
 
-    const chat_url = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const chat_url = try std.testing.allocator.print(
         "http://127.0.0.1:{d}/v1/chat/completions",
         .{fixture.port()},
     );
@@ -8188,8 +8181,7 @@ fn expectCancellableGatewayJsonCancellation(
     try fixture.start();
     try std.testing.expect(fixture.waitForAcceptStart(5000));
 
-    const models_url = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const models_url = try std.testing.allocator.print(
         "{s}://127.0.0.1:{d}/v1/models",
         .{ if (use_tls) "https" else "http", fixture.port() },
     );
@@ -8297,7 +8289,7 @@ const keep_alive_sse_payload =
 
 /// Larger than the client's transfer buffer, so it cannot all be read ahead
 /// while the terminal SSE event is parsed.
-const keep_alive_padding = ":" ** (66 * 1024);
+const keep_alive_padding = text_utils.repeat(":", 66 * 1024);
 
 fn readKeepAliveRequest(reader: *std.Io.Reader) !void {
     var header_buf: [16 * 1024]u8 = undefined;
@@ -8316,7 +8308,7 @@ fn readKeepAliveRequest(reader: *std.Io.Reader) !void {
 
 fn writeKeepAliveResponse(zio: std.Io, stream: std.Io.net.Stream) !void {
     var head_buf: [512]u8 = undefined;
-    const head_events = try std.fmt.bufPrint(
+    const head_events = try std.mem.print(
         &head_buf,
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{x}\r\n{s}\r\n",
         .{ keep_alive_sse_payload.len, keep_alive_sse_payload },
@@ -8327,7 +8319,7 @@ fn writeKeepAliveResponse(zio: std.Io, stream: std.Io.net.Stream) !void {
     // only the client-side drain can return this connection to the pool.
     io_mod.sleep(150 * std.time.ns_per_ms);
     var tail_head_buf: [64]u8 = undefined;
-    const tail_head = try std.fmt.bufPrint(&tail_head_buf, "{x}\r\n", .{keep_alive_padding.len});
+    const tail_head = try std.mem.print(&tail_head_buf, "{x}\r\n", .{keep_alive_padding.len});
     try writeLoopbackGatewayBytes(zio, stream, tail_head);
     try writeLoopbackGatewayBytes(zio, stream, keep_alive_padding);
     try writeLoopbackGatewayBytes(zio, stream, "\r\n0\r\n\r\n");
@@ -8377,7 +8369,7 @@ fn expectBoundedLoopbackTimeout(
     try fixture.start();
     try std.testing.expect(fixture.waitForAcceptStart(5000));
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/chat", .{fixture.port()});
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{fixture.port()});
     defer std.testing.allocator.free(url);
 
     var cancel_flag = std.atomic.Value(bool).init(false);
@@ -8418,7 +8410,7 @@ fn expectBoundedLoopbackCancellation(
     try std.testing.expect(fixture.waitForAcceptStart(5000));
 
     const scheme = if (use_tls) "https" else "http";
-    const url = try std.fmt.allocPrint(std.testing.allocator, "{s}://127.0.0.1:{d}/chat", .{ scheme, fixture.port() });
+    const url = try std.testing.allocator.print("{s}://127.0.0.1:{d}/chat", .{ scheme, fixture.port() });
     defer std.testing.allocator.free(url);
 
     var cancel_flag = std.atomic.Value(bool).init(false);
@@ -8577,7 +8569,7 @@ test "bounded stream traces deadline termination" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "bounded-deadline.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "bounded-deadline.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -8717,8 +8709,7 @@ test "delivery certainty becomes possibly sent before response head" {
     defer fixture.deinit();
     try fixture.start();
     try std.testing.expect(fixture.waitForAcceptStart(5000));
-    const url = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const url = try std.testing.allocator.print(
         "http://127.0.0.1:{d}/chat",
         .{fixture.port()},
     );
@@ -8753,8 +8744,7 @@ test "server error response preserves billing ambiguity" {
     defer fixture.deinit();
     try fixture.start();
     try std.testing.expect(fixture.waitForAcceptStart(5000));
-    const url = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const url = try std.testing.allocator.print(
         "http://127.0.0.1:{d}/chat",
         .{fixture.port()},
     );
@@ -8794,8 +8784,7 @@ test "generation lookup cancellation interrupts TLS setup" {
     defer fixture.deinit();
     try fixture.start();
     try std.testing.expect(fixture.waitForAcceptStart(5000));
-    const origin = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const origin = try std.testing.allocator.print(
         "https://127.0.0.1:{d}",
         .{fixture.port()},
     );
@@ -8860,7 +8849,7 @@ fn expectDirectLoopbackCancellation(
     try fixture.start();
     try std.testing.expect(fixture.waitForAcceptStart(5000));
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/chat", .{fixture.port()});
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{fixture.port()});
     defer std.testing.allocator.free(url);
 
     var cancel_flag = std.atomic.Value(bool).init(false);
@@ -8934,7 +8923,7 @@ test "direct gateway times out only while awaiting the response head" {
     try fixture.start();
     try std.testing.expect(fixture.waitForAcceptStart(5000));
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/chat", .{fixture.port()});
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{fixture.port()});
     defer std.testing.allocator.free(url);
     const Noop = struct {
         fn onChunk(_: *anyopaque, _: []const u8) void {}
@@ -8977,7 +8966,7 @@ test "direct gateway response head timeout does not limit a delayed SSE body" {
     try fixture.start();
     try std.testing.expect(fixture.waitForAcceptStart(5000));
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/chat", .{fixture.port()});
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{fixture.port()});
     defer std.testing.allocator.free(url);
     const Noop = struct {
         fn onChunk(_: *anyopaque, _: []const u8) void {}
@@ -9026,7 +9015,7 @@ test "direct gateway fails fast when cancellation watcher cannot start" {
     try fixture.start();
     try std.testing.expect(fixture.waitForAcceptStart(5000));
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/chat", .{fixture.port()});
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{fixture.port()});
     defer std.testing.allocator.free(url);
 
     test_cancel_watcher_spawn_error = error.TestCancelWatcherSpawnFailed;
@@ -9069,7 +9058,7 @@ test "direct gateway core callbacks stay on the invoking thread" {
     try fixture.start();
     try std.testing.expect(fixture.waitForAcceptStart(5000));
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/chat", .{fixture.port()});
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{fixture.port()});
     defer std.testing.allocator.free(url);
 
     const CallbackCapture = struct {
@@ -9117,7 +9106,7 @@ test "non-streaming gateway request sends extended time header" {
     try fixture.start();
     try std.testing.expect(fixture.waitForAcceptStart(5000));
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/chat", .{fixture.port()});
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{fixture.port()});
     defer std.testing.allocator.free(url);
 
     var result = try postGatewayCompletion(
@@ -9144,7 +9133,7 @@ test "gateway chat request sends extended time and attribution headers" {
     try fixture.start();
     try std.testing.expect(fixture.waitForAcceptStart(5000));
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/chat", .{fixture.port()});
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{fixture.port()});
     defer std.testing.allocator.free(url);
 
     const Noop = struct {
@@ -9191,7 +9180,7 @@ test "host-managed Gateway chat omits authentication-owned headers" {
     try fixture.start();
     try std.testing.expect(fixture.waitForAcceptStart(5000));
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/chat", .{fixture.port()});
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{fixture.port()});
     defer std.testing.allocator.free(url);
 
     const Noop = struct {

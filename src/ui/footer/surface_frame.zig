@@ -20,6 +20,7 @@ const skills_menu_presentation = @import("skills_menu_presentation.zig");
 const help_menu_presentation = @import("help_menu_presentation.zig");
 const settings_menu_presentation = @import("settings_menu_presentation.zig");
 const mcp_menu_presentation = @import("mcp_menu_presentation.zig");
+const mcp_host_menu_presentation = @import("mcp_host_menu_presentation.zig");
 const resume_menu_presentation = @import("resume_menu_presentation.zig");
 const question_ui = @import("question_ui.zig");
 const render_input = @import("render_input.zig");
@@ -30,6 +31,7 @@ const visual_layout = @import("../input/visual_layout.zig");
 const render_engine = @import("../render_engine.zig");
 const render_request = @import("../render_request.zig");
 const transcript_runtime = @import("../transcript/runtime.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const activity_overlay = render_engine.activity_overlay;
@@ -397,7 +399,7 @@ fn buildFooterSurfaceProjection(
     const inline_api_key = ctx.auth_picker.active and ctx.auth_picker.stage == .api_key and ctx.auth_picker.api_key_inline;
     const show_auth_picker = !viewer_active and !modal_active and !ctx.stream.active and ctx.auth_picker.active and !inline_api_key;
     const show_settings_menu = !viewer_active and !show_auth_picker and !modal_active and ctx.settings_menu.active;
-    const show_mcp_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !modal_active and ctx.mcp_menu.state.active;
+    const show_mcp_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !modal_active and (ctx.mcp_menu.state.active or ctx.mcp_host_menu.active());
     const show_help_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !modal_active and ctx.help_menu.active;
     const show_session_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !modal_active and ctx.session_menu.active;
     const show_models_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !modal_active and ctx.model_menu.active;
@@ -619,6 +621,12 @@ fn buildFooterSurfaceProjection(
             ctx.settings_menu,
             shell.layout.cols,
             settings_picker_row_budget,
+        )
+    else if (show_mcp_menu and ctx.mcp_host_menu.active())
+        mcp_host_menu_presentation.menuRowCount(
+            ctx.mcp_host_menu,
+            shell.layout.cols,
+            mcp_picker_row_budget,
         )
     else if (show_mcp_menu)
         mcp_menu_presentation.menuRowCount(
@@ -1505,7 +1513,7 @@ test "surface footer frame snapshots manual compaction blink with an inactive st
     var force_redraw = false;
     var ctx = surfaceTestContext(&input);
     ctx.compaction = .{ .revision = 1, .operation = .{
-        .id = @enumFromInt(1),
+        .id = @fromBackingInt(@intCast(1)),
         .turn_id = 1,
         .origin = .manual,
         .phase = .{ .running = .summary },
@@ -2141,7 +2149,7 @@ test "footer reservation traces stale off-screen external clear" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -2614,7 +2622,7 @@ test "command approval fit includes the steering banner" {
 
 test "command approval footer sizing paths use the complete command" {
     const alloc = std.testing.allocator;
-    const command = "printf 'SURFACE_COMMAND_START_" ++ ("x" ** 88) ++ "_SURFACE_COMMAND_END'";
+    const command = "printf 'SURFACE_COMMAND_START_" ++ text_utils.repeat("x", 88) ++ "_SURFACE_COMMAND_END'";
     var input = InputRuntime{};
     defer input.deinit(alloc);
     var prompt = ApprovalPrompt{};

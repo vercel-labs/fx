@@ -37,7 +37,7 @@ jobs:
         id: zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.16.0"
+          version: "0.17.0"
           cache-key: ci-unit-${{ matrix.optimize }}
 
       - name: Check formatting
@@ -51,6 +51,9 @@ jobs:
 
       - name: Check compactor boundary
         run: ./scripts/check-compactor-boundary.sh
+
+      - name: Check indexer boundary
+        run: ./scripts/check-indexer-boundary.sh
 
       - name: Test CI and release scripts
         run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need -q
@@ -101,7 +104,7 @@ jobs:
         id: zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.16.0"
+          version: "0.17.0"
           cache-key: ci-build-ReleaseSafe
 
       # Other runners execute this binary, and their CPUs can differ from this
@@ -138,7 +141,7 @@ jobs:
         id: zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.16.0"
+          version: "0.17.0"
           cache-key: ci-sdk-wasm
 
       - name: Build WASM surfaces (ReleaseSmall)
@@ -191,7 +194,7 @@ jobs:
         id: zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.16.0"
+          version: "0.17.0"
           cache-key: ci-sdk-napi-${{ matrix.platform }}
 
       - name: Build N-API addon (ReleaseSafe)
@@ -235,6 +238,9 @@ jobs:
       - name: Install terminal test dependencies
         run: npm ci --prefix sdk/node
 
+      - name: Install the durable Worlds
+        run: npm ci --prefix sdk/durable
+
       - name: Test Node + WASM
         run: npm run --prefix sdk test:node-wasm
 
@@ -244,6 +250,15 @@ jobs:
           node --experimental-wasm-jspi sdk/tests/test-host-tool-cancel.mjs wasm
           node --experimental-wasm-jspi sdk/tests/test-mcp-adapter.mjs http wasm
           node --experimental-wasm-jspi sdk/tests/test-skills-adapter.mjs host wasm
+
+      - name: Test durable sessions on Wasm
+        run: |
+          node --experimental-wasm-jspi sdk/tests/test-durable.mjs memory wasm
+          node --experimental-wasm-jspi sdk/tests/test-durable.mjs local wasm
+          node --experimental-wasm-jspi sdk/tests/test-durable-provider-crash.mjs wasm
+
+      - name: Type-check the TypeScript declarations
+        run: node sdk/tests/test-types.mjs
 
   sdk-node-napi:
     name: SDK (Node + N-API)
@@ -278,6 +293,20 @@ jobs:
           node sdk/tests/test-host-tool-cancel.mjs native
           node sdk/tests/test-mcp-adapter.mjs stdio native
           node sdk/tests/test-skills-adapter.mjs disk native
+
+      - name: Install the durable Worlds
+        run: npm ci --prefix sdk/durable
+
+      - name: Test durable sessions on N-API
+        run: |
+          node sdk/tests/test-durable.mjs memory native
+          node sdk/tests/test-durable.mjs local native
+          node sdk/tests/test-durable.mjs world native
+          node sdk/tests/test-durable-provider-crash.mjs native
+          node sdk/tests/test-durable-core.mjs memory
+          node sdk/tests/test-durable-core.mjs local
+          node sdk/tests/test-durable-core.mjs world
+          node sdk/tests/test-durable-core.mjs queue
 
   sdk-bun:
     name: SDK (Bun + N-API/WASM)
@@ -317,6 +346,9 @@ jobs:
       - name: Install terminal test dependencies
         run: npm ci --prefix sdk/node
 
+      - name: Install the durable Worlds
+        run: npm ci --prefix sdk/durable
+
       - name: Test Bun + N-API
         run: bun sdk/tests/test-node-napi.mjs
 
@@ -324,13 +356,53 @@ jobs:
         run: bun sdk/tests/test-node-wasm.mjs
 
       - name: Test Bun benchmark path
-        run: bun sdk/tests/test-libfx-benchmark.mjs
+        run: |
+          bun sdk/tests/test-libfx-benchmark.mjs
+          bun sdk/tests/test-durable-harness.mjs
+
+      - name: Test durable sessions on Bun
+        run: |
+          bun sdk/tests/test-durable.mjs memory native
+          bun sdk/tests/test-durable.mjs local native
+          bun sdk/tests/test-durable-core.mjs memory
+          bun sdk/tests/test-durable-core.mjs local
+
+      - name: Model-check durable sessions and drive the code along the model
+        run: |
+          set -euo pipefail
+          jar="$RUNNER_TEMP/tla2tools.jar"
+          curl -fsSL -o "$jar" https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
+          TLA2TOOLS_JAR="$jar" sdk/tests/model/check.sh
+          bun sdk/tests/model/drive.mjs send --walks 40
+          bun sdk/tests/model/drive.mjs lookup --walks 40 --seed 7
+          bun sdk/tests/model/drive.mjs send --walks 20 --seed 3 --durability world
+          bun sdk/tests/model/drive.mjs lookup --walks 20 --seed 9 --durability world
+          bun sdk/tests/model/drive.mjs write --walks 20 --seed 4
+          bun sdk/tests/model/drive.mjs cutoff --walks 20 --seed 5
+          bun sdk/tests/model/drive.mjs leased --walks 40 --seed 12
+          bun sdk/tests/model/drive.mjs queue --walks 40 --seed 4
+          bun sdk/tests/model/drive-agents.mjs send --walks 60 --seed 11
+          bun sdk/tests/model/drive-agents.mjs consume --walks 60 --seed 13
+
+      - name: Test libfx on a World
+        run: |
+          # The World libfx bundles, installed above from its lockfile.
+          world_root=sdk/durable
+          node sdk/tests/test-world-persistence.mjs "$world_root" native
+          node --experimental-wasm-jspi sdk/tests/test-world-persistence.mjs "$world_root" wasm
+          bun sdk/tests/test-world-persistence.mjs "$world_root" native
+          bun sdk/tests/test-world-persistence.mjs "$world_root" wasm
 
       - name: Test Bun cross-backend integrations
         run: |
           bun sdk/tests/test-agent-bootstrap.mjs auto
           bun sdk/tests/test-checkpoint.mjs native wasm
           bun sdk/tests/test-checkpoint.mjs wasm native
+          bun sdk/tests/test-journal.mjs native wasm
+          bun sdk/tests/test-journal.mjs wasm native
+          bun sdk/tests/test-tool-contract.mjs native
+          bun sdk/tests/test-tool-contract.mjs wasm
           bun sdk/tests/test-host-tools.mjs native
           bun sdk/tests/test-host-tools.mjs wasm
           bun sdk/tests/test-host-tool-cancel.mjs native
@@ -466,7 +538,7 @@ jobs:
         id: zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.16.0"
+          version: "0.17.0"
           cache-key: ci-e2e-fixtures
 
       - name: Setup Bun
@@ -569,7 +641,7 @@ jobs:
         id: zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.16.0"
+          version: "0.17.0"
           cache-key: ci-mcp-fixtures
 
       - name: Setup Bun
@@ -625,6 +697,7 @@ jobs:
           scripts=(
             benchmarks/startup.sh
             scripts/check-compactor-boundary.sh
+            scripts/check-indexer-boundary.sh
             scripts/check-public-surface.sh
             scripts/detect-macos-need.sh
             scripts/smoke-binary.sh
@@ -647,7 +720,7 @@ jobs:
         id: zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.16.0"
+          version: "0.17.0"
           cache-key: ci-unit-ReleaseSafe
 
       - name: Build

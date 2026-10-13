@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const skill_runtime = @import("../../skills/skill_runtime.zig");
 const skill_contract = @import("../../skills/skill_contract.zig");
 const skill_invocation = @import("../../skills/skill_invocation.zig");
@@ -57,6 +58,7 @@ const image_data = @import("../../images/image_data.zig");
 const runtime_assistant_stream = @import("assistant_stream.zig");
 const runtime_tool_presentation = @import("tool_presentation.zig");
 const runtime_execution_memory = @import("execution_memory.zig");
+const request_image_budget = @import("request_image_budget.zig");
 const execution_memory_helpers = @import("../execution_memory.zig");
 const runtime_agent = @import("agent.zig");
 const runtime_tool_admission = @import("tool_admission.zig");
@@ -593,7 +595,7 @@ test "legacy exec argument projection releases temporary allocations" {
             try std.testing.expectEqualStrings(":", request.object.get("command").?.string);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
 }
 
 fn findLegacyCall(
@@ -616,14 +618,12 @@ fn legacyToolSummary(
     const body = content orelse "";
     const bounded = text_utils.utf8PrefixByBytes(body, 4096);
     return if (bounded.len == 0)
-        std.fmt.allocPrint(
-            alloc,
+        alloc.print(
             "[Prior terminal {s} action completed.]",
             .{action},
         )
     else
-        std.fmt.allocPrint(
-            alloc,
+        alloc.print(
             "[Prior terminal {s} action completed. Stored result follows.]\n{s}",
             .{ action, bounded },
         );
@@ -957,10 +957,9 @@ fn subagent_history_summary(
 ) Allocator.Error![]u8 {
     const bounded = text_utils.utf8PrefixByBytes(content orelse "", 4096);
     return if (bounded.len == 0)
-        std.fmt.allocPrint(alloc, "[Prior subagent {s} action completed.]", .{action})
+        alloc.print("[Prior subagent {s} action completed.]", .{action})
     else
-        std.fmt.allocPrint(
-            alloc,
+        alloc.print(
             "[Prior subagent {s} action completed. Stored result follows.]\n{s}",
             .{ action, bounded },
         );
@@ -1289,7 +1288,7 @@ fn check_subagent_history_projection_allocation_failures(alloc: Allocator) !void
 
 test "subagent history projection cleans every partial allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_subagent_history_projection_allocation_failures,
         .{},
     );
@@ -2078,7 +2077,7 @@ fn check_legacy_replay_projection_allocations(alloc: Allocator) !void {
 }
 
 test "legacy request projection preserves replay ownership and source binding on failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_legacy_replay_projection_allocations, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_legacy_replay_projection_allocations, .{});
 }
 
 test "mixed legacy terminal batches become inert in every order" {
@@ -2261,7 +2260,7 @@ fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void
 
 test "terminal request projection cleans every partial allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_terminal_request_projection_allocation_failures,
         .{},
     );
@@ -2449,7 +2448,7 @@ fn check_terminal_request_normalization_allocation_failures(alloc: Allocator) !v
 
 test "terminal request normalization cleans every partial allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_terminal_request_normalization_allocation_failures,
         .{},
     );
@@ -2566,7 +2565,7 @@ fn prepareSkillCall(deps: *const AgentRuntimeDeps, arena: Allocator, call: ToolC
     const prepare = deps.prepare_skill_call orelse return null;
     return prepare(deps.ctx, arena, call, locations) catch |err| switch (err) {
         error.OutOfMemory, error.Cancelled => return err,
-        else => .{ .failure = .{ .model_output = try std.fmt.allocPrint(arena, "skill failed: {s}", .{@errorName(err)}) } },
+        else => .{ .failure = .{ .model_output = try arena.print("skill failed: {s}", .{@errorName(err)}) } },
     };
 }
 
@@ -2703,8 +2702,7 @@ fn preparedTerminalModelOutput(
 ) Allocator.Error![]const u8 {
     if (terminal.model_output) |model_output| return model_output;
     return switch (terminal.kind) {
-        .unsupported => try std.fmt.allocPrint(
-            alloc,
+        .unsupported => try alloc.print(
             "Unsupported tool: {s}",
             .{call.name},
         ),
@@ -4106,12 +4104,12 @@ test "recovery checkpoints do not accumulate temporary history copies in the tur
     const alloc = turn.allocator();
     var messages: std.ArrayList(ChatMessage) = .empty;
     for (0..1000) |step_index| {
-        const id = try std.fmt.allocPrint(alloc, "read_{d}", .{step_index});
+        const id = try alloc.print("read_{d}", .{step_index});
         const calls = try alloc.alloc(ToolCall, 1);
         calls[0] = .{ .id = id, .name = "read_file", .arguments_json = "{\"path\":\"evidence.txt\"}" };
         try messages.appendSlice(alloc, &.{
             .{ .role = .assistant, .tool_calls = calls },
-            .{ .role = .tool, .tool_call_id = id, .tool_name = "read_file", .tool_result_status = .success, .content = "current evidence" ** 16 },
+            .{ .role = .tool, .tool_call_id = id, .tool_name = "read_file", .tool_result_status = .success, .content = text_utils.repeat("current evidence", 16) },
         });
         const retained_bytes = turn.queryCapacity();
         try persistRecoveryCheckpoint(&deps, &finalization, fixture.job(), messages.items, "partial", "model", false, false, 10, 1, false, .transport_interrupted, .retry_request, .confirmed, .{});
@@ -4404,7 +4402,7 @@ test "discarded completion prose preserves ownership and fails atomically" {
         }
     };
     try Probe.run(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
 }
 
 fn isRetryableModelFailure(kind: agent_stream_provider.FailureKind) bool {
@@ -4513,6 +4511,95 @@ test "context overflow recovery is typed safe and bounded" {
         case.recovery_available,
         case.cancelled,
     ));
+}
+
+/// Size retries allowed in one turn. Each lowers the learned limit, so the
+/// next request leaves out more of its oldest images.
+const max_request_size_retries: u8 = 2;
+
+/// A size rejection is retried without compaction only when the rejected
+/// request carried images the next one can leave out. Anything else falls
+/// through to context overflow recovery.
+fn shouldRetryWithFewerImages(
+    failure: agent_stream_provider.Failure,
+    images_sent: usize,
+    retries_used: u8,
+    replay_safe: bool,
+    cancelled: bool,
+) bool {
+    return !cancelled and
+        replay_safe and
+        images_sent > 0 and
+        retries_used < max_request_size_retries and
+        failure.kind == .request_too_large;
+}
+
+/// The size the next request must fit after `rejected_bytes` were refused.
+fn loweredRequestByteLimit(rejected_bytes: usize) usize {
+    return rejected_bytes / 4 * 3;
+}
+
+/// Leaves the oldest images out of `request` until its serialized body fits
+/// `limits`, rebuilding after each change, and returns the body to send.
+/// Every pass leaves out at least one more image, so the loop ends.
+fn fitRequestImages(
+    arena: Allocator,
+    provider: agent_stream_provider.Provider,
+    request: *agent_stream_provider.RequestData,
+    first_body: []const u8,
+    limits: request_image_budget.Limits,
+    tool_text_limit: usize,
+    trace_ctx: TraceContext,
+) ![]const u8 {
+    var body = first_body;
+    while (true) {
+        const projection = try request_image_budget.withholdOldestImages(arena, request.messages, body.len, limits, tool_text_limit);
+        if (projection.withheld == 0) return body;
+        var smaller = request.*;
+        smaller.messages = projection.messages;
+        const rebuilt = (try provider.buildRequest(arena, smaller)) orelse return body;
+        debug_trace.eventf("images", "request_images_withheld", trace_ctx, "withheld={d} request_bytes_before={d} request_bytes_after={d} limit_bytes={d}", .{
+            projection.withheld,
+            body.len,
+            rebuilt.len,
+            limits.max_request_bytes,
+        });
+        request.* = smaller;
+        body = rebuilt;
+    }
+}
+
+test "size rejections retry with fewer images only while images remain" {
+    const too_large = agent_stream_provider.Failure{ .kind = .request_too_large };
+    const overflow_text = agent_stream_provider.Failure{
+        .kind = .invalid_request,
+        .detail = @constCast("AI_APICallError: input is too long"),
+    };
+    const cases = [_]struct {
+        failure: agent_stream_provider.Failure,
+        images_sent: usize = 3,
+        retries_used: u8 = 0,
+        replay_safe: bool = true,
+        cancelled: bool = false,
+        expected: bool,
+    }{
+        .{ .failure = too_large, .expected = true },
+        .{ .failure = too_large, .retries_used = max_request_size_retries - 1, .expected = true },
+        .{ .failure = too_large, .retries_used = max_request_size_retries, .expected = false },
+        .{ .failure = too_large, .images_sent = 0, .expected = false },
+        .{ .failure = too_large, .replay_safe = false, .expected = false },
+        .{ .failure = too_large, .cancelled = true, .expected = false },
+        .{ .failure = overflow_text, .expected = false },
+    };
+    for (cases) |case| try std.testing.expectEqual(case.expected, shouldRetryWithFewerImages(
+        case.failure,
+        case.images_sent,
+        case.retries_used,
+        case.replay_safe,
+        case.cancelled,
+    ));
+    try std.testing.expectEqual(@as(usize, 30_000), loweredRequestByteLimit(40_000));
+    try std.testing.expect(loweredRequestByteLimit(33_829_735) < 33_829_735);
 }
 
 /// fx never asks a model to extend an assistant message, and models without
@@ -4761,7 +4848,7 @@ test "deferred retry cleanup clears status and contains sink errors" {
     clear_deferred_retry_status(&deps);
     try std.testing.expectEqual(@as(usize, 1), normal.route_recovery_clear_count);
 
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
     var failed = support.FakeAgentRuntimeDeps.init(failing.allocator());
     defer failed.deinit();
     const failed_deps = failed.deps();
@@ -5227,7 +5314,7 @@ fn prepareExternalFailureDiagnostic(
 ) !types.ModelFailureDiagnostic {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     const owned_source = if (trimmed.len > 0 and !hasDiagnosticIdentifier(trimmed))
-        try std.fmt.allocPrint(alloc, "{s}: {s}", .{ fallback, trimmed })
+        try alloc.print("{s}: {s}", .{ fallback, trimmed })
     else
         null;
     defer if (owned_source) |source| alloc.free(source);
@@ -5246,9 +5333,9 @@ fn prepareExternalFailureDiagnostic(
 }
 
 fn hasDiagnosticIdentifier(text: []const u8) bool {
-    if (std.mem.indexOf(u8, text, ": ")) |separator| {
+    if (std.mem.find(u8, text, ": ")) |separator| {
         if (separator == 0) return false;
-        return std.mem.indexOfAny(u8, text[0..separator], " \t\r\n") == null;
+        return std.mem.findAny(u8, text[0..separator], " \t\r\n") == null;
     }
     for (text) |byte| {
         if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-' and byte != '.') return false;
@@ -5764,6 +5851,9 @@ fn processQueuedPromptInner(
         &stop_state,
         agent,
     ) catch |err| {
+        // A turn that yielded stays open for the host to resume, so nothing
+        // it did is finished as a failure.
+        if (err == error.TurnYielded) return err;
         if (stop_state.retained_candidate != null and
             !stop_state.terminal_materializing and
             finalization.state == .open)
@@ -6223,7 +6313,7 @@ pub fn compactContext(
         .before_summary = request.before_summary,
     };
     if (progress.operation_id) |id| deps.compaction_activity.?.running(deps.ctx, id, .preparation);
-    errdefer |err| {
+    return compactWithProgress(alloc, deps, request, &progress) catch |err| {
         if (err == error.Cancelled) {
             compactor.traceEvent(trace_ctx, .transaction_failed, "stage={s} origin={s} err={s}", .{ @tagName(progress.stage), @tagName(request.activity_origin), @errorName(err) });
         } else {
@@ -6233,7 +6323,18 @@ pub fn compactContext(
             deps.compaction_activity.?.settle(deps.ctx, id, compaction_activity.failure(err, progress.stage, cancel_flag.load(.seq_cst)));
             if (request.failure_provenance) |out| out.* = .{ .operation_id = id, .turn_id = trace_ctx.turn_id, .err = err };
         }
-    }
+        return err;
+    };
+}
+
+fn compactWithProgress(
+    alloc: Allocator,
+    deps: *const AgentRuntimeDeps,
+    request: ContextCompactionRequest,
+    progress: *CompactionProgress,
+) !?compactor.Result {
+    const trace_ctx = request.compactor.trace_ctx;
+    const cancel_flag = request.compactor.cancel_flag;
     var compactor_request = request.compactor;
     compactor_request.progress = progress.interface();
     var result = try compactor.compact(alloc, compactor_request) orelse {
@@ -6330,7 +6431,7 @@ test "compaction activity automatic error provenance excludes secondary finaliza
             var job = fixture.job();
             job.turn_id = 31;
             job.model = @constCast(model);
-            var steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast("history " ** 19_000) }};
+            var steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast(text_utils.repeat("history ", 19_000)) }};
             var history = [_]HistoryTurn{.{ .assistant = .{
                 .user = .{ .text = @constCast("earlier request") },
                 .assistant = @constCast("earlier answer"),
@@ -6448,7 +6549,7 @@ test "automatic compaction interruption persists transport cancellation and pres
         var job = fixture.job();
         job.turn_id = 37;
         job.model = @constCast(model);
-        var steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast("history " ** 19_000) }};
+        var steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast(text_utils.repeat("history ", 19_000)) }};
         var history = [_]HistoryTurn{.{ .assistant = .{
             .user = .{ .text = @constCast("earlier request") },
             .assistant = @constCast("earlier answer"),
@@ -6599,7 +6700,7 @@ test "compaction activity transaction settles only after publication and preserv
         // A tool call leaves work to summarize, so the model is asked. Its
         // output is larger than the kept budget, so the turn is compacted,
         // while its user message still fits word for word.
-        const notes = "recorded notes " ** 400;
+        const notes = text_utils.repeat("recorded notes ", 400);
         const calls = [_]types.ToolCall{.{ .id = "record-1", .name = "read_file", .arguments_json = "{\"path\":\"notes.md\"}" }};
         const results = [_]types.PersistedToolResult{.{
             .tool_call_id = @constCast("record-1"),
@@ -6611,7 +6712,7 @@ test "compaction activity transaction settles only after publication and preserv
         }};
         const steps = [_]types.ToolExecutionStep{.{ .tool_calls = @constCast(&calls), .tool_results = @constCast(&results) }};
         const turns = [_]HistoryTurn{.{ .assistant = .{
-            .user = .{ .text = @constCast("recorded source " ** 100) },
+            .user = .{ .text = @constCast(text_utils.repeat("recorded source ", 100)) },
             .assistant = @constCast("Recorded it."),
             .execution = .{ .tool_steps = @constCast(&steps) },
         } }};
@@ -7009,6 +7110,7 @@ fn processQueuedPromptLoop(
         var assistant_prefill_recovery_used = false;
         var skip_next_preflight_refresh = false;
         var context_overflow_recovery: ContextOverflowRecoveryState = .ready;
+        var request_size_retries: u8 = 0;
         var recovery_has_unexecuted_tool_start = false;
         var successful_recovery_strategy: ?model_response_recovery.Strategy = null;
         defer {
@@ -7270,7 +7372,7 @@ fn processQueuedPromptLoop(
                 config.first_call_tool_choice
             else
                 .auto;
-            const request_data = agent_stream_provider.RequestData{
+            var request_data = agent_stream_provider.RequestData{
                 .model = gateway_model,
                 .instructions = gateway_instructions.items,
                 .messages = request_messages,
@@ -7290,11 +7392,22 @@ fn processQueuedPromptLoop(
             };
             var prepared_request_body: ?[]const u8 = null;
             var request_cost_for_attempt: ?runtime_prompt_context.RequestCost = null;
+            var request_images_for_attempt: usize = 0;
             if (try deps.agent_stream_provider.buildRequest(
                 overlay_arena,
                 request_data,
-            )) |request_body| {
+            )) |built_request_body| {
+                const request_body = try fitRequestImages(
+                    overlay_arena,
+                    deps.agent_stream_provider,
+                    &request_data,
+                    built_request_body,
+                    .{ .max_request_bytes = agent.requestByteLimit(gateway_model) orelse request_image_budget.default_max_request_bytes },
+                    config.max_tool_result_bytes,
+                    step_ctx,
+                );
                 prepared_request_body = request_body;
+                request_images_for_attempt = image_data.countRequestImages(request_data.messages);
                 const measured_request_cost = try runtime_prompt_context.measureProviderRequest(std.heap.c_allocator, request_body, request_data);
                 const applicable_calibration = if (agent.request_token_calibration) |*calibration|
                     if (std.mem.eql(u8, calibration.modelSlice(), gateway_model) and calibration.cost.applies(measured_request_cost))
@@ -8105,6 +8218,32 @@ fn processQueuedPromptLoop(
             else
                 compacted_suffix_len < within_turn_suffix.items.len;
             if (response_failure) |failure| {
+                // A size rejection with images aboard retries with a lower
+                // limit, which leaves out the oldest images instead of
+                // compacting the conversation.
+                if (request_cost_for_attempt) |rejected| if (shouldRetryWithFewerImages(
+                    failure,
+                    request_images_for_attempt,
+                    request_size_retries,
+                    streamReplaySafe(&stream_ctx),
+                    config.cancel_flag.load(.seq_cst),
+                )) {
+                    const limit = loweredRequestByteLimit(rejected.serialized_bytes);
+                    agent.lowerRequestByteLimit(gateway_model, limit);
+                    request_size_retries += 1;
+                    debug_trace.eventf("images", "request_size_retry", step_ctx, "model={s} rejected_bytes={d} images_sent={d} limit_bytes={d} retry={d}", .{
+                        gateway_model,
+                        rejected.serialized_bytes,
+                        request_images_for_attempt,
+                        limit,
+                        request_size_retries,
+                    });
+                    _ = summary_accumulator.finishTokenRequestWithoutUsage(false);
+                    stream_result.deinit(arena);
+                    stream_result_set = false;
+                    reset_stream_for_next_attempt = true;
+                    continue;
+                };
                 if (shouldRecoverContextOverflow(
                     failure,
                     has_compactable_context,
@@ -9861,7 +10000,8 @@ fn processQueuedPromptLoop(
                 .none => false,
                 .read_only => root_action_permission_mode == .auto or
                     root_action_permission_mode == .yolo,
-                .subagent => true,
+                // Each call is reviewed before the group starts.
+                .subagent, .host => true,
             };
             const parallel_candidate_len = if (parallel_permission_eligible)
                 parallel_group.len

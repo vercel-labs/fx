@@ -1,0 +1,224 @@
+{
+ "format": "libfx-journal-v1",
+ "plain": {
+  "events": [
+   {
+    "v": 1,
+    "seq": 1,
+    "turn": 1,
+    "type": "turn_progress",
+    "data": {
+     "version": 2,
+     "turn_id": 1,
+     "user": {
+      "text": "remember plums",
+      "images": []
+     },
+     "assistant_source": "",
+     "execution": {
+      "schema_version": 10,
+      "tool_steps": [],
+      "files": [],
+      "steering": [],
+      "turn_summary": null
+     },
+     "cause": "network_interrupted",
+     "action": "retrying_request",
+     "tool_state": "none",
+     "authority": {
+      "provider": "gateway",
+      "model": "journal/model",
+      "credential_source": "ai_gateway_api_key",
+      "credential_identity": "3844282c2145ae9856d2b1011be6ac72c4eb3b46a13bb2c2bfdfc81747ce4e94"
+     },
+     "requested_fast_mode": false,
+     "fast_mode": false,
+     "max_provider_attempts": 10,
+     "consumed_provider_attempts": 0,
+     "outstanding_reservation": true
+    },
+    "model": "journal/model"
+   },
+   {
+    "v": 1,
+    "seq": 2,
+    "turn": 1,
+    "type": "turn_progress",
+    "data": {
+     "version": 2,
+     "turn_id": 1,
+     "user": {
+      "text": "remember plums",
+      "images": []
+     },
+     "assistant_source": "answer to remember plums",
+     "execution": {
+      "schema_version": 10,
+      "tool_steps": [],
+      "files": [],
+      "steering": [],
+      "turn_summary": null
+     },
+     "cause": "network_interrupted",
+     "action": "retrying_request",
+     "tool_state": "none",
+     "authority": {
+      "provider": "gateway",
+      "model": "journal/model",
+      "credential_source": "ai_gateway_api_key",
+      "credential_identity": "3844282c2145ae9856d2b1011be6ac72c4eb3b46a13bb2c2bfdfc81747ce4e94"
+     },
+     "requested_fast_mode": false,
+     "fast_mode": false,
+     "max_provider_attempts": 10,
+     "consumed_provider_attempts": 1,
+     "outstanding_reservation": false
+    },
+    "model": "journal/model"
+   },
+   {
+    "v": 1,
+    "seq": 3,
+    "turn": 1,
+    "type": "turn_committed",
+    "data": {
+     "kind": "assistant",
+     "user": {
+      "text": "remember plums",
+      "images": []
+     },
+     "assistant": "answer to remember plums",
+     "provider_replay": null,
+     "execution": {
+      "schema_version": 10,
+      "tool_steps": [],
+      "files": [],
+      "steering": [],
+      "turn_summary": {
+       "started_at_ms": 1790929977083,
+       "completed_at_ms": 1790929977095,
+       "thinking_duration_ms": 2,
+       "turn_duration_ms": 12,
+       "token_progress": {
+        "input_tokens": 4,
+        "output_tokens": 1,
+        "input_exact": false,
+        "output_exact": true
+       }
+      }
+     }
+    }
+   },
+   {
+    "v": 1,
+    "seq": 4,
+    "turn": 2,
+    "type": "turn_progress",
+    "data": {
+     "version": 2,
+     "turn_id": 2,
+     "user": {
+      "text": "use the tool",
+      "images": []
+     },
+     "assistant_source": "",
+     "execution": {
+      "schema_version": 10,
+      "tool_steps": [],
+      "files": [],
+      "steering": [],
+      "turn_summary": null
+     },
+     "cause": "network_interrupted",
+     "action": "retrying_request",
+     "tool_state": "none",
+     "authority": {
+      "provider": "gateway",
+      "model": "journal/model",
+      "credential_source": "ai_gateway_api_key",
+      "credential_identity": "3844282c2145ae9856d2b1011be6ac72c4eb3b46a13bb2c2bfdfc81747ce4e94"
+     },
+     "requested_fast_mode": false,
+     "fast_mode": false,
+     "max_provider_attempts": 10,
+     "consumed_provider_attempts": 0,
+     "outstanding_reservation": true
+    },
+    "model": "journal/model"
+   },
+   {
+    "v": 1,
+    "seq": 5,
+    "turn": 2,
+    "type": "turn_progress",
+    "data": {
+     "version": 2,
+     "turn_id": 2,
+     "user": {
+      "text": "use the tool",
+      "images": []
+     },
+     "assistant_source": "",
+     "execution": {
+      "schema_version": 10,
+      "tool_steps": [],
+      "files": [],
+      "steering": [],
+      "turn_summary": null
+     },
+     "cause": "network_interrupted",
+     "action": "retrying_request",
+     "tool_state": "uncertain",
+     "authority": {
+      "provider": "gateway",
+      "model": "journal/model",
+      "credential_source": "ai_gateway_api_key",
+      "credential_identity": "3844282c2145ae9856d2b1011be6ac72c4eb3b46a13bb2c2bfdfc81747ce4e94"
+     },
+     "requested_fast_mode": false,
+     "fast_mode": false,
+     "max_provider_attempts": 10,
+     "consumed_provider_attempts": 1,
+     "outstanding_reservation": false
+    },
+    "model": "journal/model"
+   },
+   {
+    "v": 1,
+    "seq": 6,
+    "turn": 2,
+    "type": "tool_intent",
+    "data": [
+     {
+      "id": "call-1",
+      "name": "lookup",
+      "arguments_json": "{\"key\":\"alpha\"}",
+      "provider_result": null
+     }
+    ]
+   },
+   {
+    "v": 1,
+    "seq": 7,
+    "turn": 2,
+    "type": "input_accepted",
+    "data": {
+     "id": "in_87844db5-4d6d-4991-bd80-4b4aadd3ce9e",
+     "kind": "steer",
+     "text": "answer in one word"
+    }
+   },
+   {
+    "v": 1,
+    "seq": 8,
+    "turn": 2,
+    "type": "input_accepted",
+    "data": {
+     "id": "in_c58a967f-c612-4d55-a754-989505f3ac22",
+     "kind": "follow_up",
+     "text": "then summarize"
+    }
+   }
+  ]
+ }
+}

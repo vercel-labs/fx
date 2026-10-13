@@ -12,7 +12,7 @@ const version_lookup = @import("provider_versions.zig");
 
 const max_catalog_models: usize = 128;
 const max_model_id_bytes: usize = 1024;
-const max_catalog_bytes: usize = 4 * 1024 * 1024;
+pub const max_catalog_bytes: usize = 4 * 1024 * 1024;
 const fetch_timeout_ms: i64 = 30_000;
 const default_models_endpoint = "https://chatgpt.com/backend-api/codex/models";
 const e2e_models_endpoint_env = "FX_E2E_OPENAI_CODEX_MODELS_URL";
@@ -121,7 +121,13 @@ fn fetchCatalogForProvider(
     if (response.status != .ok) {
         return .{ .failure = model_catalog.failureForHttpStatus(response.status) };
     }
-    var catalog = parseCatalog(alloc, response.body) catch |err| {
+    return catalogFromBody(alloc, response.body);
+}
+
+/// Parses a successful Codex models response. A catalog without the permission
+/// reviewer's model is malformed. The result owns its catalog.
+pub fn catalogFromBody(alloc: std.mem.Allocator, body: []const u8) std.mem.Allocator.Error!model_catalog.ProviderResult {
+    var catalog = parseCatalog(alloc, body) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } };
     };
@@ -184,7 +190,7 @@ const FetchOperation = struct {
             .accept_encoding = .omit,
         };
         if (self.credential) |credential| {
-            auth_header = try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{credential});
+            auth_header = try self.alloc.print("Bearer {s}", .{credential});
             headers.authorization = .{ .override = auth_header.? };
         }
         const body_buffer = try self.alloc.alloc(u8, max_catalog_bytes + 1);
@@ -220,15 +226,15 @@ const FetchOperation = struct {
     }
 };
 
-fn modelsUrl(alloc: std.mem.Allocator, version: ?versions.Version) ![]u8 {
+/// The models endpoint, with the Codex client version when known. Caller owns it.
+pub fn modelsUrl(alloc: std.mem.Allocator, version: ?versions.Version) ![]u8 {
     const base = io_mod.getenv(e2e_models_endpoint_env) orelse default_models_endpoint;
     if (io_mod.getenv(e2e_models_endpoint_env) != null and !gateway_client.isLoopbackHttpUrl(base)) {
         return error.InvalidE2ECodexModelsEndpoint;
     }
     const compatible = version orelse return alloc.dupe(u8, base);
     const separator: u8 = if (std.mem.findScalar(u8, base, '?') == null) '?' else '&';
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "{s}{c}client_version={s}",
         .{ base, separator, compatible.slice() },
     );

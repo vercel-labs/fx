@@ -698,6 +698,120 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "Ctrl-O shows session launch commands in full while the main view trails them",
+  async () => {
+    const fixture = createFixture("fx-shell-full-transcript-width-");
+    const words = Array.from({ length: 30 }, (_, index) => `word${index}`).join(" ");
+    const launchCommand = `echo ${words} FULL_LAUNCH_TAIL >/dev/null; sleep 60`;
+    let sessionId = "";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("shell_full_width_run", "shell", {
+        request: {
+          action: "run",
+          command: launchCommand,
+          profile: "clean",
+          tty: true,
+          yield_time_ms: 0,
+        },
+      }),
+      (body) => {
+        sessionId = findSessionId(JSON.parse(body)) ?? "";
+        if (!sessionId) return new Response("missing session id", { status: 500 });
+        return fakeGatewayToolCall("shell_full_width_observe", "shell", {
+          request: { action: "interact", session_id: sessionId, chars: "" },
+        });
+      },
+      (body) => {
+        const id = sessionId || findSessionId(JSON.parse(body)) || "";
+        return fakeGatewayToolCall("shell_full_width_stop", "shell", {
+          request: { action: "stop", session_id: id },
+        });
+      },
+      fakeGatewayFinalText("FULL_WIDTH_FLOW_DONE"),
+    ]);
+    gateways.push(gateway);
+    const session = await TmuxSession.create({
+      isolated: true,
+      cwd: fixture.workspace,
+      env: {
+        HOME: fixture.home,
+        SHELL: terminalFixtureShell(),
+        AI_GATEWAY_API_KEY: "fake-shell-tool-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "yolo",
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      },
+      width: 100,
+      height: 72,
+      stderrPath: fixture.stderrPath,
+    });
+    sessions.push(session);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Run and observe the session.");
+    await session.waitForText("FULL_WIDTH_FLOW_DONE", TIMEOUT);
+    await Bun.sleep(300);
+
+    // The main view keeps each row on one line and trails what does not fit.
+    const mainRows = (await session.capturePaneGrid()).map((line) => line.trimEnd());
+    const mainObserved = mainRows.find((line) => line.startsWith("├ Observed "));
+    expect(mainObserved).toBeDefined();
+    expect(mainObserved).toEndWith("…");
+    expect(mainRows.join("\n")).not.toContain("FULL_LAUNCH_TAIL");
+
+    // `interact` carries no command argument, so the Observed heading is the
+    // only place Ctrl-O can show the launch command. It must wrap under the
+    // tree rail instead of trailing. Heading continuations start "│ word";
+    // detail rows start "│  key: value".
+    const fullObservedHeading = (grid: string[]) => {
+      const rows = grid.map((line) => line.trimEnd());
+      const start = rows.findIndex((line) => line.startsWith("├ Observed "));
+      if (start < 0) return null;
+      const parts = [rows[start]!.slice("├ ".length)];
+      for (const line of rows.slice(start + 1)) {
+        if (!line.startsWith("│ ") || line.startsWith("│  ")) break;
+        parts.push(line.slice("│ ".length));
+      }
+      return parts.join(" ");
+    };
+    const expectedHeading = `Observed ${launchCommand}`;
+    const settledFullGrid = async () => {
+      const deadline = Date.now() + TIMEOUT;
+      let grid = await session.capturePaneGrid();
+      while (fullObservedHeading(grid) !== expectedHeading && Date.now() < deadline) {
+        await Bun.sleep(50);
+        grid = await session.capturePaneGrid();
+      }
+      return grid;
+    };
+    await session.sendKeys("C-o");
+    await session.waitForText("full detail · ctrl+o close", TIMEOUT);
+    let grid = await settledFullGrid();
+    expect(fullObservedHeading(grid)).toBe(expectedHeading);
+    expect(grid.join("\n")).toContain("action: interact");
+    expect(grid.join("\n")).not.toContain("…");
+
+    await session.resizeWindow(60, 72);
+    grid = await settledFullGrid();
+    expect(fullObservedHeading(grid)).toBe(expectedHeading);
+    expect(grid.join("\n")).not.toContain("…");
+
+    // Closing Ctrl-O returns to the trailing main view and leaks none of the
+    // full-detail rows into scrollback.
+    await session.sendKeys("C-o");
+    await session.waitForPane((pane) => !pane.includes("full detail · ctrl+o close"), TIMEOUT);
+    const scrollback = await session.captureFullScrollback();
+    expect(scrollback).toContain("├ Observed echo word0");
+    expect(scrollback).not.toContain("FULL_LAUNCH_TAIL");
+    expect(scrollback).not.toContain("action: interact");
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
   "resumed session rows reclip to the live width from recorded launch commands",
   async () => {
     const fixture = createFixture("fx-shell-resume-width-");

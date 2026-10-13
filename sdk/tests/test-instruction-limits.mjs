@@ -3,8 +3,8 @@ import { strict as assert } from "node:assert";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent } from "../node.js";
-import { createFxAgent as createSharedAgent } from "../fx-sdk.js";
+import { createFxEngine } from "../node.js";
+import { createFxEngine as createSharedAgent } from "../fx-sdk.js";
 import { createMcpAdapter } from "../mcp.js";
 import { createSkillsAdapter } from "../skills.js";
 
@@ -27,7 +27,7 @@ const options = {
   apiKey: "instruction-limit-test-key",
 };
 
-const agent = await createFxAgent({ ...options, instructions: exactInstructions });
+const agent = await createFxEngine({ ...options, instructions: exactInstructions });
 await agent.close();
 
 let runtimeCreations = 0;

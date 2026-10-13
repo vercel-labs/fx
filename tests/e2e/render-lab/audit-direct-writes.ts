@@ -83,6 +83,9 @@ const allowlist: AllowRule[] = [
   rule("src/core/shell_command/command_effect.zig", "(?:expectDirect|expectNativePrintfEquivalent)", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/app/app_render_runtime.zig", "checkRewritePublicationRetry", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/app/app_worker_runtime.zig", "(?:printModelTrace|printLifecycleDrainTrace)", /debug_print/, "tests", "test diagnostics"),
+  rule("src/core/indexer/scan.zig", "expectEntries", /debug_print/, "tests", "test diagnostics"),
+  rule("src/core/indexer/wildmatch.zig", "expectCases", /debug_print/, "tests", "test diagnostics"),
+  rule("src/core/shell_command/safe_git.zig", "(?:plainOutput|ready)", /debug_print/, "tests", "test diagnostics"),
 ];
 
 function rule(

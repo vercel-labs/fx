@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const browser_callback = @import("browser_callback.zig");
 const io_mod = @import("../shared/io.zig");
 const oauth_transport = @import("oauth_transport.zig");
@@ -189,7 +190,7 @@ pub fn discover(
     transport: oauth_transport.Provider,
     issuer_url: []const u8,
 ) !Metadata {
-    const url = try std.fmt.allocPrint(alloc, "{s}/.well-known/openid-configuration", .{issuer_url});
+    const url = try alloc.print("{s}/.well-known/openid-configuration", .{issuer_url});
     defer alloc.free(url);
     const bytes = try fetchJson(alloc, transport, .get, url, null, .{});
     defer alloc.free(bytes);
@@ -713,7 +714,7 @@ fn checkQueryValueAllocationFailures(alloc: Allocator) !void {
 
 test "OAuth query decoding cleans up allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkQueryValueAllocationFailures,
         .{},
     );
@@ -737,7 +738,7 @@ fn checkBrowserTokenAllocationFailures(alloc: Allocator) !void {
 
 test "browser token parsing and transfer clean up allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkBrowserTokenAllocationFailures,
         .{},
     );
@@ -930,9 +931,9 @@ test "oauth parses token set" {
 }
 
 test "oauth parsers clean up allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_metadata_allocation_failures, .{});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_device_authorization_allocation_failures, .{});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_token_set_allocation_failures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_metadata_allocation_failures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_device_authorization_allocation_failures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_token_set_allocation_failures, .{});
 }
 
 test "oauth expiry timestamps reject invalid durations" {

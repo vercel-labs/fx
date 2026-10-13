@@ -28,7 +28,7 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
     var it = parsed.value.object.iterator();
     while (it.next()) |entry| {
         if (std.mem.eql(u8, entry.key_ptr.*, "url")) continue;
-        return .{ .failure = try std.fmt.allocPrint(ctx.allocator, "web_fetch field \"{s}\" is not allowed", .{entry.key_ptr.*}) };
+        return .{ .failure = try ctx.allocator.print("web_fetch field \"{s}\" is not allowed", .{entry.key_ptr.*}) };
     }
 
     const url_value = parsed.value.object.get("url") orelse {

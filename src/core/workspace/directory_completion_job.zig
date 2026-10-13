@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const completion = @import("../input/file_completion_state.zig");
 const file_index = @import("file_index.zig");
 const path_completion = @import("path_completion.zig");
@@ -316,11 +317,11 @@ fn checkRequestFailures(alloc: std.mem.Allocator) !void {
 }
 
 test "directory completion request OOM and spawn failure release all inputs" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkRequestFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkRequestFailures, .{});
 }
 
 test "directory completion scheduling OOM is unavailable and retry owns a fresh request" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var state: completion.State = .{};
     defer state.deinit(alloc);
     bindTest(&state, "@./a", 1);
@@ -337,7 +338,7 @@ test "directory completion scheduling OOM is unavailable and retry owns a fresh 
 }
 
 test "directory completion owned output stages only and cleans harvest OOM" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     for ([_]bool{ false, true }) |fail_copy| {
         var state: completion.State = .{};
         defer state.deinit(alloc);
@@ -422,7 +423,7 @@ test "directory completion output OOM closes operation resources and partial own
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "chosen.txt", .data = "chosen" });
     const root = try @import("../shared/io.zig").dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    try std.testing.checkAllAllocationFailures(alloc, checkLookupFailures, .{root});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkLookupFailures, .{root});
 }
 
 test "directory completion binding rejects every changed identity fact" {

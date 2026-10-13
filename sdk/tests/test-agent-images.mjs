@@ -3,8 +3,8 @@ import { strict as assert } from "node:assert";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent, supportsJspi } from "../node.js";
-import { createFxAgent as createSharedAgent } from "../fx-sdk.js";
+import { createFxEngine, supportsJspi } from "../node.js";
+import { createFxEngine as createSharedAgent } from "../fx-sdk.js";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const backend = process.argv[2] || "native";
@@ -108,7 +108,7 @@ const baseOptions = {
     : { wasm: await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm")) }),
 };
 const createAgent = (gateway, overrides) =>
-  createFxAgent({ ...baseOptions, fetch: gateway.fetch, ...overrides });
+  createFxEngine({ ...baseOptions, fetch: gateway.fetch, ...overrides });
 
 async function runPrompt(agent, input) {
   const turn = agent.prompt(input);
@@ -334,6 +334,36 @@ for (const resizeImage of [undefined, (image) => image]) {
   await assert.rejects(turn.result, /Image prompts are unavailable for the selected model/);
   assert.equal(gateway.state.chatBodies.length, 0);
   await agent.close();
+}
+
+// A proxy that refuses the catalog request leaves image support unknown, so
+// an image-capable model refuses images. With `modelCatalog`, the same model
+// takes the image and the catalog is never requested.
+{
+  const model = "sdk/proxied-vision-model";
+  const refusing = mockGateway();
+  const fetch405 = async (url, init = {}) => (String(init.method ?? "GET").toUpperCase() === "GET"
+    ? new Response("", { status: 405 })
+    : refusing.fetch(url, init));
+  const blocked = await createFxEngine({ ...baseOptions, fetch: fetch405, model });
+  const refused = blocked.prompt([{ type: "image", data: pngData, mimeType: "image/png" }]);
+  await assert.rejects(refused.result, /Image prompts are unavailable for the selected model/);
+  await blocked.close();
+
+  const gateway = mockGateway();
+  const modelCatalog = [{ id: model, type: "language", tags: ["tool-use", "vision", "file-input"] }];
+  const agent = await createAgent(gateway, { model, modelCatalog });
+  const result = await runPrompt(agent, [
+    { type: "text", text: "what is in this image?" },
+    { type: "image", data: pngData, mimeType: "image/png" },
+  ]);
+  assert.equal(result.stopReason, "end_turn");
+  assert.equal(gateway.state.catalogFetches, 0, "the supplied catalog replaces the request");
+  assert.equal(fileParts(gateway.state.chatBodies[0]).length, 1);
+  await agent.close();
+
+  await assert.rejects(createAgent(mockGateway(), { modelCatalog: [{ name: "no id" }] }), /needs a string id/);
+  await assert.rejects(createAgent(mockGateway(), { modelCatalog: "catalog" }), /modelCatalog must be/);
 }
 
 // Checkpoint/restore round-trips prompt images inside the checkpoint bound:

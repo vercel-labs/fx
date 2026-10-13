@@ -33,6 +33,13 @@ pub const Registry = struct {
         return null;
     }
 
+    /// The mode a new session starts in under `permission_mode`: the mode
+    /// that applies it, or the default mode when none does.
+    pub fn startingModeId(self: Registry, permission_mode: PermissionMode) []const u8 {
+        const mode = self.forPermission(permission_mode) orelse return self.default_mode_id;
+        return mode.id;
+    }
+
     pub fn buildModelToolProjection(
         self: Registry,
         alloc: std.mem.Allocator,
@@ -111,6 +118,9 @@ test "mode registry finds the mode for a permission mode, preferring the default
 
     const ask_default = Registry{ .default_mode_id = "ask", .modes = modes[0..] };
     try std.testing.expectEqualStrings("ask", ask_default.forPermission(.ask).?.id);
+
+    try std.testing.expectEqualStrings("inspect", apply_default.startingModeId(.ask));
+    try std.testing.expectEqualStrings("apply", apply_default.startingModeId(.yolo));
 }
 
 test "mode registry applies tool policy to the supplied tool set" {

@@ -17,7 +17,7 @@ pub fn read(
     alloc: std.mem.Allocator,
     cwd: []const u8,
 ) error{OutOfMemory}!?[]u8 {
-    if (!std.fs.path.isAbsolute(cwd)) return null;
+    if (!std.Io.Dir.path.isAbsolute(cwd)) return null;
     const git_dir = try resolveGitDir(alloc, cwd);
     defer if (git_dir) |path| alloc.free(path);
     const path = git_dir orelse return null;
@@ -69,7 +69,7 @@ fn resolveGitDir(
             .invalid => return null,
             .missing => {},
         }
-        const parent = std.fs.path.dirname(candidate) orelse return null;
+        const parent = std.Io.Dir.path.dirname(candidate) orelse return null;
         if (std.mem.eql(u8, parent, candidate)) return null;
         candidate = parent;
     }
@@ -79,7 +79,7 @@ fn resolveGitDirAt(
     alloc: std.mem.Allocator,
     candidate: []const u8,
 ) error{OutOfMemory}!GitDirResolution {
-    const dot_git = try std.fs.path.join(alloc, &.{ candidate, ".git" });
+    const dot_git = try std.Io.Dir.path.join(alloc, &.{ candidate, ".git" });
     defer alloc.free(dot_git);
     const stat = std.Io.Dir.cwd().statFile(
         io_mod.getIo(),
@@ -103,10 +103,10 @@ fn resolveGitDirAt(
     if (!std.mem.startsWith(u8, trimmed, prefix)) return .invalid;
     const raw = std.mem.trim(u8, trimmed[prefix.len..], " \t\r\n");
     if (raw.len == 0) return .invalid;
-    const git_dir = if (std.fs.path.isAbsolute(raw))
+    const git_dir = if (std.Io.Dir.path.isAbsolute(raw))
         try alloc.dupe(u8, raw)
     else
-        try std.fs.path.resolve(alloc, &.{ candidate, raw });
+        try std.Io.Dir.path.resolveAlloc(alloc, &.{ candidate, raw });
     var dir = io_mod.openDirAbsoluteNoFollow(git_dir, .{}) catch {
         alloc.free(git_dir);
         return .invalid;
@@ -140,7 +140,7 @@ fn writeTestFile(
     path: []const u8,
     content: []const u8,
 ) !void {
-    if (std.fs.path.dirname(path)) |parent| {
+    if (std.Io.Dir.path.dirname(path)) |parent| {
         try dir.createDirPath(std.testing.io, parent);
     }
     var file = try dir.createFile(std.testing.io, path, .{ .truncate = true });
@@ -157,7 +157,7 @@ test "current branch parses only bounded local branch refs" {
     try std.testing.expect(parseHead("0123456789abcdef0123456789abcdef01234567\n") == null);
     try std.testing.expect(parseHead("ref: refs/tags/v1\n") == null);
     try std.testing.expect(parseHead("ref: refs/heads/bad\x1b[31m\n") == null);
-    try std.testing.expect(parseHead("ref: refs/heads/" ++ ("x" ** 256) ++ "\n") == null);
+    try std.testing.expect(parseHead("ref: refs/heads/" ++ text_utils.repeat("x", 256) ++ "\n") == null);
 }
 
 test "current branch reads nested worktree head without spawning Git" {
@@ -212,7 +212,7 @@ test "current branch rejects missing detached malformed oversized and symlinked 
     try writeTestFile(
         tmp.dir,
         "repo/.git/HEAD",
-        "ref: refs/heads/" ++ ("x" ** (max_metadata_bytes + 1)),
+        "ref: refs/heads/" ++ text_utils.repeat("x", max_metadata_bytes + 1),
     );
     try std.testing.expect(try read(alloc, cwd) == null);
 

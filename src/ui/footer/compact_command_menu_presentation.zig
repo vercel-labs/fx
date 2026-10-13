@@ -373,7 +373,7 @@ fn composeUsageCompactSummaryRow(
     var token_buf: [32]u8 = undefined;
     var spend_buf: [32]u8 = undefined;
     var buf: [96]u8 = undefined;
-    const summary = std.fmt.bufPrint(
+    const summary = std.mem.print(
         &buf,
         "{s} tokens · {s}",
         .{
@@ -403,7 +403,7 @@ fn composeCompactSessionActivityRow(
     var wall_buf: [32]u8 = undefined;
     var row_buf: [128]u8 = undefined;
     if (row_index == activity_start + 1) {
-        const text = std.fmt.bufPrint(
+        const text = std.mem.print(
             &row_buf,
             "API {s} · Wall {s}",
             .{
@@ -421,7 +421,7 @@ fn composeCompactSessionActivityRow(
     }
     if (row_index == activity_start + 2) {
         const text = if (activity.code_complete)
-            std.fmt.bufPrint(
+            std.mem.print(
                 &row_buf,
                 "Code +{d} · -{d}",
                 .{ activity.lines_added, activity.lines_removed },
@@ -619,9 +619,9 @@ fn composeUsageOverviewRow(
     }
     var row_buf: [192]u8 = undefined;
     const text = if (cells[2].len > 0)
-        std.fmt.bufPrint(&row_buf, "{s} · {s} · {s}", .{ cells[0], cells[1], cells[2] }) catch "Usage unavailable"
+        std.mem.print(&row_buf, "{s} · {s} · {s}", .{ cells[0], cells[1], cells[2] }) catch "Usage unavailable"
     else if (cells[1].len > 0)
-        std.fmt.bufPrint(&row_buf, "{s} · {s}", .{ cells[0], cells[1] }) catch "Usage unavailable"
+        std.mem.print(&row_buf, "{s} · {s}", .{ cells[0], cells[1] }) catch "Usage unavailable"
     else
         cells[0];
     return composeStyledRow(alloc, text, width, ui_render.dim_style);
@@ -724,7 +724,7 @@ fn composeUsageModelsHeader(
     const text = if (width < 48)
         "Models"
     else
-        std.fmt.bufPrint(&buf, "Models {d}", .{model_count}) catch "Models";
+        std.mem.print(&buf, "Models {d}", .{model_count}) catch "Models";
     return composeStyledRow(alloc, text, width, ui_render.system_notice_label_style);
 }
 
@@ -887,7 +887,7 @@ fn formatUsageModelFacts(
     var share_buf: [32]u8 = undefined;
     var spend_buf: [32]u8 = undefined;
     return if (include_share)
-        std.fmt.bufPrint(
+        std.mem.print(
             buf,
             "{s} · {s} · {s}",
             .{
@@ -897,7 +897,7 @@ fn formatUsageModelFacts(
             },
         ) catch "Unavailable"
     else
-        std.fmt.bufPrint(
+        std.mem.print(
             buf,
             "{s} · {s}",
             .{
@@ -918,7 +918,7 @@ fn formatUsageModelDetail(
     var reasoning_buf: [32]u8 = undefined;
     var request_buf: [32]u8 = undefined;
     var spend_buf: [32]u8 = undefined;
-    return std.fmt.bufPrint(
+    return std.mem.print(
         buf,
         "Input {s} · Output {s} · Cache {s}/{s} · Reasoning {s} · Requests {s} · {s}",
         .{
@@ -935,18 +935,18 @@ fn formatUsageModelDetail(
 
 fn formatTokenLabel(buf: *[64]u8, value: u64, label: []const u8) []const u8 {
     var value_buf: [32]u8 = undefined;
-    return std.fmt.bufPrint(buf, "{s} {s}", .{ formatCompactUnsigned(&value_buf, value), label }) catch "Unavailable";
+    return std.mem.print(buf, "{s} {s}", .{ formatCompactUnsigned(&value_buf, value), label }) catch "Unavailable";
 }
 
 fn formatMoneyLabel(buf: *[64]u8, value: f64, label: []const u8) []const u8 {
     var value_buf: [32]u8 = undefined;
-    return std.fmt.bufPrint(buf, "{s} {s}", .{ formatMoney(&value_buf, value), label }) catch "Unavailable";
+    return std.mem.print(buf, "{s} {s}", .{ formatMoney(&value_buf, value), label }) catch "Unavailable";
 }
 
 fn formatRequestLabel(buf: *[64]u8, value: ?u64) []const u8 {
     const requests = value orelse return "Requests unavailable";
     var value_buf: [32]u8 = undefined;
-    return std.fmt.bufPrint(
+    return std.mem.print(
         buf,
         "{s} {s}",
         .{
@@ -965,15 +965,15 @@ fn formatCompactUnsigned(buf: *[32]u8, value: u64) []const u8 {
     for (units) |unit| {
         if (value < unit.value) continue;
         if (value % unit.value == 0) {
-            return std.fmt.bufPrint(buf, "{d}{s}", .{ value / unit.value, unit.suffix }) catch "?";
+            return std.mem.print(buf, "{d}{s}", .{ value / unit.value, unit.suffix }) catch "?";
         }
-        return std.fmt.bufPrint(
+        return std.mem.print(
             buf,
             "{d:.1}{s}",
             .{ @as(f64, @floatFromInt(value)) / @as(f64, @floatFromInt(unit.value)), unit.suffix },
         ) catch "?";
     }
-    return std.fmt.bufPrint(buf, "{d}", .{value}) catch "?";
+    return std.mem.print(buf, "{d}", .{value}) catch "?";
 }
 
 fn formatGroupedUnsigned(buf: *[32]u8, value: u64) []const u8 {
@@ -995,7 +995,7 @@ fn formatGroupedUnsigned(buf: *[32]u8, value: u64) []const u8 {
 }
 
 fn formatMoney(buf: anytype, value: f64) []const u8 {
-    return std.fmt.bufPrint(buf, "${d:.2}", .{value}) catch "$?";
+    return std.mem.print(buf, "${d:.2}", .{value}) catch "$?";
 }
 
 fn formatUsageShare(buf: *[32]u8, tokens: u64, total_tokens: u64) []const u8 {
@@ -1003,7 +1003,7 @@ fn formatUsageShare(buf: *[32]u8, tokens: u64, total_tokens: u64) []const u8 {
         0.0
     else
         @as(f64, @floatFromInt(tokens)) * 100.0 / @as(f64, @floatFromInt(total_tokens));
-    return std.fmt.bufPrint(buf, "{d:.1}%", .{share}) catch "?%";
+    return std.mem.print(buf, "{d:.1}%", .{share}) catch "?%";
 }
 
 fn composeWorkspaceRow(
@@ -1049,13 +1049,13 @@ fn composeWorkspaceRow(
         3 => blk: {
             var count_buf: [96]u8 = undefined;
             const count = if (projection.saved_suppressed)
-                std.fmt.bufPrint(
+                std.mem.print(
                     &count_buf,
                     "{d} / {d} · Saved roots suppressed",
                     .{ projection.entries.len, workspace_access.max_additional_directories },
                 ) catch "Unavailable"
             else
-                std.fmt.bufPrint(
+                std.mem.print(
                     &count_buf,
                     "{d} / {d}",
                     .{ projection.entries.len, workspace_access.max_additional_directories },
@@ -1155,7 +1155,7 @@ fn formatWorkspaceEntryStatus(
         "Launch only"
     else
         "Session";
-    return std.fmt.bufPrint(buf, "{s} · {s}", .{ availability, source }) catch availability;
+    return std.mem.print(buf, "{s} · {s}", .{ availability, source }) catch availability;
 }
 
 fn composeWorkspaceActionRow(
@@ -1335,12 +1335,12 @@ fn formatDuration(buf: anytype, duration_ms: u64) []const u8 {
     const minutes = (total_seconds % 3600) / 60;
     const seconds = total_seconds % 60;
     if (hours > 0) {
-        return std.fmt.bufPrint(buf, "{d}h {d}m {d}s", .{ hours, minutes, seconds }) catch "Unavailable";
+        return std.mem.print(buf, "{d}h {d}m {d}s", .{ hours, minutes, seconds }) catch "Unavailable";
     }
     if (minutes > 0) {
-        return std.fmt.bufPrint(buf, "{d}m {d}s", .{ minutes, seconds }) catch "Unavailable";
+        return std.mem.print(buf, "{d}m {d}s", .{ minutes, seconds }) catch "Unavailable";
     }
-    return std.fmt.bufPrint(buf, "{d}s", .{seconds}) catch "Unavailable";
+    return std.mem.print(buf, "{d}s", .{seconds}) catch "Unavailable";
 }
 
 test "compact status line menu renders toggled items without choose copy" {

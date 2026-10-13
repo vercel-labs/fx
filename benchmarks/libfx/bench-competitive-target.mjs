@@ -75,9 +75,9 @@ const importAt = performance.now();
 let importedAt;
 let initializedAt;
 if (target === "libfx") {
-  const { createFxAgent } = await import(pathToFileURL(resolve(root, "sdk/node.js")));
+  const { createFxEngine } = await import(pathToFileURL(resolve(root, "sdk/node.js")));
   importedAt = performance.now();
-  const agent = await createFxAgent({
+  const agent = await createFxEngine({
     backend: "native",
     nativeAddon: resolve(root, "zig-out/lib/libfx.node"),
     fetch: globalThis.fetch,

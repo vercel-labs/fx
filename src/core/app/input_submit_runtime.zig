@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const paste_blocks = @import("../input/pasted_blocks.zig");
 const registered_entities = @import("../input/registered_entities.zig");
 const image_attachments = @import("../images/image_attachments.zig");
@@ -575,8 +576,7 @@ pub fn SubmitRuntime(comptime App: type) type {
 
         fn finishPendingSubmissionFailure(app: *App, err: anyerror) void {
             const turn_id = app.submission.pending.?.draft.turn_id;
-            const body = std.fmt.allocPrint(
-                app.alloc,
+            const body = app.alloc.print(
                 "failed to submit prompt after presentation ({s})",
                 .{@errorName(err)},
             ) catch |notice_err| {
@@ -769,7 +769,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     error.UnsupportedImageType => try app.alloc.dupe(u8, "unsupported image type"),
                     error.FileNotFound => try app.alloc.dupe(u8, "image file not found"),
                     error.ImageTooLarge => try app.alloc.dupe(u8, image_attachments.image_too_large_notice),
-                    else => try std.fmt.allocPrint(app.alloc, "failed to attach image: {s}", .{@errorName(err)}),
+                    else => try app.alloc.print("failed to attach image: {s}", .{@errorName(err)}),
                 };
                 defer app.alloc.free(message);
                 try app.writeDomainNotice(.{
@@ -925,9 +925,9 @@ pub fn SubmitRuntime(comptime App: type) type {
 
         fn shouldRouteUnknownSlashCommand(app: *App, text: []const u8) bool {
             if (text.len == 0 or text[0] != '/') return false;
-            const command_end = std.mem.indexOfAny(u8, text, " \t\r\n") orelse text.len;
+            const command_end = std.mem.findAny(u8, text, " \t\r\n") orelse text.len;
             if (command_end != text.len) return false;
-            if (std.mem.indexOfScalar(u8, text[1..command_end], '/') != null) return false;
+            if (std.mem.findScalar(u8, text[1..command_end], '/') != null) return false;
             if (app.input_runtime.picker.isInlinePickerDismissed(.slash)) return false;
             if (app.input_runtime.picker.inlinePickerTriggerKind(&app.input_runtime.edit_state) != .slash) return false;
             return completion_rt.slashCompletionCandidateCount(app) == 0;
@@ -1254,8 +1254,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             if (outcome != .warning) return;
             const err = app.prompt_history.lastAppendError() orelse
                 error.PromptHistoryWriteFailed;
-            const notice = std.fmt.allocPrint(
-                app.alloc,
+            const notice = app.alloc.print(
                 "failed to save input history ({s}); submission continued",
                 .{@errorName(err)},
             ) catch |notice_err| {
@@ -2004,7 +2003,7 @@ fn checkPendingDraftConstructionAllocationFailure(alloc: std.mem.Allocator) !voi
 
 test "pending draft construction frees every partial allocation" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkPendingDraftConstructionAllocationFailure,
         .{},
     );

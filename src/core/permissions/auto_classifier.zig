@@ -470,8 +470,7 @@ pub const Reviewer = struct {
         const context_message: []const u8 = switch (view) {
             .normal => "review_context_kind: normal\n",
             .contextual => blk: {
-                const message = std.fmt.allocPrint(
-                    alloc,
+                const message = alloc.print(
                     "review_context_kind: contextual\ntrusted_root_context:\n{s}",
                     .{trusted_root_context},
                 ) catch |err| return constructionFailure(err);
@@ -1017,7 +1016,7 @@ test "shell input review requires receiver evidence and bounds untrusted screen 
         .session_id = "shell-owned",
         .launch_command = "python3 key-collector.py",
         .cwd = "/tmp/fixture",
-        .screen = "UNTRUSTED_PROMPT_BEGIN\x1b[31m" ++ ("x" ** 4096) ++ "UNTRUSTED_PROMPT_END",
+        .screen = "UNTRUSTED_PROMPT_BEGIN\x1b[31m" ++ text_utils.repeat("x", 4096) ++ "UNTRUSTED_PROMPT_END",
     };
     var present = try serializeEvidence(alloc, request, deadline, &cancel);
     defer present.deinit(alloc);
@@ -1275,7 +1274,7 @@ pub const function_schema: model_tool_schema.FunctionSchema = .{
 fn toolsJsonAlloc(alloc: std.mem.Allocator) ![]u8 {
     const schema_json = try model_tool_schema.builtinFunctionSchemaJsonAlloc(alloc, function_schema);
     defer alloc.free(schema_json);
-    return std.fmt.allocPrint(alloc, "[{s}]", .{schema_json});
+    return alloc.print("[{s}]", .{schema_json});
 }
 
 test "automatic review model-facing tool contract stays byte exact" {
@@ -1606,10 +1605,10 @@ test "automatic review normalizes non-authoritative metadata" {
             .expected_rationale = "No rationale provided.",
         },
         .{
-            .arguments_json = "{\"decision\":\"clear\",\"rationale\":\"" ++ ("x" ** 239) ++ "éignored\"}",
+            .arguments_json = "{\"decision\":\"clear\",\"rationale\":\"" ++ text_utils.repeat("x", 239) ++ "éignored\"}",
             .expected_decision = .clear,
             .expected_risk = .low,
-            .expected_rationale = "x" ** 239,
+            .expected_rationale = text_utils.repeat("x", 239),
         },
     };
     for (cases) |case| {
@@ -1680,8 +1679,8 @@ test "prior tool result selection is entry bounded and keeps the newest window" 
     var contents: [20][16]u8 = undefined;
     var messages: [21]types.ChatMessage = undefined;
     for (messages[0..20], 0..) |*message, index| {
-        const call_id = try std.fmt.bufPrint(&call_ids[index], "call-{d}", .{index});
-        const content = try std.fmt.bufPrint(&contents[index], "result-{d}", .{index});
+        const call_id = try std.mem.print(&call_ids[index], "call-{d}", .{index});
+        const content = try std.mem.print(&contents[index], "result-{d}", .{index});
         message.* = .{
             .role = .tool,
             .content = content,
@@ -1727,8 +1726,8 @@ test "prior evidence excludes only host marked review feedback" {
 
 test "prior tool result evidence is byte bounded unmasked and terminal safe" {
     const entries = [_]PriorToolResultEntry{
-        .{ .tool_call_id = "first", .tool_name = "read_file", .content = "FIRST_RESULT " ++ ("a" ** 2000) },
-        .{ .tool_call_id = "last", .tool_name = "read_file", .content = "LAST_RESULT API_KEY=super-secret\x1b[31m" ++ ("z" ** 2000) },
+        .{ .tool_call_id = "first", .tool_name = "read_file", .content = "FIRST_RESULT " ++ text_utils.repeat("a", 2000) },
+        .{ .tool_call_id = "last", .tool_name = "read_file", .content = "LAST_RESULT API_KEY=super-secret\x1b[31m" ++ text_utils.repeat("z", 2000) },
     };
     var cancel_flag = std.atomic.Value(bool).init(false);
     const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
@@ -1822,7 +1821,7 @@ test "automatic review preserves the exact invalid completion cause" {
 
 test "review response uses the structured decision despite commentary" {
     for ([_][]const u8{ "clear", "caution" }) |decision| {
-        const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"decision\":\"{s}\"}}", .{decision});
+        const args = try std.testing.allocator.print("{{\"decision\":\"{s}\"}}", .{decision});
         defer std.testing.allocator.free(args);
         var result = try parseCompletion(std.testing.allocator, .{
             .content = "Additional text is not decision authority.",
@@ -2031,8 +2030,7 @@ test "automatic review sends exact unmasked secret-like action evidence" {
         .build_fn = buildTestReviewPayload,
     }, null, 1000);
     const command = "python3 -c 'import secrets; print(\"TOOL_DATA_TOKEN=\"+secrets.token_hex(12))'";
-    const arguments_json = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const arguments_json = try std.testing.allocator.print(
         "{{\"action\":\"run\",\"command\":{f}}}",
         .{std.json.fmt(command, .{})},
     );
@@ -2153,7 +2151,7 @@ test "automatic review sends symbolic secret references as complete evidence" {
 
 test "automatic review preserves prepared file lines within its evidence byte budget" {
     const alloc = std.testing.allocator;
-    const long_line = "x" ** 2048;
+    const long_line = text_utils.repeat("x", 2048);
     var content: std.Io.Writer.Allocating = .init(alloc);
     defer content.deinit();
     try content.writer.writeAll(long_line);
@@ -2503,7 +2501,7 @@ test "automatic review rejects oversized contextual root evidence without sendin
         .send_fn = FakeTransport.send,
         .build_fn = buildTestReviewPayload,
     }, null, 1000);
-    const oversized_root = "current_request: " ++ ("x" ** max_context_bytes) ++ "\n";
+    const oversized_root = "current_request: " ++ text_utils.repeat("x", max_context_bytes) ++ "\n";
     const outcome = try reviewer.review(std.testing.allocator, .{
         .review_turn = .{
             .model = "openai/gpt-5",
@@ -2574,7 +2572,7 @@ test "automatic review sends complete action evidence above sixteen kib" {
         .action = .{ .tool = .{
             .tool_name = "terminal",
             .arguments_json = "{\"action\":\"start\",\"command\":\"npm install\"}",
-            .schema_json = "{\"description\":\"" ++ ("s" ** (20 * 1024)) ++ "\"}",
+            .schema_json = "{\"description\":\"" ++ text_utils.repeat("s", 20 * 1024) ++ "\"}",
         } },
     });
     defer outcome.deinit(std.testing.allocator);
@@ -2622,7 +2620,7 @@ test "automatic review excludes assistant preamble and images" {
     };
 
     const long_preamble = "OPTIONAL_PREAMBLE_PREFIX" ++
-        ("p" ** max_review_packet_bytes) ++
+        text_utils.repeat("p", max_review_packet_bytes) ++
         "OPTIONAL_PREAMBLE_TAIL";
     var fake = FakeTransport{};
     const reviewer = Reviewer.withTransport(.{

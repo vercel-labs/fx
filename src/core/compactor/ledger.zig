@@ -578,7 +578,7 @@ pub fn read(arena: Allocator, reply: []const u8, known: Known, earlier: []const 
                 const kind = std.mem.findScalar(u8, entry_kinds, item.id[0]).?;
                 next[kind] +|= 1;
                 written.renumbered += 1;
-                break :renumbered try std.fmt.allocPrint(arena, "{c}{d}", .{ entry_kinds[kind], next[kind] });
+                break :renumbered try arena.print("{c}{d}", .{ entry_kinds[kind], next[kind] });
             },
         };
         try entries.append(arena, .{ .id = id, .text = try std.mem.concat(arena, u8, &.{ id, entryRest(item) }) });
@@ -836,13 +836,13 @@ fn usedBy(arena: Allocator, call: Call) Allocator.Error!?Found {
     if (std.mem.eql(u8, call.name, "skill")) {
         const location = try stringArgument(arena, call.arguments, "location") orelse return null;
         const resource = try stringArgument(arena, call.arguments, "resource") orelse "";
-        const name = if (resource.len == 0) location else try std.fmt.allocPrint(arena, "{s} {s}", .{ location, resource });
+        const name = if (resource.len == 0) location else try arena.print("{s} {s}", .{ location, resource });
         return .{ .kind = .skill, .name = name };
     }
     if (std.mem.eql(u8, call.name, "mcp_features")) {
         const server = try stringArgument(arena, call.arguments, "server") orelse "";
         const action = try stringArgument(arena, call.arguments, "action") orelse "";
-        return .{ .kind = .mcp, .name = try std.fmt.allocPrint(arena, "mcp_features {s} {s}", .{ server, action }) };
+        return .{ .kind = .mcp, .name = try arena.print("mcp_features {s} {s}", .{ server, action }) };
     }
     if (std.mem.startsWith(u8, call.name, "mcp_") and !std.mem.eql(u8, call.name, "mcp_select_tool")) {
         return .{ .kind = .mcp, .name = try arena.dupe(u8, call.name) };

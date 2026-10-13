@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const managed_execution = @import("../core/execution/managed_execution.zig");
 const acp_runner = @import("../core/cli/acp_runner.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
@@ -24,6 +25,7 @@ const model_catalog = @import("../core/gateway/model_catalog.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const hooks = @import("../core/hooks/hooks.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
+const mcp_host = @import("../core/mcp_host/host.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
 const session_codec = @import("../core/session/session_codec.zig");
@@ -51,6 +53,8 @@ const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const agent_checkpoint = @import("../core/agent/runtime/checkpoint.zig");
 const host_attachments = @import("../core/hosts/host_attachments.zig");
 const libfx_steering = @import("libfx_steering.zig");
+const journal_events = @import("../core/agent/runtime/journal.zig");
+const libfx_journal = @import("libfx_journal.zig");
 const tool_call_identities = @import("tool_call_identities.zig");
 
 const Allocator = std.mem.Allocator;
@@ -79,6 +83,10 @@ const AcpMethod = enum {
     libfx_restore,
     libfx_new,
     libfx_steer,
+    libfx_withdraw,
+    libfx_follow_up,
+    libfx_snapshot,
+    libfx_journal_open,
     mcp_message,
     unknown,
 
@@ -99,6 +107,10 @@ const AcpMethod = enum {
         if (std.mem.eql(u8, method, "libfx/restore")) return .libfx_restore;
         if (std.mem.eql(u8, method, "libfx/new")) return .libfx_new;
         if (std.mem.eql(u8, method, "libfx/steer")) return .libfx_steer;
+        if (std.mem.eql(u8, method, "libfx/withdraw")) return .libfx_withdraw;
+        if (std.mem.eql(u8, method, "libfx/follow_up")) return .libfx_follow_up;
+        if (std.mem.eql(u8, method, "libfx/snapshot")) return .libfx_snapshot;
+        if (std.mem.eql(u8, method, "libfx/journal_open")) return .libfx_journal_open;
         if (std.mem.eql(u8, method, "mcp/message")) return .mcp_message;
         return .unknown;
     }
@@ -115,6 +127,8 @@ const AcpMethod = enum {
             .session_close,
             .libfx_new,
             .libfx_steer,
+            .libfx_withdraw,
+            .libfx_follow_up,
             => false,
             .session_list,
             .session_remove,
@@ -122,6 +136,8 @@ const AcpMethod = enum {
             .session_set_config_option,
             .libfx_checkpoint,
             .libfx_restore,
+            .libfx_snapshot,
+            .libfx_journal_open,
             .mcp_message,
             .unknown,
             => true,
@@ -130,7 +146,7 @@ const AcpMethod = enum {
 
     fn isLibfx(self: AcpMethod) bool {
         return switch (self) {
-            .libfx_checkpoint, .libfx_restore, .libfx_new, .libfx_steer => true,
+            .libfx_checkpoint, .libfx_restore, .libfx_new, .libfx_steer, .libfx_withdraw, .libfx_follow_up, .libfx_snapshot, .libfx_journal_open => true,
             else => false,
         };
     }
@@ -158,6 +174,8 @@ pub const OutboundKind = enum {
     host_tool,
     /// MCP over ACP request to a client-served MCP server.
     mcp_message,
+    /// libfx journal flush: the host answers once it holds every event.
+    journal,
 };
 
 pub const OutboundResponse = struct {
@@ -231,6 +249,8 @@ pub const ActiveSessionState = struct {
     session_rt: session_runtime.SessionRuntime,
     title_task: ?*session_title_generation.Task = null,
     mcp: ?*mcp_runtime.McpRuntime = null,
+    /// MCP-v2's host when FX_MCP_ENGINE=v2 selects it; `mcp` then stays null.
+    mcp_host: ?*mcp_host.Host = null,
     /// Session-scoped client system prompt, appended after fx's instructions.
     /// Owned by the server allocator; empty when the client supplied none.
     client_system_prompt: []u8 = &.{},
@@ -239,6 +259,8 @@ pub const ActiveSessionState = struct {
     cancel_flag: std.atomic.Value(bool),
     pending_prompt_id: ?jsonrpc.RequestId,
     steering: libfx_steering.Runtime = .{},
+    /// Set when the host passed a journal; every state change is sent to it.
+    journal: ?libfx_journal.Journal = null,
 
     pub fn retainGrant(self: *ActiveSessionState, alloc: Allocator, tool_name: []const u8, target_path: []const u8) !void {
         for (self.session_grants) |grant| {
@@ -253,7 +275,7 @@ pub const ActiveSessionState = struct {
         const next = try alloc.alloc(types.PermissionGrant, self.session_grants.len + 1);
         errdefer alloc.free(next);
         if (self.session_grants.len > 0) {
-            std.mem.copyForwards(types.PermissionGrant, next[0..self.session_grants.len], self.session_grants);
+            @memmove(next[0..self.session_grants.len], self.session_grants);
             alloc.free(self.session_grants);
         }
         next[next.len - 1] = .{ .tool_name = name_copy, .target_path = target_copy };
@@ -284,6 +306,8 @@ pub const ServerState = struct {
     client_fs_read: bool = false,
     client_fs_write: bool = false,
     client_terminal: bool = false,
+    /// The client shows ACP v1 Session Notices (`session.notices`).
+    client_notices: bool = false,
     client_elicitation: elicitation.Capabilities = .{},
     workspace_root: []u8 = &.{},
     workspace_access: workspace_access.WorkspaceAccess = .{},
@@ -346,7 +370,7 @@ pub const ServerState = struct {
     next_mcp_message_id: std.atomic.Value(u64) = .init(1),
     pending_outbound: std.AutoHashMapUnmanaged(u64, PendingOutbound) = .empty,
     legacy_url_mutex: std.Io.Mutex = .init,
-    pending_legacy_urls: std.ArrayListUnmanaged(PendingLegacyUrl) = .empty,
+    pending_legacy_urls: std.ArrayList(PendingLegacyUrl) = .empty,
 
     pub fn deinit(self: *ServerState) void {
         // Terminals end with this process. Ending them first also releases
@@ -475,10 +499,22 @@ pub fn selectCredentialForProvider(
     return true;
 }
 
+/// True when requests on the provider's route carry no credential from this
+/// server because the host authorizes them at its fetch edge.
+fn hostManagesRoute(cfg: Config, provider: model_provider.ProviderId) bool {
+    return provider != .gateway and cfg.provider_auth_mode == .host_managed;
+}
+
+/// A tokenless credential that marks a route as authorized by the host.
+fn hostManagedCredential() credentials.Credential {
+    return .{ .token = &.{}, .source = .host_managed };
+}
+
 /// Stages authorization without changing any in-flight credential storage.
 /// The caller owns a non-null credential; null retains the current authorization.
 pub fn prepareCredentialForProvider(state: *ServerState, provider: model_provider.ProviderId) !?credentials.Credential {
     if (state.cfg.auth_mode == .host_managed) return null;
+    if (hostManagesRoute(state.cfg, provider)) return hostManagedCredential();
     const now_ms = io_mod.milliTimestamp();
     if (state.active_session) |active| {
         if (provider != .configured and credentialMatchesProvider(active.credential_source, provider) and
@@ -530,6 +566,54 @@ test "ACP credential preparation preserves the existing borrowed credential" {
     try std.testing.expectEqualStrings("active-token", borrowed);
     try std.testing.expect(state.api_key.ptr == borrowed.ptr);
     try std.testing.expectEqual(types.CredentialSource.configured, state.credential_source.?);
+}
+
+test "ACP provider routes are host-managed only when configured and never leak into Gateway" {
+    const alloc = std.testing.allocator;
+    var state: ServerState = undefined;
+    state.alloc = alloc;
+    state.cfg.auth_mode = .local;
+    state.cfg.provider_auth_mode = .host_managed;
+    state.cfg.credential_override = "gateway-key";
+    state.active_session = null;
+    state.api_key = &.{};
+    state.credential_refresh_after_ms = null;
+    state.account_id = null;
+    state.gateway_team = null;
+
+    // A Codex turn leaves the process host-managed with no token.
+    var codex = (try prepareCredentialForProvider(&state, .codex)).?;
+    try std.testing.expectEqual(types.CredentialSource.host_managed, codex.source);
+    try std.testing.expectEqual(@as(usize, 0), codex.token.len);
+    adoptServerCredential(&state, &codex);
+    codex.deinit(alloc);
+    try std.testing.expectEqual(types.CredentialSource.host_managed, state.credential_source.?);
+
+    // The next Gateway turn gets its own key, not the host-managed source.
+    var gateway = (try prepareCredentialForProvider(&state, .gateway)).?;
+    defer gateway.deinit(alloc);
+    try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, gateway.source);
+    try std.testing.expectEqualStrings("gateway-key", gateway.token);
+
+    // A Grok turn is host-managed the same way.
+    var grok = (try prepareCredentialForProvider(&state, .grok)).?;
+    defer grok.deinit(alloc);
+    try std.testing.expectEqual(types.CredentialSource.host_managed, grok.source);
+    try std.testing.expectEqual(@as(usize, 0), grok.token.len);
+
+    // So is a configured provider: the host adds its API key, if any.
+    const configured = model_provider.parse("local").?;
+    var custom = (try prepareCredentialForProvider(&state, configured)).?;
+    defer custom.deinit(alloc);
+    try std.testing.expectEqual(types.CredentialSource.host_managed, custom.source);
+    try std.testing.expectEqual(@as(usize, 0), custom.token.len);
+
+    // Without the policy each provider needs its own credential.
+    state.cfg.provider_auth_mode = .local;
+    try std.testing.expect(!hostManagesRoute(state.cfg, .codex));
+    try std.testing.expect(!hostManagesRoute(state.cfg, .grok));
+    try std.testing.expect(!hostManagesRoute(state.cfg, configured));
+    try std.testing.expect(!hostManagesRoute(state.cfg, .gateway));
 }
 
 pub fn streamProviderFor(
@@ -700,6 +784,7 @@ fn destroyActiveSession(state: *ServerState) void {
     if (active.client_system_prompt.len > 0) state.alloc.free(active.client_system_prompt);
     active.tool_identities.deinit(state.alloc);
     active.steering.deinit(state.alloc);
+    if (active.journal) |*journal| journal.deinit(state.alloc);
     types.freePermissionGrantSlice(state.alloc, active.session_grants);
     if (comptime !host_target.is_wasm) {
         if (active.mcp) |runtime| {
@@ -707,6 +792,7 @@ fn destroyActiveSession(state: *ServerState) void {
             runtime.deinit();
             state.alloc.destroy(runtime);
         }
+        if (active.mcp_host) |h| h.destroy();
     }
     active.session_rt.deinit(state.alloc);
     if (active.writable) |*writable| writable.deinit(state.alloc);
@@ -774,7 +860,9 @@ fn resolveSubagentAuthority(
     }
     state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
     defer state.subagent_authority_mutex.unlock(io_mod.getIo());
-    const integrations = if (active.mcp) |mcp|
+    const integrations = if (active.mcp_host) |h|
+        h.catalog.snapshotToolNames(alloc, active.permission_rules)
+    else if (active.mcp) |mcp|
         mcp.snapshotToolNames(alloc, active.permission_rules)
     else
         alloc.alloc([]u8, 0);
@@ -783,7 +871,9 @@ fn resolveSubagentAuthority(
         for (owned_integrations) |name| alloc.free(name);
         alloc.free(owned_integrations);
     }
-    var mcp_view = if (active.mcp) |mcp|
+    var mcp_view = if (active.mcp_host) |h|
+        try h.catalog.snapshotAccessView(alloc, root_id, root_id, active.permission_rules, false)
+    else if (active.mcp) |mcp|
         try mcp.snapshotAccessView(
             alloc,
             root_id,
@@ -1424,6 +1514,10 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
             .libfx_restore => handleKernelRestore(state, alloc, msg),
             .libfx_new => sessions.handleNewLibfxSession(state, alloc, msg),
             .libfx_steer => handleKernelSteer(state, alloc, msg),
+            .libfx_withdraw => handleKernelWithdraw(state, alloc, msg),
+            .libfx_follow_up => handleKernelFollowUp(state, alloc, msg),
+            .libfx_snapshot => handleKernelSnapshot(state, alloc, msg),
+            .libfx_journal_open => handleKernelJournalOpen(state, alloc, msg),
             else => state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.method_not_found,
                 .message = "Method not available in the web core yet",
@@ -1444,6 +1538,10 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .libfx_restore => handleKernelRestore(state, alloc, msg),
         .libfx_new => sessions.handleNewLibfxSession(state, alloc, msg),
         .libfx_steer => handleKernelSteer(state, alloc, msg),
+        .libfx_withdraw => handleKernelWithdraw(state, alloc, msg),
+        .libfx_follow_up => handleKernelFollowUp(state, alloc, msg),
+        .libfx_snapshot => handleKernelSnapshot(state, alloc, msg),
+        .libfx_journal_open => handleKernelJournalOpen(state, alloc, msg),
         .initialize,
         .request_cancel,
         .session_cancel,
@@ -1517,6 +1615,63 @@ fn activeLibfxSession(
     const active = if (state.active_session) |*session| session else return null;
     if (!std.mem.eql(u8, active.session_id, session_id.string)) return null;
     return active;
+}
+
+/// Queues libfx steering. A journaled input is recorded as accepted under
+/// the session write mutex, which every progress that places an input also
+/// takes, so its acceptance always reaches the host first.
+fn queueLibfxSteering(
+    state: *ServerState,
+    alloc: Allocator,
+    active: *ActiveSessionState,
+    text: []const u8,
+    input_id: ?[]const u8,
+) !void {
+    const id = input_id orelse return active.steering.enqueue(state.alloc, text);
+    active.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer active.session_write_mutex.unlock(io_mod.getIo());
+    try active.steering.enqueueInput(state.alloc, text, id);
+    const journal = if (active.journal) |*value| value else return;
+    journal.append(alloc, active.session_id, .{ .input_accepted = .{ .id = id, .text = text } }) catch |err| {
+        _ = active.steering.withdraw(state.alloc, id);
+        return err;
+    };
+}
+
+/// Takes back a libfx steer the running turn has not handed to the model:
+/// `withdrawn`, recorded in the journal, or `already_placed`.
+fn handleKernelWithdraw(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *const jsonrpc.Message,
+) !void {
+    var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "Invalid libfx withdraw params",
+    });
+    defer parsed.deinit();
+    const active = activeLibfxSession(state, parsed.value) orelse
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Unknown libfx session",
+        });
+    const id = parsed.value.object.get("id") orelse
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Missing input id",
+        });
+    if (id != .string or !libfx_steering.validInputId(id.string)) return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "Invalid input id",
+    });
+    const withdrawn = withdrawn: {
+        active.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer active.session_write_mutex.unlock(io_mod.getIo());
+        if (!active.steering.withdraw(state.alloc, id.string)) break :withdrawn false;
+        if (active.journal) |*journal| try journal.append(alloc, active.session_id, .{ .input_withdrawn = id.string });
+        break :withdrawn true;
+    };
+    try state.writer.writeResponse(alloc, msg.id, if (withdrawn) "{\"result\":\"withdrawn\"}" else "{\"result\":\"already_placed\"}");
 }
 
 pub fn takeSteering(
@@ -1607,6 +1762,19 @@ fn steeringPromptText(
     return text.toOwnedSlice(alloc);
 }
 
+/// The host's `checkpointMeta` in libfx `params`, borrowed from them: what a
+/// checkpoint records about the agent that saves it. Params without one
+/// record none; null when it is malformed.
+fn checkpointMetaParam(params: std.json.Value) ?agent_checkpoint.Meta {
+    const value = params.object.get("checkpointMeta") orelse return .{};
+    return agent_checkpoint.metaFromJson(value) catch null;
+}
+
+const invalid_checkpoint_meta: jsonrpc.RpcError = .{
+    .code = ErrorCode.invalid_params,
+    .message = "Invalid libfx checkpoint meta",
+};
+
 fn handleKernelCheckpoint(
     state: *ServerState,
     alloc: Allocator,
@@ -1626,8 +1794,9 @@ fn handleKernelCheckpoint(
         .code = ErrorCode.invalid_request,
         .message = "libfx checkpoint is unavailable",
     };
+    const meta = checkpointMetaParam(parsed.value) orelse return state.writer.writeError(alloc, msg.id, invalid_checkpoint_meta);
     const store = state.cfg.host_attachments orelse return state.writer.writeError(alloc, msg.id, unavailable);
-    const bytes = active.session_rt.agent.checkpoint(alloc) catch
+    const bytes = active.session_rt.agent.checkpoint(alloc, meta) catch
         return state.writer.writeError(alloc, msg.id, unavailable);
     defer alloc.free(bytes);
     // The checkpoint leaves as raw bytes beside the response frame.
@@ -1636,7 +1805,7 @@ fn handleKernelCheckpoint(
         error.AttachmentStoreFull => return state.writer.writeError(alloc, msg.id, unavailable),
     };
     var response: [64]u8 = undefined;
-    const written = std.fmt.bufPrint(&response, "{{\"checkpointAttachment\":{d}}}", .{attachment}) catch unreachable;
+    const written = try std.mem.print(&response, "{{\"checkpointAttachment\":{d}}}", .{attachment});
     try state.writer.writeResponse(alloc, msg.id, written);
 }
 
@@ -1676,11 +1845,287 @@ fn handleKernelRestore(
         }),
     };
     defer alloc.free(bytes);
-    active.session_rt.agent.restoreCheckpoint(alloc, bytes) catch
+    // A journaled session's history changes only through its journal.
+    if (active.journal != null) return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_request,
+        .message = "A journaled libfx session cannot restore a checkpoint",
+    });
+    const saved = active.session_rt.agent.restoreCheckpoint(alloc, bytes) catch |err|
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
-            .message = "Invalid or non-fresh libfx checkpoint",
+            // The host reports a newer checkpoint as it reports a newer journal.
+            .message = if (err == error.UnsupportedCheckpointVersion)
+                "libfx checkpoint was written by a newer fx"
+            else
+                "Invalid or non-fresh libfx checkpoint",
         });
+    defer saved.free(alloc);
+    if (saved.isEmpty()) return state.writer.writeResponse(alloc, msg.id, "null");
+    // What the checkpoint recorded about the agent that saved it, for the
+    // host to compare with its own.
+    var response: std.Io.Writer.Allocating = .init(alloc);
+    defer response.deinit();
+    try response.writer.writeAll("{\"checkpointMeta\":");
+    try saved.writeJson(&response.writer);
+    try response.writer.writeByte('}');
+    try state.writer.writeResponse(alloc, msg.id, response.written());
+}
+
+/// Opens a new libfx session's journal from the events its host stored,
+/// passed as one JSON array attachment. No attachment is an empty journal.
+fn handleKernelJournalOpen(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *const jsonrpc.Message,
+) !void {
+    var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "Invalid libfx journal params",
+    });
+    defer parsed.deinit();
+    const active = activeLibfxSession(state, parsed.value) orelse
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Unknown libfx session",
+        });
+    const invalid: jsonrpc.RpcError = .{
+        .code = ErrorCode.invalid_params,
+        .message = "Invalid libfx journal",
+    };
+    const too_large: jsonrpc.RpcError = .{
+        .code = ErrorCode.invalid_params,
+        .message = "libfx journal is too large",
+    };
+    var events: ?[]u8 = null;
+    defer if (events) |bytes| alloc.free(bytes);
+    if (parsed.value.object.get("journalAttachment")) |reference| {
+        const attachment = host_attachments.idFromJson(reference) orelse
+            return state.writer.writeError(alloc, msg.id, invalid);
+        const store = state.cfg.host_attachments orelse return state.writer.writeError(alloc, msg.id, invalid);
+        events = store.take(alloc, attachment, libfx_journal.max_load_bytes) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.AttachmentUnavailable => return state.writer.writeError(alloc, msg.id, invalid),
+            error.AttachmentTooLarge => return state.writer.writeError(alloc, msg.id, too_large),
+        };
+    }
+
+    var snapshot: ?[]u8 = null;
+    defer if (snapshot) |bytes| alloc.free(bytes);
+    if (parsed.value.object.get("snapshotAttachment")) |reference| {
+        const attachment = host_attachments.idFromJson(reference) orelse
+            return state.writer.writeError(alloc, msg.id, invalid);
+        const store = state.cfg.host_attachments orelse return state.writer.writeError(alloc, msg.id, invalid);
+        snapshot = store.take(alloc, attachment, journal_events.max_snapshot_bytes) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.AttachmentUnavailable => return state.writer.writeError(alloc, msg.id, invalid),
+            error.AttachmentTooLarge => return state.writer.writeError(alloc, msg.id, too_large),
+        };
+    }
+
+    active.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer active.session_write_mutex.unlock(io_mod.getIo());
+    if (active.journal != null) return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_request,
+        .message = "libfx journal is already open",
+    });
+    // A host that stores every input before handing it in, as libfx's
+    // session executor does, needs no wait before a request carries one.
+    const inputs_durable = if (parsed.value.object.get("inputsDurable")) |value| switch (value) {
+        .bool => |durable| durable,
+        else => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Invalid libfx journal params",
+        }),
+    } else false;
+    const journal, const opened = libfx_journal.open(
+        alloc,
+        state.alloc,
+        &state.writer,
+        &active.session_rt,
+        events orelse "[]",
+        snapshot,
+        inputs_durable,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.AgentNotFresh => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "A libfx journal opens only on a new session",
+        }),
+        error.UnsupportedJournalVersion => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "libfx journal was written by a newer fx",
+        }),
+        error.OutOfOrderJournalEvent => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "libfx journal events are out of order",
+        }),
+        error.JournalTooLarge => return state.writer.writeError(alloc, msg.id, too_large),
+        error.JournalTooManyTurns => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = std.fmt.comptimePrint("libfx journal holds more than {d} turns", .{journal_events.max_history_turns}),
+        }),
+        error.InvalidJournal => return state.writer.writeError(alloc, msg.id, invalid),
+    };
+    defer opened.checkpoint_meta.free(alloc);
+    active.journal = journal;
+    // The host runs the follow-ups the journal held, after any resume.
+    const follow_ups = active.journal.?.takeFollowUps();
+    defer journal_events.freePendingInputs(state.alloc, follow_ups);
+    var response: std.Io.Writer.Allocating = .init(alloc);
+    defer response.deinit();
+    try response.writer.print("{{\"turns\":{d},\"resumable\":{s}", .{
+        opened.turns,
+        if (opened.resumable) "true" else "false",
+    });
+    // The open turn stopped at the host's time, not in a crash.
+    if (opened.yielded) try response.writer.writeAll(",\"yielded\":true");
+    if (!opened.checkpoint_meta.isEmpty()) {
+        try response.writer.writeAll(",\"checkpointMeta\":");
+        try opened.checkpoint_meta.writeJson(&response.writer);
+    }
+    // The host's ids for the open turn and the last one, so a retried prompt
+    // can continue or skip its turn instead of running it twice.
+    if (opened.open_turn_id.slice()) |id| {
+        try response.writer.writeAll(",\"openTurnId\":");
+        try writeJsonStr(id, &response.writer);
+    }
+    if (opened.last_turn_id.slice()) |id| {
+        try response.writer.writeAll(",\"lastTurnId\":");
+        try writeJsonStr(id, &response.writer);
+    }
+    // The calls the open turn left running, which the host may have the
+    // resume run again instead of leaving them to the model.
+    const running = active.journal.?.ambiguousCalls();
+    if (running.len > 0) {
+        try response.writer.writeAll(",\"runningCalls\":[");
+        for (running, 0..) |call, index| {
+            if (index > 0) try response.writer.writeByte(',');
+            try response.writer.writeAll("{\"id\":");
+            try writeJsonStr(call.id, &response.writer);
+            try response.writer.writeAll(",\"name\":");
+            try writeJsonStr(call.name, &response.writer);
+            try response.writer.writeAll(",\"arguments\":");
+            try writeJsonStr(call.arguments_json, &response.writer);
+            try response.writer.writeByte('}');
+        }
+        try response.writer.writeByte(']');
+    }
+    try response.writer.writeAll(",\"followUps\":[");
+    for (follow_ups, 0..) |follow_up, index| {
+        if (index > 0) try response.writer.writeByte(',');
+        try response.writer.writeAll("{\"id\":");
+        try writeJsonStr(follow_up.id, &response.writer);
+        try response.writer.writeAll(",\"text\":");
+        try writeJsonStr(follow_up.text, &response.writer);
+        try response.writer.writeByte('}');
+    }
+    try response.writer.writeAll("]}");
+    try state.writer.writeResponse(alloc, msg.id, response.written());
+}
+
+/// A snapshot of the session for its journal to store, when it is quiet (no
+/// turn open and no follow-up waiting) or at a turn that yielded with nothing
+/// waiting for it, which the snapshot then carries. `null` otherwise; the
+/// host asks again after a later turn. The snapshot covers every event
+/// through `atSeq`.
+fn handleKernelSnapshot(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *const jsonrpc.Message,
+) !void {
+    var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "Invalid libfx snapshot params",
+    });
+    defer parsed.deinit();
+    const active = activeLibfxSession(state, parsed.value) orelse
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Unknown libfx session",
+        });
+    const store = state.cfg.host_attachments orelse return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_request,
+        .message = "libfx snapshot is unavailable",
+    });
+    const meta = checkpointMetaParam(parsed.value) orelse return state.writer.writeError(alloc, msg.id, invalid_checkpoint_meta);
+    const none = "{\"snapshotAttachment\":null}";
+    active.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer active.session_write_mutex.unlock(io_mod.getIo());
+    const journal = if (active.journal) |*value| value else return state.writer.writeResponse(alloc, msg.id, none);
+    const yielded = journal.yieldedQuiet();
+    if (!journal.quiet() and !yielded) return state.writer.writeResponse(alloc, msg.id, none);
+    // A session past a snapshot's bounds gets none until compaction brings it
+    // back within them; the host learns why.
+    const checkpoint = active.session_rt.agent.checkpoint(alloc, meta) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.CheckpointTooLarge => return writeSnapshotSkipped(state, alloc, msg.id, if (active.session_rt.agent.history.items.len > journal_events.max_history_turns) .too_many_turns else .too_large),
+        else => return writeSnapshotSkipped(state, alloc, msg.id, .invalid),
+    };
+    defer alloc.free(checkpoint);
+    const at_seq = journal.cursor.next_seq - 1;
+    var open_turn: std.Io.Writer.Allocating = .init(alloc);
+    defer open_turn.deinit();
+    if (yielded) try journal_events.writeOpenTurn(&open_turn.writer, journal.open_turn_id.slice(), journal.pending_resume.?);
+    const bytes = journal_events.encodeSnapshot(alloc, at_seq, journal.cursor.turn, journal.last_turn_id.slice(), if (yielded) open_turn.written() else null, checkpoint) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SnapshotTooLarge => return writeSnapshotSkipped(state, alloc, msg.id, .too_large),
+    };
+    defer alloc.free(bytes);
+    // A snapshot travels back as one host attachment.
+    if (bytes.len > journal_events.max_snapshot_bytes) return writeSnapshotSkipped(state, alloc, msg.id, .too_large);
+    const attachment = store.put(bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.AttachmentStoreFull => return state.writer.writeResponse(alloc, msg.id, none),
+    };
+    const written = try alloc.print("{{\"snapshotAttachment\":{d},\"atSeq\":{d}}}", .{ attachment, at_seq });
+    defer alloc.free(written);
+    try state.writer.writeResponse(alloc, msg.id, written);
+}
+
+/// Why a session past a snapshot's bounds gets none.
+const SnapshotSkip = enum { too_large, too_many_turns, invalid };
+
+fn writeSnapshotSkipped(state: *ServerState, alloc: Allocator, id: ?jsonrpc.RequestId, reason: SnapshotSkip) !void {
+    debug_trace.logf("session", "event=libfx_snapshot_skipped reason={s}", .{@tagName(reason)});
+    const body = try alloc.print("{{\"snapshotAttachment\":null,\"skipped\":\"{s}\"}}", .{@tagName(reason)});
+    defer alloc.free(body);
+    try state.writer.writeResponse(alloc, id, body);
+}
+
+/// Records a follow-up the host queued behind the running turn, so a journal
+/// keeps it across a crash. The host runs it; its turn places it.
+fn handleKernelFollowUp(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *const jsonrpc.Message,
+) !void {
+    var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "Invalid libfx follow-up params",
+    });
+    defer parsed.deinit();
+    const active = activeLibfxSession(state, parsed.value) orelse
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Unknown libfx session",
+        });
+    const id = parsed.value.object.get("id");
+    const text = parsed.value.object.get("text");
+    const valid_id = if (id) |value| value == .string and libfx_steering.validInputId(value.string) else false;
+    const valid_text = if (text) |value| value == .string and value.string.len > 0 and value.string.len <= libfx_steering.max_message_bytes else false;
+    if (!valid_id or !valid_text) return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "A follow-up needs a valid id and 1 byte to 64 KiB of text",
+    });
+    {
+        active.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer active.session_write_mutex.unlock(io_mod.getIo());
+        if (active.journal) |*journal| try journal.append(alloc, active.session_id, .{ .input_accepted = .{
+            .id = id.?.string,
+            .text = text.?.string,
+            .kind = .follow_up,
+        } });
+    }
     try state.writer.writeResponse(alloc, msg.id, "null");
 }
 
@@ -1708,18 +2153,29 @@ fn handleKernelSteer(
         .code = ErrorCode.invalid_params,
         .message = "Invalid steering text",
     });
-    active.steering.enqueue(state.alloc, text.string) catch |err| {
+    const input_id: ?[]const u8 = if (parsed.value.object.get("id")) |value| switch (value) {
+        .string => |id| id,
+        .null => null,
+        else => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Invalid input id",
+        }),
+    } else null;
+    queueLibfxSteering(state, alloc, active, text.string, input_id) catch |err| {
         return state.writer.writeError(alloc, msg.id, .{
             .code = switch (err) {
                 error.SteeringQueueFull, error.SteeringNotActive => ErrorCode.invalid_request,
-                else => ErrorCode.invalid_params,
+                error.EmptySteeringMessage, error.SteeringMessageTooLarge, error.InvalidInputId => ErrorCode.invalid_params,
+                else => ErrorCode.internal_error,
             },
             .message = switch (err) {
                 error.EmptySteeringMessage => "Steering text cannot be empty",
                 error.SteeringMessageTooLarge => "Steering text exceeds the 64 KiB libfx limit",
                 error.SteeringQueueFull => "Steering queue is full",
                 error.SteeringNotActive => "No prompt is running",
+                error.InvalidInputId => "Invalid or repeated input id",
                 error.OutOfMemory => "Failed to queue steering text",
+                else => "Failed to record steering in the journal",
             },
         });
     };
@@ -1963,6 +2419,8 @@ const InitializeRequest = struct {
     client_fs_read: bool = false,
     client_fs_write: bool = false,
     client_terminal: bool = false,
+    /// The client shows ACP v1 Session Notices (`session.notices`).
+    client_notices: bool = false,
     client_elicitation: elicitation.Capabilities = .{},
     host_tools: host_tool_runtime.Runtime = .{},
     host_instructions: []u8 = &.{},
@@ -2006,6 +2464,12 @@ fn parseInitializeRequest(
                 request.client_fs_write = value == .bool and value.bool;
             }
         }
+    }
+    if (capabilities.object.get("session")) |session| {
+        // Omitted and null both mean no.
+        if (session == .object) if (session.object.get("notices")) |notices| {
+            request.client_notices = notices != .null;
+        };
     }
     if (capabilities.object.get("terminal")) |value| {
         request.client_terminal = value == .bool and value.bool;
@@ -2075,12 +2539,17 @@ test "ordinary ACP ignores private libfx capabilities" {
 
 fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_lifecycle.StartupState {
     if (state.cfg.minimal_kernel) {
-        return app_lifecycle.loadLibfxStartupState(
+        var startup = try app_lifecycle.loadLibfxStartupState(
             alloc,
             state.cfg.workspace_root_override orelse "/",
             state.cfg.model_override orelse state.cfg.default_model,
             state.cfg.default_agent_step_limit,
         );
+        errdefer startup.deinit(alloc);
+        if (state.cfg.configured_providers_json) |json| {
+            startup.configured_providers = try @import("../core/config/configured_provider.zig").Registry.parse_json(alloc, json);
+        }
+        return startup;
     }
     if (state.cfg.home_override) |home_dir| {
         if (state.cfg.workspace_root_override) |workspace_root| {
@@ -2181,8 +2650,13 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         state.selected_model = startup.takeSelectedModel();
         state.process_model_override = startup.model_source == .process_override;
     }
-    state.provider = startup.provider;
-    state.process_provider_override = config_runtime.providerEnvOverride() != null;
+    if (state.cfg.provider_override) |override| {
+        state.provider = override;
+        state.process_provider_override = true;
+    } else {
+        state.provider = startup.provider;
+        state.process_provider_override = config_runtime.providerEnvOverride() != null;
+    }
     state.configured_providers.deinit(alloc);
     state.configured_providers = startup.configured_providers;
     startup.configured_providers = .{};
@@ -2190,7 +2664,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.gateway_source_preference = startup.credential_source_preference;
     state.configured_model = try alloc.dupe(u8, startup.configured_model);
 
-    if (state.cfg.auth_mode == .host_managed) {
+    if (state.cfg.auth_mode == .host_managed or hostManagesRoute(state.cfg, state.provider)) {
         state.api_key = &.{};
         state.credential_source = .host_managed;
         state.credential_refresh_after_ms = null;
@@ -2323,6 +2797,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.client_fs_read = request.client_fs_read;
     state.client_fs_write = request.client_fs_write;
     state.client_terminal = request.client_terminal;
+    state.client_notices = request.client_notices;
     state.client_elicitation = request.client_elicitation;
     state.host_tools.deinit();
     state.host_tools = request.host_tools;
@@ -2343,7 +2818,10 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         .mcp_servers = state.cfg.allow_acp_mcp,
         .steering = !host_target.is_wasm and !state.cfg.minimal_kernel,
         .system_prompt = !host_target.is_wasm and !state.cfg.minimal_kernel,
-        .mcp_over_acp = state.cfg.allow_acp_mcp and !host_target.is_wasm,
+        // MCP-v2 takes only what ACP v1 defines and it speaks: stdio and
+        // HTTP.
+        .mcp_over_acp = state.cfg.allow_acp_mcp and !host_target.is_wasm and !mcp_host.selected(),
+        .mcp_sse = !mcp_host.selected(),
     });
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
@@ -2427,8 +2905,7 @@ fn effortOverrideRejection(
         if (index > 0) try set.appendSlice(alloc, ", ");
         try set.appendSlice(alloc, option.label());
     }
-    return try std.fmt.allocPrint(
-        alloc,
+    return try alloc.print(
         "Reasoning effort \"{s}\" is not available for model \"{s}\" (available: {s})",
         .{ effort.label(), model, set.items },
     );
@@ -2538,7 +3015,7 @@ fn fastOverrideRejection(
     model: []const u8,
 ) Allocator.Error!?[]u8 {
     if (capabilities.supports_fast_mode or capabilities.intrinsic_fast) return null;
-    return try std.fmt.allocPrint(alloc, "Fast mode is not available for model \"{s}\"", .{model});
+    return try alloc.print("Fast mode is not available for model \"{s}\"", .{model});
 }
 
 test "fastOverrideRejection accepts models with a fast path" {
@@ -2616,7 +3093,7 @@ fn ultrafastOverrideRejection(
     model: []const u8,
 ) Allocator.Error!?[]u8 {
     if (provider == .gateway and capabilities.supports_ultrafast_mode) return null;
-    return try std.fmt.allocPrint(alloc, "Ultrafast mode is not available for model \"{s}\"", .{model});
+    return try alloc.print("Ultrafast mode is not available for model \"{s}\"", .{model});
 }
 
 test "ultrafastOverrideRejection accepts only Gateway models with the catalog capability" {
@@ -2811,7 +3288,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             .message = "No active session",
         });
         if (!target.eql(session.provider)) {
-            if (host_target.is_wasm) {
+            if (host_target.is_wasm and !hostManagesRoute(state.cfg, target)) {
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.invalid_request,
                     .message = "Subscription provider switching is unavailable in this WASM runtime",
@@ -2819,6 +3296,8 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             }
             var staged_credential: ?credentials.Credential = if (state.cfg.auth_mode == .host_managed)
                 null
+            else if (hostManagesRoute(state.cfg, target))
+                hostManagedCredential()
             else if (target == .gateway and state.cfg.credential_override != null)
                 credentials.Credential{
                     .token = try alloc.dupe(u8, state.cfg.credential_override.?),
@@ -3252,7 +3731,7 @@ fn applyActiveSessionFast(
 ) !bool {
     if (fast) {
         if (!activeSessionCapabilities(state, session).supports_fast_mode) {
-            const message = try std.fmt.allocPrint(alloc, "Fast mode is not available for model \"{s}\"", .{session.model});
+            const message = try alloc.print("Fast mode is not available for model \"{s}\"", .{session.model});
             defer alloc.free(message);
             try state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_params,
@@ -3502,7 +3981,7 @@ fn saveSessionPermissionMode(state: *ServerState, alloc: Allocator, mode: types.
     if (comptime !host_target.is_wasm) {
         if (state.cfg.minimal_kernel) return;
         const label = permissions.permissionModeLabel(mode);
-        const home = state.cfg.home_override orelse io_mod.getenv("HOME") orelse {
+        const home = state.cfg.home_override orelse io_mod.homeDir() orelse {
             debug_trace.logf("acp", "permission_mode_save_failed mode={s} err=HomeNotSet", .{label});
             return;
         };
@@ -3537,10 +4016,10 @@ pub fn loadStartingMode(state: *ServerState, alloc: Allocator) StartingMode {
             }
         }
     }
-    const registry = state.cfg.mode_registry;
-    const mode = registry.forPermission(state.permission_mode) orelse
-        return .{ .id = registry.default_mode_id, .permission_mode = state.permission_mode };
-    return .{ .id = mode.id, .permission_mode = mode.permission_mode };
+    return .{
+        .id = state.cfg.mode_registry.startingModeId(state.permission_mode),
+        .permission_mode = state.permission_mode,
+    };
 }
 
 test "applySessionMode uses registered mode policy and ignores unknown modes" {
@@ -3807,7 +4286,7 @@ test "ACP legacy URL publication owns partial allocations" {
             try std.testing.expect(reserved);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Case.run, .{});
 }
 
 test "ACP legacy URL state requires consent and completion" {
@@ -3996,7 +4475,7 @@ fn acpModelTestState(
 }
 
 test "ACP ultrafast writes preserve v2 baselines across other preference changes" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
@@ -4205,7 +4684,7 @@ test "ACP rejects refreshed Codex tokens for another account" {
 }
 
 test "ACP usage flush preserves snapshot ownership on allocation failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var runtime: session_runtime.SessionRuntime = .{ .max_history_turns = 8 };
     var runtime_owned = true;
     defer if (runtime_owned) runtime.deinit(alloc);

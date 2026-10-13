@@ -14,6 +14,8 @@ extern "fx" fn fx_host_tool_call(
     output_ptr: [*]u8,
     output_cap: usize,
     status_ptr: *u8,
+    call_id_ptr: [*]const u8,
+    call_id_len: usize,
 ) i32;
 
 extern "fx" fn fx_host_tool_result_read(offset: usize, ptr: [*]u8, cap: usize) i32;
@@ -32,6 +34,7 @@ fn call(
     _: *anyopaque,
     alloc: Allocator,
     name: []const u8,
+    call_id: []const u8,
     arguments_json: []const u8,
     max_result_bytes: usize,
     cancel_flag: ?*std.atomic.Value(bool),
@@ -50,6 +53,8 @@ fn call(
         output.ptr,
         output.len,
         &status,
+        call_id.ptr,
+        call_id.len,
     );
     if (raw == -2) {
         if (cancel_flag) |flag| flag.store(true, .seq_cst);

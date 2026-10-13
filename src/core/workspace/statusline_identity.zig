@@ -3,7 +3,7 @@ const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
 const max_git_metadata_bytes: usize = 4096;
-const max_encoded_workspace_bytes: usize = std.fs.max_path_bytes * 4;
+const max_encoded_workspace_bytes: usize = std.Io.Dir.max_path_bytes * 4;
 const max_encoded_branch_bytes: usize = 512;
 
 pub const Snapshot = struct {
@@ -142,7 +142,7 @@ pub const Runtime = struct {
             var detached_buf: [32]u8 = undefined;
             const raw = switch (value) {
                 .branch => |branch| branch,
-                .detached => |sha| std.fmt.bufPrint(
+                .detached => |sha| std.mem.print(
                     &detached_buf,
                     "detached:{s}",
                     .{sha},
@@ -201,7 +201,7 @@ fn resolveHeadPath(
             .invalid => return null,
             .missing => {},
         }
-        const parent = std.fs.path.dirname(candidate) orelse return null;
+        const parent = std.Io.Dir.path.dirname(candidate) orelse return null;
         if (std.mem.eql(u8, parent, candidate)) return null;
         candidate = parent;
     }
@@ -211,7 +211,7 @@ fn resolveHeadPathAt(
     alloc: std.mem.Allocator,
     candidate_root: []const u8,
 ) !HeadPathResolution {
-    const dot_git = try std.fs.path.join(alloc, &.{ candidate_root, ".git" });
+    const dot_git = try std.Io.Dir.path.join(alloc, &.{ candidate_root, ".git" });
     defer alloc.free(dot_git);
 
     const stat = std.Io.Dir.cwd().statFile(
@@ -224,7 +224,7 @@ fn resolveHeadPathAt(
     };
 
     if (stat.kind == .directory) {
-        return .{ .found = try std.fs.path.join(alloc, &.{ dot_git, "HEAD" }) };
+        return .{ .found = try std.Io.Dir.path.join(alloc, &.{ dot_git, "HEAD" }) };
     }
     if (stat.kind != .file) return .invalid;
 
@@ -236,12 +236,12 @@ fn resolveHeadPathAt(
 
     const raw = std.mem.trim(u8, trimmed[prefix.len..], " \t\r\n");
     if (raw.len == 0) return .invalid;
-    const git_dir = if (std.fs.path.isAbsolute(raw))
+    const git_dir = if (std.Io.Dir.path.isAbsolute(raw))
         try alloc.dupe(u8, raw)
     else
-        try std.fs.path.resolve(alloc, &.{ candidate_root, raw });
+        try std.Io.Dir.path.resolveAlloc(alloc, &.{ candidate_root, raw });
     defer alloc.free(git_dir);
-    return .{ .found = try std.fs.path.join(alloc, &.{ git_dir, "HEAD" }) };
+    return .{ .found = try std.Io.Dir.path.join(alloc, &.{ git_dir, "HEAD" }) };
 }
 
 fn readSmallFile(
@@ -283,7 +283,7 @@ fn writeTestFile(
     path: []const u8,
     content: []const u8,
 ) !void {
-    if (std.fs.path.dirname(path)) |parent| {
+    if (std.Io.Dir.path.dirname(path)) |parent| {
         try dir.createDirPath(io_mod.getIo(), parent);
     }
     var file = try dir.createFile(io_mod.getIo(), path, .{ .truncate = true });
@@ -402,8 +402,8 @@ test "workspace statusline identity represents the filesystem root" {
     var runtime: Runtime = .{ .enabled = true };
     defer runtime.deinit(alloc);
 
-    const snapshot = try runtime.refresh(alloc, std.fs.path.sep_str);
-    try std.testing.expectEqualStrings(std.fs.path.sep_str, snapshot.workspace_label);
+    const snapshot = try runtime.refresh(alloc, std.Io.Dir.path.sep_str);
+    try std.testing.expectEqualStrings(std.Io.Dir.path.sep_str, snapshot.workspace_label);
 }
 
 test "workspace statusline disabled refresh preserves cached identity" {

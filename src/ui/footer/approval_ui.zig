@@ -481,7 +481,7 @@ pub fn projectFileApproval(
     if (target_count == 0) return result;
 
     var remaining = target_count;
-    var choice_selected = [_]bool{false} ** 3;
+    var choice_selected: [3]bool = @splat(false);
     const choice_rows = @min(@as(usize, 3), remaining);
     const choice_window = picker_presentation.pickerWindow(
         3,
@@ -499,7 +499,7 @@ pub fn projectFileApproval(
     if (question_selected) remaining -= 1;
 
     var preview_selected =
-        [_]bool{false} ** diff_mod.max_preview_lines;
+        @as([diff_mod.max_preview_lines]bool, @splat(false));
     var selected_preview_count: usize = 0;
     if (remaining > 0) {
         for (request.preview.lines[0..preview_count], 0..) |line, index| {
@@ -867,7 +867,7 @@ fn composeFileApprovalHeaderRow(
         try row.appendSlice(alloc, " · ");
         try row.appendSlice(alloc, ui_render.diff_added_style);
         var additions_buf: [32]u8 = undefined;
-        const additions = std.fmt.bufPrint(
+        const additions = std.mem.print(
             &additions_buf,
             "+{d}",
             .{request.preview.additions},
@@ -877,7 +877,7 @@ fn composeFileApprovalHeaderRow(
         try row.appendSlice(alloc, "  ");
         try row.appendSlice(alloc, ui_render.diff_removed_style);
         var deletions_buf: [32]u8 = undefined;
-        const deletions = std.fmt.bufPrint(
+        const deletions = std.mem.print(
             &deletions_buf,
             "-{d}",
             .{request.preview.deletions},
@@ -966,7 +966,7 @@ fn composeFileApprovalPreviewRow(
 
     const number = line.new_line orelse line.old_line orelse 0;
     var number_buf: [32]u8 = undefined;
-    const number_text = std.fmt.bufPrint(
+    const number_text = std.mem.print(
         &number_buf,
         "{d}",
         .{number},
@@ -1021,7 +1021,7 @@ fn composeFileApprovalHiddenPreviewRow(
     width: u16,
 ) !std.ArrayList(u8) {
     var text_buf: [96]u8 = undefined;
-    const text = std.fmt.bufPrint(
+    const text = std.mem.print(
         &text_buf,
         "⋯ {d} preview {s} hidden · resize to review",
         .{
@@ -1513,7 +1513,7 @@ fn buildApprovalPanelLineWithLabel(
         return switch (row_index) {
             0 => "  Permission needed · Choose one",
             1 => "",
-            2 => std.fmt.bufPrint(buf, "  {s}{s}{s}", .{ b, approvalQuestion(label, dynamic_mcp), r }) catch "  Permission request",
+            2 => std.mem.print(buf, "  {s}{s}{s}", .{ b, approvalQuestion(label, dynamic_mcp), r }) catch "  Permission request",
             3 => approvalReasonLine(buf, label, target, explanation, dynamic_mcp),
             4 => approvalActionLine(buf, label, target),
             5 => "",
@@ -1521,20 +1521,20 @@ fn buildApprovalPanelLineWithLabel(
             7 => approvalChoiceLine(buf, approval.choice_index == 1, approvalChoiceLabel(approval, 1)),
             8 => approvalChoiceLine(buf, approval.choice_index == 2, approvalChoiceLabel(approval, 2)),
             9 => "",
-            10 => std.fmt.bufPrint(buf, "  {s}{s}{s}", .{ dim, approvalHint(approval, width -| 2), r }) catch interaction_state.approval_hint,
+            10 => std.mem.print(buf, "  {s}{s}{s}", .{ dim, approvalHint(approval, width -| 2), r }) catch interaction_state.approval_hint,
             else => "",
         };
     }
 
     return switch (row_index) {
         0 => "  Permission needed · Choose one",
-        1 => std.fmt.bufPrint(buf, "  {s}{s}{s}", .{ b, approvalQuestion(label, dynamic_mcp), r }) catch "  Permission request",
+        1 => std.mem.print(buf, "  {s}{s}{s}", .{ b, approvalQuestion(label, dynamic_mcp), r }) catch "  Permission request",
         2 => approvalReasonLine(buf, label, target, explanation, dynamic_mcp),
         3 => approvalActionLine(buf, label, target),
         4 => approvalChoiceLine(buf, approval.choice_index == 0, approvalChoiceLabel(approval, 0)),
         5 => approvalChoiceLine(buf, approval.choice_index == 1, approvalChoiceLabel(approval, 1)),
         6 => approvalChoiceLine(buf, approval.choice_index == 2, approvalChoiceLabel(approval, 2)),
-        7 => std.fmt.bufPrint(buf, "  {s}{s}{s}", .{ dim, approvalHint(approval, width -| 2), r }) catch interaction_state.approval_hint,
+        7 => std.mem.print(buf, "  {s}{s}{s}", .{ dim, approvalHint(approval, width -| 2), r }) catch interaction_state.approval_hint,
         else => "",
     };
 }
@@ -1764,7 +1764,7 @@ fn approvalChoiceLine(buf: []u8, selected: bool, label: []const u8) []const u8 {
     const marker: []const u8 = if (selected) "❯ " else "  ";
     const label_style = if (selected) ui_render.tag_style else "";
     const suffix_style = if (selected) ui_render.reset_style else "";
-    return std.fmt.bufPrint(buf, "  {s}{s}{s}{s}", .{ marker, label_style, label, suffix_style }) catch label;
+    return std.mem.print(buf, "  {s}{s}{s}{s}", .{ marker, label_style, label, suffix_style }) catch label;
 }
 
 fn composeApprovalHeaderRow(
@@ -1829,8 +1829,7 @@ fn approvalTitle(
                 diff_mod.max_request_projection_bytes,
             );
             defer encoded.deinit(alloc);
-            const owned = try std.fmt.allocPrint(
-                alloc,
+            const owned = try alloc.print(
                 "Subagent {s} needs permission",
                 .{encoded.bytes},
             );
@@ -1894,13 +1893,13 @@ fn approvalReasonLine(
     const dim = ui_render.dim_style;
     const r = ui_render.reset_style;
     if (explanation) |text| {
-        return std.fmt.bufPrint(buf, "  {s}{s}{s}", .{ dim, text, r }) catch "  Auto agent couldn’t approve because this request needs your review.";
+        return std.mem.print(buf, "  {s}{s}{s}", .{ dim, text, r }) catch "  Auto agent couldn’t approve because this request needs your review.";
     }
     if (approvalAnnotation(target)) |annotation| {
-        return std.fmt.bufPrint(buf, "  {s}Reason:{s} {s}", .{ dim, r, annotation }) catch "  Reason: permission required";
+        return std.mem.print(buf, "  {s}Reason:{s} {s}", .{ dim, r, annotation }) catch "  Reason: permission required";
     }
     if (dynamic_mcp) {
-        return std.fmt.bufPrint(
+        return std.mem.print(
             buf,
             "  {s}Reason:{s} This MCP tool needs approval before fx can send the request.",
             .{ dim, r },
@@ -1908,24 +1907,24 @@ fn approvalReasonLine(
     }
     if (commandLabelPrefix(label) != null) {
         if (firstUrlHost(target)) |host| {
-            return std.fmt.bufPrint(buf, "  {s}Reason:{s} This command may make a network request to {s}.", .{ dim, r, host }) catch "  Reason: shell command requires approval";
+            return std.mem.print(buf, "  {s}Reason:{s} This command may make a network request to {s}.", .{ dim, r, host }) catch "  Reason: shell command requires approval";
         }
         return "";
     }
     if (std.mem.startsWith(u8, label, "write_file ") or
         std.mem.startsWith(u8, label, "edit_file "))
     {
-        return std.fmt.bufPrint(buf, "  {s}Reason:{s} This action changes files in your workspace.", .{ dim, r }) catch "  Reason: file change requires approval";
+        return std.mem.print(buf, "  {s}Reason:{s} This action changes files in your workspace.", .{ dim, r }) catch "  Reason: file change requires approval";
     }
-    return std.fmt.bufPrint(buf, "  {s}Reason:{s} This action needs approval before fx can continue.", .{ dim, r }) catch "  Reason: permission required";
+    return std.mem.print(buf, "  {s}Reason:{s} This action needs approval before fx can continue.", .{ dim, r }) catch "  Reason: permission required";
 }
 
 fn approvalActionLine(buf: []u8, label: []const u8, target: []const u8) []const u8 {
     const clean_target = approvalActionTarget(target);
     if (commandLabelPrefix(label) != null) {
-        return std.fmt.bufPrint(buf, "  $ {s}", .{clean_target}) catch "  $";
+        return std.mem.print(buf, "  $ {s}", .{clean_target}) catch "  $";
     }
-    return std.fmt.bufPrint(buf, "  {s}", .{clean_target}) catch "  permission request";
+    return std.mem.print(buf, "  {s}", .{clean_target}) catch "  permission request";
 }
 
 fn writeApprovalActionLine(
@@ -2398,7 +2397,7 @@ test "inline command panel wraps the complete target before its controls" {
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(alloc);
     try std.testing.expect(try prompt.syncRequest(alloc, .{
-        .label = "shell.run printf 'INLINE_COMMAND_START " ++ "x" ** 55 ++ " INLINE_COMMAND_END'",
+        .label = "shell.run printf 'INLINE_COMMAND_START " ++ text_utils.repeat("x", 55) ++ " INLINE_COMMAND_END'",
     }));
 
     const request = prompt.request.?.view();
@@ -2431,7 +2430,7 @@ test "inline command panel wraps the complete target before its controls" {
 
 test "inline command panel uses full command when label is bounded" {
     const alloc = std.testing.allocator;
-    const command = "printf 'INLINE_FULL_COMMAND_START_" ++ ("x" ** 80) ++ "_INLINE_FULL_COMMAND_END'";
+    const command = "printf 'INLINE_FULL_COMMAND_START_" ++ text_utils.repeat("x", 80) ++ "_INLINE_FULL_COMMAND_END'";
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(alloc);
     try std.testing.expect(try prompt.syncRequest(alloc, .{
@@ -2533,7 +2532,7 @@ test "inline command panel wraps commands at word boundaries" {
 test "inline command panel never truncates the complete command" {
     const alloc = std.testing.allocator;
     const command = "printf 'INLINE_UNBOUNDED_COMMAND_START_" ++
-        ("x" ** (diff_mod.max_request_projection_bytes + 64)) ++
+        text_utils.repeat("x", diff_mod.max_request_projection_bytes + 64) ++
         "_INLINE_UNBOUNDED_COMMAND_END'";
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(alloc);
@@ -2699,8 +2698,8 @@ test "approval panel amendment starts with a dim placeholder and cursor" {
     );
     defer row.deinit(std.testing.allocator);
 
-    const cursor_start = std.mem.indexOf(u8, row.items, "\x1b[7ma") orelse return error.TestExpectedEqual;
-    const placeholder_remainder = std.mem.indexOf(u8, row.items, "nd tell fx what to do next") orelse return error.TestExpectedEqual;
+    const cursor_start = std.mem.find(u8, row.items, "\x1b[7ma") orelse return error.TestExpectedEqual;
+    const placeholder_remainder = std.mem.find(u8, row.items, "nd tell fx what to do next") orelse return error.TestExpectedEqual;
     try std.testing.expect(cursor_start < placeholder_remainder);
     try std.testing.expect(std.mem.find(u8, row.items, ui_render.statusline_style) != null);
 }

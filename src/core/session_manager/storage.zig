@@ -95,8 +95,8 @@ pub const Storage = struct {
     /// its parents may.
     pub fn openRoot(s: Storage, path: []const u8) Error!Dir {
         try s.alive();
-        const parent_path = std.fs.path.dirname(path) orelse ".";
-        const name = std.fs.path.basename(path);
+        const parent_path = std.Io.Dir.path.dirname(path) orelse ".";
+        const name = std.Io.Dir.path.basename(path);
         const cwd = Io.Dir.cwd();
         // Missing parents are the manager's own folders, so private too, for
         // example `~/.fx/sessions` on a machine that never ran v1 (D19).
@@ -110,13 +110,13 @@ pub const Storage = struct {
     /// Whether the sessions root exists, creating neither it nor its parents.
     pub fn rootExists(s: Storage, path: []const u8) Error!bool {
         try s.alive();
-        const parent_path = std.fs.path.dirname(path) orelse ".";
+        const parent_path = std.Io.Dir.path.dirname(path) orelse ".";
         var parent = Io.Dir.cwd().openDir(s.io, parent_path, .{}) catch |err| return switch (translate(err)) {
             error.NotFound => false,
             else => |e| e,
         };
         defer parent.close(s.io);
-        _ = s.stat(.{ .handle = parent }, std.fs.path.basename(path)) catch |err| return switch (err) {
+        _ = s.stat(.{ .handle = parent }, std.Io.Dir.path.basename(path)) catch |err| return switch (err) {
             error.NotFound => false,
             else => err,
         };
@@ -480,7 +480,7 @@ test "openRoot creates the root 0700 and refuses a symlinked root" {
     defer testing.allocator.free(base);
     // Like `~/.fx/sessions/v2` where neither parent exists yet: all three
     // folders are created private.
-    const root_path = try std.fs.path.join(testing.allocator, &.{ base, "a", "sessions", "v2" });
+    const root_path = try std.Io.Dir.path.join(testing.allocator, &.{ base, "a", "sessions", "v2" });
     defer testing.allocator.free(root_path);
     const root = try s.openRoot(root_path);
     s.closeDir(root);
@@ -495,7 +495,7 @@ test "openRoot creates the root 0700 and refuses a symlinked root" {
 
     try tmp.dir.createDir(io, "real", .default_dir);
     try tmp.dir.symLink(io, "real", "linked", .{ .is_directory = true });
-    const linked_path = try std.fs.path.join(testing.allocator, &.{ base, "linked" });
+    const linked_path = try std.Io.Dir.path.join(testing.allocator, &.{ base, "linked" });
     defer testing.allocator.free(linked_path);
     try testing.expectError(error.Refused, s.openRoot(linked_path));
 }

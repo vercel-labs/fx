@@ -3,7 +3,7 @@ import { strict as assert } from "node:assert";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent } from "../node.js";
+import { createFxEngine } from "../node.js";
 
 let requestStartedResolve;
 const requestStarted = new Promise((resolveStarted) => { requestStartedResolve = resolveStarted; });
@@ -22,7 +22,7 @@ const timeout = (label, ms = 5000) => new Promise((_, reject) => {
 });
 try {
   let aborted = false;
-  const agent = await createFxAgent({
+  const agent = await createFxEngine({
     nativeAddon: addon,
     backend: "native",
     fetch(input, init) {

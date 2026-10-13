@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const activity_status = @import("../core/output/activity_status.zig");
 const paint_plan = @import("render_engine/paint_plan.zig");
 
@@ -487,7 +488,7 @@ test "unfinished frame attempt restores captured work after preparation allocati
         .bottom = 4,
     });
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
 

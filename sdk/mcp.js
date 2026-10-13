@@ -67,6 +67,9 @@ export async function createMcpAdapter(client, options = {}) {
       name,
       description: tool.description || "MCP tool",
       inputSchema: tool.inputSchema ?? { type: "object", properties: {} },
+      // The server's hints are not trusted: a call is never run twice on its
+      // own. A host that knows a tool is safe to repeat can set this to true.
+      idempotent: false,
       async execute(input, { signal }) {
         const result = await client.callTool({ name: tool.name, arguments: input }, undefined, { signal });
         const text = resultText(result);

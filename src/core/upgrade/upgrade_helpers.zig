@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const update_target = @import("update_target.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -50,12 +51,12 @@ pub const platform = platformFromTarget() orelse
     @compileError("unsupported platform for auto-upgrade (requires macOS or Linux, x86_64 or aarch64)");
 
 fn platformFromTarget() ?[]const u8 {
-    const os: ?[]const u8 = switch (builtin.os.tag) {
+    const os: ?[]const u8 = switch (builtin.target.os.tag) {
         .macos => "macos",
         .linux => "linux",
         else => null,
     };
-    const arch: ?[]const u8 = switch (builtin.cpu.arch) {
+    const arch: ?[]const u8 = switch (builtin.target.cpu.arch) {
         .x86_64 => "x86_64",
         .aarch64 => "aarch64",
         else => null,
@@ -78,7 +79,7 @@ pub fn fetchTarget(alloc: Allocator, channel: Channel, base_url: []const u8, con
         .dev => blk: {
             var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
             defer client.deinit();
-            const url = try std.fmt.allocPrint(alloc, "{s}/dev.json", .{base_url});
+            const url = try alloc.print("{s}/dev.json", .{base_url});
             defer alloc.free(url);
             const manifest = try fetchTextBounded(
                 &client,
@@ -96,7 +97,7 @@ pub fn fetchTarget(alloc: Allocator, channel: Channel, base_url: []const u8, con
 fn fetchLatestVersion(alloc: Allocator, base_url: []const u8, control: TransferControl) ![]u8 {
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
-    const url = try std.fmt.allocPrint(alloc, "{s}/latest.txt", .{base_url});
+    const url = try alloc.print("{s}/latest.txt", .{base_url});
     defer alloc.free(url);
 
     const raw = try fetchTextBounded(
@@ -175,7 +176,7 @@ fn clearConnection(control: TransferControl) void {
 }
 
 test "transfer interrupt wakes a blocked socket read" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const zio = io_mod.getIo();
     const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var server = try addr.listen(zio, .{});
@@ -393,7 +394,7 @@ pub fn currentExecutablePath(out: []u8) ExecutablePathError![]const u8 {
     };
     const path = out[0..n];
     const linux_deleted_suffix = " (deleted)";
-    if (builtin.os.tag == .linux and std.mem.endsWith(u8, path, linux_deleted_suffix)) {
+    if (builtin.target.os.tag == .linux and std.mem.endsWith(u8, path, linux_deleted_suffix)) {
         return path[0 .. path.len - linux_deleted_suffix.len];
     }
     return path;
@@ -459,10 +460,10 @@ test "extractChecksumHex parses sha256sum format" {
 }
 
 test "extractChecksumHex parses raw hex" {
-    const raw = "a" ** 64 ++ "\n";
+    const raw = text_utils.repeat("a", 64) ++ "\n";
     const hex = extractChecksumHex(raw).?;
     try std.testing.expectEqual(@as(usize, 64), hex.len);
-    try std.testing.expectEqualStrings("a" ** 64, hex);
+    try std.testing.expectEqualStrings(text_utils.repeat("a", 64), hex);
 }
 
 test "extractChecksumHex rejects short raw checksum" {
@@ -470,9 +471,9 @@ test "extractChecksumHex rejects short raw checksum" {
 }
 
 test "bytesToHex renders lowercase sha256 digest" {
-    const bytes = [_]u8{0x0f} ** 32;
+    const bytes: [32]u8 = @splat(0x0f);
     const hex = bytesToHex(&bytes);
-    try std.testing.expectEqualStrings("0f" ** 32, &hex);
+    try std.testing.expectEqualStrings(text_utils.repeat("0f", 32), &hex);
 }
 
 test "replaceBinary moves replacement over target path" {
@@ -484,9 +485,9 @@ test "replaceBinary moves replacement over target path" {
     try writeTempFile(tmp.dir, "fx-new", "new");
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const new_path = try std.fs.path.join(alloc, &.{ root, "fx-new" });
+    const new_path = try std.Io.Dir.path.join(alloc, &.{ root, "fx-new" });
     defer alloc.free(new_path);
-    const target_path = try std.fs.path.join(alloc, &.{ root, "fx-old" });
+    const target_path = try std.Io.Dir.path.join(alloc, &.{ root, "fx-old" });
     defer alloc.free(target_path);
 
     try replaceBinary(new_path, target_path);

@@ -80,7 +80,7 @@ pub fn formatUtcDate(buf: *[24]u8, timestamp_ms: i64) []const u8 {
         12 => "Dec",
         else => return "Unknown",
     };
-    return std.fmt.bufPrint(
+    return std.mem.print(
         buf,
         "{s} {d}, {d}",
         .{ month, month_day.day_index + 1, year_day.year },

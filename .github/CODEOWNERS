@@ -1,0 +1,6 @@
+# Review changes to the README, the contributor guide, and the libfx npm
+# README. Feature docs belong in --help and fx.sh/docs; see Documentation
+# in AGENTS.md.
+/README.md @fazxes
+/CONTRIBUTING.md @fazxes
+/sdk/README.md @fazxes

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const client = @import("client.zig");
 const generation_usage_provider = @import("../core/session/generation_usage_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
@@ -44,7 +45,7 @@ fn lookup(
         debug_trace.logf(
             "gateway",
             "generation usage lookup status={d} outcome={s}",
-            .{ @intFromEnum(response.status), @tagName(outcome) },
+            .{ @backingInt(response.status), @tagName(outcome) },
         );
         return outcome;
     }
@@ -56,7 +57,7 @@ fn lookup(
 }
 
 fn classifyStatus(status: std.http.Status) generation_usage_provider.LookupOutcome {
-    const code = @intFromEnum(status);
+    const code = @backingInt(status);
     if (code == 404 or code == 408 or code == 425 or code == 429 or code >= 500) {
         return .retry;
     }
@@ -318,7 +319,7 @@ test "generation response allocation failure remains a terminal rejection" {
         \\"native_tokens_cache_creation":10,"billable_web_search_calls":2}}
     ;
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
 

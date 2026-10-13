@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent, supportsJspi } from "../node.js";
+import { createFxEngine, supportsJspi } from "../node.js";
 
 const backend = process.argv[2] || "native";
 if (!new Set(["native", "wasm"]).has(backend)) throw new Error("usage: test-agent-provider-tools.mjs [native|wasm]");
@@ -79,7 +79,7 @@ const options = (checkpoint) => ({
 
 let agent;
 try {
-  agent = await createFxAgent(options());
+  agent = await createFxEngine(options());
   const turn = agent.prompt("search the web");
   const events = [];
   for await (const event of turn) events.push(event);
@@ -93,7 +93,7 @@ try {
 
   const checkpoint = await agent.checkpoint();
   await agent.close();
-  agent = await createFxAgent(options(checkpoint));
+  agent = await createFxEngine(options(checkpoint));
   const restored = agent.prompt("use the saved search");
   let restoredText = "";
   for await (const event of restored) if (event.type === "text_delta") restoredText += event.delta;

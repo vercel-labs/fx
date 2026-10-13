@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const contracts = @import("contracts.zig");
 
 const Allocator = std.mem.Allocator;
@@ -240,7 +241,7 @@ fn checkUpsertAllocationFailures(alloc: Allocator) !void {
 
 test "upsert releases owned row fields on every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkUpsertAllocationFailures,
         .{},
     );

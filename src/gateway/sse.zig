@@ -1,4 +1,6 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
+const text_utils = @import("../core/shared/text_utils.zig");
 
 const Error = error{ OutOfMemory, ReadFailed, Cancelled, EventTooLarge, StreamTooLarge };
 
@@ -65,7 +67,7 @@ pub const Reader = struct {
                     if (value.len > self.max_event_bytes - self.data.items.len) return error.EventTooLarge;
                     if (!saw_data and self.line.items.len > 0) {
                         // Reuse owned split-line storage instead of retaining a second large payload.
-                        std.mem.copyForwards(u8, self.line.items[0..value.len], value);
+                        @memmove(self.line.items[0..value.len], value);
                         self.line.items.len = value.len;
                         std.mem.swap(std.ArrayList(u8), &self.line, &self.data);
                     } else try self.data.appendSlice(alloc, value);
@@ -264,12 +266,12 @@ fn check_allocations(alloc: std.mem.Allocator) !void {
 }
 
 test "provider framing releases allocations on failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_allocations, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_allocations, .{});
 }
 
 test "provider framing reuses split-line storage for large events" {
-    const alloc = std.testing.allocator;
-    const text = "x" ** (64 * 1024);
+    const alloc = testing_allocator.no_resize;
+    const text = text_utils.repeat("x", 64 * 1024);
     var fixed = std.Io.Reader.fixed("data: " ++ text ++ "\n\n");
     var buffer: [128]u8 = undefined;
     var source = fixed.limited(.unlimited, &buffer);

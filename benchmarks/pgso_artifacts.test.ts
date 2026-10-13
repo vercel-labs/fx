@@ -348,7 +348,7 @@ function provenanceFixture(): [Provenance, Provenance] {
       head_sha: sha, head_branch: branch, event, repository: { id: 1, full_name: "vercel-labs/fx" }, head_repository: { id: 1, full_name: "vercel-labs/fx" } },
     source: { sha: source, parents: source === merge ? [{ sha: base }, { sha: head }] : [] },
     manifest: { stage: "complete", status: "passed", eligible: true, evidence: {
-      identity: { source_sha: source, target: "aarch64-macos", host_arch: "arm64", zig_version: "0.16.0", llvm_version: "21.1.8" },
+      identity: { source_sha: source, target: "aarch64-macos", host_arch: "arm64", zig_version: "0.17.0", llvm_version: "22.1.8" },
       profile: { sha256: "d".repeat(64) },
       artifacts: { candidate: { sha256: "e".repeat(64), size: { size_bytes: 6_000_000 }, architecture: "arm64", signature_valid: true, version: "0.0.9", minimum_macos: "13.0" } },
     } },

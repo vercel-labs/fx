@@ -23,7 +23,7 @@ pub const Event = struct {
     kind: Kind = .source_rewrite,
     detail_len: u16 = 0,
     truncated: bool = false,
-    detail_buf: [max_detail_bytes]u8 = [_]u8{0} ** max_detail_bytes,
+    detail_buf: [max_detail_bytes]u8 = @splat(0),
 
     pub fn detail(self: *const Event) []const u8 {
         return self.detail_buf[0..self.detail_len];
@@ -106,7 +106,7 @@ test "render diagnostics are bounded and reset without enabling file tracing" {
     reset();
     defer reset();
     record(.source_rewrite, "view={d} history={d}", .{ 20, 17 });
-    const oversized = [_]u8{'x'} ** (max_detail_bytes + 10);
+    const oversized: [max_detail_bytes + 10]u8 = @splat('x');
     record(.transition, "{s}", .{oversized});
     var events: [2]Event = undefined;
     try std.testing.expectEqual(@as(usize, 2), snapshot(&events));

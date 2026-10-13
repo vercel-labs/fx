@@ -36,5 +36,5 @@ pub const Carrier = struct {
 /// Placeholder endpoint for host-channel servers. It is never dialed; its
 /// scheme fails endpoint validation if any HTTP path ever receives it.
 pub fn placeholderUrl(alloc: Allocator, server_id: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, "acp:{s}", .{server_id});
+    return alloc.print("acp:{s}", .{server_id});
 }

@@ -881,7 +881,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
   },
   {
     id: "broad-web-research-web-search",
-    userPrompt: "Research current Zig 0.16 HTTP client behavior on the web.",
+    userPrompt: "Research current Zig 0.17 HTTP client behavior on the web.",
     failureCategory: "provider-search misuse",
     expectedFirstTool: {
       category: "broad web research",

@@ -234,7 +234,7 @@ pub fn deleteRange(
     const clamped_end = @min(@max(end, clamped_start), buffer.items.len);
     if (clamped_start == clamped_end) return false;
     const count = clamped_end - clamped_start;
-    std.mem.copyForwards(u8, buffer.items[clamped_start..], buffer.items[clamped_end..]);
+    @memmove(buffer.items[clamped_start .. buffer.items.len - count], buffer.items[clamped_end..]);
     buffer.items.len -= count;
     if (cursor.* >= clamped_end) {
         cursor.* -= count;

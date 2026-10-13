@@ -1,4 +1,5 @@
 const std = @import("std");
+const display_width = @import("../shared/display_width.zig");
 
 pub const Owner = enum {
     composer,
@@ -127,7 +128,7 @@ pub fn advance(state: State, owner: Owner, byte: u8) Transition {
     next.len += 1;
     if (next.len < next.expected_len) return .{ .next = next, .step = .{} };
 
-    _ = std.unicode.utf8Decode(next.bytes[0..next.len]) catch {
+    _ = display_width.decodeUtf8Sequence(next.bytes[0..next.len]) catch {
         return .{
             .next = .{},
             .step = .{ .dropped = .{

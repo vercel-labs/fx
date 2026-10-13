@@ -10,13 +10,13 @@ pub fn profileFile(
     max_bytes: usize,
 ) host.SecretStorePresence {
     if (comptime host_target.is_wasm) return .missing;
-    return profileFileFromHome(io_mod.getenv("HOME"), file_name, max_bytes);
+    return profileFileFromHome(io_mod.homeDir(), file_name, max_bytes);
 }
 
 /// Returns whether the credential file exists after checking both write targets.
 pub fn requireWritableProfileFile(file_name: []const u8, lock_name: []const u8) error{CredentialStorageUnavailable}!bool {
     if (comptime host_target.is_wasm) return false;
-    const home = io_mod.getenv("HOME") orelse return error.CredentialStorageUnavailable;
+    const home = io_mod.homeDir() orelse return error.CredentialStorageUnavailable;
     var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch return error.CredentialStorageUnavailable;
     defer home_dir.close(io_mod.getIo());
     var profile_dir = home_dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{

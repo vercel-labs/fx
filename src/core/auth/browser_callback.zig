@@ -261,7 +261,7 @@ fn readRequest(
     const origin = requestHeaderValue(request_bytes[line_end + 2 .. request_len], "origin");
     if (form_origin) |required_origin| {
         var host_buf: [32]u8 = undefined;
-        const expected_host = try std.fmt.bufPrint(&host_buf, "127.0.0.1:{d}", .{port});
+        const expected_host = try std.mem.print(&host_buf, "127.0.0.1:{d}", .{port});
         const headers = request_bytes[line_end + 2 .. request_len];
         const content_type = unique_header(headers, "content-type") orelse return error.InvalidOAuthCallbackRequest;
         const host_header = unique_header(headers, "host") orelse return error.InvalidOAuthCallbackRequest;

@@ -19,7 +19,7 @@ if [[ -n "$reaching_in" ]]; then
   exit 1
 fi
 
-allowed='^\.\./(shared/(types|debug_trace|token_estimate|text_utils|io|history_range)|config/(model_capabilities|model_provider))\.zig$'
+allowed='^\.\./(shared/(types|debug_trace|token_estimate|text_utils|io|history_range|testing_allocator)|config/(model_capabilities|model_provider))\.zig$'
 reaching_out=""
 while IFS= read -r line; do
   target="${line#*@import(\"}"

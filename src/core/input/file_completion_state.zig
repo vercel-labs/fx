@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_index = @import("../workspace/file_index.zig");
 const file_picker_path = @import("file_picker_path.zig");
 const list_window = @import("../shared/list_window.zig");
@@ -103,18 +104,20 @@ pub const State = struct {
     presented: ?Snapshot = null,
 
     pub fn initInto(self: *State) void {
-        inline for (std.meta.fields(State)) |field| {
-            if (comptime std.mem.eql(u8, field.name, "raw_query") or
-                std.mem.eql(u8, field.name, "lookup_query")) continue;
-            @field(self.*, field.name) = field.defaultValue().?;
+        const state_info = @typeInfo(State).@"struct";
+        inline for (state_info.field_names, state_info.field_types, state_info.field_attrs) |field_name, field_type, field_attrs| {
+            if (comptime std.mem.eql(u8, field_name, "raw_query") or
+                std.mem.eql(u8, field_name, "lookup_query")) continue;
+            @field(self.*, field_name) = field_attrs.defaultValue(field_type).?;
         }
     }
 
     pub fn deinit(self: *State, alloc: std.mem.Allocator) void {
         if (self.prepared) |*value| value.deinit(alloc);
         if (self.presented) |*value| value.deinit(alloc);
-        inline for (std.meta.fields(State)) |field| {
-            @field(self.*, field.name) = field.defaultValue().?;
+        const state_info = @typeInfo(State).@"struct";
+        inline for (state_info.field_names, state_info.field_types, state_info.field_attrs) |field_name, field_type, field_attrs| {
+            @field(self.*, field_name) = field_attrs.defaultValue(field_type).?;
         }
     }
 
@@ -298,9 +301,10 @@ test "file completion deinit restores every defined field for reuse" {
     state.refresh_requested = true;
     state.selection_missing = true;
     state.deinit(std.testing.allocator);
-    inline for (std.meta.fields(State)) |field| {
-        if (comptime std.mem.eql(u8, field.name, "raw_query") or std.mem.eql(u8, field.name, "lookup_query")) continue;
-        try std.testing.expectEqualDeep(field.defaultValue().?, @field(state, field.name));
+    const state_info = @typeInfo(State).@"struct";
+    inline for (state_info.field_names, state_info.field_types, state_info.field_attrs) |field_name, field_type, field_attrs| {
+        if (comptime std.mem.eql(u8, field_name, "raw_query") or std.mem.eql(u8, field_name, "lookup_query")) continue;
+        try std.testing.expectEqualDeep(field_attrs.defaultValue(field_type).?, @field(state, field_name));
     }
     state.deinit(std.testing.allocator);
 }
@@ -343,7 +347,7 @@ fn checkRowsAllocationFailures(alloc: std.mem.Allocator) !void {
 }
 
 test "file picker owned rows clean partial allocations" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkRowsAllocationFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkRowsAllocationFailures, .{});
 }
 
 test "file picker missing selection requires navigation and retry never acknowledges" {

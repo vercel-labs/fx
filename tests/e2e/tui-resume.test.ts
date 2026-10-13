@@ -4290,12 +4290,17 @@ test.skipIf(!tmuxAvailable())(
       );
       expect(pageUpViewport).not.toEqual(tailViewport);
 
+      // Two more pages reach the earlier command's retained output, which the
+      // compact view never shows. Match any retained row rather than one
+      // offset: Ctrl-O wraps long command headings, so a page's landing row
+      // depends on their length.
+      const retainedSetupRow = /CTRL_O_PRESSURE_SETUP_OUTPUT_0(?:[1-6]\d)/;
       await active.sendHexBytes(["1b", "5b", "35", "7e"]);
       await active.sendHexBytes(["1b", "5b", "35", "7e"]);
       const priorCommandViewport = await active.waitForPane(
         (pane) =>
           pane !== pageUpViewport &&
-          pane.includes("CTRL_O_PRESSURE_SETUP_OUTPUT_055"),
+          retainedSetupRow.test(pane),
         TIMEOUT,
       );
       expect(priorCommandViewport).not.toEqual(pageUpViewport);

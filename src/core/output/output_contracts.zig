@@ -6,6 +6,7 @@ const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_health = @import("../mcp/health.zig");
+const mode_contract = @import("../modes/mode_contract.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_codec = @import("../session/session_codec.zig");
@@ -485,12 +486,20 @@ pub const StatusSnapshot = struct {
     mcp_config_error: ?[]const u8 = null,
     mcp_config_warning: ?mcp_contract.ProfileConfigWarning = null,
     permission_mode: types.PermissionMode,
+    /// The session modes ACP offers and the one a new session starts in,
+    /// when the caller has a mode registry with modes.
+    modes: ?SessionModes = null,
     workspace_root: []const u8,
     history_turns: usize,
     session_permission_grants: usize,
     agent_step_limit: usize,
     /// Requested Ultra mode. The serving provider may still fall back.
     ultrafast_requested: bool = false,
+
+    pub const SessionModes = struct {
+        current: []const u8,
+        all: []const mode_contract.ModeSpec,
+    };
 
     pub fn render(self: StatusSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
         return switch (format) {
@@ -685,6 +694,22 @@ pub const StatusSnapshot = struct {
         }
         try writer.writeAll(",\"permission_mode\":");
         try std.json.Stringify.value(permissionModeLabel(self.permission_mode), .{}, writer);
+        if (self.modes) |modes| {
+            try writer.writeAll(",\"mode\":");
+            try std.json.Stringify.value(modes.current, .{}, writer);
+            try writer.writeAll(",\"modes\":[");
+            for (modes.all, 0..) |mode, index| {
+                if (index > 0) try writer.writeByte(',');
+                try writer.writeAll("{\"id\":");
+                try std.json.Stringify.value(mode.id, .{}, writer);
+                try writer.writeAll(",\"name\":");
+                try std.json.Stringify.value(mode.name, .{}, writer);
+                try writer.writeAll(",\"description\":");
+                try std.json.Stringify.value(mode.description, .{}, writer);
+                try writer.writeByte('}');
+            }
+            try writer.writeByte(']');
+        }
         try writer.writeAll(",\"workspace\":");
         try std.json.Stringify.value(self.workspace_root, .{}, writer);
         try writer.print(",\"history_turns\":{d}", .{self.history_turns});
@@ -862,9 +887,9 @@ pub const ModelListSnapshot = struct {
         if (self.ids.len == 0) {
             const provider_name = self.emptyCatalogProviderName();
             if (self.catalogExplanation()) |explanation| {
-                return std.fmt.allocPrint(alloc, "[models] no models returned by {s}\n[models] {s}\n", .{ provider_name, explanation });
+                return alloc.print("[models] no models returned by {s}\n[models] {s}\n", .{ provider_name, explanation });
             }
-            return std.fmt.allocPrint(alloc, "[models] no models returned by {s}\n", .{provider_name});
+            return alloc.print("[models] no models returned by {s}\n", .{provider_name});
         }
 
         var out: std.Io.Writer.Allocating = .init(alloc);
@@ -892,9 +917,9 @@ pub const ModelListSnapshot = struct {
         if (self.ids.len == 0) {
             const provider_name = self.emptyCatalogProviderName();
             if (self.catalogExplanation()) |explanation| {
-                return std.fmt.allocPrint(alloc, "no models returned by {s}\n{s}", .{ provider_name, explanation });
+                return alloc.print("no models returned by {s}\n{s}", .{ provider_name, explanation });
             }
-            return std.fmt.allocPrint(alloc, "no models returned by {s}", .{provider_name});
+            return alloc.print("no models returned by {s}", .{provider_name});
         }
 
         var out: std.Io.Writer.Allocating = .init(alloc);
@@ -1004,7 +1029,7 @@ pub const SessionListSnapshot = struct {
 
     pub fn renderText(self: SessionListSnapshot, alloc: Allocator) ![]u8 {
         if (self.sessions.len == 0 and self.skipped_invalid == 0) {
-            return std.fmt.allocPrint(alloc, "[sessions] no saved sessions\n", .{});
+            return alloc.print("[sessions] no saved sessions\n", .{});
         }
 
         var out: std.Io.Writer.Allocating = .init(alloc);
@@ -1143,7 +1168,7 @@ fn writeUtcTimestamp(writer: *std.Io.Writer, timestamp_ms: i64) !void {
 
     try writer.print("{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>3} UTC", .{
         year_day.year,
-        @intFromEnum(month_day.month),
+        @backingInt(month_day.month),
         month_day.day_index + 1,
         day.getHoursIntoDay(),
         day.getMinutesIntoHour(),
@@ -1163,8 +1188,7 @@ pub const SessionSummarySnapshot = struct {
     }
 
     pub fn renderText(self: SessionSummarySnapshot, alloc: Allocator) ![]u8 {
-        return std.fmt.allocPrint(
-            alloc,
+        return alloc.print(
             "[session] {s}\ncreated_at_ms: {d}\nupdated_at_ms: {d}\nlanguage: {s}\nhistory_len: {d}\n",
             .{
                 self.summary.id,
@@ -1353,8 +1377,7 @@ pub const SessionRecoverySnapshot = struct {
     ) ![]u8 {
         const usage_warning = if (self.result.usage_incomplete) "warning: historical usage is incomplete because the source accounting data is corrupt\n" else "";
         if (self.result.status == .indeterminate) {
-            return std.fmt.allocPrint(
-                alloc,
+            return alloc.print(
                 "[session recovery] could not confirm target {s}\nsource: {s} (unchanged)\n{s}resolve: fx --resume {s}\ninspect: fx doctor\n",
                 .{
                     self.result.recovered_session_id,
@@ -1365,8 +1388,7 @@ pub const SessionRecoverySnapshot = struct {
             );
         }
         if (self.result.status == .recovered_with_unverified_artifacts) {
-            return std.fmt.allocPrint(
-                alloc,
+            return alloc.print(
                 "[session recovery] copied {s} to {s}\nhistory_turns: {d}\nwarning: legacy command artifacts could not be authenticated\n{s}resume: fx --resume {s}\n",
                 .{
                     self.result.source_session_id,
@@ -1377,8 +1399,7 @@ pub const SessionRecoverySnapshot = struct {
                 },
             );
         }
-        return std.fmt.allocPrint(
-            alloc,
+        return alloc.print(
             "[session recovery] copied {s} to {s}\nhistory_turns: {d}\n{s}resume: fx --resume {s}\n",
             .{
                 self.result.source_session_id,
@@ -1777,8 +1798,8 @@ fn displayGrantTarget(alloc: Allocator, workspace_root: []const u8, grant: types
         return alloc.dupe(u8, grant.target_path);
     }
 
-    if (std.fs.path.isAbsolute(grant.target_path)) {
-        return std.fs.path.relative(alloc, "/", null, workspace_root, grant.target_path) catch alloc.dupe(u8, grant.target_path);
+    if (std.Io.Dir.path.isAbsolute(grant.target_path)) {
+        return std.Io.Dir.path.relativeAlloc(alloc, "/", null, workspace_root, grant.target_path) catch alloc.dupe(u8, grant.target_path);
     }
 
     return alloc.dupe(u8, grant.target_path);
@@ -2137,6 +2158,38 @@ test "status reports the effort a new session starts with after the model" {
     const plain = try unresolved.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(plain);
     try std.testing.expect(std.mem.find(u8, plain, "effort") == null);
+}
+
+test "status JSON lists the session modes after the permission mode" {
+    const modes = [_]mode_contract.ModeSpec{
+        .{ .id = "careful", .name = "Careful", .description = "Asks first", .permission_mode = .ask },
+        .{ .id = "open", .name = "Open", .permission_mode = .yolo },
+    };
+    var snapshot = StatusSnapshot{
+        .model = "provider/model",
+        .permission_mode = .yolo,
+        .modes = .{ .current = "open", .all = modes[0..] },
+        .workspace_root = "/tmp/fx",
+        .history_turns = 0,
+        .session_permission_grants = 0,
+        .agent_step_limit = 24,
+    };
+    const json = try snapshot.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.find(
+        u8,
+        json,
+        "\"permission_mode\":\"yolo\",\"mode\":\"open\",\"modes\":[{\"id\":\"careful\",\"name\":\"Careful\",\"description\":\"Asks first\"},{\"id\":\"open\",\"name\":\"Open\",\"description\":\"\"}],\"workspace\":",
+    ) != null);
+
+    const text = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "careful") == null);
+
+    snapshot.modes = null;
+    const plain = try snapshot.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expect(std.mem.find(u8, plain, "\"modes\"") == null);
 }
 
 test "MCP config diagnostic renders in status text and JSON but not interactive body" {
@@ -2504,7 +2557,7 @@ test "core session list snapshot text and json stay stable" {
         script_text,
     );
 
-    const long_title = "a" ** session_display_metadata.max_title_bytes;
+    const long_title = text_utils.repeat("a", session_display_metadata.max_title_bytes);
     var long_session = sessions[0];
     long_session.title = @constCast(long_title);
     const long_text = try (SessionListSnapshot{ .sessions = @as(*const [1]session_store.SessionSummary, &long_session) }).renderText(std.testing.allocator);

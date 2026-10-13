@@ -524,7 +524,7 @@ pub const Client = struct {
             }
             const chunk = reader.buffered();
             if (chunk.len == 0) continue;
-            const chunk_len = if (std.mem.indexOfAny(u8, chunk, "\r\n")) |index|
+            const chunk_len = if (std.mem.findAny(u8, chunk, "\r\n")) |index|
                 index + 1
             else
                 chunk.len;
@@ -825,7 +825,7 @@ fn effectivePort(uri: std.Uri) ?u16 {
 }
 
 fn isEventStream(content_type: []const u8) bool {
-    const separator = std.mem.indexOfScalar(u8, content_type, ';') orelse
+    const separator = std.mem.findScalar(u8, content_type, ';') orelse
         content_type.len;
     return std.ascii.eqlIgnoreCase(
         std.mem.trim(u8, content_type[0..separator], " \t"),

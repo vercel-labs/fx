@@ -181,7 +181,7 @@ try {
     expect(modelChunks.filter((chunk) => chunk.trim()).length >= 2, "browser stream was buffered");
     expect(result.fetchCalls === 1, `expected one prompt fetch, got ${result.fetchCalls}`);
     expect(result.model === "sdk/chrome-model", `unexpected model ${result.model}`);
-    expect(JSON.stringify(result.api) === JSON.stringify(["checkpoint", "close", "prompt"]), `unexpected public API ${JSON.stringify(result.api)}`);
+    expect(JSON.stringify(result.api) === JSON.stringify(["checkpoint", "close", "followUp", "prompt", "resume", "sessionId"]), `unexpected public API ${JSON.stringify(result.api)}`);
   });
   await runCase("Blob prompt", "transport=mock&autorun=describe&model=sdk%2Fchrome-model&blob-prompt=1", (result) => {
     expect(result.stopReason === "end_turn", `unexpected stop reason ${result.stopReason}`);
@@ -196,7 +196,7 @@ try {
   await runCase("stalled cancellation", "transport=stall&autorun=wait&cancel-after=50", (result) => {
     expect(result.stopReason === "cancelled", `unexpected stop reason ${result.stopReason}`);
     expect(result.fetchAborted, "browser fetch did not receive abort");
-    expect(JSON.stringify(result.api) === JSON.stringify(["checkpoint", "close", "prompt"]), `unexpected public API ${JSON.stringify(result.api)}`);
+    expect(JSON.stringify(result.api) === JSON.stringify(["checkpoint", "close", "followUp", "prompt", "resume", "sessionId"]), `unexpected public API ${JSON.stringify(result.api)}`);
   });
   await runCase("host tool and skill", "transport=mock&autorun=use%20the%20tool&host-tool=1&host-skill=1&model=sdk%2Fchrome-model", (result) => {
     expect(result.stopReason === "end_turn", `unexpected stop reason ${result.stopReason}`);
@@ -225,7 +225,7 @@ try {
         returnByValue: true,
         expression: `(async () => {
           const expect = ${expect.toString()};
-          const { createFxAgent } = await import('/sdk/browser.js');
+          const { createFxEngine } = await import('/sdk/browser.js');
           const response = await fetch('/zig-out/bin/fx-core.wasm', { cache: 'no-store' });
           expect(response.ok, 'local core WASM fetch failed: ' + response.status);
           const wasm = await response.arrayBuffer();
@@ -267,7 +267,7 @@ try {
             };
             try {
               try {
-                agent = await createFxAgent({ wasm, apiKey: 'browser-ultrafast-test-key',
+                agent = await createFxEngine({ wasm, apiKey: 'browser-ultrafast-test-key',
                   model: { id: scenario.model, ultrafast: scenario.ultrafast }, fetch: fakeFetch });
               } catch (error) {
                 if (!scenario.reject) throw error;

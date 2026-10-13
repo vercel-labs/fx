@@ -3,6 +3,7 @@ const stream_provider = @import("../agent/stream_provider.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_set = @import("tool_set.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -87,6 +88,20 @@ pub const Runtime = struct {
 
             const description_value = entry.object.get("description") orelse return error.InvalidHostTool;
             const schema_value = entry.object.get("inputSchema") orelse return error.InvalidHostTool;
+            // A tool whose calls are safe to run twice says so. Its calls may
+            // run again after a crash, and only its calls run beside others
+            // unless it declares otherwise.
+            const idempotent = if (entry.object.get("idempotent")) |value_| switch (value_) {
+                .bool => |declared| declared,
+                else => return error.InvalidHostTool,
+            } else false;
+            // A tool that writes is a fence: earlier calls finish before it
+            // starts, and later calls wait for it. A tool that does not say
+            // writes unless it is idempotent.
+            const writes = if (entry.object.get("writes")) |value_| switch (value_) {
+                .bool => |declared| declared,
+                else => return error.InvalidHostTool,
+            } else !idempotent;
             if (description_value != .string or schema_value != .object) return error.InvalidHostTool;
             if (description_value.string.len > max_description_bytes) {
                 return error.HostToolDescriptionTooLarge;
@@ -121,6 +136,8 @@ pub const Runtime = struct {
                 .description = "",
                 .model_schema = .{ .name = name, .description = "" },
                 .model_visible = false,
+                .host_concurrent = !writes,
+                .host_idempotent = idempotent,
                 .executor_kind = .host,
                 .activity_kind = .command,
                 .action_label = "Running",
@@ -217,6 +234,7 @@ fn call(
     return provider.call(
         ctx.allocator,
         ctx.tool_call_name,
+        ctx.tool_call_id,
         input.as(RawInput).json,
         ctx.max_tool_result_bytes,
         ctx.cancel_flag,
@@ -312,7 +330,7 @@ test "host tool runtime rejects unknown provider tools" {
 
 test "host tool runtime preserves long MCP descriptions" {
     const alloc = std.testing.allocator;
-    const description = "Tool parameter guidance. " ** 100;
+    const description = text_utils.repeat("Tool parameter guidance. ", 100);
     const parsed = try std.json.parseFromSlice(
         std.json.Value,
         alloc,
@@ -331,7 +349,7 @@ test "host tool runtime bounds descriptions at 64 KiB" {
     defer alloc.free(description);
     @memset(description, 'a');
     for ([_]usize{ 64 * 1024, 64 * 1024 + 1 }) |length| {
-        const json = try std.fmt.allocPrint(alloc, "[{{\"name\":\"lookup\",\"description\":\"{s}\",\"inputSchema\":{{}}}}]", .{description[0..length]});
+        const json = try alloc.print("[{{\"name\":\"lookup\",\"description\":\"{s}\",\"inputSchema\":{{}}}}]", .{description[0..length]});
         defer alloc.free(json);
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
         defer parsed.deinit();
@@ -342,6 +360,33 @@ test "host tool runtime bounds descriptions at 64 KiB" {
         } else {
             try std.testing.expectError(error.HostToolDescriptionTooLarge, Runtime.init(alloc, parsed.value));
         }
+    }
+}
+
+test "host tools write unless they are idempotent or say they do not" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\[{"name":"lookup","description":"Look up","inputSchema":{},"idempotent":true},
+        \\ {"name":"save","description":"Save","inputSchema":{},"idempotent":true,"writes":true},
+        \\ {"name":"send","description":"Send","inputSchema":{}},
+        \\ {"name":"read","description":"Read","inputSchema":{},"writes":false}]
+    , .{});
+    defer parsed.deinit();
+    var runtime = try Runtime.init(std.testing.allocator, parsed.value);
+    defer runtime.deinit();
+    try std.testing.expect(runtime.tools[0].host_concurrent and runtime.tools[0].host_idempotent);
+    try std.testing.expect(!runtime.tools[1].host_concurrent and runtime.tools[1].host_idempotent);
+    try std.testing.expect(!runtime.tools[2].host_concurrent and !runtime.tools[2].host_idempotent);
+    try std.testing.expect(runtime.tools[3].host_concurrent and !runtime.tools[3].host_idempotent);
+
+    for ([_][]const u8{
+        \\[{"name":"write","description":"Write","inputSchema":{},"writes":"yes"}]
+        ,
+        \\[{"name":"lookup","description":"Look up","inputSchema":{},"idempotent":"yes"}]
+        ,
+    }) |json| {
+        const invalid = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+        defer invalid.deinit();
+        try std.testing.expectError(error.InvalidHostTool, Runtime.init(std.testing.allocator, invalid.value));
     }
 }
 
@@ -357,7 +402,7 @@ test "host tool runtime rejects duplicate and invalid names" {
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
         defer parsed.deinit();
         try std.testing.expectError(
-            if (std.mem.indexOf(u8, json, "bad name") != null)
+            if (std.mem.find(u8, json, "bad name") != null)
                 error.InvalidHostToolName
             else
                 error.DuplicateHostToolName,

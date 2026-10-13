@@ -23,8 +23,8 @@ try {
   const worker = new Worker(`
     const { parentPort, workerData } = require("node:worker_threads");
     (async () => {
-      const { createFxAgent } = await import(workerData.nodeModuleUrl);
-      const agent = await createFxAgent({
+      const { createFxEngine } = await import(workerData.nodeModuleUrl);
+      const agent = await createFxEngine({
         nativeAddon: workerData.addonPath,
         backend: "native",
         fetch(input, init) {

@@ -56,7 +56,7 @@
     <button type="button" id="cancel" disabled>Cancel</button>
   </form>
   <script type="module">
-    import { createFxAgent, supportsJspi } from "./browser.js";
+    import { createFxEngine, supportsJspi } from "./browser.js";
     import { createSkillsAdapter } from "./skills.js";
 
     const configPrefix = "fx.core.config.";
@@ -332,7 +332,7 @@
           name: "browser-skill",
           instructions: "BROWSER_SKILL_SENTINEL",
         }]) : { instructions: "", tools: [] };
-        agent = await createFxAgent({
+        agent = await createFxEngine({
           wasm: location.hostname === "localhost" || location.hostname === "127.0.0.1"
             ? "../zig-out/bin/fx-core.wasm"
             : "./fx-core.wasm",

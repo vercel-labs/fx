@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { createFxAgent, getBackendInfo } from "libfx";
+import { createFxEngine, getBackendInfo } from "libfx";
 import { createMcpAdapter } from "libfx/mcp";
 
 export const runtime = "nodejs";
@@ -102,7 +102,7 @@ export async function GET(request) {
         ]);
       } } : {}),
     };
-    agent = await createFxAgent(options);
+    agent = await createFxEngine(options);
     if (scenario === "startup") {
       return Response.json({ ok: true, probe, checkpointBytes: (await agent.checkpoint()).length });
     }
@@ -125,7 +125,7 @@ export async function GET(request) {
     await agent.close();
     agent = null;
     if (scenario === "resume") {
-      agent = await createFxAgent({ ...options, checkpoint });
+      agent = await createFxEngine({ ...options, checkpoint });
       const resumed = agent.prompt("Repeat the value you looked up without calling another tool.", { signal: controller.signal });
       let resumedText = "";
       for await (const event of resumed) if (event.type === "text_delta") resumedText += event.delta;

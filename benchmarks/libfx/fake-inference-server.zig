@@ -88,7 +88,7 @@ fn serveConnectionFallible(io: std.Io, stream: std.Io.net.Stream) !void {
 fn writeResponse(request: *std.http.Server.Request, protocol: Protocol, keep_alive: bool) !void {
     const request_id = next_request_id.fetchAdd(1, .monotonic);
     var request_id_buffer: [32]u8 = undefined;
-    const request_id_text = try std.fmt.bufPrint(&request_id_buffer, "{d}", .{request_id});
+    const request_id_text = try std.mem.print(&request_id_buffer, "{d}", .{request_id});
     const headers = [_]std.http.Header{
         .{ .name = "content-type", .value = "text/event-stream" },
         .{ .name = "cache-control", .value = "no-cache" },

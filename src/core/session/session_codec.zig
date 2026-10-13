@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const image_data = @import("../images/image_data.zig");
 const session = @import("session.zig");
@@ -10,6 +11,7 @@ const captured_command = @import("../tooling/captured_command.zig");
 const model_provider = @import("../config/model_provider.zig");
 const context_limits = @import("../config/context_limits.zig");
 const credential_authority = @import("../auth/credential_authority.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -72,9 +74,8 @@ pub fn parse_preferences(alloc: Allocator, value: std.json.Value) !DurableSessio
 }
 
 test "legacy connection preferences decode through the shared state codec" {
-    const alloc = std.testing.allocator;
     const state_json = "{\"id\":\"legacy\",\"origin_workspace_root\":\"/workspace\",\"workspace_root\":\"/workspace\",\"created_at_ms\":1,\"updated_at_ms\":2,\"conversation_language\":\"en\",\"preferences\":{\"connection_id\":\"vercel\",\"model_id\":\"test/model\",\"effort\":\"high\",\"fast_mode\":true},\"history\":[],\"total_input_tokens\":0,\"total_output_tokens\":0}";
-    try std.testing.checkAllAllocationFailures(alloc, struct {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn check(a: Allocator, bytes: []const u8) !void {
             var source = std.Io.Reader.fixed(bytes);
             var state = try decodeState(a, &source, .{});
@@ -1091,16 +1092,44 @@ fn parsePermissionState(
 }
 
 pub fn writeRecoveryCheckpoint(writer: *std.Io.Writer, checkpoint: RecoveryCheckpoint) !void {
+    return writeRecoveryCheckpointFrom(writer, checkpoint, null);
+}
+
+/// How many items of each list in an open turn's execution an earlier
+/// progress already holds.
+pub const ExecutionCounts = struct {
+    tool_steps: usize = 0,
+    files: usize = 0,
+    steering: usize = 0,
+};
+
+/// `writeRecoveryCheckpoint` without the user's turn, and with only the
+/// execution items after `from`: what a progress adds to the one before it,
+/// which holds the rest.
+pub fn writeRecoveryCheckpointDelta(writer: *std.Io.Writer, checkpoint: RecoveryCheckpoint, from: ExecutionCounts) !void {
+    return writeRecoveryCheckpointFrom(writer, checkpoint, from);
+}
+
+fn writeRecoveryCheckpointFrom(writer: *std.Io.Writer, checkpoint: RecoveryCheckpoint, delta: ?ExecutionCounts) !void {
     if (checkpoint.disposition == .history_only) return error.InvalidDurableField;
-    try writer.print("{{\"version\":{d},\"turn_id\":{d},\"user\":", .{
+    if (delta) |from| {
+        const execution = checkpoint.execution;
+        if (from.tool_steps > execution.tool_steps.len or from.files > execution.files.len or from.steering > execution.steering.len) {
+            return error.InvalidDurableField;
+        }
+    }
+    try writer.print("{{\"version\":{d},\"turn_id\":{d}", .{
         checkpoint.version,
         checkpoint.turn_id,
     });
-    try writeUserTurn(writer, checkpoint.user, {});
+    if (delta == null) {
+        try writer.writeAll(",\"user\":");
+        try writeUserTurn(writer, checkpoint.user, {});
+    }
     try writer.writeAll(",\"assistant_source\":");
     try writeDurableBytes(writer, checkpoint.assistant_source);
     try writer.writeAll(",\"execution\":");
-    try writeExecutionMemoryJson(writer, checkpoint.execution, .durable);
+    try writeExecutionMemoryJsonFrom(writer, checkpoint.execution, .durable, delta orelse .{});
     try writer.writeAll(",\"cause\":");
     try writeJsonString(writer, @tagName(checkpoint.cause));
     try writer.writeAll(",\"action\":");
@@ -1460,7 +1489,7 @@ test "legacy route checkpoints retain history without resumable authority" {
     const fields = "\"turn_id\":1,\"user\":{\"text\":\"saved request\",\"images\":[]},\"assistant_source\":\"saved partial\",\"execution\":{\"schema_version\":3,\"tool_steps\":[],\"files\":[]},\"cause\":\"response_interrupted\",\"action\":\"continuing_response\",\"tool_state\":\"uncertain\",\"route_model\":\"test/model\",\"requested_fast_mode\":false,\"fast_mode\":false,\"max_provider_attempts\":3,\"consumed_provider_attempts\":0,\"outstanding_reservation\":false}";
     for (routes, 2..) |route, version| {
         for ([_][]const u8{ "possibly_sent", "definitely_unsent" }) |delivery| {
-            const bytes = try std.fmt.allocPrint(alloc, "{{\"version\":{d},\"route_identity\":{s},\"delivery\":\"{s}\",{s}", .{ version, route, delivery, fields });
+            const bytes = try alloc.print("{{\"version\":{d},\"route_identity\":{s},\"delivery\":\"{s}\",{s}", .{ version, route, delivery, fields });
             defer alloc.free(bytes);
             var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
             defer parsed.deinit();
@@ -1486,7 +1515,7 @@ test "legacy route checkpoints retain history without resumable authority" {
                 .total_output_tokens = 0,
                 .recovery_checkpoint = checkpoint,
             };
-            try std.testing.checkAllAllocationFailures(alloc, struct {
+            try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
                 fn check(a: Allocator, original: DurableSessionState) !void {
                     var state = try original.dupe(a);
                     defer state.deinit(a);
@@ -1623,43 +1652,35 @@ pub noinline fn writeExecutionMemoryJson(
     execution: session.ExecutionMemory,
     format: ExecutionMemoryJsonFormat,
 ) !void {
+    return writeExecutionMemoryJsonFrom(writer, execution, format, .{});
+}
+
+/// `writeExecutionMemoryJson` with each list starting after `from` items.
+/// The caller checks that every list holds at least that many.
+fn writeExecutionMemoryJsonFrom(
+    writer: *std.Io.Writer,
+    execution: session.ExecutionMemory,
+    format: ExecutionMemoryJsonFormat,
+    from: ExecutionCounts,
+) !void {
+    std.debug.assert(from.tool_steps <= execution.tool_steps.len and from.files <= execution.files.len and from.steering <= execution.steering.len);
     try writer.writeAll(if (format == .durable)
         "{\"schema_version\":10,\"tool_steps\":["
     else
         "{\"schema_version\":3,\"tool_steps\":[");
-    for (execution.tool_steps, 0..) |step, i| {
+    for (execution.tool_steps[from.tool_steps..], 0..) |step, i| {
         if (i > 0) try writer.writeByte(',');
-        try writer.writeAll("{\"assistant\":");
-        try writeOptionalExecutionBytes(writer, step.assistant, format);
-        if (format == .durable) {
-            try writer.writeAll(",\"provider_replay\":");
-            try std.json.Stringify.value(step.provider_replay, .{}, writer);
-        }
-        try writer.writeAll(",\"tool_calls\":[");
-        for (step.tool_calls, 0..) |tool_call, call_index| {
-            if (call_index > 0) try writer.writeByte(',');
-            try writeExecutionToolCall(writer, tool_call, format);
-        }
-        try writer.writeAll("],\"tool_results\":[");
-        for (step.tool_results, 0..) |result, result_index| {
-            if (result_index > 0) try writer.writeByte(',');
-            try writeExecutionToolResult(writer, result, format);
-        }
-        try writer.writeAll("]}");
+        try writeExecutionToolStep(writer, step, format);
     }
     try writer.writeAll("],\"files\":[");
-    for (execution.files, 0..) |file, i| {
+    for (execution.files[from.files..], 0..) |file, i| {
         if (i > 0) try writer.writeByte(',');
         try writeExecutionFileEvidence(writer, file, format);
     }
     try writer.writeAll("],\"steering\":[");
-    for (execution.steering, 0..) |steering, i| {
+    for (execution.steering[from.steering..], 0..) |steering, i| {
         if (i > 0) try writer.writeByte(',');
-        try writer.writeAll("{\"text\":");
-        try writeExecutionBytes(writer, steering.text, format);
-        try writer.writeAll(",\"assistant_prefix\":");
-        try writeOptionalExecutionBytes(writer, steering.assistant_prefix, format);
-        try writer.print(",\"after_tool_step_count\":{d}}}", .{steering.after_tool_step_count});
+        try writeExecutionSteering(writer, steering, format);
     }
     if (format == .durable) {
         try writer.writeAll("],\"turn_summary\":");
@@ -1672,6 +1693,115 @@ pub noinline fn writeExecutionMemoryJson(
         try writer.writeByte(']');
     }
     try writer.writeByte('}');
+}
+
+fn writeExecutionToolStep(writer: *std.Io.Writer, step: session.ToolExecutionStep, format: ExecutionMemoryJsonFormat) !void {
+    try writer.writeAll("{\"assistant\":");
+    try writeOptionalExecutionBytes(writer, step.assistant, format);
+    if (format == .durable) {
+        try writer.writeAll(",\"provider_replay\":");
+        try std.json.Stringify.value(step.provider_replay, .{}, writer);
+    }
+    try writer.writeAll(",\"tool_calls\":[");
+    for (step.tool_calls, 0..) |tool_call, call_index| {
+        if (call_index > 0) try writer.writeByte(',');
+        try writeExecutionToolCall(writer, tool_call, format);
+    }
+    try writer.writeAll("],\"tool_results\":[");
+    for (step.tool_results, 0..) |result, result_index| {
+        if (result_index > 0) try writer.writeByte(',');
+        try writeExecutionToolResult(writer, result, format);
+    }
+    try writer.writeAll("]}");
+}
+
+fn writeExecutionSteering(writer: *std.Io.Writer, steering: types.PersistedSteering, format: ExecutionMemoryJsonFormat) !void {
+    try writer.writeAll("{\"text\":");
+    try writeExecutionBytes(writer, steering.text, format);
+    try writer.writeAll(",\"assistant_prefix\":");
+    try writeOptionalExecutionBytes(writer, steering.assistant_prefix, format);
+    try writer.print(",\"after_tool_step_count\":{d}}}", .{steering.after_tool_step_count});
+}
+
+/// A hash of an open turn's user turn and of each item its execution lists,
+/// as a progress writes them. A writer keeps the last progress's, so the next
+/// one can carry only what is new when every earlier item is unchanged.
+pub const ExecutionHashes = struct {
+    user: u64,
+    tool_steps: []u64,
+    files: []u64,
+    steering: []u64,
+
+    /// Whether `self`, a later progress's hashes, only appends to `earlier`.
+    pub fn extends(self: ExecutionHashes, earlier: ExecutionHashes) bool {
+        return self.user == earlier.user and
+            startsWith(self.tool_steps, earlier.tool_steps) and
+            startsWith(self.files, earlier.files) and
+            startsWith(self.steering, earlier.steering);
+    }
+
+    pub fn counts(self: ExecutionHashes) ExecutionCounts {
+        return .{ .tool_steps = self.tool_steps.len, .files = self.files.len, .steering = self.steering.len };
+    }
+
+    pub fn dupe(self: ExecutionHashes, alloc: Allocator) Allocator.Error!ExecutionHashes {
+        const tool_steps = try alloc.dupe(u64, self.tool_steps);
+        errdefer alloc.free(tool_steps);
+        const files = try alloc.dupe(u64, self.files);
+        errdefer alloc.free(files);
+        return .{ .user = self.user, .tool_steps = tool_steps, .files = files, .steering = try alloc.dupe(u64, self.steering) };
+    }
+
+    pub fn deinit(self: *ExecutionHashes, alloc: Allocator) void {
+        alloc.free(self.tool_steps);
+        alloc.free(self.files);
+        alloc.free(self.steering);
+        self.* = undefined;
+    }
+
+    fn startsWith(items: []const u64, prefix: []const u64) bool {
+        return items.len >= prefix.len and std.mem.eql(u64, items[0..prefix.len], prefix);
+    }
+};
+
+/// The hashes of `checkpoint`'s user turn and execution items. Allocates in
+/// `alloc`, which owns the result; an arena suits it.
+pub fn executionHashes(alloc: Allocator, checkpoint: RecoveryCheckpoint) !ExecutionHashes {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeUserTurn(&out.writer, checkpoint.user, {});
+    const user = std.hash.Wyhash.hash(0, out.written());
+    const execution = checkpoint.execution;
+    const tool_steps = try alloc.alloc(u64, execution.tool_steps.len);
+    errdefer alloc.free(tool_steps);
+    for (execution.tool_steps, tool_steps) |step, *hash| {
+        out.clearRetainingCapacity();
+        // The turn's execution is rebuilt before each progress, which stamps
+        // every result's creation time again, so the comparison leaves it
+        // out: a progress that extends another keeps the times it recorded.
+        const results = try alloc.dupe(types.PersistedToolResult, step.tool_results);
+        defer alloc.free(results);
+        for (results) |*result| result.created_at_ms = 0;
+        var stable = step;
+        stable.tool_results = results;
+        try writeExecutionToolStep(&out.writer, stable, .durable);
+        hash.* = std.hash.Wyhash.hash(0, out.written());
+    }
+    const files = try alloc.alloc(u64, execution.files.len);
+    errdefer alloc.free(files);
+    for (execution.files, files) |file, *hash| {
+        out.clearRetainingCapacity();
+        try writeExecutionFileEvidence(&out.writer, file, .durable);
+        hash.* = std.hash.Wyhash.hash(0, out.written());
+    }
+    const steering = try alloc.alloc(u64, execution.steering.len);
+    errdefer alloc.free(steering);
+    for (execution.steering, steering) |entry, *hash| {
+        out.clearRetainingCapacity();
+        try writeExecutionSteering(&out.writer, entry, .durable);
+        hash.* = std.hash.Wyhash.hash(0, out.written());
+    }
+    return .{ .user = user, .tool_steps = tool_steps, .files = files, .steering = steering };
 }
 
 fn hasDurableExecutionMemory(execution: session.ExecutionMemory) bool {
@@ -2320,7 +2450,18 @@ fn parseProviderReplay(alloc: Allocator, value: std.json.Value) !?types.Provider
     return try types.dupeProviderReplay(alloc, replay);
 }
 
-fn parseToolCalls(alloc: Allocator, value: std.json.Value) ![]session.ToolCall {
+/// Writes `calls` as the JSON array durable history stores them in.
+pub fn writeToolCalls(writer: *std.Io.Writer, calls: []const session.ToolCall) !void {
+    try writer.writeByte('[');
+    for (calls, 0..) |tool_call, index| {
+        if (index > 0) try writer.writeByte(',');
+        try writeExecutionToolCall(writer, tool_call, .durable);
+    }
+    try writer.writeByte(']');
+}
+
+/// Parses the array `writeToolCalls` writes. The caller owns the result.
+pub fn parseToolCalls(alloc: Allocator, value: std.json.Value) ![]session.ToolCall {
     if (value != .array) return error.InvalidSessionFormat;
     if (value.array.items.len == 0) return &.{};
     const calls = try alloc.alloc(session.ToolCall, value.array.items.len);
@@ -2754,8 +2895,7 @@ fn parseToolResultImages(
         const parsed = parsePersistedToolImages(alloc, images.array.items) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             if (err == error.InvalidSourceRef) return error.InvalidSessionFormat;
-            const notice = try std.fmt.allocPrint(
-                alloc,
+            const notice = try alloc.print(
                 "{s}\n[Saved tool image unavailable: {s}]",
                 .{ output.*, @errorName(err) },
             );
@@ -2765,8 +2905,7 @@ fn parseToolResultImages(
         };
         if (parsed.len != images.array.items.len) {
             types.freeToolImages(alloc, parsed);
-            const notice = try std.fmt.allocPrint(
-                alloc,
+            const notice = try alloc.print(
                 "{s}\n[Saved tool image unavailable: unsupported content]",
                 .{output.*},
             );
@@ -3722,7 +3861,7 @@ test "non-object saved function inputs are repaired without changing recorded ou
                 try session.repairPersistedToolArguments(alloc, step.tool_calls, step.tool_results, .schema_v3);
                 try std.testing.expectEqualStrings(if (native_kind == 0) "{}" else arguments, step.tool_calls[0].arguments_json);
                 if (native_kind == 0 and status == .failure and std.mem.eql(u8, arguments, "[]")) {
-                    try std.testing.checkAllAllocationFailures(alloc, checkNonObjectHistoryAllocationFailures, .{parsed.value});
+                    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkNonObjectHistoryAllocationFailures, .{parsed.value});
                 }
             }
         }
@@ -3752,7 +3891,7 @@ test "non-object interrupted inputs repair locally and preserve provider-owned r
         const repaired = (try parseOptionalToolCall(alloc, parsed.value)).?;
         defer session.freeToolCall(alloc, repaired);
         try std.testing.expectEqualStrings(if (native) "[]" else "{}", repaired.arguments_json);
-        if (!native) try std.testing.checkAllAllocationFailures(alloc, checkNonObjectInterruptedAllocationFailures, .{parsed.value});
+        if (!native) try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkNonObjectInterruptedAllocationFailures, .{parsed.value});
     }
 }
 
@@ -3794,7 +3933,7 @@ test "current history decode rejects ambiguous malformed tool result pairings" {
 
 test "current history duplicate-key repair preserves allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkCurrentToolArgumentRepairAllocationFailures,
         .{},
     );
@@ -4314,7 +4453,7 @@ fn checkV7SteeringAllocationFailures(alloc: Allocator) !void {
 
 test "v7 steering cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkV7SteeringAllocationFailures,
         .{},
     );
@@ -4445,7 +4584,7 @@ test "durable cancellation provenance roundtrips and cleans allocation failures"
     };
     for (std.enums.values(types.CancellationOrigin)) |origin| {
         for (std.enums.values(types.InterruptedTerminalReason)) |reason| {
-            try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{ origin, reason });
+            try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Case.run, .{ origin, reason });
         }
     }
 }
@@ -4454,7 +4593,7 @@ test "durable cancellation provenance accepts explicit turn and rejects invalid 
     const alloc = std.testing.allocator;
     const prefix = "{\"kind\":\"interrupted\",\"user\":{\"text\":\"request\",\"images\":[]},\"assistant\":\"partial\",\"tool_call\":null,\"completed_tool_names\":[\"read_file\"],\"cancellation_origin\":";
     for ([_][]const u8{ "\"turn\"", "\"compaction\"", "\"unknown\"", "null", "0", "true", "{}", "[]", "\"compaction\",\"unknown_field\":true" }, 0..) |value, i| {
-        const bytes = try std.fmt.allocPrint(alloc, "{s}{s}}}", .{ prefix, value });
+        const bytes = try alloc.print("{s}{s}}}", .{ prefix, value });
         defer alloc.free(bytes);
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
         defer parsed.deinit();
@@ -5024,7 +5163,7 @@ test "inline image parsing rejects missing digest and mismatched bytes" {
     var digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(png, &digest, .{});
     const digest_hex = std.fmt.bytesToHex(digest, .lower);
-    const wrong_digest = "0" ** (Sha256.digest_length * 2);
+    const wrong_digest = text_utils.repeat("0", Sha256.digest_length * 2);
 
     const Template = struct {
         snapshot_sha256: ?[]const u8,
@@ -5405,7 +5544,7 @@ test "durable state usage remains strict and releases partial allocations" {
         \\"models":[{"model":"test/model","first_sequence":1,"total_cost":1,"input_tokens":10,"output_tokens":3,"cache_read_tokens":2,"cache_write_tokens":0,"billable_web_search_calls":0}],"pending":[]},
         \\"last_subagent_work_id":"legacy-work"}
     ;
-    try std.testing.checkAllAllocationFailures(alloc, struct {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn check(a: Allocator, bytes: []const u8) !void {
             var source = std.Io.Reader.fixed(bytes);
             var decoded = try decodeState(a, &source, .{});
@@ -5519,7 +5658,7 @@ test "recovery checkpoint image and tool source refs round trip with independent
     const bytes = try encodeRecoveryCheckpoint(alloc, checkpoint);
     defer alloc.free(bytes);
     try std.testing.expect(std.mem.find(u8, bytes, "\"sourceRef\"") == null);
-    try std.testing.checkAllAllocationFailures(alloc, struct {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn check(a: Allocator, encoded: []const u8) !void {
             var parsed = try std.json.parseFromSlice(std.json.Value, a, encoded, .{});
             defer parsed.deinit();
@@ -5559,7 +5698,7 @@ test "persisted image source refs reject malformed metadata and preserve the byt
         .{ .string = "host\x1fbad" },
         .{ .string = "host\x7fbad" },
         .{ .string = "\xff" },
-        .{ .string = "r" ** 513 },
+        .{ .string = text_utils.repeat("r", 513) },
     };
     const user_ref = user.value.object.getPtr("images").?.array.items[0].object.getPtr("source_ref").?;
     const tool_ref = tools.value.array.items[0].object.getPtr("source_ref").?;
@@ -5569,7 +5708,7 @@ test "persisted image source refs reject malformed metadata and preserve the byt
         try std.testing.expectError(error.InvalidSessionFormat, parseUserTurn(alloc, user.value, null));
         try std.testing.expectError(error.InvalidSourceRef, parsePersistedToolImages(alloc, tools.value.array.items));
     }
-    const boundary = "é" ** 256;
+    const boundary = text_utils.repeat("é", 256);
     user_ref.* = .{ .string = boundary };
     tool_ref.* = .{ .string = boundary };
     const decoded_user = try parseUserTurn(alloc, user.value, null);

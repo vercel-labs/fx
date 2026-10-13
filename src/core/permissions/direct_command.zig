@@ -1,6 +1,8 @@
 const std = @import("std");
+const display_width = @import("../shared/display_width.zig");
 const builtin = @import("builtin");
 const command_effect = @import("../shell_command/command_effect.zig");
+const safe_git = @import("../shell_command/safe_git.zig");
 const command_contract = @import("../execution/command_contract.zig");
 const command_runner = @import("../execution/command_runner.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -60,7 +62,7 @@ const DirectOutputProjector = struct {
             }
 
             const sequence = bytes[index .. index + sequence_len];
-            const scalar = std.unicode.utf8Decode(sequence) catch {
+            const scalar = display_width.decodeUtf8Sequence(sequence) catch {
                 self.escaped_invalid += 1;
                 try appendByteEscape(alloc, projected, byte);
                 index += 1;
@@ -195,7 +197,7 @@ fn executeDirectReadOnlyWithLimitAndTestControls(
     }
     try checkControl(execution_cfg);
 
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) {
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) {
         return error.UnsupportedDirectPlatform;
     }
 
@@ -217,6 +219,7 @@ fn executeDirectReadOnlyWithLimitAndTestControls(
         const stage = plan.stages[child_count];
         var environment = try environmentForProfile(scratch, stage.environment_profile);
         defer environment.deinit();
+        try command_runner.applyAgentEnvironment(&environment);
 
         const child = std.process.spawn(io_mod.getIo(), .{
             .argv = stage.argv,
@@ -225,7 +228,7 @@ fn executeDirectReadOnlyWithLimitAndTestControls(
             .stdin = if (child_count == 0) .ignore else .pipe,
             .stdout = .pipe,
             .stderr = .pipe,
-            .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi)
+            .pgid = if (builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi)
                 (if (child_count == 0) 0 else group_id)
             else
                 null,
@@ -236,7 +239,7 @@ fn executeDirectReadOnlyWithLimitAndTestControls(
             };
         };
         children[child_count] = child;
-        if (child_count == 0 and builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        if (child_count == 0 and builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) {
             group_id = child.id;
         }
         if (test_controls.after_spawn) |after_spawn| {
@@ -410,24 +413,37 @@ fn environmentForProfile(
     alloc: std.mem.Allocator,
     profile: command_effect.EnvironmentProfile,
 ) !std.process.Environ.Map {
-    var environment = std.process.Environ.Map.init(alloc);
-    errdefer environment.deinit();
     switch (profile) {
-        .basic_read_only, .git_read_only => {
+        .basic_read_only => {
+            var environment = std.process.Environ.Map.init(alloc);
+            errdefer environment.deinit();
             try environment.put("PATH", "/usr/bin:/bin");
             try environment.put("LC_ALL", "C");
             try environment.put("LANG", "C");
+            return environment;
         },
+        .git_read_only => return safe_git.environment(alloc),
     }
-    if (profile == .git_read_only) {
-        try environment.put("GIT_CONFIG_NOSYSTEM", "1");
-        try environment.put("GIT_CONFIG_GLOBAL", "/dev/null");
-        try environment.put("GIT_OPTIONAL_LOCKS", "0");
-        try environment.put("GIT_TERMINAL_PROMPT", "0");
-        try environment.put("GIT_PAGER", "cat");
-        try environment.put("PAGER", "cat");
-    }
-    return environment;
+}
+
+test "direct commands receive fx agent environment" {
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return;
+
+    const stages = [_]command_effect.DirectStage{.{
+        .executable = "/usr/bin/env",
+        .argv = &.{"/usr/bin/env"},
+        .environment_profile = .basic_read_only,
+    }};
+    const result = try executeDirectReadOnly(.{
+        .max_command_output_bytes = 4096,
+    }, std.testing.allocator, .{
+        .command = "env",
+        .cwd = "/tmp",
+        .stages = &stages,
+    });
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expect(std.mem.find(u8, result.output, "AI_AGENT=fx") != null);
 }
 
 const DirectTerminationCause = enum {
@@ -681,7 +697,7 @@ const DirectOutput = struct {
         while (std.mem.findScalar(u8, pending.items, '\n')) |newline| {
             try callback(ctx, self.cfg.output_chunk_lifecycle_id, stream, pending.items[0 .. newline + 1]);
             const remaining = pending.items.len - newline - 1;
-            std.mem.copyForwards(u8, pending.items[0..remaining], pending.items[newline + 1 ..]);
+            @memmove(pending.items[0..remaining], pending.items[newline + 1 ..]);
             pending.items.len = remaining;
         }
         if (!flush and pending.items.len >= direct_output_read_chunk_bytes) {
@@ -727,7 +743,7 @@ fn deadlineExpired(cfg: command_runner.Config) bool {
 }
 
 fn signalGroup(group_id: ?std.posix.pid_t, force: bool) void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
     const pid = group_id orelse return;
     std.posix.kill(-pid, if (force) std.posix.SIG.KILL else std.posix.SIG.TERM) catch |err| switch (err) {
         error.ProcessNotFound => {},
@@ -788,7 +804,7 @@ fn formatDirectResult(
 fn commandStatusFromTerm(term: std.process.Child.Term) command_contract.CommandStatus {
     return switch (term) {
         .exited => |code| .{ .exit_code = @intCast(code) },
-        .signal => |sig| .{ .signal = @intFromEnum(sig) },
+        .signal => |sig| .{ .signal = @backingInt(sig) },
         else => .finished,
     };
 }
@@ -929,7 +945,7 @@ test "direct termination arbiter gives cancellation and timeout precedence" {
 }
 
 test "direct executor runs fixed argv with sanitized environment and no artifact" {
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     const argv = [_][]const u8{"/usr/bin/env"};
     const stages = [_]command_effect.DirectStage{.{
@@ -956,17 +972,19 @@ test "direct executor runs fixed argv with sanitized environment and no artifact
     try std.testing.expectEqual(@as(?[]const u8, null), result.command_result.?.output_file);
 }
 
-test "git direct profile removes ambient authority and disables optional mutation" {
+test "git direct profile uses the safe-git environment" {
     var environment = try environmentForProfile(std.testing.allocator, .git_read_only);
     defer environment.deinit();
+    var expected = try safe_git.environment(std.testing.allocator);
+    defer expected.deinit();
 
-    try std.testing.expectEqualStrings("/usr/bin:/bin", environment.get("PATH").?);
-    try std.testing.expectEqualStrings("1", environment.get("GIT_CONFIG_NOSYSTEM").?);
-    try std.testing.expectEqualStrings("/dev/null", environment.get("GIT_CONFIG_GLOBAL").?);
+    try std.testing.expectEqual(expected.count(), environment.count());
+    var entries = expected.iterator();
+    while (entries.next()) |entry| {
+        try std.testing.expectEqualStrings(entry.value_ptr.*, environment.get(entry.key_ptr.*).?);
+    }
     try std.testing.expectEqualStrings("0", environment.get("GIT_OPTIONAL_LOCKS").?);
-    try std.testing.expectEqualStrings("0", environment.get("GIT_TERMINAL_PROMPT").?);
-    try std.testing.expectEqualStrings("cat", environment.get("GIT_PAGER").?);
-    try std.testing.expect(environment.get("HOME") == null);
+    try std.testing.expect(environment.get("GIT_CONFIG_PARAMETERS") == null);
 }
 
 test "direct executor runs a supported pipeline and reports final output" {
@@ -975,7 +993,7 @@ test "direct executor runs a supported pipeline and reports final output" {
         "printf x | wc -c",
         "/tmp",
         false,
-        @import("builtin").os.tag,
+        @import("builtin").target.os.tag,
     );
     defer admission.deinit(std.testing.allocator);
     const plan = admission.direct_read_only;
@@ -992,7 +1010,7 @@ test "direct executor runs a supported pipeline and reports final output" {
     const foreground = result.command_result.?;
     try std.testing.expectEqualStrings("printf x | wc -c", foreground.command);
     try std.testing.expectEqual(@as(?i64, 0), foreground.exit_code);
-    const expected_stdout_bytes: usize = if (builtin.os.tag == .linux) 2 else 9;
+    const expected_stdout_bytes: usize = if (builtin.target.os.tag == .linux) 2 else 9;
     try std.testing.expectEqual(expected_stdout_bytes, foreground.stdout_bytes);
     try std.testing.expectEqual(@as(?[]const u8, null), foreground.output_file);
     try std.testing.expectEqual(@as(?[]const u8, null), foreground.stdout_file);
@@ -1031,7 +1049,7 @@ fn createListingFiles(
     for (0..full_length_count) |index| {
         var name: [255]u8 = undefined;
         @memset(&name, 'x');
-        _ = try std.fmt.bufPrint(name[0..4], "{d:0>4}", .{index});
+        _ = try std.mem.print(name[0..4], "{d:0>4}", .{index});
         var file = try dir.createFile(io_mod.getIo(), &name, .{ .truncate = true });
         file.close(io_mod.getIo());
     }
@@ -1048,7 +1066,7 @@ fn createListingFiles(
 }
 
 test "direct executor enforces canonical capacity with native large ls output" {
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1081,7 +1099,7 @@ test "direct executor enforces canonical capacity with native large ls output" {
             case.command,
             cwd,
             false,
-            builtin.os.tag,
+            builtin.target.os.tag,
         );
         defer admission.deinit(alloc);
         const result = try executeDirectReadOnly(.{
@@ -1107,7 +1125,7 @@ test "direct executor enforces canonical capacity with native large ls output" {
         "ls above-64k",
         cwd,
         false,
-        builtin.os.tag,
+        builtin.target.os.tag,
     );
     defer over_admission.deinit(alloc);
     try std.testing.expectError(
@@ -1158,7 +1176,7 @@ test "direct executor admits exact output limit and rejects limit plus one witho
 }
 
 test "direct executor canonical limit covers stderr and counted pipeline relays" {
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     const exact_stderr_argv = [_][]const u8{
         "/usr/bin/awk",
@@ -1273,7 +1291,7 @@ test "direct executor charges non-final pipeline bytes before relay" {
 }
 
 test "direct executor enforces one budget across concurrent stdout and stderr" {
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     const exact_argv = [_][]const u8{
         "/bin/sh",
@@ -1311,7 +1329,7 @@ test "direct executor enforces one budget across concurrent stdout and stderr" {
 }
 
 test "direct executor reaps partial spawn and output-limit process groups" {
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     const PidCapture = struct {
         pid: ?std.posix.pid_t = null,
@@ -1330,7 +1348,7 @@ test "direct executor reaps partial spawn and output-limit process groups" {
             }
             try std.testing.expectError(
                 error.ProcessNotFound,
-                std.posix.kill(pid, @enumFromInt(0)),
+                std.posix.kill(pid, @fromBackingInt(@intCast(0))),
             );
         }
     };
@@ -1391,7 +1409,7 @@ test "direct executor reaps partial spawn and output-limit process groups" {
 }
 
 test "direct executor cleans up cancellation after the first pipeline spawn" {
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     var cancel = std.atomic.Value(bool).init(false);
     const CancelAfterSpawn = struct {
@@ -1442,7 +1460,7 @@ test "direct executor cleans up cancellation after the first pipeline spawn" {
     }
     try std.testing.expectError(
         error.ProcessNotFound,
-        std.posix.kill(pid, @enumFromInt(0)),
+        std.posix.kill(pid, @fromBackingInt(@intCast(0))),
     );
 }
 
@@ -1514,7 +1532,7 @@ const CallbackCapture = struct {
 };
 
 test "direct executor callbacks receive only bounded projected output" {
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     const argv = [_][]const u8{
         "/bin/sh",
@@ -1548,7 +1566,7 @@ test "direct executor callbacks receive only bounded projected output" {
 }
 
 test "direct executor raw callback projection keeps projected result isolated" {
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     const argv = [_][]const u8{
         "/bin/sh",
@@ -1578,7 +1596,7 @@ test "direct executor raw callback projection keeps projected result isolated" {
 }
 
 test "direct executor accepted callbacks preserve repeated newline-free stream order" {
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     const argv = [_][]const u8{
         "/bin/sh",
@@ -1608,7 +1626,7 @@ test "direct executor accepted callbacks preserve repeated newline-free stream o
 }
 
 test "direct executor keeps stderr projector state independent per child" {
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     const producer_argv = [_][]const u8{
         "/bin/sh",
@@ -1660,7 +1678,7 @@ test "direct executor reports final stage status without pipefail" {
 }
 
 test "direct relay treats a closed downstream pipe as normal completion" {
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     const argv = [_][]const u8{"/usr/bin/false"};
     var child = try std.process.spawn(io_mod.getIo(), .{
@@ -1681,7 +1699,7 @@ test "direct relay treats a closed downstream pipe as normal completion" {
 }
 
 test "direct executor treats downstream pipe closure as normal pipeline completion" {
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     const producer_argv = [_][]const u8{
         "/bin/sh",
@@ -1709,8 +1727,7 @@ test "direct executor treats downstream pipe closure as normal pipeline completi
     try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
     const physical_tmp = try io_mod.realpathAlloc(std.testing.allocator, "/tmp");
     defer std.testing.allocator.free(physical_tmp);
-    const expected_output = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const expected_output = try std.testing.allocator.print(
         "<stdout>\n{s}\n</stdout>",
         .{physical_tmp},
     );
@@ -1769,7 +1786,7 @@ test "direct executor cancellation and timeout terminate and reap the process gr
 }
 
 test "direct executor flushes partial callback output before timeout" {
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     const argv = [_][]const u8{
         "/bin/sh",

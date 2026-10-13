@@ -416,7 +416,7 @@ pub const AssistantPacer = struct {
     fn consume(self: *AssistantPacer, byte_count: usize) void {
         const remaining = self.pending.items.len - byte_count;
         if (remaining > 0) {
-            std.mem.copyForwards(u8, self.pending.items[0..remaining], self.pending.items[byte_count..]);
+            @memmove(self.pending.items[0..remaining], self.pending.items[byte_count..]);
         }
         self.pending.items.len = remaining;
     }
@@ -967,7 +967,7 @@ test "theme-supplied inline code color is restored across rendered blocks" {
     try pacer.enqueue(alloc, "\x1b[39m done");
     try pacer.tick(alloc, 1, cap.callbacks());
 
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         cap.emitted.items,
         "code\x1b[0m\x1b[38;2;130;210;206m\x1b[39m done",
@@ -986,8 +986,8 @@ test "code style is restored across rendered blocks" {
     try pacer.enqueue(alloc, "\x1b[39m done");
     try pacer.tick(alloc, 1, cap.callbacks());
 
-    try std.testing.expect(std.mem.indexOf(u8, cap.emitted.items, "code\x1b[0m\x1b[38;5;245m\x1b[39m done") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.emitted.items, "\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, cap.emitted.items, "code\x1b[0m\x1b[38;5;245m\x1b[39m done") != null);
+    try std.testing.expect(std.mem.find(u8, cap.emitted.items, "\x1b[39m") != null);
 }
 
 test "light code style is restored across rendered blocks" {
@@ -1002,12 +1002,12 @@ test "light code style is restored across rendered blocks" {
     try pacer.enqueue(alloc, "\x1b[39m done");
     try pacer.tick(alloc, 1, cap.callbacks());
 
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         cap.emitted.items,
         "code\x1b[0m\x1b[38;5;247m\x1b[39m done",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.emitted.items, "\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, cap.emitted.items, "\x1b[39m") != null);
 }
 
 test "theme change retints active code before the next block" {
@@ -1031,8 +1031,8 @@ test "theme change retints active code before the next block" {
     try pacer.tick(alloc, 1, cap.callbacks());
 
     const after_theme_change = cap.emitted.items[emitted_before_theme_change..];
-    try std.testing.expect(std.mem.indexOf(u8, after_theme_change, "\x1b[0m\x1b[38;5;247m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, after_theme_change, "\x1b[38;5;245m") == null);
+    try std.testing.expect(std.mem.find(u8, after_theme_change, "\x1b[0m\x1b[38;5;247m") != null);
+    try std.testing.expect(std.mem.find(u8, after_theme_change, "\x1b[38;5;245m") == null);
 }
 
 test "theme change retints a queued inline code opener before it is emitted" {
@@ -1046,8 +1046,8 @@ test "theme change retints a queued inline code opener before it is emitted" {
     pacer.rethemeInlineCode(false);
     try pacer.tick(alloc, 0, cap.callbacks());
 
-    try std.testing.expect(std.mem.indexOf(u8, cap.emitted.items, "\x1b[38;5;245m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.emitted.items, "\x1b[38;5;247m") == null);
+    try std.testing.expect(std.mem.find(u8, cap.emitted.items, "\x1b[38;5;245m") != null);
+    try std.testing.expect(std.mem.find(u8, cap.emitted.items, "\x1b[38;5;247m") == null);
 }
 
 test "underline style is restored across rendered blocks" {
@@ -1062,7 +1062,7 @@ test "underline style is restored across rendered blocks" {
     try pacer.enqueue(alloc, "\x1b[24m");
     try pacer.tick(alloc, 1, cap.callbacks());
 
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         cap.emitted.items,
         "Heading\x1b[0m\x1b[4m\x1b[24m",
@@ -1127,8 +1127,8 @@ test "link color is tracked and restored like the themed inline-code color" {
     var opens: [96]u8 = undefined;
     const opens_len = sgr.writeOpens(&opens);
     const serialized = opens[0..opens_len];
-    try std.testing.expect(std.mem.indexOf(u8, serialized, "\x1b[4m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, serialized, link_open) != null);
+    try std.testing.expect(std.mem.find(u8, serialized, "\x1b[4m") != null);
+    try std.testing.expect(std.mem.find(u8, serialized, link_open) != null);
 
     sgr.apply("\x1b[39m");
     try std.testing.expect(sgr.fg == .none);

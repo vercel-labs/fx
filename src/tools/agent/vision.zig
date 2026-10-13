@@ -12,8 +12,7 @@ pub fn decode(
 ) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
     const request = vision_contracts.parse_vision_request(ctx.allocator, args_json) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return .{ .failure = try std.fmt.allocPrint(
-            ctx.allocator,
+        else => return .{ .failure = try ctx.allocator.print(
             "vision arguments are invalid: {s}",
             .{@errorName(err)},
         ) },

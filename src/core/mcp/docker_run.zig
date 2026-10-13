@@ -95,12 +95,11 @@ pub fn prepare(alloc: Allocator, argv: []const []const u8) !Prepared {
     if (!isDirectDockerRun(argv) or hasCidfile(argv)) return .{ .argv = argv };
 
     const temp_root = temporaryRoot() orelse return .{ .argv = argv };
-    if (!std.fs.path.isAbsolute(temp_root)) return .{ .argv = argv };
+    if (!std.Io.Dir.path.isAbsolute(temp_root)) return .{ .argv = argv };
     var nonce: [16]u8 = undefined;
     try std.Io.randomSecure(io_mod.getIo(), &nonce);
     const nonce_hex = std.fmt.bytesToHex(nonce, .lower);
-    const cidfile_path = try std.fmt.allocPrint(
-        alloc,
+    const cidfile_path = try alloc.print(
         "{s}/fx-mcp-{s}.cid",
         .{ std.mem.trimEnd(u8, temp_root, "/\\"), &nonce_hex },
     );
@@ -127,7 +126,7 @@ pub fn prepare(alloc: Allocator, argv: []const []const u8) !Prepared {
 
 fn isDirectDockerRun(argv: []const []const u8) bool {
     if (argv.len < 2 or !std.mem.eql(u8, argv[1], "run")) return false;
-    const command = std.fs.path.basename(argv[0]);
+    const command = std.Io.Dir.path.basename(argv[0]);
     return std.ascii.eqlIgnoreCase(command, "docker") or
         std.ascii.eqlIgnoreCase(command, "docker.exe");
 }
@@ -144,12 +143,12 @@ fn temporaryRoot() ?[]const u8 {
     return io_mod.getenv("TMPDIR") orelse
         io_mod.getenv("TEMP") orelse
         io_mod.getenv("TMP") orelse
-        if (@import("builtin").os.tag == .windows) null else "/tmp";
+        if (@import("builtin").target.os.tag == .windows) null else "/tmp";
 }
 
 fn readContainerId(alloc: Allocator, path: []const u8) ![]u8 {
-    const parent_path = std.fs.path.dirname(path) orelse return error.InvalidContainerId;
-    const basename = std.fs.path.basename(path);
+    const parent_path = std.Io.Dir.path.dirname(path) orelse return error.InvalidContainerId;
+    const basename = std.Io.Dir.path.basename(path);
     var parent = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), parent_path, .{});
     defer parent.close(io_mod.getIo());
     var file = try io_mod.openExistingRegularFile(parent, basename, .read_only);
@@ -203,7 +202,7 @@ test "docker MCP cleanup accepts only bounded hexadecimal container ids" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const cidfile = try std.fmt.allocPrint(alloc, "{s}/fixture.cid", .{root});
+    const cidfile = try alloc.print("{s}/fixture.cid", .{root});
     defer alloc.free(cidfile);
 
     {

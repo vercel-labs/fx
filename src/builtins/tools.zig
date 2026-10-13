@@ -956,14 +956,14 @@ test "built-in model-facing tool contract stays byte exact" {
 test "registry classifies every built-in progress label" {
     inline for (all) |tool| {
         var started_buf: [96]u8 = undefined;
-        const started = try std.fmt.bufPrint(&started_buf, "{s} value", .{tool.action_label});
+        const started = try std.mem.print(&started_buf, "{s} value", .{tool.action_label});
         try std.testing.expectEqual(
             tool_dispatch.ProgressLabelKind.started,
             tool_dispatch.classifyProgressLabel(registry, started),
         );
 
         var completed_buf: [96]u8 = undefined;
-        const completed = try std.fmt.bufPrint(&completed_buf, "{s} value", .{tool.completed_action_label});
+        const completed = try std.mem.print(&completed_buf, "{s} value", .{tool.completed_action_label});
         try std.testing.expectEqual(
             tool_dispatch.ProgressLabelKind.completed,
             tool_dispatch.classifyProgressLabel(registry, completed),
@@ -1031,7 +1031,7 @@ test "shell advertises only run interact and stop" {
     const schema_json = try tool_specs.toolGatewaySchemaJson(alloc, shell);
     defer alloc.free(schema_json);
     for ([_][]const u8{ "run", "interact", "stop" }) |action| {
-        const needle = try std.fmt.allocPrint(alloc, "\"{s}\"", .{action});
+        const needle = try alloc.print("\"{s}\"", .{action});
         defer alloc.free(needle);
         try std.testing.expect(std.mem.find(u8, schema_json, needle) != null);
     }

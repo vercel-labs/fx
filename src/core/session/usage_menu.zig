@@ -307,7 +307,7 @@ test "usage menu keeps session model selection inside the rendered viewport" {
     const models = try alloc.alloc(usage_report.ModelUsage, 13);
     for (models, 0..) |*model, index| {
         model.* = .{
-            .model = try std.fmt.allocPrint(alloc, "provider/model-{d}", .{index}),
+            .model = try alloc.print("provider/model-{d}", .{index}),
             .totals = testTotals(index + 1),
         };
     }

@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent } from "../node.js";
+import { createFxEngine } from "../node.js";
 
 const sourceBackend = process.argv[2] || "native";
 const targetBackend = process.argv[3] || "wasm";
@@ -109,7 +109,7 @@ for (const shape of ["plain", "reasoning-text", "reasoning-only", "provider-term
   let source;
   let target;
   try {
-    source = await createFxAgent(options(sourceBackend));
+    source = await createFxEngine(options(sourceBackend));
     const first = source.prompt(shape === "image"
       ? [{ type: "text", text: "store this context" }, { type: "image", data: pngData, mimeType: "image/png" }]
       : "store this context");
@@ -120,7 +120,7 @@ for (const shape of ["plain", "reasoning-text", "reasoning-only", "provider-term
     assert.equal(await source.close(), undefined);
     source = null;
 
-    target = await createFxAgent(options(targetBackend, checkpoint));
+    target = await createFxEngine(options(targetBackend, checkpoint));
     const second = target.prompt("continue");
     let text = "";
     for await (const update of second) {

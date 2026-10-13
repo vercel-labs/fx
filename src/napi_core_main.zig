@@ -13,13 +13,17 @@ const io_mod = @import("core/shared/io.zig");
 const fetch_state = @import("napi_fetch_state.zig");
 const streamable_http = @import("core/mcp/streamable_http.zig");
 const host_stream_provider = @import("gateway/host_stream_provider.zig");
+const host_openai_codex = @import("gateway/host_openai_codex.zig");
+const host_xai_grok = @import("gateway/host_xai_grok.zig");
+const host_chat_completions = @import("gateway/host_chat_completions.zig");
+const configured_provider = @import("core/config/configured_provider.zig");
+const provider_catalog = @import("core/auth/provider_catalog.zig");
+const model_provider = @import("core/config/model_provider.zig");
 const oauth_transport = @import("core/auth/oauth_transport.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const builtin_modes = @import("builtins/modes.zig");
 
-const c = @cImport({
-    @cInclude("node_api.h");
-});
+const c = @import("node_api");
 
 const Allocator = std.mem.Allocator;
 const max_drain_bytes = 1024 * 1024;
@@ -52,7 +56,7 @@ const ReadyNotifier = struct {
 
     fn init() error{ReadyChannelFailed}!ReadyNotifier {
         var pair: [2]c_int = undefined;
-        const flags = if (@import("builtin").os.tag == .macos) 0 else std.c.SOCK.CLOEXEC | std.c.SOCK.NONBLOCK;
+        const flags = if (@import("builtin").target.os.tag == .macos) 0 else std.c.SOCK.CLOEXEC | std.c.SOCK.NONBLOCK;
         const socket_type = std.c.SOCK.STREAM | flags;
         if (std.c.socketpair(std.c.AF.UNIX, socket_type, 0, &pair) != 0) return error.ReadyChannelFailed;
         errdefer for (pair) |fd| {
@@ -134,7 +138,7 @@ const InputQueue = struct {
         const queued = self.bytes.items.len - self.offset;
         if (data.len > max_input_bytes or queued > max_input_bytes - data.len) return error.InputQueueFull;
         if (self.offset > 0) {
-            std.mem.copyForwards(u8, self.bytes.items[0..queued], self.bytes.items[self.offset..]);
+            @memmove(self.bytes.items[0..queued], self.bytes.items[self.offset..]);
             self.bytes.items.len = queued;
             self.offset = 0;
         }
@@ -168,11 +172,18 @@ const OutputQueue = struct {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        errdefer |err| if (err != error.OutputClosed) {
-            self.failed = true;
-            self.wake.broadcast(io);
-            self.ready.?.notify();
+        self.writeLocked(alloc, data) catch |err| {
+            if (err != error.OutputClosed) {
+                self.failed = true;
+                self.wake.broadcast(io);
+                self.ready.?.notify();
+            }
+            return err;
         };
+    }
+
+    fn writeLocked(self: *OutputQueue, alloc: Allocator, data: []const u8) !void {
+        const io = io_mod.getIo();
         if (data.len > max_output_message_bytes) return error.OutputMessageTooLarge;
         var written: usize = 0;
         while (written < data.len) {
@@ -184,7 +195,7 @@ const OutputQueue = struct {
                 continue;
             }
             if (self.offset > 0) {
-                std.mem.copyForwards(u8, self.bytes.items[0..queued], self.bytes.items[self.offset..]);
+                @memmove(self.bytes.items[0..queued], self.bytes.items[self.offset..]);
                 self.bytes.items.len = queued;
                 self.offset = 0;
             }
@@ -536,7 +547,7 @@ const FetchBridge = struct {
         const queued = self.response.items.len - self.response_offset;
         if (data.len > max_fetch_response_bytes or queued > max_fetch_response_bytes - data.len) return .backpressure;
         if (self.response_offset > 0) {
-            std.mem.copyForwards(u8, self.response.items[0..queued], self.response.items[self.response_offset..]);
+            @memmove(self.response.items[0..queued], self.response.items[self.response_offset..]);
             self.response.items.len = queued;
             self.response_offset = 0;
         }
@@ -614,9 +625,17 @@ const Runtime = struct {
     fetch: FetchBridge = .{},
     attachments: AttachmentTable = .{},
     stream_context: host_stream_provider.ProviderContext = undefined,
+    codex_context: host_openai_codex.Context = undefined,
+    grok_context: host_xai_grok.Context = undefined,
+    /// The app's configured provider, when `provider` names one.
+    custom_context: ?host_chat_completions.Context = null,
     input: InputQueue = .{},
     output: OutputQueue = .{},
-    credential: []u8,
+    /// The Gateway API key; null for an agent that only uses a subscription.
+    credential: ?[]u8,
+    provider: ?model_provider.ProviderId,
+    /// The settings-style providers object behind `custom_context`.
+    configured_providers: ?[]u8,
     model: ?[]u8,
     effort: ?[]u8,
     fast: ?bool,
@@ -652,13 +671,29 @@ const Runtime = struct {
             .oauth_transport = oauth_transport.unavailable_provider,
             .chat_url = builtin_gateway.provider.chat_url,
         };
-        const providers = provider_set.gateway_only(.{
+        var providers = provider_set.gateway_only(.{
             .presentation = builtin_gateway.provider_bundle.presentation,
             .auth_strategy = .vercel,
             .fallback_model_capabilities_fn = builtin_gateway.provider_bundle.fallback_model_capabilities_fn,
             .agent_stream = host_stream_provider.provider(&self.stream_context),
             .model_catalog = @import("gateway/host_model_catalog.zig").provider(&self.stream_context.transport),
         });
+        providers.codex = .{
+            .presentation = provider_catalog.find(.codex),
+            .auth_strategy = .chatgpt,
+            .agent_stream = host_openai_codex.provider(&self.codex_context),
+            .model_catalog = host_openai_codex.modelCatalogProvider(&self.codex_context),
+        };
+        providers.grok = .{
+            .presentation = provider_catalog.find(.grok),
+            .auth_strategy = .grok,
+            .agent_stream = host_xai_grok.provider(&self.grok_context),
+            .model_catalog = host_xai_grok.modelCatalogProvider(&self.grok_context),
+        };
+        if (self.custom_context) |*context| {
+            providers.configured_fn = host_chat_completions.bundle;
+            providers.configured_context = context;
+        }
         acp_server.runWithTransport(
             self.alloc,
             .{
@@ -682,6 +717,10 @@ const Runtime = struct {
                 .context_registry = .{ .default_provider = context_contract.empty_provider },
                 .mode_registry = builtin_modes.registry,
                 .credential_override = self.credential,
+                .provider_override = self.provider,
+                // The JS host adds provider credentials at its fetch edge.
+                .provider_auth_mode = .host_managed,
+                .configured_providers_json = self.configured_providers,
                 .model_override = self.model,
                 .effort_override = self.effort,
                 .fast_override = self.fast,
@@ -721,7 +760,9 @@ const Runtime = struct {
         self.attachments.deinit();
         self.input.deinit(self.alloc);
         self.output.deinit(self.alloc);
-        self.alloc.free(self.credential);
+        if (self.credential) |value| self.alloc.free(value);
+        if (self.custom_context) |*context| context.deinit(self.alloc);
+        if (self.configured_providers) |json| self.alloc.free(json);
         if (self.model) |model| self.alloc.free(model);
         if (self.effort) |effort| self.alloc.free(effort);
         self.alloc.free(self.home);
@@ -880,6 +921,8 @@ const CreateError = error{
     JavaScriptException,
     TooManyRuntimes,
     InvalidApiKey,
+    InvalidProvider,
+    InvalidConfiguredProvider,
     InvalidModel,
     InvalidEffort,
     InvalidFast,
@@ -892,17 +935,49 @@ const CreateError = error{
     ReadyChannelFailed,
 };
 
+const max_provider_bytes = configured_provider.max_id_bytes;
+const max_configured_providers_bytes = 1024 * 1024;
+
+/// Reads the optional `provider` option: "gateway", "codex", "grok", or the name
+/// of the provider that the `configuredProviders` option defines.
+fn getProvider(env: c.napi_env, options: c.napi_value) CreateError!?model_provider.ProviderId {
+    const alloc = std.heap.c_allocator;
+    const raw = (getNamedString(env, options, "provider", alloc, max_provider_bytes) catch |err| switch (err) {
+        error.JavaScriptException => return error.JavaScriptException,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidProvider,
+    }) orelse return null;
+    defer alloc.free(raw);
+    if (std.mem.eql(u8, raw, "gateway")) return .gateway;
+    if (std.mem.eql(u8, raw, "codex")) return .codex;
+    if (std.mem.eql(u8, raw, "grok")) return .grok;
+    const configured = model_provider.parse(raw) orelse return error.InvalidProvider;
+    if (configured != .configured) return error.InvalidProvider;
+    return configured;
+}
+
 fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
     if (!claimRuntimeSlot()) return error.TooManyRuntimes;
     errdefer releaseRuntimeSlot();
     const alloc = std.heap.c_allocator;
-    const credential = getNamedString(env, options, "apiKey", alloc, max_api_key_bytes) catch |err| switch (err) {
+    const provider = try getProvider(env, options);
+    const configured_providers = getNamedString(env, options, "configuredProviders", alloc, max_configured_providers_bytes) catch |err| switch (err) {
+        error.JavaScriptException => return error.JavaScriptException,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidConfiguredProvider,
+    };
+    errdefer if (configured_providers) |json| alloc.free(json);
+    const configured = if (provider) |value| value == .configured else false;
+    if (configured != (configured_providers != null)) return error.InvalidConfiguredProvider;
+    const api_key = getNamedString(env, options, "apiKey", alloc, max_api_key_bytes) catch |err| switch (err) {
         error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidApiKey,
     };
-    const api_key = credential orelse return error.InvalidApiKey;
-    errdefer alloc.free(api_key);
+    errdefer if (api_key) |value| alloc.free(value);
+    // The host authorizes every provider but Gateway, which needs its API key.
+    const host_authorized = if (provider) |value| value != .gateway else false;
+    if (api_key == null and !host_authorized) return error.InvalidApiKey;
     const model = getNamedString(env, options, "model", alloc, max_model_bytes) catch |err| switch (err) {
         error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
@@ -954,6 +1029,8 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
     runtime.* = .{
         .alloc = alloc,
         .credential = api_key,
+        .provider = provider,
+        .configured_providers = configured_providers,
         .model = model,
         .effort = effort,
         .fast = fast,
@@ -974,6 +1051,19 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         .close_fn = FetchBridge.close,
         .consumed_fn = FetchBridge.markConsumed,
     });
+    runtime.codex_context = .{ .transport = runtime.stream_context.transport };
+    runtime.grok_context = .{ .transport = runtime.stream_context.transport };
+    if (configured_providers) |json| {
+        var context = host_chat_completions.Context.init(alloc, runtime.stream_context.transport, json) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidConfiguredProvider,
+        };
+        errdefer context.deinit(alloc);
+        // Saved sessions record the provider together with its binding.
+        runtime.provider = provider.?.bind(context.registry) catch return error.InvalidConfiguredProvider;
+        runtime.custom_context = context;
+    }
+    errdefer if (runtime.custom_context) |*context| context.deinit(alloc);
     runtime.thread = std.Thread.spawn(.{}, Runtime.run, .{runtime}) catch return error.ThreadFailed;
     return runtime;
 }
@@ -983,6 +1073,8 @@ fn throwCreateError(env: c.napi_env, err: CreateError) c.napi_value {
         error.JavaScriptException => null,
         error.TooManyRuntimes => throw(env, "LIBFX_NATIVE_LIMIT", "too many active native runtimes"),
         error.InvalidApiKey => throw(env, "LIBFX_INVALID_ARGUMENT", "apiKey is required and must be a bounded string"),
+        error.InvalidProvider => throw(env, "LIBFX_INVALID_ARGUMENT", "provider must be \"gateway\", \"codex\", \"grok\" or a configured provider's name"),
+        error.InvalidConfiguredProvider => throw(env, "LIBFX_INVALID_ARGUMENT", "configuredProviders must validly define the selected provider, without credentials"),
         error.InvalidModel => throw(env, "LIBFX_INVALID_ARGUMENT", "model must be a bounded string"),
         error.InvalidEffort => throw(env, "LIBFX_INVALID_ARGUMENT", "effort must be a bounded string"),
         error.InvalidFast => throw(env, "LIBFX_INVALID_ARGUMENT", "fast must be a boolean"),
@@ -1102,7 +1194,7 @@ fn fetch_handle_arg(env: c.napi_env, value: c.napi_value) ?fetch_state.Handle {
 
 fn fetch_operation_value(env: c.napi_env, result: FetchOperationResult) c.napi_value {
     var value: c.napi_value = undefined;
-    if (!statusOk(env, c.napi_create_uint32(env, @intFromEnum(result), &value), "could not create fetch operation result")) return null;
+    if (!statusOk(env, c.napi_create_uint32(env, @backingInt(result), &value), "could not create fetch operation result")) return null;
     return value;
 }
 
@@ -1268,7 +1360,7 @@ fn coreFetchDisposition(env: c.napi_env, info: c.napi_callback_info) callconv(.c
     defer unlockRuntime(runtime_handle);
     const disposition = runtime.fetch.disposition(fetch_handle);
     var value: c.napi_value = undefined;
-    if (!statusOk(env, c.napi_create_int32(env, @intFromEnum(disposition), &value), "could not query fetch disposition")) return null;
+    if (!statusOk(env, c.napi_create_int32(env, @backingInt(disposition), &value), "could not query fetch disposition")) return null;
     return value;
 }
 
@@ -1372,6 +1464,15 @@ export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) callco
     var supports_ultrafast: c.napi_value = undefined;
     if (!statusOk(env, c.napi_get_boolean(env, true, &supports_ultrafast), "could not create ultrafast capability")) return null;
     if (!statusOk(env, c.napi_set_named_property(env, exports, "supportsUltrafast", supports_ultrafast), "could not export ultrafast capability")) return null;
+    var supports_codex: c.napi_value = undefined;
+    if (!statusOk(env, c.napi_get_boolean(env, true, &supports_codex), "could not create Codex capability")) return null;
+    if (!statusOk(env, c.napi_set_named_property(env, exports, "supportsCodex", supports_codex), "could not export Codex capability")) return null;
+    var supports_grok: c.napi_value = undefined;
+    if (!statusOk(env, c.napi_get_boolean(env, true, &supports_grok), "could not create Grok capability")) return null;
+    if (!statusOk(env, c.napi_set_named_property(env, exports, "supportsGrok", supports_grok), "could not export Grok capability")) return null;
+    var supports_configured: c.napi_value = undefined;
+    if (!statusOk(env, c.napi_get_boolean(env, true, &supports_configured), "could not create configured provider capability")) return null;
+    if (!statusOk(env, c.napi_set_named_property(env, exports, "supportsConfiguredProvider", supports_configured), "could not export configured provider capability")) return null;
     if (!exportFunction(env, exports, "createCore", createCore)) return null;
     if (!exportFunction(env, exports, "takeCoreReadyFd", takeCoreReadyFd)) return null;
     if (!exportFunction(env, exports, "writeCore", writeCore)) return null;

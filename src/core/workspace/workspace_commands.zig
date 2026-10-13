@@ -328,7 +328,7 @@ test "shared workspace mutations apply stale actions to the latest durable roots
     var initialized: usize = 0;
     defer for (saved[0..initialized]) |path| alloc.free(path);
     for (&saved, 0..) |*path, index| {
-        const name = try std.fmt.allocPrint(alloc, "saved-{d}", .{index});
+        const name = try alloc.print("saved-{d}", .{index});
         defer alloc.free(name);
         try tmp.dir.createDir(std.testing.io, name, .default_dir);
         path.* = try io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
@@ -415,7 +415,7 @@ test "workspace add rejects effective capacity before changing settings" {
     var initialized: usize = 0;
     defer for (saved[0..initialized]) |path| alloc.free(path);
     for (&saved, 0..) |*path, index| {
-        const name = try std.fmt.allocPrint(alloc, "saved-{d}", .{index});
+        const name = try alloc.print("saved-{d}", .{index});
         defer alloc.free(name);
         try tmp.dir.createDir(std.testing.io, name, .default_dir);
         path.* = try io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
@@ -597,8 +597,7 @@ test "workspace access reconciliation accepts only intended or previous saved st
         else => return error.TestExpectedEqual,
     }
 
-    const previous_fixture = try std.fmt.allocPrint(
-        alloc,
+    const previous_fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\"]}}}}}}\n",
         .{ primary, previous },
     );
@@ -614,8 +613,7 @@ test "workspace access reconciliation accepts only intended or previous saved st
         else => return error.TestExpectedEqual,
     }
 
-    const third_fixture = try std.fmt.allocPrint(
-        alloc,
+    const third_fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\"]}}}}}}\n",
         .{ primary, third },
     );
@@ -625,8 +623,7 @@ test "workspace access reconciliation accepts only intended or previous saved st
     defer third_result.deinit(alloc);
     try std.testing.expect(third_result == .unconfirmed);
 
-    const invalid_fixture = try std.fmt.allocPrint(
-        alloc,
+    const invalid_fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\",\"{s}\"]}}}}}}\n",
         .{ primary, previous, previous },
     );
@@ -654,7 +651,7 @@ test "workspace access reconciliation rejects a retargeted durable source" {
     defer alloc.free(home);
     const primary = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "primary");
     defer alloc.free(primary);
-    const source = try std.fs.path.resolve(alloc, &.{ primary, "../saved-link" });
+    const source = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../saved-link" });
     defer alloc.free(source);
     var current = try workspace_access.WorkspaceAccess.init(
         alloc,
@@ -669,8 +666,7 @@ test "workspace access reconciliation rejects a retargeted durable source" {
     var env = try TestEnv.install(alloc, &.{.{ .key = "HOME", .value = home }});
     defer env.deinit();
 
-    const fixture = try std.fmt.allocPrint(
-        alloc,
+    const fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\"]}}}}}}\n",
         .{ primary, source },
     );

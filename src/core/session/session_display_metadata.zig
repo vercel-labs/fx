@@ -3,6 +3,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
 const session = @import("session.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -306,7 +307,7 @@ test "display metadata derives capped title from first prompt line and bounded p
 
 test "display metadata byte-caps a single-token title" {
     const alloc = std.testing.allocator;
-    const long_token = "x" ** 512;
+    const long_token = text_utils.repeat("x", 512);
     const history = [_]session.HistoryTurn{makeAssistantTurn(long_token)};
 
     var metadata = try deriveFromHistory(alloc, &history);

@@ -17,6 +17,7 @@ const session = @import("../session/session.zig");
 const interaction_state = @import("../../ui/footer/interaction_state.zig");
 const approval_prompt = @import("../permissions/approval_prompt.zig");
 const render_request = @import("../../ui/render_request.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const ToolPermissionDecision = types.ToolPermissionDecision;
 
@@ -489,7 +490,7 @@ test "approval wheel keeps scrolling a committed command review after review syn
     defer app.deinit();
     const request: permission_request.PermissionRequest = .{
         .id = 42,
-        .label = "shell.run " ++ ("x" ** 2_400),
+        .label = "shell.run " ++ text_utils.repeat("x", 2_400),
     };
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, request));
     try std.testing.expect(try approval_screen.needsScreen(

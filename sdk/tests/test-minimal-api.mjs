@@ -3,7 +3,7 @@ import { strict as assert } from "node:assert";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent } from "../node.js";
+import { createFxEngine } from "../node.js";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 let requestedAuthorization;
@@ -33,7 +33,7 @@ const { port } = server.address();
 
 let agent;
 try {
-  agent = await createFxAgent({
+  agent = await createFxEngine({
     backend: "native",
     nativeAddon: resolve(scriptDir, "../../zig-out/lib/libfx.node"),
     fetch,
@@ -41,7 +41,7 @@ try {
     gatewayChatUrl: `http://127.0.0.1:${port}/chat`,
     model: "minimal/model",
   });
-  assert.deepEqual(Object.keys(agent).sort(), ["checkpoint", "close", "prompt"]);
+  assert.deepEqual(Object.keys(agent).sort(), ["checkpoint", "close", "followUp", "prompt", "resume", "sessionId"]);
   const turn = agent.prompt("hello");
   let text = "";
   let reasoning = "";

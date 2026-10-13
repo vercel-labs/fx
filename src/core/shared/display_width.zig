@@ -299,6 +299,24 @@ pub fn nextTabStopColumn(col: u16, cols: u16) u16 {
     return @intCast(@min(next_stop, @as(u32, cols)));
 }
 
+/// Decodes `sequence` as exactly one UTF-8 scalar value. Unlike the
+/// deprecated `std.unicode.utf8Decode`, any input that is not one complete
+/// well-formed sequence returns `error.InvalidUtf8`: a lone non-ASCII byte
+/// no longer decodes as itself, and a lead byte that disagrees with the
+/// slice length no longer reaches the fixed-length decoders' assertions.
+pub fn decodeUtf8Sequence(sequence: []const u8) error{InvalidUtf8}!u21 {
+    if (sequence.len == 0) return error.InvalidUtf8;
+    const len = std.unicode.utf8ByteSequenceLength(sequence[0]) catch return error.InvalidUtf8;
+    if (len != sequence.len) return error.InvalidUtf8;
+    return switch (len) {
+        1 => sequence[0],
+        2 => std.unicode.utf8Decode2(sequence[0..2].*) catch error.InvalidUtf8,
+        3 => std.unicode.utf8Decode3(sequence[0..3].*) catch error.InvalidUtf8,
+        4 => std.unicode.utf8Decode4(sequence[0..4].*) catch error.InvalidUtf8,
+        else => unreachable,
+    };
+}
+
 pub noinline fn decodeNextRune(text: []const u8, index: usize) DecodedRune {
     if (index >= text.len) return .{ .len = 0, .codepoint = 0 };
     const first = text[index];
@@ -307,7 +325,7 @@ pub noinline fn decodeNextRune(text: []const u8, index: usize) DecodedRune {
     const len = std.unicode.utf8ByteSequenceLength(first) catch return .{ .len = 1, .codepoint = 0xfffd };
     if (index + len > text.len) return .{ .len = 1, .codepoint = 0xfffd };
 
-    const codepoint = std.unicode.utf8Decode(text[index .. index + len]) catch return .{ .len = 1, .codepoint = 0xfffd };
+    const codepoint = decodeUtf8Sequence(text[index .. index + len]) catch return .{ .len = 1, .codepoint = 0xfffd };
     return .{ .len = len, .codepoint = codepoint };
 }
 
@@ -484,6 +502,24 @@ test "packed display ranges preserve every scalar classification" {
         try std.testing.expectEqual(isInSourceRanges(codepoint, &unicode_data.emoji_modifier_ranges), isInRanges(codepoint, &emoji_modifier_ranges));
         try std.testing.expectEqual(isInSourceRanges(codepoint, &unicode_data.variation_bases), isInRanges(codepoint, &variation_bases));
     }
+}
+
+test "decodeUtf8Sequence decodes one sequence and rejects malformed input" {
+    try std.testing.expectEqual(@as(u21, 'a'), try decodeUtf8Sequence("a"));
+    try std.testing.expectEqual(@as(u21, 0xe9), try decodeUtf8Sequence("é"));
+    try std.testing.expectEqual(@as(u21, 0x4e16), try decodeUtf8Sequence("世"));
+    try std.testing.expectEqual(@as(u21, 0x1f600), try decodeUtf8Sequence("😀"));
+    try std.testing.expectError(error.InvalidUtf8, decodeUtf8Sequence(""));
+    try std.testing.expectError(error.InvalidUtf8, decodeUtf8Sequence("\x80"));
+    try std.testing.expectError(error.InvalidUtf8, decodeUtf8Sequence("\xc3"));
+    try std.testing.expectError(error.InvalidUtf8, decodeUtf8Sequence("\xc3\x28"));
+    try std.testing.expectError(error.InvalidUtf8, decodeUtf8Sequence("\xc0\x80"));
+    try std.testing.expectError(error.InvalidUtf8, decodeUtf8Sequence("\xed\xa0\x80"));
+    try std.testing.expectError(error.InvalidUtf8, decodeUtf8Sequence("😀a"));
+    // A lead byte that disagrees with the slice length, as when a caller
+    // walks back over continuation bytes in malformed text.
+    try std.testing.expectError(error.InvalidUtf8, decodeUtf8Sequence("\xe4\x80"));
+    try std.testing.expectError(error.InvalidUtf8, decodeUtf8Sequence("\x80\x80\x80\x80"));
 }
 
 test "prefixByWidth avoids cutting emoji bytes" {

@@ -23,6 +23,7 @@ const app = resolve(root, "app");
 const fixture = fileURLToPath(new URL("./next/", import.meta.url));
 const token = randomUUID();
 const env = { ...process.env, NODE_OPTIONS: "", NODE_PATH: "", NEXT_TELEMETRY_DISABLED: "1", AI_GATEWAY_API_KEY: "",
+  FX_SESSIONS_DIR: resolve(root, "sessions"),
   LIBFX_LIVE: "0", LIBFX_SMOKE_TOKEN: token, LIBFX_TEST_MODEL: "" };
 const servers = new Set();
 const results = [];
@@ -117,10 +118,63 @@ async function exercise(server, stage) {
   }));
   assert.ok(concurrent.every((result) => result.toolCalls === 1 && result.ok));
   console.log(`${stage}/eight concurrent tool turns passed`);
+
+  // A durable session through the package's default durability: two turns
+  // in one session, then the whole session replayed from its start.
+  const authorization = { authorization: `Bearer ${token}` };
+  const first = await fetch(`${server.url}/api/durable`, { method: "POST", headers: authorization, body: "hello", signal: AbortSignal.timeout(60_000) });
+  assert.equal(first.status, 200, await first.clone().text());
+  const sessionId = first.headers.get("x-libfx-session");
+  assert.match(sessionId ?? "", /^wrun_/);
+  const firstLines = await ndjsonUntil(first, (line) => line.type === "turn_end");
+  assert.equal(firstLines.at(-1).stopReason, "end_turn");
+  assert.equal(firstLines.filter((line) => line.type === "text_delta").map((line) => line.delta).join(""), "durable answer 1");
+  const second = await fetch(`${server.url}/api/durable?sessionId=${sessionId}`, { method: "POST", headers: authorization, body: "again", signal: AbortSignal.timeout(60_000) });
+  const secondLines = await ndjsonUntil(second, (line) => line.type === "turn_end");
+  assert.equal(secondLines.filter((line) => line.type === "text_delta").map((line) => line.delta).join(""), "durable answer 2");
+  const replay = await fetch(`${server.url}/api/durable?sessionId=${sessionId}&cursor=0`, { headers: authorization, signal: AbortSignal.timeout(60_000) });
+  let ends = 0;
+  const replayed = await ndjsonUntil(replay, (line) => line.type === "turn_end" && ++ends === 2);
+  assert.equal(replayed[0].cursor, 1);
+  assert.equal(replayed.filter((line) => line.type === "turn_start").length, 2);
+  results.push({ stage, scenario: "durable", sessionId, events: replayed.length });
+  console.log(`${stage}/durable session passed`);
+}
+
+// NDJSON lines from `response` until `done(line)`; a session stream stays
+// open, so the reader stops there.
+async function ndjsonUntil(response, done) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const lines = [];
+  let buffered = "";
+  for (;;) {
+    const { value, done: ended } = await reader.read();
+    if (ended) break;
+    buffered += decoder.decode(value, { stream: true });
+    for (let index = buffered.indexOf("\n"); index >= 0; index = buffered.indexOf("\n")) {
+      const line = JSON.parse(buffered.slice(0, index));
+      buffered = buffered.slice(index + 1);
+      lines.push(line);
+      if (done(line)) {
+        await reader.cancel();
+        return lines;
+      }
+    }
+  }
+  throw new Error(`the stream ended after ${lines.length} lines without its last event`);
 }
 
 async function assertBundledNativeAssets(buildDir) {
   if (!webpack) return;
+  // A deployment carries the durability modules libfx loads on first use.
+  const durableDir = resolve(buildDir, "server/app/api/durable");
+  const durableTrace = JSON.parse(await readFile(resolve(durableDir, "route.js.nft.json"), "utf8"));
+  for (const name of ["local", "vercel"]) {
+    const file = durableTrace.files.find((path) => new RegExp(`/static/media/${name}\\.[0-9a-f]+\\.mjs$`).test(path));
+    assert.ok(file, `the durable route must trace the emitted durable/${name}.mjs`);
+    await access(resolve(durableDir, file));
+  }
   const routeDir = resolve(buildDir, "server/app/api/fx");
   const trace = JSON.parse(await readFile(resolve(routeDir, "route.js.nft.json"), "utf8"));
   for (const platform of ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"]) {

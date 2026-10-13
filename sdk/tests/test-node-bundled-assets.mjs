@@ -4,7 +4,7 @@ import { cp, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { createFxAgent, getBackendInfo } from "../node.js";
+import { createFxEngine, getBackendInfo } from "../node.js";
 
 const root = await mkdtemp(join(tmpdir(), "libfx bundled assets "));
 const media = join(root, "static", "media");
@@ -35,7 +35,7 @@ try {
     assert.ok(nativeAddon instanceof URL);
     assert.throws(() => fileURLToPath(nativeAddon), { code: "ERR_INVALID_ARG_TYPE" });
     assert.equal((await getBackendInfo({ backend: "native", nativeAddon })).backend, "native");
-    const agent = await createFxAgent({ backend: "native", nativeAddon, apiKey: "fixture-key" });
+    const agent = await createFxEngine({ backend: "native", nativeAddon, apiKey: "fixture-key" });
     try { assert.ok((await agent.checkpoint()).length > 48); }
     finally { await agent.close(); }
     for (const [surface, artifact] of [["agent", "core"], ["terminal", "term"]]) {

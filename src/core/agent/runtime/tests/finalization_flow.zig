@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../../shared/testing_allocator.zig");
 const types = @import("../../../shared/types.zig");
 const debug_trace = @import("../../../shared/debug_trace.zig");
 const io_mod = @import("../../../shared/io.zig");
@@ -648,7 +649,7 @@ test "processQueuedPrompt emits exactly one structured prompt finish per termina
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "finish-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "finish-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -712,7 +713,7 @@ test "processQueuedPrompt step limit writes active debug trace" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -1559,7 +1560,7 @@ test "common Stop interruption keeps only completed calls from a partially attem
     defer tmp.cleanup();
     const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(result_dir);
-    const trace_path = try std.fs.path.join(alloc, &.{ result_dir, "trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ result_dir, "trace.log" });
     defer alloc.free(trace_path);
     debug_trace.resetForTest();
     defer debug_trace.resetForTest();
@@ -1996,7 +1997,7 @@ test "common Stop finish event failure wins and is not retried" {
 }
 
 test "common Stop terminal payload construction failure leaves guard open for one fallback" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     const calls = [_]ToolCall{
         toolCall("call_read", "read_file", "{\"path\":\"README.md\"}"),
     };

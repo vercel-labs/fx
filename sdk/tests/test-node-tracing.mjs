@@ -43,7 +43,7 @@ async function exercise(sdk) {
     const info = await sdk.getBackendInfo({ backend: "native" });
     assert.equal(info.backend, "native", JSON.stringify(info));
     for (const backend of ["native", "auto"]) {
-      const agent = await sdk.createFxAgent({
+      const agent = await sdk.createFxEngine({
         backend, home, workspaceRoot: process.cwd(), apiKey: "trace-key", model: "trace/model",
         gatewayChatUrl: `${origin}/chat`,
         fetch(input, init) {

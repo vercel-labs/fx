@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const mcp_contract = @import("mcp_contract.zig");
 
 const Allocator = std.mem.Allocator;
@@ -146,8 +147,8 @@ pub fn authorityGeneration(view: View) u64 {
     hashU64(&hash, @intFromBool(view.features_visible));
     for (view.servers) |server_identity| {
         hashString(&hash, server_identity.name);
-        hashU64(&hash, @intFromEnum(server_identity.source));
-        hashU64(&hash, @intFromEnum(server_identity.scope));
+        hashU64(&hash, @backingInt(server_identity.source));
+        hashU64(&hash, @backingInt(server_identity.scope));
         hashU64(&hash, server_identity.connection_generation);
         hashU64(&hash, server_identity.catalog_generation);
         hashU64(&hash, server_identity.auth_generation);
@@ -290,7 +291,7 @@ test "MCP view authorization intersects immutable and live authority" {
 
 test "MCP view clone cleans up every partial allocation" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkViewCloneAllocationFailures,
         .{},
     );

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const command_admission = @import("../permissions/command_admission.zig");
 const command_contract = @import("command_contract.zig");
@@ -226,7 +227,7 @@ const Entry = struct {
         const command_ctx = command_admission.CommandContext{
             .command = command,
             .resolved_cwd = cwd,
-            .target_os = builtin.os.tag,
+            .target_os = builtin.target.os.tag,
             .environment = environment,
         };
         const authority = rebindAuthority(input.authority, command_ctx);
@@ -533,7 +534,7 @@ pub const Runtime = struct {
         const value = self.next_generated_id;
         self.next_generated_id +%= 1;
         if (self.next_generated_id == 0) self.next_generated_id = 1;
-        return std.fmt.bufPrint(buffer, "shell-{d}", .{value});
+        return std.mem.print(buffer, "shell-{d}", .{value});
     }
 
     pub fn replayStore(
@@ -1027,8 +1028,7 @@ pub const Runtime = struct {
             return error.InvalidOutputRange;
         }
         if (delivered != 0) {
-            std.mem.copyForwards(
-                u8,
+            @memmove(
                 entry.output.items[0 .. entry.output.items.len - delivered],
                 entry.output.items[delivered..],
             );
@@ -1601,7 +1601,7 @@ fn testAuthority(input: StartCapturedInput) command_admission.CommandExecutionAu
     const ctx = command_admission.CommandContext{
         .command = input.command,
         .resolved_cwd = input.cwd,
-        .target_os = builtin.os.tag,
+        .target_os = builtin.target.os.tag,
         .environment = input.environment,
     };
     return .{ .shell_allowed = .{
@@ -1611,8 +1611,8 @@ fn testAuthority(input: StartCapturedInput) command_admission.CommandExecutionAu
 }
 
 test "captured managed execution yields one handle and delivers ordered output once" {
-    if (comptime builtin.os.tag == .wasi) return;
-    const alloc = std.testing.allocator;
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = testing_allocator.no_resize;
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
     var input = StartCapturedInput{
@@ -1661,7 +1661,7 @@ test "captured managed execution yields one handle and delivers ordered output o
 }
 
 test "process-exit termination joins a command a cancelled foreground wait is already joining" {
-    if (comptime builtin.os.tag == .wasi or builtin.os.tag == .windows) return;
+    if (comptime builtin.target.os.tag == .wasi or builtin.target.os.tag == .windows) return;
     const alloc = std.testing.allocator;
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
@@ -1717,7 +1717,7 @@ test "process-exit termination joins a command a cancelled foreground wait is al
 }
 
 test "captured stop returns lost when its worker cannot settle" {
-    if (comptime builtin.os.tag == .wasi) return;
+    if (comptime builtin.target.os.tag == .wasi) return;
     const alloc = std.testing.allocator;
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
@@ -1811,7 +1811,7 @@ test "captured stop returns lost when its worker cannot settle" {
 }
 
 test "generated captured execution identities do not depend on provider call ids" {
-    if (comptime builtin.os.tag == .wasi) return;
+    if (comptime builtin.target.os.tag == .wasi) return;
     const alloc = std.testing.allocator;
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
@@ -1847,7 +1847,7 @@ test "generated captured execution identities do not depend on provider call ids
 }
 
 test "captured managed execution capacity rejects before spawn" {
-    if (comptime builtin.os.tag == .wasi) return;
+    if (comptime builtin.target.os.tag == .wasi) return;
     const alloc = std.testing.allocator;
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
@@ -1879,7 +1879,7 @@ test "captured managed execution capacity rejects before spawn" {
 }
 
 test "captured managed execution exposes full output only by opaque replay handle" {
-    if (comptime builtin.os.tag == .wasi) return;
+    if (comptime builtin.target.os.tag == .wasi) return;
     const alloc = std.testing.allocator;
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
@@ -1902,7 +1902,7 @@ test "captured managed execution exposes full output only by opaque replay handl
     defer completed.deinit(alloc);
     try std.testing.expect(completed.snapshot.output_truncated);
     const handle = completed.snapshot.output_file orelse return error.TestExpectedEqual;
-    try std.testing.expect(std.fs.path.dirname(handle) == null);
+    try std.testing.expect(std.Io.Dir.path.dirname(handle) == null);
     try runtime.commitDelivery(completed.snapshot.execution_id, completed.reservation_id);
 
     var reader = try command_replay_store.Reader.openEphemeralHandle(
@@ -1927,7 +1927,7 @@ test "managed execution retains thirty two authority free terminal snapshots" {
     var ids: [contract.max_tombstones + 1][32]u8 = undefined;
     var id_lengths: [ids.len]usize = undefined;
     for (0..ids.len) |index| {
-        const id = try std.fmt.bufPrint(&ids[index], "tty-tombstone-{d}", .{index});
+        const id = try std.mem.print(&ids[index], "tty-tombstone-{d}", .{index});
         id_lengths[index] = id.len;
         var prepared = try runtime.registerTty(alloc, .{
             .execution_id = id,
@@ -1965,7 +1965,7 @@ test "delivery reservation pins a tombstone across capacity eviction" {
     var ids: [contract.max_tombstones + 1][32]u8 = undefined;
     var lengths: [ids.len]usize = undefined;
     for (0..contract.max_tombstones) |index| {
-        const id = try std.fmt.bufPrint(&ids[index], "tty-pinned-{d}", .{index});
+        const id = try std.mem.print(&ids[index], "tty-pinned-{d}", .{index});
         lengths[index] = id.len;
         var prepared = try runtime.registerTty(alloc, .{
             .execution_id = id,
@@ -1991,7 +1991,7 @@ test "delivery reservation pins a tombstone across capacity eviction" {
     ) orelse return error.TestExpectedEqual;
     defer runtime.releaseEntry(pinned);
 
-    const replacement_id = try std.fmt.bufPrint(
+    const replacement_id = try std.mem.print(
         &ids[contract.max_tombstones],
         "tty-pinned-{d}",
         .{contract.max_tombstones},

@@ -198,13 +198,11 @@ fn buildSnapshot(
         loaded.facts.len + recovery.facts.len,
     );
     defer alloc.free(facts);
-    std.mem.copyForwards(
-        usage_report.GenerationFact,
+    @memmove(
         facts[0..loaded.facts.len],
         loaded.facts,
     );
-    std.mem.copyForwards(
-        usage_report.GenerationFact,
+    @memmove(
         facts[loaded.facts.len..],
         recovery.facts,
     );
@@ -228,8 +226,7 @@ fn buildSnapshot(
             @intFromBool(unknown_pending),
     );
     defer alloc.free(incidents);
-    std.mem.copyForwards(
-        usage_report.Incident,
+    @memmove(
         incidents[0..loaded.incidents.len],
         loaded.incidents,
     );

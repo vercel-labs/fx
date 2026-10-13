@@ -49,6 +49,8 @@ const mcp_command_provider = @import("../mcp/command_provider.zig");
 const mcp_health = @import("../mcp/health.zig");
 const project_config = @import("../mcp/project_config.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
+const mcp_host = @import("../mcp_host/host.zig");
+const mcp_verbs = @import("../mcp_host/verbs.zig");
 const mcp_auth = @import("../mcp/mcp_auth.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
@@ -241,6 +243,7 @@ pub const Config = struct {
     inspect_mcp_local_config: mcp_health.InspectLocalConfigFn =
         mcp_health.inspectLocalConfigUnavailable,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
+    load_mcp_host: ?mcp_host.LoadFn = null,
     add_mcp_profile_server: mcp_command_provider.AddProfileServerFn =
         mcp_command_provider.addProfileServerUnavailable,
     remove_mcp_profile_server: mcp_command_provider.RemoveProfileServerFn =
@@ -794,8 +797,7 @@ fn writeProviderActivationError(
     caller: ProviderActivationCaller,
     detail: []const u8,
 ) !void {
-    const message = try std.fmt.allocPrint(
-        alloc,
+    const message = try alloc.print(
         "{s}: {s}\n",
         .{ if (caller == .provider_login) "fx login" else "fx provider", detail },
     );
@@ -890,7 +892,7 @@ fn activateProviderSelectionFallible(
             },
             .outcome => {},
         }
-        const message = try std.fmt.allocPrint(alloc, "Provider set to {s}.\n", .{bound.label()});
+        const message = try alloc.print("Provider set to {s}.\n", .{bound.label()});
         defer alloc.free(message);
         if (caller == .provider_command) try writeStdout(deps, message);
         return true;
@@ -997,8 +999,7 @@ fn activateProviderSelectionFallible(
         },
         .failed => |failure| {
             debug_trace.logf("catalog", "provider selection catalog failed provider={s} category={s}", .{ @tagName(target), @tagName(failure.failure.category) });
-            const detail = try std.fmt.allocPrint(
-                alloc,
+            const detail = try alloc.print(
                 "could not load the target model catalog ({s})",
                 .{@tagName(failure.failure.category)},
             );
@@ -1110,12 +1111,13 @@ fn runNonInteractiveWithDeps(
         return .handled_success;
     }
 
-    if (topLevelHelpRequest(cfg.command_catalog, effective_args)) |kind| {
+    // MCP-v2's verbs print their own help, and pass `-h` after `--` to the server.
+    if (topLevelHelpRequest(cfg.command_catalog, effective_args)) |kind| if (kind != .mcp or !mcp_host.selected()) {
         const text = try command_specs.renderTopLevelCommandHelp(alloc, cfg.command_catalog, kind);
         defer alloc.free(text);
         try writeStdout(deps, text);
         return .handled_success;
-    }
+    };
 
     switch (parsed_command) {
         .interactive, .resume_session => unreachable,
@@ -1390,6 +1392,7 @@ fn runNonInteractiveWithDeps(
             }, mcp_inspection.profile_diagnostic);
             snapshot.mcp = localMcpView(&mcp_inspection);
             snapshot.provider_endpoint = startup.provider_endpoint;
+            snapshot.modes = statusModes(cfg.mode_registry, snapshot.permission_mode);
             if (opts.format == .json) {
                 try writeStatusJsonLine(alloc, deps, snapshot);
                 return .handled_success;
@@ -1509,8 +1512,7 @@ fn runNonInteractiveWithDeps(
                 .loaded => |loaded| loaded,
                 .failure => |failure| {
                     const error_name = @errorName(failure.failure.asError());
-                    const message = try std.fmt.allocPrint(
-                        alloc,
+                    const message = try alloc.print(
                         "could not list models: {s}",
                         .{catalogFailureDetail(failure.failure)},
                     );
@@ -2102,8 +2104,7 @@ fn runPasteSetup(
         };
     }
 
-    const message = try std.fmt.allocPrint(
-        alloc,
+    const message = try alloc.print(
         "Saved API key to {s}.\n",
         .{secret_store.backend_label},
     );
@@ -2172,7 +2173,7 @@ const MaskedKeyRawMode = struct {
         }
 
         var self: MaskedKeyRawMode = .{};
-        self.original = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
+        self.original = try io_mod.tcgetattr(std.posix.STDIN_FILENO);
         var raw = self.original;
         raw.iflag.BRKINT = false;
         raw.iflag.ICRNL = false;
@@ -2185,11 +2186,11 @@ const MaskedKeyRawMode = struct {
         raw.lflag.ICANON = false;
         raw.lflag.IEXTEN = false;
         raw.lflag.ISIG = false;
-        const vmin_idx = switch (builtin.os.tag) {
+        const vmin_idx = switch (builtin.target.os.tag) {
             .linux => 6,
             else => 16,
         };
-        const vtime_idx = switch (builtin.os.tag) {
+        const vtime_idx = switch (builtin.target.os.tag) {
             .linux => 5,
             else => 17,
         };
@@ -2197,14 +2198,14 @@ const MaskedKeyRawMode = struct {
             raw.cc[vmin_idx] = 1;
             raw.cc[vtime_idx] = 0;
         }
-        try std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
+        try io_mod.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
         self.active = true;
         return self;
     }
 
     fn disable(self: *MaskedKeyRawMode) void {
         if (!self.active) return;
-        std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
+        io_mod.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
         self.active = false;
     }
 };
@@ -2338,14 +2339,14 @@ fn doctorSnapshotFromRuntime(snapshot: doctor_runtime.Snapshot) output_contracts
 }
 
 fn writeRealStdout(_: ?*anyopaque, text: []const u8) !void {
-    if (comptime builtin.os.tag != .windows) {
+    if (comptime builtin.target.os.tag != .windows) {
         return writeFdAll(std.posix.STDOUT_FILENO, text);
     }
     try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
 }
 
 fn writeRealStderr(_: ?*anyopaque, text: []const u8) !void {
-    if (comptime builtin.os.tag != .windows) {
+    if (comptime builtin.target.os.tag != .windows) {
         return writeFdAll(std.posix.STDERR_FILENO, text);
     }
     try std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), text);
@@ -2424,6 +2425,7 @@ fn runTopLevelMcp(
     cfg: Config,
     deps: RunDeps,
 ) !RunResult {
+    if (mcp_host.selected()) return runMcpVerbs(alloc, rest, cfg, deps);
     if (rest.len == 0) {
         const help = try command_specs.renderTopLevelCommandHelp(alloc, cfg.command_catalog, .mcp);
         defer alloc.free(help);
@@ -2624,6 +2626,93 @@ fn runTopLevelMcp(
     try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
     return .handled_failure;
 }
+
+/// `fx mcp` on MCP-v2: the verbs `/mcp` shares.
+fn runMcpVerbs(alloc: Allocator, rest: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
+    const home = deps.getenv(deps.env_ctx, "HOME") orelse {
+        try writeStderr(deps, "fx mcp: HOME isn't set\n");
+        return .handled_failure;
+    };
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
+    const args = try alloc.alloc([]const u8, rest.len);
+    defer alloc.free(args);
+    for (rest, args) |r, *a| a.* = r;
+    var out_buffer: [1024]u8 = undefined;
+    var err_buffer: [512]u8 = undefined;
+    var out: DepsWriter = .init(deps, .stdout, &out_buffer);
+    var err: DepsWriter = .init(deps, .stderr, &err_buffer);
+    var hosts: CliMcpHosts = .{ .alloc = alloc, .cfg = cfg, .workspace_root = workspace_root };
+    const code = mcp_verbs.run(.{
+        .gpa = alloc,
+        .out = &out.interface,
+        .err = &err.interface,
+        .surface = .cli,
+        .home = home,
+        .workspace_root = workspace_root,
+        .hosts = .{ .context = &hosts, .get = CliMcpHosts.get, .release = CliMcpHosts.release, .changed = CliMcpHosts.changed },
+    }, args);
+    return switch (code) {
+        0 => .handled_success,
+        1 => .handled_failure,
+        else => .{ .handled_exit = code },
+    };
+}
+
+/// A host made for one `fx mcp` command.
+const CliMcpHosts = struct {
+    alloc: Allocator,
+    cfg: Config,
+    workspace_root: []const u8,
+
+    fn get(context: *anyopaque, notify: ?mcp_verbs.Notify) anyerror!?*mcp_host.Host {
+        const self: *CliMcpHosts = @ptrCast(@alignCast(context));
+        const load = self.cfg.load_mcp_host orelse return null;
+        return load(self.alloc, self.workspace_root, self.cfg.tool_set.registry, .{ .notify = notify });
+    }
+
+    /// `fx mcp` exits after its one command, so nothing waits for the
+    /// servers; a logout already waited for its revocation.
+    fn release(_: *anyopaque, _: *mcp_host.Host) void {
+        mcp_host.signalServersForExit();
+    }
+
+    fn changed(_: *anyopaque) void {}
+};
+
+/// Streams through `deps`, so `login` shows its address while it waits.
+const DepsWriter = struct {
+    deps: RunDeps,
+    stream: enum { stdout, stderr },
+    interface: std.Io.Writer,
+
+    fn init(deps: RunDeps, stream: @FieldType(DepsWriter, "stream"), buffer: []u8) DepsWriter {
+        return .{ .deps = deps, .stream = stream, .interface = .{ .vtable = &.{ .drain = drain }, .buffer = buffer } };
+    }
+
+    fn emit(self: *DepsWriter, bytes: []const u8) std.Io.Writer.Error!void {
+        if (bytes.len == 0) return;
+        const written = switch (self.stream) {
+            .stdout => writeStdout(self.deps, bytes),
+            .stderr => writeStderr(self.deps, bytes),
+        };
+        written catch return error.WriteFailed;
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *DepsWriter = @alignCast(@fieldParentPtr("interface", w));
+        try self.emit(w.buffered());
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            try self.emit(d);
+            n += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| try self.emit(last);
+        return n + last.len * splat;
+    }
+};
 
 fn authenticateMcpCommand(
     alloc: Allocator,
@@ -2966,6 +3055,28 @@ fn argsContainJson(args: anytype) bool {
 
 fn workflowLanguagePlaceholder() types.ConversationLanguage {
     return types.ConversationLanguage.default();
+}
+
+/// The session modes `fx status` reports, so a client can show the mode
+/// choice before an ACP session exists. Null for a registry without modes.
+fn statusModes(registry: mode_registry.Registry, permission_mode: types.PermissionMode) ?output_contracts.StatusSnapshot.SessionModes {
+    if (registry.modes.len == 0) return null;
+    return .{ .current = registry.startingModeId(permission_mode), .all = registry.modes };
+}
+
+test "status reports the mode a new session starts in" {
+    const modes = [_]mode_registry.ModeSpec{
+        .{ .id = "auto", .name = "Auto", .permission_mode = .auto },
+        .{ .id = "ask", .name = "Ask", .permission_mode = .ask },
+        .{ .id = "full-access", .name = "Full access", .permission_mode = .yolo },
+    };
+    const registry = mode_registry.Registry{ .default_mode_id = "auto", .modes = modes[0..] };
+
+    const full = statusModes(registry, .yolo) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("full-access", full.current);
+    try std.testing.expectEqual(@as(usize, 3), full.all.len);
+    try std.testing.expectEqualStrings("ask", statusModes(registry, .ask).?.current);
+    try std.testing.expect(statusModes(.{ .default_mode_id = "surface" }, .auto) == null);
 }
 
 fn permissionModeForSnapshot(mode: anytype) types.PermissionMode {
@@ -3387,13 +3498,11 @@ fn writeSessionDetailFailure(
     format: output_contracts.OutputFormat,
 ) !void {
     const message = switch (err) {
-        error.InvalidSessionFormat => try std.fmt.allocPrint(
-            alloc,
+        error.InvalidSessionFormat => try alloc.print(
             "session {s} is corrupt; run `fx session recover {s}`",
             .{ session_id, session_id },
         ),
-        error.UnsupportedSessionSchema => try std.fmt.allocPrint(
-            alloc,
+        error.UnsupportedSessionSchema => try alloc.print(
             "session {s} uses an unsupported session version",
             .{session_id},
         ),
@@ -3623,6 +3732,7 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .max_history_turns = cfg.max_history_turns,
         .mode_registry = cfg.mode_registry,
         .load_mcp_runtime = cfg.load_mcp_runtime,
+        .load_mcp_host = cfg.load_mcp_host,
     };
 }
 
@@ -3853,7 +3963,7 @@ fn parseSessionListCursor(raw: []const u8) !session_store.ResumableSessionContin
     const updated_at_ms = std.fmt.parseInt(i64, updated_text, 10) catch
         return error.InvalidLocalSurfaceArgs;
     var canonical: [320]u8 = undefined;
-    const encoded = std.fmt.bufPrint(
+    const encoded = std.mem.print(
         &canonical,
         "v1:{d}:{s}",
         .{ updated_at_ms, id },
@@ -3866,8 +3976,7 @@ fn formatSessionListCursor(
     alloc: Allocator,
     summary: session_store.SessionSummary,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "v1:{d}:{s}",
         .{ summary.updated_at_ms, summary.id },
     );
@@ -5098,8 +5207,7 @@ test "top-level MCP trust persists project approval without interactive startup"
         deps,
     );
     try std.testing.expectEqual(RunResult.handled_success, result);
-    const expected = try std.fmt.allocPrint(
-        alloc,
+    const expected = try alloc.print(
         "Approved project MCP server 'fixture' for {s}.\n",
         .{workspace_root},
     );

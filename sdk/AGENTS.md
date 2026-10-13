@@ -2,7 +2,7 @@
 
 These instructions apply to work under `sdk/` and supplement the repository-level `AGENTS.md`.
 
-This file is maintainer guidance, not consumer documentation. Keep setup and the supported public surface in `sdk/README.md`. Keep exact API shapes in `sdk/fx-sdk.js` and its tests. Add details here only when they help an agent choose the right owner, preserve a non-obvious invariant, or run the right proof. The native Node-API architecture and security model are documented in `sdk/NAPI.md`.
+This file is maintainer guidance, not consumer documentation. Keep setup and the supported public surface in `sdk/README.md`. Keep exact API shapes in `sdk/fx-sdk.js`, its tests, and the declarations in `sdk/types/`. Add details here only when they help an agent choose the right owner, preserve a non-obvious invariant, or run the right proof. The native Node-API architecture and security model are documented in `sdk/NAPI.md`.
 
 ## Start from the correct owner
 
@@ -21,6 +21,11 @@ The SDK has two WebAssembly surfaces and one shared JavaScript host layer:
 | WASI target, optimization mode, threading, and artifact names | `build.zig` |
 | Core browser fixture and its automation contract | `sdk/index.html` and `sdk/tests/test-core-browser.mjs` |
 | Terminal fixture and static packaging contract | `sdk/term-demo.html` and `sdk/scripts/package-term-demo.mjs` |
+| Durable sessions: log, leases, queue, deadlines, UI stream, and the harness contract | `sdk/durable.js` (no fx imports) |
+| fx as a durable harness: engine options, rerun policy | `sdk/fx-harness.js` |
+| A durability over a World the app supplies; `local()` and `vercel()` are built on it | `sdk/durable/world.mjs` |
+| TypeScript declarations for every entry point | `sdk/types/`, checked by `sdk/tests/test-types.mjs` |
+| Checkpoint format, including the libfx version, tool set, and model each checkpoint records | `src/core/agent/runtime/checkpoint.zig` |
 | Commands required by CI | `.github/workflows/ci.yml` |
 
 Do not treat the demos or this file as the implementation contract. When prose and behavior disagree, establish the current behavior from code and focused tests before changing either.
@@ -43,6 +48,7 @@ Do not treat the demos or this file as the implementation contract. When prose a
 | Change | Minimum focused proof |
 | --- | --- |
 | Public export, shared loader, WASI import, or JSPI gate | Build and test both surfaces |
+| Public export, option, event, or result shape | Update `sdk/types/` and run `node sdk/tests/test-types.mjs` after `npm ci --prefix sdk/node` |
 | `createFxAgent()`, ACP translation, core session persistence, streaming, or cancellation | Core build, core Node tests, and the browser test when browser behavior is involved |
 | Live Gateway request or model-catalog translation | Core tests plus the opt-in live smoke test when a credential is available |
 | Terminal adapter, input encoding, resize, cleanup, config, or prompt history | Terminal build and the headless terminal suite |
@@ -52,6 +58,7 @@ Do not treat the demos or this file as the implementation contract. When prose a
 | `encodeXtermKeyEvent()` or `xtermAdapter()` only | `sdk/node/test-xterm-adapter.mjs` |
 | Core debugger query behavior or automation state | `sdk/tests/test-core-browser.mjs` |
 | Terminal demo asset references, integrity, or cache policy | Package into a fresh temporary directory and inspect the generated HTML, manifest, and headers |
+| Durable sessions: leases, fencing, takeovers, tool reruns, the UI stream | `sdk/tests/test-durable-core.mjs` on memory, local, world, and queue (the core with a scripted harness; world is an app-built World passed to `world()`, queue one whose queue delivers as Vercel Queues does, with `queueLeases`), `sdk/tests/test-durable.mjs` on memory, local, and world, then `sdk/tests/model/check.sh` and `bun sdk/tests/model/drive.mjs send`, `lookup`, `write`, `cutoff` (deadline cut-offs up to their bound), `leased` (a World without liveness, where each worker renews a short lease), and `queue` (a World whose queue shows whether a worker lives, so leases are held without renewals), which walk the real code along the TLC state graphs of `DurableSession.tla`; change the spec with the code. For agent names and routing, also `bun sdk/tests/model/drive-agents.mjs send` and `consume`, which walk `AgentRouting.tla`'s graphs with each process in a worker thread of its own. With a Vercel access token, also run both against Vercel's World: `test-durable.mjs vercel native` and `drive.mjs --durability vercel`, configured as `sdk/tests/vercel-storage.mjs` describes |
 | Supported public behavior or setup | Update `sdk/README.md` in the same change |
 
 Use Node.js 24 for SDK tests. CI relies on its JSPI implementation behind `--experimental-wasm-jspi`.

@@ -619,6 +619,9 @@ class PgsoQualificationTests(unittest.TestCase):
         ]
         self.assertEqual(50, len(hyperfine_calls))
         for round_index, command in enumerate(hyperfine_calls):
+            # The benchmark's own output must reach the round log, so a
+            # failed round shows why it failed.
+            self.assertIn("--output=inherit", command)
             self.assertEqual("1", command[command.index("--runs") + 1])
             self.assertEqual(
                 "0",

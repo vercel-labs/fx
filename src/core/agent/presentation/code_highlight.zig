@@ -300,7 +300,7 @@ fn blockCommentEnd(source: []const u8, index: usize, block_comment: ?languages.B
     const comment = block_comment orelse return null;
     if (!std.mem.startsWith(u8, source[index..], comment.start)) return null;
     const content_start = index + comment.start.len;
-    const close_start = std.mem.indexOfPos(u8, source, content_start, comment.end) orelse return source.len;
+    const close_start = std.mem.findPos(u8, source, content_start, comment.end) orelse return source.len;
     return close_start + comment.end.len;
 }
 
@@ -312,11 +312,11 @@ fn lineCommentEnd(source: []const u8, index: usize, prefixes: []const []const u8
 }
 
 fn lineEnd(source: []const u8, start: usize) usize {
-    return std.mem.indexOfScalarPos(u8, source, start, '\n') orelse source.len;
+    return std.mem.findScalarPos(u8, source, start, '\n') orelse source.len;
 }
 
 fn isQuote(byte: u8, quotes: []const u8) bool {
-    return std.mem.indexOfScalar(u8, quotes, byte) != null;
+    return std.mem.findScalar(u8, quotes, byte) != null;
 }
 
 fn quotedEnd(source: []const u8, start: usize) usize {
@@ -476,7 +476,7 @@ fn stripAnsi(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
 fn count(text: []const u8, needle: []const u8) usize {
     var result: usize = 0;
     var start: usize = 0;
-    while (std.mem.indexOfPos(u8, text, start, needle)) |index| {
+    while (std.mem.findPos(u8, text, start, needle)) |index| {
         result += 1;
         start = index + needle.len;
     }
@@ -492,12 +492,12 @@ test "supported source gains balanced colors without changing code bytes" {
     const plain = try stripAnsi(alloc, styled);
     defer alloc.free(plain);
     try std.testing.expectEqualStrings(source, plain);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;") != null);
     try std.testing.expectEqual(count(styled, "\x1b[38;5;"), count(styled, "\x1b[39m"));
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252mconst") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252mconst") != null);
     try std.testing.expectEqual(@as(usize, 1), count(styled, "\x1b[38;5;252mconst"));
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m\"const\"\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252mreturn") == null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;250m\"const\"\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252mreturn") == null);
 }
 
 test "light theme uses a readable syntax palette without changing code bytes" {
@@ -509,9 +509,9 @@ test "light theme uses a readable syntax palette without changing code bytes" {
     const plain = try stripAnsi(alloc, styled);
     defer alloc.free(plain);
     try std.testing.expectEqualStrings(source, plain);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;238mconst\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;241m\"ready\"\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;243m// comment\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;238mconst\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;241m\"ready\"\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;243m// comment\x1b[39m") != null);
     try std.testing.expectEqual(count(styled, "\x1b[38;5;"), count(styled, "\x1b[39m"));
 }
 
@@ -554,7 +554,7 @@ test "every registered profile highlights representative source" {
         const plain = try stripAnsi(alloc, styled);
         defer alloc.free(plain);
         try std.testing.expectEqualStrings(case.source, plain);
-        try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;") != null);
+        try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;") != null);
     }
 }
 
@@ -568,9 +568,9 @@ test "profiles use configured block comments and case-insensitive keywords" {
     const html = try highlight(alloc, source[35..], languages.resolve("html").?, .dark, null);
     defer alloc.free(html);
 
-    try std.testing.expect(std.mem.indexOf(u8, css, "\x1b[38;5;245m/* comment */\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sql, "\x1b[38;5;252mSELECT\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "\x1b[38;5;245m<!-- note -->\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, css, "\x1b[38;5;245m/* comment */\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, sql, "\x1b[38;5;252mSELECT\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, html, "\x1b[38;5;245m<!-- note -->\x1b[39m") != null);
 }
 
 test "themed attribute slots close fully without bleeding into later text" {
@@ -587,8 +587,8 @@ test "themed attribute slots close fully without bleeding into later text" {
     defer alloc.free(styled);
 
     // Italic comment and bold keyword each close with their attributes reset.
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[3;38;2;106;153;85m// note\x1b[39m\x1b[23m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[1;38;2;130;210;206mconst\x1b[39m\x1b[22m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[3;38;2;106;153;85m// note\x1b[39m\x1b[23m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[1;38;2;130;210;206mconst\x1b[39m\x1b[22m") != null);
     // Nothing stays bold or italic past the final close.
     try std.testing.expect(!std.mem.endsWith(u8, styled, "\x1b[3;38;2;106;153;85m"));
 }
@@ -600,7 +600,7 @@ test "base style wraps the span and restores after each token" {
 
     // The span opens with the base, and every token close re-establishes it.
     try std.testing.expect(std.mem.startsWith(u8, styled, "<base>\x1b[38;5;252mecho\x1b[39m<base> "));
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m'hi there'\x1b[39m<base>") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;250m'hi there'\x1b[39m<base>") != null);
     // Bare number arguments stay plain in shell.
     try std.testing.expect(std.mem.endsWith(u8, styled, "<base> 42"));
 }
@@ -628,20 +628,20 @@ test "shell operators and variables take the keyword color" {
     const styled = try highlight(alloc, "cd /tmp && echo $HOME | head -2 > out; echo $? # done", languages.resolve("sh").?, .dark, null);
     defer alloc.free(styled);
 
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m&&\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m|\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m>\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m;\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m$HOME\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m$?\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252m&&\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252m|\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252m>\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252m;\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252m$HOME\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252m$?\x1b[39m") != null);
     // Comments keep their color, flags take the number color as a unit, and
     // a $ inside quotes stays string.
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;245m# done\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m-2\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;245m# done\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;250m-2\x1b[39m") != null);
 
     const quoted = try highlight(alloc, "echo '$HOME'", languages.resolve("sh").?, .dark, null);
     defer alloc.free(quoted);
-    try std.testing.expect(std.mem.indexOf(u8, quoted, "\x1b[38;5;250m'$HOME'\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, quoted, "\x1b[38;5;250m'$HOME'\x1b[39m") != null);
 
     // Other languages do not pick up shell operators.
     const zig_src = try highlight(alloc, "a < b", languages.resolve("zig").?, .dark, null);
@@ -656,11 +656,11 @@ test "digit runs glued to words by a dash stay plain" {
 
     // The date suffix in the path is a name segment and keeps the plain text,
     // as does the literal-looking "null" in /dev/null.
-    try std.testing.expect(std.mem.indexOf(u8, styled, "build-20260918") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "/dev/null") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "build-20260918") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "/dev/null") != null);
     // The numeric flag colors as a unit, and the redirect fd still colors.
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m-80\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m2\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;250m-80\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;250m2\x1b[39m") != null);
 }
 
 test "dash flags color as units only at word boundaries" {
@@ -668,16 +668,16 @@ test "dash flags color as units only at word boundaries" {
     const styled = try highlight(alloc, "tail -8 --json && cat - < in", languages.resolve("sh").?, .dark, null);
     defer alloc.free(styled);
 
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m-8\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m--json\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;250m-8\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;250m--json\x1b[39m") != null);
     // A lone dash (stdin marker) stays plain between the verb and the
     // redirect, and the redirect target is an argument, not a keyword.
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252mcat\x1b[39m - \x1b[38;5;252m<\x1b[39m in") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252mcat\x1b[39m - \x1b[38;5;252m<\x1b[39m in") != null);
 
     // Flags after operators still count as boundaries.
     const after_pipe = try highlight(alloc, "echo x | head -1", languages.resolve("sh").?, .dark, null);
     defer alloc.free(after_pipe);
-    try std.testing.expect(std.mem.indexOf(u8, after_pipe, "\x1b[38;5;250m-1\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, after_pipe, "\x1b[38;5;250m-1\x1b[39m") != null);
 
     // Other languages keep minus signs plain.
     const zig_src = try highlight(alloc, "a - b", languages.resolve("zig").?, .dark, null);
@@ -693,18 +693,18 @@ test "command position colors any command word and only command words" {
     // Unknown binaries color in command position, matching the bash grammar's
     // variable.function; a builtin used as an argument stays plain, and the
     // redirect target is a path, not a command.
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252mgh\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252mxargs\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252mgh\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252mxargs\x1b[39m") != null);
     // echo is an argument here and stays plain; the redirect target too.
-    try std.testing.expect(std.mem.indexOf(u8, styled, " echo \x1b[38;5;252m>\x1b[39m out.txt") != null);
+    try std.testing.expect(std.mem.find(u8, styled, " echo \x1b[38;5;252m>\x1b[39m out.txt") != null);
 
     // Control keywords hand command position to the command they govern.
     const chain = try highlight(alloc, "if cd /x; then echo hi; fi", languages.resolve("sh").?, .dark, null);
     defer alloc.free(chain);
     for ([_][]const u8{ "if", "cd", "then", "echo", "fi" }) |word| {
-        const wrapped = try std.fmt.allocPrint(alloc, "\x1b[38;5;252m{s}\x1b[39m", .{word});
+        const wrapped = try alloc.print("\x1b[38;5;252m{s}\x1b[39m", .{word});
         defer alloc.free(wrapped);
-        try std.testing.expect(std.mem.indexOf(u8, chain, wrapped) != null);
+        try std.testing.expect(std.mem.find(u8, chain, wrapped) != null);
     }
 }
 
@@ -713,10 +713,10 @@ test "bare number arguments stay plain but redirect fds color" {
     const styled = try highlight(alloc, "sleep 5; exit 7 2>&1", languages.resolve("sh").?, .dark, null);
     defer alloc.free(styled);
 
-    try std.testing.expect(std.mem.indexOf(u8, styled, " 5") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, " 7 ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m2\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m1\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, " 5") != null);
+    try std.testing.expect(std.mem.find(u8, styled, " 7 ") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;250m2\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;250m1\x1b[39m") != null);
 }
 
 test "braced variables tildes globs and substitution parse like the grammar" {
@@ -724,18 +724,18 @@ test "braced variables tildes globs and substitution parse like the grammar" {
     const styled = try highlight(alloc, "cp ${SRC}/*.log ~/out && echo $(date +%F)", languages.resolve("sh").?, .dark, null);
     defer alloc.free(styled);
 
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m${SRC}\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m*\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m~\x1b[39m/out") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m$(\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252m${SRC}\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252m*\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252m~\x1b[39m/out") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252m$(\x1b[39m") != null);
     // The substitution contents open in command position.
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252mdate\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252mdate\x1b[39m") != null);
 
     // Backtick contents parse as code rather than one flat string.
     const ticks = try highlight(alloc, "echo `uname -s`", languages.resolve("sh").?, .dark, null);
     defer alloc.free(ticks);
-    try std.testing.expect(std.mem.indexOf(u8, ticks, "`\x1b[38;5;252muname\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ticks, "\x1b[38;5;250m-s\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, ticks, "`\x1b[38;5;252muname\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, ticks, "\x1b[38;5;250m-s\x1b[39m") != null);
 }
 
 test "double quotes interpolate variables inside the string color" {
@@ -743,13 +743,13 @@ test "double quotes interpolate variables inside the string color" {
     const styled = try highlight(alloc, "echo \"hi $USER from ${HOME}\"", languages.resolve("sh").?, .dark, null);
     defer alloc.free(styled);
 
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m\"hi \x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m$USER\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m${HOME}\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;250m\"hi \x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252m$USER\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252m${HOME}\x1b[39m") != null);
     // Single quotes do not interpolate.
     const single = try highlight(alloc, "echo '$USER'", languages.resolve("sh").?, .dark, null);
     defer alloc.free(single);
-    try std.testing.expect(std.mem.indexOf(u8, single, "\x1b[38;5;250m'$USER'\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, single, "\x1b[38;5;250m'$USER'\x1b[39m") != null);
 }
 
 test "diff lines paint with the caller's marker colors" {
@@ -758,12 +758,12 @@ test "diff lines paint with the caller's marker colors" {
     const styled = try highlightDiff(alloc, patch, .dark, "<added>", "<removed>");
     defer alloc.free(styled);
 
-    try std.testing.expect(std.mem.indexOf(u8, styled, "<added>+new line") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "<removed>-old line") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252m@@ -1,2 +1,2 @@\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;245m--- a/f\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;245mdiff --git a/f b/f\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\n context") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "<added>+new line") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "<removed>-old line") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;252m@@ -1,2 +1,2 @@\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;245m--- a/f\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;245mdiff --git a/f b/f\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\n context") != null);
 
     var no_syntax = shared_theme.fx_dark;
     no_syntax.syntax.enabled = false;
@@ -783,7 +783,7 @@ test "text blocks stay byte-identical and markdown colors inline code" {
 
     const md = try highlight(alloc, "run `fx upgrade` to update", languages.resolve("md").?, .dark, null);
     defer alloc.free(md);
-    try std.testing.expect(std.mem.indexOf(u8, md, "\x1b[38;5;250m`fx upgrade`\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, md, "\x1b[38;5;250m`fx upgrade`\x1b[39m") != null);
 }
 
 test "split slots let themes color commands variables and operators apart" {
@@ -803,9 +803,9 @@ test "split slots let themes color commands variables and operators apart" {
 
     // Control keywords keep the keyword color; command words take the
     // function color; variables and operators take their own.
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;204mwhile\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;201mtrue\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;201mecho\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;202m$HOME\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;203m|\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;204mwhile\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;201mtrue\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;201mecho\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;202m$HOME\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, styled, "\x1b[38;5;203m|\x1b[39m") != null);
 }

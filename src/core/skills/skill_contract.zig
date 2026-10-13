@@ -1,5 +1,6 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 pub const max_frontmatter_bytes: usize = 64 * 1024;
 pub const max_name_bytes: usize = 256;
@@ -103,7 +104,7 @@ pub const Locations = struct {
         const leaf = std.Uri.percentDecodeInPlace(decoded);
         if (leaf.len == 0 or std.mem.eql(u8, leaf, ".") or std.mem.eql(u8, leaf, "..") or
             std.mem.findAny(u8, leaf, "/\\\x00") != null or !std.unicode.utf8ValidateSlice(leaf)) return error.InvalidSkillLocation;
-        return std.fs.path.join(alloc, &.{ self.roots[index], leaf });
+        return std.Io.Dir.path.join(alloc, &.{ self.roots[index], leaf });
     }
 };
 
@@ -656,7 +657,7 @@ pub fn invalidSkillNameCause(name: []const u8) ?InvalidMetadataCause {
 pub fn validateManagedSkillName(name: []const u8) !void {
     if (name.len == 0 or name.len > max_name_bytes) return error.InvalidSkillName;
     if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return error.InvalidSkillName;
-    if (std.fs.path.isAbsolute(name)) return error.InvalidSkillName;
+    if (std.Io.Dir.path.isAbsolute(name)) return error.InvalidSkillName;
     if (std.mem.findScalar(u8, name, '/') != null) return error.InvalidSkillName;
     if (std.mem.findScalar(u8, name, '\\') != null) return error.InvalidSkillName;
 }
@@ -769,7 +770,7 @@ test "description blocks return to top-level metadata and reject malformed struc
 }
 
 test "skill metadata accepts descriptions within the frontmatter bound" {
-    const description = "use this workflow for the specified task " ** 160;
+    const description = text_utils.repeat("use this workflow for the specified task ", 160);
     const content = "---\nname: thorough\ndescription: " ++ description ++ "\n---\nbody";
     try std.testing.expectEqual(MetadataStatus.valid, parseSkillFile(content).status);
 }
@@ -777,7 +778,7 @@ test "skill metadata accepts descriptions within the frontmatter bound" {
 test "description blocks respect the complete frontmatter bound" {
     const prefix = "---\nname: bounded\ndescription: >-\n  ";
     const suffix = "\n---\n";
-    const exact = "d" ** (max_frontmatter_bytes - prefix.len - suffix.len);
+    const exact = text_utils.repeat("d", max_frontmatter_bytes - prefix.len - suffix.len);
     const over = exact ++ "d";
     try std.testing.expectEqual(
         MetadataStatus.valid,
@@ -861,11 +862,11 @@ test "parseSkillFile with partial frontmatter" {
 }
 
 test "parseSkillFile enforces hard metadata field bounds" {
-    const valid_name = "n" ** max_name_bytes;
+    const valid_name = text_utils.repeat("n", max_name_bytes);
     const oversized_name = valid_name ++ "n";
     const prefix = "---\nname: valid\ndescription: ";
     const suffix = "\n---\n";
-    const valid_description = "d" ** (max_frontmatter_bytes - prefix.len - suffix.len);
+    const valid_description = text_utils.repeat("d", max_frontmatter_bytes - prefix.len - suffix.len);
     const oversized_description = valid_description ++ "d";
 
     const name_at_limit = parseSkillFile("---\nname: " ++ valid_name ++ "\n---\n");

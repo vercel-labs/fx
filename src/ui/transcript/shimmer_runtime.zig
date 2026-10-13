@@ -333,7 +333,7 @@ test "activity status styles paint static colored text" {
     var buf: [128]u8 = undefined;
     const result = writeStaticStyledText(&buf, "⚠ API error", ui_render.warning_style);
     var expected_buf: [128]u8 = undefined;
-    const expected = std.fmt.bufPrint(
+    const expected = std.mem.print(
         &expected_buf,
         "{s}⚠ API error{s}",
         .{ ui_render.warning_style, ui_render.reset_style },
@@ -564,8 +564,8 @@ test "static status truncation preserves recovery action and attempt suffix" {
     defer preview.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.startsWith(u8, preview.bytes, "⚠ Provider unavailable ·"));
-    try std.testing.expect(std.mem.indexOf(u8, preview.bytes, "no_available_providers:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, preview.bytes, "...") != null);
+    try std.testing.expect(std.mem.find(u8, preview.bytes, "no_available_providers:") != null);
+    try std.testing.expect(std.mem.find(u8, preview.bytes, "...") != null);
     try std.testing.expect(std.mem.endsWith(u8, preview.bytes, "attempt 4/10"));
 
     var lines = std.mem.splitScalar(u8, preview.bytes, '\n');
@@ -589,7 +589,7 @@ test "static status truncation preserves leading context for non-error statuses"
 
     try std.testing.expect(std.mem.startsWith(u8, preview.bytes, "✓ Recovered · resumed"));
     try std.testing.expect(std.mem.endsWith(u8, preview.bytes, "..."));
-    try std.testing.expect(std.mem.indexOf(u8, preview.bytes, "later details") == null);
+    try std.testing.expect(std.mem.find(u8, preview.bytes, "later details") == null);
 }
 
 test "activity surface painter breaks static status rows at word boundaries" {
@@ -831,7 +831,7 @@ test "activity paint trace formats omit label payload" {
     const label_hash = std.hash.Wyhash.hash(0, label);
 
     var surface_buf: [256]u8 = undefined;
-    const surface_line = try std.fmt.bufPrint(
+    const surface_line = try std.mem.print(
         &surface_buf,
         surface_shimmer_paint_trace_fmt,
         .{ @as(u16, 3), "true", "false", label.len, label_hash },

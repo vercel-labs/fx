@@ -59,8 +59,7 @@ pub fn Runtime(comptime App: type) type {
             }
 
             app.prepareResumeHandoffForUpgrade() catch |err| {
-                const notice = try std.fmt.allocPrint(
-                    app.alloc,
+                const notice = try app.alloc.print(
                     "upgrade paused because this conversation is not safely resumable: {s}; run `fx doctor` for recovery guidance",
                     .{@errorName(err)},
                 );
@@ -69,13 +68,12 @@ pub fn Runtime(comptime App: type) type {
                 return .unavailable;
             };
 
-            var executable_buf: [std.fs.max_path_bytes]u8 = undefined;
+            var executable_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             const executable_path = deps.current_executable_path(
                 deps.ctx,
                 &executable_buf,
             ) catch |err| {
-                const notice = try std.fmt.allocPrint(
-                    app.alloc,
+                const notice = try app.alloc.print(
                     "upgrade installed, but the executable path could not be resolved: {s}; restart fx manually",
                     .{@errorName(err)},
                 );
@@ -85,8 +83,7 @@ pub fn Runtime(comptime App: type) type {
             };
 
             app.requestUpgradeRelaunch(executable_path) catch |err| {
-                const notice = try std.fmt.allocPrint(
-                    app.alloc,
+                const notice = try app.alloc.print(
                     "upgrade installed, but relaunch could not be prepared: {s}; restart fx manually",
                     .{@errorName(err)},
                 );
@@ -185,7 +182,7 @@ const TestUpgrader = struct {
         self.stop_count += 1;
     }
 
-    fn takeRenderDirty(self: *TestUpgrader) bool {
+    pub fn takeRenderDirty(self: *TestUpgrader) bool {
         const dirty = self.render_dirty;
         self.render_dirty = false;
         return dirty;
@@ -196,7 +193,7 @@ const TestWorker = struct {
     queued_count: usize = 0,
     shutdown_count: usize = 0,
 
-    fn queuedPromptCount(self: *const TestWorker) usize {
+    pub fn queuedPromptCount(self: *const TestWorker) usize {
         return self.queued_count;
     }
 
@@ -244,7 +241,7 @@ const TestApp = struct {
     notices: std.ArrayList(u8) = .empty,
     prepare_count: usize = 0,
     request_handoff_count: usize = 0,
-    relaunch_path: [std.fs.max_path_bytes]u8 = undefined,
+    relaunch_path: [std.Io.Dir.max_path_bytes]u8 = undefined,
     relaunch_path_len: usize = 0,
     prepare_error: ?anyerror = null,
     relaunch_error: ?error{NameTooLong} = null,

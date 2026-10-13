@@ -18,29 +18,96 @@
   "exports": {
     ".": {
       "node": {
-        "import": "./node.js",
-        "require": "./node.cjs"
+        "import": {
+          "types": "./types/node.d.ts",
+          "default": "./node.js"
+        },
+        "require": {
+          "types": "./types/node.d.cts",
+          "default": "./node.cjs"
+        }
       },
-      "browser": "./browser.js",
-      "default": "./browser.js"
+      "browser": {
+        "types": "./types/browser.d.ts",
+        "default": "./browser.js"
+      },
+      "default": {
+        "types": "./types/browser.d.ts",
+        "default": "./browser.js"
+      }
     },
     "./node": {
-      "import": "./node.js",
-      "require": "./node.cjs"
+      "import": {
+        "types": "./types/node.d.ts",
+        "default": "./node.js"
+      },
+      "require": {
+        "types": "./types/node.d.cts",
+        "default": "./node.cjs"
+      }
     },
-    "./browser": "./browser.js",
-    "./wasm": "./fx-sdk.js",
-    "./mcp": "./mcp.js",
-    "./skills": "./skills.js",
-    "./skills/node": "./skills-node.js"
+    "./browser": {
+      "types": "./types/browser.d.ts",
+      "default": "./browser.js"
+    },
+    "./wasm": {
+      "types": "./types/wasm.d.ts",
+      "default": "./fx-sdk.js"
+    },
+    "./durable-local": {
+      "types": "./types/durable-local.d.ts",
+      "default": "./durable/local.mjs"
+    },
+    "./durable-vercel": {
+      "types": "./types/durable-vercel.d.ts",
+      "default": "./durable/vercel.mjs"
+    },
+    "./durable-world": {
+      "types": "./types/durable-world.d.ts",
+      "default": "./durable/world.mjs"
+    },
+    "./chatgpt": {
+      "types": "./types/chatgpt.d.ts",
+      "default": "./chatgpt-sign-in.js"
+    },
+    "./grok": {
+      "types": "./types/grok.d.ts",
+      "default": "./grok-sign-in.js"
+    },
+    "./mcp": {
+      "types": "./types/mcp.d.ts",
+      "default": "./mcp.js"
+    },
+    "./skills": {
+      "types": "./types/skills.d.ts",
+      "default": "./skills.js"
+    },
+    "./skills/node": {
+      "types": "./types/skills-node.d.ts",
+      "default": "./skills-node.js"
+    }
   },
   "files": [
     "browser.js",
     "node.js",
     "node.cjs",
     "fx-sdk.js",
+    "durable.js",
+    "fx-harness.js",
+    "durable/local.mjs",
+    "durable/vercel.mjs",
+    "durable/world.mjs",
+    "types/*.d.ts",
+    "types/*.d.cts",
     "wasm-module.js",
     "core-output.js",
+    "subscription.js",
+    "oauth.js",
+    "chatgpt.js",
+    "chatgpt-sign-in.js",
+    "grok.js",
+    "grok-sign-in.js",
+    "custom-provider.js",
     "fetch-cleanup.js",
     "mcp.js",
     "skills.js",

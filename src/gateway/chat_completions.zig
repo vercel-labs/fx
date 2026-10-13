@@ -23,10 +23,17 @@ pub fn bundle(definition: *const definitions.Definition) provider_set.Bundle {
     const context: *anyopaque = @ptrCast(@constCast(definition));
     return .{
         .agent_stream = .{ .context = context, .stream_fn = stream, .build_request_fn = build, .project_replay_fn = project_replay },
-        .model_catalog = .{ .context = context, .fetch_fn = fetch_catalog, .lookup_capabilities_fn = lookup_capabilities, .provider_id = bound_identity(definition) },
+        .model_catalog = model_catalog_provider(definition),
         .cli_model_catalog = .{ .context = context, .fetch_fn = fetch_cli_catalog },
         .permission_reviewer = .{ .context = context, .review_fn = review },
     };
+}
+
+/// The models the definition declares; there is no network request. Borrows
+/// the definition, which must outlive the provider.
+pub fn model_catalog_provider(definition: *const definitions.Definition) catalog.Provider {
+    const context: *anyopaque = @ptrCast(@constCast(definition));
+    return .{ .context = context, .fetch_fn = fetch_catalog, .lookup_capabilities_fn = lookup_capabilities, .provider_id = bound_identity(definition) };
 }
 
 fn definition_at(raw: ?*anyopaque) *const definitions.Definition {
@@ -40,7 +47,12 @@ fn bound_identity(definition: *const definitions.Definition) model_provider.Prov
 }
 
 fn build(raw: ?*anyopaque, alloc: Allocator, request: streams.RequestData) ![]u8 {
-    const definition = definition_at(raw);
+    return build_for(definition_at(raw), alloc, request);
+}
+
+/// The request body for `definition`, omitting replay parts recorded for
+/// another endpoint. Caller owns the result.
+pub fn build_for(definition: *const definitions.Definition, alloc: Allocator, request: streams.RequestData) ![]u8 {
     const identity = bound_identity(definition);
     for (request.messages) |message| if (message.provider_replay) |replay| {
         if (!replay.matches(.{ .provider = identity, .model = request.model })) {
@@ -51,7 +63,7 @@ fn build(raw: ?*anyopaque, alloc: Allocator, request: streams.RequestData) ![]u8
     return codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity });
 }
 
-fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
+pub fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
     const selected = try codec.project_replay(alloc, replay, calls, text, reasoning);
     if (replay != null and selected == null) debug_trace.logf("gateway", "provider_replay_omitted reason={s}", .{if (reasoning) "associated_calls_removed" else "reasoning_removed"});
     return selected;
@@ -129,7 +141,7 @@ fn phase_deadline(milliseconds: i64, caller: ?std.Io.Clock.Timestamp) std.Io.Clo
 fn post(alloc: Allocator, definition: *const definitions.Definition, request: streams.ModelRequest, token: ?[]const u8, payload: []const u8) !streams.Result {
     const url = try definition.chat_url(alloc);
     defer alloc.free(url);
-    const authorization = if (token) |value| try std.fmt.allocPrint(alloc, "Bearer {s}", .{value}) else null;
+    const authorization = if (token) |value| try alloc.print("Bearer {s}", .{value}) else null;
     defer if (authorization) |value| secret.zeroAndFree(alloc, value);
     var client: std.http.Client = .{ .allocator = alloc, .io = io.getIo() };
     defer client.deinit();
@@ -183,19 +195,28 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
             detail = redacted;
         }
 
-        return .{ .failed = .{ .kind = switch (response.head.status) {
-            .bad_request => .invalid_request,
-            .unauthorized => .unauthorized,
-            .forbidden => .forbidden,
-            .payload_too_large => .request_too_large,
-            .too_many_requests => .rate_limited,
-            .internal_server_error => .server_error,
-            .bad_gateway => .bad_gateway,
-            .service_unavailable => .unavailable,
-            .gateway_timeout => .gateway_timeout,
-            else => .provider_error,
-        }, .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
+        return .{ .failed = .{ .kind = failure_kind(response.head.status), .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
     }
+    return consume(alloc, reader, request);
+}
+
+pub fn failure_kind(status: std.http.Status) streams.FailureKind {
+    return switch (status) {
+        .bad_request => .invalid_request,
+        .unauthorized => .unauthorized,
+        .forbidden => .forbidden,
+        .payload_too_large => .request_too_large,
+        .too_many_requests => .rate_limited,
+        .internal_server_error => .server_error,
+        .bad_gateway => .bad_gateway,
+        .service_unavailable => .unavailable,
+        .gateway_timeout => .gateway_timeout,
+        else => .provider_error,
+    };
+}
+
+/// Parses a successful streamed reply from `reader`.
+pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest) !streams.Result {
     var limits: codec.Limits = .{};
     if (request.content_capture_limit) |limit| limits.content_bytes = @min(limit, limits.content_bytes);
     return codec.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag);

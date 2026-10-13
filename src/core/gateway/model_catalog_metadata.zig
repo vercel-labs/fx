@@ -32,7 +32,7 @@ test "fromCatalogEntry preserves catalog capability metadata" {
         .id = @constCast("provider/model"),
         .model_type = @constCast("language"),
         .has_reasoning = true,
-        .reasoning_efforts = .{ .items = @constCast(efforts[0..]), .capacity = efforts.len },
+        .reasoning_efforts = .fromOwnedSlice(@constCast(efforts[0..])),
         .supports_fast_mode = true,
         .has_tool_use = true,
         .has_vision = true,

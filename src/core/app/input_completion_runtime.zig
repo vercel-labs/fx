@@ -74,6 +74,10 @@ pub fn CompletionRuntime(comptime App: type) type {
             choice: file_index.SearchResult,
         };
 
+        /// What accepting a folder row does: Tab opens it to list its
+        /// contents, Enter selects the folder itself.
+        const FolderAction = enum { open, select };
+
         pub fn slashCompletionCandidateCount(app: *App) usize {
             const prefix = command_specs.slashCompletionPrefix(
                 app.slashRegistry(),
@@ -390,6 +394,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         fn routeNonSlashPickerMove(app: *App, delta: i32) !bool {
+            if (try routeMcpHostMenuMove(app, delta)) return true;
             if (try routeSettingsMenuMove(app, delta)) return true;
             if (try routeHelpMenuMove(app, delta)) return true;
             if (try routeModelMenuMove(app, delta)) return true;
@@ -417,6 +422,13 @@ pub fn CompletionRuntime(comptime App: type) type {
             // Mid-turn bare `/model`: consume arrows without slash/skill navigation.
             if (app.stream.active and picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) return true;
             return false;
+        }
+
+        fn routeMcpHostMenuMove(app: *App, delta: i32) !bool {
+            if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
+            if (!app.mcp.hostMenuActive()) return false;
+            try app.mcpHostMenuKey(if (delta < 0) .up else .down);
+            return true;
         }
 
         fn routeSettingsMenuMove(app: *App, delta: i32) !bool {
@@ -781,6 +793,35 @@ pub fn CompletionRuntime(comptime App: type) type {
             app.harvestDirectoryCompletion(filePickerEligible(app));
         }
 
+        /// Returns true while the frame for a keystroke that started a folder
+        /// listing should wait for its rows, so they paint together.
+        pub fn holdFrameForFileListing(app: *App, now_ms: i64) bool {
+            if (comptime !runtime_profile.allows(App, .file_index)) return false;
+            app.harvestDirectoryCompletion(filePickerEligible(app));
+            const picker = &app.input_runtime.picker;
+            const state = &picker.file_completion;
+            if (!state.active) {
+                picker.file_listing_wait = .{};
+                return false;
+            }
+            const in_flight = !state.indexed and state.directory_request != null;
+            const was_holding = picker.file_listing_wait.active(now_ms);
+            const hold = picker.file_listing_wait.hold(in_flight, now_ms);
+            if (was_holding and !hold and in_flight) {
+                debug_trace.logf("input", "file picker painted before folder listing request={d}", .{state.directory_request.?});
+            }
+            return hold;
+        }
+
+        /// For the first tick of every folder listing, the event loop checks
+        /// back every millisecond instead of every tick. A listing that
+        /// finishes in that time is seen at once, which also turns waiting
+        /// back on after a slow folder.
+        pub fn fileListingHoldPending(app: *const App, now_ms: i64) bool {
+            if (comptime !runtime_profile.allows(App, .file_index)) return false;
+            return app.input_runtime.picker.file_listing_wait.measuring(now_ms);
+        }
+
         /// The sole acquisition boundary. Called after input batching, never by
         /// painters, navigation or acceptance. Directory work is scheduled, not run.
         pub fn prepareFilePicker(app: *App) void {
@@ -892,7 +933,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                 app.shell.render_requests.request(.footer);
                 return .inactive;
             };
-            return applyFilePickerSelection(app, selection, max_input_len);
+            return applyFilePickerSelection(app, selection, max_input_len, .open);
         }
 
         fn resolveFilePickerSelection(app: *App) ?FilePickerSelection {
@@ -906,6 +947,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             app: *App,
             selection: FilePickerSelection,
             max_input_len: usize,
+            folder_action: FolderAction,
         ) !edit_contract.InsertResult {
             if (!file_picker_path.isRepresentable(selection.choice.path)) {
                 debug_trace.logf("input", "file picker rejected unrepresentable selection bytes={d}", .{selection.choice.path.len});
@@ -927,17 +969,26 @@ pub fn CompletionRuntime(comptime App: type) type {
             const tail = items[replace_end..];
             const reuses_terminator = tail.len > 0 and picker_state.isFilePickerTerminator(tail[0]);
             const is_directory = selection.choice.kind == .directory;
-            const adds_terminator = !is_directory and !reuses_terminator;
-            const encoded = try file_picker_path.encode(app.alloc, selection.choice.path, .{
+            const opens_directory = is_directory and folder_action == .open;
+            const adds_terminator = !opens_directory and !reuses_terminator;
+            // An opened folder stays an active query so its contents list next.
+            // A selected folder is finished like a file: its path with the
+            // trailing slash, any quote closed, and a separating space.
+            const selected_folder = if (is_directory and !opens_directory)
+                try std.mem.concat(app.alloc, u8, &.{ selection.choice.path, "/" })
+            else
+                null;
+            defer if (selected_folder) |path| app.alloc.free(path);
+            const encoded = try file_picker_path.encode(app.alloc, selected_folder orelse selection.choice.path, .{
                 .quoted = selection.query.quoted,
-                .directory = is_directory,
+                .directory = opens_directory,
                 .workspace_relative = indexed,
             });
             var replacement = std.ArrayList(u8).fromOwnedSlice(encoded);
             defer replacement.deinit(app.alloc);
             const separator_offset = replace_start + replacement.items.len;
             if (adds_terminator) try replacement.append(app.alloc, ' ');
-            const cursor_after_replacement = replace_start + replacement.items.len + @intFromBool(!is_directory and reuses_terminator);
+            const cursor_after_replacement = replace_start + replacement.items.len + @intFromBool(!opens_directory and reuses_terminator);
 
             const result = try app.input_runtime.replacementState(&app.pending_images).replaceRangeBounded(
                 app.alloc,
@@ -954,7 +1005,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                         separator_offset,
                     );
                 }
-                if (is_directory) app.input_runtime.picker.resetFilePickerIndex();
+                if (opens_directory) app.input_runtime.picker.resetFilePickerIndex();
             }
             return result;
         }
@@ -967,7 +1018,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                 if (app.input_runtime.picker.file_completion.acceptedEmpty()) return null;
                 return .inactive;
             };
-            const result = try applyFilePickerSelection(app, selection, max_input_len);
+            const result = try applyFilePickerSelection(app, selection, max_input_len, .select);
             debug_trace.logf(
                 "input",
                 "file picker Enter consumed selected={s} limit_exceeded={s}",
@@ -1086,7 +1137,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         const navigatePickerOptions = list_window.advanceSelection;
 
         fn setModelComposerText(app: *App, comptime fmt: []const u8, args: anytype) !void {
-            const text = try std.fmt.allocPrint(app.alloc, fmt, args);
+            const text = try app.alloc.print(fmt, args);
             defer app.alloc.free(text);
             try app.input_runtime.textReplacementState().replace(app.alloc, text);
         }
@@ -1924,7 +1975,7 @@ test "file picker resize invalidation blocks acceptance without another lookup" 
     var app = FilePickerTestApp{ .alloc = alloc, .file_completion_values = &.{.{ .path = "file.txt", .kind = .file }} };
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "@file");
-    presentFilePickerForTest(&app);
+    try presentFilePickerForTest(&app);
     app.shell.render_requests.observeResizeSignal(0, 100);
     try std.testing.expectEqual(edit_contract.InsertResult.inactive, (try rt.submitFilePickerOnEnter(&app, 4096)).?);
     try std.testing.expectEqualStrings("@file", app.input_runtime.edit_state.input.items);
@@ -1958,13 +2009,13 @@ test "file picker preparation caches data but requires an explicit visible recei
     try std.testing.expectEqualStrings("@file.txt ", app.input_runtime.edit_state.input.items);
 }
 
-fn presentFilePickerForTest(app: anytype) void {
+fn presentFilePickerForTest(app: anytype) !void {
     const rt = CompletionRuntime(@TypeOf(app.*));
     rt.prepareFilePicker(app);
     if (comptime @TypeOf(app.*) == FilesystemFilePickerTestApp) {
         while (app.input_runtime.picker.file_completion.directory_request != null) {
             rt.collectFilePickerFacts(app);
-            std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch unreachable;
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
         }
     }
     if (rt.filePickerView(app).receipt) |receipt| rt.acknowledgeFilePicker(app, receipt);
@@ -1980,7 +2031,7 @@ test "streaming file selection commits the selected path" {
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "review @src/mai");
     app.stream.active = true;
-    presentFilePickerForTest(&app);
+    try presentFilePickerForTest(&app);
 
     try std.testing.expectEqual(
         edit_contract.InsertResult.inserted,
@@ -1998,7 +2049,7 @@ test "file picker encodes literal quotes without reopening quote grammar" {
     };
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "@we");
-    presentFilePickerForTest(&app);
+    try presentFilePickerForTest(&app);
 
     try std.testing.expectEqual(
         edit_contract.InsertResult.inserted,
@@ -2015,7 +2066,7 @@ test "file picker quoted middle replacement preserves only the outside tail" {
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "read @\"a\\\\old.txt\" suffix");
     app.input_runtime.edit_state.cursor = "read @\"a\\\\".len;
-    presentFilePickerForTest(&app);
+    try presentFilePickerForTest(&app);
     try std.testing.expectEqual(edit_contract.InsertResult.inserted, try rt.autocompleteFilePickerSelection(&app, 4096));
     try std.testing.expectEqualStrings("read @\"a\\\\b.txt\" suffix", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual("read @\"a\\\\b.txt\" ".len, app.input_runtime.edit_state.cursor);
@@ -2043,7 +2094,7 @@ test "filesystem file picker pipeline drills into a directory and selects a file
     defer app.deinit();
 
     try app.input_runtime.textReplacementState().replace(alloc, "@./space");
-    presentFilePickerForTest(&app);
+    try presentFilePickerForTest(&app);
     try std.testing.expectEqual(
         edit_contract.InsertResult.inserted,
         try rt.autocompleteFilePickerSelection(&app, 4096),
@@ -2058,7 +2109,7 @@ test "filesystem file picker pipeline drills into a directory and selects a file
     );
 
     try app.input_runtime.edit_state.insertSlice(alloc, "item");
-    presentFilePickerForTest(&app);
+    try presentFilePickerForTest(&app);
     try std.testing.expectEqual(
         edit_contract.InsertResult.inserted,
         try rt.autocompleteFilePickerSelection(&app, 4096),
@@ -2068,6 +2119,90 @@ test "filesystem file picker pipeline drills into a directory and selects a file
         app.input_runtime.edit_state.input.items,
     );
     try std.testing.expect(app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) == null);
+}
+
+test "filesystem file picker lists an opened folder first and Enter selects it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/space dir");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "workspace/space dir/item.txt",
+        .data = "inside",
+    });
+
+    const io_mod = @import("../shared/io.zig");
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+
+    const rt = CompletionRuntime(FilesystemFilePickerTestApp);
+    var app = FilesystemFilePickerTestApp{
+        .alloc = alloc,
+        .workspace_root = workspace_root,
+    };
+    defer app.deinit();
+
+    try app.input_runtime.textReplacementState().replace(alloc, "@./space");
+    try presentFilePickerForTest(&app);
+    try std.testing.expectEqual(edit_contract.InsertResult.inserted, try rt.autocompleteFilePickerSelection(&app, 4096));
+    try std.testing.expectEqualStrings("@\"./space dir/", app.input_runtime.edit_state.input.items);
+
+    try presentFilePickerForTest(&app);
+    const folder = app.input_runtime.picker.file_completion.selected(0).?;
+    try std.testing.expectEqualStrings("./space dir", folder.path);
+    try std.testing.expectEqual(file_index.CandidateKind.directory, folder.kind);
+    try std.testing.expectEqualStrings("./space dir/item.txt", app.input_runtime.picker.file_completion.selected(1).?.path);
+
+    try std.testing.expectEqual(edit_contract.InsertResult.inserted, (try rt.submitFilePickerOnEnter(&app, 4096)).?);
+    try std.testing.expectEqualStrings("@\"./space dir/\" ", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) == null);
+}
+
+test "filesystem file picker releases a held folder frame only with its rows" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/tree");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/tree/leaf.txt", .data = "leaf" });
+
+    const io_mod = @import("../shared/io.zig");
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+
+    const rt = CompletionRuntime(FilesystemFilePickerTestApp);
+    var app = FilesystemFilePickerTestApp{
+        .alloc = alloc,
+        .workspace_root = workspace_root,
+    };
+    defer app.deinit();
+
+    try app.input_runtime.textReplacementState().replace(alloc, "@./tree/");
+    rt.prepareFilePicker(&app);
+    // The clock stands still, so the wait can end only because the rows arrived.
+    const now_ms: i64 = 1_000;
+    var polls: usize = 0;
+    while (rt.holdFrameForFileListing(&app, now_ms)) : (polls += 1) {
+        if (polls == 5_000) return error.TestUnexpectedResult;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch unreachable;
+    }
+    const view = rt.filePickerView(&app);
+    try std.testing.expectEqual(file_completion_state.Status.ready, view.status);
+    try std.testing.expectEqual(@as(usize, 2), view.items.len);
+    try std.testing.expectEqualStrings("./tree", view.items[0].path);
+    try std.testing.expectEqualStrings("./tree/leaf.txt", view.items[1].path);
+    try std.testing.expect(!rt.fileListingHoldPending(&app, now_ms));
+}
+
+test "file picker keeps watching a listing after a slow folder so waiting can turn back on" {
+    const rt = CompletionRuntime(FilePickerTestApp);
+    var app: FilePickerTestApp = .{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    // The previous folder outlasted the wait, so this listing's frame paints
+    // at once, but the loop still checks back every millisecond.
+    app.input_runtime.picker.file_listing_wait = .{ .started_ms = 1_000, .last_outlasted_hold = true };
+    try std.testing.expect(!app.input_runtime.picker.file_listing_wait.active(1_001));
+    try std.testing.expect(rt.fileListingHoldPending(&app, 1_001));
 }
 
 test "file picker loading Tab preserves pending request and Enter never queues acceptance" {

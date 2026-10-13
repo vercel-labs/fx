@@ -25,12 +25,12 @@ pub const ToolCallMetric = struct {
     duration_ms: u32 = 0,
     outcome: ToolCallOutcome = .succeeded,
     subagent_id: u64 = 0,
-    name_buf: [max_name_len]u8 = [_]u8{0} ** max_name_len,
+    name_buf: [max_name_len]u8 = @splat(0),
     name_len: u8 = 0,
-    args_buf: [max_args_len]u8 = [_]u8{0} ** max_args_len,
+    args_buf: [max_args_len]u8 = @splat(0),
     args_len: u16 = 0,
     args_total_bytes: u32 = 0,
-    result_buf: [max_result_len]u8 = [_]u8{0} ** max_result_len,
+    result_buf: [max_result_len]u8 = @splat(0),
     result_len: u16 = 0,
     result_total_bytes: u32 = 0,
 
@@ -113,11 +113,11 @@ var stored: usize = 0;
 /// window slides.
 pub const LifetimeStats = struct {
     total_calls: u64 = 0,
-    outcome_counts: [@typeInfo(ToolCallOutcome).@"enum".fields.len]u64 = @splat(0),
+    outcome_counts: [@typeInfo(ToolCallOutcome).@"enum".field_names.len]u64 = @splat(0),
     total_duration_ms: u64 = 0,
 
     pub fn countFor(self: *const LifetimeStats, outcome: ToolCallOutcome) u64 {
-        return self.outcome_counts[@intFromEnum(outcome)];
+        return self.outcome_counts[@backingInt(outcome)];
     }
 };
 
@@ -135,7 +135,7 @@ pub fn record(call: ToolCallMetric) void {
     if (stored < ring_capacity) stored += 1;
 
     lifetime.total_calls += 1;
-    lifetime.outcome_counts[@intFromEnum(stored_call.outcome)] += 1;
+    lifetime.outcome_counts[@backingInt(stored_call.outcome)] += 1;
     lifetime.total_duration_ms += stored_call.duration_ms;
 }
 
@@ -274,5 +274,5 @@ test "tool call outcome labels remain exact" {
         try std.testing.expectEqualStrings(case.label, @tagName(case.outcome));
         try std.testing.expectEqual(case.success, case.outcome == .succeeded);
     }
-    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(ToolCallOutcome.succeeded));
+    try std.testing.expectEqual(@as(u8, 0), @backingInt(ToolCallOutcome.succeeded));
 }

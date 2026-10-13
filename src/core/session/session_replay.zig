@@ -1,8 +1,10 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const io_mod = @import("../shared/io.zig");
 const session_codec = @import("session_codec.zig");
 const session_event = @import("session_event.zig");
 const session_projection = @import("session_projection.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const Identifier = session_event.Identifier;
@@ -149,7 +151,7 @@ test "buffered session lines release allocations across buffer boundaries" {
             try std.testing.expectEqualStrings(bytes, line.bytes);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Case.run, .{});
 }
 
 test "buffered session lines enforce frame size and physical EOF" {
@@ -677,9 +679,9 @@ test "recovery replay preserves reader failure identity" {
 
 test "session replay parser honors exact copied boundary" {
     const alloc = std.testing.allocator;
-    const generation: Identifier = .{0x10} ** 16;
-    const first_id: Identifier = .{0x20} ** 16;
-    const second_id: Identifier = .{0x30} ** 16;
+    const generation: Identifier = @splat(0x10);
+    const first_id: Identifier = @splat(0x20);
+    const second_id: Identifier = @splat(0x30);
     const first = try session_event.encodeLegacyFixtureFrame(alloc, .{
         .log_generation = generation,
         .seq = 1,
@@ -782,7 +784,7 @@ test "session replay parser honors exact copied boundary" {
     try std.testing.expect(!exact.preferences.fast_mode);
 
     var mismatched = complete;
-    mismatched.through_event_id = .{0xff} ** 16;
+    mismatched.through_event_id = @splat(0xff);
     const rejected_state = try replayBoundary(alloc, file, copied);
     try std.testing.expectError(
         error.InvalidSessionFormat,
@@ -820,7 +822,7 @@ test "session replay parser honors exact copied boundary" {
     const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "events.jsonl");
     defer alloc.free(path);
     try std.testing.checkAllAllocationFailures(
-        alloc,
+        testing_allocator.no_resize,
         checkRecoveryValidationAllocationFailures,
         .{ path, copied },
     );
@@ -828,8 +830,8 @@ test "session replay parser honors exact copied boundary" {
 
 test "session replay parser rejects malformed or truncated bounded input" {
     const alloc = std.testing.allocator;
-    const generation: Identifier = .{0x40} ** 16;
-    const event_id: Identifier = .{0x50} ** 16;
+    const generation: Identifier = @splat(0x40);
+    const event_id: Identifier = @splat(0x50);
     const malformed = "{not-json}\n";
 
     var tmp = std.testing.tmpDir(.{});
@@ -856,8 +858,8 @@ test "session replay parser rejects malformed or truncated bounded input" {
 
 test "session replay parser rejects oversized bounded frame" {
     const alloc = std.testing.allocator;
-    const generation: Identifier = .{0x60} ** 16;
-    const event_id: Identifier = .{0x70} ** 16;
+    const generation: Identifier = @splat(0x60);
+    const event_id: Identifier = @splat(0x70);
     const oversized = try alloc.alloc(u8, session_event.event_frame_max_bytes + 1);
     defer alloc.free(oversized);
     @memset(oversized, 'x');
@@ -889,9 +891,9 @@ test "session replay parser rejects oversized bounded frame" {
 test "bounded child identity reads stop at their limit" {
     const alloc = std.testing.allocator;
     const frame = try session_event.encodeLegacyFixtureFrame(alloc, .{
-        .log_generation = .{0x81} ** 16,
+        .log_generation = @splat(0x81),
         .seq = 1,
-        .event_id = .{0x91} ** 16,
+        .event_id = @splat(0x91),
         .timestamp_ms = 10,
         .event = .{ .session_started = .{
             .id = @constCast("bounded-child"),
@@ -914,7 +916,7 @@ test "bounded child identity reads stop at their limit" {
     const limit: usize = 4096;
     const padded = try std.mem.concat(alloc, u8, &.{
         frame[0 .. frame.len - 2],
-        " " ** 8192,
+        text_utils.repeat(" ", 8192),
         frame[frame.len - 2 ..],
     });
     defer alloc.free(padded);
@@ -963,8 +965,8 @@ test "bounded child identity reads stop at their limit" {
 
 test "session replay parser frees line allocation on every caller path" {
     const alloc = std.testing.allocator;
-    const generation: Identifier = .{0x80} ** 16;
-    const event_id: Identifier = .{0x90} ** 16;
+    const generation: Identifier = @splat(0x80);
+    const event_id: Identifier = @splat(0x90);
     const frame = try session_event.encodeLegacyFixtureFrame(alloc, .{
         .log_generation = generation,
         .seq = 1,

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const json_number = @import("../json_number.zig");
 const mcp_contract = @import("../mcp_contract.zig");
 const mrtr = @import("../mrtr.zig");
@@ -449,7 +450,7 @@ fn checkResourceContentAllocationFailures(alloc: Allocator) !void {
 
 test "shared resource content construction is allocation failure safe" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkResourceContentAllocationFailures,
         .{},
     );

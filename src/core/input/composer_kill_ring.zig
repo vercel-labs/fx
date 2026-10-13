@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const display_width = @import("../shared/display_width.zig");
 const edit_history = @import("edit_history.zig");
 const editor_state = @import("editor_state.zig");
@@ -332,7 +333,7 @@ test "structured kill and yank remain edit history boundaries" {
 }
 
 test "history allocation failure preserves composer and kill ring state" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var fixture: Fixture = .{};
     defer fixture.deinit(alloc);
     try fixture.edit.setText(alloc, "alpha");

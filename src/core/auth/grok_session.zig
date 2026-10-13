@@ -7,6 +7,7 @@ const profile_paths = @import("../shared/profile_paths.zig");
 const types = @import("../shared/types.zig");
 const secret = @import("secret.zig");
 const session_presence = @import("session_presence.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const schema_version: i64 = 1;
@@ -94,7 +95,7 @@ pub const Mutation = struct {
 
 pub fn load(alloc: Allocator) !?Session {
     if (comptime host_target.is_wasm) return null;
-    const home = io_mod.getenv("HOME") orelse return null;
+    const home = io_mod.homeDir() orelse return null;
     var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| {
         debug_trace.logf("auth", "Grok session load failed step=open_home err={s}", .{@errorName(err)});
         if (err == error.FileNotFound) return null;
@@ -157,7 +158,7 @@ pub fn saveNewSession(alloc: Allocator, session: Session) !void {
 
 pub fn beginExistingMutation() !?Mutation {
     if (comptime host_target.is_wasm) return null;
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var home_dir = io_mod.VerifiedDir{
         .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| return session_presence.storageError(auth_file_name, err),
     };
@@ -171,7 +172,7 @@ pub fn beginExistingMutation() !?Mutation {
 }
 
 fn beginMutation() !Mutation {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var home_dir = io_mod.VerifiedDir{
         .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| return session_presence.storageError(auth_file_name, err),
     };
@@ -288,7 +289,7 @@ test "Grok account identity is bounded and safe for HTTP headers" {
     try std.testing.expect(validAccountId("acct_123"));
     try std.testing.expect(!validAccountId(""));
     try std.testing.expect(!validAccountId("acct\r\ninjected"));
-    try std.testing.expect(!validAccountId("a" ** 1025));
+    try std.testing.expect(!validAccountId(text_utils.repeat("a", 1025)));
 
     const invalid =
         \\{"version":1,"access_token":"access","refresh_token":"refresh","expires_at_ms":1234,"account_id":"acct\ninjected"}

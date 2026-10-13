@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -732,7 +733,7 @@ fn write_tool_result_part(scratch_alloc: std.mem.Allocator, writer: *std.Io.Writ
         // ignored by several gateway provider routes, so only the text
         // acknowledgment stays here.
         try writer.writeAll(",\"output\":{\"type\":\"content\",\"value\":[");
-        const text = if (failed) try std.fmt.allocPrint(scratch_alloc, "Tool error: {s}", .{content}) else content;
+        const text = if (failed) try scratch_alloc.print("Tool error: {s}", .{content}) else content;
         defer if (failed) scratch_alloc.free(text);
         try writer.writeAll("{\"type\":\"text\",\"text\":");
         try std.json.Stringify.value(text, .{}, writer);
@@ -1314,7 +1315,7 @@ test "writeChatMessageJson serializes user text plus image file parts through co
     defer types.freeImageAttachmentSlice(alloc, images);
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
     try image_attachments.captureImageSnapshot(alloc, &images[0], snapshot_dir);
 
@@ -2012,7 +2013,7 @@ fn check_grouped_request_allocations(alloc: std.mem.Allocator) !void {
 }
 
 test "grouped tool result serialization releases failed allocations" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_grouped_request_allocations, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_grouped_request_allocations, .{});
 }
 
 test "gateway request validation accepts paired assistant tool calls and results" {
@@ -2084,7 +2085,7 @@ test "gateway request validation preserves argument parser allocation failure" {
         .{ .role = .assistant, .tool_calls = calls[0..] },
         .{ .role = .tool, .content = "contents", .tool_call_id = "call_1", .tool_name = "read_file" },
     };
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
 
     try std.testing.expectError(error.OutOfMemory, validateToolMessageHistory(failing.allocator(), &messages));
 }
@@ -2231,7 +2232,7 @@ test "parseGatewayCompletion rejects duplicate-key legacy tool arguments" {
 }
 
 test "parseGatewayCompletion cleans up allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkParseGatewayCompletionAllocFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkParseGatewayCompletionAllocFailures, .{});
 }
 
 test "freeGatewayCompletion frees parsed completions under testing allocator" {

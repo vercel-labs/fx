@@ -32,15 +32,15 @@ pub const NetworkCall = struct {
     turn_id: u64 = 0,
     step_id: u64 = 0,
     subagent_id: u64 = 0,
-    model_buf: [max_model_len]u8 = [_]u8{0} ** max_model_len,
+    model_buf: [max_model_len]u8 = @splat(0),
     model_len: u8 = 0,
-    error_buf: [max_error_len]u8 = [_]u8{0} ** max_error_len,
+    error_buf: [max_error_len]u8 = @splat(0),
     error_len: u8 = 0,
-    stop_reason_buf: [max_stop_reason_len]u8 = [_]u8{0} ** max_stop_reason_len,
+    stop_reason_buf: [max_stop_reason_len]u8 = @splat(0),
     stop_reason_len: u8 = 0,
-    gateway_schema_diagnostic_buf: [max_gateway_schema_diagnostic_len]u8 = [_]u8{0} ** max_gateway_schema_diagnostic_len,
+    gateway_schema_diagnostic_buf: [max_gateway_schema_diagnostic_len]u8 = @splat(0),
     gateway_schema_diagnostic_len: u16 = 0,
-    gateway_request_shape_buf: [max_gateway_request_shape_len]u8 = [_]u8{0} ** max_gateway_request_shape_len,
+    gateway_request_shape_buf: [max_gateway_request_shape_len]u8 = @splat(0),
     gateway_request_shape_len: u16 = 0,
 
     pub fn model(self: *const NetworkCall) []const u8 {
@@ -101,7 +101,7 @@ pub const NetworkCall = struct {
 };
 
 var mutex: std.Io.Mutex = .init;
-var ring: [ring_capacity]NetworkCall = [_]NetworkCall{.{}} ** ring_capacity;
+var ring: [ring_capacity]NetworkCall = @splat(.{});
 var head: usize = 0;
 var stored: usize = 0;
 
@@ -133,7 +133,7 @@ pub const TurnRollup = struct {
 };
 
 var lifetime: LifetimeStats = .{};
-var turn_rollups: [turn_rollup_capacity]TurnRollup = [_]TurnRollup{.{}} ** turn_rollup_capacity;
+var turn_rollups: [turn_rollup_capacity]TurnRollup = @splat(.{});
 var turn_rollup_count: usize = 0;
 
 pub fn record(call: NetworkCall) void {
@@ -228,7 +228,7 @@ pub fn reset() void {
     head = 0;
     stored = 0;
     lifetime = .{};
-    turn_rollups = [_]TurnRollup{.{}} ** turn_rollup_capacity;
+    turn_rollups = @as([turn_rollup_capacity]TurnRollup, @splat(.{}));
     turn_rollup_count = 0;
 }
 

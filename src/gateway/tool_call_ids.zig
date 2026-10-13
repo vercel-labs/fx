@@ -1,5 +1,7 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const types = @import("../core/shared/types.zig");
+const text_utils = @import("../core/shared/text_utils.zig");
 
 const max_id_bytes = 64;
 
@@ -59,7 +61,7 @@ pub const Projection = struct {
                 const attempts = try std.math.add(usize, self.ids.count(), 1);
                 for (0..attempts) |attempt| {
                     var buffer: [max_id_bytes]u8 = undefined;
-                    const candidate = try std.fmt.bufPrint(&buffer, "fx_{s}_{d}", .{ &hex, attempt });
+                    const candidate = try std.mem.print(&buffer, "fx_{s}_{d}", .{ &hex, attempt });
                     if (self.ids.contains(candidate)) {
                         // Opaque state may refer to an alias from an earlier request.
                         if (opaque_history) return error.ProtectedToolCallId;
@@ -106,10 +108,10 @@ fn portable(id: []const u8) bool {
 }
 
 test "portable tool call ids use an allocation-free identity projection" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
     const calls = [_]types.ToolCall{
         .{ .id = "call_ABC-123", .name = "read", .arguments_json = "{}" },
-        .{ .id = "x" ** 64, .name = "read", .arguments_json = "{}" },
+        .{ .id = text_utils.repeat("x", 64), .name = "read", .arguments_json = "{}" },
     };
     var projection = try Projection.init(failing.allocator(), &.{.{ .role = .assistant, .tool_calls = &calls }});
     defer projection.deinit(failing.allocator());
@@ -117,7 +119,7 @@ test "portable tool call ids use an allocation-free identity projection" {
 }
 
 test "tool call id projection ignores fields not serialized for a role" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
     const calls = [_]types.ToolCall{.{ .id = "", .name = "ignored", .arguments_json = "{}" }};
     var projection = try Projection.init(failing.allocator(), &.{.{
         .role = .user,
@@ -132,7 +134,7 @@ test "tool call id projection ignores fields not serialized for a role" {
 
 test "tool call id projection is deterministic and preserves source IDs" {
     const alloc = std.testing.allocator;
-    const sources = [_][]const u8{ "functions.read:0", "functions/read:0", " ", "\t\n", "é", "x" ** 65, "x" ** 256 };
+    const sources = [_][]const u8{ "functions.read:0", "functions/read:0", " ", "\t\n", "é", text_utils.repeat("x", 65), text_utils.repeat("x", 256) };
     var calls: [sources.len]types.ToolCall = undefined;
     for (sources, 0..) |source, i| calls[i] = .{ .id = source, .name = "read", .arguments_json = "{}" };
     const messages = [_]types.ChatMessage{.{ .role = .assistant, .tool_calls = &calls }};
@@ -213,7 +215,7 @@ test "tool call id projection rejects unpaired nonportable result ids" {
 fn allocation_failure_case(alloc: std.mem.Allocator) !void {
     const calls = [_]types.ToolCall{
         .{ .id = "functions.read:0", .name = "read", .arguments_json = "{}" },
-        .{ .id = "x" ** 65, .name = "read", .arguments_json = "{}" },
+        .{ .id = text_utils.repeat("x", 65), .name = "read", .arguments_json = "{}" },
     };
     var projection = try Projection.init(alloc, &.{.{ .role = .assistant, .tool_calls = &calls }});
     defer projection.deinit(alloc);
@@ -221,5 +223,5 @@ fn allocation_failure_case(alloc: std.mem.Allocator) !void {
 }
 
 test "tool call id projection cleans up allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocation_failure_case, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, allocation_failure_case, .{});
 }

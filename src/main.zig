@@ -76,6 +76,7 @@ const display_width = @import("core/shared/display_width.zig");
 const file_index_mod = @import("core/workspace/file_index.zig");
 const mcp_command_provider = @import("core/mcp/command_provider.zig");
 const mcp_runtime_mod = @import("core/mcp/mcp_runtime.zig");
+const mcp_host = @import("core/mcp_host/host.zig");
 const mcp_model_catalog = @import("core/mcp/model_catalog.zig");
 const mcp_access_policy = @import("core/mcp/access_policy.zig");
 const mcp_menu_state = @import("core/mcp/menu_state.zig");
@@ -197,11 +198,13 @@ fn nativeLoopPollTimeoutMs(
     auth_refresh_active: bool,
     skills_refresh_active: bool,
     transcript_page_work_active: bool,
+    file_listing_hold_pending: bool,
 ) i32 {
     return if (first_frame_pending or
         auth_refresh_active or
         skills_refresh_active or
-        transcript_page_work_active)
+        transcript_page_work_active or
+        file_listing_hold_pending)
         @min(default_timeout_ms, focused_ui_worker_poll_timeout_ms)
     else
         default_timeout_ms;
@@ -439,8 +442,10 @@ const App = struct {
         return builtin_context.prompt_policy;
     }
 
-    pub fn slashRegistry(_: *const Self) command_specs.SlashRegistry {
-        return builtin_commands.slash_registry;
+    pub fn slashRegistry(self: *const Self) command_specs.SlashRegistry {
+        var registry = builtin_commands.slash_registry;
+        registry.arguments = self.mcp.host_completion;
+        return registry;
     }
 
     pub fn mcpCommandProvider(_: *const Self) mcp_command_provider.Provider {
@@ -693,6 +698,7 @@ const App = struct {
             handle_sigwinch,
             .{
                 .load_mcp_runtime = if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
+                .load_mcp_host = if (comptime host_target.is_wasm) null else builtin_mcp.loadHost,
                 .skill_root_policy = if (comptime host_target.is_wasm) wasm_skill_root_policy else builtin_skills.root_policy,
                 .terminal_title = app.terminalTitle(),
             },
@@ -1156,6 +1162,7 @@ const App = struct {
                 self.auth.sourceInventoryRefreshActive(),
                 self.skills.refreshActive(),
                 self.fullTranscriptFocusedWorkActive(),
+                InputAppRuntime.fileListingHoldPending(self, app_permission_runtime.monotonicMillis()),
             );
         }
         return if (self.pacer.hasPending()) default_timeout_ms else idle_wasm_poll_timeout_ms;
@@ -1647,6 +1654,63 @@ const App = struct {
 
     pub fn installInitialMcpRuntime(self: *App, runtime: ?*mcp_runtime_mod.McpRuntime) void {
         self.mcp.installInitial(runtime);
+    }
+
+    pub fn loadMcpHost(self: *App, load: mcp_host.LoadFn) !void {
+        try self.mcp.loadHost(load, self.alloc, self.workspace_root, self.toolRegistry(), .{ .form = true, .url = true });
+    }
+
+    pub fn mcpHostSelected(_: *const App) bool {
+        return mcp_host.selected();
+    }
+
+    pub fn runMcpVerbs(self: *App, rest: []const u8) !void {
+        try self.mcp.runVerbs(io_mod.homeDir() orelse "", self.workspace_root, rest);
+    }
+
+    pub fn takeMcpHostNotices(self: *App) []app_mcp_runtime.State.HostNotice {
+        return self.mcp.takeHostNotices();
+    }
+
+    pub fn refreshMcpCompletion(self: *App) void {
+        self.mcp.refreshCompletion();
+    }
+
+    pub fn openMcpHostMenu(self: *App) void {
+        self.mcp.openHostMenu();
+    }
+
+    /// The composer's text is the menu's filter.
+    pub fn mcpHostMenuKey(self: *App, key: mcp_host.menu.Key) !void {
+        const was = self.mcp.host_menu.screen;
+        try self.mcp.hostMenuKey(key, self.input_runtime.edit_state.input.items, io_mod.homeDir() orelse "", self.workspace_root);
+        try self.mcp.swapHostMenuFilter(was, self.alloc, &self.input_runtime.edit_state);
+        self.shell.render_requests.request(.footer);
+    }
+
+    pub fn mcpHostStatuses(self: *App, alloc: Allocator) Allocator.Error!?[]mcp_host.Status {
+        return self.mcp.hostStatuses(alloc);
+    }
+
+    pub fn refreshMcpHostStatus(self: *App) void {
+        if (self.mcp.refreshHostStatus(io_mod.milliTimestamp())) RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
+    }
+
+    pub fn startMcpHostServers(self: *App) void {
+        self.mcp.startHostServers();
+    }
+
+    pub fn refreshMcpHostMenu(self: *App) void {
+        const was = self.mcp.host_menu.screen;
+        const changed = self.mcp.refreshHostMenu(self.input_runtime.edit_state.input.items);
+        self.mcp.swapHostMenuFilter(was, self.alloc, &self.input_runtime.edit_state) catch |err|
+            debug_trace.logf("mcp", "MCP menu kept the tool filter in the composer err={s}", .{@errorName(err)});
+        if (changed) self.shell.render_requests.request(.footer);
+    }
+
+    pub fn applyMcpHostReload(self: *App) !void {
+        if (!self.mcp.takeHostReload()) return;
+        try self.mcp.reloadHost(self.alloc, self.workspace_root, self.toolRegistry());
     }
 
     pub fn acquireMcpRuntime(self: *App) ?app_mcp_runtime.Lease {
@@ -3108,6 +3172,7 @@ const App = struct {
         try app_commands.Handlers(App).collectMcpAuthenticationFacts(self);
         try app_commands.Handlers(App).collectMcpReloadFacts(self);
         try app_commands.Handlers(App).collectMcpStartupHealthFacts(self);
+        try app_commands.Handlers(App).collectMcpHostFacts(self);
         try app_commands.Handlers(App).collectShellSnapshotFacts(self);
         if (try self.mcp.refreshMenuHealth(self.alloc, @intCast(@max(io_mod.milliTimestamp(), 0)))) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
@@ -3230,7 +3295,7 @@ const App = struct {
         }
         _ = try InputAppRuntime.flushDeferredSessionInput(self, input_limits, max_prompt_history);
         if (self.should_exit) return;
-        try self.flushRequestedFrame();
+        if (!InputAppRuntime.holdFrameForFileListing(self, app_permission_runtime.monotonicMillis())) try self.flushRequestedFrame();
         if (comptime !host_target.is_wasm) {
             try SessionAppRuntime.settlePendingLiveSessionTransition(self);
             if (try InputAppRuntime.flushDeferredSessionInput(self, input_limits, max_prompt_history)) try self.flushRequestedFrame();
@@ -3393,8 +3458,6 @@ comptime {
     if (!builtin.is_test and !host_target.is_wasm) {
         @export(&main, .{ .name = "main" });
     }
-    // Replaces compiler_rt's byte-at-a-time memset in Linux executables.
-    _ = @import("core/shared/memset.zig");
 }
 
 pub fn runWasmTerminal(init: std.process.Init) !void {
@@ -3633,12 +3696,12 @@ fn topLevelHelpStyleForValues(is_terminal: bool, no_color: bool, dumb_terminal: 
 }
 
 fn stdoutIsTerminal() bool {
-    if (comptime builtin.os.tag == .windows or !builtin.link_libc) return false;
+    if (comptime builtin.target.os.tag == .windows or !builtin.link_libc) return false;
     return std.c.isatty(std.posix.STDOUT_FILENO) != 0;
 }
 
 fn stdoutTerminalColumns() ?usize {
-    if (comptime builtin.os.tag == .windows or !builtin.link_libc) return null;
+    if (comptime builtin.target.os.tag == .windows or !builtin.link_libc) return null;
 
     var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
     const req: c_int = @intCast(std.c.T.IOCGWINSZ);
@@ -3683,7 +3746,7 @@ fn processAllocator() Allocator {
 
 fn writeStdoutFast(text: []const u8) !void {
     @setRuntimeSafety(false);
-    if (comptime builtin.os.tag != .windows) {
+    if (comptime builtin.target.os.tag != .windows) {
         var remaining = text;
         while (remaining.len > 0) {
             const written = std.c.write(std.posix.STDOUT_FILENO, remaining.ptr, remaining.len);
@@ -3697,7 +3760,7 @@ fn writeStdoutFast(text: []const u8) !void {
 
 fn writeStderrFast(text: []const u8) !void {
     @setRuntimeSafety(false);
-    if (comptime builtin.os.tag != .windows) {
+    if (comptime builtin.target.os.tag != .windows) {
         var remaining = text;
         while (remaining.len > 0) {
             const written = std.c.write(std.posix.STDERR_FILENO, remaining.ptr, remaining.len);
@@ -3710,14 +3773,14 @@ fn writeStderrFast(text: []const u8) !void {
 }
 
 fn exitFast(code: u8) noreturn {
-    if (comptime builtin.link_libc and builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+    if (comptime builtin.link_libc and builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) {
         std.c._exit(@intCast(code));
     }
     std.process.exit(code);
 }
 
 fn hasPosixArgVector() bool {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .windows, .freestanding, .other => false,
         .wasi => builtin.link_libc,
         else => true,
@@ -3743,7 +3806,13 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
             std.mem.eql(u8, effective_args[2], "slack")) or
             std.mem.eql(u8, effective_args[1], "auth") or
             std.mem.eql(u8, effective_args[1], "list") or
-            std.mem.eql(u8, effective_args[1], "logout");
+            std.mem.eql(u8, effective_args[1], "logout") or
+            // MCP-v2's verbs start a host or delete a stored login.
+            std.mem.eql(u8, effective_args[1], "show") or
+            std.mem.eql(u8, effective_args[1], "login") or
+            std.mem.eql(u8, effective_args[1], "remove") or
+            std.mem.eql(u8, effective_args[1], "approve") or
+            std.mem.eql(u8, effective_args[1], "reject");
     }
     return std.mem.eql(u8, command, "slack") or
         std.mem.eql(u8, command, "login") or
@@ -3782,14 +3851,14 @@ test "credential-reading commands use early threaded io without full entry confi
 test "MCP credential commands use early threaded io" {
     try std.testing.expect(needsEarlyThreadedIo(&.{ "mcp", "add", "slack" }));
     try std.testing.expect(!needsEarlyThreadedIo(&.{ "mcp", "add", "slack", "node" }));
-    for ([_][:0]const u8{ "auth", "list", "logout" }) |operation| {
+    for ([_][:0]const u8{ "auth", "list", "logout", "show", "login", "remove", "approve", "reject" }) |operation| {
         try std.testing.expect(needsEarlyThreadedIo(&.{
             @as([:0]const u8, "mcp"),
             operation,
             @as([:0]const u8, "fixture"),
         }));
     }
-    for ([_][:0]const u8{ "add", "path", "remove" }) |operation| {
+    for ([_][:0]const u8{ "add", "path" }) |operation| {
         try std.testing.expect(!needsEarlyThreadedIo(&.{
             @as([:0]const u8, "mcp"),
             operation,
@@ -3854,12 +3923,13 @@ test "lightweight local commands do not request early threaded io" {
 }
 
 test "focused UI workers retain a bounded native poll timeout" {
-    try std.testing.expectEqual(@as(i32, 8), nativeLoopPollTimeoutMs(8, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, true, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, true, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, true));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, true, true, true));
+    try std.testing.expectEqual(@as(i32, 8), nativeLoopPollTimeoutMs(8, false, false, false, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, false, false, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, true, false, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, true, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, true, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, false, true));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, true, true, true, true));
 }
 
 test "footer runtime compatibility facade exports composeFooterFrame" {
@@ -3930,6 +4000,7 @@ fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
+        .load_mcp_host = builtin_mcp.loadHost,
         .add_mcp_profile_server = builtin_mcp.addProfileServer,
         .remove_mcp_profile_server = builtin_mcp.removeProfileServer,
         .acp_runner = .{ .run_fn = runAcpServer },
@@ -3969,6 +4040,7 @@ fn localEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
+        .load_mcp_host = builtin_mcp.loadHost,
         .add_mcp_profile_server = builtin_mcp.addProfileServer,
         .remove_mcp_profile_server = builtin_mcp.removeProfileServer,
         .acp_runner = .{ .run_fn = runAcpServer },
@@ -4008,6 +4080,7 @@ fn emptyEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
+        .load_mcp_host = builtin_mcp.loadHost,
         .add_mcp_profile_server = builtin_mcp.addProfileServer,
         .remove_mcp_profile_server = builtin_mcp.removeProfileServer,
         .acp_runner = .{ .run_fn = runAcpServer },
@@ -4041,7 +4114,7 @@ test "session reset traces and clears active paste state" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "session-reset-paste.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "session-reset-paste.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -4763,6 +4836,8 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
 }
 
 test {
+    _ = @import("mcp/mcp.zig");
+    _ = @import("core/mcp_host/runtime.zig");
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");
@@ -4811,6 +4886,7 @@ test {
     _ = @import("ui/render_engine/transcript_blocks.zig");
     _ = @import("ui/render_engine/viewport_selection.zig");
     _ = @import("core/agent/assistant_presentation.zig");
+    _ = @import("core/agent/presentation/inline_render.zig");
     _ = @import("core/upgrade/auto_upgrade.zig");
     _ = @import("core/cli/cli_ask.zig");
     _ = @import("core/cli/cli_replay.zig");
@@ -4849,6 +4925,7 @@ test {
     _ = @import("core/workspace/file_index.zig");
     _ = @import("core/workspace/path_completion.zig");
     _ = @import("core/workspace/directory_completion_job.zig");
+    _ = @import("core/indexer/indexer.zig");
     _ = @import("core/input/file_completion_state.zig");
     _ = @import("gateway/vercel_protocol.zig");
     _ = @import("core/gateway/provider_set.zig");
@@ -4868,6 +4945,7 @@ test {
     _ = @import("core/shared/message.zig");
     _ = @import("core/shared/token_estimate.zig");
     _ = @import("core/shell_command/command_effect.zig");
+    _ = @import("core/shell_command/safe_git.zig");
     _ = @import("core/execution/router.zig");
     _ = @import("core/execution/command_runner.zig");
     _ = @import("core/permissions/direct_command.zig");
@@ -4983,4 +5061,9 @@ test {
     _ = @import("core/agent/worker_runtime.zig");
     _ = @import("gateway/client.zig");
     _ = @import("gateway/host_stream_provider.zig");
+    _ = @import("gateway/vercel_failure_diagnostics.zig");
+    _ = @import("gateway/host_model_catalog.zig");
+    _ = @import("gateway/host_openai_codex.zig");
+    _ = @import("gateway/host_xai_grok.zig");
+    _ = @import("gateway/host_chat_completions.zig");
 }

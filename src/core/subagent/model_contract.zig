@@ -402,7 +402,7 @@ fn writeOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
 
 test "minimal request validation owns one-off and persistent intent" {
     const alloc = std.testing.allocator;
-    try std.testing.expectEqual(@as(usize, 2), @typeInfo(Action).@"enum".fields.len);
+    try std.testing.expectEqual(@as(usize, 2), @typeInfo(Action).@"enum".field_names.len);
     var run = try validateRequest(alloc, .{ .run = .{ .task = "review this" } });
     defer run.deinit(alloc);
     try std.testing.expectEqual(Action.run, run.action());

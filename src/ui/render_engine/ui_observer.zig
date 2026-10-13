@@ -131,12 +131,12 @@ pub const UiObserver = struct {
             return;
         };
         const root = std.mem.trim(u8, raw_root, " \t\r\n");
-        if (root.len == 0 or !std.fs.path.isAbsolute(root)) {
+        if (root.len == 0 or !std.Io.Dir.path.isAbsolute(root)) {
             self.state = .disabled;
             debug_trace.logf(
                 "ui_observer",
                 "disabled invalid_observe_dir absolute_required={s}",
-                .{if (std.fs.path.isAbsolute(root)) "false" else "true"},
+                .{if (std.Io.Dir.path.isAbsolute(root)) "false" else "true"},
             );
             return;
         }
@@ -150,7 +150,7 @@ pub const UiObserver = struct {
             );
             return;
         };
-        const frames_path = std.fs.path.join(alloc, &.{ root, "frames.jsonl" }) catch |err| {
+        const frames_path = std.Io.Dir.path.join(alloc, &.{ root, "frames.jsonl" }) catch |err| {
             self.state = .disabled;
             debug_trace.logf(
                 "ui_observer",
@@ -415,7 +415,7 @@ pub const UiObserver = struct {
         try checkpoint.writer.writeAll("}\n");
         try self.writeArtifact(alloc, "checkpoint.json", checkpoint.written());
 
-        const release_path = try std.fs.path.join(alloc, &.{ self.root, "release" });
+        const release_path = try std.Io.Dir.path.join(alloc, &.{ self.root, "release" });
         defer alloc.free(release_path);
         while (true) {
             std.Io.Dir.accessAbsolute(io_mod.getIo(), release_path, .{}) catch |err| switch (err) {
@@ -435,7 +435,7 @@ pub const UiObserver = struct {
         name: []const u8,
         contents: []const u8,
     ) !void {
-        const path = try std.fs.path.join(alloc, &.{ self.root, name });
+        const path = try std.Io.Dir.path.join(alloc, &.{ self.root, name });
         defer alloc.free(path);
         var file = try std.Io.Dir.createFileAbsolute(
             io_mod.getIo(),
@@ -448,7 +448,7 @@ pub const UiObserver = struct {
     }
 
     fn readArm(self: *UiObserver, alloc: Allocator) !?Arm {
-        const path = try std.fs.path.join(alloc, &.{ self.root, "arm" });
+        const path = try std.Io.Dir.path.join(alloc, &.{ self.root, "arm" });
         defer alloc.free(path);
         var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| switch (err) {
             error.FileNotFound => return null,
@@ -468,7 +468,7 @@ pub const UiObserver = struct {
         var contains: ?[]const u8 = null;
         var lines = std.mem.splitScalar(u8, bytes, '\n');
         while (lines.next()) |line| {
-            const separator = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+            const separator = std.mem.findScalar(u8, line, '=') orelse continue;
             const key = std.mem.trim(u8, line[0..separator], " \t\r");
             const value = std.mem.trim(u8, line[separator + 1 ..], " \t\r");
             if (std.mem.eql(u8, key, "kind")) {
@@ -541,7 +541,7 @@ fn surfaceContainsText(
     while (row <= surface.rows) : (row += 1) {
         row_text.clearRetainingCapacity();
         try target.rowText(row, &row_text);
-        if (std.mem.indexOf(u8, row_text.items, needle) != null) return true;
+        if (std.mem.find(u8, row_text.items, needle) != null) return true;
     }
     return false;
 }

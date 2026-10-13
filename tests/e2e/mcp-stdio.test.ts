@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -22,6 +22,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { buildMcpDispatcherDriver, ZIG_BUILD_WARMUP_TIMEOUT_MS } from "./zig-build";
 
 const MODEL = "openai/gpt-5";
 const TOOL_NAME = "mcp_fixture_echo";
@@ -68,6 +69,10 @@ let tui: TmuxSession | null = null;
 let gateway: ReturnType<typeof startFakeGateway> | null = null;
 let cleanupRoot: string | null = null;
 
+beforeAll(() => {
+  buildMcpDispatcherDriver(REPO_ROOT);
+}, ZIG_BUILD_WARMUP_TIMEOUT_MS);
+
 afterEach(async () => {
   const activeTui = tui;
   const activeGateway = gateway;
@@ -84,6 +89,8 @@ afterEach(async () => {
 });
 
 type RootOptions = {
+  /** The 2025 fixture accepts any client the spec allows, not only v1's wire choices. */
+  specClient?: boolean;
   mode?:
     | "normal"
     | "progress"
@@ -205,6 +212,7 @@ function createRoot(
               : undefined,
             FX_MCP_RESOURCE_TTL_MS: options.resourceTtlMs?.toString(),
             FX_MCP_LEGACY_VERSION: options.legacyVersion,
+            FX_MCP_SPEC_CLIENT: options.specClient ? "1" : undefined,
             FX_MCP_LEGACY_DISCOVERY_VERSIONS:
               options.legacyDiscoveryVersions?.join(","),
             FX_MCP_LEGACY_DISCOVERY_METHOD_NOT_FOUND:
@@ -4139,6 +4147,50 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     30_000,
   );
 
+  test.skipIf(!tmuxAvailable())(
+    "interactive fx ask on MCP-v2 puts a server's form question to the user",
+    async () => {
+      const root = createRoot("ask-interactive-mrtr-v2", MODERN_FIXTURE, {
+        mode: "mrtr_input_required",
+        expectedElicitation: "both",
+        specClient: true,
+      });
+      const activeGateway = startToolGateway("Interactive Ask elicitation complete.");
+      gateway = activeGateway;
+      const binary = join(REPO_ROOT, "zig-out", "bin", "fx");
+      const prompt = "Call the MRTR MCP fixture interactively.";
+      tui = await TmuxSession.create({
+        isolated: true,
+        cmd: `${JSON.stringify(binary)} ask --auto --no-save ${JSON.stringify(prompt)}`,
+        cwd: root.workspace,
+        width: 120,
+        height: 34,
+        remainOnExit: true,
+        env: { ...fixtureEnv(root, activeGateway), FX_MCP_ENGINE: "v2" },
+      });
+
+      await tui.waitForText("MCP server fixture requests confirmed", 20_000);
+      await tui.sendText("1");
+      await tui.waitForText("- confirmed: true", 20_000);
+      await tui.sendText("1");
+      await tui.waitForText("Interactive Ask elicitation complete.", 20_000);
+
+      // The answer went back to the server in the call's second round.
+      const calls = readWire(root.wireLogPath).filter((entry) =>
+        entry.message.method === "tools/call"
+      );
+      expect(calls).toHaveLength(2);
+      expect(calls[1]?.message.params?.inputResponses).toEqual({
+        confirm: { action: "accept", content: { confirmed: true } },
+      });
+      expect(await tui.captureFullScrollback()).not.toContain("the server asked for input fx can't give");
+
+      await tui.kill();
+      tui = null;
+    },
+    30_000,
+  );
+
   for (const legacyVersion of ["2025-06-18", "2025-11-25"] as const) {
     test.skipIf(!tmuxAvailable())(
       `interactive fx ask handles negotiated ${legacyVersion} direct elicitation/create`,
@@ -5921,4 +5973,182 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     ).toHaveLength(2);
     await expectFixtureProcessesExited(wire);
   }, 30_000);
+});
+
+describe("MCP-v2 engine (FX_MCP_ENGINE=v2)", () => {
+  const v2Env = (root: FixtureRoot, activeGateway: ReturnType<typeof startFakeGateway>) => ({
+    ...fixtureEnv(root, activeGateway),
+    FX_MCP_ENGINE: "v2",
+  });
+  const modelSaw = () => gateway!.requests.map((request) => request.body).join("\n");
+  const ask = (root: FixtureRoot, prompt: string) =>
+    runFx(["ask", "--json", "--auto", "--no-save", prompt], {
+      cwd: root.workspace,
+      env: v2Env(root, gateway!),
+      timeoutMs: 20_000,
+    });
+  const calls = (root: FixtureRoot) =>
+    readWire(root.wireLogPath).filter((entry) => entry.message.method === "tools/call");
+
+  for (const [era, fixture, resultText] of [
+    ["2026", MODERN_FIXTURE, MODERN_RESULT],
+    ["2025", LEGACY_FIXTURE, LEGACY_RESULT],
+  ] as const) {
+    test(`fx ask selects and calls a ${era} stdio tool`, async () => {
+      // MCP-v2 speaks 2025-11-25 and newer; the 2025 fixture defaults to 2024.
+      const root = createRoot(`v2-call-${era}`, fixture, { legacyVersion: "2025-11-25", specClient: true });
+      gateway = startToolGateway(`V2_${era}_DONE`);
+      const result = await ask(root, "Use the stdio MCP echo tool.");
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain(`V2_${era}_DONE`);
+      expect(modelSaw()).toContain(resultText);
+      // The server's instructions come with the selected tool.
+      if (era === "2026") expect(modelSaw()).toContain("Use the modern echo tool.");
+      expect(calls(root)).toHaveLength(1);
+      await expectFixtureProcessesExited(readWire(root.wireLogPath));
+    }, 25_000);
+  }
+
+  test("a server that only speaks 2024-11-05 is reported, not waited on", async () => {
+    const root = createRoot("v2-2024", LEGACY_FIXTURE, { legacyVersion: "2024-11-05", specClient: true });
+    gateway = startToolGateway("V2_2024_SEEN");
+    const started = Date.now();
+    const result = await ask(root, "Use the stdio MCP echo tool.");
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("V2_2024_SEEN");
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(calls(root)).toHaveLength(0);
+    expect(modelSaw()).toContain("MCP server 'fixture' is unavailable");
+    expect(modelSaw()).toContain("an MCP version fx doesn't support");
+  }, 25_000);
+
+  test("capability_search finds the tool under its fx name and the model calls it", async () => {
+    const root = createRoot("v2-search", MODERN_FIXTURE);
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("search", "capability_search", { query: "echo", server: "fixture" }),
+      fakeGatewayToolCall("call", TOOL_NAME, { text: "hello" }),
+      fakeGatewayFinalText("V2_SEARCH_DONE"),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const result = await ask(root, "Find the echo tool and use it.");
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("V2_SEARCH_DONE");
+    expect(modelSaw()).toContain(`\\"name\\":\\"${TOOL_NAME}\\",\\"server\\":\\"fixture\\"`);
+    expect(modelSaw()).toContain(MODERN_RESULT);
+    expect(calls(root)).toHaveLength(1);
+  }, 25_000);
+
+  test("a tool's own failure reaches the model and the turn goes on", async () => {
+    const root = createRoot("v2-tool-failure", MODERN_FIXTURE, { mode: "tool_failure" });
+    gateway = startToolGateway("V2_FAILURE_SEEN");
+    const result = await ask(root, "Use the stdio MCP echo tool.");
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("V2_FAILURE_SEEN");
+    expect(modelSaw()).toContain("isError");
+  }, 25_000);
+
+  test("a server that dies during a call tells the model the call ended", async () => {
+    const root = createRoot("v2-crash", MODERN_FIXTURE, { mode: "crash_always" });
+    gateway = startToolGateway("V2_CRASH_SEEN");
+    const result = await ask(root, "Use the stdio MCP echo tool.");
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("V2_CRASH_SEEN");
+    expect(modelSaw()).toContain("MCP server 'fixture' ended the call");
+  }, 25_000);
+
+  test.skipIf(!tmuxAvailable())("the shell asks a server's form question and sends the answer", async () => {
+    const root = createRoot("v2-tui-form", MODERN_FIXTURE, {
+      mode: "mrtr_input_required",
+      expectedElicitation: "both",
+      specClient: true,
+    });
+    const activeGateway = startToolGateway("V2 TUI form complete.");
+    gateway = activeGateway;
+    const stderrPath = join(root.root, "stderr.log");
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 100,
+      height: 30,
+      stderrPath,
+      env: v2Env(root, activeGateway),
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("Call the MRTR MCP fixture.");
+    await tui.waitForText("MCP server fixture requests confirmed", 20_000);
+    await tui.sendKeys("1");
+    await tui.waitForText("Current values:", 20_000);
+    await tui.sendKeys("1");
+    await tui.waitForText("V2 TUI form complete.", 20_000);
+
+    expect(activeGateway.requests[2]?.body).toContain("continued after elicitation");
+    const formCalls = calls(root);
+    expect(formCalls).toHaveLength(2);
+    expect(formCalls[1]?.message.params?.inputResponses).toEqual({
+      confirm: { action: "accept", content: { confirmed: true } },
+    });
+    expect(formCalls[1]?.message.params?.requestState).toBe("opaque");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    await tui.kill();
+    tui = null;
+    await expectFixtureProcessesExited(readWire(root.wireLogPath));
+  }, 30_000);
+
+  test.skipIf(!tmuxAvailable())("the shell answers a 2025 server's elicitation during a call", async () => {
+    const root = createRoot("v2-tui-elicit", LEGACY_FIXTURE, {
+      mode: "direct_form",
+      legacyVersion: "2025-11-25",
+      legacyDiscoveryMethodNotFound: true,
+      specClient: true,
+    });
+    const activeGateway = startToolGateway("V2 2025 elicitation complete.");
+    gateway = activeGateway;
+    const stderrPath = join(root.root, "stderr.log");
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 120,
+      height: 36,
+      stderrPath,
+      env: v2Env(root, activeGateway),
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("Call the direct legacy elicitation fixture.");
+    await tui.waitForText("MCP server fixture requests choice", 20_000);
+    // The shell submits a single compact choice without a review step.
+    await tui.sendText("1");
+    await tui.waitForText("V2 2025 elicitation complete.", 20_000);
+
+    const wire = readWire(root.wireLogPath);
+    expect(calls(root)).toHaveLength(1);
+    const answers = wire.filter((entry) => entry.message.id === "legacy-elicitation" && entry.message.method == null);
+    expect(answers).toHaveLength(1);
+    expect(answers[0]?.message.result).toMatchObject({ action: "accept" });
+    expect(modelSaw()).not.toContain("legacyvalid");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    await tui.kill();
+    tui = null;
+    await expectFixtureProcessesExited(wire);
+  }, 40_000);
+
+  test("fx ask with no way to ask tells the model the server wanted input", async () => {
+    const root = createRoot("v2-no-asker", MODERN_FIXTURE, { mode: "mrtr_input_required", specClient: true });
+    gateway = startToolGateway("V2_INPUT_DECLINED_SEEN");
+    const result = await ask(root, "Call the MRTR MCP fixture.");
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("V2_INPUT_DECLINED_SEEN");
+    expect(modelSaw()).toContain("the server asked for input fx can't give");
+  }, 25_000);
+
+  test("a search for a server that isn't configured says so", async () => {
+    const root = createRoot("v2-not-found", MODERN_FIXTURE);
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("search", "capability_search", { query: "echo", server: "nope" }),
+      fakeGatewayFinalText("V2_NOT_FOUND_SEEN"),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const result = await ask(root, "Find a tool on nope.");
+    expect(result.code).toBe(0);
+    expect(modelSaw()).toContain("server_not_found");
+    // Nothing needed the configured server, so it never started.
+    expect(existsSync(root.wireLogPath)).toBe(false);
+  }, 25_000);
 });

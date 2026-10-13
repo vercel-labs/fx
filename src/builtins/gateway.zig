@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const builtin = @import("builtin");
 
 pub const permission_reviewer = @import("gateway/permission_reviewer.zig");
@@ -643,7 +644,7 @@ fn streamAgentCompletion(
     else
         vercel_failure_diagnostics.collect(alloc, payload, result.err_body);
     if (result.status != .ok) return .{ .failed = .{
-        .kind = failureKind(result.status),
+        .kind = gatewayFailureKind(alloc, result.status, result.err_body),
         .detail = result.err_body,
         .diagnostics = .{
             .schema = diagnostics.schema,
@@ -713,6 +714,25 @@ const EventBridge = struct {
     }
 };
 
+/// Gateway reports the last provider it tried, so a provider's size rejection
+/// can arrive as a 400 from a later fallback. Classify it as too large.
+fn gatewayFailureKind(alloc: Allocator, status: std.http.Status, err_body: ?[]const u8) agent_stream_provider_contract.FailureKind {
+    const kind = failureKind(status);
+    if (kind != .invalid_request) return kind;
+    const body = err_body orelse return kind;
+    return if (vercel_failure_diagnostics.providerRejectedRequestSize(alloc, body)) .request_too_large else kind;
+}
+
+test "Gateway 400 with a provider 413 attempt is a size failure" {
+    const alloc = std.testing.allocator;
+    const fallback_body = "{\"providerMetadata\":{\"gateway\":{\"routing\":{\"modelAttempts\":[{\"providerAttempts\":[{\"statusCode\":413},{\"statusCode\":400}]}]}}}}";
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.request_too_large, gatewayFailureKind(alloc, .bad_request, fallback_body));
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.invalid_request, gatewayFailureKind(alloc, .bad_request, "AI_APICallError: Bad Request"));
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.invalid_request, gatewayFailureKind(alloc, .bad_request, null));
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.request_too_large, gatewayFailureKind(alloc, .payload_too_large, null));
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.rate_limited, gatewayFailureKind(alloc, .too_many_requests, fallback_body));
+}
+
 fn failureKind(status: std.http.Status) agent_stream_provider_contract.FailureKind {
     return switch (status) {
         .bad_request => .invalid_request,
@@ -762,7 +782,7 @@ fn fetchCreditsWithFetch(
     defer if (team_path) |path| alloc.free(path);
     if (gateway_team) |team| {
         if (shared_types.validGatewayTeam(team)) {
-            team_path = std.fmt.allocPrint(alloc, "{s}?teamId={s}", .{ credits_path, team }) catch {
+            team_path = alloc.print("{s}?teamId={s}", .{ credits_path, team }) catch {
                 return creditsErrorSnapshot(alloc, "failed to fetch credits from gateway");
             };
         } else {
@@ -1305,16 +1325,14 @@ fn normalizeGatewayCompletion(
             break :blk false;
         },
         .reject_malformed_identity => |failure| blk: {
-            try content.append(alloc, .{ .error_text = try std.fmt.allocPrint(
-                alloc,
+            try content.append(alloc, .{ .error_text = try alloc.print(
                 "provider search tool identity is malformed ({s})",
                 .{@tagName(failure)},
             ) });
             break :blk false;
         },
         .reject_unstorable_identity => |failure| blk: {
-            const detail = try std.fmt.allocPrint(
-                alloc,
+            const detail = try alloc.print(
                 "provider search tool identity cannot be stored ({s}: {s})",
                 .{ @tagName(failure.field), @tagName(failure.reason) },
             );
@@ -1323,8 +1341,7 @@ fn normalizeGatewayCompletion(
             break :blk false;
         },
         .reject_malformed_provider_result => |failure| blk: {
-            try content.append(alloc, .{ .error_text = try std.fmt.allocPrint(
-                alloc,
+            try content.append(alloc, .{ .error_text = try alloc.print(
                 "provider search result identity is malformed ({s})",
                 .{@tagName(failure)},
             ) });
@@ -1361,7 +1378,7 @@ fn normalizeGatewayCompletion(
                     search_requests += 1;
                     map_result: {
                         const hits = parseSearchHits(alloc, provider_result, request.max_results) catch |err| {
-                            try content.append(alloc, .{ .error_text = try std.fmt.allocPrint(alloc, "provider search result decode failed: {s}", .{@errorName(err)}) });
+                            try content.append(alloc, .{ .error_text = try alloc.print("provider search result decode failed: {s}", .{@errorName(err)}) });
                             break :map_result;
                         };
                         errdefer deinitHits(alloc, hits);
@@ -1497,7 +1514,7 @@ fn writePerplexityDomains(alloc: Allocator, writer: *std.Io.Writer, domains: []c
     for (domains, 0..) |domain, index| {
         if (index > 0) try writer.writeByte(',');
         if (blocked) {
-            const prefixed = try std.fmt.allocPrint(alloc, "-{s}", .{domain});
+            const prefixed = try alloc.print("-{s}", .{domain});
             defer alloc.free(prefixed);
             try std.json.Stringify.value(prefixed, .{}, writer);
         } else {
@@ -1826,8 +1843,7 @@ test "gateway worker returns one bounded error for malformed provider result ide
 
         try std.testing.expectEqual(@as(usize, 1), response.content.len);
         try std.testing.expect(response.content[0] == .error_text);
-        const expected = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const expected = try std.testing.allocator.print(
             "provider search result identity is malformed ({s})",
             .{@tagName(failure)},
         );
@@ -1838,11 +1854,11 @@ test "gateway worker returns one bounded error for malformed provider result ide
 }
 
 test "gateway worker rejects unstorable provider identities without returning search results" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, expectUnstorableProviderIdentity, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, expectUnstorableProviderIdentity, .{});
 }
 
 fn expectUnstorableProviderIdentity(alloc: Allocator) !void {
-    const oversized = [_]u8{'i'} ** 257;
+    const oversized: [257]u8 = @splat('i');
     var cancel_flag = std.atomic.Value(bool).init(false);
     var response = try normalizeGatewayCompletion(alloc, .{
         .backend = perplexity_search_backend_id,
@@ -2585,7 +2601,7 @@ fn modelCatalogTeamPath(
     if (access.credentialSource() != .fx_login) return null;
     const team = access.teamContext() orelse return null;
     if (!shared_types.validGatewayTeam(team)) return null;
-    return try std.fmt.allocPrint(alloc, "{s}?teamId={s}", .{ path, team });
+    return try alloc.print("{s}?teamId={s}", .{ path, team });
 }
 
 fn modelCatalogHeaderTeam(access: credentials.CatalogAccess) ?[]const u8 {
@@ -2641,7 +2657,7 @@ fn modelCatalogUrl(alloc: Allocator, path: []const u8, base_url_override: ?[]con
         break :blk default_model_catalog_base_url;
     } else default_model_catalog_base_url;
 
-    return std.fmt.allocPrint(alloc, "{s}{s}", .{ base_url, path });
+    return alloc.print("{s}{s}", .{ base_url, path });
 }
 
 var stable_models_test_environ: ?*std.process.Environ.Map = null;
@@ -2684,8 +2700,7 @@ const ModelsUrlTestEnv = struct {
 };
 
 fn installLoopbackModelsEnv(alloc: std.mem.Allocator, port: u16) !*ModelsUrlTestEnv {
-    const models_url = try std.fmt.allocPrint(
-        alloc,
+    const models_url = try alloc.print(
         "http://127.0.0.1:{d}/v1/models",
         .{port},
     );

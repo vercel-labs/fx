@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { cp, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
@@ -34,22 +35,31 @@ try {
   run(process.execPath, [resolve(repoRoot, "sdk/scripts/package-libfx.mjs"), packageDir]);
 
   const manifest = JSON.parse(await readFile(join(packageDir, "package.json"), "utf8"));
+  const typed = (types, entry) => ({ types: `./types/${types}`, default: entry });
+  const nodeEntry = { import: typed("node.d.ts", "./node.js"), require: typed("node.d.cts", "./node.cjs") };
   assert.deepEqual(manifest.exports["."], {
-    node: { import: "./node.js", require: "./node.cjs" },
-    browser: "./browser.js",
-    default: "./browser.js",
+    node: nodeEntry,
+    browser: typed("browser.d.ts", "./browser.js"),
+    default: typed("browser.d.ts", "./browser.js"),
   });
-  assert.deepEqual(manifest.exports["./node"], { import: "./node.js", require: "./node.cjs" });
-  assert.equal(manifest.exports["./browser"], "./browser.js");
-  assert.equal(manifest.exports["./wasm"], "./fx-sdk.js");
-  assert.equal(manifest.exports["./mcp"], "./mcp.js");
-  assert.equal(manifest.exports["./skills"], "./skills.js");
-  assert.equal(manifest.exports["./skills/node"], "./skills-node.js");
+  assert.deepEqual(manifest.exports["./node"], nodeEntry);
+  assert.deepEqual(manifest.exports["./browser"], typed("browser.d.ts", "./browser.js"));
+  assert.deepEqual(manifest.exports["./wasm"], typed("wasm.d.ts", "./fx-sdk.js"));
+  assert.deepEqual(manifest.exports["./mcp"], typed("mcp.d.ts", "./mcp.js"));
+  assert.deepEqual(manifest.exports["./skills"], typed("skills.d.ts", "./skills.js"));
+  assert.deepEqual(manifest.exports["./skills/node"], typed("skills-node.d.ts", "./skills-node.js"));
+  // Every `types` condition names a declaration the package carries.
+  for (const target of JSON.stringify(manifest.exports).match(/\.\/types\/[^"]+/g)) {
+    assert.ok(existsSync(join(packageDir, target)), `package is missing ${target}`);
+  }
 
   const archiveValidator = packageJob.match(/- name: Validate package archive\n\s+run: \|\n\s+node -e '([\s\S]*?)'/)?.[1];
   assert.ok(archiveValidator, "publisher archive validation must exist");
   const reportPath = join(temp, "libfx-pack.json");
-  const archiveFiles = new Set(await readdir(packageDir));
+  // Every file, at its path in the package, as `npm pack` reports them.
+  const archiveFiles = new Set((await readdir(packageDir, { recursive: true, withFileTypes: true }))
+    .filter((entry) => entry.isFile())
+    .map((entry) => relative(packageDir, join(entry.parentPath, entry.name)).split(sep).join("/")));
   for (const platform of ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"]) {
     archiveFiles.add(`libfx.${platform}.node`);
   }
@@ -80,15 +90,15 @@ try {
   await writeFile(join(consumerDir, "esm.mjs"), `
     import * as libfx from "libfx";
     import * as nodeEntry from "libfx/node";
-    const { createFxAgent, createFxTerminal, getBackendInfo } = libfx;
+    const { createFxEngine, createFxTerminal, getBackendInfo } = libfx;
     if (JSON.stringify(Object.keys(libfx).sort()) !== JSON.stringify(Object.keys(nodeEntry).sort())) {
       throw new Error("root and Node subpath ESM exports differ");
     }
     const info = await getBackendInfo({ backend: "native" });
-    if (typeof createFxAgent !== "function" || typeof createFxTerminal !== "function" || info.backend !== "native") {
+    if (typeof createFxEngine !== "function" || typeof createFxTerminal !== "function" || info.backend !== "native") {
       throw new Error(JSON.stringify(info));
     }
-    const agent = await createFxAgent({ backend: "native", apiKey: "package-test-key" });
+    const agent = await createFxEngine({ backend: "native", apiKey: "package-test-key" });
     const checkpoint = await agent.checkpoint();
     await agent.close();
     if (!(checkpoint instanceof Uint8Array) || checkpoint.length === 0) throw new Error("empty checkpoint");
@@ -97,16 +107,16 @@ try {
   await writeFile(join(consumerDir, "cjs.cjs"), `
     const libfx = require("libfx");
     const nodeEntry = require("libfx/node");
-    const { createFxAgent, createFxTerminal, getBackendInfo } = libfx;
+    const { createFxEngine, createFxTerminal, getBackendInfo } = libfx;
     (async () => {
       if (JSON.stringify(Object.keys(libfx).sort()) !== JSON.stringify(Object.keys(nodeEntry).sort())) {
         throw new Error("root and Node subpath CommonJS exports differ");
       }
       const info = await getBackendInfo({ backend: "native" });
-      if (typeof createFxAgent !== "function" || typeof createFxTerminal !== "function" || info.backend !== "native") {
+      if (typeof createFxEngine !== "function" || typeof createFxTerminal !== "function" || info.backend !== "native") {
         throw new Error(JSON.stringify(info));
       }
-      const agent = await createFxAgent({ backend: "native", apiKey: "package-test-key" });
+      const agent = await createFxEngine({ backend: "native", apiKey: "package-test-key" });
       const checkpoint = await agent.checkpoint();
       await agent.close();
       if (!(checkpoint instanceof Uint8Array) || checkpoint.length === 0) throw new Error("empty checkpoint");

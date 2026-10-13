@@ -3,7 +3,7 @@ import { strict as assert } from "node:assert";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent, supportsJspi } from "../node.js";
+import { createFxEngine, supportsJspi } from "../node.js";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const backend = process.argv[2] || "native";
@@ -70,7 +70,7 @@ async function collectTurn(agent, input) {
     toolCallFinish("call-1", "run_command", { command: "ls -la" }),
     textFinish("done"),
   ]);
-  const agent = await createFxAgent({
+  const agent = await createFxEngine({
     ...baseOptions,
     fetch: gateway.fetch,
     tools: [{
@@ -113,7 +113,7 @@ async function collectTurn(agent, input) {
     ],
     textFinish("done"),
   ]);
-  const agent = await createFxAgent({
+  const agent = await createFxEngine({
     ...baseOptions,
     fetch: gateway.fetch,
     tools: [
@@ -140,7 +140,7 @@ async function collectTurn(agent, input) {
     toolCallFinish("call-big", "upload_blob", { path: "/tmp/big.txt", content: huge }),
     textFinish("done"),
   ]);
-  const agent = await createFxAgent({
+  const agent = await createFxEngine({
     ...baseOptions,
     fetch: gateway.fetch,
     tools: [{
@@ -183,7 +183,7 @@ async function collectTurn(agent, input) {
     toolCallFinish("call-utf8", "probe", nonAscii),
     textFinish("three"),
   ]);
-  const agent = await createFxAgent({
+  const agent = await createFxEngine({
     ...baseOptions,
     fetch: gateway.fetch,
     tools: [{ name: "probe", description: "Probe inputs", inputSchema: { type: "object" }, execute: () => "ok" }],

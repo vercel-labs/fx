@@ -197,7 +197,7 @@ pub const Runtime = struct {
         const transport_finished_at_ms = self.clock.now();
         const usage = response.usage;
         const web_search_requests = if (usage) |value| value.web_search_requests else 0;
-        recordNetworkCall(inputs.worker_model, transport_started_at_ms, transport_finished_at_ms, @intFromEnum(std.http.Status.ok), usage, response.stop_reason, "");
+        recordNetworkCall(inputs.worker_model, transport_started_at_ms, transport_finished_at_ms, @backingInt(std.http.Status.ok), usage, response.stop_reason, "");
         const results = response.takeContent();
         const duration_ms = elapsedMs(started_at_ms, self.clock.now());
         debug_trace.logf("web_search", "complete backend={s} model={s} duration_ms={d} requests={d} stop_reason={s}", .{

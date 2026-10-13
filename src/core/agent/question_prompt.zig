@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const edit_contract = @import("../input/editor_state.zig");
 const io_mod = @import("../shared/io.zig");
@@ -597,7 +598,7 @@ pub const QuestionPrompt = struct {
         if (entry.freeform_cursor == 0) return;
         const start = text_boundaries.previousCharacterStart(entry.freeform_buffer.items, entry.freeform_cursor);
         const count = entry.freeform_cursor - start;
-        std.mem.copyForwards(u8, entry.freeform_buffer.items[start..], entry.freeform_buffer.items[entry.freeform_cursor..]);
+        @memmove(entry.freeform_buffer.items[start .. entry.freeform_buffer.items.len - count], entry.freeform_buffer.items[entry.freeform_cursor..]);
         entry.freeform_buffer.items.len -= count;
         entry.freeform_cursor = start;
     }
@@ -815,7 +816,7 @@ fn checkQuestionPromptSyncAllocationFailures(alloc: Allocator) !void {
 
 test "question prompt frees partial owned-entry allocations" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkQuestionPromptSyncAllocationFailures,
         .{},
     );
@@ -828,7 +829,7 @@ test "question prompt freeform allocation failure preserves prompt state" {
     prompt.moveChoice(-1);
 
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     try std.testing.expectError(
@@ -849,7 +850,7 @@ test "question prompt submission allocation failure preserves the draft" {
     prompt.applyFreeformCursorMove(1, 7);
 
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     try std.testing.expectError(
@@ -1539,7 +1540,7 @@ test "question prompt traces discarded drafts with their reason" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "question-draft.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "question-draft.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -1571,7 +1572,7 @@ test "question prompt traces drafts that differ from accepted submissions" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "question-draft-accepted.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "question-draft-accepted.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -1681,7 +1682,7 @@ test "compact submission keeps input distinct from actions and choice prompts cl
 }
 
 test "compact submission allocation failure preserves the unanswered input" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var prompt: QuestionPrompt = .{};
     defer prompt.deinit(alloc);
     try prompt.syncFrom(alloc, &.{.{ .question = "Input", .options = &.{}, .submission = .input }});

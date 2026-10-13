@@ -179,7 +179,7 @@ fn testExecutionAuthority(call: ToolCall) command_admission.ToolExecutionAuthori
         .fingerprint = .{
             .command = call.arguments_json,
             .resolved_cwd = "",
-            .target_os = builtin.os.tag,
+            .target_os = builtin.target.os.tag,
         },
         .source = .interactive_once,
     } } };
@@ -997,7 +997,7 @@ pub const FakeAgentRuntimeDeps = struct {
     }
 
     fn record(self: *FakeAgentRuntimeDeps, comptime fmt: []const u8, args: anytype) !void {
-        try self.log.append(self.alloc, try std.fmt.allocPrint(self.alloc, fmt, args));
+        try self.log.append(self.alloc, try self.alloc.print(fmt, args));
     }
 
     fn prepareParentTurnContext(raw: *anyopaque, arena: Allocator) !?runtime_deps.PreparedParentTurnContext {
@@ -1077,7 +1077,7 @@ pub const FakeAgentRuntimeDeps = struct {
         }
         for (self.validation_failure_names) |name| {
             if (std.mem.eql(u8, name, call.name)) {
-                return .{ .failure = try std.fmt.allocPrint(arena, "{s} arguments failed registered-tool validation", .{call.name}) };
+                return .{ .failure = try arena.print("{s} arguments failed registered-tool validation", .{call.name}) };
             }
         }
         const mcp_runtime_generation = if (self.validation_mcp_tool_name) |name|
@@ -1398,20 +1398,20 @@ pub const FakeAgentRuntimeDeps = struct {
 
     fn describeAction(_: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, _: []const []const u8) ![]const u8 {
         return if (display_target) |target|
-            std.fmt.allocPrint(arena, "start {s} {s}", .{ call.name, target })
+            arena.print("start {s} {s}", .{ call.name, target })
         else
-            std.fmt.allocPrint(arena, "start {s}", .{call.name});
+            arena.print("start {s}", .{call.name});
     }
 
     fn describeCompleted(_: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, _: []const []const u8) ![]const u8 {
         return if (display_target) |target|
-            std.fmt.allocPrint(arena, "done {s} {s}", .{ call.name, target })
+            arena.print("done {s} {s}", .{ call.name, target })
         else
-            std.fmt.allocPrint(arena, "done {s}", .{call.name});
+            arena.print("done {s}", .{call.name});
     }
 
     fn describeDenied(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
-        return std.fmt.allocPrint(arena, "{s} {s}", .{ label, call.name });
+        return arena.print("{s} {s}", .{ label, call.name });
     }
 
     fn permissionTarget(raw: *anyopaque, arena: Allocator, call: ToolCall, _: []const []const u8) ![]const u8 {
@@ -1856,7 +1856,7 @@ pub const FakeAgentRuntimeDeps = struct {
     }
 
     fn formatError(_: *anyopaque, arena: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
-        return std.fmt.allocPrint(arena, "Tool {s} failed: {s}", .{ tool_name, @errorName(err) });
+        return arena.print("Tool {s} failed: {s}", .{ tool_name, @errorName(err) });
     }
 };
 
@@ -2143,7 +2143,7 @@ pub fn expectBodyContainsInOrder(gateway: *const FakeGateway, index: usize, need
     const body = gateway.request_bodies.items[index];
     var cursor: usize = 0;
     for (needles) |needle| {
-        const found = std.mem.indexOfPos(u8, body, cursor, needle) orelse return error.TestExpectedBodyNeedleMissing;
+        const found = std.mem.findPos(u8, body, cursor, needle) orelse return error.TestExpectedBodyNeedleMissing;
         cursor = found + needle.len;
     }
 }
@@ -2210,7 +2210,7 @@ pub fn countText(hooks: *const FakeAgentRuntimeDeps, needle: []const u8) usize {
 pub fn countNeedle(haystack: []const u8, needle: []const u8) usize {
     var count: usize = 0;
     var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, haystack, pos, needle)) |found| {
+    while (std.mem.findPos(u8, haystack, pos, needle)) |found| {
         count += 1;
         pos = found + needle.len;
     }

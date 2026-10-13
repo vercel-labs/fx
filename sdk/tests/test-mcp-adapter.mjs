@@ -6,7 +6,7 @@ import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import { createFxAgent } from "../node.js";
+import { createFxEngine } from "../node.js";
 import { createMcpAdapter } from "../mcp.js";
 
 const imageError = process.argv[4] === "images-error";
@@ -154,7 +154,7 @@ try {
     gatewayChatUrl: `http://127.0.0.1:${gateway.address().port}/chat`,
     model: "mcp/model",
   };
-  agent = await createFxAgent(options);
+  agent = await createFxEngine(options);
   const turn = agent.prompt("use MCP");
   let text = "";
   for await (const event of turn) if (event.type === "text_delta") text += event.delta;
@@ -163,7 +163,7 @@ try {
   if (imageMode) {
     const checkpoint = await agent.checkpoint();
     await agent.close();
-    agent = await createFxAgent({ ...options, checkpoint });
+    agent = await createFxEngine({ ...options, checkpoint });
     const resumed = agent.prompt("Describe that screenshot again");
     for await (const event of resumed) {}
     assert.equal((await resumed.result).stopReason, "end_turn");

@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_mod = @import("../shared/io.zig");
 
 pub const mcp_add_usage = "mcp add slack | mcp add NAME COMMAND [ARGS...] | mcp add --transport http NAME URL";
 pub const mcp_auth_usage = "mcp auth NAME";
@@ -215,9 +216,9 @@ pub const HelpMenu = struct {
 
     pub fn cycleCategory(self: *HelpMenu, delta: i32) bool {
         if (!self.active or delta == 0) return false;
-        const count: i32 = @intCast(std.meta.fields(SlashPresentationCategory).len + 1);
+        const count: i32 = @intCast(@typeInfo(SlashPresentationCategory).@"enum".field_names.len + 1);
         var next: i32 = if (self.category) |category|
-            @as(i32, @intCast(@intFromEnum(category))) + 1
+            @as(i32, @intCast(@backingInt(category))) + 1
         else
             0;
         next += delta;
@@ -226,7 +227,7 @@ pub const HelpMenu = struct {
         self.category = if (next == 0)
             null
         else
-            @enumFromInt(next - 1);
+            @fromBackingInt(@intCast(next - 1));
         self.resetForQuery();
         return true;
     }
@@ -571,13 +572,20 @@ pub fn slashCompletionPrefix(registry: SlashRegistry, input: []const u8) ?[]cons
     const prefix = std.mem.trimStart(u8, input, " \t\r\n");
     if (prefix.len == 0 or prefix[0] != '/') return null;
 
-    const command_end = std.mem.indexOfAny(u8, prefix, " \t\r\n") orelse return prefix;
+    const command_end = std.mem.findAny(u8, prefix, " \t\r\n") orelse return prefix;
     const spec = registry.lookup(prefix[0..command_end]) orelse return prefix;
     if (!spec.has_args) return null;
     return prefix;
 }
 
 pub fn slashCompletionCount(registry: SlashRegistry, prefix: []const u8) usize {
+    if (runtimeArgQuery(registry, prefix)) |query| {
+        var count: usize = 0;
+        for (registry.arguments) |entry| {
+            if (runtimeArgMatches(registry, entry.full, query)) count += 1;
+        }
+        return count;
+    }
     if (allowlistArgCompletionPrefix(prefix)) |query| {
         return allowlistArgCompletionCount(query);
     }
@@ -603,6 +611,9 @@ pub fn slashCompletionCount(registry: SlashRegistry, prefix: []const u8) usize {
 }
 
 pub fn nthSlashCompletion(registry: SlashRegistry, prefix: []const u8, n: usize) ?[]const u8 {
+    if (runtimeArgQuery(registry, prefix)) |query| {
+        return (nthRuntimeArg(registry, query, n) orelse return null).full;
+    }
     if (allowlistArgCompletionPrefix(prefix)) |query| {
         return nthAllowlistArgCompletion(query, n);
     }
@@ -626,6 +637,7 @@ pub fn nthSlashCompletion(registry: SlashRegistry, prefix: []const u8, n: usize)
 /// known arg-completion commands. Returns 0 when
 /// the prefix is not an arg-completion command.
 pub fn argCompletionAnchor(prefix: []const u8) usize {
+    if (mcpVerbsOn() and argCompletionPrefix(prefix, "/mcp") != null) return "/mcp ".len;
     if (statuslineArgCompletionPrefix(prefix) != null) return "/statusline ".len;
     if (notificationsArgCompletionPrefix(prefix) != null) return "/sound ".len;
     if (permissionsArgCompletionPrefix(prefix) != null) return "/permissions ".len;
@@ -639,6 +651,10 @@ pub fn argCompletionAnchor(prefix: []const u8) usize {
 /// shows only the argument. For everything else the
 /// full command string is returned unchanged.
 pub fn nthSlashCompletionLabel(registry: SlashRegistry, prefix: []const u8, n: usize) ?[]const u8 {
+    if (runtimeArgQuery(registry, prefix)) |query| {
+        const entry = nthRuntimeArg(registry, query, n) orelse return null;
+        return entry.full[runtimeArgCommand(registry).len + 1 ..];
+    }
     if (allowlistArgCompletionPrefix(prefix)) |query| {
         return nthAllowlistArgLabel(query, n);
     }
@@ -658,6 +674,9 @@ pub fn nthSlashCompletionLabel(registry: SlashRegistry, prefix: []const u8, n: u
 }
 
 pub fn nthSlashCompletionDescription(registry: SlashRegistry, prefix: []const u8, n: usize) ?[]const u8 {
+    if (runtimeArgQuery(registry, prefix)) |query| {
+        return (nthRuntimeArg(registry, query, n) orelse return null).description;
+    }
     if (allowlistArgCompletionPrefix(prefix) != null) return null;
     if (statuslineArgCompletionPrefix(prefix) != null) return null;
     if (notificationsArgCompletionPrefix(prefix) != null) return null;
@@ -851,6 +870,46 @@ const allowlist_local_add_tool_completions = scopedAllowlistCompletions("local",
 const allowlist_user_add_tool_completions = scopedAllowlistCompletions("user", allowlist_add_tool_completions);
 const allowlist_local_remove_tool_completions = scopedAllowlistCompletions("local", allowlist_remove_tool_completions);
 const allowlist_user_remove_tool_completions = scopedAllowlistCompletions("user", allowlist_remove_tool_completions);
+
+/// MCP-v2's `/mcp` completes its verbs and server names. The
+/// check goes with FX_MCP_ENGINE when v1 is removed.
+fn mcpVerbsOn() bool {
+    const value = io_mod.getenv("FX_MCP_ENGINE") orelse return false;
+    return std.mem.eql(u8, value, "v2");
+}
+
+fn runtimeArgCommand(registry: SlashRegistry) []const u8 {
+    const first = registry.arguments[0].full;
+    return first[0 .. std.mem.findScalar(u8, first, ' ') orelse first.len];
+}
+
+/// What follows the command the app's completions are for, untrimmed at
+/// the end so a finished word moves on to the next one.
+fn runtimeArgQuery(registry: SlashRegistry, prefix: []const u8) ?[]const u8 {
+    if (registry.arguments.len == 0) return null;
+    const command = runtimeArgCommand(registry);
+    if (!std.mem.startsWith(u8, prefix, command) or prefix.len == command.len) return null;
+    if (prefix[command.len] != ' ') return null;
+    return std.mem.trimStart(u8, prefix[command.len..], " ");
+}
+
+/// A verb matches before its first space, and `VERB NAME` after it.
+fn runtimeArgMatches(registry: SlashRegistry, full: []const u8, query: []const u8) bool {
+    const rest = full[runtimeArgCommand(registry).len + 1 ..];
+    const naming = std.mem.findScalar(u8, query, ' ') != null;
+    if (naming != (std.mem.findScalar(u8, rest, ' ') != null)) return false;
+    return std.ascii.startsWithIgnoreCase(rest, query);
+}
+
+fn nthRuntimeArg(registry: SlashRegistry, query: []const u8, n: usize) ?mod_registry.ArgumentCompletion {
+    var idx: usize = 0;
+    for (registry.arguments) |entry| {
+        if (!runtimeArgMatches(registry, entry.full, query)) continue;
+        if (idx == n) return entry;
+        idx += 1;
+    }
+    return null;
+}
 
 fn argCompletionPrefix(prefix: []const u8, command: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, prefix, command)) return null;
@@ -1322,8 +1381,8 @@ fn writeTopLevelHelpEntry(writer: *std.Io.Writer, registry: TopLevelRegistry, en
     const padding = usage_width - entry.usage.len + 2;
     var prefix_buf: [128]u8 = undefined;
     var continuation_buf: [96]u8 = undefined;
-    const prefix = try std.fmt.bufPrint(&prefix_buf, "  {s}{s}{s}{s}", .{ styleStart(style, .syntax), entry.usage, styleEnd(style), spaces[0..padding] });
-    const continuation = try std.fmt.bufPrint(&continuation_buf, "  {s}", .{spaces[0 .. usage_width + 2]});
+    const prefix = try std.mem.print(&prefix_buf, "  {s}{s}{s}{s}", .{ styleStart(style, .syntax), entry.usage, styleEnd(style), spaces[0..padding] });
+    const continuation = try std.mem.print(&continuation_buf, "  {s}", .{spaces[0 .. usage_width + 2]});
     try writeWrappedLine(writer, prefix, continuation, summary, columns);
 }
 
@@ -1332,8 +1391,8 @@ fn writeTopLevelFlag(writer: *std.Io.Writer, flag: TopLevelFlag, usage_width: us
     const padding = usage_width - flag.usage.len + 2;
     var prefix_buf: [160]u8 = undefined;
     var continuation_buf: [96]u8 = undefined;
-    const prefix = try std.fmt.bufPrint(&prefix_buf, "  {s}{s}{s}{s}", .{ styleStart(style, .syntax), flag.usage, styleEnd(style), spaces[0..padding] });
-    const continuation = try std.fmt.bufPrint(&continuation_buf, "  {s}", .{spaces[0 .. usage_width + 2]});
+    const prefix = try std.mem.print(&prefix_buf, "  {s}{s}{s}{s}", .{ styleStart(style, .syntax), flag.usage, styleEnd(style), spaces[0..padding] });
+    const continuation = try std.mem.print(&continuation_buf, "  {s}", .{spaces[0 .. usage_width + 2]});
     try writeWrappedLine(writer, prefix, continuation, flag.description, columns);
 }
 
@@ -1347,7 +1406,7 @@ fn writeTopLevelResource(writer: *std.Io.Writer, resource: TopLevelResource, lab
     const spaces = "                                                                ";
     const padding = label_width - display_width.visibleWidth(resource.label) + 2;
     var prefix_buf: [128]u8 = undefined;
-    const prefix = try std.fmt.bufPrint(&prefix_buf, "{s}{s}{s}{s}", .{ styleStart(style, .label), resource.label, styleEnd(style), spaces[0..padding] });
+    const prefix = try std.mem.print(&prefix_buf, "{s}{s}{s}{s}", .{ styleStart(style, .label), resource.label, styleEnd(style), spaces[0..padding] });
     const value_role: HelpRole = if (resource.link) .link else .syntax;
     try writeWrappedStyledLine(writer, prefix, "  ", resource.value, columns, style, value_role);
 }
@@ -1814,30 +1873,30 @@ test "rendered slash summaries include aliases and welcome entries" {
 
 test "top-level specs cover every TopLevelKind" {
     const registry = testTopLevelRegistry();
-    var seen = [_]bool{false} ** std.meta.fields(TopLevelKind).len;
+    var seen: [@typeInfo(TopLevelKind).@"enum".field_names.len]bool = @splat(false);
     for (registry.specs) |spec| {
-        const index = @intFromEnum(spec.kind);
+        const index = @backingInt(spec.kind);
         try std.testing.expect(!seen[index]);
         seen[index] = true;
     }
-    inline for (std.meta.fields(TopLevelKind)) |field| {
-        const kind: TopLevelKind = @enumFromInt(field.value);
-        try std.testing.expect(seen[@intFromEnum(kind)]);
+    inline for (@typeInfo(TopLevelKind).@"enum".field_values) |field_value| {
+        const kind: TopLevelKind = @fromBackingInt(@intCast(field_value));
+        try std.testing.expect(seen[@backingInt(kind)]);
         try std.testing.expect(topLevelUsage(registry, kind).len > 0);
     }
 }
 
 test "slash specs cover every SlashKind" {
-    var seen = [_]bool{false} ** std.meta.fields(SlashKind).len;
+    var seen: [@typeInfo(SlashKind).@"enum".field_names.len]bool = @splat(false);
     const registry = testSlashRegistry();
     for (registry.commands) |spec| {
-        const index = @intFromEnum(spec.kind);
+        const index = @backingInt(spec.kind);
         try std.testing.expect(!seen[index]);
         seen[index] = true;
     }
-    inline for (std.meta.fields(SlashKind)) |field| {
-        const kind: SlashKind = @enumFromInt(field.value);
-        try std.testing.expect(seen[@intFromEnum(kind)]);
+    inline for (@typeInfo(SlashKind).@"enum".field_values) |field_value| {
+        const kind: SlashKind = @fromBackingInt(@intCast(field_value));
+        try std.testing.expect(seen[@backingInt(kind)]);
         _ = slashSpec(registry, kind);
     }
 }

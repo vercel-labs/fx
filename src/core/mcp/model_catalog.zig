@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const health = @import("health.zig");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
@@ -250,8 +251,7 @@ fn renderWithLimit(alloc: Allocator, snapshot: Snapshot, limit: usize) Allocator
     errdefer alloc.free(text);
     return .{
         .text = text,
-        .notice = try std.fmt.allocPrint(
-            alloc,
+        .notice = try alloc.print(
             "[context] omitted {d} MCP server{s} from the model catalog because the fixed {d}-byte budget was reached",
             .{ omitted_count, if (omitted_count == 1) "" else "s", limit },
         ),
@@ -279,8 +279,7 @@ fn renderEntry(alloc: Allocator, server: ServerSummary) Allocator.Error![]u8 {
 }
 
 fn truncationMarker(alloc: Allocator, omitted_count: usize) ![]u8 {
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "  <catalog_truncated omitted_count=\"{d}\" />\n",
         .{omitted_count},
     );
@@ -457,7 +456,7 @@ fn checkRenderAllocationFailures(alloc: Allocator) !void {
 
 test "render cleans up every partial allocation" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkRenderAllocationFailures,
         .{},
     );
@@ -515,7 +514,7 @@ test "renderChangeNotice bounds the transition list and encodes names" {
     var current: [10]ServerSummary = undefined;
     var names: [10][]u8 = undefined;
     for (0..10) |index| {
-        names[index] = try std.fmt.allocPrint(alloc, "server<{d}>", .{index});
+        names[index] = try alloc.print("server<{d}>", .{index});
     }
     defer for (names) |name| alloc.free(name);
     for (0..10) |index| {

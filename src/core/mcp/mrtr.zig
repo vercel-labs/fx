@@ -2,6 +2,7 @@
 //! stateless client-input requests carried by modern MCP operation results.
 
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const elicitation = @import("elicitation.zig");
 
 const Allocator = std.mem.Allocator;
@@ -435,7 +436,7 @@ test "MRTR recognizes unsupported methods without implementing their semantics" 
 
 test "MRTR parser and response validation release allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkAllocationFailures,
         .{},
     );

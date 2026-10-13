@@ -309,6 +309,7 @@ async function runTerminalToolScenario(args: {
   name: string;
   input: object;
   unsetHome?: boolean;
+  home?: string;
   expectedResultRequest: string[];
 }) {
   const gateway = startFakeGateway([
@@ -323,7 +324,7 @@ async function runTerminalToolScenario(args: {
         env: gatewayEnv(
           args.root,
           gateway,
-          args.unsetHome ? undefined : args.root.home,
+          args.unsetHome ? undefined : (args.home ?? args.root.home),
         ),
         timeoutMs: TIMEOUT,
       },
@@ -1589,6 +1590,38 @@ describe("filesystem path handling", () => {
   );
 
   test(
+    "grep_files searches a file larger than 200 KiB by path and by include",
+    async () => {
+      const root = createIsolatedRoot();
+      try {
+        mkdirSync(join(root.workspace, "src"), { recursive: true });
+        // 3,000 lines of 100 bytes, then the match on line 3,001.
+        writeFileSync(
+          join(root.workspace, "src", "big.txt"),
+          `${"x".repeat(99)}\n`.repeat(3000) + "LARGE_FILE_NEEDLE\n",
+        );
+        const cases = [
+          { id: "grep_large_path_1", input: { pattern: "LARGE_FILE_NEEDLE", path: "src/big.txt" } },
+          { id: "grep_large_include_1", input: { pattern: "LARGE_FILE_NEEDLE", include: "src/*.txt" } },
+        ];
+        for (const scenario of cases) {
+          await runFirstCallToolScenario({
+            root,
+            id: scenario.id,
+            name: "grep_files",
+            input: scenario.input,
+            expectedResultRequest: [],
+            expectedResultOutput: ["big.txt:3001", "LARGE_FILE_NEEDLE"],
+          });
+        }
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "glob pattern cannot escape the separately approved search root",
     async () => {
       const root = createIsolatedRoot();
@@ -1712,6 +1745,31 @@ describe("filesystem path handling", () => {
         });
 
         expect(existsSync(literalWorkspacePath)).toBe(false);
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "relative HOME is treated like a missing HOME instead of aborting",
+    async () => {
+      const root = createIsolatedRoot();
+      try {
+        await runTerminalToolScenario({
+          root,
+          id: "read_relative_home_1",
+          name: "read_file",
+          input: { path: "~/fx-path-fixture.txt" },
+          home: "relative/home",
+          expectedResultRequest: ["HomeNotSet"],
+        });
+
+        // Nothing resolves against the workspace: no tilde folder, and no
+        // profile written under the relative path.
+        expect(existsSync(join(root.workspace, "~"))).toBe(false);
+        expect(existsSync(join(root.workspace, "relative"))).toBe(false);
       } finally {
         rmSync(root.root, { recursive: true, force: true });
       }

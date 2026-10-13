@@ -22,7 +22,7 @@ pub const Event = struct {
     kind: Kind = .load,
     detail_len: u16 = 0,
     truncated: bool = false,
-    detail_buf: [max_detail_bytes]u8 = [_]u8{0} ** max_detail_bytes,
+    detail_buf: [max_detail_bytes]u8 = @splat(0),
 
     pub fn name(self: *const Event) []const u8 {
         return @tagName(self.kind);
@@ -139,7 +139,7 @@ test "model catalog diagnostics stay bounded, dedup consecutive repeats, and res
     try std.testing.expectEqualStrings("image_gate", events[1].name());
     try std.testing.expect(events[1].detail().len > 0);
 
-    const oversized = [_]u8{'x'} ** (max_detail_bytes + 10);
+    const oversized: [max_detail_bytes + 10]u8 = @splat('x');
     record(.load, true, "{s}", .{oversized});
     try std.testing.expectEqual(@as(usize, 3), snapshot(&events));
     try std.testing.expect(events[2].truncated);

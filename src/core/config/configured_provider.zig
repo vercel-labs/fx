@@ -1,4 +1,6 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const Allocator = std.mem.Allocator;
 
 const max_providers = 32;
@@ -470,7 +472,7 @@ fn test_allocations(alloc: Allocator) !void {
 }
 
 test "configured provider allocation failures release partial registry and URLs" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, test_allocations, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, test_allocations, .{});
 }
 
 const test_required_fields = "\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com/v1\",\"auth\":{\"type\":\"none\"}";
@@ -537,7 +539,7 @@ test "configured provider auth admits only explicit none or a portable environme
         .{ .json = "{\"type\":\"bearer\",\"command\":\"get-key\"}", .err = error.UnknownField },
     };
     for (cases) |case| {
-        const json = try std.fmt.allocPrint(alloc, "{{\"local\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com\",\"auth\":{s}}}}}", .{case.json});
+        const json = try alloc.print("{{\"local\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com\",\"auth\":{s}}}}}", .{case.json});
         defer alloc.free(json);
         try std.testing.expectError(case.err, Registry.parse_json(alloc, json));
     }
@@ -547,24 +549,24 @@ test "configured provider auth admits only explicit none or a portable environme
 }
 
 test "configured provider scalar bounds and minimum input budget" {
-    try validate_id("a" ** max_id_bytes);
+    try validate_id(text_utils.repeat("a", max_id_bytes));
     try validate_id("Local_2-test");
-    try std.testing.expectError(error.LimitExceeded, validate_id("a" ** (max_id_bytes + 1)));
-    try validate_model_id("m" ** max_model_bytes);
+    try std.testing.expectError(error.LimitExceeded, validate_id(text_utils.repeat("a", max_id_bytes + 1)));
+    try validate_model_id(text_utils.repeat("m", max_model_bytes));
     try validate_model_id("vendor/model:tag");
     try validate_model_id("model with internal spaces");
     try std.testing.expectError(error.InvalidModelId, validate_model_id(" leading"));
     try std.testing.expectError(error.InvalidModelId, validate_model_id("trailing "));
-    try std.testing.expectError(error.LimitExceeded, validate_model_id("m" ** (max_model_bytes + 1)));
+    try std.testing.expectError(error.LimitExceeded, validate_model_id(text_utils.repeat("m", max_model_bytes + 1)));
     try std.testing.expectError(error.InvalidModelId, validate_model_id("bad\xff"));
     const prefix = "https://example.com/";
-    _ = try validate_url(prefix ++ "a" ** (max_url_bytes - prefix.len));
-    try std.testing.expectError(error.LimitExceeded, validate_url(prefix ++ "a" ** (max_url_bytes - prefix.len + 1)));
+    _ = try validate_url(prefix ++ text_utils.repeat("a", max_url_bytes - prefix.len));
+    try std.testing.expectError(error.LimitExceeded, validate_url(prefix ++ text_utils.repeat("a", max_url_bytes - prefix.len + 1)));
 
     const alloc = std.testing.allocator;
     for ([_]usize{ max_env_bytes, max_env_bytes + 1 }) |length| {
-        const env = "E" ** (max_env_bytes + 1);
-        const json = try std.fmt.allocPrint(alloc, "{{\"local\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com\",\"auth\":{{\"type\":\"bearer\",\"env\":\"{s}\"}}}}}}", .{env[0..length]});
+        const env = text_utils.repeat("E", max_env_bytes + 1);
+        const json = try alloc.print("{{\"local\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com\",\"auth\":{{\"type\":\"bearer\",\"env\":\"{s}\"}}}}}}", .{env[0..length]});
         defer alloc.free(json);
         if (length == max_env_bytes) {
             var registry = try Registry.parse_json(alloc, json);
@@ -587,7 +589,7 @@ test "configured provider registry model count and raw input bounds" {
     const parsed = try std.json.parseFromSlice(std.json.Value, scratch, "{" ++ test_required_fields ++ "}", .{});
     var providers: std.json.Value = .{ .object = .empty };
     for (0..max_providers) |index| {
-        try providers.object.put(scratch, try std.fmt.allocPrint(scratch, "local{d}", .{index}), parsed.value);
+        try providers.object.put(scratch, try scratch.print("local{d}", .{index}), parsed.value);
     }
     var registry = try Registry.parse(alloc, providers);
     registry.deinit(alloc);
@@ -596,7 +598,7 @@ test "configured provider registry model count and raw input bounds" {
 
     var metadata: std.json.Value = .{ .object = .empty };
     for (0..max_models) |index| {
-        try metadata.object.put(scratch, try std.fmt.allocPrint(scratch, "model/{d}", .{index}), .{ .object = .empty });
+        try metadata.object.put(scratch, try scratch.print("model/{d}", .{index}), .{ .object = .empty });
     }
     var definition = parsed.value;
     try definition.object.put(scratch, "model_metadata", metadata);
@@ -634,5 +636,5 @@ fn test_invalid_allocations(alloc: Allocator) !void {
 }
 
 test "configured provider validation failures release earlier definitions and models" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, test_invalid_allocations, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, test_invalid_allocations, .{});
 }

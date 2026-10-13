@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_picker_path = @import("file_picker_path.zig");
 const file_completion_state = @import("file_completion_state.zig");
 const editor_state = @import("editor_state.zig");
@@ -105,6 +106,47 @@ pub const InlineSlashQuery = struct {
     prefix: []const u8,
 };
 
+/// Paces the frame for a keystroke that started a folder listing. Most folders
+/// list well within one event-loop tick, so that frame waits for the rows and
+/// the keystroke paints together with them instead of over an empty
+/// "indexing files..." list. Times are monotonic milliseconds.
+const FileListingWait = struct {
+    const hold_ms: i64 = 8;
+
+    started_ms: ?i64 = null,
+    // The previous listing outlasted the wait, so the next keystroke paints at
+    // once instead of paying the wait again on a slow folder.
+    last_outlasted_hold: bool = false,
+
+    /// Returns true while the next frame should wait for an in-flight listing.
+    /// Keystrokes during one listing share its wait.
+    pub fn hold(self: *FileListingWait, listing_in_flight: bool, now_ms: i64) bool {
+        if (!listing_in_flight) {
+            if (self.started_ms) |started| self.last_outlasted_hold = !withinHold(started, now_ms);
+            self.started_ms = null;
+            return false;
+        }
+        if (self.started_ms == null) self.started_ms = now_ms;
+        return self.active(now_ms);
+    }
+
+    pub fn active(self: FileListingWait, now_ms: i64) bool {
+        return !self.last_outlasted_hold and self.measuring(now_ms);
+    }
+
+    /// True during the first tick of every listing, waited for or not, so a
+    /// listing that finishes in time is seen at once and waiting turns back on.
+    pub fn measuring(self: FileListingWait, now_ms: i64) bool {
+        const started = self.started_ms orelse return false;
+        return withinHold(started, now_ms);
+    }
+
+    fn withinHold(started_ms: i64, now_ms: i64) bool {
+        // A clock that steps backwards ends the wait instead of extending it.
+        return now_ms >= started_ms and now_ms - started_ms < hold_ms;
+    }
+};
+
 /// Owns layout-independent composer picker state. Call `deinit` with the
 /// allocator used by `beginModelPickerFlow`.
 pub const State = struct {
@@ -142,11 +184,13 @@ pub const State = struct {
     file_completion_index: usize = 0,
     file_completion_window_start: usize = 0,
     file_picker_episode_seen: bool = false,
+    file_listing_wait: FileListingWait = .{},
 
     pub fn initInto(self: *State) void {
-        inline for (std.meta.fields(State)) |field| {
-            if (comptime std.mem.eql(u8, field.name, "file_completion")) continue;
-            @field(self.*, field.name) = field.defaultValue().?;
+        const state_info = @typeInfo(State).@"struct";
+        inline for (state_info.field_names, state_info.field_types, state_info.field_attrs) |field_name, field_type, field_attrs| {
+            if (comptime std.mem.eql(u8, field_name, "file_completion")) continue;
+            @field(self.*, field_name) = field_attrs.defaultValue(field_type).?;
         }
         self.file_completion.initInto();
     }
@@ -157,10 +201,11 @@ pub const State = struct {
         self.provider_picker_pending_provider.deinit(alloc);
         self.provider_picker_pending_method.deinit(alloc);
         self.web_picker_pending_search.deinit(alloc);
-        inline for (std.meta.fields(State)) |field| {
+        const state_info = @typeInfo(State).@"struct";
+        inline for (state_info.field_names, state_info.field_types, state_info.field_attrs) |field_name, field_type, field_attrs| {
             // The child's owner already restored its defaults.
-            if (comptime std.mem.eql(u8, field.name, "file_completion")) continue;
-            @field(self.*, field.name) = field.defaultValue().?;
+            if (comptime std.mem.eql(u8, field_name, "file_completion")) continue;
+            @field(self.*, field_name) = field_attrs.defaultValue(field_type).?;
         }
     }
 
@@ -753,14 +798,16 @@ test "picker deinit releases owned text and restores declared defaults" {
     state.file_completion.active = true;
     state.file_completion.episode = 51;
     state.deinit(alloc);
-    inline for (std.meta.fields(State)) |field| {
-        if (comptime std.mem.eql(u8, field.name, "file_completion")) {
-            inline for (std.meta.fields(file_completion_state.State)) |child| {
-                if (comptime std.mem.eql(u8, child.name, "raw_query") or std.mem.eql(u8, child.name, "lookup_query")) continue;
-                try std.testing.expectEqualDeep(child.defaultValue().?, @field(state.file_completion, child.name));
+    const state_info = @typeInfo(State).@"struct";
+    inline for (state_info.field_names, state_info.field_types, state_info.field_attrs) |field_name, field_type, field_attrs| {
+        if (comptime std.mem.eql(u8, field_name, "file_completion")) {
+            const child_info = @typeInfo(file_completion_state.State).@"struct";
+            inline for (child_info.field_names, child_info.field_types, child_info.field_attrs) |child_name, child_type, child_attrs| {
+                if (comptime std.mem.eql(u8, child_name, "raw_query") or std.mem.eql(u8, child_name, "lookup_query")) continue;
+                try std.testing.expectEqualDeep(child_attrs.defaultValue(child_type).?, @field(state.file_completion, child_name));
             }
         } else {
-            try std.testing.expectEqualDeep(field.defaultValue().?, @field(state, field.name));
+            try std.testing.expectEqualDeep(field_attrs.defaultValue(field_type).?, @field(state, field_name));
         }
     }
     state.deinit(alloc);
@@ -967,7 +1014,7 @@ test "model picker flow accepts aliased pending model input" {
 }
 
 test "model picker flow preserves state when allocation fails" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var state: State = .{};
     defer state.deinit(alloc);
 
@@ -1173,4 +1220,31 @@ test "editing a committed search token degrades the web picker to the search col
     const query = state.activeWebPickerQuery(&editor).?;
     try std.testing.expectEqual(WebPickerStage.search, query.stage);
     try std.testing.expectEqualStrings("ex", query.query);
+}
+
+test "folder listing wait spans one tick and is skipped after a slow listing" {
+    var wait: FileListingWait = .{};
+    try std.testing.expect(!wait.hold(false, 100));
+    // Keystrokes during one listing share the first keystroke's wait.
+    try std.testing.expect(wait.hold(true, 100));
+    try std.testing.expect(wait.hold(true, 100 + FileListingWait.hold_ms - 1));
+    try std.testing.expect(wait.active(100 + FileListingWait.hold_ms - 1));
+    // A listing that outlasts the wait paints at once from then on.
+    try std.testing.expect(!wait.hold(true, 100 + FileListingWait.hold_ms));
+    try std.testing.expect(!wait.hold(true, 140));
+    try std.testing.expect(!wait.active(140));
+    try std.testing.expect(!wait.hold(false, 141));
+    // The folder was slow, so the next keystroke does not wait for it, but
+    // the listing is still watched for its first tick.
+    try std.testing.expect(!wait.hold(true, 200));
+    try std.testing.expect(!wait.active(200));
+    try std.testing.expect(wait.measuring(200 + FileListingWait.hold_ms - 1));
+    try std.testing.expect(!wait.measuring(200 + FileListingWait.hold_ms));
+    // A listing that finishes within the wait turns waiting back on.
+    try std.testing.expect(!wait.hold(false, 202));
+    try std.testing.expect(wait.hold(true, 300));
+    try std.testing.expect(!wait.hold(false, 301));
+    try std.testing.expect(wait.hold(true, 400));
+    // A clock that steps backwards ends the wait.
+    try std.testing.expect(!wait.hold(true, 350));
 }

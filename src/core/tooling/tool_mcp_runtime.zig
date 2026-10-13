@@ -182,6 +182,27 @@ pub const LegacyUrlCompletionSink = struct {
     accept: *const fn (*anyopaque, InputOrigin, []const u8) LegacyUrlAcceptTransition,
     consume: *const fn (*anyopaque, LegacyUrlCompletion) LegacyUrlConsumeTransition,
     publish: *const fn (*anyopaque, []u8) void,
+
+    /// Publishes a completion that came before the client's consent, and says
+    /// what is left; null when the sink no longer knows the elicitation.
+    pub fn settleAccept(sink: LegacyUrlCompletionSink, accepted: LegacyUrlAcceptTransition) ?LegacyUrlAcceptStatus {
+        return switch (accepted) {
+            .missing => null,
+            .awaiting_completion => .awaiting_completion,
+            .completed => |id| completed: {
+                sink.publish(sink.context, id);
+                break :completed .completed;
+            },
+        };
+    }
+
+    /// A server's completion, published once the client has consented.
+    pub fn complete(sink: LegacyUrlCompletionSink, completion: LegacyUrlCompletion) void {
+        switch (sink.consume(sink.context, completion)) {
+            .missing => {},
+            .consumed => |id| if (id) |owned| sink.publish(sink.context, owned),
+        }
+    }
 };
 
 pub const LegacyUrlConsumeTransition = union(enum) {
@@ -421,8 +442,7 @@ fn callAdvertisedDynamicTool(
     );
 }
 pub fn notSelectedOutput(arena: Allocator, name: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(
-        arena,
+    return arena.print(
         "Dynamic MCP tool not selected for this model step: {s}. Use capability_search or mcp_select_tool to load its definition; the selected tool can be called on the next model step after its schema is advertised.",
         .{name},
     );

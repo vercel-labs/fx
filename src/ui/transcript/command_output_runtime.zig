@@ -269,7 +269,7 @@ pub fn commandArtifactHandleFromResult(result: []const u8) ?[]const u8 {
         if (!truncated or !has_stdout_bytes or !has_stderr_bytes) return null;
 
         const path = line[prefix.len..];
-        const handle = std.fs.path.basename(path);
+        const handle = std.Io.Dir.path.basename(path);
         if (std.mem.startsWith(u8, handle, "fx-command-") and
             std.mem.endsWith(u8, handle, ".log") and
             !std.mem.endsWith(u8, handle, ".stdout.log") and
@@ -393,7 +393,7 @@ pub fn prepareCommandOutputMutation(
     if (record and
         block.overflow_open_records[stream_index] and
         block.decoders[stream_index].isIdle() and
-        std.mem.indexOfAny(u8, text, "\r\n\x1b") == null)
+        std.mem.findAny(u8, text, "\r\n\x1b") == null)
     {
         return .{ .overflow_fragment = block_index };
     }
@@ -1348,7 +1348,7 @@ test "unbounded command output admission does not scan retained state" {
         command_output_blocks: std.ArrayList(CommandOutputBlock) = .empty,
         retained_scan_count: usize = 0,
 
-        fn retainedStructuredBytesForCommandOutput(self: *@This()) usize {
+        pub fn retainedStructuredBytesForCommandOutput(self: *@This()) usize {
             self.retained_scan_count += 1;
             return 123;
         }
@@ -1931,9 +1931,9 @@ test "dimmed command rows frame physical lines independently" {
 fn foldedHint(alloc: Allocator, hidden_records: usize, cols: u16) ![]u8 {
     const noun = if (hidden_records == 1) "line" else "lines";
     const candidates = [_][]u8{
-        try std.fmt.allocPrint(alloc, "│ … {d} {s} more (ctrl+o to view)", .{ hidden_records, noun }),
-        try std.fmt.allocPrint(alloc, "│ … {d} more (ctrl+o)", .{hidden_records}),
-        try std.fmt.allocPrint(alloc, "│ … {d} more", .{hidden_records}),
+        try alloc.print("│ … {d} {s} more (ctrl+o to view)", .{ hidden_records, noun }),
+        try alloc.print("│ … {d} more (ctrl+o)", .{hidden_records}),
+        try alloc.print("│ … {d} more", .{hidden_records}),
     };
     defer for (candidates) |candidate| alloc.free(candidate);
 
@@ -1954,8 +1954,8 @@ fn processStatusRow(
     cols: u16,
 ) ![]u8 {
     const full = switch (presentation) {
-        .exit_code => |code| try std.fmt.allocPrint(alloc, "│ exit code {d}", .{code}),
-        .signal => |signal| try std.fmt.allocPrint(alloc, "│ signal {d}", .{signal}),
+        .exit_code => |code| try alloc.print("│ exit code {d}", .{code}),
+        .signal => |signal| try alloc.print("│ signal {d}", .{signal}),
         .timed_out => try alloc.dupe(u8, "│ timed out"),
         .output_capture_failed => try alloc.dupe(u8, "│ output capture failed"),
     };
@@ -2055,7 +2055,7 @@ test "compact command output caps physical rows" {
     defer block.deinit(alloc);
 
     for (0..7) |index| {
-        const text = try std.fmt.allocPrint(alloc, "line-{d}", .{index + 1});
+        const text = try alloc.print("line-{d}", .{index + 1});
         try block.lines.append(alloc, .{
             .stream = .stdout,
             .text = text,
@@ -2244,7 +2244,7 @@ test "compact process row consumes payload budget before final hint" {
     for (0..6) |index| {
         try block.lines.append(alloc, .{
             .stream = .stdout,
-            .text = try std.fmt.allocPrint(alloc, "line-{d}", .{index + 1}),
+            .text = try alloc.print("line-{d}", .{index + 1}),
             .record_ordinal = index,
             .entry_id = @intCast(index + 1),
         });

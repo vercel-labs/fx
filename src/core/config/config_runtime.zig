@@ -293,7 +293,7 @@ pub const DetailedSettings = struct {
 };
 
 pub fn discoverPaths(alloc: Allocator, workspace_root: []const u8) !Paths {
-    return discoverPathsWithOptionalHome(alloc, io_mod.getenv("HOME"), workspace_root);
+    return discoverPathsWithOptionalHome(alloc, io_mod.homeDir(), workspace_root);
 }
 
 pub fn discoverPathsFromHome(alloc: Allocator, home_dir: []const u8, workspace_root: []const u8) !Paths {
@@ -380,7 +380,7 @@ pub fn loadProjectMcpChoices(
     alloc: Allocator,
     workspace_root: []const u8,
 ) !ProjectMcpChoiceLoad {
-    const home = io_mod.getenv("HOME") orelse return .{};
+    const home = io_mod.homeDir() orelse return .{};
     return loadProjectMcpChoicesFromHome(alloc, home, workspace_root);
 }
 
@@ -432,7 +432,7 @@ pub fn loadMergedSettingsDetailedFromHome(
 }
 
 pub fn loadMergedSettingsDetailed(alloc: Allocator, workspace_root: []const u8) !DetailedSettings {
-    return loadMergedSettingsDetailedWithOptionalHome(alloc, io_mod.getenv("HOME"), workspace_root);
+    return loadMergedSettingsDetailedWithOptionalHome(alloc, io_mod.homeDir(), workspace_root);
 }
 
 fn loadMergedSettingsDetailedWithOptionalHome(
@@ -523,7 +523,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
         }
     }
 
-    const project_path = try std.fs.path.join(alloc, &.{ workspace_root, ".fx.json" });
+    const project_path = try std.Io.Dir.path.join(alloc, &.{ workspace_root, ".fx.json" });
     defer alloc.free(project_path);
     const project_text = readOptionalFile(alloc, project_path) catch |err| blk: {
         if (err == error.OutOfMemory) return err;
@@ -1092,7 +1092,7 @@ fn ensureAbsoluteDir(path_abs: []const u8) !void {
 }
 
 pub fn userSettingsPath(alloc: Allocator) !?[]u8 {
-    const home = io_mod.getenv("HOME") orelse return null;
+    const home = io_mod.homeDir() orelse return null;
     return try profile_paths.settingsPath(alloc, home);
 }
 
@@ -1132,7 +1132,7 @@ pub fn attemptUserPreferences(
     alloc: Allocator,
     patch: UserSettingsPatch,
 ) CommitAttempt {
-    const home = io_mod.getenv("HOME") orelse return .{ .failure = .{ .err = error.HomeNotSet } };
+    const home = io_mod.homeDir() orelse return .{ .failure = .{ .err = error.HomeNotSet } };
     return attemptUserPreferencesInHome(alloc, home, patch);
 }
 
@@ -1160,7 +1160,7 @@ pub fn attemptProjectMcpMutation(
     workspace_root: []const u8,
     action: project_config.ProjectMcpAction,
 ) CommitAttempt {
-    const home = io_mod.getenv("HOME") orelse return .{ .failure = .{ .err = error.HomeNotSet } };
+    const home = io_mod.homeDir() orelse return .{ .failure = .{ .err = error.HomeNotSet } };
     var store = settings_store.Store.initFromHome(alloc, home, .writable) catch |err| {
         return .{ .failure = .{ .err = err } };
     };
@@ -1179,7 +1179,7 @@ pub fn setUserPreferences(
     alloc: Allocator,
     patch: UserSettingsPatch,
 ) !CommitOutcome {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var store = try settings_store.Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
     return store.applyUserPatch(alloc, patch);
@@ -1189,7 +1189,7 @@ pub fn mutateWorkspaceDirectory(
     alloc: Allocator,
     mutation: WorkspaceDirectoryMutation,
 ) !CommitOutcome {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var store = try settings_store.Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
     return store.applyWorkspaceDirectoryPatch(alloc, mutation);
@@ -1199,7 +1199,7 @@ pub fn mutatePermission(
     alloc: Allocator,
     mutation: PermissionMutation,
 ) !CommitOutcome {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var store = try settings_store.Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
     return store.applyPermissionPatch(alloc, mutation);
@@ -1278,7 +1278,7 @@ fn discoverPathsWithOptionalHome(alloc: Allocator, home_dir: ?[]const u8, worksp
         errdefer alloc.free(paths.sessions_dir.?);
     }
 
-    paths.workspace_settings = try std.fs.path.join(alloc, &.{ trimmed_workspace, ".fx.json" });
+    paths.workspace_settings = try std.Io.Dir.path.join(alloc, &.{ trimmed_workspace, ".fx.json" });
     errdefer alloc.free(paths.workspace_settings);
 
     return paths;
@@ -1884,7 +1884,7 @@ fn parseSkillSymlinkAuthorities(alloc: Allocator, value: std.json.Value) ![][]u8
     if (items.len > max_skill_symlink_authorities) return error.InvalidSkillSymlinkAuthorities;
     for (items) |item| {
         if (item != .string or
-            !std.fs.path.isAbsolute(item.string) or
+            !std.Io.Dir.path.isAbsolute(item.string) or
             pathHasDotDotComponent(item.string))
         {
             return error.InvalidSkillSymlinkAuthorities;
@@ -1904,7 +1904,7 @@ fn parseSkillSymlinkAuthorities(alloc: Allocator, value: std.json.Value) ![][]u8
 }
 
 fn pathHasDotDotComponent(path: []const u8) bool {
-    var it = std.fs.path.componentIterator(path);
+    var it = std.Io.Dir.path.componentIterator(path);
     while (it.next()) |component| {
         if (std.mem.eql(u8, component.name, "..")) return true;
     }
@@ -2390,8 +2390,7 @@ test "loadMergedSettings merges project defaults before profile layers" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"model\":\"user-model\",\"permission_mode\":\"ask\",\"max_agent_steps\":8,\"workspaces\":{{\"{s}\":{{\"model\":\"override-model\",\"permission_mode\":\"auto\"}}}}}}",
         .{workspace_root},
     );
@@ -2423,8 +2422,7 @@ test "provider routing settings merge across layers with project defaults" {
     const project_only_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "project-only");
     defer std.testing.allocator.free(project_only_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"provider_order\":[\"bedrock\",\"anthropic\"],\"provider_strict\":true,\"workspaces\":{{\"{s}\":{{\"provider_order\":[\"vertex\"],\"provider_strict\":false}}}}}}",
         .{workspace_root},
     );
@@ -2490,8 +2488,7 @@ test "provider routing empty list clears an inherited order" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"provider_order\":[\"bedrock\"],\"workspaces\":{{\"{s}\":{{\"provider_order\":[]}}}}}}",
         .{workspace_root},
     );
@@ -2571,8 +2568,7 @@ test "context limits resolve command line over workspace and global profile valu
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"context_limits\":{{\"skill_chunk_bytes\":111,\"mcp_description_bytes\":\"off\"}},\"workspaces\":{{\"{s}\":{{\"context_limits\":{{\"skill_chunk_bytes\":222}}}}}}}}",
         .{workspace_root},
     );
@@ -2617,8 +2613,7 @@ test "loadStartupStatusSettings merges project defaults before profile layers" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"model\":\"user-model\",\"permission_mode\":\"ask\",\"max_agent_steps\":8,\"workspaces\":{{\"/other\":{{\"model\":\"wrong\"}},\"{s}\":{{\"model\":\"override-model\",\"permission_mode\":\"yolo\"}}}}}}",
         .{workspace_root},
     );
@@ -2647,14 +2642,13 @@ test "loadMergedSettings applies startup scrollback precedence with normalized w
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"startup_scrollback\":false,\"workspaces\":{{\"{s}\":{{\"startup_scrollback\":false}}}}}}",
         .{workspace_root},
     );
     defer std.testing.allocator.free(user_settings);
 
-    const workspace_with_slash = try std.fmt.allocPrint(std.testing.allocator, "{s}/", .{workspace_root});
+    const workspace_with_slash = try std.testing.allocator.print("{s}/", .{workspace_root});
     defer std.testing.allocator.free(workspace_with_slash);
 
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", user_settings);
@@ -2830,8 +2824,7 @@ test "skill_symlink_authorities is profile-only and workspace overrides replace 
     const project_only_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "project-only");
     defer alloc.free(project_only_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        alloc,
+    const user_settings = try alloc.print(
         "{{\"skill_symlink_authorities\":[\"/opt/global-skills\"],\"workspaces\":{{\"{s}\":{{\"skill_symlink_authorities\":[\"/opt/workspace-skills\"]}}}}}}",
         .{workspace_root},
     );
@@ -3007,8 +3000,7 @@ test "workspace override can change effort from high to auto" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"effort\":\"high\",\"workspaces\":{{\"{s}\":{{\"effort\":\"auto\"}}}}}}",
         .{workspace_root},
     );
@@ -3031,8 +3023,7 @@ test "profile workspace settings effort null loads as auto" {
     defer std.testing.allocator.free(home_root);
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"effort\":null}}}}}}\n",
         .{workspace_root},
     );
@@ -3075,7 +3066,7 @@ test "oversized user and workspace settings propagate StreamTooLong" {
 
     const user_settings = try profile_paths.settingsPath(std.testing.allocator, home_root);
     defer std.testing.allocator.free(user_settings);
-    const workspace_settings = try std.fs.path.join(std.testing.allocator, &.{ workspace_root, ".fx.json" });
+    const workspace_settings = try std.Io.Dir.path.join(std.testing.allocator, &.{ workspace_root, ".fx.json" });
     defer std.testing.allocator.free(workspace_settings);
 
     try writeRepeatedByteAbsolute(user_settings, 'a', max_settings_bytes + 1);
@@ -3098,8 +3089,7 @@ test "permission rules parse from workspace override" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"permission\":{{\"edit\":{{\"src/*\":\"allow\"}},\"bash\":{{\"rm -rf*\":\"deny\"}},\"open_url\":\"ask\"}}}}}}}}",
         .{workspace_root},
     );
@@ -3126,8 +3116,7 @@ test "later permission layers replace earlier rules" {
     defer std.testing.allocator.free(home_root);
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"permission\":{{\"edit\":\"allow\"}},\"workspaces\":{{\"{s}\":{{\"permission\":{{\"bash\":\"deny\"}}}}}}}}\n",
         .{workspace_root},
     );
@@ -3154,8 +3143,7 @@ test "empty workspace override permission clears earlier rules" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"permission\":{{\"edit\":\"allow\"}},\"workspaces\":{{\"{s}\":{{\"permission\":{{}}}}}}}}",
         .{workspace_root},
     );
@@ -3302,8 +3290,7 @@ test "explicit user permission mutation writes top level and preserves local rul
     defer std.testing.allocator.free(home_root);
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"permission\":{{\"bash\":{{\"local *\":\"allow\"}}}}}}}}}}\n",
         .{workspace_root},
     );
@@ -3449,8 +3436,7 @@ test "addPermissionRule preserves unrelated workspace override keys" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"model\":\"my-model\",\"permission_mode\":\"auto\"}}}}}}",
         .{workspace_root},
     );
@@ -3480,8 +3466,7 @@ test "addPermissionRule preserves non-object category under star" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"permission\":{{\"bash\":true}}}}}}}}",
         .{workspace_root},
     );
@@ -3544,8 +3529,7 @@ test "removePermissionRule missing rule returns false without rewrite" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"permission\":{{\"bash\":{{\"git *\":\"allow\"}}}}}}}}}}\n",
         .{workspace_root},
     );
@@ -3606,8 +3590,7 @@ test "user effort preference preserves unrelated workspace override keys" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"model\":\"my-model\",\"permission_mode\":\"auto\"}}}}}}",
         .{workspace_root},
     );
@@ -3648,8 +3631,7 @@ test "user fast mode preference writes bool and preserves unrelated keys" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"model\":\"my-model\",\"permission_mode\":\"auto\"}}}}}}",
         .{workspace_root},
     );
@@ -3690,8 +3672,7 @@ test "user startup scrollback preference writes bool and preserves unrelated key
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"model\":\"my-model\",\"permission_mode\":\"auto\"}}}}}}",
         .{workspace_root},
     );
@@ -3897,8 +3878,7 @@ test "workspace statusline is global only in ordinary and detailed loads" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"statusLine\":{{\"workspace\":true}},\"workspaces\":{{\"{s}\":{{\"statusLine\":{{\"workspace\":\"ignored\"}}}}}}}}\n",
         .{workspace_root},
     );
@@ -3926,8 +3906,7 @@ test "ordinary and detailed loads agree on workspace overrides with legacy statu
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"startup_scrollback\":true,\"workspaces\":{{\"{s}\":{{\"statusLine\":7,\"startup_scrollback\":false}}}}}}\n",
         .{workspace_root},
     );
@@ -4003,8 +3982,7 @@ test "notification settings merge global and workspace while project values are 
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"notifications\":{{\"turn_end\":true,\"attention_required\":false}},\"workspaces\":{{\"{s}\":{{\"notifications\":{{\"attention_required\":true}}}}}}}}",
         .{workspace_root},
     );
@@ -4047,8 +4025,7 @@ test "detailed settings diagnose legacy workspace preferences" {
         "workspace",
     );
     defer std.testing.allocator.free(workspace_root);
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"model\":\"user/model\",\"workspaces\":{{\"{s}\":{{\"model\":\"legacy/model\",\"statusLine\":{{\"session\":true}}}}}}}}\n",
         .{workspace_root},
     );
@@ -4080,8 +4057,7 @@ test "detailed settings preserve model precedence and source" {
     defer std.testing.allocator.free(home_root);
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
-    const user_fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_fixture = try std.testing.allocator.print(
         "{{\"model\":\"user/model\",\"workspaces\":{{\"{s}\":{{\"model\":\"workspace/model\"}}}}}}\n",
         .{workspace_root},
     );
@@ -4106,8 +4082,7 @@ test "detailed settings expose target sources and permission views" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"model\":\"user/model\",\"permission_mode\":\"ask\",\"fast_mode\":true,\"input_appearance\":\"tint\",\"startup_scrollback\":false," ++
             "\"prompt_history\":{{\"enabled\":false}},\"statusLine\":{{\"sandbox\":true,\"context\":false,\"session\":true}}," ++
             "\"permission\":{{\"bash\":{{\"user *\":\"allow\"}}}},\"workspaces\":{{\"{s}\":{{" ++
@@ -4405,7 +4380,7 @@ test "detailed settings treat a missing home as read-only absence" {
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const home_root = try std.fs.path.join(alloc, &.{ root, "missing-home" });
+    const home_root = try std.Io.Dir.path.join(alloc, &.{ root, "missing-home" });
     defer alloc.free(home_root);
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace_root);
@@ -4455,8 +4430,7 @@ test "update channel resolves only from the global user profile" {
     defer alloc.free(home_root);
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace_root);
-    const user_settings = try std.fmt.allocPrint(
-        alloc,
+    const user_settings = try alloc.print(
         "{{\"update_channel\":\"dev\",\"workspaces\":{{\"{s}\":{{\"update_channel\":\"stable\"}}}}}}",
         .{workspace_root},
     );
@@ -4508,16 +4482,14 @@ test "additional directories load only from the current profile workspace" {
     const project_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "project");
     defer alloc.free(project_root);
 
-    const settings_fixture = try std.fmt.allocPrint(
-        alloc,
+    const settings_fixture = try alloc.print(
         "{{\"additional_directories\":[\"{s}\"],\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\"]}}}}}}\n",
         .{ global_root, workspace_root, shared_root },
     );
     defer alloc.free(settings_fixture);
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", settings_fixture);
 
-    const project_fixture = try std.fmt.allocPrint(
-        alloc,
+    const project_fixture = try alloc.print(
         "{{\"additional_directories\":[\"{s}\"],\"max_agent_steps\":17}}\n",
         .{project_root},
     );
@@ -4559,10 +4531,9 @@ test "detailed settings retain raw additional directory sources beside canonical
     defer alloc.free(workspace_root);
     const shared_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "shared");
     defer alloc.free(shared_root);
-    const shared_source = try std.fs.path.resolve(alloc, &.{ workspace_root, "../shared-link" });
+    const shared_source = try std.Io.Dir.path.resolveAlloc(alloc, &.{ workspace_root, "../shared-link" });
     defer alloc.free(shared_source);
-    const fixture = try std.fmt.allocPrint(
-        alloc,
+    const fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\"]}}}}}}\n",
         .{ workspace_root, shared_source },
     );
@@ -4588,8 +4559,7 @@ test "malformed or duplicate additional directories do not discard sibling setti
     defer alloc.free(workspace_root);
     const invalid_values = [_][]const u8{ "\"invalid\"", "[\"/duplicate\",\"/duplicate\"]" };
     for (invalid_values) |value| {
-        const fixture = try std.fmt.allocPrint(
-            alloc,
+        const fixture = try alloc.print(
             "{{\"workspaces\":{{\"{s}\":{{\"model\":\"workspace/model\",\"additional_directories\":{s}}}}}}}\n",
             .{ workspace_root, value },
         );

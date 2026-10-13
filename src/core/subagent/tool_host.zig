@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const approval_registry = @import("approval_registry.zig");
 const authority = @import("authority.zig");
 const child_state = @import("child_state.zig");
@@ -810,7 +811,7 @@ pub const Runtime = struct {
                     if (steering_worker) |worker| {
                         if (worker.hasPendingPlainSteering()) {
                             debug_trace.eventf("subagent", "steering_wait_yielded", .{}, "child_id={s} work_id={s} child_cancelled=false", .{ child_id, work_id });
-                            const pending_text = try std.fmt.allocPrint(alloc, "{s}\nchild_id={s} work_id={s}", .{ model_contract.steering_pending_result, child_id, work_id });
+                            const pending_text = try alloc.print("{s}\nchild_id={s} work_id={s}", .{ model_contract.steering_pending_result, child_id, work_id });
                             defer alloc.free(pending_text);
                             var pending = try self.encodeManaged(alloc, .{ .ok = true, .pending = true, .result = pending_text });
                             if (status.sink != null) attachStatusPresentation(alloc, &pending, status.current(observation.metrics));
@@ -907,7 +908,7 @@ pub const Runtime = struct {
                 .body = try model_contract.encodeResultAlloc(arena, model_contract.feedbackResult(update.delivery)),
                 .max_result_bytes = tool_result_limits.min_configured_tool_result_bytes,
                 .delivered = false,
-                .receipt_sequence = @as(u64, @intFromEnum(update.delivery)) + 1,
+                .receipt_sequence = @as(u64, @backingInt(update.delivery)) + 1,
             });
         }
         return results.toOwnedSlice(arena);
@@ -1152,7 +1153,7 @@ fn operationIdAlloc(
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(invocation_id, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
-    return std.fmt.allocPrint(alloc, "fxop:2:m:{d}:{s}", .{ epoch, &hex });
+    return alloc.print("fxop:2:m:{d}:{s}", .{ epoch, &hex });
 }
 
 fn checkYieldedOwnership(alloc: Allocator) !void {
@@ -1182,7 +1183,7 @@ fn checkYieldedOwnership(alloc: Allocator) !void {
 }
 
 test "subagent yielded identity is owned and allocation failures do not leak" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkYieldedOwnership, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkYieldedOwnership, .{});
 }
 
 test "subagent admission preserves an undelivered result before advancing its child" {
@@ -1891,7 +1892,7 @@ test "model override passes through for non-gateway providers" {
 fn formatFailedResult(alloc: Allocator, failure: ?[]const u8, partial: ?[]const u8) ![]u8 {
     const reason = failure orelse "failure reason unavailable";
     const text = partial orelse "";
-    return std.fmt.allocPrint(alloc, "Subagent failed: {s}. Earlier tool calls may have completed; their effects are not rolled back.{s}{s}", .{
+    return alloc.print("Subagent failed: {s}. Earlier tool calls may have completed; their effects are not rolled back.{s}{s}", .{
         reason,
         if (text.len > 0) "\n\nPartial result:\n" else "",
         text,

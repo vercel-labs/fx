@@ -151,9 +151,9 @@ fn percentile(sorted: []const u64, fraction: f64) u64 {
 fn formatNs(nanoseconds: u64, buf: []u8) []const u8 {
     const microseconds = @as(f64, @floatFromInt(nanoseconds)) / 1_000.0;
     const milliseconds = microseconds / 1_000.0;
-    if (nanoseconds < 1_000) return std.fmt.bufPrint(buf, "{d}ns", .{nanoseconds}) catch "?";
-    if (nanoseconds < 1_000_000) return std.fmt.bufPrint(buf, "{d:.2}us", .{microseconds}) catch "?";
-    return std.fmt.bufPrint(buf, "{d:.2}ms", .{milliseconds}) catch "?";
+    if (nanoseconds < 1_000) return std.mem.print(buf, "{d}ns", .{nanoseconds}) catch "?";
+    if (nanoseconds < 1_000_000) return std.mem.print(buf, "{d:.2}us", .{microseconds}) catch "?";
+    return std.mem.print(buf, "{d:.2}ms", .{milliseconds}) catch "?";
 }
 
 pub fn main(init: std.process.Init) !void {

@@ -18,11 +18,11 @@ pub fn parseRichResult(alloc: Allocator, bytes: []const u8, text_limit: usize, i
     if (text != .string or values != .array) return .{ .failure = try alloc.dupe(u8, "Host tool returned invalid image content") };
     const images = image_data.parseToolImages(alloc, values.array.items) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return .{ .failure = try std.fmt.allocPrint(alloc, "Host tool image could not be used: {s}", .{@errorName(err)}) },
+        else => return .{ .failure = try alloc.print("Host tool image could not be used: {s}", .{@errorName(err)}) },
     };
     errdefer types.freeToolImages(alloc, images);
     const omitted = images.len != values.array.items.len;
-    const source = if (omitted) try std.fmt.allocPrint(alloc, "[Unsupported tool images were omitted.]\n{s}", .{text.string}) else text.string;
+    const source = if (omitted) try alloc.print("[Unsupported tool images were omitted.]\n{s}", .{text.string}) else text.string;
     defer if (omitted) alloc.free(source);
     const body = @constCast(try tool_result_limits.prepareModelOutput(alloc, "host_tool", source, text_limit));
     return .{ .rich = .{ .text = body, .images = images, .is_error = is_error } };

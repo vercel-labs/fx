@@ -1,8 +1,10 @@
 const std = @import("std");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const build_checkpoint = @import("build_checkpoint.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const shared_theme = @import("../../core/shared/theme.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const types = @import("../../core/shared/types.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
 const assistant_wrap = @import("assistant_wrap.zig");
@@ -774,7 +776,7 @@ pub fn reflowDiffBlock(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
     errdefer out.deinit(alloc);
     var start: usize = 0;
     while (start < text.len) {
-        const newline = std.mem.indexOfScalarPos(u8, text, start, '\n');
+        const newline = std.mem.findScalarPos(u8, text, start, '\n');
         const end = newline orelse text.len;
         const line = text[start..end];
         if (diffPrefix(line)) |prefix| {
@@ -835,7 +837,7 @@ pub fn formatCompactCommandStatus(
 ) ![]u8 {
     if (cols == 0 or text.len == 0) return alloc.alloc(u8, 0);
 
-    const line_end = std.mem.indexOfAny(u8, text, "\r\n") orelse text.len;
+    const line_end = std.mem.findAny(u8, text, "\r\n") orelse text.len;
     var next = line_end;
     if (next < text.len) {
         if (text[next] == '\r' and next + 1 < text.len and text[next + 1] == '\n') {
@@ -849,7 +851,7 @@ pub fn formatCompactCommandStatus(
         (text[text.len - 1] == '\n' or text[text.len - 1] == '\r');
     if (next == text.len and display_width.visibleWidthIgnoringAnsi(line) <= cols) {
         return if (preserve_trailing_newline)
-            std.fmt.allocPrint(alloc, "{s}\n", .{line})
+            alloc.print("{s}\n", .{line})
         else
             alloc.dupe(u8, line);
     }
@@ -897,6 +899,79 @@ fn formatFullToolStatus(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
         if (line.hard_break and start == text.len) try out.append(alloc, '\n');
     }
     return out.toOwnedSlice(alloc);
+}
+
+/// Word-wraps one expanded tool row for the full transcript without dropping
+/// any of its text. Each continuation row starts with `continuation_prefix`
+/// in the default style, then reopens the attributes and foreground color
+/// active at the wrap point. The reopen comes from tracked state, so output
+/// stays linear in the row length; styles the shared SGR state does not
+/// track, such as backgrounds, are not reopened. A prefix that leaves no room
+/// for content is omitted, and a wide character that cannot fit leaves a `?`
+/// marker. The caller owns the result.
+pub fn wrapFullToolStatus(
+    alloc: Allocator,
+    text: []const u8,
+    cols: u16,
+    continuation_prefix: []const u8,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    if (cols == 0 or text.len == 0) return out.toOwnedSlice(alloc);
+
+    const prefix_width = display_width.visibleWidthIgnoringAnsi(continuation_prefix);
+    const prefix = if (prefix_width < cols) continuation_prefix else "";
+    var style: assistant_pacer.SgrState = .{};
+    var styled = false;
+    var start: usize = 0;
+    var continuation = false;
+    while (start < text.len) {
+        const indent: usize = if (continuation and prefix.len > 0) prefix_width else 0;
+        const line = scanToolStatusLine(text, start, @as(usize, cols) - indent);
+        if (continuation) {
+            try out.append(alloc, '\n');
+            if (styled) try out.appendSlice(alloc, "\x1b[0m");
+            try out.appendSlice(alloc, prefix);
+            if (style.isActive()) {
+                var reopen: [64]u8 = undefined;
+                try out.appendSlice(alloc, reopen[0..style.writeOpens(reopen[0..])]);
+            }
+        }
+        try out.appendSlice(alloc, text[start..line.end]);
+        if (line.omitted_rune) try out.append(alloc, '?');
+
+        const next = if (line.next > start)
+            line.next
+        else if (line.end > start)
+            line.end
+        else blk: {
+            try out.append(alloc, '?');
+            break :blk start + display_width.displayUnitAt(text, start).byte_len;
+        };
+        if (trackToolStatusStyle(&style, text[start..next])) styled = true;
+        start = next;
+        continuation = true;
+
+        if (line.hard_break and start == text.len) try out.append(alloc, '\n');
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Folds every SGR sequence in `text` into `style`. Returns whether any was
+/// present.
+fn trackToolStatusStyle(style: *assistant_pacer.SgrState, text: []const u8) bool {
+    var styled = false;
+    var index: usize = 0;
+    while (std.mem.findScalarPos(u8, text, index, 0x1b)) |escape| {
+        const end = display_width.ansiSequenceEnd(text, escape);
+        const sequence = text[escape..end];
+        if (sequence.len > 2 and sequence[1] == '[' and sequence[sequence.len - 1] == 'm') {
+            styled = true;
+            style.apply(sequence);
+        }
+        index = @max(end, escape + 1);
+    }
+    return styled;
 }
 
 /// Renders a table as a boxed grid whose cells wrap onto extra lines when the
@@ -1135,7 +1210,7 @@ fn renderCodeBlockForTranscriptWithTheme(
     var start: usize = 0;
     var emitted_line = false;
     while (start < code.len) {
-        const end = std.mem.indexOfScalarPos(u8, code, start, '\n') orelse code.len;
+        const end = std.mem.findScalarPos(u8, code, start, '\n') orelse code.len;
         try appendCodePanelLine(alloc, &rendered, code[start..end], panel_width);
         emitted_line = true;
         if (end == code.len) break;
@@ -1202,7 +1277,7 @@ fn maxCodeLineWidth(code: []const u8) usize {
     var max_width: usize = 0;
     var start: usize = 0;
     while (start < code.len) {
-        const end = std.mem.indexOfScalarPos(u8, code, start, '\n') orelse code.len;
+        const end = std.mem.findScalarPos(u8, code, start, '\n') orelse code.len;
         max_width = @max(max_width, display_width.visibleWidth(code[start..end]));
         if (end == code.len) break;
         start = end + 1;
@@ -1320,7 +1395,7 @@ fn renderUnboxedCode(
 ) !void {
     var start: usize = 0;
     while (start < code.len) {
-        const end = std.mem.indexOfScalarPos(u8, code, start, '\n') orelse code.len;
+        const end = std.mem.findScalarPos(u8, code, start, '\n') orelse code.len;
         const line = code[start..end];
         const indent = leadingCodeIndent(line);
         const indent_width = display_width.visibleWidth(indent);
@@ -2114,9 +2189,9 @@ test "full presentation composition keeps normal block gaps around detail" {
         null,
     );
 
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "  Before\n\n● Ran") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "FULL_STATUS_TAIL") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "  FULL_DETAIL\n\n  After") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "  Before\n\n● Ran") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "FULL_STATUS_TAIL") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "  FULL_DETAIL\n\n  After") != null);
 }
 
 fn renderedBlockHasContent(block: RenderedBlock) bool {
@@ -3033,8 +3108,7 @@ test "semantic notice renders every tone and resets before following content" {
         }, styles, 80);
         defer alloc.free(rendered);
 
-        const expected = try std.fmt.allocPrint(
-            alloc,
+        const expected = try alloc.print(
             "{s}{s} topic:\x1b[0m\x1b[37m body\x1b[0m",
             .{ label_style, glyph },
         );
@@ -3135,8 +3209,7 @@ test "semantic notice topics never render the tool-activity bullet or forced cap
 test "semantic notice keeps an OSC 8 target hidden and clickable" {
     const alloc = std.testing.allocator;
     const url = "https://fx.sh/feedback";
-    const body = try std.fmt.allocPrint(
-        alloc,
+    const body = try alloc.print(
         "\x1b]8;;{s}\x1b\\Open feedback form\x1b]8;;\x1b\\.",
         .{url},
     );
@@ -3478,7 +3551,7 @@ test "renderCodeBlockForTranscript highlights registered profiles without stylin
         .code = zig_code,
     }, 80);
     defer alloc.free(highlighted);
-    try std.testing.expect(std.mem.indexOf(u8, highlighted, "\x1b[38;5;252mconst\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, highlighted, "\x1b[38;5;252mconst\x1b[39m") != null);
 
     const python_language = try alloc.dupe(u8, "python");
     defer alloc.free(python_language);
@@ -3489,8 +3562,8 @@ test "renderCodeBlockForTranscript highlights registered profiles without stylin
         .code = python_code,
     }, 80);
     defer alloc.free(python);
-    try std.testing.expect(std.mem.indexOf(u8, python, "\x1b[2m─ python ─") != null);
-    try std.testing.expect(std.mem.indexOf(u8, python, "\x1b[38;5;252mdef\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, python, "\x1b[2m─ python ─") != null);
+    try std.testing.expect(std.mem.find(u8, python, "\x1b[38;5;252mdef\x1b[39m") != null);
 
     const unknown_language = try alloc.dupe(u8, "brainfuck");
     defer alloc.free(unknown_language);
@@ -3501,8 +3574,8 @@ test "renderCodeBlockForTranscript highlights registered profiles without stylin
         .code = unknown_code,
     }, 80);
     defer alloc.free(raw);
-    try std.testing.expect(std.mem.indexOf(u8, raw, "\x1b[38;5;") == null);
-    try std.testing.expect(std.mem.indexOf(u8, raw, "+++[>+++<-]") != null);
+    try std.testing.expect(std.mem.find(u8, raw, "\x1b[38;5;") == null);
+    try std.testing.expect(std.mem.find(u8, raw, "+++[>+++<-]") != null);
 }
 
 test "semantic code blocks use the light syntax palette when requested" {
@@ -3524,9 +3597,9 @@ test "semantic code blocks use the light syntax palette when requested" {
     });
     defer rendered.deinit(alloc);
 
-    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "\x1b[38;5;238mconst\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "\x1b[38;5;241m\"ready\"\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "\x1b[38;5;243m// comment\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "\x1b[38;5;238mconst\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "\x1b[38;5;241m\"ready\"\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "\x1b[38;5;243m// comment\x1b[39m") != null);
 }
 
 test "renderCodeBlockForTranscript infers registered high-confidence code blocks" {
@@ -3541,9 +3614,9 @@ test "renderCodeBlockForTranscript infers registered high-confidence code blocks
         .code = code,
     }, 100);
     defer alloc.free(unlabeled);
-    try std.testing.expect(std.mem.indexOf(u8, unlabeled, "\x1b[2m─ ts ─") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unlabeled, "\x1b[38;5;252mconst\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unlabeled, "\x1b[38;5;252mawait\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, unlabeled, "\x1b[2m─ ts ─") != null);
+    try std.testing.expect(std.mem.find(u8, unlabeled, "\x1b[38;5;252mconst\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, unlabeled, "\x1b[38;5;252mawait\x1b[39m") != null);
 
     const json_language = try alloc.dupe(u8, "");
     defer alloc.free(json_language);
@@ -3554,8 +3627,8 @@ test "renderCodeBlockForTranscript infers registered high-confidence code blocks
         .code = json_code,
     }, 100);
     defer alloc.free(json);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\x1b[2m─ json ─") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\x1b[38;5;250m\"ready\"\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\x1b[2m─ json ─") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\x1b[38;5;250m\"ready\"\x1b[39m") != null);
 
     const ambiguous_language = try alloc.dupe(u8, "");
     defer alloc.free(ambiguous_language);
@@ -3566,8 +3639,8 @@ test "renderCodeBlockForTranscript infers registered high-confidence code blocks
         .code = ambiguous_code,
     }, 100);
     defer alloc.free(ambiguous);
-    try std.testing.expect(std.mem.indexOf(u8, ambiguous, "\x1b[2mts\x1b[22m") == null);
-    try std.testing.expect(std.mem.indexOf(u8, ambiguous, "\x1b[38;5;") == null);
+    try std.testing.expect(std.mem.find(u8, ambiguous, "\x1b[2mts\x1b[22m") == null);
+    try std.testing.expect(std.mem.find(u8, ambiguous, "\x1b[38;5;") == null);
 
     const explicit_unknown_language = try alloc.dupe(u8, "brainfuck");
     defer alloc.free(explicit_unknown_language);
@@ -3578,8 +3651,8 @@ test "renderCodeBlockForTranscript infers registered high-confidence code blocks
         .code = explicit_unknown_code,
     }, 100);
     defer alloc.free(explicit_unknown);
-    try std.testing.expect(std.mem.indexOf(u8, explicit_unknown, "\x1b[2m─ brainfuck ─") != null);
-    try std.testing.expect(std.mem.indexOf(u8, explicit_unknown, "\x1b[38;5;") == null);
+    try std.testing.expect(std.mem.find(u8, explicit_unknown, "\x1b[2m─ brainfuck ─") != null);
+    try std.testing.expect(std.mem.find(u8, explicit_unknown, "\x1b[38;5;") == null);
 }
 
 test "renderCodeBlockForTranscript contains CJK fallback color in ruled and unboxed rows" {
@@ -3800,6 +3873,74 @@ test "full tool status reasserts ANSI before wrapped command continuations" {
     try std.testing.expect(continuation_rows >= 2);
 }
 
+test "full tool status paints its continuation prefix unstyled before replaying styles" {
+    const alloc = std.testing.allocator;
+    const source = "├ Ran \x1b[38;5;250m'every word of this quoted argument stays visible'\x1b[39m";
+    const out = try wrapFullToolStatus(alloc, source, 20, "│ ");
+    defer alloc.free(out);
+
+    var row_count: u16 = 0;
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    while (lines.next()) |line| : (row_count += 1) {
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 20);
+    }
+    try std.testing.expect(row_count >= 3);
+    try std.testing.expect(std.mem.find(u8, out, "…") == null);
+
+    var grid = try vt_emulator.Grid.init(alloc, 20, row_count);
+    defer grid.deinit();
+    try grid.feed(out);
+    var row: u16 = 2;
+    while (row <= row_count) : (row += 1) {
+        const rail = grid.cellAt(row, 1).?;
+        try std.testing.expectEqual(@as(u21, '│'), rail.codepoint);
+        try std.testing.expect(rail.style.fg.eql(.default));
+        try std.testing.expect(grid.cellAt(row, 3).?.style.fg.eql(.{ .indexed = 250 }));
+    }
+    var last: std.ArrayList(u8) = .empty;
+    defer last.deinit(alloc);
+    try grid.rowTextTrimmed(row_count, &last);
+    try std.testing.expect(std.mem.endsWith(u8, last.items, "visible'"));
+}
+
+test "full tool status drops a continuation prefix that leaves no room" {
+    const alloc = std.testing.allocator;
+    const out = try wrapFullToolStatus(alloc, "abcdef", 2, "│ ");
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("ab\ncd\nef", out);
+}
+
+test "full tool status reopens a bounded style on every continuation row" {
+    const alloc = std.testing.allocator;
+    // A long highlighted command: replaying every earlier sequence on each
+    // row would grow quadratically with its length.
+    const source = "├ Ran " ++ text_utils.repeat("\x1b[38;5;250m'quoted token'\x1b[39m ", 400);
+    const out = try wrapFullToolStatus(alloc, source, 20, "│ ");
+    defer alloc.free(out);
+
+    const rows = std.mem.count(u8, out, "\n") + 1;
+    try std.testing.expect(rows > 100);
+    try std.testing.expect(out.len <= source.len + rows * 32);
+
+    var grid = try vt_emulator.Grid.init(alloc, 20, @intCast(rows));
+    defer grid.deinit();
+    try grid.feed(out);
+    var row: u16 = 2;
+    while (row <= rows) : (row += 1) {
+        const rail = grid.cellAt(row, 1).?;
+        try std.testing.expectEqual(@as(u21, '│'), rail.codepoint);
+        try std.testing.expect(rail.style.fg.eql(.default));
+        try std.testing.expect(grid.cellAt(row, 3).?.style.fg.eql(.{ .indexed = 250 }));
+    }
+}
+
+test "full tool status marks a wide character that cannot fit" {
+    const alloc = std.testing.allocator;
+    const out = try wrapFullToolStatus(alloc, "日本", 1, "");
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("?\n?", out);
+}
+
 test "tool status preview honors explicit newlines and terminal width" {
     const alloc = std.testing.allocator;
     const out = try formatToolStatusPreview(
@@ -3885,14 +4026,14 @@ test "compact diff blocks reflow styled rows inside their gutters" {
 
     const narrow = try renderEntriesToBytes(alloc, entries.items, 48, .{});
     defer alloc.free(narrow);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "\x1b[0m\n\x1b[38;5;245m  │     ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "\x1b[0m\n\x1b[38;5;252m\x1b[38;5;203m\x1b[38;5;252m  │     ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "\x1b[0m\n\x1b[38;5;252m\x1b[38;5;77m\x1b[38;5;252m  │     ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "CONTEXT_ROW_MARKER") != null);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "REMOVED_ROW_MARKER") != null);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "MUTATION_NEW_MARKER") != null);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "\x1b]9050;17\x07") != null);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "\x1b]9051;17\x07") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\x1b[0m\n\x1b[38;5;245m  │     ") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\x1b[0m\n\x1b[38;5;252m\x1b[38;5;203m\x1b[38;5;252m  │     ") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\x1b[0m\n\x1b[38;5;252m\x1b[38;5;77m\x1b[38;5;252m  │     ") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "CONTEXT_ROW_MARKER") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "REMOVED_ROW_MARKER") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "MUTATION_NEW_MARKER") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\x1b]9050;17\x07") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\x1b]9051;17\x07") != null);
     var lines = std.mem.splitScalar(u8, narrow, '\n');
     while (lines.next()) |line| {
         if (display_width.visibleWidthIgnoringAnsi(line) == 0) continue;
@@ -3916,8 +4057,8 @@ test "diff block reflow preserves fitting malformed and unicode rows" {
     const unicode = "\x1b[38;5;252m  │ \x1b[38;5;77m2 +\x1b[38;5;252m 😀😀😀😀UNICODE_TAIL\x1b[0m\n";
     const narrow = try reflowDiffBlock(alloc, unicode, 16);
     defer alloc.free(narrow);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "  │     UNICODE_") != null);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "TAIL") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "  │     UNICODE_") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "TAIL") != null);
     var lines = std.mem.splitScalar(u8, narrow, '\n');
     while (lines.next()) |line| {
         if (display_width.visibleWidthIgnoringAnsi(line) == 0) continue;
@@ -3968,9 +4109,9 @@ test "compact presentation hides context notices while full presentation retains
 
     const compact = try renderEntriesToBytes(alloc, entries.items, 80, .{});
     defer alloc.free(compact);
-    try std.testing.expect(std.mem.indexOf(u8, compact, "context:") == null);
-    try std.testing.expect(std.mem.indexOf(u8, compact, "ordinary system notice") != null);
-    try std.testing.expect(std.mem.indexOf(u8, compact, "ordinary error notice") != null);
+    try std.testing.expect(std.mem.find(u8, compact, "context:") == null);
+    try std.testing.expect(std.mem.find(u8, compact, "ordinary system notice") != null);
+    try std.testing.expect(std.mem.find(u8, compact, "ordinary error notice") != null);
 
     const first_full = try renderEntryToBlockForPresentation(alloc, entries.items[0], 80, .{}, .full);
     defer first_full.deinit(alloc);
@@ -4171,8 +4312,8 @@ test "renderEntriesToBytes preserves Setext heading styles through narrow wrappi
     defer alloc.free(out);
 
     try std.testing.expect(std.mem.startsWith(u8, out, "  \x1b[1m\x1b[4m"));
-    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[24m\x1b[22m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[1mSetext H2") != null);
+    try std.testing.expect(std.mem.find(u8, out, "\x1b[24m\x1b[22m") != null);
+    try std.testing.expect(std.mem.find(u8, out, "\x1b[1mSetext H2") != null);
     var lines = std.mem.splitScalar(u8, out, '\n');
     while (lines.next()) |line| {
         try std.testing.expect(std.mem.startsWith(u8, line, "  "));
@@ -4237,8 +4378,8 @@ test "renderEntriesToBytes reflows an inline image label at narrow widths" {
         while (lines.next()) |line| {
             try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
         }
-        try std.testing.expect(std.mem.indexOf(u8, out, "▧") != null);
-        if (cols >= 32) try std.testing.expect(std.mem.indexOf(u8, out, "trailing prose") != null);
+        try std.testing.expect(std.mem.find(u8, out, "▧") != null);
+        if (cols >= 32) try std.testing.expect(std.mem.find(u8, out, "trailing prose") != null);
     }
 }
 
@@ -4410,9 +4551,9 @@ test "renderEntriesToBytes reflows parser-rendered lists at paint-time cols" {
 
     const narrow = try renderEntriesToBytes(alloc, entries.items, 20, .{});
     defer alloc.free(narrow);
-    const first = std.mem.indexOf(u8, narrow, "first-").?;
-    const second = std.mem.indexOf(u8, narrow, "second-").?;
-    const third = std.mem.indexOf(u8, narrow, "third-").?;
+    const first = std.mem.find(u8, narrow, "first-").?;
+    const second = std.mem.find(u8, narrow, "second-").?;
+    const third = std.mem.find(u8, narrow, "third-").?;
     try std.testing.expect(first < second and second < third);
     try std.testing.expect(std.mem.find(u8, narrow, "\n    ") != null);
     try std.testing.expect(std.mem.find(u8, narrow, "\n     ") != null);
@@ -4473,9 +4614,9 @@ test "renderEntriesToBytes reflows parser-rendered task lists at paint-time cols
 
     const narrow = try renderEntriesToBytes(alloc, entries.items, 20, .{});
     defer alloc.free(narrow);
-    const first = std.mem.indexOf(u8, narrow, "first-").?;
-    const completed = std.mem.indexOf(u8, narrow, "completed-").?;
-    const nested = std.mem.indexOf(u8, narrow, "nested-").?;
+    const first = std.mem.find(u8, narrow, "first-").?;
+    const completed = std.mem.find(u8, narrow, "completed-").?;
+    const nested = std.mem.find(u8, narrow, "nested-").?;
     try std.testing.expect(first < completed and completed < nested);
     try std.testing.expect(std.mem.find(u8, narrow, "\n    ") != null);
     try std.testing.expect(std.mem.find(u8, narrow, "\n       ") != null);
@@ -4593,7 +4734,7 @@ test "semantic thematic rule fills assistant content width and keeps provenance"
 }
 
 test "semantic table renderer frees rendered output when row prefixing fails" {
-    const base = std.testing.allocator;
+    const base = testing_allocator.no_resize;
 
     var table_entry = TranscriptEntry{ .assistant_table = .{
         .id = 1,
@@ -4638,7 +4779,7 @@ fn checkCodeBlockRenderAllocationFailures(alloc: Allocator) !void {
 
 test "renderEntryToBlock frees all highlighted code allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkCodeBlockRenderAllocationFailures,
         .{},
     );
@@ -4662,8 +4803,8 @@ test "renderEntriesToBytes keeps a semantic table as its own assistant entry" {
     const out = try renderEntriesToBytes(alloc, entries.items, 80, .{});
     defer alloc.free(out);
     try std.testing.expect(std.mem.find(u8, out, "Name") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Before table.").? < std.mem.indexOf(u8, out, "Name").?);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Name").? < std.mem.indexOf(u8, out, "After table.").?);
+    try std.testing.expect(std.mem.find(u8, out, "Before table.").? < std.mem.find(u8, out, "Name").?);
+    try std.testing.expect(std.mem.find(u8, out, "Name").? < std.mem.find(u8, out, "After table.").?);
 }
 
 test "renderTableForTranscript reasserts bold after an inline strong header span" {
@@ -4678,7 +4819,7 @@ test "renderTableForTranscript reasserts bold after an inline strong header span
 
     const out = try renderTableForTranscript(alloc, table, 80);
     defer alloc.free(out);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         out,
         "\x1b[1mprefix \x1b[1mstrong\x1b[22m\x1b[1m suffix\x1b[22m",
@@ -4758,7 +4899,7 @@ test "renderTableForTranscript closes and reopens inline styles across wrapped c
                 index = end;
                 continue;
             }
-            const word_end = std.mem.indexOfAnyPos(u8, line, index, " \x1b") orelse line.len;
+            const word_end = std.mem.findAnyPos(u8, line, index, " \x1b") orelse line.len;
             const word = line[index..word_end];
             for ([_][]const u8{ "alpha", "beta", "gamma", "delta" }) |code_word| {
                 if (std.mem.eql(u8, word, code_word)) try std.testing.expect(style.fg == .inline_code);
@@ -4785,7 +4926,7 @@ test "wrapTableCell breaks at the column edge and never emits a blank line" {
     try std.testing.expectEqualStrings("wraps", lines.items[2].text);
 
     // A code span ending in a space breaks after its last word.
-    const cell = try std.fmt.allocPrint(alloc, "{s}foo \x1b[39m bar", .{shared_theme.current().inline_code_open});
+    const cell = try alloc.print("{s}foo \x1b[39m bar", .{shared_theme.current().inline_code_open});
     defer alloc.free(cell);
     try wrapTableCell(alloc, cell, 3, &lines);
     try std.testing.expectEqual(@as(usize, 2), lines.items.len);
@@ -4795,7 +4936,7 @@ test "wrapTableCell breaks at the column edge and never emits a blank line" {
 
     // A code span that starts with spaces drops them at the first break and
     // keeps its style on every line.
-    const leading = try std.fmt.allocPrint(alloc, "{s}  configuration\x1b[39m", .{shared_theme.current().inline_code_open});
+    const leading = try alloc.print("{s}  configuration\x1b[39m", .{shared_theme.current().inline_code_open});
     defer alloc.free(leading);
     try wrapTableCell(alloc, leading, 7, &lines);
     try std.testing.expectEqual(@as(usize, 2), lines.items.len);
@@ -4906,7 +5047,7 @@ test "Unicode display units remain atomic in three-column vertical tables" {
     };
 
     for (sequences) |sequence| {
-        const source = try std.fmt.allocPrint(alloc, "| S |\n|---|\n| {s} |\n", .{sequence});
+        const source = try alloc.print("| S |\n|---|\n| {s} |\n", .{sequence});
         defer alloc.free(source);
         var table = try assistant_presentation.parseTablePayload(alloc, source);
         defer table.deinit(alloc);
@@ -4939,8 +5080,8 @@ test "renderEntriesToBytes keeps semantic code as its own assistant entry" {
 
     const out = try renderEntriesToBytes(alloc, entries.items, 80, .{});
     defer alloc.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Before code.").? < std.mem.indexOf(u8, out, "const").?);
-    try std.testing.expect(std.mem.indexOf(u8, out, "const").? < std.mem.indexOf(u8, out, "After code.").?);
+    try std.testing.expect(std.mem.find(u8, out, "Before code.").? < std.mem.find(u8, out, "const").?);
+    try std.testing.expect(std.mem.find(u8, out, "const").? < std.mem.find(u8, out, "After code.").?);
     try std.testing.expect(std.mem.find(u8, out, "\x1b[2m─ zig ─") != null);
     try std.testing.expect(std.mem.find(u8, out, "\x1b[2mzig\x1b[22m\n─") == null);
 

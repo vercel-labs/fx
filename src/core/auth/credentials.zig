@@ -242,7 +242,7 @@ pub fn catalogAccessForCredentialAndAccount(
 
 /// Current native product copy. Store mechanics and availability come from the
 /// injected host port; Core retains the stable user-facing source name.
-pub const stored_key_backend_label = if (builtin.os.tag == .macos) "macOS Keychain" else "profile file";
+pub const stored_key_backend_label = if (builtin.target.os.tag == .macos) "macOS Keychain" else "profile file";
 
 /// Both modes resolve the same source set; the mode selects only whether an expired
 /// fx login session is refreshed first.
@@ -1372,8 +1372,8 @@ test "credential source presence reads metadata without parsing session secrets"
         .{ .source = .grok_subscription, .file_name = profile_paths.grok_auth_file_name },
     };
     for (cases) |case| {
-        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const relative_path = try std.fmt.bufPrint(
+        var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const relative_path = try std.mem.print(
             &path_buffer,
             ".fx/{s}",
             .{case.file_name},
@@ -1477,7 +1477,7 @@ const ExpiredFxLoginFixture = struct {
         errdefer alloc.free(home);
 
         try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
-        const auth_path = try std.fs.path.join(alloc, &.{ home, ".fx", "auth.json" });
+        const auth_path = try std.Io.Dir.path.join(alloc, &.{ home, ".fx", "auth.json" });
         defer alloc.free(auth_path);
         var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), auth_path, .{
             .truncate = true,
@@ -1619,7 +1619,7 @@ test "an fx login refresh retires the consumed token when durable replacement fa
     const alloc = std.testing.allocator;
     var fixture = try ExpiredFxLoginFixture.install(alloc);
     defer fixture.deinit();
-    const auth_path = try std.fs.path.join(alloc, &.{ fixture.home, ".fx", "auth.json" });
+    const auth_path = try std.Io.Dir.path.join(alloc, &.{ fixture.home, ".fx", "auth.json" });
     defer alloc.free(auth_path);
     var refresh = FxLoginRefreshProbe{
         .token_disposition = .accepted,
