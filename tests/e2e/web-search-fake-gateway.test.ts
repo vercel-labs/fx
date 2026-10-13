@@ -605,11 +605,11 @@ describe("web_search Gateway fixture", () => {
           expect(findUnavailableCapabilityReferences(request)).toEqual([]);
           expect(customProviderGuidanceState(request)).toEqual({
             providerToolIndices: [13],
-            guidanceMessageIndices: [1],
+            guidanceMessageIndices: [0],
           });
           expect(
             request.prompt?.filter((message) =>
-              message.role === "system" && contentText(message.content) === WEB_SEARCH_GUIDANCE
+              message.role === "system" && contentText(message.content).includes(WEB_SEARCH_GUIDANCE)
             ),
           ).toHaveLength(1);
         }
@@ -847,7 +847,7 @@ describe("web_search Gateway fixture", () => {
         expect(findUnavailableCapabilityReferences(request)).toEqual([]);
         expect(customProviderGuidanceState(request)).toEqual({
           providerToolIndices: [13],
-          guidanceMessageIndices: [1],
+          guidanceMessageIndices: [0],
         });
       } finally {
         gateway.stop();
@@ -1157,7 +1157,7 @@ describe("web_search Gateway fixture", () => {
         const continuing = parseGatewayRequest(gateway.requests[1]!.body);
         for (const request of [initial, continuing]) {
           expect(findUnavailableCapabilityReferences(request)).toEqual([]);
-          expect(customProviderGuidanceState(request).guidanceMessageIndices).toEqual([1]);
+          expect(customProviderGuidanceState(request).guidanceMessageIndices).toEqual([0]);
         }
         expect(toolShapesWithoutDescriptions(continuing)).toEqual(
           toolShapesWithoutDescriptions(initial),

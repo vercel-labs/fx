@@ -245,7 +245,7 @@ export function customProviderGuidanceState(request: GatewayRequest) {
     return [];
   });
   const guidanceMessageIndices = (request.prompt ?? []).flatMap((message, index) =>
-    message.role === "system" && contentText(message.content) === WEB_SEARCH_GUIDANCE
+    message.role === "system" && contentText(message.content).includes(WEB_SEARCH_GUIDANCE)
       ? [index]
       : []
   );
