@@ -351,7 +351,7 @@ pub const ServerState = struct {
     terminal_client: terminal_client_runtime.Runtime = .{},
     managed_executions: managed_execution.Runtime = managed_execution.Runtime.init(std.heap.c_allocator),
     subagent_store: ?session_store.Store = null,
-    /// A v2 session's children (D22), borrowed by `subagent_host`.
+    /// A v2 session's children, borrowed by `subagent_host`.
     subagent_v2_children: ?*subagent_child_state.V2Children = null,
     subagent_host: ?*subagent_tool_host.Runtime = null,
     /// Open for the whole connection when sessions are on v2.
@@ -793,7 +793,7 @@ pub fn enableSubagentHost(state: *ServerState) void {
     };
 }
 
-/// Subagents on v2 keep their state in the session's log (D22). A host that
+/// Subagents on v2 keep their state in the session's log. A host that
 /// cannot start leaves them off and says why, as on v1.
 fn enableSubagentHostV2(state: *ServerState, active: *ActiveSessionState, v2: *session_adapter.Session) void {
     const children = state.alloc.create(subagent_child_state.V2Children) catch |err| {
@@ -876,8 +876,8 @@ fn resolveSubagentAuthority(
     );
 }
 
-/// Joins the child threads before the session they append to can close
-/// (`tla/Wiring.tla` ParentOutlivesChildren).
+/// Joins the child threads before the session they append to can close,
+/// so a parent session always outlives its children.
 pub fn disableSubagentHost(state: *ServerState) void {
     if (state.subagent_host) |host| {
         host.deinit();
@@ -2251,7 +2251,7 @@ fn promptWorkerMain(active: *ActivePrompt) void {
     ) catch |err| .{
         .rpc_error = .{
             .code = ErrorCode.internal_error,
-            // v2 names a storage fault (D29); v1 keeps the error name.
+            // v2 names a storage fault; v1 keeps the error name.
             .message = if (active.state.sessions_v2 != null)
                 sessions.v2StorageFaultMessage("Session could not be saved", err) orelse @errorName(err)
             else

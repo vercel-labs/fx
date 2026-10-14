@@ -3,6 +3,20 @@ const types = @import("../shared/types.zig");
 
 const configured_provider = @import("configured_provider.zig");
 
+/// fx's default AI Gateway model, used when the settings name none.
+pub const gateway_default_model = "spacexai/grok-4.7";
+
+/// The AI Gateway model that reads images for a conversation whose own model
+/// cannot see them.
+pub const gateway_vision_model = "google/gemini-2.5-flash";
+
+/// The models the compactor tries when the conversation's own model cannot
+/// write the summary. Each comes from another provider family than the
+/// conversation's, because a provider that refused once will likely refuse
+/// the same conversation again.
+pub const compaction_fallback_model = "anthropic/claude-sonnet-5";
+pub const compaction_fallback_model_for_anthropic = "openai/gpt-6-sol";
+
 pub const ProviderId = union(enum) {
     gateway,
     codex,

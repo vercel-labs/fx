@@ -9,7 +9,7 @@ const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// D7: the index is never read beyond this size.
+/// The index is never read beyond this size.
 const max_index_bytes: usize = 128 * 1024 * 1024;
 
 const mode_type_mask: u32 = 0o170000;

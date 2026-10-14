@@ -3908,9 +3908,9 @@ noinline fn pausedRequiredAction(
 }
 
 /// Hands the model's tool calls to `append_turn_piece` before any of them
-/// runs (D28). Execution memory holds only finished exchanges, so the calls
+/// runs. Execution memory holds only finished exchanges, so the calls
 /// travel apart, in the form a finished step saves them, with the text of
-/// the message that issued them, the newest one (D51).
+/// the message that issued them, the newest one.
 fn appendRunningToolCalls(
     deps: *const AgentRuntimeDeps,
     finalization: *const TurnFinalizationGuard,
@@ -4205,7 +4205,7 @@ test "running tool calls reach append_turn_piece before they run" {
     try std.testing.expectEqual(@as(usize, 2), sink.running.items.len);
     try std.testing.expectEqualStrings("run_1", sink.running.items[0]);
     try std.testing.expectEqualStrings("run_2", sink.running.items[1]);
-    // With the text of the message that issued them, not an earlier one (D51).
+    // With the text of the message that issued them, not an earlier one.
     try std.testing.expectEqualStrings("Running both now.", sink.running_text.?);
 
     // A step with no calls sends nothing.

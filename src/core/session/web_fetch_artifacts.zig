@@ -40,7 +40,7 @@ pub const Store = struct {
     used_bytes: usize = 0,
     file_count: usize = 0,
     /// A v2 session's store, owned: each download is a blob of the session
-    /// and its path is the blob's read-only file (D44, D49). The limits
+    /// and its path is the blob's read-only file. The limits
     /// count this process's downloads.
     blobs: ?session_child_store.SessionChildCapability = null,
 
@@ -100,7 +100,7 @@ pub const Store = struct {
     }
 
     /// The download as a blob: `artifact-`, its hash and the extension name
-    /// it, and its path is the blob's own read-only file (D49).
+    /// it, and its path is the blob's own read-only file.
     fn writeBlob(
         self: *Store,
         alloc: Allocator,

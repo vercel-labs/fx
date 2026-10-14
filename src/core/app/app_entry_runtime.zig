@@ -292,7 +292,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
                 return .{ .exit = 1 };
             },
             else => {
-                // v2 names a storage fault (D29); v1 reports it as it always has.
+                // v2 names a storage fault; v1 reports it as it always has.
                 if (session_adapter.enabled(launch.modifiers.sessions_v2)) {
                     if (v2StorageFaultMessage(err)) |message| {
                         writeStderr(deps, message);

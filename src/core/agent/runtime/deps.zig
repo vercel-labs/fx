@@ -37,10 +37,10 @@ pub const TurnProgress = struct {
     user: types.UserTurn,
     execution: types.ExecutionMemory,
     /// Tool calls the model issued that have no result yet, in their saved
-    /// form, so a crash while they run leaves them in the session (D28).
+    /// form, so a crash while they run leaves them in the session.
     running_calls: []const types.ToolCall = &.{},
     /// The text of the message that issued `running_calls`, so a crash also
-    /// leaves what fx already showed (D51).
+    /// leaves what fx already showed.
     running_assistant: ?[]const u8 = null,
 };
 

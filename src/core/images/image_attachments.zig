@@ -200,7 +200,7 @@ pub fn loadUserImageAttachment(
 ) !types.ImageAttachment {
     const normalized_path = try normalizePathInput(alloc, path_input);
     defer alloc.free(normalized_path);
-    // Preserve the raw entry's second trim at the old path-resolution boundary.
+    // Trim the normalized path again before it is resolved.
     return load_user_image_literal(alloc, workspace_root, std.mem.trim(u8, normalized_path, " \t\r\n"));
 }
 
@@ -1143,7 +1143,7 @@ pub fn loadVerifiedSnapshot(
 
 /// Keeps a captured snapshot's verified bytes on the attachment itself, as
 /// an in-memory capture does, so durable serializers save them with the
-/// turn: a v2 session keeps its prompt images inside the user's item (D44).
+/// turn: a v2 session keeps its prompt images inside the user's item.
 /// The capture still went through the platform resizer; its temporary
 /// snapshot file stays until the process's snapshot folder is removed.
 pub fn inlineCapturedSnapshot(alloc: std.mem.Allocator, attachment: *types.ImageAttachment) !void {

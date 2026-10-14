@@ -275,7 +275,7 @@ pub fn writeTrace(writer: *trace.Writer, instance: []const u8, t: *const Table, 
         .data = &.{
             .{ .name = "ignored", .value = .{ .boolean = out.ignored } },
             .{ .name = "sub", .value = .{ .int = sub } },
-            // TLC's integers are 32-bit; listen ids stay far below.
+            // Trace integers are 32-bit; listen ids stay far below.
             .{ .name = "id", .value = .{ .int = @intCast(@min(id, 1 << 30)) } },
             .{ .name = "filter", .value = .{ .int = switch (event) {
                 .opened => |o| o.filter,

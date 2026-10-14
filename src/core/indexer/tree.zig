@@ -3,8 +3,7 @@
 //! repository-marker file the rules depended on. A stamp is reusable only when
 //! its times are older than the scan's start by the granularity margin, so a
 //! change in the same clock tick as the scan, which a later stamp comparison
-//! could not see, always forces a new scan. This is the reuse certificate the
-//! refresh model (Refresh.tla) requires.
+//! could not see, always forces a new scan.
 
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");

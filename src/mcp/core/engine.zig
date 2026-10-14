@@ -264,7 +264,7 @@ fn record(writer: *trace.Writer, instance: []const u8, s: *const Gate, event: Ev
         .to = "",
         .data = &.{
             .{ .name = "ignored", .value = .{ .boolean = out.ignored } },
-            // TLC's integers are 32-bit; calls stay far below.
+            // Trace integers are 32-bit; calls stay far below.
             .{ .name = "n", .value = .{ .int = @min(out.n, 1 << 30) } },
             .{ .name = "allowed", .value = .{ .boolean = event == .asked and event.asked.allowed } },
             .{ .name = "keep", .value = .{ .boolean = event == .drop and event.drop.keep } },

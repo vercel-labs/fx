@@ -43,7 +43,7 @@ pub const ToolEvidence = enum {
 
 /// Whether attempts keep making forward progress. A stall (the same failure at
 /// the same progress point, repeatedly) is a broken response, not a network
-/// problem; retrying it forever is the failure mode budgets used to mask.
+/// problem, so it is not retried forever.
 pub const Progress = enum {
     unknown,
     advancing,
@@ -55,8 +55,8 @@ pub const AttemptState = struct {
     limit: usize = default_max_provider_attempts,
 };
 
-/// Ephemeral backoff state. AttemptState remains the durable diagnostic budget;
-/// exhaustion no longer terminates the turn.
+/// Ephemeral backoff state. AttemptState is the durable diagnostic budget;
+/// exhausting it does not end the turn.
 pub const RetryPacingState = union(enum) {
     idle,
     implicit: struct {

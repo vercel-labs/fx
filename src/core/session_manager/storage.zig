@@ -1,4 +1,4 @@
-//! L0 (posix storage): the only code in the session manager that touches the
+//! POSIX storage: the only code in the session manager that touches the
 //! file system. It knows nothing about sessions.
 //!
 //! Policy owned here:
@@ -8,9 +8,9 @@
 //!   exclusively, which fails on any existing name, a symlink included;
 //! - writes and reads loop until done, so callers never see partial I/O.
 //!
-//! With `-Dhooks=true`, every call first consults the fault injector in
-//! `storage_fault.zig`, which models process and machine crashes for tests
-//! and the driver. Without hooks that code does not exist in the binary.
+//! With the `hooks` build option, every call first consults the fault
+//! injector in `storage_fault.zig`, which models process and machine crashes
+//! for tests. Without hooks that code does not exist in the binary.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -21,7 +21,7 @@ pub const Fault = if (hooks) @import("storage_fault.zig").Fault else void;
 
 pub const folder_mode: std.posix.mode_t = 0o700;
 pub const file_mode: std.posix.mode_t = 0o600;
-/// A blob never changes once written, and a tool may open it by path (D49).
+/// A blob never changes once written, and a tool may open it by path.
 pub const blob_mode: std.posix.mode_t = 0o400;
 
 pub const Error = error{
@@ -43,7 +43,7 @@ pub const Error = error{
     Canceled,
 };
 
-/// I/O failures as the API reports them (D29): the OS cause when it is
+/// I/O failures as the API reports them: the OS cause when it is
 /// known, `Io` otherwise. After a failed write or sync, durability is
 /// unknown whichever it is.
 pub const IoFault = error{ Io, NoSpaceLeft, AccessDenied, ReadOnlyFileSystem, FileTooBig };
@@ -99,7 +99,7 @@ pub const Storage = struct {
         const name = std.Io.Dir.path.basename(path);
         const cwd = Io.Dir.cwd();
         // Missing parents are the manager's own folders, so private too, for
-        // example `~/.fx/sessions` on a machine that never ran v1 (D19).
+        // example `~/.fx/sessions` on a machine that never ran v1.
         // Existing ones are left as they are.
         _ = cwd.createDirPathStatus(s.io, parent_path, .fromMode(folder_mode)) catch |err| return translate(err);
         var parent = cwd.openDir(s.io, parent_path, .{}) catch |err| return translate(err);
@@ -163,7 +163,7 @@ pub const Storage = struct {
     }
 
     /// As `createFile`, but `0400`: the returned handle still writes the new
-    /// file, and nothing can open it for writing afterwards (D49).
+    /// file, and nothing can open it for writing afterwards.
     pub fn createReadOnlyFile(s: Storage, dir: Dir, name: []const u8) Error!File {
         return s.createFileMode(dir, name, blob_mode);
     }
@@ -262,7 +262,7 @@ pub const Storage = struct {
         }
     }
 
-    /// Durability point for one file: a plain `fsync` (D3).
+    /// Durability point for one file: a plain `fsync`.
     pub fn sync(s: Storage, file: File) Error!void {
         try s.alive();
         try s.mutate();

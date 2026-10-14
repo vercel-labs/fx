@@ -70,10 +70,12 @@ pub const Reply = union(enum) {
 };
 
 /// The model to try when the conversation's own model cannot write the
-/// summary. Another provider family, because a provider that refused once
-/// will likely refuse the same conversation again.
+/// summary: one from another provider family.
 fn fallbackModel(primary: []const u8) []const u8 {
-    return if (std.mem.startsWith(u8, primary, "anthropic/")) "openai/gpt-6-sol" else "anthropic/claude-sonnet-5";
+    return if (std.mem.startsWith(u8, primary, "anthropic/"))
+        model_provider.compaction_fallback_model_for_anthropic
+    else
+        model_provider.compaction_fallback_model;
 }
 
 /// The least reasoning a model accepts: `none` when it can turn reasoning

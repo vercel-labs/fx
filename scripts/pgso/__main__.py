@@ -107,7 +107,7 @@ def _parser() -> argparse.ArgumentParser:
     descriptions = {
         "build": "Build the control and instrumented compiler artifacts",
         "train": "Build a candidate from the versioned production corpus",
-        "all": "Run the complete non-publishing Stage 1 candidate gate",
+        "all": "Run the complete non-publishing candidate gate",
     }
     for command in MUTATING_COMMANDS:
         command_parser = subparsers.add_parser(

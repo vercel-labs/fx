@@ -40,7 +40,7 @@ const Request = web_search_contract.ProviderRequest;
 const Response = web_search_contract.ProviderResponse;
 const ProgressFn = web_search_contract.ProgressFn;
 
-pub const default_model = "spacexai/grok-4.7";
+pub const default_model = model_provider.gateway_default_model;
 pub const title_model = "openai/gpt-5.6-luna";
 pub const default_chat_url = "https://ai-gateway.vercel.sh/v4/ai/language-model";
 pub const models_path = "/coding-agent/v1/models";

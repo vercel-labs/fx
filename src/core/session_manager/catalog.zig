@@ -1,10 +1,10 @@
-//! L3: the catalog, `index.jsonl`.
+//! The catalog, `index.jsonl`.
 //!
 //! The index is derived and rebuildable. It holds one checksummed line per
 //! change: `put` (a session's summary), `opened` (a host opened it) and
 //! `del` (a tombstone), appended under `index.lock` and never fsynced.
 //! Folding it keeps the newest record per id; a tombstone is final, so a
-//! deleted id never comes back (`tla/Catalog.tla` `NoResurrection`).
+//! deleted id never comes back.
 //! `list` reads only the index and self-heals entries whose folder is gone;
 //! `rebuild` re-derives it from the folders and sweeps `.tmp` and `.trash`.
 //!
@@ -35,7 +35,7 @@ pub const Summary = struct {
     workspace: []const u8,
     /// Raw JSON string, as set.
     title: ?[]const u8 = null,
-    /// Raw JSON string, as set (D18).
+    /// Raw JSON string, as set.
     language: ?[]const u8 = null,
     parent: ?[]const u8 = null,
     created_ms: u64,
@@ -49,7 +49,7 @@ pub const Summary = struct {
 pub const Record = union(enum) {
     put: Summary,
     /// Read from indexes that older builds wrote; a resume now writes a
-    /// whole `put` (D42).
+    /// whole `put`.
     opened: struct { id: []const u8, host: schema.Host, ts_ms: u64 },
     del: struct { id: []const u8, ts_ms: u64 },
 };
@@ -342,7 +342,7 @@ pub const Catalog = struct {
                     .last_opened => |host| entry.summary.opened_ms[@backingInt(host)],
                 };
                 if (key == 0 and target == .last_opened) continue;
-                // A tie resolves as `list` sorts: the smaller id first (D11).
+                // A tie resolves as `list` sorts: the smaller id first.
                 const better = best == null or key > best_key or
                     (key == best_key and std.mem.lessThan(u8, entry.summary.id, best.?.id));
                 if (better) {
@@ -540,7 +540,7 @@ pub const Catalog = struct {
     }
 
     /// Whether the session's folder still exists; if not, it is tombstoned
-    /// (`tla/Catalog.tla` `Heal`) and reported once.
+    /// and reported once.
     /// One `stat` of the folder, no open: a published folder always holds
     /// its synced log (publish renames it in whole, delete renames it away),
     /// so the folder alone decides. `rebuild` checks the logs themselves.
@@ -717,9 +717,9 @@ test "the fold keeps the newest put, merges open times, and a tombstone is final
 }
 
 const catalog_model_tests = struct {
-    //! L3 and L4 against `tla/Catalog.tla`: publish, delete, crashes between
-    //! the folder change and the index write, self-heal and rebuild, driven
-    //! through the public API. Every run writes a trace for TLC.
+    //! The catalog and the manager API: publish, delete, crashes between the
+    //! folder change and the index write, self-heal and rebuild, driven
+    //! through the public API. Every run writes a trace.
 
     const api = @import("api.zig");
     const catalog_mod = @import("catalog.zig");
@@ -785,7 +785,7 @@ const catalog_model_tests = struct {
             }
             const i = t.slot(id);
             switch (what) {
-                // Updates of an indexed session are not spec actions.
+                // Updates of an indexed session are not model actions.
                 .index_put => if (std.mem.eql(u8, t.pending[i], "put")) {
                     t.pending[i] = "none";
                     t.emit("IndexPut", labels[i]);

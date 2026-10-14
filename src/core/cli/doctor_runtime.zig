@@ -299,7 +299,7 @@ fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, workspace_
     );
 }
 
-/// Doctor on v2 (D36): reports damaged sessions and removes side folders
+/// Doctor on v2: reports damaged sessions and removes side folders
 /// whose session is gone. Rebuilds nothing.
 fn appendV2StateChecks(checks: *std.ArrayList(Check), alloc: Allocator) !void {
     var store = session_adapter.Store.openFromEnv(alloc) catch |err| {

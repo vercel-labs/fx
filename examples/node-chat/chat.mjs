@@ -1,10 +1,11 @@
 import { createInterface } from 'node:readline'
 import { stdin, stdout } from 'node:process'
 import { createFxAgent } from 'libfx'
+import { model } from '../shared/model.mjs'
 
 const agent = await createFxAgent({
   apiKey: process.env.AI_GATEWAY_API_KEY,
-  model: 'openai/gpt-4.1-nano',
+  model,
 })
 const input = createInterface({ input: stdin, output: stdout, prompt: 'You: ' })
 

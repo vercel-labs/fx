@@ -58,7 +58,7 @@ pub const ManagedStat = struct {
     modified_at_ns: i128,
 };
 
-/// What a v2 session's blobs can fail with (D44).
+/// What a v2 session's blobs can fail with.
 pub const BlobError = error{
     OutOfMemory,
     /// This session holds no body under that name.
@@ -77,7 +77,7 @@ pub const BlobError = error{
 };
 
 /// The large bodies of a v2 session, each a blob of that session named by
-/// its hash (D44). The session adapter implements it; every capability
+/// its hash. The session adapter implements it; every capability
 /// that holds it keeps it alive through `retain` and `release`, so a copy
 /// may outlive the session, which then refuses only new bodies.
 pub const Blobs = struct {
@@ -91,20 +91,20 @@ pub const Blobs = struct {
         /// The first `len` bytes of an open file outside the session.
         put_file: *const fn (ctx: *anyopaque, file: std.Io.File, len: u64) BlobError!Hash,
         /// Keeps `bytes` as the compactor record `name`, replacing any record
-        /// of that name (D50).
+        /// of that name.
         put_record: *const fn (ctx: *anyopaque, name: []const u8, bytes: []const u8) BlobError!void,
         /// Every compactor record's name, with a moved session's old
-        /// tool-results names (D50). `arena` owns the list.
+        /// tool-results names. `arena` owns the list.
         record_names: *const fn (ctx: *anyopaque, arena: Allocator) BlobError![]const []const u8,
         /// The blob a handle of `kind` refers to: the one it names, a
-        /// compactor record's (D50), or in a session moved off the side
-        /// folder, the one its old name maps to (D47).
+        /// compactor record's, or in a session moved off the side
+        /// folder, the one its old name maps to.
         resolve: *const fn (ctx: *anyopaque, kind: ManagedChildKind, name: []const u8) BlobError!Hash,
         /// A blob's bytes, at most `max_bytes`, checked against its name.
         /// Caller owns.
         get: *const fn (ctx: *anyopaque, alloc: Allocator, hash: []const u8, max_bytes: usize) BlobError![]u8,
         /// The read-only file of a blob, for readers that page through a
-        /// large body and tools that open files by path (D49). Caller owns.
+        /// large body and tools that open files by path. Caller owns.
         path: *const fn (ctx: *anyopaque, alloc: Allocator, hash: []const u8) BlobError![]u8,
         retain: *const fn (ctx: *anyopaque) void,
         release: *const fn (ctx: *anyopaque) void,
@@ -226,10 +226,10 @@ const CapabilityImpl = struct {
     alloc: Allocator,
     mode: Mode,
     /// Null for a v2 session's capability, which holds its bodies as blobs
-    /// and has no side folder (D48).
+    /// and has no side folder.
     session_dir: ?io_mod.VerifiedDir,
     blobs: ?Blobs = null,
-    /// A v2 session's terminal folder, `~/.fx/terminal/{id}` (D45), where
+    /// A v2 session's terminal folder, `~/.fx/terminal/{id}`, where
     /// its terminal kinds route; opened on first use and made only by a
     /// write. `display_session_path` is its path.
     terminal_dir: ?io_mod.VerifiedDir = null,
@@ -301,8 +301,8 @@ const CapabilityImpl = struct {
                 else => error.SessionChildStoreFailed,
             };
         }
-        // A v2 capability has no side folder: its bodies are blobs (D48),
-        // and its terminal state lives in its terminal folder (D45).
+        // A v2 capability has no side folder: its bodies are blobs,
+        // and its terminal state lives in its terminal folder.
         const session_dir = if (self.session_dir) |*dir| dir else switch (kind) {
             .terminal_state, .terminal_proofs => try self.terminalDir(create_if_missing) orelse return null,
             else => return if (create_if_missing) error.SessionChildStoreFailed else null,
@@ -398,7 +398,7 @@ const CapabilityImpl = struct {
         };
     }
 
-    /// A v2 capability's terminal folder (D45), opened once. Missing, it is
+    /// A v2 capability's terminal folder, opened once. Missing, it is
     /// made only for a write (`create`); a read finds nothing.
     fn terminalDir(self: *CapabilityImpl, create: bool) !?*io_mod.VerifiedDir {
         if (self.terminal_dir) |*dir| return dir;
@@ -799,8 +799,8 @@ pub const SessionChildCapability = struct {
 
     /// A v2 session's capability: its bodies are that session's blobs, its
     /// terminal kinds route to `terminal_path`, its `~/.fx/terminal/{id}`
-    /// (D45), and it has no side folder, so every other kind is absent
-    /// (D44, D48). An empty `terminal_path` gives no terminal kinds.
+    ///, and it has no side folder, so every other kind is absent
+    ///. An empty `terminal_path` gives no terminal kinds.
     pub fn initBlobs(alloc: Allocator, blobs: Blobs, terminal_path: []const u8, mode: Mode) !SessionChildCapability {
         if (mode == .writable) io_mod.e2eFailIfDurableMutationAttempted();
         const display = try alloc.dupe(u8, terminal_path);
@@ -819,7 +819,7 @@ pub const SessionChildCapability = struct {
         return .{ .impl = impl };
     }
 
-    /// Whether bodies are blobs of a v2 session rather than files (D44).
+    /// Whether bodies are blobs of a v2 session rather than files.
     pub fn holdsBlobs(self: *const SessionChildCapability) bool {
         return self.impl.blobs != null;
     }
@@ -837,14 +837,14 @@ pub const SessionChildCapability = struct {
     }
 
     /// Keeps `bytes` as the compactor record `name`, replacing any of that
-    /// name; `holdsBlobs` only (D50). `readBlob` and `openBlobFile` read it
+    /// name; `holdsBlobs` only. `readBlob` and `openBlobFile` read it
     /// back under `.tool_results`.
     pub fn putRecord(self: *SessionChildCapability, name: []const u8, bytes: []const u8) BlobError!void {
         const blobs = try self.writableBlobs();
         return blobs.vtable.put_record(blobs.ctx, name, bytes);
     }
 
-    /// Every compactor record's name; `holdsBlobs` only (D50). `arena` owns
+    /// Every compactor record's name; `holdsBlobs` only. `arena` owns
     /// the list.
     pub fn recordNames(self: *SessionChildCapability, arena: Allocator) BlobError![]const []const u8 {
         const blobs = self.impl.blobs orelse return error.BlobStoreFailed;
@@ -860,7 +860,7 @@ pub const SessionChildCapability = struct {
     }
 
     /// Opens the read-only file of the blob a handle of `kind` refers to,
-    /// for a reader that pages through it (D49). Its bytes are not checked
+    /// for a reader that pages through it. Its bytes are not checked
     /// against the name, as a side file's never were. Caller closes it.
     pub fn openBlobFile(self: *SessionChildCapability, alloc: Allocator, kind: ManagedChildKind, name: []const u8) BlobError!std.Io.File {
         const blobs = self.impl.blobs orelse return error.BlobStoreFailed;
@@ -875,7 +875,7 @@ pub const SessionChildCapability = struct {
     }
 
     /// The read-only file of the blob a handle of `kind` refers to, for a
-    /// tool that opens files by path (D49); caller owns.
+    /// tool that opens files by path; caller owns.
     pub fn blobPath(self: *SessionChildCapability, alloc: Allocator, kind: ManagedChildKind, name: []const u8) BlobError![]u8 {
         const blobs = self.impl.blobs orelse return error.BlobStoreFailed;
         const hash = try blobs.vtable.resolve(blobs.ctx, kind, name);

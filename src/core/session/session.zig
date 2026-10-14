@@ -1808,7 +1808,7 @@ pub const SessionRuntime = struct {
     }
 
     /// As `configureWebFetchArtifacts`, for a v2 session, whose downloads
-    /// are its blobs (D44, D49).
+    /// are its blobs.
     pub fn configureWebFetchArtifactBlobs(
         self: *SessionRuntime,
         alloc: Allocator,

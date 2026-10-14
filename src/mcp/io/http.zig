@@ -442,7 +442,6 @@ pub const Client = struct {
 };
 
 test {
-    // Behavior is tested against real servers by the Bun driver and the
-    // conformance suite; this makes sure every declaration compiles.
+    // Makes sure every declaration compiles.
     std.testing.refAllDecls(Client);
 }

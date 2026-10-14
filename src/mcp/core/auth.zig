@@ -269,7 +269,7 @@ pub const Gate = struct {
     }
 };
 
-/// TLC's integers are 32-bit: keys from 2^30 up, such as the host's
+/// Trace integers are 32-bit: keys from 2^30 up, such as the host's
 /// auxiliary keys, fold into 2^30 to 2^31.
 fn traceKey(key: u64) i64 {
     const fold: u64 = 1 << 30;
@@ -315,7 +315,7 @@ pub const FlowPhase = enum { idle, discovering, registering, authorizing, redeem
 pub const Iss = enum { none, match, wrong };
 
 /// Issuers are numbered from 1 up to this; the flow keeps them as bits, at
-/// most bit 30 so every mask fits TLC's integers in the traces.
+/// most bit 30 so every mask fits a 32-bit trace integer.
 pub const max_issuers = 31;
 
 pub const FlowEvent = union(enum) {

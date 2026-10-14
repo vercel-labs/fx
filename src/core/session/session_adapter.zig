@@ -14,11 +14,11 @@
 //! - preferences, permissions, conversation language, title and usage are
 //!   `set` values in v1's encodings;
 //! - large bodies (tool results, tool images, command replay, web-fetch
-//!   downloads) are blobs of the session, each named by its hash (D44); an
-//!   ACP client's prompt and tool identities are settings (D46); hosted
-//!   terminal state lives in `~/.fx/terminal/{id}/` (D45). An older session
+//!   downloads) are blobs of the session, each named by its hash; an
+//!   ACP client's prompt and tool identities are settings; hosted
+//!   terminal state lives in `~/.fx/terminal/{id}/`. An older session
 //!   with a `~/.fx/session-files/{id}/` side folder moves on its first
-//!   writable open (D47, `tla/MoveSideFiles.tla`).
+//!   writable open.
 
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
@@ -48,9 +48,9 @@ const Event = session_event.ConversationEvent;
 const PieceKind = std.meta.Tag(Event);
 
 /// Folder of the side files older v2 sessions kept, under `~/.fx`; a
-/// session moves out of it on its first writable open (D47).
+/// session moves out of it on its first writable open.
 pub const files_dir_name = profile_paths.session_files_dir_name;
-/// Folder of v2 sessions' hosted terminal state, under `~/.fx` (D45).
+/// Folder of v2 sessions' hosted terminal state, under `~/.fx`.
 pub const terminal_dir_name = profile_paths.terminal_dir_name;
 /// The profile's home folder, opened for listing: creating `~/.fx` in it
 /// syncs it, and Linux cannot sync a folder opened any other way (`O_PATH`).
@@ -74,7 +74,7 @@ pub fn enabled(flag: bool) bool {
 pub const Host = sm.Host;
 pub const ChildOutcome = sm.Outcome;
 
-/// One child as its parent's log folds it (D22). Owns its strings.
+/// One child as its parent's log folds it. Owns its strings.
 pub const Child = struct {
     id: []u8,
     /// The child's newest work item.
@@ -111,10 +111,10 @@ pub const ChildLine = union(enum) {
 // ---------------------------------------------------------------------------
 // Wiring trace
 
-/// One step of `Wiring.tla`, as a `wiring` trace line that trace validation
-/// reads back: the store opening and closing (the process's start and
-/// exit), a host session opening and closing, and the turn and child lines
-/// a host session writes. `pid` tells one process's steps from another's.
+/// One step of the session wiring, as a `wiring` line in the debug trace:
+/// the store opening and closing (the process's start and exit), a host
+/// session opening and closing, and the turn and child lines a host
+/// session writes. `pid` tells one process's steps from another's.
 fn traceWiring(comptime action: []const u8, session_id: []const u8, comptime detail: []const u8, pid: i64) void {
     debug_trace.logf("wiring", "action=" ++ action ++ " session={s}" ++ detail ++ " pid={d}", .{ session_id, pid });
 }
@@ -198,8 +198,8 @@ pub const Store = struct {
         return io_mod.openOrCreateVerifiedPrivateDir(&fx, name);
     }
 
-    /// The folders of `id` outside the manager: its terminal state (D45)
-    /// and a side folder not yet moved (D47).
+    /// The folders of `id` outside the manager: its terminal state
+    /// and a side folder not yet moved.
     const outside_folders = [_][]const u8{ terminal_dir_name, files_dir_name };
 
     /// Removes the folders of `id` outside the manager; `why` names the
@@ -249,7 +249,7 @@ pub const Store = struct {
     }
 
     /// Removes folders outside the manager whose session is gone, except
-    /// young ones (D36, D45), in both roots.
+    /// young ones, in both roots.
     fn sweepFiles(store: *Store, alloc: Allocator, report: *Doctor, now_ms: i64) !void {
         for (outside_folders) |root_name| try store.sweepRoot(alloc, root_name, report, now_ms);
     }
@@ -362,7 +362,7 @@ pub fn commandError(err: anyerror) CommandError {
         error.Busy, error.SessionBusy => error.SessionBusy,
         error.UnsupportedVersion => error.UnsupportedSessionSchema,
         error.Corrupt => error.InvalidSessionFormat,
-        // `recover` of a session whose first turn never ended whole (D15).
+        // `recover` of a session whose first turn never ended whole.
         error.InvalidForkPoint => error.SessionRecoveryBoundaryInvalid,
         error.DurablePathUnsafe, error.SessionPathUnsafe => error.DurablePathUnsafe,
         error.HomeNotSet => error.HomeNotSet,
@@ -379,8 +379,8 @@ pub fn commandError(err: anyerror) CommandError {
 }
 
 /// A saved root session as v1's state, read without its lock while another
-/// process may hold it (D37), for `fx session {id}`: every turn, with each
-/// compaction's summary where it happened (D32). A missing session, a
+/// process may hold it, for `fx session {id}`: every turn, with each
+/// compaction's summary where it happened. A missing session, a
 /// child, or an id that cannot name one is `error.SessionNotFound`. Caller
 /// owns the result.
 pub fn readSession(store: *Store, alloc: Allocator, id: []const u8) !Resumed {
@@ -432,7 +432,7 @@ pub const Recovered = struct {
     }
 };
 
-/// `fx session recover` (D15): a new root session copied from `id` up to
+/// `fx session recover`: a new root session copied from `id` up to
 /// its last turn that ended before any damage, with a copy of its side
 /// files. The source is never changed, and may be held by another process.
 /// Caller owns the result.
@@ -488,10 +488,10 @@ pub const Doctor = struct {
 };
 
 /// A side folder younger than this may belong to a new session whose first
-/// turn has not created its log yet (D36).
+/// turn has not created its log yet.
 const orphan_min_age_ms: i64 = 24 * std.time.ms_per_hour;
 
-/// `fx doctor` on v2 (D36): verifies up to `limit` sessions and removes side
+/// `fx doctor` on v2: verifies up to `limit` sessions and removes side
 /// folders whose session is gone. Rebuilds nothing. Caller owns the report.
 pub fn doctor(store: *Store, alloc: Allocator, limit: usize, now_ms: i64) !Doctor {
     var report: Doctor = .{};
@@ -537,7 +537,7 @@ pub const Seed = struct {
     preferences: session_codec.DurableSessionPreferences,
     language: types.ConversationLanguage,
     permission_state: session_permission_state.State,
-    /// A child's instructions, kept in its own `prefs` (D34); roots leave
+    /// A child's instructions, kept in its own `prefs`; roots leave
     /// it empty.
     instructions: []const u8 = "",
 };
@@ -582,7 +582,7 @@ pub const Resumed = struct {
     }
 };
 
-/// A session's blobs as fx's stores reach them (D44), shared by every
+/// A session's blobs as fx's stores reach them, shared by every
 /// capability over the session, including the copies a background reader or
 /// a running command keeps. It lives until the last holder releases it.
 /// Once the session closes it stores nothing more; reads go to the
@@ -601,12 +601,12 @@ const BlobHost = struct {
     session: ?sm.Session,
     mutex: std.Io.Mutex = .init,
     refs: usize = 1,
-    /// Blobs stored since the last item that lists them (D44).
+    /// Blobs stored since the last item that lists them.
     pending: std.ArrayList(Hash) = .empty,
     /// A moved session's old side-file names, as `{folder}/{name}`, to their
-    /// blobs (D47). Set while the session opens; read-only after.
+    /// blobs. Set while the session opens; read-only after.
     moved: std.StringHashMapUnmanaged(Hash) = .empty,
-    /// The compactor's records by name (D50), loaded on open and kept
+    /// The compactor's records by name, loaded on open and kept
     /// since; `mutex` guards them.
     records: std.array_hash_map.String(Hash) = .empty,
     /// Records kept since the last `compaction_records` line, which the
@@ -704,7 +704,7 @@ const BlobHost = struct {
     }
 
     /// Every record's name, then a moved session's old tool-results names
-    /// that no record replaced (D47, D50).
+    /// that no record replaced.
     fn recordNames(ctx: *anyopaque, arena: Allocator) session_child_store.BlobError![]const []const u8 {
         const host = from(ctx);
         const io = io_mod.getIo();
@@ -726,7 +726,7 @@ const BlobHost = struct {
     }
 
     /// The records map as JSON and the records it adds, when it changed
-    /// since the last line that recorded it (D50); in `a`.
+    /// since the last line that recorded it; in `a`.
     fn recordsDue(host: *BlobHost, a: Allocator) error{OutOfMemory}!?RecordsDue {
         const io = io_mod.getIo();
         host.mutex.lockUncancelable(io);
@@ -753,7 +753,7 @@ const BlobHost = struct {
     const RecordsDue = struct { map_json: []const u8, added: []const Hash, generation: u64 };
 
     fn storeFailed(host: *BlobHost, err: sm.AppendError) session_child_store.BlobError {
-        // A body is stored only while the session is on disk (D44).
+        // A body is stored only while the session is on disk.
         if (err == error.InvalidTransition) debug_trace.logf("session", "event=sessions_v2_body_before_turn session={s}", .{host.id});
         return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
@@ -869,7 +869,7 @@ const BlobHost = struct {
 };
 
 /// The side-folder layout an older session kept each kind of body in, as
-/// `session_child_store` routes it; the key prefix of its moved names (D47).
+/// `session_child_store` routes it; the key prefix of its moved names.
 fn movedFolder(kind: session_child_store.ManagedChildKind) ?[]const u8 {
     return switch (kind) {
         .tool_results => "tool-results",
@@ -887,9 +887,9 @@ pub const Session = struct {
     store: *Store,
     handle: sm.Session,
     /// `~/.fx/session-files/{id}`, owned: where an older session kept its
-    /// side files, read once by the move (D47).
+    /// side files, read once by the move.
     files_path: []u8,
-    /// The session's blobs, shared with every capability over it (D44).
+    /// The session's blobs, shared with every capability over it.
     host: *BlobHost,
     capability: ?session_child_store.SessionChildCapability = null,
     /// Serializes this adapter's own state; the manager's Session is
@@ -899,7 +899,7 @@ pub const Session = struct {
     streamed: std.ArrayList([]u8) = .empty,
     /// Result files the open turn's stream wrote, by call id; both owned.
     stored_results: std.StringHashMapUnmanaged([]u8) = .empty,
-    /// Ids of the open turn's calls already saved as running (D28), owned.
+    /// Ids of the open turn's calls already saved as running, owned.
     running: std.ArrayList([]u8) = .empty,
     turn_open: bool = false,
     /// Highest turn number started; the manager numbers turns the same way.
@@ -911,14 +911,14 @@ pub const Session = struct {
     language: ?[]u8 = null,
     /// Started in this process: its first commit may name it.
     fresh: bool,
-    /// A host's own session, not a subagent child's: `Wiring.tla` models
-    /// only these.
+    /// A host's own session, not a subagent child's: only these write
+    /// wiring trace lines.
     root: bool = true,
     titled: bool = false,
     /// A resumed session with no title: the title its first prompt gives,
-    /// owned, written with its next turn end (D52).
+    /// owned, written with its next turn end.
     first_title: ?[]u8 = null,
-    /// A child's instructions as its `prefs` hold them (D34), owned; null
+    /// A child's instructions as its `prefs` hold them, owned; null
     /// for a root and for a child without any.
     instructions: ?[]u8 = null,
 
@@ -949,7 +949,7 @@ pub const Session = struct {
         self.language = try self.alloc.dupe(u8, seed.language.view());
     }
 
-    /// Opens a child of `parent_id` for one work item (D22, D34): its log
+    /// Opens a child of `parent_id` for one work item: its log
     /// when it has one, or a new child under `child_id`, the id the parent's
     /// `child_spawned` already names, holding `seed` until its first turn.
     /// Instructions in `seed` replace the stored ones; empty keeps them.
@@ -996,7 +996,7 @@ pub const Session = struct {
         return decodePreferences(alloc, state.prefs orelse return error.InvalidSessionFormat);
     }
 
-    /// A child's instructions (D34), or empty. Borrowed until `close`.
+    /// A child's instructions, or empty. Borrowed until `close`.
     pub fn childInstructions(self: *const Session) []const u8 {
         return self.instructions orelse "";
     }
@@ -1016,7 +1016,7 @@ pub const Session = struct {
     }
 
     /// As `resumeSession`, but SessionBusy at once when another process has
-    /// the session open, for the session picker (D38).
+    /// the session open, for the session picker.
     pub fn resumeSessionWithoutWaiting(alloc: Allocator, store: *Store, target: Target, workspace: []const u8, host: Host) !*Session {
         return resumeWaiting(alloc, store, target, workspace, host, 0);
     }
@@ -1060,11 +1060,11 @@ pub const Session = struct {
     }
 
     /// Appends through the manager; a host session also traces the turn and
-    /// child lines `Wiring.tla` models. The first item lists every blob the
+    /// child lines of the wiring trace. The first item lists every blob the
     /// stores kept since the last such line, so verify and recover see a
-    /// lost one as damage (D39, D44). Compactor records kept since the last
+    /// lost one as damage. Compactor records kept since the last
     /// `compaction_records` line get a new one first, so the line that
-    /// cites them never lands without them (D50).
+    /// cites them never lands without them.
     fn write(self: *Session, events: []const sm.Event) sm.AppendError!u64 {
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
         defer scratch.deinit();
@@ -1088,7 +1088,7 @@ pub const Session = struct {
     }
 
     /// The `compaction_records` lines for `due`: its map as one more blob,
-    /// listed with the records it adds, in chunks as the move's are (D50).
+    /// listed with the records it adds, in chunks as the move's are.
     fn recordLines(self: *Session, a: Allocator, due: BlobHost.RecordsDue) sm.AppendError![]const sm.Event {
         const map_hash = try a.dupe(u8, &(try self.handle.putBlob(due.map_json)));
         const value = try a.print("{{\"map\":\"{s}\"}}", .{map_hash});
@@ -1123,9 +1123,9 @@ pub const Session = struct {
     }
 
     /// Closes the session and frees the adapter. Every child thread of this
-    /// session must have joined (`tla/Wiring.tla` ParentOutlivesChildren).
+    /// session must have joined, so the parent outlives its children.
     /// A copy of its capability that a background reader still holds keeps
-    /// reading, and stores nothing more (D44).
+    /// reading, and stores nothing more.
     pub fn close(self: *Session) void {
         self.host.detach();
         self.handle.close() catch |err| debug_trace.logf("session", "event=sessions_v2_close_failed session={s} err={s}", .{ self.id(), @errorName(err) });
@@ -1187,8 +1187,8 @@ pub const Session = struct {
 
     // -- bodies --------------------------------------------------------------
 
-    /// The capability over this session's blobs (D44): it stores and reads
-    /// large bodies, routes terminal state to `~/.fx/terminal/{id}` (D45),
+    /// The capability over this session's blobs: it stores and reads
+    /// large bodies, routes terminal state to `~/.fx/terminal/{id}`,
     /// and has no side folder. Borrowed until `close`.
     pub fn childCapability(self: *Session) !*session_child_store.SessionChildCapability {
         self.mutex.lockUncancelable(io_mod.getIo());
@@ -1207,7 +1207,7 @@ pub const Session = struct {
     // -- turns ---------------------------------------------------------------
 
     /// Opens the turn on disk if it is not open yet, so a body stored for it
-    /// is a blob of a session on disk (D44). Caller holds the mutex.
+    /// is a blob of a session on disk. Caller holds the mutex.
     fn openTurnLocked(self: *Session) !void {
         if (self.turn_open) return;
         _ = try self.write(&.{.turn_started});
@@ -1215,7 +1215,7 @@ pub const Session = struct {
     }
 
     /// Opens the turn as its work starts. A subagent child streams nothing,
-    /// and its tools may store bodies before the commit (D44); an ACP prompt
+    /// and its tools may store bodies before the commit; an ACP prompt
     /// opens it before the model is asked, so a disk that cannot take the
     /// turn fails the prompt first.
     pub fn beginTurn(self: *Session) !void {
@@ -1299,7 +1299,7 @@ pub const Session = struct {
         const language_changed = self.language == null or !std.mem.eql(u8, self.language.?, language_tag);
         if (language_changed) try tail.append(a, .{ .set = .{ .key = .language, .value = try jsonString(a, language_tag) } });
         // A new session's first turn names it, or a resumed one's first
-        // prompt, which a crash may have left in an interrupted turn (D52).
+        // prompt, which a crash may have left in an interrupted turn.
         const derived_title = if (!self.root or self.titled)
             null
         else if (self.first_title) |title|
@@ -1329,8 +1329,8 @@ pub const Session = struct {
     /// write for it (`withResultFiles`); a tool image without its handle
     /// waits for the commit, which is authoritative. `running`'s calls are
     /// saved once each as `tool_running` items, outside the streamed pieces,
-    /// so a finished step still streams and commits as it always did (D28),
-    /// and its message's text with them (D51).
+    /// so a finished step still streams and commits as it always did,
+    /// and its message's text with them.
     pub fn appendProgress(
         self: *Session,
         user: types.UserTurn,
@@ -1344,7 +1344,7 @@ pub const Session = struct {
         const a = arena.allocator();
         var events: std.ArrayList(Event) = .empty;
         try events.append(a, .{ .user = .{ .text = user.text, .images = user.images, .work_id = user.work_id } });
-        // A result's blob needs the turn on disk first (D44).
+        // A result's blob needs the turn on disk first.
         if (storesBodies(execution)) try self.openTurnLocked();
         // On a missing handle the list keeps the pieces before it.
         session_event.appendExecutionConversationEvents(a, &events, try self.withResultFiles(a, execution)) catch |err| switch (err) {
@@ -1371,7 +1371,7 @@ pub const Session = struct {
 
     /// Saves the calls not yet saved as running in the open turn, which the
     /// pieces above have just opened if it was not. A step's first save also
-    /// keeps its message's text as an `assistant_running` item (D51). Not
+    /// keeps its message's text as an `assistant_running` item. Not
     /// its provider replay, which binds to all of that message's calls.
     fn saveRunning(self: *Session, a: Allocator, running: Running) !void {
         var batch: std.ArrayList(sm.Event) = .empty;
@@ -1557,7 +1557,7 @@ pub const Session = struct {
         _ = try self.write(&.{.{ .set = .{ .key = .prefs, .value = try encodePreferences(arena.allocator(), preferences, self.instructions) } }});
     }
 
-    // -- children (D22) ------------------------------------------------------
+    // -- children ------------------------------------------------------
 
     /// Every child of this session as its log folds them, in first-spawn
     /// order. Free with `freeChildren`.
@@ -1611,7 +1611,7 @@ pub const Session = struct {
         _ = try self.write(&.{.{ .set = .{ .key = .permissions, .value = value } }});
     }
 
-    // -- an ACP client's settings (D46) ---------------------------------------
+    // -- an ACP client's settings ---------------------------------------
 
     /// The system prompt the ACP client gave this session, or null. Caller
     /// owns it.
@@ -1780,11 +1780,11 @@ pub const Session = struct {
         return .{ .store = self.store, .id = self.id(), .handle = self.handle, .host = self.host, .files_path = self.files_path };
     }
 
-    // -- the move off the side folder (D47) -----------------------------------
+    // -- the move off the side folder -----------------------------------
 
-    /// Makes an older session one manager folder (D47, `tla/MoveSideFiles.tla`)
-    /// on its first writable open, then loads the map its old handles resolve
-    /// through. Every body in the side folder becomes a blob, the map from
+    /// Makes an older session one manager folder on its first writable
+    /// open, then loads the map its old handles resolve through. Every
+    /// body in the side folder becomes a blob, the map from
     /// each old name to its blob is one more blob, and one batch records the
     /// map, every moved blob, and the client's settings from the old files.
     /// Then the terminal folder moves to `~/.fx/terminal/{id}` and the side
@@ -1812,8 +1812,9 @@ pub const Session = struct {
         debug_trace.logf("session", "event=sessions_v2_moved session={s} bodies={d}", .{ self.id(), bodies });
     }
 
-    /// Every step of the move but the side folder's removal, in the order
-    /// `tla/MoveSideFiles.tla` checks; returns how many bodies moved.
+    /// Every step of the move but the side folder's removal, in an order
+    /// that a crash at any step leaves recoverable; returns how many bodies
+    /// moved.
     fn moveOut(self: *Session, side: *io_mod.VerifiedDir) !usize {
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
         defer scratch.deinit();
@@ -1884,7 +1885,7 @@ pub const Session = struct {
     }
 
     /// Renames `side/terminal` to `~/.fx/terminal/{id}/terminal`, the layout
-    /// the terminal store keeps (D45). A terminal folder already there was
+    /// the terminal store keeps. A terminal folder already there was
     /// moved by an earlier try.
     fn moveTerminalFolder(self: *Session, side: *io_mod.VerifiedDir) !void {
         const io = io_mod.getIo();
@@ -1917,7 +1918,7 @@ pub const Session = struct {
         const value = std.json.parseFromSliceLeaky(Value, sa, raw, .{ .ignore_unknown_fields = true }) catch return error.InvalidSessionFormat;
         const bytes = self.store.manager.getBlob(sa, self.id(), value.map) catch |err| switch (err) {
             // A lost or damaged map damages the session, as a lost blob
-            // does (D39); its old handles read as gone.
+            // does; its old handles read as gone.
             error.NotFound, error.Corrupt, error.InvalidArgument => {
                 debug_trace.logf("session", "event=sessions_v2_moved_map_unreadable session={s} err={s}", .{ self.id(), @errorName(err) });
                 return;
@@ -1934,7 +1935,7 @@ pub const Session = struct {
         }
     }
 
-    /// Reads the compactor's records map (D50), once, as `loadMovedMap` reads
+    /// Reads the compactor's records map, once, as `loadMovedMap` reads
     /// the move's.
     fn loadRecords(self: *Session) !void {
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
@@ -1945,7 +1946,7 @@ pub const Session = struct {
         const value = std.json.parseFromSliceLeaky(Value, sa, raw, .{ .ignore_unknown_fields = true }) catch return error.InvalidSessionFormat;
         const bytes = self.store.manager.getBlob(sa, self.id(), value.map) catch |err| switch (err) {
             // A lost or damaged map damages the session, as a lost blob
-            // does (D39); its records read as gone.
+            // does; its records read as gone.
             error.NotFound, error.Corrupt, error.InvalidArgument => {
                 debug_trace.logf("session", "event=sessions_v2_records_map_unreadable session={s} err={s}", .{ self.id(), @errorName(err) });
                 return;
@@ -1966,12 +1967,12 @@ pub const Session = struct {
     }
 };
 
-/// The side-folder layouts an older session kept its bodies in (D47); the
+/// The side-folder layouts an older session kept its bodies in; the
 /// first three are `movedFolder`'s, and `images` holds prompt images.
 const moved_body_folders = [_][]const u8{ "tool-results", "logs/commands", "artifacts/web-fetch", "images" };
 /// The side files an ACP client's settings came from, as `acp`'s
 /// `client_instructions.file_name` and `tool_call_identities.file_name`
-/// name them under the `client` folder (D46).
+/// name them under the `client` folder.
 pub const moved_client_prompt_file = "client/system-prompt.txt";
 pub const moved_tool_identities_file = "client/mcp-tool-identities.json";
 const moved_client_prompt_max = 64 * 1024;
@@ -2006,7 +2007,7 @@ const Source = struct {
     store: *Store,
     id: []const u8,
     handle: ?sm.Session = null,
-    /// An open session's blobs, for a moved session's old names (D47).
+    /// An open session's blobs, for a moved session's old names.
     host: ?*BlobHost = null,
     /// Where that session kept its side files before the move.
     files_path: ?[]const u8 = null,
@@ -2035,8 +2036,8 @@ const Source = struct {
     }
 
     /// `user` with the bytes of each image an older session kept in its side
-    /// folder (D47), from its blob: inside the turn, as a v2 session keeps
-    /// images now (D44). Other images are unchanged; an unreadable one keeps
+    /// folder, from its blob: inside the turn, as a v2 session keeps
+    /// images now. Other images are unchanged; an unreadable one keeps
     /// its old path, as a lost snapshot does.
     fn withMovedImages(src: Source, pa: Allocator, user: session_event.ConversationUser) !session_event.ConversationUser {
         const host = src.host orelse return user;
@@ -2060,7 +2061,7 @@ const Source = struct {
     }
 
     /// A piece's bytes, from its blob when the line holds a reference. The
-    /// item may list more blobs, the stores' bodies (D44); the reference is
+    /// item may list more blobs, the stores' bodies; the reference is
     /// the one its data names.
     fn pieceData(src: Source, pa: Allocator, piece: sm.Body.Piece) ![]const u8 {
         const hash = blobRefOf(piece.data) orelse return piece.data;
@@ -2070,7 +2071,7 @@ const Source = struct {
         if (!listed) return piece.data;
         return src.store.manager.getBlob(pa, src.id, hash) catch |err| switch (err) {
             // A blob the log names that is gone or damaged damages the
-            // session, as a bad line does (D39).
+            // session, as a bad line does.
             error.NotFound, error.Corrupt => {
                 debug_trace.logf("session", "event=sessions_v2_blob_unreadable session={s} err={s}", .{ src.id, @errorName(err) });
                 return error.InvalidSessionFormat;
@@ -2202,7 +2203,7 @@ fn settingsFrom(alloc: Allocator, sa: Allocator, state: sm.State) !Restored {
 }
 
 /// Every turn in the log, oldest first, with each compaction's summary where
-/// its line sits, as v1's archive lists them for `fx session {id}` (D32).
+/// its line sits, as v1's archive lists them for `fx session {id}`.
 /// Pages are freed as they are read. Caller owns the result.
 fn detailHistory(src: Source, alloc: Allocator) ![]types.HistoryTurn {
     var history: std.ArrayList(types.HistoryTurn) = .empty;
@@ -2234,7 +2235,7 @@ const RestoreSink = struct {
 
 /// Keeps every turn and each compaction's summary where its line sits,
 /// counted as v1's archive counts them: the turns before the summary, and
-/// its place among the compactions (D32).
+/// its place among the compactions.
 const DetailSink = struct {
     alloc: Allocator,
     history: *std.ArrayList(types.HistoryTurn),
@@ -2354,13 +2355,13 @@ noinline fn replay(
     var piece_arena = std.heap.ArenaAllocator.init(alloc);
     defer piece_arena.deinit();
     // The open turn's calls saved as running, and the call ids its pieces
-    // already answer or hold (D28).
+    // already answer or hold.
     var turn_arena = std.heap.ArenaAllocator.init(alloc);
     defer turn_arena.deinit();
     var running: std.ArrayList(session_event.ConversationToolCall) = .empty;
     var represented: std.ArrayList([]const u8) = .empty;
     // The text of the message whose calls are running, until a finished
-    // step's own assistant piece supersedes it (D51).
+    // step's own assistant piece supersedes it.
     var running_text: ?[]const u8 = null;
     var from = start;
     while (true) {
@@ -2478,9 +2479,9 @@ fn withoutCreatedAt(a: Allocator, bytes: []const u8) ![]u8 {
 }
 
 /// Gives each call that was saved as running but that `represented` does not
-/// name a failed result saying it may have partly run (D28), as one more
+/// name a failed result saying it may have partly run, as one more
 /// step of `turn`, so every call keeps its result. That step keeps `text`,
-/// the text of the message that issued them (D51). Returns how many.
+/// the text of the message that issued them. Returns how many.
 fn answerRunning(
     alloc: Allocator,
     turn: *types.InterruptedHistoryTurn,
@@ -2558,7 +2559,7 @@ fn historyToolCall(call: session_event.ConversationToolCall) types.ToolCall {
 const list_page_size: usize = 256;
 
 /// Every saved root session, newest first, as v1's picker summaries, leaving
-/// out `active_id`. A saved session always has a turn (D2), so each one can
+/// out `active_id`. A saved session always has a turn, so each one can
 /// be resumed. Stops with `error.Cancelled` once `cancel` is set. Caller
 /// owns the list and every summary; safe from any thread.
 pub fn listSummaries(
@@ -2617,7 +2618,7 @@ fn summaryOf(alloc: Allocator, scratch: Allocator, item: sm.Summary) !session_st
 /// v1's error names for a failed resume, so every host reports the same
 /// error whichever backend is on.
 /// Whether a failed write may still have reached the log: after any I/O
-/// fault, whatever its cause, durability is unknown (D29).
+/// fault, whatever its cause, durability is unknown.
 pub fn writeMayHaveLanded(err: anyerror) bool {
     inline for (comptime @typeInfo(sm.IoFault).error_set.error_names.?) |fault_name| {
         if (err == @field(sm.IoFault, fault_name)) return true;
@@ -2646,9 +2647,9 @@ fn resumeError(err: sm.OpenError, target: Target) ResumeError {
 /// Item type of a turn closed because its streamed pieces did not match
 /// the final turn; resume drops that turn.
 const superseded_type = "superseded";
-/// A tool call saved before it runs (D28); its data is a `tool_call` piece.
+/// A tool call saved before it runs; its data is a `tool_call` piece.
 const running_type = "tool_running";
-/// The text of the message whose calls are running (D51).
+/// The text of the message whose calls are running.
 const running_assistant_type = "assistant_running";
 /// What the model reads for a call that was running when its turn ended.
 pub const unfinished_tool_output = "fx stopped while this tool was running, so it may have partly run. Check its effects before running it again.";
@@ -2731,7 +2732,7 @@ const ListedBatch = struct {
 
 /// `events` with every pending blob on its first item, in `a`; unchanged
 /// when it has no item or nothing is pending. Only the move lists blobs on a
-/// setting (D47).
+/// setting.
 fn listPending(a: Allocator, events: []const sm.Event, pending: []const BlobHost.Hash) !ListedBatch {
     if (pending.len == 0) return .{ .events = events, .listed = false };
     const at = for (events, 0..) |event, index| {
@@ -2783,7 +2784,7 @@ fn decodePiece(arena: Allocator, kind: PieceKind, data: []const u8, allocate: st
 
 /// A user piece as v2 writes it: `session_event.ConversationUser` field for
 /// field, so a prompt without inline images encodes as v1's does. An
-/// image's inline bytes, which a v2 session keeps inside the turn (D44),
+/// image's inline bytes, which a v2 session keeps inside the turn,
 /// are base64 text, since a JSON string cannot hold raw bytes.
 const WireUser = struct {
     text: []const u8,
@@ -2874,7 +2875,7 @@ fn jsonString(alloc: Allocator, value: []const u8) ![]u8 {
 
 /// v1's shape, which `session_codec.parse_preferences` reads back: effort
 /// as its label, the provider in its saved form.
-/// A child's `prefs` also hold its instructions under this key (D34).
+/// A child's `prefs` also hold its instructions under this key.
 const instructions_key = "instructions";
 
 fn encodePreferences(alloc: Allocator, preferences: session_codec.DurableSessionPreferences, instructions: ?[]const u8) ![]u8 {
@@ -3857,7 +3858,7 @@ test "a failed resume reports v1's error names" {
     try testing.expectEqual(error.InvalidSessionFormat, resumeError(error.Corrupt, .last));
     try testing.expectEqual(error.UnsupportedSessionFormat, resumeError(error.UnsupportedVersion, .last));
     try testing.expectEqual(error.Io, resumeError(error.Io, .last));
-    // An OS cause reaches the user as itself (D29).
+    // An OS cause reaches the user as itself.
     try testing.expectEqual(error.NoSpaceLeft, resumeError(error.NoSpaceLeft, .last));
     try testing.expectEqual(error.ReadOnlyFileSystem, resumeError(error.ReadOnlyFileSystem, .{ .id = "AAAAAAAAAAAA" }));
 }
@@ -3899,7 +3900,7 @@ test "the picker lists saved root sessions newest first, without the open one" {
     const first_id = try testing.allocator.dupe(u8, first.id());
     defer testing.allocator.free(first_id);
     first.close();
-    // A session with no turn is not saved, so it is never listed (D2).
+    // A session with no turn is not saved, so it is never listed.
     const empty = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
     empty.close();
     io_mod.sleep(2 * std.time.ns_per_ms);
@@ -4033,7 +4034,7 @@ test "a v2 session keeps its bodies as blobs its items list, and never makes a s
         try testing.expect(std.mem.find(u8, page, "kept as a blob") != null);
     }
 
-    // Because an item lists it, a lost body damages the session (D39).
+    // Because an item lists it, a lost body damages the session.
     const blob_path = try t.store.manager.blobPath(testing.allocator, id, hash);
     defer testing.allocator.free(blob_path);
     try std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), blob_path);
@@ -4170,7 +4171,7 @@ test "a resume makes a hand-made ~/.fx private instead of refusing the session" 
     try testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
 }
 
-/// The side folder an older v2 session kept (D27), with one body of each
+/// The side folder an older v2 session kept, with one body of each
 /// kind the move carries, the client's settings, and terminal state.
 const OldSideFolder = struct {
     const result_handle = "result-shell-0011223344556677-8899aabbccddeeff.txt";
@@ -4257,7 +4258,7 @@ test "an older session moves off its side folder on its first writable open, and
     replay_file.close(io_mod.getIo());
     try testing.expectError(error.BlobNotFound, capability.readBlob(testing.allocator, .tool_results, "result-shell-0-0.txt", 1024));
     // The compactor still lists and reads its old record, until a newer one
-    // of the same name replaces it (D50).
+    // of the same name replaces it.
     {
         var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena_state.deinit();

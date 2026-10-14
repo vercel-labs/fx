@@ -298,7 +298,7 @@ const AcpContext = struct {
     /// before its server reconnects. A failure costs only replay detail.
     fn rememberToolIdentity(self: *AcpContext, name: []const u8, identity: mcp_runtime.McpRuntime.ToolIdentity) void {
         const session = if (self.state.active_session) |*active| active else return;
-        // A v2 session keeps the record as a setting (D46).
+        // A v2 session keeps the record as a setting.
         const target: tool_call_identities.Target = if (session.v2) |v2| .{ .v2 = v2 } else blk: {
             const writable = if (session.writable) |*value| value else break :blk .none;
             const capability = writable.childCapability() catch |err| {
@@ -870,7 +870,7 @@ pub fn handlePrompt(
             var temporary_snapshot_dir: ?[]u8 = null;
             defer if (temporary_snapshot_dir) |path| alloc.free(path);
             // A v2 session captures into a temporary folder, then keeps the
-            // bytes inside the turn (D44).
+            // bytes inside the turn.
             const snapshot_dir = try session_store.imageSnapshotStorageDir(
                 alloc,
                 if (session.v2 != null) null else if (session.store) |store| store.sessions_dir else null,

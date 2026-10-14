@@ -1,17 +1,17 @@
-//! L2 pure core: lines in, state out.
+//! The session's pure core: lines in, state out.
 //!
 //! No I/O, no clock, no hidden allocation: every function takes its inputs
 //! and returns or updates a value it owns. `plan` decides what a batch may
 //! write; `apply` folds a written line into the state; `encodeState` and
 //! `decodeState` turn the state into a snapshot and back. Resuming from the
-//! newest snapshot must equal a full fold (`tla/ResumeSnapshot.tla`).
+//! newest snapshot must equal a full fold.
 
 const std = @import("std");
 const schema = @import("schema.zig");
 
 pub const Interruption = struct { turn: u64, reason: schema.Reason };
 
-/// One child spawned in this session (D22). Owns its slices.
+/// One child spawned in this session. Owns its slices.
 pub const Child = struct {
     id: []u8,
     /// The child's newest work item.
@@ -75,7 +75,7 @@ pub const State = struct {
     tool_identities: ?[]u8 = null,
     moved_files: ?[]u8 = null,
     compaction_records: ?[]u8 = null,
-    /// Every child spawned in this session, in first-spawn order (D22).
+    /// Every child spawned in this session, in first-spawn order.
     children: std.ArrayList(Child) = .empty,
     last_compaction_seq: ?u64 = null,
     /// Byte offset of the newest `compacted` line. fx's `data` there may
@@ -85,7 +85,7 @@ pub const State = struct {
     clean_exit: bool = false,
     last_seq: u64 = 0,
     /// `ts` of line 1 and of the newest line; 0 before the first turn
-    /// (D20). The session fills both in the copies it hands out, from the
+    ///. The session fills both in the copies it hands out, from the
     /// log it reads and writes; the fold and snapshots leave them alone.
     created_ms: u64 = 0,
     updated_ms: u64 = 0,
@@ -99,7 +99,7 @@ pub const State = struct {
         state.* = undefined;
     }
 
-    /// Forgets every child: a fork owns none of its source's (D5).
+    /// Forgets every child: a fork owns none of its source's.
     pub fn clearChildren(state: *State, gpa: std.mem.Allocator) void {
         for (state.children.items) |child| child.deinit(gpa);
         state.children.clearRetainingCapacity();
@@ -272,7 +272,7 @@ pub const Event = union(enum) {
 
 /// One completed piece of a turn: fx's data, and the blobs it refers to.
 pub const Piece = struct {
-    /// fx's name for the piece, such as `steering` or `tool_result` (D17).
+    /// fx's name for the piece, such as `steering` or `tool_result`.
     type: []const u8,
     data: []const u8,
     blobs: []const []const u8 = &.{},
@@ -313,8 +313,8 @@ pub fn plan(state: *const State, events: []const Event, out: []schema.Body) Tran
                 break :blk .{ .turn_interrupted = .{ .turn = turn, .reason = reason } };
             },
             .set => |s| .{ .set = s },
-            // One unfinished work item per child (`tla/Subagents.tla`
-            // OneOpenWork); a finish names exactly that one.
+            // One unfinished work item per child; a finish names exactly
+            // that one.
             .child_spawned => |c| blk: {
                 if (openWorkAt(state, events[0..i], c.child) != null) return error.InvalidTransition;
                 break :blk .{ .child_spawned = c };
@@ -509,7 +509,8 @@ fn randomEvent(random: std.Random) Event {
     };
 }
 
-/// `TurnLifecycle.tla` `Valid(l, k)` for one event, from the spec's view.
+/// Whether the turn lifecycle allows `event` when a turn is or is not
+/// open; null for events the lifecycle does not constrain.
 fn specValid(open: bool, event: Event) ?bool {
     return switch (event) {
         .turn_started => !open,

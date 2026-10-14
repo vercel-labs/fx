@@ -1,4 +1,5 @@
-//! Test-only fault injection for L0, compiled only with `-Dhooks=true`.
+//! Test-only fault injection for `storage.zig`, compiled only with the
+//! `hooks` build option.
 //!
 //! It models what the kernel and the disk may do when things go wrong:
 //! - an injected short or failed write, and a failed sync;
@@ -10,7 +11,7 @@
 //!   be undone.
 //!
 //! This is the guarantee a plain `fsync` gives on an OS crash, or a power cut
-//! on Linux (D3). `restart` revives the process after a `kill`; `reboot`
+//! on Linux. `restart` revives the process after a `kill`; `reboot`
 //! brings the machine back after a `powerLoss`.
 
 const std = @import("std");
@@ -28,7 +29,7 @@ pub const Fault = struct {
     /// One-shot: the next sync fails, so durability is unknown.
     fail_next_sync: bool = false,
     /// What a planned write failure or a failed sync reports: `Io` unless
-    /// a test names an OS cause (D29).
+    /// a test names an OS cause.
     fail_error: storage.Error = error.Io,
     /// Written files, keyed by inode, each with a private duplicate handle so
     /// a power loss can cut it after its owner has closed or renamed it.
@@ -41,7 +42,7 @@ pub const Fault = struct {
     /// links, cuts, deletes).
     steps: u64 = 0,
     /// A real `kill -9`: the process sends itself SIGKILL just before this
-    /// mutating call (counting from 1). The driver's crash matrix sets it.
+    /// mutating call (counting from 1). Crash tests set it.
     kill_at_step: ?u64 = null,
     /// A machine crash just before this mutating call: unsynced bytes and
     /// names are dropped, and this call and every later one fail.
@@ -334,7 +335,7 @@ fn join(gpa: std.mem.Allocator, parent: []const u8, name: []const u8) storage.Er
 }
 
 /// Silent damage: flips one bit of a file without the fault layer noticing.
-/// A read-only blob (D49) is made writable for the flip and then restored.
+/// A read-only blob is made writable for the flip and then restored.
 pub fn flipBit(io: Io, dir: storage.Dir, name: []const u8, offset: u64, bit: u3) !void {
     const before = try dir.handle.statFile(io, name, .{ .follow_symlinks = false });
     const read_only = before.permissions.toMode() & 0o200 == 0;

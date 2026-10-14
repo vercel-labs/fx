@@ -1620,21 +1620,7 @@ pub const Store = struct {
         alloc: Allocator,
         workspace_root: []const u8,
     ) !session_codec.DurableSessionPreferences {
-        var detailed = try config_runtime.loadMergedSettingsDetailedFromHome(
-            alloc,
-            self.home_dir,
-            workspace_root,
-        );
-        defer detailed.deinit(alloc);
-        return .{
-            .model = try alloc.dupe(
-                u8,
-                detailed.settings.models.get(.gateway) orelse "anthropic/claude-opus-4.7",
-            ),
-            .effort = detailed.settings.effort orelse .auto,
-            .fast_mode = detailed.settings.fast_mode orelse false,
-            .ultrafast_mode = detailed.settings.ultrafast_mode orelse false,
-        };
+        return migration.settingsPreferences(alloc, self.home_dir, workspace_root);
     }
 
     fn attachWritableChildCapability(
@@ -8105,12 +8091,12 @@ test "malformed settings do not block legacy detail or migration" {
     var loaded = try ctx.store.loadReadOnly(alloc, "legacy-with-bad-settings");
     defer loaded.deinit(alloc);
     try std.testing.expectEqualStrings("legacy-with-bad-settings", loaded.id);
-    try std.testing.expectEqualStrings("anthropic/claude-opus-4.7", loaded.preferences.model);
+    try std.testing.expectEqualStrings(model_provider.gateway_default_model, loaded.preferences.model);
 
     var resumed = try ctx.store.resumeForWrite(alloc, "legacy-with-bad-settings");
     defer resumed.deinit(alloc);
     try std.testing.expectEqualStrings("legacy-with-bad-settings", resumed.state.id);
-    try std.testing.expectEqualStrings("anthropic/claude-opus-4.7", resumed.state.preferences.model);
+    try std.testing.expectEqualStrings(model_provider.gateway_default_model, resumed.state.preferences.model);
 }
 
 test "explicit conversation resume rebinds workspace" {

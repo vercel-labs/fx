@@ -230,7 +230,7 @@ pub fn writeTrace(writer: *trace.Writer, instance: []const u8, t: *const Table, 
         .to = "",
         .data = &.{
             .{ .name = "ignored", .value = .{ .boolean = out.ignored } },
-            // TLC's integers are 32-bit; elicitations stay far below.
+            // Trace integers are 32-bit; elicitations stay far below.
             .{ .name = "n", .value = .{ .int = @min(out.n, 1 << 30) } },
             .{ .name = "required", .value = .{ .boolean = if (asked) |a| a.origin == .required else false } },
             .{ .name = "url", .value = .{ .boolean = if (asked) |a| a.mode == .url else false } },

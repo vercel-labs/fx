@@ -47,7 +47,7 @@ pub const Kind = union(enum) {
 };
 pub const Phase = enum { idle, running, awaiting_approval, interrupted, finished };
 /// `lost`: the work never reached the child's log before a crash; only a
-/// v2 parent's reopen repair records it (D33).
+/// v2 parent's reopen repair records it.
 pub const Outcome = enum { completed, failed, cancelled, interrupted, lost };
 
 pub const ActiveWork = struct {
@@ -413,7 +413,7 @@ pub const Registry = struct {
 };
 
 /// Where a parent keeps its children: v1's `children.json` beside its
-/// session, or its v2 log (D22). One backend per process.
+/// session, or its v2 log. One backend per process.
 pub const Backend = union(enum) {
     v1: *session_store.Store,
     v2: *V2Children,
@@ -540,7 +540,7 @@ pub const Store = struct {
     }
 };
 
-/// A parent's children in its v2 log (D22). The log is the record, and this
+/// A parent's children in its v2 log. The log is the record, and this
 /// copy is the truth while this process holds the parent, the only one that
 /// can append to it. Loaded on first use; each save appends what changed.
 /// Unfinished work's message and evidence live only here, as v1 drops them
@@ -556,7 +556,7 @@ pub const V2Children = struct {
     state: std.Io.Mutex = .init,
     registry: ?Registry = null,
     /// Settings for children with no log yet, from their admission; taken
-    /// when their work first opens them (D34). Keys and models owned.
+    /// when their work first opens them. Keys and models owned.
     seeds: std.array_hash_map.String(ChildSeed) = .empty,
 
     pub const ChildSeed = struct {
@@ -651,7 +651,7 @@ const FinishData = struct {
 /// Pure: the registry a v2 parent's folded children describe. The
 /// manager's reopen repair has finished every open item, so an open one
 /// here means another writer and is refused. Instructions live in each
-/// child's own `prefs` (D34), read when its work runs.
+/// child's own `prefs`, read when its work runs.
 fn registryFromChildren(alloc: Allocator, parent_id: []const u8, folded: []const session_adapter.Child) !Registry {
     var registry = try Registry.init(alloc, parent_id);
     errdefer registry.deinit(alloc);
@@ -717,7 +717,7 @@ fn childFromFolded(alloc: Allocator, entry: session_adapter.Child) !Child {
     };
 }
 
-/// Pure: the child lines that take the log from `old` to `next` (D22). A
+/// Pure: the child lines that take the log from `old` to `next`. A
 /// change of phase alone writes nothing. For each child a finish comes
 /// before a spawn, so new work on a finished child is one legal batch.
 fn planLines(arena: Allocator, old: Registry, next: Registry) ![]session_adapter.ChildLine {
@@ -781,7 +781,7 @@ fn fxOutcome(outcome: session_adapter.ChildOutcome) Outcome {
     };
 }
 
-/// Only the manager's reopen repair records `lost` (D22).
+/// Only the manager's reopen repair records `lost`.
 fn v2Outcome(outcome: Outcome) !session_adapter.ChildOutcome {
     return switch (outcome) {
         .completed => .ok,
@@ -1499,7 +1499,7 @@ test "a v2 parent's folded children rebuild the registry v1 would hold (D22)" {
     try std.testing.expectEqualStrings("", failed.instructions());
     try std.testing.expectEqual(Phase.idle, failed.phase);
     try std.testing.expectEqualStrings("boom", failed.last_failure.?.view());
-    // A named child lost before its first turn can take new work (D33).
+    // A named child lost before its first turn can take new work.
     const lost = registry.children[2];
     try std.testing.expectEqual(Phase.interrupted, lost.phase);
     try std.testing.expectEqual(Outcome.lost, lost.last_outcome.?);

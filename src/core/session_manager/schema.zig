@@ -94,19 +94,19 @@ fn isKindChar(c: u8) bool {
 
 pub const Role = enum { root, child };
 pub const Host = enum { app, ask, acp, sdk, child };
-/// Hosts end a turn with `cancel` or `failed` (D21); the manager writes
+/// Hosts end a turn with `cancel` or `failed`; the manager writes
 /// `closed` on close and `crash` on reopen.
 pub const Reason = enum { cancel, failed, closed, crash };
-/// How a child's work item ended (D22). Hosts never write `lost`.
+/// How a child's work item ended. Hosts never write `lost`.
 pub const Outcome = enum { ok, failed, cancelled, interrupted, lost };
 /// `language` is the conversation language fx keeps per session, a JSON
-/// string such as `"es"` or `"und-Latn"` (D18); the index lists it.
+/// string such as `"es"` or `"und-Latn"`; the index lists it.
 /// `client_prompt` (a JSON string) and `tool_identities` are an ACP
-/// client's settings (D46). `moved_files` records a session moved off fx's
+/// client's settings. `moved_files` records a session moved off fx's
 /// side folder: its value names the blob that maps old handles to blobs,
-/// and its line lists every moved blob (D47). `compaction_records` names
+/// and its line lists every moved blob. `compaction_records` names
 /// the blob that maps fx's compactor record names to blobs, and its line
-/// lists the map and the records it adds (D50).
+/// lists the map and the records it adds.
 pub const SetKey = enum { prefs, title, permissions, usage, workspace, language, client_prompt, tool_identities, moved_files, compaction_records };
 
 pub const ForkOrigin = struct { id: []const u8, seq: u64 };
@@ -138,7 +138,7 @@ pub const Body = union(Kind) {
     pub const Piece = struct {
         turn: u64,
         /// fx's name for the piece (`steering`, `tool_call`, ...); checked
-        /// by `validItemType`, never interpreted (D17).
+        /// by `validItemType`, never interpreted.
         type: []const u8,
         data: []const u8,
         /// Hashes of the blobs this piece refers to; each exists before the line.
@@ -150,7 +150,7 @@ pub const Body = union(Kind) {
         key: SetKey,
         value: []const u8,
         /// Hashes of the blobs this setting refers to, under the item's
-        /// rule; allowed outside a turn (D47).
+        /// rule; allowed outside a turn.
         blobs: []const []const u8 = &.{},
     };
 
@@ -162,14 +162,14 @@ pub const Body = union(Kind) {
             else => &.{},
         };
     }
-    /// `data` is fx's raw JSON about the child or the work (D22).
+    /// `data` is fx's raw JSON about the child or the work.
     pub const WorkItem = struct { child: []const u8, work_id: []const u8, data: ?[]const u8 = null };
     pub const Finished = struct { child: []const u8, work_id: []const u8, outcome: Outcome, data: ?[]const u8 = null };
     pub const Snapshot = struct { covers_seq: u64, state: []const u8, compaction_offset: ?u64 };
 };
 
 /// Appends the fields of `body`. Strings must be valid UTF-8 and raw values
-/// valid JSON; L4 checks both before anything reaches here.
+/// valid JSON; `api.zig` checks both before anything reaches here.
 pub fn appendBody(gpa: std.mem.Allocator, out: *std.ArrayList(u8), body: Body) error{OutOfMemory}!void {
     var w: FieldWriter = .{ .gpa = gpa, .out = out };
     switch (body) {
@@ -582,7 +582,7 @@ pub const new_id_len = 12;
 /// Length of a blob name: a SHA-256 hash in lowercase hex.
 pub const blob_hash_len = 64;
 
-/// Pure: an item type is 1 to 32 of `a-z`, `0-9` and `_` (D17). The name is
+/// Pure: an item type is 1 to 32 of `a-z`, `0-9` and `_`. The name is
 /// fx's; the manager checks only its form.
 pub fn validItemType(name: []const u8) bool {
     if (name.len == 0 or name.len > max_item_type_len) return false;

@@ -57,8 +57,8 @@ for direct requests; it does not save or send that key to the proxy.
 
 Before making the demo public, configure a Vercel Firewall rule that rate-limits
 `POST /api/*` by IP. The hosted examples use 10 requests per minute per project.
-The shared transport restricts generation to GPT-4.1 nano, 512 output tokens, a
-32 KiB request body, and a 30-second timeout. The key budget is the shared spend
+The shared transport restricts generation to the model in `shared/model.mjs`,
+512 output tokens, a 32 KiB request body, and a 30-second timeout. The key budget is the shared spend
 boundary; the last in-flight requests may finish after it is reached.
 
 These guards protect anonymous demos. Replace them with your app's authentication

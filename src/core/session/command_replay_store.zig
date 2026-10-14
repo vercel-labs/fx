@@ -61,7 +61,7 @@ fn decodeFrameHeader(header: []const u8) !DecodedFrameHeader {
 const ReplayFile = union(enum) {
     saved: session_child_store.ManagedFile,
     ephemeral: std.Io.File,
-    /// A v2 session's kept replay: its blob's read-only file (D44, D49).
+    /// A v2 session's kept replay: its blob's read-only file.
     blob: std.Io.File,
 
     fn deinit(self: *ReplayFile) void {
@@ -236,7 +236,7 @@ fn createUnlinkedFile(alloc: Allocator, temp_dir: []const u8, stem: []const u8) 
 }
 
 /// Where a v2 session's capture spools while its command runs: outside the
-/// session, as the ephemeral store's spools are (D44).
+/// session, as the ephemeral store's spools are.
 const blob_spool_dir = "/tmp";
 
 fn duplicateFile(file: std.Io.File) !std.Io.File {
@@ -255,7 +255,7 @@ const ReplayBacking = union(enum) {
     saved: *session_child_store.SessionChildCapability,
     ephemeral: *EphemeralStore,
     /// A v2 session: the capture spools to an unlinked temporary file and
-    /// becomes the session's blob when kept (D44).
+    /// becomes the session's blob when kept.
     blobs: *session_child_store.SessionChildCapability,
 
     fn of(capability: *session_child_store.SessionChildCapability) ReplayBacking {
@@ -264,7 +264,7 @@ const ReplayBacking = union(enum) {
 };
 
 /// A v2 session's replay handle: `fx-command-replay-`, the name of its
-/// blob, and `.bin` (D44). Caller owns.
+/// blob, and `.bin`. Caller owns.
 fn blobReplayHandle(alloc: Allocator, hash: session_child_store.Blobs.Hash) ![]u8 {
     return std.mem.concat(alloc, u8, &.{ "fx-command-replay-", &hash, ".bin" });
 }
@@ -1049,7 +1049,7 @@ pub const Reader = struct {
     ) !void {
         if (!hasContentDigest(handle)) return error.ResultHandleNotFound;
         // Every store's blobs share the session, found by hash alone, so a
-        // v2 replay is only a replay handle; a web-fetch `.bin` is not (D44).
+        // v2 replay is only a replay handle; a web-fetch `.bin` is not.
         if (capability.holdsBlobs() and !isReplayHandle(handle)) return error.ResultHandleNotFound;
         var file = if (capability.holdsBlobs()) ReplayFile{ .blob = capability.openBlobFile(
             alloc,

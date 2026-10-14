@@ -4,11 +4,12 @@ const image_attachments = @import("../../images/image_attachments.zig");
 const types = @import("../../shared/types.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const runtime_gateway_step = @import("gateway_step.zig");
+const model_provider = @import("../../config/model_provider.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
 
-const model = "google/gemini-2.5-flash";
+const model = model_provider.gateway_vision_model;
 
 pub const Request = struct {
     stream_provider: agent_stream_provider.Provider,

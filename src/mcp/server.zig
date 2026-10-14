@@ -1890,7 +1890,6 @@ pub const Server = struct {
 };
 
 test {
-    // Behavior is tested by the conformance suite and the Bun driver, which
-    // run cli/conformance.zig on this; this makes sure everything compiles.
+    // Makes sure every declaration compiles.
     std.testing.refAllDecls(Server);
 }

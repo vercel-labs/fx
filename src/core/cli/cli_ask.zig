@@ -620,7 +620,7 @@ const AskContext = struct {
     /// Sessions v2: set instead of `store` and `writable`, never both.
     v2_store: ?session_adapter.Store = null,
     v2: ?*session_adapter.Session = null,
-    /// The v2 parent's children (D22), borrowed by `subagent_host`.
+    /// The v2 parent's children, borrowed by `subagent_host`.
     v2_children: ?*subagent_child_state.V2Children = null,
     /// A resumed v2 session's preferences; `model` borrows from here.
     v2_preferences: ?session_codec.DurableSessionPreferences = null,
@@ -881,7 +881,7 @@ const AskContext = struct {
 
     fn imageSnapshotStorageDir(self: *AskContext) ![]u8 {
         // A v2 session captures into the process's temporary folder, then
-        // keeps the bytes inside the turn (D44).
+        // keeps the bytes inside the turn.
         const sessions_dir = if (self.v2 != null) null else if (self.store) |*store| store.sessions_dir else null;
         const session_id = if (self.v2 != null) null else self.activeSessionId();
         return session_store.imageSnapshotStorageDir(
@@ -1113,7 +1113,7 @@ const AskContext = struct {
         try self.startV2SubagentHost(v2);
     }
 
-    /// Subagents on v2 keep their state in the parent's log (D22). A host
+    /// Subagents on v2 keep their state in the parent's log. A host
     /// that cannot start leaves them off and says why in the trace, as v1.
     fn startV2SubagentHost(self: *AskContext, v2: *session_adapter.Session) !void {
         const children = try self.alloc.create(subagent_child_state.V2Children);

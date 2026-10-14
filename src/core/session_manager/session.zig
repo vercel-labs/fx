@@ -1,12 +1,12 @@
-//! L2: one session and its lifecycle.
+//! One session and its lifecycle.
 //!
 //! - `openNew` touches nothing on disk. `set` lines are held in memory until
-//!   the first `turn_started`, which publishes the session (D2).
+//!   the first `turn_started`, which publishes the session.
 //! - `append` assigns seq and ts under the Session mutex, checks the batch
 //!   with the pure rules in fold.zig, writes it with one call, and syncs
-//!   after the unlock when the batch holds a durable-class event (D3).
+//!   after the unlock when the batch holds a durable-class event.
 //! - `openResume` takes the flock, cuts a torn tail, folds from the newest
-//!   snapshot, and repairs what a crash left open (D1).
+//!   snapshot, and repairs what a crash left open.
 //! - `close` interrupts an open turn, appends `closed`, syncs, unlocks.
 //! - `readPage` reads any session without a lock.
 //!
@@ -25,8 +25,8 @@ const trace = if (storage.hooks) @import("trace.zig") else struct {};
 const hooks = storage.hooks;
 const Log = log_mod.Log;
 
-/// D7, tuned by `zig build bench`: at 10K turns resume takes 1.2 ms at
-/// 256 KB and 0.4 ms at 64 KB. Smaller distances gain little and cost more
+/// Measured at 10K turns, resume takes 1.2 ms at 256 KB and 0.4 ms at
+/// 64 KB. Smaller distances gain little and cost more
 /// log bytes when the folded state (settings, children) is large.
 pub const default_snapshot_every_bytes: u64 = 64 << 10;
 
@@ -34,13 +34,14 @@ pub const Options = struct {
     /// How long `openResume` retries a held flock before Busy.
     lock_wait_ms: u64 = 2000,
     /// A snapshot follows once this many bytes were appended since the last
-    /// one (D7). A `compacted` line always gets one.
+    /// one. A `compacted` line always gets one.
     snapshot_every_bytes: u64 = default_snapshot_every_bytes,
     /// The index is rewritten with one line per id past this size.
     index_compact_bytes: u64 = 1 << 20,
 };
 
-/// What every Session of one manager shares. Owned by L4; outlives them.
+/// What every Session of one manager shares. Owned by the `Manager` in
+/// `api.zig`; outlives them.
 pub const Env = struct {
     /// Thread-safe when Sessions are used from several threads.
     gpa: std.mem.Allocator,
@@ -52,7 +53,7 @@ pub const Env = struct {
     catalog_observer: if (hooks) ?CatalogObserver else void = if (hooks) null else {},
     planted: if (hooks) trace.Planted else void = if (hooks) .none else {},
 
-    /// Hooks only: reports a catalog-level step (`tla/Catalog.tla`).
+    /// Hooks only: reports a catalog-level step.
     pub fn observeCatalog(env: *const Env, id: []const u8, what: CatalogStep) void {
         if (hooks) {
             const observer = env.catalog_observer orelse return;
@@ -69,7 +70,7 @@ pub const Env = struct {
     }
 };
 
-/// Hooks only: what the Session just did, for the spec tracers in tests.
+/// Hooks only: what the Session just did, for the tracers in tests.
 pub const Observed = union(enum) {
     opened_new,
     made_tmp,
@@ -209,13 +210,13 @@ pub const Session = struct {
     /// Under `mutex`.
     state: fold.State = .{},
     phase: Phase,
-    /// Import only (D8): keep the original timestamp of each event.
+    /// Import only: keep the original timestamp of each event.
     import_ts: ?u64 = null,
     /// `ts` of line 1: set by an import, else by the first publish or fork,
     /// or read back on resume.
     created_ms: ?u64 = null,
     /// `ts` of the newest line, never before `created_ms`; 0 until the
-    /// first write (D20). Under `mutex`.
+    /// first write. Under `mutex`.
     updated_ms: u64 = 0,
 
     // Scratch and held lines, under `mutex`.
@@ -235,7 +236,7 @@ pub const Session = struct {
     /// A sync that failed outside `mutex`, as a `FaultCode`; `none` until then.
     sync_fault: std.atomic.Value(u8) = .init(@backingInt(FaultCode.none)),
     /// Under `mutex`: the cause of the write or sync that failed the
-    /// session. Every later call reports it (D40).
+    /// session. Every later call reports it.
     fault: ?storage.IoFault = null,
 
     pub fn id(session: *const Session) []const u8 {
@@ -243,7 +244,7 @@ pub const Session = struct {
     }
 
     /// Whether appending `events` leaves this session held in memory, so it
-    /// needs no disk, not even the root folder (D2). A publishing thread
+    /// needs no disk, not even the root folder. A publishing thread
     /// always opens the root first, so a stale answer is harmless.
     pub fn staysHeld(session: *Session, events: []const fold.Event) bool {
         const io = session.env.s.io;
@@ -404,10 +405,10 @@ pub const Session = struct {
 
     /// The first turn: stage the session in `.tmp/{id}`, make line 1
     /// durable, then rename it into place and sync the root, so a visible
-    /// session always has a durable first line (`tla/Lifecycle.tla`).
+    /// session always has a durable first line.
     fn publish(session: *Session, bodies: []const schema.Body, ts: u64) AppendError!void {
         session.writeFirstTurn(bodies, ts) catch |err| {
-            // Nothing is visible; later calls name the cause (D40).
+            // Nothing is visible; later calls name the cause.
             session.phase = .{ .failed = null };
             if (session.fault == null) session.fault = asIoFault(err);
             return err;
@@ -456,7 +457,7 @@ pub const Session = struct {
     /// the lines framed in `session.batch`, blobs linked from a fork's
     /// source, a synced log, the lock, a synced folder, the rename into
     /// place, and a synced root. Only then is the session visible, always
-    /// with a durable first line (`tla/Lifecycle.tla`).
+    /// with a durable first line.
     fn stage(session: *Session, source_blobs: ?storage.Dir) AppendError!Live {
         const env = session.env;
         const s = env.s;
@@ -500,7 +501,7 @@ pub const Session = struct {
         return .{ .dir = dir, .log = log, .lock = lock };
     }
 
-    /// Hard-links every blob of a fork's source (D6), copying when a link
+    /// Hard-links every blob of a fork's source, copying when a link
     /// is refused, for example across file systems.
     fn linkBlobs(session: *Session, source: storage.Dir, target: storage.Dir) AppendError!void {
         const s = session.env.s;
@@ -521,7 +522,7 @@ pub const Session = struct {
     }
 
     /// Stores `bytes` as a blob of this session and returns its name, the
-    /// SHA-256 hash (D6). Returns only once the blob and its name are
+    /// SHA-256 hash. Returns only once the blob and its name are
     /// durable: a line referring to it may become durable through any later
     /// fsync, including one another thread starts. Storing the same bytes
     /// again costs one stat.
@@ -532,7 +533,7 @@ pub const Session = struct {
 
     /// As `putBlob`, for the first `len` bytes of `file`, an open file
     /// outside the session such as a command's output spool. They are
-    /// copied in chunks, so the body is never whole in memory (D44).
+    /// copied in chunks, so the body is never whole in memory.
     pub fn putBlobFile(session: *Session, file: std.Io.File, len: u64) AppendError![schema.blob_hash_len]u8 {
         if (len > max_blob_bytes) return error.TooLarge;
         return session.storeBlob(.{ .file = .{ .file = file, .len = len } });
@@ -595,7 +596,7 @@ pub const Session = struct {
     }
 
     /// Every blob an item or a setting refers to must already exist in this
-    /// session (`tla/Fork.tla` `RefsExist`).
+    /// session.
     fn checkBlobRefs(session: *Session, live: *Live, bodies: []const schema.Body) AppendError!void {
         if (!hasBlobRefs(bodies)) return;
         const s = session.env.s;
@@ -974,15 +975,16 @@ fn hasTurnStart(bodies: []const schema.Body) bool {
     return false;
 }
 
-/// Durability points (system-design.md "Durable State And Schema").
+/// Durability points: the lines that must reach the disk before `append`
+/// returns.
 fn needsSync(bodies: []const schema.Body) bool {
     for (bodies) |body| switch (body) {
         .turn_committed, .turn_interrupted, .child_spawned, .child_finished => return true,
-        // Usage is durable before fx clears its usage-recovery marker
-        // (`tla/Wiring.tla` UsageNeverSilent).
-        // fx removes the side folder only once the move is durable (D47).
+        // Usage is durable before fx clears its usage-recovery marker, so
+        // usage is never lost silently.
+        // fx removes the side folder only once the move is durable.
         // Compactor records need no sync of their own: the compaction line
-        // that cites them comes later in the log, which keeps a prefix (D50).
+        // that cites them comes later in the log, which keeps a prefix.
         .set => |s| switch (s.key) {
             .permissions, .usage, .moved_files => return true,
             .prefs, .title, .workspace, .language, .client_prompt, .tool_identities, .compaction_records => {},
@@ -1001,7 +1003,7 @@ pub const NewOptions = struct {
     host: schema.Host,
     parent: ?[]const u8 = null,
     forked_from: ?schema.ForkOrigin = null,
-    /// Import (D8) keeps a v1 id; otherwise a fresh id is drawn.
+    /// Import keeps a v1 id; otherwise a fresh id is drawn.
     id: ?[]const u8 = null,
     /// Import only: the original creation time, stamped on line 1.
     created_ms: ?u64 = null,
@@ -1037,7 +1039,7 @@ pub const ResumeOptions = struct {
     /// Required to resume a child session.
     parent: ?[]const u8 = null,
     /// How long to wait for the flock before Busy; null uses the
-    /// environment's `lock_wait_ms` (D38).
+    /// environment's `lock_wait_ms`.
     lock_wait_ms: ?u64 = null,
 };
 
@@ -1255,7 +1257,7 @@ fn loadFolded(env: *const Env, arena_state: *std.heap.ArenaAllocator, file: stor
         .state = state,
         .snapshot_end = if (snapshot) |snap| snap.end else 0,
         .created_ms = created_ms,
-        // A fork's copied lines keep the source's older times (D20).
+        // A fork's copied lines keep the source's older times.
         .updated_ms = @max(updated_ms, created_ms),
     };
 }
@@ -1268,17 +1270,17 @@ fn mapRead(err: log_mod.ReadError) OpenError {
     };
 }
 
-/// Crash repair at the end of `openResume` (D1, `tla/Subagents.tla`).
+/// Crash repair at the end of `openResume`.
 fn repair(session: *Session, workspace: []const u8) AppendError!void {
     const gpa = session.env.gpa;
     const live = &session.phase.live;
     const ts = session.timestamp();
-    // An open turn from the previous owner is interrupted (D1).
+    // An open turn from the previous owner is interrupted.
     if (session.state.open_turn) |turn| {
         try session.writeBodies(live, &.{.{ .turn_interrupted = .{ .turn = turn, .reason = .crash } }}, ts, .interrupt_repair);
     }
     session.observe(.reopened);
-    // Every unfinished work item gets a known outcome (tla/Subagents.tla).
+    // Every unfinished work item gets a known outcome.
     var finished: std.ArrayList(schema.Body) = .empty;
     defer finished.deinit(gpa);
     for (session.state.children.items) |child| {
@@ -1543,7 +1545,7 @@ pub fn readBlob(env: *const Env, gpa: std.mem.Allocator, id_: []const u8, hash: 
 }
 
 /// Whether session `id_` holds a regular blob file named `hash`; its bytes
-/// are not read (D49).
+/// are not read.
 pub fn blobExists(env: *const Env, id_: []const u8, hash: []const u8) (error{NotFound} || storage.IoFault)!void {
     const s = env.s;
     if (!schema.validId(id_) or !schema.validBlobHash(hash)) return error.NotFound;
@@ -1560,7 +1562,7 @@ fn notFoundOr(err: storage.Error) (error{NotFound} || storage.IoFault) {
 }
 
 /// Whether a blob of session `id_` is present and matches its name. A
-/// missing or damaged one damages its session like a bad line (D39).
+/// missing or damaged one damages its session like a bad line.
 fn blobIsWhole(env: *const Env, id_: []const u8, hash: []const u8) (error{OutOfMemory} || storage.IoFault)!bool {
     const bytes = readBlob(env, env.gpa, id_, hash) catch |err| switch (err) {
         error.NotFound, error.Corrupt => return false,
@@ -1573,7 +1575,7 @@ fn blobIsWhole(env: *const Env, id_: []const u8, hash: []const u8) (error{OutOfM
 pub const ForkPoint = union(enum) {
     /// The end of this turn; 0 means before the first turn.
     turn: u64,
-    /// The last turn that ended before any damage (`fx session recover`, D15).
+    /// The last turn that ended before any damage (`fx session recover`).
     last_good,
 };
 
@@ -1587,9 +1589,9 @@ pub const ForkOptions = struct {
 pub const ForkError = OpenError || error{InvalidForkPoint};
 
 /// A new root session whose lines 2..S are the source's, unchanged, where
-/// S ends a turn (D5). The source is read without its lock and never
+/// S ends a turn. The source is read without its lock and never
 /// changed; a damaged source forks up to its last good turn. Every source
-/// blob is hard-linked (D6), so the fork stays whole if the source goes.
+/// blob is hard-linked, so the fork stays whole if the source goes.
 pub fn openFork(env: *const Env, options: ForkOptions) ForkError!*Session {
     const s = env.s;
     const gpa = env.gpa;
@@ -1655,7 +1657,7 @@ const ForkPointFound = struct {
 };
 
 /// Pass 1 of a fork: where S is. Reading stops at the first damage: a bad
-/// line, or a line naming a missing or damaged blob (D39).
+/// line, or a line naming a missing or damaged blob.
 fn findForkPoint(env: *const Env, source: []const u8, src: storage.File, end: u64, at: ForkPoint) ForkError!ForkPointFound {
     const gpa = env.gpa;
     var reader = log_mod.ForwardReader.init(gpa, env.s, src, 0, end, 1);
@@ -1670,7 +1672,7 @@ fn findForkPoint(env: *const Env, source: []const u8, src: storage.File, end: u6
     defer arena.deinit();
     while (true) {
         const line = (reader.next() catch |err| switch (err) {
-            error.Corrupt => break, // the good part ends here (D15)
+            error.Corrupt => break, // the good part ends here
             error.OutOfMemory => return error.OutOfMemory,
             else => |io_err| return storage.ioFault(io_err),
         }) orelse break;
@@ -1765,9 +1767,9 @@ pub fn childrenOf(env: *const Env, id_: []const u8) DeleteError![][]u8 {
     return children.toOwnedSlice(gpa);
 }
 
-/// Step 1 of a delete (`tla/Catalog.tla` `Trash`): Busy if the session is
-/// open anywhere, else it is renamed to `.trash/{id}`, which makes it gone
-/// for everyone at once. The caller then appends the index tombstone and
+/// Step 1 of a delete: Busy if the session is open anywhere, else it is
+/// renamed to `.trash/{id}`, which makes it gone for everyone at once. The
+/// caller then appends the index tombstone and
 /// calls `purgeTrashed`; owned children are deleted first (`childrenOf`),
 /// so a Busy child never leaves an orphan.
 pub fn trashSession(env: *const Env, id_: []const u8) DeleteError!void {
@@ -1855,7 +1857,7 @@ pub const Verified = struct {
     damaged_at: ?u64,
     /// Snapshots whose state differs from the fold at their position.
     bad_snapshots: u64,
-    /// Blobs a line names that are missing or fail their hash (D39).
+    /// Blobs a line names that are missing or fail their hash.
     bad_blobs: u64 = 0,
 };
 
@@ -1952,8 +1954,8 @@ pub fn readSummary(env: *const Env, id_: []const u8) OpenError!Summary {
 }
 
 const session_tests = struct {
-    //! L2 behavior, through the Session only: data-flow.md scenarios 1 to 3 and
-    //! 5 to 11. Runs with and without hooks; fault-only cases skip without.
+    //! Session behavior, through the Session only. Runs with and without
+    //! hooks; fault-only cases skip without.
 
     const session_mod = @import("session.zig");
 
@@ -2032,8 +2034,8 @@ const session_tests = struct {
         s.destroy();
     }
 
-    /// Delete as L3 composes it, minus the index: children first, then trash
-    /// and purge.
+    /// Delete as the catalog composes it, minus the index: children first,
+    /// then trash and purge.
     pub fn deleteWithoutIndex(env: *const session_mod.Env, id: []const u8) session_mod.DeleteError!void {
         const children = try session_mod.childrenOf(env, id);
         defer {
@@ -2431,7 +2433,7 @@ const session_tests = struct {
         t.init(.{});
         defer t.deinit();
 
-        // A full disk on a log write (D29).
+        // A full disk on a log write.
         const s = try newRoot(&t);
         _ = try s.append(&.{ .turn_started, item, .turn_committed });
         const id = try gpa.dupe(u8, s.id());
@@ -2440,7 +2442,7 @@ const session_tests = struct {
         t.fault.next_write = .{ .keep = 0, .then = .fail };
         try testing.expectError(error.NoSpaceLeft, s.append(&.{.turn_started}));
         // Durability is unknown after a failed write, so nothing more is
-        // written; later calls still name the cause (D40).
+        // written; later calls still name the cause.
         try testing.expectError(error.NoSpaceLeft, s.append(&.{.turn_started}));
         try testing.expectError(error.NoSpaceLeft, s.putBlob("after the full disk"));
         try closeAndDestroy(s);
@@ -2468,7 +2470,7 @@ const session_tests = struct {
     }
 
     // ---------------------------------------------------------------------------
-    // Blobs, fork, children, delete (plan checkpoint 4)
+    // Blobs, fork, children, delete
 
     /// `refs` must outlive the event: the caller owns the array.
     fn itemWith(refs: []const []const u8) fold.Event {
@@ -2748,12 +2750,12 @@ test {
 }
 
 const session_model_tests = struct {
-    //! L2 against its four specs: every scenario here writes a trace that
-    //! `zig build traces` checks with TLC, and every spec also gets one planted
-    //! bug whose trace must be rejected.
+    //! The session against its four models: every scenario here writes a
+    //! trace for model checking, and every model also gets one planted bug
+    //! whose trace must be rejected.
     //!
     //! Each tracer is an Observer: the Session notifies what it just did, and
-    //! the tracer names the spec action, reads the disk fields straight from the
+    //! the tracer names the model action, reads the disk fields straight from the
     //! files (never through the session), and writes one trace line.
 
     const session_mod = @import("session.zig");
@@ -3753,7 +3755,7 @@ const session_model_tests = struct {
             const parent = t.parent orelse return out.items;
             const bytes = (try readLog(t.root, parent)) orelse return out.items;
             defer gpa.free(bytes);
-            // A child's work number counts its spawn lines (`tla/Subagents.tla`).
+            // A child's work number counts its spawn lines.
             var works: [2]u64 = .{ 0, 0 };
             for (try diskLines(arena, bytes)) |line| {
                 if (t.horizon) |h| if (line.seq > h) break;

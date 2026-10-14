@@ -1,10 +1,10 @@
 //! The session manager: one append-only log per session, one owner for
 //! session storage and the live-session lifecycle.
 //!
-//! This file (L4) is the only public root; fx imports it and nothing else.
+//! This file is the only public root; fx imports it and nothing else.
 //! A process creates one `Manager` with `init`, which does no disk I/O.
-//! Thirteen operations cover every host (docs/session-manager/system-design.md
-//! "API"), plus `verify` and `rebuild` for doctor:
+//! Thirteen operations cover every host, plus `verify` and `rebuild` for
+//! doctor:
 //!
 //!   openNew  openResume  openFork  openImport        -> Session
 //!   Session.append  Session.putBlob  Session.state  Session.read  Session.close
@@ -58,7 +58,7 @@ pub const max_blob_bytes = session_mod.max_blob_bytes;
 pub const max_value_bytes: usize = log_mod.max_line_bytes - 64 * 1024;
 const max_text_bytes = 4096;
 
-/// An I/O failure with its OS cause when known, `Io` otherwise (D29).
+/// An I/O failure with its OS cause when known, `Io` otherwise.
 pub const IoFault = storage.IoFault;
 pub const OpenError = error{ InvalidArgument, NotFound, Busy, ChildSession, Corrupt, UnsupportedVersion, InvalidForkPoint, Exists, OutOfMemory } || storage.IoFault;
 pub const AppendError = error{ InvalidArgument, InvalidTransition, SessionClosed, TooLarge, OutOfMemory } || storage.IoFault;
@@ -74,15 +74,15 @@ pub const RebuildError = error{ Busy, OutOfMemory } || storage.IoFault;
 pub const Backend = enum { posix };
 
 pub const InitOptions = struct {
-    /// The sessions root, `~/.fx/sessions/v2` in fx (D19); created on first
+    /// The sessions root, `~/.fx/sessions/v2` in fx; created on first
     /// use, with any missing parent folders, all `0700`.
     root: []const u8,
     backend: Backend = .posix,
-    /// Called once for every repair or drop (D14).
+    /// Called once for every repair or drop.
     diagnostics: ?Diagnostics = null,
     /// How long an open waits for a session or index lock before Busy.
     lock_wait_ms: u64 = 2000,
-    /// Snapshot distance (D7).
+    /// Snapshot distance.
     snapshot_every_bytes: u64 = session_mod.default_snapshot_every_bytes,
     /// Index size that triggers a rewrite with one line per id.
     index_compact_bytes: u64 = 1 << 20,
@@ -94,7 +94,7 @@ pub const NewOptions = struct {
     role: Role = .root,
     /// Required for a child session.
     parent: ?[]const u8 = null,
-    /// A child's id, already named in its parent's `child_spawned` (D34); a
+    /// A child's id, already named in its parent's `child_spawned`; a
     /// root always gets a fresh one. A taken id fails the first turn's
     /// append and leaves the existing session as it was.
     id: ?[]const u8 = null,
@@ -116,7 +116,7 @@ pub const ResumeOptions = struct {
     parent: ?[]const u8 = null,
     /// How long this open waits for the session's writer lock before Busy;
     /// null uses the manager's `lock_wait_ms`. A picker passes 0 so a
-    /// session open elsewhere shows as busy at once (D38).
+    /// session open elsewhere shows as busy at once.
     lock_wait_ms: ?u64 = null,
 };
 
@@ -128,7 +128,7 @@ pub const ForkOptions = struct {
 };
 
 pub const ImportOptions = struct {
-    /// The v1 id, kept (D8).
+    /// The v1 id, kept.
     id: []const u8,
     workspace: []const u8,
     host: Host,
@@ -195,7 +195,7 @@ pub const Manager = struct {
         m.gpa.destroy(m);
     }
 
-    /// Test and driver builds only: report internal steps to a tracer, and
+    /// Hook builds only: report internal steps to a tracer, and
     /// optionally plant a known bug the trace check must reject.
     pub fn setTracing(
         m: *Manager,
@@ -208,7 +208,7 @@ pub const Manager = struct {
         }
     }
 
-    /// Test and driver builds only: route storage through a fault injector.
+    /// Hook builds only: route storage through a fault injector.
     pub fn setFault(m: *Manager, fault: if (storage.hooks) *storage.Fault else void) void {
         if (storage.hooks) m.env.s.fault = fault;
     }
@@ -254,7 +254,7 @@ pub const Manager = struct {
     // -- open -----------------------------------------------------------------
 
     /// A new session in memory. Nothing touches the disk until its first
-    /// turn (D2).
+    /// turn.
     pub fn openNew(m: *Manager, options: NewOptions) OpenError!Session {
         try checkText(options.workspace);
         try checkRoleParent(options.role, options.parent);
@@ -309,7 +309,7 @@ pub const Manager = struct {
         };
         const session: Session = .{ .manager = m, .inner = inner };
         // The repair may have moved the workspace or interrupted a turn, so
-        // the whole entry is written, not only the open time (D42).
+        // the whole entry is written, not only the open time.
         session.updateIndexAs(.{ .resumed = options.host });
         return session;
     }
@@ -323,8 +323,8 @@ pub const Manager = struct {
     }
 
     /// A new root session that starts as a copy of `source` up to a turn
-    /// boundary (D5). The source is never changed, and may be damaged
-    /// (`.last_good`, D15).
+    /// boundary. The source is never changed, and may be damaged
+    /// (`.last_good`).
     pub fn openFork(m: *Manager, options: ForkOptions) OpenError!Session {
         try checkId(options.source);
         try checkText(options.workspace);
@@ -343,7 +343,7 @@ pub const Manager = struct {
         return session;
     }
 
-    /// The v1 conversion only (D8): a new session under an existing id,
+    /// The v1 conversion only: a new session under an existing id,
     /// whose batches keep their original times (`Session.appendAt`). Exists
     /// if the id is taken now or was ever deleted.
     pub fn openImport(m: *Manager, options: ImportOptions) OpenError!Session {
@@ -385,7 +385,7 @@ pub const Manager = struct {
 
     /// A blob's bytes, checked against its hash. The caller frees them.
     /// A saved session's state, folded without its lock as the catalog
-    /// reads it: line 1, the newest snapshot, then the tail (D37). A torn
+    /// reads it: line 1, the newest snapshot, then the tail. A torn
     /// tail is left as it is, and a child needs no parent to be read.
     pub fn peek(m: *Manager, gpa: std.mem.Allocator, id: []const u8) OpenError!Peeked {
         try checkId(id);
@@ -414,7 +414,7 @@ pub const Manager = struct {
     }
 
     /// The path of a durable blob of session `id`, for a tool that opens
-    /// files by path, such as a web-fetch download (D49). The file is
+    /// files by path, such as a web-fetch download. The file is
     /// read-only; only `getBlob` checks its bytes. The caller frees it.
     pub fn blobPath(m: *Manager, gpa: std.mem.Allocator, id: []const u8, hash: []const u8) BlobError![]u8 {
         try checkId(id);
@@ -431,9 +431,9 @@ pub const Manager = struct {
     }
 
     /// Deletes a session and the children it owns. Busy if any is open.
-    /// Order per session (`tla/Catalog.tla`): children first, then the
+    /// Order per session: children first, then the
     /// rename to `.trash`, the index tombstone, and the purge. fx removes
-    /// the matching terminal folders (D13).
+    /// the matching terminal folders.
     pub fn delete(m: *Manager, id: []const u8) DeleteError!void {
         try checkId(id);
         if (!try readyToRead(m)) return error.NotFound;
@@ -485,7 +485,7 @@ pub const Session = struct {
     }
 
     /// Appends a batch and returns the seq of its last line. Returns after
-    /// the fsync when the batch holds a durable-class event (D3).
+    /// the fsync when the batch holds a durable-class event.
     pub fn append(s: Session, events: []const Event) AppendError!u64 {
         if (s.import) return error.InvalidArgument;
         return s.appendChecked(events, null);
@@ -500,20 +500,20 @@ pub const Session = struct {
     fn appendChecked(s: Session, events: []const Event, ts_ms: ?u64) AppendError!u64 {
         try checkEvents(s.manager.gpa, events, s.import);
         // The root opens on the first publish at the latest, and an append
-        // that stays held in memory does no disk I/O at all (D2).
+        // that stays held in memory does no disk I/O at all.
         if (!s.inner.staysHeld(events)) try s.manager.ready();
         const result = try s.inner.appendReport(events, ts_ms);
         if (result.published) s.updateIndexAs(.published) else if (result.listing_changed) s.updateIndex();
         return result.last_seq;
     }
 
-    /// Stores a large body and returns its hash, once it is durable (D6).
+    /// Stores a large body and returns its hash, once it is durable.
     pub fn putBlob(s: Session, bytes: []const u8) AppendError!BlobHash {
         return s.inner.putBlob(bytes);
     }
 
     /// As `putBlob`, for the first `len` bytes of an open file outside the
-    /// session, copied in chunks (D44). A file shorter than `len` is `Io`.
+    /// session, copied in chunks. A file shorter than `len` is `Io`.
     pub fn putBlobFile(s: Session, file: std.Io.File, len: u64) AppendError!BlobHash {
         return s.inner.putBlobFile(file, len);
     }
@@ -580,7 +580,7 @@ pub const Session = struct {
             .title = st.title,
             .language = st.language,
             .parent = identity.parent,
-            // The newest line's time, as a rebuild computes it (D20).
+            // The newest line's time, as a rebuild computes it.
             .created_ms = if (st.created_ms != 0) st.created_ms else s.manager.nowMs(),
             .updated_ms = if (st.updated_ms != 0) st.updated_ms else s.manager.nowMs(),
             .turns = st.committed + st.interrupted,
@@ -588,8 +588,8 @@ pub const Session = struct {
     }
 };
 
-/// Test and driver builds only (`-Dhooks=true`): fault injection, the trace
-/// writer and the internals a tracer reads. Empty in the build fx uses.
+/// Builds with the `hooks` option only: fault injection, the trace writer,
+/// and the internals a tracer reads. Empty in the build fx uses.
 pub const hooks = if (storage.hooks) struct {
     pub const Fault = storage.Fault;
     pub const flipBit = @import("storage_fault.zig").flipBit;
@@ -638,7 +638,7 @@ fn checkJsonString(gpa: std.mem.Allocator, raw: []const u8) AppendError!void {
 }
 
 /// A JSON string of 1 to 24 bytes, as v1 stores a conversation language
-/// (D18); any bytes, so every v1 value converts.
+///; any bytes, so every v1 value converts.
 fn checkLanguage(gpa: std.mem.Allocator, raw: []const u8) AppendError!void {
     try checkJsonString(gpa, raw);
     const parsed = std.json.parseFromSlice([]const u8, gpa, raw, .{}) catch return error.InvalidArgument;
@@ -688,7 +688,7 @@ fn checkEvents(gpa: std.mem.Allocator, events: []const Event, import: bool) Appe
     };
 }
 
-/// Folded into every snapshot for each child, so kept small (D22).
+/// Folded into every snapshot for each child, so kept small.
 fn checkChildData(gpa: std.mem.Allocator, raw: []const u8) AppendError!void {
     if (raw.len > max_child_data_bytes) return error.TooLarge;
     try checkJson(gpa, raw);
@@ -708,7 +708,7 @@ test {
     _ = @import("fold.zig");
     _ = @import("session.zig");
     _ = @import("catalog.zig");
-    // Fault injection and traces exist only with -Dhooks=true.
+    // Fault injection and traces exist only with the `hooks` build option.
     if (storage.hooks) {
         _ = @import("storage_fault.zig");
         _ = @import("trace.zig");
@@ -890,7 +890,7 @@ const api_tests = struct {
         defer f.deinit();
         try testing.expectError(error.FileNotFound, f.dir());
         // Held settings and a close before any turn: still nothing, not even the
-        // root folder, so fx starting up does no session I/O (D2).
+        // root folder, so fx starting up does no session I/O.
         const s = try f.manager.openNew(.{ .workspace = "/w", .host = .app });
         _ = try s.append(&.{.{ .set = .{ .key = .title, .value = "\"draft\"" } }});
         s.release();
@@ -1256,7 +1256,7 @@ const api_tests = struct {
         try testing.expectEqual(@as(u64, 2000), page.entries[1].ts_ms);
         try testing.expectEqual(@as(u64, 3000), page.entries[5].ts_ms);
         try testing.expectError(error.Exists, m.openImport(.{ .id = "1786460757753-v1", .workspace = "/w", .host = .app, .created_ms = 1 }));
-        // The list shows the original times, not the time of the conversion (D20).
+        // The list shows the original times, not the time of the conversion.
         var listed = try m.list(gpa, .all, null, 10);
         defer listed.deinit();
         try testing.expectEqual(@as(u64, 1000), listed.items[0].created_ms);
@@ -1541,7 +1541,7 @@ const api_tests = struct {
         const s = try m.openNew(.{ .workspace = "/w", .host = .app });
         const id = try gpa.dupe(u8, s.id());
         defer gpa.free(id);
-        // Held before the first turn, like any setting (D2).
+        // Held before the first turn, like any setting.
         _ = try s.append(&.{.{ .set = .{ .key = .language, .value = "\"es\"" } }});
         _ = try s.append(&.{ .turn_started, piece, .turn_committed });
         try expectListedLanguage(m, "\"es\"");
@@ -1691,7 +1691,7 @@ const api_tests = struct {
             const path = try gpa.print("{s}/blobs/{s}", .{ id, &hash });
             defer gpa.free(path);
             if (overwrite) {
-                // A blob is read-only (D49), so damage replaces the file, as
+                // A blob is read-only, so damage replaces the file, as
                 // an editor that renames over it would.
                 try testing.expectError(error.AccessDenied, root.writeFile(io, .{ .sub_path = path, .data = "x" }));
                 try root.deleteFile(io, path);

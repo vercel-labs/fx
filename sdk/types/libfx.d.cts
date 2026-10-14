@@ -40,7 +40,7 @@ export type FxEffort = "default" | "low" | "medium" | "high" | "xhigh" | (string
 
 /** Model configuration: the model ID and model-specific options. */
 export interface FxModelOptions {
-  /** The model ID, such as `"anthropic/claude-haiku-4.5"`. */
+  /** The model ID, such as `"anthropic/claude-haiku-5.5"`. */
   id: string;
   /** The reasoning effort, for models that advertise effort levels. A named level is validated at creation. */
   effort?: FxEffort;

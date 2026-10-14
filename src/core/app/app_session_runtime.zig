@@ -815,7 +815,7 @@ const SessionPickerLoad = struct {
         }
     };
 
-    /// Where a listing comes from: v1's store, or the v2 store (D26).
+    /// Where a listing comes from: v1's store, or the v2 store.
     const Source = union(enum) {
         v1: *const session_store.Store,
         v2: struct { store: *session_adapter.Store, workspace_root: []const u8 },
@@ -1286,7 +1286,7 @@ pub const Persistence = struct {
     writable: ?session_store.LoadedWritableSession = null,
     remember_fresh_session: bool = false,
     subagent_host: ?*subagent_tool_host.Runtime = null,
-    /// The v2 session's children (D22), borrowed by `subagent_host`.
+    /// The v2 session's children, borrowed by `subagent_host`.
     v2_children: ?*subagent_child_state.V2Children = null,
     workspace_preferences: ?session_codec.DurableSessionPreferences = null,
     session_preferences: ?session_codec.DurableSessionPreferences = null,
@@ -1310,7 +1310,7 @@ pub const Persistence = struct {
     pending_live_session_wait: ?LiveSessionWait = null,
     shutdown_failure: ?anyerror = null,
     /// `--sessions-v2` for this process; with it (or FX_SESSIONS_V2=1) the
-    /// session lives in `v2` and `store` and `writable` stay null (D26).
+    /// session lives in `v2` and `store` and `writable` stay null.
     sessions_v2: bool = false,
     v2_store: ?session_adapter.Store = null,
     v2: ?*session_adapter.Session = null,
@@ -1459,13 +1459,13 @@ pub fn Runtime(comptime App: type) type {
                 attachment,
                 snapshot_dir,
             );
-            // A v2 session keeps the image inside the turn (D44).
+            // A v2 session keeps the image inside the turn.
             if (app.session_persistence.v2 != null) try image_attachments.inlineCapturedSnapshot(app.alloc, attachment);
         }
 
         fn imageSnapshotStorageDir(app: *App) ![]u8 {
             // A v2 session captures into the process's temporary folder,
-            // then keeps the bytes inside the turn (D44).
+            // then keeps the bytes inside the turn.
             const sessions_dir = if (app.session_persistence.v2 != null)
                 null
             else if (app.session_persistence.store) |*store|
@@ -1540,7 +1540,7 @@ pub fn Runtime(comptime App: type) type {
             required: bool,
         ) !void {
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
-            // One backend per process (D26): with v2 on, v1's store stays closed.
+            // One backend per process: with v2 on, v1's store stays closed.
             if (session_adapter.enabled(app.session_persistence.sessions_v2)) {
                 app.session_persistence.v2_store = session_adapter.Store.openFromEnv(app.alloc) catch |err| {
                     if (required) return err;
@@ -1564,7 +1564,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
             if (app.session_persistence.v2) |v2| {
                 if (comptime @hasDecl(@TypeOf(app.session), "configureWebFetchArtifactBlobs")) {
-                    // A v2 session's downloads are its blobs (D44, D49).
+                    // A v2 session's downloads are its blobs.
                     if (v2.childCapability()) |capability| {
                         app.session.configureWebFetchArtifactBlobs(app.alloc, capability, v2.id());
                     } else |err| {
@@ -1649,7 +1649,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// A v2 session starts in memory; its folder appears with the first
-        /// turn (D2), so a launch that never prompts leaves nothing behind.
+        /// turn, so a launch that never prompts leaves nothing behind.
         fn beginFreshV2Session(app: *App, v2_store: *session_adapter.Store) !void {
             const preferences = app.session_persistence.workspace_preferences orelse
                 return error.SessionPreferencesUnavailable;
@@ -2235,7 +2235,7 @@ pub fn Runtime(comptime App: type) type {
             const selected_id = app.session_persistence.session_picker.selectedId() orelse return false;
             if (app.session_persistence.v2_store) |*v2_store| {
                 // A session open in another fx shows as busy at once, as
-                // v1's picker does (D38).
+                // v1's picker does.
                 const v2 = try session_adapter.Session.resumeSessionWithoutWaiting(app.alloc, v2_store, .{ .id = selected_id }, app.workspace_root, .app);
                 var v2_owned = true;
                 errdefer if (v2_owned) v2.close();
@@ -3416,7 +3416,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// `AgentRuntimeDeps.append_turn_piece` on v2: the pieces finished so
-        /// far reach the log before the next request (D12).
+        /// far reach the log before the next request.
         pub fn appendTurnPiece(app: *App, progress: agent_runtime.TurnProgress) !void {
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
@@ -3824,8 +3824,8 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Stops the subagent host, joining its child threads, before the
-        /// session they append to can close (`tla/Wiring.tla`
-        /// ParentOutlivesChildren).
+        /// session they append to can close, so a parent session always
+        /// outlives its children.
         pub fn disableSubagentHost(app: *App) void {
             if (app.session_persistence.subagent_host) |host| {
                 host.deinit();
@@ -5598,7 +5598,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Closes; the manager ends an open turn as `closed`, and a session
-        /// with no turn leaves nothing on disk (D2).
+        /// with no turn leaves nothing on disk.
         fn closeV2Session(app: *App, v2: *session_adapter.Session, handoff_intent: ResumeHandoffIntent) ?ResumeHandoff {
             const create_handoff = shouldCreateResumeHandoff(.{
                 .intent = handoff_intent,
@@ -5697,7 +5697,7 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
-        /// Subagents on v2 keep their state in the session's log (D22). A
+        /// Subagents on v2 keep their state in the session's log. A
         /// host that cannot start leaves them off and says why, as on v1.
         fn enableSubagentHostV2(app: *App, v2: *session_adapter.Session) void {
             disableSubagentHost(app);

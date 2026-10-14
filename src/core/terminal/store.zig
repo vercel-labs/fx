@@ -477,8 +477,8 @@ pub const ProfileStore = struct {
     sessions_dir: io_mod.VerifiedDir,
     display_sessions_path: []u8,
     /// `~/.fx`, kept open to reach the folders v2 sessions keep terminal
-    /// state in, in v1's layout: `~/.fx/terminal/{id}` (D45), or the side
-    /// folder of a session not moved yet (D27, D47).
+    /// state in, in v1's layout: `~/.fx/terminal/{id}`, or the side
+    /// folder of a session not moved yet.
     fx_dir: io_mod.VerifiedDir,
     /// `~/.fx/terminal` and `~/.fx/session-files`, as `outside_roots`.
     display_outside_paths: [outside_roots.len][]u8,
@@ -644,8 +644,8 @@ pub const ProfileStore = struct {
     };
 
     /// Where v2 sessions keep terminal state outside the session manager,
-    /// in order: `~/.fx/terminal` (D45), then side folders not moved yet
-    /// (D27, D47). A new owner folder is made only in the first.
+    /// in order: `~/.fx/terminal`, then side folders not moved yet
+    ///. A new owner folder is made only in the first.
     const outside_roots = [_][]const u8{ profile_paths.terminal_dir_name, profile_paths.session_files_dir_name };
 
     /// The folder an owner keeps its terminal state in: its v1 session
@@ -2534,7 +2534,7 @@ pub const DurableSession = struct {
         defer profile.mutex.unlock(zio);
         try contracts.validate_session_id(input.session_id);
         try input.dimensions.validate();
-        // A new terminal makes a v2 owner's folder (D45).
+        // A new terminal makes a v2 owner's folder.
         var state = try profile.open_capability(
             input.persistence.grant.principal.durable_session_id,
             false,
@@ -5925,7 +5925,7 @@ test "a v2 session's terminal folder owns its terminal state, an unmoved side fo
     defer fixture.deinit();
     var root = io_mod.VerifiedDir{ .dir = try fixture.tmp.dir.openDir(std.testing.io, ".fx", .{ .iterate = true, .follow_symlinks = false }) };
     defer root.close();
-    // Made after the store opened: an older session's side folder (D27),
+    // Made after the store opened: an older session's side folder,
     // and one that also has a v1 folder.
     var files = try io_mod.openOrCreateVerifiedPrivateDir(&root, profile_paths.session_files_dir_name);
     defer files.close();

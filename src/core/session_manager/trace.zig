@@ -1,10 +1,9 @@
-//! Test-only trace hook, compiled only with `-Dhooks=true`.
+//! Test-only trace hook, compiled only with the `hooks` build option.
 //!
-//! Each traced run writes `zig-out/traces/SPEC--CASE.ndjson`: one JSON line
-//! per spec action, named like the action, with one field per spec variable
-//! (`docs/session-manager/tla/trace/README.md`). Fields that model the disk
-//! are read back from the real files after the step; fields that model
-//! memory come from the code's own state.
+//! Each traced run writes `MODEL--CASE.ndjson` under `default_dir`: one JSON
+//! line per model action, named like the action, with one field per model
+//! variable. Fields that model the disk are read back from the real files
+//! after the step; fields that model memory come from the code's own state.
 //!
 //! A trace write failure never changes the traced code's behavior; it is
 //! kept and returned by `finish`, which fails the test.
@@ -96,7 +95,7 @@ pub const Trace = struct {
     }
 };
 
-/// Traces `SessionLog.tla` for one log file.
+/// Traces the SessionLog model for one log file.
 pub const SessionLogTracer = struct {
     trace: Trace,
     /// The traced log's folder and name. Read directly, never through the
@@ -187,10 +186,10 @@ test "the disk abstraction counts a torn tail and parses seqs" {
 const session_mod = @import("session.zig");
 const log_mod = @import("log.zig");
 
-/// Traces `TurnLifecycle.tla` for every session of one manager, one file
+/// Traces the TurnLifecycle model for every session of one manager, one file
 /// per session: `{dir}/TurnLifecycle--{case}-{id}.ndjson`. A session is
 /// traced from its creation; forks and sessions created elsewhere are not
-/// (`Fork.tla` covers forks). Each line also records the tracer's own state
+/// (the Fork model covers forks). Each line also records the tracer's own state
 /// (`status`, `fresh`), so a later process can continue a trace after the
 /// one that wrote it was killed.
 pub const TurnTraces = struct {
@@ -270,7 +269,7 @@ pub const TurnTraces = struct {
             .status = status,
             .fresh = fresh,
         });
-        // Crash applies only to an open session (the spec's guard).
+        // Crash applies only to an open session (the model's guard).
         if (std.mem.eql(u8, status, "open")) t.crash(id);
     }
 

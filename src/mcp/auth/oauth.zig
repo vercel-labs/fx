@@ -328,7 +328,7 @@ pub fn refusesGrant(raw: []const u8) bool {
 
 // ---- Scopes ----
 
-/// At most 31 scope names, so every mask fits TLC's integers in the traces;
+/// At most 31 scope names, so every mask fits a 32-bit trace integer;
 /// more are dropped, and a step-up for a dropped one ends at the bound.
 pub const max_scopes = 31;
 

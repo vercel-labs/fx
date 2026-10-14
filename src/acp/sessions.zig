@@ -513,8 +513,8 @@ const V2Start = struct {
 };
 
 /// `session/new` on v2. The session stays in memory until its first prompt,
-/// so one that never gets a prompt leaves no session behind (D24). A client
-/// prompt goes to the side folder at once, as v1 saves it (D27).
+/// so one that never gets a prompt leaves no session behind. A client
+/// prompt goes to the side folder at once, as v1 saves it.
 fn startV2Session(
     state: *server.ServerState,
     alloc: Allocator,
@@ -1014,7 +1014,7 @@ fn handleRestoreSession(
         durable.history,
         durable.permission_state,
     );
-    // A v2 session's downloads are its blobs (D44); v1 keeps them in its folder.
+    // A v2 session's downloads are its blobs; v1 keeps them in its folder.
     const session_dir: ?[]u8 = if (v2 != null) null else try session_store.sessionDirPath(alloc, store.?.sessions_dir, session_id);
     defer if (session_dir) |path| alloc.free(path);
 
@@ -1364,7 +1364,7 @@ const SessionActivation = struct {
 };
 
 /// The session that keeps its client prompt and tool identities, on either
-/// backend: a v1 session's side files, or a v2 session's settings (D46).
+/// backend: a v1 session's side files, or a v2 session's settings.
 /// Borrowed for the call.
 const SavedFiles = union(enum) {
     v1: *session_store.LoadedWritableSession,
@@ -1561,7 +1561,7 @@ fn handleLoadFailure(
         "session operation=load outcome=failed error={s}",
         .{@errorName(err)},
     );
-    // v2 names a storage fault (D29); v1 keeps its messages below.
+    // v2 names a storage fault; v1 keeps its messages below.
     if (state.sessions_v2 != null) {
         if (v2StorageFaultMessage("Session could not be loaded", err)) |message| {
             return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = message });

@@ -1,7 +1,7 @@
 //! MCPv2 module root and public API.
 //!
 //! Files under `src/mcp/` import only `std` and each other. The host passes in
-//! `std.Io` and everything else through `host.zig`. See `docs/approach.md`.
+//! `std.Io` and everything else through `host.zig`.
 
 const std = @import("std");
 
@@ -45,11 +45,11 @@ pub const engine = @import("engine.zig");
 /// What the host gives the engine.
 pub const Host = @import("host.zig").Host;
 
-/// Step trace format shared by the I/O layer, the dev tools, and the Bun bridge.
+/// Step trace format written by the I/O layer.
 pub const trace = @import("io/trace.zig");
 
-/// Pure protocol machines, one per unit. Public so the dev labs and the
-/// Bun driver can exercise them directly; fx itself uses the engine API.
+/// Pure protocol machines, one per unit. Public so tests and tools can
+/// exercise them directly; fx itself uses the engine API.
 pub const core = struct {
     pub const request = @import("core/request.zig");
     pub const stdio_conn = @import("core/stdio_conn.zig");

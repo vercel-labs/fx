@@ -1,6 +1,6 @@
-//! Diagnostics (D14): every repair or drop the manager makes is reported
+//! Diagnostics: every repair or drop the manager makes is reported
 //! once through one optional callback, like SQLite's log callback. The
-//! adapter forwards events to fx's `debug_trace`; the driver captures them.
+//! adapter forwards events to fx's `debug_trace`; tests capture them.
 //! With no callback the cost is one null check.
 
 const std = @import("std");
@@ -12,7 +12,7 @@ pub const Kind = enum {
     /// session is readable only up to `offset`.
     opened_read_only,
     /// A session closed before its first turn: `count` held lines were never
-    /// written, by design (D2).
+    /// written, by design.
     held_lines_dropped,
     /// The index named a session whose folder is gone; the entry was removed.
     index_healed,

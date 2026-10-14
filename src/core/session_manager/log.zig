@@ -1,4 +1,4 @@
-//! L1: one append-only log file.
+//! One append-only log file.
 //!
 //! Owns the line format's frame (the CRC32C field), the seq check, the batch
 //! append, the torn-tail cut on open, and bounded forward and backward reads.
@@ -6,7 +6,7 @@
 //!
 //! The pure core is `appendLine`, `checkLine` and `Scanner`: bytes in, values
 //! out, no I/O. `Log`, `ForwardReader` and `BackwardReader` are the thin
-//! effectful shell over L0.
+//! effectful shell over `storage.zig`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -233,7 +233,7 @@ pub fn scanBytes(bytes: []const u8, base_offset: u64, next_seq: ?u64) struct { s
 
 pub const Status = enum { open, writing, down };
 
-/// Test hooks, compiled only with `-Dhooks=true`.
+/// Test hooks, compiled only with the `hooks` build option.
 pub const Hook = if (hooks) struct {
     tracer: ?*trace.SessionLogTracer = null,
     planted: trace.Planted = .none,
@@ -280,8 +280,8 @@ pub const Log = struct {
 
     /// Opens an existing log. It checks only the last lines, so its cost
     /// does not grow with the log. A writable open cuts a torn tail and
-    /// syncs, which makes everything kept durable (`SessionLog.tla`
-    /// `Recover`). A corrupt tail or a newer version opens read-only.
+    /// syncs, which makes everything kept durable. A corrupt tail or a
+    /// newer version opens read-only.
     pub fn open(
         gpa: std.mem.Allocator,
         s: storage.Storage,
@@ -787,7 +787,7 @@ fn fuzzScan(_: void, smith: *testing.Smith) anyerror!void {
 }
 
 /// A log folder for tests. With hooks, the storage goes through the fault
-/// layer (idle unless a test arms it); without hooks, straight to L0.
+/// layer (idle unless a test arms it); without hooks, straight to storage.
 const TestLog = struct {
     tmp: testing.TmpDir,
     fault: if (hooks) Fault else void,
@@ -941,10 +941,10 @@ test "crc32c equals std's byte-at-a-time CRC32C at every length and alignment" {
 }
 
 const log_model_tests = struct {
-    //! L1 against `tla/SessionLog.tla`: random schedules of appends, syncs,
-    //! process crashes (including in the middle of a write), machine crashes and
-    //! recoveries. After every step the four spec invariants are checked on the
-    //! real file, and selected runs write a trace for TLC (`zig build traces`).
+    //! The log under random schedules of appends, syncs, process crashes
+    //! (including in the middle of a write), machine crashes and recoveries.
+    //! After every step the log's four invariants are checked on the real
+    //! file, and with hooks selected runs also write a trace.
 
     const log_mod = @import("log.zig");
 
@@ -965,7 +965,7 @@ const log_model_tests = struct {
         /// Byte length and line count acknowledged durable (ghost state).
         acked_bytes: usize = 0,
         acked_lines: u64 = 0,
-        /// Durable lines of the last open log: survives a crash, like the spec's
+        /// Durable lines of the last open log: survives a crash, like the model's
         /// `durable`, until the next recovery sets it.
         durable: u64 = 0,
         tracer: ?*trace.SessionLogTracer = null,

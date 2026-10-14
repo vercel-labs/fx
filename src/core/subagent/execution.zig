@@ -220,7 +220,7 @@ pub const CommitError = error{
 };
 
 /// The child session a turn writes: v1's loaded session, or a v2 child
-/// through the adapter (D22).
+/// through the adapter.
 pub const ChildSession = union(enum) {
     v1: *session_store.LoadedWritableSession,
     v2: *session_adapter.Session,
@@ -322,7 +322,7 @@ pub const TurnContext = struct {
         self: *TurnContext,
         alloc: Allocator,
     ) CommitError!?session_codec.RecoveryCheckpoint {
-        // v2 keeps no paused-response checkpoint (D31).
+        // v2 keeps no paused-response checkpoint.
         const loaded = switch (self.loaded) {
             .v1 => |value| value,
             .v2 => return null,
@@ -346,7 +346,7 @@ pub const TurnContext = struct {
     }
 
     /// Opens a v2 child's turn on disk as its work starts, so a body its
-    /// tools store is a blob of a session on disk (D44). A v1 child keeps
+    /// tools store is a blob of a session on disk. A v1 child keeps
     /// side files and has nothing to open.
     pub fn beginTurn(self: *TurnContext) !void {
         switch (self.loaded) {
@@ -676,7 +676,7 @@ pub const TurnContext = struct {
         bound.user.work_id = @constCast(work_id);
         const loaded = switch (self.loaded) {
             .v1 => |value| value,
-            // v2 keeps no paused-response checkpoint (D31), as the root
+            // v2 keeps no paused-response checkpoint, as the root
             // hosts do not; the pause is not claimed as saved.
             .v2 => |child| {
                 debug_trace.logf("subagent", "child pause not kept child_id={s} work_id={s} cause={s} reason=sessions_v2", .{ child.id(), work_id, @tagName(checkpoint.cause) });

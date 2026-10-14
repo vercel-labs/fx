@@ -649,7 +649,7 @@ const OpenChild = union(enum) {
     },
 
     /// v2 opens the child's log, or starts it under the id its spawn line
-    /// names with the seed its admission left (D34).
+    /// names with the seed its admission left.
     fn open(owner: *Owner, child_id: []const u8, instructions: []const u8) !OpenChild {
         const children = switch (owner.backend) {
             .v1 => |sessions| return .{ .v1 = try sessions.resumeTargetForWrite(
@@ -713,7 +713,7 @@ const OpenChild = union(enum) {
     }
 
     /// v1 keeps instructions in `children.json`; a v2 child keeps them in
-    /// its own `prefs` (D34).
+    /// its own `prefs`.
     fn overlayInstructions(self: *const OpenChild, registry_instructions: []const u8) []const u8 {
         return switch (self.*) {
             .v1 => registry_instructions,

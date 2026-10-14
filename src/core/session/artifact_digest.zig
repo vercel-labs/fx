@@ -5,7 +5,7 @@ const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 /// A v1 handle keeps the first 8 bytes of the digest.
 const digest_hex_bytes = 16;
-/// A v2 handle keeps all of it: the name of the body's blob (D44).
+/// A v2 handle keeps all of it: the name of the body's blob.
 pub const blob_hex_bytes = 2 * Sha256.digest_length;
 
 pub fn contentAddressedHandle(
@@ -29,7 +29,7 @@ pub fn contentAddressedHandle(
 }
 
 /// A v2 session's handle for a body: `prefix`, the whole digest, which is
-/// the name of the body's blob, then `suffix` (D44). `prefix` ends in `-`.
+/// the name of the body's blob, then `suffix`. `prefix` ends in `-`.
 /// Caller owns the result.
 pub fn blobHandle(
     alloc: Allocator,

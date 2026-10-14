@@ -602,8 +602,7 @@ fn same(a: Config, b: Config) bool {
 }
 
 test {
-    // Behavior is tested by the Bun driver through tools/labs/engine_lab.zig;
-    // this makes sure everything compiles.
+    // Makes sure every declaration compiles.
     std.testing.refAllDecls(Engine);
 }
 

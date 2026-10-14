@@ -151,10 +151,9 @@ pub const Runtime = struct {
         return createWith(alloc, .{ .v1 = sessions }, root_id, host_authority, child_runner);
     }
 
-    /// A host over a v2 parent, whose children live in its log (D22).
+    /// A host over a v2 parent, whose children live in its log.
     /// Borrows `children` and the callback contexts until deinit; the
-    /// parent stays open until then (`tla/Wiring.tla`
-    /// ParentOutlivesChildren).
+    /// parent stays open until then, so it outlives its children.
     pub fn createV2(
         alloc: Allocator,
         children: *child_state.V2Children,
@@ -665,7 +664,7 @@ pub const Runtime = struct {
                     );
                     try self.managed.state_store.save(alloc, registry);
                     // A v2 child lost before its first turn has no log to
-                    // resume, so its next work starts it fresh (D33).
+                    // resume, so its next work starts it fresh.
                     if (self.backend == .v2) try self.ensureManagedChildSession(alloc, started.id, active.id, defaults);
                     return managedAdmissionReady(alloc, started.id);
                 }
@@ -703,7 +702,7 @@ pub const Runtime = struct {
         const sessions = switch (self.backend) {
             .v2 => |children| {
                 // A v2 child reaches the disk with its first turn, under
-                // the id its spawn line names (D34); until then only its
+                // the id its spawn line names; until then only its
                 // settings wait here.
                 try children.rememberSeed(child_id, .{
                     .preferences = .{
@@ -1950,7 +1949,7 @@ fn terminalResult(
     };
 }
 
-/// A crash lost the work before the child started it (D33).
+/// A crash lost the work before the child started it.
 const lost_result = "fx stopped before this message reached the subagent, so it never ran. Send it again if it is still needed.";
 
 test "terminal result projects every managed outcome without a lifecycle phase" {
@@ -1982,7 +1981,7 @@ test "terminal result projects every managed outcome without a lifecycle phase" 
     }
 
     // Work lost before the child started it says so, so the parent can
-    // send it again (D33).
+    // send it again.
     const lost = terminalResult(.{ .phase = .interrupted, .outcome = .lost }, null);
     try std.testing.expect(!lost.ok);
     try std.testing.expectEqualStrings(lost_result, lost.result.?);

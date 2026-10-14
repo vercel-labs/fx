@@ -1,9 +1,10 @@
-//! JSONL trace of core steps (docs/approach.md §6, format version 1).
+//! JSONL trace of core steps, format version 1.
 //!
-//! The I/O layer writes one line per `step` call when tracing is on. The Bun
-//! bridge turns a trace into a TLA+ observation and asks TLC whether it is a
-//! behavior of the machine's model. `data` carries only model projections
-//! (ids, versions, flags, counters), never tokens or user content.
+//! The I/O layer writes one line per `step` call when tracing is on. Each
+//! line is one step of a machine's model, so a model checker can decide
+//! whether a trace is a behavior of that model; trace integers stay within
+//! 32 bits. `data` carries only model projections (ids, versions, flags,
+//! counters), never tokens or user content.
 
 const std = @import("std");
 

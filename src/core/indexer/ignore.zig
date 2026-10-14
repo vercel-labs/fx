@@ -8,7 +8,7 @@ const wildmatch = @import("wildmatch.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// Largest pattern file read, per source (D7).
+/// Largest pattern file read, per source.
 pub const max_pattern_file_bytes: usize = 1024 * 1024;
 
 const Pattern = struct {

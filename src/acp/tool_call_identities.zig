@@ -21,7 +21,7 @@ const max_bytes: usize = 256 * 1024;
 const max_entries: usize = 1024;
 
 /// Where a session keeps its record: a v1 session's side file, or a v2
-/// session's `tool_identities` setting (D46).
+/// session's `tool_identities` setting.
 pub const Target = union(enum) {
     none,
     capability: *session_child_store.SessionChildCapability,

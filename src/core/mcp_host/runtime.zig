@@ -1160,7 +1160,7 @@ pub const Runtime = struct {
     }
 
     /// Permission is fx's tool admission, before the call reaches the
-    /// runtime, and only the runtime calls the engine (D6).
+    /// runtime, and only the runtime calls the engine.
     fn allow(_: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8) bool {
         return true;
     }

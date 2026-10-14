@@ -3284,7 +3284,7 @@ fn runSessionListV2(alloc: Allocator, deps: RunDeps, opts: SessionListOptions) !
     return writeSessionList(alloc, deps, page, opts);
 }
 
-/// `fx session last|{id}` on v2, read without the session's lock (D37).
+/// `fx session last|{id}` on v2, read without the session's lock.
 fn runSessionDetailV2(
     alloc: Allocator,
     deps: RunDeps,
@@ -3322,7 +3322,7 @@ fn runSessionDetailV2(
     }
 }
 
-/// `fx session recover` on v2 (D15): a copy up to the last good turn.
+/// `fx session recover` on v2: a copy up to the last good turn.
 fn runSessionRecoveryV2(alloc: Allocator, deps: RunDeps, recovery: SessionRecoveryOptions) !RunResult {
     var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
         try writeLookupFailure(alloc, deps, "session", session_adapter.commandError(err), recovery.format);

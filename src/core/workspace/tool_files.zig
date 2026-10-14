@@ -73,7 +73,7 @@ fn relativeInside(workspace_root: []const u8, absolute_root: []const u8) ?[]cons
 /// Whether the workspace tree's entries below `subtree` are exactly what a
 /// scan of that folder would list: the walk entered it as an ordinary folder
 /// of the workspace, not as a nested repository's boundary and not below an
-/// ignored folder, where a direct scan applies the plain rules instead (U3).
+/// ignored folder, where a direct scan applies the plain rules instead.
 fn subtreeFromSnapshot(tree: *const indexer.Tree, subtree: []const u8) bool {
     if (subtree.len == 0) return true;
     for (tree.folders) |folder| {
@@ -204,7 +204,7 @@ test "listing sees a file created a moment earlier and honors hidden and custom 
     const root = try @import("../shared/io.zig").dirRealpathAlloc(arena, tmp.dir, "root");
 
     // The temporary folder sits below an ignored path, so the skipped names
-    // apply (U3); `build` is skipped by default.
+    // apply; `build` is skipped by default.
     const first = try list(std.testing.allocator, arena, root, root, .{});
     try std.testing.expectEqual(@as(usize, 3), first.files.len);
     try std.testing.expectEqualStrings("a.txt", first.files[0]);

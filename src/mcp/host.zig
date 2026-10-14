@@ -1,4 +1,4 @@
-//! What the host gives the engine: fx, or the dev lab. Everything else
+//! What the host, such as fx or a test, gives the engine. Everything else
 //! the host does it does through the engine's API and events: showing input
 //! forms, opening sign-in URLs, and rendering status.
 

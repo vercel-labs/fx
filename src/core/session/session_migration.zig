@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const model_provider = @import("../config/model_provider.zig");
 const io_mod = @import("../shared/io.zig");
 const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
@@ -341,21 +342,50 @@ fn loadMigrationPreferences(
     seed_preferences: ?session_codec.DurableSessionPreferences,
 ) !session_codec.DurableSessionPreferences {
     if (seed_preferences) |preferences| return preferences.dupe(alloc);
+    return settingsPreferences(alloc, ctx.home_dir, workspace_root);
+}
+
+/// Preferences for a legacy session that saved none: the merged settings for
+/// `workspace_root`, with fx's default gateway model when the settings name
+/// none. The caller owns the returned model.
+pub fn settingsPreferences(
+    alloc: Allocator,
+    home_dir: []const u8,
+    workspace_root: []const u8,
+) !session_codec.DurableSessionPreferences {
     var detailed = try config_runtime.loadMergedSettingsDetailedFromHome(
         alloc,
-        ctx.home_dir,
+        home_dir,
         workspace_root,
     );
     defer detailed.deinit(alloc);
     return .{
         .model = try alloc.dupe(
             u8,
-            detailed.settings.models.get(.gateway) orelse "anthropic/claude-opus-4.7",
+            detailed.settings.models.get(.gateway) orelse model_provider.gateway_default_model,
         ),
         .effort = detailed.settings.effort orelse .auto,
         .fast_mode = detailed.settings.fast_mode orelse false,
         .ultrafast_mode = detailed.settings.ultrafast_mode orelse false,
     };
+}
+
+test "legacy preferences use the default gateway model unless settings name one" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var defaults = try settingsPreferences(alloc, home, home);
+    defer defaults.deinit(alloc);
+    try std.testing.expectEqualStrings(model_provider.gateway_default_model, defaults.model);
+
+    try tmp.dir.createDirPath(std.testing.io, ".fx");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".fx/settings.json", .data = "{\"models\":{\"gateway\":\"test/configured\"}}" });
+    var configured = try settingsPreferences(alloc, home, home);
+    defer configured.deinit(alloc);
+    try std.testing.expectEqualStrings("test/configured", configured.model);
 }
 
 test "schema v3 import archives legacy recovery with allocation failure cleanup" {

@@ -36,7 +36,7 @@ pub const ResultReader = struct {
 
     const Source = union(enum) {
         file: session_child_store.ManagedFile,
-        /// A v2 session's body, read whole from its blob (D44); owned.
+        /// A v2 session's body, read whole from its blob; owned.
         bytes: struct { alloc: Allocator, data: []u8 },
     };
 
@@ -660,7 +660,7 @@ pub fn openReaderManaged(
 }
 
 /// Removes a stored result. A v2 session's blob stays with the session,
-/// which a fork or recover may share (D44).
+/// which a fork or recover may share.
 pub fn deleteManaged(
     capability: *session_child_store.SessionChildCapability,
     handle: []const u8,
@@ -711,7 +711,7 @@ pub fn makeHandle(alloc: Allocator, tool_call_id: []const u8, tool_name: []const
 }
 
 /// The handle a v2 session gives `text`: `result-`, the name of its blob,
-/// and `.txt` (D44).
+/// and `.txt`.
 pub fn blobHandle(alloc: Allocator, text: []const u8) ![]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(text, &digest, .{});
@@ -750,7 +750,7 @@ pub fn isStoredTextHandle(handle: []const u8) bool {
 }
 
 /// A compactor record's name, such as `compacted-M12.txt`, which
-/// `read_tool_result` opens by its ID (D50).
+/// `read_tool_result` opens by its ID.
 fn isRecordHandle(handle: []const u8) bool {
     return std.mem.startsWith(u8, handle, "compacted-") and
         std.mem.endsWith(u8, handle, ".txt");
@@ -789,8 +789,7 @@ fn readStoredTextManaged(
     if (capability.holdsBlobs()) {
         // Every store's blobs share the session, found by hash alone, so
         // only this store's own handles are its results, its compactor
-        // records among them: a command replay's is read by its own store
-        // (D44, D50).
+        // records among them: a command replay's is read by its own store.
         if (!isStoredTextHandle(handle) and !isImageHandle(handle) and !isRecordHandle(handle)) return error.ResultHandleNotFound;
         return capability.readBlob(alloc, .tool_results, handle, stored_text_max_bytes) catch |err| switch (err) {
             error.BlobNotFound => error.ResultHandleNotFound,
@@ -811,7 +810,7 @@ fn readStoredTextManaged(
 }
 
 /// This session's tool-results folder as fx-compactor's record store, or on
-/// v2 its records kept as blobs (D50). The store borrows `capability`.
+/// v2 its records kept as blobs. The store borrows `capability`.
 pub fn compactorStore(capability: *session_child_store.SessionChildCapability) compactor.Store {
     return .{ .context = capability, .vtable = &.{
         .write = writeCompactorFile,
@@ -847,7 +846,7 @@ fn readCompactorFile(context: *anyopaque, arena: Allocator, name: []const u8, ma
 }
 
 /// Up to `max_bytes` from the start of a v2 record's read-only blob file,
-/// which may be far larger than what the compactor searches (D50).
+/// which may be far larger than what the compactor searches.
 fn readRecordBlob(capability: *session_child_store.SessionChildCapability, arena: Allocator, name: []const u8, max_bytes: usize) compactor.Store.Error![]const u8 {
     session_child_store.SessionChildCapability.validateManagedName(name) catch |err| return compactorStoreError("read", name, err);
     const io = io_mod.getIo();

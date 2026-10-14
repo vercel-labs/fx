@@ -441,7 +441,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .propagate_history_turn = propagateHistoryTurn,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
-        // v2 keeps no paused-response checkpoint (D31), so a v2 child, like
+        // v2 keeps no paused-response checkpoint, so a v2 child, like
         // a v2 root, offers the orchestrator no place to save one.
         .recovery_checkpoint = switch (context.turn.loaded) {
             .v1 => .{
@@ -481,7 +481,7 @@ fn resolveModelCapabilities(raw: *anyopaque, arena: Allocator, model: []const u8
     // merges the loaded model cache, so gateway-hosted children resolve the
     // same capabilities as the parent. The provider bundle's synchronous
     // lookup is empty for providers that only fetch asynchronously (gateway),
-    // which previously left every gateway child at "unknown" support.
+    // which would leave every gateway child at "unknown" support.
     if (context.config.tool_context.model_capability_resolver) |resolver| {
         return resolver.resolve(arena, model);
     }
