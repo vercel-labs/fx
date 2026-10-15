@@ -61,7 +61,7 @@ const shell_process_description = shell_description_start ++
 // The flat contract read by `core/terminal/shell_request.zig`: no request
 // wrapper, no action, and nothing nested.
 const shell_command_property = model_tool_schema.Property{ .name = "command", .json_type = .string, .bounds = &.{ .max_length = terminal_contracts.max_command_bytes }, .description = "The command to run, in any shell syntax." };
-const shell_shell_property = model_tool_schema.Property{ .name = "shell", .json_type = .string, .description = "Leave out for the user's login shell, with their aliases and functions. If that is zsh, arrays start at 1 and unquoted variables are not split into words, so for bash-specific syntax set bash. Also sh, dash, ksh, or an absolute path; every shell gets the user's environment and PATH. macOS /bin/bash is version 3.2." };
+const shell_shell_property = model_tool_schema.Property{ .name = "shell", .json_type = .string, .description = "Leave out for the user's login shell, with their aliases and functions. If that is zsh, arrays start at 1, so for bash-specific syntax set bash. Also sh, dash, ksh, or an absolute path; every shell gets the user's environment and PATH. macOS /bin/bash is version 3.2." };
 const shell_cwd_property = model_tool_schema.Property{ .name = "cwd", .json_type = .string, .description = "Folder to run in. Defaults to the workspace." };
 const shell_interactive_property = model_tool_schema.Property{ .name = "interactive", .json_type = .boolean, .description = "true for programs that need a terminal, such as REPLs, editors, or prompts. The session stays open; use session_id to type into it." };
 const shell_timeout_property = model_tool_schema.Property{ .name = "timeout", .json_type = .integer, .bounds = &.{ .minimum = 1 }, .description = "Seconds before the command is killed. Leave out unless a deadline is wanted." };
@@ -884,7 +884,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "259a77e875ac175f0721c6e9b98f351686169ad129e3c0a4e88540899304b2aa",
+        "013e8899344511d21e71f424e5afed9e654329fbe28f3d3aeabac369aaeef39d",
         &actual_hex,
     );
 }
