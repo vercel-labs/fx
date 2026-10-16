@@ -603,6 +603,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
 
     let projectRequestCount = 0;
     const projectEndpoint = Bun.serve({
+      hostname: "127.0.0.1",
       port: 0,
       fetch() {
         projectRequestCount += 1;
@@ -4253,6 +4254,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     async () => {
       let targetRequests = 0;
       const target = Bun.serve({
+        hostname: "127.0.0.1",
         port: 0,
         fetch() {
           targetRequests += 1;
@@ -4739,6 +4741,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     async () => {
       let targetRequests = 0;
       const target = Bun.serve({
+        hostname: "127.0.0.1",
         port: 0,
         fetch() {
           targetRequests += 1;
@@ -4822,6 +4825,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     async () => {
       let targetRequests = 0;
       const target = Bun.serve({
+        hostname: "127.0.0.1",
         port: 0,
         fetch() {
           targetRequests += 1;

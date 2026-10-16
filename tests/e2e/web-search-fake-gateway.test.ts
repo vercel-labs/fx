@@ -254,6 +254,7 @@ function startFakeGateway(
   const requests: GatewayRequest[] = [];
   const titleRequests: GatewayRequest[] = [];
   const server = Bun.serve({
+    hostname: "127.0.0.1",
     port: 0,
     async fetch(req) {
       const url = new URL(req.url);
