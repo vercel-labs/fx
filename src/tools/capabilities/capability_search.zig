@@ -232,6 +232,7 @@ fn combineProjected(
         mcp_parsed.value.object.get("state"),
         mcp_parsed.value.object.get("error"),
         mcp_parsed.value.object.get("context_limit"),
+        mcp_parsed.value.object.get("unavailable"),
     ) catch |err| switch (err) {
         error.WriteFailed => return error.OutOfMemory,
         else => return err,
@@ -252,6 +253,8 @@ fn renderCombined(
     mcp_state: ?std.json.Value,
     mcp_error: ?std.json.Value,
     mcp_context_limit: ?std.json.Value,
+    /// Servers a search that matched no tool couldn't look in, and why.
+    mcp_unavailable: ?std.json.Value,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -293,6 +296,10 @@ fn renderCombined(
     }
     if (mcp_context_limit) |value| {
         try out.writer.writeAll(",\"mcp_context_limit\":");
+        try std.json.Stringify.value(value, .{}, &out.writer);
+    }
+    if (mcp_unavailable) |value| {
+        try out.writer.writeAll(",\"mcp_unavailable\":");
         try std.json.Stringify.value(value, .{}, &out.writer);
     }
     try out.writer.writeByte('}');
@@ -408,6 +415,20 @@ test "capability search combines bounded skill and MCP results" {
     try std.testing.expectError(
         error.CapabilitySearchResultLimitTooSmall,
         combineProjected(alloc, &skill_result, mcp, output.len - 1),
+    );
+}
+
+test "a search that matched nothing keeps the MCP servers it couldn't look in" {
+    const alloc = std.testing.allocator;
+    const mcp =
+        \\{"tools":[],"count":0,"total_matches":0,"more_available":false,"next_cursor":null,"unavailable":["MCP server 'linear' needs a login."]}
+    ;
+    const output = try combineProjected(alloc, null, mcp, 4096);
+    defer alloc.free(output);
+    try std.testing.expectEqualStrings(
+        \\{"skills":[],"mcp_tools":[],"counts":{"skills":0,"mcp_tools":0},"total_matches":{"skills":0,"mcp_tools":0},"state":"no_match","mcp_unavailable":["MCP server 'linear' needs a login."]}
+    ,
+        output,
     );
 }
 

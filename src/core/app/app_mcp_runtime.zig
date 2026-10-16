@@ -91,6 +91,19 @@ pub const ReloadOutcome = union(enum) {
     }
 };
 
+/// The server a typed `/mcp ARGS` signs in to, or null if it isn't a valid
+/// `login`. Read by the verb's own parser, since `--no-browser` may come
+/// before or after the name. The result points into `args`.
+fn typedLoginServer(arena: Allocator, args: []const []const u8) Allocator.Error!?[]const u8 {
+    return switch (try mcp_verbs.parse(arena, .shell, args)) {
+        .command => |command| switch (command) {
+            .login => |login| login.name,
+            else => null,
+        },
+        .usage, .moved => null,
+    };
+}
+
 fn isUnavailableForReload(server: mcp_health.ServerSnapshot) bool {
     return server.connection != .ready and
         (server.connection != .disabled or server.required);
@@ -1734,7 +1747,7 @@ pub const State = struct {
             sink.* = .{};
             self.host_sink = sink;
         }
-        self.replaceHost(try load(alloc, workspace_root, registry, .{ .questions = questions, .notify = self.host_sink.?.notify() }));
+        self.replaceHost(try load(alloc, workspace_root, registry, .{ .questions = questions, .notify = self.host_sink.?.notify(), .slash_commands = true }));
     }
 
     /// Loads the config again after `/mcp` changed it; calls still using the
@@ -1742,7 +1755,7 @@ pub const State = struct {
     pub fn reloadHost(self: *State, alloc: Allocator, workspace_root: []const u8, registry: tool_dispatch.Registry) !void {
         const load = self.host_load orelse return;
         const sink = self.host_sink orelse return;
-        self.replaceHost(try load(alloc, workspace_root, registry, .{ .questions = self.host_questions, .notify = sink.notify() }));
+        self.replaceHost(try load(alloc, workspace_root, registry, .{ .questions = self.host_questions, .notify = sink.notify(), .slash_commands = true }));
         self.startHostServers();
     }
 
@@ -1828,20 +1841,24 @@ pub const State = struct {
         h.leases -= 1;
         const last = h.retired and h.leases == 0;
         self.host_mutex.unlock(io_mod.getIo());
-        if (last) h.destroy();
+        if (last) h.stop();
     }
 
-    /// Swaps in `next` on the UI thread; the old host goes with its last lease.
+    /// Swaps in `next` on the UI thread. Calls still using the old host
+    /// finish on it; it goes with its last lease, its servers stopping in the
+    /// background, and until then `next` starts no server.
     fn replaceHost(self: *State, next: ?*mcp_host.Host) void {
         self.host_mutex.lockUncancelable(io_mod.getIo());
         const old = self.host;
+        // Before anyone can lease `next`.
+        if (old) |h| h.retire();
         self.host = next;
         const unused = if (old) |h| unused: {
             h.retired = true;
             break :unused h.leases == 0;
         } else false;
         self.host_mutex.unlock(io_mod.getIo());
-        if (unused) old.?.destroy();
+        if (unused) old.?.stop();
     }
 
     fn destroyHost(self: *State) void {
@@ -1859,6 +1876,8 @@ pub const State = struct {
         while (self.host_verbs.load(.acquire) > 0 and waited < 500) : (waited += 1) io_mod.sleep(10 * std.time.ns_per_ms);
         if (self.host_verbs.load(.acquire) > 0) debug_trace.logf("mcp", "MCP commands still running at exit count={d}", .{self.host_verbs.load(.acquire)});
         self.replaceHost(null);
+        // The retired hosts' servers notify the sink until they're gone.
+        mcp_host.waitRetired();
         if (self.host_completion_arena) |*arena| arena.deinit();
         self.host_completion_arena = null;
         self.host_completion = &.{};
@@ -1932,6 +1951,11 @@ pub const State = struct {
                 },
                 // The status line says so for as long as it's true.
                 .needs_login => {},
+                .not_saved => |n| {
+                    const server = safeText(aa, n.server, 160);
+                    const text = a.print("Couldn't save {s}'s new login: {s}. It keeps working here, but after a restart {s} needs a login again.", .{ server, safeText(aa, n.reason, 240), server }) catch return;
+                    sink.pushLocked(text, true);
+                },
             }
         }
 
@@ -2087,8 +2111,10 @@ pub const State = struct {
         const args = try a.alloc([]const u8, argv.tokens.len);
         defer a.free(args);
         for (argv.tokens, args) |t, *arg| arg.* = t.value;
-        if (args.len >= 2 and std.mem.eql(u8, args[0], "login")) {
-            if (self.host_sink) |sink| sink.markTyped(args[args.len - 1]);
+        if (self.host_sink) |sink| {
+            var arena: std.heap.ArenaAllocator = .init(a);
+            defer arena.deinit();
+            if (try typedLoginServer(arena.allocator(), args)) |server| sink.markTyped(server);
         }
         try self.startVerbs(home, workspace_root, args);
     }
@@ -3460,6 +3486,30 @@ fn destroyRuntime(
         .process_exit => runtime.deinitForProcessExit(),
     }
     alloc.destroy(runtime);
+}
+
+test "a typed /mcp login names its server wherever --no-browser goes" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const cases = [_]struct { args: []const []const u8, server: ?[]const u8 }{
+        .{ .args = &.{ "login", "web" }, .server = "web" },
+        .{ .args = &.{ "login", "--no-browser", "web" }, .server = "web" },
+        .{ .args = &.{ "login", "web", "--no-browser" }, .server = "web" },
+        .{ .args = &.{ "login", "--no-browser" }, .server = null },
+        .{ .args = &.{ "login", "web", "docs" }, .server = null },
+        .{ .args = &.{ "login", "web", "--json" }, .server = null },
+        .{ .args = &.{ "login", "web", "--help" }, .server = null },
+        .{ .args = &.{"login"}, .server = null },
+        .{ .args = &.{}, .server = null },
+        .{ .args = &.{ "logout", "web" }, .server = null },
+        .{ .args = &.{ "show", "web" }, .server = null },
+    };
+    for (cases) |case| {
+        const server = try typedLoginServer(arena.allocator(), case.args);
+        if (case.server) |want| {
+            try std.testing.expectEqualStrings(want, server orelse return error.TestExpectedEqual);
+        } else try std.testing.expectEqual(@as(?[]const u8, null), server);
+    }
 }
 
 test "MCP menu preview display flattens untrusted multi-line content" {

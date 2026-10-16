@@ -1,6 +1,7 @@
 const std = @import("std");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
+const result_store = @import("../session/result_store.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -86,7 +87,7 @@ fn call(
         ctx.allocator,
         ctx.tool_call_name,
         input.arguments_json,
-        ctx.max_tool_result_bytes,
+        resultBytes(ctx),
         ctx.mcp_call_options,
     ) catch |err| {
         if (ctx.mcp_execution_error_sink) |sink| sink.* = err;
@@ -101,6 +102,14 @@ fn call(
         .success => .{ .success = body },
         .tool_failure, .protocol_failure, .input_required => .{ .failure = body },
     };
+}
+
+/// How large an MCP result may come back. Where fx keeps results behind a
+/// handle, that store keeps it whole and the model sees a preview; only
+/// without one is it cut to the model's limit here.
+fn resultBytes(ctx: tool_dispatch.DispatchContext) usize {
+    if (ctx.session_child_capability != null or ctx.tool_result_dir != null) return result_store.stored_text_max_bytes;
+    return ctx.max_tool_result_bytes;
 }
 
 fn unsupported(
@@ -172,5 +181,43 @@ fn callFixture(
     _: usize,
     _: tool_mcp_runtime.CallOptions,
 ) anyerror!?tool_mcp_runtime.CallResult {
+    return .{ .model_output = try alloc.dupe(u8, "mcp ok") };
+}
+
+test "an MCP result may be as large as the result store keeps where fx stores results" {
+    var seen: usize = 0;
+    const advertised = [_][]const u8{"mcp_fs_read"};
+    const runtime = tool_mcp_runtime.RuntimeCapabilities{ .context = @ptrCast(&seen), .call_tool = callRecordingBytes };
+    const tool = switch (resolve(&advertised, runtime, "mcp_fs_read")) {
+        .registered => |registered| registered,
+        else => return error.TestUnexpectedResult,
+    };
+    const tools = [_]tool_dispatch.Tool{tool};
+    const registry = tool_dispatch.Registry{ .tools = tools[0..] };
+    const Case = struct { dir: ?[]const u8, want: usize };
+    for ([_]Case{ .{ .dir = null, .want = 4096 }, .{ .dir = "/nonexistent-tool-results", .want = result_store.stored_text_max_bytes } }) |case| {
+        const result = try tool_dispatch.dispatchAuthorizedToolCall(.{
+            .allocator = std.testing.allocator,
+            .tool_call_name = "mcp_fs_read",
+            .mcp_ctx = @ptrCast(&seen),
+            .mcp_call_tool = callRecordingBytes,
+            .max_tool_result_bytes = 4096,
+            .tool_result_dir = case.dir,
+        }, registry, .{ .id = "bytes-test", .name = "mcp_fs_read", .arguments_json = "{}" });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.want, seen);
+    }
+}
+
+fn callRecordingBytes(
+    raw: *anyopaque,
+    alloc: Allocator,
+    _: []const u8,
+    _: []const u8,
+    max_bytes: usize,
+    _: tool_mcp_runtime.CallOptions,
+) anyerror!?tool_mcp_runtime.CallResult {
+    const seen: *usize = @ptrCast(@alignCast(raw));
+    seen.* = max_bytes;
     return .{ .model_output = try alloc.dupe(u8, "mcp ok") };
 }

@@ -3,6 +3,11 @@
 //! the macOS Keychain, or in a private file under `~/.fx/mcp-credentials/`.
 //! Either way the directory's advisory lock is held while the store is read
 //! and rewritten, so two fx processes don't overwrite each other's entries.
+//! A store this fx can't read, damaged or saved by a newer fx, is never
+//! written over. v1's logins are never taken over: v1 and
+//! MCP-v2 refreshing one login apart, neither seeing the other's saves, would
+//! sign it out. One fx refreshes a login at a time, under that login's
+//! refresh lock.
 //!
 //! TLA+ models: `tests/tla/mcp_host/Credentials.tla` and, for logins shared between
 //! processes, `tests/tla/mcp_host/SharedLogins.tla`.
@@ -14,8 +19,6 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const native_keychain = @import("../hosts/native_keychain.zig");
 const secret = @import("../auth/secret.zig");
-const v1_auth = @import("../mcp/mcp_auth.zig");
-const v1_store = @import("../mcp/mcp_auth_store.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -26,6 +29,20 @@ const lock_deadline_ms: u64 = 2_000;
 const max_store_bytes: usize = 1024 * 1024;
 
 pub const Backend = enum { keychain, file };
+
+/// What a credential is saved under. A server from a workspace's `.mcp.json`
+/// has its own, kept apart from the profile's and from other workspaces'
+///: `workspace` is that workspace's root, null for every other server.
+pub const Key = struct {
+    name: []const u8,
+    url: []const u8,
+    workspace: ?[]const u8 = null,
+
+    fn matches(k: Key, e: Entry) bool {
+        const same_workspace = if (k.workspace) |w| (if (e.workspace) |ew| std.mem.eql(u8, w, ew) else false) else e.workspace == null;
+        return same_workspace and std.mem.eql(u8, e.name, k.name) and std.mem.eql(u8, e.url, k.url);
+    }
+};
 
 pub const Store = struct {
     /// The user's home directory, borrowed for the store's lifetime.
@@ -39,98 +56,131 @@ pub const Store = struct {
         return .{ .home = home, .backend = if (keychain) .keychain else .file };
     }
 
-    /// The credential saved for `name` at `url`, or null. The caller owns it
-    /// and frees it with `secret.zeroAndFree`.
-    pub fn get(s: Store, alloc: Allocator, name: []const u8, url: []const u8) !?[]u8 {
+    /// Where the store is, for a message about one that can't be read.
+    pub fn place(s: Store) []const u8 {
+        return switch (s.backend) {
+            .file => "~/" ++ profile_paths.root_dir_name ++ "/" ++ profile_paths.mcp_credentials_dir_name ++ "/" ++ file_name,
+            .keychain => "the Keychain item " ++ native_keychain.mcp_host_credentials_service_name,
+        };
+    }
+
+    /// The credential saved under `key`, or null, also when the store can't be
+    /// read. The caller owns it and frees it with `secret.zeroAndFree`.
+    pub fn get(s: Store, alloc: Allocator, key: Key) !?[]u8 {
         var locked = try s.lock();
         defer locked.release();
-        var doc = try s.read(alloc, &locked.dir);
+        var doc = s.read(alloc, &locked.dir) catch |err| switch (err) {
+            error.CredentialStoreUnreadable => return null,
+            else => return err,
+        };
         defer doc.deinit(alloc);
-        const i = doc.find(name, url) orelse return null;
+        const i = doc.find(key) orelse return null;
         return try alloc.dupe(u8, doc.entries.items[i].credential);
     }
 
-    /// Saves `credential` for `name` at `url`, replacing any earlier one.
-    pub fn put(s: Store, alloc: Allocator, name: []const u8, url: []const u8, credential: []const u8) !void {
+    /// Fails with `error.CredentialStoreUnreadable` when the store can't be
+    /// read, so a sign-in can stop before it starts.
+    pub fn check(s: Store, alloc: Allocator) !void {
+        var locked = try s.lock();
+        defer locked.release();
+        var doc = try s.read(alloc, &locked.dir);
+        doc.deinit(alloc);
+    }
+
+    /// Saves `credential` under `key`, replacing any earlier one; an
+    /// unreadable store fails with `error.CredentialStoreUnreadable`.
+    pub fn put(s: Store, alloc: Allocator, key: Key, credential: []const u8) !void {
         var locked = try s.lock();
         defer locked.release();
         var doc = try s.read(alloc, &locked.dir);
         defer doc.deinit(alloc);
-        if (doc.find(name, url)) |i| {
+        if (doc.find(key)) |i| {
             const entry = &doc.entries.items[i];
             const copy = try alloc.dupe(u8, credential);
             secret.zeroAndFree(alloc, entry.credential);
             entry.credential = copy;
         } else {
             try doc.entries.ensureUnusedCapacity(alloc, 1);
-            const entry: Entry = .{
-                .name = try alloc.dupe(u8, name),
-                .url = try alloc.dupe(u8, url),
-                .credential = try alloc.dupe(u8, credential),
-            };
-            doc.entries.appendAssumeCapacity(entry);
+            doc.entries.appendAssumeCapacity(try Entry.of(alloc, key, credential));
         }
         try s.write(alloc, &locked.dir, doc);
     }
 
-    /// Deletes the credential for `name` at `url`; false when there was none.
-    pub fn remove(s: Store, alloc: Allocator, name: []const u8, url: []const u8) !bool {
+    /// Deletes the credential saved under `key`; false when there was none.
+    /// An unreadable store fails with `error.CredentialStoreUnreadable`.
+    pub fn remove(s: Store, alloc: Allocator, key: Key) !bool {
         var locked = try s.lock();
         defer locked.release();
         var doc = try s.read(alloc, &locked.dir);
         defer doc.deinit(alloc);
-        const i = doc.find(name, url) orelse return false;
+        const i = doc.find(key) orelse return false;
         var entry = doc.entries.orderedRemove(i);
         entry.deinit(alloc);
         try s.write(alloc, &locked.dir, doc);
         return true;
     }
 
-    const Locked = struct {
+    /// Deletes the credential saved under `key` only if it is `own`, the
+    /// digest of the one this process had, so one another fx saved since
+    /// stays. False when none was deleted.
+    pub fn removeIfSame(s: Store, alloc: Allocator, key: Key, own: [32]u8) !bool {
+        var locked = try s.lock();
+        defer locked.release();
+        var doc = try s.read(alloc, &locked.dir);
+        defer doc.deinit(alloc);
+        const i = doc.find(key) orelse return false;
+        if (!std.mem.eql(u8, &digest(doc.entries.items[i].credential), &own)) return false;
+        var entry = doc.entries.orderedRemove(i);
+        entry.deinit(alloc);
+        try s.write(alloc, &locked.dir, doc);
+        return true;
+    }
+
+    /// The refresh lock of the login saved under `key`, or null while another
+    /// fx holds it: one fx refreshes a login at a time, and the others take
+    /// what it saved. The lock goes with `release`, or with the process.
+    pub fn tryRefreshLock(s: Store, key: Key) !?Locked {
+        var dir = try s.openDir();
+        errdefer dir.close();
+        const name = refreshLockName(key);
+        const advisory = io_mod.acquireTimedAdvisoryLock(&dir, &name, 0) catch |err| switch (err) {
+            error.LockBusy => {
+                dir.close();
+                return null;
+            },
+            else => return err,
+        };
+        return .{ .dir = dir, .lock = advisory };
+    }
+
+    pub const Locked = struct {
         dir: io_mod.VerifiedDir,
         lock: io_mod.TimedAdvisoryLock,
 
-        fn release(l: *Locked) void {
+        pub fn release(l: *Locked) void {
             l.lock.release();
             l.dir.close();
         }
     };
 
-    fn lock(s: Store) !Locked {
+    fn openDir(s: Store) !io_mod.VerifiedDir {
         var home = io_mod.VerifiedDir{ .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), s.home, .{ .iterate = true }) };
         defer home.close();
         var root = try io_mod.openOrCreateVerifiedPrivateDir(&home, profile_paths.root_dir_name);
         defer root.close();
-        var dir = try io_mod.openOrCreateVerifiedPrivateDir(&root, profile_paths.mcp_credentials_dir_name);
+        return io_mod.openOrCreateVerifiedPrivateDir(&root, profile_paths.mcp_credentials_dir_name);
+    }
+
+    fn lock(s: Store) !Locked {
+        var dir = try s.openDir();
         errdefer dir.close();
         const advisory = try io_mod.acquireTimedAdvisoryLock(&dir, lock_file_name, lock_deadline_ms);
         return .{ .dir = dir, .lock = advisory };
     }
 
-    /// The store, holding v1's logins too the first time it's read.
+    /// The store as saved, empty when there is none. One that doesn't parse or
+    /// has another version fails with `error.CredentialStoreUnreadable`.
     fn read(s: Store, alloc: Allocator, dir: *io_mod.VerifiedDir) !Doc {
-        var doc = try s.readSaved(alloc, dir);
-        errdefer doc.deinit(alloc);
-        if (!doc.imported_v1) {
-            s.importV1(alloc, dir, &doc);
-            try s.write(alloc, dir, doc);
-        }
-        return doc;
-    }
-
-    /// Takes over the logins v1 kept, once: what MCP-v2 already has stays,
-    /// and a login signed out later isn't brought back. One that can't be
-    /// carried over stays behind, and that server signs in again.
-    fn importV1(s: Store, alloc: Allocator, dir: *io_mod.VerifiedDir, doc: *Doc) void {
-        doc.imported_v1 = true;
-        v1_store.eachLocked(alloc, dir, s.backend == .keychain, ImportV1{ .alloc = alloc, .doc = doc }, ImportV1.add) catch |err| {
-            debug_trace.logf("mcp", "MCP v1 logins not taken over err={s}", .{@errorName(err)});
-        };
-    }
-
-    /// The store as saved; an unreadable one counts as empty, and the next
-    /// change replaces it.
-    fn readSaved(s: Store, alloc: Allocator, dir: *io_mod.VerifiedDir) !Doc {
         const bytes = (switch (s.backend) {
             .keychain => native_keychain.loadMcpHostCredentials(alloc) catch |err| switch (err) {
                 error.KeychainItemNotFound => null,
@@ -142,8 +192,8 @@ pub const Store = struct {
         return Doc.parse(alloc, bytes) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
-                debug_trace.logf("mcp", "MCP credential store unreadable, treated as empty err={s}", .{@errorName(err)});
-                return .{};
+                debug_trace.logf("mcp", "MCP credential store unreadable, left as it is err={s}", .{@errorName(err)});
+                return error.CredentialStoreUnreadable;
             },
         };
     }
@@ -154,13 +204,37 @@ pub const Store = struct {
             std.crypto.secureZero(u8, out.writer.buffer);
             out.deinit();
         }
-        try std.json.Stringify.value(.{ .version = 1, .imported_v1 = doc.imported_v1, .servers = doc.entries.items }, .{}, &out.writer);
+        // A profile server's entry has no workspace field, as before.
+        try std.json.Stringify.value(.{ .version = 1, .servers = doc.entries.items }, .{ .emit_null_optional_fields = false }, &out.writer);
         switch (s.backend) {
             .keychain => try native_keychain.storeMcpHostCredentials(out.written()),
             .file => try io_mod.durableReplaceVerified(alloc, dir, file_name, out.written()),
         }
     }
 };
+
+/// What tells two saved credentials apart, without keeping either.
+pub fn digest(bytes: []const u8) [32]u8 {
+    var out: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &out, .{});
+    return out;
+}
+
+/// `refresh-` and 16 hex digits of the key's digest: one file per login.
+fn refreshLockName(key: Key) [29]u8 {
+    var h: std.crypto.hash.sha2.Sha256 = .init(.{});
+    for ([_][]const u8{ key.name, key.url, key.workspace orelse "" }) |part| {
+        h.update(part);
+        h.update(&.{0});
+    }
+    var d: [32]u8 = undefined;
+    h.final(&d);
+    var name: [29]u8 = undefined;
+    @memcpy(name[0..8], "refresh-");
+    @memcpy(name[8..24], &std.fmt.bytesToHex(d[0..8].*, .lower));
+    @memcpy(name[24..], ".lock");
+    return name;
+}
 
 fn readFile(alloc: Allocator, dir: *io_mod.VerifiedDir) !?[]u8 {
     var file = dir.dir.openFile(io_mod.getIo(), file_name, .{
@@ -179,98 +253,62 @@ fn readFile(alloc: Allocator, dir: *io_mod.VerifiedDir) !?[]u8 {
 const Entry = struct {
     name: []u8,
     url: []u8,
+    /// The workspace a `.mcp.json` server's credential belongs to; null for others.
+    workspace: ?[]u8 = null,
     credential: []u8,
+
+    /// Copies of `key` and `credential`, owned by `alloc`.
+    fn of(alloc: Allocator, key: Key, credential: []const u8) Allocator.Error!Entry {
+        const name = try alloc.dupe(u8, key.name);
+        errdefer alloc.free(name);
+        const url = try alloc.dupe(u8, key.url);
+        errdefer alloc.free(url);
+        const workspace = if (key.workspace) |w| try alloc.dupe(u8, w) else null;
+        errdefer if (workspace) |w| alloc.free(w);
+        return .{ .name = name, .url = url, .workspace = workspace, .credential = try alloc.dupe(u8, credential) };
+    }
 
     fn deinit(e: *Entry, alloc: Allocator) void {
         alloc.free(e.name);
         alloc.free(e.url);
+        if (e.workspace) |w| alloc.free(w);
         secret.zeroAndFree(alloc, e.credential);
     }
 };
 
 const Doc = struct {
     entries: std.ArrayList(Entry) = .empty,
-    /// v1's logins were taken over; never again after that.
-    imported_v1: bool = false,
 
     fn deinit(d: *Doc, alloc: Allocator) void {
         for (d.entries.items) |*e| e.deinit(alloc);
         d.entries.deinit(alloc);
     }
 
-    fn find(d: *const Doc, name: []const u8, url: []const u8) ?usize {
-        for (d.entries.items, 0..) |e, i| {
-            if (std.mem.eql(u8, e.name, name) and std.mem.eql(u8, e.url, url)) return i;
-        }
+    fn find(d: *const Doc, key: Key) ?usize {
+        for (d.entries.items, 0..) |e, i| if (key.matches(e)) return i;
         return null;
     }
 
     fn parse(alloc: Allocator, bytes: []const u8) !Doc {
+        // An older fx's `imported_v1` flag is ignored.
         const Saved = struct {
             version: u32,
-            imported_v1: bool = false,
-            servers: []const struct { name: []const u8, url: []const u8, credential: []const u8 },
+            servers: []const struct { name: []const u8, url: []const u8, workspace: ?[]const u8 = null, credential: []const u8 },
         };
         var arena: std.heap.ArenaAllocator = .init(alloc);
         defer arena.deinit();
         const saved = try std.json.parseFromSliceLeaky(Saved, arena.allocator(), bytes, .{ .ignore_unknown_fields = true });
         if (saved.version != 1) return error.UnsupportedVersion;
-        var doc: Doc = .{ .imported_v1 = saved.imported_v1 };
+        var doc: Doc = .{};
         errdefer doc.deinit(alloc);
         try doc.entries.ensureTotalCapacity(alloc, saved.servers.len);
         for (saved.servers) |entry| {
-            var copy: Entry = .{ .name = try alloc.dupe(u8, entry.name), .url = undefined, .credential = undefined };
-            errdefer alloc.free(copy.name);
-            copy.url = try alloc.dupe(u8, entry.url);
-            errdefer alloc.free(copy.url);
-            copy.credential = try alloc.dupe(u8, entry.credential);
-            doc.entries.appendAssumeCapacity(copy);
+            doc.entries.appendAssumeCapacity(try Entry.of(alloc, .{ .name = entry.name, .url = entry.url, .workspace = entry.workspace }, entry.credential));
             std.crypto.secureZero(u8, @constCast(entry.credential));
         }
         return doc;
     }
 };
-
-const ImportV1 = struct {
-    alloc: Allocator,
-    doc: *Doc,
-
-    fn add(ctx: ImportV1, server: []const u8, c: *const v1_auth.Credentials) Allocator.Error!void {
-        if (ctx.doc.find(server, c.endpoint) != null) return;
-        const credential = try fromV1(ctx.alloc, c) orelse return;
-        errdefer secret.zeroAndFree(ctx.alloc, credential);
-        try ctx.doc.entries.ensureUnusedCapacity(ctx.alloc, 1);
-        const name = try ctx.alloc.dupe(u8, server);
-        errdefer ctx.alloc.free(name);
-        const url = try ctx.alloc.dupe(u8, c.endpoint);
-        ctx.doc.entries.appendAssumeCapacity(.{ .name = name, .url = url, .credential = credential });
-    }
-};
-
-/// A v1 login as the credential MCP-v2 saves, or null for one it can't use:
-/// a token that isn't a bearer token, or a client method it doesn't know.
-fn fromV1(alloc: Allocator, c: *const v1_auth.Credentials) Allocator.Error!?[]u8 {
-    if (!std.ascii.eqlIgnoreCase(c.token_type, "bearer")) return null;
-    const Method = enum { none, client_secret_basic, client_secret_post };
-    const method = std.meta.stringToEnum(Method, c.token_endpoint_auth_method) orelse return null;
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer {
-        std.crypto.secureZero(u8, out.writer.buffer);
-        out.deinit();
-    }
-    std.json.Stringify.value(.{
-        .access = c.access_token,
-        .refresh = c.refresh_token,
-        .expires_at_ms = if (c.expires_at_ms == std.math.maxInt(i64)) null else @as(?i64, c.expires_at_ms),
-        .token_endpoint = c.token_endpoint,
-        .revocation_endpoint = c.revocation_endpoint,
-        .resource = c.resource,
-        .client_id = c.client_id,
-        .client_secret = c.client_secret,
-        .method = @tagName(method),
-    }, .{}, &out.writer) catch return error.OutOfMemory;
-    return try out.toOwnedSlice();
-}
 
 const testing = std.testing;
 
@@ -285,74 +323,167 @@ test "a credential is kept per server name and URL, replaced, and removed" {
     defer testing.allocator.free(home);
     const store: Store = .{ .home = home, .backend = .file };
 
-    try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, "linear", "https://mcp.linear.app/mcp"));
-    try store.put(testing.allocator, "linear", "https://mcp.linear.app/mcp", "{\"access\":\"a1\"}");
-    try store.put(testing.allocator, "linear", "https://other.example/mcp", "{\"access\":\"b1\"}");
-    try store.put(testing.allocator, "linear", "https://mcp.linear.app/mcp", "{\"access\":\"a2\"}");
+    try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, .{ .name = "linear", .url = "https://mcp.linear.app/mcp" }));
+    try store.put(testing.allocator, .{ .name = "linear", .url = "https://mcp.linear.app/mcp" }, "{\"access\":\"a1\"}");
+    try store.put(testing.allocator, .{ .name = "linear", .url = "https://other.example/mcp" }, "{\"access\":\"b1\"}");
+    try store.put(testing.allocator, .{ .name = "linear", .url = "https://mcp.linear.app/mcp" }, "{\"access\":\"a2\"}");
 
-    const first = (try store.get(testing.allocator, "linear", "https://mcp.linear.app/mcp")).?;
+    const first = (try store.get(testing.allocator, .{ .name = "linear", .url = "https://mcp.linear.app/mcp" })).?;
     defer secret.zeroAndFree(testing.allocator, first);
     try testing.expectEqualStrings("{\"access\":\"a2\"}", first);
-    const other = (try store.get(testing.allocator, "linear", "https://other.example/mcp")).?;
+    const other = (try store.get(testing.allocator, .{ .name = "linear", .url = "https://other.example/mcp" })).?;
     defer secret.zeroAndFree(testing.allocator, other);
     try testing.expectEqualStrings("{\"access\":\"b1\"}", other);
 
-    try testing.expect(try store.remove(testing.allocator, "linear", "https://mcp.linear.app/mcp"));
-    try testing.expect(!try store.remove(testing.allocator, "linear", "https://mcp.linear.app/mcp"));
-    try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, "linear", "https://mcp.linear.app/mcp"));
+    try testing.expect(try store.remove(testing.allocator, .{ .name = "linear", .url = "https://mcp.linear.app/mcp" }));
+    try testing.expect(!try store.remove(testing.allocator, .{ .name = "linear", .url = "https://mcp.linear.app/mcp" }));
+    try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, .{ .name = "linear", .url = "https://mcp.linear.app/mcp" }));
 }
 
-test "v1's logins are taken over once, and a sign-out isn't undone" {
+test "a workspace server's credential is its workspace's own, apart from the profile's and other workspaces'" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const home = try testHome(&tmp);
     defer testing.allocator.free(home);
-    {
-        var home_dir = io_mod.VerifiedDir{ .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) };
-        defer home_dir.close();
-        var root = try io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.root_dir_name);
-        defer root.close();
-        var dir = try io_mod.openOrCreateVerifiedPrivateDir(&root, profile_paths.mcp_credentials_dir_name);
-        defer dir.close();
-        const entry =
-            \\"endpoint":"https://mcp.linear.app/mcp","resource":"https://mcp.linear.app/mcp","issuer":"https://linear.app",
-            \\"client_id":"c1","client_secret":null,"access_token":"v1-access","refresh_token":"v1-refresh","scope":"read",
-            \\"token_endpoint_auth_method":"none","authorization_endpoint":"https://linear.app/oauth/authorize",
-            \\"token_endpoint":"https://linear.app/oauth/token","revocation_endpoint":null,"expires_at_ms":null
-        ;
-        try io_mod.durableReplaceVerified(testing.allocator, &dir, profile_paths.mcp_credentials_file_name, "{\"version\":1,\"credentials\":[" ++
-            "{\"server_identity\":\"linear\",\"token_type\":\"Bearer\"," ++ entry ++ "}," ++
-            "{\"server_identity\":\"bound\",\"token_type\":\"DPoP\"," ++ entry ++ "}]}");
-    }
     const store: Store = .{ .home = home, .backend = .file };
-    const got = (try store.get(testing.allocator, "linear", "https://mcp.linear.app/mcp")).?;
+    const url = "https://mcp.example.com/mcp";
+    const profile: Key = .{ .name = "github", .url = url };
+    const repo_a: Key = .{ .name = "github", .url = url, .workspace = "/Users/example/a" };
+    const repo_b: Key = .{ .name = "github", .url = url, .workspace = "/Users/example/b" };
+
+    try store.put(testing.allocator, profile, "{\"access\":\"mine\"}");
+    // The profile's login never reaches a workspace's server, nor one
+    // workspace's another's.
+    try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, repo_a));
+    try store.put(testing.allocator, repo_a, "{\"access\":\"a\"}");
+    try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, repo_b));
+    const a = (try store.get(testing.allocator, repo_a)).?;
+    defer secret.zeroAndFree(testing.allocator, a);
+    try testing.expectEqualStrings("{\"access\":\"a\"}", a);
+    const mine = (try store.get(testing.allocator, profile)).?;
+    defer secret.zeroAndFree(testing.allocator, mine);
+    try testing.expectEqualStrings("{\"access\":\"mine\"}", mine);
+
+    // Only the workspace's entry names one; the profile's is saved as before.
+    const bytes = try tmp.dir.readFileAlloc(testing.io, test_path, testing.allocator, .limited(1 << 16));
+    defer testing.allocator.free(bytes);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\"workspace\""));
+    try testing.expect(std.mem.find(u8, bytes, "\"workspace\":\"/Users/example/a\"") != null);
+
+    // Removing under one key leaves the others.
+    try testing.expect(!try store.remove(testing.allocator, repo_b));
+    try testing.expect(!try store.removeIfSame(testing.allocator, repo_b, digest("{\"access\":\"a\"}")));
+    try testing.expect(try store.remove(testing.allocator, repo_a));
+    const still = (try store.get(testing.allocator, profile)).?;
+    defer secret.zeroAndFree(testing.allocator, still);
+    try testing.expectEqualStrings("{\"access\":\"mine\"}", still);
+}
+
+/// v1's store with a login for linear, and one MCP-v2 can't use.
+fn writeV1(home: []const u8) !void {
+    var home_dir = io_mod.VerifiedDir{ .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) };
+    defer home_dir.close();
+    var root = try io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.root_dir_name);
+    defer root.close();
+    var dir = try io_mod.openOrCreateVerifiedPrivateDir(&root, profile_paths.mcp_credentials_dir_name);
+    defer dir.close();
+    const entry =
+        \\"endpoint":"https://mcp.linear.app/mcp","resource":"https://mcp.linear.app/mcp","issuer":"https://linear.app",
+        \\"client_id":"c1","client_secret":null,"access_token":"v1-access","refresh_token":"v1-refresh","scope":"read",
+        \\"token_endpoint_auth_method":"none","authorization_endpoint":"https://linear.app/oauth/authorize",
+        \\"token_endpoint":"https://linear.app/oauth/token","revocation_endpoint":null,"expires_at_ms":null
+    ;
+    try io_mod.durableReplaceVerified(testing.allocator, &dir, profile_paths.mcp_credentials_file_name, "{\"version\":1,\"credentials\":[" ++
+        "{\"server_identity\":\"linear\",\"token_type\":\"Bearer\"," ++ entry ++ "}," ++
+        "{\"server_identity\":\"bound\",\"token_type\":\"DPoP\"," ++ entry ++ "}]}");
+}
+
+test "v1's logins aren't taken over, and an older fx's store with its flag is read as before" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    try writeV1(home);
+    const store: Store = .{ .home = home, .backend = .file };
+    const linear: Key = .{ .name = "linear", .url = "https://mcp.linear.app/mcp" };
+    try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, linear));
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, test_path, .{}));
+    // An older fx wrote its flag; the login is found, and the flag goes.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = test_path, .data = "{\"version\":1,\"imported_v1\":true,\"servers\":[{\"name\":\"linear\",\"url\":\"https://mcp.linear.app/mcp\",\"credential\":\"{}\"}]}" });
+    const got = (try store.get(testing.allocator, linear)) orelse return error.TestUnexpectedResult;
     defer secret.zeroAndFree(testing.allocator, got);
-    try testing.expectEqualStrings(
-        \\{"access":"v1-access","refresh":"v1-refresh","expires_at_ms":null,"token_endpoint":"https://linear.app/oauth/token","revocation_endpoint":null,"resource":"https://mcp.linear.app/mcp","client_id":"c1","client_secret":null,"method":"none"}
-    , got);
-    // A token bound to a key isn't one MCP-v2 can send.
-    try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, "bound", "https://mcp.linear.app/mcp"));
-    // Signed out, it stays signed out: v1's copy isn't taken again.
-    try testing.expect(try store.remove(testing.allocator, "linear", "https://mcp.linear.app/mcp"));
-    try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, "linear", "https://mcp.linear.app/mcp"));
+    try testing.expectEqualStrings("{}", got);
+    try store.put(testing.allocator, .{ .name = "plain", .url = "https://mcp.plain.com/mcp" }, "{}");
+    const bytes = try tmp.dir.readFileAlloc(testing.io, test_path, testing.allocator, .limited(1 << 16));
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.find(u8, bytes, "imported_v1") == null);
 }
 
-test "the credential file is private, and an unreadable one is replaced on the next save" {
+test "one fx holds a login's refresh lock at a time, and each login has its own" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const home = try testHome(&tmp);
     defer testing.allocator.free(home);
     const store: Store = .{ .home = home, .backend = .file };
+    const plain: Key = .{ .name = "plain", .url = "https://mcp.plain.com/mcp" };
+    var held = (try store.tryRefreshLock(plain)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(?Store.Locked, null), try store.tryRefreshLock(plain));
+    // Another login's, and the store itself, aren't held by it.
+    var other = (try store.tryRefreshLock(.{ .name = "plain", .url = "https://mcp.plain.com/mcp", .workspace = "/Users/example/a" })) orelse return error.TestUnexpectedResult;
+    other.release();
+    try store.put(testing.allocator, plain, "{}");
+    held.release();
+    var again = (try store.tryRefreshLock(plain)) orelse return error.TestUnexpectedResult;
+    again.release();
+}
 
-    try store.put(testing.allocator, "plain", "https://mcp.plain.com/mcp", "{\"access\":\"p1\"}");
-    const path = ".fx/" ++ profile_paths.mcp_credentials_dir_name ++ "/" ++ file_name;
-    const stat = try tmp.dir.statFile(testing.io, path, .{});
+const test_path = ".fx/" ++ profile_paths.mcp_credentials_dir_name ++ "/" ++ file_name;
+
+test "the credential file is private, and one this fx can't read is never written over" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    const store: Store = .{ .home = home, .backend = .file };
+    const url = "https://mcp.plain.com/mcp";
+
+    try store.put(testing.allocator, .{ .name = "plain", .url = url }, "{\"access\":\"p1\"}");
+    const stat = try tmp.dir.statFile(testing.io, test_path, .{});
     try testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
 
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = path, .data = "not json" });
-    try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, "plain", "https://mcp.plain.com/mcp"));
-    try store.put(testing.allocator, "plain", "https://mcp.plain.com/mcp", "{\"access\":\"p2\"}");
-    const saved = (try store.get(testing.allocator, "plain", "https://mcp.plain.com/mcp")).?;
-    defer secret.zeroAndFree(testing.allocator, saved);
-    try testing.expectEqualStrings("{\"access\":\"p2\"}", saved);
+    // A damaged file, then one a newer fx saved: no login is found, a
+    // sign-in or sign-out fails, and the file stays as it was.
+    for ([_][]const u8{
+        "not json",
+        "{\"version\":2,\"imported_v1\":true,\"servers\":[{\"name\":\"plain\",\"url\":\"https://mcp.plain.com/mcp\",\"credential\":\"{}\"}]}",
+    }) |bytes| {
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = test_path, .data = bytes });
+        try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, .{ .name = "plain", .url = url }));
+        try testing.expectError(error.CredentialStoreUnreadable, store.check(testing.allocator));
+        try testing.expectError(error.CredentialStoreUnreadable, store.put(testing.allocator, .{ .name = "plain", .url = url }, "{\"access\":\"p2\"}"));
+        try testing.expectError(error.CredentialStoreUnreadable, store.remove(testing.allocator, .{ .name = "plain", .url = url }));
+        const after = try tmp.dir.readFileAlloc(testing.io, test_path, testing.allocator, .limited(1 << 16));
+        defer testing.allocator.free(after);
+        try testing.expectEqualStrings(bytes, after);
+    }
+}
+
+test "a refused login removes only its own: one another fx saved since stays" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    const store: Store = .{ .home = home, .backend = .file };
+    const url = "https://mcp.linear.app/mcp";
+
+    try store.put(testing.allocator, .{ .name = "linear", .url = url }, "{\"access\":\"mine\"}");
+    const mine = digest("{\"access\":\"mine\"}");
+    // Another fx signs in and saves its own.
+    try store.put(testing.allocator, .{ .name = "linear", .url = url }, "{\"access\":\"theirs\"}");
+    try testing.expect(!try store.removeIfSame(testing.allocator, .{ .name = "linear", .url = url }, mine));
+    const kept = (try store.get(testing.allocator, .{ .name = "linear", .url = url })).?;
+    defer secret.zeroAndFree(testing.allocator, kept);
+    try testing.expectEqualStrings("{\"access\":\"theirs\"}", kept);
+    try testing.expect(try store.removeIfSame(testing.allocator, .{ .name = "linear", .url = url }, digest("{\"access\":\"theirs\"}")));
+    try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, .{ .name = "linear", .url = url }));
 }

@@ -15,6 +15,7 @@ const tools = @import("protocol/tools.zig");
 const mrtr = @import("protocol/mrtr.zig");
 const wire = @import("protocol/wire.zig");
 const elicitation = @import("protocol/elicitation.zig");
+const elicit_core = @import("core/elicitation.zig");
 const auth_client = @import("auth/client.zig");
 const trace = @import("io/trace.zig");
 const Bell = @import("io/bell.zig").Bell;
@@ -48,7 +49,7 @@ pub const Options = struct {
 };
 
 /// How a call ended: the server's outcomes, and the engine's own.
-pub const Outcome = enum { result, failure, lost, http_failure, cancelled, rounds_exceeded, unsupported_input, malformed, needs_auth, denied, transport_failed };
+pub const Outcome = enum { result, failure, lost, http_failure, cancelled, rounds_exceeded, unsupported_input, malformed, needs_auth, auth_unavailable, denied, transport_failed };
 
 pub const Event = struct {
     /// The server's name, valid until the next `reload`.
@@ -97,6 +98,8 @@ const Slot = struct {
     tracer: trace.Writer = undefined,
     calls: std.ArrayList(Call) = .empty,
     backoff_due: ?i64 = null,
+    /// When a ready server's tries start over.
+    stable_due: ?i64 = null,
     last_error: ?[]const u8 = null,
     /// Dropped by `reload`: freed once it is down and the host read its events.
     retired_at: i64 = 0,
@@ -145,7 +148,6 @@ pub const Engine = struct {
         for (e.retired.items) |slot| e.destroySlot(slot);
         e.retired.deinit(e.gpa);
         e.slots.deinit(e.gpa);
-        e.bell.deinit();
     }
 
     /// Takes a new list of servers. One whose config is unchanged keeps
@@ -249,9 +251,9 @@ pub const Engine = struct {
     }
 
     /// Answers a 2025 server's elicitation, as `server.zig` does.
-    pub fn answerElicitation(e: *Engine, name: []const u8, elicit: u8, answer: elicitation.Answer) Error!void {
+    pub fn answerElicitation(e: *Engine, name: []const u8, id: elicit_core.Id, answer: elicitation.Answer) Error!void {
         const s = (try e.find(name)).server orelse return error.UnknownElicitation;
-        try s.answerElicitation(elicit, answer);
+        try s.answerElicitation(id, answer);
     }
 
     /// Sign-in, as `server.zig` does; a server that never started
@@ -268,6 +270,20 @@ pub const Engine = struct {
 
     pub fn cancelSignIn(e: *Engine, name: []const u8) Error!void {
         try (try e.ensureServer(try e.find(name))).cancelSignIn();
+    }
+
+    /// Hands server `name` a credential its host found saved since, as after
+    /// a sign-in, and starts the server.
+    pub fn useCredential(e: *Engine, name: []const u8, saved: []const u8) Error!void {
+        const slot = try e.find(name);
+        try (try e.ensureServer(slot)).useCredential(saved);
+        try e.step(slot, .need);
+    }
+
+    /// Sends the refresh server `name` said was due.
+    pub fn refresh(e: *Engine, name: []const u8) Error!void {
+        const server = (try e.find(name)).server orelse return;
+        try server.refresh();
     }
 
     pub fn signOut(e: *Engine, name: []const u8) Error!void {
@@ -320,6 +336,10 @@ pub const Engine = struct {
                     // A subscription waiting to listen again is demand.
                     if (slot.server) |s| if (s.waiting()) try e.step(slot, .need);
                 };
+                if (slot.stable_due) |due| if (due <= e.now()) {
+                    slot.stable_due = null;
+                    try e.step(slot, .stable);
+                };
                 // What the host should see goes out before that server is
                 // read again, so the slices in it stay valid. What the same
                 // read queued is taken with it, so the gate is current when
@@ -340,6 +360,7 @@ pub const Engine = struct {
             var wait = deadline;
             for (e.slots.items) |slot| {
                 if (slot.backoff_due) |due| wait = @min(wait, due);
+                if (slot.stable_due) |due| wait = @min(wait, due);
                 if (slot.server) |s| {
                     if (s.dueMs()) |due| wait = @min(wait, due);
                 }
@@ -356,7 +377,9 @@ pub const Engine = struct {
                 slot.last_error = switch (f) {
                     .era => |why| @tagName(why),
                     .session => "session",
+                    .initialized_timed_out => "initialized_timed_out",
                     .needs_auth => "needs_auth",
+                    .auth_unavailable => "auth_unavailable",
                 };
                 // One that needs a sign-in is dropped, as the host would,
                 // and what waits ends needs_auth; once signed in, the next
@@ -439,6 +462,7 @@ pub const Engine = struct {
             .list => try slot.server.?.needTools(),
             .refuse_need => e.emit(slot, .{ .server = .{ .tools = .{ .ok = false, .fresh = false, .needs_auth = why == .needs_auth } } }),
             .arm_backoff => |ms| slot.backoff_due = e.now() + ms,
+            .arm_stable => |ms| slot.stable_due = e.now() + ms,
             .teardown => {
                 slot.backoff_due = null;
                 if (slot.server) |s| try s.reset();
@@ -520,7 +544,7 @@ pub const Engine = struct {
         };
         const auth = &slot.config.auth;
         auth.client_name = try a.dupe(u8, c.auth.client_name);
-        inline for (.{ "client_id", "client_secret", "client_metadata_url", "saved" }) |field| {
+        inline for (.{ "client_id", "client_secret", "client_metadata_url", "saved", "resource", "scopes" }) |field| {
             if (@field(c.auth, field)) |v| @field(auth, field) = try a.dupe(u8, v);
         }
         return slot;
@@ -592,7 +616,7 @@ fn same(a: Config, b: Config) bool {
             for (h.headers, g.headers) |x, y| if (!std.mem.eql(u8, x.name, y.name) or !std.mem.eql(u8, x.value, y.value)) return false;
         },
     }
-    inline for (.{ "client_id", "client_secret", "client_metadata_url" }) |field| {
+    inline for (.{ "client_id", "client_secret", "client_metadata_url", "resource", "scopes" }) |field| {
         const x = @field(a.auth, field);
         const y = @field(b.auth, field);
         if ((x == null) != (y == null)) return false;
@@ -607,22 +631,29 @@ test {
     std.testing.refAllDecls(Engine);
 }
 
+/// A host that allows everything and logs nothing, for the tests below.
+const TestHost = struct {
+    var context: u8 = 0;
+    fn allow(_: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8) bool {
+        return true;
+    }
+    fn log(_: *anyopaque, _: []const u8, _: []const u8) void {}
+    fn start(e: *Engine) !void {
+        try e.init(std.testing.io, std.testing.allocator, .{ .context = &context, .allow = allow, .log = log }, .{
+            .client = .{ .info = .{ .name = "test", .version = "0" } },
+        }, &.{});
+    }
+};
+
 test "wake from another thread ends a waiting next early" {
     const Fake = struct {
-        fn allow(_: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8) bool {
-            return true;
-        }
-        fn log(_: *anyopaque, _: []const u8, _: []const u8) void {}
         fn wakeLater(e: *Engine) void {
             std.Io.sleep(e.io, .fromMilliseconds(30), .awake) catch {};
             e.wake();
         }
     };
-    var context: u8 = 0;
     var e: Engine = undefined;
-    try e.init(std.testing.io, std.testing.allocator, .{ .context = &context, .allow = Fake.allow, .log = Fake.log }, .{
-        .client = .{ .info = .{ .name = "test", .version = "0" } },
-    }, &.{});
+    try TestHost.start(&e);
     defer e.deinit();
 
     const started = e.now();
@@ -645,5 +676,49 @@ test "a stdio server's directory is part of its config, so a new one restarts it
     b.transport.stdio.cwd = "/b";
     try std.testing.expect(!same(a, b));
     b.transport.stdio.cwd = null;
+    try std.testing.expect(!same(a, b));
+}
+
+test "a slot copies every auth string, so the host may free its configs" {
+    var e: Engine = undefined;
+    try TestHost.start(&e);
+    defer e.deinit();
+    const info = @typeInfo(auth_client.Options).@"struct";
+    var text = "borrowed".*;
+    var auth: auth_client.Options = .{};
+    inline for (info.field_names, info.field_types) |name, T| switch (T) {
+        []const u8, ?[]const u8 => @field(auth, name) = &text,
+        else => {},
+    };
+    const argv = [_][]const u8{"x"};
+    const slot = try e.newSlot(.{ .name = "x", .transport = .{ .stdio = .{ .argv = &argv } }, .auth = auth });
+    defer e.destroySlot(slot);
+    @memset(&text, 'U');
+    inline for (info.field_names, info.field_types) |name, T| switch (T) {
+        []const u8 => try std.testing.expectEqualStrings("borrowed", @field(slot.config.auth, name)),
+        ?[]const u8 => try std.testing.expectEqualStrings("borrowed", @field(slot.config.auth, name).?),
+        else => {},
+    };
+}
+
+test "the resource is part of a server's config, so a new one restarts it" {
+    const argv = [_][]const u8{"x"};
+    const a: Config = .{ .name = "x", .transport = .{ .stdio = .{ .argv = &argv } }, .auth = .{ .resource = "https://a.example/" } };
+    var b = a;
+    try std.testing.expect(same(a, b));
+    b.auth.resource = "https://b.example/";
+    try std.testing.expect(!same(a, b));
+    b.auth.resource = null;
+    try std.testing.expect(!same(a, b));
+}
+
+test "the scopes are part of a server's config, so new ones restart it" {
+    const argv = [_][]const u8{"x"};
+    const a: Config = .{ .name = "x", .transport = .{ .stdio = .{ .argv = &argv } }, .auth = .{ .scopes = "a.read" } };
+    var b = a;
+    try std.testing.expect(same(a, b));
+    b.auth.scopes = "a.write";
+    try std.testing.expect(!same(a, b));
+    b.auth.scopes = null;
     try std.testing.expect(!same(a, b));
 }

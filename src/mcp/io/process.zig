@@ -15,12 +15,14 @@
 //! stop together. A descendant that leaves the group with setsid escapes.
 //!
 //! Every process is listed, so a program about to exit can send each
-//! server's group SIGTERM from any thread and wait for none of them.
+//! server's group SIGTERM from any thread and wait for none of them. A
+//! helper process stops what is left once the program is gone (`helper`).
 
 const std = @import("std");
 const core = @import("../core/stdio_conn.zig");
 const wire = @import("../protocol/wire.zig");
 const lines = @import("lines.zig");
+const Budget = @import("budget.zig").Budget;
 const trace = @import("trace.zig");
 const Bell = @import("bell.zig").Bell;
 
@@ -45,6 +47,69 @@ pub fn signalAllForExit(io: std.Io) void {
         p.signal(.term);
     }
 }
+
+/// The helper that stops what is left of the servers once the program is
+/// gone, by exit or by crash. It hears
+/// each group that starts ("+") and each one that is reaped ("-"). When its
+/// stdin closes it sends the groups still listed SIGTERM, then SIGKILL 2 s
+/// later, so the program's exit waits for nothing.
+const helper = struct {
+    /// A leaf lock: taken under `pid_lock`, and nothing is taken under it.
+    var mutex: std.Io.Mutex = .init;
+    var started = false;
+    /// Its stdin; null when it never started or can't be told.
+    var stdin: ?std.posix.fd_t = null;
+    var pid: std.posix.pid_t = 0;
+
+    const script =
+        \\trap '' INT HUP
+        \\g=
+        \\while read -r m; do
+        \\  case $m in
+        \\    +*) g="$g ${m#+}" ;;
+        \\    -*) k=; for x in $g; do [ "$x" = "${m#-}" ] || k="$k $x"; done; g=$k ;;
+        \\  esac
+        \\done
+        \\[ -n "$g" ] || exit 0
+        \\for x in $g; do kill -s TERM -- "-$x"; done
+        \\sleep 2
+        \\for x in $g; do kill -s KILL -- "-$x"; done
+    ;
+
+    /// Starts it, once, before the first server.
+    fn start(io: std.Io) void {
+        mutex.lockUncancelable(io);
+        defer mutex.unlock(io);
+        if (started) return;
+        started = true;
+        const child = std.process.spawn(io, .{
+            .argv = &.{ "/bin/sh", "-c", script },
+            .stdin = .pipe,
+            .stdout = .ignore,
+            .stderr = .ignore,
+            // Its own group, so the terminal's Ctrl-C doesn't reach it.
+            .pgid = 0,
+        }) catch return;
+        const fd = child.stdin.?.handle;
+        // A write never waits on it.
+        _ = std.posix.system.fcntl(fd, std.posix.F.SETFL, @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK"));
+        stdin = fd;
+        pid = child.id.?;
+    }
+
+    /// Tells it a group started (`sign` '+') or was reaped ('-'). One that
+    /// can't be told is stopped, so it never acts on a list out of date.
+    fn tell(io: std.Io, sign: u8, group: std.posix.pid_t) void {
+        mutex.lockUncancelable(io);
+        defer mutex.unlock(io);
+        const fd = stdin orelse return;
+        var buffer: [16]u8 = undefined;
+        const line = std.mem.print(&buffer, "{c}{d}\n", .{ sign, group }) catch return;
+        if (std.c.write(fd, line.ptr, line.len) == line.len) return;
+        std.posix.kill(pid, .KILL) catch {};
+        stdin = null;
+    }
+};
 
 pub const Options = struct {
     argv: []const []const u8,
@@ -98,7 +163,8 @@ const Posted = union(enum) {
     stderr: []u8,
     exited: core.Generation,
     timer: core.Timer,
-    wake: u32,
+    /// A write to that process's stdin failed.
+    write_failed: core.Generation,
 
     fn free(posted: Posted, gpa: std.mem.Allocator) void {
         switch (posted) {
@@ -106,6 +172,34 @@ const Posted = union(enum) {
             .stderr => |s| gpa.free(s),
             else => {},
         }
+    }
+};
+
+/// One process's stdin, written in order by its own task, so a server that
+/// stops reading blocks only that task, never the host. The process
+/// and the task each hold a reference; the last to let go closes the file
+/// and frees this.
+const Stdin = struct {
+    file: std.Io.File,
+    generation: core.Generation,
+    queue: std.Io.Queue([]u8),
+    /// Above the request table's 64 slots and their cancels, so only the
+    /// byte cap can refuse a send.
+    buffer: [256][]u8 = undefined,
+    /// Bytes queued and not yet written.
+    queued: std.atomic.Value(usize) = .init(0),
+    refs: std.atomic.Value(u8) = .init(2),
+
+    fn unref(s: *Stdin, p: *Process) void {
+        if (s.refs.fetchSub(1, .acq_rel) != 1) return;
+        var rest: [16][]u8 = undefined;
+        while (true) {
+            const n = s.queue.getUncancelable(p.io, &rest, 0) catch break;
+            if (n == 0) break;
+            for (rest[0..n]) |line| p.gpa.free(line);
+        }
+        s.file.close(p.io);
+        p.gpa.destroy(s);
     }
 };
 
@@ -121,15 +215,20 @@ pub const Process = struct {
     pid_lock: std.Io.Mutex = .init,
     /// Set while the current process is unreaped.
     pid: ?std.posix.pid_t = null,
-    stdin: ?std.Io.File = null,
+    stdin: ?*Stdin = null,
     /// The bytes behind the last `message` or `stderr` returned by `next`.
     held: ?[]u8 = null,
     /// The message `send` is writing, while its step runs.
     outgoing: []const u8 = "",
-    /// Counts `next` timeouts, so a stale wake-up is ignored.
-    wake_id: u32 = 0,
+    /// Rung after each post, as is the shared `bell` if any. `next` waits on
+    /// this one, so a timed wait starts no task and never takes a ring meant
+    /// for another server.
+    own: Bell = undefined,
     /// stderr lines dropped because the queue was full.
     stderr_dropped: std.atomic.Value(u32) = .init(0),
+    /// Bytes of stdout lines posted and not yet taken: at most one longest
+    /// line, so a fast server waits instead of growing fx.
+    budget: Budget,
     /// Why the last start failed, for logs.
     spawn_error: ?SpawnError = null,
     /// This process in `everyone.list`.
@@ -137,7 +236,8 @@ pub const Process = struct {
 
     /// `options` (and the slices it holds) must outlive the process.
     pub fn init(p: *Process, io: std.Io, gpa: std.mem.Allocator, options: Options) void {
-        p.* = .{ .io = io, .gpa = gpa, .options = options, .conn = .init(options.config), .queue = undefined };
+        p.* = .{ .io = io, .gpa = gpa, .options = options, .conn = .init(options.config), .queue = undefined, .budget = .{ .max = options.max_line } };
+        p.own.init(io);
         p.queue = .init(&p.queue_buffer);
         everyone.mutex.lockUncancelable(io);
         everyone.list.append(&p.node);
@@ -153,13 +253,14 @@ pub const Process = struct {
         everyone.mutex.unlock(p.io);
         p.pid_lock.lockUncancelable(p.io);
         if (p.pid) |pid| {
-            std.posix.kill(pid, .KILL) catch {};
+            // The whole group, as `signal` does.
+            std.posix.kill(-pid, .KILL) catch std.posix.kill(pid, .KILL) catch {};
             _ = std.c.waitpid(pid, null, 0);
+            helper.tell(p.io, '-', pid);
             p.pid = null;
         }
         p.pid_lock.unlock(p.io);
-        if (p.stdin) |file| file.close(p.io);
-        p.stdin = null;
+        p.closeStdin();
         p.tasks.cancel(p.io);
         p.queue.close(p.io);
         var rest: [16]Posted = undefined;
@@ -169,6 +270,7 @@ pub const Process = struct {
             for (rest[0..n]) |posted| posted.free(p.gpa);
         }
         p.release();
+        p.budget.deinit(p.gpa);
     }
 
     pub fn start(p: *Process) Error!void {
@@ -199,19 +301,12 @@ pub const Process = struct {
     /// Waits for the next thing the host should see. With `timeout_ms`,
     /// returns `timeout` if nothing arrives first.
     pub fn next(p: *Process, timeout_ms: ?u32) Error!Incoming {
-        p.release();
-        if (timeout_ms) |ms| {
-            p.wake_id +%= 1;
-            try p.tasks.concurrent(p.io, postAfter, .{ p, .{ .wake = p.wake_id }, ms });
-        }
+        const deadline = if (timeout_ms) |ms| std.Io.Clock.awake.now(p.io).toMilliseconds() + ms else null;
         while (true) {
-            const posted = p.queue.getOne(p.io) catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-                error.Closed => unreachable, // only deinit closes the queue
-            };
-            if (posted == .wake) {
-                if (posted.wake == p.wake_id and timeout_ms != null) return .timeout;
-            } else if (try p.take(posted)) |incoming| return incoming;
+            if (try p.poll()) |incoming| return incoming;
+            const left: ?u32 = if (deadline) |d| @intCast(@max(0, d - std.Io.Clock.awake.now(p.io).toMilliseconds())) else null;
+            if (left == 0) return .timeout;
+            try p.own.wait(left);
         }
     }
 
@@ -220,7 +315,11 @@ pub const Process = struct {
         p.release();
         var one: [1]Posted = undefined;
         while ((p.queue.get(p.io, &one, 0) catch 0) == 1) {
-            if (one[0] != .wake) if (try p.take(one[0])) |incoming| return incoming;
+            switch (one[0]) {
+                .line => |l| p.budget.give(p.io, l.bytes.len),
+                else => {},
+            }
+            if (try p.take(one[0])) |incoming| return incoming;
         }
         return null;
     }
@@ -229,7 +328,6 @@ pub const Process = struct {
     fn take(p: *Process, posted: Posted) Error!?Incoming {
         const before = p.conn.state;
         const lost = switch (posted) {
-            .wake => unreachable,
             .line => |line| {
                 const message = wire.decode(line.bytes) catch |err| {
                     p.gpa.free(line.bytes);
@@ -253,13 +351,15 @@ pub const Process = struct {
             .oversized => |g| (try p.apply(.{ .oversized_line = g })).lost,
             .exited => |g| (try p.apply(.{ .process_exited = g })).lost,
             .timer => |t| (try p.apply(.{ .timer_fired = t })).lost,
+            // One from an earlier process is stale.
+            .write_failed => |g| if (g == p.conn.generation) (try p.apply(.write_failed)).lost else false,
         };
         if (lost or p.conn.state != before) return .{ .changed = .{ .state = p.conn.state, .lost = lost } };
         return null;
     }
 
     fn release(p: *Process) void {
-        if (p.held) |bytes| p.gpa.free(bytes);
+        if (p.held) |bytes| p.budget.recycle(p.io, p.gpa, bytes);
         p.held = null;
     }
 
@@ -285,10 +385,7 @@ pub const Process = struct {
                         break :blk .spawn_failed;
                     };
                 },
-                .close_stdin => if (p.stdin) |file| {
-                    file.close(p.io);
-                    p.stdin = null;
-                },
+                .close_stdin => p.closeStdin(),
                 .signal => |s| p.signal(s.signal),
                 .arm_timer => |a| try p.tasks.concurrent(p.io, postAfter, .{ p, .{ .timer = a.timer }, p.delay(a.timer.kind, a.after_ms) }),
                 .deliver => result.delivered = true,
@@ -299,8 +396,7 @@ pub const Process = struct {
                 .lost => {
                     result.lost = true;
                     // The process is gone, so its stdin is too.
-                    if (p.stdin) |file| file.close(p.io);
-                    p.stdin = null;
+                    p.closeStdin();
                 },
             };
         }
@@ -309,7 +405,9 @@ pub const Process = struct {
 
     fn spawn(p: *Process, generation: core.Generation) SpawnError!void {
         std.debug.assert(p.stdin == null);
-        const child = try std.process.spawn(p.io, .{
+        helper.start(p.io);
+        const stdin = try p.gpa.create(Stdin);
+        const child = std.process.spawn(p.io, .{
             .argv = p.options.argv,
             .environ_map = p.options.environ_map,
             .cwd = if (p.options.cwd) |dir| .{ .path = dir } else .inherit,
@@ -318,31 +416,52 @@ pub const Process = struct {
             .stderr = .pipe,
             // A new process group, led by the server.
             .pgid = 0,
-        });
+        }) catch |err| {
+            p.gpa.destroy(stdin);
+            return err;
+        };
         const pid = child.id.?;
         p.pid_lock.lockUncancelable(p.io);
         p.pid = pid;
         p.pid_lock.unlock(p.io);
+        // Before the exit watcher, which reaps it, starts.
+        helper.tell(p.io, '+', pid);
         // Started after `signalAllForExit` went through the list.
         if (everyone.exiting.load(.seq_cst)) p.signal(.term);
-        p.stdin = child.stdin;
-        errdefer p.stopSpawned(child.stdout.?, child.stderr.?);
+        stdin.* = .{ .file = child.stdin.?, .generation = generation, .queue = undefined };
+        stdin.queue = .init(&stdin.buffer);
+        p.tasks.concurrent(p.io, writeLines, .{ p, stdin }) catch |err| {
+            stdin.file.close(p.io);
+            p.gpa.destroy(stdin);
+            p.stopSpawned(child.stdout.?, child.stderr.?);
+            return err;
+        };
+        p.stdin = stdin;
+        // A reader that started closes its pipe; only the others are closed
+        // here.
+        var unread: [2]?std.Io.File = .{ child.stdout.?, child.stderr.? };
+        errdefer p.stopSpawned(unread[0], unread[1]);
         try p.tasks.concurrent(p.io, readLines, .{ p, child.stdout.?, .{ .stdout = generation } });
+        unread[0] = null;
         try p.tasks.concurrent(p.io, readLines, .{ p, child.stderr.?, .stderr });
+        unread[1] = null;
         try p.tasks.concurrent(p.io, watch, .{ p, generation, pid });
     }
 
-    /// Undoes a spawn whose tasks couldn't all start.
-    fn stopSpawned(p: *Process, stdout: std.Io.File, stderr: std.Io.File) void {
+    /// Undoes a spawn whose tasks couldn't all start, closing the pipes no
+    /// reader took.
+    fn stopSpawned(p: *Process, stdout: ?std.Io.File, stderr: ?std.Io.File) void {
         p.signal(.kill);
         p.pid_lock.lockUncancelable(p.io);
-        if (p.pid) |pid| _ = std.c.waitpid(pid, null, 0);
+        if (p.pid) |pid| {
+            _ = std.c.waitpid(pid, null, 0);
+            helper.tell(p.io, '-', pid);
+        }
         p.pid = null;
         p.pid_lock.unlock(p.io);
-        if (p.stdin) |file| file.close(p.io);
-        p.stdin = null;
-        stdout.close(p.io);
-        stderr.close(p.io);
+        p.closeStdin();
+        if (stdout) |f| f.close(p.io);
+        if (stderr) |f| f.close(p.io);
     }
 
     fn signal(p: *Process, which: core.Signal) void {
@@ -358,10 +477,50 @@ pub const Process = struct {
         std.posix.kill(-pid, sig) catch std.posix.kill(pid, sig) catch {};
     }
 
+    /// Queues the outgoing message for stdin's writer. A server that stops
+    /// reading fills the queue: once what waits passes the line limit, it is
+    /// broken. A lone message of any size still goes out.
     fn write(p: *Process) !void {
-        const file = p.stdin orelse return error.NotOpen;
-        try file.writeStreamingAll(p.io, p.outgoing);
-        try file.writeStreamingAll(p.io, "\n");
+        const s = p.stdin orelse return error.NotOpen;
+        const size = p.outgoing.len + 1;
+        const waiting = s.queued.fetchAdd(size, .monotonic);
+        if (waiting != 0 and waiting + size > p.options.max_line) {
+            _ = s.queued.fetchSub(size, .monotonic);
+            return error.Full;
+        }
+        errdefer _ = s.queued.fetchSub(size, .monotonic);
+        const line = try p.gpa.alloc(u8, size);
+        errdefer p.gpa.free(line);
+        @memcpy(line[0..p.outgoing.len], p.outgoing);
+        line[p.outgoing.len] = '\n';
+        if (try s.queue.put(p.io, &.{line}, 0) == 0) return error.Full;
+    }
+
+    /// Writes `s`'s lines in order until its queue is closed and empty. A
+    /// failed write is posted for its process, and the rest is dropped.
+    fn writeLines(p: *Process, s: *Stdin) std.Io.Cancelable!void {
+        defer s.unref(p);
+        while (true) {
+            const line = s.queue.getOne(p.io) catch |err| switch (err) {
+                error.Closed => return,
+                error.Canceled => return error.Canceled,
+            };
+            defer p.gpa.free(line);
+            _ = s.queued.fetchSub(line.len, .monotonic);
+            s.file.writeStreamingAll(p.io, line) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => return p.post(.{ .write_failed = s.generation }),
+            };
+        }
+    }
+
+    /// Closes stdin after what is already queued; the writer then closes
+    /// the file.
+    fn closeStdin(p: *Process) void {
+        const s = p.stdin orelse return;
+        p.stdin = null;
+        s.queue.close(p.io);
+        s.unref(p);
     }
 
     /// Backoff delays get jitter, uniform in [half, full].
@@ -376,11 +535,15 @@ pub const Process = struct {
     /// Posts to the queue, or frees what can't be posted.
     fn post(p: *Process, posted: Posted) std.Io.Cancelable!void {
         p.queue.putOne(p.io, posted) catch |err| {
+            switch (posted) {
+                .line => |l| p.budget.give(p.io, l.bytes.len),
+                else => {},
+            }
             posted.free(p.gpa);
             if (err == error.Canceled) return error.Canceled;
             return;
         };
-        if (posted != .wake) if (p.options.bell) |b| b.ring();
+        p.ring();
     }
 
     const Stream = union(enum) {
@@ -414,7 +577,11 @@ pub const Process = struct {
                 const sink = p.options.stderr.?;
                 sink.line(sink.context, bytes);
             } else if (bytes.len > 0) {
-                const owned = p.gpa.dupe(u8, bytes) catch return;
+                // A stdout line waits for room before it is copied.
+                const owned = switch (stream) {
+                    .stdout => try p.budget.copy(p.io, p.gpa, bytes),
+                    .stderr => p.gpa.dupe(u8, bytes) catch null,
+                } orelse return;
                 switch (stream) {
                     .stdout => |g| try p.post(.{ .line = .{ .generation = g, .bytes = owned } }),
                     // Stderr is only logged and never blocks on the
@@ -423,7 +590,7 @@ pub const Process = struct {
                     .stderr => if ((p.queue.put(p.io, &.{.{ .stderr = owned }}, 0) catch 0) == 0) {
                         p.gpa.free(owned);
                         _ = p.stderr_dropped.fetchAdd(1, .monotonic);
-                    } else if (p.options.bell) |b| b.ring(),
+                    } else p.ring(),
                 }
             }
             if (at_end) return;
@@ -436,14 +603,23 @@ pub const Process = struct {
             const result = std.c.waitpid(pid, null, std.c.W.NOHANG);
             // -1 means the pid is no longer ours to wait for; treat it as gone.
             const gone = result == pid or result == -1;
-            if (gone) p.pid = null;
+            if (gone) {
+                // Told while its id can't yet come round.
+                helper.tell(p.io, '-', pid);
+                p.pid = null;
+            }
             p.pid_lock.unlock(p.io);
             if (gone) return p.post(.{ .exited = generation });
             try p.io.sleep(.fromMilliseconds(p.options.poll_ms), .awake);
         }
     }
 
-    /// Posts `posted` after `after_ms`: a timer for the core, or a wake-up for `next`.
+    fn ring(p: *Process) void {
+        p.own.ring();
+        if (p.options.bell) |b| b.ring();
+    }
+
+    /// Posts `posted` after `after_ms`: a timer for the core.
     fn postAfter(p: *Process, posted: Posted, after_ms: u32) std.Io.Cancelable!void {
         try p.io.sleep(.fromMilliseconds(after_ms), .awake);
         try p.post(posted);
@@ -485,6 +661,24 @@ test "messages arrive, and a stop that closes stdin ends the server" {
     try p.stop();
     try expectState(&p, .stopped);
     try testing.expect(!p.conn.term_sent and !p.conn.kill_sent);
+}
+
+test "lines past the budget all arrive, each once the one before it is taken" {
+    // Six lines of 46 bytes against a 64-byte budget: each waits for room.
+    const argv = shell("for i in 1 2 3 4 5 6; do printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/n%s\"}\\n' $i; done; exec cat >/dev/null");
+    var p: Process = undefined;
+    initTest(&p, &argv);
+    defer p.deinit();
+    try p.start();
+    var got: usize = 0;
+    while (got < 6) switch (try p.next(5_000)) {
+        .message => got += 1,
+        .timeout => return error.TestTimeout,
+        else => {},
+    };
+    try testing.expect(p.budget.used <= 64);
+    try p.stop();
+    try expectState(&p, .stopped);
 }
 
 test "a server starts in the directory it's given" {
@@ -597,6 +791,71 @@ test "lines that aren't MCP messages are dropped, and CRLF and empty lines are h
     try testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"method\":\"m\"}", message.bytes);
 }
 
+test "a send to a server that stops reading returns at once; only stdin's writer waits" {
+    // It never reads stdin, so the pipe fills long before 1 MiB.
+    const argv = shell("exec sleep 30");
+    var p: Process = undefined;
+    p.init(testing.io, testing.allocator, .{ .argv = &argv, .config = test_config, .poll_ms = 5 });
+    defer p.deinit();
+    try p.start();
+    try testing.expectEqual(core.State.running, p.conn.state);
+    const big = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(big);
+    @memset(big, 'x');
+    const started = std.Io.Clock.awake.now(testing.io).toMilliseconds();
+    try p.send(.notification, big);
+    try p.send(.notification, "{}");
+    try testing.expect(std.Io.Clock.awake.now(testing.io).toMilliseconds() - started < 2_000);
+    try testing.expectEqual(core.State.running, p.conn.state);
+}
+
+test "a server that stops reading is a broken connection once what waits passes the line limit" {
+    const argv = shell("exec sleep 30");
+    var p: Process = undefined;
+    p.init(testing.io, testing.allocator, .{ .argv = &argv, .config = test_config, .poll_ms = 5, .max_line = 4096 });
+    defer p.deinit();
+    try p.start();
+    const big = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(big);
+    @memset(big, 'x');
+    // A lone message of any size goes out; it fills the pipe.
+    try p.send(.notification, big);
+    try testing.expectEqual(core.State.running, p.conn.state);
+    for (0..4) |_| if (p.conn.state == .running) try p.send(.notification, big[0..3000]);
+    try testing.expectEqual(core.State.killing, p.conn.state);
+    try expectState(&p, .backoff);
+}
+
+test "a server that closes its stdin is a broken connection once a write fails" {
+    const argv = shell("exec 0<&-; sleep 30");
+    var p: Process = undefined;
+    initTest(&p, &argv);
+    defer p.deinit();
+    try p.start();
+    // Writes before the shell closes stdin still land in the pipe.
+    for (0..250) |_| {
+        try p.send(.notification, "{}");
+        switch (try p.next(20)) {
+            .changed => |c| if (c.state == .killing) return,
+            else => {},
+        }
+    }
+    return error.TestTimeout;
+}
+
+test "a write failure from an earlier process is ignored" {
+    const argv = shell("exec cat >/dev/null");
+    var p: Process = undefined;
+    initTest(&p, &argv);
+    defer p.deinit();
+    try p.start();
+    try p.post(.{ .write_failed = p.conn.generation -% 1 });
+    try testing.expect(try p.next(50) == .timeout);
+    try testing.expectEqual(core.State.running, p.conn.state);
+    try p.post(.{ .write_failed = p.conn.generation });
+    try expectState(&p, .killing);
+}
+
 test "an oversized line kills the server" {
     const argv = shell("printf '%0100d\\n' 0; exec cat >/dev/null");
     var p: Process = undefined;
@@ -639,4 +898,192 @@ test "a stop signals the server's whole process group, so its children stop too"
         try testing.io.sleep(.fromMilliseconds(10), .awake);
     }
     return error.ChildStillRunning;
+}
+
+test "the helper hears each server group that starts and each one that is reaped, in order" {
+    // The test reads in place of the helper.
+    helper.start(testing.io);
+    const ends = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    defer for (ends) |fd| {
+        _ = std.c.close(fd);
+    };
+    helper.mutex.lockUncancelable(testing.io);
+    const real = helper.stdin;
+    helper.stdin = ends[1];
+    helper.mutex.unlock(testing.io);
+    defer {
+        helper.mutex.lockUncancelable(testing.io);
+        helper.stdin = real;
+        helper.mutex.unlock(testing.io);
+    }
+    const argv = shell("exec cat >/dev/null");
+    var p: Process = undefined;
+    initTest(&p, &argv);
+    defer p.deinit();
+    try p.start();
+    p.pid_lock.lockUncancelable(testing.io);
+    const pid = p.pid.?;
+    p.pid_lock.unlock(testing.io);
+    try p.stop();
+    try expectState(&p, .stopped);
+    var heard: [64]u8 = undefined;
+    const n = std.c.read(ends[0], &heard, heard.len);
+    var want: [64]u8 = undefined;
+    try testing.expectEqualStrings(try std.mem.print(&want, "+{d}\n-{d}\n", .{ pid, pid }), heard[0..@intCast(n)]);
+}
+
+test "once the program is gone, the helper kills a server that ignores SIGTERM and closed stdin, after 2 s" {
+    // It ignores both, and so does its sleep.
+    const argv = shell("trap '' TERM; echo ready >&2; exec 0</dev/null; while :; do sleep 1; done");
+    var p: Process = undefined;
+    initTest(&p, &argv);
+    defer p.deinit();
+    try p.start();
+    // Once its trap is set.
+    try testing.expectEqualStrings("ready", (try p.next(5_000)).stderr);
+    // What the system does as the program exits: the helper's stdin closes.
+    helper.mutex.lockUncancelable(testing.io);
+    const fd = helper.stdin;
+    if (fd) |f| _ = std.c.close(f);
+    helper.stdin = null;
+    helper.mutex.unlock(testing.io);
+    if (fd == null) return error.NoHelper;
+    const closed = std.Io.Clock.awake.now(testing.io).toMilliseconds();
+    while (true) switch (try p.next(10_000)) {
+        .changed => |c| if (c.state != .running) break,
+        .timeout => return error.TestTimeout,
+        else => {},
+    };
+    const waited = std.Io.Clock.awake.now(testing.io).toMilliseconds() - closed;
+    try testing.expect(waited >= 1_900 and waited < 6_000);
+}
+
+test "deinit kills the server's whole process group, so its children stop too" {
+    const argv = shell("sleep 30 & echo $! >&2; wait");
+    var p: Process = undefined;
+    initTest(&p, &argv);
+    try p.start();
+    const child = try std.fmt.parseInt(std.posix.pid_t, (try p.next(5_000)).stderr, 10);
+    defer std.posix.kill(child, .KILL) catch {};
+    p.deinit();
+    for (0..100) |_| {
+        std.posix.kill(child, @fromBackingInt(@intCast(0))) catch |err| switch (err) {
+            error.ProcessNotFound => return,
+            else => return err,
+        };
+        try testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    return error.ChildStillRunning;
+}
+
+/// A process group of a shell that ignores SIGTERM, ready once returned.
+fn stubbornGroup() !std.process.Child {
+    var child = try std.process.spawn(testing.io, .{
+        .argv = &.{ "/bin/sh", "-c", "trap '' TERM; echo ready >&2; while :; do sleep 1; done" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .pipe,
+        .pgid = 0,
+    });
+    var buffer: [16]u8 = undefined;
+    var reader = child.stderr.?.reader(testing.io, &buffer);
+    _ = try reader.interface.takeDelimiterInclusive('\n');
+    return child;
+}
+
+/// Whether child `pid` has ended within `ms`, reaping it if so.
+fn endsWithin(pid: std.posix.pid_t, ms: u32) bool {
+    for (0..ms / 10) |_| {
+        if (std.c.waitpid(pid, null, std.c.W.NOHANG) == pid) return true;
+        testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    return false;
+}
+
+test "the helper kills the groups it still lists 2 s after its stdin closes, and none it was told are gone" {
+    var listed = try stubbornGroup();
+    defer listed.stderr.?.close(testing.io);
+    var gone = try stubbornGroup();
+    defer gone.stderr.?.close(testing.io);
+    defer if (!endsWithin(gone.id.?, 10)) {
+        std.posix.kill(-gone.id.?, .KILL) catch {};
+        _ = std.c.waitpid(gone.id.?, null, 0);
+    };
+    defer if (!endsWithin(listed.id.?, 10)) {
+        std.posix.kill(-listed.id.?, .KILL) catch {};
+        _ = std.c.waitpid(listed.id.?, null, 0);
+    };
+    var reaper = try std.process.spawn(testing.io, .{ .argv = &.{ "/bin/sh", "-c", helper.script }, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore, .pgid = 0 });
+    var said: [64]u8 = undefined;
+    const told = try std.mem.print(&said, "+{d}\n+{d}\n-{d}\n", .{ listed.id.?, gone.id.?, gone.id.? });
+    try testing.expectEqual(@as(isize, @intCast(told.len)), std.c.write(reaper.stdin.?.handle, told.ptr, told.len));
+    reaper.stdin.?.close(testing.io);
+    const closed = std.Io.Clock.awake.now(testing.io).toMilliseconds();
+    try testing.expect(endsWithin(reaper.id.?, 6_000));
+    const waited = std.Io.Clock.awake.now(testing.io).toMilliseconds() - closed;
+    try testing.expect(waited >= 1_900);
+    try testing.expect(endsWithin(listed.id.?, 1_000));
+    try testing.expect(!endsWithin(gone.id.?, 100));
+}
+
+/// How many descriptors are open in this process.
+fn openDescriptors() usize {
+    var n: usize = 0;
+    for (0..1024) |fd| {
+        if (std.posix.system.fcntl(@intCast(fd), std.posix.F.GETFD, @as(usize, 0)) != -1) n += 1;
+    }
+    return n;
+}
+
+test "a start whose tasks can't all run closes each of the server's pipes once" {
+    helper.start(testing.io);
+    // One, two, then three tasks run: the stdout reader, then the stderr
+    // reader, then the exit watcher can't start.
+    for ([_]usize{ 1, 2, 3 }) |limit| {
+        var threaded: std.Io.Threaded = .init(testing.allocator, .{ .concurrent_limit = .limited(limit) });
+        defer threaded.deinit();
+        const before = openDescriptors();
+        const argv = shell("exec cat >/dev/null");
+        var p: Process = undefined;
+        p.init(threaded.io(), testing.allocator, .{ .argv = &argv, .config = test_config, .poll_ms = 5, .max_line = 64 });
+        // The backoff timer after the failed spawn can't run either.
+        p.start() catch |err| try testing.expectEqual(error.ConcurrencyUnavailable, err);
+        try testing.expectEqual(@as(?SpawnError, error.ConcurrencyUnavailable), p.spawn_error);
+        p.deinit();
+        // A pipe closed twice would have hit unreachable; one never closed leaks.
+        try testing.expectEqual(before, openDescriptors());
+    }
+}
+
+test "what a process says wakes a timed wait at once" {
+    // One server writes only a message, the other only a stderr line, so
+    // neither can wake the other's wait. Each ends a long wait well before
+    // its timeout.
+    const scripts = [_][]const u8{
+        "printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}\\n'; exec cat >/dev/null",
+        "echo warming up >&2; exec cat >/dev/null",
+    };
+    for (scripts, 0..) |script, i| {
+        const argv = shell(script);
+        var p: Process = undefined;
+        initTest(&p, &argv);
+        defer p.deinit();
+        try p.start();
+        const started = std.Io.Clock.awake.now(testing.io).toMilliseconds();
+        const incoming = try p.next(10_000);
+        if (i == 0)
+            try testing.expectEqualStrings("notifications/message", incoming.message.message.notification.method)
+        else
+            try testing.expectEqualStrings("warming up", incoming.stderr);
+        try testing.expect(std.Io.Clock.awake.now(testing.io).toMilliseconds() - started < 3_000);
+    }
+}
+
+test "a timed wait starts no task, so it works where none can run" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{ .concurrent_limit = .nothing });
+    defer threaded.deinit();
+    var p: Process = undefined;
+    p.init(threaded.io(), testing.allocator, .{ .argv = &.{"/bin/true"}, .config = test_config });
+    defer p.deinit();
+    try testing.expect((try p.next(20)) == .timeout);
 }

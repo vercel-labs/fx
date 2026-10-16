@@ -564,16 +564,21 @@ pub const NativeConfigs = struct {
 pub fn loadNativeConfigs(alloc: Allocator, workspace_root: []const u8) !NativeConfigs {
     var profile: std.ArrayList(McpServerConfig) = .empty;
     errdefer freeConfigs(alloc, &profile);
+    // A profile entry fx can't read is skipped with a note, ahead of the
+    // project's notes.
+    var loaded: NativeConfigs = .{};
+    errdefer loaded.deinit(alloc);
     if (io_mod.homeDir()) |home| {
         const config_path = try configPathFromHome(alloc, home);
         defer alloc.free(config_path);
-        profile = try loadConfigFromPath(alloc, config_path);
+        profile = try readProfile(alloc, config_path, &loaded.diagnostics);
     }
 
     var choice_load = config_runtime.loadProjectMcpChoices(alloc, workspace_root) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         debug_trace.logf("mcp", "workspace MCP choices unavailable err={s}", .{@errorName(err)});
-        return .{ .configs = profile };
+        loaded.configs = profile;
+        return loaded;
     };
     defer choice_load.deinit(alloc);
     for (choice_load.diagnostics.items) |diagnostic| {
@@ -599,13 +604,12 @@ pub fn loadNativeConfigs(alloc: Allocator, workspace_root: []const u8) !NativeCo
     );
     defer workspace.deinit(alloc);
     traceWorkspaceDiagnostics(workspace.diagnostics.items);
+    // The workspace's notes move over, so `workspace.deinit` frees only its list.
+    try loaded.diagnostics.appendSlice(alloc, workspace.diagnostics.items);
+    workspace.diagnostics.clearRetainingCapacity();
 
-    var loaded: NativeConfigs = .{
-        .configs = try project_config.mergeNative(alloc, &profile, &workspace.configs),
-    };
+    loaded.configs = try project_config.mergeNative(alloc, &profile, &workspace.configs);
     profile.deinit(alloc);
-    loaded.diagnostics = workspace.diagnostics;
-    workspace.diagnostics = .empty;
     return loaded;
 }
 
@@ -636,6 +640,25 @@ pub fn loadRuntime(
     return runtime;
 }
 
+/// A server name a terminal can't show as is, such as one with an escape
+/// sequence in a repository's `.mcp.json`, never reaches a terminal or the
+/// model: the server is skipped with a note, which escapes the name.
+fn skipUnprintableNames(alloc: Allocator, loaded: *NativeConfigs) Allocator.Error!void {
+    var i: usize = 0;
+    while (i < loaded.configs.items.len) {
+        const c = &loaded.configs.items[i];
+        if (text_utils.isTerminalSafe(c.name)) {
+            i += 1;
+            continue;
+        }
+        try loaded.diagnostics.ensureUnusedCapacity(alloc, 1);
+        const name = try alloc.dupe(u8, c.name);
+        loaded.diagnostics.appendAssumeCapacity(.{ .profile = c.source != .workspace, .server_name = name, .cause = .invalid_entry, .problem = .name });
+        var removed = loaded.configs.orderedRemove(i);
+        removed.deinit(alloc);
+    }
+}
+
 /// MCP-v2's host for the workspace when FX_MCP_ENGINE=v2 selects it,
 /// or null. Its servers start when the model first needs them.
 pub fn loadHost(
@@ -652,6 +675,7 @@ pub fn loadHost(
     var inherited = try io_mod.cloneEnvironMap(alloc);
     defer inherited.deinit();
     try project_config.expandProfileConfigs(alloc, &loaded.configs, &loaded.diagnostics, &inherited);
+    try skipUnprintableNames(alloc, &loaded);
     // A host with no servers still carries the notes saying why.
     if (loaded.configs.items.len == 0 and loaded.diagnostics.items.len == 0) return null;
     const notes = try alloc.alloc([]const u8, loaded.diagnostics.items.len);
@@ -667,8 +691,10 @@ pub fn loadHost(
     const h = try mcp_host.Host.create(alloc, io_mod.getIo(), loaded.configs.items, &inherited, .{
         .client_version = build_options.app_version,
         .credentials = .detect(alloc, home),
+        .workspace_root = workspace_root,
         .questions = extras.questions,
         .notify = extras.notify,
+        .slash_commands = extras.slash_commands,
     }, builtins);
     h.notes = notes;
     return h;
@@ -884,6 +910,11 @@ fn runtimeFromConfigs(
 }
 
 pub fn loadConfigFromPath(alloc: Allocator, path: []const u8) !std.ArrayList(McpServerConfig) {
+    return readProfile(alloc, path, null);
+}
+
+/// With `skipped`, see `project_config.parseProfileServers`.
+fn readProfile(alloc: Allocator, path: []const u8, skipped: ?*std.ArrayList(project_config.WorkspaceDiagnostic)) !std.ArrayList(McpServerConfig) {
     var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| {
         if (err == error.FileNotFound) return .empty;
         logConfigFailure("open", path, err);
@@ -897,7 +928,7 @@ pub fn loadConfigFromPath(alloc: Allocator, path: []const u8) !std.ArrayList(Mcp
     };
     defer alloc.free(json_text);
 
-    return loadConfigFromJson(alloc, json_text) catch |err| {
+    return project_config.parseProfileServers(alloc, json_text, skipped) catch |err| {
         logConfigFailure("load", path, err);
         return err;
     };
@@ -1331,6 +1362,36 @@ fn tmpRoot(alloc: Allocator, tmp: std.testing.TmpDir) ![]u8 {
 
 fn tmpPath(alloc: Allocator, root: []const u8, name: []const u8) ![]u8 {
     return std.Io.Dir.path.join(alloc, &.{ root, name });
+}
+
+test "a server whose name a terminal can't show is skipped with a note that escapes it" {
+    const alloc = std.testing.allocator;
+    // An escape sequence, a right-to-left override, and a lone byte that
+    // isn't UTF-8; "caf\u00e9" and a space are printable and stay.
+    const json =
+        \\{"mcpServers":{"ok":{"command":"true"},"evil\u001b]0;x\u0007":{"command":"true"},"rtl\u202etxt":{"command":"true"},"caf\u00e9 two":{"command":"true"}}}
+    ;
+    var loaded: NativeConfigs = .{};
+    defer loaded.deinit(alloc);
+    loaded.configs = try project_config.parseProfileServers(alloc, json, &loaded.diagnostics);
+    try std.testing.expectEqual(@as(usize, 4), loaded.configs.items.len);
+    alloc.free(loaded.configs.items[0].name);
+    loaded.configs.items[0].name = try alloc.dupe(u8, "bad\xff");
+
+    try skipUnprintableNames(alloc, &loaded);
+    try std.testing.expectEqual(@as(usize, 1), loaded.configs.items.len);
+    try std.testing.expectEqualStrings("caf\u{e9} two", loaded.configs.items[0].name);
+    try std.testing.expectEqual(@as(usize, 3), loaded.diagnostics.items.len);
+    const expected = [_][]const u8{
+        "~/.fx/mcp.json server 'bad\\xff' was skipped: its name has a character fx won't print.",
+        "~/.fx/mcp.json server 'evil\\x1b]0;x\\x07' was skipped: its name has a character fx won't print.",
+        "~/.fx/mcp.json server 'rtl\\u{202e}txt' was skipped: its name has a character fx won't print.",
+    };
+    for (loaded.diagnostics.items, expected) |diagnostic, want| {
+        const note = try project_config.renderWorkspaceDiagnostic(alloc, diagnostic);
+        defer alloc.free(note);
+        try std.testing.expectEqualStrings(want, note);
+    }
 }
 
 test "saving MCP config replaces the file durably" {
@@ -2365,7 +2426,7 @@ test "profile config rejects a mixed set containing invalid client metadata URLs
 
 test "profile config reports literal authorization secrets" {
     try std.testing.expectError(
-        error.McpConfigInvalidHeaders,
+        error.McpConfigAuthorizationHeader,
         loadConfigFromJson(std.testing.allocator,
             \\{"mcp":{"unsafe":{"type":"http","url":"https://api.example.com/mcp","headers":{"Authorization":"Bearer secret-value"}}}}
         ),

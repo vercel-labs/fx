@@ -8,7 +8,10 @@ const testing = std.testing;
 
 /// A 2025 MCP server in sh: discovery gets an error, so the engine falls back
 /// to `initialize`; it lists one `echo` tool and answers calls, except a call
-/// that mentions "slow", which never answers.
+/// that mentions "slow", which never answers. A call that mentions
+/// "withdraw" asks form question Q1, withdraws it, asks Q2, and once Q2 is
+/// answered, returns what reached each: "e1 " if Q1 got an answer, then
+/// "e2=" and Q2's `name`.
 pub const script =
     \\#!/bin/sh
     \\while IFS= read -r line; do
@@ -18,6 +21,15 @@ pub const script =
     \\    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id" ;;
     \\    *'"method":"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echoes","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
     \\    *'"method":"tools/call"'*slow*) ;;
+    \\    *'"method":"tools/call"'*withdraw*)
+    \\      call=$id
+    \\      printf '{"jsonrpc":"2.0","id":"e1","method":"elicitation/create","params":{"mode":"form","message":"Q1","requestedSchema":{"type":"object","properties":{"name":{"type":"string"}}}}}\n'
+    \\      printf '{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"e1"}}\n'
+    \\      printf '{"jsonrpc":"2.0","id":"e2","method":"elicitation/create","params":{"mode":"form","message":"Q2","requestedSchema":{"type":"object","properties":{"name":{"type":"string"}}}}}\n' ;;
+    \\    *'"id":"e1"'*) got="${got}e1 " ;;
+    \\    *'"id":"e2"'*)
+    \\      name=$(printf '%s' "$line" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
+    \\      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%se2=%s"}]}}\n' "$call" "$got" "$name" ;;
     \\    *'"method":"tools/call"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"hi"}]}}\n' "$id" ;;
     \\  esac
     \\done

@@ -3,7 +3,10 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs
 const protocolVersion = "2026-07-28";
 const wireLogPath = process.env.FX_MCP_WIRE_LOG;
 const pidPath = process.env.FX_MCP_PID_PATH;
-const resultText = process.env.FX_MCP_RESULT_TEXT ?? "MODERN_MCP_TOOL_RESULT";
+// FX_MCP_RESULT_PAD_BYTES puts that many bytes before the result text, for
+// results too large to pass through the environment.
+const resultText = "p".repeat(Number(process.env.FX_MCP_RESULT_PAD_BYTES ?? "0")) +
+  (process.env.FX_MCP_RESULT_TEXT ?? "MODERN_MCP_TOOL_RESULT");
 const mode = process.env.FX_MCP_MODE ?? "normal";
 const imagePath = process.env.FX_MCP_IMAGE_PATH;
 const crashMarkerPath = process.env.FX_MCP_CRASH_MARKER;
@@ -42,6 +45,13 @@ const stalledRequestIds = new Set();
 let buffer = Buffer.alloc(0);
 
 if (pidPath) writeFileSync(pidPath, String(process.pid));
+// Some servers keep running after their input closes, or ignore SIGTERM.
+if (process.env.FX_MCP_IGNORE_EOF === "1") setInterval(() => {}, 1 << 30);
+if (process.env.FX_MCP_IGNORE_TERM === "1") process.on("SIGTERM", () => {});
+const eofPath = process.env.FX_MCP_EOF_PATH;
+// A server slow to start: its first answer comes this late.
+const discoverDelayMs = Number(process.env.FX_MCP_DISCOVER_DELAY_MS ?? "0") || 0;
+if (eofPath) process.stdin.on("end", () => appendFileSync(eofPath, `${process.pid}\n`));
 if (environmentCapturePath) {
   writeFileSync(environmentCapturePath, JSON.stringify({
     configured: process.env.FX_MCP_ENV_SENTINEL,
@@ -50,6 +60,9 @@ if (environmentCapturePath) {
     home: process.env.HOME,
     httpsProxy: process.env.HTTPS_PROXY,
   }));
+}
+if (process.env.FX_MCP_ENV_NAMES_CAPTURE) {
+  writeFileSync(process.env.FX_MCP_ENV_NAMES_CAPTURE, JSON.stringify(Object.keys(process.env).sort()));
 }
 if (stallRecovery) setInterval(() => {}, 1000);
 
@@ -233,6 +246,8 @@ function handle(message) {
       }, 5);
     } else if (mode === "crash_once_new_tool" && recoveryGeneration) {
       setTimeout(() => send(response), 150);
+    } else if (discoverDelayMs > 0) {
+      setTimeout(() => sendDiscoverResponse(response), discoverDelayMs);
     } else {
       sendDiscoverResponse(response);
     }

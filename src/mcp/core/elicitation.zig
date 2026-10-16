@@ -24,12 +24,17 @@ pub const Phase = enum { shown, waiting };
 /// The modes the client declared.
 pub const Config = struct { form: bool = false, url: bool = false };
 
+/// One elicitation the host was shown: its slot, and its number. A freed
+/// slot is used again, so an answer names both, and one to an elicitation
+/// that is gone never reaches the next in its slot.
+pub const Id = struct { slot: u8, n: u32 };
+
 pub const Event = union(enum) {
     /// The server started an elicitation. `eid`: a url one carries an
     /// elicitationId. One a -32042 error lists is url mode with an id.
     asked: struct { origin: Origin, mode: Mode, eid: bool, readable: bool },
     /// The host's answer; `valid` is false when form content fails the schema.
-    answered: struct { slot: u8, action: Action, valid: bool },
+    answered: struct { id: Id, action: Action, valid: bool },
     /// notifications/cancelled for the request in `slot`; null when no
     /// request the client holds has that id.
     server_cancelled: ?u8,
@@ -136,9 +141,10 @@ pub const Table = struct {
             },
             .answered => |a| {
                 out.action = "answer";
-                const s = t.held(a.slot) orelse return ignore(out);
-                out.n = s.n;
-                out.slot = a.slot;
+                // The one the host answered, even when it is gone.
+                out.n = a.id.n;
+                const s = t.find(a.id) orelse return ignore(out);
+                out.slot = a.id.slot;
                 if (s.phase != .shown) return ignore(out);
                 const content = a.action == .accept and s.mode == .form;
                 if (content and !a.valid) {
@@ -151,7 +157,7 @@ pub const Table = struct {
                         .decline => .decline,
                         .cancel => .cancel,
                     };
-                    out.emit(.{ .send = .{ .slot = a.slot, .action = a.action, .content = content } });
+                    out.emit(.{ .send = .{ .slot = a.id.slot, .action = a.action, .content = content } });
                 }
                 if (a.action == .accept and s.mode == .url and s.eid) {
                     if (!s.early) {
@@ -159,9 +165,9 @@ pub const Table = struct {
                         return;
                     }
                     // Its completion came first, so the host hears it now.
-                    out.emit(.{ .complete = a.slot });
+                    out.emit(.{ .complete = a.id.slot });
                 }
-                t.free(a.slot, out);
+                t.free(a.id.slot, out);
             },
             .server_cancelled => |maybe| {
                 out.action = "cancel";
@@ -203,6 +209,12 @@ pub const Table = struct {
     pub fn held(t: *Table, slot: u8) ?*Slot {
         if (slot >= max_pending or !t.slots[slot].used) return null;
         return &t.slots[slot];
+    }
+
+    /// The elicitation `id` names, if its slot still holds it.
+    pub fn find(t: *Table, id: Id) ?*Slot {
+        const s = t.held(id.slot) orelse return null;
+        return if (s.n == id.n) s else null;
     }
 
     fn free(t: *Table, slot: u8, out: *Output) void {
@@ -265,7 +277,7 @@ const World = struct {
         if (out.n >= max_n) return;
         // The host accepted a url one with an id, answered or not.
         if (event == .answered and !out.ignored and !out.refused and event.answered.action == .accept) {
-            const slot = before.slots[event.answered.slot];
+            const slot = before.slots[event.answered.id.slot];
             if (slot.mode == .url and slot.eid) w.accepted_url[slot.n] = true;
         }
         for (out.effects()) |effect| switch (effect) {
@@ -288,6 +300,7 @@ const World = struct {
                 try testing.expect(!s.content or a.valid); // ValidOnly
                 try testing.expect(!w.withdrawn[slot.n]); // NothingAfterWithdraw
                 try testing.expect(!w.required[slot.n]); // RequiredUnanswered
+                try testing.expectEqual(a.id.n, slot.n); // The answer reaches only the question it was for.
                 w.sends[slot.n] += 1;
             },
             .withdraw => |slot| {
@@ -321,12 +334,12 @@ const World = struct {
                 try testing.expectEqual(a.readable and declared and open, out.slot != null);
                 if (a.origin == .request) try testing.expect(out.slot != null or out.sent == .@"error");
             },
-            .answered => |a| if (a.slot < max_pending and before.slots[a.slot].used and before.slots[a.slot].phase == .shown) {
-                const s = before.slots[a.slot];
+            .answered => |a| if (a.id.slot < max_pending and before.slots[a.id.slot].used and before.slots[a.id.slot].n == a.id.n and before.slots[a.id.slot].phase == .shown) {
+                const s = before.slots[a.id.slot];
                 if (a.action == .accept and s.mode == .form and !a.valid) {
                     try testing.expect(out.refused and out.effect_count == 0);
-                } else try testing.expect(!t.slots[a.slot].used or t.slots[a.slot].phase == .waiting);
-            },
+                } else try testing.expect(!t.slots[a.id.slot].used or t.slots[a.id.slot].phase == .waiting);
+            } else try testing.expect(out.ignored and out.effect_count == 0),
             .session_ended => for (t.slots) |s| try testing.expect(!s.used),
             else => {},
         }
@@ -339,11 +352,14 @@ const alphabet = [_]Event{
     .{ .asked = .{ .origin = .request, .mode = .url, .eid = false, .readable = true } },
     .{ .asked = .{ .origin = .request, .mode = .form, .eid = false, .readable = false } },
     .{ .asked = .{ .origin = .required, .mode = .url, .eid = true, .readable = true } },
-    .{ .answered = .{ .slot = 0, .action = .accept, .valid = true } },
-    .{ .answered = .{ .slot = 0, .action = .accept, .valid = false } },
-    .{ .answered = .{ .slot = 0, .action = .decline, .valid = true } },
-    .{ .answered = .{ .slot = 1, .action = .accept, .valid = true } },
-    .{ .answered = .{ .slot = 1, .action = .cancel, .valid = true } },
+    // Fixed numbers: on some paths the slot holds that one, on others a
+    // later one, so answers to ones that are gone are explored too.
+    .{ .answered = .{ .id = .{ .slot = 0, .n = 1 }, .action = .accept, .valid = true } },
+    .{ .answered = .{ .id = .{ .slot = 0, .n = 1 }, .action = .accept, .valid = false } },
+    .{ .answered = .{ .id = .{ .slot = 0, .n = 2 }, .action = .decline, .valid = true } },
+    .{ .answered = .{ .id = .{ .slot = 0, .n = 3 }, .action = .accept, .valid = true } },
+    .{ .answered = .{ .id = .{ .slot = 1, .n = 2 }, .action = .accept, .valid = true } },
+    .{ .answered = .{ .id = .{ .slot = 1, .n = 3 }, .action = .cancel, .valid = true } },
     .{ .server_cancelled = 0 },
     .{ .server_cancelled = 1 },
     .{ .server_cancelled = null },
@@ -383,7 +399,12 @@ test "random long sequences keep the model's invariants, past max_pending" {
                     .{ .origin = .request, .mode = .form, .eid = false, .readable = random.uintLessThan(u8, 8) != 0 }
                 else
                     .{ .origin = if (random.boolean()) .request else .required, .mode = .url, .eid = true, .readable = true } },
-                2 => .{ .answered = .{ .slot = random.uintLessThan(u8, max_pending + 1), .action = random.enumValue(Action), .valid = random.boolean() } },
+                2 => answer: {
+                    const slot = random.uintLessThan(u8, max_pending + 1);
+                    // Mostly the one the slot holds; sometimes one that may be gone.
+                    const n = if (slot < max_pending and random.uintLessThan(u8, 4) != 0) t.slots[slot].n else random.uintAtMost(u32, t.last + 1);
+                    break :answer .{ .answered = .{ .id = .{ .slot = slot, .n = n }, .action = random.enumValue(Action), .valid = random.boolean() } };
+                },
                 3 => .{ .server_cancelled = random.uintLessThan(u8, max_pending) },
                 4 => .{ .completed = random.uintLessThan(u8, max_pending) },
                 else => if (random.uintLessThan(u8, 10) == 0) .session_ended else .{ .server_cancelled = null },
@@ -402,14 +423,35 @@ test "a form request is shown, answered once with its content, and freed" {
     t.step(.{ .asked = .{ .origin = .request, .mode = .form, .eid = false, .readable = true } }, &out);
     try testing.expectEqualSlices(Effect, &.{.{ .show = 0 }}, out.effects());
     out = .{};
-    t.step(.{ .answered = .{ .slot = 0, .action = .accept, .valid = false } }, &out);
+    t.step(.{ .answered = .{ .id = .{ .slot = 0, .n = 1 }, .action = .accept, .valid = false } }, &out);
     try testing.expect(out.refused and out.effect_count == 0 and t.slots[0].used);
     out = .{};
-    t.step(.{ .answered = .{ .slot = 0, .action = .accept, .valid = true } }, &out);
+    t.step(.{ .answered = .{ .id = .{ .slot = 0, .n = 1 }, .action = .accept, .valid = true } }, &out);
     try testing.expectEqualSlices(Effect, &.{ .{ .send = .{ .slot = 0, .action = .accept, .content = true } }, .{ .release = 0 } }, out.effects());
     out = .{};
-    t.step(.{ .answered = .{ .slot = 0, .action = .decline, .valid = true } }, &out);
+    t.step(.{ .answered = .{ .id = .{ .slot = 0, .n = 1 }, .action = .decline, .valid = true } }, &out);
     try testing.expect(out.ignored and out.effect_count == 0);
+}
+
+test "an answer to an elicitation that is gone never reaches the next one in its slot" {
+    var t: Table = .init(.{ .form = true });
+    var out: Output = .{};
+    t.step(.{ .asked = .{ .origin = .request, .mode = .form, .eid = false, .readable = true } }, &out);
+    out = .{};
+    t.step(.{ .server_cancelled = 0 }, &out);
+    try testing.expectEqualSlices(Effect, &.{ .{ .withdraw = 0 }, .{ .release = 0 } }, out.effects());
+    out = .{};
+    t.step(.{ .asked = .{ .origin = .request, .mode = .form, .eid = false, .readable = true } }, &out);
+    try testing.expectEqualSlices(Effect, &.{.{ .show = 0 }}, out.effects());
+    // The host answers the first, still on screen: nothing goes out.
+    out = .{};
+    t.step(.{ .answered = .{ .id = .{ .slot = 0, .n = 1 }, .action = .accept, .valid = true } }, &out);
+    try testing.expect(out.ignored and out.effect_count == 0);
+    try testing.expectEqual(@as(u32, 1), out.n);
+    try testing.expect(t.find(.{ .slot = 0, .n = 2 }) != null);
+    out = .{};
+    t.step(.{ .answered = .{ .id = .{ .slot = 0, .n = 2 }, .action = .accept, .valid = true } }, &out);
+    try testing.expectEqualSlices(Effect, &.{ .{ .send = .{ .slot = 0, .action = .accept, .content = true } }, .{ .release = 0 } }, out.effects());
 }
 
 test "an undeclared mode or an unreadable request is refused, and a full table too" {
@@ -438,7 +480,7 @@ test "a completion before the host accepts is kept and told the moment it does, 
     t.step(.{ .completed = 0 }, &out);
     try testing.expect(!out.ignored and out.effect_count == 0);
     out = .{};
-    t.step(.{ .answered = .{ .slot = 0, .action = .accept, .valid = false } }, &out);
+    t.step(.{ .answered = .{ .id = .{ .slot = 0, .n = 1 }, .action = .accept, .valid = false } }, &out);
     try testing.expectEqualSlices(Effect, &.{ .{ .send = .{ .slot = 0, .action = .accept, .content = false } }, .{ .complete = 0 }, .{ .release = 0 } }, out.effects());
     out = .{};
     t.step(.{ .completed = 0 }, &out);
@@ -450,7 +492,7 @@ test "an accepted url elicitation waits for its completion, told once" {
     var out: Output = .{};
     t.step(.{ .asked = .{ .origin = .request, .mode = .url, .eid = true, .readable = true } }, &out);
     out = .{};
-    t.step(.{ .answered = .{ .slot = 0, .action = .accept, .valid = false } }, &out);
+    t.step(.{ .answered = .{ .id = .{ .slot = 0, .n = 1 }, .action = .accept, .valid = false } }, &out);
     try testing.expectEqualSlices(Effect, &.{.{ .send = .{ .slot = 0, .action = .accept, .content = false } }}, out.effects());
     try testing.expectEqual(Phase.waiting, t.slots[0].phase);
     out = .{};
@@ -478,7 +520,7 @@ test "a server's cancel and the session's end withdraw what the host holds" {
     t.step(.{ .server_cancelled = 0 }, &out);
     try testing.expectEqualSlices(Effect, &.{ .{ .withdraw = 0 }, .{ .release = 0 } }, out.effects());
     out = .{};
-    t.step(.{ .answered = .{ .slot = 1, .action = .accept, .valid = true } }, &out);
+    t.step(.{ .answered = .{ .id = .{ .slot = 1, .n = 2 }, .action = .accept, .valid = true } }, &out);
     try testing.expectEqual(@as(usize, 0), out.effect_count); // required: nothing to send, waits
     out = .{};
     t.step(.session_ended, &out);

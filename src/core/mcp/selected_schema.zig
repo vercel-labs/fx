@@ -32,7 +32,9 @@ pub const AlwaysLoaded = struct {
     }
 
     pub fn deinit(b: *AlwaysLoaded, alloc: Allocator) void {
-        tool_mcp_runtime.freeSelectedTools(alloc, b.selected.items);
+        for (b.selected.items) |tool| tool.deinit(alloc);
+        // The list's whole capacity, not just its tools.
+        b.selected.deinit(alloc);
         b.* = undefined;
     }
 
@@ -149,4 +151,32 @@ fn renderSchemaNotice(
         .{ action, observed_bytes, limit.effectiveBytes(), limit.source.label(), limit_name },
     );
     return try out.toOwnedSlice();
+}
+
+const testing = std.testing;
+
+/// Adds four always-loaded tools and hands them over, as
+/// `snapshotAlwaysLoadedTools` does. With four the list's capacity passes
+/// its length.
+fn loadFour(alloc: Allocator) !void {
+    var loaded: AlwaysLoaded = .init(.{});
+    errdefer loaded.deinit(alloc);
+    var names = [_][5]u8{ "srv_a".*, "srv_b".*, "srv_c".*, "srv_d".* };
+    var description = "Echoes text.".*;
+    var schema = "{\"type\":\"object\"}".*;
+    for (&names) |*name| {
+        const tool: McpTool = .{ .original_name = name[4..], .prefixed_name = name, .description = &description, .input_schema_json = &schema, .tags = &.{} };
+        // The schema's writer reports a failed allocation as WriteFailed.
+        loaded.add(alloc, tool, null, .{ .runtime_generation = 1, .connection_generation = 1, .catalog_generation = 1, .auth_generation = 1 }, .{}) catch |err| return switch (err) {
+            error.WriteFailed => error.OutOfMemory,
+            else => err,
+        };
+    }
+    var tools = try loaded.finish(alloc);
+    defer tools.deinit(alloc);
+    try testing.expectEqual(@as(usize, 4), tools.tools.len);
+}
+
+test "always-loaded tools are freed whole when memory runs out partway" {
+    try testing.checkAllAllocationFailures(testing.allocator, loadFour, .{});
 }

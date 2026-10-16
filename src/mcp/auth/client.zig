@@ -36,10 +36,32 @@ pub const Options = struct {
     /// `https://mcp.slack.com/`). Used only when it names the server's own
     /// resource, give or take a trailing slash.
     resource: ?[]const u8 = null,
+    /// The scopes to ask for, space-separated, in place of those the
+    /// resource metadata lists; a challenge's scopes still win.
+    scopes: ?[]const u8 = null,
+    /// The host decides each refresh: `refresh_due` says one is due,
+    /// and the host answers with `refreshNow`, or with `restore` and a newer
+    /// credential another process saved. Off, a refresh goes out at once.
+    refresh_via_host: bool = false,
 };
 
-/// Why a sign-in ended without a token.
-pub const Failure = enum { discovery, registration, response, redemption, cancelled, refused };
+/// Why a sign-in ended without a token. `insecure_endpoint` and
+/// `internal_endpoint` are a discovery that found only an authorization
+/// server fx won't contact: plain HTTP, or an internal address.
+pub const Failure = enum {
+    discovery,
+    registration,
+    /// The authorization server's answer was an error, or had no code.
+    response,
+    /// The answer wasn't for this sign-in: its state or issuer didn't match,
+    /// so nothing in it was used.
+    mismatch,
+    redemption,
+    cancelled,
+    refused,
+    insecure_endpoint,
+    internal_endpoint,
+};
 
 pub const Action = union(enum) {
     /// Post request `key`, again if it went out before, with the token of
@@ -61,6 +83,11 @@ pub const Action = union(enum) {
     /// The credential to keep changed; the host writes it with
     /// `save`, which says when there is none to keep.
     save,
+    /// A refresh is due (`refresh_via_host`): the host answers with
+    /// `refreshNow`, or with `restore` and a newer credential.
+    refresh_due,
+    /// That refresh ended, or a sign-in or sign-out replaced it.
+    refresh_ended,
 };
 
 /// How a request ended, as the gate needs it.
@@ -130,9 +157,13 @@ pub const Auth = struct {
     response_error: ?[]const u8 = null,
     /// Why the code wasn't redeemed, in the token endpoint's words.
     token_error: ?[]const u8 = null,
+    /// Why this discovery passed over an authorization server, if it did.
+    discovery_refusal: ?discovery.Refusal = null,
     pending_code: ?[]const u8 = null,
     flow_key: u64 = 0,
     refresh_key: u64 = 0,
+    /// A refresh waits for the host's answer (`refresh_via_host`).
+    refresh_due: bool = false,
     /// The revocation a sign-out sent, until its answer: closing waits for it.
     revoke_key: u64 = 0,
     next_key: u64 = fetch_base,
@@ -205,8 +236,8 @@ pub const Auth = struct {
                     // A refresh brings no new scopes; this needs a sign-in.
                     try a.stepFlow(.{ .challenged = try a.scopeBits(c.scope) });
                     try a.stepGate(.{ .accepted = key });
-                    try a.actions.append(a.gpa, .{ .give_up = .{ .key = key, .why = .needs_sign_in } });
                     try a.announce(true);
+                    try a.actions.append(a.gpa, .{ .give_up = .{ .key = key, .why = .needs_sign_in } });
                     return true;
                 }
                 // The challenge's scopes, or none, which leaves the
@@ -229,11 +260,18 @@ pub const Auth = struct {
         for (out.effects()) |effect| switch (effect) {
             .post => |p| try a.actions.append(a.gpa, .{ .post = .{ .key = p.key, .token = p.token } }),
             .refresh => try a.startRefresh(),
+            // The sign-in is announced before anything gives up for it, so a
+            // host woken by the give-up already knows.
             .give_up => |g| {
-                try a.actions.append(a.gpa, .{ .give_up = .{ .key = g.key, .why = g.why } });
                 if (g.why == .needs_sign_in) try a.announce(false);
+                try a.actions.append(a.gpa, .{ .give_up = .{ .key = g.key, .why = g.why } });
             },
         };
+        // A sign-in or sign-out replaced the refresh the host was deciding.
+        if (a.refresh_due and !a.gate.refreshing) {
+            a.refresh_due = false;
+            try a.actions.append(a.gpa, .refresh_ended);
+        }
     }
 
     fn announce(a: *Auth, step_up: bool) Allocator.Error!void {
@@ -243,6 +281,20 @@ pub const Auth = struct {
     }
 
     fn startRefresh(a: *Auth) Error!void {
+        if (!a.options.refresh_via_host) return a.sendRefresh();
+        a.refresh_due = true;
+        try a.actions.append(a.gpa, .refresh_due);
+    }
+
+    /// Sends the refresh `refresh_due` announced; nothing once a sign-in or
+    /// sign-out replaced it.
+    pub fn refreshNow(a: *Auth) Error!void {
+        if (!a.refresh_due) return;
+        a.refresh_due = false;
+        try a.sendRefresh();
+    }
+
+    fn sendRefresh(a: *Auth) Error!void {
         const cred = a.cred orelse return a.refreshEnded(.failed);
         const token = a.refresh_token orelse return a.refreshEnded(.failed);
         var body: std.Io.Writer.Allocating = .init(a.gpa);
@@ -260,6 +312,7 @@ pub const Auth = struct {
             try a.actions.append(a.gpa, .save);
         }
         try a.stepGate(.{ .refreshed = how });
+        if (a.options.refresh_via_host) try a.actions.append(a.gpa, .refresh_ended);
     }
 
     // ---- Signing in (the flow) ----
@@ -342,22 +395,33 @@ pub const Auth = struct {
 
     /// Takes back a credential `save` wrote: its tokens are held again, so
     /// requests carry them and a refresh can renew them. One that can't be
-    /// read is ignored.
+    /// read, whose access token isn't valid, or whose endpoints
+    /// discovery may not reach for this server, is ignored.
     pub fn restore(a: *Auth, saved: []const u8) Error!void {
         const names = [_][]const u8{ "access", "refresh", "expires_at_ms", "skew_ms", "token_endpoint", "revocation_endpoint", "resource", "client_id", "client_secret", "method" };
         var raw: [names.len]?[]const u8 = undefined;
         wire.objectFields(saved, &names, &raw) catch return;
+        // Checked before the credential in use is replaced, so an ignored one
+        // leaves it whole.
+        var scratch: std.heap.ArenaAllocator = .init(a.gpa);
+        defer scratch.deinit();
+        var text: [names.len]?[]const u8 = undefined;
+        for (raw, &text) |r, *t| t.* = if (r) |v| try wire.decodeString(scratch.allocator(), v) else null;
+        const access = text[0] orelse return;
+        if (!oauth.validToken(access)) return;
+        const method = std.meta.stringToEnum(oauth.Method, text[9] orelse return) orelse return;
+        const token_endpoint = text[4] orelse return;
+        if (!discovery.fetchable(token_endpoint, a.server_url)) return;
+        if (text[5]) |revocation| if (!discovery.fetchable(revocation, a.server_url)) return;
+        const resource = text[6] orelse return;
+        const client_id = text[7] orelse return;
         _ = a.cred_arena.reset(.retain_capacity);
         const ca = a.cred_arena.allocator();
-        var text: [names.len]?[]const u8 = undefined;
-        for (raw, &text) |r, *t| t.* = if (r) |v| try wire.decodeString(ca, v) else null;
-        const access = text[0] orelse return;
-        const method = std.meta.stringToEnum(oauth.Method, text[9] orelse return) orelse return;
         a.cred = .{
-            .token_endpoint = text[4] orelse return,
-            .revocation_endpoint = text[5],
-            .resource = text[6] orelse return,
-            .client = .{ .id = text[7] orelse return, .secret = text[8], .method = method },
+            .token_endpoint = try ca.dupe(u8, token_endpoint),
+            .revocation_endpoint = if (text[5]) |v| try ca.dupe(u8, v) else null,
+            .resource = try ca.dupe(u8, resource),
+            .client = .{ .id = try ca.dupe(u8, client_id), .secret = if (text[8]) |v| try ca.dupe(u8, v) else null, .method = method },
         };
         a.dropTokens();
         try a.storeTokens(.{ .access = access, .refresh = text[1], .expires_in = null });
@@ -374,6 +438,7 @@ pub const Auth = struct {
             .discover => {
                 a.prm = null;
                 a.meta = null;
+                a.discovery_refusal = null;
                 a.candidates = try discovery.resourceMetadataUrls(a.flow_arena.allocator(), a.server_url, a.challenge_url);
                 a.candidate = 0;
                 try a.fetchCandidate(.resource_metadata);
@@ -393,10 +458,17 @@ pub const Auth = struct {
             },
             .failed => |f| {
                 a.stage = .idle;
+                const why: Failure = switch (f.stage) {
+                    // The core lets a response's error show exactly when its
+                    // state and issuer were checked and matched.
+                    .response => if (f.show_error) .response else .mismatch,
+                    inline else => |s| @field(Failure, @tagName(s)),
+                };
                 try a.actions.append(a.gpa, .{ .sign_in_failed = .{
-                    .why = switch (f.stage) {
-                        inline else => |s| @field(Failure, @tagName(s)),
-                    },
+                    .why = if (why != .discovery) why else if (a.discovery_refusal) |r| switch (r) {
+                        .insecure => .insecure_endpoint,
+                        .internal => .internal_endpoint,
+                    } else .discovery,
                     .message = if (f.show_error) a.response_error else if (f.stage == .redemption) a.token_error else null,
                 } });
             },
@@ -410,7 +482,10 @@ pub const Auth = struct {
             const url = a.candidates[a.candidate];
             a.candidate += 1;
             // The authorization server's metadata only from hosts discovery may reach.
-            if (stage == .server_metadata and !discovery.fetchable(url, a.server_url)) continue;
+            if (stage == .server_metadata) if (discovery.refusal(url, a.server_url)) |r| {
+                a.discovery_refusal = r;
+                continue;
+            };
             a.stage = stage;
             a.flow_key = a.newKey();
             a.client.fetch(a.flow_key, .get, url, null, "", &.{.{ .name = "accept", .value = "application/json" }}) catch continue;
@@ -526,14 +601,24 @@ pub const Auth = struct {
             },
             .server_metadata => {
                 const prm = a.prm.?;
-                if (status == 200) if (discovery.parseServerMetadata(fa, body, prm.issuer)) |meta| {
+                if (status == 200) if (discovery.parseServerMetadata(fa, body, prm.issuer, a.server_url)) |meta| {
                     a.meta = meta;
                     a.stage = .idle;
                     const issuer = try a.internIssuer(prm.issuer);
-                    const defaults = if (prm.scopes) |s| try a.scopes.ofArray(a.keep.allocator(), s) else 0;
+                    const defaults = if (a.options.scopes) |s|
+                        try a.scopes.ofList(a.keep.allocator(), s)
+                    else if (prm.scopes) |s|
+                        try a.scopes.ofArray(a.keep.allocator(), s)
+                    else
+                        0;
                     try a.stepFlow(.{ .discovered = .{ .issuer = issuer, .scopes = defaults } });
                     return true;
-                } else |err| if (err == error.OutOfMemory) return error.OutOfMemory;
+                } else |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InsecureEndpoint => a.discovery_refusal = .insecure,
+                    error.InternalEndpoint => a.discovery_refusal = .internal,
+                    else => {},
+                };
                 try a.fetchCandidate(.server_metadata);
             },
             .registration => {
@@ -565,10 +650,12 @@ pub const Auth = struct {
             const rotated = token.refresh != null;
             try a.storeTokens(token);
             try a.actions.append(a.gpa, .save);
-            return a.stepGate(.{ .refreshed = if (rotated) .rotated else .ok });
+            try a.stepGate(.{ .refreshed = if (rotated) .rotated else .ok });
+            if (a.options.refresh_via_host) try a.actions.append(a.gpa, .refresh_ended);
+            return;
         } else |err| if (err == error.OutOfMemory) return error.OutOfMemory;
-        // invalid_grant: the refresh token is gone for good (RFC 6749 §5.2).
-        try a.refreshEnded(if (status >= 400 and status < 500 and oauth.refusesGrant(body)) .refused else .failed);
+        // An answer naming an error refuses the refresh token for good.
+        try a.refreshEnded(if (oauth.refusesRefresh(status, body)) .refused else .failed);
     }
 
     /// What a refresh needs comes from the sign-in that brought the tokens.
@@ -682,10 +769,153 @@ test "a saved credential comes back whole: requests carry its token, and it save
     try testing.expectEqual(@as(?[]const u8, null), a.authorization(a.gate.gen));
     const fields = ",\"expires_at_ms\":4102444800000,\"skew_ms\":30000,\"token_endpoint\":\"https://as/token\",\"revocation_endpoint\":\"https://as/revoke\"," ++
         "\"resource\":\"http://127.0.0.1:9/mcp\",\"client_id\":\"c1\",\"client_secret\":null,\"method\":\"none\"}";
+    // Whole, but with a token that would break its header: ignored too.
+    try a.restore("{\"access\":\"at\\r\\n1\",\"refresh\":\"rt\"" ++ fields);
+    try testing.expectEqual(@as(?[]const u8, null), a.authorization(a.gate.gen));
+    try testing.expect(!try a.save(&out.writer));
     // A JSON escape in the token is read as what it stands for.
     try a.restore("{\"access\":\"at\\/1\",\"refresh\":\"rt\"" ++ fields);
     try testing.expectEqualStrings("Bearer at/1", a.authorization(a.gate.gen).?);
     try testing.expect(a.gate.refreshable);
     try testing.expect(try a.save(&out.writer));
     try testing.expectEqualStrings("{\"access\":\"at/1\",\"refresh\":\"rt\"" ++ fields, out.written());
+}
+
+test "a refresh the host decides waits for it, and ends however it does: replaced, signed out of, answered, refused, or failed" {
+    const testing = std.testing;
+    var client: http.Client = undefined;
+    try client.init(testing.io, testing.allocator, .{ .url = "http://127.0.0.1:9/mcp" });
+    defer client.deinit();
+    var a: Auth = .init(testing.io, testing.allocator, &client, "http://127.0.0.1:9/mcp", .{ .refresh_via_host = true }, null);
+    defer a.deinit();
+    const saved = "{{\"access\":\"{s}\",\"refresh\":\"rt\",\"expires_at_ms\":4102444800000,\"skew_ms\":30000,\"token_endpoint\":\"http://127.0.0.1:9/token\"," ++
+        "\"revocation_endpoint\":null,\"resource\":\"http://127.0.0.1:9/mcp\",\"client_id\":\"c1\",\"client_secret\":null,\"method\":\"none\"}}";
+    var buffer: [512]u8 = undefined;
+    const actions = &a.actions.items;
+    for ([_]enum { replaced, signed_out, answered, refused, refused_200, failed_429 }{ .replaced, .signed_out, .answered, .refused, .refused_200, .failed_429 }) |case| {
+        try a.restore(try std.mem.print(&buffer, saved, .{"at1"}));
+        try a.beforeSend(1);
+        a.actions.clearRetainingCapacity();
+        // The server rejects the token: the refresh waits, and nothing goes out.
+        _ = try a.ended(1, .{ .rejected = .{ .status = 401, .challenge = "" } });
+        try testing.expectEqual(@as(usize, 1), actions.len);
+        try testing.expect(actions.*[0] == .refresh_due);
+        try testing.expectEqual(@as(u64, 0), a.refresh_key);
+        a.actions.clearRetainingCapacity();
+        switch (case) {
+            // Another process saved a newer one: the request goes again
+            // with it, and the refresh is over.
+            .replaced => {
+                try a.restore(try std.mem.print(&buffer, saved, .{"at2"}));
+                try testing.expectEqual(@as(usize, 2), actions.len);
+                try testing.expect(actions.*[0] == .post and actions.*[0].post.key == 1);
+                try testing.expect(actions.*[1] == .refresh_ended);
+                try testing.expectEqualStrings("Bearer at2", a.authorization(actions.*[0].post.token).?);
+            },
+            .signed_out => {
+                try a.signOut();
+                try testing.expect(actions.*[actions.len - 1] == .refresh_ended);
+                try testing.expectEqual(@as(?[]const u8, null), a.authorization(a.gate.gen));
+            },
+            // The host sent it, and the token endpoint answered: saved, the
+            // request goes again, and the refresh is over.
+            .answered => {
+                a.refresh_due = false;
+                a.refresh_key = a.newKey();
+                _ = try a.fetched(a.refresh_key, 200, "{\"access_token\":\"at3\",\"token_type\":\"Bearer\",\"refresh_token\":\"rt3\",\"expires_in\":3600}");
+                try testing.expectEqual(@as(usize, 3), actions.len);
+                try testing.expect(actions.*[0] == .save);
+                try testing.expect(actions.*[1] == .post and actions.*[1].post.key == 1);
+                try testing.expect(actions.*[2] == .refresh_ended);
+                try testing.expectEqualStrings("Bearer at3", a.authorization(actions.*[1].post.token).?);
+            },
+            // Refused: the tokens go, and the refresh is over all the same.
+            .refused => {
+                a.refresh_due = false;
+                a.refresh_key = a.newKey();
+                _ = try a.fetched(a.refresh_key, 400, "{\"error\":\"invalid_grant\"}");
+                try testing.expect(actions.*[0] == .save);
+                try testing.expect(actions.*[actions.len - 1] == .refresh_ended);
+                try testing.expectEqual(@as(?[]const u8, null), a.authorization(a.gate.gen));
+            },
+            // Slack refuses with HTTP 200 and ok:false: refused all the same,
+            // so the dead refresh token is never sent again.
+            .refused_200 => {
+                a.refresh_due = false;
+                a.refresh_key = a.newKey();
+                _ = try a.fetched(a.refresh_key, 200, "{\"ok\":false,\"error\":\"bad_client_secret\"}");
+                try testing.expect(actions.*[0] == .save);
+                try testing.expect(actions.*[actions.len - 1] == .refresh_ended);
+                try testing.expectEqual(@as(?[]const u8, null), a.authorization(a.gate.gen));
+                try testing.expectEqual(@as(?[]u8, null), a.refresh_token);
+            },
+            // A 429 may pass later: the tokens stay, and nothing is saved.
+            .failed_429 => {
+                a.refresh_due = false;
+                a.refresh_key = a.newKey();
+                _ = try a.fetched(a.refresh_key, 429, "{\"error\":\"slow_down\"}");
+                for (actions.*) |x| try testing.expect(x != .save);
+                try testing.expect(actions.*[actions.len - 1] == .refresh_ended);
+                try testing.expectEqualStrings("rt", a.refresh_token.?);
+            },
+        }
+        if (case != .signed_out) _ = try a.ended(1, .answered);
+        // An answer that comes too late sends nothing.
+        a.actions.clearRetainingCapacity();
+        try a.refreshNow();
+        try testing.expectEqual(@as(u64, 0), a.refresh_key);
+        try testing.expectEqual(@as(usize, 0), actions.len);
+    }
+}
+
+test "a request a sign-in is needed for gives up only after the sign-in is announced" {
+    const testing = std.testing;
+    var client: http.Client = undefined;
+    try client.init(testing.io, testing.allocator, .{ .url = "http://127.0.0.1:9/mcp" });
+    defer client.deinit();
+    var a: Auth = .init(testing.io, testing.allocator, &client, "http://127.0.0.1:9/mcp", .{}, null);
+    defer a.deinit();
+    // No login: the server's 401 leaves nothing to refresh.
+    try a.beforeSend(1);
+    a.actions.clearRetainingCapacity();
+    _ = try a.ended(1, .{ .rejected = .{ .status = 401, .challenge = "" } });
+    const actions = a.actions.items;
+    var announced: ?usize = null;
+    var gave_up: ?usize = null;
+    for (actions, 0..) |x, i| switch (x) {
+        .needs_sign_in => announced = announced orelse i,
+        .give_up => |g| if (g.key == 1 and g.why == .needs_sign_in) {
+            gave_up = gave_up orelse i;
+        },
+        else => {},
+    };
+    try testing.expect(announced.? < gave_up.?);
+}
+
+test "a saved credential whose endpoints discovery may not reach is ignored" {
+    const testing = std.testing;
+    var client: http.Client = undefined;
+    try client.init(testing.io, testing.allocator, .{ .url = "https://mcp.example.com/mcp" });
+    defer client.deinit();
+    var a: Auth = .init(testing.io, testing.allocator, &client, "https://mcp.example.com/mcp", .{}, null);
+    defer a.deinit();
+    const saved = "{{\"access\":\"at\",\"refresh\":\"rt\",\"expires_at_ms\":0,\"skew_ms\":30000,\"token_endpoint\":\"{s}\",\"revocation_endpoint\":{s},\"resource\":\"https://mcp.example.com/mcp\",\"client_id\":\"c1\",\"client_secret\":null,\"method\":\"none\"}}";
+    var buffer: [512]u8 = undefined;
+    for ([_][2][]const u8{
+        .{ "https://0.0.0.0:1/token", "null" },
+        .{ "https://10.0.0.5/token", "null" },
+        .{ "http://localhost:9/token", "null" },
+        .{ "http://auth.example.com/token", "null" },
+        .{ "https://auth.example.com/token", "\"https://169.254.169.254/revoke\"" },
+    }) |case| {
+        try a.restore(try std.mem.print(&buffer, saved, .{ case[0], case[1] }));
+        try testing.expectEqual(@as(?[]const u8, null), a.authorization(a.gate.gen));
+    }
+    try a.restore(try std.mem.print(&buffer, saved, .{ "https://auth.example.com/token", "\"https://auth.example.com/revoke\"" }));
+    try testing.expectEqualStrings("Bearer at", a.authorization(a.gate.gen).?);
+    // An ignored one after it leaves it whole, its endpoints included.
+    try a.restore(try std.mem.print(&buffer, saved, .{ "https://0.0.0.0:1/tokenxxxxxx", "null" }));
+    try testing.expectEqualStrings("Bearer at", a.authorization(a.gate.gen).?);
+    try testing.expectEqualStrings("https://auth.example.com/token", a.cred.?.token_endpoint);
+    try testing.expectEqualStrings("https://auth.example.com/revoke", a.cred.?.revocation_endpoint.?);
 }

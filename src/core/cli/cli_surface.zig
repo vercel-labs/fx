@@ -2659,6 +2659,8 @@ fn runMcpVerbs(alloc: Allocator, rest: []const [:0]const u8, cfg: Config, deps: 
     };
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     defer alloc.free(workspace_root);
+    // `FX_TRACE` and `FX_TRACE_LOG` keep a trace here, as in the shell.
+    debug_trace.configureFromEnv(alloc, workspace_root);
     const args = try alloc.alloc([]const u8, rest.len);
     defer alloc.free(args);
     for (rest, args) |r, *a| a.* = r;

@@ -84,12 +84,19 @@ pub const Failure = union(enum) {
     era: era.Failure,
     /// A 2025 session ended and a new one couldn't be started.
     session,
+    /// A 2025 server didn't answer the initialized notification within the
+    /// request timeout, so nothing else could be sent.
+    initialized_timed_out,
     /// Detection needs a sign-in first; `detect` again after it.
     needs_auth,
+    /// Detection needed a refresh, and the authorization server gave no
+    /// usable answer: a 429, a 5xx, or none. The login stays, and the
+    /// server starts again after its backoff.
+    auth_unavailable,
 };
 
 /// How a call ended: the exchange's outcomes, and a chain's.
-pub const CallOutcome = enum { result, failure, lost, http_failure, cancelled, rounds_exceeded, unsupported_input, malformed, needs_auth };
+pub const CallOutcome = enum { result, failure, lost, http_failure, cancelled, rounds_exceeded, unsupported_input, malformed, needs_auth, auth_unavailable };
 
 pub const Event = union(enum) {
     /// Detection finished; requests carry this version.
@@ -114,6 +121,11 @@ pub const Event = union(enum) {
     /// `message` is the authorization server's own, from a checked response
     /// or from its token endpoint.
     sign_in_failed: struct { why: auth_client.Failure, message: ?[]const u8 },
+    /// A refresh is due (`refresh_via_host`): answer with `refresh`, or with
+    /// `useCredential` and a newer credential another process saved.
+    refresh_due,
+    /// That refresh ended, or a sign-in or sign-out replaced it.
+    refresh_ended,
     /// The tool list subscription is acknowledged: the server will send these.
     listening: subscription.Filter,
     /// It ended for good.
@@ -122,8 +134,9 @@ pub const Event = union(enum) {
     /// `elicitation.parse` and answer with `answerElicitation`. `params` stays
     /// valid until the slot is used again. `required`: listed in a call's
     /// -32042 error, so nothing is sent back, accept is the user's consent to
-    /// open the URL, and the host calls again when it completes.
-    elicit: struct { slot: u8, params: []const u8, required: bool },
+    /// open the URL, and the host calls again when it completes. The answer
+    /// names `id`, so one to an elicitation that is gone is refused.
+    elicit: struct { id: elicit_core.Id, params: []const u8, required: bool },
     /// The host no longer holds `slot`: the server cancelled it, or the
     /// session ended.
     elicit_withdrawn: u8,
@@ -167,6 +180,8 @@ const Logical = struct {
     chain_instance: []const u8 = "",
     /// The gate gave up on it for want of a sign-in.
     needs_auth: bool = false,
+    /// The gate gave up on it: its login couldn't be renewed.
+    unrenewed: bool = false,
     /// A listen: its subscription and filter, its id once sent, and
     /// whether it listens again after an abrupt end.
     sub: u8 = 0,
@@ -186,7 +201,7 @@ const Kept = struct {
 };
 
 const Timer = struct {
-    kind: union(enum) { request: request.Timer, probe: u32, expiry: catalog.Generation, resume_stream: request.Id, listen, listen_wait, backoff: Handle, relisten: struct { sub: u8, generation: u32 } },
+    kind: union(enum) { request: request.Timer, probe: u32, expiry: catalog.Generation, resume_stream: request.Id, listen, listen_wait, backoff: Handle, relisten: struct { sub: u8, generation: u32 }, initialized: u64 },
     due_ms: i64,
 };
 
@@ -379,11 +394,11 @@ pub const Server = struct {
         for (&r.logicals) |*l| if (l.used) {
             if (l.id) |id| {
                 try r.stepRequest(.{ .transport_lost = id });
-                try r.closeKey(id);
+                try r.closeKey(id, .forgotten);
             }
             l.used = false;
         };
-        if (r.listen_key) |key| try r.closeKey(key);
+        if (r.listen_key) |key| try r.closeKey(key, .forgotten);
         r.listen_key = null;
         r.timers.clearRetainingCapacity();
         r.held_sends.clearRetainingCapacity();
@@ -484,18 +499,19 @@ pub const Server = struct {
         try r.stepChain(l, .provided);
     }
 
-    /// Answers the 2025 elicitation in `slot`: accept with content for a
-    /// form, accept for a URL, decline, or cancel. Content that fails the
-    /// schema is refused, and the host still holds the elicitation.
-    pub fn answerElicitation(r: *Server, slot: u8, answer: elicitation.Answer) Error!void {
-        const s = r.elicit.held(slot) orelse return error.UnknownElicitation;
+    /// Answers the 2025 elicitation `id`: accept with content for a form,
+    /// accept for a URL, decline, or cancel. One that is gone is unknown, even
+    /// when its slot holds another. Content that fails the schema is refused,
+    /// and the host still holds the elicitation.
+    pub fn answerElicitation(r: *Server, id: elicit_core.Id, answer: elicitation.Answer) Error!void {
+        const s = r.elicit.find(id) orelse return error.UnknownElicitation;
         var form: elicitation.Form = .{};
-        _ = elicitation.parse(r.elicit_held[slot].params, &form) catch return error.InvalidAnswer; // read when asked
+        _ = elicitation.parse(r.elicit_held[id.slot].params, &form) catch return error.InvalidAnswer; // read when asked
         const valid = if (elicitation.check(s.mode, &form, answer)) true else |err| switch (err) {
             error.InvalidAnswer => return error.InvalidAnswer,
             error.InvalidContent => false,
         };
-        try r.stepElicit(.{ .answered = .{ .slot = slot, .action = answer.action, .valid = valid } }, .{ .content = answer.content });
+        try r.stepElicit(.{ .answered = .{ .id = id, .action = answer.action, .valid = valid } }, .{ .content = answer.content });
         if (!valid) return error.InvalidAnswer;
     }
 
@@ -520,6 +536,21 @@ pub const Server = struct {
     pub fn cancelSignIn(r: *Server) Error!void {
         if (r.stdio) return error.NotReady;
         try r.auth.cancelSignIn();
+        try r.runAuth(null);
+    }
+
+    /// Takes a credential `saveCredential` wrote, as a sign-in would: what
+    /// waits for one goes out with it (another host process signed in).
+    pub fn useCredential(r: *Server, saved: []const u8) Error!void {
+        if (r.stdio) return error.NotReady;
+        try r.auth.restore(saved);
+        try r.runAuth(null);
+    }
+
+    /// Sends the refresh `refresh_due` announced.
+    pub fn refresh(r: *Server) Error!void {
+        if (r.stdio) return error.NotReady;
+        try r.auth.refreshNow();
         try r.runAuth(null);
     }
 
@@ -583,10 +614,24 @@ pub const Server = struct {
 
     /// The next thing that happened, without waiting; null for nothing. The
     /// engine reads each server when its bell rings, or a timer is due.
+    /// Due timers come before what waits, and one call reads at most `burst`
+    /// messages, then rings the bell for the rest: a server that sends
+    /// faster than they are handled can't hold back its timers or the
+    /// other servers.
     pub fn poll(r: *Server) Error!?Event {
         r.held_answer = null;
+        var read: u32 = 0;
         while (true) {
             if (r.take()) |event| return event;
+            if (r.dueMs()) |due| if (due <= r.now()) {
+                try r.fireTimers();
+                continue;
+            };
+            if (read == burst) {
+                if (if (r.stdio) r.proc.options.bell else r.client.options.bell) |b| b.ring();
+                return null;
+            }
+            read += 1;
             if (r.stdio) {
                 if (try r.proc.poll()) |incoming| {
                     try r.onProcess(incoming);
@@ -596,11 +641,12 @@ pub const Server = struct {
                 try r.onHttp(incoming);
                 continue;
             }
-            const due = r.dueMs() orelse return null;
-            if (due > r.now()) return null;
-            try r.fireTimers();
+            return null;
         }
     }
+
+    /// What `poll` reads at most per call: a queue's worth.
+    const burst = 64;
 
     /// An event already queued, without reading anything. The engine
     /// takes what one read queued together, such as a process exit's lost
@@ -701,10 +747,16 @@ pub const Server = struct {
             },
             .list => try r.stepCatalog(try r.pageEvent(body)),
             .call => _ = try r.callAnswer(body),
-            // A result ends a listen gracefully, an error refuses it.
-            .listen => try r.stepSubs(.{ .final = .{ .id = id, .end = if (body == .result) .result else .refused } }),
+            .listen => try r.stepSubs(.{ .final = .{ .id = id, .end = listenEnd(body) } }),
         }
         try r.stepRequest(.{ .response_received = .{ .id = id, .response = if (body == .result) .result else .peer_error } });
+    }
+
+    /// A complete result ends a listen gracefully. An error refuses it, and so
+    /// does a result whose `resultType` is invalid or input_required, which a
+    /// listen never is (WIRE-07).
+    fn listenEnd(body: @FieldType(wire.Response, "body")) subscription.End {
+        return if (body == .result and body.result.kind == .complete) .result else .refused;
     }
 
     /// A stdio request ended in the request table: its logical request ends.
@@ -807,7 +859,7 @@ pub const Server = struct {
         var id: request.Id = 0;
         for (out.effects()) |effect| switch (effect) {
             .write_request => |w| id = w.id,
-            .arm_timer => |a| try r.timers.append(r.gpa, .{ .kind = .{ .request = a.timer }, .due_ms = r.now() + a.after_ms }),
+            .arm_timer => |a| try r.armRequestTimer(a.timer, a.after_ms),
             else => {},
         };
         if (r.questionsHeld() > 0) try r.stepRequest(.{ .idle_paused = id });
@@ -842,7 +894,11 @@ pub const Server = struct {
                 try r.stepCatalog(.invalidated);
                 try r.stepCatalog(.need);
             },
-            .close => if (l.id) |id| try r.closeKey(id),
+            // After an answer, or as the cancellation.
+            .close => if (l.id) |id| {
+                l.id = null;
+                try r.closeKey(id, if (l.exchange.phase == .cancelled) .forgotten else .answered);
+            },
             .deliver => |d| {
                 // A call's round ended: its chain decides what comes next.
                 if (l.what == .call) return r.roundEnded(l, d.outcome);
@@ -1008,14 +1064,13 @@ pub const Server = struct {
                             .failure, .invalid => .failure,
                         };
                     },
-                    // A result ends it gracefully, an error refuses it.
                     .listen => blk: {
-                        try r.stepSubs(.{ .final = .{ .id = key, .end = if (resp.body == .result) .result else .refused } });
+                        try r.stepSubs(.{ .final = .{ .id = key, .end = listenEnd(resp.body) } });
                         break :blk if (resp.body == .result) .result else .failure;
                     },
                     .initialize => unreachable,
                 };
-                l.id = null;
+                // The answer's `close` lets go of the id and the stream.
                 try r.stepExchange(l, .{ .answer = answer });
             },
         }
@@ -1153,7 +1208,7 @@ pub const Server = struct {
                 r.emit(.{
                     .called = .{
                         .handle = l.handle,
-                        .outcome = if (l.needs_auth and o == .http_failure) .needs_auth else switch (o) {
+                        .outcome = if (l.needs_auth and o == .http_failure) .needs_auth else if (l.unrenewed and o == .http_failure) .auth_unavailable else switch (o) {
                             .none => .failure,
                             inline else => |tag| @field(CallOutcome, @tagName(tag)),
                         },
@@ -1205,6 +1260,9 @@ pub const Server = struct {
                 try era.writeInitialized(&body.writer);
                 const key = r.auxKey();
                 r.initialized_key = key;
+                // Everything after it waits for its answer, so it gets the
+                // request timeout too.
+                try r.timers.append(r.gpa, .{ .kind = .{ .initialized = key }, .due_ms = r.now() + r.options.timeouts.idle_ms });
                 try r.sendLegacy(key, .post, body.written(), null);
             },
             .post => |id| {
@@ -1241,7 +1299,7 @@ pub const Server = struct {
                 try r.sendLegacy(key, .get, null, r.listen_last_event_id);
             },
             .close_listen => if (r.listen_key) |key| {
-                try r.closeKey(key);
+                try r.closeKey(key, .forgotten);
                 r.listen_key = null;
             },
             .arm_listen => |ms| try r.timers.append(r.gpa, .{ .kind = .listen, .due_ms = r.now() + ms }),
@@ -1252,12 +1310,12 @@ pub const Server = struct {
                 try r.sendLegacy(key, .delete, null, null);
             },
             .deliver => |d| {
-                if (d.outcome != .result) {
+                // Nothing reads its stream now, so one still open is closed,
+                // after an answer too. A disconnect cancels nothing in
+                // 2025; notifications/cancelled did.
+                if (d.outcome == .result) try r.closeKey(d.id, .answered) else {
                     try r.stepRequest(.{ .transport_lost = d.id });
-                    // Nothing reads its answer now, so a stream still open is
-                    // closed. A disconnect cancels nothing in 2025;
-                    // notifications/cancelled did.
-                    try r.closeKey(d.id);
+                    try r.closeKey(d.id, .forgotten);
                 }
                 try r.legacyDelivered(d.id, d.outcome);
             },
@@ -1412,9 +1470,33 @@ pub const Server = struct {
         // An answer would have freed it: initialize ended without one.
         l.used = false;
         try r.stepRequest(.{ .transport_lost = key });
+        try r.initializeFailed(l, .{ .initialize_error = false });
+    }
+
+    /// A 2025 initialize timed out. It can't be cancelled, so nothing else
+    /// ends it: its stream is closed, and the session fails as if the stream
+    /// had ended.
+    fn onInitializeTimedOut(r: *Server, l: *Logical, id: request.Id) Error!void {
+        l.used = false;
+        try r.closeKey(id, .forgotten);
+        try r.initializeFailed(l, .initialize_timed_out);
+    }
+
+    /// A 2025 initialized notification went unanswered for the request
+    /// timeout. Every later send waits for it, so the session can't go on:
+    /// it fails with the reason. The host's teardown closes the
+    /// POST with the session.
+    fn onInitializedTimedOut(r: *Server) void {
+        r.initialized_key = null;
+        r.emit(.{ .failed = .initialized_timed_out });
+    }
+
+    /// The session's initialize ended without an answer: a first one fails
+    /// detection with `event`, a later one fails the session.
+    fn initializeFailed(r: *Server, l: *const Logical, event: era.Event) Error!void {
         const first = r.detector.state == .initializing;
         try r.stepLegacy(.initialize_failed);
-        if (first) try r.stepEra(.{ .initialize_error = false }) else r.emit(.{ .failed = if (l.needs_auth) .needs_auth else .session });
+        if (first) try r.stepEra(event) else r.emit(.{ .failed = if (l.needs_auth) .needs_auth else .session });
     }
 
     fn onLegacyAnswer(r: *Server, l: *Logical, key: u64, status: u16, body: @FieldType(wire.Response, "body")) Error!void {
@@ -1484,7 +1566,7 @@ pub const Server = struct {
                         else => .result,
                     } else .result,
                     .lost => .lost,
-                    .failed, .none => if (l.needs_auth) .needs_auth else .http_failure,
+                    .failed, .none => if (l.needs_auth) .needs_auth else if (l.unrenewed) .auth_unavailable else .http_failure,
                     .cancelled => .cancelled,
                 },
                 // Only a lost stream leaves the call maybe run.
@@ -1561,7 +1643,7 @@ pub const Server = struct {
                 h.* = .{ .params = params };
                 if (with.id) |id| h.id = try r.gpa.dupe(u8, id);
                 if (with.eid) |eid| h.eid = try r.gpa.dupe(u8, eid);
-                r.emit(.{ .elicit = .{ .slot = slot, .params = h.params, .required = event.asked.origin == .required } });
+                r.emit(.{ .elicit = .{ .id = .{ .slot = slot, .n = out.n }, .params = h.params, .required = event.asked.origin == .required } });
             },
             .reject => |why| {
                 var body: std.Io.Writer.Allocating = .init(r.gpa);
@@ -1598,14 +1680,20 @@ pub const Server = struct {
     /// for this request is posted at once, so a send that can't go out is the
     /// caller's to handle, as before.
     fn send(r: *Server, key: u64, method: http.Method, body: ?[]const u8, headers: []const std.http.Header) Error!void {
-        var arena: std.heap.ArenaAllocator = .init(r.gpa);
-        errdefer arena.deinit();
-        const a = arena.allocator();
-        const copies = try a.alloc(std.http.Header, headers.len + 1);
-        for (headers, copies[0..headers.len]) |h, *c| c.* = .{ .name = try a.dupe(u8, h.name), .value = try a.dupe(u8, h.value) };
-        try r.outbox.append(r.gpa, .{ .key = key, .method = method, .body = if (body) |b| try a.dupe(u8, b) else null, .headers = copies, .arena = arena });
-        try r.auth.beforeSend(key);
-        r.runAuth(key) catch |err| {
+        {
+            var arena: std.heap.ArenaAllocator = .init(r.gpa);
+            errdefer arena.deinit();
+            const a = arena.allocator();
+            const copies = try a.alloc(std.http.Header, headers.len + 1);
+            for (headers, copies[0..headers.len]) |h, *c| c.* = .{ .name = try a.dupe(u8, h.name), .value = try a.dupe(u8, h.value) };
+            try r.outbox.append(r.gpa, .{ .key = key, .method = method, .body = if (body) |b| try a.dupe(u8, b) else null, .headers = copies, .arena = arena });
+        }
+        // The outbox owns the copies now: `unkeep` frees them, once.
+        const sent: Error!void = blk: {
+            r.auth.beforeSend(key) catch |err| break :blk err;
+            break :blk r.runAuth(key);
+        };
+        sent catch |err| {
             // It never went out: the gate forgets it too.
             if (r.kept(key) != null) {
                 r.unkeep(key);
@@ -1628,12 +1716,14 @@ pub const Server = struct {
         };
     }
 
-    /// Closes request `key`'s stream; the gate forgets it.
-    fn closeKey(r: *Server, key: u64) Error!void {
+    /// Closes request `key`'s stream and tells the gate how it ended:
+    /// `.answered` once its answer is in, though the server may have left the
+    /// stream open, or `.forgotten` when it is dropped unanswered.
+    fn closeKey(r: *Server, key: u64, how: auth_client.Ending) Error!void {
         r.client.cancel(key);
         if (r.kept(key) == null) return;
         r.unkeep(key);
-        _ = try r.auth.ended(key, .forgotten);
+        _ = try r.auth.ended(key, how);
         try r.runAuth(null);
     }
 
@@ -1655,6 +1745,8 @@ pub const Server = struct {
                 .signed_in => r.emit(.signed_in),
                 .sign_in_failed => |f| r.emit(.{ .sign_in_failed = .{ .why = f.why, .message = f.message } }),
                 .save => r.emit(.credential),
+                .refresh_due => r.emit(.refresh_due),
+                .refresh_ended => r.emit(.refresh_ended),
             }
         }
     }
@@ -1671,25 +1763,32 @@ pub const Server = struct {
         try r.client.send(key, k.method, k.body, k.headers[0..count]);
     }
 
-    /// The gate gave up on `key`. Before the era is known that stops detection;
-    /// otherwise the request ends as it would have: a 401 for want of a
-    /// sign-in, a broken stream when the refresh got no answer.
+    /// The gate gave up on `key`. Before the era is known that stops detection.
+    /// Otherwise a request ends as the server's 401: the server never read
+    /// it, whether it waited for a sign-in or for a renewal that got no usable
+    /// answer, so a call never counts as maybe run. Anything else, such as
+    /// the listening GET, ends as a broken stream when the refresh got no
+    /// answer.
     fn authGaveUp(r: *Server, key: u64, why: auth_core.GiveUp) Error!void {
         r.unkeep(key);
         if (key < aux_base) if (r.logicalFor(key)) |l| {
             l.needs_auth = why == .needs_sign_in;
-            if ((l.what == .discover or l.what == .initialize) and !r.detector.ready()) return r.abortDetection();
+            l.unrenewed = why == .failed;
+            if ((l.what == .discover or l.what == .initialize) and !r.detector.ready()) return r.abortDetection(why);
+            return r.onEndedDomain(key, 401, .http_failure);
         };
         try r.onEndedDomain(key, if (why == .needs_sign_in) 401 else 0, if (why == .needs_sign_in) .http_failure else .broken);
     }
 
-    /// A rejection says nothing about the era. Detection stops, and the
-    /// host signs in and detects again, as a new run with its own traces.
-    fn abortDetection(r: *Server) Error!void {
+    /// A rejection says nothing about the era. Detection stops, as a new run
+    /// with its own traces: for a sign-in, the host signs in and detects
+    /// again; for a refresh that got no usable answer, the start failed and
+    /// the server starts again after its backoff, keeping its login.
+    fn abortDetection(r: *Server, why: auth_core.GiveUp) Error!void {
         for (&r.logicals) |*l| if (l.used and (l.what == .discover or l.what == .initialize)) {
             if (l.id) |id| {
                 try r.stepRequest(.{ .transport_lost = id });
-                try r.closeKey(id);
+                try r.closeKey(id, .forgotten);
             }
             l.used = false;
         };
@@ -1700,7 +1799,7 @@ pub const Server = struct {
         r.legacy = null;
         try r.endElicitations();
         r.newEraRun();
-        r.emit(.{ .failed = .needs_auth });
+        r.emit(.{ .failed = if (why == .needs_sign_in) .needs_auth else .auth_unavailable });
     }
 
     /// Detection starts over as a new run, with its own era and session
@@ -1712,6 +1811,21 @@ pub const Server = struct {
     }
 
     // ---- shared machines ----
+
+    /// Arms a request's timer. Accepted progress re-arms a request's idle timer
+    /// with a new generation, and the one it replaces could only fire to be
+    /// ignored, so it is replaced in place: one idle timer per request, however
+    /// much progress comes.
+    fn armRequestTimer(r: *Server, timer: request.Timer, after_ms: u32) Error!void {
+        const due_ms = r.now() + after_ms;
+        if (timer.kind == .idle) for (r.timers.items) |*t| {
+            if (t.kind == .request and t.kind.request.id == timer.id and t.kind.request.kind == .idle) {
+                t.* = .{ .kind = .{ .request = timer }, .due_ms = due_ms };
+                return;
+            }
+        };
+        try r.timers.append(r.gpa, .{ .kind = .{ .request = timer }, .due_ms = due_ms });
+    }
 
     fn stepRequest(r: *Server, event: request.Event) Error!void {
         var out: request.Output = .{};
@@ -1736,7 +1850,11 @@ pub const Server = struct {
                 r.proc.send(.notification, body.written()) catch {};
             } else try r.stepLegacy(.{ .cancel = id }),
             .deliver => |d| if (r.stdio) try r.stdioDelivered(d.id, d.outcome) else switch (d.outcome) {
-                .timed_out => if (r.legacy == null) if (r.logicalFor(d.id)) |l| try r.stepExchange(l, .cancel),
+                // 2026: closing the stream cancels it. 2025: a call or list's
+                // cancel goes through the session, but initialize has none.
+                .timed_out => if (r.logicalFor(d.id)) |l| {
+                    if (r.legacy == null) try r.stepExchange(l, .cancel) else if (l.what == .initialize) try r.onInitializeTimedOut(l, d.id);
+                },
                 // The server ended the listen; its stream closes.
                 .ended => if (r.logicalFor(d.id)) |l| {
                     try r.stepSubs(.{ .final = .{ .id = d.id, .end = .server_cancelled } });
@@ -1744,7 +1862,7 @@ pub const Server = struct {
                 },
                 else => {},
             },
-            .arm_timer => |a| try r.timers.append(r.gpa, .{ .kind = .{ .request = a.timer }, .due_ms = r.now() + a.after_ms }),
+            .arm_timer => |a| try r.armRequestTimer(a.timer, a.after_ms),
             .disarm_timers => |id| {
                 var i: usize = 0;
                 while (i < r.timers.items.len) {
@@ -1883,6 +2001,7 @@ pub const Server = struct {
                 .listen_wait => try r.listenSettled(),
                 .backoff => |handle| if (r.logicalByHandle(handle)) |l| try r.stepChain(l, .backoff_elapsed),
                 .relisten => |x| try r.stepSubs(.{ .retry_due = .{ .sub = x.sub, .generation = x.generation } }),
+                .initialized => |key| if (r.initialized_key == key) r.onInitializedTimedOut(),
             }
             i = 0;
         }

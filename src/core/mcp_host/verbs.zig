@@ -299,6 +299,16 @@ fn runParsed(c: Context, arena: Allocator, args: []const []const u8) !u8 {
     };
 }
 
+/// Why a write to `path` failed; a link says what it points to.
+fn whyNot(arena: Allocator, err: anyerror, path: []const u8) ![]const u8 {
+    // The profile's replace refuses a link itself (DurablePathUnsafe).
+    if (err != error.Linked and err != error.DurablePathUnsafe) return describe(err);
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = std.Io.Dir.readLinkAbsolute(io_mod.getIo(), path, &buffer) catch return "it has another hard link, and fx edits only a plain file; edit it by hand";
+    const target = try safe(arena, buffer[0..n]);
+    return try arena.print("it's a link to {s}, and fx edits only a plain file; edit {s} by hand", .{ target, target });
+}
+
 /// fx's words for an error, never its name.
 fn describe(err: anyerror) []const u8 {
     return switch (err) {
@@ -311,7 +321,7 @@ fn describe(err: anyerror) []const u8 {
         error.AccessDenied => "permission denied",
         error.Timeout, error.LockTimeout => "another fx is changing the MCP config; try again",
         error.McpConfigInvalidJson => "~/.fx/mcp.json isn't valid JSON",
-        error.McpConfigInvalidHeaders => "a server in ~/.fx/mcp.json has headers fx won't send; put a token in bearer_token_env, or sign in with login",
+        error.McpConfigInvalidHeaders, error.McpConfigAuthorizationHeader => "a server in ~/.fx/mcp.json has headers fx won't send; put a token in bearer_token_env, or sign in with login",
         else => if (std.mem.startsWith(u8, @errorName(err), "McpConfig")) "~/.fx/mcp.json has a server entry fx can't read" else "something went wrong",
     };
 }
@@ -339,6 +349,8 @@ fn sourceFile(status: Status) config_file.File {
 fn list(c: Context, arena: Allocator, json: bool) !u8 {
     const host = try c.hosts.get(c.hosts.context, null);
     defer if (host) |h| c.hosts.release(c.hosts.context, h);
+    // A login another fx saved since counts before statuses are read.
+    if (host) |h| h.runtime.pickUpLogins() catch |err| debug_trace.logf("mcp", "MCP saved logins not checked err={s}", .{@errorName(err)});
     const statuses = if (host) |h| try h.runtime.statuses(arena) else &.{};
     if (host) |h| try writeNotes(c, h);
     const p = try paths(c, arena);
@@ -362,6 +374,7 @@ pub fn statusText(arena: Allocator, s: Status) Allocator.Error![]const u8 {
         .rejected => "rejected",
         .unsupported => "not supported",
         .missing_env => try arena.print("needs ${s}", .{s.missing orelse "a variable"}),
+        .invalid_env => try arena.print("can't use ${s}", .{s.missing orelse "a variable"}),
         else => if (s.needs_login) "needs login" else switch (s.state) {
             .ready => try arena.print("ready, {d} tool{s}", .{ s.tools, if (s.tools == 1) "" else "s" }),
             .connecting => "connecting",
@@ -380,6 +393,7 @@ fn statusToken(s: Status) []const u8 {
         .rejected => "rejected",
         .unsupported => "not_supported",
         .missing_env => "missing_env",
+        .invalid_env => "invalid_env",
         else => if (s.needs_login) "needs_login" else switch (s.state) {
             .ready => "ready",
             .connecting => "connecting",
@@ -560,7 +574,7 @@ fn add(c: Context, arena: Allocator, name: []const u8, file: config_file.File, e
     const p = try paths(c, arena);
     const path = if (file == .project) p.project else p.profile;
     _ = config_file.update(c.gpa, p.profile, file, path, .{ .add = .{ .name = name, .entry = entry } }) catch |err| {
-        try c.err.print("Couldn't add {s} to {s}: {s}.\n", .{ name, fileLabel(file), describe(err) });
+        try c.err.print("Couldn't add {s} to {s}: {s}.\n", .{ name, fileLabel(file), try whyNot(arena, err, path) });
         return 1;
     };
     c.hosts.changed(c.hosts.context);
@@ -592,8 +606,9 @@ fn remove(c: Context, arena: Allocator, name: []const u8, only: ?config_file.Fil
         return 1;
     }
     const file: config_file.File = if (in_profile) .profile else .project;
-    const updated = config_file.update(c.gpa, p.profile, file, if (file == .project) p.project else p.profile, .{ .remove = name }) catch |err| {
-        try c.err.print("Couldn't remove {s} from {s}: {s}.\n", .{ try safe(arena, name), fileLabel(file), describe(err) });
+    const path = if (file == .project) p.project else p.profile;
+    const updated = config_file.update(c.gpa, p.profile, file, path, .{ .remove = name }) catch |err| {
+        try c.err.print("Couldn't remove {s} from {s}: {s}.\n", .{ try safe(arena, name), fileLabel(file), try whyNot(arena, err, path) });
         return 1;
     };
     const url = switch (updated) {
@@ -602,7 +617,8 @@ fn remove(c: Context, arena: Allocator, name: []const u8, only: ?config_file.Fil
     };
     defer if (url) |u| c.gpa.free(u);
     var forgot = false;
-    if (url) |u| forgot = credentials.Store.detect(arena, c.home).remove(arena, name, u) catch false;
+    // A `.mcp.json` server's login is its workspace's own.
+    if (url) |u| forgot = credentials.Store.detect(arena, c.home).remove(arena, .{ .name = name, .url = u, .workspace = if (file == .project) c.workspace_root else null }) catch false;
     c.hosts.changed(c.hosts.context);
     try c.out.print("Removed {s} from {s}{s}.\n", .{ name, fileLabel(file), if (forgot) ", and deleted its login" else "" });
     return 0;
@@ -629,14 +645,19 @@ fn trust(c: Context, arena: Allocator, action: project_config.ProjectMcpAction) 
         }
         return 1;
     }
-    var attempt = config_runtime.attemptProjectMcpMutation(arena, c.workspace_root, action);
-    defer attempt.deinit(arena);
-    switch (attempt) {
-        .failure => |f| {
-            try c.err.print("Couldn't save that choice: {s}.\n", .{describe(f.err)});
-            return 1;
-        },
-        .outcome => {},
+    // `--all` approves each server shown here, so a server added later still
+    // waits for approval.
+    for (0..if (action == .approve_all) targets.items.len else 1) |i| {
+        const one: project_config.ProjectMcpAction = if (action == .approve_all) .{ .approve = targets.items[i].name } else action;
+        var attempt = config_runtime.attemptProjectMcpMutation(arena, c.workspace_root, one);
+        defer attempt.deinit(arena);
+        switch (attempt) {
+            .failure => |f| {
+                try c.err.print("Couldn't save that choice: {s}.\n", .{describe(f.err)});
+                return 1;
+            },
+            .outcome => {},
+        }
     }
     c.hosts.changed(c.hosts.context);
     for (targets.items) |s| {
@@ -652,6 +673,15 @@ fn trust(c: Context, arena: Allocator, action: project_config.ProjectMcpAction) 
     return 0;
 }
 
+/// A sign-in or sign-out that changed nothing, since the saved sign-ins can't
+/// be read.
+fn unreadableLogins(c: Context, arena: Allocator, doing: []const u8, name: []const u8) !u8 {
+    try c.err.print("Can't {s} {s}: fx can't read the saved MCP sign-ins in {s}. A newer fx saved them, or they're damaged; fix or delete them, then try again.\n", .{
+        doing, try safe(arena, name), credentials.Store.detect(arena, c.home).place(),
+    });
+    return 1;
+}
+
 fn logout(c: Context, arena: Allocator, name: []const u8) !u8 {
     const host = (try c.hosts.get(c.hosts.context, null)) orelse return missing(c, arena, name);
     defer c.hosts.release(c.hosts.context, host);
@@ -663,7 +693,11 @@ fn logout(c: Context, arena: Allocator, name: []const u8) !u8 {
     const was = findStatus(try host.runtime.statuses(arena), name).?;
     host.runtime.logout(name) catch |err| switch (err) {
         // A held server isn't in the engine; its saved login still goes.
-        error.UnknownServer => _ = credentials.Store.detect(arena, c.home).remove(arena, name, server.url.?) catch false,
+        error.UnknownServer => _ = credentials.Store.detect(arena, c.home).remove(arena, server.credentialKey()) catch |e| switch (e) {
+            error.CredentialStoreUnreadable => return unreadableLogins(c, arena, "sign out of", name),
+            else => false,
+        },
+        error.CredentialStoreUnreadable => return unreadableLogins(c, arena, "sign out of", name),
         else => return err,
     };
     if (was.signed_in or was.needs_login or was.state == .ready) {
@@ -681,6 +715,8 @@ const Waiter = struct {
     shown: bool = false,
     done: ?bool = null,
     reason: ?[]u8 = null,
+    /// Why the new login wasn't saved, if it wasn't.
+    not_saved: ?[]u8 = null,
     gpa: Allocator,
     name: []const u8,
 
@@ -705,12 +741,16 @@ const Waiter = struct {
                 w.done = false;
             },
             .needs_login => {},
+            .not_saved => |n| if (std.mem.eql(u8, n.server, w.name) and w.not_saved == null) {
+                w.not_saved = w.gpa.dupe(u8, n.reason) catch null;
+            },
         }
     }
 
     fn deinit(w: *Waiter) void {
         if (w.authorize) |a| w.gpa.free(a);
         if (w.reason) |r| w.gpa.free(r);
+        if (w.not_saved) |r| w.gpa.free(r);
     }
 };
 
@@ -735,6 +775,11 @@ fn login(c: Context, arena: Allocator, name: []const u8, browser: bool) !u8 {
             try c.err.writeAll(".\n");
             return 1;
         },
+        error.CredentialStoreUnreadable => return unreadableLogins(c, arena, "sign in to", name),
+        error.CallbackPortInUse => {
+            try c.err.print("Couldn't sign in to {s}: port {d} is in use, maybe by another app signing in. Try again once it's free.\n", .{ try safe(arena, name), server.callback_port.? });
+            return 1;
+        },
         else => return err,
     };
     // The shell's host reports the address and the outcome in the transcript.
@@ -749,10 +794,12 @@ fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open
     while (true) {
         var done: ?bool = null;
         var url: ?[]const u8 = null;
+        var not_saved: ?[]const u8 = null;
         {
             waiter.mutex.lockUncancelable(io);
             defer waiter.mutex.unlock(io);
             done = waiter.done;
+            if (waiter.not_saved) |why| not_saved = try arena.dupe(u8, why);
             if (!waiter.shown and waiter.authorize != null) {
                 waiter.shown = true;
                 url = try arena.dupe(u8, waiter.authorize.?);
@@ -768,6 +815,11 @@ fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open
             try c.out.flush();
         }
         if (done) |ok| {
+            // The login was saved first, so a failed save is known by now.
+            if (ok) if (not_saved) |why| {
+                try c.err.print("Signed in to {s}, but couldn't save the login: {s}. Sign in again once that's fixed.\n", .{ try safe(arena, name), try safe(arena, why) });
+                return 1;
+            };
             if (ok) {
                 try c.out.print("Signed in to {s}.\n", .{try safe(arena, name)});
                 return 0;

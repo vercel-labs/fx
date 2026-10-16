@@ -23,6 +23,9 @@ let sawDiscovery = false;
 let toolsListCalls = 0;
 let currentToolName = "echo";
 let pendingToolCall = null;
+// FX_MCP_MODE=ping_before_initialize: the initialize answer, held until the
+// client answers this server's ping, as a server that blocks on it would.
+let pendingInitialize = null;
 let urlRequiredSent = false;
 let completionStage = 0;
 
@@ -196,6 +199,14 @@ function handle(message) {
     return;
   }
 
+  if (pendingInitialize && message.id === "legacy-ping" && message.method === undefined) {
+    if (message.jsonrpc !== "2.0" || JSON.stringify(message.result) !== "{}") process.exit(11);
+    const answer = pendingInitialize;
+    pendingInitialize = null;
+    send(answer);
+    return;
+  }
+
   if (message.method === "server/discover") {
     sawDiscovery = true;
     if (process.env.FX_MCP_IGNORE_DISCOVERY === "1") return;
@@ -260,7 +271,7 @@ function handle(message) {
         (capability?.form == null || capability?.url == null)
       ) process.exit(7);
     }
-    send({
+    const answer = {
       jsonrpc: "2.0",
       id: message.id,
       result: {
@@ -272,7 +283,13 @@ function handle(message) {
         },
         serverInfo: { name: "legacy-fixture", version: "1.0.0" },
       },
-    });
+    };
+    if (mode === "ping_before_initialize") {
+      pendingInitialize = answer;
+      send({ jsonrpc: "2.0", id: "legacy-ping", method: "ping" });
+      return;
+    }
+    send(answer);
     return;
   }
   if (message.method === "notifications/initialized") return;

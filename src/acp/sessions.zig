@@ -432,6 +432,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     var mcp_preparation = try mcp_servers.prepare(
         alloc,
         &mcp_configs,
+        workspace_root,
         state.client_elicitation,
         server.legacyUrlCompletionSink(state),
         hostChannel(state),
@@ -918,6 +919,7 @@ fn handleRestoreSession(
     var mcp_preparation = try mcp_servers.prepare(
         alloc,
         &mcp_configs,
+        workspace_root,
         state.client_elicitation,
         server.legacyUrlCompletionSink(state),
         hostChannel(state),
@@ -970,7 +972,7 @@ fn handleRestoreSession(
                 runtime.deinit();
                 alloc.destroy(runtime);
             }
-            if (previous_host) |h| h.destroy();
+            if (previous_host) |h| h.stop();
             server.enableSubagentHost(state);
             if (kind.replaysHistory()) {
                 try sendActiveHistoryUpdates(state, alloc, session_id);

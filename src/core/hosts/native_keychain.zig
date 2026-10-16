@@ -24,7 +24,7 @@ const FindGenericPasswordFn = *const fn (
 pub const service_name = "FX_AI_GATEWAY_API_KEY";
 const mcp_credentials_service_name = "FX_MCP_OAUTH_CREDENTIALS_V1";
 /// The sign-in credentials MCP-v2 hands fx to keep, a different format.
-const mcp_host_credentials_service_name = "FX_MCP_OAUTH_CREDENTIALS_V2";
+pub const mcp_host_credentials_service_name = "FX_MCP_OAUTH_CREDENTIALS_V2";
 pub const oauth_session_service_name = "FX_OAUTH_SESSION_V1";
 
 /// Backing store for a resolved account name. Must outlive any argv built from it.

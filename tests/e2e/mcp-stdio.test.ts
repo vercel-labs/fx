@@ -264,6 +264,16 @@ function moveProfileFixtureToWorkspace(root: FixtureRoot): void {
   writeFileSync(profilePath, JSON.stringify({ mcp: {} }));
 }
 
+/** The text fx sent the model as one tool call's result. */
+function toolResultText(body: string, callId: string): string {
+  const prompt = (JSON.parse(body) as { prompt: Array<{ content?: unknown }> }).prompt;
+  const part = prompt
+    .flatMap((message) => (Array.isArray(message.content) ? message.content : []) as Array<Record<string, unknown>>)
+    .find((item) => item.type === "tool-result" && item.toolCallId === callId);
+  if (!part) throw new Error(`missing the tool result for ${callId}`);
+  return contentText(part.output);
+}
+
 function fixtureEnv(root: FixtureRoot, activeGateway: ReturnType<typeof startFakeGateway>) {
   return {
     HOME: root.home,
@@ -760,10 +770,84 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     expect(result.stdout).not.toContain("broken");
     expect(result.stderr).toContain("skipped unapproved project MCP servers: fixture");
     expect(result.stderr).toContain(
-      ".mcp.json server 'broken' was skipped: invalid_entry.",
+      ".mcp.json server 'broken' was skipped: its \"url\" isn't valid.",
     );
     expect(existsSync(root.wireLogPath)).toBe(false);
   }, 25_000);
+
+  // One text item over 1 MiB used to fail the whole result. Now a
+  // saved session keeps the whole result behind a handle, and without one it
+  // is cut to the model's limit like any big result.
+  for (const engine of ["v1", "v2"] as const) {
+    const engineEnv = { FX_MCP_ENGINE: engine === "v2" ? "v2" : undefined };
+    const bigResultRoot = (label: string) => {
+      const root = createRoot(`${label}-${engine}`, MODERN_FIXTURE);
+      const profilePath = join(root.home, ".fx", "mcp.json");
+      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+      profile.mcp.fixture.environment.FX_MCP_RESULT_PAD_BYTES = String(1536 * 1024);
+      profile.mcp.fixture.environment.FX_MCP_RESULT_TEXT = "SBXF2_TAIL";
+      writeFileSync(profilePath, JSON.stringify(profile));
+      return root;
+    };
+
+    test(`fx ask on ${engine} keeps a big MCP result whole behind a handle, and read_tool_result reaches its end`, async () => {
+      const root = bigResultRoot("big-result-stored");
+      let stored = "";
+      let read = "";
+      gateway = startFakeGateway([
+        fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
+        fakeGatewayToolCall("call_mcp", TOOL_NAME, { text: "hello" }),
+        (body: string) => {
+          stored = toolResultText(body, "call_mcp");
+          const handle = /<tool_result_handle>([^<]+)<\/tool_result_handle>/.exec(stored)?.[1] ?? "missing";
+          // The whole result is one line, so read its last bytes by range.
+          const size = Number(/stored_bytes="(\d+)"/.exec(stored)?.[1] ?? 0);
+          return fakeGatewayToolCall("read_tail", "read_tool_result", { request: { handle, start_byte: Math.max(size - 255, 1), byte_count: 256 } });
+        },
+        (body: string) => {
+          read = toolResultText(body, "read_tail");
+          return fakeGatewayFinalText("BIG_RESULT_READ");
+        },
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      const result = await runFx(["ask", "--json", "--auto", "Read the big result."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway), ...engineEnv },
+        timeoutMs: 30_000,
+      });
+      expect(result.code).toBe(0);
+      expect(stored).not.toContain("InvalidContent");
+      expect(stored).toContain("<tool_result_handle>");
+      expect(Number(/stored_bytes="(\d+)"/.exec(stored)?.[1] ?? 0)).toBeGreaterThan(1536 * 1024);
+      expect(read).toContain("SBXF2_TAIL:hello");
+    }, 45_000);
+
+    test(`fx ask --no-save on ${engine} cuts a big MCP result to the model's limit instead of failing it`, async () => {
+      const root = bigResultRoot("big-result-unsaved");
+      let cut = "";
+      gateway = startFakeGateway([
+        fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
+        fakeGatewayToolCall("call_mcp", TOOL_NAME, { text: "hello" }),
+        (body: string) => {
+          cut = toolResultText(body, "call_mcp");
+          return fakeGatewayFinalText("BIG_RESULT_CUT");
+        },
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Read the big result."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway), ...engineEnv },
+        timeoutMs: 30_000,
+      });
+      expect(result.code).toBe(0);
+      expect(cut).not.toContain("InvalidContent");
+      expect(cut).not.toContain("<tool_result_handle>");
+      expect(cut).toContain("[mcp tool result truncated for fixture/");
+      expect(cut.length).toBeLessThanOrEqual(64 * 1024);
+    }, 45_000);
+  }
 
   test(
     "top-level mcp list reports a missing workspace variable without exposing config values",
@@ -3110,6 +3194,50 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       home: root.home,
       httpsProxy: proxySentinel,
     });
+    await expectFixtureProcessesExited(readWire(root.wireLogPath));
+  }, 30_000);
+
+  // As the MCP SDKs do, MCP-v2 gives a stdio server only HOME,
+  // LOGNAME, PATH, SHELL, TERM and USER of fx's environment, then its own
+  // `env`; never fx's Gateway key or anything else.
+  test("on MCP-v2 a stdio server gets only the MCP SDKs' few variables of fx's, then its config's env", async () => {
+    const root = createRoot("ask-environment-sdk", MODERN_FIXTURE, { captureEnvironment: true });
+    const namesPath = join(root.root, "mcp-environment-names.json");
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    profile.mcp.fixture.environment.FX_MCP_ENV_NAMES_CAPTURE = namesPath;
+    writeFileSync(profilePath, JSON.stringify(profile));
+    const configured = Object.keys(profile.mcp.fixture.environment);
+    const activeGateway = startToolGateway("Environment kept small.");
+    gateway = activeGateway;
+    const parentPath = process.env.PATH ?? "/usr/bin:/bin";
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Call the environment MCP fixture."],
+      {
+        cwd: root.workspace,
+        env: {
+          ...fixtureEnv(root, activeGateway),
+          FX_MCP_ENGINE: "v2",
+          PATH: parentPath,
+          FX_MCP_INHERITED_SENTINEL: "inherited-parent-value",
+          HTTPS_PROXY: "http://proxy.example.test:8080",
+        },
+        timeoutMs: 20_000,
+      },
+    );
+
+    expect(result.code, result.stderr || result.stdout).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("Environment kept small.");
+    expect(JSON.parse(readFileSync(root.environmentCapturePath, "utf8"))).toEqual({
+      configured: "configured",
+      path: parentPath,
+      home: root.home,
+    });
+    const names = JSON.parse(readFileSync(namesPath, "utf8")) as string[];
+    const allowed = new Set(["HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER", ...configured]);
+    expect(names.filter((name) => !allowed.has(name))).toEqual([]);
+    expect(names).not.toContain("AI_GATEWAY_API_KEY");
     await expectFixtureProcessesExited(readWire(root.wireLogPath));
   }, 30_000);
 
@@ -6008,6 +6136,25 @@ describe("MCP-v2 engine (FX_MCP_ENGINE=v2)", () => {
       await expectFixtureProcessesExited(readWire(root.wireLogPath));
     }, 25_000);
   }
+
+  test("a 2025 server that pings before it answers initialize gets its pong, and its tool is called", async () => {
+    // It holds its initialize answer until fx answers the ping, as a server
+    // that blocks on it would (STDIO-09).
+    const root = createRoot("v2-ping-before-initialize", LEGACY_FIXTURE, { legacyVersion: "2025-11-25", specClient: true, mode: "ping_before_initialize" });
+    gateway = startToolGateway("V2_PING_DONE");
+    const result = await ask(root, "Use the stdio MCP echo tool.");
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("V2_PING_DONE");
+    expect(modelSaw()).toContain(LEGACY_RESULT);
+    expect(calls(root)).toHaveLength(1);
+    // The pong came during the handshake, before notifications/initialized.
+    const wire = readWire(root.wireLogPath);
+    const pong = wire.findIndex((entry) => entry.message.id === "legacy-ping" && entry.message.method === undefined);
+    const initialized = wire.findIndex((entry) => entry.message.method === "notifications/initialized");
+    expect(pong).toBeGreaterThanOrEqual(0);
+    expect(pong).toBeLessThan(initialized);
+    await expectFixtureProcessesExited(wire);
+  }, 25_000);
 
   test("a server that only speaks 2024-11-05 is reported, not waited on", async () => {
     const root = createRoot("v2-2024", LEGACY_FIXTURE, { legacyVersion: "2024-11-05", specClient: true });

@@ -1178,6 +1178,59 @@ describe("version-scoped legacy MCP remote transports", () => {
   }
 
   test.skipIf(!tmuxAvailable())(
+    "MCP-v2: /mcp remove ends a 2025 session with a DELETE, and fx keeps running",
+    async () => {
+      // The removal reloads fx's MCP host, which closes the old host's
+      // servers; a 2025 session waits there for its DELETE.
+      const version = "2025-06-18";
+      streamable = startLegacyStreamableHttpFixture(version);
+      const root = createRoot("remove-http", "http", streamable.url);
+      gateway = startFakeGateway([]);
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 100,
+        height: 30,
+        env: { ...fixtureEnv(root, gateway), FX_MCP_ENGINE: "v2" },
+      });
+
+      await tui.waitForComposer(15_000);
+      const listDeadline = Date.now() + 15_000;
+      while (
+        !streamable.requests.some(
+          (entry) => entry.message?.method === "tools/list",
+        ) &&
+        Date.now() < listDeadline
+      ) {
+        await Bun.sleep(25);
+      }
+      expect(
+        streamable.requests.some(
+          (entry) => entry.message?.method === "tools/list",
+        ),
+      ).toBe(true);
+
+      await tui.sendText("/mcp remove fixture");
+      await tui.waitForText("Removed fixture from ~/.fx/mcp.json.", 10_000);
+      const deleteDeadline = Date.now() + 10_000;
+      while (streamable.deleteCalls === 0 && Date.now() < deleteDeadline) {
+        await Bun.sleep(25);
+      }
+      expect(streamable.deleteCalls).toBe(1);
+      const deleted = streamable.requests.find(
+        (entry) => entry.httpMethod === "DELETE",
+      )!;
+      expect(deleted.headers["mcp-session-id"]).toBe(`session-${version}`);
+
+      // fx is still running: the next command answers.
+      await tui.waitForComposer(10_000);
+      await tui.sendText("/mcp list");
+      await tui.waitForText("No MCP servers configured.", 10_000);
+    },
+    40_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "TUI cancellation routes HTTP+SSE cancellation to the discovered message endpoint",
     async () => {
       legacySse = startLegacyHttpSseFixture({ stallCall: true });
@@ -1219,5 +1272,49 @@ describe("version-scoped legacy MCP remote transports", () => {
       ).toBe("/messages");
     },
     40_000,
+  );
+
+  // MCP-v2's timeouts are engine-wide, so this waits out the 60 s default.
+  test(
+    "MCP-v2: a 2025 server that never answers initialize fails after its timeout instead of hanging",
+    async () => {
+      const fixture = startLegacyStreamableHttpFixture("2025-11-25", { mode: "hold_initialize" });
+      streamable = fixture;
+      const root = createRoot("hold-initialize-v2", "http", fixture.url);
+      const started = Date.now();
+      const result = await runFx(["mcp", "show", "fixture", "--json"], {
+        cwd: root.workspace,
+        env: { HOME: root.home, FX_AUTO_UPGRADE: "0", FX_MCP_ENGINE: "v2" },
+        timeoutMs: 90_000,
+      });
+      expect(result.signal).toBeNull();
+      expect(Date.now() - started).toBeLessThan(85_000);
+      expect(result.code).toBe(1);
+      expect(JSON.parse(result.stdout).error).toContain("initialize");
+      expect(fixture.initializeCalls).toBe(1);
+    },
+    120_000,
+  );
+
+  test(
+    "MCP-v2: a 2025 server that never answers notifications/initialized fails with the reason instead of looking ready with no tools",
+    async () => {
+      const fixture = startLegacyStreamableHttpFixture("2025-11-25", { mode: "hold_initialized" });
+      streamable = fixture;
+      const root = createRoot("hold-initialized-v2", "http", fixture.url);
+      const started = Date.now();
+      const result = await runFx(["mcp", "show", "fixture", "--json"], {
+        cwd: root.workspace,
+        env: { HOME: root.home, FX_AUTO_UPGRADE: "0", FX_MCP_ENGINE: "v2" },
+        timeoutMs: 90_000,
+      });
+      expect(result.signal).toBeNull();
+      expect(Date.now() - started).toBeLessThan(85_000);
+      expect(result.code).toBe(1);
+      expect(JSON.parse(result.stdout).error).toBe("it never answered fx's initialized notification");
+      // Everything after initialized waits for its answer.
+      expect(fixture.toolsListCalls).toBe(0);
+    },
+    120_000,
   );
 });

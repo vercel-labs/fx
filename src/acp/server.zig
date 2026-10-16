@@ -391,6 +391,9 @@ pub const ServerState = struct {
                 .{@errorName(err)},
             );
         };
+        // A host `session/load` replaced may still be stopping its servers;
+        // they end before this process does.
+        if (comptime !host_target.is_wasm) mcp_host.waitRetired();
         if (self.sessions_v2) |*store| store.deinit(self.alloc);
         self.workspace_access.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
@@ -2482,9 +2485,10 @@ fn parseInitializeRequest(
         }
     }
     if (capabilities.object.get("session")) |session| {
-        // Omitted and null both mean no.
+        // ACP v1 advertises notices with an object, `{}`. Omitted, null,
+        // and any value v1 doesn't define, such as `false`, all mean no.
         if (session == .object) if (session.object.get("notices")) |notices| {
-            request.client_notices = notices != .null;
+            request.client_notices = notices == .object;
         };
     }
     if (capabilities.object.get("terminal")) |value| {
@@ -4177,6 +4181,31 @@ test "ACP initialize request validation requires a uint16 protocol version" {
             case.expected,
             parseInitializeRequest(alloc, case.params, false),
         );
+    }
+}
+
+test "ACP initialize reads session.notices as advertised only for an object" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { capabilities: []const u8, advertised: bool }{
+        .{ .capabilities = "{\"session\":{\"notices\":{}}}", .advertised = true },
+        .{ .capabilities = "{\"session\":{\"notices\":{\"_meta\":{}}}}", .advertised = true },
+        .{ .capabilities = "{}", .advertised = false },
+        .{ .capabilities = "{\"session\":null}", .advertised = false },
+        .{ .capabilities = "{\"session\":{}}", .advertised = false },
+        .{ .capabilities = "{\"session\":{\"notices\":null}}", .advertised = false },
+        .{ .capabilities = "{\"session\":{\"notices\":false}}", .advertised = false },
+        .{ .capabilities = "{\"session\":{\"notices\":true}}", .advertised = false },
+        .{ .capabilities = "{\"session\":{\"notices\":\"yes\"}}", .advertised = false },
+        .{ .capabilities = "{\"session\":{\"notices\":[]}}", .advertised = false },
+    };
+    for (cases) |case| {
+        const params = try alloc.print("{{\"protocolVersion\":1,\"clientCapabilities\":{s}}}", .{case.capabilities});
+        defer alloc.free(params);
+        const request = try parseInitializeRequest(alloc, params, false);
+        std.testing.expectEqual(case.advertised, request.client_notices) catch |err| {
+            std.debug.print("capabilities: {s}\n", .{case.capabilities});
+            return err;
+        };
     }
 }
 

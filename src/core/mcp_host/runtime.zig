@@ -22,7 +22,6 @@ const secret = @import("../auth/secret.zig");
 const config = @import("config.zig");
 const credentials = @import("credentials.zig");
 const loopback = @import("login.zig");
-const slack = @import("slack.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 
@@ -35,6 +34,11 @@ const login_timeout_ms: i64 = 5 * 60 * 1000;
 const idle_wait_ms: u32 = 1000;
 /// How long a logout waits for its revocation, as MCP-v2's `close` does.
 const revoke_wait_ms: i64 = 2000;
+/// How long a refresh waits for another fx refreshing the same login; then
+/// it refreshes anyway.
+const refresh_lock_wait_ms: i64 = 10_000;
+/// How often a refresh waiting for that lock tries it again.
+const refresh_retry_ms: u32 = 20;
 
 /// For a program that exits next: every stdio server it
 /// runs gets SIGTERM and nothing waits, so quitting takes no longer with
@@ -43,6 +47,28 @@ const revoke_wait_ms: i64 = 2000;
 pub fn signalServersForExit() void {
     if (comptime host_target.is_wasm) return;
     mcp.stdio.signalAllForExit(io_mod.getIo());
+}
+
+/// Retired runtimes, in the whole program, from when they were replaced until
+/// their servers are gone: still in use by calls that began on them, or
+/// stopping on a thread of their own (`Host.stop`). Until then, no other
+/// runtime takes a request that could start a server, so one never runs
+/// twice.
+var retiring: std.atomic.Value(u32) = .init(0);
+/// How often a held runtime looks again.
+const retiring_wait_ms: u32 = 50;
+
+fn retireStarted() void {
+    _ = retiring.fetchAdd(1, .acq_rel);
+}
+
+fn retireEnded() void {
+    _ = retiring.fetchSub(1, .acq_rel);
+}
+
+/// Waits until every retired runtime's servers are gone.
+pub fn waitRetired() void {
+    while (retiring.load(.acquire) != 0) io_mod.sleep(5 * std.time.ns_per_ms);
 }
 
 /// FX_MCP_ENGINE=v2 selects MCP-v2.
@@ -62,6 +88,7 @@ pub const State = enum {
     rejected,
     unsupported,
     missing_env,
+    invalid_env,
 };
 
 pub const Status = struct {
@@ -74,7 +101,7 @@ pub const Status = struct {
     last_error: ?[]const u8 = null,
     needs_login: bool = false,
     signed_in: bool = false,
-    /// The variable a `missing_env` server names.
+    /// The variable a `missing_env` or `invalid_env` server names.
     missing: ?[]const u8 = null,
     /// What the server told fx to tell the model about it.
     instructions: ?[]const u8 = null,
@@ -122,6 +149,8 @@ pub const Notice = union(enum) {
     signed_in: []const u8,
     sign_in_failed: struct { server: []const u8, reason: []const u8 },
     needs_login: []const u8,
+    /// A new login couldn't be saved: it works in this process only.
+    not_saved: struct { server: []const u8, reason: []const u8 },
 };
 
 /// Called on the owner thread; the slices in a notice are valid for the call.
@@ -133,6 +162,8 @@ pub const Notify = struct {
 pub const Options = struct {
     client_version: []const u8,
     credentials: credentials.Store,
+    /// The workspace whose `.mcp.json` servers keep their own logins.
+    workspace_root: []const u8 = "",
     notify: ?Notify = null,
     /// The questions fx's UI on this surface can ask, declared to servers so
     /// they only ask those.
@@ -140,6 +171,9 @@ pub const Options = struct {
     /// Where a 2025 server's URL completions go: ACP sends the editor
     /// `elicitation/complete`.
     url_completions: ?tool_mcp_runtime.LegacyUrlCompletionSink = null,
+    /// The surface takes slash commands, as fx's shell does, so the model
+    /// tells the user to sign in with `/mcp login NAME`, not in a terminal.
+    slash_commands: bool = false,
 };
 
 pub const Error = Allocator.Error || error{
@@ -156,6 +190,11 @@ pub const Error = Allocator.Error || error{
     Cancelled,
     /// The engine refused the request; the trace says why.
     Failed,
+    /// The saved sign-ins can't be read, damaged or saved by a newer fx, so a
+    /// sign-in or sign-out changes nothing.
+    CredentialStoreUnreadable,
+    /// Another program holds the sign-in's fixed callback port.
+    CallbackPortInUse,
 };
 
 const Request = struct {
@@ -186,8 +225,18 @@ const Request = struct {
         login: struct { server: []const u8, open_browser: bool },
         finish_login: struct { server: []const u8, url: []const u8 },
         logout: []const u8,
+        /// Servers that need a login take one another fx saved since.
+        pick_up,
         /// What the user answered, posted by the caller that asked.
         answer: struct { pending: Pending, json: ?[]u8 },
+
+        /// Whether handling it could start a server.
+        fn mayStart(k: Kind) bool {
+            return switch (k) {
+                .tools, .need, .call, .login, .finish_login, .pick_up => true,
+                .cancel, .logout, .answer => false,
+            };
+        }
     };
 
     const Outcome = union(enum) {
@@ -208,8 +257,9 @@ const Pending = struct {
     reply: union(enum) {
         /// 2026: the call's input requests, answered in this key order.
         input: struct { call: engine.Handle, keys: [][]u8 },
-        /// 2025: the server's elicitation slot.
-        elicit: u8,
+        /// 2025: the server's elicitation, by slot and number, so an answer
+        /// to one it withdrew never reaches the next in that slot.
+        elicit: mcp.core.elicitation.Id,
     },
 
     fn deinit(p: *Pending, gpa: Allocator) void {
@@ -248,6 +298,8 @@ pub const Runtime = struct {
     /// Per server in `resolved.servers`; owner thread only.
     flags: []Flags,
     thread: ?std.Thread = null,
+    /// Set by `retire`; read by the owner thread.
+    retired: std.atomic.Value(bool) = .init(false),
 
     mutex: std.Io.Mutex = .init,
     /// Guarded by `mutex`.
@@ -270,11 +322,29 @@ pub const Runtime = struct {
     url_questions: std.ArrayList(struct { server: usize, slot: u8, id: []u8 }) = .empty,
     /// Logouts waiting for their revocation's answer.
     logouts: std.ArrayList(struct { server: usize, request: *Request, deadline_ms: i64 }) = .empty,
+    refreshes: std.ArrayList(Refresh) = .empty,
     /// Finished requests, woken only once the snapshot that follows them is
     /// published, so a caller never reads a status older than its result.
     finished: std.ArrayList(*Request) = .empty,
 
-    const Flags = struct { needs_login: bool = false, signed_in: bool = false };
+    const Flags = struct {
+        needs_login: bool = false,
+        signed_in: bool = false,
+        /// The last saved credential this server had or tried, so a stale
+        /// one isn't taken twice.
+        tried: ?[32]u8 = null,
+        /// A save failed, and the user heard so.
+        not_saved: bool = false,
+    };
+
+    /// A refresh MCP-v2 said was due: waiting for its login's refresh lock,
+    /// or holding it until the refresh ends.
+    const Refresh = struct {
+        server: usize,
+        lock: ?credentials.Store.Locked = null,
+        sent: bool = false,
+        deadline_ms: i64,
+    };
 
     /// Starts the engine with `configs` (from `loadNativeConfigs`) and its
     /// owner thread. `configs` and `inherited` are read only during the call.
@@ -302,10 +372,13 @@ pub const Runtime = struct {
         errdefer r.arena.deinit();
         errdefer r.snapshot_arena.deinit();
         const arena = r.arena.allocator();
-        r.resolved = try config.resolve(arena, configs, inherited, .{ .context = r, .get = savedCredential });
+        r.resolved = try config.resolve(arena, configs, inherited, .{ .context = r, .get = savedCredential }, r.options.workspace_root);
         r.flags = try arena.alloc(Flags, r.resolved.servers.len);
         for (r.flags) |*f| f.* = .{};
-        for (r.resolved.engine, r.resolved.engine_server) |c, i| r.flags[i].signed_in = c.auth.saved != null;
+        for (r.resolved.engine, r.resolved.engine_server) |c, i| {
+            r.flags[i].signed_in = c.auth.saved != null;
+            if (c.auth.saved) |saved| r.flags[i].tried = credentials.digest(saved);
+        }
         try r.engine.init(io, gpa, .{ .context = r, .allow = allow, .log = log }, .{
             .client = .{ .info = .{ .name = "fx", .version = options.client_version }, .capabilities = declaredCapabilities(options.questions) },
         }, r.resolved.engine);
@@ -316,6 +389,18 @@ pub const Runtime = struct {
         r.resolved.engine = &.{};
         try r.publish();
         r.thread = try std.Thread.spawn(.{}, run, .{r});
+    }
+
+    /// Replaced: from now until `deinit`, no other runtime starts a server.
+    /// This one still takes every request, so calls that began here finish.
+    pub fn retire(r: *Runtime) void {
+        if (!r.retired.swap(true, .acq_rel)) retireStarted();
+    }
+
+    /// Whether requests that could start a server wait: a retired runtime
+    /// elsewhere still has servers.
+    fn waitsForRetired(r: *const Runtime) bool {
+        return !r.retired.load(.acquire) and retiring.load(.acquire) != 0;
     }
 
     /// Ends every waiting request, stops the servers, and joins the owner.
@@ -332,12 +417,16 @@ pub const Runtime = struct {
         r.tool_waiters.deinit(r.gpa);
         r.logins.deinit(r.gpa);
         r.logouts.deinit(r.gpa);
+        r.refreshes.deinit(r.gpa);
         for (r.url_questions.items) |q| r.gpa.free(q.id);
         r.url_questions.deinit(r.gpa);
         r.finished.deinit(r.gpa);
         r.snapshot_arena.deinit();
         r.arena.deinit();
+        const was_retired = r.retired.load(.acquire);
         r.* = undefined;
+        // Its servers are down: the others may start theirs.
+        if (was_retired) retireEnded();
     }
 
     /// Every configured server's status, copied into `alloc`.
@@ -444,6 +533,13 @@ pub const Runtime = struct {
         try r.submitOk(&req);
     }
 
+    /// Every server that needs a login takes one saved since by another fx,
+    /// if there is one, before a status is shown.
+    pub fn pickUpLogins(r: *Runtime) Error!void {
+        var req: Request = .{ .kind = .pick_up, .alloc = r.gpa };
+        try r.submitOk(&req);
+    }
+
     fn submitOk(r: *Runtime, req: *Request) Error!void {
         try r.submit(req, null);
         switch (req.result) {
@@ -528,6 +624,7 @@ pub const Runtime = struct {
             };
             r.expireLogins();
             r.endLogouts();
+            r.retryRefreshes();
             r.flush();
         }
         r.shutdown();
@@ -546,6 +643,20 @@ pub const Runtime = struct {
         const stopping = r.stopping;
         var taken = r.queue;
         r.queue = .empty;
+        if (!stopping and r.waitsForRetired()) {
+            // A retired runtime's servers are still stopping: what could
+            // start a server waits, in order.
+            var kept: usize = 0;
+            for (taken.items) |req| {
+                if (req.kind.mayStart()) held: {
+                    r.queue.append(r.gpa, req) catch break :held; // out of memory: handled now
+                    continue;
+                }
+                taken.items[kept] = req;
+                kept += 1;
+            }
+            taken.shrinkRetainingCapacity(kept);
+        }
         r.mutex.unlock(r.io);
         defer taken.deinit(r.gpa);
         for (taken.items) |req| {
@@ -566,7 +677,7 @@ pub const Runtime = struct {
             .tools => |name| {
                 const i = r.serverIndex(name) orelse return r.finish(req, .{ .tools = .unknown_server });
                 if (r.heldReason(req.alloc, i)) |why| return r.finish(req, .{ .tools = .{ .failed = try why } });
-                if (r.flags[i].needs_login and r.loginFor(i) == null) return r.finish(req, .{ .tools = .needs_login });
+                if (r.flags[i].needs_login and r.loginFor(i) == null and !try r.pickUpLogin(i)) return r.finish(req, .{ .tools = .needs_login });
                 if (r.enginePhase(i) == .backoff) {
                     try r.engine.needTools(r.resolved.servers[i].name);
                     return r.finish(req, .{ .tools = .{ .failed = try req.alloc.dupe(u8, r.lastError(i) orelse "the server is unavailable") } });
@@ -574,6 +685,12 @@ pub const Runtime = struct {
                 try r.tool_waiters.ensureUnusedCapacity(r.gpa, 1);
                 try r.engine.needTools(r.resolved.servers[i].name);
                 r.tool_waiters.appendAssumeCapacity(.{ .server = i, .request = req });
+            },
+            .pick_up => {
+                for (r.flags, 0..) |f, i| if (f.needs_login) {
+                    _ = try r.pickUpLogin(i);
+                };
+                r.finish(req, .ok);
             },
             .need => |i| {
                 if (r.resolved.servers[i].held == null) r.engine.needTools(r.resolved.servers[i].name) catch |err| {
@@ -584,6 +701,7 @@ pub const Runtime = struct {
             .call => |c| {
                 const i = r.serverIndex(c.server) orelse return r.finish(req, .{ .call = .unknown_server });
                 if (r.resolved.servers[i].held != null) return r.finish(req, .{ .failed = error.Held });
+                if (r.flags[i].needs_login) _ = try r.pickUpLogin(i);
                 // Room first: a call the engine took must have its waiter.
                 try r.calls.ensureUnusedCapacity(r.gpa, 1);
                 const handle_ = try r.engine.call(r.resolved.servers[i].name, c.tool, c.arguments);
@@ -637,9 +755,9 @@ pub const Runtime = struct {
                             r.engine.cancel(input.call) catch {};
                         }
                     },
-                    .elicit => |slot| {
+                    .elicit => |id| {
                         const answer = elicitAnswer(scratch.allocator(), a.json) orelse mcp.elicitation.Answer{ .action = .decline };
-                        r.engine.answerElicitation(name, slot, answer) catch |err| {
+                        r.engine.answerElicitation(name, id, answer) catch |err| {
                             debug_trace.logf("mcp", "MCP elicitation answer not sent server={s} err={s}", .{ name, @errorName(err) });
                         };
                     },
@@ -649,10 +767,13 @@ pub const Runtime = struct {
                 const i = r.engineServer(name) orelse return r.finish(req, .{ .failed = error.UnknownServer });
                 const s = r.resolved.servers[i];
                 if (s.transport != .http) return r.finish(req, .{ .failed = error.NotHttp });
-                try r.engine.signOut(s.name);
-                _ = r.options.credentials.remove(r.gpa, s.name, s.url.?) catch |err| {
-                    debug_trace.logf("mcp", "MCP credential not removed server={s} err={s}", .{ s.name, @errorName(err) });
+                // The saved login goes first: a store that can't be read leaves
+                // the session signed in rather than half signed out.
+                _ = r.options.credentials.remove(r.gpa, s.credentialKey()) catch |err| switch (err) {
+                    error.CredentialStoreUnreadable => return r.finish(req, .{ .failed = error.CredentialStoreUnreadable }),
+                    else => debug_trace.logf("mcp", "MCP credential not removed server={s} err={s}", .{ s.name, @errorName(err) }),
                 };
+                try r.engine.signOut(s.name);
                 r.flags[i] = .{};
                 // A program that exits next would lose a revocation still on
                 // its way, so the logout ends when it's answered.
@@ -666,9 +787,16 @@ pub const Runtime = struct {
         const i = r.engineServer(name) orelse return r.finish(req, .{ .failed = if (r.serverIndex(name) == null) error.UnknownServer else error.Held });
         const s = r.resolved.servers[i];
         if (s.transport != .http) return r.finish(req, .{ .failed = error.NotHttp });
+        // A sign-in that couldn't be saved would last only this session.
+        r.options.credentials.check(r.gpa) catch |err| switch (err) {
+            error.CredentialStoreUnreadable => return r.finish(req, .{ .failed = error.CredentialStoreUnreadable }),
+            else => debug_trace.logf("mcp", "MCP credential store not checked server={s} err={s}", .{ s.name, @errorName(err) }),
+        };
         r.endLogin(i);
-        // The bridge passes the port on, so any free one does.
-        var listener = try loopback.Listener.open(r.io, if (s.bridge) null else s.callback_port);
+        var listener = loopback.Listener.open(r.io, s.callback_port) catch |err| switch (err) {
+            error.AddressInUse => return r.finish(req, .{ .failed = error.CallbackPortInUse }),
+            else => return err,
+        };
         const l = r.gpa.create(Login) catch |err| {
             listener.close(r.io);
             return err;
@@ -680,7 +808,7 @@ pub const Runtime = struct {
             .deadline_ms = r.nowMs() + login_timeout_ms,
             .open_browser = open_browser,
         };
-        if (s.bridge) l.listener.bridge = .{ .origin = slack.origin(), .redirect = slack.redirect_uri, .path = "/slack/oauth/callback" };
+        l.listener.localhost = s.slack_app;
         r.logins.append(r.gpa, l) catch |err| {
             l.listener.close(r.io);
             r.gpa.destroy(l);
@@ -724,16 +852,6 @@ pub const Runtime = struct {
             r.gpa.free(url);
             r.gpa.destroy(req);
         };
-    }
-
-    /// fx.sh's start for a bridged sign-in to `server`, owned by `gpa`; null
-    /// for any other, or when the address lacks what the bridge needs.
-    fn bridgeStart(r: *const Runtime, server: usize, authorize: []const u8) ?[]u8 {
-        if (!r.resolved.servers[server].bridge) return null;
-        const l = r.loginFor(server) orelse return null;
-        const url = slack.startUrl(r.gpa, slack.origin(), authorize, l.listener.port) catch null;
-        if (url == null) debug_trace.logf("mcp", "MCP sign-in has no bridge start server={s}", .{r.resolved.servers[server].name});
-        return url;
     }
 
     fn loginFor(r: *const Runtime, server: usize) ?*Login {
@@ -843,14 +961,13 @@ pub const Runtime = struct {
                 r.endToolWaiters(i, .needs_login);
             },
             .authorize => |authorize| {
-                // A bridged sign-in starts at the bridge, which goes on to the server's page.
-                const bridged = r.bridgeStart(i, authorize);
-                defer if (bridged) |owned| r.gpa.free(owned);
-                const url = bridged orelse authorize;
-                r.notify(.{ .authorize = .{ .server = name, .url = url } });
-                for (r.logins.items) |l| if (l.server == i and l.open_browser) {
+                r.notify(.{ .authorize = .{ .server = name, .url = authorize } });
+                for (r.logins.items) |l| if (l.server == i) {
+                    // Only a return carrying this sign-in's state ends its wait.
+                    l.listener.expect(r.io, authorize);
+                    if (!l.open_browser) continue;
                     // The URL went out in the notice either way.
-                    const opened = url_opener.native_opener.open(r.gpa, url) catch false;
+                    const opened = url_opener.native_opener.open(r.gpa, authorize) catch false;
                     if (!opened) debug_trace.logf("mcp", "browser not opened for MCP login server={s}", .{name});
                 };
             },
@@ -868,24 +985,44 @@ pub const Runtime = struct {
                 r.notify(.{ .sign_in_failed = .{ .server = name, .reason = reason } });
             },
             .credential => try r.saveCredential(i),
+            .refresh_due => try r.refreshDue(i),
+            .refresh_ended => r.endRefresh(i),
             .elicit => |x| {
                 const decline: mcp.elicitation.Answer = .{ .action = .decline };
                 const req = r.callAsking(name) orelse {
                     debug_trace.logf("mcp", "MCP elicitation declined server={s} reason=no call can ask", .{name});
-                    return r.engine.answerElicitation(name, x.slot, decline);
+                    return r.engine.answerElicitation(name, x.id, decline);
                 };
                 const json = try r.gpa.print("{{\"elicitation\":{{\"method\":\"elicitation/create\",\"params\":{s}}}}}", .{x.params});
-                var pending: Pending = .{ .server = i, .json = json, .version = r.versionCopy(i), .reply = .{ .elicit = x.slot } };
+                var pending: Pending = .{ .server = i, .json = json, .version = r.versionCopy(i), .reply = .{ .elicit = x.id } };
                 if (!r.offer(req, pending)) {
                     pending.deinit(r.gpa);
-                    return r.engine.answerElicitation(name, x.slot, decline);
+                    return r.engine.answerElicitation(name, x.id, decline);
                 }
-                try r.holdUrl(i, x.slot, x.params);
+                try r.holdUrl(i, x.id.slot, x.params);
             },
             .elicitation_complete => |slot| r.endUrl(i, slot, true),
-            .elicit_withdrawn => |slot| r.endUrl(i, slot, false),
+            .elicit_withdrawn => |slot| {
+                r.dropWithdrawn(i, slot);
+                r.endUrl(i, slot, false);
+            },
             else => {},
         }
+    }
+
+    /// The server withdrew its 2025 question in `slot`: one no call has shown
+    /// yet is never shown. One on screen stays, and its answer is refused.
+    fn dropWithdrawn(r: *Runtime, i: usize, slot: u8) void {
+        r.mutex.lockUncancelable(r.io);
+        defer r.mutex.unlock(r.io);
+        var it = r.calls.valueIterator();
+        while (it.next()) |req| if (req.*.question) |*q| {
+            if (q.server != i or q.reply != .elicit or q.reply.elicit.slot != slot) continue;
+            debug_trace.logf("mcp", "MCP question dropped server={s} reason=withdrawn before it was shown", .{r.resolved.servers[i].name});
+            q.deinit(r.gpa);
+            req.*.question = null;
+            return;
+        };
     }
 
     /// Keeps a 2025 URL question's id, which its completion names.
@@ -924,25 +1061,46 @@ pub const Runtime = struct {
 
     fn saveCredential(r: *Runtime, i: usize) !void {
         const s = r.resolved.servers[i];
-        const url = s.url orelse return;
+        if (s.url == null) return;
         var out: std.Io.Writer.Allocating = .init(r.gpa);
         defer {
             std.crypto.secureZero(u8, out.writer.buffer);
             out.deinit();
         }
         if (try r.engine.saveCredential(s.name, &out.writer)) {
-            r.options.credentials.put(r.gpa, s.name, url, out.written()) catch |err| {
+            if (r.options.credentials.put(r.gpa, s.credentialKey(), out.written())) {
+                // Only a saved login is this process's own; one that wasn't
+                // leaves the store's as it was, for a refusal to remove.
+                r.flags[i].tried = credentials.digest(out.written());
+                r.flags[i].not_saved = false;
+            } else |err| {
                 debug_trace.logf("mcp", "MCP credential not saved server={s} err={s}", .{ s.name, @errorName(err) });
-            };
-        } else {
-            _ = r.options.credentials.remove(r.gpa, s.name, url) catch |err| {
+                if (r.flags[i].not_saved) return;
+                r.flags[i].not_saved = true;
+                var buf: [320]u8 = undefined;
+                r.notify(.{ .not_saved = .{ .server = s.name, .reason = notSavedReason(&buf, r.options.credentials, err) } });
+            }
+        } else if (r.flags[i].tried) |own| {
+            // Only this process's own login goes: one another fx saved since
+            // stays, for the next request to take.
+            _ = r.options.credentials.removeIfSame(r.gpa, s.credentialKey(), own) catch |err| {
                 debug_trace.logf("mcp", "MCP credential not removed server={s} err={s}", .{ s.name, @errorName(err) });
             };
         }
     }
 
     fn shutdown(r: *Runtime) void {
-        while (r.logins.items.len > 0) r.endLogin(r.logins.items[0].server);
+        while (r.logins.items.len > 0) {
+            // Only a config change ends a host while it signs in: the
+            // shell's "Signing in" clears, and it says why.
+            const server = r.logins.items[0].server;
+            const name = r.resolved.servers[server].name;
+            var buf: [320]u8 = undefined;
+            const reason = std.mem.print(&buf, "the MCP config changed before the browser came back; run /mcp login {s} again", .{name}) catch
+                "the MCP config changed before the browser came back; sign in again";
+            r.notify(.{ .sign_in_failed = .{ .server = name, .reason = reason } });
+            r.endLogin(server);
+        }
         var it = r.calls.valueIterator();
         while (it.next()) |req| r.finish(req.*, .{ .failed = error.Stopped });
         r.calls.clearRetainingCapacity();
@@ -950,6 +1108,8 @@ pub const Runtime = struct {
         r.tool_waiters.clearRetainingCapacity();
         for (r.logouts.items) |l| r.finish(l.request, .ok);
         r.logouts.clearRetainingCapacity();
+        for (r.refreshes.items) |*f| if (f.lock) |*l| l.release();
+        r.refreshes.clearRetainingCapacity();
         // Requests queued after the last drain.
         _ = r.drain();
         r.flush();
@@ -971,6 +1131,7 @@ pub const Runtime = struct {
                     .rejected => .rejected,
                     .unsupported => .unsupported,
                     .missing_env => .missing_env,
+                    .invalid_env => .invalid_env,
                 };
                 continue;
             }
@@ -1007,6 +1168,10 @@ pub const Runtime = struct {
         const now = r.nowMs();
         for (r.logins.items) |l| wait = @min(wait, @max(0, l.deadline_ms - now));
         for (r.logouts.items) |l| wait = @min(wait, @max(0, l.deadline_ms - now));
+        for (r.refreshes.items) |f| if (!f.sent) {
+            wait = @min(wait, refresh_retry_ms);
+        };
+        if (r.waitsForRetired()) wait = @min(wait, retiring_wait_ms);
         return @intCast(wait);
     }
 
@@ -1144,6 +1309,7 @@ pub const Runtime = struct {
             else
                 "servers of \"type\": \"acp\" are not supported: ACP v1 defines stdio, HTTP, and SSE"),
             .missing_env => alloc.print("{s} is not set", .{s.missing orelse "a variable"}),
+            .invalid_env => alloc.print("{s} holds a line break or another character a header can't carry", .{s.missing orelse "a variable"}),
         };
     }
 
@@ -1157,12 +1323,86 @@ pub const Runtime = struct {
         return out;
     }
 
-    fn savedCredential(context: *anyopaque, alloc: Allocator, name: []const u8, url: []const u8) Allocator.Error!?[]u8 {
-        const r: *Runtime = @ptrCast(@alignCast(context));
-        const found = r.options.credentials.get(r.gpa, name, url) catch |err| switch (err) {
+    /// A login saved since by another fx, taken in place of asking for one;
+    /// true when server `i` took it. One already had or tried is skipped,
+    /// and so is a server signing in here.
+    fn pickUpLogin(r: *Runtime, i: usize) !bool {
+        const s = r.resolved.servers[i];
+        if (s.transport != .http or s.held != null or r.loginFor(i) != null) return false;
+        if (!try r.takeSaved(i)) return false;
+        r.flags[i].needs_login = false;
+        r.flags[i].signed_in = true;
+        debug_trace.logf("mcp", "MCP login saved by another fx taken server={s}", .{s.name});
+        r.notify(.{ .signed_in = s.name });
+        return true;
+    }
+
+    /// Server `i`'s refresh is due. One left over, whose end was
+    /// dropped, goes first: a server refreshes once at a time.
+    fn refreshDue(r: *Runtime, i: usize) !void {
+        r.endRefresh(i);
+        try r.refreshes.append(r.gpa, .{ .server = i, .deadline_ms = r.nowMs() + refresh_lock_wait_ms });
+        try r.tryRefresh(&r.refreshes.items[r.refreshes.items.len - 1]);
+    }
+
+    /// Under the login's refresh lock, one fx refreshes it at a time: this one
+    /// takes the login another fx saved meanwhile, or refreshes its own.
+    /// Waiting too long, or without the lock at all, it refreshes anyway.
+    fn tryRefresh(r: *Runtime, f: *Refresh) !void {
+        const s = r.resolved.servers[f.server];
+        if (r.options.credentials.tryRefreshLock(s.credentialKey())) |maybe| {
+            if (maybe) |lock| {
+                f.lock = lock;
+            } else if (r.nowMs() < f.deadline_ms) {
+                return;
+            } else debug_trace.logf("mcp", "MCP refresh went ahead server={s} reason=another fx held its refresh lock too long", .{s.name});
+        } else |err| debug_trace.logf("mcp", "MCP refresh went ahead server={s} reason=no refresh lock err={s}", .{ s.name, @errorName(err) });
+        f.sent = true;
+        if (try r.takeSaved(f.server)) debug_trace.logf("mcp", "MCP refresh replaced server={s} reason=another fx refreshed", .{s.name});
+        // Nothing goes out once a saved login replaced the refresh.
+        try r.engine.refresh(s.name);
+    }
+
+    fn retryRefreshes(r: *Runtime) void {
+        for (r.refreshes.items) |*f| if (!f.sent) r.tryRefresh(f) catch |err| {
+            debug_trace.logf("mcp", "MCP refresh not started server={s} err={s}", .{ r.resolved.servers[f.server].name, @errorName(err) });
+        };
+    }
+
+    /// Server `i`'s refresh ended, or a sign-in or sign-out replaced it.
+    fn endRefresh(r: *Runtime, i: usize) void {
+        for (r.refreshes.items, 0..) |*f, k| if (f.server == i) {
+            if (f.lock) |*l| l.release();
+            _ = r.refreshes.swapRemove(k);
+            return;
+        };
+    }
+
+    /// The login another fx saved under server `i`'s key, given to it; false
+    /// when there is none, or it's one `i` had or tried already.
+    fn takeSaved(r: *Runtime, i: usize) !bool {
+        const s = r.resolved.servers[i];
+        const saved = r.options.credentials.get(r.gpa, s.credentialKey()) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
-                debug_trace.logf("mcp", "MCP credential not loaded server={s} err={s}", .{ name, @errorName(err) });
+                debug_trace.logf("mcp", "MCP saved login not read server={s} err={s}", .{ s.name, @errorName(err) });
+                return false;
+            },
+        } orelse return false;
+        defer secret.zeroAndFree(r.gpa, saved);
+        const digest = credentials.digest(saved);
+        if (r.flags[i].tried) |tried| if (std.mem.eql(u8, &tried, &digest)) return false;
+        r.flags[i].tried = digest;
+        try r.engine.useCredential(s.name, saved);
+        return true;
+    }
+
+    fn savedCredential(context: *anyopaque, alloc: Allocator, key: credentials.Key) Allocator.Error!?[]u8 {
+        const r: *Runtime = @ptrCast(@alignCast(context));
+        const found = r.options.credentials.get(r.gpa, key) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                debug_trace.logf("mcp", "MCP credential not loaded server={s} err={s}", .{ key.name, @errorName(err) });
                 return null;
             },
         } orelse return null;
@@ -1191,6 +1431,16 @@ fn declaredCapabilities(questions: elicitation.Capabilities) []const u8 {
 
 /// MCP-v2 names why a server is down; fx says it in words. Anything else,
 /// such as an HTTP failure's own text, is shown as it is.
+/// Why a new login wasn't saved, in words.
+fn notSavedReason(buffer: []u8, store: credentials.Store, err: anyerror) []const u8 {
+    const why: []const u8 = switch (err) {
+        error.CredentialStoreUnreadable => "a newer fx saved it, or it's damaged",
+        error.LockBusy => "another fx kept it busy",
+        else => @errorName(err),
+    };
+    return std.mem.print(buffer, "{s} couldn't be written: {s}", .{ store.place(), why }) catch "the saved MCP sign-ins couldn't be written";
+}
+
 /// Why a sign-in failed, in words, with the authorization server's own when
 /// it gave some.
 fn signInFailure(buffer: []u8, why: mcp.auth.client.Failure, message: ?[]const u8) []const u8 {
@@ -1198,9 +1448,12 @@ fn signInFailure(buffer: []u8, why: mcp.auth.client.Failure, message: ?[]const u
         .discovery => "fx couldn't find how to sign in to it",
         .registration => "it didn't register fx as a client; set oauth.client_id for it in mcp.json",
         .response => "the sign-in page returned an error",
+        .mismatch => "the answer that came back wasn't for this sign-in",
         .redemption => "it didn't accept the sign-in",
         .cancelled => "the sign-in was cancelled",
         .refused => "fx has tried to sign in to it too many times; restart fx to try again",
+        .insecure_endpoint => "its sign-in server uses plain HTTP, not HTTPS",
+        .internal_endpoint => "its sign-in server points at an internal address fx won't contact",
     };
     var said = std.mem.trimEnd(u8, message orelse return what, ". \t\r\n");
     if (said.len == 0) return what;
@@ -1219,6 +1472,7 @@ test "a failed sign-in says why in words, with the server's own" {
     try std.testing.expectEqualStrings("the sign-in was cancelled", signInFailure(&buffer, .cancelled, null));
     try std.testing.expectEqualStrings("it didn't register fx as a client; set oauth.client_id for it in mcp.json", signInFailure(&buffer, .registration, null));
     try std.testing.expectEqualStrings("the sign-in page returned an error", signInFailure(&buffer, .response, " . "));
+    try std.testing.expectEqualStrings("the answer that came back wasn't for this sign-in", signInFailure(&buffer, .mismatch, null));
     const long = text_utils.repeat("\xc3\xa9", 200);
     const said = signInFailure(&buffer, .redemption, long);
     try std.testing.expect(std.unicode.utf8ValidateSlice(said));
@@ -1233,7 +1487,9 @@ fn describeFailure(why: []const u8) []const u8 {
         .{ "unsupported_version", "it answered with an MCP version fx doesn't support (fx speaks 2025-03-26 and newer)" },
         .{ "initialize_failed", "it refused or never answered fx's initialize request" },
         .{ "session", "its session ended" },
+        .{ "initialized_timed_out", "it never answered fx's initialized notification" },
         .{ "needs_auth", "it needs a login" },
+        .{ "auth_unavailable", "its login couldn't be renewed: the sign-in server didn't answer; fx tries again" },
         .{ "process", "its process exited" },
         .{ "FileNotFound", "its command was not found" },
         .{ "AccessDenied", "its command could not be run (permission denied)" },
@@ -1371,6 +1627,135 @@ test "a cancelled call ends, and stopping ends a call that never answers" {
     stopped = true;
     waiter.join();
     try testing.expectEqual(@as(?Error, error.Stopped), got);
+}
+
+test "while a retired host's servers stop, nothing starts a server, and a cancel still gets through" {
+    waitRetired();
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{
+        .{ .name = "fake", .command = f.server },
+        .{ .name = "late", .command = f.server },
+    };
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    _ = try r.tools(a, "fake", null);
+
+    const Caller = struct {
+        fn call(runtime: *Runtime, cancel: *std.atomic.Value(bool), out: *?engine.Outcome) void {
+            var ca: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer ca.deinit();
+            const result = runtime.call(ca.allocator(), "fake", "echo", "{\"text\":\"slow\"}", cancel, null) catch return;
+            if (result == .ended) out.* = result.ended.outcome;
+        }
+        fn list(runtime: *Runtime, done: *std.atomic.Value(bool)) void {
+            var la: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer la.deinit();
+            const listed = runtime.tools(la.allocator(), "late", null) catch return;
+            if (listed == .tools and listed.tools.len == 1) done.store(true, .release);
+        }
+    };
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var outcome: ?engine.Outcome = null;
+    const caller = try std.Thread.spawn(.{}, Caller.call, .{ &r, &cancel, &outcome });
+    std.Io.sleep(testing.io, .fromMilliseconds(200), .awake) catch {};
+
+    retireStarted();
+    var holding = true;
+    defer if (holding) retireEnded();
+    var listed: std.atomic.Value(bool) = .init(false);
+    const lister = try std.Thread.spawn(.{}, Caller.list, .{ &r, &listed });
+    // A cancel can't start a server, so it isn't held.
+    cancel.store(true, .release);
+    caller.join();
+    try testing.expectEqual(@as(?engine.Outcome, .cancelled), outcome);
+    std.Io.sleep(testing.io, .fromMilliseconds(300), .awake) catch {};
+    try testing.expect(!listed.load(.acquire));
+    try testing.expectEqual(State.idle, (try r.statuses(a))[1].state);
+
+    retireEnded();
+    holding = false;
+    const ended_ms = std.Io.Clock.awake.now(testing.io).toMilliseconds();
+    while ((try r.statuses(a))[1].state == .idle) std.Io.sleep(testing.io, .fromMilliseconds(5), .awake) catch {};
+    // Looked at again within 50 ms, not at the next idle wake a second later.
+    try testing.expect(std.Io.Clock.awake.now(testing.io).toMilliseconds() - ended_ms < 500);
+    lister.join();
+    try testing.expect(listed.load(.acquire));
+}
+
+test "a replaced runtime still in use serves its calls, and holds the others until it's gone" {
+    waitRetired();
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var old: Runtime = undefined;
+    try old.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    var old_up = true;
+    defer if (old_up) old.deinit();
+    var next: Runtime = undefined;
+    try next.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer next.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    old.retire();
+    // What began on the old one finishes there, so its last user can let go.
+    try testing.expectEqual(@as(usize, 1), (try old.tools(a, "fake", null)).tools.len);
+
+    const Lister = struct {
+        fn run(runtime: *Runtime, done: *std.atomic.Value(bool)) void {
+            var la: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer la.deinit();
+            const listed = runtime.tools(la.allocator(), "fake", null) catch return;
+            if (listed == .tools and listed.tools.len == 1) done.store(true, .release);
+        }
+    };
+    var done: std.atomic.Value(bool) = .init(false);
+    const lister = try std.Thread.spawn(.{}, Lister.run, .{ &next, &done });
+    std.Io.sleep(testing.io, .fromMilliseconds(300), .awake) catch {};
+    try testing.expect(!done.load(.acquire));
+    try testing.expectEqual(State.idle, (try next.statuses(a))[0].state);
+
+    old.deinit();
+    old_up = false;
+    lister.join();
+    try testing.expect(done.load(.acquire));
+}
+
+test "an answer to a withdrawn 2025 question reaches no one, and the next question gets its own" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var options = f.options();
+    options.questions = .{ .form = true };
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, options);
+    defer r.deinit();
+
+    // The user answers whichever question is on screen, naming it. Q1 is
+    // withdrawn, so its answer is refused if it was shown in time, and it
+    // is never shown if the withdrawal came first.
+    const User = struct {
+        fn ask(_: *anyopaque, alloc: Allocator, question: Question) anyerror!?[]u8 {
+            const which = if (std.mem.find(u8, question.input_requests_json, "\"Q2\"") != null) "Q2" else "Q1";
+            return try alloc.print("{{\"elicitation\":{{\"action\":\"accept\",\"content\":{{\"name\":\"for-{s}\"}}}}}}", .{which});
+        }
+    };
+    var user: u8 = 0;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const result = try r.call(arena.allocator(), "fake", "echo", "{\"text\":\"withdraw\"}", null, .{ .context = &user, .ask = User.ask });
+    try testing.expect(result == .result);
+    try testing.expect(std.mem.find(u8, result.result.content, "e2=for-Q2") != null);
+    try testing.expect(std.mem.find(u8, result.result.content, "e1 ") == null);
 }
 
 test "held servers say why, and unknown names and stdio logins are refused" {

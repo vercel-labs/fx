@@ -23,6 +23,9 @@ pub const Limits = struct {
     max_metadata_bytes: usize = 128 * 1024,
     max_content_items: usize = 256,
     max_content_field_bytes: usize = 1024 * 1024,
+    /// A text item, or a resource's text, may be as large as the whole
+    /// result: fx stores or cuts a big result itself.
+    max_content_text_bytes: usize = @import("../../images/image_data.zig").max_result_frame_bytes,
     max_image_bytes: usize = @import("../../images/image_data.zig").max_encoded_image_bytes,
     max_input_requests: usize = 32,
     max_request_state_bytes: usize = 64 * 1024,
@@ -553,7 +556,7 @@ fn validateContentItem(alloc: Allocator, value: std.json.Value, limits: Limits) 
         _ = try boundedJsonLength(metadata, limits.max_metadata_bytes);
     }
     if (std.mem.eql(u8, type_value.string, "text")) {
-        _ = try requireBoundedString(value.object, "text", limits.max_content_field_bytes);
+        _ = try requireBoundedString(value.object, "text", limits.max_content_text_bytes);
         return;
     }
     if (std.mem.eql(u8, type_value.string, "image") or std.mem.eql(u8, type_value.string, "audio")) {
@@ -606,7 +609,7 @@ fn validateEmbeddedResource(alloc: Allocator, value: std.json.Value, limits: Lim
     const blob = value.object.get("blob");
     if ((text == null) == (blob == null)) return error.InvalidContent;
     if (text) |content| {
-        if (content != .string or content.string.len > limits.max_content_field_bytes) {
+        if (content != .string or content.string.len > limits.max_content_text_bytes) {
             return error.InvalidContent;
         }
     }
@@ -1103,4 +1106,29 @@ test "tools list request carries pagination cursor after modern metadata" {
         "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/list\",\"params\":{\"cursor\":\"next\"}}",
         request,
     );
+}
+
+test "a text item may be as large as the whole result, and other fields keep their limit" {
+    const alloc = std.testing.allocator;
+    const limits: Limits = .{};
+    const big = try alloc.alloc(u8, 1536 * 1024);
+    defer alloc.free(big);
+    @memset(big, 'a');
+    const text = try std.fmt.allocPrint(alloc, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}}}", .{big});
+    defer alloc.free(text);
+    var outcome = try parseCallOutcome(alloc, text, .modern, null, limits.max_content_text_bytes, limits);
+    outcome.deinit(alloc);
+    const resource = try std.fmt.allocPrint(alloc, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"resource\",\"resource\":{{\"uri\":\"file:///big.txt\",\"text\":\"{s}\"}}}}]}}}}", .{big});
+    defer alloc.free(resource);
+    outcome = try parseCallOutcome(alloc, resource, .modern, null, limits.max_content_text_bytes, limits);
+    outcome.deinit(alloc);
+    const link = try std.fmt.allocPrint(alloc, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"resource_link\",\"uri\":\"{s}\",\"name\":\"n\"}}]}}}}", .{big});
+    defer alloc.free(link);
+    try std.testing.expectError(error.InvalidContent, parseCallOutcome(alloc, link, .modern, null, limits.max_content_text_bytes, limits));
+    const huge = try alloc.alloc(u8, limits.max_content_text_bytes + 1);
+    defer alloc.free(huge);
+    @memset(huge, 'a');
+    const over = try std.fmt.allocPrint(alloc, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}}}", .{huge});
+    defer alloc.free(over);
+    try std.testing.expectError(error.InvalidContent, parseCallOutcome(alloc, over, .modern, null, limits.max_content_text_bytes, limits));
 }

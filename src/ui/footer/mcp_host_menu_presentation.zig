@@ -174,7 +174,7 @@ fn serverListRow(alloc: Allocator, arena: Allocator, r: menu.Row, selected: bool
     try row.appendSlice(alloc, ui_render.reset_style);
     try row_text.appendSpacesToColumn(alloc, &row, status_col);
     const needs_you = r.status.needs_login or switch (r.status.state) {
-        .failed, .retrying, .waiting_for_approval, .missing_env => true,
+        .failed, .retrying, .waiting_for_approval, .missing_env, .invalid_env => true,
         else => false,
     };
     const idle = !needs_you and switch (r.status.state) {

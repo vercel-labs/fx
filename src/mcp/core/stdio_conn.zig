@@ -121,7 +121,8 @@ pub const Output = struct {
 pub const StepError = error{
     /// Messages can be written only while the connection is running.
     NotRunning,
-    /// Responses go only to a 2025 server.
+    /// No responses to a 2026 server. Before detection ends they're allowed:
+    /// a 2025 server can ping during `initialize` (STDIO-09).
     ResponseNotAllowed,
     GenerationsExhausted,
 };
@@ -192,7 +193,7 @@ pub const Conn = struct {
             },
             .send => |kind| {
                 if (conn.state != .running) return error.NotRunning;
-                if (kind == .response and conn.era != .legacy) return error.ResponseNotAllowed;
+                if (kind == .response and conn.era == .modern) return error.ResponseNotAllowed;
                 out.push(.{ .write = conn.generation });
             },
         }
@@ -471,7 +472,7 @@ fn step(conn: *Conn, world: *World, event: Event) !bool {
         try testing.expectEqual(before, conn.*);
         switch (err) {
             error.NotRunning => try testing.expect(before.state != .running),
-            error.ResponseNotAllowed => try testing.expect(event.send == .response and before.era != .legacy),
+            error.ResponseNotAllowed => try testing.expect(event.send == .response and before.era == .modern),
             error.GenerationsExhausted => return error.TestUnexpectedResult,
         }
         return true;
@@ -540,7 +541,7 @@ fn step(conn: *Conn, world: *World, event: Event) !bool {
             // WritesOnlyWhenOpen and NoClientResponsesModern.
             try testing.expectEqual(world.gen, g);
             try testing.expect(world.stdin_open);
-            if (event.send == .response) try testing.expectEqual(Era.legacy, conn.era);
+            if (event.send == .response) try testing.expect(conn.era != .modern);
         },
         .ready => |g| try testing.expectEqual(world.gen, g),
         .lost => |g| try testing.expectEqual(world.gen, g),
@@ -750,13 +751,15 @@ test "a delivered message resets the failure count; a stale one doesn't" {
     try testing.expectEqual(@as(u8, 0), conn.attempts);
 }
 
-test "responses go only to a 2025 server; nothing is written outside running" {
+test "no responses to a 2026 server; nothing is written outside running" {
     var conn: Conn = .init(test_config);
     var out: Output = .{};
     try testing.expectError(error.NotRunning, conn.step(.{ .send = .request }, &out));
     try conn.step(.start_requested, &out);
     try conn.step(.spawned, &out);
-    try testing.expectError(error.ResponseNotAllowed, conn.step(.{ .send = .response }, &out));
+    // Before detection ends: a 2025 server's ping during initialize (STDIO-09).
+    try conn.step(.{ .send = .response }, &out);
+    try testing.expectEqualSlices(Effect, &.{.{ .write = 1 }}, out.effects());
     try conn.step(.{ .era_detected = .modern }, &out);
     try testing.expectError(error.ResponseNotAllowed, conn.step(.{ .send = .response }, &out));
     try conn.step(.{ .send = .notification }, &out);

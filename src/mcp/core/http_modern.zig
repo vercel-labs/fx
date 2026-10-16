@@ -41,7 +41,8 @@ pub const Effect = union(enum) {
     post,
     /// Re-list the tools before retrying the call.
     relist,
-    /// Close the attempt's stream: that is the cancellation.
+    /// Close the attempt's stream: after its answer, which the server should
+    /// have ended it with, or as the cancellation.
     close,
     /// What the caller gets. `maybe_ran`: a lost `tools/call` may have run.
     deliver: struct { outcome: Outcome, maybe_ran: bool },
@@ -113,12 +114,16 @@ pub const Exchange = struct {
             },
             .answer => |answer| if (x.phase != .posted) {
                 ignored = true;
-            } else if (answer == .mismatch and x.kind == .call and x.header_retries == 0) {
-                x.phase = .relisting;
-                x.header_retries = 1;
-                out.push(.relist);
             } else {
-                x.finish(.done, if (answer == .result) .result else .failure, out);
+                // Nothing more comes for an answered attempt.
+                out.push(.close);
+                if (answer == .mismatch and x.kind == .call and x.header_retries == 0) {
+                    x.phase = .relisting;
+                    x.header_retries = 1;
+                    out.push(.relist);
+                } else {
+                    x.finish(.done, if (answer == .result) .result else .failure, out);
+                }
             },
             .http_failure => if (x.phase == .posted) x.finish(.failed, .http_failure, out) else {
                 ignored = true;
@@ -140,7 +145,8 @@ pub const Exchange = struct {
                 x.finish(.done, .failure, out);
             },
             .cancel => if (x.phase == .posted or x.phase == .relisting) {
-                out.push(.close);
+                // A re-list holds no stream: its answer closed it.
+                if (x.phase == .posted) out.push(.close);
                 x.finish(.cancelled, .cancelled, out);
             } else {
                 ignored = true;
@@ -247,6 +253,7 @@ fn apply(x: *Exchange, w: *World, event: Event) !void {
             // ReissueNewId holds by construction: each post is a new request.
             w.posts += 1;
             w.posted = true;
+            w.closed = false;
             // NoCallResent: a call is posted once, plus one retry after -32020.
             if (x.kind == .call) try testing.expect(w.posts <= 1 + w.relists);
             try testing.expect(w.posts <= x.config.max_attempts + w.relists);
@@ -258,7 +265,9 @@ fn apply(x: *Exchange, w: *World, event: Event) !void {
             w.relisting = true;
         },
         .close => {
-            try testing.expect(event == .cancel);
+            // Only an open stream closes, after its answer or as a cancel.
+            try testing.expect(event == .cancel or event == .answer);
+            try testing.expect(!w.closed);
             w.closed = true;
         },
         .deliver => |d| {
@@ -272,6 +281,8 @@ fn apply(x: *Exchange, w: *World, event: Event) !void {
             if (event == .cancel) w.cancelled = true;
         },
     };
+    // AnsweredStreamClosed.
+    if (event == .answer) try testing.expect(w.closed);
     // Where the model has no choice, the core must act.
     if (event == .stream_broken and before.phase == .posted and x.kind == .call) try testing.expectEqual(Phase.lost, x.phase);
     if (event == .cancel) try testing.expect(x.phase == .cancelled);
@@ -342,11 +353,24 @@ test "-32020 to a call re-lists, then retries once" {
     var out: Output = .{};
     call.step(.send, &out);
     call.step(.{ .answer = .mismatch }, &out);
-    try testing.expectEqualSlices(Effect, &.{.relist}, out.effects());
+    try testing.expectEqualSlices(Effect, &.{ .close, .relist }, out.effects());
     call.step(.{ .relisted = true }, &out);
     try testing.expectEqualSlices(Effect, &.{.post}, out.effects());
     call.step(.{ .answer = .mismatch }, &out);
-    try testing.expectEqualSlices(Effect, &.{.{ .deliver = .{ .outcome = .failure, .maybe_ran = false } }}, out.effects());
+    try testing.expectEqualSlices(Effect, &.{ .close, .{ .deliver = .{ .outcome = .failure, .maybe_ran = false } } }, out.effects());
+}
+
+test "an answer closes its attempt's stream; a cancel while re-listing closes nothing more" {
+    var x: Exchange = .init(.{}, .idempotent);
+    var out: Output = .{};
+    x.step(.send, &out);
+    x.step(.{ .answer = .result }, &out);
+    try testing.expectEqualSlices(Effect, &.{ .close, .{ .deliver = .{ .outcome = .result, .maybe_ran = false } } }, out.effects());
+    var call: Exchange = .init(.{}, .call);
+    call.step(.send, &out);
+    call.step(.{ .answer = .mismatch }, &out);
+    call.step(.cancel, &out);
+    try testing.expectEqualSlices(Effect, &.{.{ .deliver = .{ .outcome = .cancelled, .maybe_ran = false } }}, out.effects());
 }
 
 test "cancelling closes the stream; a late answer changes nothing" {

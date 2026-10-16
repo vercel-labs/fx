@@ -3206,6 +3206,52 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "an editor that sets session.notices to false gets context notices as agent messages",
+    async () => {
+      // ACP v1 advertises notices only with an object, `{}`.
+      const root = createIsolatedRoot("fx-acp-notices-false-");
+      const httpFixture = startModernMcpHttpFixture("json");
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("search_notice", "capability_search", { kind: "mcp", server: "fixture", query: "echo", limit: 5 }),
+        finalText("ACP notices complete"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_MCP_ENGINE: "v2" },
+          args: ["--context-limit", "mcp_description_bytes=8", "acp"],
+        });
+        const init = await client.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: false } } }, 1) as any;
+        expect(init.error).toBeUndefined();
+        const created = await client.request(
+          "session/new",
+          {
+            cwd: root.workspace,
+            mcpServers: [{ type: "http", name: "fixture", url: httpFixture.url, headers: [], _meta: { fx: { alwaysLoaded: false } } }],
+          },
+          2,
+        ) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+        const prompt = await runPrompt(client, "Find the echo tool.", TIMEOUT);
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        const updates = prompt.messages.map((message) => message.params?.update).filter(Boolean);
+        expect(updates.filter((update) => update.sessionUpdate === "notice")).toEqual([]);
+        const texts = updates.filter((update) => update.sessionUpdate === "agent_message_chunk").map((update) => update.content?.text ?? "");
+        expect(texts.join("")).toContain("[context] MCP description for");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        httpFixture.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
     "ACP on MCP-v2 loads a supplied server's tools every turn, unless it opts out",
     async () => {
       const root = createIsolatedRoot("fx-acp-mcp-v2-loaded-");
@@ -3252,6 +3298,146 @@ describe("acp: model-independent", () => {
         await client?.close();
         gateway.stop();
         httpFixture.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "ACP on MCP-v2 answers session/load at once while the old session's stdio server stops",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-mcp-v2-load-stop-");
+      const pidPath = join(root.root, "fixture.pid");
+      const eofPath = join(root.root, "fixture.eof");
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("call_stdio", MCP_TOOL_NAME, { text: "acp" }),
+        finalText("ACP MCP-v2 stdio"),
+      ]);
+      // It keeps running after its input closes, so fx sends SIGTERM after 1.5 s.
+      let oldPid = 0;
+      const server = {
+        name: "fixture",
+        command: process.execPath,
+        args: [MCP_STDIO_FIXTURE],
+        env: [
+          { name: "FX_MCP_SPEC_CLIENT", value: "1" },
+          { name: "FX_MCP_IGNORE_EOF", value: "1" },
+          { name: "FX_MCP_PID_PATH", value: pidPath },
+          { name: "FX_MCP_EOF_PATH", value: eofPath },
+        ],
+      };
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_MCP_ENGINE: "v2" },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [server] }, 2) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+        const called = await runPrompt(client, "Call the supplied MCP echo tool.", TIMEOUT);
+        expect(called.promptResult.result.stopReason).toBe("end_turn");
+        oldPid = Number(readFileSync(pidPath, "utf8").trim());
+
+        const sentAt = Date.now();
+        const loaded = await client.request("session/load", { sessionId: created.result.sessionId, cwd: root.workspace, mcpServers: [server] }, 4) as any;
+        expect(loaded.error).toBeUndefined();
+        expect(Date.now() - sentAt).toBeLessThan(1_000);
+        // The fixture creates the file, then writes its pid.
+        await waitForCondition("the old server to see its input close", () => existsSync(eofPath) && readFileSync(eofPath, "utf8").trim() !== "", 5_000);
+        expect(readFileSync(eofPath, "utf8").trim()).toBe(String(oldPid));
+        expect(processAlive(oldPid)).toBe(true);
+
+        // Closing straight away still stops it: fx never leaves it behind.
+        client.endStdin();
+        expect(await client.waitForExit()).toBe(0);
+        expect(processAlive(oldPid)).toBe(false);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        client = null;
+        gateway.stop();
+        // A server fx left behind would never exit by itself.
+        if (oldPid && processAlive(oldPid)) process.kill(oldPid, "SIGKILL");
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "ACP on MCP-v2 starts a server again after session/load only once its old copy is gone",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-mcp-v2-load-once-");
+      const pidPath = join(root.root, "fixture.pid");
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("call_old", MCP_TOOL_NAME, { text: "old" }),
+        finalText("ACP MCP-v2 old"),
+        fakeGatewayToolCall("call_new", MCP_TOOL_NAME, { text: "new" }),
+        finalText("ACP MCP-v2 new"),
+      ]);
+      // It keeps running after its input closes, so the old copy takes 1.5 s to stop.
+      const server = {
+        name: "fixture",
+        command: process.execPath,
+        args: [MCP_STDIO_FIXTURE],
+        env: [
+          { name: "FX_MCP_SPEC_CLIENT", value: "1" },
+          { name: "FX_MCP_IGNORE_EOF", value: "1" },
+          { name: "FX_MCP_PID_PATH", value: pidPath },
+        ],
+      };
+      const pids = new Set<number>();
+      // The supplied server's tools are offered at once: a call, then the answer.
+      const callTool = async (acp: AcpClient, callId: string) => {
+        const start = gateway.requests.length;
+        const prompt = await runPrompt(acp, "Call the supplied MCP echo tool.", TIMEOUT);
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(start + 2);
+        expect(acpToolResultText(gateway.requests[start + 1]!.body, callId)).toContain("MODERN_MCP_TOOL_RESULT");
+      };
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_MCP_ENGINE: "v2" },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [server] }, 2) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+        await callTool(client, "call_old");
+        const oldPid = Number(readFileSync(pidPath, "utf8").trim());
+        pids.add(oldPid);
+
+        const loaded = await client.request("session/load", { sessionId: created.result.sessionId, cwd: root.workspace, mcpServers: [server] }, 4) as any;
+        expect(loaded.error).toBeUndefined();
+        expect(processAlive(oldPid)).toBe(true);
+        // The model calls the tool at once: the new copy starts only once the old one is gone.
+        let oldAliveAtSwitch: boolean | null = null;
+        const prompt = callTool(client, "call_new");
+        let settled = false;
+        prompt.finally(() => { settled = true; });
+        while (!settled && oldAliveAtSwitch === null) {
+          const pid = Number(readFileSync(pidPath, "utf8").trim());
+          if (pid !== oldPid) {
+            oldAliveAtSwitch = processAlive(oldPid);
+            pids.add(pid);
+          }
+          await Bun.sleep(5);
+        }
+        await prompt;
+        pids.add(Number(readFileSync(pidPath, "utf8").trim()));
+        expect(pids.size).toBe(2);
+        expect(oldAliveAtSwitch).toBe(false);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        client = null;
+        gateway.stop();
+        for (const pid of pids) if (processAlive(pid)) process.kill(pid, "SIGKILL");
         rmSync(root.root, { recursive: true, force: true });
       }
     },

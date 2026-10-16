@@ -132,12 +132,68 @@ pub const WorkspaceEnvironmentField = enum {
     http_header,
 };
 
+/// Why an entry fx can't read was skipped, for its note. The
+/// field ones are named by their JSON key.
+pub const EntryProblem = enum {
+    not_object,
+    url_without_type,
+    command,
+    type,
+    url,
+    headers,
+    /// A token written into an `Authorization` header, which fx won't send.
+    authorization,
+    oauth,
+    env,
+    bearer_token_env,
+    enabled,
+    required,
+    startup_timeout_ms,
+    operation_timeout_ms,
+    restart_limit,
+    /// A `${...}` that isn't a variable, or a header it made invalid.
+    variable,
+    /// A name with a control character, or another a terminal can't show as is.
+    name,
+    other,
+};
+
+/// Notes `name` as skipped because fx can't read it.
+fn noteInvalidEntry(alloc: Allocator, notes: *std.ArrayList(WorkspaceDiagnostic), profile: bool, name: []const u8, err: anyerror) Allocator.Error!void {
+    const owned = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned);
+    try notes.append(alloc, .{ .profile = profile, .server_name = owned, .cause = .invalid_entry, .problem = entryProblem(err) });
+}
+
+fn entryProblem(err: anyerror) EntryProblem {
+    return switch (err) {
+        error.McpConfigServerMustBeObject => .not_object,
+        error.McpConfigUrlWithoutType => .url_without_type,
+        error.McpConfigInvalidCommand => .command,
+        error.McpConfigInvalidType => .type,
+        error.McpConfigMissingUrl, error.McpConfigInvalidUrl => .url,
+        error.McpConfigInvalidHeaders => .headers,
+        error.McpConfigAuthorizationHeader => .authorization,
+        error.McpConfigInvalidOAuth => .oauth,
+        error.McpConfigInvalidEnvironment => .env,
+        error.McpConfigInvalidBearerEnvironment => .bearer_token_env,
+        error.McpConfigInvalidEnabled => .enabled,
+        error.McpConfigInvalidRequired => .required,
+        error.McpConfigInvalidStartupTimeout => .startup_timeout_ms,
+        error.McpConfigInvalidOperationTimeout => .operation_timeout_ms,
+        error.McpConfigInvalidRestartLimit => .restart_limit,
+        else => .other,
+    };
+}
+
 pub const WorkspaceDiagnostic = struct {
     /// About `~/.fx/mcp.json` rather than `.mcp.json`.
     profile: bool = false,
     server_name: ?[]u8 = null,
     environment_variable: ?[]u8 = null,
     environment_field: ?WorkspaceEnvironmentField = null,
+    /// Why, for `.invalid_entry`.
+    problem: ?EntryProblem = null,
     cause: WorkspaceDiagnosticCause,
 
     pub fn deinit(self: *WorkspaceDiagnostic, alloc: Allocator) void {
@@ -179,9 +235,20 @@ pub fn renderWorkspaceDiagnostic(
             },
         );
     }
+    // Every reason is a constant, so this is the one `print` there is.
+    const why: []const u8 = if (diagnostic.cause == .invalid_entry) switch (diagnostic.problem orelse .other) {
+        .not_object => "it isn't a JSON object",
+        .url_without_type => "it has a \"url\" but no \"type\"; add \"type\": \"http\"",
+        .command => "it needs a \"command\", with any \"args\" as strings",
+        .variable => "a ${...} in it isn't valid",
+        .name => "its name has a character fx won't print",
+        .authorization => "fx won't send its Authorization header; put the token in \"bearer_token_env\", or sign in with login",
+        .other => "fx can't read it",
+        inline else => |field| "its \"" ++ @tagName(field) ++ "\" isn't valid",
+    } else @tagName(diagnostic.cause);
     return alloc.print(
         "{s} server '{s}' was skipped: {s}.",
-        .{ diagnosticFile(diagnostic), encoded_server.bytes, @tagName(diagnostic.cause) },
+        .{ diagnosticFile(diagnostic), encoded_server.bytes, why },
     );
 }
 
@@ -230,7 +297,13 @@ const SuspiciousKeyScan = union(enum) {
 };
 
 pub fn parseProfileJson(alloc: Allocator, json_text: []const u8) !std.ArrayList(McpServerConfig) {
-    var result = try parseProfileDocument(alloc, json_text);
+    return parseProfileServers(alloc, json_text, null);
+}
+
+/// The profile's servers. With `skipped`, an entry fx can't read is left out
+/// and noted there instead of failing the file.
+pub fn parseProfileServers(alloc: Allocator, json_text: []const u8, skipped: ?*std.ArrayList(WorkspaceDiagnostic)) !std.ArrayList(McpServerConfig) {
+    var result = try parseProfileDocumentInto(alloc, json_text, skipped);
     defer result.deinit(alloc);
     const configs = result.configs;
     result.configs = .empty;
@@ -246,6 +319,10 @@ noinline fn failProfileParseDynamic(err: anyerror) anyerror!ProfileParseResult {
 }
 
 pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8) !ProfileParseResult {
+    return parseProfileDocumentInto(alloc, json_text, null);
+}
+
+fn parseProfileDocumentInto(alloc: Allocator, json_text: []const u8, skipped: ?*std.ArrayList(WorkspaceDiagnostic)) !ProfileParseResult {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch |err| switch (err) {
         error.OutOfMemory => return failProfileParse(error.OutOfMemory),
         else => return failProfileParse(error.McpConfigInvalidJson),
@@ -257,7 +334,7 @@ pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8) !ProfilePar
     const canonical = object.get("mcp");
     const alias = object.get("mcpServers");
     if (canonical orelse alias) |servers| {
-        var result = ProfileParseResult{ .configs = try parseProfileServerMap(alloc, servers) };
+        var result = ProfileParseResult{ .configs = try parseProfileServerMap(alloc, servers, skipped) };
         errdefer result.deinit(alloc);
         switch (scanSuspiciousProfileKeys(object)) {
             .clear => if (canonical != null and alias != null and profileAliasIsNonEmpty(alias.?)) {
@@ -313,6 +390,7 @@ pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8) !ProfilePar
 fn parseProfileServerMap(
     alloc: Allocator,
     servers: std.json.Value,
+    skipped: ?*std.ArrayList(WorkspaceDiagnostic),
 ) !std.ArrayList(McpServerConfig) {
     if (servers != .object) return error.McpConfigServersMustBeObject;
 
@@ -320,11 +398,16 @@ fn parseProfileServerMap(
     errdefer deinitConfigs(alloc, &configs);
     var it = servers.object.iterator();
     while (it.next()) |entry| {
-        const config = try parseServerEntry(alloc, entry.key_ptr.*, entry.value_ptr.*, .{
+        const config = parseServerEntry(alloc, entry.key_ptr.*, entry.value_ptr.*, .{
             .source = .profile,
             .scope = .profile,
             .allow_stored_credentials = true,
-        });
+        }) catch |err| {
+            const notes = skipped orelse return err;
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            try noteInvalidEntry(alloc, notes, true, entry.key_ptr.*, err);
+            continue;
+        };
         configs.append(alloc, config) catch |err| {
             var mutable = config;
             mutable.deinit(alloc);
@@ -488,12 +571,7 @@ fn parseWorkspaceJsonInternal(
         }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
-                const server_name = try alloc.dupe(u8, entry.key_ptr.*);
-                errdefer mem_utils.free(alloc, server_name);
-                try result.diagnostics.append(alloc, .{
-                    .server_name = server_name,
-                    .cause = .invalid_entry,
-                });
+                try noteInvalidEntry(alloc, &result.diagnostics, false, entry.key_ptr.*, err);
                 continue;
             },
         };
@@ -568,6 +646,7 @@ fn expandConfigs(
                 .profile = profile,
                 .server_name = server_name,
                 .cause = .invalid_entry,
+                .problem = .variable,
             }),
             .limit_exceeded => try diagnostics.append(alloc, .{
                 .profile = profile,
@@ -989,7 +1068,8 @@ fn parseServerEntry(
         return failServerConfig(error.McpConfigPolicyInvalid);
     }
     const object = value.object;
-    const type_string = if (object.get("type")) |kind_value|
+    const type_value = object.get("type");
+    const type_string = if (type_value) |kind_value|
         (if (kind_value == .string) kind_value.string else return failServerConfig(error.McpConfigInvalidType))
     else
         "local";
@@ -1068,6 +1148,8 @@ fn parseServerEntry(
         0,
         std.math.maxInt(u8),
     ) catch return failServerConfig(error.McpConfigInvalidRestartLimit);
+    // The usual mistake: a remote server copied without its type.
+    if (type_value == null and object.get("url") != null) return failServerConfig(error.McpConfigUrlWithoutType);
     const command = parseCommandSpec(alloc, object) catch |err| switch (err) {
         error.OutOfMemory => return failServerConfig(error.OutOfMemory),
         else => return failServerConfig(error.McpConfigInvalidCommand),
@@ -1128,11 +1210,8 @@ fn parseRemoteHeaders(
     try headers.ensureTotalCapacity(alloc, value.object.count());
     var it = value.object.iterator();
     while (it.next()) |entry| {
-        if (entry.value_ptr.* != .string or
-            (!allow_authorization and std.ascii.eqlIgnoreCase(entry.key_ptr.*, "authorization")))
-        {
-            return error.McpConfigInvalidHeaders;
-        }
+        if (entry.value_ptr.* != .string) return error.McpConfigInvalidHeaders;
+        if (!allow_authorization and std.ascii.eqlIgnoreCase(entry.key_ptr.*, "authorization")) return error.McpConfigAuthorizationHeader;
         const owned_name = try alloc.dupe(u8, entry.key_ptr.*);
         errdefer mem_utils.free(alloc, owned_name);
         const owned_value = try alloc.dupe(u8, entry.value_ptr.*.string);
@@ -1149,9 +1228,9 @@ fn parseRemoteHeaderEnv(alloc: Allocator, object: std.json.ObjectMap) ![]McpHttp
     errdefer freeHttpHeaderEnvList(alloc, &refs);
     var it = value.object.iterator();
     while (it.next()) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "authorization")) return error.McpConfigAuthorizationHeader;
         if (entry.value_ptr.* != .string or
-            !isValidEnvName(entry.value_ptr.*.string) or
-            std.ascii.eqlIgnoreCase(entry.key_ptr.*, "authorization")) return error.McpConfigInvalidHeaders;
+            !isValidEnvName(entry.value_ptr.*.string)) return error.McpConfigInvalidHeaders;
         for (refs.items) |previous| {
             if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, previous.name)) return error.McpConfigInvalidHeaders;
         }
@@ -1773,7 +1852,7 @@ test "workspace Authorization header expansion does not broaden profile headers"
     try std.testing.expectEqualStrings("Bearer secret", workspace.configs.items[0].headers[0].value);
 
     try std.testing.expectError(
-        error.McpConfigInvalidHeaders,
+        error.McpConfigAuthorizationHeader,
         parseProfileJson(
             alloc,
             "{\"mcp\":{\"remote\":{\"type\":\"http\",\"url\":\"https://example.test/mcp\",\"headers\":{\"Authorization\":\"Bearer ${TOKEN}\"}}}}",
@@ -1984,4 +2063,52 @@ test "choice parsing and mutation release every partial allocation failure" {
         break;
     }
     try std.testing.expect(fail_index < 128);
+}
+
+test "a profile entry fx can't read is skipped with a note naming it, and the rest load" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"mcpServers":{"webonly":{"url":"http://127.0.0.1:9/mcp"},"ok":{"command":"true"},"bad":{"type":"http","url":"https://x.example/mcp","enabled":"yes"}}}
+    ;
+    var skipped: std.ArrayList(WorkspaceDiagnostic) = .empty;
+    defer {
+        for (skipped.items) |*note| note.deinit(alloc);
+        skipped.deinit(alloc);
+    }
+    var configs = try parseProfileServers(alloc, json, &skipped);
+    defer deinitConfigs(alloc, &configs);
+    try std.testing.expectEqual(@as(usize, 1), configs.items.len);
+    try std.testing.expectEqualStrings("ok", configs.items[0].name);
+    try std.testing.expectEqual(@as(usize, 2), skipped.items.len);
+    const expected = [_][]const u8{
+        "~/.fx/mcp.json server 'webonly' was skipped: it has a \"url\" but no \"type\"; add \"type\": \"http\".",
+        "~/.fx/mcp.json server 'bad' was skipped: its \"enabled\" isn't valid.",
+    };
+    for (skipped.items, expected) |note, words| {
+        const said = try renderWorkspaceDiagnostic(alloc, note);
+        defer alloc.free(said);
+        try std.testing.expectEqualStrings(words, said);
+    }
+    // Without a list the file still fails, as rewriting it needs.
+    try std.testing.expectError(error.McpConfigUrlWithoutType, parseProfileJson(alloc, json));
+}
+
+test "a project entry fx can't read says why in words" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"mcpServers":{"odd":{"type":"pigeon","url":"https://x.example/mcp"},"plain":7}}
+    ;
+    var result = try parseWorkspaceJson(alloc, json, .workspace, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), result.configs.items.len);
+    const expected = [_][]const u8{
+        ".mcp.json server 'odd' was skipped: its \"type\" isn't valid.",
+        ".mcp.json server 'plain' was skipped: it isn't a JSON object.",
+    };
+    try std.testing.expectEqual(expected.len, result.diagnostics.items.len);
+    for (result.diagnostics.items, expected) |note, words| {
+        const said = try renderWorkspaceDiagnostic(alloc, note);
+        defer alloc.free(said);
+        try std.testing.expectEqualStrings(words, said);
+    }
 }

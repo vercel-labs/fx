@@ -1,8 +1,9 @@
-//! Slack signs in through fx.sh, as v1 did: Slack has no client
-//! registration, and fx's Slack app redirects only to fx.sh, whose page
-//! hands the code back to fx on 127.0.0.1. MCP-v2 runs the sign-in as for
-//! any server; only the redirect, the page the browser opens, and the
-//! callback fx takes differ.
+//! Slack signs in as fx's Slack app, since Slack has no client registration,
+//! with the redirect `http://localhost:3118/callback`. Slack refreshes a PKCE
+//! app's tokens without the app's secret only for a localhost redirect
+//! (Slack's "Using PKCE"), so a login made through any other one lasts only
+//! until its first token expires. MCP-v2 signs in as for any server, asking
+//! for the scopes the app has.
 
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
@@ -13,9 +14,13 @@ pub const server_url = "https://mcp.slack.com/mcp";
 /// fx's Slack app, used for Slack when the config names no app of its own.
 pub const client_id = "12364000946.12017137861236";
 
-/// The user scopes fx's Slack app has, encoded for a query. fx.sh takes
-/// exactly these.
-const scopes_query = "channels:history%20channels:read%20channels:write%20chat:write%20emoji:read%20files:write%20groups:history%20im:history%20mpim:history%20search:read.public%20search:read.users%20users:read";
+/// The port of the one redirect fx's Slack app allows,
+/// `http://localhost:3118/callback`. A config's `oauth.callback_port`
+/// replaces it.
+pub const callback_port: u16 = 3118;
+
+/// The user scopes fx's Slack app has; it may ask for no others.
+pub const scopes = "channels:history channels:read channels:write chat:write emoji:read files:write groups:history im:history mpim:history search:read.public search:read.users users:read";
 
 /// Whether `url` is Slack's MCP server.
 pub fn isSlack(url: ?[]const u8) bool {
@@ -23,10 +28,25 @@ pub fn isSlack(url: ?[]const u8) bool {
     return std.mem.eql(u8, u, "https://mcp.slack.com") or std.mem.startsWith(u8, u, "https://mcp.slack.com/");
 }
 
-/// fx.sh, or for tests a bridge on 127.0.0.1 (`FX_E2E_SLACK_ORIGIN`), as v1 takes it.
-pub fn origin() []const u8 {
-    const configured = io_mod.getenv("FX_E2E_SLACK_ORIGIN") orelse return "https://fx.sh";
-    return if (loopbackOrigin(configured)) configured else "https://fx.sh";
+/// A stand-in for Slack's server in tests, on 127.0.0.1
+/// (`FX_E2E_SLACK_ORIGIN`), as v1 takes it; null otherwise.
+fn standIn() ?[]const u8 {
+    const configured = io_mod.getenv("FX_E2E_SLACK_ORIGIN") orelse return null;
+    return if (loopbackOrigin(configured)) configured else null;
+}
+
+/// Whether `url` may sign in as fx's Slack app: Slack's MCP server, or in
+/// tests the server at the stand-in's own `{origin}/mcp`. Another server that
+/// names fx's app signs in with a redirect the app doesn't allow, so Slack
+/// never sends it a code.
+pub fn appServer(url: ?[]const u8) bool {
+    return appServerAt(url orelse return false, standIn());
+}
+
+fn appServerAt(url: []const u8, stand_in: ?[]const u8) bool {
+    if (isSlack(url)) return true;
+    const o = stand_in orelse return false;
+    return std.mem.startsWith(u8, url, o) and std.mem.eql(u8, url[o.len..], "/mcp");
 }
 
 fn loopbackOrigin(o: []const u8) bool {
@@ -36,47 +56,9 @@ fn loopbackOrigin(o: []const u8) bool {
     return port >= 1024;
 }
 
-/// Where Slack sends the browser back to: the one redirect fx's Slack app
-/// allows, even when a test bridge stands in for fx.sh's pages.
-pub const redirect_uri = "https://fx.sh/api/slack/oauth/callback";
-
-/// The page the browser opens instead of Slack's: fx.sh's start, with the
-/// state, PKCE challenge, and client from MCP-v2's `authorize` address, and
-/// the port fx waits on. Owned by `alloc`; null when the address lacks one.
-pub fn startUrl(alloc: std.mem.Allocator, bridge_origin: []const u8, authorize: []const u8, port: u16) std.mem.Allocator.Error!?[]u8 {
-    const query = authorize[(std.mem.findScalar(u8, authorize, '?') orelse return null) + 1 ..];
-    const state = param(query, "state") orelse return null;
-    const challenge = param(query, "code_challenge") orelse return null;
-    const client = param(query, "client_id") orelse return null;
-    // All three are already encoded for a query, as MCP-v2 wrote them.
-    return try alloc.print("{s}/api/slack/auth?state={s}&challenge={s}&client_id={s}&scope={s}&port={d}", .{
-        bridge_origin, state, challenge, client, scopes_query, port,
-    });
-}
-
-/// A query parameter's raw value, if it's there once or more; the first wins.
-fn param(query: []const u8, name: []const u8) ?[]const u8 {
-    var it = std.mem.splitScalar(u8, query, '&');
-    while (it.next()) |pair| {
-        const eq = std.mem.findScalar(u8, pair, '=') orelse continue;
-        if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
-    }
-    return null;
-}
-
 const testing = std.testing;
 
-test "fx.sh's start carries MCP-v2's state, challenge, and client, fx's scopes, and the port" {
-    const authorize = "https://slack.com/oauth/v2_user/authorize?response_type=code&client_id=12364000946.12017137861236" ++
-        "&redirect_uri=https%3A%2F%2Ffx.sh%2Fapi%2Fslack%2Foauth%2Fcallback&scope=a%20b&state=S1&code_challenge=C1&code_challenge_method=S256";
-    const url = (try startUrl(testing.allocator, "https://fx.sh", authorize, 53883)).?;
-    defer testing.allocator.free(url);
-    try testing.expectEqualStrings("https://fx.sh/api/slack/auth?state=S1&challenge=C1&client_id=12364000946.12017137861236" ++
-        "&scope=channels:history%20channels:read%20channels:write%20chat:write%20emoji:read%20files:write%20groups:history%20im:history%20mpim:history%20search:read.public%20search:read.users%20users:read&port=53883", url);
-    try testing.expectEqual(@as(?[]u8, null), try startUrl(testing.allocator, "https://fx.sh", "https://slack.com/oauth?state=S1", 1));
-}
-
-test "only Slack's MCP server, and only a loopback test bridge" {
+test "only Slack's MCP server, and only a loopback test stand-in" {
     try testing.expect(isSlack("https://mcp.slack.com/mcp"));
     try testing.expect(isSlack("https://mcp.slack.com"));
     try testing.expect(!isSlack("https://mcp.slack.com.evil.example/mcp"));
@@ -85,4 +67,16 @@ test "only Slack's MCP server, and only a loopback test bridge" {
     try testing.expect(!loopbackOrigin("http://127.0.0.1:80"));
     try testing.expect(!loopbackOrigin("https://evil.example"));
     try testing.expect(!loopbackOrigin("http://127.0.0.1:8080/x"));
+}
+
+test "fx's Slack app signs in only to Slack's MCP server, or a test stand-in's own" {
+    try testing.expect(appServerAt("https://mcp.slack.com/mcp", null));
+    try testing.expect(!appServerAt("https://mcp.example.com/mcp", null));
+    try testing.expect(!appServerAt("http://127.0.0.1:8080/mcp", null));
+    try testing.expect(appServerAt("http://127.0.0.1:8080/mcp", "http://127.0.0.1:8080"));
+    try testing.expect(appServerAt("https://mcp.slack.com/mcp", "http://127.0.0.1:8080"));
+    try testing.expect(!appServerAt("http://127.0.0.1:9090/mcp", "http://127.0.0.1:8080"));
+    try testing.expect(!appServerAt("http://127.0.0.1:80800/mcp", "http://127.0.0.1:8080"));
+    try testing.expect(!appServerAt("http://127.0.0.1:8080/other", "http://127.0.0.1:8080"));
+    try testing.expect(!appServer(null));
 }

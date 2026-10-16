@@ -158,7 +158,15 @@ fn profileDir(profile_path: []const u8) !io_mod.VerifiedDir {
 fn write(alloc: Allocator, file: File, path: []const u8, text: []const u8) !void {
     switch (file) {
         .profile => try replaceProfile(alloc, path, text),
-        .project => try io_mod.writeFileAtomic(alloc, path, text),
+        .project => {
+            // A link isn't replaced, which forks the file it points to, nor
+            // followed, which could write outside the project.
+            // The profile's own replace refuses one too.
+            if (std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{ .follow_symlinks = false })) |stat| {
+                if (stat.kind == .sym_link or stat.nlink > 1) return error.Linked;
+            } else |err| if (err != error.FileNotFound) return err;
+            try io_mod.writeFileAtomic(alloc, path, text);
+        },
     }
 }
 
@@ -325,4 +333,29 @@ test "remove drops one entry, keeps the rest in order, and returns its url" {
     try testing.expect(stdio.url == null);
     try testing.expect(try remove(a, .profile, before, "missing") == null);
     try testing.expect(try remove(a, .project, "{\"mcp\":{\"a\":{}}}", "a") == null);
+}
+
+test "a linked config file is never edited, whether a symlink or a hard link" {
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "shared.json", .data = "{}" });
+    try tmp.dir.symLink(io, "shared.json", "soft.json", .{});
+    try tmp.dir.hardLink("shared.json", tmp.dir, "hard.json", io, .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "plain.json", .data = "{}" });
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const Case = struct { name: []const u8, linked: bool };
+    for ([_]Case{
+        .{ .name = "soft.json", .linked = true },
+        .{ .name = "hard.json", .linked = true },
+        .{ .name = "plain.json", .linked = false },
+        .{ .name = "missing.json", .linked = false },
+        .{ .name = "no-dir/mcp.json", .linked = false },
+    }) |case| {
+        const path = try std.Io.Dir.path.join(alloc, &.{ root, case.name });
+        defer alloc.free(path);
+        if (case.linked) try testing.expectError(error.Linked, write(alloc, .project, path, "{}")) else write(alloc, .project, path, "{}") catch |err| try testing.expect(case.name.len > 0 and err == error.FileNotFound);
+    }
 }

@@ -28,6 +28,8 @@ type StreamableMode =
   | "resume"
   | "poll"
   | "hold_open_call"
+  | "hold_initialize"
+  | "hold_initialized"
   | "stall_call"
   | "expire_session"
   | "elicitation_form"
@@ -292,6 +294,25 @@ export function startLegacyStreamableHttpFixture(
         return new Response(null, { status: 404 });
       }
       if (message!.method === "notifications/initialized") {
+        // A stream that stays connected but never ends: everything after
+        // initialized waits for its answer. The comments keep Bun from
+        // closing it after 10 s idle.
+        if (mode === "hold_initialized") {
+          let keepAlive: ReturnType<typeof setInterval> | undefined;
+          return new Response(
+            new ReadableStream({
+              start(controller) {
+                const comment = new TextEncoder().encode(": waiting\n\n");
+                controller.enqueue(comment);
+                keepAlive = setInterval(() => controller.enqueue(comment), 5_000);
+              },
+              cancel() {
+                clearInterval(keepAlive);
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        }
         return new Response(null, { status: 202 });
       }
       if (message!.method === "notifications/cancelled") {
@@ -300,6 +321,24 @@ export function startLegacyStreamableHttpFixture(
       }
       if (message!.method === "initialize") {
         initializeCalls += 1;
+        // A stream that stays connected but never brings the answer. The
+        // comments keep Bun from closing it after 10 s idle.
+        if (mode === "hold_initialize") {
+          let keepAlive: ReturnType<typeof setInterval> | undefined;
+          return new Response(
+            new ReadableStream({
+              start(controller) {
+                const comment = new TextEncoder().encode(": waiting\n\n");
+                controller.enqueue(comment);
+                keepAlive = setInterval(() => controller.enqueue(comment), 3_000);
+              },
+              cancel() {
+                clearInterval(keepAlive);
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        }
         let sessionId: string | null = null;
         if (usesSession) {
           sessionId = mode === "expire_session"

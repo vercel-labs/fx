@@ -128,6 +128,7 @@ pub fn parseResume(alloc: Allocator, params_raw: ?[]const u8) ParseError!OwnedSe
 fn prepareHost(
     alloc: Allocator,
     configs: []const mcp_contract.McpServerConfig,
+    workspace_root: []const u8,
     questions: elicitation.Capabilities,
     url_completions: ?tool_mcp_runtime.LegacyUrlCompletionSink,
 ) Allocator.Error!Preparation {
@@ -141,6 +142,7 @@ fn prepareHost(
     const h = mcp_host.Host.create(alloc, io_mod.getIo(), configs, &inherited, .{
         .client_version = build_options.app_version,
         .credentials = .detect(alloc, home),
+        .workspace_root = workspace_root,
         .questions = questions,
         .url_completions = url_completions,
     }, builtin_tools.registry) catch |err| switch (err) {
@@ -153,13 +155,15 @@ fn prepareHost(
 pub fn prepare(
     alloc: Allocator,
     configs: *OwnedServerConfigs,
+    /// The session's workspace, whose `.mcp.json` servers keep their own logins.
+    workspace_root: []const u8,
     elicitation_capabilities: elicitation.Capabilities,
     legacy_url_completion_sink: ?tool_mcp_runtime.LegacyUrlCompletionSink,
     host_channel: ?message_carrier.Carrier,
 ) Allocator.Error!Preparation {
     if (configs.items.items.len == 0) return .{ .ready = null };
     // MCP-v2 starts each server when the model first needs it.
-    if (mcp_host.selected()) return prepareHost(alloc, configs.items.items, elicitation_capabilities, legacy_url_completion_sink);
+    if (mcp_host.selected()) return prepareHost(alloc, configs.items.items, workspace_root, elicitation_capabilities, legacy_url_completion_sink);
 
     const runtime = try alloc.create(mcp_runtime.McpRuntime);
     runtime.* = mcp_runtime.McpRuntime.initWithElicitation(alloc, elicitation_capabilities);

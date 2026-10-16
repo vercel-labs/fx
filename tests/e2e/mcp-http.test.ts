@@ -1707,6 +1707,40 @@ describe("modern MCP Streamable HTTP", () => {
     expect(fixture.cancelledCalls).toBe(1);
   }, 30_000);
 
+  test("MCP-v2 closes a held-open SSE response once its answer arrives", async () => {
+    const heldOpen = startModernMcpHttpFixture("held_open_final");
+    fixture = heldOpen;
+    const root = createRoot("held-open-final-v2", heldOpen, 1_000);
+    // While the model answers, fx still runs and holds the tool's result: the
+    // stream the server never ended must be closed by then, not at exit.
+    let closedWhileRunning = -1;
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
+      fakeGatewayToolCall("call_mcp", TOOL_NAME, { text: "hello" }),
+      async () => {
+        await Bun.sleep(300);
+        closedWhileRunning = heldOpen.cancelledCalls;
+        return fakeGatewayFinalText("Held-open SSE complete.");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Call the held-open HTTP fixture."],
+      {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway), FX_MCP_ENGINE: "v2" },
+        timeoutMs: 20_000,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("Held-open SSE complete.");
+    expect(heldOpen.requests.filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
+    expect(closedWhileRunning).toBe(1);
+  }, 30_000);
+
   test("operation timeout closes a stalled request-scoped SSE response", async () => {
     fixture = startModernMcpHttpFixture("stall_call");
     const root = createRoot("timeout", fixture, 100);

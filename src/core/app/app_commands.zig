@@ -2734,6 +2734,7 @@ fn writeMcpHostProblems(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
             .failed => "failed",
             .retrying => "retrying",
             .missing_env => "missing a variable",
+            .invalid_env => "can't use a variable",
             else => if (s.needs_login) "needs login" else continue,
         };
         count += 1;

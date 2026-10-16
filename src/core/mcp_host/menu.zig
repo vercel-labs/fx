@@ -393,7 +393,7 @@ pub const news_ms: i64 = 5000;
 
 /// What the status line says about MCP, written into `buf`: fresh news,
 /// else the sign-in waiting for the browser, else what needs the user until
-/// it's handled, else how many servers are ready. Empty with no servers.
+/// it's handled. Empty when nothing does: `/mcp` lists every server.
 /// `notes` counts config problems, which `/mcp list` shows.
 pub fn statusLine(buf: []u8, statuses: []const runtime.Status, signing_in: ?[]const u8, news: ?[]const u8, notes: usize) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
@@ -409,12 +409,8 @@ pub fn statusLine(buf: []u8, statuses: []const runtime.Status, signing_in: ?[]co
     }
     var needs: usize = 0;
     var first: ?runtime.Status = null;
-    var ready: usize = 0;
-    var enabled: usize = 0;
     for (statuses) |s| {
         if (s.state == .disabled or s.state == .rejected) continue;
-        enabled += 1;
-        if (s.state == .ready) ready += 1;
         if (attention(s) == null) continue;
         if (needs == 0) first = s;
         needs += 1;
@@ -426,8 +422,6 @@ pub fn statusLine(buf: []u8, statuses: []const runtime.Status, signing_in: ?[]co
         w.print("{d} MCP servers need you · /mcp", .{needs}) catch {};
     } else if (notes > 0) {
         w.print("MCP config has {d} problem{s} · /mcp list", .{ notes, if (notes == 1) "" else "s" }) catch {};
-    } else if (enabled > 0) {
-        w.print("mcp {d}/{d}", .{ ready, enabled }) catch {};
     }
     return whole(w.buffered());
 }
@@ -439,6 +433,7 @@ fn attention(s: runtime.Status) ?[]const u8 {
         .waiting_for_approval => "is waiting for approval",
         .failed => "failed",
         .missing_env => "needs a variable",
+        .invalid_env => "can't use a variable",
         else => null,
     };
 }
@@ -466,7 +461,7 @@ fn whole(bytes: []const u8) []const u8 {
 
 const testing = std.testing;
 
-test "the status line puts news first, then what needs the user, then a count" {
+test "the status line puts news first, then what needs the user, and is quiet when nothing does" {
     var buf: [96]u8 = undefined;
     const plain: runtime.Status = .{ .name = "plain", .source = .profile, .transport = .http, .state = .idle, .needs_login = true };
     const ready: runtime.Status = .{ .name = "linear", .source = .profile, .transport = .http, .state = .ready };
@@ -477,8 +472,9 @@ test "the status line puts news first, then what needs the user, then a count" {
     try testing.expectEqualStrings("plain needs login · /mcp", statusLine(&buf, &.{ plain, ready, off }, null, null, 0));
     try testing.expectEqualStrings("2 MCP servers need you · /mcp", statusLine(&buf, &.{ plain, proj, ready }, null, null, 3));
     try testing.expectEqualStrings("MCP config has 2 problems · /mcp list", statusLine(&buf, &.{ready}, null, null, 2));
-    // Disabled servers aren't counted.
-    try testing.expectEqualStrings("mcp 1/1", statusLine(&buf, &.{ ready, off }, null, null, 0));
+    // All is well, starting included: nothing to say.
+    const starting: runtime.Status = .{ .name = "web", .source = .profile, .transport = .http, .state = .connecting };
+    try testing.expectEqualStrings("", statusLine(&buf, &.{ ready, off, starting }, null, null, 0));
     try testing.expectEqualStrings("", statusLine(&buf, &.{}, null, null, 0));
 }
 

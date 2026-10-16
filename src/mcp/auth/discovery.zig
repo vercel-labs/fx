@@ -213,15 +213,25 @@ pub fn secureOrLoopback(url: []const u8) bool {
     return std.ascii.eqlIgnoreCase(u.scheme, "https") or isLoopback(u.host);
 }
 
-/// An authorization server's metadata may be fetched unless its host is
-/// private, loopback, link-local, or a cloud metadata service; those only
-/// when the MCP server itself is on loopback.
+/// Why fx won't contact a URL for an MCP server.
+pub const Refusal = enum { insecure, internal };
+
+/// Why `url` may not be contacted for the MCP server at `server_url`, or null
+/// when it may. It must be HTTPS, or HTTP to loopback. A private, loopback,
+/// link-local, or cloud metadata host only when the MCP server itself is on
+/// loopback.
+pub fn refusal(url: []const u8, server_url: []const u8) ?Refusal {
+    const u = parseUrl(url) orelse return .insecure;
+    if (!secureOrLoopback(url)) return .insecure;
+    if (!isInternal(u.host)) return null;
+    const s = parseUrl(server_url) orelse return .internal;
+    return if (isLoopback(s.host) and isLoopback(u.host)) null else .internal;
+}
+
+/// An authorization server's metadata may be fetched, and the endpoints fx
+/// itself contacts used, only where `refusal` finds nothing.
 pub fn fetchable(url: []const u8, server_url: []const u8) bool {
-    const u = parseUrl(url) orelse return false;
-    if (!secureOrLoopback(url)) return false;
-    if (!isInternal(u.host)) return true;
-    const s = parseUrl(server_url) orelse return false;
-    return isLoopback(s.host) and isLoopback(u.host);
+    return refusal(url, server_url) == null;
 }
 
 pub fn isLoopback(host: []const u8) bool {
@@ -270,7 +280,7 @@ pub const ResourceMetadata = struct {
     scopes: ?[]const u8,
 };
 
-pub const DocumentError = Allocator.Error || error{ Malformed, NoAuthorizationServer, ResourceMismatch, IssuerMismatch, NoPkce, InsecureEndpoint };
+pub const DocumentError = Allocator.Error || error{ Malformed, NoAuthorizationServer, ResourceMismatch, IssuerMismatch, NoPkce, InsecureEndpoint, InternalEndpoint };
 
 /// Reads protected resource metadata for `server_url`.
 pub fn parseResourceMetadata(a: Allocator, raw: []const u8, server_url: []const u8) DocumentError!ResourceMetadata {
@@ -305,7 +315,7 @@ pub const ServerMetadata = struct {
 /// Reads authorization server metadata fetched for `issuer`: its issuer must
 /// be the same string, it must list S256, and its
 /// endpoints must be HTTPS or loopback.
-pub fn parseServerMetadata(a: Allocator, raw: []const u8, issuer: []const u8) DocumentError!ServerMetadata {
+pub fn parseServerMetadata(a: Allocator, raw: []const u8, issuer: []const u8, server_url: []const u8) DocumentError!ServerMetadata {
     const names = [_][]const u8{
         "issuer",                                         "authorization_endpoint",                "token_endpoint",
         "registration_endpoint",                          "revocation_endpoint",                   "code_challenge_methods_supported",
@@ -320,8 +330,9 @@ pub fn parseServerMetadata(a: Allocator, raw: []const u8, issuer: []const u8) Do
     if (!(wire.arrayHasString(pkce, "S256") catch return error.Malformed)) return error.NoPkce;
     var m: ServerMetadata = .{
         .issuer = got,
+        // The browser opens it; fx itself never contacts it.
         .authorization_endpoint = try endpoint(a, f[1] orelse return error.Malformed),
-        .token_endpoint = try endpoint(a, f[2] orelse return error.Malformed),
+        .token_endpoint = try contacted(a, f[2] orelse return error.Malformed, server_url),
         .registration_endpoint = null,
         .revocation_endpoint = null,
         .iss_supported = if (f[6]) |v| std.mem.eql(u8, v, "true") else false,
@@ -329,8 +340,8 @@ pub fn parseServerMetadata(a: Allocator, raw: []const u8, issuer: []const u8) Do
         .auth_methods = f[8],
         .scopes = f[9],
     };
-    if (f[3]) |v| m.registration_endpoint = try endpoint(a, v);
-    if (f[4]) |v| m.revocation_endpoint = try endpoint(a, v);
+    if (f[3]) |v| m.registration_endpoint = try contacted(a, v, server_url);
+    if (f[4]) |v| m.revocation_endpoint = try contacted(a, v, server_url);
     return m;
 }
 
@@ -338,6 +349,15 @@ fn endpoint(a: Allocator, raw: []const u8) DocumentError![]const u8 {
     const url = (try wire.decodeString(a, raw)) orelse return error.Malformed;
     if (!secureOrLoopback(url)) return error.InsecureEndpoint;
     return url;
+}
+
+/// An endpoint fx itself contacts, where `refusal` must find nothing.
+fn contacted(a: Allocator, raw: []const u8, server_url: []const u8) DocumentError![]const u8 {
+    const url = (try wire.decodeString(a, raw)) orelse return error.Malformed;
+    return switch (refusal(url, server_url) orelse return url) {
+        .insecure => error.InsecureEndpoint,
+        .internal => error.InternalEndpoint,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -414,6 +434,9 @@ test "which URLs may be used or fetched" {
     }
     try testing.expect(fetchable("http://localhost:9000/x", "http://127.0.0.1:8000/mcp"));
     try testing.expect(!fetchable("https://10.0.0.1/x", "http://127.0.0.1:8000/mcp"));
+    try testing.expectEqual(@as(?Refusal, null), refusal("https://auth.example.com/x", "https://mcp.example.com/mcp"));
+    try testing.expectEqual(@as(?Refusal, .insecure), refusal("http://auth.example.com/x", "https://mcp.example.com/mcp"));
+    try testing.expectEqual(@as(?Refusal, .internal), refusal("https://10.0.0.1/x", "https://mcp.example.com/mcp"));
 }
 
 test "reads and checks both metadata documents" {
@@ -428,12 +451,37 @@ test "reads and checks both metadata documents" {
     try testing.expectError(error.Malformed, parseResourceMetadata(a, "{\"authorization_servers\":[\"https://a\"]}", "https://x.com/mcp"));
 
     const ok = "{\"issuer\":\"https://auth.x.com\",\"authorization_endpoint\":\"https://auth.x.com/authorize\",\"token_endpoint\":\"https://auth.x.com/token\",\"code_challenge_methods_supported\":[\"plain\",\"S256\"],\"authorization_response_iss_parameter_supported\":true,\"registration_endpoint\":\"https://auth.x.com/register\"}";
-    const m = try parseServerMetadata(a, ok, "https://auth.x.com");
+    const m = try parseServerMetadata(a, ok, "https://auth.x.com", "https://mcp.x.com/mcp");
     try testing.expect(m.iss_supported and !m.cimd_supported);
     try testing.expectEqualStrings("https://auth.x.com/register", m.registration_endpoint.?);
     // The issuer is compared as a string: a trailing slash is another issuer.
-    try testing.expectError(error.IssuerMismatch, parseServerMetadata(a, ok, "https://auth.x.com/"));
-    try testing.expectError(error.NoPkce, parseServerMetadata(a, "{\"issuer\":\"https://a\",\"authorization_endpoint\":\"https://a/x\",\"token_endpoint\":\"https://a/t\"}", "https://a"));
-    try testing.expectError(error.NoPkce, parseServerMetadata(a, "{\"issuer\":\"https://a\",\"authorization_endpoint\":\"https://a/x\",\"token_endpoint\":\"https://a/t\",\"code_challenge_methods_supported\":[\"plain\"]}", "https://a"));
-    try testing.expectError(error.InsecureEndpoint, parseServerMetadata(a, "{\"issuer\":\"https://a\",\"authorization_endpoint\":\"http://a/x\",\"token_endpoint\":\"https://a/t\",\"code_challenge_methods_supported\":[\"S256\"]}", "https://a"));
+    try testing.expectError(error.IssuerMismatch, parseServerMetadata(a, ok, "https://auth.x.com/", "https://mcp.x.com/mcp"));
+    try testing.expectError(error.NoPkce, parseServerMetadata(a, "{\"issuer\":\"https://a\",\"authorization_endpoint\":\"https://a/x\",\"token_endpoint\":\"https://a/t\"}", "https://a", "https://mcp.x.com/mcp"));
+    try testing.expectError(error.NoPkce, parseServerMetadata(a, "{\"issuer\":\"https://a\",\"authorization_endpoint\":\"https://a/x\",\"token_endpoint\":\"https://a/t\",\"code_challenge_methods_supported\":[\"plain\"]}", "https://a", "https://mcp.x.com/mcp"));
+    try testing.expectError(error.InsecureEndpoint, parseServerMetadata(a, "{\"issuer\":\"https://a\",\"authorization_endpoint\":\"http://a/x\",\"token_endpoint\":\"https://a/t\",\"code_challenge_methods_supported\":[\"S256\"]}", "https://a", "https://mcp.x.com/mcp"));
+}
+
+test "the endpoints fx contacts follow the fetch rule; the browser's needs only HTTPS" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const remote = "https://mcp.x.com/mcp";
+    const doc = "{{\"issuer\":\"https://auth.x.com\",\"authorization_endpoint\":\"{s}\",\"token_endpoint\":\"{s}\",\"code_challenge_methods_supported\":[\"S256\"]{s}}}";
+    const internal = [_][]const u8{ "https://10.0.0.5/t", "https://127.0.0.1/t", "http://localhost:9/t", "https://0.0.0.0:1/t", "https://169.254.169.254/t", "https://metadata.google.internal/t", "https://[::1]/t", "https://[fd00::1]/t" };
+    for (internal) |url| {
+        // As the token endpoint, the registration endpoint, or the revocation endpoint.
+        try testing.expectError(error.InternalEndpoint, parseServerMetadata(a, try a.print(doc, .{ "https://auth.x.com/a", url, "" }), "https://auth.x.com", remote));
+        const registration = try a.print(",\"registration_endpoint\":\"{s}\"", .{url});
+        try testing.expectError(error.InternalEndpoint, parseServerMetadata(a, try a.print(doc, .{ "https://auth.x.com/a", "https://auth.x.com/t", registration }), "https://auth.x.com", remote));
+        const revocation = try a.print(",\"revocation_endpoint\":\"{s}\"", .{url});
+        try testing.expectError(error.InternalEndpoint, parseServerMetadata(a, try a.print(doc, .{ "https://auth.x.com/a", "https://auth.x.com/t", revocation }), "https://auth.x.com", remote));
+    }
+    // Plain HTTP to another host is insecure, wherever it is.
+    try testing.expectError(error.InsecureEndpoint, parseServerMetadata(a, try a.print(doc, .{ "https://auth.x.com/a", "http://auth.x.com/t", "" }), "https://auth.x.com", remote));
+    // The browser opens the authorization endpoint; fx never contacts it.
+    _ = try parseServerMetadata(a, try a.print(doc, .{ "https://10.0.0.5/a", "https://auth.x.com/t", "" }), "https://auth.x.com", remote);
+    // A loopback MCP server may use a loopback authorization server, but no other internal host.
+    const loopback = "http://127.0.0.1:8000/mcp";
+    _ = try parseServerMetadata(a, try a.print(doc, .{ "http://127.0.0.1:9/a", "http://127.0.0.1:9/t", ",\"registration_endpoint\":\"http://localhost:9/r\"" }), "https://auth.x.com", loopback);
+    try testing.expectError(error.InternalEndpoint, parseServerMetadata(a, try a.print(doc, .{ "http://127.0.0.1:9/a", "https://10.0.0.5/t", "" }), "https://auth.x.com", loopback));
 }
