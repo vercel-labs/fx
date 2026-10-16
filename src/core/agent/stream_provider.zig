@@ -465,6 +465,9 @@ pub const Provider = struct {
     build_request_fn: ?BuildRequestFn = null,
     /// Pure provider-owned slicing when one reply becomes separate history units.
     project_replay_fn: ?*const fn (Allocator, ?types.ProviderReplay, []const types.ToolCall, bool, bool) anyerror!?types.ProviderReplay = null,
+    /// The largest request body this provider's transport can carry, when it
+    /// has its own limit below any provider's.
+    max_request_bytes: ?usize = null,
 
     /// Borrows unchanged payloads; projected payloads live in the caller's arena.
     pub fn projectReplay(self: Provider, arena: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
