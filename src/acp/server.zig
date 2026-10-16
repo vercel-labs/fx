@@ -2031,6 +2031,7 @@ fn handleKernelSnapshot(
         error.OutOfMemory => return error.OutOfMemory,
         error.AttachmentStoreFull => return state.writer.writeResponse(alloc, msg.id, none),
     };
+    if (yielded) journal.noteOpenTurnSnapshot();
     const written = try alloc.print("{{\"snapshotAttachment\":{d},\"atSeq\":{d}}}", .{ attachment, at_seq });
     defer alloc.free(written);
     try state.writer.writeResponse(alloc, msg.id, written);

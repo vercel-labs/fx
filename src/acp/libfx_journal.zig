@@ -104,7 +104,7 @@ pub const Journal = struct {
     pending_resume_ambiguous: []types.ToolCall = &.{},
     /// The last progress this journal sent in the open turn, so the next can
     /// carry only what is new. Its hashes are owned by the session's
-    /// allocator; `stale` once its turn ended.
+    /// allocator; `stale` once its turn ended or a snapshot took the turn in.
     last_progress: ?LastProgress = null,
 
     const LastProgress = struct {
@@ -367,6 +367,14 @@ pub const Journal = struct {
         return self.progress_open and self.pending_resume != null and self.pending_resume_yielded and
             self.pending_resume_answered == null and self.pending_inputs.len == 0 and
             self.steers_waiting == 0 and self.follow_ups_waiting == 0;
+    }
+
+    /// Records that a snapshot holding the open turn went to the host. A load
+    /// from it starts the turn from the snapshot, without the progress record
+    /// the snapshot folded, so the turn's next progress carries all of it
+    /// instead of extending that record.
+    pub fn noteOpenTurnSnapshot(self: *Journal) void {
+        if (self.last_progress) |*last| last.stale = true;
     }
 
     /// Records that the open turn ended without a history entry. A turn
@@ -833,6 +841,29 @@ test "a progress after its turn's first carries only what is new, and the next t
     try session.appendProgress(alloc, alloc, "session", progress, "fake/model");
     try std.testing.expect(std.mem.find(u8, capture.frames.items[next..], "\"base\"") == null);
     try std.testing.expect(std.mem.find(u8, capture.frames.items[next..], "\"user\"") != null);
+}
+
+test "a progress after a snapshot that holds its turn carries all of it" {
+    const alloc = std.testing.allocator;
+    var capture: TestCapture = .{};
+    defer capture.frames.deinit(alloc);
+    var writer = jsonrpc.Writer.initCallback(&capture, TestCapture.write);
+    var session: Journal = .{ .writer = &writer };
+    defer session.deinit(alloc);
+    var progress = try testProgress(alloc);
+    defer progress.deinit(alloc);
+
+    try session.appendProgress(alloc, alloc, "session", progress, "fake/model");
+    // A load from the snapshot has no record for the next progress to extend.
+    session.noteOpenTurnSnapshot();
+    const next = capture.frames.items.len;
+    try session.appendProgress(alloc, alloc, "session", progress, "fake/model");
+    try std.testing.expect(std.mem.find(u8, capture.frames.items[next..], "\"base\"") == null);
+    try std.testing.expect(std.mem.find(u8, capture.frames.items[next..], "\"user\"") != null);
+    // The progress after that one extends it again.
+    const after = capture.frames.items.len;
+    try session.appendProgress(alloc, alloc, "session", progress, "fake/model");
+    try std.testing.expect(std.mem.find(u8, capture.frames.items[after..], "\"base\":2,") != null);
 }
 
 test "a resumed turn runs again the calls the host asks for and leaves the rest to the model" {

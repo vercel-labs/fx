@@ -1477,6 +1477,44 @@ test("a tool receives the model's call id as its execution id, and its session's
   await agent.close();
   assert.deepEqual(seen, [{ keys: ["executionId", "sessionId", "signal"], executionId: "call-1", sessionId, signal: true }]);
 });
+
+test("a yielded turn resumed in place after its checkpoint reopens from any cut", async () => {
+  // The store keeps a copy of itself after each append, as a crash there
+  // would leave it.
+  const store = createMemoryPersistence();
+  const states = [];
+  const append = store.append.bind(store);
+  store.append = async (input) => {
+    const out = await append(input);
+    states.push({
+      records: store.records.map((record) => ({ ...record, data: record.data.slice() })),
+      checkpoint: store.checkpoint && { through: store.checkpoint.through, data: store.checkpoint.data.slice() },
+    });
+    return out;
+  };
+  const agent = await createFxEngine(options(sourceBackend, undefined, { persistence: store, checkpointAfterBytes: 0 }));
+  const first = agent.prompt("use the tool", { yieldAt: Date.now() });
+  for await (const _ of first) {}
+  assert.equal((await first.result).stopReason, "yielded");
+  for (let wait = 0; wait < 100 && !store.checkpoint; wait += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.ok(store.checkpoint, "a checkpoint holding the open turn was saved at the yield");
+  const before = states.length;
+  const turn = agent.resume();
+  for await (const _ of turn) {}
+  assert.equal((await turn.result).stopReason, "end_turn");
+  await agent.close();
+  const cuts = states.slice(before).filter((state) => state.checkpoint);
+  assert.ok(cuts.length > 0, "the resumed turn appended after the checkpoint");
+  for (const [index, state] of cuts.entries()) {
+    const copy = createMemoryPersistence();
+    copy.records.push(...state.records);
+    await copy.saveCheckpoint(state.checkpoint);
+    const reopened = await createFxEngine(options(targetBackend, undefined, { persistence: copy })).catch((error) => {
+      throw new Error(`the cut after resumed append ${index + 1} (checkpoint through ${state.checkpoint.through}, ${state.records.length} records) did not reopen: ${error.code}`);
+    });
+    await reopened.close();
+  }
+});
 try {
   for (const { name, body } of cases) {
     await body();
