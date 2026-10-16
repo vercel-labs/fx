@@ -460,7 +460,7 @@ fn parseGlobalLaunchArgs(
         } else if (std.mem.startsWith(u8, arg, "--provider=")) {
             provider_override = model_provider.parse(arg["--provider=".len..]) orelse
                 return error.InvalidProviderValue;
-        } else if (std.mem.eql(u8, arg, "--model")) {
+        } else if (std.mem.eql(u8, arg, "--model") or std.mem.eql(u8, arg, "-m")) {
             index += 1;
             if (index >= args.len) return error.MissingModelValue;
             const model = std.mem.trim(u8, args[index], " \t\r\n");
@@ -549,6 +549,7 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             std.mem.eql(u8, arg, "--provider") or
             std.mem.eql(u8, arg, "--provider-order") or
             std.mem.eql(u8, arg, "--model") or
+            std.mem.eql(u8, arg, "-m") or
             std.mem.eql(u8, arg, "--effort"))
         {
             index += 1;
@@ -1062,7 +1063,7 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         } else {
             try writer.writer.print("fx: invalid global launch option: {s}\n", .{@errorName(err)});
         }
-        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] <command>\n");
+        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--provider <name>] [-m|--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] <command>\n");
         try writeStderr(deps, writer.written());
         return .handled_failure;
     };
@@ -1137,7 +1138,7 @@ fn runNonInteractiveWithDeps(
         },
         .acp => |rest| {
             const acp_opts = parseAcpArgs(rest) catch {
-                try writeStderr(deps, "usage: fx acp [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]\n");
+                try writeStderr(deps, "usage: fx acp [-m|--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]\n");
                 return .handled_failure;
             };
             try cfg.acp_runner.run(alloc, .{
@@ -3861,7 +3862,7 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
         error.DuplicateAdditionalDirectorySuppression => "--no-additional-dirs may only be specified once",
-        error.MissingModelValue => "--model requires a model id",
+        error.MissingModelValue => "-m/--model requires a model id",
         error.MissingEffortValue => "--effort requires a value",
         error.InvalidEffortValue => "--effort value is not a valid reasoning effort",
         error.ConflictingFastFlags => "--fast and --no-fast cannot be used together",
@@ -3879,7 +3880,7 @@ fn parseAcpArgs(args: []const [:0]const u8) !AcpOptions {
     var opts = AcpOptions{};
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--model")) {
+        if (std.mem.eql(u8, args[i], "--model") or std.mem.eql(u8, args[i], "-m")) {
             if (opts.model != null or i + 1 >= args.len) return error.InvalidAcpArgs;
             i += 1;
             opts.model = args[i];
@@ -4521,6 +4522,26 @@ test "global launch modifiers own provider model effort and fast overrides befor
     try std.testing.expectEqual(@as(usize, 2), untouched.remaining.len);
 }
 
+test "global launch modifiers accept -m as the short form of --model" {
+    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
+        @constCast("-m"),
+        @constCast(" provider/short-model "),
+        @constCast("--fast"),
+        @constCast("--effort"),
+        @constCast("high"),
+        @constCast("ask"),
+    });
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("provider/short-model", parsed.modifiers.model_override.?);
+    try std.testing.expectEqual(@as(?bool, true), parsed.modifiers.fast_override);
+    try std.testing.expectEqualStrings("ask", parsed.remaining[0]);
+
+    const args = [_][:0]const u8{ "-m", "provider/short-model", "ask", "hello" };
+    try std.testing.expectEqualStrings("ask", commandAfterGlobalLaunchArgs(&args).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), commandAfterGlobalLaunchArgs(&.{"-m"}));
+    try std.testing.expectError(error.MissingModelValue, parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("-m")}));
+}
+
 test "global launch modifiers accept configured provider names" {
     var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
         @constCast("--provider"),
@@ -4634,6 +4655,14 @@ test "parse acp args extracts known flags and rejects invalid arguments" {
     try std.testing.expectError(
         error.InvalidAcpArgs,
         parseAcpArgs(&.{ @constCast("--model"), @constCast("first"), @constCast("--model"), @constCast("second") }),
+    );
+
+    const short = try parseAcpArgs(&.{ @constCast("-m"), @constCast("openai/gpt-4o") });
+    try std.testing.expectEqualStrings("openai/gpt-4o", short.model.?);
+    try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("-m")}));
+    try std.testing.expectError(
+        error.InvalidAcpArgs,
+        parseAcpArgs(&.{ @constCast("-m"), @constCast("first"), @constCast("--model"), @constCast("second") }),
     );
 }
 

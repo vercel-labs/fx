@@ -4109,7 +4109,7 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
         } else if (std.mem.eql(u8, arg, "--full-access") or std.mem.eql(u8, arg, "--yolo")) {
             if (opts.permission_override != null) return error.InvalidAskArgs;
             opts.permission_override = .yolo;
-        } else if (std.mem.eql(u8, arg, "--model")) {
+        } else if (std.mem.eql(u8, arg, "--model") or std.mem.eql(u8, arg, "-m")) {
             i += 1;
             if (i >= args.len) return error.InvalidAskArgs;
             const model = std.mem.trim(u8, args[i], " \t\r\n");
@@ -5767,6 +5767,13 @@ test "parse options preserves model effort and fast overrides" {
     var last_model = try parseOptionsWithStdin(alloc, &.{ "--model", "first/model", "--model", "second/model", "hello" }, .tty);
     defer last_model.deinit(alloc);
     try std.testing.expectEqualStrings("second/model", last_model.model_override.?);
+
+    var short_model = try parseOptionsWithStdin(alloc, &.{ "-m", "provider/short-model", "--fast", "hello" }, .tty);
+    defer short_model.deinit(alloc);
+    try std.testing.expectEqualStrings("provider/short-model", short_model.model_override.?);
+    try std.testing.expectEqual(@as(?bool, true), short_model.fast_override);
+    try std.testing.expectEqualStrings("hello", short_model.prompt);
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{"-m"}, .tty));
 }
 
 test "parse options accepts provider routing flags and rejects malformed values" {
