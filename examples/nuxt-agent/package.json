@@ -8,8 +8,8 @@
     "start": "node .output/server/index.mjs"
   },
   "dependencies": {
-    "libfx": "0.0.8",
-    "nuxt": "4.5.2"
+    "libfx": "0.0.14-dev.1534.g6afa7c33dac5",
+    "nuxt": "4.6.1"
   },
   "engines": {
     "node": "24.x"

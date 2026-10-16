@@ -9,7 +9,8 @@ the agent calls in its entry point. Start with the one that matches your runtime
 - [Nuxt](nuxt-agent): a Vue form and a streaming Nitro route.
 
 Use Node.js 24 and an [AI Gateway API key](https://vercel.com/docs/ai-gateway/authentication-and-byok).
-The examples pin libfx 0.0.8. They do not use the CLI's built-in tools.
+The examples pin a 0.0.14 preview of libfx and use `createFxEngine()` for one
+conversation. They do not use the CLI's built-in tools.
 
 ## Run an example
 
