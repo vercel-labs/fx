@@ -99,6 +99,12 @@ pub const ProvisionalToolStatuses = struct {
                 .activity_kind = .read,
             } };
         }
+        if (tooling_presentation.providerToolRow(tool_name)) |row| {
+            if (registry.lookup(tool_name) == null) return .{ .eligible = .{
+                .action_label = row.active_label,
+                .activity_kind = row.activity,
+            } };
+        }
         const lookup_name = if (std.mem.eql(u8, tool_name, "run_command"))
             "shell"
         else
@@ -709,6 +715,9 @@ pub fn transitionPresentationGroup(
 
 pub fn activityKind(registry: tool_dispatch.Registry, tool_name: []const u8) types.ToolActivityKind {
     if (tooling_presentation.isProviderSearchAlias(tool_name)) return .read;
+    if (registry.lookup(tool_name) == null) {
+        if (tooling_presentation.providerToolRow(tool_name)) |row| return row.activity;
+    }
     return tool_dispatch.toolActivityKind(registry, tool_name);
 }
 
@@ -718,6 +727,9 @@ pub fn activityKindForCall(
     call: ToolCall,
 ) types.ToolActivityKind {
     if (tooling_presentation.isProviderSearchAlias(call.name)) return .read;
+    if (registry.lookup(call.name) == null) {
+        if (tooling_presentation.providerToolRow(call.name)) |row| return row.activity;
+    }
     return tool_dispatch.toolActivityKindForCall(alloc, registry, call);
 }
 

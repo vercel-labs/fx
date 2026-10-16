@@ -626,7 +626,7 @@ fn keychainReadDeferrable(
     const source = preferred orelse return !env_credential_present;
     return switch (source) {
         .fx_login, .stored_key => true,
-        .vercel_oidc_token, .ai_gateway_api_key, .chatgpt_subscription, .grok_subscription, .host_managed, .configured => false,
+        .vercel_oidc_token, .ai_gateway_api_key, .chatgpt_subscription, .grok_subscription, .claude_cli, .host_managed, .configured => false,
     };
 }
 

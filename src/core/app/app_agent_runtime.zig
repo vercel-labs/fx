@@ -1321,6 +1321,16 @@ fn formatToolAction(
         return formatWebSearchAction(arena, call, state, denied_label);
     }
     const spec = ctx.tool_registry.lookup(call.name) orelse {
+        if (tool_presentation.providerToolRow(call.name)) |row| {
+            const detail = try tool_presentation.providerToolDetail(arena, call, row);
+            const label = switch (state) {
+                .active => row.active_label,
+                .completed => row.completed_label,
+                .denied => denied_label.?,
+            };
+            if (row.activity == .command) return formatCommandActionValue(arena, label, detail);
+            return formatToolActionValue(arena, label, detail);
+        }
         if (dynamicMcpActionLabel(state)) |label| {
             if (mcpToolAvailable(ctx, call.name)) {
                 return formatToolActionValue(arena, label, call.name);

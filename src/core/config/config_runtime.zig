@@ -310,6 +310,9 @@ pub fn modelEnvOverride() ?[]const u8 {
     return if (trimmed.len > 0) trimmed else null;
 }
 
+/// The Claude CLI picks the account's own default model when fx passes none.
+const claude_default_model = "default";
+
 pub const ModelSelectionError = error{
     CodexModelNotSelected,
     GrokModelNotSelected,
@@ -331,6 +334,7 @@ pub fn selectProviderModel(
         .gateway => default_model,
         .codex => run_model orelse return error.CodexModelNotSelected,
         .grok => run_model orelse return error.GrokModelNotSelected,
+        .claude => run_model orelse claude_default_model,
         .configured => run_model orelse return error.ConfiguredModelNotSelected,
     };
     return .{ .provider = provider, .model = model };

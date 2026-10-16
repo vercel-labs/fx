@@ -43,6 +43,7 @@ pub const LogoutFacts = struct {
 
 pub fn decideLogoutProvider(facts: LogoutFacts) model_provider.ProviderId {
     if (facts.requested) |provider| return provider;
+    if (facts.selected == .claude or facts.active_source == .claude_cli) return .claude;
     if (facts.selected == .grok or facts.active_source == .grok_subscription) return .grok;
     if (facts.selected == .codex or facts.active_source == .chatgpt_subscription) return .codex;
     if (facts.active_source == .fx_login) return .gateway;
@@ -73,7 +74,7 @@ pub fn logoutFallbackProviders(facts: LogoutFacts) [2]?model_provider.ProviderId
                 facts.available_sources.contains(.stored_key),
             .codex => facts.available_sources.contains(.chatgpt_subscription),
             .grok => facts.available_sources.contains(.grok_subscription),
-            .configured => false,
+            .claude, .configured => false,
         };
         if (!available) continue;
         candidates[count] = provider;
@@ -157,6 +158,10 @@ pub fn signInCompletion(
             .{ .switch_provider = .grok }
         else
             .{ .activate_source = .grok_subscription },
+        .claude => if (provider_routing_supported)
+            .{ .switch_provider = .claude }
+        else
+            .{ .activate_source = .claude_cli },
     };
 }
 
@@ -317,4 +322,44 @@ test "auth replay is one delivery-safe refresh outside semantic policy" {
     blocked = eligible;
     blocked.delivery_safe = false;
     try std.testing.expectEqual(AuthReplayDecision.fail, decideAuthReplay(blocked));
+}
+
+test "claude logout is chosen by selection or source and never falls back to another provider" {
+    const sources = std.EnumSet(credentials.Source).initMany(&.{ .ai_gateway_api_key, .claude_cli });
+    try std.testing.expectEqual(model_provider.ProviderId.claude, decideLogoutProvider(.{
+        .requested = null,
+        .selected = .claude,
+        .active_source = null,
+        .available_sources = sources,
+    }));
+    try std.testing.expectEqual(model_provider.ProviderId.claude, decideLogoutProvider(.{
+        .requested = null,
+        .selected = .gateway,
+        .active_source = .claude_cli,
+        .available_sources = sources,
+    }));
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, decideLogoutProvider(.{
+        .requested = .gateway,
+        .selected = .claude,
+        .active_source = .claude_cli,
+        .available_sources = sources,
+    }));
+    const candidates = logoutFallbackProviders(.{
+        .requested = .codex,
+        .selected = .codex,
+        .active_source = null,
+        .available_sources = std.EnumSet(credentials.Source).initMany(&.{.claude_cli}),
+    });
+    try std.testing.expect(candidates[0] == null);
+}
+
+test "claude sign-in completion switches provider or activates the Claude CLI source" {
+    try std.testing.expectEqual(
+        SignInCompletionAction{ .switch_provider = .claude },
+        signInCompletion(.claude, true),
+    );
+    try std.testing.expectEqual(
+        SignInCompletionAction{ .activate_source = .claude_cli },
+        signInCompletion(.claude, false),
+    );
 }
