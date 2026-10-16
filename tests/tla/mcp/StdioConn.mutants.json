@@ -66,7 +66,7 @@
     "property": "Progress"
   },
   {
-    "description": "A 2025 server's ping during the handshake is refused: responses only once detection says 2025 (CORE-11)",
+    "description": "A 2025 server's ping during the handshake is refused: responses only once detection says 2025",
     "old": "ResponseAllowed == era # \"modern\"",
     "new": "ResponseAllowed == era = \"legacy\"",
     "invariant": "NoRefusedAnswer"

@@ -5,7 +5,7 @@
 // bridge, and keeps all evidence under <out>/<unit>/<case>/, where <out> is a
 // fresh folder under FX_TLA_OUT or the system temp folder.
 //
-// Usage: bun tests/tla/drivers/mcp/driver.ts [--unit S05] [--case name] [--repeat N] [--next] [--list]
+// Usage: bun tests/tla/drivers/mcp/driver.ts [--unit S05] [--case name] [--repeat N] [--list]
 //
 // The binaries are labs built from labs/ against this checkout's src/mcp/.
 // Exit: 0 every case passed, 1 a case failed, 2 usage or tooling error.
@@ -175,14 +175,6 @@ async function main(): Promise<number> {
   if (args.includes("--list")) {
     for (const s of scenarios) console.log(`${s.unit} ${s.name.padEnd(36)} ${s.description}`);
     return 0;
-  }
-  // engine_lab is written for the next MCP-v2 version and does not build
-  // against this checkout's src/mcp/ yet. Its scenarios run only with --next.
-  const nextOnly = (s: Scenario) => s.needs.includes("engine_lab");
-  if (!args.includes("--next")) {
-    const later = scenarios.filter(nextOnly);
-    if (later.length > 0) console.log(`driver: skipping ${later.length} scenario(s) that need engine_lab (next MCP-v2 version); pass --next to run them`);
-    scenarios = scenarios.filter((s) => !nextOnly(s));
   }
   if (scenarios.length === 0) {
     console.error("driver: no scenarios selected");

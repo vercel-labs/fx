@@ -16,7 +16,6 @@ export function parseStatus(pane: string): Line | null {
   if ((m = /(\S+) needs login · \/mcp/.exec(tail))) return { k: "attn", who: m[1]!, why: "login", r: 0, e: 0 };
   if ((m = /(\S+) failed · \/mcp/.exec(tail))) return { k: "attn", who: m[1]!, why: "failed", r: 0, e: 0 };
   if ((m = /(\d+) MCP servers need you · \/mcp/.exec(tail))) return { k: "many", who: "", why: "", r: Number(m[1]), e: 0 };
-  if ((m = /\bmcp (\d+)\/(\d+)\b/.exec(tail))) return { k: "count", who: "", why: "", r: Number(m[1]), e: Number(m[2]) };
   return null;
 }
 
@@ -49,7 +48,8 @@ export class Shell {
     const deadline = Date.now() + timeoutMs;
     let last: string | null = null, since = Date.now(), line: Line | null = null;
     while (Date.now() < deadline) {
-      line = parseStatus(await this.tui.capturePane());
+      // With nothing that needs attention the line says nothing about MCP.
+      line = parseStatus(await this.tui.capturePane()) ?? (want?.k === "none" ? { k: "none", who: "", why: "", r: 0, e: 0 } : null);
       const key = JSON.stringify(line);
       if (key !== last) { last = key; since = Date.now(); }
       const fits = want === null || (line !== null && Object.entries(want).every(([k, v]) => (line as never)[k] === v));

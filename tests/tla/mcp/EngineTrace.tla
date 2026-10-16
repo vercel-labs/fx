@@ -1,6 +1,4 @@
 ---- MODULE EngineTrace ----
-\* Updated for the next MCP-v2 version: it can describe behavior that src/mcp/
-\* does not have yet, so its traces from the current src/mcp/ may not match.
 \* Trace wrapper for Engine.tla (U12). tests/bun/bridge.ts generates TraceObs
 \* from the records of one server (one engine instance, named for the server).
 \*

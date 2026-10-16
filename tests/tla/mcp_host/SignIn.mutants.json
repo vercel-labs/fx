@@ -37,15 +37,21 @@
     "property": "EveryLoginEnds"
   },
   {
-    "description": "a host's end closes its sign-in without a notice",
+    "description": "A host's end closes its sign-in without a notice",
     "old": "GoneIndicator(h) == IF SignsIn(h) THEN FALSE ELSE indicator",
     "new": "GoneIndicator(h) == indicator",
     "invariant": "IndicatorImpliesListener"
   },
   {
-    "description": "a new host starts a sign-in while an old one still signs in",
+    "description": "A new host starts a sign-in while an old one still signs in",
     "old": "    /\\ \\A h \\in Hosts : alive[h] => h = cur\n",
     "new": "",
     "invariant": "OneSignInPerServer"
+  },
+  {
+    "description": "The listener takes a return carrying any state, so a stray one ends the sign-in",
+    "old": "    /\\ IF Takes(kind) /\\ s = k\n",
+    "new": "    /\\ IF Takes(kind)\n",
+    "invariant": "ListenerTakesOnlyItsOwn"
   }
 ]

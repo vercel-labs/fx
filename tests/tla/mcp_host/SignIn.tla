@@ -6,13 +6,17 @@
 \*     earlier login, then a new Login: a loopback listener and the
 \*     awaitBrowser task, then engine.signIn), awaitBrowser (the first
 \*     `GET /callback`, or for a bridged server the first form posted from
-\*     the bridge's origin, is posted as finish_login; the task then ends),
-\*     `.finish_login` (engine.finishSignIn: MCP-v2's flow checks the state),
+\*     the bridge's origin, carrying the state `.authorize` gave the
+\*     listener, is posted as finish_login; the task then ends),
+\*     finishLogin (`fx mcp login NAME --no-browser`: a pasted address,
+\*     past the listener), `.finish_login` (engine.finishSignIn: MCP-v2's
+\*     flow checks the state),
 \*     onServer `.authorize` / `.signed_in` / `.sign_in_failed`, expireLogins
 \*     (5 minutes), shutdown (endLogin for every login, each with a
 \*     `.sign_in_failed`: the MCP config changed). While another
 \*     host is retired but alive, a login waits.
-\*   - src/core/mcp_host/login.zig: Listener.accept, answer, answerForm.
+\*   - src/core/mcp_host/login.zig: Listener.accept, takeReturn, takeForm
+\*     (any other return gets a 404 and the wait goes on).
 \*   - src/core/app/app_mcp_runtime.zig HostSink: `.authorize` sets the
 \*     shell's "Signing in to NAME" (sign_in), `.signed_in` and
 \*     `.sign_in_failed` clear it; it lives in the shell's State, not in the
@@ -111,19 +115,28 @@ Authorize(k) ==
     /\ indicator' = TRUE
     /\ UNCHANGED <<cur, alive, retired, leases, phase, hostOf, got, live, flow, saved, next, badRedeem, foreignTaken>>
 
-\* login.zig answer/answerForm: what the listener takes. A non-bridged
+\* login.zig takeReturn/takeForm: what the listener takes. A non-bridged
 \* listener takes GET /callback; a bridged one takes a form only from the
-\* bridge's origin. Anything else gets a 404 and the wait goes on.
+\* bridge's origin. Either carries the login's own state. Anything else gets
+\* a 404 and the wait goes on, so a stray return never ends a sign-in.
 Takes(kind) == IF Bridge THEN kind = "form_ours" ELSE kind = "get"
 
 Arrive(k, s, kind) ==
     /\ phase[k] = "open"
-    /\ IF Takes(kind)
+    /\ IF Takes(kind) /\ s = k
        THEN /\ phase' = [phase EXCEPT ![k] = "consumed"]
             /\ got' = [got EXCEPT ![k] = s]
-            /\ foreignTaken' = (foreignTaken \/ kind \in {"form_foreign", "other"})
+            /\ foreignTaken' = (foreignTaken \/ kind \in {"form_foreign", "other"} \/ s # k)
        ELSE UNCHANGED <<phase, got, foreignTaken>>
     /\ UNCHANGED <<cur, alive, retired, leases, hostOf, live, flow, shownUrl, indicator, saved, next, badRedeem>>
+
+\* finishLogin: the address the browser ended on, pasted. It goes to MCP-v2
+\* as it is, past the listener, so a wrong one fails the sign-in there.
+Paste(k, s) ==
+    /\ phase[k] = "open"
+    /\ phase' = [phase EXCEPT ![k] = "consumed"]
+    /\ got' = [got EXCEPT ![k] = s]
+    /\ UNCHANGED <<cur, alive, retired, leases, hostOf, live, flow, shownUrl, indicator, saved, next, badRedeem, foreignTaken>>
 
 \* `.finish_login`: MCP-v2 checks the state against the live flow.
 Handle(k) ==
@@ -205,6 +218,7 @@ Next ==
     \/ StartLogin
     \/ \E k \in Logins : Authorize(k) \/ Handle(k) \/ Expire(k) \/ Redeemed(k, TRUE) \/ Redeemed(k, FALSE)
     \/ \E k \in Logins, s \in States, kind \in Kinds : Arrive(k, s, kind)
+    \/ \E k \in Logins, s \in States : Paste(k, s)
     \/ Lease
     \/ \E h \in Hosts : Release(h)
     \/ Reload
@@ -223,8 +237,9 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 \* A token is redeemed only for a callback whose state matches the live sign-in.
 RedeemOnlyLiveState == ~badRedeem
 
-\* A listener takes only the browser's return of its own kind of sign-in: a
-\* bridged one only a form from the bridge's origin.
+\* A listener takes only the browser's return of its own sign-in: of its
+\* kind (a bridged one only a form from the bridge's origin), and carrying
+\* its state.
 ListenerTakesOnlyItsOwn == ~foreignTaken
 
 \* A login's listener never outlives its host.

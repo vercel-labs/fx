@@ -31,8 +31,10 @@ export interface AuthServer {
   /** Issue refresh tokens (default true), rotated (default true). */
   refresh?: boolean;
   rotate?: boolean;
-  /** Answer every refresh with 400 and this error. */
+  /** Answer every refresh with this error, at `refreshStatus`. */
   refreshError?: string;
+  /** The status `refreshError` comes with (default 400). At 200 the body is Slack's: `ok:false` and the error. */
+  refreshStatus?: number;
   /** The token endpoint is plain HTTP to another host. */
   insecureEndpoint?: boolean;
   /** The token endpoint is on an internal address: 0.0.0.0, which reaches this machine, on port 1. */
@@ -202,7 +204,10 @@ export function createAuth(config: AuthConfig, base: () => string, log: Log) {
           return Response.json(issue(i, s.grantOnly ? c.scopes.filter((x) => s.grantOnly!.includes(x)) : c.scopes));
         }
         if (form.grant_type === "refresh_token") {
-          if (s.refreshError) return Response.json({ error: s.refreshError }, { status: 400 });
+          if (s.refreshError) {
+            const status = s.refreshStatus ?? 400;
+            return Response.json(status === 200 ? { ok: false, error: s.refreshError } : { error: s.refreshError }, { status });
+          }
           const r = refresh.get(form.refresh_token);
           if (!r || r.server !== i || !form.resource) return Response.json({ error: "invalid_grant" }, { status: 400 });
           const body = issue(i, r.scopes);

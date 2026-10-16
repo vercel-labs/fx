@@ -11,23 +11,17 @@ import { BUN, HTTP_FAKE, fixture, fxEnv, probe, save, stdioServer, waitFor, writ
 import { Shell } from "./shell";
 import { checkTrace, type TraceRecord } from "./trace";
 
-// Tests marked NEXT_MCP check the MCP host fixes from the next MCP-v2
-// version, which src/core/mcp_host/ does not have yet. They run only with
-// FX_TLA_NEXT_MCP=1.
-const NEXT_MCP = process.env.FX_TLA_NEXT_MCP === "1";
-
-
 const MODERN = "2026-07-28";
 const RULES = [
   { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } },
   { method: "tools/list", result: { resultType: "complete", tools: [{ name: "echo", inputSchema: { type: "object" } }] } },
 ];
 
-async function startFake(f: Fixture) {
+async function startFake(f: Fixture, server: Record<string, unknown> = {}) {
   if (!existsSync(HTTP_FAKE)) throw new Error(`harness: MCP-v2's fake HTTP server is missing at ${HTTP_FAKE}`);
   const rules = join(f.base, "rules.json"), auth = join(f.base, "auth.json"), log = join(f.base, "http-fake.jsonl");
   writeFileSync(rules, JSON.stringify(RULES));
-  writeFileSync(auth, JSON.stringify({ servers: [{}], challengeScope: "mcp:read" }));
+  writeFileSync(auth, JSON.stringify({ servers: [server], challengeScope: "mcp:read" }));
   const child = Bun.spawn([BUN, HTTP_FAKE, "--script", rules, "--log", log, "--auth", auth], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   const reader = child.stdout.getReader();
   let text = "";
@@ -82,9 +76,21 @@ async function signInScenario(name: string, tamper: boolean) {
     const location = new URL(redirect.headers.get("location")!);
     const state = location.searchParams.get("state");
     expect(state).toBe(authorize.searchParams.get("state"));
-    if (tamper) location.searchParams.set("state", "not-the-state-fx-made");
+    let stray: { status: number; open: string } | undefined;
+    if (tamper) {
+      // A return with a state fx never made gets a 404 and the wait goes on.
+      const wrong = new URL(location.toString());
+      wrong.searchParams.set("state", "not-the-state-fx-made");
+      records.push({ event: "callback", data: { login: 1, state: 0, kind: "get" }, at: at() });
+      const reply = await fetch(wrong.toString(), { signal: AbortSignal.timeout(10_000) });
+      await reply.text();
+      const still = await probe(port);
+      records.push({ event: "probe", data: { login: 1, result: still.result }, at: at() });
+      stray = { status: reply.status, open: still.result };
+      save(join(f.base, "stray.json"), { location: wrong.toString(), ...stray });
+    }
     // Recorded when sent: fx answers the page and redeems before this fetch returns.
-    records.push({ event: "callback", data: { login: 1, state: tamper ? 0 : 1, kind: "get" }, at: at() });
+    records.push({ event: "callback", data: { login: 1, state: 1, kind: "get" }, at: at() });
     const back = await fetch(location.toString());
     save(join(f.base, "callback.json"), { location: location.toString(), status: back.status, body: (await back.text()).slice(0, 400) });
     const code = await login.done();
@@ -99,7 +105,7 @@ async function signInScenario(name: string, tamper: boolean) {
     records.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
     const verdict = await checkTrace({ module: "SignIn", records, dir: join(f.base, "trace"), constants: { ObsMaxLogins: 1, ObsMaxHosts: 1, ObsMaxLeases: 0, ObsBridge: false } });
     save(join(f.base, "verdict.json"), verdict);
-    return { f, code, tokens, verdict, after, out: login.out(), err: login.err() };
+    return { f, code, tokens, verdict, after, stray, out: login.out(), err: login.err() };
   } finally { fake.stop(); }
 }
 
@@ -113,18 +119,76 @@ test("control: a sign-in redeems the code of the callback whose state matches, t
   expect(r.verdict.verdict).toBe("ACCEPTED");
 }, 120_000);
 
-test("control: a callback whose state isn't the live sign-in's is never redeemed (trace ACCEPTED)", async () => {
+// Fixed. Before the fix a return with a state fx never made ended the
+// sign-in ("Couldn't sign in to web"), so anything that could reach the port
+// could cancel it. It fails that way on the code before.
+test("contract: a return whose state isn't the live sign-in's gets a 404 and the sign-in goes on; its own return still signs in (trace ACCEPTED)", async () => {
   const r = await signInScenario("signin-wrong-state", true);
-  expect(r.code).toBe(1);
-  expect(r.err).toContain("Couldn't sign in to web");
-  expect(r.tokens).toEqual([]);
+  expect(r.stray).toEqual({ status: 404, open: "open" });
+  expect(r.code).toBe(0);
+  expect(r.out).toContain("Signed in to web.");
+  // Only the sign-in's own code is redeemed.
+  expect(r.tokens.length).toBe(1);
+  expect(r.after.result).toBe("closed");
   expect(r.verdict.verdict).toBe("ACCEPTED");
 }, 120_000);
 
-// Fixed by stopping the sign-in and saying so. Before the fix this case was
-// a finding: the shell kept saying "Signing in" and the trace broke
+// Fixed. A return whose iss names another authorization server is
+// never redeemed; before the fix fx called it "the sign-in page returned an
+// error". It fails that way on the code before.
+test("contract: a return naming another issuer redeems nothing, and fx says the answer wasn't for this sign-in", async () => {
+  const f = fixture(artifacts, "signin-wrong-iss");
+  const fake = await startFake(f, { iss: "wrong" });
+  writeProfile(f, { web: { type: "http", url: fake.url } });
+  try {
+    const login = await cliLogin(f);
+    const url = await waitFor("the authorization URL", () => /\n\s+(http\S+)\n/.exec(login.out())?.[1], 30_000);
+    const redirect = await fetch(url, { redirect: "manual" });
+    const location = new URL(redirect.headers.get("location")!);
+    expect(location.searchParams.get("iss")).toBe("https://evil.example.com");
+    const back = await fetch(location.toString());
+    save(join(f.base, "callback.json"), { location: location.toString(), status: back.status, body: (await back.text()).slice(0, 400) });
+    const code = await login.done();
+    save(join(f.base, "login-output.json"), { code, stdout: login.out(), stderr: login.err() });
+    save(join(f.base, "http-fake-entries.json"), fake.entries());
+    expect(code).toBe(1);
+    expect(login.err()).toContain("Couldn't sign in to web");
+    expect(login.err()).toContain("the answer that came back wasn't for this sign-in");
+    expect(login.err()).not.toContain("the sign-in page returned an error");
+    expect(redemptions(fake.entries())).toEqual([]);
+  } finally { fake.stop(); }
+}, 120_000);
+
+// A pasted address goes to the sign-in without
+// the listener's state check. One with a state fx never made is never
+// redeemed; before the fix fx called it "the sign-in page returned an error".
+test("contract: a pasted return with a state fx never made redeems nothing, and fx says the answer wasn't for this sign-in", async () => {
+  const f = fixture(artifacts, "signin-pasted-wrong-state");
+  const fake = await startFake(f);
+  writeProfile(f, { web: { type: "http", url: fake.url } });
+  try {
+    const login = await cliLogin(f);
+    const url = await waitFor("the authorization URL", () => /\n\s+(http\S+)\n/.exec(login.out())?.[1], 30_000);
+    const redirect = await fetch(url, { redirect: "manual" });
+    const wrong = new URL(redirect.headers.get("location")!);
+    wrong.searchParams.set("state", "not-the-state-fx-made");
+    login.child.stdin.write(`${wrong.toString()}\n`);
+    login.child.stdin.flush();
+    const code = await login.done();
+    save(join(f.base, "login-output.json"), { pasted: wrong.toString(), code, stdout: login.out(), stderr: login.err() });
+    save(join(f.base, "http-fake-entries.json"), fake.entries());
+    expect(code).toBe(1);
+    expect(login.err()).toContain("Couldn't sign in to web");
+    expect(login.err()).toContain("the answer that came back wasn't for this sign-in");
+    expect(login.err()).not.toContain("the sign-in page returned an error");
+    expect(redemptions(fake.entries())).toEqual([]);
+  } finally { fake.stop(); }
+}, 120_000);
+
+// Fixed by stopping the sign-in and saying so. Before the fix this
+// case was a finding: the shell kept saying "Signing in" and the trace broke
 // IndicatorImpliesListener. It fails that way on the code before.
-test.skipIf(!NEXT_MCP)("contract: a reload during a sign-in closes its listener, and the shell stops saying \"Signing in\" and says why (trace ACCEPTED)", async () => {
+test("contract: a reload during a sign-in closes its listener, and the shell stops saying \"Signing in\" and says why (trace ACCEPTED)", async () => {
   const f = fixture(artifacts, "signin-reload");
   const fake = await startFake(f);
   writeProfile(f, { web: { type: "http", url: fake.url } });

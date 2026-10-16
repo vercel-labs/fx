@@ -42,13 +42,13 @@
     "property": "EveryStopEnds"
   },
   {
-    "description": "a new host starts a server while a leased old host still runs it",
+    "description": "A new host starts a server while a leased old host still runs it",
     "old": "    /\\ \\A p \\in Live : p[1] = h\n",
     "new": "    /\\ stopping = {}\n",
     "invariant": "OneProcessPerServer"
   },
   {
-    "description": "a new host starts a server while the old host's copy is still stopping",
+    "description": "A new host starts a server while the old host's copy is still stopping",
     "old": "    /\\ \\A p \\in Live : p[1] = h\n",
     "new": "    /\\ \\A p \\in procs : p[1] = h\n",
     "invariant": "OneProcessPerServer"

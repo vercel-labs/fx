@@ -7,7 +7,7 @@
 \*                      "unreadable" (it rewrote the document as a newer
 \*                      version), "repair" (it wrote version 1 back) or
 \*                      "delete" (it removed the document)
-\*   observe {kind, entries, imported, marked, v1}  the files after it
+\*   observe {kind, entries, v1}  the files after it
 \* Between a run record and the next observation, the store operations that
 \* command may make are hidden steps; an observation ends the command.
 EXTENDS Credentials, TraceObs, Sequences
@@ -15,7 +15,7 @@ EXTENDS Credentials, TraceObs, Sequences
 VARIABLES i, bad, cmd, srv
 
 Viol ==
-    (IF NoLogoutUndoneByImport THEN {} ELSE {"NoLogoutUndoneByImport"}) \cup
+    (IF NoV1LoginTaken THEN {} ELSE {"NoV1LoginTaken"}) \cup
     (IF UnreadableNeverOverwritten THEN {} ELSE {"UnreadableNeverOverwritten"}) \cup
     (IF SignedInKept THEN {} ELSE {"SignedInKept"}) \cup
     (IF LogoutStays THEN {} ELSE {"LogoutStays"})
@@ -23,8 +23,6 @@ Viol ==
 Observed(d) ==
     /\ kind = d.kind
     /\ entries = d.entries
-    /\ (kind = "ok" => imported = d.imported)
-    /\ marked = d.marked
     /\ v1 = d.v1
 
 Step(rec) ==

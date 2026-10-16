@@ -1,7 +1,3 @@
-//! Written for the next MCP-v2 version: it does not build against this
-//! checkout's src/mcp/ until that version lands, so the driver runs its
-//! scenarios only with --next.
-//!
 //! U12 lab: runs a script of host actions against `mcp.engine`, playing the
 //! host: its permission answers, its stderr sink, and what it does with each
 //! event. One run traces every server's machines into one file, the engine
@@ -10,6 +6,7 @@
 //!
 //! Usage: engine_lab <trace-path> <script> [--deny TOOL]... [--capabilities JSON]
 //!          [--max-attempts N] [--no-listen] [--preferred V1,V2] [--probe-ms N]
+//!          [--timeout-ms IDLE] [--hard-ms N]
 //!          [--define NAME=VALUE]... (each {NAME} in the script becomes VALUE)
 //!
 //! Script, one action per line (blank lines and lines starting with # are skipped):
@@ -320,6 +317,8 @@ pub fn main(init: std.process.Init) !void {
             options.era.probe_timeout_ms = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--timeout-ms")) {
             options.timeouts.idle_ms = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, flag, "--hard-ms")) {
+            options.timeouts.hard_ms = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--preferred")) {
             var list: std.ArrayList([]const u8) = .empty;
             var it = std.mem.splitScalar(u8, value, ',');

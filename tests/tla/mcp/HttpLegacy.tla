@@ -1,6 +1,4 @@
 ---- MODULE HttpLegacy ----
-\* Updated for the next MCP-v2 version: it can describe behavior that src/mcp/
-\* does not have yet, so its traces from the current src/mcp/ may not match.
 \* U07 Streamable HTTP with 2025 sessions, client side, one endpoint.
 \* Rules: LHTTP-01..LHTTP-08 (rules.md).
 \*

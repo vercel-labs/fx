@@ -42,6 +42,8 @@ interface Line {
   final?: { ok: boolean; logged: { name: string; lines: number }[] };
 }
 type Log = { dir: string; line: string }[];
+/** One line of the trace every machine writes. */
+type Step = { machine: string; inst: string; event: string; from: string; to: string; data?: { id?: number; progress?: number; outcome?: string } };
 type Machine = "engine" | "stdio" | "request" | "era" | "catalog" | "subscription" | "elicitation" | { mrtr: string };
 
 interface EngineCase {
@@ -61,16 +63,19 @@ interface EngineCase {
   machines: { [name: string]: Machine[] };
   /** A planted control: the attempts the engine trace's model is given, and the verdict expected. */
   control?: { server: string; maxAttempts: number };
-  check?: (lines: Line[], logs: { [name: string]: Log }) => string | null;
+  check?: (lines: Line[], logs: { [name: string]: Log }, trace: Step[]) => string | null;
   timeoutMs?: number;
 }
 
 const BASE: Machine[] = ["engine", "stdio", "request", "era"];
+/** One 64 KiB notification line, for `yes` to repeat (u12-flood). */
+const FLOOD_LINE = JSON.stringify({ jsonrpc: "2.0", method: "notifications/message", params: { level: "info", data: "x".repeat(65536) } });
 /** server/discover's answer for a stdio server written in shell. */
 const STUCK_DISCOVER = JSON.stringify({ jsonrpc: "2.0", id: 1, result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } });
 
 function engineScenario(c: EngineCase): Scenario {
   let caseDir = "";
+  let tracePath = "";
   const attempts = c.maxAttempts ?? 8;
   const traces: TraceExpectation[] = [];
   for (const [server, machines] of Object.entries(c.machines)) {
@@ -95,6 +100,7 @@ function engineScenario(c: EngineCase): Scenario {
     needs: ["engine_lab"],
     setup: (ctx: ScenarioContext) => {
       caseDir = ctx.caseDir;
+      tracePath = ctx.tracePath;
       const declared = Object.entries(c.servers).map(([name, s]) => {
         const rules = join(ctx.caseDir, `${name}.rules.json`);
         writeFileSync(rules, JSON.stringify(s.rules));
@@ -130,7 +136,9 @@ function engineScenario(c: EngineCase): Scenario {
           const path = join(caseDir, `${name}.jsonl`);
           logs[name] = existsSync(path) ? readFileSync(path, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)) : [];
         }
-        return c.check ? c.check(lines, logs) : null;
+        if (!c.check) return null;
+        const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as Step) : [];
+        return c.check(lines, logs, trace);
       },
     },
     timeoutMs: c.timeoutMs ?? 60_000,
@@ -255,6 +263,16 @@ export const scenarios: Scenario[] = [
     check: (lines) => same(lines.at(-1)!.final!.logged, [{ name: "a", lines: 5000 }], "stderr lines logged"),
   }),
   engineScenario({
+    name: "u12-flood",
+    description: "A server that floods 64 KiB notifications faster than they are read, and never answers, can't hold the engine: another server's call answers meanwhile, and the flooding server's probe and initialize still time out, so it fails. Its stdio trace, a step per line, is left unchecked",
+    servers: { a: { rules: [], argv: ["/usr/bin/yes", FLOOD_LINE] }, b: { rules: modern() } },
+    maxAttempts: 1,
+    labFlags: ["--timeout-ms", "1000"],
+    // Before the fix the engine read a's flood without end, so even drain hung.
+    script: ["call b echo", "expect b.called.1.result 10000", "tools a", "drain 500", "call b echo", "expect b.called.2.result 700", "expect a.phase.failed 15000"],
+    machines: { a: ["engine", "era"], b: [...BASE, "subscription"] },
+  }),
+  engineScenario({
     name: "u12-cancel-waiting",
     description: "A call cancelled while its server is still starting ends cancelled and never reaches the server",
     servers: { a: { rules: modern(), flags: ["--start-delay", "1500"] } },
@@ -285,7 +303,7 @@ export const scenarios: Scenario[] = [
   }),
   engineScenario({
     name: "u12-ping-during-initialize",
-    description: "A 2025 stdio server that pings before it answers initialize gets its pong: the connection takes a response before detection ends (STDIO-09, CORE-11)",
+    description: "A 2025 stdio server that pings before it answers initialize gets its pong: the connection takes a response before detection ends (STDIO-09)",
     servers: { b: { rules: [{ ...initialize, before: [{ jsonrpc: "2.0", id: "p1", method: "ping" }] }, list25("add"), ok25("fine")] } },
     script: ["tools b", "expect b.tools.ok", "drain 300"],
     machines: { b: BASE },
@@ -301,7 +319,7 @@ export const scenarios: Scenario[] = [
   }),
   engineScenario({
     name: "u12-elicit-withdrawn",
-    description: "A 2025 server withdraws its elicitation and asks another, which takes the same slot: the host's answer to the first is refused and reaches no one, and its answer to the second reaches the second",
+    description: "A 2025 server withdraws its elicitation and asks another, which takes the same slot: the host's answer to the first is refused and reaches no one, and its answer to the second reaches the second (fx P0 bug 8)",
     servers: {
       b: {
         rules: legacy({
@@ -429,6 +447,40 @@ export const scenarios: Scenario[] = [
         same(event(lines, "b.called.2")?.answer, '[{"type":"text","text":"fine"}]', "b's answer"),
         same(event(lines, "a.called.1")?.timed_out, true, "the stuck call timed out"),
       ),
+  }),
+  engineScenario({
+    name: "u12-progress-one-idle-timer",
+    description: "Progress re-arms a call's idle timer in place: no stale timer is left to fire, another call's idle timer is its own, and the hard limit still ends the call",
+    servers: {
+      a: {
+        rules: modern(
+          { method: "tools/call", tool: "hang", noReply: true },
+          {
+            method: "tools/call",
+            tool: "slow",
+            before: Array.from({ length: 30 }, (_, n) => ({ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: "$id", progress: n + 1 } })),
+            beforeEveryMs: 100,
+            result: { resultType: "complete", content: [{ type: "text", text: "late" }] },
+          },
+        ),
+      },
+    },
+    labFlags: ["--no-listen", "--timeout-ms", "300", "--hard-ms", "1500"],
+    script: ["call a hang", "call a slow", "expect a.called.1.cancelled 1000", "expect a.called.2.cancelled 4000"],
+    machines: { a: BASE },
+    check: (lines, _logs, trace) => {
+      const calls = trace.filter((t) => t.machine === "request" && t.inst === "a.remote");
+      const slow = calls.find((t) => t.event === "send" && t.to === "inflight" && calls.some((u) => u.event === "progress_received" && u.data?.id === t.data?.id))?.data?.id;
+      const ended = calls.find((t) => t.data?.id === slow && t.to === "done");
+      return first(
+        same(event(lines, "a.called.1")?.timed_out, true, "the silent call timed out"),
+        same(event(lines, "a.called.2")?.timed_out, true, "the call with progress timed out"),
+        expectThat(slow !== undefined, "no call got progress"),
+        same(ended?.event, "timer_fired", "what ended the call with progress"),
+        expectThat((ended?.data?.progress ?? 0) >= 10, `the call with progress ended after ${ended?.data?.progress} progress, before the hard limit`),
+        same(calls.filter((t) => t.data?.id === slow && t.event === "timer_fired" && t.to === "inflight").length, 0, "stale idle timers that fired"),
+      );
+    },
   }),
   engineScenario({
     name: "u12-retry-recovers",

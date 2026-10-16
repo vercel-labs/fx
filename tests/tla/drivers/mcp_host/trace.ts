@@ -48,7 +48,7 @@ export function traceObs(records: TraceRecord[], constants: Record<string, Value
 
 const substitutions: Record<string, string[]> = {
   HostLifecycle: ["Servers", "Project", "Reachable", "NeedsAuth", "MaxHosts", "MaxLeases"],
-  Credentials: ["Names", "Faults", "InitKinds", "InitEntries", "InitImported", "InitMarked", "InitV1"],
+  Credentials: ["Names", "Faults", "InitKinds", "InitEntries", "InitV1"],
   SignIn: ["MaxLogins", "MaxHosts", "MaxLeases", "Bridge"],
   ElicitationRouting: ["Versions", "MaxQ", "Slots", "Guard"],
 };

@@ -32,17 +32,17 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
 const controls: { name: string; module: string; constants: Record<string, never> | Record<string, unknown>; good: TraceRecord[]; bad: TraceRecord[]; badAt: number }[] = [
   {
     name: "credentials", module: "Credentials",
-    constants: { ObsNames: ["web"], ObsFaults: ["unreadable"], ObsInitKinds: ["absent"], ObsInitEntries: [], ObsInitImported: [false], ObsInitMarked: [false], ObsInitV1: ["web"] },
+    constants: { ObsNames: ["web"], ObsFaults: ["unreadable"], ObsInitKinds: ["absent"], ObsInitEntries: [], ObsInitV1: ["web"] },
     good: [
-      { event: "observe", data: { kind: "absent", entries: [], imported: false, marked: false, v1: ["web"] } },
+      { event: "observe", data: { kind: "absent", entries: [], v1: ["web"] } },
       { event: "run", data: { cmd: "get", server: "" } },
-      { event: "observe", data: { kind: "ok", entries: ["web"], imported: true, marked: true, v1: ["web"] } },
+      { event: "observe", data: { kind: "absent", entries: [], v1: ["web"] } },
     ],
-    // A read that took over v1's login but didn't save the flag.
+    // A read that took over v1's login.
     bad: [
-      { event: "observe", data: { kind: "absent", entries: [], imported: false, marked: false, v1: ["web"] } },
+      { event: "observe", data: { kind: "absent", entries: [], v1: ["web"] } },
       { event: "run", data: { cmd: "get", server: "" } },
-      { event: "observe", data: { kind: "ok", entries: ["web"], imported: false, marked: true, v1: ["web"] } },
+      { event: "observe", data: { kind: "ok", entries: ["web"], v1: ["web"] } },
     ],
     badAt: 2,
   },

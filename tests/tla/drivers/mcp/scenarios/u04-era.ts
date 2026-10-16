@@ -95,6 +95,15 @@ export const scenarios: Scenario[] = [
       expectFinal(final, { era: "legacy" }) ?? sameList(methods(log), ["server/discover", "initialize", "notifications/initialized"], "received methods"),
   }),
   eraScenario({
+    name: "u04-invalid-resulttype",
+    description: "A discover result whose resultType is unknown is invalid, so it isn't a modern answer: a server that also speaks 2025 is used at 2025 (WIRE-07)",
+    rules: [{ ...discoverResult([MODERN]), result: { ...discoverResult([MODERN]).result, resultType: "bogus" } }, initializeResult(), toolsFor(null)],
+    script: ["start", "detect", "expect era-legacy", "request tools/list", "outcome 3 result", ...STOP],
+    check: (_, final, log) =>
+      expectFinal(final, { era: "legacy", era_version: LEGACY }) ??
+      sameList(methods(log), ["server/discover", "initialize", "notifications/initialized", "tools/list"], "received methods"),
+  }),
+  eraScenario({
     name: "u04-legacy-error-without-id",
     description: "An error without an id during the probe means a legacy server",
     rules: [{ method: "server/discover", raw: '{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid Request"}}' }, initializeResult()],

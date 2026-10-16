@@ -1,6 +1,4 @@
 ---- MODULE HttpModern ----
-\* Updated for the next MCP-v2 version: it can describe behavior that src/mcp/
-\* does not have yet, so its traces from the current src/mcp/ may not match.
 \* U06 Streamable HTTP (2026), client side: one logical request and its
 \* attempts. Rules: HTTP-01, HTTP-08, HTTP-09, HTTP-10, HTTP-13, CAT-09.
 \*
@@ -91,6 +89,8 @@ Answer(a) ==
     /\ UNCHANGED <<kind, attempts, currentId, nextId, maybeRan, usedIds, reused, cancelNote>>
 
 \* An HTTP status with no JSON-RPC body, for example 401, 403, or 502.
+\* An attempt the auth gate gave up on ends so too, as the server's 401: the
+\* server never read it, so a call never counts as maybe run.
 HttpFailure ==
     /\ phase = "posted"
     /\ phase' = "failed"

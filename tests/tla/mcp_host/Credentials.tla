@@ -1,29 +1,24 @@
 ---- MODULE Credentials ----
 \* fx's MCP-v2 credential store (src/core/mcp_host/credentials.zig), file
 \* backend (FX_DISABLE_KEYCHAIN=1; the Keychain backend reads and writes the
-\* same document through native_keychain, and keeps its note as a file too).
+\* same document through native_keychain).
 \*
 \* One document, `~/.fx/mcp-credentials/credentials-v2.json`:
-\*   {"version":1, "imported_v1":bool, "servers":[{name,url,credential}]}
-\* and one note beside it, `v1-imported`, saying v1's logins were taken over.
+\*   {"version":1, "servers":[{name,url,credential}]}
 \* Every operation holds the directory's advisory lock (Store.lock), so each
-\* is atomic here. Each one reads the document first (Store.read):
-\*   - readSaved: a missing file is empty. One that doesn't parse, or whose
-\*     version isn't 1, is unreadable, and nothing writes over it:
-\*     get finds no login, and put and remove fail;
-\*   - read: unless the document's flag or the note says v1's logins were
-\*     taken over, they are (importV1: each v1 login whose name and URL the
-\*     document lacks), and the document and the note are written at once,
-\*     even by `get`. A document with the flag but no note, saved before the
-\*     note existed, gets the note.
+\* is atomic here, and reads the document first (Store.read): a missing file
+\* is empty; one that doesn't parse, or whose version isn't 1, is unreadable,
+\* and nothing writes over it: get finds no login, and put and remove
+\* fail. A read writes nothing. v1's logins (mcp_auth_store.zig) are never
+\* taken over: v1 and MCP-v2 refreshing one login apart, neither seeing
+\* the other's saves, would sign it out.
 \* Operations: get (config.resolve -> Runtime.savedCredential, for every
 \* HTTP server, whenever a host starts: `fx mcp list`, `fx ask`, the shell),
 \* put (a `credential` event after a sign-in or refresh), remove (logout:
 \* runtime.zig `.logout`; verbs.zig remove and logout).
 \*
-\* Entries are names: each scenario gives each server one URL. Deleting the
-\* note as well (the whole directory) is outside the model: with the
-\* Keychain, v1's logins would then be taken over again.
+\* Entries are names: each scenario gives each server one URL. An older fx's
+\* `imported_v1` flag and `v1-imported` note are ignored.
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS
@@ -31,8 +26,6 @@ CONSTANTS
     Faults,        \* environment faults allowed: SUBSET {"unreadable", "repair", "delete", "v1login"}
     InitKinds,     \* SUBSET {"absent", "ok", "unreadable"}
     InitEntries,   \* entries an initial document may hold
-    InitImported,  \* SUBSET BOOLEAN: its flag, when there is a document
-    InitMarked,    \* SUBSET BOOLEAN: whether the note is there at the start
     InitV1         \* v1's logins at the start may be any subset of these
 
 Kinds == {"absent", "ok", "unreadable"}
@@ -40,86 +33,63 @@ Kinds == {"absent", "ok", "unreadable"}
 VARIABLES
     kind,        \* the document: missing, readable, or unreadable
     entries,     \* what it holds (an unreadable one still holds it, for a reader that can read it)
-    imported,    \* its imported_v1 flag
-    marked,      \* the note beside it
     v1,          \* v1's logins (mcp_auth_store.zig), never changed by MCP-v2
     loggedOut,   \* ghost: names signed out of and not signed in to since
     kept,        \* ghost: names signed in to and not signed out of since
-    undone,      \* ghost: an import brought back a login signed out of
+    taken,       \* ghost: a write added a v1 login no sign-in here made
     overwritten  \* ghost: an unreadable document was written over
 
-vars == <<kind, entries, imported, marked, v1, loggedOut, kept, undone, overwritten>>
+vars == <<kind, entries, v1, loggedOut, kept, taken, overwritten>>
 
 TypeOK ==
     /\ kind \in Kinds
     /\ entries \subseteq Names
-    /\ imported \in BOOLEAN /\ marked \in BOOLEAN
     /\ v1 \subseteq Names
     /\ loggedOut \subseteq Names
     /\ kept \subseteq Names
-    /\ undone \in BOOLEAN /\ overwritten \in BOOLEAN
+    /\ taken \in BOOLEAN /\ overwritten \in BOOLEAN
 
 Init ==
     /\ kind \in InitKinds
     /\ entries \in (IF kind = "absent" THEN {{}} ELSE SUBSET InitEntries)
-    /\ imported \in (IF kind = "absent" THEN {FALSE} ELSE InitImported)
-    /\ marked \in InitMarked
     /\ v1 \in SUBSET InitV1
     /\ loggedOut = {}
     /\ kept = entries
-    /\ undone = FALSE /\ overwritten = FALSE
+    /\ taken = FALSE /\ overwritten = FALSE
 
-\* readSaved: what this fx reads.
+\* Store.read: what this fx reads.
 Unread == kind = "unreadable"
 SavedEntries == IF kind = "ok" THEN entries ELSE {}
-\* read: whether v1's logins were taken over already, and what it takes now.
-Copied == (kind = "ok" /\ imported) \/ marked
-Imports == IF Copied THEN {} ELSE v1 \ SavedEntries
-AfterRead == SavedEntries \cup Imports
 
-\* Store.write of `e`, then the note; `fresh` is a name signed in to by this operation.
+\* Store.write of `e`; `fresh` is a name signed in to by this operation.
 Write(e, fresh) ==
     /\ kind' = "ok"
     /\ entries' = e
-    /\ imported' = TRUE
-    /\ marked' = TRUE
-    /\ undone' = (undone \/ ((Imports \cap loggedOut \cap e) \ {fresh}) # {})
+    /\ taken' = (taken \/ ((e \ (SavedEntries \cup {fresh})) \cap v1) # {})
     /\ overwritten' = (overwritten \/ Unread)
 
-Same == UNCHANGED <<kind, entries, imported, marked, undone, overwritten>>
-
-\* Only the note is written.
-Mark ==
-    /\ marked' = TRUE
-    /\ UNCHANGED <<kind, entries, imported, undone, overwritten>>
-
-\* What Store.read itself writes: the import, or a missing note.
-ReadEffect ==
-    IF Unread THEN Same
-    ELSE IF ~Copied THEN Write(AfterRead, "")
-    ELSE IF ~marked THEN Mark
-    ELSE Same
+Same == UNCHANGED <<kind, entries, taken, overwritten>>
 
 \* Store.get, from config.resolve when a host starts. An unreadable document
 \* gives no login and stays as it is.
 Get ==
-    /\ ReadEffect
+    /\ Same
     /\ UNCHANGED <<v1, loggedOut, kept>>
 
 \* Store.put after a sign-in (or a refresh) of `n`. It fails on an
 \* unreadable document, so the sign-in isn't saved.
 Put(n) ==
     /\ ~Unread
-    /\ Write(AfterRead \cup {n}, n)
+    /\ Write(SavedEntries \cup {n}, n)
     /\ loggedOut' = loggedOut \ {n}
     /\ kept' = kept \cup {n}
     /\ UNCHANGED v1
 
-\* Store.remove on logout of `n`: written when it had `n`, else only what
-\* the read writes. It fails on an unreadable document, so `n` stays.
+\* Store.remove on logout of `n`: written when it had `n`. It fails on an
+\* unreadable document, so `n` stays.
 Remove(n) ==
     /\ ~Unread
-    /\ IF n \in AfterRead THEN Write(AfterRead \ {n}, "") ELSE ReadEffect
+    /\ IF n \in SavedEntries THEN Write(SavedEntries \ {n}, "") ELSE Same
     /\ loggedOut' = loggedOut \cup {n}
     /\ kept' = kept \ {n}
     /\ UNCHANGED v1
@@ -129,28 +99,27 @@ Remove(n) ==
 Unreadable ==
     /\ "unreadable" \in Faults /\ kind = "ok"
     /\ kind' = "unreadable"
-    /\ UNCHANGED <<entries, imported, marked, v1, loggedOut, kept, undone, overwritten>>
+    /\ UNCHANGED <<entries, v1, loggedOut, kept, taken, overwritten>>
 
 \* Environment: it is readable again (fixed by hand, or saved as version 1
 \* again), holding what it held.
 Repair ==
     /\ "repair" \in Faults /\ kind = "unreadable"
     /\ kind' = "ok"
-    /\ UNCHANGED <<entries, imported, marked, v1, loggedOut, kept, undone, overwritten>>
+    /\ UNCHANGED <<entries, v1, loggedOut, kept, taken, overwritten>>
 
-\* Environment: the user deletes the document, and with it what it kept;
-\* the note stays.
+\* Environment: the user deletes the document, and with it what it kept.
 Delete ==
     /\ "delete" \in Faults /\ kind # "absent"
-    /\ kind' = "absent" /\ entries' = {} /\ imported' = FALSE
+    /\ kind' = "absent" /\ entries' = {}
     /\ kept' = {}
-    /\ UNCHANGED <<marked, v1, loggedOut, undone, overwritten>>
+    /\ UNCHANGED <<v1, loggedOut, taken, overwritten>>
 
 \* Environment: a sign-in with the v1 engine (FX_MCP_ENGINE unset).
 V1Login(n) ==
     /\ "v1login" \in Faults /\ n \notin v1
     /\ v1' = v1 \cup {n}
-    /\ UNCHANGED <<kind, entries, imported, marked, loggedOut, kept, undone, overwritten>>
+    /\ UNCHANGED <<kind, entries, loggedOut, kept, taken, overwritten>>
 
 Next ==
     \/ Get
@@ -163,8 +132,8 @@ Spec == Init /\ [][Next]_vars
 
 \* ---- Safety ----
 
-\* The import is once: after it, a read never adds v1's logins again.
-ImportOnce == Copied => Imports = {}
+\* MCP-v2 never takes a v1 login; each server signs in on its own.
+NoV1LoginTaken == ~taken
 
 \* What was signed in to, and not signed out of since, is kept.
 SignedInKept == kind = "ok" => kept \subseteq entries
@@ -172,9 +141,6 @@ SignedInKept == kind = "ok" => kept \subseteq entries
 \* A login signed out of stays out of a readable document until the next
 \* sign-in.
 LogoutStays == kind = "ok" => loggedOut \cap entries = {}
-
-\* A logout is never undone by an import, even after the document is deleted.
-NoLogoutUndoneByImport == ~undone
 
 \* An unreadable document is never written over.
 UnreadableNeverOverwritten == ~overwritten

@@ -103,8 +103,6 @@ export async function probe(port: number, path = "/favicon.ico"): Promise<{ resu
 export const credDir = (f: Fixture) => join(f.home, ".fx", "mcp-credentials");
 export const v2Path = (f: Fixture) => join(credDir(f), "credentials-v2.json");
 export const v1Path = (f: Fixture) => join(credDir(f), "credentials.json");
-/** The note that v1's logins were taken over. */
-export const notePath = (f: Fixture) => join(credDir(f), "v1-imported");
 
 /** A v1 login as v1's store keeps it (mcp_auth_store.zig, its own test's shape). */
 export function v1Entry(name: string, url: string) {
@@ -121,20 +119,19 @@ export function writeV1(f: Fixture, entries: object[]) {
   writeFileSync(v1Path(f), JSON.stringify({ version: 1, credentials: entries }), { mode: 0o600 });
 }
 
-/** The documents as the model sees them: the v2 one's kind, entries, and flag; v1's logins. */
+/** The documents as the model sees them: the v2 one's kind and entries; v1's logins. */
 export function observeStores(f: Fixture) {
-  let kind = "absent", entries: string[] = [], imported = false;
+  let kind = "absent", entries: string[] = [];
   if (existsSync(v2Path(f))) {
     const text = readFileSync(v2Path(f), "utf8");
     try {
       const doc = JSON.parse(text);
       entries = (doc.servers ?? []).map((s: { name: string }) => s.name).sort();
-      imported = doc.imported_v1 === true;
       kind = doc.version === 1 && Array.isArray(doc.servers) ? "ok" : "unreadable";
     } catch { kind = "unreadable"; }
   }
   const v1 = existsSync(v1Path(f)) ? (JSON.parse(readFileSync(v1Path(f), "utf8")).credentials ?? []).map((c: { server_identity: string }) => c.server_identity).sort() : [];
-  return { kind, entries, imported, marked: existsSync(notePath(f)), v1 };
+  return { kind, entries, v1 };
 }
 
 export function save(path: string, value: unknown) {

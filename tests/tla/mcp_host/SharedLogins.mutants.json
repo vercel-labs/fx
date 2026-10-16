@@ -1,26 +1,44 @@
 [
   {
-    "description": "a refused process removes the saved login whoever saved it",
+    "description": "A refused process removes the saved login whoever saved it",
     "old": "    /\\ store' = IF store = tried[p] THEN 0 ELSE store",
     "new": "    /\\ store' = 0",
     "invariant": "NoNewerLoginErased"
   },
   {
-    "description": "a process takes a saved login it had or tried before",
+    "description": "A process takes a saved login it had or tried before",
     "old": "    /\\ store # 0\n    /\\ store # tried[p]\n",
     "new": "    /\\ store # 0\n",
     "invariant": "NoLoginRetaken"
   },
   {
     "description": "A sign-in isn't remembered as had, so its own refusal would leave it saved",
-    "old": "    /\\ tried' = [tried EXCEPT ![p] = next]",
-    "new": "    /\\ tried' = tried",
+    "old": "    /\\ tried' = [tried EXCEPT ![p] = next]\n    /\\ needs' = [needs EXCEPT ![p] = FALSE]",
+    "new": "    /\\ tried' = tried\n    /\\ needs' = [needs EXCEPT ![p] = FALSE]",
     "invariant": "HeldIsTried"
   },
   {
     "description": "A login taken isn't remembered as tried",
-    "old": "    /\\ tried' = [tried EXCEPT ![p] = store]",
-    "new": "    /\\ tried' = tried",
+    "old": "    /\\ tried' = [tried EXCEPT ![p] = store]\n    /\\ needs' = [needs EXCEPT ![p] = FALSE]",
+    "new": "    /\\ tried' = tried\n    /\\ needs' = [needs EXCEPT ![p] = FALSE]",
     "invariant": "HeldIsTried"
+  },
+  {
+    "description": "A refresh sends the version it holds without looking at the store",
+    "old": "    /\\ IF Newer(p) THEN Take(p) ELSE Send(p)",
+    "new": "    /\\ Send(p)",
+    "invariant": "NoRetiredRefresh"
+  },
+  {
+    "description": "A refresh whose save failed still takes the new version as its own",
+    "old": "               /\\ UNCHANGED <<store, tried>>",
+    "new": "               /\\ tried' = [tried EXCEPT ![p] = next]\n               /\\ UNCHANGED store",
+    "invariant": "NoStaleLoginLeft"
+  },
+  {
+    "description": "A refresh compares the saved login with the one it holds, not the one it had or tried",
+    "old": "Newer(p) == store # 0 /\\ store # tried[p]",
+    "new": "Newer(p) == store # 0 /\\ store # held[p]",
+    "invariant": "NoLoginRetaken"
   }
 ]

@@ -47,12 +47,11 @@ zig build libfx-napi -Dnapi-surface=core
 npm ci --prefix sdk/durable
 ```
 
-## Models of code that has not landed
+## MCP in CI
 
-Some models describe the next MCP-v2 version, which `src/mcp/` and `src/core/mcp_host/` do not have yet. Their model checks pass, but the real code does not match them until that version lands:
+CI's `TLA+ MCP models and drivers` job runs each MCP-v2 model's smoke config (`mcp/run.py check`), `mcp_host/check.sh`, and both MCP drivers. The MCP-v2 models' planted bugs (`mcp/check.sh`) run only by hand: they measure the checks, not the code.
 
-- In `mcp/`, `Engine`, `EngineTrace`, `HttpModern`, `HttpModernTrace`, `HttpLegacy`, and `StdioConn` say so at the top. `drivers/mcp/labs/engine_lab.zig` does not build against `src/mcp/` yet, so `drivers/mcp/driver.ts` runs its scenarios only with `--next`.
-- In `drivers/mcp_host/`, the tests marked `NEXT_MCP` run only with `FX_TLA_NEXT_MCP=1`.
+## MCP models without a driver here
 
 The MCP-v2 models of the two HTTP transports, input-required rounds, authorization, subscriptions, and elicitation are model-checked only. Their traces came from a conformance adapter that is not part of fx. The `drivers/mcp_host/` sign-in tests drive real fx over HTTP against the fake server in `drivers/mcp/fakes/`.
 
@@ -72,6 +71,8 @@ tests/tla/indexer/check.sh                              # every config and its e
 tests/tla/acp/check.sh                                  # likewise for acp/, cli/, durable/, shell_command/, terminal/, usage/
 tests/tla/mcp/check.sh                                  # every MCP-v2 model and planted bug
 tests/tla/mcp_host/check.sh                             # every MCP host model, planted bug, and finding
+bun tests/tla/drivers/mcp/driver.ts                      # src/mcp/ along the MCP-v2 models
+bun test ./tests/tla/drivers/mcp_host/                  # fx's MCP host along its models; FX_BIN picks the binary
 tests/tla/sdk/check.sh                                  # the SDK specs; writes the state graphs the drivers walk
 bun tests/tla/drivers/drive.mjs send --walks 40         # one durable-session graph; see .github/workflows/ci.yml for the rest
 bun tests/tla/drivers/drive-agents.mjs --walks 60       # agent routing

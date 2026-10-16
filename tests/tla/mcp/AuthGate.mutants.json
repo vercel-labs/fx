@@ -37,8 +37,8 @@
   },
   {
     "description": "A sign-in replaces the refresh but leaves the requests waiting",
-    "old": "    /\\ inflight' = 0\n    /\\ req' = Release(\"sent\")\n    /\\ sends' = Released(\"sent\")\n    /\\ UNCHANGED <<usedRt, rejectedG>>",
-    "new": "    /\\ inflight' = 0\n    /\\ UNCHANGED <<req, sends, usedRt, rejectedG>>",
+    "old": "    /\\ inflight' = 0\n    /\\ req' = Release(\"sent\")\n    /\\ sends' = Released(\"sent\")\n    /\\ UNCHANGED <<deadRt, usedRt, rejectedG>>",
+    "new": "    /\\ inflight' = 0\n    /\\ UNCHANGED <<req, sends, deadRt, usedRt, rejectedG>>",
     "invariant": "WaitingHasRefresh"
   },
   {
@@ -46,5 +46,11 @@
     "old": "    /\\ WF_vars(Refreshed)\n",
     "new": "    /\\ TRUE\n",
     "property": "EveryRequestEnds"
+  },
+  {
+    "description": "A refusal that names an error is read as a passing failure, so the tokens are kept and the dead refresh token is sent again (Slack's HTTP-200 ok:false)",
+    "old": "    /\\ held' = FALSE\n    /\\ refreshable' = FALSE\n    /\\ inflight' = 0\n    /\\ req' = [k \\in Keys |-> IF req[k].phase = \"waiting\" THEN [req[k] EXCEPT !.phase = \"needs_sign_in\"] ELSE req[k]]\n    /\\ UNCHANGED <<gen, rt, valid, serverRt, usedRt, sends, rejectedG>>",
+    "new": "    /\\ inflight' = 0\n    /\\ req' = [k \\in Keys |-> IF req[k].phase = \"waiting\" THEN [req[k] EXCEPT !.phase = \"failed\"] ELSE req[k]]\n    /\\ UNCHANGED <<gen, held, refreshable, rt, valid, serverRt, usedRt, sends, rejectedG>>",
+    "invariant": "NoDeadRefresh"
   }
 ]

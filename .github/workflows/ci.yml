@@ -80,7 +80,7 @@ jobs:
   zig:
     name: Build & Test
     if: ${{ always() }}
-    needs: [zig_mode, sdk-node-wasm, sdk-node-napi, sdk-bun, sdk-browser-wasm]
+    needs: [zig_mode, sdk-node-wasm, sdk-node-napi, sdk-bun, sdk-browser-wasm, tla-mcp]
     runs-on: ubuntu-latest
     steps:
       - name: Require unit tests and every SDK job
@@ -88,7 +88,7 @@ jobs:
           RESULTS: ${{ toJSON(needs.*.result) }}
         run: |
           printf '%s\n' "$RESULTS"
-          jq -e 'length == 5 and all(.[]; . == "success")' <<<"$RESULTS"
+          jq -e 'length == 6 and all(.[]; . == "success")' <<<"$RESULTS"
 
   build:
     name: Build fx (ReleaseSafe)
@@ -506,6 +506,53 @@ jobs:
         env:
           CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
         run: npm run --prefix sdk test:browser-wasm
+
+  # The MCP engine and host models, and the drivers that run src/mcp/ and
+  # fx along them. Their planted bugs stay local (tests/tla/mcp/check.sh):
+  # they measure the checks, not the code.
+  tla-mcp:
+    name: TLA+ MCP models and drivers
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      AI_GATEWAY_API_KEY: ""
+      VERCEL_OIDC_TOKEN: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download fx
+        uses: actions/download-artifact@v4
+        with:
+          name: fx-linux-x86_64
+          path: zig-out/bin
+      - name: Restore executable mode
+        run: chmod +x zig-out/bin/fx
+      # The MCP driver builds its labs against src/mcp/.
+      - name: Setup Zig
+        uses: ./.github/actions/setup-zig
+        with:
+          version: "0.17.0"
+          cache-key: ci-tla-mcp
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - name: Install tmux
+        run: |
+          command -v tmux >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y tmux; }
+          printf 'set-option -g history-limit 100000\n' > "$HOME/.tmux.conf"
+          tmux -V
+      - name: Model-check the MCP engine and host, and drive the code along the models
+        run: |
+          set -euo pipefail
+          jar="$RUNNER_TEMP/tla2tools.jar"
+          curl -fsSL -o "$jar" https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
+          export TLA2TOOLS_JAR="$jar"
+          python3 tests/tla/mcp/run.py check
+          tests/tla/mcp_host/check.sh
+          bun tests/tla/drivers/mcp/driver.ts
+          bun test ./tests/tla/drivers/mcp_host/
 
   e2e_mode:
     name: E2E (deterministic, shard ${{ matrix.shard.label }})

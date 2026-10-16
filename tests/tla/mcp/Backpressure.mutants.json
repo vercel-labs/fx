@@ -1,0 +1,32 @@
+[
+  {
+    "description": "Waiters aren't served in order, so small messages can starve a large one",
+    "old": "First(r) == line # <<>> /\\ Head(line) = r",
+    "new": "First(r) == TRUE",
+    "property": "EveryMessagePosted"
+  },
+  {
+    "description": "A cancelled waiter keeps its place, and everyone behind it waits for ever",
+    "old": "    /\\ want' = [want EXCEPT ![r] = 0]\n    /\\ line' = Without(line, r)\n    /\\ UNCHANGED <<queue, used>>",
+    "new": "    /\\ want' = [want EXCEPT ![r] = 0]\n    /\\ line' = line\n    /\\ UNCHANGED <<queue, used>>",
+    "invariant": "LineIsWaiters"
+  },
+  {
+    "description": "A message is posted whatever the budget holds",
+    "old": "Fits(n) == used = 0 \\/ used + n <= Max",
+    "new": "Fits(n) == TRUE",
+    "invariant": "Bounded"
+  },
+  {
+    "description": "Taking a message doesn't give its bytes back",
+    "old": "    /\\ used' = used - Head(queue)\n",
+    "new": "    /\\ used' = used\n",
+    "invariant": "UsedIsQueued"
+  },
+  {
+    "description": "A message waits for room even when nothing is held, so a largest one waiting behind none never goes",
+    "old": "Fits(n) == used = 0 \\/ used + n <= Max",
+    "new": "Fits(n) == used + n < Max",
+    "property": "EveryMessagePosted"
+  }
+]

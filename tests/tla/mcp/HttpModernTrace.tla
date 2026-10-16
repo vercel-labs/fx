@@ -1,6 +1,4 @@
 ---- MODULE HttpModernTrace ----
-\* Updated for the next MCP-v2 version: it can describe behavior that src/mcp/
-\* does not have yet, so its traces from the current src/mcp/ may not match.
 \* Trace wrapper for HttpModern.tla (U06). tests/bun/bridge.ts generates TraceObs
 \* from the records of one logical request (one instance, such as "x3").
 \*

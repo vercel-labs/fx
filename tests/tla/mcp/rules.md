@@ -175,6 +175,7 @@ drivers in `../drivers/mcp/` cite.
 | AUTH-24 | MUST | Follow OAuth 2.1 §7 security considerations | `2026-07-28_basic_authorization_security-considerations` (intro) | U09 |
 | AUTH-25 | INFO | Public clients get rotated refresh tokens, so replace the stored one after each refresh | `2026-07-28_basic_authorization_security-considerations` §Token Theft | U09 |
 | AUTH-26 | MUST | Refuse an access token that isn't 1*VSCHAR (0x20..0x7E): a token response with one fails the sign-in and nothing is saved, and a saved credential with one is ignored, so no other byte reaches `Authorization` | RFC 6749 appendix A.12 | U09 |
+| AUTH-27 | MUST | A refresh answer that names an error, at 200 or a 4xx other than 429, refuses the refresh token for good: both tokens are dropped and the requests waiting need a sign-in, so the dead refresh token is never sent again. A 429, a 5xx, or no answer keeps them | RFC 6749 §5.2; Slack's `oauth.v2.user.access`, which refuses with HTTP 200 and `ok:false` | U09 |
 
 ## Elicitation (ELIC)
 

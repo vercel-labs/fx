@@ -47,7 +47,7 @@ Hosts == 1..MaxHosts
 States == {"absent", "waiting", "rejected", "idle", "starting", "ready", "needs_login", "failed"}
 Decisions == {"ok", "pending", "approved", "rejected", "removed"}
 Changes == {"approved", "rejected", "removed", "ok"}
-Lines == [k : {"none", "attn", "many", "count", "empty"}, who : Servers \cup {""}, why : {"", "waiting", "login", "failed"}, r : 0..10, e : 0..10]
+Lines == [k : {"none", "attn", "many"}, who : Servers \cup {""}, why : {"", "waiting", "login", "failed"}, r : 0..10, e : 0..10]
 NoLine == [k |-> "none", who |-> "", why |-> "", r |-> 0, e |-> 0]
 
 VARIABLES
@@ -79,10 +79,9 @@ Held(d) == {s \in Servers : Initial(d, s) \in {"absent", "waiting", "rejected"}}
 \* runtime.zig `.need`: a held server is skipped.
 Started(x) == IF x = "idle" THEN "starting" ELSE x
 
-\* menu.zig statusLine, without news, a sign-in, or config notes.
+\* menu.zig statusLine, without news, a sign-in, or config notes: it names
+\* the servers that need attention, and says nothing about MCP otherwise.
 Needy(h) == {s \in Servers : st[h][s] \in {"waiting", "needs_login", "failed"}}
-EnabledSet(h) == {s \in Servers : st[h][s] \notin {"absent", "rejected"}}
-ReadySet(h) == {s \in Servers : st[h][s] = "ready"}
 Why(x) == CASE x = "waiting" -> "waiting" [] x = "needs_login" -> "login" [] OTHER -> "failed"
 Line(h) ==
     IF Cardinality(Needy(h)) = 1
@@ -90,9 +89,7 @@ Line(h) ==
          IN [k |-> "attn", who |-> s, why |-> Why(st[h][s]), r |-> 0, e |-> 0]
     ELSE IF Cardinality(Needy(h)) > 1
     THEN [k |-> "many", who |-> "", why |-> "", r |-> Cardinality(Needy(h)), e |-> 0]
-    ELSE IF EnabledSet(h) # {}
-    THEN [k |-> "count", who |-> "", why |-> "", r |-> Cardinality(ReadySet(h)), e |-> Cardinality(EnabledSet(h))]
-    ELSE [k |-> "empty", who |-> "", why |-> "", r |-> 0, e |-> 0]
+    ELSE NoLine
 
 Of(h) == {p \in procs : p[1] = h}
 Live == procs \cup stopping

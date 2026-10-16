@@ -10,12 +10,6 @@ import { fixture, merge, save, serverEvents, stdioServer, waitFor, writeProfile,
 import { serverRecords, Shell } from "./shell";
 import { checkTrace } from "./trace";
 
-// Tests marked NEXT_MCP check the MCP host fixes from the next MCP-v2
-// version, which src/core/mcp_host/ does not have yet. They run only with
-// FX_TLA_NEXT_MCP=1.
-const NEXT_MCP = process.env.FX_TLA_NEXT_MCP === "1";
-
-
 function alive(pid: number) { try { process.kill(pid, 0); return true; } catch { return false; } }
 const started = (f: Fixture, name: string) => serverEvents(f).filter((e) => e.name === name && e.ev === "start");
 const listed = (f: Fixture, name: string) => serverEvents(f).filter((e) => e.name === name && e.ev === "listed");
@@ -72,7 +66,7 @@ test("approve reloads: the project server starts and the unchanged servers come 
     await shell.type("/mcp approve p", { event: "reload", data: { server: "p", change: "approved" } });
     await shell.tui.waitForText("Approved p", 10_000);
     await waitFor("p, a and b listed again", () => listed(shell.f, "p").length && listed(shell.f, "a").length === 2 && listed(shell.f, "b").length === 2, 20_000);
-    expect(await shell.status({ k: "count", r: 3, e: 3 })).toEqual({ k: "count", who: "", why: "", r: 3, e: 3 });
+    expect(await shell.status({ k: "none" })).toEqual({ k: "none", who: "", why: "", r: 0, e: 0 });
     await shell.quit();
     await Bun.sleep(500);
     const { verdict, events } = await finish(shell, { ObsServers: ["a", "b", "p"], ObsProject: ["p"], ObsReachable: ["a", "b", "p"], ObsNeedsAuth: [], ObsMaxHosts: 2, ObsMaxLeases: 1 });
@@ -91,11 +85,11 @@ test("reject and remove reload: the project server never starts and the removed 
     await shell.type("/mcp reject p", { event: "reload", data: { server: "p", change: "rejected" } });
     await shell.tui.waitForText("Rejected p", 10_000);
     await waitFor("a and b listed again", () => listed(shell.f, "a").length === 2 && listed(shell.f, "b").length === 2, 20_000);
-    expect(await shell.status({ k: "count", r: 2, e: 2 })).toEqual({ k: "count", who: "", why: "", r: 2, e: 2 });
+    expect(await shell.status({ k: "none" })).toEqual({ k: "none", who: "", why: "", r: 0, e: 0 });
     await shell.type("/mcp remove b", { event: "reload", data: { server: "b", change: "removed" } });
     await shell.tui.waitForText("Removed b", 10_000);
     await waitFor("a listed a third time", () => listed(shell.f, "a").length === 3, 20_000);
-    expect(await shell.status({ k: "count", r: 1, e: 1 })).toEqual({ k: "count", who: "", why: "", r: 1, e: 1 });
+    expect(await shell.status({ k: "none" })).toEqual({ k: "none", who: "", why: "", r: 0, e: 0 });
     await shell.quit();
     await Bun.sleep(500);
     const { verdict } = await finish(shell, { ObsServers: ["a", "b", "p"], ObsProject: ["p"], ObsReachable: ["a", "b", "p"], ObsNeedsAuth: [], ObsMaxHosts: 3, ObsMaxLeases: 1 });
@@ -105,35 +99,39 @@ test("reject and remove reload: the project server never starts and the removed 
   } finally { await shell.stop(); }
 }, 150_000);
 
-test.skipIf(!NEXT_MCP)("finding: a reload while `/mcp show` holds the old host runs two owners and two processes of one server (trace VIOLATES AtMostOneOwner, OneProcessPerServer)", async () => {
-  const shell = new Shell(setup("hl-two-owners", ["s"], ["p"], ["s"]));
+test("a reload while `/mcp show` holds the old host runs one process of a server at a time: the new host starts nothing until the old one's process stops (trace VIOLATES AtMostOneOwner only, by design)", async () => {
+  const shell = new Shell(setup("hl-one-process", ["s"], ["p"], ["s"]));
   try {
     await shell.start();
-    await waitFor("s started", () => started(shell.f, "s").length === 1, 20_000);
+    const [first] = await waitFor("s started", () => { const s = started(shell.f, "s"); return s.length === 1 ? s : null; }, 20_000);
     // `/mcp show s` waits for s, which takes 6 s to answer, holding the host it leased.
     await shell.type("/mcp show s", { event: "lease" });
     await Bun.sleep(500);
     await shell.type("/mcp approve p", { event: "reload", data: { server: "p", change: "approved" } });
     await shell.tui.waitForText("Approved p", 10_000);
-    const both = await waitFor("a second s while the first runs", () => {
-      const s = started(shell.f, "s");
-      return s.length === 2 && s.every((e) => alive(e.pid)) ? s : null;
-    }, 10_000);
-    save(join(shell.f.base, "two-processes.json"), { at: Date.now(), pids: both.map((e) => e.pid), alive: both.map((e) => alive(e.pid)) });
     // The show prints once the first s answers; its lease ends and the old host goes.
     await shell.tui.waitForText("status     ready", 20_000);
     const seen = Date.now();
-    const eof = await waitFor("the first s stopped", () => serverEvents(shell.f).find((e) => e.name === "s" && e.ev === "eof" && e.pid === both[0]!.pid), 10_000);
-    // The show prints once the first s answered, then its lease ends and the
-    // old host goes: `finish` puts the release right before that s's exit.
+    const eof = await waitFor("the first s stopped", () => serverEvents(shell.f).find((e) => e.name === "s" && e.ev === "eof" && e.pid === first!.pid), 10_000);
+    // `finish` puts the release right before that s's exit.
     shell.records.push({ event: "release", at: seen, note: `seen ${seen}, first s eof ${eof.t}; placed before pid ${eof.pid}'s exit`, data: { beforeExitOf: eof.pid } });
     await waitFor("p and the second s listed", () => listed(shell.f, "p").length && listed(shell.f, "s").length === 2, 20_000);
-    await shell.status({ k: "count", r: 2, e: 2 });
+    const runs = started(shell.f, "s");
+    const p = started(shell.f, "p");
+    save(join(shell.f.base, "one-process.json"), { firstEof: eof.t, s: runs.map((e) => ({ pid: e.pid, t: e.t })), p: p.map((e) => ({ pid: e.pid, t: e.t })) });
+    await shell.status({ k: "none" });
     await shell.quit();
     await Bun.sleep(500);
     const { verdict } = await finish(shell, { ObsServers: ["s", "p"], ObsProject: ["p"], ObsReachable: ["s", "p"], ObsNeedsAuth: [], ObsMaxHosts: 2, ObsMaxLeases: 1 });
-    expect(both.length).toBe(2);
+    // By the servers' own log: two runs of s, never at once, and the new
+    // host started both its servers only after the old s stopped.
+    expect(runs.length).toBe(2);
+    expect(runs[1]!.t).toBeGreaterThanOrEqual(eof.t);
+    expect(p.length).toBe(1);
+    expect(p[0]!.t).toBeGreaterThanOrEqual(eof.t);
+    // A lease keeps the old host's owner running to finish its calls, so two
+    // owners are alive at once by design; one process per server holds.
     expect(verdict.verdict).toBe("VIOLATES");
-    expect(verdict.broken).toEqual(expect.arrayContaining(["AtMostOneOwner", "OneProcessPerServer"]));
+    expect(verdict.broken).toEqual(["AtMostOneOwner"]);
   } finally { await shell.stop(); }
 }, 150_000);

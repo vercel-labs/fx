@@ -8,14 +8,8 @@ import { expect, test } from "bun:test";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { artifacts, binary } from "../lib/context";
-import { fixture, fxEnv, observeStores, runFx, save, v1Entry, v2Path, writeProfile, writeV1, type Fixture } from "./driver";
+import { fixture, fxEnv, observeStores, runFx, save, v1Entry, v1Path, v2Path, writeProfile, writeV1, type Fixture } from "./driver";
 import { checkTrace, type TraceRecord } from "./trace";
-
-// Tests marked NEXT_MCP check the MCP host fixes from the next MCP-v2
-// version, which src/core/mcp_host/ does not have yet. They run only with
-// FX_TLA_NEXT_MCP=1.
-const NEXT_MCP = process.env.FX_TLA_NEXT_MCP === "1";
-
 
 const URL = "http://127.0.0.1:9/mcp";
 const UNREADABLE = "fx can't read the saved MCP sign-ins in ~/.fx/mcp-credentials/credentials-v2.json. A newer fx saved them, or they're damaged; fix or delete them, then try again.\n";
@@ -43,17 +37,25 @@ class Session {
   fault(cmd: "unreadable" | "repair" | "delete") {
     this.records.push({ event: "run", data: { cmd, server: "" }, at: Date.now() });
   }
-  async check(initKinds: string[], initEntries: string[], initImported = [false, true]) {
+  async check(initKinds: string[], initEntries: string[]) {
     const verdict = await checkTrace({
       module: "Credentials", records: this.records, dir: join(this.f.base, "trace"),
       constants: {
         ObsNames: ["web"], ObsFaults: ["unreadable", "repair", "delete"], ObsInitKinds: initKinds, ObsInitEntries: initEntries,
-        ObsInitImported: initImported, ObsInitMarked: [false], ObsInitV1: ["web"],
+        ObsInitV1: ["web"],
       },
     });
     save(join(this.f.base, "verdict.json"), verdict);
     return verdict;
   }
+}
+
+const CREDENTIAL = JSON.stringify({ access: "kept-by-newer-fx", refresh: "r", expires_at_ms: null, token_endpoint: "http://127.0.0.1:9/token", revocation_endpoint: null, resource: URL, client_id: "c", client_secret: null, method: "none" });
+
+/** MCP-v2's store holding web's login, as `version` (1 is this fx's). */
+function writeV2(f: Fixture, version = 1) {
+  mkdirSync(join(f.home, ".fx", "mcp-credentials"), { recursive: true, mode: 0o700 });
+  writeFileSync(v2Path(f), JSON.stringify({ version, servers: [{ name: "web", url: URL, credential: CREDENTIAL }] }), { mode: 0o600 });
 }
 
 /** A newer fx's document: version 2, which this fx can't read. */
@@ -62,31 +64,27 @@ function rewriteAsVersion(f: Fixture, version: number) {
   writeFileSync(v2Path(f), JSON.stringify({ ...doc, version }), { mode: 0o600 });
 }
 
-test.skipIf(!NEXT_MCP)("control: v1's login is taken over once, and a logout stays (trace ACCEPTED)", async () => {
+test("control: v1's login is never taken over, and v1's store is left as it is (trace ACCEPTED)", async () => {
   const s = new Session(setup("cred-control"));
   writeV1(s.f, [v1Entry("web", URL)]);
-  expect(s.observe()).toEqual({ kind: "absent", entries: [], imported: false, marked: false, v1: ["web"] });
+  const v1Before = readFileSync(v1Path(s.f), "utf8");
+  expect(s.observe()).toEqual({ kind: "absent", entries: [], v1: ["web"] });
   const list = await s.run("get", ["mcp", "list", "--json"]);
   expect(list.ran.code).toBe(0);
-  expect(list.o).toEqual({ kind: "ok", entries: ["web"], imported: true, marked: true, v1: ["web"] });
-  const out = await s.run("logout", ["mcp", "logout", "web"], "web");
-  expect(out.ran.code).toBe(0);
-  expect(out.ran.stdout).toBe("Signed out of web.\n");
-  expect(out.o.entries).toEqual([]);
-  const again = await s.run("get", ["mcp", "list", "--json"]);
-  expect(again.o).toEqual({ kind: "ok", entries: [], imported: true, marked: true, v1: ["web"] });
+  expect(list.o).toEqual({ kind: "absent", entries: [], v1: ["web"] });
+  // Independent oracle: web isn't signed in, and v1's file is byte for byte as written.
+  expect(JSON.parse(list.ran.stdout).servers[0].status).not.toBe("signed_in");
+  expect(readFileSync(v1Path(s.f), "utf8")).toBe(v1Before);
   const verdict = await s.check(["absent"], []);
   expect(verdict.verdict).toBe("ACCEPTED");
 }, 120_000);
 
-test.skipIf(!NEXT_MCP)("a newer fx's store is never written over; sign-in and sign-out say why they can't, and the login is there once it's readable (trace ACCEPTED)", async () => {
+test("A newer fx's store is never written over; sign-in and sign-out say why they can't, and the login is there once it's readable (trace ACCEPTED)", async () => {
   const s = new Session(setup("cred-unreadable"));
-  const credential = JSON.stringify({ access: "kept-by-newer-fx", refresh: "r", expires_at_ms: null, token_endpoint: "http://127.0.0.1:9/token", revocation_endpoint: null, resource: URL, client_id: "c", client_secret: null, method: "none" });
-  mkdirSync(join(s.f.home, ".fx", "mcp-credentials"), { recursive: true, mode: 0o700 });
-  writeFileSync(v2Path(s.f), JSON.stringify({ version: 2, imported_v1: true, servers: [{ name: "web", url: URL, credential }] }), { mode: 0o600 });
+  writeV2(s.f, 2);
   const before = readFileSync(v2Path(s.f), "utf8");
   save(join(s.f.base, "store-before.json"), before);
-  expect(s.observe()).toEqual({ kind: "unreadable", entries: ["web"], imported: true, marked: false, v1: [] });
+  expect(s.observe()).toEqual({ kind: "unreadable", entries: ["web"], v1: [] });
 
   // `fx mcp list` never connects; it reads web's credential to start the host.
   const list = await s.run("get", ["mcp", "list", "--json"]);
@@ -100,24 +98,23 @@ test.skipIf(!NEXT_MCP)("a newer fx's store is never written over; sign-in and si
   // Independent oracle: the file is byte for byte what the newer fx wrote.
   save(join(s.f.base, "store-after.json"), readFileSync(v2Path(s.f), "utf8"));
   expect(readFileSync(v2Path(s.f), "utf8")).toBe(before);
-  expect(login.o).toEqual({ kind: "unreadable", entries: ["web"], imported: true, marked: false, v1: [] });
+  expect(login.o).toEqual({ kind: "unreadable", entries: ["web"], v1: [] });
 
   // Readable again (version 1), the login is still there and still used.
   rewriteAsVersion(s.f, 1);
   s.fault("repair");
   s.observe();
   const back = await s.run("get", ["mcp", "list", "--json"]);
-  expect(back.o).toEqual({ kind: "ok", entries: ["web"], imported: true, marked: true, v1: [] });
+  expect(back.o).toEqual({ kind: "ok", entries: ["web"], v1: [] });
   expect(readFileSync(v2Path(s.f), "utf8")).toContain("kept-by-newer-fx");
-  const verdict = await s.check(["unreadable"], ["web"], [true]);
+  const verdict = await s.check(["unreadable"], ["web"]);
   expect(verdict.verdict).toBe("ACCEPTED");
 }, 120_000);
 
-test.skipIf(!NEXT_MCP)("a logout stays when the store becomes unreadable (trace ACCEPTED)", async () => {
-  const s = new Session(setup("cred-undone"));
-  writeV1(s.f, [v1Entry("web", URL)]);
+test("a logout stays when the store becomes unreadable (trace ACCEPTED)", async () => {
+  const s = new Session(setup("cred-logout-unreadable"));
+  writeV2(s.f);
   s.observe();
-  await s.run("get", ["mcp", "list", "--json"]);
   const out = await s.run("logout", ["mcp", "logout", "web"], "web");
   expect(out.ran.stdout).toBe("Signed out of web.\n");
   expect(out.o.entries).toEqual([]);
@@ -126,26 +123,25 @@ test.skipIf(!NEXT_MCP)("a logout stays when the store becomes unreadable (trace 
   const before = readFileSync(v2Path(s.f), "utf8");
   expect(s.observe().kind).toBe("unreadable");
   const back = await s.run("get", ["mcp", "list", "--json"]);
-  const verdict = await s.check(["absent"], []);
-  // Independent oracle: nothing was imported or written.
-  expect(back.o).toEqual({ kind: "unreadable", entries: [], imported: true, marked: true, v1: ["web"] });
+  const verdict = await s.check(["ok"], ["web"]);
+  // Independent oracle: nothing was written.
+  expect(back.o).toEqual({ kind: "unreadable", entries: [], v1: [] });
   expect(readFileSync(v2Path(s.f), "utf8")).toBe(before);
   expect(verdict.verdict).toBe("ACCEPTED");
 }, 120_000);
 
-test.skipIf(!NEXT_MCP)("deleting the v2 file doesn't bring back a login signed out of (trace ACCEPTED)", async () => {
+test("With MCP-v2's store deleted after a logout, v1's login still isn't taken (trace ACCEPTED)", async () => {
   const s = new Session(setup("cred-deleted"));
   writeV1(s.f, [v1Entry("web", URL)]);
+  writeV2(s.f);
   s.observe();
-  await s.run("get", ["mcp", "list", "--json"]);
   await s.run("logout", ["mcp", "logout", "web"], "web");
   rmSync(v2Path(s.f));
   s.fault("delete");
   s.observe();
   const back = await s.run("get", ["mcp", "list", "--json"]);
-  const verdict = await s.check(["absent"], []);
-  // Independent oracle: v1's copy stayed out, and only the note remains.
-  expect(back.o.entries).toEqual([]);
-  expect(back.o).toEqual({ kind: "absent", entries: [], imported: false, marked: true, v1: ["web"] });
+  const verdict = await s.check(["ok"], ["web"]);
+  // Independent oracle: v1's copy stayed out.
+  expect(back.o).toEqual({ kind: "absent", entries: [], v1: ["web"] });
   expect(verdict.verdict).toBe("ACCEPTED");
 }, 120_000);

@@ -1,6 +1,4 @@
 ---- MODULE StdioConn ----
-\* Updated for the next MCP-v2 version: it can describe behavior that src/mcp/
-\* does not have yet, so its traces from the current src/mcp/ may not match.
 \* U03 stdio connection, client side: at most one server process at a time.
 \* Rules: STDIO-01 (WritesOnlyWhenOpen), STDIO-02 (NoClientResponsesModern),
 \* STDIO-09 (NoRefusedAnswer),
