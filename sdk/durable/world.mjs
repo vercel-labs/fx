@@ -41,12 +41,17 @@ const durabilityTag = Symbol.for("libfx.durability");
  *   Queue messages name it, so a route delivers each to the agents on its
  *   store, and on one store an agent name belongs to one configuration. Give
  *   each customer of an app a store of its own.
+ * - `recover(writer)`: for a World whose queue ends with its process. When
+ *   an agent starts, it continues each session of its name in this World
+ *   that still has work and whose last writer `alive()` says died, when
+ *   `recover` returns true for that writer's holder info. Needs
+ *   `livenessKnown`, and a World with `runs.list()`.
  */
 export function world(source, options = {}) {
   const owned = typeof source === "function";
   if (!owned && !(source && typeof source === "object")) throw new TypeError("world() takes a World or a function that creates one");
   if (!options || typeof options !== "object" || Array.isArray(options)) throw new TypeError("world() options must be an object");
-  const { name = "world", store = name, livenessKnown = false, queueLeases = false, runInRequest = queueLeases, waitUntil, queueDurable = false, pollMs, leaseMs, maxDurationMs, reserveMs, alive, holderInfo, gatewayKey } = options;
+  const { name = "world", store = name, livenessKnown = false, queueLeases = false, runInRequest = queueLeases, waitUntil, queueDurable = false, pollMs, leaseMs, maxDurationMs, reserveMs, alive, holderInfo, gatewayKey, recover } = options;
   if (typeof name !== "string" || name.length === 0) throw new TypeError("world() name must be a non-empty string");
   if (typeof store !== "string" || store.length === 0) throw new TypeError(`${name}() store must be a non-empty string`);
   for (const [key, value] of Object.entries({ livenessKnown, queueLeases, runInRequest, queueDurable })) {
@@ -58,10 +63,12 @@ export function world(source, options = {}) {
   for (const [key, value] of Object.entries({ maxDurationMs, reserveMs })) {
     if (value !== undefined && !(Number.isSafeInteger(value) && value >= 0)) throw new TypeError(`${name}() ${key} must be a non-negative integer`);
   }
-  for (const [key, value] of Object.entries({ alive, holderInfo, gatewayKey, waitUntil })) {
+  for (const [key, value] of Object.entries({ alive, holderInfo, gatewayKey, waitUntil, recover })) {
     if (value !== undefined && typeof value !== "function") throw new TypeError(`${name}() ${key} must be a function`);
   }
   if (livenessKnown && !alive) throw new TypeError(`${name}() livenessKnown needs alive()`);
+  // Only a writer known dead leaves work nobody else delivers.
+  if (recover && !livenessKnown) throw new TypeError(`${name}() recover needs livenessKnown`);
   // Only the backstop's own message coming back continues a turn a dead
   // request ran.
   if (runInRequest && !queueLeases) throw new TypeError(`${name}() runInRequest needs queueLeases`);
@@ -83,5 +90,6 @@ export function world(source, options = {}) {
     ...(holderInfo === undefined ? {} : { holderInfo }),
     ...(gatewayKey === undefined ? {} : { gatewayKey }),
     ...(waitUntil === undefined ? {} : { waitUntil }),
+    ...(recover === undefined ? {} : { recover }),
   };
 }

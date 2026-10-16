@@ -125,6 +125,8 @@ createFxAgent({ durability: local({ dir: ".fx/sessions" }) });
 createFxAgent({ durability: memory() }); // nothing outlives the process
 ```
 
+On `local()`, an agent continues the work that a killed process left in its sessions, without waiting for a new prompt. The first time an agent is used in a process, such as by a request that reads a session's stream, it looks through the 1,000 most recently created sessions in its folder. It continues each turn that a process on this machine, started in the same working directory, left open when it died, and each prompt that such a process stored but never ran. The working directory tells apps apart, since every app on the machine that names no durability keeps its sessions in the same folder. The agent queues the work as the dead process had, naming only the stored input, so the turn runs with the context and settings its caller gave. Restarting a dev server finishes the turn it was killed in, and `onEvent` gets a `session.recovered` event for each session the agent continues. A session that belongs to another agent waits until an agent with that name starts. Pass `local({ recover: false })` to leave these turns for the session's next prompt or `session.resume()`.
+
 On `local()`, `vercel()` and `world()`, a session id is a Workflow run id, `wrun_` followed by letters and digits. Take it from `turn.accepted` or `await agent.newSessionId()` instead of making one up. On `memory()`, any 1 to 128 letters, digits, `.`, `_` or `-` work.
 
 A session stores the conversation, and with each prompt and steer the caller's `context` and the session object's settings. Every process passes its own model, credentials, tools, MCP clients and skills when it creates the agent.

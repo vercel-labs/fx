@@ -22,9 +22,9 @@
 // deliver the same message again, and the next worker continues the turn.
 //
 // TLA+ models: `tests/tla/sdk/DurableSession.tla` (the log, leases and
-// takeovers), `tests/tla/sdk/AgentRouting.tla` (agent names and routing),
-// and `tests/tla/sdk/DurableSteer.tla` (where each message a user sends is
-// placed). The drivers in `tests/tla/drivers/` run this code along them.
+// takeovers), `tests/tla/sdk/AgentRouting.tla` (agent names, routing, and
+// recovering what a dead process left), and `tests/tla/sdk/DurableSteer.tla`
+// (where each message a user sends is placed). The drivers in `tests/tla/drivers/` run this code along them.
 
 // A write the session's chain refused because another worker continued it.
 // Harnesses recognize it by its code.
@@ -186,6 +186,10 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
   // it join it, before it started too.
   let openTurn = typeof base?.openTurn?.id === "string" ? { id: base.openTurn.id, at: Number(base.openTurn.at) || 0, from: Number(base.openTurn.from ?? base.openTurn.at) || 0, context: base.openTurn.context ?? null, settings: base.openTurn.settings ?? null } : null;
   let lastTurnId = base?.lastTurnId ?? null;
+  // The process that last wrote the session, as its holder info says: the
+  // holder of the newest lease, which wrote the checkpoint too, or the
+  // sender of a newer input. Null when the newest writer left none.
+  let writer = base?.lease ?? null;
   // The agent the session belongs to: the one its first stored input, or the
   // checkpoint it was restored from, names. A session stored before agents
   // had names belongs to the default agent.
@@ -231,6 +235,7 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
         agent ??= typeof entry.agent === "string" ? entry.agent : defaultAgentName;
         if (seenInputs.has(entry.key)) break;
         seenInputs.add(entry.key);
+        writer = entry.from ?? null;
         inputs.push({ ...entry, cursor: position });
         if (entry.context !== undefined) contexts.set(entry.messageId, entry.context);
         if (entry.settings !== undefined) settingsOf.set(entry.messageId, entry.settings);
@@ -243,7 +248,10 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
         if ((entry.a ?? null) !== head) break;
         head = cursor;
         if (entry.k === "lease") {
-          lease = { holder: entry.holder, epoch: entry.epoch, expiresAt: entry.expiresAt ?? null, pid: entry.pid, host: entry.host, delivery: entry.delivery, cursor };
+          // With what its worker's holder info put in it, for `alive()`.
+          const { k: _k, a: _a, ...held } = entry;
+          lease = { ...held, expiresAt: entry.expiresAt ?? null, cursor };
+          writer = lease;
           if (Number.isSafeInteger(entry.epoch) && entry.epoch > epoch) epoch = entry.epoch;
         } else if (entry.k === "release") {
           if (lease?.holder === entry.holder) lease = null;
@@ -379,6 +387,7 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
     lease: leaseStands(lease, now, alive) ? lease : null,
     lastLease: lease,
     lastEpoch: epoch,
+    lastWriter: writer,
     checkpoint: base ? { through: base.through ?? null, data: base.data } : null,
     records,
     openTurn,
@@ -573,7 +582,9 @@ function createMemoryBackend({ maxDurationMs, reserveMs } = {}) {
   };
 }
 
-// World runs are sessions; `fx.log` steps are its entries.
+// World runs are sessions, each under this workflow name; `fx.log` steps are
+// its entries.
+const sessionWorkflow = "libfx/session";
 const logStep = "fx.log";
 // A World names streams for its whole project, so each session's stream is
 // named after its run, as Workflow names a run's own streams: `strm_` and
@@ -773,7 +784,7 @@ function claimName(name, member) {
 // libfx starts and closes a World it `owned`, having created it; a World the
 // app passed in stays the app's.
 function createWorldBackend(world, durability) {
-  const { name, reserveMs, pollMs, leaseMs, alive, holderInfo, livenessKnown = false, queueLeases = false, runInRequest = queueLeases, waitUntil, queueDurable = false, maxDurationMs, owned = true } = durability;
+  const { name, reserveMs, pollMs, leaseMs, alive, holderInfo, recover, livenessKnown = false, queueLeases = false, runInRequest = queueLeases, waitUntil, queueDurable = false, maxDurationMs, owned = true } = durability;
   const spec = world.specVersion === undefined ? {} : { specVersion: world.specVersion };
   const created = new Set();
   // Runs being created now: writes that go out together create a run once.
@@ -849,6 +860,27 @@ function createWorldBackend(world, durability) {
       if (held) liveHolders.add(holder);
       else liveHolders.delete(holder);
     },
+    // Whether the process a session's writer info names still runs, as the
+    // durability's `alive()` says: true, false, or null when unknown.
+    writerAlive: (writer) => (alive ? alive(writer) : null),
+    // Which writers' sessions an agent continues when it starts (see
+    // recoverSessions), or null for none.
+    recovers: livenessKnown && typeof recover === "function" ? recover : null,
+    // One page of the World's sessions, newest first, as `{ ids, count,
+    // cursor }`: the sessions' ids, how many runs the page listed, and the
+    // cursor of the next page or null. Null when the World cannot list its
+    // runs.
+    async listSessions(cursor, limit) {
+      if (typeof world.runs?.list !== "function") return null;
+      const page = await world.runs.list({
+        workflowName: sessionWorkflow,
+        resolveData: "none",
+        pagination: { limit, sortOrder: "desc", ...(cursor ? { cursor } : {}) },
+      });
+      const runs = Array.isArray(page?.data) ? page.data : [];
+      const ids = runs.map((run) => run?.runId).filter((id) => backend.validSessionId(id));
+      return { ids, count: runs.length, cursor: page?.hasMore && typeof page.cursor === "string" ? page.cursor : null };
+    },
     async start() {
       if (owned) await world.start?.();
       if (typeof world.getRuntimeDeadline === "function") {
@@ -904,7 +936,7 @@ function createWorldBackend(world, durability) {
           await world.events.create(runId, {
             eventType: "run_created",
             ...spec,
-            eventData: { deploymentId, workflowName: "libfx/session", input: encoder.encode("{}") },
+            eventData: { deploymentId, workflowName: sessionWorkflow, input: encoder.encode("{}") },
           });
         } catch (error) {
           // Another worker created it first.
@@ -1249,10 +1281,12 @@ const inputTooLarge = (bytes) => Object.assign(
 
 // What a message adds to its session's log: a restored agent's first
 // checkpoint and the message's input, a prompt with its caller's context and
-// its session object's settings. Only the sender calls it, before it queues
-// the message, so what a turn runs and as whom comes from the app's own
-// call, never from a queue delivery. Nothing the log already holds. Pure.
-function messageEntries(state, message) {
+// its session object's settings, and `from`, the holder info of the process
+// that writes it, when its durability has one. Only the sender calls it,
+// before it queues the message, so what a turn runs and as whom comes from
+// the app's own call, never from a queue delivery. Nothing the log already
+// holds. Pure.
+function messageEntries(state, message, from) {
   const entries = [];
   const named = typeof message.agent === "string" ? { agent: message.agent } : {};
   if (message.seed && state.checkpoint === null && state.records.length === 0) {
@@ -1271,6 +1305,7 @@ function messageEntries(state, message) {
       ...(typeof message.target === "string" ? { target: message.target } : {}),
       ...((message.type === "prompt" || message.type === "steer") && message.context !== undefined ? { context: message.context } : {}),
       ...((message.type === "prompt" || message.type === "steer") && message.settings !== undefined ? { settings: message.settings } : {}),
+      ...(from ? { from } : {}),
     });
   }
   return entries;
@@ -1293,12 +1328,21 @@ const messageIdInUse = (message) => Object.assign(
   { code: "FX_MESSAGE_ID_IN_USE" },
 );
 
-// Writes what a message adds to its session, in order, and returns how many
-// entries it wrote. Only the sender calls it, before it queues the message.
-// A message that reuses another input's id writes nothing and throws.
-async function recordMessage(log, state, message) {
+// What a sender puts in the inputs it writes: its holder info, so a process
+// that starts later can tell whether the session's last writer still runs.
+// Undefined on a durability whose holders carry none.
+function writerOf(backend) {
+  const info = backend.holderInfo();
+  return info && typeof info === "object" && Object.keys(info).length > 0 ? info : undefined;
+}
+
+// Writes what a message adds to its session, in order, with the sender's
+// holder info as `from`, and returns how many entries it wrote. Only the
+// sender calls it, before it queues the message. A message that reuses
+// another input's id writes nothing and throws.
+async function recordMessage(log, state, message, from) {
   if (idInUse(state, message)) throw messageIdInUse(message);
-  const entries = messageEntries(state, message);
+  const entries = messageEntries(state, message, from);
   for (const entry of entries) await log.append(entry);
   return entries.length;
 }
@@ -1382,9 +1426,11 @@ class SessionWorker {
   // steer or cancel reaches the running turn even before this runs. A
   // delivery the session's log does not hold is not from a sender and is
   // dropped before anything is written, whether or not its session exists
-  // (`tests/tla/sdk/TenantIsolation.tla` OnlySentRuns). Then it runs the
-  // session when no live worker holds it. Returns `{ timeoutSeconds }` to
-  // have the same message delivered again later.
+  // (`tests/tla/sdk/TenantIsolation.tla` OnlySentRuns). A recovery an agent
+  // queues as it starts names an input its session already holds, so it
+  // passes the same check (see recoverSessions). Then it runs the session
+  // when no live worker holds it. Returns `{ timeoutSeconds }` to have the
+  // same message delivered again later.
   async consume(message, delivery = null) {
     const log = await this.backend.session(this.sessionId);
     let entries = await log.read();
@@ -1589,6 +1635,9 @@ class SessionWorker {
     const ui = uiWriter(log, (error) => agent.emit("ui.error", { sessionId: this.sessionId, error: error?.name ?? "Error" }), lease.epoch);
     // When the lease runs out, as this worker last renewed it.
     let leaseExpiresAt = lease.expiresAt;
+    // What the durability's holder info put in the lease, which a checkpoint
+    // keeps with it.
+    const { k: _k, a: _a, holder: _holder, epoch: _epoch, expiresAt: _expiresAt, delivery: _delivery, ...holderFields } = lease;
     const store = {
       load: async () => ({
         ...(state.checkpoint?.data ? { checkpoint: { through: state.checkpoint.through ?? "0", data: fromBase64(state.checkpoint.data) } } : {}),
@@ -1615,7 +1664,7 @@ class SessionWorker {
           lastTurnId: now.lastTurnId,
           ...(now.agent === null ? {} : { agent: now.agent }),
           ...(now.openTurn ? { openTurn: now.openTurn, yielded: now.yielded } : {}),
-          lease: { holder: this.holder, epoch: lease.epoch, expiresAt: leaseExpiresAt, pid: lease.pid, host: lease.host, ...(lease.delivery ? { delivery: lease.delivery } : {}) },
+          lease: { ...holderFields, holder: this.holder, epoch: lease.epoch, expiresAt: leaseExpiresAt, ...(lease.delivery ? { delivery: lease.delivery } : {}) },
         });
       },
     };
@@ -1959,6 +2008,94 @@ class SessionWorker {
 }
 
 // ---------------------------------------------------------------------------
+// Recovery: the work a process left in its sessions when it died.
+//
+// A durability whose queue ends with its process, as local()'s does, loses
+// the messages a process held when it dies: the delivery running a turn,
+// and any prompt it stored and had not yet delivered. The log keeps the
+// work, and an agent that starts on such a durability continues it. A
+// process that still runs delivers its own messages, so an agent continues
+// only the sessions whose last writer died.
+
+// How many sessions an agent looks through when it starts, newest first, in
+// pages of how many, reading how many of their logs at once.
+const recoveryMaxSessions = 1000;
+const recoveryPageSize = 200;
+const recoveryReads = 8;
+
+// The durabilities each agent name in this process has looked through, so a
+// name's copies, and an agent created again on the same durability, look
+// once. Shared by every copy of this module in the process.
+const recoveredBy = (globalThis[Symbol.for("libfx.recoveredBy")] ??= new WeakMap());
+
+// Whether an agent named `name` continues the session `state` folds: it is
+// the agent's own, has a turn open or an input waiting, holds no standing
+// lease, and the process that last wrote it, by its holder info, has died
+// and is one `backend.recovers` accepts (`tests/tla/sdk/AgentRouting.tla`
+// Recover).
+function recoverable(backend, state, name) {
+  if (state.agent !== name || !state.hasWork || state.lease !== null || state.lastWriter === null) return false;
+  return backend.writerAlive(state.lastWriter) === false && backend.recovers(state.lastWriter) === true;
+}
+
+// The input a recovery's message names, as queuedMessage() has it: one the
+// session's log already holds, so its delivery passes the check every
+// delivery passes and runs only what the log says
+// (`tests/tla/sdk/TenantIsolation.tla` OnlySentRuns). That is the newest
+// input no turn took, whose message the dead process's queue lost, or else
+// the open turn's own. Null when the log names neither.
+function recoveryMessage(backend, state, name, sessionId) {
+  const waiting = state.unconsumed.filter((input) => messageTypes.has(input.type)).at(-1);
+  const opener = state.openTurn?.id;
+  const named = waiting
+    ? { type: waiting.type, messageId: waiting.messageId }
+    : typeof opener === "string" ? { type: state.consumedKind(opener) ?? "prompt", messageId: opener } : null;
+  if (named === null || !validId(named.messageId) || !knownMessage(state, named)) return null;
+  return queuedMessage({ ...named, sessionId, agent: name }, backend.store);
+}
+
+// Looks through the newest sessions of `backend`'s World once, until
+// `stopped()`, and has the agent named `name` continue each one
+// `recoverable` finds: the message recoveryMessage() names goes on the
+// agent's own queue, on its own store, and its delivery takes the session
+// through the agent's own worker like any other
+// (`tests/tla/sdk/AgentRouting.tla` Recovered). Never rejects; `emit`
+// reports a failure.
+async function recoverSessions(backend, name, emit, stopped) {
+  try {
+    let cursor = null;
+    for (let read = 0; read < recoveryMaxSessions && !stopped();) {
+      const page = await backend.listSessions(cursor, Math.min(recoveryPageSize, recoveryMaxSessions - read));
+      if (!page) {
+        emit("recovery.error", { error: { name: "TypeError", message: "the World has no runs.list() to find its sessions with" } });
+        return;
+      }
+      for (let index = 0; index < page.ids.length && !stopped(); index += recoveryReads) {
+        await Promise.all(page.ids.slice(index, index + recoveryReads).map(async (sessionId) => {
+          try {
+            const log = await backend.session(sessionId);
+            const state = foldSessionLog(await log.read(), { now: Date.now(), alive: (lease) => backend.alive(lease) });
+            if (stopped() || !recoverable(backend, state, name)) return;
+            const message = recoveryMessage(backend, state, name, sessionId);
+            if (message === null) return;
+            // A recovery still in flight on this World is not sent again.
+            await backend.queue.send(message, { idempotencyKey: `${sessionId}:${message.type}:${message.messageId}:recover` });
+            emit("session.recovered", { sessionId });
+          } catch (error) {
+            if (!stopped()) emit("session.error", { sessionId, error: errorSummary(error) });
+          }
+        }));
+      }
+      read += page.count;
+      if (page.cursor === null || page.count === 0) return;
+      cursor = page.cursor;
+    }
+  } catch (error) {
+    if (!stopped()) emit("recovery.error", { error: errorSummary(error) });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // The public API.
 
 const internalEvent = new Set(["turn_start", "turn_resume", "turn_yield", "turn_end", "idle"]);
@@ -2047,6 +2184,45 @@ async function turnEndIn(log, messageId, count) {
   if (!found) return null;
   const { type: _type, ...rest } = found;
   return rest;
+}
+
+// Where, among the first `count` lines of the stream, the worker that holds
+// the session's open turn began its run of it: the index of its newest
+// `turn_start` or `turn_resume` for that turn, with no `turn_end` or
+// `turn_yield` after it. Null when no live worker holds the open turn, or
+// when its first line comes after those.
+async function heldTurnLine(log, count, backend) {
+  if (count === 0) return null;
+  const state = foldSessionLog(await log.read(), { now: Date.now(), alive: (lease) => backend.alive(lease) });
+  if (state.lease === null || state.openTurn === null || !Number.isSafeInteger(state.lease.epoch)) return null;
+  const { epoch } = state.lease;
+  const turnId = state.openTurn.id;
+  const shows = uiRanker();
+  const reader = log.ui.read(0).getReader();
+  let buffered = "";
+  let seen = 0;
+  let found = null;
+  try {
+    while (seen < count) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffered += decoder.decode(value, { stream: true });
+      for (let index = buffered.indexOf("\n"); index >= 0 && seen < count; index = buffered.indexOf("\n")) {
+        const line = buffered.slice(0, index);
+        buffered = buffered.slice(index + 1);
+        const at = seen;
+        seen += 1;
+        let event;
+        try { event = JSON.parse(line); } catch { continue; }
+        if (!shows(event) || event.messageId !== turnId) continue;
+        if ((event.type === "turn_start" || event.type === "turn_resume") && event.epoch === epoch) found = at;
+        else if (event.type === "turn_end" || event.type === "turn_yield") found = null;
+      }
+    }
+  } finally {
+    void reader.cancel().catch(() => {});
+  }
+  return found;
 }
 
 // How long a retried turn waits for an end the log already holds.
@@ -2296,6 +2472,8 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
     let durabilityPromise = null;
     let chosenDurability = null;
     let unlisten = null;
+    // The agent's look through its sessions when it started, once begun.
+    let recovering = null;
     let closed = false;
     const workers = new Map();
     const active = new Set();
@@ -2326,9 +2504,23 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
           }
           return receive(created, message, deliveryOf(meta));
         }, agentName);
+        recover(chosen, created);
         return created;
       })();
       return backendPromise;
+    };
+    // Once the agent listens, on a durability that recovers sessions, it
+    // continues the work dead processes left in its own, in the background:
+    // once per name and durability in this process. close() stops the look
+    // and waits for the turns it started.
+    const recover = (chosen, created) => {
+      if (typeof created.recovers !== "function") return;
+      let names = recoveredBy.get(chosen);
+      if (!names) recoveredBy.set(chosen, names = new Set());
+      if (names.has(agentName)) return;
+      names.add(agentName);
+      recovering = recoverSessions(created, agentName, emit, () => closed);
+      agent.track(recovering);
     };
     // The durability the agent's sessions live in, chosen once.
     const durabilityOf = () => (durabilityPromise ??= durability ? Promise.resolve(durability) : defaultDurability());
@@ -2411,13 +2603,14 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
         };
         const full = { ...message, ...extra, agent: agentName, sessionId };
         // The input and its caller's context reach the log here, on the
-        // app's own call, before the caller hears it was accepted. The queue
-        // carries only which input to run, so a delivery cannot choose what
-        // a turn runs or as whom (`tests/tla/sdk/TenantIsolation.tla`
-        // OnlySentRuns), and a queue that ends with the process loses no
-        // input.
+        // app's own call, before the caller hears it was accepted, with this
+        // process's holder info, so a process that starts later knows
+        // whether the sender still runs. The queue carries only which input
+        // to run, so a delivery cannot choose what a turn runs or as whom
+        // (`tests/tla/sdk/TenantIsolation.tla` OnlySentRuns), and a queue
+        // that ends with the process loses no input.
         const log = await created.session(sessionId);
-        await recordMessage(log, foldSessionLog(await log.read()), full);
+        await recordMessage(log, foldSessionLog(await log.read()), full, writerOf(created));
         const queued = queuedMessage(full, created.store);
         const idempotencyKey = `${sessionId}:${message.type}:${message.messageId}`;
         if (inRequest && created.runInRequest) {
@@ -2496,6 +2689,10 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
               // The viewer starts where the stream is now, before the
               // message can produce anything.
               from ??= await log.ui.length();
+              // A resume of a turn a live worker already continues, as an
+              // agent that just started may, follows that worker's run of it
+              // from its first line, which may come before `from`.
+              if (type === "resume") from = (await heldTurnLine(log, from, created)) ?? from;
               await send({ type, messageId, ...(input === undefined ? {} : { input }) }, { inRequest: type === "prompt" });
               accept.resolve({ messageId, sessionId });
               return { log, from, attaching };
@@ -2537,7 +2734,10 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
           }
           return turn;
         },
-        /** Continues the turn a stopped worker left open, if any. */
+        /**
+         * Continues the turn a stopped worker left open, if any, or follows
+         * the live worker that already continues it.
+         */
         resume() {
           if (closed) throw new Error(`${label} is closed`);
           return startTurn("resume", newId("res"));
@@ -2679,6 +2879,12 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
           return message ? receive(created, message, delivery) : undefined;
         },
         liveWorkers: () => workers.size,
+        // Starts the agent and waits until it has looked through its
+        // sessions for work dead processes left, and queued what it found.
+        recovery: async () => {
+          await backend();
+          await recovering;
+        },
         // A session's log as one worker holds it, with its own view of the
         // chain.
         openLog: async (sessionId) => (await backend()).session(sessionId),

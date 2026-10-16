@@ -10,7 +10,7 @@ TLA+ specifications for fx, checked with TLC, together with the scripts and Bun 
 | `indexer/` | When a scanned root's listing may be reused, merging parallel grep results, the file picker's loading row, and listing snapshots (`src/core/indexer/`). | `indexer/check.sh` |
 | `mcp/` | The MCP-v2 engine (`src/mcp/`): wire format, requests, stdio, version detection, the tool catalog, both HTTP transports, input-required rounds, authorization, subscriptions, elicitation, and the engine. `rules.md` lists the MCP specification rules the models cite by ID. | `mcp/check.sh`, then the drivers in `drivers/mcp/` |
 | `mcp_host/` | fx's MCP host (`src/core/mcp_host/`): host lifecycle, saved credentials, logins shared between processes, sign-in, and elicitation routing. | `mcp_host/check.sh`, `bun test drivers/mcp_host/` |
-| `sdk/` | libfx durable sessions (`DurableSession.tla`), agent names and routing (`AgentRouting.tla`), tenants whose agents share one process (`TenantIsolation.tla`), steering (`DurableSteer.tla`), and the provider credential edge (`ProviderAuth.tla`). `check.sh` also writes the TLC state graphs the drivers walk. | `sdk/check.sh`, then the drivers |
+| `sdk/` | libfx durable sessions (`DurableSession.tla`), agent names, routing, and recovering what a dead process left (`AgentRouting.tla`), tenants whose agents share one process (`TenantIsolation.tla`), steering (`DurableSteer.tla`), and the provider credential edge (`ProviderAuth.tla`). `check.sh` also writes the TLC state graphs the drivers walk. | `sdk/check.sh`, then the drivers |
 | `session_manager/` | The session log, turn lifecycle, writer lock, snapshots, fork, subagents, catalog, host wiring, the side-file move, and v1 conversion. `rollout/` holds the models of the changes that moved fx onto the session manager. `system-design.md` is the design record the specs check and defines the `D1` to `D62` decision numbers that code comments cite. | `session_manager/check.sh`, `session_manager/rollout/run.py`, `bun test drivers/session_manager/` |
 | `shell_command/` | How an agent git command is admitted and run (`src/core/shell_command/safe_git.zig`), and one model turn through the shell tool, for the current design and a redesign. | `shell_command/check.sh`, `bun test drivers/shell_command/` |
 | `terminal/` | The in-memory shell snapshot owner (`src/core/terminal/shell_snapshot.zig`) and the lifecycle of hosted terminals. | `terminal/check.sh` |
@@ -75,6 +75,7 @@ tests/tla/mcp_host/check.sh                             # every MCP host model, 
 tests/tla/sdk/check.sh                                  # the SDK specs; writes the state graphs the drivers walk
 bun tests/tla/drivers/drive.mjs send --walks 40         # one durable-session graph; see .github/workflows/ci.yml for the rest
 bun tests/tla/drivers/drive-agents.mjs --walks 60       # agent routing
+bun tests/tla/drivers/drive-agents.mjs recover --walks 60  # recovering what a dead local() process left
 bun tests/tla/drivers/drive-tenants.mjs --walks 60      # tenants in one process
 bun tests/tla/drivers/drive-steer.mjs ideal --walks 20  # steering
 bun test ./tests/tla/drivers/shell_command/             # a driver written as bun tests; see each check.sh for its own

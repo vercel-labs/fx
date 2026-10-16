@@ -5,11 +5,17 @@
 // does. Every message its agents queue goes to the driver, which holds them
 // all until a step delivers one here, to the queue handler of the World the
 // driver picks.
+//
+// With "recover", the durability recovers sessions as local() does, on what
+// the driver says of each writer: an input's writer still runs while the
+// driver holds a message for its session, so one whose messages a crash
+// lost has died. A Recover step starts another copy of an agent here, which
+// looks through the sessions as it starts.
 import { parentPort, workerData } from "node:worker_threads";
 import { createDurableAgentFactory, foldSessionLog } from "../../../sdk/durable.js";
 import { world } from "../../../sdk/durable/world.mjs";
 
-const { names } = workerData;
+const { names, mode } = workerData;
 const { createWorld } = await import(new URL("../../../sdk/durable/node_modules/@workflow/world-local/dist/index.js", import.meta.url).href);
 const encoder = new TextEncoder();
 const inner = Symbol("handler");
@@ -59,6 +65,11 @@ const ask = (message) => new Promise((resolve) => {
 });
 
 let walk = null;
+// With "recover": the session whose input a prompt is writing now, and the
+// sessions the driver holds a message for.
+let writing = null;
+let queued = new Set();
+const recoveredBy = globalThis[Symbol.for("libfx.recoveredBy")];
 
 const methods = {
   // A walk over `dir`: this process's agents, each listening.
@@ -80,9 +91,15 @@ const methods = {
         },
       };
     };
-    const durability = world(createInstance, { name: "routing", pollMs: 250, runInRequest: false });
+    const recovery = mode === "recover" ? {
+      livenessKnown: true,
+      holderInfo: () => (writing ? { session: writing } : { worker: true }),
+      alive: (writer) => (typeof writer.session === "string" ? queued.has(writer.session) : null),
+      recover: () => true,
+    } : {};
+    const durability = world(createInstance, { name: "routing", pollMs: 250, runInRequest: false, ...recovery });
     const agents = Object.fromEntries(names.map((name) => [name, createAgent({ durability, name, tag: name })]));
-    walk = { handlers, agents };
+    walk = { handlers, agents, durability, copies: [] };
     ran = [];
   },
   newSessionId: () => walk.agents[names[0]].newSessionId(),
@@ -92,7 +109,29 @@ const methods = {
     for (const agent of Object.values(walk.agents)) await agent[Symbol.for("libfx.durableInternals")].openLog(sessionId);
   },
   async prompt({ agent, sessionId, input, messageId }) {
-    await walk.agents[agent].session(sessionId).prompt(input, { messageId }).accepted;
+    writing = sessionId;
+    try {
+      await walk.agents[agent].session(sessionId).prompt(input, { messageId }).accepted;
+    } finally {
+      writing = null;
+    }
+  },
+  // Agent `agent` starts here again, as in a process that starts, and looks
+  // through the sessions with what the driver holds: `sessions` are those it
+  // holds a message for.
+  async recover({ agent, sessions }) {
+    queued = new Set(sessions);
+    recoveredBy.get(walk.durability)?.delete(agent);
+    const copy = createAgent({ durability: walk.durability, name: agent, tag: agent });
+    walk.copies.push(copy);
+    await copy[Symbol.for("libfx.durableInternals")].recovery();
+  },
+  // The inputs no turn has taken, by session.
+  async pending({ sessionIds }) {
+    const internals = walk.agents[names[0]][Symbol.for("libfx.durableInternals")];
+    const pending = {};
+    for (const sessionId of sessionIds) pending[sessionId] = foldSessionLog(await (await internals.openLog(sessionId)).read()).unconsumed.map((input) => input.messageId);
+    return pending;
   },
   // Delivers a queued message to the World `world` of this process, by
   // index; a name this process has no agent for is a miss.
@@ -114,8 +153,9 @@ const methods = {
   },
   async close() {
     if (!walk) return;
-    for (const agent of Object.values(walk.agents)) await agent.close().catch(() => {});
+    for (const agent of [...Object.values(walk.agents), ...walk.copies]) await agent.close().catch(() => {});
     walk = null;
+    queued = new Set();
   },
 };
 

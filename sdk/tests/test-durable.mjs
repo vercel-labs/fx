@@ -1537,6 +1537,66 @@ if (durabilityKind !== "memory") {
   }
 }
 
+// A process that starts on a durability whose queue ends with the process
+// continues the turns dead processes left: here local(), and an app's World
+// built with local()'s settings.
+if (durabilityKind === "local" || durabilityKind === "world") {
+  // A child that starts a turn calling `tool`, killed once the call runs.
+  const crashChild = async (tool) => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-durable-recover-"));
+    dirs.push(dir);
+    const child = spawn(process.execPath, [...process.execArgv, fileURLToPath(import.meta.url), durabilityKind, engineBackend, "--child", dir, tool], {
+      stdio: ["ignore", "pipe", "inherit"], env: { ...process.env },
+    });
+    const exited = new Promise((resolveExit) => child.once("exit", resolveExit));
+    let output = "";
+    child.stdout.on("data", (chunk) => { output += chunk; });
+    try {
+      await until(() => output.includes("\n"), "the child to start its tool", 30_000);
+    } finally {
+      child.kill("SIGKILL");
+      await exited;
+    }
+    return { dir, ...JSON.parse(output.trim().split("\n")[0]) };
+  };
+
+  for (const tool of ["lookup", "send"]) {
+    test(`a turn a process was killed in during ${tool} goes on once an agent starts, with no prompt or resume`, async () => {
+      const { dir, sessionId, executionId } = await crashChild(tool);
+      const runsBefore = runs.filter(([name]) => name === tool).length;
+      const events = [];
+      const agent = createFxAgent(agentOptions(await durabilityAt(dir), {
+        onEvent: (event) => { if (event.type.startsWith("session.")) events.push(event); },
+      }));
+      // A client that reconnects to the session's stream is the agent's
+      // first use, as after a dev server restarts.
+      const lines = await linesUntil(agent.session(sessionId), (line) => line.type === "turn_end" && line.messageId === "crash-turn", "the turn's end");
+      const end = lines.find((line) => line.type === "turn_end");
+      assert.equal(end.stopReason, "end_turn");
+      assert.ok(lines.some((line) => line.type === "turn_resume" && line.messageId === "crash-turn"), "the agent continued the turn");
+      assert.deepEqual(events.map((event) => [event.type, event.sessionId]), [["session.recovered", sessionId]]);
+      const reran = runs.filter(([name]) => name === tool).slice(runsBefore);
+      if (tool === "send") {
+        assert.deepEqual(reran, [], "a call with effects never runs twice on its own");
+        assert.ok(JSON.stringify(requests.at(-1)).includes("may have partly run"), "the model hears the call may have run");
+      } else {
+        assert.deepEqual(reran.map(([, id]) => id), [executionId], "the idempotent call ran again, once, under its id");
+      }
+      await agent.close();
+    });
+  }
+
+  test("with recover: false, a turn a killed process left open waits for a resume", async () => {
+    const { dir, sessionId } = await crashChild("lookup");
+    const agent = createFxAgent(agentOptions(await durabilityAt(dir, { recover: false })));
+    const session = agent.session(sessionId);
+    const lines = await readLines(session.stream(0), 64, 500 * timeScale);
+    assert.ok(!lines.some((line) => line.type === "turn_resume"), "nothing continued the turn");
+    assert.equal((await session.resume().result).stopReason, "end_turn");
+    await agent.close();
+  });
+}
+
 if (durabilityKind === "local") {
   test("a worker that dies frees its session a lease after its last renewal, not at its deadline", async () => {
     const dir = await mkdtemp(join(tmpdir(), "libfx-durable-leased-"));

@@ -20,6 +20,10 @@ export interface World {
     get(runId: string, name: string, startIndex?: number): unknown;
     getInfo(runId: string, name: string): unknown;
   };
+  /** With `recover`, libfx lists the World's sessions, newest first, to find the work dead processes left. */
+  readonly runs?: {
+    list(params: unknown): unknown;
+  };
   queue(queueName: string, message: unknown, options?: unknown): unknown;
   createQueueHandler(prefix: string, handler: (message: unknown, meta: any) => Promise<unknown>): (request: Request) => Promise<Response>;
   /** A World with `registerHandler` delivers to the agent in its process; any other delivers over HTTP to `agent.wakeHandler()`. */
@@ -31,7 +35,10 @@ export interface World {
   close?(): unknown;
 }
 
-/** A lease as `alive()` sees it: the fields `holderInfo()` returned when it was taken, beside libfx's own. */
+/**
+ * A lease as `alive()` sees it: the fields `holderInfo()` returned when it was taken, beside libfx's own. An input a
+ * process stored carries that process's `holderInfo()` the same way, which `alive()` and `recover()` also see.
+ */
 export type WorldLease = Readonly<Record<string, unknown>>;
 
 /** A World, or a function that creates one. libfx starts and closes a World it creates; a World passed in stays the app's. */
@@ -83,11 +90,20 @@ export type WorldOptions = {
     livenessKnown: true;
     /** True when the holder runs, false when it does not, and null when unknown. */
     alive(lease: WorldLease): boolean | null;
+    /**
+     * For a World whose queue ends with its process. When an agent starts, it continues each session of its name in
+     * this World that still has work and whose last writer `alive()` says died, when `recover` returns true for that
+     * writer: the holder info of the session's newest lease, or of a newer input's sender. The World needs
+     * `runs.list()`. Off by default.
+     */
+    recover?(writer: WorldLease): boolean;
   }
   | {
     /** Without liveness, a worker renews its lease while it runs, and the session of one that died frees `leaseMs` after its last renewal. */
     livenessKnown?: false;
     alive?(lease: WorldLease): boolean | null;
+    /** Recovery needs `livenessKnown`. */
+    recover?: never;
   }
 );
 

@@ -391,6 +391,7 @@ jobs:
           bun tests/tla/drivers/drive.mjs leased --walks 40 --seed 12
           bun tests/tla/drivers/drive.mjs queue --walks 40 --seed 4
           bun tests/tla/drivers/drive-agents.mjs --walks 60 --seed 11
+          bun tests/tla/drivers/drive-agents.mjs recover --walks 60 --seed 5
           bun tests/tla/drivers/drive-tenants.mjs --walks 60 --seed 11
           bun tests/tla/drivers/drive-steer.mjs ideal --walks 20 --seed 2
           bun tests/tla/drivers/drive-steer.mjs faults --walks 20 --seed 4
