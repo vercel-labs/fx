@@ -272,15 +272,18 @@ describe("fx ask presentation", () => {
     };
     const shellTool = firstRequest.tools.find(({ name }) => name === "shell");
     const shellSchema = shellTool?.inputSchema;
-    expect(Object.keys(shellSchema?.properties ?? {})).toEqual(["request"]);
-    expect(shellSchema?.required).toEqual(["request"]);
-    expect(shellSchema?.additionalProperties).toBe(false);
-    const branches = shellSchema?.properties?.request?.oneOf ?? [];
-    expect(branches.map((branch: any) => branch.properties.action.enum[0])).toEqual([
-      "run",
-      "interact",
+    // Without a saved session there is no terminal to type into: no interactive or input.
+    expect(Object.keys(shellSchema?.properties ?? {})).toEqual([
+      "command",
+      "shell",
+      "cwd",
+      "timeout",
+      "wait",
+      "session_id",
       "stop",
     ]);
+    expect(shellSchema?.required ?? []).toEqual([]);
+    expect(shellSchema?.additionalProperties).toBe(false);
     const serializedShellTool = JSON.stringify(shellTool);
     expect(serializedShellTool).not.toContain('"tty"');
     expect(serializedShellTool).not.toContain('"write"');

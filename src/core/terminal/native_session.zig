@@ -1682,6 +1682,7 @@ const Session = struct {
         defer self.alloc.free(executable);
         const bootstrap = try shell_resolver.buildBootstrap(
             self.alloc,
+            invocation.path,
             executable,
             control_path,
             &nonce,
