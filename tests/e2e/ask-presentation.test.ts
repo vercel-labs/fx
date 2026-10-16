@@ -527,6 +527,41 @@ describe("fx ask presentation", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
+    "TTY launch flag rejection starts on its own line and wraps",
+    async () => {
+      const root = createRoot();
+      const entry = (id: string) => ({ id, type: "language", tags: ["tool-use"] });
+      const gateway = startFakeGateway([fakeGatewayFinalText("UNREACHED")], {
+        models: [entry(FAKE_GATEWAY_MODEL), entry("openai/flag-twin-one"), entry("openai/flag-twin-two")],
+      });
+      gateways.push(gateway);
+
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--no-save", "--model", "flag-twin", "Check the launch flags."]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 80,
+        height: 20,
+        remainOnExit: true,
+      });
+      sessions.push(session);
+
+      await session.waitForText("__FX_EXIT_1__", TIMEOUT);
+      const rows = (await session.captureFullScrollback()).split("\n").map((row) => row.trimEnd());
+      expect(rows).toContain("┃ Check the launch flags.");
+      const start = rows.findIndex((row) => row.startsWith("fx ask: Model \"flag-twin\" matches several"));
+      expect(start).toBeGreaterThan(-1);
+      // The 118-column message wraps at 80 columns; compare it without the wrap points.
+      expect(rows.slice(start, start + 3).join("").replace(/\s/g, "")).toContain(
+        "openai/flag-twin-one,openai/flag-twin-two.UseanexactmodelID.",
+      );
+      expect(gateway.requests).toEqual([]);
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "inline code URL keeps its full target across wrapped transcript rows",
     async () => {
       const root = createRoot();

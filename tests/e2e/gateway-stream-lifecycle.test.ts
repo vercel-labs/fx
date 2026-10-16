@@ -1431,6 +1431,95 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
+  test("ask checks --model, --fast and --effort against the catalog before sending", async () => {
+    const plain = {
+      id: "anthropic/flag-plain",
+      type: "language",
+      tags: ["tool-use", "reasoning"],
+      reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+    };
+    const models = [
+      { id: MODEL, type: "language", tags: ["tool-use"], fast_options: [{ type: "toggle" }] },
+      plain,
+      { ...plain, id: "openai/flag-twin-one" },
+      { ...plain, id: "openai/flag-twin-two" },
+    ];
+    const cases: Array<{ args: string[]; error?: string; stderr?: string; sentModel?: string }> = [
+      {
+        args: ["--model", "openai/not-a-model"],
+        error: "UnknownModel",
+        stderr: "Unknown model \"openai/not-a-model\"",
+      },
+      {
+        args: ["--model", "flag-twin"],
+        error: "AmbiguousModel",
+        stderr: "Model \"flag-twin\" matches several catalog models: openai/flag-twin-one, openai/flag-twin-two.",
+      },
+      {
+        args: ["--model", plain.id, "--fast"],
+        error: "UnsupportedFast",
+        stderr: `Fast mode is not available for model "${plain.id}"`,
+      },
+      {
+        args: ["--model", plain.id, "--effort", "minimal"],
+        error: "UnsupportedEffort",
+        stderr: `Reasoning effort "minimal" is not available for model "${plain.id}" (available: low, high)`,
+      },
+      { args: ["--model", "flag-plain"], sentModel: plain.id },
+    ];
+
+    for (const scenario of cases) {
+      // Text output explains a rejection on stderr; JSON output reports only its code.
+      // The text run saves sessions, so a rejection must leave none behind.
+      for (const json of [false, true]) {
+        const root = createFixtureRoot("ask-launch-check");
+        const tracePath = join(root.root, "trace.log");
+        const gateway = startDynamicFakeGateway(
+          () => fakeGatewayFinalText("LAUNCH_CHECK_COMPLETE"),
+          { models },
+        );
+        try {
+          const result = await runFx(
+            ["ask", ...(json ? ["--json", "--no-save"] : []), "--auto", ...scenario.args, "Check the launch flags."],
+            {
+              cwd: root.workspace,
+              env: {
+                ...fixtureEnv(root, gateway, tracePath),
+                FX_MODEL: undefined,
+                FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+              },
+              timeoutMs: 30_000,
+            },
+          );
+
+          if (scenario.error) {
+            expect(result.code).toBe(1);
+            expect(gateway.requests).toEqual([]);
+            if (json) {
+              expect(parseAskJson(result.stdout).error).toBe(scenario.error);
+              expect(result.stderr).toBe("");
+            } else {
+              expect(result.stderr).toContain(`fx ask: ${scenario.stderr}`);
+              const sessions = join(root.home, ".fx", "sessions");
+              const saved = existsSync(sessions)
+                ? readdirSync(sessions, { withFileTypes: true }).filter((entry) => entry.isDirectory())
+                : [];
+              expect(saved).toEqual([]);
+            }
+          } else {
+            expect(result.code).toBe(0);
+            expect(json ? parseAskJson(result.stdout).output : result.stdout).toContain("LAUNCH_CHECK_COMPLETE");
+            expect(gateway.requests).toHaveLength(1);
+            expect(gateway.requests[0]!.headers.get("ai-language-model-id")).toBe(scenario.sentModel);
+          }
+        } finally {
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      }
+    }
+  }, 120_000);
+
   test("ask flag overrides win over resumed session preferences without persisting", async () => {
     const root = createFixtureRoot("ask-flag-resume");
     const tracePath = join(root.root, "trace.log");

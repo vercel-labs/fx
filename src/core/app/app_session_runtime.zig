@@ -29,6 +29,7 @@ const list_window = @import("../shared/list_window.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const session_runtime = @import("../session/session.zig");
 const session_catalog = @import("../session/session_catalog.zig");
+const launch_selection = @import("../session/launch_selection.zig");
 const session_codec = @import("../session/session_codec.zig");
 const js_host_session_store = @import("../session/js_host_session_store.zig");
 const session_event = @import("../session/session_event.zig");
@@ -1330,6 +1331,9 @@ pub const Persistence = struct {
     process_effort_override: ?types.ReasoningEffort = null,
     process_fast_override: ?bool = null,
     process_ultrafast_override: ?bool = null,
+    /// Launch `--model`, `--fast`, `--ultrafast` and `--effort` flags still
+    /// to be checked against the first catalog load.
+    launch_check: ?launch_selection.Pending = null,
     session_picker: SessionPicker = .{},
     session_picker_load: SessionPickerLoad = .{},
     session_picker_cache: SessionPickerCatalogCache = .{},
@@ -1373,6 +1377,7 @@ pub const Persistence = struct {
         storage.process_effort_override = null;
         storage.process_fast_override = null;
         storage.process_ultrafast_override = null;
+        storage.launch_check = null;
         storage.session_picker = .{};
         storage.session_picker_load = .{};
         storage.session_picker_cache = .{};
@@ -1425,6 +1430,7 @@ pub const Persistence = struct {
         if (self.session_preferences) |*preferences| preferences.deinit(alloc);
         if (self.js_host_session) |*owner| owner.deinit(alloc);
         if (self.process_model_override) |model| alloc.free(model);
+        if (self.launch_check) |pending| pending.deinit(alloc);
         self.session_picker.deinit(alloc);
         self.session_picker_load.deinit();
         if (catalog == .free) self.session_picker_cache.deinit();

@@ -1785,6 +1785,104 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   }, TIMEOUT * 2);
 
+  test("interactive launch corrects flags the catalog rules out", async () => {
+    const CONFIGURED_MODEL = "provider/configured-model";
+    const PLAIN_MODEL = "provider/plain-model";
+    root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-launch-check-")));
+    const home = join(root, "home");
+    const workspacePath = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    const settingsPath = join(home, ".fx", "settings.json");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspacePath, { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({ model: CONFIGURED_MODEL }));
+    const workspace = realpathSync(workspacePath);
+    const plainEntry = (id: string) => ({
+      id,
+      type: "language",
+      tags: ["tool-use", "reasoning"],
+      reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+    });
+
+    const queuedGateway = startFakeGateway([
+      fakeGatewayFinalText("CORRECTED_FLAGS_OK"),
+      fakeGatewayFinalText("FALLBACK_MODEL_OK"),
+    ], { models: [plainEntry(CONFIGURED_MODEL), plainEntry(PLAIN_MODEL)] });
+    gateway = queuedGateway;
+    const env = {
+      HOME: home,
+      AI_GATEWAY_API_KEY: "fake-launch-check-key",
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_AUTO_UPGRADE: "0",
+      FX_PERMISSION_MODE: "auto",
+      FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
+      FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+      FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+      FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+      FX_MODEL: undefined,
+    };
+    const footer = (pane: string) => pane.split("\n").map((line) => line.trimEnd()).filter(Boolean).at(-1) ?? "";
+
+    // Speed and effort the model does not offer are turned off with a notice.
+    session = await TmuxSession.create({
+      cmd: `${FX_BIN} --model ${PLAIN_MODEL} --fast --effort minimal`,
+      cwd: workspace,
+      width: 240,
+      height: 30,
+      minimumHistoryLines: 200,
+      stderrPath,
+      env,
+    });
+    await session.waitForText(`! fast: Fast mode is not available for model "${PLAIN_MODEL}". Using normal speed.`, TIMEOUT);
+    await session.waitForText(
+      `! effort: Reasoning effort "minimal" is not available for model "${PLAIN_MODEL}" (available: low, high). Using the default effort.`,
+      TIMEOUT,
+    );
+    await session.waitForPane((pane) => footer(pane).includes("plain-model") && !footer(pane).includes("⚡"), TIMEOUT);
+
+    await session.sendText("Use the corrected flags.");
+    await session.waitForText("CORRECTED_FLAGS_OK", TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT);
+    expect(queuedGateway.requests).toHaveLength(1);
+    expect(queuedGateway.requests[0]!.headers.get("ai-language-model-id")).toBe(PLAIN_MODEL);
+    const corrected = JSON.parse(queuedGateway.requests[0]!.body);
+    expect(corrected).not.toHaveProperty("reasoning");
+    expect(corrected).not.toHaveProperty("providerOptions.gateway.speed");
+
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    await session.kill();
+
+    // An unknown model falls back to the configured model.
+    session = await TmuxSession.create({
+      cmd: `${FX_BIN} --model provider/not-a-model --fast`,
+      cwd: workspace,
+      width: 240,
+      height: 30,
+      minimumHistoryLines: 200,
+      stderrPath,
+      env,
+    });
+    await session.waitForText("! model: Unknown model \"provider/not-a-model\"", TIMEOUT);
+    await session.waitForText(`Using ${CONFIGURED_MODEL} instead.`, TIMEOUT);
+    await session.waitForPane((pane) => footer(pane).includes("configured-model") && !footer(pane).includes("⚡"), TIMEOUT);
+
+    await session.sendText("Use the configured model.");
+    await session.waitForText("FALLBACK_MODEL_OK", TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT);
+    expect(queuedGateway.requests).toHaveLength(2);
+    expect(queuedGateway.requests[1]!.headers.get("ai-language-model-id")).toBe(CONFIGURED_MODEL);
+    expect(JSON.parse(queuedGateway.requests[1]!.body)).not.toHaveProperty("providerOptions.gateway.speed");
+
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    // Launch flags and their corrections never reach saved settings.
+    expect(JSON.parse(readFileSync(settingsPath, "utf8"))).toMatchObject({ model: CONFIGURED_MODEL });
+    expect(JSON.parse(readFileSync(settingsPath, "utf8"))).not.toHaveProperty("fast_mode", true);
+  }, TIMEOUT * 2);
+
   test(
     "clear response language mismatch never reaches TUI scrollback",
     async () => {

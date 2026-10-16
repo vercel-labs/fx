@@ -584,6 +584,17 @@ pub const Runtime = struct {
         return model_catalog_metadata.fromCatalogEntry(entry.*);
     }
 
+    /// True when the ready catalog came from an authenticated request, so a
+    /// model it does not list is not available.
+    pub fn listsEveryAvailableModel(self: *Self) bool {
+        self.finishThreadIfDone();
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.state != .ready) return false;
+        const provenance = self.outcome.loaded orelse return false;
+        return provenance.listsEveryAvailableModel();
+    }
+
     pub const TraceSnapshot = struct {
         state: []const u8,
         entries: usize,
