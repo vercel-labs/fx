@@ -15,6 +15,7 @@ import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewaySse,
   fakeGatewayToolCall,
   startFakeGateway,
   terminalFixtureShell,
@@ -134,6 +135,28 @@ function toolResultEnvelope(body: string, toolCallId: string): string {
   };
   visit(JSON.parse(body));
   return matches.join("\n");
+}
+
+/// Returns the output the model receives for one tool call: `text` for a
+/// result and `error-text` for a failure.
+function toolResultOutput(body: string, toolCallId: string): { type: string; value: string } {
+  let found: { type: string; value: string } | null = null;
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item);
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    const object = value as Record<string, unknown>;
+    if (object.type === "tool-result" && object.toolCallId === toolCallId) {
+      found = object.output as { type: string; value: string };
+      return;
+    }
+    for (const child of Object.values(object)) visit(child);
+  };
+  visit(JSON.parse(body));
+  if (!found) throw new Error(`missing tool result for ${toolCallId}`);
+  return found;
 }
 
 function schemaFromRequest(body: string): Record<string, unknown> {
@@ -257,6 +280,46 @@ async function waitForFile(path: string): Promise<void> {
   }
   throw new Error(`Timed out waiting for ${path}`);
 }
+
+test.skipIf(!tmuxAvailable())(
+  "a grep with no matches is an answer, not a failed command",
+  async () => {
+    const fixture = createFixture("fx-shell-exit-meaning-");
+    writeFileSync(join(fixture.workspace, "notes.txt"), "hello\n");
+    const noMatch = "grep -n absent-word notes.txt";
+    const failure = "sh -c 'exit 3'";
+    const gateway = startFakeGateway([
+      fakeGatewaySse([
+        { type: "tool-call", toolCallId: "no_match", toolName: "shell", input: { request: { action: "run", command: noMatch } } },
+        { type: "tool-call", toolCallId: "failure", toolName: "shell", input: { request: { action: "run", command: failure } } },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+      ]),
+      fakeGatewayFinalText("EXIT_MEANING_OK"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+    await active.sendText("Search the notes, then run the failing check.");
+    await active.sendKeys("Enter");
+    await active.waitForText("EXIT_MEANING_OK", TIMEOUT);
+
+    expect(gateway.requests).toHaveLength(2);
+    const answer = toolResultOutput(gateway.requests[1]!.body, "no_match");
+    expect(answer.type).toBe("text");
+    const result = JSON.parse(answer.value);
+    expect(result.exit_code).toBe(1);
+    expect(result.exit_meaning).toBe("no matches found");
+    const failed = toolResultOutput(gateway.requests[1]!.body, "failure");
+    expect(failed.type).toBe("error-text");
+    expect(JSON.parse(failed.value).exit_meaning).toBeNull();
+
+    // Only the real failure counts as failed in the transcript.
+    const scrollback = await active.captureFullScrollback();
+    expect(scrollback).toContain("2 commands · 1 failed");
+    expect(scrollback).toContain(`Ran ${noMatch}`);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
 
 test.skipIf(!tmuxAvailable())(
   "shell captured empty observation floors short waits without respawn",

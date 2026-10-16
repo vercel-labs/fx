@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const command_admission = @import("../../core/permissions/command_admission.zig");
 const command_contract = @import("../../core/execution/command_contract.zig");
 const command_environment = @import("../../core/execution/command_environment.zig");
+const command_policy = @import("../../core/tooling/command_policy.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
 const managed_contract = @import("../../core/execution/managed_execution_contract.zig");
@@ -1451,7 +1452,7 @@ fn publishSnapshotMetadata(
         if (projection.signal) |signal| {
             memory.command_process_presentation = .{ .signal = signal };
         } else if (projection.exit_code) |exit_code| {
-            if (exit_code != 0) {
+            if (exit_code != 0 and ordinaryExitMeaning(snapshot) == null) {
                 memory.command_process_presentation = .{ .exit_code = exit_code };
             }
         }
@@ -1721,6 +1722,7 @@ fn formatSnapshotRaw(
         .output_terminal_safe = true,
         .full_output_handle = snapshot.output_file,
         .exit_code = projection.exit_code,
+        .exit_meaning = ordinaryExitMeaning(snapshot),
         .signal = projection.signal,
         .termination_indeterminate = projection.termination_indeterminate,
         .duration_ms = snapshot.duration_ms,
@@ -1746,12 +1748,30 @@ fn snapshotFailed(snapshot: managed_execution.Snapshot) bool {
     return switch (snapshot.state) {
         .running => false,
         .completed => |status| switch (status) {
-            .exit_code => |code| code != 0,
+            .exit_code => |code| code != 0 and ordinaryExitMeaning(snapshot) == null,
             .signal, .indeterminate => true,
             .finished => false,
         },
         .stopped, .lost => true,
     };
+}
+
+/// Returns what a finished command's non-zero exit code means when it is an
+/// ordinary answer rather than an error, such as `grep` finding no matches.
+/// Such a result is not reported as a failure. Only complete captured runs
+/// qualify, and only when the command wrote nothing to stderr: a TTY run mixes
+/// stderr into its output, and a failed step before the last one, such as a
+/// `cd`, reports itself on stderr.
+fn ordinaryExitMeaning(snapshot: managed_execution.Snapshot) ?[]const u8 {
+    if (snapshot.backend != .captured or snapshot.output_incomplete or snapshot.stderr_bytes != 0) return null;
+    const code = switch (snapshot.state) {
+        .completed => |status| switch (status) {
+            .exit_code => |code| code,
+            .signal, .indeterminate, .finished => return null,
+        },
+        .running, .stopped, .lost => return null,
+    };
+    return command_policy.semantic_exit_annotation(snapshot.command, code, "");
 }
 
 fn stop_result_failed(state: managed_execution.SnapshotState) bool {
@@ -2322,6 +2342,61 @@ test "stopped execution is a successful shell observation without command failur
         });
         try std.testing.expect(memory != null);
         try std.testing.expect(memory.?.command_process_presentation == null);
+    }
+}
+
+const grep_without_matches: managed_execution.Snapshot = .{
+    .execution_id = @constCast("shell-grep"),
+    .command = @constCast("cd /tmp && grep -rn needle ."),
+    .cwd = @constCast("/tmp"),
+    .retained = false,
+    .state = .{ .completed = .{ .exit_code = 1 } },
+    .output_delta = @constCast(""),
+    .output_truncated = false,
+};
+
+test "grep finding no matches is reported as an answer, not a failure" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(!snapshotFailed(grep_without_matches));
+
+    var memory: ?types.ToolResultMemory = null;
+    try publishSnapshotMetadata(.{ .allocator = alloc, .tool_result_memory_sink = &memory }, grep_without_matches);
+    try std.testing.expect(memory.?.command_process_presentation == null);
+
+    const body = try formatSnapshot(alloc, grep_without_matches, null);
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("exit_code").?.integer);
+    try std.testing.expectEqualStrings("no matches found", parsed.value.object.get("exit_meaning").?.string);
+}
+
+test "a non-zero exit stays a failure when its cause could be an error" {
+    const alloc = std.testing.allocator;
+    var wrote_stderr = grep_without_matches;
+    wrote_stderr.stderr_bytes = 32;
+    var tty = grep_without_matches;
+    tty.backend = .tty;
+    var other_command = grep_without_matches;
+    other_command.command = @constCast("python3 check.py");
+    var other_code = grep_without_matches;
+    other_code.state = .{ .completed = .{ .exit_code = 2 } };
+    var incomplete = grep_without_matches;
+    incomplete.output_incomplete = true;
+
+    for ([_]managed_execution.Snapshot{ wrote_stderr, tty, other_command, other_code, incomplete }) |snapshot| {
+        try std.testing.expect(snapshotFailed(snapshot));
+        try std.testing.expect(ordinaryExitMeaning(snapshot) == null);
+
+        var memory: ?types.ToolResultMemory = null;
+        try publishSnapshotMetadata(.{ .allocator = alloc, .tool_result_memory_sink = &memory }, snapshot);
+        try std.testing.expect(memory.?.command_process_presentation.? == .exit_code);
+
+        const body = try formatSnapshot(alloc, snapshot, null);
+        defer alloc.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("exit_meaning").? == .null);
     }
 }
 
