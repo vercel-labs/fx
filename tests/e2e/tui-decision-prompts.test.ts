@@ -3025,3 +3025,71 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
     TIMEOUT,
   );
 });
+
+describe.skipIf(SKIP)("tui: herdr lifecycle reporting", () => {
+  test(
+    "answering a question moves herdr from blocked back to working",
+    async () => {
+      // macOS limits Unix socket paths to 104 bytes, so keep this one short.
+      const socketPath = join("/tmp", `fxh-${process.pid}-${Date.now()}.sock`);
+      const states: string[] = [];
+      let resolveWorkingAfterBlocked: () => void = () => {};
+      const workingAfterBlocked = new Promise<void>((resolve) => {
+        resolveWorkingAfterBlocked = resolve;
+      });
+      const herdr = Bun.listen({
+        unix: socketPath,
+        socket: {
+          data(socket, data) {
+            for (const line of data.toString().split("\n")) {
+              if (line.trim() === "") continue;
+              const request = JSON.parse(line);
+              if (request.method === "pane.report_agent") {
+                states.push(request.params.state);
+                if (
+                  request.params.state === "working" &&
+                  states.slice(0, -1).includes("blocked")
+                ) {
+                  resolveWorkingAfterBlocked();
+                }
+              }
+              socket.write(`${JSON.stringify({ id: request.id, result: { type: "ok" } })}\n`);
+            }
+          },
+        },
+      });
+      try {
+        const ctx = await launchScenario(
+          [
+            outerQuestionCall(),
+            // Hold the follow-up response until herdr hears `working`, so
+            // the turn is still running when the question closes.
+            async () => {
+              await Promise.race([workingAfterBlocked, sleep(10_000)]);
+              return outerText("Herdr question handled");
+            },
+          ],
+          "input",
+          { HERDR_SOCKET_PATH: socketPath, HERDR_PANE_ID: "w1:p1", FX_HERDR: undefined },
+        );
+        await ctx.session.sendText("Ask me which path to take.");
+        await ctx.session.waitForText(QUESTION_PROMPT, TIMEOUT);
+        await expectQuestionSelection(ctx.session, 1, "Inspect repo state");
+        expect(states.at(-1)).toBe("blocked");
+
+        await resolveQuestionWithSecondOption(ctx.session);
+        await ctx.session.waitForText("Herdr question handled", TIMEOUT);
+        await waitForPaneState(ctx.session, "herdr idle report", () => states.at(-1) === "idle");
+
+        const blockedIndex = states.indexOf("blocked");
+        expect(blockedIndex).toBeGreaterThan(0);
+        expect(states.slice(blockedIndex)).toEqual(["blocked", "working", "idle"]);
+        await assertProcessAliveAndClean(ctx);
+      } finally {
+        herdr.stop(true);
+        rmSync(socketPath, { force: true });
+      }
+    },
+    TIMEOUT,
+  );
+});

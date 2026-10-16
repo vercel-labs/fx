@@ -45,6 +45,12 @@ pub fn Runtime(comptime App: type) type {
             app.herdr.reportState(.working, null);
         }
 
+        /// The approval or question that blocked the turn has closed and the
+        /// turn is still running.
+        pub fn reportAttentionCleared(app: *App) void {
+            app.herdr.reportResumedFromBlocked();
+        }
+
         fn postTurnEndHandler(
             raw: *anyopaque,
             input: hooks.PostTurnEndInput,
@@ -104,7 +110,46 @@ const RecordingClient = struct {
         self.reports[self.report_count] = .{ .state = state, .status = status };
         self.report_count += 1;
     }
+
+    fn reportResumedFromBlocked(self: *RecordingClient) void {
+        if (self.report_count == 0) return;
+        if (self.reports[self.report_count - 1].state != .blocked) return;
+        self.reportState(.working, null);
+    }
 };
+
+test "built-in Herdr hooks resume working only after a blocked report" {
+    const TestApp = struct {
+        alloc: std.mem.Allocator,
+        lifecycle_runtime: hooks.Runtime,
+        herdr: RecordingClient = .{},
+    };
+    const Provider = Runtime(TestApp);
+
+    var app = TestApp{
+        .alloc = std.testing.allocator,
+        .lifecycle_runtime = hooks.Runtime.init(std.testing.allocator),
+    };
+    defer app.lifecycle_runtime.deinit();
+
+    try Provider.configure(&app, null);
+    const view = app.lifecycle_runtime.freeze();
+
+    Provider.reportWorking(&app);
+    Provider.reportAttentionCleared(&app);
+    view.runAttentionRequired(.{
+        .invocation = testInvocation(.interactive),
+        .kind = .question,
+    });
+    Provider.reportAttentionCleared(&app);
+    Provider.reportAttentionCleared(&app);
+
+    try std.testing.expectEqual(@as(usize, 4), app.herdr.report_count);
+    try expectReport(app.herdr.reports[0], .idle, null);
+    try expectReport(app.herdr.reports[1], .working, null);
+    try expectReport(app.herdr.reports[2], .blocked, "question");
+    try expectReport(app.herdr.reports[3], .working, null);
+}
 
 test "built-in Herdr hooks report only interactive lifecycle state" {
     const TestApp = struct {

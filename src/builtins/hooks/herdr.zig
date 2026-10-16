@@ -37,6 +37,8 @@ pub const Client = struct {
     socket_path: []u8 = &.{},
     pane_id: []u8 = &.{},
     next_id: u64 = 1,
+    /// Last semantic state sent to herdr. Guarded by `mutex`.
+    last_state: ?State = null,
 
     pub fn shouldEnable(
         fx_herdr: ?[]const u8,
@@ -99,6 +101,19 @@ pub const Client = struct {
         self.send(.{ .report = .{ .state = state, .custom_status = clampStatus(custom_status) } });
     }
 
+    /// Report `working` only when the last reported state is `blocked`. Called
+    /// after an approval or question prompt closes while the turn continues, so
+    /// herdr does not keep showing the pane as blocked.
+    pub fn reportResumedFromBlocked(self: *Client) void {
+        if (comptime host_target.is_wasm) return;
+        if (!self.enabled) return;
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.last_state != .blocked) return;
+        self.sendLockedLogged(.{ .report = .{ .state = .working, .custom_status = null } });
+    }
+
     /// Report fx's session id so herdr can associate the pane with a resumable
     /// session. Does not affect herdr's semantic state.
     pub fn reportSession(self: *Client, session_id: []const u8) void {
@@ -135,15 +150,19 @@ pub const Client = struct {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        for (requests) |request| {
-            self.sendLocked(request) catch |err| {
-                debug_trace.logf(
-                    "herdr",
-                    "send failed kind={s} err={s}",
-                    .{ @tagName(request), @errorName(err) },
-                );
-            };
-        }
+        for (requests) |request| self.sendLockedLogged(request);
+    }
+
+    fn sendLockedLogged(self: *Client, request: Request) void {
+        // Record intent even if delivery fails so a later resume is not lost.
+        if (request == .report) self.last_state = request.report.state;
+        self.sendLocked(request) catch |err| {
+            debug_trace.logf(
+                "herdr",
+                "send failed kind={s} err={s}",
+                .{ @tagName(request), @errorName(err) },
+            );
+        };
     }
 
     fn sendLocked(self: *Client, request: Request) !void {
@@ -229,7 +248,7 @@ fn writeReportAgent(
     try w.writeAll(",\"state\":");
     try jsonrpc.writeJsonStr(@tagName(state), w);
     if (custom_status) |status| {
-        try w.writeAll(",\"custom_status\":");
+        try w.writeAll(",\"message\":");
         try jsonrpc.writeJsonStr(status, w);
     }
     try w.writeAll("}}\n");
@@ -307,7 +326,7 @@ test "report_agent serializes a single newline-delimited json line" {
     try std.testing.expectEqualStrings(
         "{\"id\":\"7\",\"method\":\"pane.report_agent\",\"params\":{\"pane_id\":\"w1:p1\"," ++
             "\"source\":\"custom:fx\",\"agent\":\"fx\",\"state\":\"working\"," ++
-            "\"custom_status\":\"editing\"}}\n",
+            "\"message\":\"editing\"}}\n",
         out.written(),
     );
 }

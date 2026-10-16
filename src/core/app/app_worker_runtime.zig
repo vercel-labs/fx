@@ -791,6 +791,12 @@ pub fn Runtime(comptime App: type) type {
             // elapsed clock for the duration of the wait.
             activity_status.syncWaitingClock(&app.stream, modal_active, io_mod.milliTimestamp());
 
+            // Once the approval or question closes and the turn keeps running,
+            // lift the blocked lifecycle state reported when it opened.
+            if (comptime @hasDecl(App, "attentionCleared")) {
+                if (!modal_active and app.stream.active) app.attentionCleared();
+            }
+
             if (comptime @hasField(App, "program_status")) {
                 reportProgramStatus(app, !cancellation_stops_turn and
                     (app.stream.active or snapshot.processing or snapshot.queued_count > 0));

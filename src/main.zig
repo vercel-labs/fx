@@ -832,6 +832,10 @@ const App = struct {
         NotificationAppRuntime.dispatchAttentionRequired(self, turn_id, kind);
     }
 
+    pub fn attentionCleared(self: *App) void {
+        HerdrAppRuntime.reportAttentionCleared(self);
+    }
+
     /// Must be called after init() returns so the AutoUpgrade thread
     /// captures a pointer to the final App location (not a temporary).
     pub fn startAutoUpgrade(self: *App) void {
