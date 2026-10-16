@@ -5,7 +5,8 @@
 # GitAdmission (src/core/shell_command/safe_git.zig): how an agent git command
 # is planned, admitted, and run in every permission mode and shell environment.
 # git-admission.cfg must pass; git-admission-mutation.cfg plants a bug that
-# HoldSafety must catch.
+# HoldSafety must catch, and git-admission-env-mutation.cfg drops the agent
+# environment, which ExposureOnlyDocumented must catch.
 #
 # ShellContract: one model turn through the shell tool, for the design fx
 # implements ("current") and a redesign ("proposed"). proposed.cfg and
@@ -26,6 +27,7 @@ cd "$(dirname "$0")"
 tlc_verdicts "$@" <<'EOF'
 GitAdmission git-admission - -deadlock
 GitAdmission git-admission-mutation HoldSafety -deadlock
+GitAdmission git-admission-env-mutation ExposureOnlyDocumented -deadlock
 ShellContract proposed -
 ShellContract current-holds -
 ShellContract current-completeness Completeness

@@ -3,6 +3,7 @@ const auto_classifier = @import("auto_classifier.zig");
 const command_effect = @import("../shell_command/command_effect.zig");
 const command_environment = @import("../execution/command_environment.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
+const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 
 pub const CommandExecutionMode = enum {
@@ -128,6 +129,33 @@ pub fn defaultForRunCommand(
     command_ctx: CommandContext,
     permission_mode: types.PermissionMode,
 ) DefaultApproval {
+    // A repository's own config can name programs git starts for even its
+    // read-only subcommands, so in `auto` mode every non-interactive git
+    // command is planned through safe git before the shell profile is
+    // considered. The plan runs a shape it can express with those programs
+    // turned off, sends any other shape to review, and refuses a fetch or a
+    // repository safe git cannot read with `.unsafe_git`, which the caller
+    // holds. A reviewed command runs in the shell under the agent environment
+    // from `safe_git.appendAgentEnvironment`. `ask` mode keeps the ordinary
+    // prompt, because a person decides there.
+    if (permission_mode == .auto and
+        command_ctx.execution_mode != .tty and
+        command_effect.isGitCommand(command_ctx.command))
+    {
+        var admission = command_effect.plan(
+            alloc,
+            command_ctx.command,
+            command_ctx.resolved_cwd,
+            false,
+            command_ctx.target_os,
+        ) catch return .{ .approval_required = .planning_failure };
+        defer admission.deinit(alloc);
+        return switch (admission) {
+            .direct_read_only => .{ .direct_only = .init(command_ctx) },
+            .approval_required => |reason| .{ .approval_required = reason },
+        };
+    }
+
     const requires_shell_authority = command_ctx.execution_mode == .tty or
         switch (command_ctx.environment) {
             .user => true,
@@ -187,6 +215,52 @@ test "explicit user environment always requires shell authority" {
             command_effect.ApprovalReason.dynamic_shell,
             defaultForRunCommand(std.testing.allocator, user_ctx, permission_mode).approval_required,
         );
+    }
+}
+
+test "a git command is planned through safe git in automatic mode" {
+    // `git fetch` is a shape safe git refuses, so it must arrive as a refusal
+    // rather than as user-shell authority: the shell profile would otherwise
+    // run plain git, whose repository config can name uploadpack, sshCommand,
+    // gitProxy and credential helpers.
+    const fetch_ctx = CommandContext{
+        .command = "git fetch origin",
+        .resolved_cwd = "/workspace",
+        .target_os = .macos,
+        .environment = .{ .user = "/bin/zsh" },
+    };
+    try std.testing.expectEqual(
+        command_effect.ApprovalReason.unsafe_git,
+        defaultForRunCommand(std.testing.allocator, fetch_ctx, .auto).approval_required,
+    );
+    // A person decides in `ask` mode, so the prompt stays.
+    try std.testing.expectEqual(
+        command_effect.ApprovalReason.dynamic_shell,
+        defaultForRunCommand(std.testing.allocator, fetch_ctx, .ask).approval_required,
+    );
+}
+
+test "a readable git inspection command in the user profile is direct only" {
+    if (@import("builtin").target.os.tag != .macos and @import("builtin").target.os.tag != .linux) return;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try io_mod.dirRealpathAlloc(arena, tmp.dir, ".");
+    const status_ctx = CommandContext{
+        .command = "git status --short --branch",
+        .resolved_cwd = cwd,
+        .target_os = .macos,
+        .environment = .{ .user = "/bin/zsh" },
+    };
+    switch (defaultForRunCommand(arena, status_ctx, .auto)) {
+        .direct_only => |fingerprint| try std.testing.expect(fingerprint.matches(status_ctx)),
+        // A host without a usable git cannot plan the command at all.
+        .approval_required => |reason| try std.testing.expectEqual(
+            command_effect.ApprovalReason.unsafe_git,
+            reason,
+        ),
     }
 }
 

@@ -208,7 +208,7 @@ test "git argv: every snapshot command is built by the safe-git helper" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const ready: safe_git.Ready = .{ .executable = "/usr/bin/git", .filter_names = &.{"x"} };
+    const ready: safe_git.Ready = .{ .executable = "/usr/bin/git", .filter_names = &.{"x"}, .no_lazy_fetch = true };
 
     for (queries) |query| {
         var prefix: std.ArrayList([]const u8) = .empty;
@@ -222,7 +222,7 @@ test "git argv: every snapshot command is built by the safe-git helper" {
 
 test "git repository detection treats allocation failure as unavailable" {
     var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
-    const ready: safe_git.Ready = .{ .executable = "/usr/bin/git", .filter_names = &.{} };
+    const ready: safe_git.Ready = .{ .executable = "/usr/bin/git", .filter_names = &.{}, .no_lazy_fetch = true };
     try std.testing.expect(!isGitRepository(failing.allocator(), ready));
 }
 

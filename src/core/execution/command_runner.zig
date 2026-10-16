@@ -14,6 +14,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
 const shell_snapshot = @import("../terminal/shell_snapshot.zig");
+const safe_git = @import("../shell_command/safe_git.zig");
 const darwin_process_spawn = @import("../shared/darwin_process_spawn.zig");
 
 const Allocator = std.mem.Allocator;
@@ -1345,6 +1346,7 @@ fn executeProcessWithScript(
         try io_mod.cloneEnvironMap(scratch);
     defer environment.deinit();
     try applyAgentEnvironment(&environment);
+    try safe_git.appendAgentEnvironment(scratch, &environment, cwd);
     if (comptime supports_foreground_session) {
         return executeProcessWithDetachedSession(
             scratch,

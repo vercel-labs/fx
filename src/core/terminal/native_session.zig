@@ -15,6 +15,7 @@ const process_provider_mod = @import(
 const process_tree = @import("../execution/process_tree.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const command_runner = @import("../execution/command_runner.zig");
+const safe_git = @import("../shell_command/safe_git.zig");
 const execution_router = @import("../execution/router.zig");
 const io_mod = @import("../shared/io.zig");
 const self_exe = @import("../shared/self_exe.zig");
@@ -1708,11 +1709,19 @@ const Session = struct {
             .handle = pty.slave,
             .flags = .{ .nonblocking = false },
         };
+        // The launcher passes its environment to the shell, so every git the
+        // session starts runs with the repository's programs turned off.
+        var git_scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer git_scratch.deinit();
+        var environment = try io_mod.cloneEnvironMap(self.alloc);
+        defer environment.deinit();
+        try safe_git.appendAgentEnvironment(git_scratch.allocator(), &environment, request.cwd);
         var child = try std.process.spawn(io_mod.getIo(), .{
             .argv = &helper_argv,
             .stdin = .pipe,
             .stdout = .{ .file = slave_file },
             .stderr = .pipe,
+            .environ_map = &environment,
         });
         var child_owned = true;
         errdefer if (child_owned) child.kill(io_mod.getIo());
