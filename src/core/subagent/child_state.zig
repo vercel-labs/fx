@@ -393,6 +393,33 @@ pub const Registry = struct {
         self.generation +|= 1;
     }
 
+    /// Drops a persistent child that has no work, so its slot counts toward
+    /// `max_children` no more. A running or approval-waiting child, or one
+    /// still holding active work, is `ChildBusy`; a one-off or unknown id is
+    /// `ChildNotFound`. The caller deletes the session the child named.
+    pub fn removeIdlePersistent(self: *Registry, alloc: Allocator, child_id: []const u8) !void {
+        var index: ?usize = null;
+        for (self.children, 0..) |child, i| {
+            if (std.mem.eql(u8, child.id, child_id)) index = i;
+        }
+        const at = index orelse return error.ChildNotFound;
+        const child = &self.children[at];
+        if (child.kind != .persistent) return error.ChildNotFound;
+        switch (child.phase) {
+            .running, .awaiting_approval => return error.ChildBusy,
+            .idle, .interrupted, .finished => {},
+        }
+        if (child.active != null) return error.ChildBusy;
+        const remaining = self.children.len - 1;
+        const next: []Child = if (remaining == 0) &.{} else try alloc.alloc(Child, remaining);
+        @memcpy(next[0..at], self.children[0..at]);
+        @memcpy(next[at..], self.children[at + 1 ..]);
+        child.deinit(alloc);
+        alloc.free(self.children);
+        self.children = next;
+        self.generation +|= 1;
+    }
+
     pub fn interruptActive(self: *Registry, alloc: Allocator) void {
         var changed = false;
         for (self.children) |*child| {
@@ -508,6 +535,23 @@ pub const Store = struct {
             bytes,
         );
         entry.deinit(alloc);
+    }
+
+    /// Removes an idle persistent child from the parent's registry under the
+    /// registry lock, so no admission or turn can start on it meanwhile.
+    /// `ChildNotFound` when it is already gone, `ChildBusy` when it has work.
+    /// Threads are v1-only, so a v2 parent returns `UnsupportedBackend`.
+    pub fn removeIdlePersistent(self: Store, alloc: Allocator, child_id: []const u8) !void {
+        switch (self.backend) {
+            .v2 => return error.UnsupportedBackend,
+            .v1 => {},
+        }
+        var lock = try self.acquireLock(alloc);
+        defer lock.release();
+        var registry = try self.load(alloc);
+        defer registry.deinit(alloc);
+        try registry.removeIdlePersistent(alloc, child_id);
+        try self.save(alloc, registry);
     }
 
     pub fn markChildSession(
@@ -1419,6 +1463,84 @@ test "persistent state derives create continue busy and terminal transitions" {
         "Audit security only.",
         replaced.instructions(),
     );
+}
+
+test "removing an idle persistent child frees its slot and refuses active work" {
+    const alloc = std.testing.allocator;
+    var registry = try Registry.init(alloc, "01J00000000000000000000000");
+    defer registry.deinit(alloc);
+    var work = try testWork(alloc, "work-1", 1);
+    defer work.deinit(alloc);
+    try registry.appendPersistent(alloc, "01J00000000000000000000001", "first", "", work);
+    try registry.appendPersistent(alloc, "01J00000000000000000000002", "second", "", work);
+    try registry.appendOneOff(alloc, "01J00000000000000000000003", work);
+
+    try std.testing.expectError(error.ChildBusy, registry.removeIdlePersistent(alloc, "01J00000000000000000000001"));
+    try std.testing.expectError(error.ChildNotFound, registry.removeIdlePersistent(alloc, "01J00000000000000000000003"));
+    try std.testing.expectError(error.ChildNotFound, registry.removeIdlePersistent(alloc, "missing"));
+    try std.testing.expectEqual(@as(usize, 3), registry.children.len);
+
+    try registry.finish(alloc, "01J00000000000000000000001", "work-1", .completed, null);
+    const before = registry.generation;
+    try registry.removeIdlePersistent(alloc, "01J00000000000000000000001");
+    try std.testing.expect(registry.generation > before);
+    try std.testing.expectEqual(@as(usize, 2), registry.children.len);
+    try std.testing.expect(registry.findPersistent("first") == null);
+    try std.testing.expect(registry.findPersistent("second") != null);
+    // The name is free again.
+    var again = try testWork(alloc, "work-2", 2);
+    defer again.deinit(alloc);
+    try registry.appendPersistent(alloc, "01J00000000000000000000004", "first", "", again);
+
+    registry.interruptActive(alloc);
+    try registry.removeIdlePersistent(alloc, "01J00000000000000000000002");
+    try registry.removeIdlePersistent(alloc, "01J00000000000000000000004");
+    try std.testing.expectEqual(@as(usize, 1), registry.children.len);
+}
+
+test "store removes an idle persistent child under the lock and v2 is unsupported" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var sessions = try session_store.Store.initFromHome(alloc, home, home);
+    defer sessions.deinit(alloc);
+    const parent_id = "01J00000000000000000000000";
+    var parent = try sessions.startWritableSession(alloc, .{
+        .id = @constCast(parent_id),
+        .origin_workspace_root = @constCast(home),
+        .workspace_root = @constCast(home),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = types.ConversationLanguage.literal("en"),
+        .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    });
+    defer parent.deinit(alloc);
+    const store = Store{ .backend = .{ .v1 = &sessions }, .parent_id = parent_id };
+
+    var registry = try Registry.init(alloc, parent_id);
+    defer registry.deinit(alloc);
+    var work = try testWork(alloc, "work-1", 1);
+    defer work.deinit(alloc);
+    try registry.appendPersistent(alloc, "01J00000000000000000000001", "worker", "", work);
+    try store.save(alloc, registry);
+    try std.testing.expectError(error.ChildBusy, store.removeIdlePersistent(alloc, "01J00000000000000000000001"));
+
+    try registry.finish(alloc, "01J00000000000000000000001", "work-1", .completed, null);
+    try store.save(alloc, registry);
+    try store.removeIdlePersistent(alloc, "01J00000000000000000000001");
+    var loaded = try store.load(alloc);
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), loaded.children.len);
+    try std.testing.expectError(error.ChildNotFound, store.removeIdlePersistent(alloc, "01J00000000000000000000001"));
+
+    var v2_children: V2Children = undefined;
+    const v2 = Store{ .backend = .{ .v2 = &v2_children }, .parent_id = parent_id };
+    try std.testing.expectError(error.UnsupportedBackend, v2.removeIdlePersistent(alloc, "01J00000000000000000000001"));
 }
 
 fn testWork(alloc: Allocator, id: []const u8, fingerprint_byte: u8) !ActiveWork {

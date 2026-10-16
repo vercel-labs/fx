@@ -2,6 +2,7 @@ const std = @import("std");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const app_thread_runtime = @import("app_thread_runtime.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
 const app_bootstrap_runtime = @import("app_bootstrap_runtime.zig");
 const io_mod = @import("../shared/io.zig");
@@ -406,6 +407,7 @@ pub fn Handlers(comptime App: type) type {
                 .handle_notifications = commandHandleNotifications,
                 .handle_workspace = commandHandleWorkspace,
                 .handle_shell = commandHandleShell,
+                .handle_thread = commandHandleThread,
                 .show_version = commandShowVersion,
                 .unknown = commandUnknown,
             };
@@ -698,11 +700,13 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandResetSession(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
+            if (try app_thread_runtime.Runtime(App).blocksSessionChange(app, "reset the session")) return;
             try app.resetSession();
         }
 
         fn commandNewSession(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
+            if (try app_thread_runtime.Runtime(App).blocksSessionChange(app, "start a new session")) return;
             try app.newSession();
         }
 
@@ -716,6 +720,7 @@ pub fn Handlers(comptime App: type) type {
                 }, true);
                 return;
             }
+            if (try app_thread_runtime.Runtime(App).blocksSessionChange(app, "resume another session")) return;
             try app_session_runtime.Runtime(App).openSessionPicker(app);
         }
 
@@ -1841,6 +1846,7 @@ pub fn Handlers(comptime App: type) type {
             if (comptime @hasField(InputRuntime, "statusline_menu")) app.input_runtime.statusline_menu.close();
             if (comptime @hasField(InputRuntime, "usage_menu")) closeUsageMenu(app);
             if (comptime @hasField(InputRuntime, "workspace_menu")) app.input_runtime.workspace_menu.close();
+            if (comptime @hasField(InputRuntime, "thread_menu")) app.input_runtime.thread_menu.close(app.alloc);
         }
 
         fn commandCopyLast(ctx: *anyopaque) !void {
@@ -1981,6 +1987,23 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleNotifications(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try handleNotificationsCommand(app, rest);
+        }
+
+        fn commandHandleThread(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            // On its own, /thread opens the menu of threads, as /workspace does.
+            if (std.mem.trim(u8, rest, " \t").len == 0 and comptime @hasField(@TypeOf(app.input_runtime), "thread_menu")) {
+                if (comptime @hasField(App, "skills")) app.skills.closeMenu();
+                if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
+                closeHelpMenuIfPresent(app);
+                app.input_runtime.settings_menu.close();
+                closeInlineCommandMenusIfPresent(app);
+                if (try app_thread_runtime.Runtime(App).openMenu(app)) {
+                    app.shell.render_requests.request(.footer);
+                }
+                return;
+            }
+            try app_thread_runtime.Runtime(App).handle(app, rest);
         }
 
         fn commandHandleShell(ctx: *anyopaque, rest: []const u8) !void {

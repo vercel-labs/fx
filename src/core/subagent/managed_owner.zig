@@ -5,6 +5,7 @@ const authority = @import("authority.zig");
 const child_state = @import("child_state.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
+const thread_feed = @import("../threads/thread_feed.zig");
 const live_metrics = @import("live_metrics.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -97,6 +98,9 @@ pub const Owner = struct {
     slots: std.ArrayList(*Slot) = .empty,
     feedback: std.ArrayList(*Feedback) = .empty,
     closed: bool = false,
+    /// Finds the live feed of a watched thread. Null for a child nobody tails.
+    feed_context: ?*anyopaque = null,
+    feed_for_fn: ?*const fn (?*anyopaque, []const u8) ?*thread_feed.Feed = null,
 
     fn feedbackReplayLocked(self: *Owner, operation_id: []const u8, fingerprint: [32]u8) ?FeedbackResult {
         for (self.feedback.items) |item| {
@@ -566,6 +570,7 @@ fn runOne(slot: *Slot) OneOutcome {
     turn.phase_context = owner;
     turn.phase_fn = Owner.phaseTransition;
     turn.live_metrics = &slot.metrics;
+    if (owner.feed_for_fn) |feed_for| turn.live_feed = feed_for(owner.feed_context, slot.child_id);
     owner.mutex.lockUncancelable(io_mod.getIo());
     slot.worker = turn.workerRuntime();
     slot.work_id = turn.active_work_id;

@@ -21,6 +21,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const types = @import("../shared/types.zig");
 const history_range = @import("../shared/history_range.zig");
+const thread_feed = @import("../threads/thread_feed.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -245,6 +246,9 @@ pub const TurnContext = struct {
         child_state.Phase,
     ) anyerror!void = null,
     live_metrics: ?*live_metrics.LiveMetrics = null,
+    /// Where a watched thread's text and events are copied. Null for a
+    /// one-off child, which has nothing to tail.
+    live_feed: ?*thread_feed.Feed = null,
     failure_diagnostic: ?types.ModelFailureDiagnostic = null,
     committed: bool = false,
 
@@ -372,12 +376,16 @@ pub const TurnContext = struct {
         return &self.managed_executions;
     }
 
-    pub fn appendLiveText(_: *TurnContext, _: []const u8) void {}
+    pub fn appendLiveText(self: *TurnContext, text: []const u8) void {
+        if (self.live_feed) |feed| feed.appendText(text);
+    }
 
     pub fn appendLiveEvent(
-        _: *TurnContext,
-        _: worker_runtime.WorkerEvent,
-    ) void {}
+        self: *TurnContext,
+        event: worker_runtime.WorkerEvent,
+    ) void {
+        if (self.live_feed) |feed| feed.appendEvent(event);
+    }
 
     pub fn resolveLiveAuthority(
         self: *TurnContext,

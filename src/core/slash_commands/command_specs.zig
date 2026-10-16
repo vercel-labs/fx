@@ -28,6 +28,7 @@ pub const TopLevelKind = enum {
     teams,
     session,
     sessions,
+    thread,
     @"resume",
     credits,
     usage,
@@ -72,6 +73,7 @@ pub const SlashKind = enum {
     notifications,
     workspace,
     shell,
+    thread,
     version,
 };
 
@@ -599,6 +601,9 @@ pub fn slashCompletionCount(registry: SlashRegistry, prefix: []const u8) usize {
     if (workspaceArgCompletionPrefix(prefix)) |query| {
         return workspaceArgCompletionCount(query);
     }
+    if (threadArgCompletionPrefix(prefix)) |query| {
+        return threadArgCompletionCount(query);
+    }
     if (prefix.len == 0 or prefix[0] != '/') return 0;
     var count: usize = 0;
     for (registry.commands) |spec| {
@@ -627,6 +632,9 @@ pub fn nthSlashCompletion(registry: SlashRegistry, prefix: []const u8, n: usize)
     if (workspaceArgCompletionPrefix(prefix)) |query| {
         return nthWorkspaceArgCompletion(query, n);
     }
+    if (threadArgCompletionPrefix(prefix)) |query| {
+        return nthThreadArgCompletion(query, n);
+    }
     if (prefix.len == 0 or prefix[0] != '/') return null;
     return (nthSlashCommandCompletionMatch(registry, prefix, n) orelse return null).command;
 }
@@ -640,6 +648,7 @@ pub fn argCompletionAnchor(prefix: []const u8) usize {
     if (notificationsArgCompletionPrefix(prefix) != null) return "/sound ".len;
     if (permissionsArgCompletionPrefix(prefix) != null) return "/permissions ".len;
     if (workspaceArgCompletionPrefix(prefix) != null) return "/workspace ".len;
+    if (threadArgCompletionPrefix(prefix) != null) return "/thread ".len;
     if (allowlistArgCompletionAnchor(prefix)) |anchor| return anchor;
     return 0;
 }
@@ -668,6 +677,9 @@ pub fn nthSlashCompletionLabel(registry: SlashRegistry, prefix: []const u8, n: u
     if (workspaceArgCompletionPrefix(prefix)) |query| {
         return nthWorkspaceArgLabel(query, n);
     }
+    if (threadArgCompletionPrefix(prefix)) |query| {
+        return nthThreadArgLabel(query, n);
+    }
     return nthSlashCompletion(registry, prefix, n);
 }
 
@@ -680,6 +692,7 @@ pub fn nthSlashCompletionDescription(registry: SlashRegistry, prefix: []const u8
     if (notificationsArgCompletionPrefix(prefix) != null) return null;
     if (permissionsArgCompletionPrefix(prefix) != null) return null;
     if (workspaceArgCompletionPrefix(prefix) != null) return null;
+    if (threadArgCompletionPrefix(prefix) != null) return null;
     if (prefix.len == 0 or prefix[0] != '/') return null;
     return (nthSlashCommandCompletionMatch(registry, prefix, n) orelse return null).spec.completion_description;
 }
@@ -694,6 +707,7 @@ pub fn slashCompletionHasArgs(registry: SlashRegistry, command: []const u8) bool
     if (allowlistCompletionHasArgs(command)) return true;
     if (std.mem.eql(u8, command, "/workspace add") or
         std.mem.eql(u8, command, "/workspace remove")) return true;
+    if (threadCompletionHasArgs(command)) return true;
     for (registry.commands) |spec| {
         if (std.mem.eql(u8, spec.command, command)) return spec.has_args;
         for (spec.aliases) |alias| {
@@ -774,6 +788,20 @@ const workspace_arg_completions = [_][]const u8{
     "/workspace add",
     "/workspace remove",
     "/workspace clear",
+};
+
+/// Thread names are not known here, so only the verbs complete. Every verb
+/// but `list` takes a name or text next.
+const thread_arg_completions = [_][]const u8{
+    "/thread list",
+    "/thread status",
+    "/thread new",
+    "/thread watch",
+    "/thread send",
+    "/thread stop",
+    "/thread switch",
+    "/thread rename",
+    "/thread delete",
 };
 
 const allowlist_action_completions = [_][]const u8{
@@ -943,6 +971,30 @@ pub fn permissionsArgCompletionPrefix(prefix: []const u8) ?[]const u8 {
 
 pub fn workspaceArgCompletionPrefix(prefix: []const u8) ?[]const u8 {
     return argCompletionPrefix(prefix, "/workspace");
+}
+
+pub fn threadArgCompletionPrefix(prefix: []const u8) ?[]const u8 {
+    return argCompletionPrefix(prefix, "/thread");
+}
+
+fn threadCompletionHasArgs(command: []const u8) bool {
+    for (thread_arg_completions) |completion| {
+        if (std.mem.eql(u8, completion, command)) return !(std.mem.eql(u8, command, "/thread list") or std.mem.eql(u8, command, "/thread status"));
+    }
+    return false;
+}
+
+fn threadArgCompletionCount(query: []const u8) usize {
+    return argCompletionCount(&thread_arg_completions, "/thread ".len, query);
+}
+
+fn nthThreadArgCompletion(query: []const u8, n: usize) ?[]const u8 {
+    return nthArgCompletion(&thread_arg_completions, "/thread ".len, query, n);
+}
+
+fn nthThreadArgLabel(query: []const u8, n: usize) ?[]const u8 {
+    const full = nthThreadArgCompletion(query, n) orelse return null;
+    return full["/thread ".len..];
 }
 
 fn argCompletionCount(completions: []const []const u8, command_with_space_len: usize, query: []const u8) usize {
@@ -1827,7 +1879,7 @@ test "slash completion categories follow canonical entries" {
 test "help catalog groups visible commands and searches all command metadata" {
     const registry = testSlashRegistry();
 
-    try std.testing.expectEqual(@as(usize, 36), helpCatalogCount(registry, ""));
+    try std.testing.expectEqual(@as(usize, 37), helpCatalogCount(registry, ""));
     try std.testing.expectEqualStrings("/help", helpCatalogSpecAt(registry, "", 0).?.command);
     try std.testing.expectEqual(@as(usize, 5), helpCatalogCategoryCount(registry, "", .general));
     try std.testing.expectEqual(@as(usize, 3), helpCatalogCount(registry, "appearance"));
@@ -2073,6 +2125,16 @@ test "allowlist staged completions with more arguments append space on tab" {
     try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist view"));
     try std.testing.expect(!slashCompletionHasArgs(testSlashRegistry(), "/allowlist view user"));
     try std.testing.expect(!slashCompletionHasArgs(testSlashRegistry(), "/allowlist reset all"));
+}
+
+test "thread completions offer each verb and keep name verbs open" {
+    try std.testing.expectEqual(@as(usize, 9), slashCompletionCount(testSlashRegistry(), "/thread "));
+    try std.testing.expectEqualStrings("/thread switch", nthSlashCompletion(testSlashRegistry(), "/thread sw", 0).?);
+    try std.testing.expectEqualStrings("switch", nthSlashCompletionLabel(testSlashRegistry(), "/thread sw", 0).?);
+    try std.testing.expectEqual(@as(usize, 4), slashCompletionCount(testSlashRegistry(), "/thread s"));
+    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/thread new"));
+    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/thread delete"));
+    try std.testing.expect(!slashCompletionHasArgs(testSlashRegistry(), "/thread list"));
 }
 
 test "workspace completions expose actions and keep path actions open" {

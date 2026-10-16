@@ -10259,6 +10259,17 @@ pub const TranscriptRuntime = struct {
         return transcript_store.replaceSemanticNoticeAtomic(self, alloc, entry_id, notice);
     }
 
+    /// Like `replaceSemanticNotice`, but the entry stays pinned so it can be
+    /// replaced again. A later `replaceSemanticNotice` releases it.
+    pub fn replaceSemanticNoticeKeepingPin(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        entry_id: u32,
+        notice: types.SemanticNotice,
+    ) !bool {
+        return transcript_store.replaceSemanticNoticeKeepingPinAtomic(self, alloc, entry_id, notice);
+    }
+
     pub fn setCommandOutputRenderPolicy(self: *TranscriptRuntime, styles: Styles) void {
         return command_output_runtime.setCommandOutputRenderPolicy(self, styles);
     }

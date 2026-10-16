@@ -1823,15 +1823,18 @@ fn approvalTitle(
     return switch (origin) {
         .active_session => .{ .text = active_title },
         .subagent => |child_name| blk: {
+            // A thread arrives as "thread:NAME".
+            const thread_prefix = "thread:";
+            const is_thread = std.mem.startsWith(u8, child_name, thread_prefix);
             var encoded = try text_utils.encodeTerminalSafe(
                 alloc,
-                child_name,
+                if (is_thread) child_name[thread_prefix.len..] else child_name,
                 diff_mod.max_request_projection_bytes,
             );
             defer encoded.deinit(alloc);
             const owned = try alloc.print(
-                "Subagent {s} needs permission",
-                .{encoded.bytes},
+                "{s} {s} needs permission",
+                .{ if (is_thread) "Thread" else "Subagent", encoded.bytes },
             );
             break :blk .{ .text = owned, .owned = owned };
         },
@@ -3004,4 +3007,14 @@ test "permission hints use compact ask modal language" {
     ) != null);
     try std.testing.expect(std.mem.find(u8, file.text.items, "wheel scroll") != null);
     try std.testing.expect(std.mem.find(u8, file.text.items, "tab amend") != null);
+}
+
+test "approval title names a thread by its user-facing name" {
+    var thread = try approvalTitle(std.testing.allocator, .{ .subagent = "thread:alpha" }, "unused");
+    defer thread.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Thread alpha needs permission", thread.text);
+
+    var child = try approvalTitle(std.testing.allocator, .{ .subagent = "worker" }, "unused");
+    defer child.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Subagent worker needs permission", child.text);
 }

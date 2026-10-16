@@ -12,6 +12,9 @@ pub const Options = struct {
     permission_mode: types.PermissionMode = .auto,
     permission_rules: types.PermissionRuleSet = .{},
     subagent_available: bool = false,
+    /// The session is the root of a thread tree, so `thread_read` and
+    /// `thread_send` have threads to reach. Children never set it.
+    threads_available: bool = false,
 };
 
 const BuildKind = enum { full, read_only };
@@ -560,6 +563,7 @@ fn appendBuiltinTool(
     if (!tool.model_visible) return;
     if (!includeBuiltinForKind(tool.name, kind, tool_set)) return;
     if (std.mem.eql(u8, tool.name, "subagent") and !options.subagent_available) return;
+    if (isThreadTool(tool.name) and !options.threads_available) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
     if (options.permission_mode != .yolo) {
         if (tool.provider_executed and !providerExecutionIsAllowed(tool.name, options.permission_rules)) return;
@@ -577,6 +581,10 @@ fn appendBuiltinTool(
         }
         try guidance_writer.writeAll(tool.description);
     }
+}
+
+fn isThreadTool(name: []const u8) bool {
+    return std.mem.eql(u8, name, "thread_read") or std.mem.eql(u8, name, "thread_send") or std.mem.eql(u8, name, "thread_new");
 }
 
 /// A provider-executed tool is never dispatched locally, so an unsettled `ask`

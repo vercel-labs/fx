@@ -22,6 +22,7 @@ const types = @import("../../core/shared/types.zig");
 const workspace_access = @import("../../core/workspace/workspace_access.zig");
 const file_index = @import("../../core/workspace/file_index.zig");
 const workspace_menu = @import("../../core/workspace/workspace_menu.zig");
+const thread_menu = @import("../../core/threads/thread_menu.zig");
 const activity_runtime = @import("../../core/output/activity_runtime.zig");
 const transcript_presentation = @import("../../core/output/transcript_presentation.zig");
 const usage_menu = @import("../../core/session/usage_menu.zig");
@@ -336,10 +337,25 @@ pub fn workspaceMenuProjection(
     };
 }
 
+pub const ThreadsMenuProjection = struct {
+    active: bool = false,
+    selected_index: usize = 0,
+    rows: []const thread_menu.Row = &.{},
+};
+
+pub fn threadsMenuProjection(menu: *const thread_menu.State) ThreadsMenuProjection {
+    return .{
+        .active = menu.active,
+        .selected_index = menu.selected_index,
+        .rows = menu.rows,
+    };
+}
+
 pub const CompactCommandMenuProjection = union(enum) {
     statusline: StatuslineMenuProjection,
     usage: UsageMenuProjection,
     workspace: WorkspaceMenuProjection,
+    threads: ThreadsMenuProjection,
 };
 
 pub fn settingsMenuProjection(
@@ -464,6 +480,7 @@ pub const RenderContext = struct {
     statusline_menu: StatuslineMenuProjection = .{},
     usage_menu: UsageMenuProjection = .{},
     workspace_menu: WorkspaceMenuProjection = .{},
+    threads_menu: ThreadsMenuProjection = .{},
     upgrade_status: []const u8 = "",
     /// What MCP has to say, after everything else on the right.
     mcp_status: []const u8 = "",
@@ -482,6 +499,7 @@ pub fn activeCompactCommandMenu(ctx: RenderContext) ?CompactCommandMenuProjectio
     if (ctx.statusline_menu.active) return .{ .statusline = ctx.statusline_menu };
     if (ctx.usage_menu.active) return .{ .usage = ctx.usage_menu };
     if (ctx.workspace_menu.active) return .{ .workspace = ctx.workspace_menu };
+    if (ctx.threads_menu.active) return .{ .threads = ctx.threads_menu };
     return null;
 }
 

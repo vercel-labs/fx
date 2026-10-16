@@ -702,6 +702,12 @@ pub fn formatPermissionLabel(alloc: Allocator, registry: tool_dispatch.Registry,
             .{ call.name, spec.label_arg_default },
         );
     }
+    if (std.mem.eql(u8, call.name, "thread_send")) {
+        if (try formatThreadSendPermissionLabel(alloc, args, "thread_send", "message")) |label| return label;
+    }
+    if (std.mem.eql(u8, call.name, "thread_new")) {
+        if (try formatThreadSendPermissionLabel(alloc, args, "thread_new", "task")) |label| return label;
+    }
     const value = tool_dispatch.toolLabelValue(spec.*, args) orelse return try alloc.dupe(u8, call.name);
 
     if (spec.label_arg_kind == .command) {
@@ -713,6 +719,30 @@ pub fn formatPermissionLabel(alloc: Allocator, registry: tool_dispatch.Registry,
     }
 
     return alloc.print("{s} {s}", .{ call.name, value });
+}
+
+const thread_send_label_message_width: usize = 160;
+
+/// A message to a thread is what the approval screen has to show, since the
+/// thread name alone says nothing about what the other agent will be asked to
+/// do. The text is flattened to one line and clipped. Null when the arguments
+/// lack a name or message. The caller owns the returned allocation.
+fn formatThreadSendPermissionLabel(
+    alloc: Allocator,
+    args: std.json.ObjectMap,
+    tool_name: []const u8,
+    text_field: []const u8,
+) Allocator.Error!?[]const u8 {
+    const name = tool_args.optionalStringArg(args, "name") orelse return null;
+    const message = tool_args.optionalStringArg(args, text_field) orelse return null;
+    const flat = try alloc.dupe(u8, message);
+    defer alloc.free(flat);
+    for (flat) |*byte| {
+        if (byte.* == '\n' or byte.* == '\r' or byte.* == '\t') byte.* = ' ';
+    }
+    var clip_buf: [thread_send_label_message_width * 4 + 8]u8 = undefined;
+    const clipped = text_utils.clippedLabel(&clip_buf, std.mem.trim(u8, flat, " "), thread_send_label_message_width);
+    return try alloc.print("{s} {s}: {s}", .{ tool_name, name, clipped });
 }
 
 /// The caller owns the returned allocation and must free it with `alloc`.
@@ -1499,6 +1529,42 @@ test "tool presentation frees all formatted output with a normal allocator" {
     try std.testing.expectEqualStrings("current Zig release | blocked: spam.example", detail);
 }
 
+test "thread_send permission label shows the thread and a one line message" {
+    const alloc = std.testing.allocator;
+    const registry = tool_dispatch.Registry{ .tools = &.{test_builtin_tools.thread_send} };
+    const label = try formatPermissionLabel(alloc, registry, .{
+        .id = "send",
+        .name = "thread_send",
+        .arguments_json = "{\"name\":\"alpha\",\"message\":\"first line\\nsecond\\tline  \"}",
+    });
+    defer alloc.free(label);
+    try std.testing.expectEqualStrings("thread_send alpha: first line second line", label);
+
+    const long: [400]u8 = @splat('x');
+    const args = try alloc.print("{{\"name\":\"alpha\",\"message\":\"{s}\"}}", .{long});
+    defer alloc.free(args);
+    const clipped = try formatPermissionLabel(alloc, registry, .{ .id = "send", .name = "thread_send", .arguments_json = args });
+    defer alloc.free(clipped);
+    try std.testing.expect(clipped.len < 200);
+    try std.testing.expect(std.mem.endsWith(u8, clipped, "..."));
+
+    const missing = try formatPermissionLabel(alloc, registry, .{ .id = "send", .name = "thread_send", .arguments_json = "{\"name\":\"alpha\"}" });
+    defer alloc.free(missing);
+    try std.testing.expect(std.mem.startsWith(u8, missing, "thread_send"));
+}
+
 fn expectContains(text: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.find(u8, text, needle) != null);
+}
+
+test "thread_new permission label shows the thread and a one line task" {
+    const alloc = std.testing.allocator;
+    const registry = tool_dispatch.Registry{ .tools = &.{test_builtin_tools.thread_new} };
+    const label = try formatPermissionLabel(alloc, registry, .{
+        .id = "new",
+        .name = "thread_new",
+        .arguments_json = "{\"name\":\"beta\",\"task\":\"fix the\\nlogin bug\"}",
+    });
+    defer alloc.free(label);
+    try std.testing.expectEqualStrings("thread_new beta: fix the login bug", label);
 }

@@ -16868,3 +16868,21 @@ test "retint rewrites custom theme colors on a variant flip" {
     try std.testing.expect(std.mem.find(u8, muted, "\x1b[38;5;90mKeyword row") != null);
     try std.testing.expect(std.mem.find(u8, muted, "\x1b[38;5;201muser output") != null);
 }
+
+test "replaceable semantic notice can keep its pin across live updates until released" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime.init();
+    defer runtime.deinit(alloc);
+    runtime.setCommandOutputRenderPolicy(semanticNoticePaletteA());
+
+    const entry_id = try runtime.appendReplaceableSemanticNotice(alloc, .{ .topic = "watch", .tone = .neutral, .body = "running" });
+    for ([_][]const u8{ "running 1", "running 2", "running 3" }) |body| {
+        try std.testing.expect(try runtime.replaceSemanticNoticeKeepingPin(alloc, entry_id, .{ .topic = "watch", .tone = .neutral, .body = body }));
+        try std.testing.expect(runtime.entries.items[0].semantic_notice.pending_replacement);
+        try std.testing.expectEqualStrings(body, runtime.entries.items[0].semantic_notice.body);
+    }
+    // The final replacement releases the pin, after which the entry is history.
+    try std.testing.expect(try runtime.replaceSemanticNotice(alloc, entry_id, .{ .topic = "watch", .tone = .neutral, .body = "idle" }));
+    try std.testing.expect(!runtime.entries.items[0].semantic_notice.pending_replacement);
+    try std.testing.expectError(error.MissingNoticeReplacementPin, runtime.replaceSemanticNoticeKeepingPin(alloc, entry_id, .{ .topic = "watch", .tone = .neutral, .body = "late" }));
+}

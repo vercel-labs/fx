@@ -20,6 +20,7 @@ const usage_host = @import("core/app/usage_host.zig");
 const app_auth_runtime = @import("core/app/app_auth_runtime.zig");
 const app_host_config_runtime = @import("core/app/app_host_config_runtime.zig");
 const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
+const app_thread_runtime = @import("core/app/app_thread_runtime.zig");
 const acp_runner = @import("core/cli/acp_runner.zig");
 const acp_server = @import("acp/server.zig");
 const app_input_runtime = @import("core/app/app_input_runtime.zig");
@@ -576,6 +577,8 @@ const App = struct {
 
     worker_thread: ?std.Thread = null,
     worker: WorkerRuntime = .{},
+    /// The live `/thread watch` view, redrawn by the worker tick.
+    thread_watch: app_thread_runtime.WatchState = .{},
     terminal_client: terminal_client_runtime.Runtime = .{},
     managed_executions: managed_execution.Runtime = managed_execution.Runtime.init(std.heap.c_allocator),
     legacy_process_provider: process_provider.Provider = process_provider.unavailable_provider,
@@ -2086,6 +2089,7 @@ const App = struct {
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
             .subagent_available = self.session_persistence.subagent_host != null,
+            .threads_available = self.session_persistence.subagent_host != null,
         });
     }
 
@@ -2695,6 +2699,11 @@ const App = struct {
 
     pub fn replaceDomainNotice(self: *App, entry_id: u32, notice: types.SemanticNotice) !bool {
         return self.shell.replaceSemanticNotice(self.alloc, entry_id, notice);
+    }
+
+    /// Updates a replaceable notice and keeps it replaceable, for a live view.
+    pub fn replaceDomainNoticeKeepingPin(self: *App, entry_id: u32, notice: types.SemanticNotice) !bool {
+        return self.shell.replaceSemanticNoticeKeepingPin(self.alloc, entry_id, notice);
     }
 
     pub fn writeCommandOutputChunk(self: *App, stream: command_output_content.Stream, text: []const u8, record: bool) !void {
@@ -5027,6 +5036,15 @@ test {
     _ = @import("tools/web/html_to_markdown.zig");
     _ = @import("tools/filesystem/read_file.zig");
     _ = @import("tools/session/read_tool_result.zig");
+    _ = @import("core/threads/thread_registry.zig");
+    _ = @import("core/threads/thread_feed.zig");
+    _ = @import("core/threads/thread_menu.zig");
+    _ = @import("core/threads/thread_tools.zig");
+    _ = @import("core/threads/thread_tool_provider.zig");
+    _ = @import("tools/session/thread_read.zig");
+    _ = @import("tools/session/thread_send.zig");
+    _ = @import("tools/session/thread_new.zig");
+    _ = @import("core/app/app_thread_runtime.zig");
     _ = @import("tools/skills/install_skill.zig");
     _ = @import("tools/skills/skill.zig");
     _ = @import("core/upgrade/upgrade_helpers.zig");

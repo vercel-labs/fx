@@ -1465,6 +1465,276 @@ pub const SessionDetailSnapshot = struct {
     }
 };
 
+/// One row of `fx thread`. Every string is borrowed from the caller.
+pub const ThreadListEntry = struct {
+    name: []const u8,
+    /// Empty until the thread has started.
+    session_id: []const u8,
+    /// The state last saved on disk, or `not_started`.
+    state: []const u8,
+    last_outcome: ?[]const u8 = null,
+};
+
+pub const thread_state_note = "saved state; live state is only visible inside the running fx session";
+pub const thread_reply_max_bytes: usize = 4096;
+
+/// Masks secrets in a thread's reply and makes it terminal-safe within
+/// `thread_reply_max_bytes`, keeping line breaks. Caller owns the result.
+pub fn threadReplyForDisplay(alloc: Allocator, raw: []const u8) !text_utils.EncodedText {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const masked = try text_utils.maskSecrets(arena_state.allocator(), raw);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var truncated = false;
+    var lines = std.mem.splitScalar(u8, masked, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        const separator: usize = if (first) 0 else 1;
+        if (out.items.len + separator >= thread_reply_max_bytes) {
+            truncated = true;
+            break;
+        }
+        var encoded = try text_utils.encodeTerminalSafe(alloc, line, thread_reply_max_bytes - out.items.len - separator);
+        defer encoded.deinit(alloc);
+        if (!first) try out.append(alloc, '\n');
+        try out.appendSlice(alloc, encoded.bytes);
+        first = false;
+        if (encoded.truncated) {
+            truncated = true;
+            break;
+        }
+    }
+    return .{ .bytes = try out.toOwnedSlice(alloc), .truncated = truncated };
+}
+
+fn writeTerminalSafeField(alloc: Allocator, writer: *std.Io.Writer, raw: []const u8) !void {
+    var encoded = try text_utils.encodeTerminalSafe(alloc, raw, 256);
+    defer encoded.deinit(alloc);
+    try writer.writeAll(encoded.bytes);
+}
+
+fn writeOptionalJsonString(writer: *std.Io.Writer, value: ?[]const u8) !void {
+    if (value) |text| {
+        try std.json.Stringify.value(text, .{}, writer);
+    } else {
+        try writer.writeAll("null");
+    }
+}
+
+pub const ThreadListSnapshot = struct {
+    root_session_id: []const u8,
+    threads: []const ThreadListEntry,
+
+    pub fn render(self: ThreadListSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    pub fn renderText(self: ThreadListSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("[threads] ");
+        try writeTerminalSafeField(alloc, &out.writer, self.root_session_id);
+        try out.writer.print(" {d} saved\n", .{self.threads.len});
+        try out.writer.print("note: {s}\n", .{thread_state_note});
+        if (self.threads.len == 0) {
+            try out.writer.writeAll("(no threads)\n");
+            return try out.toOwnedSlice();
+        }
+        for (self.threads) |thread| {
+            try out.writer.writeAll("  ");
+            try writeTerminalSafeField(alloc, &out.writer, thread.name);
+            try out.writer.print("  {s}", .{thread.state});
+            if (thread.last_outcome) |outcome| try out.writer.print("  {s}", .{outcome});
+            try out.writer.writeByte('\n');
+        }
+        return try out.toOwnedSlice();
+    }
+
+    pub fn renderJson(self: ThreadListSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"kind\":\"threads\",\"session_id\":");
+        try std.json.Stringify.value(self.root_session_id, .{}, &out.writer);
+        try out.writer.writeAll(",\"state_source\":\"saved\",\"threads\":[");
+        for (self.threads, 0..) |thread, i| {
+            if (i > 0) try out.writer.writeByte(',');
+            try out.writer.writeAll("{\"name\":");
+            try std.json.Stringify.value(thread.name, .{}, &out.writer);
+            try out.writer.writeAll(",\"session_id\":");
+            if (thread.session_id.len == 0) {
+                try out.writer.writeAll("null");
+            } else {
+                try std.json.Stringify.value(thread.session_id, .{}, &out.writer);
+            }
+            try out.writer.writeAll(",\"state\":");
+            try std.json.Stringify.value(thread.state, .{}, &out.writer);
+            try out.writer.writeAll(",\"last_outcome\":");
+            try writeOptionalJsonString(&out.writer, thread.last_outcome);
+            try out.writer.writeByte('}');
+        }
+        try out.writer.writeAll("]}");
+        return try out.toOwnedSlice();
+    }
+};
+
+pub const ThreadDetailSnapshot = struct {
+    root_session_id: []const u8,
+    entry: ThreadListEntry,
+    /// Already masked and terminal-safe (`threadReplyForDisplay`).
+    last_reply: ?[]const u8 = null,
+    last_reply_truncated: bool = false,
+    turns: usize = 0,
+
+    pub fn render(self: ThreadDetailSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    pub fn renderText(self: ThreadDetailSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("[thread] ");
+        try writeTerminalSafeField(alloc, &out.writer, self.entry.name);
+        try out.writer.writeAll("\nsession: ");
+        try writeTerminalSafeField(alloc, &out.writer, self.root_session_id);
+        try out.writer.writeAll("\nthread_session: ");
+        if (self.entry.session_id.len == 0) {
+            try out.writer.writeAll("(not started)");
+        } else {
+            try writeTerminalSafeField(alloc, &out.writer, self.entry.session_id);
+        }
+        try out.writer.print("\nstate: {s}\n", .{self.entry.state});
+        try out.writer.print("note: {s}\n", .{thread_state_note});
+        try out.writer.print("last_outcome: {s}\n", .{self.entry.last_outcome orelse "(none)"});
+        try out.writer.print("turns: {d}\n", .{self.turns});
+        try out.writer.writeAll("\n[last reply]\n");
+        if (self.last_reply) |reply| {
+            try writeTextBlock(&out.writer, reply);
+            if (self.last_reply_truncated) try out.writer.writeAll("(reply truncated)\n");
+        } else {
+            try out.writer.writeAll("(none)\n");
+        }
+        return try out.toOwnedSlice();
+    }
+
+    pub fn renderJson(self: ThreadDetailSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"kind\":\"thread\",\"session_id\":");
+        try std.json.Stringify.value(self.root_session_id, .{}, &out.writer);
+        try out.writer.writeAll(",\"name\":");
+        try std.json.Stringify.value(self.entry.name, .{}, &out.writer);
+        try out.writer.writeAll(",\"thread_session_id\":");
+        if (self.entry.session_id.len == 0) {
+            try out.writer.writeAll("null");
+        } else {
+            try std.json.Stringify.value(self.entry.session_id, .{}, &out.writer);
+        }
+        try out.writer.writeAll(",\"state_source\":\"saved\",\"state\":");
+        try std.json.Stringify.value(self.entry.state, .{}, &out.writer);
+        try out.writer.writeAll(",\"last_outcome\":");
+        try writeOptionalJsonString(&out.writer, self.entry.last_outcome);
+        try out.writer.print(",\"turns\":{d},\"last_reply\":", .{self.turns});
+        try writeOptionalJsonString(&out.writer, self.last_reply);
+        try out.writer.print(",\"last_reply_truncated\":{s}}}", .{if (self.last_reply_truncated) "true" else "false"});
+        return try out.toOwnedSlice();
+    }
+};
+
+test "thread list renders text and json from one snapshot" {
+    const alloc = std.testing.allocator;
+    const snapshot = ThreadListSnapshot{
+        .root_session_id = "root-1",
+        .threads = &.{
+            .{ .name = "alpha", .session_id = "child-1", .state = "idle", .last_outcome = "completed" },
+            .{ .name = "beta", .session_id = "", .state = "not_started" },
+        },
+    };
+    const text = try snapshot.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(
+        "[threads] root-1 2 saved\nnote: " ++ thread_state_note ++ "\n  alpha  idle  completed\n  beta  not_started\n",
+        text,
+    );
+    const json = try snapshot.render(alloc, .json);
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"threads\",\"session_id\":\"root-1\",\"state_source\":\"saved\",\"threads\":[" ++
+            "{\"name\":\"alpha\",\"session_id\":\"child-1\",\"state\":\"idle\",\"last_outcome\":\"completed\"}," ++
+            "{\"name\":\"beta\",\"session_id\":null,\"state\":\"not_started\",\"last_outcome\":null}]}",
+        json,
+    );
+    const empty = try (ThreadListSnapshot{ .root_session_id = "r", .threads = &.{} }).render(alloc, .text);
+    defer alloc.free(empty);
+    try std.testing.expect(std.mem.find(u8, empty, "(no threads)") != null);
+}
+
+test "thread detail renders text and json from one snapshot" {
+    const alloc = std.testing.allocator;
+    const snapshot = ThreadDetailSnapshot{
+        .root_session_id = "root-1",
+        .entry = .{ .name = "alpha", .session_id = "child-1", .state = "interrupted", .last_outcome = "interrupted" },
+        .last_reply = "line one\n\"quoted\"",
+        .last_reply_truncated = true,
+        .turns = 3,
+    };
+    const text = try snapshot.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(
+        "[thread] alpha\nsession: root-1\nthread_session: child-1\nstate: interrupted\nnote: " ++ thread_state_note ++
+            "\nlast_outcome: interrupted\nturns: 3\n\n[last reply]\nline one\n\"quoted\"\n(reply truncated)\n",
+        text,
+    );
+    const json = try snapshot.render(alloc, .json);
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"thread\",\"session_id\":\"root-1\",\"name\":\"alpha\",\"thread_session_id\":\"child-1\"," ++
+            "\"state_source\":\"saved\",\"state\":\"interrupted\",\"last_outcome\":\"interrupted\",\"turns\":3," ++
+            "\"last_reply\":\"line one\\n\\\"quoted\\\"\",\"last_reply_truncated\":true}",
+        json,
+    );
+
+    const fresh = try (ThreadDetailSnapshot{
+        .root_session_id = "root-1",
+        .entry = .{ .name = "beta", .session_id = "", .state = "not_started" },
+    }).render(alloc, .json);
+    defer alloc.free(fresh);
+    try std.testing.expect(std.mem.find(u8, fresh, "\"thread_session_id\":null") != null);
+    try std.testing.expect(std.mem.find(u8, fresh, "\"last_reply\":null") != null);
+}
+
+test "thread reply is masked and terminal-safe" {
+    const alloc = std.testing.allocator;
+    var encoded = try threadReplyForDisplay(alloc, "AI_GATEWAY_API_KEY=abcdefghijklmnop \x1b[31mred");
+    defer encoded.deinit(alloc);
+    try std.testing.expect(std.mem.findScalar(u8, encoded.bytes, 0x1b) == null);
+    try std.testing.expect(std.mem.find(u8, encoded.bytes, "abcdefghijklmnop") == null);
+    try std.testing.expect(std.mem.find(u8, encoded.bytes, "[redacted]") != null);
+}
+
+test "thread reply keeps line breaks and bounds its length" {
+    const alloc = std.testing.allocator;
+    var short = try threadReplyForDisplay(alloc, "one\ntwo\x07\nthree");
+    defer short.deinit(alloc);
+    try std.testing.expectEqualStrings("one\ntwo\\x07\nthree", short.bytes);
+    try std.testing.expect(!short.truncated);
+
+    const long = try alloc.alloc(u8, thread_reply_max_bytes * 3);
+    defer alloc.free(long);
+    for (long, 0..) |*c, i| c.* = if (i % 50 == 49) '\n' else 'x';
+    var bounded = try threadReplyForDisplay(alloc, long);
+    defer bounded.deinit(alloc);
+    try std.testing.expect(bounded.truncated);
+    try std.testing.expect(bounded.bytes.len <= thread_reply_max_bytes);
+}
+
 pub const SessionMigrationSnapshot = struct {
     result: session_store.SessionMigrationResult,
 

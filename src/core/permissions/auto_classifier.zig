@@ -947,7 +947,10 @@ fn selectReviewView(request: ReviewRequest) ReviewView {
     return switch (request.action) {
         .command, .shell_input => .contextual,
         .file_mutation => .normal,
-        .tool => |tool| if (tool.schema_required) .contextual else .normal,
+        // A message to a thread hands text to another agent that can run
+        // tools, so the reviewer needs the user's own requests to tell trusted
+        // intent from injected influence, as it does for subagent actions.
+        .tool => |tool| if (tool.schema_required or std.mem.eql(u8, tool.tool_name, "thread_send") or std.mem.eql(u8, tool.tool_name, "thread_new")) .contextual else .normal,
     };
 }
 
@@ -1000,7 +1003,16 @@ test "review view selection uses only normalized action and origin facts" {
     request.action.tool.schema_required = true;
     try std.testing.expectEqual(ReviewView.contextual, selectReviewView(request));
 
-    request.action.tool.schema_required = false;
+    request.action = .{ .tool = .{
+        .tool_name = "thread_send",
+        .arguments_json = "{\"name\":\"a\",\"message\":\"hi\"}",
+    } };
+    try std.testing.expectEqual(ReviewView.contextual, selectReviewView(request));
+
+    request.action = .{ .tool = .{
+        .tool_name = "web_fetch",
+        .arguments_json = "{}",
+    } };
     request.review_turn.origin = .subagent;
     try std.testing.expectEqual(ReviewView.contextual, selectReviewView(request));
 

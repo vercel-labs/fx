@@ -8,6 +8,8 @@ pub const chatgpt_auth_file_name = "chatgpt-auth.json";
 pub const grok_auth_file_name = "grok-auth.json";
 pub const api_key_file_name = "api-key";
 pub const sessions_dir_name = "sessions";
+/// Thread registries, one file per root session id.
+pub const threads_dir_name = "threads";
 /// Side folders older v2 sessions kept (D27): v1's per-session layout, one
 /// folder per session id. A session moves out on its first open (D47).
 pub const session_files_dir_name = "session-files";

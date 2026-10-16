@@ -33,6 +33,8 @@ const skill_runtime = @import("../skills/skill_runtime.zig");
 const subagent_model_contract = @import("../subagent/model_contract.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_tool_provider = @import("../subagent/tool_provider.zig");
+const thread_tool_provider = @import("../threads/thread_tool_provider.zig");
+const thread_tools = @import("../threads/thread_tools.zig");
 const session_runtime = @import("../session/session.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const session_child_store = @import("../session/session_child_store.zig");
@@ -853,6 +855,7 @@ fn executeRegisteredTool(
         .call = call,
         .completion_sink = &dispatch_metadata.subagent_completion,
     };
+    var thread_provider = ThreadProviderState{ .runtime = ctx };
     var dispatch_ctx = typedDispatchContextForCall(ctx, arena, call);
     dispatch_metadata.attach(&dispatch_ctx);
     var result_commit_token: ?result_commit.Token = null;
@@ -892,6 +895,10 @@ fn executeRegisteredTool(
         .subagent => dispatch_ctx.subagent_provider = .{
             .context = &subagent_provider,
             .execute_fn = executeSubagentProvider,
+        },
+        .thread => dispatch_ctx.thread_provider = .{
+            .context = &thread_provider,
+            .execute_fn = executeThreadProvider,
         },
     }
     dispatch_ctx.mcp_execution_error_sink = &mcp_execution_error;
@@ -2225,6 +2232,54 @@ fn executeSubagentProvider(
         .status = if (output.success) .success else .failure,
         .body = output.body,
     };
+}
+
+const ThreadProviderState = struct {
+    runtime: Context,
+};
+
+/// Thread tools act for the session that owns the subagent host. Sends return
+/// as soon as the thread has the message, so no cancel flag, progress sink, or
+/// steering worker is handed to the host.
+fn executeThreadProvider(
+    raw_context: ?*anyopaque,
+    arena: Allocator,
+    request: thread_tool_provider.Request,
+    invocation_id: []const u8,
+) thread_tool_provider.ExecuteError!thread_tool_provider.Result {
+    const state: *ThreadProviderState = @ptrCast(@alignCast(raw_context.?));
+    const ctx = state.runtime;
+    const host = ctx.subagent_host orelse
+        return threadProviderFailure(arena, "Threads are not available in this session.");
+    const caller_id = ctx.subagent_caller_id orelse
+        return threadProviderFailure(arena, "Threads are not available in this session.");
+    return thread_tools.execute(arena, host, caller_id, request, .{
+        .caller_id = caller_id,
+        .invocation_id = invocation_id,
+        .parent_permission_mode = ctx.permission_mode,
+        .root_user_intent_context = ctx.root_user_intent_context,
+        .root_user_messages = ctx.root_user_messages,
+        .root_user_evidence_complete = ctx.root_user_evidence_complete,
+        .defaults = .{
+            .provider = ctx.provider,
+            .model = ctx.model,
+            .effort = ctx.effort,
+            .fast_mode = ctx.fast_mode,
+            .ultrafast_mode = ctx.ultrafast_mode,
+            .conversation_language = ctx.session.languageSnapshot(),
+        },
+        .max_result_bytes = ctx.max_tool_result_bytes,
+        .timestamp_ms = io_mod.milliTimestamp(),
+        .model_capability_resolver = ctx.model_capability_resolver,
+        .model_override_resolver = ctx.model_override_resolver,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return threadProviderFailure(arena, "The thread host failed."),
+    };
+}
+
+fn threadProviderFailure(alloc: Allocator, text: []const u8) Allocator.Error!thread_tool_provider.Result {
+    return .{ .status = .failure, .body = try alloc.dupe(u8, text) };
 }
 
 fn noopOutput(_: *anyopaque, _: ?types.ToolLifecycleId, _: command_contract.CommandOutputStream, _: []const u8) !void {}

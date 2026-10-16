@@ -5,6 +5,7 @@ const question_prompt = @import("../agent/question_prompt.zig");
 const app_auth_runtime = @import("app_auth_runtime.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const app_thread_runtime = @import("app_thread_runtime.zig");
 const app_workspace_runtime = @import("app_workspace_runtime.zig");
 const app_commands = @import("app_commands.zig");
 const project_config = @import("../mcp/project_config.zig");
@@ -2332,12 +2333,14 @@ pub fn Runtime(comptime App: type) type {
             statusline,
             usage,
             workspace,
+            threads,
         };
 
         fn activeCompactCommandMenu(app: *App) ?CompactCommandMenuKind {
             if (app.input_runtime.statusline_menu.active) return .statusline;
             if (app.input_runtime.usage_menu.active) return .usage;
             if (app.input_runtime.workspace_menu.active) return .workspace;
+            if (app.input_runtime.thread_menu.active) return .threads;
             return null;
         }
 
@@ -2606,6 +2609,10 @@ pub fn Runtime(comptime App: type) type {
                 try prepareWorkspaceMenuCommand(app, max_input_len);
                 return;
             }
+            if (menu == .threads) {
+                try app_thread_runtime.Runtime(App).selectMenuRow(app);
+                return;
+            }
             if (menu == .usage) {
                 if (app.input_runtime.usage_menu.openDetail()) app.shell.render_requests.request(.footer);
                 return;
@@ -2613,7 +2620,7 @@ pub fn Runtime(comptime App: type) type {
             const snapshot = app_commands.settingsCatalogSnapshot(app);
             const change = switch (menu) {
                 .statusline => app.input_runtime.statusline_menu.selectedChange(snapshot),
-                .usage, .workspace => unreachable,
+                .usage, .workspace, .threads => unreachable,
             } orelse return;
             if (comptime @hasDecl(App, "notificationPreferences")) {
                 try app_commands.applySettingsCatalogMenuChange(app, change);
@@ -2666,6 +2673,7 @@ pub fn Runtime(comptime App: type) type {
                     )
                 else
                     false,
+                .threads => app.input_runtime.thread_menu.move(delta),
             };
         }
 
@@ -2718,7 +2726,7 @@ pub fn Runtime(comptime App: type) type {
                 const delta: i32 = if (resolved == .cursor_left) -1 else 1;
                 const change = switch (menu) {
                     .statusline => app.input_runtime.statusline_menu.changeSelectedOption(&snapshot, delta),
-                    .usage, .workspace => unreachable,
+                    .usage, .workspace, .threads => unreachable,
                 } orelse return;
                 if (comptime @hasDecl(App, "notificationPreferences")) {
                     try app_commands.applySettingsCatalogMenuChange(app, change);
@@ -3288,6 +3296,11 @@ pub fn Runtime(comptime App: type) type {
             }
             if (app.input_runtime.workspace_menu.active) {
                 app.input_runtime.workspace_menu.close();
+                return true;
+            }
+            if (app.input_runtime.thread_menu.active) {
+                app.input_runtime.thread_menu.close(app.alloc);
+                app.shell.render_requests.request(.footer);
                 return true;
             }
             return false;

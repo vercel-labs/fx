@@ -4,6 +4,7 @@ const display_width = @import("../../core/shared/display_width.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const workspace_access = @import("../../core/workspace/workspace_access.zig");
 const workspace_menu = @import("../../core/workspace/workspace_menu.zig");
+const thread_menu = @import("../../core/threads/thread_menu.zig");
 const render_input = @import("render_input.zig");
 const usage_presentation = @import("usage_presentation.zig");
 
@@ -16,6 +17,8 @@ const CompactCommandMenuProjection = render_input.CompactCommandMenuProjection;
 
 const column_gap: usize = 4;
 const workspace_pinned_rows = 5;
+/// Title row plus the blank row above the first thread.
+const threads_pinned_rows = 2;
 /// Title row plus the blank row above the first toggle choice.
 const settings_row_offset: usize = 2;
 
@@ -33,6 +36,7 @@ pub fn desiredRowCount(projection: CompactCommandMenuProjection, width: u16) u16
         .usage => |usage| usage_presentation.desiredRowCount(usage),
         .workspace => |workspace| workspace_pinned_rows +
             workspace_menu.State.rowCount(workspace.entries),
+        .threads => |threads| threads_pinned_rows + threads.rows.len,
     };
     return std.math.cast(u16, count) orelse std.math.maxInt(u16);
 }
@@ -50,6 +54,7 @@ pub noinline fn composeCompactCommandMenuRow(
         .statusline => composeSettingsRow(alloc, projection, row_index, visible_rows, width),
         .usage => |usage| usage_presentation.composeRow(alloc, usage, row_index, visible_rows, width),
         .workspace => |workspace| composeWorkspaceRow(alloc, workspace, row_index, visible_rows, width),
+        .threads => |threads| composeThreadsRow(alloc, threads, row_index, visible_rows, width),
     };
 }
 
@@ -63,7 +68,7 @@ fn composeSettingsRow(
     const empty: std.ArrayList(u8) = .empty;
     const statusline = switch (projection) {
         .statusline => |value| value,
-        .usage, .workspace => return empty,
+        .usage, .workspace, .threads => return empty,
     };
     const choice_count = settings_catalog.statuslineChoiceCount();
     if (choice_count == 0) return empty;
@@ -103,8 +108,56 @@ fn choiceView(projection: CompactCommandMenuProjection, choice_index: usize) ?Ch
                 .selected = choice_index == statusline.selected_index % settings_catalog.statuslineChoiceCount(),
             };
         },
-        .usage, .workspace => null,
+        .usage, .workspace, .threads => null,
     };
+}
+
+fn composeThreadsRow(
+    alloc: Allocator,
+    projection: render_input.ThreadsMenuProjection,
+    row_index: u16,
+    visible_rows: u16,
+    width: u16,
+) !std.ArrayList(u8) {
+    const empty: std.ArrayList(u8) = .empty;
+    const header_rows: u16 = if (visible_rows > threads_pinned_rows) threads_pinned_rows else @intFromBool(visible_rows > 1);
+    if (header_rows > 0 and row_index == 0) {
+        return composeStyledRow(alloc, "Threads", width, ui_render.selected_completion_style);
+    }
+    if (row_index < header_rows) return empty;
+    const choice_rows: usize = visible_rows - header_rows;
+    const row_count = projection.rows.len;
+    if (choice_rows == 0 or row_count == 0) return empty;
+    // Keep the selected row on screen, as the other menus do.
+    const selected = projection.selected_index % row_count;
+    const window_start = @min(selected -| (choice_rows - 1), row_count -| choice_rows);
+    const choice_index = window_start + @as(usize, row_index - header_rows);
+    if (choice_index >= row_count) return empty;
+    const row = projection.rows[choice_index];
+
+    var safe_label = try text_utils.encodeTerminalSafe(alloc, row.label, std.math.maxInt(usize));
+    defer safe_label.deinit(alloc);
+    var safe_info = try text_utils.encodeTerminalSafe(alloc, row.info, std.math.maxInt(usize));
+    defer safe_info.deinit(alloc);
+
+    var longest_label: usize = 0;
+    for (projection.rows) |candidate| {
+        longest_label = @max(longest_label, text_utils.terminalSafeVisibleWidth(candidate.label));
+    }
+    const indent: usize = if (width <= 2) 0 else 2;
+    const content_width: usize = width;
+    const info_column: ?usize = if (content_width < indent + 8 + column_gap + 12)
+        null
+    else
+        @min(indent + longest_label + column_gap, content_width - 12);
+    return composeWorkspaceActionRow(
+        alloc,
+        safe_label.bytes,
+        safe_info.bytes,
+        choice_index == selected,
+        info_column,
+        width,
+    );
 }
 
 fn composeWorkspaceRow(

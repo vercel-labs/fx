@@ -24,6 +24,8 @@ const session_store = @import("../session/session_store.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
+const thread_feed = @import("../threads/thread_feed.zig");
+const thread_registry = @import("../threads/thread_registry.zig");
 
 const Allocator = std.mem.Allocator;
 /// Bounds how long a parent wait takes to observe cancellation or steering,
@@ -147,6 +149,13 @@ pub const Runtime = struct {
     admission_mutex: std.Io.Mutex = .init,
     yielded_mutex: std.Io.Mutex = .init,
     yielded: std.ArrayList(YieldedWork) = .empty,
+    /// Live feeds of the threads this host runs, by child id. A feed outlives
+    /// the turn that fills it so a watcher can read what a finished turn said.
+    feeds_mutex: std.Io.Mutex = .init,
+    feeds: std.StringHashMapUnmanaged(*thread_feed.Feed) = .empty,
+    /// Feeds of deleted threads. A watcher may still hold the pointer it got
+    /// from `feedFor`, so they are freed with the host rather than at delete.
+    retired_feeds: std.ArrayList(*thread_feed.Feed) = .empty,
 
     const YieldedWork = struct { child_id: []u8, work_id: []u8, max_result_bytes: usize, result: ?ManagedExecutionResult = null, delivered: bool = false };
     pub const YieldedResult = struct { child_id: []const u8, work_id: []const u8, body: []const u8, max_result_bytes: usize, delivered: bool, receipt_sequence: u64 = 0 };
@@ -218,6 +227,7 @@ pub const Runtime = struct {
         self.yielded.deinit(self.alloc);
         self.managed.deinit();
         self.approvals.deinit();
+        self.deinitFeeds();
         self.alloc.free(self.root_id);
         const alloc = self.alloc;
         self.* = undefined;
@@ -257,7 +267,39 @@ pub const Runtime = struct {
         self: *Runtime,
         alloc: Allocator,
     ) !?approval_registry.PendingRequest {
-        return self.approvals.firstPendingRequest(alloc, self.root_id);
+        var pending = (try self.approvals.firstPendingRequest(alloc, self.root_id)) orelse return null;
+        errdefer pending.deinit(alloc);
+        // A label is a nicety; an unreadable registry leaves the child id.
+        self.labelThreadOrigin(alloc, &pending) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {},
+        };
+        return pending;
+    }
+
+    /// Shows a thread's approval under its user-facing name. The UI reads the
+    /// `thread:` prefix.
+    fn labelThreadOrigin(
+        self: *Runtime,
+        alloc: Allocator,
+        pending: *approval_registry.PendingRequest,
+    ) !void {
+        var registry = try self.managed.state_store.load(alloc);
+        defer registry.deinit(alloc);
+        for (registry.children) |child| {
+            if (!std.mem.eql(u8, child.id, pending.child_id)) continue;
+            const name = thread_registry.nameFromAgent(child.agentName() orelse return) orelse return;
+            const label = try alloc.print("thread:{s}", .{name});
+            switch (pending.request.origin) {
+                .subagent => |old| alloc.free(@constCast(old)),
+                .active_session => {
+                    alloc.free(label);
+                    return;
+                },
+            }
+            pending.request.origin = .{ .subagent = label };
+            return;
+        }
     }
 
     pub fn resolveApproval(
@@ -508,7 +550,294 @@ pub const Runtime = struct {
             },
             .authority_resolver = &self.authority_resolver,
             .approvals = &self.approvals,
+            .feed_context = self,
+            .feed_for_fn = feedForChild,
         };
+    }
+
+    fn feedForChild(raw: ?*anyopaque, child_id: []const u8) ?*thread_feed.Feed {
+        const self: *Runtime = @ptrCast(@alignCast(raw.?));
+        return self.feedFor(child_id);
+    }
+
+    fn deinitFeeds(self: *Runtime) void {
+        var it = self.feeds.iterator();
+        while (it.next()) |entry| {
+            self.alloc.free(entry.key_ptr.*);
+            entry.value_ptr.*.deinit();
+            self.alloc.destroy(entry.value_ptr.*);
+        }
+        self.feeds.deinit(self.alloc);
+        for (self.retired_feeds.items) |feed| {
+            feed.deinit();
+            self.alloc.destroy(feed);
+        }
+        self.retired_feeds.deinit(self.alloc);
+    }
+
+    /// Stops serving the feed of a deleted thread. Its memory stays until the
+    /// host is destroyed. When retiring cannot allocate, the feed stays served.
+    fn retireFeed(self: *Runtime, child_id: []const u8) void {
+        self.feeds_mutex.lockUncancelable(io_mod.getIo());
+        defer self.feeds_mutex.unlock(io_mod.getIo());
+        self.retired_feeds.ensureUnusedCapacity(self.alloc, 1) catch return;
+        const removed = self.feeds.fetchRemove(child_id) orelse return;
+        self.alloc.free(removed.key);
+        self.retired_feeds.appendAssumeCapacity(removed.value);
+    }
+
+    /// The feed of a thread, or null when the child is not a watched thread.
+    /// The pointer stays valid until the host is destroyed.
+    pub fn feedFor(self: *Runtime, child_id: []const u8) ?*thread_feed.Feed {
+        self.feeds_mutex.lockUncancelable(io_mod.getIo());
+        defer self.feeds_mutex.unlock(io_mod.getIo());
+        return self.feeds.get(child_id);
+    }
+
+    fn ensureFeed(self: *Runtime, child_id: []const u8) !*thread_feed.Feed {
+        self.feeds_mutex.lockUncancelable(io_mod.getIo());
+        defer self.feeds_mutex.unlock(io_mod.getIo());
+        if (self.feeds.get(child_id)) |existing| return existing;
+        const key = try self.alloc.dupe(u8, child_id);
+        errdefer self.alloc.free(key);
+        const feed = try self.alloc.create(thread_feed.Feed);
+        errdefer self.alloc.destroy(feed);
+        feed.* = thread_feed.Feed.init(self.alloc);
+        try self.feeds.put(self.alloc, key, feed);
+        return feed;
+    }
+
+    pub const ThreadSend = union(enum) {
+        /// A new work item started. Owned child id.
+        started: []u8,
+        /// The thread was mid-turn; the text joined it as steering.
+        steered,
+        /// Refused. The code is a static string.
+        rejected: []const u8,
+
+        pub fn deinit(self: ThreadSend, alloc: Allocator) void {
+            switch (self) {
+                .started => |id| alloc.free(id),
+                .steered, .rejected => {},
+            }
+        }
+    };
+
+    /// Starts or continues the named thread with `message` and returns at
+    /// once; the turn runs on its own agent thread. A thread that is already
+    /// running takes the text as steering. Unlike the model tool path this
+    /// never registers a yielded result, so the end of the root's turn leaves
+    /// the thread running.
+    pub fn sendThread(
+        self: *Runtime,
+        alloc: Allocator,
+        name: []const u8,
+        message: []const u8,
+        options: ExecuteOptions,
+    ) !ThreadSend {
+        if (!std.mem.eql(u8, options.caller_id, self.root_id)) return .{ .rejected = "caller_unavailable" };
+        var request = model_contract.validateRequest(alloc, .{ .message = .{
+            .agent = name,
+            .message = message,
+        } }) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.InvalidAgent => .{ .rejected = "invalid_thread_name" },
+            else => .{ .rejected = "invalid_message" },
+        };
+        defer request.deinit(alloc);
+        const identity_epoch = if (options.identity_epoch != 0)
+            options.identity_epoch
+        else
+            self.issueOperationIdentity(options.invocation_id);
+        const operation_id = try operationIdAlloc(alloc, options.invocation_id, identity_epoch);
+        defer alloc.free(operation_id);
+
+        var attempts: usize = 0;
+        while (attempts < 100) : (attempts += 1) {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            var admitted = blk: {
+                self.admission_mutex.lockUncancelable(io_mod.getIo());
+                defer self.admission_mutex.unlock(io_mod.getIo());
+                break :blk try self.admitManagedWork(arena.allocator(), request, operation_id, options, null);
+            };
+            defer admitted.deinit(arena.allocator());
+            switch (admitted) {
+                .ready => |ready| {
+                    _ = try self.ensureFeed(ready.child_id);
+                    _ = self.managed.start(ready.child_id) catch |err| {
+                        debug_trace.logf("subagent", "thread start failed child_id={s} err={s}", .{ ready.child_id, @errorName(err) });
+                        return .{ .rejected = "start_failed" };
+                    };
+                    return .{ .started = try alloc.dupe(u8, ready.child_id) };
+                },
+                .feedback => |target| {
+                    const result = try self.managed.steer(
+                        target.child_id,
+                        target.work_id,
+                        operation_id,
+                        model_contract.requestFingerprint(request),
+                        message,
+                    );
+                    switch (result) {
+                        .receipt => return .steered,
+                        // The turn ended between admission and steering; admit again.
+                        .waiting => io_mod.sleep(terminal_wait_pulse_ms * std.time.ns_per_ms),
+                        .capacity => return .{ .rejected = "steering_capacity" },
+                        .cancelled => return .{ .rejected = "thread_cancelled" },
+                        .conflict => return .{ .rejected = "operation_conflict" },
+                        .unavailable => return .{ .rejected = "state_unavailable" },
+                    }
+                },
+                .completed => return .{ .rejected = "duplicate_operation" },
+                .rejected => |failure| return .{ .rejected = failure.code },
+            }
+        }
+        return .{ .rejected = "thread_busy" };
+    }
+
+    pub const ThreadStatus = struct {
+        /// Owned.
+        child_id: []u8,
+        phase: child_state.Phase,
+        last_outcome: ?child_state.Outcome,
+        /// Present while a turn is queued or running. Owned.
+        active_message: ?[]u8,
+        /// When the turn that is queued or running was admitted.
+        active_since_ms: ?i64 = null,
+
+        pub fn deinit(self: ThreadStatus, alloc: Allocator) void {
+            alloc.free(self.child_id);
+            if (self.active_message) |m| alloc.free(m);
+        }
+    };
+
+    /// Current state of the named thread, or null when this host has none.
+    pub fn threadStatus(self: *Runtime, alloc: Allocator, name: []const u8) !?ThreadStatus {
+        var registry = try self.managed.state_store.load(alloc);
+        defer registry.deinit(alloc);
+        const child = registry.findPersistent(name) orelse return null;
+        const id = try alloc.dupe(u8, child.id);
+        errdefer alloc.free(id);
+        const message = if (child.active) |active| try alloc.dupe(u8, active.message) else null;
+        return .{
+            .child_id = id,
+            .phase = child.phase,
+            .last_outcome = child.last_outcome,
+            .active_message = message,
+            .active_since_ms = if (child.active) |active| active.created_at_ms else null,
+        };
+    }
+
+    pub const ThreadDelete = enum {
+        /// The child entry, session and feed are gone, or were already.
+        deleted,
+        /// The thread is running or waiting for approval; nothing changed.
+        running,
+        /// The thread's session is open in another process; nothing changed.
+        in_use,
+        /// The store refused or failed. A retry finishes what is left.
+        failed,
+    };
+
+    /// Deletes an idle thread for good: its child registry entry, its saved
+    /// session directory with the managed-child marker, and its live feed.
+    /// `agent` names the child; `session_id` is the thread registry's record
+    /// of its session, used only when the child entry is already gone, and
+    /// then only when the session carries a managed-child marker. A missing
+    /// entry or session counts as already deleted, so a retry after a crash
+    /// finishes the job. The caller drops the thread's name afterward.
+    /// Threads need the default (v1) session format.
+    pub fn deleteThread(
+        self: *Runtime,
+        alloc: Allocator,
+        agent: []const u8,
+        session_id: []const u8,
+    ) !ThreadDelete {
+        const sessions = switch (self.backend) {
+            .v1 => |value| value,
+            .v2 => return error.UnsupportedBackend,
+        };
+        // The same gate as admission, so no send can start work meanwhile.
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+
+        var registry = try self.managed.state_store.load(alloc);
+        defer registry.deinit(alloc);
+        var target_id: []const u8 = session_id;
+        var in_registry = false;
+        if (registry.findPersistent(agent)) |child| {
+            switch (child.phase) {
+                .running, .awaiting_approval => return .running,
+                .idle, .interrupted, .finished => {},
+            }
+            target_id = child.id;
+            in_registry = true;
+        }
+        if (target_id.len == 0) return .deleted;
+        if (std.mem.eql(u8, target_id, self.root_id)) return .failed;
+        if (self.managed.hasRunningChild(target_id)) return .running;
+
+        // Hold the session's writer first, so a session open elsewhere is
+        // found before anything is removed. A finishing turn may still be
+        // letting go of it.
+        var loaded: ?session_store.LoadedWritableSession = null;
+        var attempts: usize = 0;
+        while (attempts < 40) : (attempts += 1) {
+            loaded = sessions.resumeForWrite(alloc, target_id) catch |err| switch (err) {
+                error.SessionNotFound => break,
+                error.SessionBusy => {
+                    io_mod.sleep(25 * std.time.ns_per_ms);
+                    continue;
+                },
+                else => return .failed,
+            };
+            break;
+        } else return .in_use;
+        errdefer if (loaded) |*value| {
+            value.log.park();
+            value.deinit(alloc);
+        };
+
+        if (loaded != null and !in_registry) {
+            const marked = child_state.hasManagedChildMarker(sessions.*, alloc, target_id) catch false;
+            if (!marked) {
+                releaseSession(alloc, &loaded);
+                return .failed;
+            }
+        }
+        if (in_registry) {
+            self.managed.state_store.removeIdlePersistent(alloc, target_id) catch |err| switch (err) {
+                error.ChildNotFound => {},
+                error.ChildBusy => {
+                    releaseSession(alloc, &loaded);
+                    return .running;
+                },
+                else => return err,
+            };
+        }
+        if (loaded) |*value| {
+            // Consumes the session on every return.
+            const disposition = sessions.deleteCommittedSession(alloc, value);
+            loaded = null;
+            if (disposition != .discarded) return .failed;
+        }
+        self.retireFeed(target_id);
+        return .deleted;
+    }
+
+    fn releaseSession(alloc: Allocator, loaded: *?session_store.LoadedWritableSession) void {
+        if (loaded.*) |*value| {
+            value.log.park();
+            value.deinit(alloc);
+        }
+        loaded.* = null;
+    }
+
+    /// Stops the thread's running turn. The thread keeps its session and can
+    /// take new messages.
+    pub fn cancelThread(self: *Runtime, child_id: []const u8) !void {
+        try self.managed.cancel(child_id);
     }
 
     fn childStateStore(self: *Runtime) child_state.Store {
@@ -1421,6 +1750,124 @@ test "subagent feedback waits for admitted work to install its worker" {
     try std.testing.expect(std.mem.find(u8, first.result.?.body, "ORIGINAL_RESULT") != null);
     try std.testing.expectEqual(@as(usize, 1), fixture.runs);
     try std.testing.expectEqual(@as(usize, 1), fixture.consumed);
+}
+
+test "deleting a thread frees its slot, session and feed, and refuses a running one" {
+    const Fixture = struct {
+        release: std.Io.Event = .unset,
+        block: bool = false,
+
+        fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
+            return authority.HostAuthority.capture(alloc, &.{}, &.{}, .{}, &.{});
+        }
+
+        fn run(raw: ?*anyopaque, turn: *execution.TurnContext, message: domain.QueuedMessage, _: domain.AdmissionSnapshot, _: *std.atomic.Value(bool)) execution.ServiceError!execution.RunOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.block) self.release.waitUncancelable(io_mod.getIo());
+            turn.commit(turn.active_work_id.?, .{ .assistant = .{
+                .user = .{ .text = message.content },
+                .assistant = @constCast("THREAD_REPLY"),
+            } }, 0, 0, 2) catch return error.ProviderFailed;
+            return .completed;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var sessions = try session_store.Store.initFromHome(alloc, home, home);
+    defer sessions.deinit(alloc);
+    var parent = try sessions.startWritableSession(alloc, .{
+        .id = @constCast("thread-delete-parent"),
+        .origin_workspace_root = @constCast(home),
+        .workspace_root = @constCast(home),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    });
+    defer parent.deinit(alloc);
+    var plain = try sessions.startWritableSession(alloc, .{
+        .id = @constCast("plain-session"),
+        .origin_workspace_root = @constCast(home),
+        .workspace_root = @constCast(home),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    });
+    plain.deinit(alloc);
+    var fixture = Fixture{};
+    const runtime = try Runtime.create(alloc, &sessions, "thread-delete-parent", .{ .resolve_fn = Fixture.resolve }, .{ .context = &fixture, .run_fn = Fixture.run });
+    defer runtime.deinit();
+    defer fixture.release.set(io_mod.getIo());
+
+    const options = ExecuteOptions{
+        .caller_id = "thread-delete-parent",
+        .invocation_id = "thread-new-1",
+        .defaults = .{ .provider = .gateway, .model = "test", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+    };
+
+    // A thread that never started has nothing to delete.
+    try std.testing.expectEqual(Runtime.ThreadDelete.deleted, try runtime.deleteThread(alloc, "th-1-ghost", ""));
+
+    // Running: refused, and nothing is removed.
+    fixture.block = true;
+    const running = try runtime.sendThread(alloc, "th-1-alpha", "work", options);
+    defer running.deinit(alloc);
+    const child_id = try alloc.dupe(u8, running.started);
+    defer alloc.free(child_id);
+    try std.testing.expectEqual(Runtime.ThreadDelete.running, try runtime.deleteThread(alloc, "th-1-alpha", child_id));
+    try std.testing.expect(runtime.feedFor(child_id) != null);
+    fixture.release.set(io_mod.getIo());
+    for (0..2000) |_| {
+        const status = (try runtime.threadStatus(alloc, "th-1-alpha")).?;
+        defer status.deinit(alloc);
+        if (status.phase == .idle and !runtime.managed.hasRunningChild(child_id)) break;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+
+    // Idle: the entry, the session directory and the feed go.
+    var before = try sessions.loadReadOnly(alloc, child_id);
+    before.deinit(alloc);
+    try std.testing.expectEqual(Runtime.ThreadDelete.deleted, try runtime.deleteThread(alloc, "th-1-alpha", child_id));
+    try std.testing.expect((try runtime.threadStatus(alloc, "th-1-alpha")) == null);
+    var children = try runtime.managed.state_store.load(alloc);
+    defer children.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), children.children.len);
+    try std.testing.expect(runtime.feedFor(child_id) == null);
+    try std.testing.expectError(error.SessionNotFound, sessions.loadReadOnly(alloc, child_id));
+    const session_dir = try std.Io.Dir.path.join(alloc, &.{ home, ".fx", "sessions", child_id });
+    defer alloc.free(session_dir);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.openDirAbsolute(io_mod.getIo(), session_dir, .{}));
+
+    // The session already gone, and a repeat delete, are both fine.
+    try std.testing.expectEqual(Runtime.ThreadDelete.deleted, try runtime.deleteThread(alloc, "th-1-alpha", child_id));
+
+    // A recorded session id is never trusted without the child marker.
+    try std.testing.expectEqual(Runtime.ThreadDelete.failed, try runtime.deleteThread(alloc, "th-1-bogus", "plain-session"));
+    try std.testing.expectEqual(Runtime.ThreadDelete.failed, try runtime.deleteThread(alloc, "th-1-bogus", "thread-delete-parent"));
+    var survivor = try sessions.loadReadOnly(alloc, "plain-session");
+    survivor.deinit(alloc);
+
+    // A name's slot is reusable with no old history.
+    fixture.block = false;
+    const again = try runtime.sendThread(alloc, "th-2-alpha", "fresh", .{ .caller_id = options.caller_id, .invocation_id = "thread-new-2", .defaults = options.defaults, .max_result_bytes = 4096, .timestamp_ms = 2 });
+    defer again.deinit(alloc);
+    try std.testing.expect(!std.mem.eql(u8, again.started, child_id));
+    for (0..2000) |_| {
+        if (!runtime.managed.hasRunningChild(again.started)) break;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
 }
 
 fn checkFailedStartBookkeeping(action: model_contract.Action) !void {

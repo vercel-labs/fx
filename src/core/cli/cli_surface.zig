@@ -33,6 +33,7 @@ const prompt_policy = @import("../config/prompt_policy.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_store = @import("../session/session_store.zig");
 const session_adapter = @import("../session/session_adapter.zig");
+const thread_command = @import("thread_command.zig");
 const subagent_resume_admission = @import("../subagent/resume_admission.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const types = @import("../shared/types.zig");
@@ -84,6 +85,7 @@ pub const Command = union(enum) {
     teams: []const [:0]const u8,
     session: []const [:0]const u8,
     sessions: []const [:0]const u8,
+    thread: []const [:0]const u8,
     resume_session: ResumeInvocation,
     credits: []const [:0]const u8,
     usage: []const [:0]const u8,
@@ -638,6 +640,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
         },
         't' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .teams)) return .{ .teams = args[1..] };
+            if (command_specs.matchesTopLevel(command_catalog, command, .thread)) return .{ .thread = args[1..] };
         },
         'u' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .usage)) return .{ .usage = args[1..] };
@@ -1726,6 +1729,7 @@ fn runNonInteractiveWithDeps(
                 },
             }
         },
+        .thread => |rest| return runThread(alloc, cfg.command_catalog, deps, rest, sessions_v2),
         .sessions => |rest| {
             if (rest.len > 0 and std.mem.eql(u8, rest[0], "convert")) {
                 const format = parseSessionConvertArgs(rest[1..]) catch |err| {
@@ -2984,6 +2988,89 @@ fn writeUsageOrJsonError(
     }
 }
 
+/// `fx thread`: the saved threads of a session, read-only.
+fn runThread(
+    alloc: Allocator,
+    command_catalog: CommandCatalog,
+    deps: RunDeps,
+    rest: []const [:0]const u8,
+    sessions_v2: bool,
+) !RunResult {
+    var opts = thread_command.parseArgs(alloc, rest) catch |err| {
+        try writeUsageOrJsonError(alloc, command_catalog, deps, .thread, "thread", err, rest);
+        return .handled_failure;
+    };
+    defer opts.deinit(alloc);
+    const output_kind: []const u8 = switch (opts.action) {
+        .list => "threads",
+        .show => "thread",
+    };
+    if (sessions_v2) {
+        try writeThreadFailure(alloc, deps, output_kind, error.ThreadsNeedDefaultSessionFormat, opts.format);
+        return .handled_failure;
+    }
+    const home = io_mod.homeDir() orelse {
+        try writeThreadFailure(alloc, deps, output_kind, error.HomeNotSet, opts.format);
+        return .handled_failure;
+    };
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
+    var store = session_store.Store.initReadOnly(alloc, workspace_root) catch |err| {
+        try writeThreadFailure(alloc, deps, output_kind, err, opts.format);
+        return .handled_failure;
+    };
+    defer store.deinit(alloc);
+
+    const root_id = thread_command.resolveRoot(alloc, &store, opts.session) catch |err| {
+        try writeThreadFailure(alloc, deps, output_kind, err, opts.format);
+        return .handled_failure;
+    };
+    defer alloc.free(root_id);
+
+    switch (opts.action) {
+        .list => {
+            var loaded = thread_command.loadList(alloc, &store, home, root_id) catch |err| {
+                try writeThreadFailure(alloc, deps, output_kind, err, opts.format);
+                return .handled_failure;
+            };
+            defer loaded.deinit();
+            const text = try loaded.snapshot.render(alloc, opts.format);
+            defer alloc.free(text);
+            try writeFormattedOutput(deps, text, opts.format);
+        },
+        .show => |name| {
+            var loaded = thread_command.loadDetail(alloc, &store, home, root_id, name) catch |err| {
+                try writeThreadFailure(alloc, deps, output_kind, err, opts.format);
+                return .handled_failure;
+            };
+            defer loaded.deinit();
+            const text = try loaded.snapshot.render(alloc, opts.format);
+            defer alloc.free(text);
+            try writeFormattedOutput(deps, text, opts.format);
+        },
+    }
+    return .handled_success;
+}
+
+fn writeThreadFailure(
+    alloc: Allocator,
+    deps: RunDeps,
+    kind: []const u8,
+    err: anyerror,
+    format: output_contracts.OutputFormat,
+) !void {
+    const message = thread_command.failureMessage(err) orelse lookupFailureMessage(err) orelse switch (err) {
+        error.HomeNotSet => "HOME is not set",
+        else => "couldn't read saved threads",
+    };
+    if (format == .json) {
+        return writeJsonCommandFailure(alloc, deps, kind, err, message);
+    }
+    try writeStderr(deps, "fx thread: ");
+    try writeStderr(deps, message);
+    try writeStderr(deps, "\n");
+}
+
 fn writeUsageCommandFailure(
     alloc: Allocator,
     deps: RunDeps,
@@ -3610,6 +3697,7 @@ fn commandFailureMessage(err: anyerror) ?[]const u8 {
         error.InvalidSessionMigrationArgs,
         error.InvalidSessionRecoveryArgs,
         error.InvalidResumeArgs,
+        error.InvalidThreadArgs,
         => "invalid arguments",
         else => null,
     };
@@ -4366,6 +4454,10 @@ test "parse recognizes every top-level command and preserves unknown commands" {
     }
     switch (parse(command_catalog, &.{@constCast("upgrade")})) {
         .upgrade => |rest| try std.testing.expectEqual(@as(usize, 0), rest.len),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(command_catalog, &.{ @constCast("thread"), @constCast("show"), @constCast("alpha") })) {
+        .thread => |rest| try std.testing.expectEqual(@as(usize, 2), rest.len),
         else => return error.TestExpectedEqual,
     }
     switch (parse(command_catalog, &.{ @constCast("replay"), @constCast("tape") })) {

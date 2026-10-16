@@ -2303,6 +2303,31 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        /// Makes `session_id` the foreground session without the resume
+        /// picker's refusal of managed children. Callers check that the target
+        /// is a thread they own and is not running. v1 sessions only.
+        pub fn switchForegroundSession(app: *App, session_id: []const u8) !void {
+            if (app.session_persistence.v2_store != null) return error.UnsupportedSessionFormat;
+            const store = app.session_persistence.store orelse return error.SessionStoreUnavailable;
+            var loaded = try store.resumeTargetForWrite(
+                app.alloc,
+                .{ .id = session_id },
+                app.workspace_root,
+                .{
+                    .seed_preferences = app.session_persistence.workspace_preferences,
+                    .log = .{ .session_lock_deadline_ms = 0 },
+                },
+            );
+            var loaded_owned = true;
+            errdefer if (loaded_owned) loaded.deinit(app.alloc);
+
+            try app.prepareLiveSessionResume();
+            loaded_owned = false;
+            try installResumedSession(app, &loaded, .session);
+            startResumedSessionWarmup(app);
+            try app.finishLiveSessionResume();
+        }
+
         fn loadResumeTargetForWrite(
             app: *App,
             target: session_store.ResumeTarget,

@@ -179,6 +179,16 @@ pub fn permissionTargetForCall(
         return arena.dupe(u8, source);
     }
 
+    if (std.mem.eql(u8, call.name, "thread_send") or std.mem.eql(u8, call.name, "thread_new")) {
+        const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
+        const name = try tool_args.requiredStringArg(args, "name");
+        // Real thread names never hold wildcard characters. A name that does
+        // is refused when the call runs, and it must not become a grant
+        // pattern that matches every thread.
+        if (containsWildcard(name)) return arena.dupe(u8, call.name);
+        return arena.dupe(u8, name);
+    }
+
     if (std.mem.eql(u8, call.name, "skill")) {
         if (call.resolved_skill) |prepared| return arena.dupe(u8, prepared.skill.name);
         const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
@@ -2097,6 +2107,36 @@ test "permissionTargetForCall preserves skill and install skill targets" {
     try std.testing.expectEqualStrings("skill", permissionNameForTool("install_skill"));
 }
 
+test "thread_send permission target is the thread name and grants stay per thread" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const alpha: types.ToolCall = .{ .id = "a", .name = "thread_send", .arguments_json = "{\"name\":\"alpha\",\"message\":\"hi\"}" };
+    const beta: types.ToolCall = .{ .id = "b", .name = "thread_send", .arguments_json = "{\"name\":\"beta\",\"message\":\"hi\"}" };
+    const wild: types.ToolCall = .{ .id = "w", .name = "thread_send", .arguments_json = "{\"name\":\"*\",\"message\":\"hi\"}" };
+    const alpha_target = try permissionTargetForCall(arena, "/tmp/workspace", alpha, .none);
+    const beta_target = try permissionTargetForCall(arena, "/tmp/workspace", beta, .none);
+    try std.testing.expectEqualStrings("alpha", alpha_target);
+    try std.testing.expectEqualStrings("beta", beta_target);
+    try std.testing.expectEqualStrings("thread_send", try permissionTargetForCall(arena, "/tmp/workspace", wild, .none));
+
+    const grants = try suggestedSessionGrants(std.testing.allocator, "/tmp/workspace", "thread_send", alpha_target, .none);
+    defer {
+        for (grants) |grant| {
+            std.testing.allocator.free(grant.tool_name);
+            std.testing.allocator.free(grant.target_path);
+        }
+        std.testing.allocator.free(grants);
+    }
+    try std.testing.expectEqual(@as(usize, 1), grants.len);
+    try std.testing.expectEqualStrings("thread_send", grants[0].tool_name);
+    try std.testing.expectEqualStrings("alpha", grants[0].target_path);
+    try std.testing.expect(sessionGrantAllowed(grants, "thread_send", alpha_target));
+    try std.testing.expect(!sessionGrantAllowed(grants, "thread_send", beta_target));
+    try std.testing.expect(!sessionGrantAllowed(grants, "thread_send", "thread_send"));
+}
+
 test "web_search permission target is whole tool name" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -3383,4 +3423,14 @@ test "a shell refresh resets remembered command grants only" {
     shell_snapshot.processOwner().recordShellGrant(command);
     try std.testing.expect(sessionGrantAllowed(&grants, "run_command", command));
     try std.testing.expectEqual(@as(usize, 2), liveSessionGrantCount(&grants));
+}
+
+test "thread_new permission target is the thread name and a wildcard name is not a grant" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const beta: types.ToolCall = .{ .id = "a", .name = "thread_new", .arguments_json = "{\"name\":\"beta\",\"task\":\"go\"}" };
+    const wild: types.ToolCall = .{ .id = "w", .name = "thread_new", .arguments_json = "{\"name\":\"*\",\"task\":\"go\"}" };
+    try std.testing.expectEqualStrings("beta", try permissionTargetForCall(arena, "/tmp/workspace", beta, .none));
+    try std.testing.expectEqualStrings("thread_new", try permissionTargetForCall(arena, "/tmp/workspace", wild, .none));
 }

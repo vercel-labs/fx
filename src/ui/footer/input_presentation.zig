@@ -805,6 +805,11 @@ pub fn composeCompactCommandMenuHintRow(
             "↑↓ move  enter use  esc",
             "enter esc",
         },
+        .threads => [_][]const u8{
+            "↑↓ navigate     enter switch     esc close",
+            "↑↓ move  enter switch  esc",
+            "enter esc",
+        },
     };
     var hint = variants[variants.len - 1];
     for (variants) |candidate| {

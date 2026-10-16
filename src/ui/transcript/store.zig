@@ -1400,6 +1400,28 @@ pub fn replaceSemanticNoticeAtomic(
     entry_id: u32,
     notice: types.SemanticNotice,
 ) !bool {
+    return replaceSemanticNoticePinned(self, alloc, entry_id, notice, false);
+}
+
+/// Replaces a pinned notice and keeps its pin, so a producer can update the
+/// entry again. The entry stays out of terminal scrollback until a later
+/// replacement releases the pin with `replaceSemanticNoticeAtomic`.
+pub fn replaceSemanticNoticeKeepingPinAtomic(
+    self: anytype,
+    alloc: Allocator,
+    entry_id: u32,
+    notice: types.SemanticNotice,
+) !bool {
+    return replaceSemanticNoticePinned(self, alloc, entry_id, notice, true);
+}
+
+fn replaceSemanticNoticePinned(
+    self: anytype,
+    alloc: Allocator,
+    entry_id: u32,
+    notice: types.SemanticNotice,
+    keep_pin: bool,
+) !bool {
     std.debug.assert(notice.body.len > 0);
     if (semanticNoticeIndex(self, entry_id) == null) return false;
     try self.assertCanMutateTranscript();
@@ -1431,6 +1453,7 @@ pub fn replaceSemanticNoticeAtomic(
         .tone = owned.tone,
         .body = owned.body,
         .visibility = owned.visibility,
+        .pending_replacement = keep_pin,
     } };
     handed_off = true;
     previous.deinit(alloc);
