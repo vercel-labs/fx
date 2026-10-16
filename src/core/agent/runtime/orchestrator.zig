@@ -7421,6 +7421,20 @@ fn processQueuedPromptLoop(
                 .max_output_tokens = model_capabilities.requestOutputTokens(request_capabilities),
                 .budget = .{ .cancel_flag = config.cancel_flag },
             };
+            // The request re-sends every image the session keeps, and
+            // building it whole would hold all of them, encoded, at once.
+            // Images that pass every limit by their own size leave before the
+            // build; `fitRequestImages` fits the rest to this model's limit.
+            const past_limit = try request_image_budget.withholdImagesPastLimit(
+                overlay_arena,
+                request_data.messages,
+                request_image_budget.largestRequestBytes(agent.requestByteLimit(gateway_model)),
+                config.max_tool_result_bytes,
+            );
+            if (past_limit.withheld > 0) {
+                debug_trace.eventf("images", "request_images_withheld_before_build", step_ctx, "withheld={d}", .{past_limit.withheld});
+                request_data.messages = past_limit.messages;
+            }
             var prepared_request_body: ?[]const u8 = null;
             var request_cost_for_attempt: ?runtime_prompt_context.RequestCost = null;
             var request_images_for_attempt: usize = 0;
