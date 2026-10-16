@@ -1144,42 +1144,42 @@ D59 replaces D55's import at start with conversion on open):
   state a v1 session holds outside `session.json` and its event log.
   **Alternative:** convert the conversation only.
 - **D57 Decision:** v1 is removed in one step after the converter ships:
-  the writer, store, listing, catalog, migration, recovery and every host
-  branch, leaving only the converter's read path. One release later the
-  converter and that path go too (D8). wasm and libfx persistence is
-  decided separately and blocks only the JS-host snapshot
-  store and the codec parts it needs. **Why:** each release ships one
-  store and no unused code. **Alternative:** remove v1 module by module
-  across several releases.
+  the writer, store, listing, catalog, migration, recovery and every
+  host branch, leaving only the converter's read path. One release later
+  the converter and that path go too (D8); D65 keeps them. wasm and
+  libfx persistence is decided separately and blocks only the JS-host
+  snapshot store and the codec parts it needs. **Why:** each release
+  ships one store and no unused code. **Alternative:** remove v1 module
+  by module across several releases.
 
 Settled for `/fork` (2026-10-02):
-- **D58 Decision:** `/fork` in the interactive app, on v2, opens a menu of
-  the session's prompts, oldest at the top and the newest selected, each
-  shown up to three lines and then `…`. Picking one forks the session
-  before that prompt: the manager's `open(.fork)` copies the log to the
-  end of the previous turn under a new id and hard-links the blobs (D5),
-  so the source is never written. The app switches to the fork as a
-  resume does, opening it before it closes the source (D41), writes
-  `original session fx --sessions-v2 --resume` and the source's id in the
-  transcript, and puts the prompt back in the input box. The fork's title is the source's with
-  ` (fork)` once. `/fork` waits for a running turn to end, and without
-  v2 it says it needs `--sessions-v2`. Subagent children and hosted
-  terminals stay with the source, since the fold counts children only
-  after a fork point. The adapter adds two calls: `forkPoints`, each
-  turn's prompt and number, and `fork(before_turn, …)`. **Why:** the
-  manager already forks at turn boundaries, so the feature adds no
-  format and no new way to write a log. **Alternative:** fork after the
-  chosen turn's reply; or copy the log in fx instead of the manager.
-  `Fork.tla` models the manager's fork at a boundary with blob links.
-  `Wiring.tla` gains `Fork`: on v2, between turns and with no child
-  running, a session that never existed becomes the one to switch to,
-  and the source is not written (`ForkIsNewSession`, `ForkLeavesSource`,
-  `ForkBetweenTurns`). `trace/check_wiring_traces.py` checks the
-  `wiring` traces of `/fork` runs against `Wiring`, and
-  `trace/check_saved_logs.py` checks each saved log against
-  `TurnLifecycle` and, for a fork, `trace/ForkLog.tla`, which accepts
-  only a copy that is the source's first lines byte for byte, ending at a
-  turn boundary.
+- **D58 Decision:** `/fork` in the interactive app, on v2, opens a menu
+  of the session's prompts, oldest at the top and the newest selected,
+  each shown up to three lines and then `…`. Picking one forks the
+  session before that prompt: the manager's `open(.fork)` copies the log
+  to the end of the previous turn under a new id and hard-links the
+  blobs (D5), so the source is never written. The app switches to the
+  fork as a resume does, opening it before it closes the source (D41),
+  writes `original session fx --sessions-v2 --resume` and the source's
+  id in the transcript, and puts the prompt back in the input box. The
+  fork's title is the source's with ` (fork)` once. `/fork` waits for a
+  running turn to end, and without v2 it says it needs `--sessions-v2`.
+  Subagent children and hosted terminals stay with the source, since the
+  fold counts children only after a fork point. The adapter adds two
+  calls: `forkPoints`, each turn's prompt and number, and
+  `fork(before_turn, …)`. **Why:** the manager already forks at turn
+  boundaries, so the feature adds no format and no new way to write a
+  log. **Alternative:** fork after the chosen turn's reply; or copy the
+  log in fx instead of the manager. `Fork.tla` models the manager's fork
+  at a boundary with blob links. `Wiring.tla` gains `Fork`: on v2,
+  between turns and with no child running, a session that never existed
+  becomes the one to switch to, and the source is not written
+  (`ForkIsNewSession`, `ForkLeavesSource`, `ForkBetweenTurns`).
+  `trace/check_wiring_traces.py` checks the `wiring` traces of `/fork`
+  runs against `Wiring`, and `trace/check_saved_logs.py` checks each
+  saved log against `TurnLifecycle` and, for a fork,
+  `trace/ForkLog.tla`, which accepts only a copy that is the source's
+  first lines byte for byte, ending at a turn boundary.
 
 Settled for the converter (2026-10-06):
 - **D59 Decision (amends D55 and D57):** a v1 session converts when it
@@ -1263,6 +1263,44 @@ Settled for the converter (2026-10-06):
   run showed each
   limit. **Alternative:** keep whole families in memory, refuse the
   family, or fix the listing later.
+
+Settled for removing v1 (2026-10-16):
+- **D63 Decision:** libfx's `createFxTerminal({ sessionStore })` keeps
+  saving conversations as the snapshots `js_host_session_store` writes
+  through `session_codec`, unchanged, and so do the codec parts that
+  `sdk/durable.js` uses. Removing v1 removes v1's store on disk, not this
+  format: an app's store holds data fx cannot convert for it. **Why:** no
+  app's saved conversations are lost. **Alternative:** move the snapshots
+  to v2's log, with a conversion in the SDK.
+- **D64 Decision:** `fx session recover` on a v1 session salvages it as
+  v1's recover did: it copies the start that v1's validated prefix keeps
+  (a schema-3 session's manifest boundary) into a fresh v2 session with
+  a new id, and never changes the v1 session, which stays listed and can
+  be salvaged again. A healthy v1 session answers that no recovery is
+  needed, in an older format too, where v1 asked for `migrate` first;
+  damage v1 could not get past is reported as such, a busy one is
+  busy, and a subagent child is refused as v1 refused it.
+  `V1Conversion.tla` models it (`SBegin`, `SFinish`,
+  `SalvageLeavesSource`, `RefusedOnlyWithCause`) with two kinds of damage:
+  one v1's recover salvages and one it cannot. **Why:** a user with a
+  damaged v1 session keeps the way back v1 gave. **Alternative:** drop
+  salvage, which leaves such a session unreadable.
+- **D65 Decision (amends D8 and D57):** removing v1 keeps the converter
+  and v1's read path, with no release set for their removal: a user may
+  open a v1 session after any number of releases. Everything else of v1
+  goes in one change: the writer, the switch, the listing and catalog,
+  migration and every host branch. The converter's checks run against
+  v1 sessions written by a built v1 writer, the last commit with v1 and
+  older releases, since the new build writes no v1. **Why:** no user's
+  session becomes unreadable. **Alternative:** remove the converter one
+  release later, as D57 had it.
+- **D66 Decision:** a v1 session today's v1 cannot continue stays as it
+  is, read only: a schema-3 prompt that is not UTF-8, which v1 shows but
+  cannot continue or salvage (`InvalidConversationEvent`), is refused by
+  the converter with the file, the turn and the reason, and `fx session`
+  shows it. **Why:** the new build loses nothing v1 had, and adds no
+  rewriting of a prompt. **Alternative:** convert it with each invalid
+  sequence replaced by U+FFFD.
 
 ## Design Risks And Failure Behavior
 

@@ -379,6 +379,7 @@ pub const CommandError = error{
     InvalidSessionFormat,
     UnsupportedSessionSchema,
     SessionRecoveryBoundaryInvalid,
+    SessionRecoveryNotNeeded,
     SessionStoreUnavailable,
     DurablePathUnsafe,
     HomeNotSet,
@@ -397,6 +398,11 @@ pub fn commandError(err: anyerror) CommandError {
         error.Corrupt => error.InvalidSessionFormat,
         // `recover` of a session whose first turn never ended whole (D15).
         error.InvalidForkPoint => error.SessionRecoveryBoundaryInvalid,
+        // v1's own recovery, salvaging a v1 session (D64). An older format
+        // it reads whole needs none; one it cannot read has no boundary.
+        error.SessionRecoveryNotNeeded => error.SessionRecoveryNotNeeded,
+        error.SessionRecoveryBoundaryInvalid, error.SessionRecoveryRequiresCurrentSchema => error.SessionRecoveryBoundaryInvalid,
+        error.SessionRecoveryUnsupportedSchema => error.UnsupportedSessionSchema,
         error.DurablePathUnsafe, error.SessionPathUnsafe => error.DurablePathUnsafe,
         error.HomeNotSet => error.HomeNotSet,
         error.OutOfMemory => error.OutOfMemory,
@@ -545,14 +551,15 @@ pub const Recovered = struct {
 /// `fx session recover` (D15): a new root session copied from `id` up to
 /// its last turn that ended before any damage, with a copy of its side
 /// files. The source is never changed, and may be held by another process.
-/// Caller owns the result.
+/// A v1 session is salvaged as v1's recover salvaged it (D64). Caller owns
+/// the result.
 pub fn recover(store: *Store, alloc: Allocator, id: []const u8) !Recovered {
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     const sa = scratch.allocator();
     // Line 1 names the session's kind and workspace, however damaged the rest is.
     var first = store.manager.read(sa, id, .start, .forward, 1) catch |err| return switch (err) {
-        error.NotFound, error.InvalidArgument => error.SessionNotFound,
+        error.NotFound, error.InvalidArgument => salvageV1(store, alloc, id),
         else => err,
     };
     defer first.deinit();
@@ -573,6 +580,14 @@ pub fn recover(store: *Store, alloc: Allocator, id: []const u8) !Recovered {
     errdefer alloc.free(copy_id);
     copy.close() catch |err| debug_trace.logf("session", "event=sessions_v2_recovered_close_failed session={s} err={s}", .{ copy_id, @errorName(err) });
     return .{ .id = copy_id, .history_len = restored.history.len, .files_complete = store.copyFiles(id, copy_id) };
+}
+
+/// `fx session recover` on a session only v1 holds (D64). Caller owns the
+/// result.
+fn salvageV1(store: *Store, alloc: Allocator, id: []const u8) !Recovered {
+    var conversion: Conversion = .{ .store = store, .alloc = alloc, .host = .ask, .started = io_mod.nanoTimestamp() };
+    defer conversion.deinit();
+    return conversion.salvage(id);
 }
 
 pub const Doctor = struct {
@@ -2622,6 +2637,51 @@ const Conversion = struct {
         for (staged.items[0 .. staged.items.len - 1]) |member| removeMember(&v1, root_id, member);
         c.members = members.len;
         return .converted;
+    }
+
+    /// A salvage of a v1 root (D64; `tests/tla/session_manager/V1Conversion.tla`
+    /// SBegin, SFinish): under the family's locks, v1's own recovery reads
+    /// the start of the root it keeps, which is written under a fresh id as
+    /// a root of its own and published. No v1 file is written.
+    fn salvage(c: *Conversion, root_id: []const u8) !Recovered {
+        const store = c.store;
+        store.problem = .{};
+        var v1 = try session_store.Store.initReadOnlyFromHome(c.alloc, store.home, "/");
+        defer v1.deinit(c.alloc);
+        if (try v1_conversion.kindOf(&v1, c.alloc, root_id) != .root) return error.SessionNotFound;
+        var locks = try v1_conversion.lockFamily(c.alloc, &v1, root_id, 0, &store.problem);
+        defer locks.release();
+        const locked = &locks.members.items[0];
+        // A session the converter reads whole needs no salvage, as v1's
+        // recover finds once it has brought an older format up to date.
+        if (v1_conversion.readMember(c.alloc, &v1, locked, &store.problem)) |whole| {
+            var read = whole;
+            read.deinit();
+            return error.SessionRecoveryNotNeeded;
+        } else |err| if (err == error.OutOfMemory) return err;
+        store.problem = .{};
+        var member = try v1_conversion.readSalvage(c.alloc, &v1, locked, &store.problem);
+        defer member.deinit();
+        try c.findLeftOut(root_id, locked);
+        var id: [sm.new_id_len]u8 = undefined;
+        sm.newId(io_mod.getIo(), &id);
+        const handle = store.manager.openImport(.{ .id = &id, .workspace = member.workspace, .host = c.host, .created_ms = member.created_ms }) catch |err|
+            return conversionStorageFailed("salvage", err);
+        const session = Session.init(c.alloc, store, handle, false) catch |err| {
+            handle.release();
+            c.discardStaging(&id);
+            return err;
+        };
+        session.root = false;
+        defer session.dropImport();
+        errdefer c.discardStaging(&id);
+        var arena = std.heap.ArenaAllocator.init(c.alloc);
+        defer arena.deinit();
+        var registry = try child_state.Registry.init(arena.allocator(), &id);
+        try c.writeMember(session, &member, locked, .{ .root = .{ .registry = &registry, .has_log = &.{} } });
+        try session.handle.publishImport();
+        debug_trace.logf("convert", "action=Salvaged session={s} copy={s} turns={d}", .{ root_id, &id, member.turns });
+        return .{ .id = try c.alloc.dupe(u8, &id), .history_len = member.steps.len, .files_complete = c.left_out.items.len == 0 };
     }
 
     fn traceHeld(root_id: []const u8) Outcome {
@@ -6114,6 +6174,37 @@ test "an unreadable v1 session is refused with its file and reason, and nothing 
     const after = try V1Home.read(&t, ".fx/sessions/v1-torn/events.jsonl");
     defer alloc.free(after);
     try testing.expectEqualStrings(damaged, after);
+}
+
+test "recover salvages a damaged v1 session into a fresh v2 root and leaves its v1 folder as it was (D64)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    try v1.session("v1-torn", &.{ assistantTurn("q1", "a1"), assistantTurn("q2", "a2") });
+    const log = try V1Home.read(&t, ".fx/sessions/v1-torn/events.jsonl");
+    defer alloc.free(log);
+    const damaged = try std.mem.concat(alloc, u8, &.{ log, "{ not json\n" });
+    defer alloc.free(damaged);
+    try v1.put("v1-torn", null, "events.jsonl", damaged);
+
+    var recovered = try recover(&t.store, alloc, "v1-torn");
+    defer recovered.deinit(alloc);
+    try testing.expectEqual(@as(usize, 2), recovered.history_len);
+    try testing.expect(!std.mem.eql(u8, recovered.id, "v1-torn"));
+    var copy = try t.store.manager.peek(alloc, recovered.id);
+    defer copy.deinit(alloc);
+    try testing.expectEqual(sm.Role.root, copy.role);
+    try testing.expectError(error.NotFound, t.store.manager.peek(alloc, "v1-torn"));
+    const after = try V1Home.read(&t, ".fx/sessions/v1-torn/events.jsonl");
+    defer alloc.free(after);
+    try testing.expectEqualStrings(damaged, after);
+
+    try v1.session("v1-whole", &.{assistantTurn("q", "a")});
+    try testing.expectError(error.SessionRecoveryNotNeeded, recover(&t.store, alloc, "v1-whole"));
+    try testing.expectError(error.SessionNotFound, recover(&t.store, alloc, "v1-none"));
 }
 
 test "a leftover v1 folder goes on a later open only while it is what was converted (D60)" {

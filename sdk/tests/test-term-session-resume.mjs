@@ -16,8 +16,11 @@ if (!supportsJspi()) {
 const wasm = await readFile(wasmPath);
 const encoded = new TextEncoder();
 let fetchCalls = 0;
-const mockFetch = async () => {
+const requestBodies = [];
+const mockFetch = async (_input, init) => {
   fetchCalls += 1;
+  const body = init?.body;
+  requestBodies.push(typeof body === "string" ? body : body ? new TextDecoder().decode(body) : "");
   return new Response(new ReadableStream({
     start(controller) {
       controller.enqueue(encoded.encode('data: {"type":"text-delta","id":"answer","delta":"ZXQJ"}\n\n'));
@@ -141,4 +144,29 @@ if (!restoredBeforeInput.includes("ZXQJ")) {
 if (fetchCalls !== 1) throw new Error("restore triggered an unexpected gateway request");
 await exit(second.runtime, "second terminal");
 
-console.log(`term session resume passed: commits=${commits}, records=${records.size}, restored_prompt=true, restored_reply=true`);
+// A snapshot published libfx 0.0.13 saved, before v1 sessions were removed
+// (D63): its bytes load unchanged, the conversation replays, and the next
+// turn sends the model the restored history.
+const saved = JSON.parse(await readFile(resolve(scriptDir, "fixtures/libfx-0.0.13-term-session.json"), "utf8"));
+if (saved.libfx !== "0.0.13") throw new Error(`the fixture names libfx ${saved.libfx}`);
+records.clear();
+records.set(saved.id, { bytes: new Uint8Array(Buffer.from(saved.snapshot, "base64")), revision: "libfx-0.0.13", updatedAtMs: 1 });
+const restored = await start(["--resume", saved.id]);
+const replayed = restored.capture.text();
+if (!replayed.includes("remember the plum orchard") || !replayed.includes("PLUMQ")) {
+  throw new Error(`the libfx 0.0.13 snapshot did not replay: ${JSON.stringify(replayed.slice(-1000))}`);
+}
+const sentBefore = requestBodies.length;
+const commitsBefore = commits;
+restored.runtime.write("what did I ask you to remember\r");
+await waitFor(
+  () => requestBodies.length === sentBefore + 1 && commits === commitsBefore + 1,
+  "the restored session's next turn",
+  () => `commits=${commits}, fetches=${fetchCalls}, output=${JSON.stringify(restored.capture.text().slice(-1000))}`,
+);
+if (!requestBodies.at(-1).includes("remember the plum orchard")) {
+  throw new Error("the next turn did not send the model the restored history");
+}
+await exit(restored.runtime, "restored terminal");
+
+console.log(`term session resume passed: commits=${commits}, records=${records.size}, restored_prompt=true, restored_reply=true, libfx_0.0.13_snapshot=true`);

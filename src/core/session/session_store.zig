@@ -2803,22 +2803,32 @@ pub const Store = struct {
         };
     }
 
-    /// Copies a validated conversation prefix or legacy manifest boundary to a
-    /// new session. The source is locked for the read and is never modified.
-    pub fn recoverSessionCopy(
+    /// A damaged session's recoverable part (`recoverableState`).
+    pub const Recoverable = struct {
+        state: session_codec.DurableSessionState,
+        /// The current format's last valid frame; null for schema 3.
+        boundary: ?session_log.ConversationRecoveryBoundary,
+        title: ?[]u8,
+
+        pub fn deinit(recoverable: *Recoverable, alloc: Allocator) void {
+            recoverable.state.deinit(alloc);
+            if (recoverable.title) |title| alloc.free(title);
+            recoverable.* = undefined;
+        }
+    };
+
+    /// What `fx session recover` keeps of a damaged session, read from its
+    /// folder `dir`, which the caller holds locked: its state up to the last
+    /// frame v1 validates, or a schema-3 session's manifest boundary (D64).
+    /// `error.SessionRecoveryNotNeeded` when nothing is damaged. Caller owns
+    /// the result.
+    pub fn recoverableState(
         self: Store,
         alloc: Allocator,
+        dir: *io_mod.VerifiedDir,
         session_id: []const u8,
-        options: session_log.Options,
-    ) !SessionRecoveryResult {
-        try validateSessionId(session_id);
-        var source = try self.openWritableSessionDir(
-            alloc,
-            session_id,
-            options.session_lock_deadline_ms,
-        );
-        defer source.deinit(alloc);
-        var metadata = session_log.readConversationMetadata(alloc, &source.dir) catch |err| switch (err) {
+    ) !Recoverable {
+        var metadata = session_log.readConversationMetadata(alloc, dir) catch |err| switch (err) {
             error.InvalidSessionMetadata, error.InvalidSessionFormat => return error.SessionRecoveryBoundaryInvalid,
             else => return err,
         };
@@ -2828,7 +2838,7 @@ pub const Store = struct {
             if (metadata) |current| {
                 if (!std.mem.eql(u8, current.value.id, session_id)) return error.SessionRecoveryBoundaryInvalid;
                 if (current.value.subagent_child) return error.SessionNotFound;
-                const recovery = session_log.classify_conversation_recovery(alloc, &source.dir, session_id) catch |err| {
+                const recovery = session_log.classify_conversation_recovery(alloc, dir, session_id) catch |err| {
                     if (err == error.SessionRecoveryNotNeeded) {
                         var healthy = try self.loadReadOnly(alloc, session_id);
                         healthy.deinit(alloc);
@@ -2836,18 +2846,18 @@ pub const Store = struct {
                     return err;
                 };
                 current_boundary = recovery.boundary;
-                break :recovery_state try session_log.load_conversation_recovery_state(alloc, &source.dir, session_id, current_boundary.?);
+                break :recovery_state try session_log.load_conversation_recovery_state(alloc, dir, session_id, current_boundary.?);
             }
             const authority = try classifyAuthority(
                 alloc,
-                &source.dir,
+                dir,
                 session_id,
             );
             if (authority != .schema_v3) {
                 return error.SessionRecoveryRequiresCurrentSchema;
             }
             var manifest_file = openSessionFile(
-                &source.dir,
+                dir,
                 "session.json",
                 .read_only,
             ) catch return error.SessionRecoveryBoundaryInvalid;
@@ -2882,7 +2892,7 @@ pub const Store = struct {
             };
             defer manifest.deinit(alloc);
             if (!std.mem.eql(u8, manifest.id, session_id)) return error.SessionRecoveryBoundaryInvalid;
-            var events = openSessionFile(&source.dir, "events.jsonl", .read_only) catch
+            var events = openSessionFile(dir, "events.jsonl", .read_only) catch
                 return error.SessionRecoveryBoundaryInvalid;
             defer events.close(io_mod.getIo());
             var imported = session_replay.replayCommittedPrefix(
@@ -2905,7 +2915,7 @@ pub const Store = struct {
             imported_owned = false;
             break :recovery_state recovered_state;
         };
-        defer recovered.deinit(alloc);
+        errdefer recovered.deinit(alloc);
         try resolveSessionSnapshotLocators(
             alloc,
             recovered.history,
@@ -2921,7 +2931,7 @@ pub const Store = struct {
         defer alloc.free(source_dir_path);
         var source_children = try session_child_store.SessionChildCapability.init(
             alloc,
-            source.dir.dir,
+            dir.dir,
             source_dir_path,
             .read_only,
         );
@@ -2929,6 +2939,34 @@ pub const Store = struct {
         if (try subagent_child_state.capabilityHasManagedChildMarker(alloc, &source_children)) {
             return error.SessionNotFound;
         }
+        const title = if (metadata) |current| if (current.value.title) |value| try alloc.dupe(u8, value) else null else null;
+        return .{ .state = recovered, .boundary = current_boundary, .title = title };
+    }
+
+    /// Copies a validated conversation prefix or legacy manifest boundary to a
+    /// new session. The source is locked for the read and is never modified.
+    pub fn recoverSessionCopy(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+        options: session_log.Options,
+    ) !SessionRecoveryResult {
+        try validateSessionId(session_id);
+        var source = try self.openWritableSessionDir(
+            alloc,
+            session_id,
+            options.session_lock_deadline_ms,
+        );
+        defer source.deinit(alloc);
+        const recoverable = try self.recoverableState(alloc, &source.dir, session_id);
+        defer if (recoverable.title) |title| alloc.free(title);
+        var recovered = recoverable.state;
+        defer recovered.deinit(alloc);
+        const current_boundary = recoverable.boundary;
+        const source_dir_path = try sessionDirPath(alloc, self.sessions_dir, session_id);
+        defer alloc.free(source_dir_path);
+        var source_children = try session_child_store.SessionChildCapability.init(alloc, source.dir.dir, source_dir_path, .read_only);
+        defer source_children.deinit();
 
         const source_id = try alloc.dupe(u8, recovered.id);
         errdefer alloc.free(source_id);
@@ -3025,7 +3063,7 @@ pub const Store = struct {
         );
         if (current_boundary) |boundary| {
             try session_log.copy_conversation_recovery_prefix(alloc, &source.dir, &target.log.dir, boundary);
-            if (metadata.?.value.title) |title| _ = try target.renameConversation(alloc, title);
+            if (recoverable.title) |title| _ = try target.renameConversation(alloc, title);
         }
         const promotion = self.promoteRecoveryStagedSession(
             &staging_root,

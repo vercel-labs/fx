@@ -27,10 +27,14 @@ TLA = HERE.parent
 sys.path.insert(0, str(TLA.parent / "lib"))
 from tlc import toolchain  # noqa: E402
 
-KINDS = {"create", "write", "hold", "release", "open", "all", "crash", "open2", "damage", "fresh", "list"}
-REQUESTS = {"open", "all", "crash", "open2"}
-ANSWERS = {"none", "opened", "converted", "busy", "unreadable", "notfound"}
-STATUS = {"none", "import", "fresh"}
+KINDS = {"create", "write", "hold", "release", "open", "all", "crash", "open2", "damage", "fresh", "list",
+         "recover"}
+REQUESTS = {"open", "all", "crash", "open2", "recover"}
+ANSWERS = {"none", "opened", "converted", "busy", "unreadable", "notfound",
+           "recovered", "healthy", "unsalvageable", "inv2"}
+STATUS = {"none", "import", "fresh", "salvage"}
+# A member's damage, as the v1 writer's own `fx session recover` judges it.
+DAMAGES = {"ok", "salvage", "lost"}
 EXIT = {"ACCEPTED": 0, "REJECTED": 1, "INCONCLUSIVE": 2, "TOOL_ERROR": 3}
 
 
@@ -96,15 +100,15 @@ def model_obs(request):
                 if v not in STATUS:
                     raise Inconclusive(f"observation {n}: unknown v2 status {v!r}")
 
-            def flag(v):
-                if not isinstance(v, bool):
-                    raise Inconclusive(f"observation {n}: a flag is not a boolean")
+            def damage(v):
+                if v not in DAMAGES:
+                    raise Inconclusive(f"observation {n}: unknown damage {v!r}")
 
             v1, _ = by_model("v1", 0, nat)
             pub, _ = by_model("pub", "none", status)
             base, _ = by_model("base", 0, nat)
             extra, _ = by_model("extra", 0, nat)
-            bad, _ = by_model("bad", False, flag)
+            bad, _ = by_model("bad", "ok", damage)
             listed, held, denied = o["listed"], o.get("held", []), o.get("denied", False)
             if not isinstance(o["dirty"], bool) or not isinstance(listed, list) or not isinstance(held, list) \
                     or not isinstance(denied, bool):
@@ -120,7 +124,7 @@ def model_obs(request):
                 "pub": {i: pub.get(i, "none") for i in every},
                 "base": {i: base.get(i, 0) for i in every},
                 "extra": {i: extra.get(i, 0) for i in every},
-                "bad": {i: bad.get(i, False) for i in member},
+                "bad": {i: bad.get(i, "ok") for i in member},
                 "dirty": o["dirty"],
                 "denied": denied,
                 "held": sorted(names[i] for i in held),
@@ -138,7 +142,7 @@ def data_module(obs):
                 + ", ans2 |-> " + tla_str(o["ans2"])
                 + ", v1 |-> " + tla_fun(o["v1"], str) + ", pub |-> " + tla_fun(o["pub"], tla_str)
                 + ", base |-> " + tla_fun(o["base"], str) + ", extra |-> " + tla_fun(o["extra"], str)
-                + ", bad |-> " + tla_fun(o["bad"], lambda b: "TRUE" if b else "FALSE")
+                + ", bad |-> " + tla_fun(o["bad"], tla_str)
                 + ", dirty |-> " + ("TRUE" if o["dirty"] else "FALSE")
                 + ", denied |-> " + ("TRUE" if o["denied"] else "FALSE")
                 + ", held |-> {" + ", ".join(tla_str(i) for i in o["held"]) + "}"
@@ -211,10 +215,13 @@ def selftest():
     """Planted observation sequences: each must get its verdict."""
     ids = {"root": "R", "child": None, "fresh": []}
 
-    def ob(k, v1=0, pub="none", base=0, extra=0, ans="none", dirty=False, listed=None, bad=False, r="R", held=(),
-           denied=False, ans2="none"):
-        return {"k": k, "r": r, "ans": ans, "ans2": ans2, "v1": {"R": v1}, "pub": {"R": pub}, "base": {"R": base},
-                "extra": {"R": extra}, "bad": {"R": bad}, "dirty": dirty, "held": list(held),
+    def ob(k, v1=0, pub="none", base=0, extra=0, ans="none", dirty=False, listed=None, bad="ok", r="R", held=(),
+           denied=False, ans2="none", salvaged=None):
+        # `salvaged`: the status of the fresh id S a salvage copies into.
+        fresh = {} if salvaged is None else {"S": salvaged}
+        return {"k": k, "r": r, "ans": ans, "ans2": ans2, "v1": {"R": v1}, "pub": {"R": pub, **fresh},
+                "base": {"R": base, **{i: 0 for i in fresh}}, "extra": {"R": extra, **{i: 0 for i in fresh}},
+                "bad": {"R": bad}, "dirty": dirty, "held": list(held),
                 "listed": ["R"] if listed is None else listed, "denied": denied}
     made = ob("create", v1=1)
     kept = ob("open", v1=1, pub="import", base=1, ans="opened", denied=True)
@@ -228,7 +235,7 @@ def selftest():
          [made, ob("hold", v1=1, held=["R"]), ob("open", v1=1, ans="busy", held=["R"]), ob("release", v1=1),
           ob("open", pub="import", base=1, ans="opened")], "ACCEPTED"),
         ("unreadable: refused, nothing converted or deleted",
-         [made, ob("damage", v1=1, bad=True), ob("open", v1=1, bad=True, ans="unreadable")], "ACCEPTED"),
+         [made, ob("damage", v1=1, bad="lost"), ob("open", v1=1, bad="lost", ans="unreadable")], "ACCEPTED"),
         ("a refused delete leaves the folder; the next open deletes it",
          [made, kept, ob("open", pub="import", base=1, ans="opened")], "ACCEPTED"),
         ("an older build changes a leftover; the next open keeps it, and v2 keeps its copy",
@@ -249,7 +256,7 @@ def selftest():
         ("planted: the listing hides an unconverted v1 session",
          [made, ob("list", v1=1, listed=[]), ob("open", pub="import", base=1, ans="opened")], "REJECTED"),
         ("planted: unreadable, yet half converted",
-         [made, ob("damage", v1=1, bad=True), ob("open", v1=1, bad=True, dirty=True, ans="unreadable")], "REJECTED"),
+         [made, ob("damage", v1=1, bad="lost"), ob("open", v1=1, bad="lost", dirty=True, ans="unreadable")], "REJECTED"),
         ("planted: an older build's later write reaches the v2 copy",
          [made, kept, ob("write", v1=2, pub="import", base=2)], "REJECTED"),
         ("planted: converted with no request",
@@ -262,11 +269,36 @@ def selftest():
         ("planted: the v1 folder deleted before its copy was published",
          [made, ob("crash", dirty=True)], "REJECTED"),
     ]
+    # Salvage (D64): the copy lands in the fresh id S; the v1 session stays.
+    salvage_ids = {"root": "R", "child": None, "fresh": ["S"]}
+    broken = ob("damage", v1=1, bad="salvage", salvaged="none")
+    lost = ob("damage", v1=1, bad="lost", salvaged="none")
+    salvage_cases = [
+        ("salvage copies a damaged root's start into a fresh session and keeps the v1 session",
+         [ob("create", v1=1, salvaged="none"), broken,
+          ob("recover", v1=1, bad="salvage", ans="recovered", salvaged="salvage", listed=["R", "S"])], "ACCEPTED"),
+        ("salvage of a healthy root changes nothing",
+         [ob("create", v1=1, salvaged="none"), ob("recover", v1=1, ans="healthy", salvaged="none")], "ACCEPTED"),
+        ("salvage reports damage it cannot get past and changes nothing",
+         [ob("create", v1=1, salvaged="none"), lost,
+          ob("recover", v1=1, bad="lost", ans="unsalvageable", salvaged="none")], "ACCEPTED"),
+        ("planted: salvage refuses a root v1 could salvage",
+         [ob("create", v1=1, salvaged="none"), broken,
+          ob("recover", v1=1, bad="salvage", ans="unsalvageable", salvaged="none")], "REJECTED"),
+        ("planted: salvage deletes the damaged v1 session",
+         [ob("create", v1=1, salvaged="none"), broken,
+          ob("recover", bad="salvage", ans="recovered", salvaged="salvage", listed=["S"])], "REJECTED"),
+        ("planted: salvage converts the damaged root in place",
+         [ob("create", v1=1, salvaged="none"), broken,
+          ob("recover", v1=1, pub="import", base=1, bad="salvage", ans="recovered", salvaged="none")], "REJECTED"),
+    ]
+    cases = [(label, ids, o, want) for label, o, want in cases] + \
+            [(label, salvage_ids, o, want) for label, o, want in salvage_cases]
     bad = 0
     root = Path(tempfile.mkdtemp(prefix="check-conversion-selftest-"))
-    for n, (label, observations, want) in enumerate(cases, 1):
+    for n, (label, case_ids, observations, want) in enumerate(cases, 1):
         try:
-            got = verify({"version": 1, "ids": ids, "observations": observations}, root / str(n))
+            got = verify({"version": 1, "ids": case_ids, "observations": observations}, root / str(n))
             verdict = got["verdict"]
         except Inconclusive as why:
             verdict = f"INCONCLUSIVE ({why})"

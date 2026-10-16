@@ -35,7 +35,17 @@
 (* its copy was made is never converted again or deleted, so v1ver may   *)
 (* run ahead of base.                                                      *)
 (*                                                                         *)
-(* Design: system-design.md D53 to D57 and D59 to D61.                     *)
+(* Salvage (D64): `fx session recover` on a damaged v1 root copies the   *)
+(* start v1's own recover would keep into a fresh v2 session. It holds   *)
+(* the root's v1 lock for the read, as v1 does, and never writes,        *)
+(* converts or deletes the v1 session. A healthy root needs no salvage,  *)
+(* and a root whose damage leaves no validated start cannot be salvaged. *)
+(* No answer refuses without its cause: "busy" only while another holds *)
+(* a lock, "unreadable" or "unsalvageable" only for damage v1 could not  *)
+(* get past either, so nothing v1 opens or salvages is lost (no-bricking *)
+(* contract, docs/session-manager/v1-removal/plan.md).                   *)
+(*                                                                         *)
+(* Design: system-design.md D53 to D57 and D59 to D61, D64.               *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
@@ -62,16 +72,19 @@ Roots == {i \in Ids : Parent[i] = None}
 Children(r) == {c \in Ids : Parent[c] = r}
 Fam(r) == {r} \cup Children(r)
 
-Kinds == {"none", "open", "all"}
-Answers == {"none", "opened", "converted", "busy", "unreadable", "notfound"}
-Status == {"none", "import", "fresh"}
+Kinds == {"none", "open", "all", "recover"}
+Answers == {"none", "opened", "converted", "busy", "unreadable", "notfound",
+            "recovered", "healthy", "unsalvageable", "inv2"}
+Status == {"none", "import", "fresh", "salvage"}
+\* "salvage": damaged, with a start v1's recover validates; "lost": none.
+Damages == {"ok", "salvage", "lost"}
 
 VARIABLES
     v1ver,      \* [Ids -> 0..MaxV]: 0 absent, else the version of its files
     v1lock,     \* [Ids -> {"free", "writer"} \cup Procs]
     writing,    \* [Ids -> BOOLEAN]: a writer is mid-write; the files are torn
     locks,      \* [Ids -> 0..MaxLocks]: times a writer took the lock
-    bad,        \* [Ids -> BOOLEAN]: the member's v1 files cannot be read
+    bad,        \* [Ids -> Damages]: the member's v1 files cannot be read
     pub,        \* [AllIds -> Status]: the id in v2
     base,       \* [AllIds -> 0..MaxV \cup {Torn}]: the version a conversion
                 \* copied, which the v2 copy records as its fingerprint
@@ -98,14 +111,14 @@ TypeOK ==
     /\ v1lock \in [Ids -> {"free", "writer"} \cup Procs]
     /\ writing \in [Ids -> BOOLEAN]
     /\ locks \in [Ids -> 0..MaxLocks]
-    /\ bad \in [Ids -> BOOLEAN]
+    /\ bad \in [Ids -> Damages]
     /\ pub \in [AllIds -> Status]
     /\ base \in [AllIds -> (0..MaxV) \cup {Torn}]
     /\ staged \in [Ids -> BOOLEAN]
     /\ stagedBase \in [Ids -> (0..MaxV) \cup {Torn}]
     /\ extra \in [AllIds -> 0..MaxExtra]
     /\ \A p \in Procs :
-         /\ conv[p].pc \in {"idle", "locked", "staged", "published"}
+         /\ conv[p].pc \in {"idle", "locked", "staged", "published", "salvaging"}
          /\ conv[p].root \in Roots \cup {None}
          /\ conv[p].members \subseteq Ids /\ conv[p].copied \subseteq conv[p].members
          /\ req[p].kind \in Kinds /\ req[p].root \in Roots \cup {None}
@@ -115,7 +128,7 @@ TypeOK ==
     /\ crashes \in 0..MaxCrash
     /\ famOf \in [Roots -> SUBSET Ids]
 
-Live(i) == pub[i] \in {"import", "fresh"}
+Live(i) == pub[i] \in {"import", "fresh", "salvage"}
 
 \* A published child whose root is not published: a crash's leftover, which
 \* the next conversion of its family reuses as it is.
@@ -126,7 +139,7 @@ Dirty == \E i \in Ids : staged[i]
 \* copy (damage changes its fingerprint too), free, and not refused in p's
 \* current request: p's open deletes it.
 Leftover(p, i) ==
-    /\ pub[i] = "import" /\ v1ver[i] > 0 /\ v1ver[i] = base[i] /\ ~bad[i]
+    /\ pub[i] = "import" /\ v1ver[i] > 0 /\ v1ver[i] = base[i] /\ bad[i] = "ok"
     /\ v1lock[i] = "free" /\ i \notin refused[p]
 
 \* What the picker and `fx sessions` list: v2 roots, and v1 roots v2 does not
@@ -140,7 +153,7 @@ Init ==
     /\ v1lock = [i \in Ids |-> "free"]
     /\ writing = [i \in Ids |-> FALSE]
     /\ locks = [i \in Ids |-> 0]
-    /\ bad = [i \in Ids |-> FALSE]
+    /\ bad = [i \in Ids |-> "ok"]
     /\ pub = [i \in AllIds |-> "none"]
     /\ base = [i \in AllIds |-> 0]
     /\ staged = [i \in Ids |-> FALSE]
@@ -206,11 +219,12 @@ WCrash(i) ==
     /\ UNCHANGED <<v1ver, locks, bad, pub, base, staged, stagedBase, extra,
                    conv, req, out, refused, reqs, famOf>>
 
-\* A member's v1 files become unreadable: damage from outside fx.
+\* A member's v1 files become unreadable: damage from outside fx, which may
+\* leave a start v1's recover validates.
 Damage(i) ==
     /\ v1ver[i] > 0
-    /\ ~bad[i]
-    /\ bad' = [bad EXCEPT ![i] = TRUE]
+    /\ bad[i] = "ok"
+    /\ \E d \in Damages \ {"ok"} : bad' = [bad EXCEPT ![i] = d]
     /\ UNCHANGED <<v1ver, v1lock, writing, locks, pub, base, staged,
                    stagedBase, extra, conv, req, out, refused, reqs, crashes, famOf>>
 
@@ -235,7 +249,7 @@ FAppend(i) ==
 (* -- requests and the converter, in each requesting process *)
 
 Request(p, k, r) ==
-    /\ k \in {"open", "all"}
+    /\ k \in Kinds \ {"none"}
     /\ req[p] = NoReq
     /\ conv[p] = Idle
     /\ reqs < MaxReq
@@ -252,7 +266,7 @@ Answer(p, a) ==
 
 Done(p) == IF req[p].kind = "open" THEN "opened" ELSE "converted"
 
-Waiting(p) == req[p] # NoReq /\ conv[p] = Idle
+Waiting(p) == req[p] # NoReq /\ conv[p] = Idle /\ req[p].kind # "recover"
 
 \* v2 already holds the id: any leftover of its family is cleaned first.
 AHeld(p) ==
@@ -317,7 +331,7 @@ CStage(p) ==
     LET m == conv[p].members
         copy == {i \in m : pub[i] = "none"} IN
     /\ conv[p].pc = "locked"
-    /\ IF \E i \in copy : bad[i]
+    /\ IF \E i \in copy : bad[i] # "ok"
        THEN /\ v1lock' = [i \in Ids |-> IF i \in m THEN "free" ELSE v1lock[i]]
             /\ staged' = [i \in Ids |-> IF i \in Fam(conv[p].root) THEN FALSE ELSE staged[i]]
             /\ conv' = [conv EXCEPT ![p] = Idle]
@@ -360,7 +374,7 @@ CPublishRoot(p) ==
 \* reused child still at its copy's version and fingerprint.
 Deletable(p, i) ==
     /\ i \in conv[p].members /\ v1ver[i] > 0 /\ v1ver[i] = base[i]
-    /\ i \in conv[p].copied \/ ~bad[i]
+    /\ i \in conv[p].copied \/ bad[i] = "ok"
 
 \* D60: with the copy durable, each member's v1 folder goes, still locked.
 CDelete(p, i) ==
@@ -393,6 +407,55 @@ CFinish(p) ==
     /\ UNCHANGED <<v1ver, writing, locks, bad, pub, base, staged, stagedBase,
                    extra, refused, reqs, crashes, famOf>>
 
+(* -- salvage of a damaged v1 root (D64) *)
+
+SWaiting(p) == req[p].kind = "recover" /\ conv[p] = Idle
+OnlyV1(r) == pub[r] = "none" /\ v1ver[r] > 0
+
+\* The id is not a v1-only session: v2's own recover answers, or nothing
+\* holds it.
+SElsewhere(p) ==
+    /\ SWaiting(p)
+    /\ ~OnlyV1(req[p].root)
+    /\ Answer(p, IF Live(req[p].root) THEN "inv2" ELSE "notfound")
+    /\ UNCHANGED <<v1ver, v1lock, writing, locks, bad, pub, base, staged,
+                   stagedBase, extra, conv, refused, reqs, crashes, famOf>>
+
+\* Takes the root's v1 lock for the read, or answers "busy".
+SBegin(p) ==
+    LET r == req[p].root IN
+    /\ SWaiting(p)
+    /\ OnlyV1(r)
+    /\ IF v1lock[r] = "free"
+       THEN /\ v1lock' = [v1lock EXCEPT ![r] = p]
+            /\ conv' = [conv EXCEPT ![p] = [pc |-> "salvaging", root |-> r, members |-> {r}, copied |-> {}]]
+            /\ UNCHANGED <<req, out>>
+       ELSE /\ Answer(p, "busy")
+            /\ UNCHANGED <<conv, v1lock>>
+    /\ UNCHANGED <<v1ver, writing, locks, bad, pub, base, staged,
+                   stagedBase, extra, refused, reqs, crashes, famOf>>
+
+\* Reads the root under its lock and answers. A validated start is
+\* published as a fresh v2 session in one rename, the manager's import;
+\* when every fresh id this model tracks is taken, it lands in one it does
+\* not track (real ids are random).
+SFinish(p) ==
+    LET r == conv[p].root
+        free == {n \in NewIds : pub[n] = "none"} IN
+    /\ conv[p].pc = "salvaging"
+    /\ IF bad[r] = "salvage" /\ free # {}
+       THEN \E n \in free : pub' = [pub EXCEPT ![n] = "salvage"]
+       ELSE UNCHANGED pub
+    /\ v1lock' = [v1lock EXCEPT ![r] = "free"]
+    /\ conv' = [conv EXCEPT ![p] = Idle]
+    /\ Answer(p, CASE bad[r] = "ok" -> "healthy"
+                  [] bad[r] = "salvage" -> "recovered"
+                  [] OTHER -> "unsalvageable")
+    /\ UNCHANGED <<v1ver, writing, locks, bad, base, staged, stagedBase,
+                   extra, refused, reqs, crashes, famOf>>
+
+SalvStep(p) == SElsewhere(p) \/ SBegin(p) \/ SFinish(p)
+
 \* The process dies: no answer, and its locks go with it.
 CCrash(p) ==
     /\ req[p] # NoReq
@@ -408,6 +471,7 @@ CCrash(p) ==
 \* A converter's steps, without its faults.
 ConvWork(p) ==
     \/ AHeld(p) \/ AMissing(p) \/ CBegin(p) \/ CStage(p) \/ CPublishRoot(p) \/ CFinish(p)
+    \/ SalvStep(p)
     \/ \E c \in Ids : CPublishChild(p, c) \/ CDelete(p, c) \/ CClean(p, c)
 
 \* Faults: a refused delete.
@@ -420,7 +484,7 @@ WriterStep(i) == WCreate(i) \/ WLock(i) \/ WBegin(i) \/ WEnd(i) \/ WUnlock(i) \/
 Next ==
     \/ \E p \in Procs :
          \/ ConvStep(p)
-         \/ \E k \in {"open", "all"}, r \in Roots : Request(p, k, r)
+         \/ \E k \in Kinds \ {"none"}, r \in Roots : Request(p, k, r)
     \/ \E i \in Ids : WriterStep(i) \/ Damage(i)
     \/ \E i \in AllIds : FCreate(i) \/ FAppend(i)
 
@@ -433,6 +497,7 @@ FairSpec ==
     /\ \A p \in Procs :
          /\ WF_vars(AHeld(p)) /\ WF_vars(AMissing(p)) /\ WF_vars(CBegin(p))
          /\ WF_vars(CStage(p)) /\ WF_vars(CPublishRoot(p)) /\ WF_vars(CFinish(p))
+         /\ WF_vars(SElsewhere(p)) /\ WF_vars(SBegin(p)) /\ WF_vars(SFinish(p))
          /\ \A c \in Ids : WF_vars(CPublishChild(p, c)) /\ WF_vars(CDelete(p, c)) /\ WF_vars(CClean(p, c))
     /\ \A i \in Ids : WF_vars(WUnlock(i)) /\ WF_vars(WEnd(i))
 
@@ -443,7 +508,7 @@ FairSpec ==
 \* folder it deletes is that version.
 LockHeld ==
     \A p \in Procs :
-        conv[p].pc \in {"locked", "staged", "published"} =>
+        conv[p].pc \in {"locked", "staged", "published", "salvaging"} =>
             \A i \in conv[p].members : v1lock[i] = p
 CopyIsCurrent ==
     \A p \in Procs :
@@ -510,7 +575,7 @@ LeftoversGone ==
          (AnswerStep(p) /\ out'[p].ans \in {"opened", "converted"}) =>
              \A i \in Fam(req[p].root) :
                  (pub'[i] = "import" /\ v1ver'[i] > 0 /\ v1ver'[i] = base'[i])
-                     => (v1lock'[i] \in {"writer"} \cup (Procs \ {p}) \/ bad'[i] \/ i \in refused'[p])]_vars
+                     => (v1lock'[i] \in {"writer"} \cup (Procs \ {p}) \/ bad'[i] # "ok" \/ i \in refused'[p])]_vars
 
 \* The converter writes no v1 file: it only deletes v1 folders.
 ConverterOnlyDeletes ==
@@ -531,6 +596,28 @@ RootsStick ==
 ChildrenStick ==
     [][\A c \in Ids :
          (Parent[c] # None /\ pub[c] = "import") => (pub'[c] = "import" /\ base'[c] = base[c])]_vars
+
+\* D64: salvage never writes, converts or deletes a v1 session; the only id
+\* it changes is a fresh one (RootsStick keeps that from replacing a live
+\* session).
+SalvageLeavesSource ==
+    [][\A p \in Procs :
+         SalvStep(p) => /\ UNCHANGED <<v1ver, writing, bad, base, staged>>
+                        /\ \A i \in Ids : pub'[i] = pub[i]]_vars
+
+\* No-bricking: an answer that refuses names a cause v1 shares. "busy" only
+\* while someone else holds a lock of the family; "unreadable" only for a
+\* damaged member not yet in v2; salvage reports the damage as it is.
+RefusedOnlyWithCause ==
+    [][\A p \in Procs :
+         LET r == req[p].root
+             a == out'[p].ans IN
+         AnswerStep(p) =>
+             /\ a = "busy" => \E i \in Fam(r) : v1lock[i] \notin {"free", p}
+             /\ a = "unreadable" => \E i \in Fam(r) : pub[i] = "none" /\ bad[i] # "ok"
+             /\ a = "unsalvageable" => bad[r] = "lost"
+             /\ a = "healthy" => bad[r] = "ok"
+             /\ a = "recovered" => bad[r] = "salvage"]_vars
 
 \* Every request is answered, unless its process dies.
 RequestsAnswered == \A p \in Procs : (req[p] # NoReq) ~> (req[p] = NoReq)

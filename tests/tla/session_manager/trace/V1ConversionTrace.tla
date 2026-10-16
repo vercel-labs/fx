@@ -7,10 +7,12 @@
 (*   k      the step: create | write | hold | release (older-build v1     *)
 (*          writers), open | all | crash (a request, the last one killed  *)
 (*          mid-request), open2 (two processes opening the same root at   *)
-(*          once), damage, fresh (a new v2 session), list                 *)
+(*          once), recover (a salvage, D64), damage, fresh (a new v2      *)
+(*          session), list                                                 *)
 (*   r      the requested root ("none" for other steps)                    *)
 (*   ans    the request's answer: opened | converted | busy | unreadable  *)
-(*          | notfound, or none; ans2 the second process's, for open2     *)
+(*          | notfound, recovered | healthy | unsalvageable | inv2 for    *)
+(*          recover, or none; ans2 the second process's, for open2       *)
 (*   v1     [Ids -> version]: each v1 member's distinct contents in order *)
 (*          of first appearance, 0 absent                                  *)
 (*   pub    [AllIds -> Status]: each id in v2                              *)
@@ -19,7 +21,8 @@
 (*   extra  [AllIds -> Nat]: v2 turns after the copied ones                *)
 (*   dirty  conversion leftovers in .tmp                                   *)
 (*   listed the ids the listing shows                                      *)
-(*   bad    [Ids -> BOOLEAN]: members the driver made unreadable          *)
+(*   bad    [Ids -> Damages]: members the driver made unreadable, and     *)
+(*          whether the v1 writer's own recover salvages them              *)
 (*   held   the members a still-running older build has open               *)
 (*   denied the driver made the file system refuse deletes in this step    *)
 (* Between observations, only the actions of that step's kind may run,   *)
@@ -39,7 +42,7 @@ P1 == "p1"
 P2 == "p2"
 
 \* The requests observation `j` makes.
-Made(o) == CASE o.k = "open2" -> 2 [] o.k \in {"open", "all", "crash"} -> 1 [] OTHER -> 0
+Made(o) == CASE o.k = "open2" -> 2 [] o.k \in {"open", "all", "crash", "recover"} -> 1 [] OTHER -> 0
 RECURSIVE ReqCount(_)
 ReqCount(n) == IF n = 0 THEN 0 ELSE Made(Obs[n]) + ReqCount(n - 1)
 
@@ -56,7 +59,7 @@ Hidden(o, n) ==
             \E i \in Ids : WriterStep(i)
       [] o.k = "damage" -> \E i \in Ids : Damage(i)
       [] o.k = "fresh" -> \E i \in NewIds : FCreate(i) \/ FAppend(i)
-      [] o.k \in {"open", "all"} ->
+      [] o.k \in {"open", "all", "recover"} ->
             \/ reqs < ReqCount(n) /\ Request(P1, o.k, o.r)
             \/ ConvAllowed(P1, o)
             \/ \E i \in Ids : HolderStep(i)
@@ -84,7 +87,7 @@ Match(o, n) ==
     /\ {i \in Ids : v1lock[i] = "writer"} = o.held
     /\ reqs = ReqCount(n)
     /\ \A p \in Procs : req[p] = NoReq /\ conv[p] = Idle
-    /\ o.k \in {"open", "all"} => out[P1].ans = o.ans
+    /\ o.k \in {"open", "all", "recover"} => out[P1].ans = o.ans
     /\ o.k = "open2" =>
          \/ out[P1].ans = o.ans /\ out[P2].ans = o.ans2
          \/ out[P1].ans = o.ans2 /\ out[P2].ans = o.ans

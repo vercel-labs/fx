@@ -500,11 +500,38 @@ pub fn readMember(gpa: Allocator, store: *session_store.Store, locked: *Locked, 
             } else try readOlderFormat(a, store, locked, &member, problem);
         },
     }
+    member.turns = countTurns(member.steps);
+    return member;
+}
+
+fn countTurns(steps: []const Step) usize {
     var turns: usize = 0;
-    for (member.steps) |step| {
+    for (steps) |step| {
         if (step != .compacted) turns += 1;
     }
-    member.turns = turns;
+    return turns;
+}
+
+/// The start of a damaged root that v1's `fx session recover` keeps (D64),
+/// read by v1's own recovery from the locked folder, as a member to import
+/// under a new id. Errors as `session_store.Store.recoverableState`, and
+/// `error.InvalidSessionFormat` with `problem` set when a kept turn is one
+/// the current format cannot keep.
+pub fn readSalvage(gpa: Allocator, store: *session_store.Store, locked: *Locked, problem: *Problem) !Member {
+    var member: Member = undefined;
+    member.arena = .init(gpa);
+    errdefer member.arena.deinit();
+    const a = member.arena.allocator();
+    member.stored = &.{};
+    member.fingerprint = fingerprintOf(a, &locked.dir) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return problem.set("its folder can't be read ({s})", .{@errorName(err)}),
+    };
+    var recoverable = try store.recoverableState(a, &locked.dir, locked.id);
+    member.listed_ms = @intCast(@max(recoverable.state.updated_at_ms, 0));
+    member.title = recoverable.title;
+    try fromState(a, locked, &recoverable.state, "events.jsonl", &member, problem);
+    member.turns = countTurns(member.steps);
     return member;
 }
 
@@ -774,13 +801,21 @@ fn readOlderFormat(a: Allocator, store: *session_store.Store, locked: *Locked, m
         error.OutOfMemory => return err,
         else => return problem.set("session.json can't be read in any format this fx knows ({s})", .{@errorName(err)}),
     };
-    const state = &detail.state;
+    member.listed_ms = @intCast(@max(detail.summary.updated_at_ms, 0));
+    member.title = detail.summary.title;
+    // Schema 3 keeps its history in its log, a legacy session in its
+    // snapshot.
+    const history_file: []const u8 = if (locked.dir.dir.statFile(io_mod.getIo(), "authority.json", .{ .follow_symlinks = false })) |_| "events.jsonl" else |_| "session.json";
+    try fromState(a, locked, &detail.state, history_file, member, problem);
+}
+
+/// Fills `member` from a v1 state as v1's migration leaves it. `history_file`
+/// names the file its turns came from, for a refusal.
+fn fromState(a: Allocator, locked: *Locked, state: *session_codec.DurableSessionState, history_file: []const u8, member: *Member, problem: *Problem) !void {
     member.workspace = state.workspace_root;
     member.created_ms = @intCast(@max(state.created_at_ms, 0));
-    member.listed_ms = @intCast(@max(detail.summary.updated_at_ms, 0));
     member.language = state.conversation_language;
     member.preferences = state.preferences;
-    member.title = detail.summary.title;
     member.permissions = state.permission_state;
     if (state.permission_state.version != session_permission_state.schema_version) {
         member.permissions = session_permission_state.migrateV1ToV2(a, state.permission_state) catch |err| switch (err) {
@@ -795,9 +830,6 @@ fn readOlderFormat(a: Allocator, store: *session_store.Store, locked: *Locked, m
     if (!try state.archive_legacy_recovery(a) and state.recovery_checkpoint != null)
         debug_trace.logf("convert", "action=RecoveryDropped session={s} reason=older_format", .{locked.id});
     _ = try session_log.discardEmptyLegacyFileEvidence(a, state.history);
-    // Schema 3 keeps its history in its log, a legacy session in its
-    // snapshot.
-    const history_file: []const u8 = if (locked.dir.dir.statFile(io_mod.getIo(), "authority.json", .{ .follow_symlinks = false })) |_| "events.jsonl" else |_| "session.json";
     var stored: std.ArrayList(Stored) = .empty;
     var steps: std.ArrayList(Step) = .empty;
     const ts_floor: u64 = member.created_ms;

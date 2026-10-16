@@ -53,6 +53,8 @@ pub const Filter = catalog_mod.Filter;
 pub const Rebuilt = catalog_mod.Rebuilt;
 pub const BlobHash = [schema.blob_hash_len]u8;
 pub const max_blob_bytes = session_mod.max_blob_bytes;
+pub const new_id_len = schema.new_id_len;
+pub const newId = schema.newId;
 /// Largest `data` or `value` accepted in one event; the adapter moves
 /// bodies above its own, smaller threshold into blobs.
 pub const max_value_bytes: usize = log_mod.max_line_bytes - 64 * 1024;

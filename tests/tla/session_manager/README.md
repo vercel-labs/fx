@@ -121,9 +121,17 @@ The Bun drivers in `../drivers/session_manager/` run the real binary and have
 TLC judge each run's saved logs and `wiring` trace: `runtime.test.ts` through
 `fx ask`, and `fork.test.ts` through `/fork` in a terminal, including a fork's
 log against `trace/ForkLog.tla` and planted faults that must be rejected.
+`conversion/` opens, converts and salvages v1 sessions through every way fx
+opens one, and `trace/check_conversion.py` judges each run against
+`V1Conversion.tla`. Its v1 sessions come from built v1 writers: the last
+commit with v1, older releases for older formats, and a scrubbed real session
+in `conversion/fixtures/`. An older release builds only with its own Zig, which
+`FX_RELEASE_ZIG` names; `FX_TLA_V1_WRITER` picks another release of the
+current format, such as `v0.0.14`.
 
 ```sh
 bun test ../drivers/session_manager/       # from this folder; needs tmux
+FX_RELEASE_ZIG=/path/to/zig-0.16 bun test ../drivers/session_manager/conversion/
 ```
 
 ## What the models do not cover
