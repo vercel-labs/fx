@@ -736,12 +736,8 @@ pub const Reducer = struct {
         if (try index_value(choice.get("index") orelse return error.InvalidChunk) != 0) return error.InvalidChunk;
         const delta = try object(choice.get("delta") orelse return error.InvalidChunk);
         if (self.phase == .finished) {
-            // ponytail: some OpenAI-compatible proxies (observed: SoFi llm-proxy)
-            // send the trailing usage-only frame as a populated choice with an
-            // empty delta and no finish_reason at all, instead of the spec's
-            // empty choices array. Tolerate omission here; still require an
-            // exact match when finish_reason is present, and still reject any
-            // unexpected delta content below.
+            // Some proxies put usage in an empty-delta choice without finish_reason.
+            // Accept it, but reject mismatched reasons and unexpected delta content.
             if (non_null(choice, "finish_reason")) |finish_reason_value| {
                 const reason = try string(finish_reason_value);
                 if (!std.mem.eql(u8, reason, @tagName(self.finish_reason.?))) return error.InconsistentFinishReason;
