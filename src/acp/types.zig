@@ -114,6 +114,22 @@ pub const StopReason = enum {
     }
 };
 
+/// ACP uses standard stop reasons; libfx keeps its existing result contract.
+pub const PromptProtocol = enum {
+    acp,
+    libfx,
+
+    fn stopReasonString(self: PromptProtocol, reason: StopReason) []const u8 {
+        if (self == .libfx) return reason.jsonString();
+        return switch (reason) {
+            .max_output_tokens => "max_tokens",
+            .max_model_turns => "max_turn_requests",
+            .refused => "refusal",
+            else => reason.jsonString(),
+        };
+    }
+};
+
 pub const ToolCallKind = enum {
     read,
     edit,
@@ -331,9 +347,9 @@ pub fn writeInitializeResponse(w: *std.Io.Writer, capabilities: AgentCapabilitie
     try w.writeAll("\"authMethods\":[]}");
 }
 
-pub fn writePromptResponse(w: *std.Io.Writer, reason: StopReason) !void {
+pub fn writePromptResponse(w: *std.Io.Writer, reason: StopReason, protocol: PromptProtocol) !void {
     try w.writeAll("{\"stopReason\":");
-    try writeJsonStr(reason.jsonString(), w);
+    try writeJsonStr(protocol.stopReasonString(reason), w);
     try w.writeAll("}");
 }
 
@@ -345,9 +361,9 @@ pub const SteeringDelivery = enum {
 
 /// Answers a steering prompt with its receiving turn's stop reason. Usage is
 /// reported once, on the response to the prompt that started the turn.
-pub fn writeSteeringPromptResponse(w: *std.Io.Writer, reason: StopReason, delivery: SteeringDelivery) !void {
+pub fn writeSteeringPromptResponse(w: *std.Io.Writer, reason: StopReason, delivery: SteeringDelivery, protocol: PromptProtocol) !void {
     try w.writeAll("{\"stopReason\":");
-    try writeJsonStr(reason.jsonString(), w);
+    try writeJsonStr(protocol.stopReasonString(reason), w);
     try w.writeAll(",\"_meta\":{\"fx\":{\"steering\":");
     try writeJsonStr(@tagName(delivery), w);
     try w.writeAll("}}}");
@@ -395,9 +411,10 @@ pub fn writePromptResponseWithUsage(
     w: *std.Io.Writer,
     reason: StopReason,
     usage: core_types.Usage,
+    protocol: PromptProtocol,
 ) !void {
     try w.writeAll("{\"stopReason\":");
-    try writeJsonStr(reason.jsonString(), w);
+    try writeJsonStr(protocol.stopReasonString(reason), w);
     try w.writeAll(",\"usage\":{");
     var first = true;
     inline for (.{
@@ -485,8 +502,51 @@ test "writePromptResponse produces valid json" {
     const alloc = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writePromptResponse(&out.writer, .end_turn);
+    try writePromptResponse(&out.writer, .end_turn, .acp);
     try std.testing.expectEqualStrings("{\"stopReason\":\"end_turn\"}", out.writer.buffered());
+}
+
+test "prompt responses use ACP stop reasons and preserve libfx results" {
+    const alloc = std.testing.allocator;
+    const cases = .{
+        .{ StopReason.end_turn, "end_turn", "end_turn" },
+        .{ StopReason.max_output_tokens, "max_tokens", "max_output_tokens" },
+        .{ StopReason.max_model_turns, "max_turn_requests", "max_model_turns" },
+        .{ StopReason.refused, "refusal", "refused" },
+        .{ StopReason.cancelled, "cancelled", "cancelled" },
+        .{ StopReason.yielded, "yielded", "yielded" },
+    };
+    inline for (cases) |case| {
+        inline for (.{ PromptProtocol.acp, PromptProtocol.libfx }) |protocol| {
+            // Only libfx's journal can yield a turn for later resume.
+            if (protocol == .acp and case[0] == .yielded) continue;
+            const expected = if (protocol == .acp) case[1] else case[2];
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            try writePromptResponse(&out.writer, case[0], protocol);
+            const plain = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+            defer plain.deinit();
+            try std.testing.expectEqualStrings(expected, plain.value.object.get("stopReason").?.string);
+
+            out.clearRetainingCapacity();
+            try writePromptResponseWithUsage(&out.writer, case[0], .{ .input_tokens = 3, .output_tokens = 2 }, protocol);
+            const used = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+            defer used.deinit();
+            try std.testing.expectEqualStrings(expected, used.value.object.get("stopReason").?.string);
+            try std.testing.expectEqual(@as(i64, 3), used.value.object.get("usage").?.object.get("inputTokens").?.integer);
+            try std.testing.expectEqual(@as(i64, 2), used.value.object.get("usage").?.object.get("outputTokens").?.integer);
+
+            inline for (.{ SteeringDelivery.absorbed, SteeringDelivery.dropped }) |delivery| {
+                out.clearRetainingCapacity();
+                try writeSteeringPromptResponse(&out.writer, case[0], delivery, protocol);
+                const steered = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+                defer steered.deinit();
+                try std.testing.expectEqualStrings(expected, steered.value.object.get("stopReason").?.string);
+                try std.testing.expectEqualStrings(@tagName(delivery), steered.value.object.get("_meta").?.object.get("fx").?.object.get("steering").?.string);
+                try std.testing.expect(steered.value.object.get("usage") == null);
+            }
+        }
+    }
 }
 
 test "StopReason jsonString values" {

@@ -8036,7 +8036,7 @@ describe("acp: model-independent", () => {
         }
 
         expect(response.error).toBeUndefined();
-        expect(response.result.stopReason).toBe("refused");
+        expect(response.result.stopReason).toBe("refusal");
         const authUpdate = messages.find((message) =>
           message.method === "session/update" &&
           message.params?.update?.sessionUpdate === "agent_message_chunk"
@@ -9129,6 +9129,53 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP uses max_tokens for the original and absorbed steering responses",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-steer-length-");
+      const firstRequest = deferred<void>();
+      const releaseFirst = deferred<void>();
+      const gateway = startFakeGateway([
+        async () => {
+          firstRequest.resolve();
+          await releaseFirst.promise;
+          return finalText("First answer.");
+        },
+        noToolLength(),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startAutoSession(client);
+        sendPrompt(client, 100, "Answer the first question.");
+        await firstRequest.promise;
+        sendSteeringPrompt(client, 101, "Answer the second question too.");
+        sendPrompt(client, 102, "Unopted second prompt.");
+        expect((await readResponse(client, 102)).error.code).toBe(-32600);
+        releaseFirst.resolve();
+
+        const { responses } = await readUntilResponses(client, [100, 101]);
+        expect(responses.get(100)!.result.stopReason).toBe("max_tokens");
+        expect(responses.get(100)!.result.usage).toBeDefined();
+        expect(responses.get(101)!.result.stopReason).toBe("max_tokens");
+        expect(responses.get(101)!.result._meta.fx.steering).toBe("absorbed");
+        expect(responses.get(101)!.result.usage).toBeUndefined();
+        expect(gateway.requests).toHaveLength(2);
+        client.endStdin();
+        expect(await client.waitForExit()).toBe(0);
+        expect(client.stderr).toBe("");
+      } finally {
+        releaseFirst.resolve();
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "provider length with tool calls returns max output tokens without execution",
     async () => {
       const root = createIsolatedRoot("fx-acp-length-tool-");
@@ -9148,7 +9195,7 @@ describe("acp: model-independent", () => {
           TIMEOUT,
         );
 
-        expect(result.promptResult.result.stopReason).toBe("max_output_tokens");
+        expect(result.promptResult.result.stopReason).toBe("max_tokens");
         expect(JSON.stringify(result.messages)).toContain("ACP partial output");
         expect(JSON.stringify(result.messages)).toContain("did not execute");
         expect(existsSync(sentinelPath)).toBe(false);
@@ -9187,7 +9234,7 @@ describe("acp: model-independent", () => {
           TIMEOUT,
         );
 
-        expect(result.promptResult.result.stopReason).toBe("max_output_tokens");
+        expect(result.promptResult.result.stopReason).toBe("max_tokens");
         expect(gateway.requests).toHaveLength(3);
         expect(gateway.requests.some(({ body }) =>
           body.includes("Summarize what you just did.")
