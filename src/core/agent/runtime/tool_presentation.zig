@@ -14,6 +14,7 @@ const debug_trace = @import("../../shared/debug_trace.zig");
 const diff = @import("../../output/diff.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
+const read_result_presentation = @import("../../tooling/read_tool_result_presentation.zig");
 const command_result_mapping = if (@import("builtin").is_test)
     @import("../../tooling/command_result_mapping.zig")
 else
@@ -751,6 +752,198 @@ pub fn fileMutationDisplayPath(
     };
 }
 
+/// The handles under which a tool result keeps its full output or images.
+pub fn savedOutputHandles(
+    output_handle: ?[]const u8,
+    tool_image_handle: ?[]const u8,
+    command_output_replay: ?types.CommandOutputReplay,
+) [3]?[]const u8 {
+    return .{
+        output_handle,
+        tool_image_handle,
+        if (command_output_replay) |replay| switch (replay) {
+            .available => |descriptor| descriptor.handle,
+            .unavailable => null,
+        } else null,
+    };
+}
+
+/// Finds which call saved an output among a running prompt's messages: the
+/// newest tool result that keeps the handle, and the call that produced it.
+pub const TurnSavedOutputSources = struct {
+    registry: tool_dispatch.Registry,
+    workspace_root: []const u8,
+    /// Message lists in conversation order, searched newest first.
+    turns: []const []const types.ChatMessage,
+
+    /// Returns the terminal-safe name of the call that saved `handle`, or null
+    /// when no message still holds it. The arena owns the returned text.
+    pub fn find(self: TurnSavedOutputSources, arena: Allocator, handle: []const u8) !?[]const u8 {
+        var turn_index = self.turns.len;
+        while (turn_index > 0) {
+            turn_index -= 1;
+            const messages = self.turns[turn_index];
+            var message_index = messages.len;
+            while (message_index > 0) {
+                message_index -= 1;
+                const message = messages[message_index];
+                if (message.role != .tool) continue;
+                const memory = message.tool_result_memory orelse continue;
+                if (!holdsHandle(savedOutputHandles(memory.output_handle, memory.tool_image_handle, memory.command_output_replay), handle)) continue;
+                const source = self.findCall(message.tool_call_id orelse return null) orelse return null;
+                return tooling_presentation.savedOutputSourceLabel(arena, self.registry, self.workspace_root, source);
+            }
+        }
+        return null;
+    }
+
+    fn findCall(self: TurnSavedOutputSources, call_id: []const u8) ?ToolCall {
+        var turn_index = self.turns.len;
+        while (turn_index > 0) {
+            turn_index -= 1;
+            const messages = self.turns[turn_index];
+            var message_index = messages.len;
+            while (message_index > 0) {
+                message_index -= 1;
+                const message = messages[message_index];
+                if (message.role != .assistant) continue;
+                for (message.tool_calls) |call| {
+                    if (std.mem.eql(u8, call.id, call_id)) return call;
+                }
+            }
+        }
+        return null;
+    }
+};
+
+/// Names of the calls whose saved output later `read_tool_result` calls read,
+/// recorded while a saved conversation replays in order and keyed by output
+/// handle. Owns its keys and names; free them with `deinit`.
+pub const ReplayedSavedOutputSources = struct {
+    map: std.StringHashMapUnmanaged([]const u8) = .empty,
+
+    pub fn deinit(self: *ReplayedSavedOutputSources, alloc: Allocator) void {
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            alloc.free(entry.value_ptr.*);
+        }
+        self.map.deinit(alloc);
+    }
+
+    /// Records `call` under each handle that keeps `result`'s output. A later
+    /// call saving the same handle wins.
+    pub fn record(
+        self: *ReplayedSavedOutputSources,
+        alloc: Allocator,
+        registry: tool_dispatch.Registry,
+        workspace_root: []const u8,
+        call: ToolCall,
+        result: types.PersistedToolResult,
+    ) Allocator.Error!void {
+        const handles = savedOutputHandles(result.output_handle, result.tool_image_handle, result.command_output_replay);
+        for (handles) |maybe_handle| {
+            if (maybe_handle != null) break;
+        } else return;
+        const label = (try tooling_presentation.savedOutputSourceLabel(alloc, registry, workspace_root, call)) orelse return;
+        defer alloc.free(label);
+        for (handles) |maybe_handle| {
+            const handle = maybe_handle orelse continue;
+            const owned_handle = try alloc.dupe(u8, handle);
+            errdefer alloc.free(owned_handle);
+            const owned_label = try alloc.dupe(u8, label);
+            errdefer alloc.free(owned_label);
+            const gop = try self.map.getOrPut(alloc, owned_handle);
+            if (gop.found_existing) {
+                alloc.free(owned_handle);
+                alloc.free(gop.value_ptr.*);
+            }
+            gop.value_ptr.* = owned_label;
+        }
+    }
+
+    /// The name of the call that saved `handle`, borrowed from the map, for
+    /// `readToolResultDisplayTarget`.
+    pub fn find(self: *const ReplayedSavedOutputSources, _: Allocator, handle: []const u8) error{}!?[]const u8 {
+        return self.map.get(handle);
+    }
+};
+
+fn holdsHandle(handles: [3]?[]const u8, handle: []const u8) bool {
+    for (handles) |candidate| {
+        if (std.mem.eql(u8, candidate orelse continue, handle)) return true;
+    }
+    return false;
+}
+
+/// Row text for a `read_tool_result` call: what it reads, and the earlier
+/// call whose output that is when `sources.find(arena, handle)` still knows
+/// it. Returns null for other tools. The arena owns the returned text.
+pub fn readToolResultDisplayTarget(
+    arena: Allocator,
+    registry: tool_dispatch.Registry,
+    call: ToolCall,
+    sources: anytype,
+) !?[]const u8 {
+    const spec = registry.lookup(call.name) orelse return null;
+    if (spec.executor_kind != .read_tool_result) return null;
+    const source = if (try read_result_presentation.requestedHandle(arena, call.arguments_json)) |handle|
+        try sources.find(arena, handle)
+    else
+        null;
+    return try read_result_presentation.displayTarget(arena, call.arguments_json, source);
+}
+
+test "read_tool_result rows name the earlier call whose output they read" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const registry = test_builtin_tools.advertisement_set.registry;
+    const replay = "fx-command-replay-0123.bin";
+    const earlier_turn = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &.{.{
+            .id = "read-1",
+            .name = "read_file",
+            .arguments_json = "{\"path\":\"src/main.zig\"}",
+        }} },
+        .{ .role = .tool, .tool_call_id = "read-1", .tool_result_memory = .{ .output_handle = "result-read_file-1.txt" } },
+    };
+    const current_turn = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &.{.{
+            .id = "run-1",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"zig build test\"}",
+        }} },
+        .{ .role = .tool, .tool_call_id = "run-1", .tool_result_memory = .{
+            .command_output_replay = .{ .available = .{ .handle = replay, .framed_bytes = 64 } },
+        } },
+    };
+    const sources: TurnSavedOutputSources = .{
+        .registry = registry,
+        .workspace_root = "/workspace",
+        .turns = &.{ earlier_turn[0..], current_turn[0..] },
+    };
+    const cases = [_]struct { arguments_json: []const u8, expected: ?[]const u8 }{
+        .{ .arguments_json = "{\"request\":{\"handle\":\"" ++ replay ++ "\",\"start_byte\":9}}", .expected = "more output from zig build test" },
+        .{ .arguments_json = "{\"request\":{\"handle\":\"" ++ replay ++ "\",\"query\":\"error:\"}}", .expected = "zig build test output for \"error:\"" },
+        // The model may drop the `.txt` that `validate` restores.
+        .{ .arguments_json = "{\"request\":{\"handle\":\"result-read_file-1\"}}", .expected = "more output from src/main.zig" },
+        .{ .arguments_json = "{\"request\":{\"handle\":\"fx-command-replay-ffff.bin\"}}", .expected = null },
+        .{ .arguments_json = "{\"request\":{\"handle\":\"T5\"}}", .expected = "earlier tool call T5" },
+    };
+    for (cases) |case| {
+        const call: ToolCall = .{ .id = "page", .name = "read_tool_result", .arguments_json = case.arguments_json };
+        const target = try readToolResultDisplayTarget(arena, registry, call, sources);
+        if (case.expected) |expected| {
+            try std.testing.expectEqualStrings(expected, target orelse return error.TestExpectedDisplayTarget);
+        } else {
+            try std.testing.expect(target == null);
+        }
+    }
+    const other: ToolCall = .{ .id = "grep", .name = "grep_files", .arguments_json = "{\"pattern\":\"x\"}" };
+    try std.testing.expect(try readToolResultDisplayTarget(arena, registry, other, sources) == null);
+}
+
 pub noinline fn startToolVisibleLifecycle(
     hooks: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -778,6 +971,7 @@ pub noinline fn startToolVisibleLifecycle(
         .activity_kind = activity_kind,
         .arguments_json = redacted_arguments,
         .place_after_current_transcript = false,
+        .resolved_display_target = call.resolved_display_target,
     } });
     if (activity_line) |line| {
         try hooks.push_tool_lifecycle(hooks.ctx, .{ .progress = .{

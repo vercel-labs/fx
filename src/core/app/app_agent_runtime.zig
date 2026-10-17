@@ -1366,6 +1366,7 @@ fn formatToolAction(
 
     const presentation = tool_dispatch.presentationForArgs(spec.*, args);
     const value = display_target orelse
+        call.resolved_display_target orelse
         tool_presentation.resolvedSkillName(call, presentation) orelse
         tool_dispatch.presentationLabelValue(presentation, args) orelse
         presentation.label_arg_default;

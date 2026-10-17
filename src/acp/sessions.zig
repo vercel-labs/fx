@@ -26,6 +26,7 @@ const session_runtime = @import("../core/session/session.zig");
 const agent_execution_memory = @import("../core/agent/execution_memory.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const tool_call_presentation = @import("tool_call_presentation.zig");
+const runtime_tool_presentation = @import("../core/agent/runtime/tool_presentation.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const mcp_host = @import("../core/mcp_host/host.zig");
 const mcp_contract = @import("../core/mcp/mcp_contract.zig");
@@ -729,7 +730,9 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
 
     if (state.active_session) |*active| {
         if (sameSessionId(active.session_id, session_id)) {
-            for (active.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
+            var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
+            defer sources.deinit(alloc);
+            for (active.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, &sources, turn);
             try sendActiveSessionInfoUpdate(state, alloc);
             return writeLoadSessionResponse(state, alloc, msg, active.model, observer_hooks);
         }
@@ -792,7 +795,9 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     sid_owned = false;
     model_owned = false;
     session_rt_owned = false;
-    for (state.active_session.?.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
+    var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
+    defer sources.deinit(alloc);
+    for (state.active_session.?.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, &sources, turn);
     try sendActiveSessionInfoUpdate(state, alloc);
     try writeLoadSessionResponse(state, alloc, msg, state.active_session.?.model, observer_hooks);
 }
@@ -1295,7 +1300,9 @@ fn sendPendingRecoveryUpdate(
 ) !void {
     const recovery = checkpoint orelse return;
     try sendUserHistoryTurn(state, alloc, session_id, recovery.user);
-    try sendExecutionHistory(state, alloc, session_id, recovery.execution);
+    var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
+    defer sources.deinit(alloc);
+    try sendExecutionHistory(state, alloc, session_id, &sources, recovery.execution);
     if (recovery.assistant_source.len > 0) {
         try sendAgentHistoryChunk(state, alloc, session_id, recovery.assistant_source);
     }
@@ -1882,17 +1889,20 @@ fn parseListCursor(raw: []const u8) !session_store.ResumableSessionContinuation 
 
 fn sendActiveHistoryUpdates(state: *server.ServerState, alloc: Allocator, session_id: []const u8) !void {
     const active = &state.active_session.?;
+    var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
+    defer sources.deinit(alloc);
     if (active.store) |store| {
         const Visitor = struct {
             state: *server.ServerState,
             alloc: Allocator,
             session_id: []const u8,
+            sources: *runtime_tool_presentation.ReplayedSavedOutputSources,
 
             pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
-                try sendHistoryTurnAsUpdates(self.state, self.alloc, self.session_id, turn);
+                try sendHistoryTurnAsUpdates(self.state, self.alloc, self.session_id, self.sources, turn);
             }
         };
-        var visitor = Visitor{ .state = state, .alloc = alloc, .session_id = session_id };
+        var visitor = Visitor{ .state = state, .alloc = alloc, .session_id = session_id, .sources = &sources };
         return store.visitConversationHistory(alloc, session_id, &visitor);
     }
     // Every saved turn, as v1 replays it, not only those in memory.
@@ -1901,20 +1911,27 @@ fn sendActiveHistoryUpdates(state: *server.ServerState, alloc: Allocator, sessio
             state: *server.ServerState,
             alloc: Allocator,
             session_id: []const u8,
+            sources: *runtime_tool_presentation.ReplayedSavedOutputSources,
 
             pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
-                try sendHistoryTurnAsUpdates(self.state, self.alloc, self.session_id, turn);
+                try sendHistoryTurnAsUpdates(self.state, self.alloc, self.session_id, self.sources, turn);
             }
         };
-        var visitor = Visitor{ .state = state, .alloc = alloc, .session_id = session_id };
+        var visitor = Visitor{ .state = state, .alloc = alloc, .session_id = session_id, .sources = &sources };
         return v2.visitHistory(alloc, &visitor);
     }
     for (active.session_rt.agent.history.items) |turn| {
-        try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
+        try sendHistoryTurnAsUpdates(state, alloc, session_id, &sources, turn);
     }
 }
 
-fn sendHistoryTurnAsUpdates(state: *server.ServerState, alloc: Allocator, session_id: []const u8, turn: types.HistoryTurn) !void {
+fn sendHistoryTurnAsUpdates(
+    state: *server.ServerState,
+    alloc: Allocator,
+    session_id: []const u8,
+    sources: *runtime_tool_presentation.ReplayedSavedOutputSources,
+    turn: types.HistoryTurn,
+) !void {
     switch (turn) {
         .assistant => |assistant| try sendUserHistoryTurn(state, alloc, session_id, assistant.user),
         .interrupted => |interrupted| try sendUserHistoryTurn(state, alloc, session_id, interrupted.user),
@@ -1923,11 +1940,11 @@ fn sendHistoryTurnAsUpdates(state: *server.ServerState, alloc: Allocator, sessio
 
     switch (turn) {
         .assistant => |assistant| {
-            try sendExecutionHistory(state, alloc, session_id, assistant.execution);
+            try sendExecutionHistory(state, alloc, session_id, sources, assistant.execution);
             try sendAgentHistoryChunk(state, alloc, session_id, assistant.assistant);
         },
         .interrupted => |i| {
-            try sendExecutionHistory(state, alloc, session_id, i.execution);
+            try sendExecutionHistory(state, alloc, session_id, sources, i.execution);
             if (i.assistant) |assistant| {
                 if (assistant.len > 0) try sendAgentHistoryChunk(state, alloc, session_id, assistant);
             }
@@ -2012,6 +2029,7 @@ fn sendExecutionHistory(
     state: *server.ServerState,
     alloc: Allocator,
     session_id: []const u8,
+    sources: *runtime_tool_presentation.ReplayedSavedOutputSources,
     execution: types.ExecutionMemory,
 ) !void {
     if (execution.isEmpty()) return;
@@ -2022,6 +2040,11 @@ fn sendExecutionHistory(
         tool_call_presentation.activeToolRegistry(state),
         activeSessionMcp(state),
         if (state.active_session) |*active| &active.tool_identities else null,
+        .{
+            .alloc = alloc,
+            .workspace_root = if (state.active_session) |*active| active.workspace_root else state.workspace_root,
+            .sources = sources,
+        },
         execution,
     );
     for (frames) |frame| {
@@ -2066,14 +2089,37 @@ fn findToolResultIndex(results: []const types.PersistedToolResult, call_id: []co
     return null;
 }
 
+/// Calls whose saved output later replayed reads name, kept across the turns
+/// of one replay.
+const ReplaySources = struct {
+    alloc: Allocator,
+    workspace_root: []const u8,
+    sources: *runtime_tool_presentation.ReplayedSavedOutputSources,
+};
+
 fn planToolCallFrame(
     arena: Allocator,
     registry: tool_dispatch.Registry,
     mcp: ?*mcp_runtime.McpRuntime,
     identities: ?*tool_call_identities.Record,
-    call: types.ToolCall,
+    replay_sources: ReplaySources,
+    replayed_call: types.ToolCall,
     result: ?types.PersistedToolResult,
 ) !ReplayToolCall {
+    var call = replayed_call;
+    call.resolved_display_target = try runtime_tool_presentation.readToolResultDisplayTarget(
+        arena,
+        registry,
+        call,
+        replay_sources.sources,
+    );
+    if (result) |saved| try replay_sources.sources.record(
+        replay_sources.alloc,
+        registry,
+        replay_sources.workspace_root,
+        call,
+        saved,
+    );
     const name = tool_call_presentation.acpToolName(call.name);
     // MCP identity comes from the live catalog, or from the identity recorded
     // when the session made the call; it is never guessed from the exposed
@@ -2136,6 +2182,7 @@ fn planExecutionReplay(
     registry: tool_dispatch.Registry,
     mcp: ?*mcp_runtime.McpRuntime,
     identities: ?*tool_call_identities.Record,
+    replay_sources: ReplaySources,
     execution: types.ExecutionMemory,
 ) ![]ReplayFrame {
     var frames: std.ArrayList(ReplayFrame) = .empty;
@@ -2151,7 +2198,7 @@ fn planExecutionReplay(
                 matched[i] = true;
                 break :blk step.tool_results[i];
             } else null;
-            try frames.append(arena, .{ .tool_call = try planToolCallFrame(arena, registry, mcp, identities, call, result) });
+            try frames.append(arena, .{ .tool_call = try planToolCallFrame(arena, registry, mcp, identities, replay_sources, call, result) });
         }
         // Results without a surviving call record (e.g. trimmed history) still
         // replay as completed frames so the transcript stays faithful.
@@ -2162,7 +2209,7 @@ fn planExecutionReplay(
                 .name = result.tool_name,
                 .arguments_json = "{}",
             };
-            try frames.append(arena, .{ .tool_call = try planToolCallFrame(arena, registry, mcp, identities, call, result) });
+            try frames.append(arena, .{ .tool_call = try planToolCallFrame(arena, registry, mcp, identities, replay_sources, call, result) });
         }
         steering_index = try appendSteeringReplay(arena, &frames, execution.steering, steering_index, step_index + 1);
     }
@@ -2701,7 +2748,7 @@ test "ACP history excludes typed summaries without filtering original user text"
     var state = try initAcpSessionTestState(arena, workspace, capture);
     defer state.deinit();
 
-    try sendHistoryTurnAsUpdates(&state, arena, "session-1", .{ .compacted_summary = .{
+    try sendTestHistoryTurn(&state, arena, "session-1", .{ .compacted_summary = .{
         .summary = @constCast("internal summary"),
         .removed_turn_count = 1,
         .compaction_count = 1,
@@ -2709,7 +2756,7 @@ test "ACP history excludes typed summaries without filtering original user text"
     try std.testing.expectEqual(@as(u64, 0), try capture.length(io_mod.getIo()));
 
     const original = "Explain <context_handoff> without hiding my question.";
-    try sendHistoryTurnAsUpdates(&state, arena, "session-1", .{ .assistant = .{
+    try sendTestHistoryTurn(&state, arena, "session-1", .{ .assistant = .{
         .user = .{ .text = @constCast(original) },
         .assistant = @constCast("original reply"),
     } });
@@ -2743,7 +2790,7 @@ test "ACP interrupted history replay hides model-only abort context" {
         var state = try initAcpSessionTestState(arena, workspace, capture);
         defer state.deinit();
         var completed_tool_names = [_][]u8{@constCast("read_file")};
-        try sendHistoryTurnAsUpdates(&state, arena, "session-1", .{ .interrupted = .{
+        try sendTestHistoryTurn(&state, arena, "session-1", .{ .interrupted = .{
             .user = .{ .text = @constCast("inspect the project") },
             .completed_tool_names = completed_tool_names[0..],
         } });
@@ -2809,7 +2856,7 @@ test "ACP history replay emits structured tool call frames" {
         .tool_calls = calls[0..],
         .tool_results = results[0..],
     }};
-    try sendHistoryTurnAsUpdates(&state, arena, "session-1", .{ .assistant = .{
+    try sendTestHistoryTurn(&state, arena, "session-1", .{ .assistant = .{
         .user = .{ .text = @constCast("read and write") },
         .assistant = @constCast("All done."),
         .execution = .{ .tool_steps = steps[0..] },
@@ -2857,7 +2904,7 @@ test "ACP history replay leaves resultless tool calls pending" {
         .{ .id = "call_orphan", .name = "read_file", .arguments_json = "{\"path\":\"a.txt\"}" },
     };
     var steps = [_]types.ToolExecutionStep{.{ .tool_calls = calls[0..] }};
-    try sendHistoryTurnAsUpdates(&state, arena, "session-1", .{ .interrupted = .{
+    try sendTestHistoryTurn(&state, arena, "session-1", .{ .interrupted = .{
         .user = .{ .text = @constCast("inspect") },
         .execution = .{ .tool_steps = steps[0..] },
     } });
@@ -2895,7 +2942,7 @@ test "ACP history replay redacts sensitive tool arguments" {
         .stored_output_bytes = 2,
     }};
     var steps = [_]types.ToolExecutionStep{.{ .tool_calls = calls[0..], .tool_results = results[0..] }};
-    try sendHistoryTurnAsUpdates(&state, arena, "session-1", .{ .assistant = .{
+    try sendTestHistoryTurn(&state, arena, "session-1", .{ .assistant = .{
         .user = .{ .text = @constCast("run it") },
         .assistant = @constCast("done"),
         .execution = .{ .tool_steps = steps[0..] },
@@ -2940,11 +2987,14 @@ test "execution replay plan interleaves assistant text and orphan results" {
         .tool_results = results[0..],
     }};
 
+    var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
+    defer sources.deinit(arena);
     const frames = try planExecutionReplay(
         arena,
         @import("../builtins/tools.zig").registry,
         null,
         null,
+        .{ .alloc = arena, .workspace_root = "/workspace", .sources = &sources },
         .{ .tool_steps = steps[0..] },
     );
     try std.testing.expectEqual(@as(usize, 3), frames.len);
@@ -2956,6 +3006,64 @@ test "execution replay plan interleaves assistant text and orphan results" {
     try std.testing.expectEqualStrings("call_orphaned", frames[2].tool_call.id);
     try std.testing.expectEqual(acp_types.ToolCallStatus.failed, frames[2].tool_call.status);
     try std.testing.expect(frames[2].tool_call.raw_input != null);
+}
+
+fn sendTestHistoryTurn(state: *server.ServerState, alloc: Allocator, session_id: []const u8, turn: types.HistoryTurn) !void {
+    var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
+    defer sources.deinit(alloc);
+    return sendHistoryTurnAsUpdates(state, alloc, session_id, &sources, turn);
+}
+
+test "execution replay titles reads with the call whose saved output they read" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const replay = "fx-command-replay-0123.bin";
+    var run_calls = [_]types.ToolCall{
+        .{ .id = "run", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"zig build test\"}" },
+    };
+    var run_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("run"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast("{\"exit_code\":0}"),
+        .output_bytes = 15,
+        .stored_output_bytes = 15,
+        .command_output_replay = .{ .available = .{ .handle = replay, .framed_bytes = 64 } },
+    }};
+    var read_calls = [_]types.ToolCall{
+        .{ .id = "read", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"" ++ replay ++ "\",\"query\":\"error:\"}}" },
+    };
+    var read_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("read"),
+        .tool_name = @constCast("read_tool_result"),
+        .status = .success,
+        .output = @constCast("error: x"),
+        .output_bytes = 8,
+        .stored_output_bytes = 8,
+    }};
+    var steps = [_]types.ToolExecutionStep{
+        .{ .tool_calls = run_calls[0..], .tool_results = run_results[0..] },
+        .{ .tool_calls = read_calls[0..], .tool_results = read_results[0..] },
+    };
+
+    var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
+    defer sources.deinit(alloc);
+    const registry = @import("../builtins/tools.zig").registry;
+    const replay_sources: ReplaySources = .{ .alloc = alloc, .workspace_root = "/workspace", .sources = &sources };
+    const frames = try planExecutionReplay(arena, registry, null, null, replay_sources, .{ .tool_steps = steps[0..] });
+    try std.testing.expectEqual(@as(usize, 2), frames.len);
+    try std.testing.expectEqualStrings("Searching zig build test output for \"error:\"", frames[1].tool_call.title);
+
+    // A later turn replayed with the same sources still names the command.
+    var later_calls = [_]types.ToolCall{
+        .{ .id = "later", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"" ++ replay ++ "\"}}" },
+    };
+    var later_steps = [_]types.ToolExecutionStep{.{ .tool_calls = later_calls[0..] }};
+    const later = try planExecutionReplay(arena, registry, null, null, replay_sources, .{ .tool_steps = later_steps[0..] });
+    try std.testing.expectEqualStrings("Reading more output from zig build test", later[0].tool_call.title);
 }
 
 test "ACP load maps one-off child denial to invalid params" {

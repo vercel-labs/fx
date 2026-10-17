@@ -246,6 +246,10 @@ pub const ToolLifecycleEvent = union(enum) {
         activity_kind: ToolActivityKind,
         arguments_json: ?[]const u8 = null,
         place_after_current_transcript: bool = false,
+        /// The call's `ToolCall.resolved_display_target`, for hosts that
+        /// title a call when it starts. Borrowed for this push only; copies
+        /// omit it.
+        resolved_display_target: ?[]const u8 = null,
     },
     progress: struct {
         id: ToolLifecycleId,
@@ -953,6 +957,10 @@ pub const ToolCall = struct {
     provenance: ToolExecutionProvenance = .fx_local,
     /// Borrowed only for this action. Copies and durable/provider encodings omit it.
     resolved_skill: ?*const skill_contract.PreparedSkill = null,
+    /// What this action works on, resolved from earlier results, such as the
+    /// command whose saved output a `read_tool_result` call reads. Borrowed
+    /// only for this action. Copies and durable/provider encodings omit it.
+    resolved_display_target: ?[]const u8 = null,
 };
 
 pub const WebSearchProgress = union(enum) {
@@ -3080,12 +3088,19 @@ test "dupeToolCall preserves argument integrity" {
     try std.testing.expectEqual(ToolArgumentIntegrity.malformed_json, copy.argument_integrity);
 }
 
-test "dupeToolCall drops action scoped skill bindings" {
+test "dupeToolCall drops action scoped bindings" {
     const skill: skill_contract.PreparedSkill = .{ .skill = .{ .name = "workflow", .description = "", .path = "/skills/workflow", .source = .global_fx } };
-    const source: ToolCall = .{ .id = "skill", .name = "skill", .arguments_json = "{\"location\":\"/skills/workflow\"}", .resolved_skill = &skill };
+    const source: ToolCall = .{
+        .id = "skill",
+        .name = "skill",
+        .arguments_json = "{\"location\":\"/skills/workflow\"}",
+        .resolved_skill = &skill,
+        .resolved_display_target = "more output from zig build test",
+    };
     const copy = try dupeToolCall(std.testing.allocator, source);
     defer freeToolCall(std.testing.allocator, copy);
     try std.testing.expect(copy.resolved_skill == null);
+    try std.testing.expect(copy.resolved_display_target == null);
     try std.testing.expectEqualStrings(source.arguments_json, copy.arguments_json);
 }
 

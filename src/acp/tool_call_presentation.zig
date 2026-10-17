@@ -38,8 +38,13 @@ pub fn mapToolKind(tool_name: []const u8) acp_types.ToolCallKind {
 }
 
 pub fn describeToolTitle(registry: tool_dispatch.Registry, arena: Allocator, call: ToolCall) ![]const u8 {
-    if (registry.lookup(call.name) != null) {
+    if (registry.lookup(call.name)) |tool| {
         if (try tool_presentation.formatSubagentPlainAction(arena, call, .identity)) |title| return title;
+        // A read's input is an opaque handle, so its verb alone says nothing
+        // about what it reads.
+        if (tool.executor_kind == .read_tool_result) {
+            return tool_presentation.formatPlainAction(arena, .{ .tool_registry = registry, .call = call });
+        }
     }
     if (tool_presentation.isProviderSearchAlias(call.name)) {
         return tool_presentation.formatPlainAction(arena, .{
@@ -159,6 +164,25 @@ test "describeToolCall flags internal discovery and names MCP identity" {
     });
     try std.testing.expectEqualStrings("Evaluate JavaScript", titled.title);
     try std.testing.expect(!titled.meta.internal);
+}
+
+test "read titles say what they read while other tools keep their verb" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const registry = builtin_tools.registry;
+    const read: ToolCall = .{
+        .id = "read",
+        .name = "read_tool_result",
+        .arguments_json = "{\"request\":{\"handle\":\"fx-command-replay-0123.bin\",\"query\":\"error:\"}}",
+        .resolved_display_target = "zig build test output for \"error:\"",
+    };
+    try std.testing.expectEqualStrings("Searching zig build test output for \"error:\"", describeToolCall(registry, arena, read, null).title);
+    var unresolved = read;
+    unresolved.resolved_display_target = null;
+    try std.testing.expectEqualStrings("Searching command output", describeToolCall(registry, arena, unresolved, null).title);
+    const file: ToolCall = .{ .id = "file", .name = "read_file", .arguments_json = "{\"path\":\"a.txt\"}" };
+    try std.testing.expectEqualStrings("Reading", describeToolCall(registry, arena, file, null).title);
 }
 
 test "toolUpdateContentText clips long output and guards unsafe bytes" {

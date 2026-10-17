@@ -5,13 +5,9 @@ const session_child_store = @import("../../core/session/session_child_store.zig"
 const io_mod = @import("../../core/shared/io.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const compactor = @import("../../core/compactor/compactor.zig");
+const read_result_presentation = @import("../../core/tooling/read_tool_result_presentation.zig");
 
 const Allocator = std.mem.Allocator;
-
-const HandleNormalization = struct {
-    trimmed: []const u8,
-    suffix: []const u8,
-};
 
 pub const Input = struct {
     handle: []u8,
@@ -130,20 +126,10 @@ fn inputDeinit(ptr: *anyopaque, alloc: Allocator) void {
     alloc.destroy(input);
 }
 
-fn classifyHandleNormalization(handle: []const u8) HandleNormalization {
-    const trimmed = std.mem.trim(u8, handle, " \t\r\n");
-    const suffix = if ((std.mem.startsWith(u8, trimmed, "result-") or result_store.isImageHandle(trimmed)) and
-        std.mem.findScalar(u8, trimmed, '.') == null)
-        ".txt"
-    else
-        "";
-    return .{ .trimmed = trimmed, .suffix = suffix };
-}
-
 pub fn validate(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput) tool_dispatch.DispatchError!?[]u8 {
     const input = erased.as(Input);
     if (input.selector == .search) return null;
-    const normalization = classifyHandleNormalization(input.handle);
+    const normalization = read_result_presentation.classifyHandleNormalization(input.handle);
     if (normalization.trimmed.len == 0) return try ctx.allocator.dupe(u8, "read_tool_result field \"handle\" must not be empty");
     var record_buffer: compactor.RecordFileBuffer = undefined;
     if (compactor.recordFile(&record_buffer, normalization.trimmed)) |file| {
@@ -278,6 +264,9 @@ pub fn readsOnly(_: tool_dispatch.ToolInput) bool {
 pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
     return false;
 }
+
+/// Labels each call by what it reads. See `read_tool_result_presentation.zig`.
+pub const presentation = read_result_presentation.presentation;
 
 test "read_tool_result decodes range and query inputs" {
     const alloc = std.testing.allocator;

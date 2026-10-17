@@ -3247,6 +3247,7 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
                 .id = started.id.call_id,
                 .name = started.tool_name,
                 .arguments_json = started.arguments_json orelse "{}",
+                .resolved_display_target = started.resolved_display_target,
             });
         },
         .terminal => |terminal| {

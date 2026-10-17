@@ -6356,6 +6356,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("RETRIEVAL_TURN_COMPLETE") || text.includes("request failed:")), 30000);
           expect(pane).not.toContain("request failed:");
           expect(pane).toContain("RETRIEVAL_TURN_COMPLETE");
+          // The read names the command whose saved output it searches.
+          expect(pane).toContain("cat source.txt output for \"RETRIEVAL_MATCH\"");
           if (trigger === "manual") {
             await compactAndWait(tui, root, 20000);
           }
@@ -6391,7 +6393,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(readFileSync(join(toolResults, "compacted-T1.txt"), "utf8")).toContain(sourceHandle);
           const resumed = await runFx(["ask", "--json", "--resume-id", sessionId, "Recover the clipped tail from the saved retrieval without rerunning the command."], { cwd: root.workspace, env, timeoutMs: 30000 });
           expect(resumed.code).toBe(0);
-          expect(resumed.stderr).toBe("Reading tool result\n");
+          // Compaction folded the command into T1, so the read has no call
+          // left to name.
+          expect(resumed.stderr).toBe("Reading more command output\n");
           expect(JSON.parse(resumed.stdout).final_output).toBe("RETRIEVAL_RESTART_COMPLETE");
           expect(gateway.requests).toHaveLength(8);
           expect(readFileSync(join(root.workspace, "effects.txt"), "utf8")).toBe("once\n");

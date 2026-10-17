@@ -4530,6 +4530,9 @@ pub fn Runtime(comptime App: type) type {
 
             workspace_root: []const u8,
             map: std.StringHashMapUnmanaged(Label) = .empty,
+            /// Calls whose saved output later `read_tool_result` rows read, so
+            /// those rows name them as the live session did.
+            saved_output_sources: tool_presentation.ReplayedSavedOutputSources = .{},
 
             fn deinit(self: *HistoricalSessionLabels, alloc: Allocator) void {
                 var it = self.map.iterator();
@@ -4539,6 +4542,7 @@ pub fn Runtime(comptime App: type) type {
                     if (entry.value_ptr.reflow) |value| alloc.free(value);
                 }
                 self.map.deinit(alloc);
+                self.saved_output_sources.deinit(alloc);
             }
         };
 
@@ -5066,6 +5070,13 @@ pub fn Runtime(comptime App: type) type {
             result: types.PersistedToolResult,
             labels: *HistoricalSessionLabels,
         ) !void {
+            try labels.saved_output_sources.record(
+                app.alloc,
+                app.toolAdvertisementSet().registry,
+                labels.workspace_root,
+                call,
+                result,
+            );
             if (try writeAnsweredQuestionResult(app, sink, call, result)) return;
             if (try writeCommittedFilePresentation(app, sink, call, result)) return;
 
@@ -5080,7 +5091,13 @@ pub fn Runtime(comptime App: type) type {
 
             var action_arena = std.heap.ArenaAllocator.init(app.alloc);
             defer mem_utils.deinit_arena(action_arena);
-            const session_target = historicalSessionTarget(action_arena.allocator(), labels, call);
+            const action_target = historicalSessionTarget(action_arena.allocator(), labels, call) orelse
+                try tool_presentation.readToolResultDisplayTarget(
+                    action_arena.allocator(),
+                    app.toolAdvertisementSet().registry,
+                    call,
+                    &labels.saved_output_sources,
+                );
             const command_decision = if (is_command)
                 try tool_presentation.commandOutcomeDecision(
                     action_arena.allocator(),
@@ -5100,7 +5117,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.describeToolActionDeniedWithAdvertised(
                     action_arena.allocator(),
                     call,
-                    session_target,
+                    action_target,
                     if (context_deferred)
                         types.context_deferred_tool_status_label
                     else
@@ -5111,7 +5128,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.describeToolActionDeniedWithAdvertised(
                     action_arena.allocator(),
                     call,
-                    session_target,
+                    action_target,
                     tool_admission.permissionDeniedStatusLabel(reason),
                     &.{},
                 )
@@ -5119,7 +5136,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.describeToolActionDeniedWithAdvertised(
                     action_arena.allocator(),
                     call,
-                    session_target,
+                    action_target,
                     decision.label,
                     &.{},
                 )
@@ -5143,13 +5160,13 @@ pub fn Runtime(comptime App: type) type {
                 break :success try app.describeToolActionCompletedWithAdvertised(
                     action_arena.allocator(),
                     call,
-                    display_target orelse session_target,
+                    display_target orelse action_target,
                     &.{},
                 );
             } else try app.describeToolActionDeniedWithAdvertised(
                 action_arena.allocator(),
                 call,
-                session_target,
+                action_target,
                 try tooling_presentation.subagentFailureLabel(action_arena.allocator(), call, result.output),
                 &.{},
             );
@@ -8257,6 +8274,86 @@ test "execution replay records session labels for tty-launched sessions" {
         "● Completed shell npm run dev\n",
         app.completed_tool_statuses.items[1],
     );
+}
+
+test "execution replay names the call whose saved output a later read opens" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    const replay = "fx-command-replay-0123.bin";
+    const run_output = "{\"exit_code\":0,\"full_output_handle\":\"" ++ replay ++ "\"}";
+    const file_output = "<path>src/main.zig</path>";
+    var source_calls = [_]types.ToolCall{
+        .{ .id = "call_run", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"zig build test\"}" },
+        .{ .id = "call_file", .name = "read_file", .arguments_json = "{\"path\":\"src/main.zig\"}" },
+    };
+    var source_results = [_]types.PersistedToolResult{
+        .{
+            .tool_call_id = @constCast("call_run"),
+            .tool_name = @constCast("shell"),
+            .status = .success,
+            .output = @constCast(run_output),
+            .output_bytes = run_output.len,
+            .stored_output_bytes = run_output.len,
+            .command_output_replay = .{ .available = .{ .handle = replay, .framed_bytes = 64 } },
+        },
+        .{
+            .tool_call_id = @constCast("call_file"),
+            .tool_name = @constCast("read_file"),
+            .status = .success,
+            .output = @constCast(file_output),
+            .output_handle = @constCast("result-read_file-1.txt"),
+            .output_bytes = file_output.len,
+            .stored_output_bytes = file_output.len,
+        },
+    };
+    var source_steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = source_calls[0..],
+        .tool_results = source_results[0..],
+    }};
+    var read_calls = [_]types.ToolCall{
+        .{ .id = "page", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"" ++ replay ++ "\",\"start_byte\":9}}" },
+        .{ .id = "query", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"" ++ replay ++ "\",\"query\":\"error:\"}}" },
+        .{ .id = "file", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"result-read_file-1\"}}" },
+        .{ .id = "unknown", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"result-gone.txt\"}}" },
+    };
+    var read_results: [read_calls.len]types.PersistedToolResult = undefined;
+    for (&read_results, read_calls) |*result, call| {
+        result.* = .{
+            .tool_call_id = @constCast(call.id),
+            .tool_name = @constCast(call.name),
+            .status = .success,
+            .output = @constCast("page"),
+            .output_bytes = 4,
+            .stored_output_bytes = 4,
+        };
+    }
+    var read_steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = read_calls[0..],
+        .tool_results = read_results[0..],
+    }};
+    const history = [_]types.HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("run the tests") },
+            .assistant = @constCast(""),
+            .execution = .{ .tool_steps = source_steps[0..] },
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("find the failure") },
+            .assistant = @constCast(""),
+            .execution = .{ .tool_steps = read_steps[0..] },
+        } },
+    };
+
+    try Runtime(TestApp).replayHistory(&app, &history);
+
+    const statuses = app.completed_tool_statuses.items;
+    try std.testing.expectEqual(@as(usize, 6), statuses.len);
+    try std.testing.expectEqualStrings("● Completed read_tool_result more output from zig build test\n", statuses[2]);
+    try std.testing.expectEqualStrings("● Completed read_tool_result zig build test output for \"error:\"\n", statuses[3]);
+    try std.testing.expectEqualStrings("● Completed read_tool_result more output from src/main.zig\n", statuses[4]);
+    try std.testing.expectEqualStrings("● Completed read_tool_result\n", statuses[5]);
 }
 
 test "resume projection stores reflow metadata for session action rows" {

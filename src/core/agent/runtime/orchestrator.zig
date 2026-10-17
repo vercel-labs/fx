@@ -9726,8 +9726,19 @@ fn processQueuedPromptLoop(
             ToolCall,
             prepared_tool_calls.len,
         );
+        const saved_output_sources: runtime_tool_presentation.TurnSavedOutputSources = .{
+            .registry = deps.tool_registry,
+            .workspace_root = config.workspace_root,
+            .turns = &.{ history_messages.items, within_turn_suffix.items },
+        };
         for (prepared_tool_calls, 0..) |prepared_call, i| {
             effective_tool_calls[i] = prepared_call.call();
+            effective_tool_calls[i].resolved_display_target = try runtime_tool_presentation.readToolResultDisplayTarget(
+                arena,
+                deps.tool_registry,
+                effective_tool_calls[i],
+                saved_output_sources,
+            );
         }
         const pending_assistant: ChatMessage = .{
             .role = .assistant,
@@ -10000,6 +10011,7 @@ fn processQueuedPromptLoop(
         for (prepared_tool_calls, 0..) |prepared_tool_call, tool_call_index| {
             if (tool_call_index < parallel_skip_until) continue;
             var tool_call = prepared_tool_call.call();
+            tool_call.resolved_display_target = effective_tool_calls[tool_call_index].resolved_display_target;
             const root_live_permission_mode = snapshotRootPermissionMode(deps);
             const root_action_permission_mode = permissionModeForAction(
                 job.permission_mode,

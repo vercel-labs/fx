@@ -672,10 +672,51 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
         return alloc.print("{s} {s}", .{ presentation.action_label, try formatWebSearchActionDetail(scratch, args) });
     }
     const value = input.display_target orelse
+        call.resolved_display_target orelse
         resolvedSkillName(call, presentation) orelse
         tool_dispatch.presentationLabelValue(presentation, args) orelse
         presentation.label_arg_default;
     return alloc.print("{s} {s}", .{ presentation.action_label, value });
+}
+
+/// Names an earlier call in the row of a later call that reads its saved
+/// output: the command it ran, the path or URL it read, or the name of an MCP
+/// tool. Returns null when the call has none of these, or when its command
+/// cannot be described, so a label never fails the turn that shows it. The
+/// text is terminal-safe. The caller owns the returned allocation.
+pub fn savedOutputSourceLabel(
+    alloc: Allocator,
+    registry: tool_dispatch.Registry,
+    workspace_root: []const u8,
+    call: ToolCall,
+) Allocator.Error!?[]const u8 {
+    const command_activity = formatRunCommandActivity(alloc, registry, workspace_root, call) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (command_activity) |activity| return activity.detail;
+    const spec = registry.lookup(call.name) orelse {
+        if (isProviderSearchAlias(call.name)) return null;
+        return try encodeSourceLabel(alloc, call.name);
+    };
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer mem_utils.deinit_arena(scratch_state);
+    const args = tool_args.parseToolArgsObject(scratch_state.allocator(), call.arguments_json) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    const presentation = tool_dispatch.presentationForArgs(spec.*, args);
+    switch (presentation.label_arg_kind) {
+        .path, .url => {},
+        else => return null,
+    }
+    const value = tool_dispatch.presentationLabelValue(presentation, args) orelse return null;
+    return try encodeSourceLabel(alloc, value);
+}
+
+fn encodeSourceLabel(alloc: Allocator, raw: []const u8) ![]const u8 {
+    const encoded = try text_utils.encodeTerminalSafe(alloc, raw, max_run_command_activity_bytes);
+    return encoded.bytes;
 }
 
 /// The caller owns the returned allocation and must free it with `alloc`.
@@ -1501,4 +1542,45 @@ test "tool presentation frees all formatted output with a normal allocator" {
 
 fn expectContains(text: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.find(u8, text, needle) != null);
+}
+
+test "read_tool_result rows use the resolved source and the request kind" {
+    const alloc = std.testing.allocator;
+    const registry = test_builtin_tools.advertisement_set.registry;
+    const page: ToolCall = .{
+        .id = "page",
+        .name = "read_tool_result",
+        .arguments_json = "{\"request\":{\"handle\":\"fx-command-replay-0123.bin\"}}",
+    };
+    const generic = try formatPlainAction(alloc, .{ .tool_registry = registry, .call = page });
+    defer alloc.free(generic);
+    try std.testing.expectEqualStrings("Reading more command output", generic);
+
+    var resolved = page;
+    resolved.resolved_display_target = "more output from zig build test";
+    const named = try formatPlainAction(alloc, .{ .tool_registry = registry, .call = resolved });
+    defer alloc.free(named);
+    try std.testing.expectEqualStrings("Reading more output from zig build test", named);
+}
+
+test "saved output sources name commands, paths, URLs, and MCP tools" {
+    const alloc = std.testing.allocator;
+    const registry = test_builtin_tools.advertisement_set.registry;
+    const cases = [_]struct { call: ToolCall, expected: ?[]const u8 }{
+        .{ .call = .{ .id = "run", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"zig build test\"}" }, .expected = "zig build test" },
+        .{ .call = .{ .id = "file", .name = "read_file", .arguments_json = "{\"path\":\"src/\\u001b[2Jmain.zig\"}" }, .expected = "src/\\x1b[2Jmain.zig" },
+        .{ .call = .{ .id = "fetch", .name = "web_fetch", .arguments_json = "{\"url\":\"https://fx.sh/docs\"}" }, .expected = "https://fx.sh/docs" },
+        .{ .call = .{ .id = "mcp", .name = "mcp_linear_list_issues", .arguments_json = "{}" }, .expected = "mcp_linear_list_issues" },
+        .{ .call = .{ .id = "grep", .name = "grep_files", .arguments_json = "{\"pattern\":\"needle\"}" }, .expected = null },
+        .{ .call = .{ .id = "bad", .name = "read_file", .arguments_json = "not json" }, .expected = null },
+    };
+    for (cases) |case| {
+        const label = try savedOutputSourceLabel(alloc, registry, "/workspace", case.call);
+        defer if (label) |value| alloc.free(value);
+        if (case.expected) |expected| {
+            try std.testing.expectEqualStrings(expected, label orelse return error.TestExpectedSourceLabel);
+        } else {
+            try std.testing.expect(label == null);
+        }
+    }
 }

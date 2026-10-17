@@ -830,8 +830,8 @@ pub const read_tool_result = ToolSpec{
     .requires_approval = false,
     .action_label = "Reading",
     .completed_action_label = "Read",
-    .label_arg_kind = .path,
-    .label_arg_default = "tool result",
+    .label_arg_default = "saved output",
+    .presentation_fn = read_tool_result_impl.presentation,
     .permission_target_kind = .none,
     .decode = read_tool_result_impl.decode,
     .validate = read_tool_result_impl.validate,
@@ -1707,8 +1707,9 @@ test "built-in read_tool_result owns product metadata schema and callbacks" {
     try std.testing.expect(!read_tool_result.requires_approval);
     try std.testing.expectEqualStrings("Reading", read_tool_result.action_label);
     try std.testing.expectEqualStrings("Read", read_tool_result.completed_action_label);
-    try std.testing.expectEqual(tool_dispatch.LabelArgKind.path, read_tool_result.label_arg_kind);
-    try std.testing.expectEqualStrings("tool result", read_tool_result.label_arg_default);
+    try std.testing.expectEqual(tool_dispatch.LabelArgKind.none, read_tool_result.label_arg_kind);
+    try std.testing.expectEqualStrings("saved output", read_tool_result.label_arg_default);
+    try std.testing.expect(read_tool_result.presentation_fn.? == read_tool_result_impl.presentation);
     try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, read_tool_result.permission_target_kind);
     try std.testing.expect(read_tool_result.decode == read_tool_result_impl.decode);
     try std.testing.expect(read_tool_result.validate.? == read_tool_result_impl.validate);
