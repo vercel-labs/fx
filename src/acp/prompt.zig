@@ -134,8 +134,46 @@ fn promptInputFailure(err: anyerror) anyerror!TerminalOutcome {
             .code = ErrorCode.invalid_params,
             .message = "Image prompt exceeds size limit",
         } },
+        error.PromptImagesTooLarge => .{ .rpc_error = .{
+            .code = ErrorCode.invalid_params,
+            .message = "Prompt images exceed the libfx limit",
+        } },
         else => err,
     };
+}
+
+/// Whether `images` fit one libfx prompt: at most
+/// `image_attachments.max_libfx_prompt_images` of them, holding at most
+/// `max_libfx_prompt_images_bytes` together. An open stages its open turn's
+/// images on top of the session's image window, and counts on this.
+fn fitsLibfxPrompt(images: []const PendingPromptImage) bool {
+    if (images.len > image_attachments.max_libfx_prompt_images) return false;
+    var bytes: usize = 0;
+    for (images) |image| bytes += image.bytes.len;
+    return bytes <= image_attachments.max_libfx_prompt_images_bytes;
+}
+
+test "a libfx prompt holds at most its limit of images and image bytes" {
+    const alloc = std.testing.allocator;
+    var media_type = "image/png".*;
+    var byte: [1]u8 = .{0x89};
+    var images: [image_attachments.max_libfx_prompt_images + 1]PendingPromptImage = @splat(.{ .id = 1, .bytes = &byte, .media_type = &media_type });
+    try std.testing.expect(fitsLibfxPrompt(images[0..image_attachments.max_libfx_prompt_images]));
+    try std.testing.expect(!fitsLibfxPrompt(&images));
+    // Reference-only images count toward the number too.
+    var references = images;
+    for (&references) |*image| image.bytes = &.{};
+    try std.testing.expect(!fitsLibfxPrompt(&references));
+
+    const bytes = try alloc.alloc(u8, image_attachments.max_libfx_prompt_images_bytes + 1);
+    defer alloc.free(bytes);
+    const exact = [_]PendingPromptImage{.{ .id = 1, .bytes = bytes[1..], .media_type = &media_type }};
+    try std.testing.expect(fitsLibfxPrompt(&exact));
+    const over = [_]PendingPromptImage{
+        .{ .id = 1, .bytes = bytes[0..1024], .media_type = &media_type },
+        .{ .id = 2, .bytes = bytes[1024..], .media_type = &media_type },
+    };
+    try std.testing.expect(!fitsLibfxPrompt(&over));
 }
 
 fn promptExecutionFailure(err: anyerror) anyerror!TerminalOutcome {
@@ -880,8 +918,10 @@ pub fn handlePrompt(
         if (session.store == null and session.wasm_state == null and session.v2 == null) {
             // libfx kernel session: images stay in memory and ride the kernel
             // checkpoint, so no filesystem snapshot backend is needed.
+            if (!fitsLibfxPrompt(prompt_input.pending_images)) return promptInputFailure(error.PromptImagesTooLarge);
             prompt_input.captureImagesInline(alloc) catch |err|
                 return promptInputFailure(err);
+            if (session.journal) |*journal| try prompt_input.noteStoredImages(state.alloc, journal);
         } else {
             if (comptime host_target.is_wasm) return promptInputFailure(error.UnsupportedPromptImage);
             var temporary_snapshot_dir: ?[]u8 = null;
@@ -1486,6 +1526,8 @@ const PendingPromptImage = struct {
     bytes: []u8,
     media_type: []u8,
     source_ref: ?[]u8 = null,
+    /// The name the host stored the bytes under before it sent them.
+    stored_name: ?session_codec.ImageName = null,
 
     fn deinit(self: *PendingPromptImage, alloc: Allocator) void {
         alloc.free(self.bytes);
@@ -1580,6 +1622,16 @@ const ParsedPromptInput = struct {
             captured += 1;
         }
         self.images = images;
+    }
+
+    /// Tells `journal` which captured images the host stored before it sent
+    /// them, so its events name them. `captureImagesInline` keeps the order.
+    fn noteStoredImages(self: *const ParsedPromptInput, session_alloc: Allocator, journal: *libfx_journal.Journal) Allocator.Error!void {
+        std.debug.assert(self.images.len == self.pending_images.len);
+        for (self.images, self.pending_images) |image, pending| {
+            const name = pending.stored_name orelse continue;
+            try journal.noteStoredImage(session_alloc, image, name);
+        }
     }
 
     fn retainImageSnapshots(self: *ParsedPromptInput) void {
@@ -1764,6 +1816,11 @@ fn parsePromptInputWithFirstImageId(
                 break :bytes try alloc.alloc(u8, 0);
             };
             errdefer alloc.free(decoded);
+            // A host with an image store names the bytes it stored first.
+            const stored_name: ?session_codec.ImageName = if (acp_types.fxMetaField(block.object, "stored")) |value| name: {
+                if (value != .string or decoded.len == 0) return error.InvalidPromptImage;
+                break :name session_codec.imageName(value.string) orelse return error.InvalidPromptImage;
+            } else null;
 
             const image_id = std.math.add(usize, first_image_id, pending_images.items.len) catch
                 return error.ImageIdOverflow;
@@ -1782,6 +1839,7 @@ fn parsePromptInputWithFirstImageId(
                 .bytes = decoded,
                 .media_type = media_type,
                 .source_ref = source_ref,
+                .stored_name = stored_name,
             });
         } else if (std.mem.eql(u8, block_type.string, "resource")) {
             if (block.object.get("resource")) |resource| {
@@ -2939,6 +2997,7 @@ fn persistAcpHistoryTurn(
         session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
         prepared_owned = false;
         if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
+        try keepImageWindow(alloc, session);
         if (session.wasm_state != null) try sessions.commitWasmSessionLocked(alloc, session);
         return;
     }
@@ -2958,6 +3017,7 @@ fn persistAcpHistoryTurn(
         session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
         prepared_owned = false;
         if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
+        try keepImageWindow(alloc, session);
         return;
     };
     try writable.prepareHistoryTurnForCommit(alloc, &prepared);
@@ -2979,6 +3039,15 @@ fn persistAcpHistoryTurn(
     session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
     prepared_owned = false;
     if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
+}
+
+/// Keeps a libfx session within its image window once a turn enters its
+/// history (owned by `alloc`): its images are the newest, and older ones past
+/// the window give up their bytes. A turn that fails before it is recorded
+/// drops nothing, so a reopen keeps the same images.
+fn keepImageWindow(alloc: Allocator, session: *server.ActiveSessionState) Allocator.Error!void {
+    const journal = if (session.journal) |*value| value else return;
+    try journal.dropOutsideWindow(alloc, alloc, session.session_rt.agent.history.items);
 }
 
 fn commitContextCompaction(

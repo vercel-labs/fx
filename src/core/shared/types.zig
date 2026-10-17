@@ -1494,6 +1494,13 @@ pub const ImageAttachment = struct {
     inline_data: ?[]u8 = null,
     /// Owned opaque host reference, never filesystem or network authority.
     source_ref: ?[]u8 = null,
+
+    /// Whether the session no longer holds this image: a libfx session with
+    /// an image store keeps only its newest images, and an older one keeps
+    /// its digest, which names it in the host's store, without its bytes.
+    pub fn droppedFromSession(self: ImageAttachment) bool {
+        return self.inline_data == null and self.snapshot_path == null and self.snapshot_sha256 != null;
+    }
 };
 
 pub const UserTurn = struct {

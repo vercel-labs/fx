@@ -390,6 +390,10 @@ jobs:
           bun tests/tla/drivers/drive.mjs cutoff --walks 20 --seed 5
           bun tests/tla/drivers/drive.mjs leased --walks 40 --seed 12
           bun tests/tla/drivers/drive.mjs queue --walks 40 --seed 4
+          bun tests/tla/drivers/drive-intake.mjs --walks 60 --seed 1
+          bun tests/tla/drivers/drive-intake.mjs --walks 30 --seed 2 --durability world
+          bun tests/tla/drivers/drive-images.mjs --walks 40 --seed 1
+          bun tests/tla/drivers/drive-images.mjs --walks 20 --seed 2 --backend wasm
           bun tests/tla/drivers/drive-agents.mjs --walks 60 --seed 11
           bun tests/tla/drivers/drive-tenants.mjs --walks 60 --seed 11
           bun tests/tla/drivers/drive-steer.mjs ideal --walks 20 --seed 2

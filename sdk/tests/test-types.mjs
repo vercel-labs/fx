@@ -27,7 +27,7 @@ const sdkDir = fileURLToPath(new URL("..", import.meta.url));
 const fixturesDir = fileURLToPath(new URL("./types/", import.meta.url));
 
 // fx-sdk.js exports these for libfx's own modules; they are not public API.
-const wasmInternals = new Set(["coreAnswered", "engineInternals", "journalMarksWanted", "normalizeAgentOptions", "normalizeInstructions", "normalizeModelChoice"]);
+const wasmInternals = new Set(["checkPromptInput", "coreAnswered", "engineInternals", "journalMarksWanted", "normalizeAgentOptions", "normalizeInstructions", "normalizeModelChoice", "persistenceImages"]);
 
 // Each specifier as a consumer resolves it, the declaration file it must
 // reach, and the module whose runtime exports that file must match. node.cjs

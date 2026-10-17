@@ -11,6 +11,12 @@ const magic = "FXCP";
 /// Its little-endian payload is:
 ///   u32 json_len | json | u32 blob_count | (u32 blob_len | blob)*
 const version: u16 = 2;
+/// Version 3 has version 2's layout, and its JSON may name images instead of
+/// holding their bytes: ones the host stored (`inline_ref`), or ones the
+/// session dropped. Only a checkpoint that names one is version 3, so an fx
+/// that reads only version 2 reports a newer checkpoint instead of an
+/// invalid one.
+const naming_version: u16 = 3;
 /// Version 1 embedded inline image bytes as base64 inside a JSON-only payload.
 const json_only_version: u16 = 1;
 const header_bytes: usize = 4 + 2 + 2 + 4 + Sha256.digest_length;
@@ -89,12 +95,34 @@ pub const Decoded = struct {
 };
 
 /// `meta` is recorded when any of its fields is set; each must fit
-/// `max_meta_field_bytes`.
+/// `max_meta_field_bytes`. The checkpoint holds every image's bytes.
 pub fn encode(
     alloc: Allocator,
     history: []const types.HistoryTurn,
     usage: types.Usage,
     meta: Meta,
+) Error![]u8 {
+    return encodeWith(alloc, history, usage, meta, null);
+}
+
+/// Like `encode`, but names the images `stored` holds instead of holding
+/// their bytes.
+pub fn encodeNamingImages(
+    alloc: Allocator,
+    history: []const types.HistoryTurn,
+    usage: types.Usage,
+    meta: Meta,
+    stored: *const session_codec.StoredImages,
+) Error![]u8 {
+    return encodeWith(alloc, history, usage, meta, stored);
+}
+
+fn encodeWith(
+    alloc: Allocator,
+    history: []const types.HistoryTurn,
+    usage: types.Usage,
+    meta: Meta,
+    stored: ?*const session_codec.StoredImages,
 ) Error![]u8 {
     std.debug.assert(meta.fits());
     if (history.len > max_history_turns) return error.CheckpointTooLarge;
@@ -105,12 +133,18 @@ pub fn encode(
     defer blobs.deinit(alloc);
     const image_blobs: session_codec.ImageBlobs = .{ .alloc = alloc, .items = &blobs };
     var blob_section_bytes: usize = 0;
+    var names_images = false;
 
     json.writer.writeAll("{\"history\":[") catch return error.OutOfMemory;
     for (history, 0..) |turn, index| {
         if (index > 0) json.writer.writeByte(',') catch return error.OutOfMemory;
         const first_new_blob = blobs.items.len;
-        session_codec.writeHistoryTurnWithImageBlobs(&json.writer, turn, image_blobs) catch |err| switch (err) {
+        names_images = names_images or session_codec.turnNamesImages(turn, stored);
+        const written = if (stored) |names|
+            session_codec.writeHistoryTurnNamingImages(&json.writer, turn, .{ .stored = names, .blobs = image_blobs })
+        else
+            session_codec.writeHistoryTurnWithImageBlobs(&json.writer, turn, image_blobs);
+        written catch |err| switch (err) {
             error.InvalidSessionFormat => return error.InvalidCheckpoint,
             else => return error.OutOfMemory,
         };
@@ -138,7 +172,7 @@ pub fn encode(
     std.debug.assert(cursor == out.len);
 
     @memcpy(out[0..magic.len], magic);
-    std.mem.writeInt(u16, out[4..6], version, .little);
+    std.mem.writeInt(u16, out[4..6], if (names_images) naming_version else version, .little);
     std.mem.writeInt(u16, out[6..8], 0, .little);
     std.mem.writeInt(u32, out[8..12], @intCast(payload_len), .little);
     Sha256.hash(out[header_bytes..], out[12..header_bytes], .{});
@@ -161,12 +195,19 @@ fn writeSection(out: []u8, cursor: *usize, bytes: []const u8) void {
 }
 
 pub fn decode(alloc: Allocator, bytes: []const u8) Error!Decoded {
+    return decodeWithImages(alloc, bytes, null);
+}
+
+/// Like `decode`, but resolves named images through `names`. Without it a
+/// checkpoint that names images is invalid. A name `names` cannot resolve is
+/// recorded there, and the decoded images it names have no bytes.
+pub fn decodeWithImages(alloc: Allocator, bytes: []const u8, names: ?*session_codec.ImageResolver) Error!Decoded {
     if (bytes.len < header_bytes or bytes.len > max_checkpoint_bytes) {
         return error.CorruptCheckpoint;
     }
     if (!std.mem.eql(u8, bytes[0..magic.len], magic)) return error.CorruptCheckpoint;
     const checkpoint_version = std.mem.readInt(u16, bytes[4..6], .little);
-    if (checkpoint_version != version and checkpoint_version != json_only_version) {
+    if (checkpoint_version != version and checkpoint_version != json_only_version and checkpoint_version != naming_version) {
         return error.UnsupportedCheckpointVersion;
     }
     if (std.mem.readInt(u16, bytes[6..8], .little) != 0) {
@@ -180,7 +221,7 @@ pub fn decode(alloc: Allocator, bytes: []const u8) Error!Decoded {
         return error.CorruptCheckpoint;
     }
     const payload = bytes[header_bytes..];
-    if (checkpoint_version == json_only_version) return decodeJson(alloc, payload, null);
+    if (checkpoint_version == json_only_version) return decodeJson(alloc, payload, .{});
 
     var reader: PayloadReader = .{ .bytes = payload };
     const json = reader.section() orelse return error.CorruptCheckpoint;
@@ -192,7 +233,11 @@ pub fn decode(alloc: Allocator, bytes: []const u8) Error!Decoded {
     for (blobs) |*blob| blob.* = reader.section() orelse return error.CorruptCheckpoint;
     if (reader.remaining() != 0) return error.CorruptCheckpoint;
     var blob_reader: session_codec.ImageBlobReader = .{ .blobs = blobs };
-    return decodeJson(alloc, json, &blob_reader);
+    // Only a version 3 checkpoint names images.
+    return decodeJson(alloc, json, .{
+        .blobs = &blob_reader,
+        .names = if (checkpoint_version == naming_version) names else null,
+    });
 }
 
 /// Reads length-prefixed sections from a version 2 payload. Returned slices
@@ -221,7 +266,7 @@ const PayloadReader = struct {
     }
 };
 
-fn decodeJson(alloc: Allocator, json: []const u8, image_blobs: ?*session_codec.ImageBlobReader) Error!Decoded {
+fn decodeJson(alloc: Allocator, json: []const u8, images: session_codec.ImageSources) Error!Decoded {
     const parsed = std.json.parseFromSlice(
         std.json.Value,
         alloc,
@@ -244,13 +289,13 @@ fn decodeJson(alloc: Allocator, json: []const u8, image_blobs: ?*session_codec.I
         alloc.free(history);
     }
     for (history_value.array.items, 0..) |turn_value, index| {
-        history[index] = session_codec.parseHistoryTurnWithImageBlobs(alloc, turn_value, image_blobs) catch |err| switch (err) {
+        history[index] = session_codec.parseHistoryTurnWithImages(alloc, turn_value, images) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidCheckpoint,
         };
         decoded_count += 1;
     }
-    if (image_blobs) |blobs| {
+    if (images.blobs) |blobs| {
         if (!blobs.consumedAll()) return error.InvalidCheckpoint;
     }
     const usage = std.json.parseFromValueLeaky(types.Usage, alloc, usage_value, .{}) catch
@@ -327,9 +372,9 @@ test "kernel checkpoint refuses meta that is not short text" {
         "{\"history\":[],\"usage\":{},\"meta\":{\"model\":7}}",
         "{\"history\":[],\"usage\":{},\"meta\":{\"model\":\"" ++ text_utils.repeat("m", max_meta_field_bytes + 1) ++ "\"}}",
     };
-    for (cases) |json| try std.testing.expectError(error.InvalidCheckpoint, decodeJson(alloc, json, null));
+    for (cases) |json| try std.testing.expectError(error.InvalidCheckpoint, decodeJson(alloc, json, .{}));
     // Fields it does not know are left alone.
-    var decoded = try decodeJson(alloc, "{\"history\":[],\"usage\":{},\"meta\":{\"model\":\"m\",\"later\":1}}", null);
+    var decoded = try decodeJson(alloc, "{\"history\":[],\"usage\":{},\"meta\":{\"model\":\"m\",\"later\":1}}", .{});
     defer decoded.deinit(alloc);
     try std.testing.expectEqualStrings("m", decoded.meta.model);
     try std.testing.expectEqualStrings("", decoded.meta.libfx_version);
@@ -425,7 +470,7 @@ test "kernel checkpoint rejects corruption and unsupported versions" {
 
     const unsupported = try alloc.dupe(u8, bytes);
     defer alloc.free(unsupported);
-    std.mem.writeInt(u16, unsupported[4..6], version + 1, .little);
+    std.mem.writeInt(u16, unsupported[4..6], naming_version + 1, .little);
     try std.testing.expectError(
         error.UnsupportedCheckpointVersion,
         decode(alloc, unsupported),
@@ -576,4 +621,153 @@ test "kernel checkpoint requires each image blob once, in order" {
     std.mem.writeInt(u32, unreferenced[count_at..][0..length_bytes], 3, .little);
     resealForTest(unreferenced);
     try std.testing.expectError(error.InvalidCheckpoint, decode(alloc, unreferenced));
+}
+
+test "kernel checkpoint names stored images and keeps the bytes of the rest" {
+    const alloc = std.testing.allocator;
+    const stored_png = "\x89PNG\r\n\x1a\nstored-in-host";
+    const kept_png = "\x89PNG\r\n\x1a\nnever-stored";
+    var stored_image: TestImageHistory = undefined;
+    stored_image.init(stored_png);
+    var kept_image: TestImageHistory = undefined;
+    kept_image.init(kept_png);
+    const history = [_]types.HistoryTurn{ stored_image.history[0], kept_image.history[0] };
+    var stored: session_codec.StoredImages = .{};
+    defer stored.deinit(alloc);
+    try stored.add(alloc, stored_image.digest_hex);
+
+    const bytes = try encodeNamingImages(alloc, &history, .{}, .{}, &stored);
+    defer alloc.free(bytes);
+    try std.testing.expectEqual(naming_version, std.mem.readInt(u16, bytes[4..6], .little));
+    // The stored image is named, not held; the other keeps its raw blob.
+    try std.testing.expect(std.mem.find(u8, bytes, stored_png) == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"inline_ref\":\"" ++ stored_image.digest_hex ++ "\"") != null);
+    try std.testing.expect(std.mem.endsWith(u8, bytes, kept_png));
+
+    // Without the host's images it cannot be read.
+    try std.testing.expectError(error.InvalidCheckpoint, decode(alloc, bytes));
+
+    var staged: session_codec.StagedImages = .{};
+    defer staged.deinit(alloc);
+    try staged.add(alloc, stored_image.digest_hex, try alloc.dupe(u8, stored_png));
+    var resolver: session_codec.ImageResolver = .{ .alloc = alloc, .staged = &staged };
+    defer resolver.deinit();
+    var decoded = try decodeWithImages(alloc, bytes, &resolver);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualStrings(stored_png, decoded.history[0].assistant.user.images[0].inline_data.?);
+    try std.testing.expectEqualStrings(kept_png, decoded.history[1].assistant.user.images[0].inline_data.?);
+    try std.testing.expectEqual(@as(usize, 0), resolver.missing.count());
+    try std.testing.expect(resolver.resolved.contains(stored_image.digest_hex));
+}
+
+test "kernel checkpoint names a stored image with its size" {
+    const alloc = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\nsized-in-host";
+    var fixture: TestImageHistory = undefined;
+    fixture.init(png);
+    var stored: session_codec.StoredImages = .{};
+    defer stored.deinit(alloc);
+    try stored.add(alloc, fixture.digest_hex);
+    const bytes = try encodeNamingImages(alloc, &fixture.history, .{}, .{}, &stored);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, std.fmt.comptimePrint("\"inline_size\":{d}", .{png.len})) != null);
+
+    // A staged image whose size is not the one recorded is refused.
+    const sized = "\"inline_size\":";
+    const resized = try alloc.dupe(u8, bytes);
+    defer alloc.free(resized);
+    const at = std.mem.find(u8, resized, sized).? + sized.len;
+    resized[at] += 1;
+    resealForTest(resized);
+    var staged: session_codec.StagedImages = .{};
+    defer staged.deinit(alloc);
+    try staged.add(alloc, fixture.digest_hex, try alloc.dupe(u8, png));
+    var resolver: session_codec.ImageResolver = .{ .alloc = alloc, .staged = &staged };
+    defer resolver.deinit();
+    try std.testing.expectError(error.InvalidCheckpoint, decodeWithImages(alloc, resized, &resolver));
+}
+
+test "kernel checkpoint keeps a dropped image's name alone, at the naming version" {
+    const alloc = std.testing.allocator;
+    var fixture: TestImageHistory = undefined;
+    fixture.init("\x89PNG\r\n\x1a\ndropped-from-the-session");
+    fixture.images[0].inline_data = null;
+    try std.testing.expect(fixture.images[0].droppedFromSession());
+
+    // Even where no image is named, a dropped one needs the naming version.
+    const bytes = try encode(alloc, &fixture.history, .{}, .{});
+    defer alloc.free(bytes);
+    try std.testing.expectEqual(naming_version, std.mem.readInt(u16, bytes[4..6], .little));
+    try std.testing.expect(std.mem.find(u8, bytes, "\"dropped\":true") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"inline_ref\"") == null);
+
+    var decoded = try decode(alloc, bytes);
+    defer decoded.deinit(alloc);
+    const image = decoded.history[0].assistant.user.images[0];
+    try std.testing.expect(image.droppedFromSession());
+    try std.testing.expectEqualStrings(&fixture.digest_hex, image.snapshot_sha256.?);
+}
+
+test "kernel checkpoint naming no stored image stays version 2, byte for byte" {
+    const alloc = std.testing.allocator;
+    var fixture: TestImageHistory = undefined;
+    fixture.init("\x89PNG\r\n\x1a\nnot-in-the-store");
+    var stored: session_codec.StoredImages = .{};
+    defer stored.deinit(alloc);
+    try stored.add(alloc, session_codec.imageNameOf("some other image"));
+
+    const plain = try encode(alloc, &fixture.history, .{}, .{});
+    defer alloc.free(plain);
+    const named = try encodeNamingImages(alloc, &fixture.history, .{}, .{}, &stored);
+    defer alloc.free(named);
+    try std.testing.expectEqualSlices(u8, plain, named);
+}
+
+test "kernel checkpoint records a named image the host did not stage" {
+    const alloc = std.testing.allocator;
+    var fixture: TestImageHistory = undefined;
+    fixture.init("\x89PNG\r\n\x1a\nlost-from-the-store");
+    var stored: session_codec.StoredImages = .{};
+    defer stored.deinit(alloc);
+    try stored.add(alloc, fixture.digest_hex);
+    const bytes = try encodeNamingImages(alloc, &fixture.history, .{}, .{}, &stored);
+    defer alloc.free(bytes);
+
+    var staged: session_codec.StagedImages = .{};
+    defer staged.deinit(alloc);
+    var resolver: session_codec.ImageResolver = .{ .alloc = alloc, .staged = &staged };
+    defer resolver.deinit();
+    var decoded = try decodeWithImages(alloc, bytes, &resolver);
+    defer decoded.deinit(alloc);
+    try std.testing.expect(resolver.missing.contains(fixture.digest_hex));
+    try std.testing.expect(decoded.history[0].assistant.user.images[0].inline_data == null);
+}
+
+test "kernel checkpoint rejects a name that is not the image's digest" {
+    const alloc = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\nnamed-wrongly";
+    var fixture: TestImageHistory = undefined;
+    fixture.init(png);
+    var stored: session_codec.StoredImages = .{};
+    defer stored.deinit(alloc);
+    try stored.add(alloc, fixture.digest_hex);
+    const bytes = try encodeNamingImages(alloc, &fixture.history, .{}, .{}, &stored);
+    defer alloc.free(bytes);
+
+    // Point the reference at another staged image.
+    const other = "\x89PNG\r\n\x1a\nsomething-else";
+    const other_name = session_codec.imageNameOf(other);
+    const renamed = try alloc.dupe(u8, bytes);
+    defer alloc.free(renamed);
+    const reference = "\"inline_ref\":\"";
+    const at = std.mem.find(u8, renamed, reference).? + reference.len;
+    @memcpy(renamed[at..][0..other_name.len], &other_name);
+    resealForTest(renamed);
+
+    var staged: session_codec.StagedImages = .{};
+    defer staged.deinit(alloc);
+    try staged.add(alloc, other_name, try alloc.dupe(u8, other));
+    var resolver: session_codec.ImageResolver = .{ .alloc = alloc, .staged = &staged };
+    defer resolver.deinit();
+    try std.testing.expectError(error.InvalidCheckpoint, decodeWithImages(alloc, renamed, &resolver));
 }

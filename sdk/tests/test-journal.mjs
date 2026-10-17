@@ -64,8 +64,13 @@ function persisted(journal) {
 // "gather everything" calls bulky bulkySteps times, one call per response.
 // Any other prompt is answered with its own text.
 const bulkySteps = 24;
+// An image prompt's text ends with a marker per image, which the scripts
+// ignore.
+function scriptText(prompt) {
+  return lastUserText(prompt).replace(/(\n\[Image #\d+\])+$/u, "");
+}
 function framesFor(prompt) {
-  const text = lastUserText(prompt);
+  const text = scriptText(prompt);
   // "keep using the tool" asks for a lookup until three results are in, so an
   // agent that ignored a fence would keep calling it.
   if (text === "keep using the tool") {
@@ -139,7 +144,7 @@ const server = createServer((request, response) => {
     Object.defineProperty(prompt, "toolChoice", { value: toolChoice?.type ?? null });
     requests.push(prompt);
     sessionHeaders.push([request.headers["x-session-id"], request.headers["x-session-affinity"]]);
-    if (lastUserText(prompt) === "fail please") {
+    if (scriptText(prompt) === "fail please") {
       response.writeHead(400, { "content-type": "application/json" });
       response.end(JSON.stringify({ error: { message: "refused for the test", type: "invalid_request_error" } }));
       return;
@@ -663,7 +668,7 @@ test("a journal that does not fold is refused", async () => {
   const invalid = (pattern) => (error) => pattern.test(error.message) && error.code === "FX_JOURNAL_INVALID";
   const duplicated = eventJournal([...journal.events, journal.events.at(-1)]);
   await assert.rejects(createFxEngine(options(targetBackend, duplicated)), invalid(/libfx journal events are out of order/));
-  const newer = eventJournal([{ ...journal.events[0], v: 3 }]);
+  const newer = eventJournal([{ ...journal.events[0], v: 4 }]);
   await assert.rejects(createFxEngine(options(targetBackend, newer)), /libfx journal was written by a newer fx/);
   const garbled = eventJournal([{ v: 1, seq: 1, turn: 1, type: "turn_committed", data: { kind: "nope" } }]);
   await assert.rejects(createFxEngine(options(targetBackend, garbled)), invalid(/Invalid libfx journal/));
@@ -1039,7 +1044,7 @@ test("a turn left open resumes under the tools the new agent has", async () => {
 });
 
 test("a journal from a newer libfx is refused", async () => {
-  const future = eventJournal([{ v: 3, seq: 1, turn: 1, type: "turn_progress", data: {} }]);
+  const future = eventJournal([{ v: 4, seq: 1, turn: 1, type: "turn_progress", data: {} }]);
   const newer = (error) => error instanceof FxJournalVersionError && error.code === "FX_JOURNAL_VERSION";
   await assert.rejects(createFxEngine(options(sourceBackend, future)), newer);
   const record = (format) => ({
@@ -1310,6 +1315,312 @@ test("an image prompt after a crashed image turn gets the next image id", async 
   await reopened.close();
   assert.equal(result.stopReason, "end_turn");
   assert.match(lastUserText(requests.at(-1)), /\[Image #2\]$/);
+});
+
+// Images for the image store's tests: a PNG header, then filler that differs
+// per salt, so each image has its own name.
+const visionCatalog = { modelCatalog: [{ id: "journal/model", type: "language", tags: ["tool-use", "vision", "file-input"] }] };
+const pngOf = (size, salt) => {
+  const bytes = new Uint8Array(size);
+  bytes.set(Buffer.from(pngData, "base64"));
+  for (let index = 67; index < size; index += 1) bytes[index] = (index * 31 + salt) & 255;
+  return bytes;
+};
+const base64Of = (bytes) => Buffer.from(bytes).toString("base64");
+const imageBlock = (bytes) => ({ type: "image", data: bytes, mimeType: "image/png" });
+const nameOf = async (bytes) => Buffer.from(await crypto.subtle.digest("SHA-256", bytes)).toString("hex");
+// Whether saved bytes hold any of an image, raw or as base64.
+const holdsImage = (data, bytes) => Buffer.from(data).includes(Buffer.from(bytes.subarray(200, 264))) ||
+  Buffer.from(data).includes(Buffer.from(base64Of(bytes).slice(400, 480)));
+const savedData = (store) => [...store.records.map((record) => record.data), ...(store.checkpoint ? [store.checkpoint.data] : [])];
+const requestImages = (prompt) => prompt
+  .flatMap((message) => Array.isArray(message.content) ? message.content : [])
+  .filter((part) => part.type === "file")
+  .map((part) => part.data?.data ?? part.data);
+// libfx's own key for a persistence's image store, which durable sessions
+// give the engines they run.
+const persistenceImages = Symbol.for("libfx.persistenceImages");
+// `persistence` with an image store that keeps each image once, by name, in
+// `images`, as a durable session gives its engines.
+const withImageStore = (persistence, images = new Map()) => Object.assign(persistence, {
+  images,
+  [persistenceImages]: {
+    put: async (name, bytes) => { if (!images.has(name)) images.set(name, bytes.slice()); },
+    get: async (name) => images.get(name)?.slice(),
+  },
+});
+const createImagePersistence = () => withImageStore(createMemoryPersistence());
+
+test("a store keeps each prompt image once, and records and checkpoints only name it", async () => {
+  const store = createImagePersistence();
+  const first = pngOf(300_000, 1);
+  const second = pngOf(200_000, 2);
+  const source = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: store, checkpointAfterBytes: 0 }));
+  await run(source, [{ type: "text", text: "one" }, imageBlock(first)]);
+  await run(source, [{ type: "text", text: "two" }, imageBlock(second), imageBlock(first)]);
+  // A turn without images: its events name none.
+  await run(source, "no image here");
+  await source.close();
+  assert.equal(store.images.size, 2);
+  assert.deepEqual([...store.images.keys()].sort(), [await nameOf(first), await nameOf(second)].sort());
+  assert.ok(store.checkpoint, "a checkpoint was saved");
+  for (const data of savedData(store)) {
+    assert.ok(!holdsImage(data, first) && !holdsImage(data, second), "saved data holds no image bytes");
+  }
+  // Events that name an image are version 3. A progress that extends another
+  // (`base`) is version 2 and leaves out the user's turn, so it names none;
+  // every other event stays version 1.
+  const versions = storedEvents(store).map((event) => [JSON.stringify(event).includes("inline_ref"), event.v, event.base !== undefined || event.type === "tool_result"]);
+  assert.ok(versions.some(([named]) => named), "some events name images");
+  for (const [named, version, delta] of versions) {
+    assert.ok(!(named && delta), "a delta names no image");
+    assert.equal(version, named ? 3 : delta ? 2 : 1);
+  }
+  assert.ok(versions.some(([named]) => !named), "the text-only turn's events name none");
+
+  const target = await createFxEngine(options(targetBackend, undefined, { ...visionCatalog, persistence: store }));
+  requests.length = 0;
+  const { result } = await run(target, "four");
+  await target.close();
+  assert.equal(result.stopReason, "end_turn");
+  assert.deepEqual(requestImages(requests.at(-1)), [base64Of(first), base64Of(second), base64Of(first)]);
+});
+
+test("a session whose store lost an image is refused, naming it", async () => {
+  const store = createImagePersistence();
+  const kept = pngOf(50_000, 4);
+  const lost = pngOf(60_000, 5);
+  const source = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: store, checkpointAfterBytes: 0 }));
+  await run(source, [{ type: "text", text: "one" }, imageBlock(kept), imageBlock(lost)]);
+  await source.close();
+  const name = await nameOf(lost);
+  store.images.delete(name);
+  await assert.rejects(
+    createFxEngine(options(targetBackend, undefined, { ...visionCatalog, persistence: store })),
+    (error) => error.code === "FX_JOURNAL_IMAGE_MISSING" && error.image === name && error.message.includes(name),
+  );
+});
+
+test("a persistence without an image store keeps writing images inline", async () => {
+  const image = pngOf(20_000, 6);
+  const journal = eventJournal();
+  const agent = await createFxEngine(options(sourceBackend, journal, visionCatalog));
+  await run(agent, [{ type: "text", text: "inline" }, imageBlock(image)]);
+  await agent.close();
+  // No event is the version that names stored images; a progress that
+  // extends another is version 2, every other event version 1.
+  for (const event of journal.events) assert.equal(event.v, event.base !== undefined || event.type === "tool_result" ? 2 : 1);
+  assert.ok(JSON.stringify(journal.events).includes(base64Of(image)));
+  assert.ok(!JSON.stringify(journal.events).includes("inline_ref"));
+});
+
+test("an image turn that crashed after a delta reopens with its image", async () => {
+  // The turn's first progress names the image. The one after the tool step
+  // extends it and leaves out the user's turn, so a crash right after that
+  // one brings the image back from the first.
+  const image = pngOf(50_000, 8);
+  const images = new Map();
+  const journal = eventJournal();
+  const source = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: withImageStore(persisted(journal), images) }));
+  assert.equal((await run(source, [{ type: "text", text: "use the tool" }, imageBlock(image)])).text, "tool said beta");
+  await source.close();
+  const progress = journal.events.filter((event) => event.type === "turn_progress");
+  assert.equal(progress[0].v, 3, "the first progress names the image");
+  const stepped = progress.find((event) => event.steps === 1);
+  assert.ok(stepped?.base !== undefined && stepped.v === 2, "the progress after the tool extends it");
+  assert.ok(!JSON.stringify(stepped).includes("inline_ref"), "and names no image");
+  const survived = journal.events.slice(0, journal.events.indexOf(stepped) + 1);
+  const resumed = await createFxEngine(options(targetBackend, undefined, { ...visionCatalog, persistence: withImageStore(persisted(eventJournal(survived)), images) }));
+  requests.length = 0;
+  const turn = resumed.resume();
+  for await (const _ of turn) {}
+  assert.equal((await turn.result).stopReason, "end_turn");
+  await resumed.close();
+  assert.deepEqual(requestImages(requests[0]), [base64Of(image)], "the image came back from the first progress");
+  assert.equal(toolResults(requests[0]).length, 1, "the step came back from the delta");
+});
+
+// A smaller image window than the core's, so a test reaches its edge.
+const imageWindow = Symbol.for("libfx.imageWindow");
+const droppedNote = /\[Image #1 is no longer in this session, which keeps only its newest images\.\]/;
+
+for (const [label, limits] of [["images", { images: 2 }], ["bytes", { bytes: 2 * 40_000 }]]) {
+  test(`a session keeps its newest images within its window of ${label}, and an older one leaves as a note`, async () => {
+    const store = createImagePersistence();
+    const pictures = [pngOf(40_000, 11), pngOf(40_000, 12), pngOf(40_000, 13)];
+    const window = { [imageWindow]: limits };
+    const source = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: store, checkpointAfterBytes: 0, ...window }));
+    for (const [index, picture] of pictures.entries()) {
+      await run(source, [{ type: "text", text: `look ${index}` }, imageBlock(picture)]);
+    }
+    // The third turn's request still carries every image; once it entered the
+    // history, its image pushed the first out, and the next request carries
+    // the two newest and a note where the first was.
+    assert.deepEqual(requestImages(requests.at(-1)), pictures.map(base64Of));
+    await run(source, "and then?");
+    assert.deepEqual(requestImages(requests.at(-1)), [base64Of(pictures[1]), base64Of(pictures[2])]);
+    assert.match(JSON.stringify(requests.at(-1)), droppedNote);
+    await source.close();
+    assert.ok(savedData(store).some((data) => Buffer.from(data).includes("\"dropped\":true")), "the checkpoint keeps the first image's name alone");
+
+    // A store that lost the first image still opens the session, which reads
+    // only the images its window keeps.
+    store.images.delete(await nameOf(pictures[0]));
+    const read = [];
+    const { get } = store[persistenceImages];
+    store[persistenceImages].get = async (name) => {
+      read.push(name);
+      return get(name);
+    };
+    const target = await createFxEngine(options(targetBackend, undefined, { ...visionCatalog, persistence: store, ...window }));
+    await run(target, "and now?");
+    await target.close();
+    assert.deepEqual(read.sort(), [await nameOf(pictures[1]), await nameOf(pictures[2])].sort());
+    assert.deepEqual(requestImages(requests.at(-1)), [base64Of(pictures[1]), base64Of(pictures[2])]);
+    assert.match(JSON.stringify(requests.at(-1)), droppedNote);
+  });
+}
+
+test("a turn that fails before it enters the history drops no image", async () => {
+  const store = createImagePersistence();
+  const pictures = [pngOf(40_000, 21), pngOf(40_000, 22), pngOf(40_000, 23)];
+  const agent = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: store, [imageWindow]: { images: 2 } }));
+  await run(agent, [{ type: "text", text: "look 0" }, imageBlock(pictures[0])]);
+  await run(agent, [{ type: "text", text: "look 1" }, imageBlock(pictures[1])]);
+  const failed = await run(agent, [{ type: "text", text: "fail please" }, imageBlock(pictures[2])]);
+  assert.notEqual(failed.result.stopReason, "end_turn");
+  // The failed turn is not in the history, so the window still holds both.
+  await run(agent, "and then?");
+  assert.deepEqual(requestImages(requests.at(-1)), [base64Of(pictures[0]), base64Of(pictures[1])]);
+  assert.doesNotMatch(JSON.stringify(requests.at(-1)), /no longer in this session/);
+  await agent.close();
+});
+
+test("a turn that crashed with a full image window reopens with all of its images", async () => {
+  // An open stages the whole window and the open turn's images, which the
+  // window leaves out: one prompt's, up to 8 of them.
+  const tiny = (n) => {
+    const bytes = pngOf(80, 0);
+    new DataView(bytes.buffer).setUint32(70, n);
+    return bytes;
+  };
+  let made = 0;
+  const prompt = (text) => [{ type: "text", text }, ...Array.from({ length: 8 }, () => imageBlock(tiny(made++)))];
+  const images = new Map();
+  const journal = eventJournal();
+  const source = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: withImageStore(persisted(journal), images) }));
+  for (let turn = 0; turn < 4096 / 8; turn += 1) await run(source, prompt(`look ${turn}`));
+  const open = prompt("use the tool");
+  assert.equal((await run(source, open)).text, "tool said beta");
+  await source.close();
+  assert.equal(images.size, 4096 + 8);
+  // A crash after the last turn's tool step leaves it open, with the window
+  // full of the turns before it.
+  const stepped = journal.events.findLast((event) => event.type === "turn_progress" && event.steps === 1);
+  const survived = journal.events.slice(0, journal.events.indexOf(stepped) + 1);
+  const read = new Set();
+  const reading = withImageStore(persisted(eventJournal(survived)), images);
+  const { get } = reading[persistenceImages];
+  reading[persistenceImages].get = async (name) => { read.add(name); return get(name); };
+  const resumed = await createFxEngine(options(targetBackend, undefined, { ...visionCatalog, persistence: reading }));
+  requests.length = 0;
+  const turn = resumed.resume();
+  for await (const _ of turn) {}
+  assert.equal((await turn.result).stopReason, "end_turn");
+  await resumed.close();
+  assert.equal(read.size, 4096 + 8, "the open read the window and the open turn's images");
+  const sent = requestImages(requests[0]);
+  for (const block of open.slice(1)) assert.ok(sent.includes(base64Of(block.data)), "the open turn kept its images");
+});
+
+test("a failed image write fails the prompt before it is sent", async () => {
+  const store = createImagePersistence();
+  store[persistenceImages].put = async () => { throw new Error("disk full"); };
+  const agent = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: store }));
+  requests.length = 0;
+  const turn = agent.prompt([{ type: "text", text: "look" }, imageBlock(pngOf(1_000, 7))]);
+  // The store's own error.
+  await assert.rejects(turn.result, (error) => error.message === "disk full");
+  assert.equal(requests.length, 0, "the prompt never reached the model");
+  assert.equal(storedEvents(store).length, 0, "nothing was recorded");
+  const { result } = await run(agent, "text only");
+  assert.equal(result.stopReason, "end_turn");
+  await agent.close();
+});
+
+test("a session saved inline opens behind an image store, and only new images are stored", async () => {
+  const old = pngOf(40_000, 8);
+  const fresh = pngOf(30_000, 9);
+  const journal = eventJournal();
+  const before = await createFxEngine(options(sourceBackend, journal, visionCatalog));
+  await run(before, [{ type: "text", text: "old" }, imageBlock(old)]);
+  await before.close();
+
+  const images = new Map();
+  const upgraded = withImageStore(persisted(journal), images);
+  const after = await createFxEngine(options(targetBackend, undefined, { ...visionCatalog, persistence: upgraded }));
+  requests.length = 0;
+  await run(after, [{ type: "text", text: "new" }, imageBlock(fresh)]);
+  await after.close();
+  assert.deepEqual(requestImages(requests.at(-1)), [base64Of(old), base64Of(fresh)]);
+  assert.deepEqual([...images.keys()], [await nameOf(fresh)]);
+
+  const again = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: upgraded }));
+  requests.length = 0;
+  await run(again, "again");
+  await again.close();
+  assert.deepEqual(requestImages(requests.at(-1)), [base64Of(old), base64Of(fresh)]);
+});
+
+test("images too large for a checkpoint are named instead", async () => {
+  // Two 2.1 MiB images: more than one checkpoint holds raw.
+  const images = [pngOf(2_200_000, 10), pngOf(2_200_000, 11)];
+  const prompt = [{ type: "text", text: "large" }, ...images.map(imageBlock)];
+
+  // Without an image store, the core refuses the checkpoint.
+  const inline = createMemoryPersistence();
+  const without = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: inline, checkpointAfterBytes: 0 }));
+  await run(without, prompt);
+  await without.close();
+  assert.equal(inline.checkpoint, null);
+
+  const store = createImagePersistence();
+  const saved = [];
+  const named = await createFxEngine(options(sourceBackend, undefined, {
+    ...visionCatalog, persistence: store, checkpointAfterBytes: 0,
+    onEvent: (event) => { if (event.type === "checkpoint.save") saved.push(event.type); },
+  }));
+  await run(named, prompt);
+  await named.close();
+  assert.deepEqual(saved, ["checkpoint.save"]);
+  assert.ok(store.checkpoint.data.byteLength < 64 * 1024, `checkpoint is ${store.checkpoint.data.byteLength} bytes`);
+
+  const reopened = await createFxEngine(options(targetBackend, undefined, { ...visionCatalog, persistence: store }));
+  requests.length = 0;
+  const { result } = await run(reopened, "and now");
+  await reopened.close();
+  assert.equal(result.stopReason, "end_turn");
+  assert.deepEqual(requestImages(requests.at(-1)), images.map(base64Of));
+});
+
+test("a session holds more images than a checkpoint could, turn after turn", async () => {
+  const store = createImagePersistence();
+  const images = Array.from({ length: 5 }, (_, index) => pngOf(1024 * 1024, 20 + index));
+  let saves = 0;
+  const countSaves = { onEvent: (event) => { if (event.type === "checkpoint.save") saves += 1; } };
+  for (const [index, image] of images.entries()) {
+    // Each turn reopens the session, as a new process would.
+    const agent = await createFxEngine(options(index % 2 ? targetBackend : sourceBackend, undefined, { ...visionCatalog, ...countSaves, persistence: store, checkpointAfterBytes: 0 }));
+    const { result } = await run(agent, [{ type: "text", text: `turn ${index}` }, imageBlock(image)]);
+    await agent.close();
+    assert.equal(result.stopReason, "end_turn");
+  }
+  assert.equal(saves, images.length, "every turn saved a checkpoint");
+  const last = await createFxEngine(options(targetBackend, undefined, { ...visionCatalog, persistence: store }));
+  requests.length = 0;
+  await run(last, "all of them");
+  await last.close();
+  assert.deepEqual(requestImages(requests.at(-1)), images.map(base64Of));
 });
 
 test("a journal past the turn limit is refused by name", async () => {

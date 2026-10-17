@@ -2,6 +2,7 @@ const std = @import("std");
 const testing_allocator = @import("../../shared/testing_allocator.zig");
 const types = @import("../../shared/types.zig");
 const checkpoint_codec = @import("checkpoint.zig");
+const session_codec = @import("../../session/session_codec.zig");
 const runtime_prompt_context = @import("prompt_context.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const text_utils = @import("../../shared/text_utils.zig");
@@ -42,6 +43,17 @@ pub const Agent = struct {
     /// agent that saves them. Caller owns the bytes.
     pub fn checkpoint(self: *const Agent, alloc: Allocator, meta: checkpoint_codec.Meta) checkpoint_codec.Error![]u8 {
         return checkpoint_codec.encode(alloc, self.history.items, self.turn_usage, meta);
+    }
+
+    /// Like `checkpoint`, but names the images a libfx host's store holds
+    /// instead of holding their bytes.
+    pub fn checkpointNamingImages(
+        self: *const Agent,
+        alloc: Allocator,
+        meta: checkpoint_codec.Meta,
+        stored: *const session_codec.StoredImages,
+    ) checkpoint_codec.Error![]u8 {
+        return checkpoint_codec.encodeNamingImages(alloc, self.history.items, self.turn_usage, meta, stored);
     }
 
     /// Restores `bytes` into this fresh agent. Returns what the checkpoint

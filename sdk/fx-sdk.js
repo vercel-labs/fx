@@ -37,7 +37,10 @@ const maxUnreadEvents = 256;
 // Prompt images travel as raw bytes beside the ACP frame and are base64
 // encoded only in the model request. An image may use 5 MiB of encoded
 // request data, and a prompt's images 8 MiB, so the raw limits are 3/4 of that.
-// The kernel still validates content and media type.
+// The kernel still validates content and media type, and holds a prompt to
+// these limits too: `max_libfx_prompt_images` and
+// `max_libfx_prompt_images_bytes` in src/core/images/image_attachments.zig
+// must match them.
 const maxPromptImages = 8;
 const maxPromptImageDataBytes = 5 * 1024 * 1024;
 const maxPromptImagesDataBytes = 8 * 1024 * 1024;
@@ -45,6 +48,7 @@ const maxPromptImageBytes = (maxPromptImageDataBytes / 4) * 3;
 const maxPromptImagesBytes = (maxPromptImagesDataBytes / 4) * 3;
 // Matches the native attachment table: one prompt's images or one checkpoint.
 const maxPendingAttachments = 8;
+const maxPendingAttachmentBytes = 8 * 1024 * 1024;
 const maxOutboundAttachments = 4;
 // Matches the core's kernel checkpoint limit (max_checkpoint_bytes).
 const maxCheckpointBytes = 4 * 1024 * 1024;
@@ -234,6 +238,14 @@ export function normalizeAgentOptions(value) {
 // public surface.
 export const engineInternals = Symbol.for("libfx.engineInternals");
 export const journalMarksWanted = Symbol.for("libfx.journalMarks");
+// A persistence's image store, `{ put(name, bytes), get(name) }`, which keeps
+// each image once, named by the SHA-256 of its bytes, so records and
+// checkpoints only name it. Durable sessions give one to the engines they
+// run; without it, images stay inline.
+export const persistenceImages = Symbol.for("libfx.persistenceImages");
+// `{ images, bytes }`: a smaller image window than the core's, the newest
+// images a session with an image store keeps, so tests can reach its edge.
+const imageWindowLimits = Symbol.for("libfx.imageWindow");
 // Marks an error the core answered a request with, as opposed to one from a
 // core that stopped answering.
 export const coreAnswered = Symbol.for("libfx.coreAnswered");
@@ -279,7 +291,25 @@ const journalOpenErrorCodes = new Map([
   ["libfx journal events are out of order", "FX_JOURNAL_INVALID"],
   ["libfx journal is too large", "FX_JOURNAL_TOO_LARGE"],
   ["libfx journal holds more than 1024 turns", "FX_JOURNAL_TOO_LARGE"],
+  ["libfx journal images are too large", "FX_JOURNAL_TOO_LARGE"],
+  ["Invalid libfx journal images", "FX_JOURNAL_INVALID"],
+  ["libfx image does not match its name", "FX_JOURNAL_IMAGE_MISSING"],
 ]);
+
+// An image's name in a persistence's image store: the lowercase hex SHA-256
+// of its bytes, as the core names it.
+async function imageName(bytes) {
+  const digest = new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", bytes));
+  let name = "";
+  for (const byte of digest) name += byte.toString(16).padStart(2, "0");
+  return name;
+}
+
+function imageMissingError(name, cause) {
+  const error = journalLoadError(`libfx journal names an image the store does not hold: ${name}`, "FX_JOURNAL_IMAGE_MISSING", cause);
+  error.image = name;
+  return error;
+}
 
 /**
  * A persistence store that keeps a session's records and its latest
@@ -1977,6 +2007,62 @@ function normalizePromptInput(input, { deferImageLimits = false } = {}) {
   return prompt;
 }
 
+// The image types libfx's core takes, each known by how its bytes start.
+const imageSignatures = [
+  ["image/png", 0, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]],
+  ["image/jpeg", 0, [0xff, 0xd8, 0xff]],
+  ["image/gif", 0, [0x47, 0x49, 0x46, 0x38, 0x37, 0x61]],
+  ["image/gif", 0, [0x47, 0x49, 0x46, 0x38, 0x39, 0x61]],
+  ["image/webp", 0, [0x52, 0x49, 0x46, 0x46]],
+];
+const imageTypes = new Set(imageSignatures.map(([type]) => type));
+const webpMarker = [0x57, 0x45, 0x42, 0x50];
+
+// The image type `bytes` start as, or null.
+function imageTypeOf(bytes) {
+  const startsWith = (offset, signature) => bytes.length >= offset + signature.length && signature.every((byte, index) => bytes[offset + index] === byte);
+  for (const [type, offset, signature] of imageSignatures) {
+    if (!startsWith(offset, signature)) continue;
+    if (type === "image/webp" && !startsWith(8, webpMarker)) continue;
+    return type;
+  }
+  return null;
+}
+
+// Refuses image bytes that are not the type they declare, as libfx's core does.
+function checkImageBytesType(bytes, mimeType, index) {
+  const type = imageTypeOf(bytes);
+  if (type === null) throw new TypeError(`image prompt block ${index} is not a PNG, JPEG, GIF or WebP image`);
+  if (type !== mimeType) throw new TypeError(`image prompt block ${index} holds ${type} data, not ${mimeType}`);
+}
+
+/**
+ * Checks a prompt's input as libfx takes it and returns it normalized:
+ * every check `prompt()` makes, and the ones libfx's core makes on images,
+ * which would otherwise refuse the prompt only once it reached the core: a
+ * supported image type, and bytes or base64 that are that type. A Blob is not
+ * read, so its bytes are checked once read (`checkImageBytesType`). With
+ * `resizeImage`, image bytes are checked after it runs instead. Throws a
+ * TypeError or RangeError.
+ */
+export function checkPromptInput(input, { resizeImage } = {}) {
+  const resized = resizeImage !== undefined;
+  const normalized = normalizePromptInput(input, { deferImageLimits: resized });
+  // The core takes no prompt without text or an image; a resource adds neither.
+  if (!normalized.some((block) => block.type === "image" || (block.type === "text" && block.text.length > 0))) {
+    throw new TypeError("prompt is empty");
+  }
+  // resizeImage decides the final image sizes, so they are counted after it runs.
+  checkPromptFrameSize(normalized, !resized);
+  normalized.forEach((block, index) => {
+    if (block.type !== "image" || (resized && block.data !== undefined)) return;
+    if (!imageTypes.has(block.mimeType)) throw new TypeError(`image prompt block ${index} mimeType must be image/png, image/jpeg, image/gif or image/webp`);
+    if (block.source === "bytes") checkImageBytesType(block.data, block.mimeType, index);
+    else if (block.source === "base64") checkImageBytesType(base64ToBytes(block.data.slice(0, 16)), block.mimeType, index);
+  });
+  return normalized;
+}
+
 // Image bytes travel beside the frame as attachment references, but the model
 // request carries them base64 encoded and the native host caps that request at
 // 8 MiB. Images therefore count at their encoded size, the same budget they
@@ -2062,6 +2148,11 @@ async function materializePromptImages(blocks, isCancelled, resizeImage) {
   }
   if (promptFrameSize(prepared) > maxPromptFrameBytes) prepared = omitReferencedImageData(prepared);
   checkPromptFrameSize(prepared, true);
+  // A file's bytes, or what resizeImage made, are checked once there are
+  // some, after the size limits.
+  prepared.forEach((image, index) => {
+    if (image.type === "image" && image.bytes !== undefined) checkImageBytesType(image.bytes, image.mimeType, index);
+  });
   return prepared;
 }
 
@@ -2308,6 +2399,11 @@ export async function createFxEngine(options = {}) {
   // waits for it: the core before an action others can see, such as a tool
   // call with effects, or a caller for its input.
   const persistence = options.persistence ?? null;
+  // A persistence with an image store keeps each prompt image once, by
+  // name, and the core names it in records and checkpoints instead of
+  // holding its bytes.
+  const imageStorage = persistence?.[persistenceImages] ?? null;
+  const imageStore = imageStorage !== null;
   const wantsMarks = persistence?.marks === true || persistence?.[journalMarksWanted] === true;
   const checkpointAfterBytes = options.checkpointAfterBytes ?? defaultCheckpointAfterBytes;
   // The store's last cursor, and the last seq its records hold.
@@ -2736,6 +2832,25 @@ export async function createFxEngine(options = {}) {
     if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) throw new Error("fx returned an invalid checkpoint");
     return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   }
+  // Stores each prompt image in the persistence's image store, by name,
+  // before the prompt that carries it is sent: nothing the core writes may
+  // name an image the store does not hold. Returns the blocks with their
+  // names, or null when the prompt stopped meanwhile.
+  async function storePromptImages(blocks, stopped) {
+    const named = [];
+    for (const block of blocks) {
+      if (block.type !== "image" || block.bytes === undefined) {
+        named.push(block);
+        continue;
+      }
+      const name = await imageName(block.bytes);
+      if (stopped()) return null;
+      await imageStorage.put(name, block.bytes);
+      if (stopped()) return null;
+      named.push({ ...block, stored: name });
+    }
+    return named;
+  }
   const sendPrompt = (blocks, resuming = false, followUp = null, turnId = null, rerun = [], yieldAt = undefined) => {
     // A journaled turn given a time to stop at yields before its first model
     // request after it, keeping the turn open.
@@ -2750,7 +2865,8 @@ export async function createFxEngine(options = {}) {
       type: "image",
       mimeType: block.mimeType,
       ...(block.sourceRef === undefined ? {} : { sourceRef: block.sourceRef }),
-      ...(block.bytes === undefined ? {} : { _meta: { fx: { attachment: ids[next++] } } }),
+      // An image the store holds carries its name, so the core names it too.
+      ...(block.bytes === undefined ? {} : { _meta: { fx: { attachment: ids[next++], ...(block.stored === undefined ? {} : { stored: block.stored }) } } }),
     });
     // A follow-up's turn places it; the core records it as accepted first
     // when the host could not. A journaled turn's first progress records its id.
@@ -2868,24 +2984,62 @@ export async function createFxEngine(options = {}) {
     }
     if (journal) {
       const { events, checkpoint } = loaded;
-      const params = { sessionId, ...(options.inputsDurable === true ? { inputsDurable: true } : {}) };
-      // One call: attaching again would drop the first attachment.
-      const attachments = [];
-      if (events.length > 0) {
-        const bytes = encoder.encode(JSON.stringify(withoutSupersededProgress(events)));
-        if (bytes.byteLength > maxJournalBytes) throw journalLoadError("libfx journal is too large", "FX_JOURNAL_TOO_LARGE");
-        attachments.push(["journalAttachment", bytes]);
-      }
-      if (checkpoint) attachments.push(["snapshotAttachment", checkpoint]);
-      const ids = attachments.length ? attachBytes(attachments.map(([, bytes]) => bytes)) : [];
-      attachments.forEach(([name], index) => { params[name] = ids[index]; });
-      const opened = await request("libfx/journal_open", params).catch((error) => {
+      const journalBytes = events.length > 0 ? encoder.encode(JSON.stringify(withoutSupersededProgress(events))) : null;
+      if (journalBytes && journalBytes.byteLength > maxJournalBytes) throw journalLoadError("libfx journal is too large", "FX_JOURNAL_TOO_LARGE");
+      const openFailed = (error) => {
         const message = error?.message ?? "";
         if (/newer fx/.test(message)) throw new FxJournalVersionError(message);
         const code = journalOpenErrorCodes.get(message);
         if (code) throw journalLoadError(message, code, error);
         throw error;
-      });
+      };
+      const openOnce = () => {
+        const params = {
+          sessionId,
+          ...(options.inputsDurable === true ? { inputsDurable: true } : {}),
+          ...(imageStore ? { imageStore: true } : {}),
+          ...(imageStore && options[imageWindowLimits] ? { imageWindow: options[imageWindowLimits] } : {}),
+        };
+        // One call: attaching again would drop the first attachment.
+        const attachments = [];
+        if (journalBytes) attachments.push(["journalAttachment", journalBytes]);
+        if (checkpoint) attachments.push(["snapshotAttachment", checkpoint]);
+        const ids = attachments.length ? attachBytes(attachments.map(([, bytes]) => bytes)) : [];
+        attachments.forEach(([name], index) => { params[name] = ids[index]; });
+        return request("libfx/journal_open", params).catch(openFailed);
+      };
+      // Stages the images a history names, read from the store, in batches
+      // the attachment table holds. A store that lacks one fails the open:
+      // the history without it is not the one saved.
+      const stageImages = async (names) => {
+        let batch = [];
+        let batchBytes = 0;
+        const flush = async () => {
+          if (batch.length === 0) return;
+          const ids = attachBytes(batch.map(({ bytes }) => bytes));
+          const images = batch.map(({ name }, index) => ({ name, attachment: ids[index] }));
+          batch = [];
+          batchBytes = 0;
+          await request("libfx/journal_images", { sessionId, images }).catch(openFailed);
+        };
+        for (const name of new Set(names.map(String))) {
+          const stored = imageStore ? await imageStorage.get(name) : undefined;
+          if (stored === undefined || stored === null) throw imageMissingError(name);
+          const bytes = persistenceBytes(stored, "an image the image store returns");
+          if (batch.length === maxPendingAttachments || batchBytes + bytes.byteLength > maxPendingAttachmentBytes) await flush();
+          batch.push({ name, bytes });
+          batchBytes += bytes.byteLength;
+        }
+        await flush();
+      };
+      // A history that names images opens once they are staged from the
+      // store: the core answers with the names it needs, all at once.
+      let opened = await openOnce();
+      if (Array.isArray(opened?.imagesNeeded)) {
+        await stageImages(opened.imagesNeeded);
+        opened = await openOnce();
+        if (Array.isArray(opened?.imagesNeeded)) throw imageMissingError(String(opened.imagesNeeded[0]));
+      }
       compareCheckpointMeta(opened?.checkpointMeta);
       resumable = opened?.resumable === true;
       openTurnId = resumable && validTurnId(opened?.openTurnId) ? opened.openTurnId : null;
@@ -3201,13 +3355,12 @@ export async function createFxEngine(options = {}) {
     const resizeImage = options.resizeImage;
     const resuming = promptOptions[resumeTurn] === true;
     const followUp = promptOptions[followUpInput] ?? null;
-    const normalized = resuming ? [] : normalizePromptInput(input, { deferImageLimits: resizeImage !== undefined });
+    const normalized = resuming ? [] : checkPromptInput(input, { resizeImage });
     const hasPixels = normalized.some((block) => block.type === "image" && block.data !== undefined);
-    // Blob reads and resizeImage run before the prompt frame is sent.
-    const asyncImages = hasPixels && (resizeImage !== undefined ||
+    // Blob reads, resizeImage and storing images run before the prompt
+    // frame is sent.
+    const asyncImages = hasPixels && (resizeImage !== undefined || imageStore ||
       normalized.some((block) => block.type === "image" && block.source === "blob"));
-    // resizeImage decides the final image sizes, so they are counted after it runs.
-    checkPromptFrameSize(normalized, resizeImage === undefined);
     // Snapshot caller-owned bytes, which could change before an async send.
     const prompt = asyncImages
       ? normalized.map((block) => block.type === "image" && block.source === "bytes" ? { ...block, data: block.data.slice() } : block)
@@ -3412,8 +3565,11 @@ export async function createFxEngine(options = {}) {
     }) : null;
     let response;
     if (asyncImages) {
+      const stopped = () => cancelled || closing;
       response = Promise.race([
-        Promise.resolve().then(() => materializePromptImages(prompt, () => cancelled || closing, resizeImage)),
+        Promise.resolve()
+          .then(() => materializePromptImages(prompt, stopped, resizeImage))
+          .then((prepared) => prepared && imageStore ? storePromptImages(prepared, stopped) : prepared),
         imagePrepCancelled,
       ]).then((prepared) => {
         cancelImagePrep = null;

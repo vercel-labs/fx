@@ -1,7 +1,8 @@
 #!/bin/sh
-# Model-checks DurableSession.tla with TLC, confirms each witness is
-# violated, and writes the state graphs ../drivers/drive.mjs walks against
-# the code.
+# Model-checks DurableSession.tla, PromptIntake.tla, ImageStore.tla,
+# DurableSteer.tla and AgentRouting.tla with TLC, confirms each witness is
+# violated, and writes the state graphs the drivers in ../drivers/ walk
+# against the code.
 #
 # Needs Java 11+ and tla2tools.jar:
 #   brew install openjdk
@@ -14,6 +15,8 @@
 #   bun ../drivers/drive.mjs write && bun ../drivers/drive.mjs cutoff
 #   bun ../drivers/drive.mjs leased   # the Heartbeat graph, on a World without liveness
 #   bun ../drivers/drive.mjs queue    # the QueueHeld graph, on a World whose queue shows it
+#   bun ../drivers/drive-intake.mjs   # prompts with images
+#   bun ../drivers/drive-images.mjs   # images stored once, across crashes and reopens
 #   bun ../drivers/drive-agents.mjs   # AgentRouting
 #   bun ../drivers/drive-steer.mjs ideal && bun ../drivers/drive-steer.mjs faults   # DurableSteer
 #   bun ../drivers/drive-tenants.mjs   # TenantIsolation
@@ -95,6 +98,73 @@ for pair in NoInterrupt:NoSteerWaitsOnReply NoHandBack:NothingLost \
         echo "== steer witness $witness reached"
     else
         echo "== steer witness $witness NOT reached" >&2; status=1
+    fi
+done
+
+# PromptIntake.tla: how a session object takes prompts in. Deadlock checking
+# stays on, since a prompt left waiting forever is a failure there; the
+# drive graph is the one drive-intake.mjs walks.
+for config in PromptIntake PromptIntake-drive; do
+    echo "== $config"
+    dump=""
+    [ "$config" = PromptIntake-drive ] && dump="-dump dot,actionlabels graphs/intake"
+    # shellcheck disable=SC2086 # $dump is two words or none
+    if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers auto -cleanup \
+        -metadir "$work/$config" $dump -config "$config.cfg" PromptIntake.tla > "$work/$config.log" 2>&1; then
+        cat "$work/$config.log"; status=1; continue
+    fi
+    grep -E 'distinct states|depth of' "$work/$config.log"
+done
+# NoGate breaks ImageOrder: a prompt that does not wait for an earlier one
+# still preparing its images is stored first. NoCloseCheck breaks
+# ClosedStopsPreparing: a prompt still preparing when the agent closes is
+# stored anyway. GateHeldOnFailure deadlocks: a failed prompt that never
+# lets the prompts behind it go leaves them waiting forever. NoWithdraw
+# breaks CancelOnlyWhenSent: a prompt that goes on after an abort before
+# its send began has its cancel go out before it does.
+for pair in NoGate:"Invariant ImageOrder is violated" NoCloseCheck:"Invariant ClosedStopsPreparing is violated" \
+    GateHeldOnFailure:"Deadlock reached" NoWithdraw:"Invariant CancelOnlyWhenSent is violated"; do
+    witness="${pair%%:*}" expected="${pair#*:}"
+    if "$java" -cp "$jar" tlc2.TLC -workers auto -cleanup -metadir "$work/intake-$witness" \
+        -config "PromptIntake-$witness.cfg" PromptIntake.tla 2>&1 | grep -q -F "$expected"; then
+        echo "== witness PromptIntake-$witness reached"
+    else
+        echo "== witness PromptIntake-$witness NOT reached" >&2; status=1
+    fi
+done
+
+# ImageStore.tla: how a session saves each image once and names it. The
+# durable config sends prompts through the log; the engine config straight
+# to the core; the drive graph is the one drive-images.mjs walks. Deadlock
+# checking stays on: an open that can never finish is a failure.
+for config in ImageStore ImageStore-engine ImageStore-drive; do
+    echo "== $config"
+    dump=""
+    [ "$config" = ImageStore-drive ] && dump="-dump dot,actionlabels graphs/images"
+    # shellcheck disable=SC2086 # $dump is two words or none
+    if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers auto -cleanup \
+        -metadir "$work/$config" $dump -config "$config.cfg" ImageStore.tla > "$work/$config.log" 2>&1; then
+        cat "$work/$config.log"; status=1; continue
+    fi
+    grep -E 'distinct states|depth of' "$work/$config.log"
+done
+# SendBeforeStore breaks NoDanglingRef: a prompt sent while its image write
+# is in flight leaves a record naming an image the store does not hold.
+# NameUnstored breaks NoDanglingRef: a checkpoint names an image an older
+# libfx saved inline, which the store never held. DropMissing breaks
+# OpenExact: an open that drops an image the store lost runs on a history
+# that is not the one saved. RetryLands breaks NoDanglingRef: a retry stores
+# nothing, so a log that kept its input would name an image never stored.
+# KeepAll breaks WindowHeld: a core that keeps every image outgrows the
+# window an open can stage. NeedAll breaks FailsOnlyOnLossInWindow: an open
+# that stages every named image fails on one the window had dropped.
+for pair in SendBeforeStore:NoDanglingRef NameUnstored:NoDanglingRef DropMissing:OpenExact RetryLands:NoDanglingRef KeepAll:WindowHeld NeedAll:FailsOnlyOnLossInWindow; do
+    witness="${pair%%:*}" invariant="${pair#*:}"
+    if "$java" -cp "$jar" tlc2.TLC -workers auto -cleanup -metadir "$work/images-$witness" \
+        -config "ImageStore-$witness.cfg" ImageStore.tla 2>&1 | grep -q -F "Invariant $invariant is violated"; then
+        echo "== witness ImageStore-$witness reached"
+    else
+        echo "== witness ImageStore-$witness NOT reached" >&2; status=1
     fi
 done
 

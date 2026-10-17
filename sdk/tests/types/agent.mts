@@ -205,6 +205,7 @@ export async function worlds(): Promise<void> {
       async write() {},
       async writeMulti() {},
       async get() { return new ReadableStream<Uint8Array>(); },
+      async getChunks() { return { data: [], cursor: null, hasMore: false }; },
       async getInfo() { return { tailIndex: -1 }; },
     },
     async queue() { return { messageId: null }; },

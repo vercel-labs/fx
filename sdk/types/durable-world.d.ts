@@ -15,9 +15,12 @@ export interface World {
     list(params: unknown): unknown;
   };
   readonly streams: {
-    write(runId: string, name: string, chunk: string): unknown;
+    /** A session's view is written as text; each prompt image as one chunk of bytes. */
+    write(runId: string, name: string, chunk: string | Uint8Array): unknown;
     writeMulti?(runId: string, name: string, chunks: string[]): unknown;
     get(runId: string, name: string, startIndex?: number): unknown;
+    /** Read for a session's images: a page of chunks, `{ data: { data }[] }`. */
+    getChunks(runId: string, name: string, options?: { limit?: number; cursor?: string }): unknown;
     getInfo(runId: string, name: string): unknown;
   };
   queue(queueName: string, message: unknown, options?: unknown): unknown;

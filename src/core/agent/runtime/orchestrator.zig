@@ -7337,11 +7337,12 @@ fn processQueuedPromptLoop(
                     subagent_request_messages.len,
                 });
             }
-            const result_request_messages = try project_read_tool_result_request_messages(
+            // Images the session dropped leave every request as notes.
+            const result_request_messages = try image_attachments.withholdDroppedImages(overlay_arena, try project_read_tool_result_request_messages(
                 overlay_arena,
                 read_tool_result_request_eligible,
                 subagent_request_messages,
-            );
+            ));
             if (!tool_image_capabilities_resolved and request_capabilities.image_input_support == .unknown) {
                 for (result_request_messages) |message| {
                     const memory = message.tool_result_memory orelse continue;
