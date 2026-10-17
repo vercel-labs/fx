@@ -121,7 +121,7 @@ async function startFx(
       VERCEL_OIDC_TOKEN: undefined,
       FX_GATEWAY_BASE_URL: gateway?.baseUrl,
       FX_GATEWAY_CHAT_URL: gateway?.chatUrl,
-      FX_E2E_GATEWAY_MODELS_URL: gateway
+      FX_TEST_GATEWAY_MODELS_URL: gateway
         ? `${gateway.baseUrl}/coding-agent/v1/models`
         : undefined,
       FX_MODEL: withGateway ? FAKE_GATEWAY_MODEL : undefined,
@@ -594,12 +594,12 @@ tmuxTest(
         FX_MODEL: FAKE_GATEWAY_MODEL,
         FX_AUTO_UPGRADE: "0",
         FX_SOUND: "0",
-        FX_SKIP_ONBOARDING: "1",
+        FX_TEST_SKIP_ONBOARDING: "1",
         FX_PERMISSION_MODE: "full-access",
         FX_GATEWAY_BASE_URL: dynamicGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: dynamicGateway.chatUrl,
-        FX_E2E_GATEWAY_CHAT_URL: dynamicGateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${dynamicGateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_CHAT_URL: dynamicGateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${dynamicGateway.baseUrl}/coding-agent/v1/models`,
       },
     });
     try {

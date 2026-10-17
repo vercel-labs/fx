@@ -168,9 +168,9 @@ test(
       AI_GATEWAY_API_KEY: undefined,
       VERCEL_OIDC_TOKEN: undefined,
       FX_DISABLE_KEYCHAIN: "1",
-      FX_SKIP_ONBOARDING: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
       FX_AUTO_UPGRADE: "0",
-      FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
+      FX_TEST_OAUTH_ISSUER_URL: oauth.issuerUrl,
       FX_GATEWAY_BASE_URL: gateway.baseUrl,
       FX_GATEWAY_CHAT_URL: gateway.chatUrl,
       FX_MODEL: FAKE_GATEWAY_MODEL,
@@ -185,7 +185,7 @@ test(
       const logout = runFx(["logout"], {
         env: {
           ...env,
-          FX_E2E_AUTH_LOCK_CONTENTION: "1",
+          FX_TEST_AUTH_LOCK_CONTENTION: "1",
         },
         timeoutMs: TIMEOUT,
       });
@@ -250,9 +250,9 @@ test(
             AI_GATEWAY_API_KEY: undefined,
             VERCEL_OIDC_TOKEN: undefined,
             FX_DISABLE_KEYCHAIN: "1",
-            FX_SKIP_ONBOARDING: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
             FX_AUTO_UPGRADE: "0",
-            FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
+            FX_TEST_OAUTH_ISSUER_URL: oauth.issuerUrl,
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
             FX_GATEWAY_CHAT_URL: gateway.chatUrl,
             FX_MODEL: FAKE_GATEWAY_MODEL,
@@ -317,9 +317,9 @@ test(
       AI_GATEWAY_API_KEY: undefined,
       VERCEL_OIDC_TOKEN: undefined,
       FX_DISABLE_KEYCHAIN: "1",
-      FX_SKIP_ONBOARDING: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
       FX_AUTO_UPGRADE: "0",
-      FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
+      FX_TEST_OAUTH_ISSUER_URL: oauth.issuerUrl,
     };
 
     try {
@@ -384,7 +384,7 @@ test(
             AI_GATEWAY_API_KEY: SELECTED_API_KEY,
             VERCEL_OIDC_TOKEN: undefined,
             FX_DISABLE_KEYCHAIN: "1",
-            FX_SKIP_ONBOARDING: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
             FX_AUTO_UPGRADE: "0",
             FX_TRACE_LOG: tracePath,
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
@@ -449,7 +449,7 @@ test(
       AI_GATEWAY_API_KEY: SELECTED_API_KEY,
       VERCEL_OIDC_TOKEN: undefined,
       FX_DISABLE_KEYCHAIN: "1",
-      FX_SKIP_ONBOARDING: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
       FX_AUTO_UPGRADE: "0",
       FX_GATEWAY_BASE_URL: gateway.baseUrl,
       FX_GATEWAY_CHAT_URL: gateway.chatUrl,
@@ -562,7 +562,7 @@ test(
       AI_GATEWAY_API_KEY: undefined,
       VERCEL_OIDC_TOKEN: undefined,
       FX_DISABLE_KEYCHAIN: "1",
-      FX_E2E_OAUTH_ISSUER_URL: issuerB.issuerUrl,
+      FX_TEST_OAUTH_ISSUER_URL: issuerB.issuerUrl,
       FX_GATEWAY_BASE_URL: gateway.baseUrl,
       FX_MODEL: FAKE_GATEWAY_MODEL,
     };

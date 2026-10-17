@@ -148,11 +148,13 @@ test.skipIf(!tmuxAvailable())(
       await session.sendText("/sound");
       await session.waitForText("* sound: on", TIMEOUT);
       expect(await session.captureFullScrollback()).not.toContain(
-        "saved to user settings",
+        "saved to global settings",
       );
 
       let settings = JSON.parse(readFileSync(settingsPath, "utf8"));
-      expect(settings.notifications).toEqual({
+      // Saving moves the older `notifications` group to `sound`.
+      expect(settings).not.toHaveProperty("notifications");
+      expect(settings.sound).toEqual({
         turn_end: true,
         attention_required: true,
         max: false,
@@ -161,7 +163,7 @@ test.skipIf(!tmuxAvailable())(
       await session.sendText("/sound off");
       await session.waitForText("* sound: off", TIMEOUT);
       settings = JSON.parse(readFileSync(settingsPath, "utf8"));
-      expect(settings.notifications).toEqual({
+      expect(settings.sound).toEqual({
         turn_end: false,
         attention_required: false,
         max: false,
@@ -173,7 +175,7 @@ test.skipIf(!tmuxAvailable())(
         TIMEOUT,
       );
       settings = JSON.parse(readFileSync(settingsPath, "utf8"));
-      expect(settings.notifications).toEqual({
+      expect(settings.sound).toEqual({
         turn_end: true,
         attention_required: true,
         max: false,

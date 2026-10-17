@@ -1,4 +1,5 @@
 const std = @import("std");
+const profile_paths = @import("../shared/profile_paths.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -1146,7 +1147,7 @@ pub fn skillSourceLabel(source: SkillSource) []const u8 {
         .workspace_claude => "workspace .claude/skills",
         .workspace_agents => "workspace .agents/skills",
         .workspace_claw => "workspace .claw/skills",
-        .global_fx => "global ~/.fx/skills",
+        .global_fx => profile_paths.displayText("global ~/.fx/skills"),
         .global_opencode => "global ~/.config/opencode/skills",
         .global_codex => "global ~/.codex/skills",
         .global_claude => "global ~/.claude/skills",

@@ -247,7 +247,7 @@ describe("lean auto mode reliability", () => {
       const held = events.find((entry) => entry.event.tool_result?.call_id === "edit_plan").event.tool_result;
       expect(held.review_feedback).toBe(true);
       const resumed = await runFx(
-        ["ask", "--auto", "--quiet", "--json", "--resume-id", sessionId, "Summarize the previous result without tools."],
+        ["ask", "--auto", "--quiet", "--json", "--resume", sessionId, "Summarize the previous result without tools."],
         { cwd: root.workspace, env: gatewayEnv(root, gateway), timeoutMs: TIMEOUT },
       );
       expect(resumed.code).toBe(0);
@@ -1436,14 +1436,14 @@ describe("lean auto mode reliability", () => {
 
       for (const prompt of [olderPrompt, recentPrompt]) {
         const turn = await runFx(
-          ["ask", "--quiet", "--json", "--resume-id", sessionId, prompt],
+          ["ask", "--quiet", "--json", "--resume", sessionId, prompt],
           { cwd: root.workspace, env, timeoutMs: TIMEOUT },
         );
         expect(turn.code).toBe(0);
       }
 
       const current = await runFx(
-        ["ask", "--quiet", "--json", "--resume-id", sessionId, currentPrompt],
+        ["ask", "--quiet", "--json", "--resume", sessionId, currentPrompt],
         { cwd: root.workspace, env, timeoutMs: TIMEOUT },
       );
 
@@ -2203,7 +2203,7 @@ describe("lean auto mode reliability", () => {
         [
           "ask",
           "--json",
-          "--resume-id",
+          "--resume",
           sessionIds[0]!,
           "Run the exact saved action.",
         ],

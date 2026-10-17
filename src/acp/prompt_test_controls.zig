@@ -29,9 +29,9 @@ pub fn noteReapBeforeJoin() void {
 
 fn controls() ?Controls {
     return controlsFromPaths(
-        io_mod.getenv("FX_E2E_ACP_PROMPT_TERMINAL_READY"),
-        io_mod.getenv("FX_E2E_ACP_PROMPT_REAP_READY"),
-        io_mod.getenv("FX_E2E_ACP_PROMPT_RELEASE"),
+        io_mod.getenv("FX_TEST_ACP_PROMPT_TERMINAL_READY"),
+        io_mod.getenv("FX_TEST_ACP_PROMPT_REAP_READY"),
+        io_mod.getenv("FX_TEST_ACP_PROMPT_RELEASE"),
     );
 }
 

@@ -22,7 +22,7 @@ fn setRecvTimeout(conn: *std.http.Client.Connection) void {
 pub const cdn_base = "https://releases.fx.sh";
 
 pub fn resolveCdnBase() []const u8 {
-    if (io_mod.getenv("FX_E2E_UPGRADE_BASE_URL")) |url| {
+    if (io_mod.getenv("FX_TEST_UPGRADE_BASE_URL")) |url| {
         if (isLoopbackE2eUpgradeBase(url)) return url;
     }
     return cdn_base;

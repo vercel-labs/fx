@@ -18,8 +18,8 @@ pub const max_catalog_bytes: usize = 1024 * 1024;
 const fetch_timeout_ms: i64 = 30_000;
 const default_models_endpoint = "https://cli-chat-proxy.grok.com/v1/models";
 const default_modalities_endpoint = "https://api.x.ai/v1/language-models";
-const e2e_models_endpoint_env = "FX_E2E_XAI_GROK_MODELS_URL";
-const e2e_modalities_endpoint_env = "FX_E2E_XAI_GROK_MODALITIES_URL";
+const e2e_models_endpoint_env = "FX_TEST_XAI_GROK_MODELS_URL";
+const e2e_modalities_endpoint_env = "FX_TEST_XAI_GROK_MODALITIES_URL";
 
 pub const model_catalog_provider = model_catalog.Provider{
     .fetch_fn = fetchCatalogForProvider,
@@ -861,7 +861,7 @@ const CatalogEndpointEnvironment = struct {
         errdefer self.map.deinit();
         try self.map.put(e2e_models_endpoint_env, models_url);
         try self.map.put(e2e_modalities_endpoint_env, modalities_url);
-        try self.map.put("FX_E2E_GROK_CLIENT_VERSION", "1.0.6");
+        try self.map.put("FX_TEST_GROK_CLIENT_VERSION", "1.0.6");
         io_mod.setEnvironMap(&self.map);
         return self;
     }

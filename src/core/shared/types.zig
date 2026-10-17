@@ -2254,6 +2254,16 @@ pub const PermissionMode = enum {
             std.ascii.eqlIgnoreCase(raw, "yolo")) return .yolo;
         return null;
     }
+
+    /// The name fx saves and prints: `ask`, `auto`, or `full-access`.
+    /// `parse` still reads the older `yolo`.
+    pub fn label(self: PermissionMode) []const u8 {
+        return switch (self) {
+            .ask => "ask",
+            .auto => "auto",
+            .yolo => "full-access",
+        };
+    }
 };
 
 pub const RuleDecision = enum {

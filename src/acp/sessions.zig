@@ -2412,7 +2412,9 @@ pub fn writeModeConfigOption(
         try writeJsonStr(mode.description, w);
         // ACP leaves extra value fields to `_meta`.
         try w.writeAll(",\"_meta\":{\"fx\":{\"permissionMode\":");
-        try writeJsonStr(permissions.permissionModeLabel(mode.permission_mode), w);
+        // ACP clients may read this field, so it keeps the original names,
+        // including `yolo` for full access, which settings no longer save.
+        try writeJsonStr(@tagName(mode.permission_mode), w);
         try w.writeAll("}}}");
     }
     try w.writeAll("]}");

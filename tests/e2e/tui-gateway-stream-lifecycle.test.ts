@@ -128,7 +128,7 @@ for (const { cancelBeforeConsumption, lateFeedback } of [
   const options = { cwd: workspace, width: 120, height: 40, stderrPath: stderr, isolated: true, remainOnExit: true,
     env: { HOME: home, AI_GATEWAY_API_KEY: "fake-child-steering", FX_DISABLE_KEYCHAIN: "1",
       FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: MODEL, FX_PERMISSION_MODE: "full-access",
-      FX_GATEWAY_BASE_URL: host.baseUrl, FX_GATEWAY_CHAT_URL: host.chatUrl, FX_E2E_GATEWAY_CHAT_URL: host.chatUrl,
+      FX_GATEWAY_BASE_URL: host.baseUrl, FX_GATEWAY_CHAT_URL: host.chatUrl, FX_TEST_GATEWAY_CHAT_URL: host.chatUrl,
       FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "agent,worker,tool,subagent,permission,session,input,interrupt" } };
   session = await TmuxSession.create(options);
   let parentId = "";
@@ -1352,7 +1352,7 @@ async function runCanonicalLifecycleFixture(
       FX_AUTO_UPGRADE: "0",
       FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
       FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-      FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+      FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
       FX_MODEL: MODEL,
       FX_TRACE_LOG: tracePath,
       FX_TRACE_SCOPES: undefined,
@@ -1535,8 +1535,8 @@ async function launchRouteRecoveryTui(
       FX_PERMISSION_MODE: "auto",
       FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
       FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-      FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-      FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+      FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+      FX_TEST_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
       FX_MODEL: model,
     },
   });
@@ -1610,8 +1610,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         FX_PERMISSION_MODE: "auto",
         FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-        FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
         FX_MODEL: MODEL,
       },
     });
@@ -1720,8 +1720,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         FX_PERMISSION_MODE: "auto",
         FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-        FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
         FX_MODEL: undefined,
       },
     });
@@ -1747,7 +1747,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     // The first launch stored the configured model with Fast mode off; the
     // resume leg's flags must win over those stored preferences for this launch.
     session = await TmuxSession.create({
-      cmd: `${FX_BIN} --fast --effort low --model ${LAUNCH_MODEL} --resume-last`,
+      cmd: `${FX_BIN} --fast --effort low --model ${LAUNCH_MODEL} --resume last`,
       cwd: workspace,
       width: 72,
       height: 24,
@@ -1761,8 +1761,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         FX_PERMISSION_MODE: "auto",
         FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-        FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
         FX_MODEL: undefined,
       },
     });
@@ -1998,7 +1998,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "yolo",
           FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -2318,7 +2318,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "auto",
           FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
           FX_MODEL: MODEL,
         },
       });
@@ -2399,7 +2399,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "auto",
           FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
           FX_MODEL: MODEL,
         },
       });
@@ -2602,7 +2602,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         session = null;
         const resumedStderr = join(root!, "resumed-stderr.log");
         session = await TmuxSession.create({
-          cmd: `${FX_BIN} --resume-last`,
+          cmd: `${FX_BIN} --resume last`,
           cwd: join(root!, "workspace"),
           width: 100,
           height: 32,
@@ -2614,8 +2614,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
             FX_PERMISSION_MODE: "auto",
             FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
             FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-            FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-            FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
             FX_MODEL: MODEL,
           },
         });
@@ -2778,7 +2778,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       session = null;
       const resumedStderrPath = join(root!, "resumed-stderr.log");
       session = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: join(root!, "workspace"),
         width: 72,
         height: 24,
@@ -2792,8 +2792,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "auto",
           FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: directFastModel,
         },
       });
@@ -3132,7 +3132,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "auto",
           FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -3217,7 +3217,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: streamingGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: streamingGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: streamingGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: streamingGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -3288,7 +3288,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: heldGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: heldGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: heldGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: heldGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -3389,7 +3389,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -3468,7 +3468,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: heldGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: heldGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: heldGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: heldGateway.chatUrl,
           FX_MODEL: MODEL,
         },
       });
@@ -3549,7 +3549,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: heldGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: heldGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: heldGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: heldGateway.chatUrl,
           FX_MODEL: MODEL,
         },
       });
@@ -3643,7 +3643,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: splitGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: splitGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: splitGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: splitGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -3815,7 +3815,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "yolo",
           FX_GATEWAY_BASE_URL: recoveryGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: recoveryGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: recoveryGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: recoveryGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "agent,worker,input,tool,scroll,frame_schedule",
@@ -3916,7 +3916,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_SOUND: "0",
           FX_GATEWAY_BASE_URL: lateTailGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: lateTailGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: lateTailGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: lateTailGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "agent,gateway,stream,worker,input,prompt",
@@ -4042,7 +4042,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "yolo",
           FX_GATEWAY_BASE_URL: handoffGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: handoffGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: handoffGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: handoffGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt",
@@ -4140,7 +4140,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "yolo",
           FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt",
@@ -4287,8 +4287,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "yolo",
           FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${steeringGateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${steeringGateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: MODEL,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt",
@@ -4389,7 +4389,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "yolo",
           FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt",
@@ -4465,7 +4465,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "yolo",
           FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt,history",
@@ -4572,8 +4572,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${steeringGateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${steeringGateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -4708,7 +4708,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "auto",
           FX_GATEWAY_BASE_URL: heldGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: heldGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: heldGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: heldGateway.chatUrl,
           FX_MODEL: MODEL,
         },
       });
@@ -4804,7 +4804,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: heldGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: heldGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: heldGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: heldGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -4902,7 +4902,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: fakeGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: fakeGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: fakeGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: fakeGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -5161,7 +5161,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "auto",
           FX_GATEWAY_BASE_URL: scrollback_gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: scrollback_gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: scrollback_gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: scrollback_gateway.chatUrl,
           FX_MODEL: MODEL,
         },
       });
@@ -5226,7 +5226,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "auto",
           FX_GATEWAY_BASE_URL: phase_gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: phase_gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: phase_gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: phase_gateway.chatUrl,
           FX_MODEL: MODEL,
         },
       });
@@ -5338,7 +5338,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: tableGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: tableGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: tableGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: tableGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -5450,7 +5450,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
               FX_PERMISSION_MODE: "ask",
               FX_GATEWAY_BASE_URL: mcpGateway.baseUrl,
               FX_GATEWAY_CHAT_URL: mcpGateway.chatUrl,
-              FX_E2E_GATEWAY_CHAT_URL: mcpGateway.chatUrl,
+              FX_TEST_GATEWAY_CHAT_URL: mcpGateway.chatUrl,
               FX_MODEL: MODEL,
             },
           });
@@ -5556,7 +5556,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "ask",
           FX_GATEWAY_BASE_URL: mcpGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: mcpGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: mcpGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: mcpGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_SOUND: "0",
         },
@@ -5636,7 +5636,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "auto",
           FX_GATEWAY_BASE_URL: refreshGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: refreshGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: refreshGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: refreshGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
         },
@@ -5749,7 +5749,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         FX_PERMISSION_MODE: "auto",
         FX_GATEWAY_BASE_URL: unsupportedGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: unsupportedGateway.chatUrl,
-        FX_E2E_GATEWAY_CHAT_URL: unsupportedGateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: unsupportedGateway.chatUrl,
         FX_MODEL: MODEL,
         FX_TRACE_LOG: tracePath,
         FX_TRACE_SCOPES: "tool,core",
@@ -5825,7 +5825,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       session = null;
 
       session = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: workspace,
         width: 100,
         height: 30,
@@ -5900,7 +5900,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         FX_PERMISSION_MODE: "auto",
         FX_GATEWAY_BASE_URL: childGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: childGateway.chatUrl,
-        FX_E2E_GATEWAY_CHAT_URL: childGateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: childGateway.chatUrl,
         FX_MODEL: MODEL,
       };
       session = await TmuxSession.create({ cwd: workspace, env, stderrPath, width: 110, height: 35 });
@@ -6027,7 +6027,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         FX_PERMISSION_MODE: "auto",
         FX_GATEWAY_BASE_URL: rowGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: rowGateway.chatUrl,
-        FX_E2E_GATEWAY_CHAT_URL: rowGateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: rowGateway.chatUrl,
         FX_MODEL: MODEL,
       };
       session = await TmuxSession.create({ cwd: workspace, env, width: 110, height: 35, stderrPath });
@@ -6115,7 +6115,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         FX_PERMISSION_MODE: "auto",
         FX_GATEWAY_BASE_URL: rowGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: rowGateway.chatUrl,
-        FX_E2E_GATEWAY_CHAT_URL: rowGateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: rowGateway.chatUrl,
         FX_MODEL: MODEL,
       };
       session = await TmuxSession.create({ cwd: workspace, env, width: 110, height: 35, stderrPath });
@@ -6159,7 +6159,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         await session.sendText("/quit");
         expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
         await session.kill();
-        session = await TmuxSession.create({ cmd: `${FX_BIN} --resume-last`, cwd: workspace, env, width: 110, height: 35, stderrPath: join(root, "resumed-stderr.log") });
+        session = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: workspace, env, width: 110, height: 35, stderrPath: join(root, "resumed-stderr.log") });
         await session.waitForText(finalText, TIMEOUT);
         const resumed = await session.captureFullScrollback();
         expect(resumed).toContain("● 5 tool calls · 4 subagent · 1 read");
@@ -6254,7 +6254,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         FX_PERMISSION_MODE: "auto",
         FX_GATEWAY_BASE_URL: summaryGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: summaryGateway.chatUrl,
-        FX_E2E_GATEWAY_CHAT_URL: summaryGateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: summaryGateway.chatUrl,
         FX_MODEL: MODEL,
         FX_TRACE_LOG: tracePath,
         FX_TRACE_SCOPES: "tool",
@@ -6341,7 +6341,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       session = null;
 
       session = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: workspace,
         width: 120,
         height: 30,
@@ -6389,7 +6389,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "auto",
           FX_GATEWAY_BASE_URL: linkGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: linkGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: linkGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: linkGateway.chatUrl,
           FX_MODEL: MODEL,
         },
       });
@@ -6440,7 +6440,7 @@ test.skipIf(!tmuxAvailable())("command rows reclip to the live width while runni
         HOME: home, AI_GATEWAY_API_KEY: "fake-live-reclip", FX_DISABLE_KEYCHAIN: "1",
         FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: MODEL, FX_PERMISSION_MODE: "full-access",
         FX_GATEWAY_BASE_URL: host.baseUrl, FX_GATEWAY_CHAT_URL: host.chatUrl,
-        FX_E2E_GATEWAY_CHAT_URL: host.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: host.chatUrl,
       },
     });
     await session.waitForStableComposer(TIMEOUT);

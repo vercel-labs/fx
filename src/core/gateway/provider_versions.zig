@@ -89,12 +89,12 @@ fn cacheFile(provider: Provider) []const u8 {
 fn loadCache(_: ?*anyopaque, alloc: Allocator, provider: Provider) !?Cached {
     if (comptime host_target.is_wasm) return null;
     const home = io_mod.homeDir() orelse return null;
-    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{}) catch |err| {
+    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{}) catch |err| {
         if (err == error.FileNotFound) return null;
         return err;
     };
     defer home_dir.close(io_mod.getIo());
-    var profile_dir = home_dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{ .follow_symlinks = false }) catch |err| {
+    var profile_dir = home_dir.openDir(io_mod.getIo(), profile_paths.rootName(), .{ .follow_symlinks = false }) catch |err| {
         if (err == error.FileNotFound) return null;
         return err;
     };
@@ -134,9 +134,9 @@ fn saveCache(_: ?*anyopaque, alloc: Allocator, provider: Provider, cached: Cache
 }
 
 fn saveCacheAtHome(alloc: Allocator, provider: Provider, cached: Cached, home: []const u8) !void {
-    var home_dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true });
+    var home_dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{ .iterate = true });
     defer home_dir.close(io_mod.getIo());
-    var profile_dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(home_dir, profile_paths.root_dir_name);
+    var profile_dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(home_dir, profile_paths.rootName());
     defer profile_dir.close();
     var cache_dir = try io_mod.openOrCreateVerifiedPrivateDir(&profile_dir, cache_dir_name);
     defer cache_dir.close();

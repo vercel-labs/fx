@@ -58,8 +58,11 @@ pub const Host = struct {
     now_fn: *const fn (ctx: ?*anyopaque) i64,
     /// The I/O implementation for files, locks and the worker.
     io_fn: *const fn (ctx: ?*anyopaque) Io,
-    /// The user's home directory; the cache lives in `<home>/.fx`.
+    /// The folder that holds fx's folder: the user's home directory, or the
+    /// parent of `$FX_HOME`. The cache lives in `<home>/<fx_dir_name>`.
     home: []const u8,
+    /// The name of fx's folder inside `home`.
+    fx_dir_name: []const u8 = ".fx",
 };
 
 /// The sign-in `/usage` reads with. The bearer is borrowed only for the call
@@ -501,7 +504,7 @@ pub const Dashboard = struct {
     fn openFxDir(self: *Dashboard) ?Io.Dir {
         var home = self.openHome() orelse return null;
         defer home.close(self.io());
-        return home.openDir(self.io(), ".fx", .{}) catch null;
+        return home.openDir(self.io(), self.host.fx_dir_name, .{}) catch null;
     }
 
     /// `~/.fx`, created private when missing: `fx usage` with only an API
@@ -509,11 +512,11 @@ pub const Dashboard = struct {
     fn openOrCreateFxDir(self: *Dashboard) ?Io.Dir {
         var home = self.openHome() orelse return null;
         defer home.close(self.io());
-        home.createDir(self.io(), ".fx", .fromMode(0o700)) catch |err| switch (err) {
+        home.createDir(self.io(), self.host.fx_dir_name, .fromMode(0o700)) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return null,
         };
-        return home.openDir(self.io(), ".fx", .{}) catch null;
+        return home.openDir(self.io(), self.host.fx_dir_name, .{}) catch null;
     }
 
     fn maybeStartLocked(self: *Dashboard, trigger: policy.Trigger) bool {

@@ -2877,7 +2877,7 @@ const ProcessObserver = struct {
     fn statusFromTerm(
         term: std.process.Child.Term,
     ) command_contract.CommandStatus {
-        if (io_mod.getenv("FX_COMMAND_TEST_INDETERMINATE_AFTER_EXIT") != null) {
+        if (io_mod.getenv("FX_TEST_COMMAND_INDETERMINATE_AFTER_EXIT") != null) {
             debug_trace.logf(
                 "core",
                 "command termination became indeterminate reason=injected_after_exit",
@@ -3382,7 +3382,7 @@ fn collectSpawnedProcess(
     );
     wait_pending = false;
     var output_incomplete = collected_output.output_incomplete;
-    if (io_mod.getenv("FX_COMMAND_TEST_OUTPUT_INCOMPLETE_AFTER_EXIT") != null) {
+    if (io_mod.getenv("FX_TEST_COMMAND_OUTPUT_INCOMPLETE_AFTER_EXIT") != null) {
         recordOutputDrainFailure(
             &output_incomplete,
             "injected_after_exit",

@@ -55,8 +55,11 @@ jobs:
       - name: Check indexer boundary
         run: ./scripts/check-indexer-boundary.sh
 
+      - name: Check CLI shape
+        run: python3 -m scripts.check_cli_shape
+
       - name: Test CI and release scripts
-        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need -q
+        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need scripts.tests.test_check_cli_shape -q
 
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}

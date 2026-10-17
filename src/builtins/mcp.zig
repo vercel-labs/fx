@@ -5,6 +5,8 @@ const builtin_tools = @import("tools.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const command_provider_contract = @import("../core/mcp/command_provider.zig");
+const cli_flags = @import("../core/cli/cli_flags.zig");
+const builtin_commands = @import("commands.zig");
 const mcp_contract = @import("../core/mcp/mcp_contract.zig");
 const mcp_health = @import("../core/mcp/health.zig");
 const project_config = @import("../core/mcp/project_config.zig");
@@ -145,12 +147,17 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
         var tokens = std.mem.tokenizeAny(u8, trimmed[4..], " \t");
         const name = tokens.next() orelse
             return lineLiteral(alloc, "usage: /mcp auth <name> [--open]", false);
-        const confirmation = tokens.next();
-        if (tokens.next() != null or
-            (confirmation != null and !std.mem.eql(u8, confirmation.?, "--open")))
-        {
-            return lineLiteral(alloc, "usage: /mcp auth <name> [--open]", false);
-        }
+        // The words after the name are flags, read as the CLI reads them.
+        var flags_arena: std.heap.ArenaAllocator = .init(alloc);
+        defer flags_arena.deinit();
+        var flag_words: std.ArrayList([:0]const u8) = .empty;
+        while (tokens.next()) |token| try flag_words.append(flags_arena.allocator(), try flags_arena.allocator().dupeSentinel(u8, token, 0));
+        var open = false;
+        var parser: cli_flags.Parser = .init(&builtin_commands.mcp_auth_options, flag_words.items);
+        while (parser.next() catch return lineLiteral(alloc, "usage: /mcp auth <name> [--open]", false)) |item| switch (item) {
+            .positional => return lineLiteral(alloc, "usage: /mcp auth <name> [--open]", false),
+            .option => open = true,
+        };
         const validate = command_request.validate_authentication_server orelse
             return lineLiteral(
                 alloc,
@@ -164,7 +171,7 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
                 false,
             );
         };
-        if (confirmation == null) {
+        if (!open) {
             return lineParts(
                 alloc,
                 &.{ "Run /mcp auth ", name, " --open to confirm opening your browser." },
@@ -290,13 +297,14 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
     }
 
     if (std.mem.startsWith(u8, trimmed, "add ")) {
-        var tokens: std.ArrayList([]const u8) = .empty;
-        defer tokens.deinit(alloc);
-
+        // The shared parser reads arguments as the CLI receives them.
+        var words_arena: std.heap.ArenaAllocator = .init(alloc);
+        defer words_arena.deinit();
+        var words: std.ArrayList([:0]const u8) = .empty;
         var it = std.mem.tokenizeAny(u8, trimmed[4..], " \t");
-        while (it.next()) |token| try tokens.append(alloc, token);
+        while (it.next()) |token| try words.append(words_arena.allocator(), try words_arena.allocator().dupeSentinel(u8, token, 0));
 
-        const intent = command_provider_contract.parseAddIntent(tokens.items) catch |err| switch (err) {
+        const intent = command_provider_contract.parseAddIntent(words.items) catch |err| switch (err) {
             error.McpAddUsage => return lineLiteral(alloc, add_usage, false),
             else => return lineParts(
                 alloc,
@@ -2631,7 +2639,7 @@ test "MCP add intent rejects invalid server names" {
     for ([_][]const u8{ "", "bad/name", "bad name", "bad.name" }) |name| {
         try std.testing.expectError(
             error.McpInvalidServerName,
-            command_provider_contract.parseAddIntent(&.{ name, "node" }),
+            command_provider_contract.localIntent(name, "node", &.{}),
         );
     }
 }

@@ -1780,6 +1780,10 @@ pub const Grid = struct {
             }
             i += 1;
         }
+        if (!colors_enabled) {
+            self.current_style.fg = .default;
+            self.current_style.bg = .default;
+        }
     }
 
     fn resetSgrPresentation(self: *Grid) void {
@@ -3284,6 +3288,13 @@ fn emitSgrTransition(out: *std.Io.Writer, next: Style) !void {
     try emitColor(out, next.bg, .bg);
 }
 
+/// Whether SGR colors land on cells. The interactive session turns it off once
+/// at startup, before any other thread runs, when `NO_COLOR` is set.
+/// Cells then keep bold, dim, italic, underline, reverse, and strikethrough but
+/// never take a color, so every grid, and every diff between grids, agrees on
+/// colorless cells.
+pub var colors_enabled: bool = true;
+
 const ColorChannel = enum { fg, bg };
 
 fn emitColor(out: *std.Io.Writer, color: Color, channel: ColorChannel) !void {
@@ -3418,6 +3429,23 @@ fn expectWideCellInvariant(grid: Grid) !void {
             }
         }
     }
+}
+
+test "with colors off, cells keep emphasis and serialized rows carry no color" {
+    var g = try Grid.init(testing.allocator, 12, 1);
+    defer g.deinit();
+    colors_enabled = false;
+    defer colors_enabled = true;
+    try g.feed("\x1b[1;38;5;196;48;2;1;2;3mHot\x1b[0m");
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try g.rowStyledTextTrimmed(1, &out.writer);
+    const text = out.written();
+    try testing.expect(std.mem.find(u8, text, "Hot") != null);
+    try testing.expect(std.mem.find(u8, text, "\x1b[1m") != null);
+    try testing.expect(std.mem.find(u8, text, "38;") == null);
+    try testing.expect(std.mem.find(u8, text, "48;") == null);
 }
 
 test "plain writes land on the grid" {

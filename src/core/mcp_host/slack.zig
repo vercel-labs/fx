@@ -23,9 +23,9 @@ pub fn isSlack(url: ?[]const u8) bool {
     return std.mem.eql(u8, u, "https://mcp.slack.com") or std.mem.startsWith(u8, u, "https://mcp.slack.com/");
 }
 
-/// fx.sh, or for tests a bridge on 127.0.0.1 (`FX_E2E_SLACK_ORIGIN`), as v1 takes it.
+/// fx.sh, or for tests a bridge on 127.0.0.1 (`FX_TEST_SLACK_ORIGIN`), as v1 takes it.
 pub fn origin() []const u8 {
-    const configured = io_mod.getenv("FX_E2E_SLACK_ORIGIN") orelse return "https://fx.sh";
+    const configured = io_mod.getenv("FX_TEST_SLACK_ORIGIN") orelse return "https://fx.sh";
     return if (loopbackOrigin(configured)) configured else "https://fx.sh";
 }
 

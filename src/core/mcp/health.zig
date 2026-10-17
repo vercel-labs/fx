@@ -343,6 +343,75 @@ pub fn render(alloc: Allocator, snapshot: Snapshot) ![]u8 {
     return out.toOwnedSlice();
 }
 
+/// Renders the same snapshot as `render` as one JSON object followed by a
+/// newline, for `fx mcp list --json`. The caller owns the returned bytes.
+pub fn renderJson(alloc: Allocator, snapshot: Snapshot) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    var jw: std.json.Stringify = .{ .writer = &out.writer };
+    try jw.beginObject();
+    try jw.objectField("kind");
+    try jw.write("mcp_list");
+    try jw.objectField("servers");
+    try jw.beginArray();
+    for (snapshot.servers) |server| {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(server.configured_name);
+        try jw.objectField("source");
+        try jw.write(@tagName(server.source));
+        try jw.objectField("scope");
+        try jw.write(@tagName(server.scope));
+        try jw.objectField("required");
+        try jw.write(server.required);
+        try jw.objectField("transport");
+        try jw.write(@tagName(server.transport));
+        try jw.objectField("state");
+        try jw.write(@tagName(server.connection));
+        try jw.objectField("auth");
+        try jw.write(@tagName(server.authentication));
+        try jw.objectField("status");
+        try jw.write(@tagName(classify(server.connection, server.authentication, false)));
+        try jw.objectField("admission");
+        try jw.write(if (server.workspace_admission) |admission| @tagName(admission) else null);
+        try jw.objectField("negotiated_name");
+        try jw.write(server.negotiated_name);
+        try jw.objectField("negotiated_version");
+        try jw.write(server.negotiated_version);
+        try jw.objectField("protocol_version");
+        try jw.write(server.protocol_version);
+        try jw.objectField("tools");
+        try jw.write(server.counts.tools);
+        try jw.objectField("resources");
+        try jw.write(server.counts.resources);
+        try jw.objectField("resource_templates");
+        try jw.write(server.counts.resource_templates);
+        try jw.objectField("prompts");
+        try jw.write(server.counts.prompts);
+        try jw.objectField("cache");
+        try jw.write(@tagName(server.cache_freshness));
+        try jw.objectField("subscription");
+        try jw.write(@tagName(server.subscription));
+        try jw.objectField("retry_attempt");
+        try jw.write(server.retry_attempt);
+        try jw.objectField("retry_in_ms");
+        try jw.write(server.retry_in_ms);
+        try jw.objectField("discovery");
+        try jw.write(if (server.last_successful_discovery_ms == null) "pending" else "completed");
+        try jw.objectField("error");
+        try jw.write(server.failure);
+        try jw.endObject();
+    }
+    try jw.endArray();
+    try jw.objectField("configuration_issues");
+    try jw.beginArray();
+    for (snapshot.configuration_issues) |issue| try jw.write(issue.message);
+    try jw.endArray();
+    try jw.endObject();
+    try out.writer.writeByte('\n');
+    return out.toOwnedSlice();
+}
+
 pub fn renderSummary(alloc: Allocator, snapshot: Snapshot) ![]u8 {
     if (snapshot.servers.len == 0 and snapshot.configuration_issues.len == 0) {
         return alloc.dupe(

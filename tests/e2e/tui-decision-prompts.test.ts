@@ -700,13 +700,47 @@ function hasSelection(pane: string, ordinal: number, selectedLabel: string) {
   return visibleText(pane).includes(visibleText(`› ${ordinal}. ${selectedLabel}`));
 }
 
-// The selected option is the only row carrying the white (255) style; match
-// the ordinal/label on that row after stripping the interleaved escapes.
+// The selected option is bold. Sessions here run with NO_COLOR, which keeps
+// emphasis but drops color, so bold is the cue a user can still see. tmux
+// carries SGR state from row to row, so bold is tracked across the whole pane
+// and checked at the first visible character of the selected label.
+function boldAfterSgr(bold: boolean, params: string): boolean {
+  const values = params.split(";");
+  for (let i = 0; i < values.length; i++) {
+    const value = values[i] === "" ? "0" : values[i];
+    if (value === "38" || value === "48" || value === "58") {
+      i += values[i + 1] === "2" ? 4 : 2;
+    } else if (value === "0" || value === "22") {
+      bold = false;
+    } else if (value === "1") {
+      bold = true;
+    }
+  }
+  return bold;
+}
+
 function hasQuestionSelection(paneEscapes: string, ordinal: number, selectedLabel: string) {
-  const needle = visibleText(`${ordinal}) ${selectedLabel}`);
-  return paneEscapes.split(/\r?\n/).some((line) =>
-    line.includes("38;5;255") && visibleText(stripAnsi(line)).includes(needle)
-  );
+  const needle = Array.from(visibleText(`${ordinal}) ${selectedLabel}`));
+  let bold = false;
+  for (const line of paneEscapes.split(/\r?\n/)) {
+    const chars: string[] = [];
+    const flags: boolean[] = [];
+    for (const part of line.split(/(\x1b\[[0-9;]*m)/)) {
+      const sgr = /^\x1b\[([0-9;]*)m$/.exec(part);
+      if (sgr) {
+        bold = boldAfterSgr(bold, sgr[1]!);
+        continue;
+      }
+      for (const ch of Array.from(visibleText(stripAnsi(part)))) {
+        chars.push(ch);
+        flags.push(bold);
+      }
+    }
+    for (let at = 0; at + needle.length <= chars.length; at++) {
+      if (flags[at] && needle.every((ch, k) => chars[at + k] === ch)) return true;
+    }
+  }
+  return false;
 }
 
 function hasApprovalSelection(pane: string, ordinal: number, selectedLabel: string) {

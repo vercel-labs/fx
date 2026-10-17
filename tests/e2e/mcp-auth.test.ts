@@ -929,7 +929,7 @@ describe("MCP remote authentication lifecycle", () => {
         other, slack: { type: "http", url: auth.url, operation_timeout_ms: 1234 },
       } }));
       const origin = new URL(auth.url).origin;
-      const env = { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: origin, AI_GATEWAY_API_KEY: undefined };
+      const env = { ...baseEnv(root), FX_TEST_SLACK_ORIGIN: origin, AI_GATEWAY_API_KEY: undefined };
       const authentication = runFx(["mcp", "add", "slack"], { cwd: root.workspace, env, timeoutMs: 15_000 });
       expect(await waitForFileText(root.openLog, "/api/slack/auth?", 5_000)).toBe(true);
       const start = new URL(readFileSync(root.openLog, "utf8").trim());
@@ -990,7 +990,7 @@ describe("MCP remote authentication lifecycle", () => {
       const original = JSON.stringify({ mcp: { slack: { url: auth.url, ...custom } } });
       writeFileSync(profilePath, original);
       const result = await runFx(["mcp", "add", "slack"], {
-        cwd: root.workspace, env: { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: new URL(auth.url).origin },
+        cwd: root.workspace, env: { ...baseEnv(root), FX_TEST_SLACK_ORIGIN: new URL(auth.url).origin },
       });
       expect(result.code).not.toBe(0);
       expect(result.stderr).toContain("Slack has custom configuration");
@@ -1014,7 +1014,7 @@ describe("MCP remote authentication lifecycle", () => {
       ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
       tui = await TmuxSession.create({
         isolated: true, cwd: root.workspace, width: 120, height: 34,
-        env: { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: origin, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+        env: { ...baseEnv(root), FX_TEST_SLACK_ORIGIN: origin, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
       });
       await tui.waitForComposer(15_000);
       if (entry === "menu") {
@@ -1068,7 +1068,7 @@ describe("MCP remote authentication lifecycle", () => {
       if (scenario === "no-scopes") delete profile.mcp.fixture.oauth.scopes;
       if (scenario === "extra-scopes") profile.mcp.fixture.oauth.scopes = ["tools.read", "im:history", "search:read.private"];
       writeFileSync(profilePath, JSON.stringify(profile));
-      const env = { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: bridgeOrigin, AI_GATEWAY_API_KEY: undefined };
+      const env = { ...baseEnv(root), FX_TEST_SLACK_ORIGIN: bridgeOrigin, AI_GATEWAY_API_KEY: undefined };
       const authentication = runFx(["mcp", "auth", "fixture"], { cwd: root.workspace, env, timeoutMs: 15_000 });
       expect(await waitForFileText(root.openLog, "/api/slack/auth?", 5_000)).toBe(true);
       const start = new URL(readFileSync(root.openLog, "utf8").trim());
@@ -1126,7 +1126,7 @@ describe("MCP remote authentication lifecycle", () => {
     auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID, resourceAtOrigin: false });
     const root = createRoot(auth, true, "http", auth.url, false, FX_SLACK_CLIENT_ID);
     const result = await runFx(["mcp", "auth", "fixture"], {
-      cwd: root.workspace, env: { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: new URL(auth.url).origin }, timeoutMs: 15_000,
+      cwd: root.workspace, env: { ...baseEnv(root), FX_TEST_SLACK_ORIGIN: new URL(auth.url).origin }, timeoutMs: 15_000,
     });
     expect(result.code).not.toBe(0);
     expect(result.stderr).toContain("InvalidSlackAuthorizationResource");
@@ -1146,7 +1146,7 @@ describe("MCP remote authentication lifecycle", () => {
       profile.mcp.fixture.oauth.scopes = scenario === "empty" ? [] :
         scenario === "unrelated-extra" ? ["channels:read", "im:history"] : ["channels:read"];
       writeFileSync(profilePath, JSON.stringify(profile));
-      const env = { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: new URL(auth.url).origin, AI_GATEWAY_API_KEY: undefined };
+      const env = { ...baseEnv(root), FX_TEST_SLACK_ORIGIN: new URL(auth.url).origin, AI_GATEWAY_API_KEY: undefined };
       if (scenario === "empty") {
         const added = await runFx(["mcp", "add", "auxiliary", "echo"], { cwd: root.workspace, env });
         expect(added.code).toBe(0);
@@ -1188,7 +1188,7 @@ describe("MCP remote authentication lifecycle", () => {
       auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID, slackBridgeScopes: scopes });
       const root = createRoot(auth, true, "http", auth.url, false, FX_SLACK_CLIENT_ID);
       const result = await runFx(["mcp", "auth", "fixture"], {
-        cwd: root.workspace, env: { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: new URL(auth.url).origin }, timeoutMs: 15_000,
+        cwd: root.workspace, env: { ...baseEnv(root), FX_TEST_SLACK_ORIGIN: new URL(auth.url).origin }, timeoutMs: 15_000,
       });
       expect(result.code).not.toBe(0);
       expect(result.stderr).toContain("InvalidSlackBridgeConfiguration");
@@ -1203,7 +1203,7 @@ describe("MCP remote authentication lifecycle", () => {
     auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID, slackBridgeStatus: status === 503 ? status : undefined });
     const root = createRoot(auth);
     const result = await runFx(["mcp", "auth", "fixture"], {
-      cwd: root.workspace, env: { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: new URL(auth.url).origin }, timeoutMs: 15_000,
+      cwd: root.workspace, env: { ...baseEnv(root), FX_TEST_SLACK_ORIGIN: new URL(auth.url).origin }, timeoutMs: 15_000,
     });
     expect(result.code).toBe(0);
     expect(result.stderr).toBe("");
@@ -1223,7 +1223,7 @@ describe("MCP remote authentication lifecycle", () => {
     });
     const root = createRoot(auth, true, "http", auth.url, false, FX_SLACK_CLIENT_ID);
     const result = await runFx(["mcp", "auth", "fixture"], {
-      cwd: root.workspace, env: { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: new URL(auth.url).origin }, timeoutMs: 15_000,
+      cwd: root.workspace, env: { ...baseEnv(root), FX_TEST_SLACK_ORIGIN: new URL(auth.url).origin }, timeoutMs: 15_000,
     });
     expect(result.code).not.toBe(0);
     expect(result.stderr).toContain(scenario === "unavailable" ? "SlackBridgeUnavailable" : "InvalidSlackBridgeConfiguration");
@@ -1246,7 +1246,7 @@ describe("MCP remote authentication lifecycle", () => {
     gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     tui = await TmuxSession.create({
       isolated: true, cwd: root.workspace, width: 120, height: 34,
-      env: { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: bridgeOrigin, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+      env: { ...baseEnv(root), FX_TEST_SLACK_ORIGIN: bridgeOrigin, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
     });
     await tui.waitForComposer(15_000);
     await tui.sendText("/mcp auth fixture --open");
@@ -1280,7 +1280,7 @@ describe("MCP remote authentication lifecycle", () => {
     gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     tui = await TmuxSession.create({
       isolated: true, cwd: root.workspace, width: 120, height: 34,
-      env: { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: new URL(auth.url).origin, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+      env: { ...baseEnv(root), FX_TEST_SLACK_ORIGIN: new URL(auth.url).origin, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
     });
     await tui.waitForComposer(15_000);
     await tui.sendText("/mcp auth fixture --open");
@@ -1985,7 +1985,7 @@ describe("MCP remote authentication lifecycle", () => {
           ...baseEnv(root),
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_MCP_AUTH_AUTOMATE: "1",
+          FX_TEST_MCP_AUTH_AUTOMATE: "1",
         },
         timeoutMs: 25_000,
       },
@@ -2334,7 +2334,7 @@ describe("MCP remote authentication lifecycle", () => {
           cwd: root.workspace,
           env: {
             ...baseEnv(root),
-            FX_E2E_MCP_AUTH_AUTOMATE: "1",
+            FX_TEST_MCP_AUTH_AUTOMATE: "1",
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
             FX_GATEWAY_CHAT_URL: gateway.chatUrl,
           },
@@ -2382,7 +2382,7 @@ describe("MCP remote authentication lifecycle", () => {
         cwd: root.workspace,
         env: {
           ...baseEnv(root),
-          FX_E2E_MCP_AUTH_AUTOMATE: "1",
+          FX_TEST_MCP_AUTH_AUTOMATE: "1",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
         },
@@ -3301,7 +3301,7 @@ describe("MCP remote authentication lifecycle", () => {
             env: {
               ...process.env,
               ...baseEnv(root),
-              FX_E2E_MCP_AUTH_AUTOMATE: "1",
+              FX_TEST_MCP_AUTH_AUTOMATE: "1",
             },
             stdout: "pipe",
             stderr: "pipe",
@@ -3395,7 +3395,7 @@ describe("MCP remote authentication lifecycle", () => {
             ...baseEnv(root),
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
             FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            FX_E2E_MCP_AUTH_AUTOMATE: "1",
+            FX_TEST_MCP_AUTH_AUTOMATE: "1",
           },
           timeoutMs: 20_000,
         },
@@ -4438,7 +4438,7 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
     auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID });
     const root = createRoot(auth, true, "http", auth.url, false, FX_SLACK_CLIENT_ID);
     const bridgeOrigin = new URL(auth.url).origin;
-    const env = { ...v2Env(root), FX_E2E_SLACK_ORIGIN: bridgeOrigin };
+    const env = { ...v2Env(root), FX_TEST_SLACK_ORIGIN: bridgeOrigin };
     const login = runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
     // The browser opens fx.sh's start, which goes on to Slack's page.
     expect(await waitForFileText(root.openLog, "/api/slack/auth?", 10_000)).toBe(true);

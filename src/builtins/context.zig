@@ -5,6 +5,7 @@ const host = @import("../core/hosts/host.zig");
 const io_mod = @import("../core/shared/io.zig");
 const model_context_encoding = @import("../core/shared/model_context_encoding.zig");
 const pathing = @import("../core/workspace/pathing.zig");
+const profile_paths = @import("../core/shared/profile_paths.zig");
 const session_runtime = @import("../core/session/session.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 const types = @import("../core/shared/types.zig");
@@ -328,7 +329,7 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
                     .host => home,
                 };
                 if (canonical_home) |home_root| {
-                    global_source_path = try std.Io.Dir.path.join(arena, &.{ home_root, ".fx", "AGENTS.md" });
+                    global_source_path = try profile_paths.rootPath(arena, home_root, &.{"AGENTS.md"});
                     global_rule = try loadRuleForSelection(arena, &scratch, files, global_source_path.?, options.context_limits.project_instruction_file_bytes);
                     if (pathing.pathInside(home_root, options.workspace_root)) {
                         if (options.bounded_reconstruction) {

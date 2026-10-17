@@ -47,14 +47,14 @@ function baseEnv(root: FixtureRoot, gateway: { baseUrl: string; chatUrl: string 
     FX_E2E_DISABLE_DOTENV: "1",
     FX_AUTO_UPGRADE: "0",
     FX_SOUND: "0",
-    FX_SKIP_ONBOARDING: "1",
+    FX_TEST_SKIP_ONBOARDING: "1",
     FX_MODEL: MAIN_MODEL,
     FX_PERMISSION_MODE: "full-access",
     FX_MAX_AGENT_STEPS: "2",
     FX_GATEWAY_BASE_URL: gateway.baseUrl,
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
   };
 }
 
@@ -289,7 +289,7 @@ test.skipIf(SKIP_TMUX)("tui generates a title after an upgrade relaunch resumes 
       env: {
         ...baseEnv(root, gateway),
         FX_AUTO_UPGRADE: "1",
-        FX_E2E_UPGRADE_BASE_URL: release.baseUrl,
+        FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
       },
     });
     await tui.waitForStableComposer(15000);

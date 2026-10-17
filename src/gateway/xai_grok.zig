@@ -15,7 +15,7 @@ const Allocator = std.mem.Allocator;
 const endpoint = "https://cli-chat-proxy.grok.com/v1/responses";
 // The proxy gates this as Grok wire compatibility; fx identifies itself separately below.
 const version_lookup = @import("provider_versions.zig");
-const e2e_endpoint_env = "FX_E2E_XAI_GROK_RESPONSES_URL";
+const e2e_endpoint_env = "FX_TEST_XAI_GROK_RESPONSES_URL";
 const max_error_body_bytes: usize = 256 * 1024;
 const max_sse_line_bytes: usize = 1024 * 1024;
 const max_sse_aggregate_bytes: usize = 64 * 1024 * 1024;
@@ -867,7 +867,7 @@ const XaiTestEnvironment = struct {
         };
         errdefer self.map.deinit();
         try self.map.put(e2e_endpoint_env, responses_url);
-        try self.map.put("FX_E2E_GROK_CLIENT_VERSION", "1.0.6");
+        try self.map.put("FX_TEST_GROK_CLIENT_VERSION", "1.0.6");
         io_mod.setEnvironMap(&self.map);
         return self;
     }

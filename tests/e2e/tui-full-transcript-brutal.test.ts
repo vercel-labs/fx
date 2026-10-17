@@ -1207,7 +1207,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
     if (config.resumeCycles > 0) {
       resumedGateway = startFakeGateway([]);
       session = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: realpathSync(paths.workspace),
         env: {
           ...gatewayEnv(paths.home, resumedGateway),

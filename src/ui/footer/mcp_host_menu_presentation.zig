@@ -3,6 +3,7 @@
 //! The logic is `core/mcp_host/menu.zig`; this only turns it into rows.
 
 const std = @import("std");
+const profile_paths = @import("../../core/shared/profile_paths.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const menu = @import("../../core/mcp_host/menu.zig");
 const verbs = @import("../../core/mcp_host/verbs.zig");
@@ -28,8 +29,8 @@ pub const Projection = struct {
     notes: usize = 0,
     /// While the open server's sign-in waits for the browser, its address.
     sign_in_url: ?[]const u8 = null,
-    /// The two config files, as shown.
-    profile_file: []const u8 = "~/.fx/mcp.json",
+    /// The project config file, as shown. The profile file is named by
+    /// `profile_paths.displayText`.
     project_file: []const u8 = ".mcp.json",
 
     pub fn active(p: Projection) bool {
@@ -62,7 +63,7 @@ pub const Projection = struct {
     }
 
     fn fileOf(p: Projection, r: menu.Row) []const u8 {
-        return if (r.status.source == .workspace) p.project_file else p.profile_file;
+        return if (r.status.source == .workspace) p.project_file else profile_paths.displayText("~/.fx/mcp.json");
     }
 };
 

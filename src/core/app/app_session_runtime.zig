@@ -411,7 +411,8 @@ test "resume handoff policy requires requested durable non-pristine state" {
 /// Owns `session_id`; callers must release it with `deinit`.
 pub const ResumeHandoff = struct {
     session_id: []u8,
-    /// The session is in `v2`: resuming it needs `--sessions-v2`.
+    /// The session is in `v2` and `experimental.sessions_v2` is off: resuming
+    /// it needs `--sessions-v2`.
     sessions_v2: bool = false,
 
     pub fn deinit(self: *ResumeHandoff, alloc: Allocator) void {
@@ -1342,9 +1343,13 @@ pub const Persistence = struct {
     pending_live_session_policy: ?BackgroundSessionPolicy = null,
     pending_live_session_wait: ?LiveSessionWait = null,
     shutdown_failure: ?anyerror = null,
-    /// `--sessions-v2` for this process; with it (or FX_SESSIONS_V2=1) the
-    /// session lives in `v2` and `store` and `writable` stay null (D26).
+    /// `--sessions-v2` or `experimental.sessions_v2` for this process; with
+    /// it (or FX_SESSIONS_V2=1) the session lives in `v2` and `store` and
+    /// `writable` stay null (D26).
     sessions_v2: bool = false,
+    /// `experimental.sessions_v2` is on, so a plain `fx --resume` reopens a v2
+    /// session and resume hints don't name `--sessions-v2`.
+    sessions_v2_setting: bool = false,
     v2_store: ?session_adapter.Store = null,
     v2: ?*session_adapter.Session = null,
 
@@ -1352,7 +1357,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (@typeInfo(Persistence).@"struct".field_names.len != 31) {
+            if (@typeInfo(Persistence).@"struct".field_names.len != 32) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1386,6 +1391,7 @@ pub const Persistence = struct {
         storage.pending_live_session_wait = null;
         storage.shutdown_failure = null;
         storage.sessions_v2 = false;
+        storage.sessions_v2_setting = false;
         storage.v2_store = null;
         storage.v2 = null;
     }
@@ -2345,7 +2351,7 @@ pub fn Runtime(comptime App: type) type {
             const v2 = app.session_persistence.v2 orelse return app.writeDomainNotice(.{
                 .topic = "session",
                 .tone = .warning,
-                .body = "forking needs --sessions-v2",
+                .body = "forking needs experimental.sessions_v2: fx config set experimental.sessions_v2 true",
             }, true);
             if (app.stream.active) return app.writeDomainNotice(.{
                 .topic = "session",
@@ -4769,8 +4775,12 @@ pub fn Runtime(comptime App: type) type {
                         .body = display.title,
                     });
                     // A plain line, so the command copies as it is. Forks
-                    // exist only on v2, so the command always names it.
-                    const line = try app.alloc.print("original session fx --sessions-v2 --resume {s}\n", .{source_id});
+                    // exist only on v2, so the command names --sessions-v2
+                    // unless the experimental.sessions_v2 setting turns v2 on.
+                    const line = if (app.session_persistence.sessions_v2_setting)
+                        try app.alloc.print("original session fx --resume {s}\n", .{source_id})
+                    else
+                        try app.alloc.print("original session fx --sessions-v2 --resume {s}\n", .{source_id});
                     defer app.alloc.free(line);
                     try sink.appendRaw(line);
                 },
@@ -5753,7 +5763,7 @@ pub fn Runtime(comptime App: type) type {
                     debug_trace.logf("session", "resume handoff unavailable session={s} err={s}", .{ v2.id(), @errorName(err) });
                     break :blk null;
                 };
-                break :blk .{ .session_id = session_id, .sessions_v2 = true };
+                break :blk .{ .session_id = session_id, .sessions_v2 = !app.session_persistence.sessions_v2_setting };
             } else null;
             if (comptime @hasDecl(@TypeOf(app.session), "clearWebFetchArtifacts")) {
                 app.session.clearWebFetchArtifacts();
@@ -7618,7 +7628,7 @@ test "/fork needs v2, waits for the turn and a prompt, then opens on the newest 
         try Runtime(TestApp).initializePersistence(&app, true);
         try Runtime(TestApp).beginFreshPersistedSession(&app);
         try Runtime(TestApp).openForkMenu(&app);
-        try std.testing.expectEqualStrings("! session: forking needs --sessions-v2", app.notices.last().?);
+        try std.testing.expectEqualStrings("! session: forking needs experimental.sessions_v2: fx config set experimental.sessions_v2 true", app.notices.last().?);
         try std.testing.expect(!app.session_persistence.fork_menu.active());
     }
 
