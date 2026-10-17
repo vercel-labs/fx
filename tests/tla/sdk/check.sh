@@ -158,7 +158,11 @@ done
 # KeepAll breaks WindowHeld: a core that keeps every image outgrows the
 # window an open can stage. NeedAll breaks FailsOnlyOnLossInWindow: an open
 # that stages every named image fails on one the window had dropped.
-for pair in SendBeforeStore:NoDanglingRef NameUnstored:NoDanglingRef DropMissing:OpenExact RetryLands:NoDanglingRef KeepAll:WindowHeld NeedAll:FailsOnlyOnLossInWindow; do
+# ToolBeforeStore breaks NoDanglingRef: a tool result handed to the core
+# while its image write is in flight leaves a record naming an image the
+# store does not hold. InlineUncounted breaks WindowBound: a window that
+# never counts a tool image the store refused holds more than Window images.
+for pair in SendBeforeStore:NoDanglingRef NameUnstored:NoDanglingRef DropMissing:OpenExact RetryLands:NoDanglingRef KeepAll:WindowHeld NeedAll:FailsOnlyOnLossInWindow ToolBeforeStore:NoDanglingRef InlineUncounted:WindowBound; do
     witness="${pair%%:*}" invariant="${pair#*:}"
     if "$java" -cp "$jar" tlc2.TLC -workers auto -cleanup -metadir "$work/images-$witness" \
         -config "ImageStore-$witness.cfg" ImageStore.tla 2>&1 | grep -q -F "Invariant $invariant is violated"; then

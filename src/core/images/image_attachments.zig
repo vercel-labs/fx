@@ -860,6 +860,31 @@ pub fn attachmentEncodedBytes(attachment: types.ImageAttachment) ?usize {
 pub fn withholdDroppedImages(arena: std.mem.Allocator, messages: []const types.ChatMessage) ![]const types.ChatMessage {
     var result: ?[]types.ChatMessage = null;
     for (messages, 0..) |message, index| {
+        if (message.tool_result_memory) |memory| {
+            var dropped_tools: usize = 0;
+            for (memory.tool_images) |image| {
+                if (image.droppedFromSession()) dropped_tools += 1;
+            }
+            if (dropped_tools > 0) {
+                const projected = result orelse try arena.dupe(types.ChatMessage, messages);
+                result = projected;
+                const kept = try arena.alloc(types.ToolImage, memory.tool_images.len - dropped_tools);
+                var next: usize = 0;
+                for (memory.tool_images) |image| {
+                    if (image.droppedFromSession()) continue;
+                    kept[next] = image;
+                    next += 1;
+                }
+                var withheld = memory;
+                withheld.tool_images = kept;
+                projected[index].tool_result_memory = withheld;
+                const notice = if (dropped_tools == 1)
+                    "[1 image from this result is no longer in this session, which keeps only its newest images.]\n"
+                else
+                    try arena.print("[{d} images from this result are no longer in this session, which keeps only its newest images.]\n", .{dropped_tools});
+                projected[index].content = try std.mem.concat(arena, u8, &.{ notice, message.content orelse "" });
+            }
+        }
         var dropped: usize = 0;
         for (message.images) |image| {
             if (image.droppedFromSession()) dropped += 1;
@@ -879,7 +904,7 @@ pub fn withholdDroppedImages(arena: std.mem.Allocator, messages: []const types.C
             }
         }
         projected[index].images = kept;
-        projected[index].content = try std.mem.concat(arena, u8, &.{ notice.written(), message.content orelse "" });
+        projected[index].content = try std.mem.concat(arena, u8, &.{ notice.written(), projected[index].content orelse "" });
     }
     return result orelse messages;
 }
@@ -3114,6 +3139,28 @@ test "requests leave out images the session dropped, each with a note" {
     // A request without dropped images passes through untouched.
     const kept = [_]types.ChatMessage{.{ .role = .user, .content = "[Image #2]", .images = images[1..] }};
     try std.testing.expect((try withholdDroppedImages(arena, &kept)).ptr == (&kept).ptr);
+}
+
+test "requests leave out tool images the session dropped, with one note per result" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const name = text_utils.repeat("b", 64)[0..64].*;
+    const tool_images = [_]types.ToolImage{
+        .{ .data = @constCast(&[_]u8{}), .mime_type = @constCast("image/png"), .name = name },
+        .{ .data = @constCast("aGVsbG8="), .mime_type = @constCast("image/png"), .name = name },
+        .{ .data = @constCast(&[_]u8{}), .mime_type = @constCast("image/png"), .name = name },
+    };
+    const messages = [_]types.ChatMessage{
+        .{ .role = .tool, .content = "took it", .tool_call_id = "call-1", .tool_name = "screenshot", .tool_result_memory = .{ .tool_images = &tool_images } },
+    };
+    const projected = try withholdDroppedImages(arena, &messages);
+    const memory = projected[0].tool_result_memory.?;
+    try std.testing.expectEqual(@as(usize, 1), memory.tool_images.len);
+    try std.testing.expectEqualStrings("aGVsbG8=", memory.tool_images[0].data);
+    try std.testing.expectEqualStrings("[2 images from this result are no longer in this session, which keeps only its newest images.]\ntook it", projected[0].content.?);
+    // The session's own messages keep their images.
+    try std.testing.expectEqual(@as(usize, 3), messages[0].tool_result_memory.?.tool_images.len);
 }
 
 test "requests leave out attachments over the model pixel limit and name their saved file" {

@@ -5,6 +5,7 @@
 //   node --experimental-wasm-jspi sdk/tests/test-durable.mjs [memory|local] [native|wasm]
 import { strict as assert } from "node:assert";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -61,6 +62,8 @@ const crashSteer = (kind) => (kind === "image"
   ? [{ type: "text", text: "use lookup with this" }, { type: "image", data: onePixelPng, mimeType: "image/png" }]
   : "use lookup");
 const resumeNotice = "Resuming from unexpected session interruption.";
+// The user message the gateway adds after a tool result's images.
+const toolImageFollowUp = "Attached image(s) from the tool result.";
 
 const textOf = (message) => typeof message.content === "string"
   ? message.content
@@ -81,7 +84,7 @@ const answer = (text) => [{ type: "text-delta", id: "answer", delta: text }, fin
 // lookup call's input a little at a time for a few seconds; anything else is
 // echoed.
 function framesFor(prompt) {
-  const users = userTexts(prompt).filter((text) => text !== resumeNotice);
+  const users = userTexts(prompt).filter((text) => text !== resumeNotice && text !== toolImageFollowUp);
   const text = users.at(-1) ?? "";
   const results = toolResults(prompt);
   const turnResults = results.filter((part) => String(part.toolCallId).startsWith(`call-${users.length}-`));
@@ -1923,6 +1926,81 @@ test("a durable session saves each image once, and a new agent sends it again", 
     .filter((part) => part.type === "file");
   assert.deepEqual(files.map((part) => part.data?.data), [base64, base64]);
   await second.close();
+});
+
+// A PNG of 300 KB with filler after its header, so its bytes are easy to
+// look for, as base64.
+const shotBytes = (() => {
+  const header = Uint8Array.from(atob(onePixelPng), (char) => char.charCodeAt(0));
+  const bytes = new Uint8Array(300_000);
+  bytes.set(header);
+  for (let index = header.length; index < bytes.length; index += 1) bytes[index] = (index * 17 + 3) & 255;
+  return bytes;
+})();
+const shotBase64 = Buffer.from(shotBytes).toString("base64");
+const shotName = createHash("sha256").update(shotBytes).digest("hex");
+const holdsShot = (data) => data.includes(Buffer.from(shotBase64.slice(1000, 1100))) || data.includes(Buffer.from(shotBytes.subarray(1000, 1064)));
+const entryData = (entry) => (entry.k === "record" || entry.k === "checkpoint" ? Buffer.from(entry.data, "base64") : Buffer.from(JSON.stringify(entry)));
+// Returns the screenshot as a typed result.
+const screenshot = {
+  name: "screenshot",
+  description: "Takes a screenshot",
+  idempotent: true,
+  inputSchema: { type: "object", properties: { key: { type: "string" } } },
+  execute: async () => ({ type: "libfx.tool-result", text: "the screen", images: [{ type: "image", data: shotBase64, mimeType: "image/png" }] }),
+};
+const requestFiles = (prompt) => prompt
+  .filter((message) => message.role === "user" && Array.isArray(message.content))
+  .flatMap((message) => message.content)
+  .filter((part) => part.type === "file")
+  .map((part) => part.data?.data ?? part.data);
+
+test("a durable session saves a tool's image once, its log only names it, and a new agent sends it again", async () => {
+  const durability = await durabilityFor();
+  const withShots = { model: "durable/vision-model", tools: [lookup, send, save, screenshot] };
+  const first = createFxAgent(agentOptions(durability, withShots));
+  const session = first.session();
+  const { result } = await collect(session.prompt("use screenshot"));
+  assert.equal(result.stopReason, "end_turn");
+  assert.deepEqual(requestFiles(chats.at(-1).prompt), [shotBase64], "the model saw the screenshot");
+  await first.close();
+  if (durabilityKind === "memory") {
+    const log = await durability.create().session(session.id);
+    const entries = (await log.readSince("0")).map(({ entry }) => entry);
+    assert.ok(!entries.map(entryData).some(holdsShot), "no entry holds the screenshot");
+    assert.ok(Buffer.from(await log.images.get(shotName)).equals(Buffer.from(shotBytes)), "the image store holds it by name");
+  }
+
+  const second = createFxAgent(agentOptions(durabilityKind === "memory" ? durability : await durabilityFor({ dir: dirs.at(-1) }), withShots));
+  const { result: after } = await collect(second.session(session.id).prompt("and now"));
+  assert.equal(after.stopReason, "end_turn");
+  assert.deepEqual(requestFiles(chats.at(-1).prompt), [shotBase64], "a new agent sends the screenshot again");
+  await second.close();
+});
+
+test("a durable steer saves its image once, and its log entry only names it", async () => {
+  const durability = await durabilityFor();
+  const agent = createFxAgent(agentOptions(durability, { model: "durable/vision-model" }));
+  const session = agent.session();
+  const before = slow.length;
+  const turn = session.prompt("slow reply");
+  await turn.accepted;
+  await until(() => slow.length > before && slow.at(-1).sent > 0, "the reply to stream");
+  await session.steer([{ type: "text", text: "match the shot" }, { type: "image", data: shotBase64, mimeType: "image/png" }], { messageId: "m-shot" });
+  await turn.result;
+  await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "m-shot", "the steer's turn");
+  const steered = chats.findLast(({ prompt }) => userTexts(prompt).some((text) => text.includes("match the shot")));
+  assert.deepEqual(requestFiles(steered.prompt), [shotBase64], "the steer's image reached the model");
+  await agent.close();
+  if (durabilityKind === "memory") {
+    const log = await durability.create().session(session.id);
+    const entries = (await log.readSince("0")).map(({ entry }) => entry);
+    const entry = entries.find((item) => item.k === "input" && item.messageId === "m-shot");
+    assert.ok(entry, "the steer is in the log");
+    assert.deepEqual(entry.input.find((block) => block.type === "image").data, { sha256: shotName });
+    assert.ok(!entries.map(entryData).some(holdsShot), "no entry holds the image");
+    assert.ok(Buffer.from(await log.images.get(shotName)).equals(Buffer.from(shotBytes)), "the image store holds it by name");
+  }
 });
 
 test("the fx harness tells a refused turn from one whose core exited under it", async () => {

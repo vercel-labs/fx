@@ -708,6 +708,98 @@ test "kernel checkpoint keeps a dropped image's name alone, at the naming versio
     try std.testing.expectEqualStrings(&fixture.digest_hex, image.snapshot_sha256.?);
 }
 
+/// A history of one turn whose one tool call returned one image, held as
+/// base64 and named as the host stored it.
+const TestToolImageHistory = struct {
+    digest_hex: [Sha256.digest_length * 2]u8,
+    encoded: [64]u8,
+    images: [1]types.ToolImage,
+    calls: [1]types.ToolCall,
+    results: [1]types.PersistedToolResult,
+    steps: [1]types.ToolExecutionStep,
+    history: [1]types.HistoryTurn,
+
+    fn init(self: *TestToolImageHistory, png: []const u8) void {
+        var digest: [Sha256.digest_length]u8 = undefined;
+        Sha256.hash(png, &digest, .{});
+        self.digest_hex = std.fmt.bytesToHex(digest, .lower);
+        const data = std.base64.standard.Encoder.encode(&self.encoded, png);
+        self.images = .{.{ .data = @constCast(data), .mime_type = @constCast("image/png"), .name = self.digest_hex }};
+        self.calls = .{.{ .id = "call-1", .name = "screenshot", .arguments_json = "{}" }};
+        self.results = .{.{
+            .tool_images = &self.images,
+            .tool_call_id = @constCast("call-1"),
+            .tool_name = @constCast("screenshot"),
+            .status = .success,
+            .output = @constCast("took it"),
+            .output_bytes = 7,
+            .stored_output_bytes = 7,
+        }};
+        self.steps = .{.{ .tool_calls = &self.calls, .tool_results = &self.results }};
+        self.history = .{.{ .assistant = .{
+            .user = .{ .text = @constCast("look") },
+            .assistant = @constCast("seen"),
+            .execution = .{ .tool_steps = &self.steps },
+        } }};
+    }
+};
+
+test "kernel checkpoint names a stored tool image and reads it back from the host's copy" {
+    const alloc = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\ntool-image-in-host";
+    var fixture: TestToolImageHistory = undefined;
+    fixture.init(png);
+    var stored: session_codec.StoredImages = .{};
+    defer stored.deinit(alloc);
+
+    const bytes = try encodeNamingImages(alloc, &fixture.history, .{}, .{}, &stored);
+    defer alloc.free(bytes);
+    try std.testing.expectEqual(naming_version, std.mem.readInt(u16, bytes[4..6], .little));
+    // Named and sized, never held.
+    try std.testing.expect(std.mem.find(u8, bytes, fixture.images[0].data) == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"inline_ref\":\"" ++ fixture.digest_hex ++ "\"") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, std.fmt.comptimePrint("\"inline_size\":{d}", .{png.len})) != null);
+
+    // Without the host's images it cannot be read.
+    try std.testing.expectError(error.InvalidCheckpoint, decode(alloc, bytes));
+
+    var staged: session_codec.StagedImages = .{};
+    defer staged.deinit(alloc);
+    try staged.add(alloc, fixture.digest_hex, try alloc.dupe(u8, png));
+    var resolver: session_codec.ImageResolver = .{ .alloc = alloc, .staged = &staged };
+    defer resolver.deinit();
+    var decoded = try decodeWithImages(alloc, bytes, &resolver);
+    defer decoded.deinit(alloc);
+    const image = decoded.history[0].assistant.execution.tool_steps[0].tool_results[0].tool_images[0];
+    try std.testing.expectEqualStrings(fixture.images[0].data, image.data);
+    try std.testing.expectEqualStrings(&fixture.digest_hex, &image.name.?);
+    try std.testing.expectEqual(@as(usize, 0), resolver.missing.count());
+}
+
+test "kernel checkpoint without a store keeps a tool image's bytes, and a dropped one's name alone" {
+    const alloc = std.testing.allocator;
+    var fixture: TestToolImageHistory = undefined;
+    fixture.init("\x89PNG\r\n\x1a\ntool-image-kept");
+    const bytes = try encode(alloc, &fixture.history, .{}, .{});
+    defer alloc.free(bytes);
+    try std.testing.expectEqual(version, std.mem.readInt(u16, bytes[4..6], .little));
+    try std.testing.expect(std.mem.find(u8, bytes, fixture.images[0].data) != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"inline_ref\"") == null);
+
+    fixture.images[0].data = fixture.images[0].data[0..0];
+    try std.testing.expect(fixture.images[0].droppedFromSession());
+    const dropped = try encode(alloc, &fixture.history, .{}, .{});
+    defer alloc.free(dropped);
+    try std.testing.expectEqual(naming_version, std.mem.readInt(u16, dropped[4..6], .little));
+    try std.testing.expect(std.mem.find(u8, dropped, "\"dropped\":true") != null);
+    try std.testing.expect(std.mem.find(u8, dropped, "\"inline_size\"") == null);
+    var decoded = try decode(alloc, dropped);
+    defer decoded.deinit(alloc);
+    const image = decoded.history[0].assistant.execution.tool_steps[0].tool_results[0].tool_images[0];
+    try std.testing.expect(image.droppedFromSession());
+    try std.testing.expectEqualStrings(&fixture.digest_hex, &image.name.?);
+}
+
 test "kernel checkpoint naming no stored image stays version 2, byte for byte" {
     const alloc = std.testing.allocator;
     var fixture: TestImageHistory = undefined;

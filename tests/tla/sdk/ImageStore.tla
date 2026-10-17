@@ -31,6 +31,17 @@
 (* WindowAtOpen = FALSE an open stages every named image, so one the store *)
 (* lost outside the window fails it (ImageStore-NeedAll.cfg).              *)
 (*                                                                         *)
+(* With Tools a turn's host tool may return an image. The engine stores it  *)
+(* before it hands the result to the core, whose next record names it; a   *)
+(* store that refuses it leaves it in the result, held inline. The window  *)
+(* counts it as any image, and once it leaves it keeps the name of its     *)
+(* bytes; with CountInline = FALSE the window never counts it, so the      *)
+(* session holds more than Window images (ImageStore-InlineUncounted.cfg). *)
+(* With ToolStoreFirst = FALSE the result reaches the core while the write *)
+(* is in flight (ImageStore-ToolBeforeStore.cfg). A tool image joins the   *)
+(* window with its turn, as the prompt's does, and an open stages every    *)
+(* image of the open turn.                                                 *)
+(*                                                                         *)
 (* The core may crash, losing what it held and the image writes in flight. *)
 (* It opens again in two phases: it names the images it needs, the host    *)
 (* stages each from its store, then the core opens. An image the store     *)
@@ -57,13 +68,18 @@ CONSTANTS
     DropRepeats,    \* whether the log drops a retried prompt's input
     Window,         \* the newest images the session keeps
     LiveWindow,     \* whether the core drops images older than the window
-    WindowAtOpen    \* whether an open stages only the window's images
+    WindowAtOpen,   \* whether an open stages only the window's images
+    CountInline,    \* whether the window counts a tool image held inline
+    Tools,          \* whether a turn's tool may return an image
+    ToolStoreFirst  \* whether a tool's result reaches the core only after its image is stored
 
 ASSUME N \in Nat /\ MaxFaults \in Nat /\ MaxCrashes \in Nat /\ MaxLoss \in Nat
 ASSUME Old \in BOOLEAN /\ Durable \in BOOLEAN /\ StoreFirst \in BOOLEAN
 ASSUME MarkOnlyStored \in BOOLEAN /\ FailOnMissing \in BOOLEAN
 ASSUME MaxRetries \in Nat /\ DropRepeats \in BOOLEAN
 ASSUME Window \in Nat \ {0} /\ LiveWindow \in BOOLEAN /\ WindowAtOpen \in BOOLEAN
+ASSUME CountInline \in BOOLEAN
+ASSUME Tools \in BOOLEAN /\ ToolStoreFirst \in BOOLEAN
 ASSUME "o" \notin Imgs
 
 Prompts == 1..N
@@ -72,6 +88,9 @@ OldImg == "o"
 AllImgs == Imgs \cup {OldImg}
 Phases == {"unmade", "putting", "put", "queued", "sent", "started", "ended", "failed", "lost"}
 CoreStates == {"open", "down", "opening", "failed"}
+\* Where each turn's tool image is: none yet; called, its write in flight;
+\* put or refused by the store; given to the core; or lost to a crash.
+ToolPhases == {"none", "called", "put", "refused", "given", "lost"}
 
 VARIABLES
     made,      \* how many prompts the caller has made
@@ -90,9 +109,14 @@ VARIABLES
     crashes,   \* crashes so far
     retries,   \* retries so far
     repeats,   \* the images retried inputs that landed in the log name
+    tool,      \* the image each turn's tool returned
+    tph,       \* where each turn's tool image is
+    tputting,  \* the turns whose tool image write is in flight
+    turnAt,    \* where the open turn's images start in the saved history
     act        \* the last step and its arguments
 
-vars == <<made, img, ph, putting, store, lostImgs, saved, inputs, mem, up, staged, dirty, faults, crashes, retries, repeats, act>>
+tools == <<tool, tph, tputting, turnAt>>
+vars == <<made, img, ph, putting, store, lostImgs, saved, inputs, mem, up, staged, dirty, faults, crashes, retries, repeats, tools, act>>
 
 TypeOK ==
     /\ made \in 0..N
@@ -101,9 +125,9 @@ TypeOK ==
     /\ putting \subseteq Prompts
     /\ store \subseteq AllImgs
     /\ lostImgs \subseteq AllImgs
-    /\ saved \in Seq([i : AllImgs, ref : BOOLEAN, dropped : BOOLEAN])
+    /\ saved \in Seq([i : AllImgs, ref : BOOLEAN, dropped : BOOLEAN, named : BOOLEAN])
     /\ inputs \in Seq(Prompts)
-    /\ mem \in Seq([i : AllImgs, stored : BOOLEAN, dropped : BOOLEAN])
+    /\ mem \in Seq([i : AllImgs, stored : BOOLEAN, dropped : BOOLEAN, named : BOOLEAN])
     /\ up \in CoreStates
     /\ staged \subseteq AllImgs
     /\ dirty \in BOOLEAN
@@ -111,6 +135,10 @@ TypeOK ==
     /\ crashes \in 0..MaxCrashes
     /\ retries \in 0..MaxRetries
     /\ repeats \subseteq Imgs
+    /\ tool \in [Prompts -> Imgs \cup {None}]
+    /\ tph \in [Prompts -> ToolPhases]
+    /\ tputting \subseteq Prompts
+    /\ turnAt \in Nat
 
 Init ==
     /\ made = 0
@@ -119,7 +147,7 @@ Init ==
     /\ putting = {}
     /\ store = {}
     /\ lostImgs = {}
-    /\ saved = IF Old THEN << [i |-> OldImg, ref |-> FALSE, dropped |-> FALSE] >> ELSE << >>
+    /\ saved = IF Old THEN << [i |-> OldImg, ref |-> FALSE, dropped |-> FALSE, named |-> TRUE] >> ELSE << >>
     /\ inputs = << >>
     /\ mem = << >>
     /\ up = "down"
@@ -129,24 +157,33 @@ Init ==
     /\ crashes = 0
     /\ retries = 0
     /\ repeats = {}
+    /\ tool = [p \in Prompts |-> None]
+    /\ tph = [p \in Prompts |-> "none"]
+    /\ tputting = {}
+    /\ turnAt = 0
     /\ act = << "Init" >>
 
 \* The images the saved history names.
 Named == {saved[k].i : k \in {j \in 1..Len(saved) : saved[j].ref}}
-\* Whether image k of a history of n is one of the newest Window.
-InWindow(k, n) == k + Window > n
-\* A turn has started and not ended: its image is the last saved, and it has
-\* not entered the history the window counts.
+\* Whether image k of s is one the window keeps when it counts the first n:
+\* it counts every image, a tool image the store refused, held inline,
+\* too, and keeps every image past the first n. With CountInline = FALSE it
+\* counts only images with a name, which a refused tool image lacks.
+WindowKeeps(s, k, n) ==
+    IF CountInline THEN Cardinality(k..n) <= Window
+    ELSE ~s[k].named \/ Cardinality({j \in k..n : s[j].named}) <= Window
+\* A turn has started and not ended: its images are the last saved, from
+\* turnAt on, and it has not entered the history the window counts.
 OpenTurn == \E p \in Prompts : ph[p] = "started"
-Counted == IF OpenTurn THEN Len(saved) - 1 ELSE Len(saved)
+Counted == IF OpenTurn THEN turnAt - 1 ELSE Len(saved)
 \* The named images an open stages: those inside the window, and the open
-\* turn's, which is past every counted one.
-Needed == {saved[k].i : k \in {j \in 1..Len(saved) : saved[j].ref /\ (InWindow(j, Counted) \/ ~WindowAtOpen)}}
+\* turn's, which are past every counted one.
+Needed == {saved[k].i : k \in {j \in 1..Len(saved) : saved[j].ref /\ (WindowKeeps(saved, j, Counted) \/ ~WindowAtOpen)}}
 \* A core history whose images older than the window are dropped: each
 \* keeps its name, and the core no longer counts it as stored.
 Windowed(s) ==
     IF ~LiveWindow THEN s
-    ELSE [k \in 1..Len(s) |-> IF InWindow(k, Len(s)) THEN s[k] ELSE [i |-> s[k].i, stored |-> FALSE, dropped |-> TRUE]]
+    ELSE [k \in 1..Len(s) |-> IF WindowKeeps(s, k, Len(s)) THEN s[k] ELSE [i |-> s[k].i, stored |-> FALSE, dropped |-> TRUE, named |-> TRUE]]
 Images(s) == [k \in 1..Len(s) |-> s[k].i]
 Running == \E p \in Prompts : ph[p] \in {"sent", "started"}
 Queued(p) == \E k \in 1..Len(inputs) : inputs[k] = p
@@ -171,7 +208,7 @@ Make(p, i) ==
     /\ ph' = Set(ph, p, "putting")
     /\ putting' = putting \cup {p}
     /\ act' = << "Make", p, i >>
-    /\ UNCHANGED <<store, lostImgs, saved, inputs, mem, up, staged, dirty, faults, crashes, retries, repeats>>
+    /\ UNCHANGED <<store, lostImgs, saved, inputs, mem, up, staged, dirty, faults, crashes, retries, repeats, tools>>
 
 \* The prompt's image write lands in the store.
 PutLand(p) ==
@@ -180,7 +217,7 @@ PutLand(p) ==
     /\ putting' = putting \ {p}
     /\ ph' = IF ph[p] = "putting" THEN Set(ph, p, "put") ELSE ph
     /\ act' = << "PutLand", p >>
-    /\ UNCHANGED <<made, img, lostImgs, saved, inputs, mem, up, staged, dirty, faults, crashes, retries, repeats>>
+    /\ UNCHANGED <<made, img, lostImgs, saved, inputs, mem, up, staged, dirty, faults, crashes, retries, repeats, tools>>
 
 \* The write fails. A prompt not yet sent fails with it; one sent early
 \* (StoreFirst = FALSE) goes on naming an image the store never got.
@@ -191,7 +228,7 @@ PutFail(p) ==
     /\ putting' = putting \ {p}
     /\ ph' = IF ph[p] = "putting" THEN Set(ph, p, "failed") ELSE ph
     /\ act' = << "PutFail", p >>
-    /\ UNCHANGED <<made, img, store, lostImgs, saved, inputs, mem, up, staged, dirty, crashes, retries, repeats>>
+    /\ UNCHANGED <<made, img, store, lostImgs, saved, inputs, mem, up, staged, dirty, crashes, retries, repeats, tools>>
 
 ----------------------------------------------------------------------------
 \* The host and the core
@@ -204,7 +241,7 @@ Send(p) ==
     /\ IF StoreFirst THEN ph[p] = "put" ELSE ph[p] \in {"putting", "put"}
     /\ ph' = Set(ph, p, "sent")
     /\ act' = << "Send", p >>
-    /\ UNCHANGED <<made, img, putting, store, lostImgs, saved, inputs, mem, up, staged, dirty, faults, crashes, retries, repeats>>
+    /\ UNCHANGED <<made, img, putting, store, lostImgs, saved, inputs, mem, up, staged, dirty, faults, crashes, retries, repeats, tools>>
 
 \* A durable prompt lands in the log after its image, naming it.
 Enqueue(p) ==
@@ -213,7 +250,7 @@ Enqueue(p) ==
     /\ inputs' = Append(inputs, p)
     /\ ph' = Set(ph, p, "queued")
     /\ act' = << "Enqueue", p >>
-    /\ UNCHANGED <<made, img, putting, store, lostImgs, saved, mem, up, staged, dirty, faults, crashes, retries, repeats>>
+    /\ UNCHANGED <<made, img, putting, store, lostImgs, saved, mem, up, staged, dirty, faults, crashes, retries, repeats, tools>>
 
 \* The worker takes the next prompt and resolves its image's name. An
 \* image the store lost fails the turn.
@@ -224,29 +261,31 @@ Take(p) ==
     /\ NextInput(p)
     /\ ph' = Set(ph, p, IF img[p] \in store THEN "sent" ELSE "failed")
     /\ act' = << "Take", p >>
-    /\ UNCHANGED <<made, img, putting, store, lostImgs, saved, inputs, mem, up, staged, dirty, faults, crashes, retries, repeats>>
+    /\ UNCHANGED <<made, img, putting, store, lostImgs, saved, inputs, mem, up, staged, dirty, faults, crashes, retries, repeats, tools>>
 
 \* The turn's first record lands, naming the image the host stored.
 TurnStart(p) ==
     /\ ph[p] = "sent"
     /\ up = "open"
-    /\ mem' = Append(mem, [i |-> img[p], stored |-> TRUE, dropped |-> FALSE])
-    /\ saved' = Append(saved, [i |-> img[p], ref |-> TRUE, dropped |-> FALSE])
+    /\ mem' = Append(mem, [i |-> img[p], stored |-> TRUE, dropped |-> FALSE, named |-> TRUE])
+    /\ saved' = Append(saved, [i |-> img[p], ref |-> TRUE, dropped |-> FALSE, named |-> TRUE])
+    /\ turnAt' = Len(saved) + 1
     /\ dirty' = TRUE
     /\ ph' = Set(ph, p, "started")
     /\ act' = << "TurnStart", p >>
-    /\ UNCHANGED <<made, img, putting, store, lostImgs, inputs, up, staged, faults, crashes, retries, repeats>>
+    /\ UNCHANGED <<made, img, putting, store, lostImgs, inputs, up, staged, faults, crashes, retries, repeats, tool, tph, tputting>>
 
 \* The model answers and the turn enters the history. Its image is the
 \* newest; the core drops any older than the window.
 TurnEnd(p) ==
     /\ ph[p] = "started"
+    /\ tph[p] \in {"none", "given", "lost"}
     /\ up = "open"
     /\ mem' = Windowed(mem)
     /\ ph' = Set(ph, p, "ended")
     /\ dirty' = TRUE
     /\ act' = << "TurnEnd", p >>
-    /\ UNCHANGED <<made, img, putting, store, lostImgs, saved, inputs, up, staged, faults, crashes, retries, repeats>>
+    /\ UNCHANGED <<made, img, putting, store, lostImgs, saved, inputs, up, staged, faults, crashes, retries, repeats, tools>>
 
 \* A checkpoint between turns writes the history again from the core. A
 \* dropped image is saved by its name alone, neither named nor inline.
@@ -257,10 +296,11 @@ Checkpoint ==
     /\ saved' = [k \in 1..Len(mem) |->
                    [i |-> mem[k].i,
                     ref |-> ~mem[k].dropped /\ (mem[k].stored \/ ~MarkOnlyStored),
-                    dropped |-> mem[k].dropped]]
+                    dropped |-> mem[k].dropped,
+                    named |-> mem[k].named]]
     /\ dirty' = FALSE
     /\ act' = << "Checkpoint" >>
-    /\ UNCHANGED <<made, img, ph, putting, store, lostImgs, inputs, mem, up, staged, faults, crashes, retries, repeats>>
+    /\ UNCHANGED <<made, img, ph, putting, store, lostImgs, inputs, mem, up, staged, faults, crashes, retries, repeats, tools>>
 
 \* The core crashes: it loses what it held and every write in flight. A
 \* prompt not yet in the log or not yet started is lost to a plain engine;
@@ -277,8 +317,10 @@ Crash ==
                 CASE ph[p] \in {"putting", "put"} -> "lost"
                   [] ph[p] = "sent" -> IF Durable THEN "queued" ELSE "lost"
                   [] OTHER -> ph[p]]
+    /\ tputting' = {}
+    /\ tph' = [p \in Prompts |-> IF tph[p] \in {"called", "put", "refused"} THEN "lost" ELSE tph[p]]
     /\ act' = << "Crash" >>
-    /\ UNCHANGED <<made, img, store, lostImgs, saved, inputs, dirty, faults, retries, repeats>>
+    /\ UNCHANGED <<made, img, store, lostImgs, saved, inputs, dirty, faults, retries, repeats, tool, turnAt>>
 
 \* Opening, first phase: the core reads the saved history and names the
 \* images it does not hold.
@@ -287,7 +329,7 @@ OpenBegin ==
     /\ up' = "opening"
     /\ staged' = {}
     /\ act' = << "OpenBegin" >>
-    /\ UNCHANGED <<made, img, ph, putting, store, lostImgs, saved, inputs, mem, dirty, faults, crashes, retries, repeats>>
+    /\ UNCHANGED <<made, img, ph, putting, store, lostImgs, saved, inputs, mem, dirty, faults, crashes, retries, repeats, tools>>
 
 \* The host stages one image the open needs from its store.
 Stage(i) ==
@@ -296,7 +338,7 @@ Stage(i) ==
     /\ i \in store
     /\ staged' = staged \cup {i}
     /\ act' = << "Stage", i >>
-    /\ UNCHANGED <<made, img, ph, putting, store, lostImgs, saved, inputs, mem, up, dirty, faults, crashes, retries, repeats>>
+    /\ UNCHANGED <<made, img, ph, putting, store, lostImgs, saved, inputs, mem, up, dirty, faults, crashes, retries, repeats, tools>>
 
 \* An image the open needs that the store does not hold fails the open.
 OpenMissing ==
@@ -305,7 +347,7 @@ OpenMissing ==
     /\ \E i \in Needed \ staged : i \notin store
     /\ up' = "failed"
     /\ act' = << "OpenMissing" >>
-    /\ UNCHANGED <<made, img, ph, putting, store, lostImgs, saved, inputs, mem, staged, dirty, faults, crashes, retries, repeats>>
+    /\ UNCHANGED <<made, img, ph, putting, store, lostImgs, saved, inputs, mem, staged, dirty, faults, crashes, retries, repeats, tools>>
 
 \* Opening, second phase: every image the open needs is staged, and the
 \* core holds the saved history again; a named image outside the window
@@ -316,14 +358,14 @@ OpenOk ==
     /\ \/ Needed \subseteq staged
        \/ ~FailOnMissing /\ \A i \in Needed \ staged : i \notin store
     /\ LET marked == [k \in 1..Len(saved) |->
-                        [saved[k] EXCEPT !.dropped = @ \/ (saved[k].ref /\ saved[k].i \notin staged /\ ~InWindow(k, Counted))]]
+                        [saved[k] EXCEPT !.dropped = @ \/ (saved[k].ref /\ saved[k].i \notin staged /\ ~WindowKeeps(saved, k, Counted))]]
            Kept(s) == SelectSeq(s, LAMBDA e : e.dropped \/ ~e.ref \/ e.i \in staged)
-           AsCore(s) == [k \in 1..Len(s) |-> [i |-> s[k].i, stored |-> s[k].ref /\ ~s[k].dropped, dropped |-> s[k].dropped]]
+           AsCore(s) == [k \in 1..Len(s) |-> [i |-> s[k].i, stored |-> s[k].ref /\ ~s[k].dropped, dropped |-> s[k].dropped, named |-> s[k].named]]
        IN mem' = Windowed(AsCore(Kept(SubSeq(marked, 1, Counted)))) \o AsCore(Kept(SubSeq(marked, Counted + 1, Len(saved))))
     /\ up' = "open"
     /\ staged' = {}
     /\ act' = << "OpenOk" >>
-    /\ UNCHANGED <<made, img, ph, putting, store, lostImgs, saved, inputs, dirty, faults, crashes, retries, repeats>>
+    /\ UNCHANGED <<made, img, ph, putting, store, lostImgs, saved, inputs, dirty, faults, crashes, retries, repeats, tools>>
 
 \* A retry of prompt p, which the log holds, under its messageId, carrying
 \* image i. It stores nothing; the log drops its input, or with DropRepeats
@@ -335,7 +377,52 @@ Retry(p, i) ==
     /\ retries' = retries + 1
     /\ repeats' = IF DropRepeats THEN repeats ELSE repeats \cup {i}
     /\ act' = << "Retry", p, i >>
-    /\ UNCHANGED <<made, img, ph, putting, store, lostImgs, saved, inputs, mem, up, staged, dirty, faults, crashes>>
+    /\ UNCHANGED <<made, img, ph, putting, store, lostImgs, saved, inputs, mem, up, staged, dirty, faults, crashes, tools>>
+
+\* The model calls the turn's tool, which returns image i once. The engine
+\* writes it to the store before it hands the result on.
+ToolCall(p, i) ==
+    /\ Tools
+    /\ up = "open"
+    /\ ph[p] = "started"
+    /\ tph[p] = "none"
+    /\ tool' = Set(tool, p, i)
+    /\ tph' = Set(tph, p, "called")
+    /\ tputting' = tputting \cup {p}
+    /\ act' = << "ToolCall", p, i >>
+    /\ UNCHANGED <<made, img, ph, putting, store, lostImgs, saved, inputs, mem, up, staged, dirty, faults, crashes, retries, repeats, turnAt>>
+
+ToolPutLand(p) ==
+    /\ p \in tputting
+    /\ store' = store \cup {tool[p]}
+    /\ tputting' = tputting \ {p}
+    /\ tph' = IF tph[p] = "called" THEN Set(tph, p, "put") ELSE tph
+    /\ act' = << "ToolPutLand", p >>
+    /\ UNCHANGED <<made, img, ph, putting, lostImgs, saved, inputs, mem, up, staged, dirty, faults, crashes, retries, repeats, tool, turnAt>>
+
+\* The store refuses the image. The tool has run, so its result keeps it.
+ToolPutFail(p) ==
+    /\ p \in tputting
+    /\ faults < MaxFaults
+    /\ faults' = faults + 1
+    /\ tputting' = tputting \ {p}
+    /\ tph' = IF tph[p] = "called" THEN Set(tph, p, "refused") ELSE tph
+    /\ act' = << "ToolPutFail", p >>
+    /\ UNCHANGED <<made, img, ph, putting, store, lostImgs, saved, inputs, mem, up, staged, dirty, crashes, retries, repeats, tool, turnAt>>
+
+\* The result reaches the core, and the turn's next record names the image
+\* the store holds; a refused one is held inline, without a name.
+ToolResult(p) ==
+    /\ up = "open"
+    /\ ph[p] = "started"
+    /\ tph[p] \in IF ToolStoreFirst THEN {"put", "refused"} ELSE {"called", "put", "refused"}
+    /\ LET named == tph[p] # "refused"
+       IN /\ mem' = Append(mem, [i |-> tool[p], stored |-> named, dropped |-> FALSE, named |-> named])
+          /\ saved' = Append(saved, [i |-> tool[p], ref |-> named, dropped |-> FALSE, named |-> named])
+    /\ tph' = Set(tph, p, "given")
+    /\ dirty' = TRUE
+    /\ act' = << "ToolResult", p >>
+    /\ UNCHANGED <<made, img, ph, putting, store, lostImgs, inputs, up, staged, faults, crashes, retries, repeats, tool, tputting, turnAt>>
 
 \* The store loses an image: corruption, or an operator deleting it.
 Lose(i) ==
@@ -344,7 +431,7 @@ Lose(i) ==
     /\ store' = store \ {i}
     /\ lostImgs' = lostImgs \cup {i}
     /\ act' = << "Lose", i >>
-    /\ UNCHANGED <<made, img, ph, putting, saved, inputs, mem, up, staged, dirty, faults, crashes, retries, repeats>>
+    /\ UNCHANGED <<made, img, ph, putting, saved, inputs, mem, up, staged, dirty, faults, crashes, retries, repeats, tools>>
 
 \* Nothing is left to do: every prompt settled, or the open failed.
 Finished ==
@@ -352,6 +439,7 @@ Finished ==
     \/ /\ up = "open"
        /\ made = N
        /\ putting = {}
+       /\ tputting = {}
        /\ ~dirty
        /\ \A p \in Prompts : ph[p] \in {"ended", "failed", "lost"}
 
@@ -368,6 +456,8 @@ Next ==
     \/ OpenOk
     \/ \E i \in AllImgs : Lose(i)
     \/ \E p \in Prompts, i \in Imgs : Retry(p, i)
+    \/ \E p \in Prompts, i \in Imgs : ToolCall(p, i)
+    \/ \E p \in Prompts : ToolPutLand(p) \/ ToolPutFail(p) \/ ToolResult(p)
     \/ Done
 
 Spec == Init /\ [][Next]_vars
@@ -378,7 +468,7 @@ Spec == Init /\ [][Next]_vars
 \* own as soon as it can, so the driver moves only when none of them can.
 Idle == \A p \in Prompts : ph[p] \notin {"putting", "put", "sent", "started"}
 Auto ==
-    \/ \E p \in Prompts : Send(p) \/ TurnStart(p)
+    \/ \E p \in Prompts : Send(p) \/ TurnStart(p) \/ ToolResult(p)
     \/ Checkpoint
     \/ \E i \in AllImgs : Stage(i)
     \/ OpenMissing
@@ -387,6 +477,8 @@ Quiet == ~ENABLED Auto
 DriverStep ==
     \/ \E p \in Prompts, i \in Imgs : Idle /\ Make(p, i)
     \/ \E p \in Prompts : PutLand(p) \/ PutFail(p) \/ TurnEnd(p)
+    \/ \E p \in Prompts, i \in Imgs : ToolCall(p, i)
+    \/ \E p \in Prompts : ToolPutLand(p) \/ ToolPutFail(p)
     \/ Crash
     \/ OpenBegin
     \/ \E i \in AllImgs : Lose(i)
@@ -403,8 +495,9 @@ NoDanglingRef ==
         /\ Durable => \A k \in 1..Len(inputs) : img[inputs[k]] \in store
         /\ repeats \subseteq store
 
-\* Only the image an older libfx saved inline is ever saved inline.
-OneCopy == \A k \in 1..Len(saved) : ~saved[k].ref /\ ~saved[k].dropped => saved[k].i = OldImg
+\* Only the image an older libfx saved inline is ever saved inline, but for
+\* a tool image the store refused, which has no name.
+OneCopy == \A k \in 1..Len(saved) : ~saved[k].ref /\ ~saved[k].dropped /\ saved[k].named => saved[k].i = OldImg
 
 \* An open core holds exactly the saved history's images, in order.
 OpenExact == up = "open" => Images(mem) = Images(saved)
@@ -419,12 +512,17 @@ FailsOnlyOnLoss == up = "failed" => lostImgs # {}
 \* An open fails only when the store lost an image the window keeps.
 FailsOnlyOnLossInWindow ==
     up = "failed" =>
-        \E k \in 1..Len(saved) : saved[k].ref /\ InWindow(k, Counted) /\ saved[k].i \in lostImgs
+        \E k \in 1..Len(saved) : saved[k].ref /\ WindowKeeps(saved, k, Counted) /\ saved[k].i \in lostImgs
 
-\* An open core keeps exactly its newest Window images between turns: each
-\* older one is dropped, keeping its name. A running turn's image joins the
-\* window once the turn enters the history.
+\* An open core holds at most Window images between turns, counting each it
+\* holds inline, as a tool image the store refused.
+WindowBound ==
+    (up = "open" /\ ~OpenTurn) => Cardinality({k \in 1..Len(mem) : ~mem[k].dropped}) <= Window
+
+\* An open core keeps exactly its newest Window named images between turns:
+\* each older one is dropped, keeping its name. A running turn's images join
+\* the window once the turn enters the history.
 WindowHeld ==
-    (up = "open" /\ ~OpenTurn) => \A k \in 1..Len(mem) : mem[k].dropped = ~InWindow(k, Len(mem))
+    (up = "open" /\ ~OpenTurn) => \A k \in 1..Len(mem) : mem[k].dropped = ~WindowKeeps(mem, k, Len(mem))
 
 =============================================================================

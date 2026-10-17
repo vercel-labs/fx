@@ -2660,9 +2660,9 @@ fn completeAuthorizedToolCallTransport(
 }
 
 /// Records a finished call's result in a journaled libfx session, so a
-/// crash before the next progress answers it with what the model sees
-/// instead of with "may have partly run". Nothing waits for it. A cancelled
-/// call did not finish and stays unanswered; a result's images are not kept.
+/// crash before the next progress answers it with what the model sees,
+/// its images too, instead of with "may have partly run". Nothing waits for
+/// it. A cancelled call did not finish and stays unanswered.
 fn recordJournalToolResult(ctx: *AcpContext, call: ToolCall, result: ToolExecutionResult) void {
     if (result.cancelled) return;
     const session = if (ctx.state.active_session) |*value| value else return;
@@ -2674,6 +2674,7 @@ fn recordJournalToolResult(ctx: *AcpContext, call: ToolCall, result: ToolExecuti
         .name = call.name,
         .failed = result.status == .failure,
         .output = result.model_output,
+        .images = if (result.tool_result_memory) |memory| memory.tool_images else &.{},
     }) catch |err| {
         debug_trace.logf("session", "event=libfx_journal_tool_result_dropped call={s} err={s} answered_by=next_progress", .{ call.id, @errorName(err) });
     };

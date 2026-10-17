@@ -275,6 +275,10 @@ pub const ActiveSessionState = struct {
     /// Images the host staged from its store for the journal it opens next.
     /// Owned by the server allocator; cleared once the journal opens.
     staged_images: session_codec.StagedImages = .{},
+    /// What the last open that found images missing needs staged, all told:
+    /// an open turn's tool images can take a session past one window and one
+    /// prompt, and what a running session held must reopen.
+    staging_needed: StagedTotals = .{},
 
     pub fn retainGrant(self: *ActiveSessionState, alloc: Allocator, tool_name: []const u8, target_path: []const u8) !void {
         for (self.session_grants) |grant| {
@@ -1930,7 +1934,15 @@ fn handleKernelJournalOpen(
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         // The host stages them from its store, then opens again.
-        error.ImagesMissing => return writeImagesNeeded(state, alloc, msg.id, images.missing.keys()),
+        error.ImagesMissing => {
+            var needed: StagedTotals = .{ .images = active.staged_images.images.count(), .bytes = active.staged_images.bytes };
+            for (images.missing.values()) |size| {
+                needed.images +|= 1;
+                needed.bytes +|= size;
+            }
+            active.staging_needed = needed;
+            return writeImagesNeeded(state, alloc, msg.id, images.missing.keys());
+        },
         error.AgentNotFresh => return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
             .message = "A libfx journal opens only on a new session",
@@ -1954,6 +1966,7 @@ fn handleKernelJournalOpen(
     active.journal = journal;
     // The history holds its own copies of every staged image it named.
     active.staged_images.clear(state.alloc);
+    active.staging_needed = .{};
     // The host runs the follow-ups the journal held, after any resume.
     const follow_ups = active.journal.?.takeFollowUps();
     defer journal_events.freePendingInputs(state.alloc, follow_ups);
@@ -2027,8 +2040,13 @@ fn writeImagesNeeded(state: *ServerState, alloc: Allocator, id: ?jsonrpc.Request
 /// the largest image window, the newest images a session keeps, and those of
 /// the open turn, which the window leaves out and which holds one prompt's
 /// images at most.
+/// An open that needs more, because its open turn's tools returned images
+/// beyond one prompt's, may stage what it reported missing
+/// (`ActiveSessionState.staging_needed`).
 const max_staged_images = (session_codec.ImageWindow{}).max_images + image_attachments.max_libfx_prompt_images;
 const max_staged_image_bytes = (session_codec.ImageWindow{}).max_bytes + image_attachments.max_libfx_prompt_images_bytes;
+
+const StagedTotals = struct { images: usize = 0, bytes: usize = 0 };
 
 /// The image window an open asks for, `{images, bytes}`, each at most the
 /// default: a host may keep fewer images, never more than an open stages.
@@ -2096,13 +2114,13 @@ fn handleKernelJournalImages(
         const name = session_codec.imageName(name_value.string) orelse return state.writer.writeError(alloc, msg.id, invalid);
         const reference = item.object.get("attachment") orelse return state.writer.writeError(alloc, msg.id, invalid);
         const attachment = host_attachments.idFromJson(reference) orelse return state.writer.writeError(alloc, msg.id, invalid);
-        if (active.staged_images.images.count() >= max_staged_images) return state.writer.writeError(alloc, msg.id, too_large);
+        if (active.staged_images.images.count() >= @max(max_staged_images, active.staging_needed.images)) return state.writer.writeError(alloc, msg.id, too_large);
         const bytes = store.take(state.alloc, attachment, image_attachments.max_image_bytes) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.AttachmentUnavailable => return state.writer.writeError(alloc, msg.id, invalid),
             error.AttachmentTooLarge => return state.writer.writeError(alloc, msg.id, too_large),
         };
-        if (bytes.len > max_staged_image_bytes - active.staged_images.bytes) {
+        if (bytes.len > @max(max_staged_image_bytes, active.staging_needed.bytes) -| active.staged_images.bytes) {
             state.alloc.free(bytes);
             return state.writer.writeError(alloc, msg.id, too_large);
         }
@@ -2177,7 +2195,7 @@ fn handleKernelSnapshot(
         } else {
             try journal_events.writeOpenTurn(&open_turn.writer, journal.open_turn_id.slice(), journal.pending_resume.?);
             // An image the session dropped is written by name even here.
-            open_turn_names_images = session_codec.namesImages(journal.pending_resume.?.user, null);
+            open_turn_names_images = session_codec.checkpointNamesImages(journal.pending_resume.?, null, null);
         }
     }
     const snapshot_bytes = if (open_turn_names_images)

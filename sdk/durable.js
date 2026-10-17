@@ -2911,7 +2911,16 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
           const messageId = steerOptions.messageId ?? newId("str");
           if (!validId(messageId)) throw new TypeError(`messageId must be ${idRule}`);
           admit(input);
-          await send({ type: "steer", messageId, input });
+          // A steer's images go in the session's image store before the steer
+          // that names them, as a prompt's do; storing one again under its
+          // name is harmless, so a retry needs no check.
+          let named = input;
+          if (Array.isArray(input) && input.some((block) => block?.type === "image" && typeof block.data === "string")) {
+            const { created, id: sessionId } = await resolved;
+            named = await storePromptImages((await created.session(sessionId)).images, input);
+            if (closed) throw new Error(`${label} is closed`);
+          }
+          await send({ type: "steer", messageId, input: named });
           return { messageId };
         },
         /** Cancels the running turn; dropping a turn's view does not. */

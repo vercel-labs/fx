@@ -7,7 +7,9 @@
 // Each walk keeps one session in a memory persistence with an image store,
 // first written by an engine without one, so its first image is saved
 // inline as an older libfx saved it. Then the walk opens an engine on it and
-// makes the prompts it chooses, each with image a or b. Every image write
+// makes the prompts it chooses, each with image a or b; a turn's tool may
+// return image a or b as well, which the engine stores before the core gets
+// the result. Every image write
 // waits until the driver lets it land or fail; every model request waits
 // until the driver ends its turn. A crash leaves the engine behind at once:
 // its writes in flight never land, and nothing it does later reaches the
@@ -16,7 +18,8 @@
 // waits until the code is quiet and moves to the model states that show the
 // same prompts, store, open state and held request. On every step, nothing
 // saved may name an image the store does not hold (until one is deleted),
-// only the old image may be saved inline, and a model request must carry
+// only the old image, or a tool's image the store refused, may be saved
+// inline, and a model request must carry
 // exactly the history the model holds.
 //
 // `tests/tla/sdk/check.sh` writes graphs/images.dot from ImageStore-drive.cfg.
@@ -85,8 +88,12 @@ function savedImages(store) {
       return;
     }
     if (!value || typeof value !== "object") return;
-    if (typeof value.inline_ref === "string") named.add(value.inline_ref);
+    // One the session dropped keeps its name alone, which needs no bytes: an
+    // image held inline takes the name of its bytes when it leaves.
+    if (typeof value.inline_ref === "string" && value.dropped !== true) named.add(value.inline_ref);
     if (value.inline_data !== undefined) inline.push(durableBytes(value.inline_data));
+    // A tool's image held inline: its base64 data.
+    if (value.type === "image" && typeof value.data === "string" && typeof value.mimeType === "string") inline.push(Buffer.from(value.data, "base64"));
     if (Number.isInteger(value.inline_blob)) inline.push(blobs[value.inline_blob]);
     for (const item of Object.values(value)) visit(item, blobs);
   };
@@ -127,6 +134,19 @@ function savedImages(store) {
 
 const vision = "images/vision";
 const usage = { inputTokens: { total: 1 }, outputTokens: { total: 1 } };
+// The model calls the turn's tool for image `label`.
+const callShot = (p, label) => new Response(
+  [{ type: "tool-call", toolCallId: `call-${p}`, toolName: "shot", input: { label } }, { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, usage }, "[DONE]"]
+    .map((frame) => `data: ${typeof frame === "string" ? frame : JSON.stringify(frame)}\n\n`).join(""),
+  { headers: { "content-type": "text/event-stream" } },
+);
+// The tool returns the image it is asked for.
+const shot = {
+  name: "shot",
+  description: "Returns an image",
+  inputSchema: { type: "object", properties: { label: { type: "string" } }, required: ["label"] },
+  execute: async ({ label }) => ({ type: "libfx.tool-result", text: `image ${label}`, images: [{ type: "image", data: base64Of[label], mimeType: "image/png" }] }),
+};
 const answer = () => new Response(
   [{ type: "text-delta", id: "a", delta: "seen" }, { type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage }, "[DONE]"]
     .map((frame) => `data: ${typeof frame === "string" ? frame : JSON.stringify(frame)}\n\n`).join(""),
@@ -199,6 +219,7 @@ async function harness(n) {
     fetch: fetchFor(current),
     persistence,
     checkpointAfterBytes: 0,
+    tools: [shot],
     [imageWindow]: { images: windowImages },
   });
 
@@ -220,6 +241,10 @@ async function harness(n) {
   let made = 0;
   const ph = Array(n).fill("unmade");
   const gates = {};
+  // Each turn's tool image write, held until the driver lets it land or fail,
+  // and the images the store refused, which the session holds inline.
+  const toolGates = {};
+  const refused = new Set();
   const watch = (p, turn) => {
     turn.result.then(
       (result) => { if (result.stopReason === "end_turn") ph[p - 1] = "ended"; },
@@ -242,6 +267,21 @@ async function harness(n) {
       }
       case "PutLand": gates[p].resolve(true); return;
       case "PutFail": gates[p].resolve(false); return;
+      case "ToolCall": {
+        if (!held || held.p !== p) throw new Error(`no model request is held for prompt ${p}`);
+        toolGates[p] = { gate: deferred(), image };
+        imageGates.set(nameOf[image], { promise: toolGates[p].gate.promise });
+        const { response } = held;
+        held = null;
+        response.resolve(callShot(p, image));
+        return;
+      }
+      case "ToolPutLand": toolGates[p].gate.resolve(true); return;
+      case "ToolPutFail": {
+        refused.add(toolGates[p].image);
+        toolGates[p].gate.resolve(false);
+        return;
+      }
       case "TurnEnd": {
         if (!held || held.p !== p) throw new Error(`no model request is held for prompt ${p}`);
         const { response } = held;
@@ -258,6 +298,7 @@ async function harness(n) {
         }
         for (let q = 1; q <= n; q += 1) if (ph[q - 1] === "putting") ph[q - 1] = "lost";
         for (const gate of Object.values(gates)) gate.resolve(true);
+        for (const { gate } of Object.values(toolGates)) gate.resolve(true);
         const left = engine;
         engine = null;
         up = "down";
@@ -298,7 +339,10 @@ async function harness(n) {
     if (held && held.life === life && ph[held.p - 1] !== "ended") ph[held.p - 1] = "started";
     const { named, inline } = savedImages(store);
     if (!lost) for (const name of named) if (!storedImages.has(name)) problems.push(`a record or checkpoint names ${labelOfName[name] ?? name}, which the store does not hold`);
-    for (const bytes of inline) if (labelOfBytes(bytes) !== "o") problems.push(`image ${labelOfBytes(bytes)} is saved inline`);
+    for (const bytes of inline) {
+      const label = labelOfBytes(bytes);
+      if (label !== "o" && !refused.has(label)) problems.push(`image ${label} is saved inline`);
+    }
     return {
       made,
       ph: [...ph],
@@ -324,6 +368,7 @@ async function harness(n) {
   async function close() {
     if (held) held.response.resolve(answer());
     for (const gate of Object.values(gates)) gate.resolve(true);
+    for (const { gate } of Object.values(toolGates)) gate.resolve(true);
     if (engine) await Promise.race([engine.close().catch(() => {}), sleep(3000)]);
   }
 
@@ -335,14 +380,16 @@ async function harness(n) {
 
 const graph = await loadGraph(resolve(here, "../sdk/graphs", "images.dot"));
 const n = graph.states.get(graph.init).ph.length;
-const autoActs = new Set(["Send", "TurnStart", "Checkpoint", "Stage", "OpenMissing", "OpenOk"]);
+const autoActs = new Set(["Send", "TurnStart", "ToolResult", "Checkpoint", "Stage", "OpenMissing", "OpenOk"]);
+// While a turn's tool stores its image or hands it on, no request is held.
+const toolRunning = (state) => state.tph.some((phase) => ["called", "put", "refused"].includes(phase));
 const view = (state) => JSON.stringify({
   made: state.made,
   ph: state.ph,
   up: state.up,
   store: [...state.store].sort(),
   // A model request carries the images the core keeps; a dropped one is a note.
-  held: state.up === "open" && state.ph.includes("started") ? state.mem.filter((entry) => !entry.dropped).map((entry) => entry.i) : null,
+  held: state.up === "open" && state.ph.includes("started") && !toolRunning(state) ? state.mem.filter((entry) => !entry.dropped).map((entry) => entry.i) : null,
 });
 const { steps, covered, totalEdges } = await walkGraph({
   graph,

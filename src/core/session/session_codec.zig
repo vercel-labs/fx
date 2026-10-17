@@ -616,10 +616,35 @@ pub fn namesImages(user: session.UserTurn, stored: ?*const StoredImages) bool {
 
 pub fn turnNamesImages(turn: session.HistoryTurn, stored: ?*const StoredImages) bool {
     return switch (turn) {
-        .assistant => |entry| namesImages(entry.user, stored),
-        .interrupted => |entry| namesImages(entry.user, stored),
+        .assistant => |entry| namesImages(entry.user, stored) or executionNamesImages(entry.execution, .{}, stored),
+        .interrupted => |entry| namesImages(entry.user, stored) or executionNamesImages(entry.execution, .{}, stored),
         .compacted_summary => false,
     };
+}
+
+/// Whether writing the items of `execution` after `from` names a tool image:
+/// one the host stored, when `stored` is given, or one the session dropped.
+pub fn executionNamesImages(execution: session.ExecutionMemory, from: ExecutionCounts, stored: ?*const StoredImages) bool {
+    for (execution.tool_steps[from.tool_steps..]) |step| for (step.tool_results) |result| {
+        if (toolImagesNameImages(result.tool_images, stored)) return true;
+    };
+    return false;
+}
+
+/// Whether writing `images` names one: one the host stored, when `stored` is
+/// given, or one the session dropped.
+pub fn toolImagesNameImages(images: []const types.ToolImage, stored: ?*const StoredImages) bool {
+    for (images) |image| {
+        if (image.droppedFromSession() or (stored != null and image.name != null)) return true;
+    }
+    return false;
+}
+
+/// Whether writing `checkpoint` names an image; with `delta`, only the
+/// execution items after it, which is all a delta progress writes.
+pub fn checkpointNamesImages(checkpoint: RecoveryCheckpoint, delta: ?ExecutionCounts, stored: ?*const StoredImages) bool {
+    if (delta == null and namesImages(checkpoint.user, stored)) return true;
+    return executionNamesImages(checkpoint.execution, delta orelse .{}, stored);
 }
 
 /// The images a libfx session with an image store keeps: its newest, at most
@@ -768,7 +793,7 @@ fn writeHistoryTurnTo(writer: *std.Io.Writer, turn: session.HistoryTurn, image_b
             try writer.writeAll(",\"provider_replay\":");
             try std.json.Stringify.value(entry.provider_replay, .{}, writer);
             try writer.writeAll(",\"execution\":");
-            try writeExecutionMemoryJson(writer, entry.execution, .durable);
+            try writeExecutionMemoryJsonFrom(writer, entry.execution, .durable, .{}, image_blobs);
             try writer.writeByte('}');
         },
         .interrupted => |entry| {
@@ -795,7 +820,7 @@ fn writeHistoryTurnTo(writer: *std.Io.Writer, turn: session.HistoryTurn, image_b
             }
             if (hasDurableExecutionMemory(entry.execution)) {
                 try writer.writeAll(",\"execution\":");
-                try writeExecutionMemoryJson(writer, entry.execution, .durable);
+                try writeExecutionMemoryJsonFrom(writer, entry.execution, .durable, .{}, image_blobs);
             }
             if (entry.cancelled_command) |presentation| {
                 try writer.writeAll(",\"cancelled_command\":");
@@ -910,7 +935,7 @@ pub fn parseHistoryTurnWithImages(
         errdefer session.freeUserTurn(alloc, user);
         const assistant = try parseRequiredDurableBytes(alloc, object, "assistant");
         errdefer mem_utils.free(alloc, assistant);
-        const execution = try parseExecutionMemory(alloc, object.get("execution") orelse return error.InvalidSessionFormat);
+        const execution = try parseExecutionMemoryWith(alloc, object.get("execution") orelse return error.InvalidSessionFormat, sources);
         errdefer session.freeExecutionMemory(alloc, execution);
         const replay = try parseProviderReplay(alloc, object.get("provider_replay") orelse .null);
         return .{ .assistant = .{
@@ -935,7 +960,7 @@ pub fn parseHistoryTurnWithImages(
             null;
         defer if (legacy_assistant) |owned| mem_utils.free(alloc, owned);
         const execution = if (shape.extended)
-            try parseExecutionMemory(alloc, object.get("execution") orelse return error.InvalidSessionFormat)
+            try parseExecutionMemoryWith(alloc, object.get("execution") orelse return error.InvalidSessionFormat, sources)
         else
             session.ExecutionMemory{};
         errdefer session.freeExecutionMemory(alloc, execution);
@@ -991,7 +1016,7 @@ pub fn parseHistoryTurnWithImages(
         else
             .turn;
         const execution = if (has_execution)
-            try parseExecutionMemory(alloc, object.get("execution") orelse return error.InvalidSessionFormat)
+            try parseExecutionMemoryWith(alloc, object.get("execution") orelse return error.InvalidSessionFormat, sources)
         else
             session.ExecutionMemory{};
         errdefer session.freeExecutionMemory(alloc, execution);
@@ -1274,6 +1299,12 @@ pub fn writeRecoveryCheckpointDelta(writer: *std.Io.Writer, checkpoint: Recovery
     return writeRecoveryCheckpointFrom(writer, checkpoint, from, {});
 }
 
+/// Like `writeRecoveryCheckpointDelta`, but names the tool images the host
+/// stored instead of writing their bytes.
+pub fn writeRecoveryCheckpointDeltaNamingImages(writer: *std.Io.Writer, checkpoint: RecoveryCheckpoint, from: ExecutionCounts, names: ImageNames) !void {
+    return writeRecoveryCheckpointFrom(writer, checkpoint, from, names);
+}
+
 fn writeRecoveryCheckpointFrom(writer: *std.Io.Writer, checkpoint: RecoveryCheckpoint, delta: ?ExecutionCounts, image_mode: anytype) !void {
     if (checkpoint.disposition == .history_only) return error.InvalidDurableField;
     if (delta) |from| {
@@ -1293,7 +1324,7 @@ fn writeRecoveryCheckpointFrom(writer: *std.Io.Writer, checkpoint: RecoveryCheck
     try writer.writeAll(",\"assistant_source\":");
     try writeDurableBytes(writer, checkpoint.assistant_source);
     try writer.writeAll(",\"execution\":");
-    try writeExecutionMemoryJsonFrom(writer, checkpoint.execution, .durable, delta orelse .{});
+    try writeExecutionMemoryJsonFrom(writer, checkpoint.execution, .durable, delta orelse .{}, image_mode);
     try writer.writeAll(",\"cause\":");
     try writeJsonString(writer, @tagName(checkpoint.cause));
     try writer.writeAll(",\"action\":");
@@ -1582,7 +1613,7 @@ pub fn parseRecoveryCheckpointWithImages(alloc: Allocator, value: std.json.Value
     errdefer session.freeUserTurn(alloc, user);
     const assistant_source = try parseDurableBytes(alloc, object.get("assistant_source") orelse return error.InvalidSessionFormat);
     errdefer alloc.free(assistant_source);
-    const execution = try parseExecutionMemory(alloc, object.get("execution") orelse return error.InvalidSessionFormat);
+    const execution = try parseExecutionMemoryWith(alloc, object.get("execution") orelse return error.InvalidSessionFormat, sources);
     errdefer session.freeExecutionMemory(alloc, execution);
     const authority = if (legacy_route) TurnAuthority{
         .provider = .gateway,
@@ -1816,16 +1847,19 @@ pub noinline fn writeExecutionMemoryJson(
     execution: session.ExecutionMemory,
     format: ExecutionMemoryJsonFormat,
 ) !void {
-    return writeExecutionMemoryJsonFrom(writer, execution, format, .{});
+    return writeExecutionMemoryJsonFrom(writer, execution, format, .{}, {});
 }
 
 /// `writeExecutionMemoryJson` with each list starting after `from` items.
-/// The caller checks that every list holds at least that many.
+/// The caller checks that every list holds at least that many. `image_mode`
+/// is as for `writeHistoryTurnTo`; only `ImageNames` changes how tool images
+/// are written.
 fn writeExecutionMemoryJsonFrom(
     writer: *std.Io.Writer,
     execution: session.ExecutionMemory,
     format: ExecutionMemoryJsonFormat,
     from: ExecutionCounts,
+    image_mode: anytype,
 ) !void {
     std.debug.assert(from.tool_steps <= execution.tool_steps.len and from.files <= execution.files.len and from.steering <= execution.steering.len);
     try writer.writeAll(if (format == .durable)
@@ -1834,7 +1868,7 @@ fn writeExecutionMemoryJsonFrom(
         "{\"schema_version\":3,\"tool_steps\":[");
     for (execution.tool_steps[from.tool_steps..], 0..) |step, i| {
         if (i > 0) try writer.writeByte(',');
-        try writeExecutionToolStep(writer, step, format);
+        try writeExecutionToolStep(writer, step, format, image_mode);
     }
     try writer.writeAll("],\"files\":[");
     for (execution.files[from.files..], 0..) |file, i| {
@@ -1859,7 +1893,7 @@ fn writeExecutionMemoryJsonFrom(
     try writer.writeByte('}');
 }
 
-fn writeExecutionToolStep(writer: *std.Io.Writer, step: session.ToolExecutionStep, format: ExecutionMemoryJsonFormat) !void {
+fn writeExecutionToolStep(writer: *std.Io.Writer, step: session.ToolExecutionStep, format: ExecutionMemoryJsonFormat, image_mode: anytype) !void {
     try writer.writeAll("{\"assistant\":");
     try writeOptionalExecutionBytes(writer, step.assistant, format);
     if (format == .durable) {
@@ -1874,7 +1908,7 @@ fn writeExecutionToolStep(writer: *std.Io.Writer, step: session.ToolExecutionSte
     try writer.writeAll("],\"tool_results\":[");
     for (step.tool_results, 0..) |result, result_index| {
         if (result_index > 0) try writer.writeByte(',');
-        try writeExecutionToolResult(writer, result, format);
+        try writeExecutionToolResult(writer, result, format, image_mode);
     }
     try writer.writeAll("]}");
 }
@@ -1948,7 +1982,7 @@ pub fn executionHashes(alloc: Allocator, checkpoint: RecoveryCheckpoint) !Execut
         for (results) |*result| result.created_at_ms = 0;
         var stable = step;
         stable.tool_results = results;
-        try writeExecutionToolStep(&out.writer, stable, .durable);
+        try writeExecutionToolStep(&out.writer, stable, .durable, {});
         hash.* = std.hash.Wyhash.hash(0, out.written());
     }
     const files = try alloc.alloc(u64, execution.files.len);
@@ -2032,6 +2066,7 @@ fn writeExecutionToolResult(
     writer: *std.Io.Writer,
     result: session.PersistedToolResult,
     format: ExecutionMemoryJsonFormat,
+    image_mode: anytype,
 ) !void {
     if (format == .durable and
         result.review_feedback and
@@ -2099,7 +2134,7 @@ fn writeExecutionToolResult(
             try writeDurableBytes(writer, handle);
         } else if (result.tool_images.len > 0) {
             try writer.writeAll(",\"tool_images\":");
-            writePersistedToolImages(writer, result.tool_images) catch |err| switch (err) {
+            writeToolImagesTo(writer, result.tool_images, @TypeOf(image_mode) == ImageNames) catch |err| switch (err) {
                 error.InvalidSourceRef, error.InvalidImage => return error.InvalidSessionFormat,
                 else => |write_err| return write_err,
             };
@@ -2473,6 +2508,11 @@ fn validateInlineImageBytes(bytes: []const u8, media_type: []const u8) !void {
 }
 
 fn parseExecutionMemory(alloc: Allocator, value: std.json.Value) !session.ExecutionMemory {
+    return parseExecutionMemoryWith(alloc, value, .{});
+}
+
+/// `parseExecutionMemory`, reading named tool images from `sources`.
+fn parseExecutionMemoryWith(alloc: Allocator, value: std.json.Value, sources: ImageSources) !session.ExecutionMemory {
     const source = try requireObject(value);
     const schema_version = try requireU64(source, "schema_version");
     const object = switch (schema_version) {
@@ -2486,6 +2526,7 @@ fn parseExecutionMemory(alloc: Allocator, value: std.json.Value) !session.Execut
         alloc,
         object.get("tool_steps") orelse return error.InvalidSessionFormat,
         schema_version,
+        sources,
     );
     errdefer session.freeExecutionMemory(alloc, .{ .tool_steps = tool_steps });
     const files = try parseFiles(alloc, object.get("files") orelse return error.InvalidSessionFormat);
@@ -2603,6 +2644,7 @@ fn parseToolSteps(
     alloc: Allocator,
     value: std.json.Value,
     schema_version: u64,
+    sources: ImageSources,
 ) ![]session.ToolExecutionStep {
     if (value != .array) return error.InvalidSessionFormat;
     if (value.array.items.len == 0) return &.{};
@@ -2628,6 +2670,7 @@ fn parseToolSteps(
             alloc,
             object.get("tool_results") orelse return error.InvalidSessionFormat,
             schema_version,
+            sources,
         );
         errdefer session.freePersistedToolResults(alloc, tool_results);
         try session.repairPersistedToolArguments(alloc, tool_calls, tool_results, .schema_v3);
@@ -2731,6 +2774,7 @@ fn parseToolResults(
     alloc: Allocator,
     value: std.json.Value,
     schema_version: u64,
+    sources: ImageSources,
 ) ![]session.PersistedToolResult {
     if (value != .array) return error.InvalidSessionFormat;
     if (value.array.items.len == 0) return &.{};
@@ -2754,7 +2798,7 @@ fn parseToolResults(
         }
     };
     for (value.array.items, 0..) |result_value, i| {
-        results[i] = try parseToolResult(alloc, result_value, schema_version);
+        results[i] = try parseToolResultWith(alloc, result_value, schema_version, sources);
         parsed_count += 1;
     }
     return results;
@@ -2764,6 +2808,15 @@ fn parseToolResult(
     alloc: Allocator,
     value: std.json.Value,
     schema_version: u64,
+) !session.PersistedToolResult {
+    return parseToolResultWith(alloc, value, schema_version, .{});
+}
+
+fn parseToolResultWith(
+    alloc: Allocator,
+    value: std.json.Value,
+    schema_version: u64,
+    sources: ImageSources,
 ) !session.PersistedToolResult {
     const v1_keys = &.{
         "tool_call_id",
@@ -2881,7 +2934,7 @@ fn parseToolResult(
         result_shape.extended,
     );
     errdefer presentations.deinit(alloc);
-    var images = try parseToolResultImages(alloc, object, &text.output);
+    var images = try parseToolResultImages(alloc, object, &text.output, sources);
     errdefer images.deinit(alloc);
     return .{
         .tool_images = images.items,
@@ -3026,16 +3079,41 @@ fn parseToolResultPresentations(
 
 /// Writes typed image blocks with persistence-owned source_ref spelling.
 pub fn writePersistedToolImages(writer: *std.Io.Writer, images: []const types.ToolImage) !void {
+    return writeToolImagesTo(writer, images, false);
+}
+
+/// `writePersistedToolImages`, but with `naming`, an image the host stored is
+/// written as its name (`inline_ref`) and decoded size instead of its bytes.
+/// An image the session dropped is written as its name alone either way.
+/// Writes a tool result's `images` as a list: with `naming`, each the host
+/// stored by its name, and every other with its bytes; one the session
+/// dropped by its name alone. `parseToolImages` reads it back.
+pub fn writeToolImages(writer: *std.Io.Writer, images: []const types.ToolImage, naming: bool) !void {
+    return writeToolImagesTo(writer, images, naming);
+}
+
+fn writeToolImagesTo(writer: *std.Io.Writer, images: []const types.ToolImage, naming: bool) !void {
     try writer.writeByte('[');
     for (images, 0..) |image, index| {
         if (index > 0) try writer.writeByte(',');
         if (image.source_ref) |source_ref| {
             if (!image_data.validSourceRef(source_ref)) return error.InvalidSourceRef;
-        } else if (image.data.len == 0) return error.InvalidImage;
+        } else if (image.data.len == 0 and image.name == null) return error.InvalidImage;
         try writer.writeAll("{\"type\":\"image\",\"mimeType\":");
         try writeJsonString(writer, image.mime_type);
-        try writer.writeAll(",\"data\":");
-        try writeJsonString(writer, image.data);
+        if (image.droppedFromSession()) {
+            try writer.writeAll(",\"inline_ref\":");
+            try writeJsonString(writer, &image.name.?);
+            try writer.writeAll(",\"dropped\":true");
+        } else if (naming and image.name != null) {
+            const size = std.base64.standard.Decoder.calcSizeForSlice(image.data) catch return error.InvalidImage;
+            try writer.writeAll(",\"inline_ref\":");
+            try writeJsonString(writer, &image.name.?);
+            try writer.print(",\"inline_size\":{d}", .{size});
+        } else {
+            try writer.writeAll(",\"data\":");
+            try writeJsonString(writer, image.data);
+        }
         if (image.source_ref) |source_ref| {
             try writer.writeAll(",\"source_ref\":");
             try writeJsonString(writer, source_ref);
@@ -3076,6 +3154,106 @@ pub fn parsePersistedToolImages(alloc: Allocator, content: []const std.json.Valu
     return image_data.parseToolImages(alloc, normalized[0..initialized]);
 }
 
+/// `parsePersistedToolImages`, but an image written by name (`inline_ref`)
+/// reads its bytes from the host's staged copy in `sources.names`. One the
+/// session dropped, or one an open has yet to stage, parses with its name and
+/// without bytes; the open's `missing` tells the two apart. Caller owns the
+/// images.
+/// Reads a list `writeToolImages` wrote. Caller owns the images. A name
+/// `sources.names` has no bytes for reads as an image without bytes, and the
+/// resolver records it as missing.
+pub fn parseToolImages(alloc: Allocator, content: []const std.json.Value, sources: ImageSources) ![]types.ToolImage {
+    return parseToolImagesWith(alloc, content, sources);
+}
+
+fn parseToolImagesWith(alloc: Allocator, content: []const std.json.Value, sources: ImageSources) ![]types.ToolImage {
+    for (content) |item| {
+        if (item == .object and item.object.contains("inline_ref")) break;
+    } else return parsePersistedToolImages(alloc, content);
+    if (content.len > image_data.max_tool_images) return error.ImageLimitExceeded;
+    var images: std.ArrayList(types.ToolImage) = .empty;
+    defer {
+        for (images.items) |image| freeToolImage(alloc, image);
+        images.deinit(alloc);
+    }
+    for (content) |item| {
+        if (item != .object) return error.InvalidImage;
+        if (!item.object.contains("inline_ref")) {
+            // An image written inline keeps its own admission; an unsupported
+            // one parses as none, which the caller notes.
+            const inline_images = try parsePersistedToolImages(alloc, &[_]std.json.Value{item});
+            images.ensureUnusedCapacity(alloc, inline_images.len) catch |err| {
+                types.freeToolImages(alloc, inline_images);
+                return err;
+            };
+            images.appendSliceAssumeCapacity(inline_images);
+            alloc.free(inline_images);
+            continue;
+        }
+        const image = try parseNamedToolImage(alloc, item.object, sources);
+        images.append(alloc, image) catch |err| {
+            freeToolImage(alloc, image);
+            return err;
+        };
+    }
+    return images.toOwnedSlice(alloc);
+}
+
+fn parseNamedToolImage(alloc: Allocator, object: std.json.ObjectMap, sources: ImageSources) !types.ToolImage {
+    var keys = object.iterator();
+    while (keys.next()) |entry| {
+        for ([_][]const u8{ "type", "mimeType", "inline_ref", "inline_size", "dropped", "source_ref" }) |known| {
+            if (std.mem.eql(u8, entry.key_ptr.*, known)) break;
+        } else return error.InvalidSessionFormat;
+    }
+    if (!std.mem.eql(u8, try requireString(object, "type"), "image")) return error.InvalidSessionFormat;
+    const mime_type = try requireString(object, "mimeType");
+    if (!image_data.supportedMediaType(mime_type)) return error.InvalidSessionFormat;
+    const name = imageName(try requireString(object, "inline_ref")) orelse return error.InvalidSessionFormat;
+    const source_ref: ?[]const u8 = if (object.get("source_ref")) |value| ref: {
+        if (value != .string or !image_data.validSourceRef(value.string)) return error.InvalidSourceRef;
+        break :ref value.string;
+    } else null;
+    if (object.get("dropped")) |value| {
+        if (value != .bool or !value.bool or object.contains("inline_size")) return error.InvalidSessionFormat;
+        return ownedToolImage(alloc, try alloc.dupe(u8, ""), mime_type, source_ref, name);
+    }
+    const resolver = sources.names orelse return error.InvalidSessionFormat;
+    const size = try requireUsize(object, "inline_size");
+    if (size == 0 or size > image_data.max_encoded_image_bytes) return error.InvalidSessionFormat;
+    const resolved = try resolver.resolve(alloc, name, size);
+    const bytes = resolved orelse return ownedToolImage(alloc, try alloc.dupe(u8, ""), mime_type, source_ref, name);
+    defer alloc.free(bytes);
+    if (bytes.len != size) return error.InvalidSessionFormat;
+    const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+    _ = std.base64.standard.Encoder.encode(encoded, bytes);
+    // The same admission as an image written inline.
+    image_data.validateImage(alloc, encoded, mime_type) catch |err| {
+        alloc.free(encoded);
+        return err;
+    };
+    return ownedToolImage(alloc, encoded, mime_type, source_ref, name);
+}
+
+/// A tool image owning `data`, which it takes, and copies of the rest.
+fn ownedToolImage(alloc: Allocator, data: []u8, mime_type: []const u8, source_ref: ?[]const u8, name: ImageName) Allocator.Error!types.ToolImage {
+    errdefer alloc.free(data);
+    const owned_type = try alloc.dupe(u8, mime_type);
+    errdefer alloc.free(owned_type);
+    return .{
+        .data = data,
+        .mime_type = owned_type,
+        .source_ref = if (source_ref) |value| try alloc.dupe(u8, value) else null,
+        .name = name,
+    };
+}
+
+fn freeToolImage(alloc: Allocator, image: types.ToolImage) void {
+    alloc.free(image.data);
+    alloc.free(image.mime_type);
+    if (image.source_ref) |source_ref| alloc.free(source_ref);
+}
+
 const ParsedToolResultImages = struct {
     handle: ?[]u8,
     items: []types.ToolImage,
@@ -3091,6 +3269,7 @@ fn parseToolResultImages(
     alloc: Allocator,
     object: std.json.ObjectMap,
     output: *[]u8,
+    sources: ImageSources,
 ) !ParsedToolResultImages {
     const handle = if (object.get("tool_image_handle")) |value|
         try parseOptionalDurableBytes(alloc, value)
@@ -3099,9 +3278,11 @@ fn parseToolResultImages(
     errdefer if (handle) |owned| mem_utils.free(alloc, owned);
     const items = if (object.get("tool_images")) |images| items: {
         if (images != .array) return error.InvalidSessionFormat;
-        const parsed = parsePersistedToolImages(alloc, images.array.items) catch |err| {
+        const parsed = parseToolImagesWith(alloc, images.array.items, sources) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
-            if (err == error.InvalidSourceRef) return error.InvalidSessionFormat;
+            // A named image that cannot be read is a format error, not an
+            // image to leave out: the record says the store holds it.
+            if (err == error.InvalidSourceRef or err == error.InvalidSessionFormat) return error.InvalidSessionFormat;
             const notice = try alloc.print(
                 "{s}\n[Saved tool image unavailable: {s}]",
                 .{ output.*, @errorName(err) },
@@ -3803,7 +3984,7 @@ test "durable tool image validation preserves the session format error contract"
             .provider_native = false,
             .created_at_ms = 0,
             .tool_images = &images,
-        }, .durable));
+        }, .durable, {}));
     }
 }
 
@@ -4305,7 +4486,7 @@ test "review feedback durable codec rejects invalid provenance and unknown field
     result.review_feedback = true;
     var encoded: std.Io.Writer.Allocating = .init(alloc);
     defer encoded.deinit();
-    try writeExecutionToolResult(&encoded.writer, result, .durable);
+    try writeExecutionToolResult(&encoded.writer, result, .durable, {});
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
     defer parsed.deinit();
     const cases = [_]struct { status: []const u8, provider_native: bool, marker: std.json.Value }{
@@ -4331,7 +4512,7 @@ test "review feedback durable codec rejects invalid provenance and unknown field
         invalid.provider_native = native;
         try std.testing.expectError(
             error.InvalidSessionFormat,
-            writeExecutionToolResult(&encoded.writer, invalid, .durable),
+            writeExecutionToolResult(&encoded.writer, invalid, .durable, {}),
         );
     }
 }
@@ -4343,7 +4524,7 @@ test "review feedback defaults old durable results without inspecting output" {
     result.output = @constCast("Security review held this action.");
     var encoded: std.Io.Writer.Allocating = .init(alloc);
     defer encoded.deinit();
-    try writeExecutionToolResult(&encoded.writer, result, .durable);
+    try writeExecutionToolResult(&encoded.writer, result, .durable, {});
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value.object.swapRemove("review_feedback"));

@@ -50,6 +50,7 @@ const std = @import("std");
 const types = @import("../../shared/types.zig");
 const testing_allocator = @import("../../shared/testing_allocator.zig");
 const session_codec = @import("../../session/session_codec.zig");
+const image_data = @import("../../images/image_data.zig");
 const checkpoint_codec = @import("checkpoint.zig");
 const compactor = @import("../../compactor/compactor.zig");
 
@@ -122,6 +123,9 @@ pub const ToolResult = struct {
     name: []const u8,
     failed: bool,
     output: []const u8,
+    /// The images the result returned, which a reopened turn gives back to
+    /// the call with its output.
+    images: []const types.ToolImage = &.{},
 };
 
 /// The longest turn id a host may give.
@@ -194,7 +198,10 @@ pub const Cursor = struct {
                 try writer.writeAll(",\"data\":");
                 if (progress.delta) |delta| {
                     if (delta.base_seq >= self.next_seq) return error.InvalidDurableField;
-                    try session_codec.writeRecoveryCheckpointDelta(writer, progress.checkpoint, delta.from);
+                    if (stored) |names|
+                        try session_codec.writeRecoveryCheckpointDeltaNamingImages(writer, progress.checkpoint, delta.from, .{ .stored = names })
+                    else
+                        try session_codec.writeRecoveryCheckpointDelta(writer, progress.checkpoint, delta.from);
                     try writer.print(",\"base\":{d},\"steps\":{d}", .{ delta.base_seq, progress.checkpoint.execution.tool_steps.len });
                 } else if (stored) |names| {
                     try session_codec.writeRecoveryCheckpointNamingImages(writer, progress.checkpoint, .{ .stored = names });
@@ -241,13 +248,17 @@ pub const Cursor = struct {
             },
             .turn_yielded => {},
             .tool_result => |result| {
-                try writer.writeAll(",\"data\":");
-                try std.json.Stringify.value(.{
-                    .id = result.id,
-                    .name = result.name,
-                    .status = if (result.failed) "failure" else "success",
-                    .output = result.output,
-                }, .{}, writer);
+                try writer.writeAll(",\"data\":{\"id\":");
+                try std.json.Stringify.value(result.id, .{}, writer);
+                try writer.writeAll(",\"name\":");
+                try std.json.Stringify.value(result.name, .{}, writer);
+                try writer.print(",\"status\":\"{s}\",\"output\":", .{if (result.failed) "failure" else "success"});
+                try std.json.Stringify.value(result.output, .{}, writer);
+                if (result.images.len > 0) {
+                    try writer.writeAll(",\"images\":");
+                    try session_codec.writeToolImages(writer, result.images, stored != null);
+                }
+                try writer.writeByte('}');
             },
         }
         try writer.writeByte('}');
@@ -263,12 +274,14 @@ pub const Cursor = struct {
 fn eventNamesImages(event: Event, stored: ?*const session_codec.StoredImages) bool {
     return switch (event) {
         .turn_committed => |turn| session_codec.turnNamesImages(turn, stored),
-        // A delta leaves out the user's turn, so it names nothing.
-        .turn_progress => |progress| progress.delta == null and session_codec.namesImages(progress.checkpoint.user, stored),
+        // A delta leaves out the user's turn: it names only what its new
+        // tool results do.
+        .turn_progress => |progress| session_codec.checkpointNamesImages(progress.checkpoint, if (progress.delta) |delta| delta.from else null, stored),
         .history_replaced => |history| for (history) |turn| {
             if (session_codec.turnNamesImages(turn, stored)) break true;
         } else false,
-        .tool_intent, .turn_progress_cleared, .input_accepted, .input_withdrawn, .turn_yielded, .tool_result => false,
+        .tool_result => |result| session_codec.toolImagesNameImages(result.images, stored),
+        .tool_intent, .turn_progress_cleared, .input_accepted, .input_withdrawn, .turn_yielded => false,
     };
 }
 
@@ -411,7 +424,7 @@ pub fn writeOpenTurnNamingImages(
     stored: *const session_codec.StoredImages,
 ) !bool {
     try writeOpenTurnWith(writer, turn_id, progress, stored);
-    return session_codec.namesImages(progress.user, stored);
+    return session_codec.checkpointNamesImages(progress, null, stored);
 }
 
 fn writeOpenTurnWith(
@@ -490,14 +503,22 @@ pub const Finished = struct {
     id: []u8,
     failed: bool,
     output: []u8,
+    /// Owned. An image the host has yet to stage has no bytes, and the
+    /// fold's resolver records it as missing.
+    images: []types.ToolImage = &.{},
 };
 
 fn freeFinished(alloc: Allocator, finished: []Finished) void {
+    freeFinishedEntries(alloc, finished);
+    alloc.free(finished);
+}
+
+fn freeFinishedEntries(alloc: Allocator, finished: []const Finished) void {
     for (finished) |entry| {
         alloc.free(entry.id);
         alloc.free(entry.output);
+        types.freeToolImages(alloc, entry.images);
     }
-    alloc.free(finished);
 }
 
 pub fn freePendingInputs(alloc: Allocator, inputs: []PendingInput) void {
@@ -546,14 +567,12 @@ fn announcedCall(calls: []const std.json.Value, id: []const u8) bool {
     return false;
 }
 
-/// Owned copies of the newest recorded result of each call in `calls`.
-fn finishedOf(alloc: Allocator, calls: []const types.ToolCall, results: []const std.json.Value) LoadError![]Finished {
+/// Owned copies of the newest recorded result of each call in `calls`, with
+/// the images each names resolved through `sources`.
+fn finishedOf(alloc: Allocator, calls: []const types.ToolCall, results: []const std.json.Value, sources: session_codec.ImageSources) LoadError![]Finished {
     var finished: std.ArrayList(Finished) = .empty;
     errdefer {
-        for (finished.items) |entry| {
-            alloc.free(entry.id);
-            alloc.free(entry.output);
-        }
+        freeFinishedEntries(alloc, finished.items);
         finished.deinit(alloc);
     }
     for (calls) |call| {
@@ -566,10 +585,19 @@ fn finishedOf(alloc: Allocator, calls: []const types.ToolCall, results: []const 
         errdefer alloc.free(id);
         const output = try alloc.dupe(u8, result.object.get("output").?.string);
         errdefer alloc.free(output);
+        const images: []types.ToolImage = if (result.object.get("images")) |list|
+            session_codec.parseToolImages(alloc, list.array.items, sources) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidJournal,
+            }
+        else
+            &.{};
+        errdefer types.freeToolImages(alloc, images);
         try finished.append(alloc, .{
             .id = id,
             .failed = std.mem.eql(u8, result.object.get("status").?.string, "failure"),
             .output = output,
+            .images = images,
         });
     }
     return finished.toOwnedSlice(alloc);
@@ -736,6 +764,7 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
                     if (!std.mem.eql(u8, status, "success") and !std.mem.eql(u8, status, "failure")) return error.InvalidJournal;
                     const output = data.object.get("output") orelse return error.InvalidJournal;
                     if (output != .string) return error.InvalidJournal;
+                    if (data.object.get("images")) |images| if (images != .array) return error.InvalidJournal;
                     // One for a call no intent announced answers nothing.
                     if (announcedCall(running.items, id)) try results.append(alloc, data);
                 }
@@ -804,7 +833,7 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
         return err;
     };
     errdefer types.freeToolCallSlice(alloc, unanswered);
-    const finished = try finishedOf(alloc, unanswered, results.items);
+    const finished = try finishedOf(alloc, unanswered, results.items, .{ .names = base.images });
     errdefer freeFinished(alloc, finished);
     const pending = try pendingInputsOf(alloc, if (open_turn != null) inputs.items else &.{}, .steer);
     errdefer freePendingInputs(alloc, pending);
@@ -1910,6 +1939,64 @@ test "one fold names every image the host did not stage" {
     try std.testing.expectEqual(@as(usize, 2), resolver.missing.count());
     try std.testing.expect(resolver.missing.contains(session_codec.imageNameOf(first_png)));
     try std.testing.expect(resolver.missing.contains(session_codec.imageNameOf(second_png)));
+}
+
+test "a recorded tool result keeps its images, naming the stored one" {
+    const alloc = std.testing.allocator;
+    const stored_png = image_data.testPngHeader(1, 1);
+    const inline_png = image_data.testPngHeader(2, 1);
+    const name = session_codec.imageNameOf(&stored_png);
+    var stored: session_codec.StoredImages = .{};
+    defer stored.deinit(alloc);
+    try stored.add(alloc, name);
+    var stored_data: [std.base64.standard.Encoder.calcSize(stored_png.len)]u8 = undefined;
+    var inline_data: [std.base64.standard.Encoder.calcSize(inline_png.len)]u8 = undefined;
+    const images = [_]types.ToolImage{
+        .{ .data = @constCast(std.base64.standard.Encoder.encode(&stored_data, &stored_png)), .mime_type = @constCast("image/png"), .name = name },
+        .{ .data = @constCast(std.base64.standard.Encoder.encode(&inline_data, &inline_png)), .mime_type = @constCast("image/png") },
+    };
+    var progress = try testProgress(alloc, "take two shots");
+    defer progress.deinit(alloc);
+    const calls = [_]types.ToolCall{.{ .id = "call-a", .name = "screenshot", .arguments_json = "{}" }};
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeByte('[');
+    var cursor: Cursor = .{};
+    cursor = try cursor.writeNamingImages(&out.writer, .{ .turn_progress = .{ .checkpoint = progress } }, &stored);
+    try out.writer.writeByte(',');
+    cursor = try cursor.writeNamingImages(&out.writer, .{ .tool_intent = &calls }, &stored);
+    try out.writer.writeByte(',');
+    _ = try cursor.writeNamingImages(&out.writer, .{ .tool_result = .{ .id = "call-a", .name = "screenshot", .failed = false, .output = "two shots", .images = &images } }, &stored);
+    try out.writer.writeByte(']');
+    const bytes = out.written();
+    // It names the stored image, which makes it a naming event, and holds the
+    // other's bytes.
+    try std.testing.expect(std.mem.find(u8, bytes, "{\"v\":3,\"seq\":3,\"turn\":1,\"type\":\"tool_result\"") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, images[0].data) == null);
+    try std.testing.expect(std.mem.find(u8, bytes, images[1].data) != null);
+
+    // An open that has yet to stage the stored image names it as missing.
+    var staged: session_codec.StagedImages = .{};
+    defer staged.deinit(alloc);
+    var discover: session_codec.ImageResolver = .{ .alloc = alloc, .staged = &staged };
+    defer discover.deinit();
+    var unstaged = try foldFrom(alloc, bytes, .{ .images = &discover });
+    defer unstaged.deinit(alloc);
+    try std.testing.expect(discover.missing.contains(name));
+
+    // Staged, the call is answered with both images.
+    try staged.add(alloc, name, try alloc.dupe(u8, &stored_png));
+    var resolver: session_codec.ImageResolver = .{ .alloc = alloc, .staged = &staged };
+    defer resolver.deinit();
+    var folded = try foldFrom(alloc, bytes, .{ .images = &resolver });
+    defer folded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), resolver.missing.count());
+    try std.testing.expectEqual(@as(usize, 1), folded.finished.len);
+    try std.testing.expectEqualStrings("two shots", folded.finished[0].output);
+    try std.testing.expectEqual(@as(usize, 2), folded.finished[0].images.len);
+    try std.testing.expectEqualStrings(images[0].data, folded.finished[0].images[0].data);
+    try std.testing.expectEqualStrings(images[1].data, folded.finished[0].images[1].data);
 }
 
 test "a yielded snapshot names its open turn's stored images" {
