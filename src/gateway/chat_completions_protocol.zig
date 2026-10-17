@@ -1038,9 +1038,10 @@ fn append_bounded(alloc: Allocator, destination: *std.ArrayList(u8), text: []con
 
 /// Thin stream consumer, not a network transport. The source owns blocking-I/O
 /// cancellation. EventSink receives synchronous presentation-only text. Stops
-/// exactly at framed [DONE], without waiting for EOF or consuming another event.
-/// event_bytes also bounds all wire between dispatched data events (including
-/// ignored fields/comments); total_wire_bytes bounds the entire consumed stream.
+/// at framed [DONE] or clean EOF following a finished turn, without consuming
+/// another event. event_bytes also bounds all wire between dispatched data
+/// events (including ignored fields/comments); total_wire_bytes bounds the
+/// entire consumed stream.
 pub fn consume_stream(alloc: Allocator, source: *std.Io.Reader, request: stream_provider.RequestData, limits: Limits, events: ?stream_provider.EventSink, cancel_flag: *const std.atomic.Value(bool)) Error!stream_provider.Result {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     var reducer = try Reducer.init(alloc, request, limits);
@@ -1055,7 +1056,13 @@ pub fn consume_stream(alloc: Allocator, source: *std.Io.Reader, request: stream_
             error.StreamTooLarge => return if (event_limited) error.EventTooLarge else error.StreamTooLarge,
             else => return err,
         };
-        const chunk = data orelse return error.IncompleteStream;
+        const chunk = data orelse {
+            if (reducer.phase == .finished) {
+                reducer.phase = .done;
+                return reducer.finish(cancel_flag.load(.seq_cst));
+            }
+            return error.IncompleteStream;
+        };
         const deltas = try reducer.accept(chunk, cancel_flag.load(.seq_cst));
         if (events) |sink| {
             for (deltas.reasoning) |delta| if (delta) |text| {
@@ -2300,7 +2307,25 @@ test "chat completions stream framing handles chunks trailers truncation and wir
         try std.testing.expectEqualStrings("hello", result.completed.completion.content.?);
         try std.testing.expectEqual(@as(?u64, 5), result.completed.completion.usage.input_tokens);
     }
-    for ([_][]const u8{ "", "data: [DONE]\n\n", "data: " ++ test_stop ++ "\n\n", "data: " ++ test_stop ++ "\n\ndata: [DONE]", "data: " ++ test_stop ++ "\n\ndata: [DONE]\n" }) |truncated| {
+    {
+        const wire_without_done = "data: " ++ test_text ++ "\n\ndata: " ++ test_stop ++ "\n\n";
+        var source = std.Io.Reader.fixed(wire_without_done);
+        var result = try consume_stream(alloc, &source, test_request(), .{}, null, &cancelled);
+        defer result.deinit(alloc);
+        try std.testing.expectEqualStrings("hello", result.completed.completion.content.?);
+        try std.testing.expectEqual(types.ProviderFinishReason.stop, result.completed.completion.finish_reason.?);
+    }
+    {
+        const wire_with_usage_without_done = "data: " ++ test_text ++ "\n\ndata: " ++ test_stop ++ "\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1}}\n\n";
+        var source = std.Io.Reader.fixed(wire_with_usage_without_done);
+        var result = try consume_stream(alloc, &source, test_request(), .{}, null, &cancelled);
+        defer result.deinit(alloc);
+        try std.testing.expectEqualStrings("hello", result.completed.completion.content.?);
+        try std.testing.expectEqual(@as(?u64, 5), result.completed.completion.usage.input_tokens);
+        try std.testing.expectEqual(@as(?u64, 1), result.completed.completion.usage.output_tokens);
+        try std.testing.expectEqual(types.ProviderFinishReason.stop, result.completed.completion.finish_reason.?);
+    }
+    for ([_][]const u8{ "", "data: [DONE]\n\n", "data: " ++ test_text ++ "\n\n", "data: " ++ test_text ++ "\n\ndata: [DONE]", "data: " ++ test_text ++ "\n\ndata: [DONE]\n" }) |truncated| {
         var source = std.Io.Reader.fixed(truncated);
         try std.testing.expectError(error.IncompleteStream, consume_stream(alloc, &source, test_request(), .{}, null, &cancelled));
     }
