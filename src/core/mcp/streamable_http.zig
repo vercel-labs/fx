@@ -4,6 +4,7 @@ const mcp_contract = @import("mcp_contract.zig");
 const operation_control = @import("operation_control.zig");
 const protocol_negotiation = @import("protocol_negotiation.zig");
 const io_mod = @import("../shared/io.zig");
+const select_watch = @import("../shared/select_watch.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -160,43 +161,43 @@ pub fn post(alloc: Allocator, options: PostOptions) !PostResponse {
     };
     const Event = union(enum) {
         request: anyerror!PostResponse,
-        cancelled: anyerror!void,
-        deadline: anyerror!void,
+        watch: std.Io.Cancelable!select_watch.Outcome,
     };
     const Cleanup = struct {
-        fn drain(result_alloc: Allocator, select: *std.Io.Select(Event)) void {
+        fn drain(result_alloc: Allocator, select: *std.Io.Select(Event), watch: *operation_control.RequestWatch) void {
+            watch.stop(select.io);
             while (select.cancel()) |item| switch (item) {
                 .request => |result| {
                     var response = result catch continue;
                     response.deinit(result_alloc);
                 },
-                .cancelled, .deadline => {},
+                .watch => {},
             };
         }
     };
 
-    var select_buffer: [3]Event = undefined;
+    var watch: operation_control.RequestWatch = .{};
+    var select_buffer: [2]Event = undefined;
     var select: std.Io.Select(Event) = .init(io_mod.getIo(), &select_buffer);
-    select.concurrent(.cancelled, waitForCancellation, .{cancellation}) catch |err| return err;
-    select.concurrent(.deadline, waitForDeadline, .{options.control.deadline}) catch |err| {
-        select.cancelDiscard();
-        return err;
-    };
+    select.concurrent(.watch, operation_control.RequestWatch.run, .{ &watch, select.io, operation_control.RequestCondition{
+        .cancellation = cancellation,
+        .deadline = options.control.deadline,
+    } }) catch |err| return err;
     select.concurrent(.request, Operation.run, .{Operation{
         .alloc = alloc,
         .options = options,
     }}) catch |err| {
-        select.cancelDiscard();
+        watch.finish(&select);
         return err;
     };
 
     const event = select.await() catch |err| {
-        Cleanup.drain(alloc, &select);
+        Cleanup.drain(alloc, &select, &watch);
         return err;
     };
     switch (event) {
         .request => |result| {
-            Cleanup.drain(alloc, &select);
+            watch.finish(&select);
             if (cancellation.cancelled()) {
                 var response = result catch return error.Cancelled;
                 response.deinit(alloc);
@@ -204,22 +205,11 @@ pub fn post(alloc: Allocator, options: PostOptions) !PostResponse {
             }
             return result;
         },
-        .cancelled => |result| {
-            result catch |err| {
-                Cleanup.drain(alloc, &select);
-                return err;
-            };
-            Cleanup.drain(alloc, &select);
+        .watch => |result| {
+            Cleanup.drain(alloc, &select, &watch);
+            const outcome = try result;
+            if (outcome == .deadline and !cancellation.cancelled()) return error.McpRequestTimedOut;
             return error.Cancelled;
-        },
-        .deadline => |result| {
-            result catch |err| {
-                Cleanup.drain(alloc, &select);
-                return err;
-            };
-            Cleanup.drain(alloc, &select);
-            if (cancellation.cancelled()) return error.Cancelled;
-            return error.McpRequestTimedOut;
         },
     }
 }
@@ -1213,16 +1203,6 @@ fn isLegacyDiscoveryCompatibilityResponse(alloc: Allocator, body: []const u8) Al
     defer parsed.deinit();
     if (parsed.value != .object) return false;
     return isLegacyDiscoveryCompatibilityError(parsed.value.object);
-}
-
-fn waitForCancellation(cancellation: operation_control.CancellationSources) anyerror!void {
-    while (!cancellation.cancelled()) {
-        try io_mod.getIo().sleep(.fromMilliseconds(5), .awake);
-    }
-}
-
-fn waitForDeadline(deadline: std.Io.Clock.Timestamp) anyerror!void {
-    try deadline.wait(io_mod.getIo());
 }
 
 fn isValidHeaderValue(value: []const u8) bool {

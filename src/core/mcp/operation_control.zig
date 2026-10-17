@@ -1,5 +1,6 @@
 const std = @import("std");
 const atomic_value = @import("atomic_value.zig");
+const select_watch = @import("../shared/select_watch.zig");
 
 pub fn monotonicMillis(io: std.Io) u64 {
     const now = std.Io.Clock.Timestamp.now(io, .awake);
@@ -46,6 +47,25 @@ pub const CancellationSources = struct {
         return self.state().cancelled();
     }
 };
+
+/// Ends an MCP request's watch when either cancellation source fires or the
+/// deadline passes. See `select_watch` for why the request owner stops the
+/// watch instead of cancelling it.
+pub const RequestCondition = struct {
+    cancellation: CancellationSources,
+    deadline: std.Io.Clock.Timestamp,
+
+    pub fn cancelled(condition: RequestCondition) bool {
+        return condition.cancellation.cancelled();
+    }
+
+    pub fn expired(condition: RequestCondition, io: std.Io) bool {
+        const now = std.Io.Clock.Timestamp.now(io, .awake);
+        return !std.Io.Clock.Timestamp.compare(now, .lt, condition.deadline);
+    }
+};
+
+pub const RequestWatch = select_watch.Watch(RequestCondition);
 
 pub const DeadlineGate = struct {
     deadline_ms: atomic_value.Value(i64),

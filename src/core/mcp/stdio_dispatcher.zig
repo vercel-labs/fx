@@ -3,6 +3,7 @@ const host_target = @import("../hosts/target.zig");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const select_watch = @import("../shared/select_watch.zig");
 const mcp_contract = @import("mcp_contract.zig");
 const docker_run = @import("docker_run.zig");
 const operation_control = @import("operation_control.zig");
@@ -763,62 +764,40 @@ pub const StdioDispatcher = struct {
     ) !WriteOutcome {
         const Event = union(enum) {
             write: anyerror!void,
-            deadline: anyerror!void,
-            cancelled: anyerror!void,
-            lifecycle_cancelled: anyerror!void,
-            commit_cancelled: anyerror!void,
+            watch: std.Io.Cancelable!select_watch.Outcome,
         };
         var operation = WriteOperation{
             .dispatcher = self,
             .body = body,
             .precommit = precommit,
         };
-        var select_buffer: [5]Event = undefined;
+        const condition: WriteCondition = .{
+            .deadline = deadline,
+            .cancel_flag = cancel_flag,
+            .lifecycle_cancel_flag = lifecycle_cancel_flag,
+            .commit_cancel_flag = commit_cancel_flag,
+        };
+        var watch: WriteWatch = .{};
+        var select_buffer: [2]Event = undefined;
         var select: std.Io.Select(Event) = .init(io_mod.getIo(), &select_buffer);
-        select.concurrent(.deadline, waitForWriteDeadline, .{deadline}) catch |err| {
+        select.concurrent(.watch, WriteWatch.run, .{ &watch, select.io, condition }) catch |err| {
             return err;
         };
-        if (cancel_flag) |flag| {
-            select.concurrent(.cancelled, waitForWriteCancellation, .{flag}) catch |err| {
-                select.cancelDiscard();
-                return err;
-            };
-        }
-        if (lifecycle_cancel_flag) |flag| {
-            if (cancel_flag == null or cancel_flag.? != flag) {
-                select.concurrent(.lifecycle_cancelled, waitForWriteCancellation, .{flag}) catch |err| {
-                    select.cancelDiscard();
-                    return err;
-                };
-            }
-        }
-        if (commit_cancel_flag) |flag| {
-            if ((cancel_flag == null or cancel_flag.? != flag) and
-                (lifecycle_cancel_flag == null or lifecycle_cancel_flag.? != flag))
-            {
-                select.concurrent(.commit_cancelled, waitForWriteCancellation, .{flag}) catch |err| {
-                    select.cancelDiscard();
-                    return err;
-                };
-            }
-        }
         select.concurrent(.write, WriteOperation.run, .{&operation}) catch |err| {
-            select.cancelDiscard();
+            watch.finish(&select);
             return err;
         };
 
         const event = select.await() catch |err| {
+            watch.stop(select.io);
             select.cancelDiscard();
             return err;
         };
         switch (event) {
             .write => |write_result| {
-                select.cancelDiscard();
+                watch.finish(&select);
                 const phase = operation.phase.load(.acquire);
-                if (cancelRequested(cancel_flag) or
-                    cancelRequested(lifecycle_cancel_flag) or
-                    cancelRequested(commit_cancel_flag))
-                {
+                if (condition.cancelled()) {
                     return .{ .phase = phase, .result = error.Cancelled };
                 }
                 if (deadlineExpired(io_mod.getIo(), deadline)) {
@@ -826,54 +805,15 @@ pub const StdioDispatcher = struct {
                 }
                 return .{ .phase = phase, .result = write_result };
             },
-            .deadline => |deadline_result| {
-                deadline_result catch |err| {
-                    select.cancelDiscard();
-                    return err;
-                };
+            .watch => |watch_result| {
                 select.cancelDiscard();
-                const phase = operation.phase.load(.acquire);
+                const outcome = try watch_result;
                 return .{
-                    .phase = phase,
-                    .result = if (cancelRequested(cancel_flag) or
-                        cancelRequested(lifecycle_cancel_flag) or
-                        cancelRequested(commit_cancel_flag))
-                        error.Cancelled
+                    .phase = operation.phase.load(.acquire),
+                    .result = if (outcome == .deadline and !condition.cancelled())
+                        error.McpRequestTimedOut
                     else
-                        error.McpRequestTimedOut,
-                };
-            },
-            .cancelled => |cancel_result| {
-                cancel_result catch |err| {
-                    select.cancelDiscard();
-                    return err;
-                };
-                select.cancelDiscard();
-                return .{
-                    .phase = operation.phase.load(.acquire),
-                    .result = error.Cancelled,
-                };
-            },
-            .lifecycle_cancelled => |cancel_result| {
-                cancel_result catch |err| {
-                    select.cancelDiscard();
-                    return err;
-                };
-                select.cancelDiscard();
-                return .{
-                    .phase = operation.phase.load(.acquire),
-                    .result = error.Cancelled,
-                };
-            },
-            .commit_cancelled => |cancel_result| {
-                cancel_result catch |err| {
-                    select.cancelDiscard();
-                    return err;
-                };
-                select.cancelDiscard();
-                return .{
-                    .phase = operation.phase.load(.acquire),
-                    .result = error.Cancelled,
+                        error.Cancelled,
                 };
             },
         }
@@ -1743,15 +1683,26 @@ const WriteOperation = struct {
     }
 };
 
-fn waitForWriteDeadline(deadline: std.Io.Clock.Timestamp) anyerror!void {
-    try deadline.wait(io_mod.getIo());
-}
+/// Ends a write's watch when any of its cancel flags is set or its deadline
+/// passes. See `select_watch` for why the writer stops it instead of cancelling.
+const WriteCondition = struct {
+    deadline: std.Io.Clock.Timestamp,
+    cancel_flag: ?*const std.atomic.Value(bool),
+    lifecycle_cancel_flag: ?*const std.atomic.Value(bool),
+    commit_cancel_flag: ?*const std.atomic.Value(bool),
 
-fn waitForWriteCancellation(cancel_flag: *const std.atomic.Value(bool)) anyerror!void {
-    while (!cancel_flag.load(.seq_cst)) {
-        try io_mod.getIo().sleep(.fromMilliseconds(5), .awake);
+    pub fn cancelled(condition: WriteCondition) bool {
+        return cancelRequested(condition.cancel_flag) or
+            cancelRequested(condition.lifecycle_cancel_flag) or
+            cancelRequested(condition.commit_cancel_flag);
     }
-}
+
+    pub fn expired(condition: WriteCondition, io: std.Io) bool {
+        return deadlineExpired(io, condition.deadline);
+    }
+};
+
+const WriteWatch = select_watch.Watch(WriteCondition);
 
 fn requestDeadline(
     io: std.Io,

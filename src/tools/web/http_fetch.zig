@@ -1,6 +1,7 @@
 const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const select_watch = @import("../../core/shared/select_watch.zig");
 const url_policy = @import("url_policy.zig");
 
 const Allocator = std.mem.Allocator;
@@ -342,26 +343,52 @@ fn resolveDefault(_: *anyopaque, alloc: Allocator, host: []const u8, port: u16, 
 
 const ResolveSelect = union(enum) {
     lookup: anyerror![]IpAddress,
-    timeout: anyerror!void,
+    watch: std.Io.Cancelable!select_watch.Outcome,
 };
+
+/// Ends a DNS lookup's watch when the hop deadline passes. Cancellation is
+/// checked by the lookup itself. See `select_watch` for why the resolver stops
+/// the watch instead of cancelling it.
+const ResolveCondition = struct {
+    deadline: Deadline,
+
+    pub fn cancelled(_: ResolveCondition) bool {
+        return false;
+    }
+
+    pub fn expired(condition: ResolveCondition, _: std.Io) bool {
+        return monotonicMillis() >= condition.deadline.deadline_ms;
+    }
+};
+
+const ResolveWatch = select_watch.Watch(ResolveCondition);
 
 fn resolveWithDeadline(alloc: Allocator, host_name: std.Io.net.HostName, port: u16, deadline: Deadline, options: FetchOptions) anyerror![]IpAddress {
     const zio = io_mod.getIo();
+    var watch: ResolveWatch = .{};
     var select_buffer: [2]ResolveSelect = undefined;
     var select: std.Io.Select(ResolveSelect) = .init(zio, &select_buffer);
 
-    try select.concurrent(.lookup, collectLookup, .{ alloc, host_name, port, options });
-    try select.concurrent(.timeout, waitForDeadline, .{deadline});
+    try select.concurrent(.watch, ResolveWatch.run, .{ &watch, zio, ResolveCondition{ .deadline = deadline } });
+    select.concurrent(.lookup, collectLookup, .{ alloc, host_name, port, options }) catch |err| {
+        watch.finish(&select);
+        return err;
+    };
 
-    const result = try select.await();
+    const result = select.await() catch |err| {
+        watch.stop(zio);
+        cancelResolveSelect(alloc, &select);
+        return err;
+    };
     switch (result) {
         .lookup => |lookup_result| {
-            select.cancelDiscard();
+            watch.finish(&select);
             return lookup_result;
         },
-        .timeout => |timeout_result| {
+        // getaddrinfo cannot be stopped any other way, so the lookup is cancelled.
+        .watch => |watch_result| {
             cancelResolveSelect(alloc, &select);
-            try timeout_result;
+            _ = try watch_result;
             return error.Timeout;
         },
     }
@@ -390,22 +417,13 @@ fn collectLookup(alloc: Allocator, host_name: std.Io.net.HostName, port: u16, op
     return addresses.toOwnedSlice(alloc);
 }
 
-fn waitForDeadline(deadline: Deadline) anyerror!void {
-    const timestamp: std.Io.Clock.Timestamp = .{
-        .clock = .awake,
-        .raw = std.Io.Timestamp.fromNanoseconds(@as(i96, deadline.deadline_ms) * std.time.ns_per_ms),
-    };
-    try timestamp.wait(io_mod.getIo());
-    return error.Timeout;
-}
-
 fn cancelResolveSelect(alloc: Allocator, select: *std.Io.Select(ResolveSelect)) void {
     while (select.cancel()) |item| switch (item) {
         .lookup => |lookup_result| {
             const addresses = lookup_result catch continue;
             alloc.free(addresses);
         },
-        .timeout => {},
+        .watch => {},
     };
 }
 

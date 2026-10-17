@@ -23,6 +23,7 @@ const js_host_steering = if (host_target.is_wasm)
 else
     struct {};
 const io_mod = @import("../core/shared/io.zig");
+const select_watch = @import("../core/shared/select_watch.zig");
 const host_attachments = @import("../core/hosts/host_attachments.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const image_data = @import("../core/images/image_data.zig");
@@ -3628,9 +3629,29 @@ fn answerBindingForAcpInput(
 
 const AcpElicitationWait = union(enum) {
     response: ?server.OutboundResponse,
-    deadline: anyerror!void,
-    cancelled: anyerror!void,
+    watch: std.Io.Cancelable!select_watch.Outcome,
 };
+
+/// Ends an ACP elicitation's watch when either cancel flag is set or its
+/// deadline passes. See `select_watch` for why the waiter stops it instead of
+/// cancelling it.
+const AcpElicitationCondition = struct {
+    deadline_ms: i64,
+    lifecycle_cancel_flag: ?*const std.atomic.Value(bool),
+    operation_cancel_flag: ?*const std.atomic.Value(bool),
+
+    pub fn cancelled(condition: AcpElicitationCondition) bool {
+        const lifecycle = if (condition.lifecycle_cancel_flag) |flag| flag.load(.acquire) else false;
+        const operation = if (condition.operation_cancel_flag) |flag| flag.load(.acquire) else false;
+        return lifecycle or operation;
+    }
+
+    pub fn expired(condition: AcpElicitationCondition, _: std.Io) bool {
+        return acpAwakeMillis() >= condition.deadline_ms;
+    }
+};
+
+const AcpElicitationWatch = select_watch.Watch(AcpElicitationCondition);
 
 fn awaitAcpElicitationResponse(
     state: *server.ServerState,
@@ -3638,65 +3659,42 @@ fn awaitAcpElicitationResponse(
     origin: tool_mcp_runtime.InputOrigin,
     operation_cancel_flag: ?*const std.atomic.Value(bool),
 ) !?server.OutboundResponse {
-    const Cleanup = struct {
-        fn drain(state_alloc: Allocator, select: *std.Io.Select(AcpElicitationWait)) void {
-            while (select.cancel()) |item| switch (item) {
-                .response => |maybe_response| if (maybe_response) |owned| {
-                    var response = owned;
-                    response.deinit(state_alloc);
-                },
-                .deadline, .cancelled => {},
-            };
-        }
-    };
-
-    var select_buffer: [3]AcpElicitationWait = undefined;
+    var watch: AcpElicitationWatch = .{};
+    var select_buffer: [2]AcpElicitationWait = undefined;
     var select: std.Io.Select(AcpElicitationWait) = .init(io_mod.getIo(), &select_buffer);
     try select.concurrent(.response, server.awaitOutboundResponse, .{ state, id, server.OutboundKind.elicitation });
-    select.concurrent(.deadline, waitForAcpElicitationDeadline, .{origin.deadline_ms}) catch |err| {
-        Cleanup.drain(state.alloc, &select);
-        return err;
-    };
-    select.concurrent(.cancelled, waitForAcpElicitationCancellation, .{
-        origin.lifecycle_cancel_flag,
-        operation_cancel_flag,
-    }) catch |err| {
-        Cleanup.drain(state.alloc, &select);
+    select.concurrent(.watch, AcpElicitationWatch.run, .{ &watch, select.io, AcpElicitationCondition{
+        .deadline_ms = origin.deadline_ms,
+        .lifecycle_cancel_flag = origin.lifecycle_cancel_flag,
+        .operation_cancel_flag = operation_cancel_flag,
+    } }) catch |err| {
+        server.cancelOutboundRequest(state, id);
+        server.takeCancelledResponse(state, &select);
         return err;
     };
     const event = select.await() catch |err| {
-        Cleanup.drain(state.alloc, &select);
+        watch.stop(select.io);
+        server.cancelOutboundRequest(state, id);
+        while (select.cancel()) |item| switch (item) {
+            .response => |maybe_response| if (maybe_response) |owned| {
+                var response = owned;
+                response.deinit(state.alloc);
+            },
+            .watch => {},
+        };
         return err;
     };
     return switch (event) {
         .response => |response| result: {
-            Cleanup.drain(state.alloc, &select);
+            watch.finish(&select);
             break :result response;
         },
-        .deadline, .cancelled => result: {
+        .watch => result: {
             server.cancelOutboundRequest(state, id);
-            Cleanup.drain(state.alloc, &select);
+            server.takeCancelledResponse(state, &select);
             break :result null;
         },
     };
-}
-
-fn waitForAcpElicitationDeadline(deadline_ms: i64) anyerror!void {
-    while (acpAwakeMillis() < deadline_ms) {
-        const remaining = deadline_ms - acpAwakeMillis();
-        try io_mod.getIo().sleep(.fromMilliseconds(@intCast(@max(@min(remaining, 20), 1))), .awake);
-    }
-}
-
-fn waitForAcpElicitationCancellation(
-    lifecycle_cancel_flag: ?*const std.atomic.Value(bool),
-    operation_cancel_flag: ?*const std.atomic.Value(bool),
-) anyerror!void {
-    while ((lifecycle_cancel_flag == null or !lifecycle_cancel_flag.?.load(.acquire)) and
-        (operation_cancel_flag == null or !operation_cancel_flag.?.load(.acquire)))
-    {
-        try io_mod.getIo().sleep(.fromMilliseconds(10), .awake);
-    }
 }
 
 fn acpAwakeMillis() i64 {

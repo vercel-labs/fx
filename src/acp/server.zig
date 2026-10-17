@@ -1071,6 +1071,26 @@ pub fn awaitOutboundResponse(state: *ServerState, id: u64, kind: OutboundKind) ?
     }
 }
 
+/// Takes the event of an `awaitOutboundResponse` task in `select` after
+/// `cancelOutboundRequest` made it return, and frees any response. Call when
+/// that event is the only one outstanding; `select` then has nothing left to
+/// cancel. `select` must hold a `response: ?OutboundResponse` event.
+pub fn takeCancelledResponse(state: *ServerState, select: anytype) void {
+    const item = select.queue.getOneUncancelable(select.io) catch |err| switch (err) {
+        // Only Select.cancel and cancelDiscard close the queue, and they leave
+        // nothing outstanding.
+        error.Closed => return,
+    };
+    switch (item) {
+        .response => |maybe_response| if (maybe_response) |owned| {
+            var response = owned;
+            response.deinit(state.alloc);
+        },
+        else => {},
+    }
+    std.debug.assert(select.cancel() == null);
+}
+
 /// Forgets a request that was never written to the client.
 pub fn discardOutboundRequest(state: *ServerState, id: u64) void {
     state.outbound_mutex.lockUncancelable(io_mod.getIo());

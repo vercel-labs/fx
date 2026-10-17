@@ -2,6 +2,7 @@ const std = @import("std");
 const host_target = @import("../hosts/target.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const select_watch = @import("../shared/select_watch.zig");
 const legacy_sse = @import("legacy_sse.zig");
 const mcp_auth = @import("mcp_auth.zig");
 const mcp_contract = @import("mcp_contract.zig");
@@ -674,17 +675,15 @@ fn postMessageBounded(
     };
     const Event = union(enum) {
         post: anyerror!void,
-        deadline: anyerror!void,
-        cancelled: anyerror!void,
+        watch: std.Io.Cancelable!select_watch.Outcome,
     };
-    var select_buffer: [3]Event = undefined;
+    var watch: operation_control.RequestWatch = .{};
+    var select_buffer: [2]Event = undefined;
     var select: std.Io.Select(Event) = .init(io_mod.getIo(), &select_buffer);
-    select.concurrent(.deadline, waitForDeadline, .{deadline}) catch |err|
-        return err;
-    select.concurrent(.cancelled, waitForCancellation, .{cancellation}) catch |err| {
-        select.cancelDiscard();
-        return err;
-    };
+    select.concurrent(.watch, operation_control.RequestWatch.run, .{ &watch, select.io, operation_control.RequestCondition{
+        .cancellation = cancellation,
+        .deadline = deadline,
+    } }) catch |err| return err;
     select.concurrent(.post, Operation.run, .{Operation{
         .alloc = alloc,
         .client = client,
@@ -692,37 +691,27 @@ fn postMessageBounded(
         .committed = committed,
         .precommit = precommit,
     }}) catch |err| {
-        select.cancelDiscard();
+        watch.finish(&select);
         return err;
     };
 
     const event = select.await() catch |err| {
+        watch.stop(select.io);
         select.cancelDiscard();
         return err;
     };
     switch (event) {
         .post => |result| {
-            select.cancelDiscard();
+            watch.finish(&select);
             if (cancellation.cancelled()) return error.Cancelled;
             if (deadlineExpired(deadline)) return error.McpRequestTimedOut;
             return result;
         },
-        .cancelled => |result| {
-            result catch |err| {
-                select.cancelDiscard();
-                return err;
-            };
+        .watch => |result| {
             select.cancelDiscard();
+            const outcome = try result;
+            if (outcome == .deadline and !cancellation.cancelled()) return error.McpRequestTimedOut;
             return error.Cancelled;
-        },
-        .deadline => |result| {
-            result catch |err| {
-                select.cancelDiscard();
-                return err;
-            };
-            select.cancelDiscard();
-            if (cancellation.cancelled()) return error.Cancelled;
-            return error.McpRequestTimedOut;
         },
     }
 }
@@ -859,16 +848,6 @@ fn waitForStop(stop_flag: *std.atomic.Value(bool)) anyerror!void {
     while (!stop_flag.load(.acquire)) {
         try io_mod.getIo().sleep(.fromMilliseconds(5), .awake);
     }
-}
-
-fn waitForCancellation(cancellation: operation_control.CancellationSources) anyerror!void {
-    while (!cancellation.cancelled()) {
-        try io_mod.getIo().sleep(.fromMilliseconds(5), .awake);
-    }
-}
-
-fn waitForDeadline(deadline: std.Io.Clock.Timestamp) anyerror!void {
-    try deadline.wait(io_mod.getIo());
 }
 
 test "HTTP+SSE endpoint resolution stays same-origin" {

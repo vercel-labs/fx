@@ -10,6 +10,8 @@ const jsonrpc = @import("jsonrpc.zig");
 const server = @import("server.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
+const select_watch = @import("../core/shared/select_watch.zig");
+const operation_control = @import("../core/mcp/operation_control.zig");
 const message_carrier = @import("../core/mcp/message_carrier.zig");
 const streamable_http = @import("../core/mcp/streamable_http.zig");
 
@@ -160,68 +162,49 @@ const Outcome = union(enum) {
 
 const Wait = union(enum) {
     response: ?server.OutboundResponse,
-    deadline: anyerror!void,
-    cancelled: anyerror!void,
+    watch: std.Io.Cancelable!select_watch.Outcome,
 };
 
 /// Waits for the client's reply, the MCP deadline, or cancellation. When the
 /// deadline or cancellation wins, the client receives `$/cancel_request` for
 /// the outer request. The pending request is always retired on return.
 fn awaitResponse(state: *server.ServerState, id: u64, control: streamable_http.Control) !Outcome {
-    const Cleanup = struct {
-        fn drain(state_alloc: Allocator, select: *std.Io.Select(Wait)) void {
-            while (select.cancel()) |item| switch (item) {
-                .response => |maybe_response| if (maybe_response) |owned| {
-                    var response = owned;
-                    response.deinit(state_alloc);
-                },
-                .deadline, .cancelled => {},
-            };
-        }
-    };
-
-    var select_buffer: [3]Wait = undefined;
+    const cancellation = control.cancellation();
+    var watch: operation_control.RequestWatch = .{};
+    var select_buffer: [2]Wait = undefined;
     var select: std.Io.Select(Wait) = .init(io_mod.getIo(), &select_buffer);
     try select.concurrent(.response, server.awaitOutboundResponse, .{ state, id, server.OutboundKind.mcp_message });
-    select.concurrent(.deadline, waitForDeadline, .{control.deadline}) catch |err| {
+    select.concurrent(.watch, operation_control.RequestWatch.run, .{ &watch, select.io, operation_control.RequestCondition{
+        .cancellation = cancellation,
+        .deadline = control.deadline,
+    } }) catch |err| {
         server.cancelOutboundRequest(state, id);
-        Cleanup.drain(state.alloc, &select);
-        return err;
-    };
-    select.concurrent(.cancelled, waitForCancellation, .{control}) catch |err| {
-        server.cancelOutboundRequest(state, id);
-        Cleanup.drain(state.alloc, &select);
+        server.takeCancelledResponse(state, &select);
         return err;
     };
     const event = select.await() catch |err| {
+        watch.stop(select.io);
         server.cancelOutboundRequest(state, id);
-        Cleanup.drain(state.alloc, &select);
+        while (select.cancel()) |item| switch (item) {
+            .response => |maybe_response| if (maybe_response) |owned| {
+                var response = owned;
+                response.deinit(state.alloc);
+            },
+            .watch => {},
+        };
         return err;
     };
     switch (event) {
         .response => |response| {
-            Cleanup.drain(state.alloc, &select);
+            watch.finish(&select);
             return if (response) |value| .{ .response = value } else .cancelled;
         },
-        .deadline, .cancelled => {
+        .watch => |result| {
             server.cancelOutboundRequest(state, id);
-            Cleanup.drain(state.alloc, &select);
-            return if (event == .deadline and !control.cancellation().cancelled()) .timed_out else .cancelled;
+            server.takeCancelledResponse(state, &select);
+            const outcome = try result;
+            return if (outcome == .deadline and !cancellation.cancelled()) .timed_out else .cancelled;
         },
-    }
-}
-
-fn waitForDeadline(deadline: std.Io.Clock.Timestamp) anyerror!void {
-    const io = io_mod.getIo();
-    while (std.Io.Clock.Timestamp.compare(std.Io.Clock.Timestamp.now(io, .awake), .lt, deadline)) {
-        try io.sleep(.fromMilliseconds(5), .awake);
-    }
-}
-
-fn waitForCancellation(control: streamable_http.Control) anyerror!void {
-    const cancellation = control.cancellation();
-    while (!cancellation.cancelled()) {
-        try io_mod.getIo().sleep(.fromMilliseconds(5), .awake);
     }
 }
 

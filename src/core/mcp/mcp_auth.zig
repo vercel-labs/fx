@@ -3,6 +3,7 @@ const host_target = @import("../hosts/target.zig");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const select_watch = @import("../shared/select_watch.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const operation_control = @import("operation_control.zig");
 const browser_callback = @import("../auth/browser_callback.zig");
@@ -840,44 +841,43 @@ pub fn refreshCredentials(
     };
     const Event = union(enum) {
         refresh: anyerror!Credentials,
-        cancelled: anyerror!void,
-        deadline: anyerror!void,
+        watch: std.Io.Cancelable!select_watch.Outcome,
     };
     const Cleanup = struct {
-        fn drain(result_alloc: Allocator, select: *std.Io.Select(Event)) void {
+        fn drain(result_alloc: Allocator, select: *std.Io.Select(Event), watch: *operation_control.RequestWatch) void {
+            watch.stop(select.io);
             while (select.cancel()) |item| switch (item) {
                 .refresh => |result| {
                     var refreshed = result catch continue;
                     refreshed.deinit(result_alloc);
                 },
-                .cancelled, .deadline => {},
+                .watch => {},
             };
         }
     };
 
-    var select_buffer: [3]Event = undefined;
+    var watch: operation_control.RequestWatch = .{};
+    var select_buffer: [2]Event = undefined;
     var select: std.Io.Select(Event) = .init(io_mod.getIo(), &select_buffer);
-    select.concurrent(.cancelled, waitForRefreshCancellation, .{cancellation}) catch |err|
-        return err;
-    select.concurrent(.deadline, waitForRefreshDeadline, .{control.deadline}) catch |err| {
-        select.cancelDiscard();
-        return err;
-    };
+    select.concurrent(.watch, operation_control.RequestWatch.run, .{ &watch, select.io, operation_control.RequestCondition{
+        .cancellation = cancellation,
+        .deadline = control.deadline,
+    } }) catch |err| return err;
     select.concurrent(.refresh, Operation.run, .{Operation{
         .alloc = alloc,
         .credentials = credentials,
     }}) catch |err| {
-        select.cancelDiscard();
+        watch.finish(&select);
         return err;
     };
 
     const event = select.await() catch |err| {
-        Cleanup.drain(alloc, &select);
+        Cleanup.drain(alloc, &select, &watch);
         return err;
     };
     switch (event) {
         .refresh => |result| {
-            Cleanup.drain(alloc, &select);
+            watch.finish(&select);
             if (cancellation.cancelled()) {
                 var refreshed = result catch return error.Cancelled;
                 refreshed.deinit(alloc);
@@ -885,22 +885,11 @@ pub fn refreshCredentials(
             }
             return result;
         },
-        .cancelled => |result| {
-            result catch |err| {
-                Cleanup.drain(alloc, &select);
-                return err;
-            };
-            Cleanup.drain(alloc, &select);
+        .watch => |result| {
+            Cleanup.drain(alloc, &select, &watch);
+            const outcome = try result;
+            if (outcome == .deadline and !cancellation.cancelled()) return error.McpRequestTimedOut;
             return error.Cancelled;
-        },
-        .deadline => |result| {
-            result catch |err| {
-                Cleanup.drain(alloc, &select);
-                return err;
-            };
-            Cleanup.drain(alloc, &select);
-            if (cancellation.cancelled()) return error.Cancelled;
-            return error.McpRequestTimedOut;
         },
     }
 }
@@ -986,18 +975,6 @@ fn refreshCredentialsCore(
     }
     next.expires_at_ms = expires_at_ms;
     return next;
-}
-
-fn waitForRefreshCancellation(
-    cancellation: operation_control.CancellationSources,
-) anyerror!void {
-    while (!cancellation.cancelled()) {
-        try io_mod.getIo().sleep(.fromMilliseconds(5), .awake);
-    }
-}
-
-fn waitForRefreshDeadline(deadline: std.Io.Clock.Timestamp) anyerror!void {
-    try deadline.wait(io_mod.getIo());
 }
 
 /// RFC 6749 §5.2: only invalid_grant marks the grant permanently dead.

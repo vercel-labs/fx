@@ -33,6 +33,7 @@ const image_attachments = @import("../images/image_attachments.zig");
 const hooks = @import("../hooks/hooks.zig");
 const notification_sound = @import("../notifications/sound.zig");
 const io_mod = @import("../shared/io.zig");
+const select_watch = @import("../shared/select_watch.zig");
 const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const session_title_generation = @import("../session/session_title_generation.zig");
 const compactor = @import("../compactor/compactor.zig");
@@ -3919,9 +3920,29 @@ fn openAskMcpUrl(_: ?*anyopaque, alloc: Allocator, url: []const u8) anyerror!boo
 
 const AskReadEvent = union(enum) {
     line: anyerror![]u8,
-    deadline: anyerror!void,
-    cancelled: anyerror!void,
+    watch: std.Io.Cancelable!select_watch.Outcome,
 };
+
+/// Ends a terminal question's watch when the run is cancelled or the question's
+/// deadline passes. See `select_watch` for why the reader stops it instead of
+/// cancelling it.
+const AskReadCondition = struct {
+    ctx: *AskContext,
+    deadline_ms: i64,
+    lifecycle_cancel_flag: ?*const std.atomic.Value(bool),
+
+    pub fn cancelled(condition: AskReadCondition) bool {
+        if (condition.ctx.cancelFlag().load(.acquire)) return true;
+        const flag = condition.lifecycle_cancel_flag orelse return false;
+        return flag.load(.acquire);
+    }
+
+    pub fn expired(condition: AskReadCondition, _: std.Io) bool {
+        return askAwakeMillis() >= condition.deadline_ms;
+    }
+};
+
+const AskReadWatch = select_watch.Watch(AskReadCondition);
 
 fn readAskTerminalLine(
     ctx: *AskContext,
@@ -3930,43 +3951,42 @@ fn readAskTerminalLine(
     lifecycle_cancel_flag: ?*const std.atomic.Value(bool),
 ) !?[]u8 {
     const Cleanup = struct {
-        fn drain(result_alloc: Allocator, select: *std.Io.Select(AskReadEvent)) void {
+        fn drain(result_alloc: Allocator, select: *std.Io.Select(AskReadEvent), watch: *AskReadWatch) void {
+            watch.stop(select.io);
             while (select.cancel()) |item| switch (item) {
                 .line => |line_result| {
                     const line = line_result catch continue;
                     result_alloc.free(line);
                 },
-                .deadline, .cancelled => {},
+                .watch => {},
             };
         }
     };
 
-    var select_buffer: [3]AskReadEvent = undefined;
+    var watch: AskReadWatch = .{};
+    var select_buffer: [2]AskReadEvent = undefined;
     var select: std.Io.Select(AskReadEvent) = .init(io_mod.getIo(), &select_buffer);
-    try select.concurrent(.line, readOwnedStdinLine, .{alloc});
-    select.concurrent(.deadline, waitForAskDeadline, .{deadline_ms}) catch |err| {
-        Cleanup.drain(alloc, &select);
-        return err;
-    };
-    select.concurrent(.cancelled, waitForAskCancellation, .{ ctx, lifecycle_cancel_flag }) catch |err| {
-        Cleanup.drain(alloc, &select);
+    try select.concurrent(.watch, AskReadWatch.run, .{ &watch, select.io, AskReadCondition{
+        .ctx = ctx,
+        .deadline_ms = deadline_ms,
+        .lifecycle_cancel_flag = lifecycle_cancel_flag,
+    } });
+    select.concurrent(.line, readOwnedStdinLine, .{alloc}) catch |err| {
+        watch.finish(&select);
         return err;
     };
     const event = select.await() catch |err| {
-        Cleanup.drain(alloc, &select);
+        Cleanup.drain(alloc, &select, &watch);
         return err;
     };
     return switch (event) {
         .line => |line_result| result: {
-            const line = line_result catch {
-                Cleanup.drain(alloc, &select);
-                break :result null;
-            };
-            Cleanup.drain(alloc, &select);
-            break :result line;
+            watch.finish(&select);
+            break :result line_result catch null;
         },
-        .deadline, .cancelled => result: {
-            Cleanup.drain(alloc, &select);
+        // The stdin read cannot be stopped any other way, so it is cancelled.
+        .watch => result: {
+            Cleanup.drain(alloc, &select, &watch);
             break :result null;
         },
     };
@@ -3979,14 +3999,6 @@ fn readOwnedStdinLine(alloc: Allocator) anyerror![]u8 {
     return alloc.dupe(u8, line);
 }
 
-fn waitForAskDeadline(deadline_ms: i64) anyerror!void {
-    while (askAwakeMillis() < deadline_ms) {
-        const remaining = deadline_ms - askAwakeMillis();
-        const delay_ms: i64 = @min(remaining, 20);
-        try io_mod.getIo().sleep(.fromMilliseconds(@intCast(@max(delay_ms, 1))), .awake);
-    }
-}
-
 fn askAwakeMillis() i64 {
     const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
     const milliseconds = @divFloor(now.raw.nanoseconds, std.time.ns_per_ms);
@@ -3994,17 +4006,6 @@ fn askAwakeMillis() i64 {
         std.math.minInt(i64)
     else
         std.math.maxInt(i64);
-}
-
-fn waitForAskCancellation(
-    ctx: *AskContext,
-    lifecycle_cancel_flag: ?*const std.atomic.Value(bool),
-) anyerror!void {
-    while (!ctx.cancelFlag().load(.acquire) and
-        (lifecycle_cancel_flag == null or !lifecycle_cancel_flag.?.load(.acquire)))
-    {
-        try io_mod.getIo().sleep(.fromMilliseconds(10), .awake);
-    }
 }
 
 fn resolveAskSubagentAuthority(
