@@ -7365,9 +7365,12 @@ fn processQueuedPromptLoop(
                 break :native projection.messages;
             } else result_request_messages;
             const image_projection = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, request_capabilities.image_input_support, vision_policy.route == .fallback, config.max_tool_result_bytes);
-            const request_messages = try with_replyable_conversation_tail(overlay_arena, image_projection.messages);
-            if (request_messages.ptr != image_projection.messages.ptr) {
-                debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{image_projection.messages.len});
+            // Saved turns keep steering without its envelope; the model gets it
+            // back as the live update it saw when the turn took it.
+            const steering_messages = try runtime_execution_memory.rewrapRestoredSteering(overlay_arena, image_projection.messages);
+            const request_messages = try with_replyable_conversation_tail(overlay_arena, steering_messages);
+            if (request_messages.ptr != steering_messages.ptr) {
+                debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{steering_messages.len});
             }
             // Tool images withheld because the catalog could not confirm image
             // input are invisible in the transcript otherwise. Tell the user

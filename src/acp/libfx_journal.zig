@@ -13,6 +13,7 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const session_adapter = @import("../core/session/session_adapter.zig");
 const checkpoint_codec = @import("../core/agent/runtime/checkpoint.zig");
 const execution_memory = @import("../core/agent/execution_memory.zig");
+const runtime_execution_memory = @import("../core/agent/runtime/execution_memory.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 
 const Allocator = std.mem.Allocator;
@@ -20,7 +21,7 @@ const Allocator = std.mem.Allocator;
 pub const Event = journal.Event;
 pub const max_load_bytes = journal.max_load_bytes;
 /// What the model is told when libfx continues a turn a crash left open.
-const resume_notice = "Resuming from unexpected session interruption.";
+const resume_notice = runtime_execution_memory.resume_notice;
 
 /// A host's id for a turn, kept in place so copying a journal copies it.
 pub const TurnId = struct {

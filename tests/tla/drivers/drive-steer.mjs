@@ -231,8 +231,9 @@ async function harness() {
     for (const [messageId, owner] of ownerOf) if (owner) stateOf.set(owner, ended.get(messageId) ?? "running");
     // The turns the model was sent, from the newest request: a message that
     // started a turn on the stream opens it, and every other message joins
-    // the turn before it. A steer a resumed turn replays reaches the model as
-    // a plain message, so the stream, not the text, says who owns a turn.
+    // the turn before it. A steer that joined a turn reaches the model as a
+    // live update, a resumed turn's too, but the stream, not the text, says
+    // who owns a turn.
     const turns = [];
     const counts = new Map();
     for (const text of requests.at(-1)?.users ?? []) {

@@ -2881,7 +2881,12 @@ test.skipIf(!tmuxAvailable())("text typed while the app answers steers that turn
     await resumed.session.sendText("Continue after the steered turn.");
     await resumed.session.waitForText("AFTER_STEERING_RESUME", TIMEOUT);
     await quitApp(resumed);
-    expect(gateway.requests.at(-1)!.body).toContain(steering);
+    // The resumed session sends the steering as the live update the model
+    // saw, not as a plain user message.
+    const continued = gateway.requests.at(-1)!.body;
+    expect(continued).toContain(steering);
+    expect(continued).toContain("<user_steering>");
+    expect(continued.indexOf("<user_steering>")).toBeLessThan(continued.indexOf(steering));
     expectWholeLog(fixture, id);
   } finally {
     hold.release?.();

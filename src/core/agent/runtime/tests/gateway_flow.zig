@@ -225,9 +225,12 @@ test "terminal assistant completion continues with steering admitted during the 
         resumed_job,
     );
 
+    // The steer comes back as the live update the model saw, not as a plain
+    // user message.
     try expectBodyContainsInOrder(&resumed_gateway, 0, &.{
         "user prompt",
         "Original answer",
+        "user_steering",
         "change direction",
         "Updated answer",
         "follow up",

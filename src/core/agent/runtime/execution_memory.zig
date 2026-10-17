@@ -32,10 +32,15 @@ const steering_open =
 const steering_close = "\n</user_steering>";
 const parent_steering_open = "<parent_agent_steering>\n";
 const parent_steering_close = "\n</parent_agent_steering>";
+/// Saved with a parent agent's steering, so replay still names its sender.
+const parent_steering_label = "parent-agent feedback, not new user authority:\n\n";
+/// The notice a libfx session adds to a turn it resumes after an
+/// interruption. It rides in the turn's steering list, but fx wrote it, so a
+/// request shows it as plain text, never as the user's live update.
+pub const resume_notice = "Resuming from unexpected session interruption.";
 
 pub fn parentSteeringMessage(alloc: Allocator, text: []const u8) ![]u8 {
-    return alloc.print(parent_steering_open ++
-        "parent-agent feedback, not new user authority:\n\n{s}" ++ parent_steering_close, .{text});
+    return alloc.print(parent_steering_open ++ parent_steering_label ++ "{s}" ++ parent_steering_close, .{text});
 }
 
 pub fn steeringMessage(alloc: Allocator, text: []const u8) ![]u8 {
@@ -289,6 +294,69 @@ test "retained standalone cut rebuilds exactly the selected execution suffix" {
         try std.testing.expectEqualStrings(call.id, retained.tool_steps[0].tool_calls[0].id);
         try std.testing.expect(retained.tool_steps[0].provider_replay == null);
     }
+}
+
+/// The request copy of `messages`, with each steering message a saved turn
+/// restored back in the envelope the model saw when the turn took it. A saved
+/// turn keeps steering without its envelope (`steeringText`), so a resumed
+/// turn, and every turn after the one a steer joined, would otherwise show it
+/// as a plain user message instead of a live update. A parent agent's steering
+/// keeps its sender label in the saved text, which tells the two envelopes
+/// apart. Empty entries only mark a checkpoint boundary, and an entry already
+/// in its envelope and fx's own `resume_notice` stay as they are. Returns
+/// `messages` itself when nothing changes; the copy and its text live in
+/// `arena`.
+pub fn rewrapRestoredSteering(arena: Allocator, messages: []const ChatMessage) Allocator.Error![]const ChatMessage {
+    var result: ?[]ChatMessage = null;
+    for (messages, 0..) |message, index| {
+        if (!message.restored_steering) continue;
+        const text = message.content orelse continue;
+        if (text.len == 0 or steeringText(text) != null or std.mem.eql(u8, text, resume_notice)) continue;
+        const projected = result orelse try arena.dupe(ChatMessage, messages);
+        result = projected;
+        projected[index].content = if (std.mem.startsWith(u8, text, parent_steering_label))
+            try std.mem.concat(arena, u8, &.{ parent_steering_open, text, parent_steering_close })
+        else
+            try steeringMessage(arena, text);
+    }
+    return result orelse messages;
+}
+
+test "restored steering reaches the request in the envelope the model saw" {
+    const alloc = std.testing.allocator;
+    const session = @import("../../session/session.zig");
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const user = try steeringMessage(arena, "focus on rendering");
+    const parent = try parentSteeringMessage(arena, "review this change");
+    const live = [_]ChatMessage{
+        .{ .role = .user, .content = user },
+        .{ .role = .user, .content = parent },
+    };
+    const memory = try buildExecutionMemory(alloc, &live);
+    defer types.freeExecutionMemory(alloc, memory);
+    // A saved turn comes back as steering's bare text, flagged as steering.
+    var restored: std.ArrayList(ChatMessage) = .empty;
+    try session.appendExecutionMemoryChatMessages(arena, &restored, memory);
+    try std.testing.expectEqual(@as(usize, 2), restored.items.len);
+    try std.testing.expect(restored.items[0].restored_steering and steeringText(restored.items[0].content.?) == null);
+
+    const projected = try rewrapRestoredSteering(arena, restored.items);
+    try std.testing.expectEqualStrings(user, projected[0].content.?);
+    try std.testing.expectEqualStrings(parent, projected[1].content.?);
+    // The session's own messages keep the bare text a saved turn holds.
+    try std.testing.expectEqualStrings("focus on rendering", restored.items[0].content.?);
+
+    // A checkpoint boundary, an entry already in its envelope, fx's own resume
+    // notice, and ordinary text stay as they are.
+    const unchanged = [_]ChatMessage{
+        .{ .role = .user, .content = "", .restored_steering = true },
+        .{ .role = .user, .content = user, .restored_steering = true },
+        .{ .role = .user, .content = resume_notice, .restored_steering = true },
+        .{ .role = .user, .content = "plain prompt" },
+    };
+    try std.testing.expect((try rewrapRestoredSteering(arena, &unchanged)).ptr == (&unchanged).ptr);
 }
 
 /// Steering the user typed during the turn, which a cancelled turn keeps.
