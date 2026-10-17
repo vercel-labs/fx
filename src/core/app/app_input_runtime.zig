@@ -75,6 +75,7 @@ const input_question_runtime = @import("input_question_runtime.zig");
 const input_full_transcript_runtime = @import("input_full_transcript_runtime.zig");
 const input_selection_runtime = @import("input_selection_runtime.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
+const app_mcp_runtime = @import("app_mcp_runtime.zig");
 const app_upgrade_runtime = @import("app_upgrade_runtime.zig");
 
 test {
@@ -1317,10 +1318,10 @@ pub fn Runtime(comptime App: type) type {
             if (mcpMenuActive(app)) {
                 if (comptime @hasField(App, "mcp")) {
                     if (app.mcp.menu.screen == .add) {
-                        return try handleMcpAddInput(app, byte, max_input_len);
+                        return try handleMcpAddInput(app, raw, max_input_len);
                     }
                     if (app.mcp.menu.screen == .arguments) {
-                        return try handleMcpArgumentInput(app, byte, max_input_len);
+                        return try handleMcpArgumentInput(app, raw, max_input_len);
                     }
                     if (app.mcp.menu.filter_active) {
                         if (byte == 0x7f) {
@@ -2251,8 +2252,9 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        fn handleMcpAddInput(app: *App, byte: u8, max_input_len: usize) !bool {
+        fn handleMcpAddInput(app: *App, raw: input_action.RawTerminalInput, max_input_len: usize) !bool {
             if (comptime !@hasField(App, "mcp")) return false;
+            const byte = raw.byte;
             switch (byte) {
                 '\t' => {
                     try commitMcpAddDraft(app);
@@ -2295,9 +2297,21 @@ pub fn Runtime(comptime App: type) type {
                     }
                     app.shell.render_requests.request(.footer);
                 },
-                else => try handleTextByte(app, .composer, byte, max_input_len),
+                else => try handleMcpFieldByte(app, raw, max_input_len),
             }
             return true;
+        }
+
+        /// A form field edits the composer draft, so it takes the same editing
+        /// keys. The decoder has already resolved those keys into a shortcut;
+        /// a control byte with no shortcut is not text for a field.
+        fn handleMcpFieldByte(app: *App, raw: input_action.RawTerminalInput, max_input_len: usize) !void {
+            if (raw.composer_shortcut) |action| {
+                try routeComposerShortcutAction(app, action, max_input_len);
+                return;
+            }
+            if (raw.byte < 0x20 or raw.byte == 0x7f) return;
+            try handleTextByte(app, .composer, raw.byte, max_input_len);
         }
 
         fn commitMcpAddDraft(app: *App) !void {
@@ -2310,9 +2324,10 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        fn handleMcpArgumentInput(app: *App, byte: u8, max_input_len: usize) !bool {
+        fn handleMcpArgumentInput(app: *App, raw: input_action.RawTerminalInput, max_input_len: usize) !bool {
             if (comptime !@hasField(App, "mcp")) return false;
             if (app.mcp.menu.pending_generation != null) return true;
+            const byte = raw.byte;
             switch (byte) {
                 '\t' => {
                     try commitMcpArgumentDraft(app);
@@ -2336,7 +2351,7 @@ pub fn Runtime(comptime App: type) type {
                         try startMcpMenuEffect(app, effect);
                     }
                 },
-                else => try handleTextByte(app, .composer, byte, max_input_len),
+                else => try handleMcpFieldByte(app, raw, max_input_len),
             }
             return true;
         }
@@ -3937,6 +3952,7 @@ const RoutingFakeApp = struct {
     should_exit: bool = false,
     statusline_context: bool = false,
     permission_state: app_permission_runtime.State = .{},
+    mcp: app_mcp_runtime.State = .{},
     total_input_tokens: u64 = 0,
     last_command: ?[]u8 = null,
     input_len_at_command: usize = 0,
@@ -3985,6 +4001,12 @@ const RoutingFakeApp = struct {
         return routing_test_slash_registry;
     }
 
+    /// The MCP menu action dispatch resolves its result type from the app's
+    /// hooks, so these routing tests declare one.
+    pub fn beginMcpMenuAuthentication(_: *RoutingFakeApp, _: u64) !void {
+        return error.McpMenuActionUnavailable;
+    }
+
     pub fn urlOpener(_: *const RoutingFakeApp) host.UrlOpener {
         return .{ .open_fn = routingOpenUrl };
     }
@@ -4027,6 +4049,7 @@ const RoutingFakeApp = struct {
         self.notice_body.deinit(self.alloc);
         self.last_preference_model.deinit(self.alloc);
         self.permission_engine.deinit(self.alloc);
+        self.mcp.deinit(self.alloc);
         self.model_cache.deinit();
         self.workspace_access.deinit(self.alloc);
         if (self.last_command) |command| self.alloc.free(command);
@@ -15939,4 +15962,64 @@ test "app input bridge loads the most recent durable history in chronological or
     try std.testing.expectEqual(@as(usize, 100), app.input_runtime.composer_history.count());
     try std.testing.expectEqualStrings("prompt-1", app.input_runtime.composer_history.entryText(0).?);
     try std.testing.expectEqualStrings("prompt-100", app.input_runtime.composer_history.entryText(99).?);
+}
+
+test "app_input_runtime MCP add field applies composer editing keys to the draft" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+
+    app.mcp.menu.active = true;
+    app.mcp.menu.screen = .add;
+    app.mcp.menu.add_field_index = 0;
+
+    const limits: paste_framing.InputLimits = .{};
+
+    _ = try Runtime(RoutingFakeApp).routeActiveModalInput(&app, .{ .byte = 'a' }, limits.decision_bytes);
+    _ = try Runtime(RoutingFakeApp).routeActiveModalInput(&app, .{ .byte = 'b' }, limits.decision_bytes);
+    try std.testing.expectEqualStrings("ab", app.input_runtime.edit_state.input.items);
+
+    // Backspace reaches the field as 127 with the delete_backward shortcut.
+    // The field used to append the byte instead of deleting.
+    _ = try Runtime(RoutingFakeApp).routeActiveModalInput(
+        &app,
+        .{ .byte = 0x7f, .composer_shortcut = .delete_backward },
+        limits.decision_bytes,
+    );
+    try std.testing.expectEqualStrings("a", app.input_runtime.edit_state.input.items);
+
+    _ = try Runtime(RoutingFakeApp).routeActiveModalInput(
+        &app,
+        .{ .byte = 8, .composer_shortcut = .delete_backward },
+        limits.decision_bytes,
+    );
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+
+    // A control byte with no editing action stays out of the field, even 127.
+    _ = try Runtime(RoutingFakeApp).routeActiveModalInput(&app, .{ .byte = 0x10 }, limits.decision_bytes);
+    _ = try Runtime(RoutingFakeApp).routeActiveModalInput(&app, .{ .byte = 0x7f }, limits.decision_bytes);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+}
+
+test "app_input_runtime MCP argument field applies composer editing keys to the draft" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+
+    app.mcp.menu.active = true;
+    app.mcp.menu.screen = .arguments;
+    app.mcp.menu.argument_index = 0;
+
+    const limits: paste_framing.InputLimits = .{};
+
+    _ = try Runtime(RoutingFakeApp).routeActiveModalInput(&app, .{ .byte = 'a' }, limits.decision_bytes);
+    _ = try Runtime(RoutingFakeApp).routeActiveModalInput(&app, .{ .byte = 'b' }, limits.decision_bytes);
+    try std.testing.expectEqualStrings("ab", app.input_runtime.edit_state.input.items);
+
+    _ = try Runtime(RoutingFakeApp).routeActiveModalInput(
+        &app,
+        .{ .byte = 0x7f, .composer_shortcut = .delete_backward },
+        limits.decision_bytes,
+    );
+    try std.testing.expectEqualStrings("a", app.input_runtime.edit_state.input.items);
 }
