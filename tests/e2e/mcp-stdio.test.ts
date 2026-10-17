@@ -1292,6 +1292,53 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     await expectFixtureProcessesExited(wire);
   }, 45_000);
 
+  test("a resumed fx ask turn runs a direct call to a tool selected in an earlier turn", async () => {
+    const root = createRoot("ask-direct-next-turn", MODERN_FIXTURE);
+    const firstGateway = startFakeGateway([
+      fakeGatewayToolCall("first_select", "mcp_select_tool", { name: TOOL_NAME }),
+      fakeGatewayToolCall("first_call", TOOL_NAME, { text: "first" }),
+      fakeGatewayFinalText("FIRST_TURN_READY"),
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    gateway = firstGateway;
+    const first = await runFx(
+      ["ask", "--json", "--auto", "Use the fixture MCP."],
+      { cwd: root.workspace, env: fixtureEnv(root, firstGateway), timeoutMs: 20_000 },
+    );
+    expect(first.code).toBe(0);
+    const sessionId = JSON.parse(first.stdout).session_id;
+    expect(sessionId).toBeTruthy();
+    firstGateway.stop();
+    gateway = null;
+
+    const secondGateway = startFakeGateway([
+      fakeGatewayToolCall("second_direct", TOOL_NAME, { text: "second" }),
+      fakeGatewayFinalText("SECOND_TURN_READY"),
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    gateway = secondGateway;
+    const second = await runFx(
+      ["ask", "--json", "--auto", "--resume", sessionId, "Use it again."],
+      { cwd: root.workspace, env: fixtureEnv(root, secondGateway), timeoutMs: 20_000 },
+    );
+    expect(second.code).toBe(0);
+    expect(JSON.parse(second.stdout)).toMatchObject({
+      session_id: sessionId,
+      output: expect.stringContaining("SECOND_TURN_READY"),
+    });
+    const resultRequest = secondGateway.requests.find((request) =>
+      request.body.includes('"toolCallId":"second_direct"')
+    );
+    expect(resultRequest?.body).not.toContain("Dynamic MCP tool not selected for this model step");
+    const wire = readWire(root.wireLogPath);
+    const calls = wire.filter((entry) => entry.message.method === "tools/call");
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.message.params?.arguments).toEqual({ text: "second" });
+    await expectFixtureProcessesExited(wire);
+  }, 45_000);
+
   test("managed child uses only its captured MCP tools resources prompts and completion view", async () => {
     const root = createRoot("one-off-mcp-view", MODERN_FIXTURE, { mode: "features" });
     const parentPrompt = "CREATE_SCOPED_MCP_ONE_OFF";
@@ -5462,7 +5509,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
   );
 
   test.skipIf(process.platform === "win32" || !tmuxAvailable())(
-    "the first dynamic call after MCP reload returns selection recovery guidance",
+    "the first dynamic call after MCP reload loads the current definition and runs",
     async () => {
       const root = createRoot("reload-dynamic-guidance", MODERN_FIXTURE, {
         expectedElicitation: "both",
@@ -5511,18 +5558,16 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       const postReloadResult = activeGateway.requests.find((request) =>
         request.body.includes('"toolCallId":"reload_direct"')
       );
-      expect(postReloadResult?.body).toContain(
+      expect(postReloadResult?.body).not.toContain(
         "Dynamic MCP tool not selected for this model step",
-      );
-      expect(postReloadResult?.body).toContain(
-        "Use capability_search or mcp_select_tool to load its definition",
       );
       expect(postReloadResult?.body).not.toContain(`Unsupported tool: ${TOOL_NAME}`);
       const calls = readWire(root.wireLogPath).filter((entry) =>
         entry.message.method === "tools/call"
       );
-      expect(calls).toHaveLength(1);
+      expect(calls).toHaveLength(2);
       expect(calls[0]?.message.params?.arguments).toEqual({ text: "before" });
+      expect(calls[1]?.message.params?.arguments).toEqual({ text: "stale" });
 
       await tui.kill();
       tui = null;

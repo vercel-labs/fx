@@ -2032,6 +2032,20 @@ const App = struct {
         return self.mcp.snapshotToolDefinition(alloc, name, known, self.permission_engine.rules, self.context_limits, .unrestricted);
     }
 
+    /// Resolves a live MCP tool the model called without selecting it this
+    /// step. Returns null for unknown, denied, or oversized definitions. The
+    /// result is allocated in `arena`.
+    pub fn resolveUnselectedMcpTool(self: *App, arena: Allocator, name: []const u8) !?tool_mcp_runtime.SelectedTool {
+        const projection = (self.mcp.toolSchema(arena, name, self.permission_engine.rules, self.context_limits, .unrestricted, null) catch |err| switch (err) {
+            error.OutOfMemory, error.Cancelled => return err,
+            else => return null,
+        }) orelse return null;
+        return switch (projection) {
+            .selected => |payload| .{ .name = name, .schema_json = payload.model_output, .mcp_binding = payload.mcp_binding },
+            .rejected => null,
+        };
+    }
+
     pub fn snapshotMcpToolNames(self: *App, alloc: Allocator) ![][]u8 {
         return self.mcp.snapshotToolNames(alloc, self.permission_engine.rules);
     }

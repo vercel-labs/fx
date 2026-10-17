@@ -2333,6 +2333,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
         .snapshot_mcp_definition = snapshotMcpDefinition,
+        .resolve_unselected_mcp_tool = resolveUnselectedMcpTool,
         .prepare_skill_call = prepareSkillCall,
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermissionOutcomeWithRequest,
@@ -2566,6 +2567,11 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, project_context: ?
 fn snapshotMcpDefinition(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     return tool_runtime.snapshotMcpDefinition(ctx.toolContext(), arena, name, known);
+}
+
+fn resolveUnselectedMcpTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8) !?tool_mcp_runtime.SelectedTool {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    return tool_runtime.resolveUnselectedMcpTool(ctx.toolContext(), arena, name);
 }
 
 fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
