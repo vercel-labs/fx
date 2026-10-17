@@ -7094,6 +7094,87 @@ test "processQueuedPrompt explicit checkpoint continuation starts a fresh attemp
     try std.testing.expectEqual(@as(usize, 1), second_hooks.history_propagation_count);
 }
 
+test "processQueuedPrompt resumed reply retries a size rejection with fewer images" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const image_path = try writeTestImagePath(alloc, &tmp);
+    defer alloc.free(image_path);
+    const image = try testCapturedImage(alloc, &tmp, image_path, 1);
+    defer types.freeImageAttachment(alloc, image);
+    var images = [_]types.ImageAttachment{image};
+    const native_images = model_capabilities.Capabilities{
+        .image_input_support = .native,
+        .context_window = 1_000_000,
+    };
+
+    // The first run streams part of a reply, then loses the connection and
+    // parks, so its checkpoint holds the image and the partial reply.
+    const partial_chunks = [_][]const u8{"partial"};
+    const interrupted = [_]FakeCompletion{.{
+        .chunks = &partial_chunks,
+        .stream_error_after_chunks = error.ReadFailed,
+    }};
+    var first_gateway = FakeGateway.init(alloc, &interrupted);
+    defer first_gateway.deinit();
+    var first_hooks = FakeAgentRuntimeDeps.init(alloc);
+    first_hooks.enable_recovery_checkpoint = true;
+    first_hooks.default_model_capabilities = native_images;
+    defer first_hooks.deinit();
+    var fixture = PromptFixture{};
+    var first_config = fixture.config();
+    first_config.max_provider_attempts = 1;
+    var pause_flag = std.atomic.Value(bool).init(false);
+    first_hooks.pause_on_auto_retry_status = true;
+    first_hooks.recovery_pause_flag = &pause_flag;
+    first_config.recovery_pause_flag = &pause_flag;
+    var first_job = fixture.job();
+    first_job.credential_source = .fx_login;
+    first_job.account_id = @constCast("acct_1");
+    first_job.prompt = @constCast("Describe the attached image.");
+    first_job.images = &images;
+    first_job.authorized_image_catalog = &images;
+
+    try runFakePrompt(&first_gateway, &first_hooks, first_config, first_job);
+    try expectBodyContains(&first_gateway, 0, "\"type\":\"file\"");
+    const saved = first_hooks.recovery_checkpoints.items[first_hooks.recovery_checkpoints.items.len - 1];
+    try std.testing.expectEqual(@as(usize, 1), saved.user.images.len);
+    try std.testing.expect(saved.assistant_source.len > 0);
+    var checkpoint = try saved.dupe(alloc);
+    defer checkpoint.deinit(alloc);
+
+    // Resumed, the restarted reply is refused for its size before any output;
+    // the turn sends it again without the image instead of failing.
+    const resumed = [_]FakeCompletion{
+        .{ .status = .payload_too_large, .err_body = "request entity too large" },
+        .{ .content = "finished without the image" },
+    };
+    var second_gateway = FakeGateway.init(alloc, &resumed);
+    defer second_gateway.deinit();
+    var second_hooks = FakeAgentRuntimeDeps.init(alloc);
+    second_hooks.enable_recovery_checkpoint = true;
+    second_hooks.default_model_capabilities = native_images;
+    defer second_hooks.deinit();
+    var continued_job = fixture.job();
+    continued_job.credential_source = .fx_login;
+    continued_job.account_id = @constCast("acct_1");
+    continued_job.prompt = checkpoint.user.text;
+    continued_job.images = checkpoint.user.images;
+    continued_job.authorized_image_catalog = checkpoint.user.images;
+    continued_job.recovery_checkpoint = checkpoint;
+    var continued_config = fixture.config();
+    continued_config.max_provider_attempts = 2;
+
+    try runFakePrompt(&second_gateway, &second_hooks, continued_config, continued_job);
+
+    try expectGatewayPromptTailText(&second_gateway, 0, .user, "Restart that response from the beginning");
+    try expectBodyContains(&second_gateway, 0, "\"type\":\"file\"");
+    try std.testing.expectEqual(@as(usize, 2), second_gateway.request_models.items.len);
+    try expectBodyNotContains(&second_gateway, 1, "\"type\":\"file\"");
+    try expectBodyContains(&second_gateway, 1, "not sent to keep the request under");
+    try std.testing.expectEqualStrings("finished without the image", second_hooks.history_assistant_text.?);
+}
+
 test "processQueuedPrompt retries system resume through the heartbeat" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{

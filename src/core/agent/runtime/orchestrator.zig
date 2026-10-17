@@ -3464,6 +3464,16 @@ fn streamReplaySafe(
     return stream_ctx.interruption_source_or("").len == 0 and !stream_ctx.saw_tool_start;
 }
 
+/// Whether the current attempt has shown no output. A provider refuses a
+/// request for its size before any output, so a reply an earlier attempt
+/// streamed, such as one restored when a turn resumes, does not make sending
+/// it again with fewer images unsafe.
+fn attemptReplaySafe(
+    stream_ctx: *const runtime_assistant_stream.StreamChunkContext,
+) bool {
+    return stream_ctx.raw_text.items.len == 0 and !stream_ctx.saw_tool_start;
+}
+
 const continue_response_recovery_prompt =
     "The previous response was interrupted. Restart that response from the beginning using the completed tool results above. Do not repeat completed tool actions.";
 const regenerate_tool_recovery_prompt =
@@ -8244,7 +8254,7 @@ fn processQueuedPromptLoop(
                     failure,
                     request_images_for_attempt,
                     request_size_retries,
-                    streamReplaySafe(&stream_ctx),
+                    attemptReplaySafe(&stream_ctx),
                     config.cancel_flag.load(.seq_cst),
                 )) {
                     const limit = loweredRequestByteLimit(rejected.serialized_bytes);
