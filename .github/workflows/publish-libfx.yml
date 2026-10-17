@@ -269,7 +269,7 @@ jobs:
             (.bin == null)
           ' sdk/package.json >/dev/null
 
-          node sdk/scripts/package-libfx.mjs sdk/dist/libfx native-addons/*.node
+          LIBFX_REQUIRE_DOCS=1 node sdk/scripts/package-libfx.mjs sdk/dist/libfx native-addons/*.node
           jq --arg version "$LIBFX_VERSION" '.version = $version' \
             sdk/dist/libfx/package.json > sdk/dist/libfx/package.json.tmp
           mv sdk/dist/libfx/package.json.tmp sdk/dist/libfx/package.json
@@ -291,7 +291,10 @@ jobs:
               "libfx.linux-x64.node", "libfx.linux-arm64.node",
               "libfx.darwin-x64.node", "libfx.darwin-arm64.node",
             ];
-            if (names.size !== required.length) throw new Error(`unexpected package file count: ${names.size}`);
+            // The libfx docs pages, taken from fx.sh when the package is built.
+            const docs = [...names].filter((name) => /^docs\/[A-Za-z0-9/-]+\.md$/.test(name));
+            if (!names.has("docs/README.md") || !names.has("docs/api.md")) throw new Error("package is missing the libfx docs");
+            if (names.size !== required.length + docs.length) throw new Error(`unexpected package file count: ${names.size}`);
             for (const name of required) {
               if (!names.has(name)) throw new Error(`package is missing ${name}`);
             }

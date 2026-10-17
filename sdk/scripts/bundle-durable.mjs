@@ -24,6 +24,36 @@ const pinWorldVersion = {
   },
 };
 
+// libfx ships no copy of undici (PERF-14). The Worlds send their requests
+// through undici dispatchers they build, unless Workflow's `node:http`
+// transport (`WORKFLOW_NODE_HTTP`) is on: then Node's own HTTP client sends
+// them, the Vercel queue client's go through the runtime's `fetch`, and
+// nothing builds undici. The bundled Worlds always use that transport, and
+// `undici` resolves to a module that throws if anything does build it.
+const flagMarker = "return envFlag(NODE_HTTP_ENV_VAR, NODE_HTTP_DEFAULT, env);";
+const noUndici = {
+  name: "no-undici",
+  setup(build) {
+    build.onLoad({ filter: /[\\/]@workflow[\\/]world[\\/]dist[\\/]node-http-flag\.js$/ }, async ({ path }) => {
+      const source = await Bun.file(path).text();
+      if (source.split(flagMarker).length !== 2) throw new Error("@workflow/world's isNodeHttpEnabled() changed; update the transport pin");
+      return { contents: source.replace(flagMarker, "return true;"), loader: "js" };
+    });
+    build.onResolve({ filter: /^undici$/ }, () => ({ path: "undici", namespace: "no-undici" }));
+    build.onLoad({ filter: /.*/, namespace: "no-undici" }, () => ({
+      contents: `const unavailable = (name) => function () {
+  throw new Error(\`libfx bundles no undici, and its World sends requests over node:http, so nothing may use undici's \${name}\`);
+};
+export const Agent = unavailable("Agent");
+export const DecoratorHandler = unavailable("DecoratorHandler");
+export const RetryAgent = unavailable("RetryAgent");
+export const request = unavailable("request");
+`,
+      loader: "js",
+    }));
+  },
+};
+
 // `world` carries no World; `local` and `vercel` inline it.
 for (const name of ["local", "vercel", "world"]) {
   const result = await Bun.build({
@@ -35,10 +65,13 @@ for (const name of ["local", "vercel", "world"]) {
     minify: true,
     // cbor-x prefers an optional native addon and falls back without it.
     external: ["cbor-extract"],
-    plugins: [pinWorldVersion],
+    plugins: [pinWorldVersion, noUndici],
+    metafile: true,
   });
   if (!result.success) {
     for (const log of result.logs) console.error(log);
     process.exit(1);
   }
+  const bundled = Object.keys(result.metafile.inputs).filter((input) => /(^|[\\/])node_modules[\\/]undici[\\/]/.test(input));
+  if (bundled.length > 0) throw new Error(`durable/${name}.mjs would bundle undici: ${bundled.slice(0, 3).join(", ")}`);
 }

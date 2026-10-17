@@ -506,6 +506,24 @@ const App = struct {
         try self.flushRequestedFrame();
     }
 
+    /// One round of a blocking wait, such as an approval prompt, on the
+    /// single-threaded host: draw and handle input, then suspend until input
+    /// arrives or the idle poll elapses so the page keeps running. False when
+    /// fx is exiting or the host failed, which ends the wait.
+    pub fn cooperativeWait(self: *Self) bool {
+        if (comptime !host_target.is_wasm) return false;
+        self.cooperativeTransportPulse() catch |err| {
+            debug_trace.logf("worker", "event=cooperative_wait_failed stage=pulse err={s}", .{@errorName(err)});
+            return false;
+        };
+        if (self.should_exit) return false;
+        _ = self.terminal.pollInput(idle_wasm_poll_timeout_ms) catch |err| {
+            debug_trace.logf("worker", "event=cooperative_wait_failed stage=poll err={s}", .{@errorName(err)});
+            return false;
+        };
+        return true;
+    }
+
     pub fn secretStore(self: *const Self) host.SecretStore {
         return self.auth.secret_store;
     }

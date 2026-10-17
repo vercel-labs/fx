@@ -1309,6 +1309,32 @@ test "denied web_fetch is presented without dns http or cache work" {
     try expectBodyContains(&gateway, 1, "permission_required");
 }
 
+test "a response that ends in a call it streamed no start for runs tools before the call starts" {
+    // libfx steering reads this phase to decide whether a steer cuts the
+    // reply short, and a reply that has ended in a call has nothing left to
+    // cut (`tests/tla/sdk/DurableSteer.tla` CallWaits).
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"README.md\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .chunks = &.{"Looking it up. "}, .tool_calls = &calls },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.permission_decisions = &.{.once};
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    const generating = logIndex(&hooks, "event:turn_phase:generating") orelse return error.MissingGeneratingPhase;
+    const running = logIndex(&hooks, "event:turn_phase:running") orelse return error.MissingRunningPhase;
+    const executed = logIndex(&hooks, "execute:read_file") orelse return error.MissingToolExecution;
+    try std.testing.expect(generating < running);
+    try std.testing.expect(running < executed);
+}
+
 test "accepted automatic review remains internal before ordinary tool execution" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_1", "terminal", "{\"action\":\"exec\",\"command\":\"printf done\"}")};

@@ -178,6 +178,9 @@ pub const OutboundKind = enum {
     mcp_message,
     /// libfx journal flush: the host answers once it holds every event.
     journal,
+    /// libfx inputs: the host answers once it has handed in the inputs it
+    /// stored since it last read them.
+    inputs,
 };
 
 pub const OutboundResponse = struct {

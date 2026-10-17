@@ -2,7 +2,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { cp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
-import { basename, resolve } from "node:path";
+import { basename, dirname, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
@@ -97,6 +97,18 @@ const bundle = spawnSync(process.env.BUN_BIN || "bun", [resolve(repoRoot, "sdk/s
 if (bundle.error) throw bundle.error;
 if (bundle.status !== 0) process.exit(bundle.status ?? 1);
 
+// A release requires the docs (`LIBFX_REQUIRE_DOCS=1`). Any other build
+// packages without them when the docs site cannot give them, so a local build
+// or an unrelated test does not fail on the website.
+let docs = [];
+try {
+  docs = await packageDocs(resolve(outputDir, "docs"));
+} catch (error) {
+  if (process.env.LIBFX_REQUIRE_DOCS === "1") throw error;
+  await rm(resolve(outputDir, "docs"), { recursive: true, force: true });
+  console.warn(`warning: packaging libfx without its docs: ${error.message}`);
+}
+
 const manifest = JSON.parse(await readFile(resolve(outputDir, "package.json"), "utf8"));
 manifest.files = undefined;
 await writeFile(resolve(outputDir, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`);
@@ -107,7 +119,55 @@ for (const [, destination] of files) console.log(`  ${destination}`);
 console.log("  durable/local.mjs");
 console.log("  durable/vercel.mjs");
 console.log("  durable/world.mjs");
+for (const name of docs) console.log(`  docs/${name}`);
 for (const name of declarations) console.log(`  types/${name}`);
 for (const addon of nativeAddons) {
   console.log(`  ${requestedNativeAddons.length ? basename(addon) : localNativeName}`);
+}
+
+// The libfx docs ship in the package (PKG-5). They are written in the fx
+// website's repository, so each build takes the pages fx.sh publishes as
+// Markdown, the libfx entries of its llms.txt, instead of keeping a copy
+// here that would go stale. Links between the pages point at the packaged
+// files. `LIBFX_DOCS_SITE` takes the pages from another copy of the site,
+// such as the fixture `sdk/tests/test-node-package.mjs` serves; a release
+// takes fx.sh's. Returns the files written, relative to `docsDir`.
+async function packageDocs(docsDir) {
+  const site = (process.env.LIBFX_DOCS_SITE || "https://fx.sh").replace(/\/+$/, "");
+  const get = async (url) => {
+    const response = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+    if (!response.ok) throw new Error(`packaging the libfx docs: ${url} answered HTTP ${response.status}`);
+    return response.text();
+  };
+  const sitePattern = site.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // `- [Title](https://fx.sh/docs/lib/<page>.md): what it covers`, under `## libfx / <section>`.
+  const pageUrl = new RegExp(`^${sitePattern}/docs/lib((?:/[a-z0-9-]+)*)\\.md$`);
+  const pageLink = new RegExp(`\\]\\((${sitePattern}/docs/lib(?:/[a-z0-9-]+)*\\.md)`, "g");
+  const pages = new Map();
+  const index = [
+    "# libfx docs",
+    "",
+    `The libfx pages of the fx docs, as fx.sh published them when this package was built. The latest version of each page is at ${site}/docs/lib.`,
+  ];
+  for (const line of (await get(`${site}/llms.txt`)).split("\n")) {
+    const section = /^## libfx \/ (.+)$/.exec(line);
+    if (section) index.push("", `## ${section[1][0].toUpperCase()}${section[1].slice(1)}`, "");
+    const entry = /^- \[([^\]]+)\]\(([^)]+)\)(.*)$/.exec(line);
+    const page = entry && pageUrl.exec(entry[2]);
+    if (!page) continue;
+    const file = page[1] === "" ? "index.md" : `${page[1].slice(1)}.md`;
+    pages.set(entry[2], file);
+    index.push(`- [${entry[1]}](${file})${entry[3]}`);
+  }
+  if (pages.size === 0) throw new Error(`packaging the libfx docs: ${site}/llms.txt lists no libfx page`);
+  await mkdir(docsDir, { recursive: true });
+  await writeFile(resolve(docsDir, "README.md"), `${index.join("\n")}\n`);
+  for (const [url, file] of pages) {
+    const text = (await get(url)).replace(pageLink, (link, target) => (
+      pages.has(target) ? `](${posix.relative(posix.dirname(file), pages.get(target))}` : link
+    ));
+    await mkdir(dirname(resolve(docsDir, file)), { recursive: true });
+    await writeFile(resolve(docsDir, file), text);
+  }
+  return ["README.md", ...pages.values()];
 }

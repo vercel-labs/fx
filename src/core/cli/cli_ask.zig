@@ -1838,7 +1838,11 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         owned_prompt = try alloc.dupe(u8, recovery_checkpoint.?.user.text);
         ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
     } else if (ctx.writable) |*writable| {
-        if (writable.conversation_writer.turn_open) {
+        // A checkpoint whose turn has no frames in the log (a turn is written
+        // when it ends, and a reopen discards an unfinished one) still holds
+        // the user's prompt: close it into history before the new prompt
+        // replaces it, so the prompt is not lost (DUR-23).
+        if (writable.conversation_writer.turn_open or writable.state.recovery_checkpoint != null) {
             const checkpoint = writable.state.recovery_checkpoint orelse
                 return error.InvalidRecoveryCheckpoint;
             const prompt_snapshot_committed = ctx.prompt_snapshot_committed;

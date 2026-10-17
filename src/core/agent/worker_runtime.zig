@@ -586,6 +586,9 @@ pub const WorkerRuntime = struct {
     pending_permission_request_shared: ?permission_request.OwnedPermissionRequest = null,
     pending_permission_review: ?*const diff_mod.FileReview = null,
     pending_permission_waiting: bool = false,
+    /// Set by a single-threaded host while it runs a turn. Read and written
+    /// only on that host's one thread.
+    cooperative_wait: ?CooperativeWait = null,
     pending_question_shared: ?OwnedQuestionBatch = null,
     pending_question_response: QuestionResponse = .pending,
     agent_turn_settings: AgentTurnSettings = .{},
@@ -2346,6 +2349,17 @@ pub const WorkerRuntime = struct {
         };
     }
 
+    /// One round of a blocking approval wait on a host with no second thread,
+    /// such as fx-term.wasm. Nothing there can signal `worker_cond`, so the
+    /// wait itself must run the host's event loop: draw the prompt, read the
+    /// keys that answer it, and yield to the host until input arrives. Returns
+    /// false when the host can no longer answer, for example after its input
+    /// closed; the request then resolves as denied.
+    pub const CooperativeWait = struct {
+        context: *anyopaque,
+        wait_fn: *const fn (*anyopaque) bool,
+    };
+
     pub const PermissionRequestObserver = struct {
         context: *anyopaque,
         observe_fn: *const fn (
@@ -2405,6 +2419,18 @@ pub const WorkerRuntime = struct {
         }
 
         while (self.pending_permission_response == null and !self.worker_stop_requested) {
+            if (self.cooperative_wait) |wait| {
+                // Release the lock as worker_cond.wait would: the host answers
+                // through submitPermissionResponse, which takes it.
+                self.worker_mutex.unlock(io_mod.getIo());
+                const keep_waiting = wait.wait_fn(wait.context);
+                self.worker_mutex.lockUncancelable(io_mod.getIo());
+                if (!keep_waiting) {
+                    debug_trace.logf("permission", "event=cooperative_wait_ended reason=host_unavailable", .{});
+                    break;
+                }
+                continue;
+            }
             self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch break;
         }
 
@@ -4215,11 +4241,14 @@ pub fn dupeToolLifecycleEvent(
             const call_id = try alloc.dupe(u8, started.id.call_id);
             errdefer alloc.free(call_id);
             const tool_name = if (started.tool_name) |name| try alloc.dupe(u8, name) else null;
+            errdefer if (tool_name) |name| alloc.free(name);
+            const arguments_json = if (started.arguments_json) |value| try alloc.dupe(u8, value) else null;
             break :blk .{ .provisional = .{
                 .id = .{ .turn_id = started.id.turn_id, .call_id = call_id },
                 .presentation_group_id = started.presentation_group_id,
                 .tool_name = tool_name,
                 .activity_kind = started.activity_kind,
+                .arguments_json = arguments_json,
             } };
         },
         .authoritative_started => |started| blk: {
@@ -4296,6 +4325,7 @@ pub fn freeToolLifecycleEvent(
         .provisional => |started| {
             alloc.free(@constCast(started.id.call_id));
             if (started.tool_name) |name| alloc.free(@constCast(name));
+            if (started.arguments_json) |arguments_json| alloc.free(@constCast(arguments_json));
         },
         .authoritative_started => |started| {
             alloc.free(@constCast(started.id.call_id));
@@ -6409,6 +6439,7 @@ test "typed lifecycle worker events duplicate and free every payload variant" {
             .id = .{ .turn_id = 1, .call_id = "provisional" },
             .tool_name = "glob_files",
             .activity_kind = .list,
+            .arguments_json = "{\"pattern\":\"*.zig\"}",
         } },
         .{ .authoritative_started = .{
             .id = .{ .turn_id = 1, .call_id = "final" },
@@ -6456,6 +6487,15 @@ fn checkToolLifecycleDupAllocationFailure(alloc: std.mem.Allocator) !void {
         "read_file",
         owned.authoritative_started.tool_name,
     );
+
+    const provisional = try dupeToolLifecycleEvent(alloc, .{ .provisional = .{
+        .id = .{ .turn_id = 7, .call_id = "search" },
+        .tool_name = "gateway.exa_search",
+        .activity_kind = .open,
+        .arguments_json = "{\"query\":\"zig\"}",
+    } });
+    defer freeToolLifecycleEvent(alloc, provisional);
+    try std.testing.expectEqualStrings("{\"query\":\"zig\"}", provisional.provisional.arguments_json.?);
 }
 
 test "typed lifecycle duplication frees every partial allocation" {
@@ -6911,6 +6951,60 @@ test "permission blocking handles submit and stop" {
     var shutdown_snapshot = try shutdown_runtime.snapshotState(alloc);
     defer shutdown_snapshot.deinit(alloc);
     try std.testing.expect(shutdown_snapshot.pending_permission_request == null);
+}
+
+/// A host with one thread: each wait round sees the pending request, as the
+/// host's prompt would, and answers it on a later round.
+const CooperativeApprovalHost = struct {
+    runtime: *WorkerRuntime,
+    answer_on_round: usize,
+    decision: ?types.ToolPermissionDecision,
+    rounds: usize = 0,
+    saw_request: bool = false,
+
+    fn wait(raw: *anyopaque) bool {
+        const self: *CooperativeApprovalHost = @ptrCast(@alignCast(raw));
+        self.rounds += 1;
+        var snapshot = self.runtime.snapshotState(std.testing.allocator) catch return false;
+        defer snapshot.deinit(std.testing.allocator);
+        const request = snapshot.pending_permission_request orelse return false;
+        self.saw_request = std.mem.eql(u8, request.label, "Run ls?");
+        if (self.rounds < self.answer_on_round) return true;
+        const decision = self.decision orelse return false;
+        return submitPermissionDecisionForTest(self.runtime, request.id, decision) == .accepted;
+    }
+
+    fn hook(self: *CooperativeApprovalHost) WorkerRuntime.CooperativeWait {
+        return .{ .context = @ptrCast(self), .wait_fn = wait };
+    }
+};
+
+test "a single-threaded host answers a permission request from inside the wait" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+
+    // No second thread exists: before the cooperative wait, this request
+    // blocked on worker_cond forever (fx-term.wasm froze on an approval).
+    var host = CooperativeApprovalHost{ .runtime = &runtime, .answer_on_round = 3, .decision = .once };
+    runtime.cooperative_wait = host.hook();
+    var response = try runtime.requestPermissionBlocking(alloc, .{ .label = "Run ls?" });
+    defer response.deinit();
+    try std.testing.expectEqual(types.ToolPermissionDecision.once, response.decision);
+    try std.testing.expectEqual(@as(usize, 3), host.rounds);
+    try std.testing.expect(host.saw_request);
+    var snapshot = try runtime.snapshotState(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expect(snapshot.pending_permission_request == null);
+
+    // A host that can no longer answer ends the wait as a denial.
+    var gone = CooperativeApprovalHost{ .runtime = &runtime, .answer_on_round = 2, .decision = null };
+    runtime.cooperative_wait = gone.hook();
+    var denied = try runtime.requestPermissionBlocking(alloc, .{ .label = "Run ls?" });
+    defer denied.deinit();
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, denied.decision);
+    try std.testing.expectEqual(@as(usize, 2), gone.rounds);
 }
 
 test "permission response accepts feedback ownership" {

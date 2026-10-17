@@ -168,6 +168,7 @@ pub const ProvisionalToolStatuses = struct {
                 .presentation_group_id = self.presentation_group_id,
                 .tool_name = tool_name,
                 .activity_kind = observed_kind,
+                .arguments_json = arguments_json,
             },
         }) catch |err| {
             if (recorded) self.forget(alloc, tool_id);

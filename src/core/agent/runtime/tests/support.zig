@@ -1687,6 +1687,7 @@ pub const FakeAgentRuntimeDeps = struct {
                 self.route_recovery_clear_count += 1;
                 try self.record("event:clear_route_recovery_status", .{});
             },
+            .turn_phase_update => |update| try self.record("event:turn_phase:{t}", .{update.phase}),
             .finish_prompt => |finished| {
                 self.finish_event_attempt_count += 1;
                 if (self.finish_event_error) |err| return err;

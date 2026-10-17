@@ -21,7 +21,7 @@ import { world } from "./world.mjs";
  * next invocation continues the turn.
  */
 export function vercel({ reserveMs, leaseMs } = {}) {
-  return world(() => createWorld(), {
+  const durability = world(() => createWorld(), {
     name: "vercel",
     // The deployment's own AI Gateway credential, fresh for each request.
     gatewayKey: () => getVercelOidcToken(),
@@ -36,4 +36,8 @@ export function vercel({ reserveMs, leaseMs } = {}) {
     reserveMs,
     leaseMs,
   });
+  // Vercel's World stores a batch of stream lines with one request, in
+  // order, so libfx writes a turn's lines in batches there; on a World it
+  // knows no such thing of, it writes them one after another.
+  return { ...durability, [Symbol.for("libfx.batchesInOrder")]: true };
 }

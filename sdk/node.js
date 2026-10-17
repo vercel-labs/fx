@@ -79,7 +79,9 @@ async function loadNativeCandidate(candidate) {
       // Bundlers trace the asset URL; Node must load the native file at runtime.
       return Reflect.apply(nodeRequire, undefined, [fileURLToPath(candidate)]);
     }
-    const imported = await import(candidate.href);
+    // The app names this module at run time, so a bundler must leave the
+    // import to Node rather than turn it into a context of every file.
+    const imported = await import(/* webpackIgnore: true */ /* turbopackIgnore: true */ candidate.href);
     return imported.default ?? imported;
   }
   if (typeof candidate === "object") return candidate.default ?? candidate;
@@ -89,7 +91,7 @@ async function loadNativeCandidate(candidate) {
   if (candidate.endsWith(".node")) {
     return Reflect.apply(nodeRequire, undefined, [isAbsolute(candidate) ? candidate : resolve(candidate)]);
   }
-  const imported = await import(candidate.startsWith("file:") ? candidate : pathToFileURL(candidate).href);
+  const imported = await import(/* webpackIgnore: true */ /* turbopackIgnore: true */ candidate.startsWith("file:") ? candidate : pathToFileURL(candidate).href);
   return imported.default ?? imported;
 }
 
@@ -680,6 +682,8 @@ export async function createFxEngine(options = {}) {
 // live, as agents passed one durability do, so they can send each other's
 // prompts on.
 const environments = new Map();
+// The process's environment, read at run time (see `development` below).
+const processEnv = process.env;
 function environmentDurability() {
   const dir = process.env.VERCEL ? null : process.env.FX_SESSIONS_DIR || resolve(tmpdir(), "libfx", "sessions");
   const key = dir ?? "vercel";
@@ -712,6 +716,13 @@ export const createFxAgent = createDurableAgentFactory({
   defaultDurability: environmentDurability,
   // One durability per environment, so agents created without one share it.
   defaultShared: true,
+  // A dev server such as `next dev` loads a module again and so creates its
+  // agents again: there the newest replaces the agent its name had. Read
+  // each time, as a process may set it after loading libfx, and through
+  // `processEnv`: a bundler replaces `process.env.NODE_ENV` with the mode
+  // it builds in, as Bun does when it builds node.cjs, which would make
+  // every process that loads that build a development server (SEC-2).
+  development: () => processEnv.NODE_ENV === "development",
   harness: fxHarness({
     createEngine: createFxEngine,
     // An explicit key, then the durability's own credential, such as a
@@ -719,6 +730,7 @@ export const createFxAgent = createDurableAgentFactory({
     defaultApiKey: async (durability) => process.env.AI_GATEWAY_API_KEY ||
       (await Promise.resolve(durability?.gatewayKey?.()).catch(() => undefined)) ||
       process.env.VERCEL_OIDC_TOKEN || undefined,
+    keySources: ", set AI_GATEWAY_API_KEY or VERCEL_OIDC_TOKEN in the environment, or give its durability a gatewayKey()",
   }),
 });
 

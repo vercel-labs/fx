@@ -14,6 +14,7 @@
 #   bun ../drivers/drive.mjs write && bun ../drivers/drive.mjs cutoff
 #   bun ../drivers/drive.mjs leased   # the Heartbeat graph, on a World without liveness
 #   bun ../drivers/drive.mjs queue    # the QueueHeld graph, on a World whose queue shows it
+#   bun ../drivers/drive.mjs refuse   # the Refused graph: a turn that ends before any record
 #   bun ../drivers/drive-agents.mjs   # AgentRouting
 #   bun ../drivers/drive-steer.mjs ideal && bun ../drivers/drive-steer.mjs faults   # DurableSteer
 #   bun ../drivers/drive-tenants.mjs   # TenantIsolation
@@ -34,7 +35,7 @@ work="$(mktemp -d "${TMPDIR:-/tmp}/libfx-model-tlc.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 mkdir -p graphs
 status=0
-for tool in send lookup write cutoff leased queue; do
+for tool in send lookup write cutoff leased queue refuse; do
     echo "== DurableSession ($tool)"
     if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup \
         -metadir "$work/$tool" -dump dot,actionlabels "graphs/$tool" \
@@ -58,10 +59,16 @@ done
 # that intent lands has the model ask again, under a new execution id.
 # WriteRunsAhead breaks OneExecutionId: a write that ran ahead the same way
 # would run under two ids, which is why a write waits for its intent.
+# NoEndRepair breaks EndRecoverable: without Repair, a holder that crashes
+# between a turn's end record and its turn_end line leaves a done turn no
+# reader sees end, and every worker that reads the log finds nothing to do.
+# NoRefusedRepair breaks it the same way for a turn the harness refused,
+# which ends through an `ended` entry and no record: libfx repaired only a
+# turn a record ended, which on the refuse graph is no repair at all.
 for pair in UiInOrder:UiInOrder NoStaleShown:NoStaleShown NotTwoActive:NotTwoActive \
     NoSelfStop:TwoActiveNeedsFreeze NoClaimFence:EffectsAtMostOnce NoCutoffBound:HandoffsBounded \
     LeasedTwoActive:NotTwoActive LookupRunsAhead:EveryCallAfterIntent LookupNewId:IdsAtMostOne \
-    WriteRunsAhead:OneExecutionId; do
+    WriteRunsAhead:OneExecutionId NoEndRepair:EndRecoverable NoRefusedRepair:EndRecoverable; do
     witness="${pair%%:*}" invariant="${pair#*:}"
     if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/w-$witness" \
         -config "Witness-$witness.cfg" DurableSession.tla 2>&1 | grep -q -E "Invariant $invariant is violated"; then
@@ -85,10 +92,16 @@ done
 # Each witness turns one rule off and must break the property it protects:
 # without Interrupt a steer waits on a streaming reply, without HandBack a
 # cancel loses a steer that never reached the model, without JoinBeforeStart
-# a steer sent before the first turn starts runs as a turn of its own, and
-# without Dedupe a retried steer reaches the model twice.
+# a steer sent before the first turn starts runs as a turn of its own,
+# without Dedupe a retried steer reaches the model twice, without
+# ReadAfterTool a steer stored while a tool runs misses the request after
+# its result when the worker has not read the log since, without
+# CallWaits a steer sent once a reply ended in a tool call ends the turn and
+# runs as a turn of its own, and without ReadAtEnd so does one another
+# server stores while the last reply streams.
 for pair in NoInterrupt:NoSteerWaitsOnReply NoHandBack:NothingLost \
-    NoJoinBeforeStart:PreStartJoins NoDedupe:AtMostOnce; do
+    NoJoinBeforeStart:PreStartJoins NoDedupe:AtMostOnce NoReadAfterTool:SteerInNextRequest \
+    NoCallWait:NoParkedSteer NoReadAtEnd:NoParkedSteer; do
     witness="${pair%%:*}" invariant="${pair#*:}"
     if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/sw-$witness" \
         -config "SteerWitness-$witness.cfg" DurableSteer.tla 2>&1 | grep -q -E "Invariant $invariant is violated"; then
@@ -97,6 +110,27 @@ for pair in NoInterrupt:NoSteerWaitsOnReply NoHandBack:NothingLost \
         echo "== steer witness $witness NOT reached" >&2; status=1
     fi
 done
+
+# UiStream.tla: a session's UI stream as a reader in another process sees it
+# while a worker writes it. libfx writes each line before the next unless
+# the World keeps a batch's order, as Vercel's does: on either World the
+# live reader gets what a replay gets. The witness writes batches to a World
+# that writes a batch's chunks in parallel, as libfx did on world-local, and
+# the live reader gets a line under another cursor than a replay gives it.
+for config in local vercel; do
+    echo "== UiStream ($config)"
+    if ! "$java" -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup -metadir "$work/ui-$config" \
+        -config "UiStream-$config.cfg" UiStream.tla > "$work/ui-$config.log" 2>&1; then
+        cat "$work/ui-$config.log"; status=1; continue
+    fi
+    grep -E 'distinct states|depth of' "$work/ui-$config.log"
+done
+if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/uw-Batched" \
+    -config UiStreamWitness-Batched.cfg UiStream.tla 2>&1 | grep -q -E "Invariant LiveIsReplay is violated"; then
+    echo "== ui witness Batched reached"
+else
+    echo "== ui witness Batched NOT reached" >&2; status=1
+fi
 
 # AgentRouting.tla: which agent runs a session's turns when an app has
 # several. Its graph is what ../drivers/drive-agents.mjs walks, with process p2
@@ -143,24 +177,35 @@ done
 # TrustBody runs a forged delivery, ShareName runs one tenant's prompt on
 # another's agent, RouteByName strands a prompt on another store,
 # NoAdmission stores an oversized input, and Today, every rule off as libfx
-# was before them, runs a prompt in another tenant's store.
-echo "== TenantIsolation (route)"
-if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup \
-    -metadir "$work/tenants-route" -dump dot,actionlabels graphs/tenants-route \
-    -config TenantIsolation-route.cfg TenantIsolation.tla > "$work/tenants-route.log" 2>&1; then
-    cat "$work/tenants-route.log"; status=1
-else
-    grep -E 'distinct states|depth of' "$work/tenants-route.log"
-fi
-if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/tenants-drains" \
-    -config TenantIsolation-drains.cfg TenantIsolation.tla > "$work/tenants-drains.log" 2>&1; then
-    echo "== TenantIsolation (drains): SentRuns holds"
-else
-    cat "$work/tenants-drains.log"; status=1
-fi
+# was before them, runs a prompt in another tenant's store. The dev graph,
+# two tenants on one store under NODE_ENV=development, is what
+# ../drivers/drive-tenants.mjs --development walks. DevReplaces shows a
+# replaced agent's prompt running on its replacement, DevOtherStore that a
+# replacement on another store under the same key leaves it unrun, and
+# DevOldestWins that without NewestWins an agent created on the default store
+# that learns its store late replaces a newer agent there, as libfx did.
+for config in route dev; do
+    echo "== TenantIsolation ($config)"
+    if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup \
+        -metadir "$work/tenants-$config" -dump dot,actionlabels "graphs/tenants-$config" \
+        -config "TenantIsolation-$config.cfg" TenantIsolation.tla > "$work/tenants-$config.log" 2>&1; then
+        cat "$work/tenants-$config.log"; status=1
+    else
+        grep -E 'distinct states|depth of' "$work/tenants-$config.log"
+    fi
+done
+for config in drains dev-drains; do
+    if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/tenants-$config" \
+        -config "TenantIsolation-$config.cfg" TenantIsolation.tla > "$work/tenants-$config.log" 2>&1; then
+        echo "== TenantIsolation ($config): SentRuns holds"
+    else
+        cat "$work/tenants-$config.log"; status=1
+    fi
+done
 for pair in "TrustBody:Invariant OnlySentRuns is violated" "ShareName:Invariant RunsOnSenderAgent is violated" \
     "RouteByName:Temporal properties were violated" "NoAdmission:Invariant StoredWithinLimit is violated" \
-    "Today:Invariant RunsInSenderStore is violated"; do
+    "Today:Invariant RunsInSenderStore is violated" "DevReplaces:Invariant RunsOnSenderAgent is violated" \
+    "DevOtherStore:Temporal properties were violated" "DevOldestWins:Invariant ReplacedByNewer is violated"; do
     witness="${pair%%:*}" verdict="${pair#*:}"
     if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/tw-$witness" \
         -config "TenantWitness-$witness.cfg" TenantIsolation.tla 2>&1 | grep -q -F "$verdict"; then

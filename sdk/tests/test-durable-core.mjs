@@ -220,14 +220,13 @@ const createAgent = createDurableAgentFactory({ harness: scriptedHarness(), defa
 
 // Agents that record which of them opened each session's engine, by `tag`.
 const openedBy = [];
-const createTaggedAgent = createDurableAgentFactory({
-  harness: ({ tag }) => {
-    const plugged = scriptedHarness()();
-    return { open: (args) => { openedBy.push([tag, args.sessionId]); return plugged.open(args); } };
-  },
-  defaultDurability: async () => memory(),
-  name: "createTaggedAgent",
-});
+const taggedHarness = ({ tag }) => {
+  const plugged = scriptedHarness()();
+  return { open: (args) => { openedBy.push([tag, args.sessionId]); return plugged.open(args); } };
+};
+const createTaggedAgent = createDurableAgentFactory({ harness: taggedHarness, defaultDurability: async () => memory(), name: "createTaggedAgent" });
+// The same, as a factory whose process is a development server.
+const createDevTaggedAgent = createDurableAgentFactory({ harness: taggedHarness, defaultDurability: async () => memory(), development: () => true, name: "createTaggedAgent" });
 const openersOf = (sessionId) => [...new Set(openedBy.filter(([, id]) => id === sessionId).map(([tag]) => tag))];
 
 async function durabilityFor(options = {}) {
@@ -1061,6 +1060,26 @@ test("a worker lives only while a delivery runs it", async () => {
   await agent.close();
 });
 
+test("opening a session starts no durability until the session is used", async () => {
+  // How often the agent created its durability's backend or World.
+  const counts = { started: 0 };
+  const base = await durabilityFor();
+  const durability = typeof base.create === "function"
+    ? { ...base, create() { counts.started += 1; return base.create(); } }
+    : { ...base, async world() { counts.started += 1; return base.world(); } };
+  const agent = createAgent({ durability });
+  const fresh = agent.session();
+  const named = agent.session("wrun_01JRCOREOPENNOIO00000");
+  await sleep(100);
+  assert.equal(counts.started, 0, "API-12, API-31: createAgent() and session() did no I/O");
+  assert.equal(fresh.id, null, "a new session has no id before it is used");
+  assert.equal(named.id, "wrun_01JRCOREOPENNOIO00000");
+  assert.equal((await fresh.prompt("alpha", { messageId: "turn-a" }).result).stopReason, "end_turn");
+  assert.equal(counts.started, 1, "the first prompt started the durability, once");
+  assert.ok(typeof fresh.id === "string", "and gave the new session its id");
+  await agent.close();
+});
+
 test("a new session's id can come before its first prompt, and null is no id", async () => {
   const agent = createAgent({ durability: await durabilityFor() });
   assert.throws(() => agent.session(null), /session id must be/);
@@ -1116,6 +1135,184 @@ if (durabilityKind === "memory") {
     ]).finally(() => clearTimeout(timer));
     assert.equal(result.stopReason, "error");
     assert.equal(result.error.message, "no engine");
+    await agent.close();
+  });
+}
+
+// memory(), with a worker that dies right after the record that ends its
+// turn while `dies.now` is set: its turn_end lines never land and it never
+// lets the session go.
+function dyingAfterEnd(base, dies) {
+  let wrapped = null;
+  const isEnd = (line) => {
+    try { return JSON.parse(line).type === "turn_end"; } catch { return false; }
+  };
+  return {
+    ...base,
+    create() {
+      const backend = base.create();
+      wrapped ??= Object.assign(Object.create(backend), {
+        async session(id) {
+          const log = await backend.session(id);
+          return {
+            ...log,
+            ui: { ...log.ui, write: (lines) => log.ui.write(dies.now ? lines.filter((line) => !isEnd(line)) : lines) },
+            append: (entry) => (dies.now && entry?.k === "release" ? Promise.reject(new Error("the process died")) : log.append(entry)),
+          };
+        },
+      });
+      return wrapped;
+    },
+  };
+}
+
+if (durabilityKind === "memory") {
+  test("a turn whose worker died between its end and its turn_end line ends for its viewers when the session is next delivered", async () => {
+    const dies = { now: true };
+    const durability = dyingAfterEnd(memory(), dies);
+    const agent = createAgent({ durability });
+    const session = agent.session();
+    const first = session.prompt("alpha", { messageId: "turn-a" });
+    const { sessionId } = await first.accepted;
+    // The log holds the turn's end; the stream never heard it.
+    const log = await durability.create().session(sessionId);
+    const ended = async () => foldSessionLog(await log.read()).lastTurnId === "turn-a";
+    while (!(await ended())) await sleep(10);
+    await sleep(landMs);
+    dies.now = false;
+    let timer;
+    const retried = await Promise.race([
+      session.prompt("alpha", { messageId: "turn-a" }).result,
+      new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error("the retry waited for an end nobody writes")), 5000); }),
+    ]).finally(() => clearTimeout(timer));
+    // How it ended is not in the log (`tests/tla/sdk/DurableSession.tla` EndLine).
+    assert.equal(retried.stopReason, "unknown");
+    assert.equal((await first.result).stopReason, "unknown");
+    const lines = await readLines(session.stream(0), 100);
+    assert.equal(lines.filter((line) => line.type === "turn_end" && line.messageId === "turn-a").length, 1);
+    assert.equal((await session.prompt("after", { messageId: "turn-after" }).result).stopReason, "end_turn");
+    await agent.close();
+  });
+}
+
+// memory(), with a worker that dies right after the first entry that ends a
+// turn while `dies.armed` is set, by default a record: from then until the
+// test sets `dies.dead` back, no write but a sender's input lands, and no
+// line reaches the stream.
+const recordEnds = (entry) => entry?.k === "record" && (entry.marks ?? []).some((mark) => mark.end === true);
+// The entry that ends a turn which wrote no record of its own.
+const endedEntry = (entry) => entry?.k === "ended";
+function deadAfterEnd(base, dies, ends = recordEnds) {
+  let wrapped = null;
+  return {
+    ...base,
+    create() {
+      const backend = base.create();
+      wrapped ??= Object.assign(Object.create(backend), {
+        async session(id) {
+          const log = await backend.session(id);
+          return {
+            ...log,
+            ui: { ...log.ui, write: (lines) => log.ui.write(dies.dead ? [] : lines) },
+            async append(entry) {
+              if (dies.dead && entry?.k !== "input") throw new Error("the process died");
+              const appended = await log.append(entry);
+              if (dies.armed && ends(entry)) {
+                dies.armed = false;
+                dies.dead = true;
+              }
+              return appended;
+            },
+          };
+        },
+      });
+      return wrapped;
+    },
+  };
+}
+
+if (durabilityKind === "memory") {
+  test("a turn whose worker died between its end and its turn_end line ends for its viewers before the next queued turn runs", async () => {
+    const dies = { armed: true, dead: false };
+    const durability = deadAfterEnd(memory(), dies);
+    const agent = createAgent({ durability });
+    const session = agent.session();
+    const first = session.prompt("alpha", { messageId: "turn-a" });
+    await first.accepted;
+    const second = session.prompt("beta", { messageId: "turn-b" });
+    await second.accepted;
+    while (!dies.dead) await sleep(10);
+    await sleep(landMs);
+    dies.dead = false;
+    let timer;
+    const [a, b] = await Promise.race([
+      Promise.all([first.result, second.result]),
+      new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error("the first turn never ended for its viewers")), 5000); }),
+    ]).finally(() => clearTimeout(timer));
+    assert.equal(a.stopReason, "unknown");
+    assert.equal(b.stopReason, "end_turn");
+    const lines = await readLines(session.stream(0), 200);
+    const ends = (id) => lines.filter((line) => line.type === "turn_end" && line.messageId === id).length;
+    assert.equal(ends("turn-a"), 1);
+    assert.equal(ends("turn-b"), 1);
+    const at = (type, id) => lines.findIndex((line) => line.type === type && line.messageId === id);
+    assert.ok(at("turn_end", "turn-a") < at("turn_start", "turn-b"), "the first turn ended for its viewers before the next one started");
+    await agent.close();
+  });
+
+  // DUR-20, DUR-25: a turn that ends before writing any record ends through
+  // an `ended` entry in the log, then its turn_end line, and the next worker
+  // writes that line when its holder died between the two, as for a turn a
+  // record ended (`tests/tla/sdk/DurableSession.tla` with Refused, EndLine).
+  // Each retry here would otherwise wait 30 s for an end nobody writes.
+  const endsForItsViewers = async (session, input, messageId, first) => {
+    let timer;
+    const retried = await Promise.race([
+      session.prompt(input, { messageId }).result,
+      new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error("the retry waited for an end nobody writes")), 5000); }),
+    ]).finally(() => clearTimeout(timer));
+    // How it ended is not in the log.
+    assert.equal(retried.stopReason, "unknown");
+    assert.equal((await first.result).stopReason, "unknown");
+    const lines = await readLines(session.stream(0), 100);
+    assert.equal(lines.filter((line) => line.type === "turn_end" && line.messageId === messageId).length, 1);
+    assert.equal((await session.prompt("after", { messageId: `${messageId}-after` }).result).stopReason, "end_turn");
+  };
+
+  test("a prompt the harness refused, whose worker died before its turn_end line, ends for its viewers when the session is next delivered", async () => {
+    const dies = { armed: true, dead: false };
+    const agent = createAgent({ durability: deadAfterEnd(memory(), dies, endedEntry) });
+    const session = agent.session();
+    const first = session.prompt("refuse", { messageId: "turn-r" });
+    await first.accepted;
+    while (!dies.dead) await sleep(10);
+    await sleep(landMs);
+    dies.dead = false;
+    await endsForItsViewers(session, "refuse", "turn-r", first);
+    await agent.close();
+  });
+
+  test("a prompt its own cancel stopped before it started, whose worker died before its turn_end line, ends for its viewers when the session is next delivered", async () => {
+    const dies = { armed: false, dead: false };
+    const agent = createAgent({ durability: deadAfterEnd(memory(), dies, endedEntry) });
+    const session = agent.session();
+    // The prompt waits behind a running turn, and its cancel lands first.
+    const held = holdStep("alpha-1");
+    const running = session.prompt("alpha", { messageId: "turn-a" });
+    await held.holding;
+    const waiting = new AbortController();
+    const first = session.prompt("beta", { messageId: "turn-b", signal: waiting.signal });
+    await first.accepted;
+    waiting.abort();
+    const log = await agent[Symbol.for("libfx.durableInternals")].openLog(session.id);
+    while (!(await log.read()).some(({ entry }) => entry.type === "cancel" && entry.target === "turn-b")) await sleep(10);
+    dies.armed = true;
+    held.release();
+    assert.equal((await running.result).stopReason, "end_turn");
+    while (!dies.dead) await sleep(10);
+    await sleep(landMs);
+    dies.dead = false;
+    await endsForItsViewers(session, "beta", "turn-b", first);
     await agent.close();
   });
 }
@@ -1214,6 +1411,123 @@ if (durabilityKind !== "memory") {
     assert.equal(result.stopReason, "end_turn");
     assert.equal(text, "alpha-0 alpha-1 alpha-2", "a reader that comes later sees the whole turn");
     assert.ok(counts.reads > 0, "reading the view read the stream");
+    await agent.close();
+  });
+}
+
+// A World durability whose session streams live in this test, as
+// world-local's do on disk: each chunk gets its place in the stream when its
+// write starts, and a reader is handed each chunk once it is visible, in
+// place order among those it has not had, as world-local's reader in another
+// process is. A batch's chunks become visible last first, as world-local's
+// parallel writes of one batch can finish, or in order with `inOrder`. The
+// first write is slow, so the lines a turn pushes meanwhile go out together.
+function batchesLandOutOfOrder(durability, { inOrder = false } = {}) {
+  const seen = { batches: 0 };
+  const worldOf = durability.world;
+  const streams = new Map();
+  const streamOf = (runId, name) => {
+    const key = `${runId}/${name}`;
+    if (!streams.has(key)) streams.set(key, { chunks: [], visible: new Set(), readers: new Set(), writes: 0 });
+    return streams.get(key);
+  };
+  const land = (stream, place) => {
+    stream.visible.add(place);
+    for (const wake of stream.readers) wake();
+  };
+  const fake = {
+    async write(runId, name, chunk) {
+      const stream = streamOf(runId, name);
+      const place = stream.chunks.push(chunk) - 1;
+      if (stream.writes++ === 0) await sleep(150);
+      land(stream, place);
+    },
+    async writeMulti(runId, name, chunks) {
+      seen.batches += 1;
+      const stream = streamOf(runId, name);
+      const places = chunks.map((chunk) => stream.chunks.push(chunk) - 1);
+      for (const place of inOrder ? places : [...places].reverse()) {
+        await sleep(20);
+        land(stream, place);
+      }
+    },
+    async getInfo(runId, name) {
+      return { tailIndex: streamOf(runId, name).visible.size - 1 };
+    },
+    async get(runId, name, from = 0) {
+      const stream = streamOf(runId, name);
+      const sorted = [...stream.visible].sort((a, b) => a - b);
+      const handed = new Set(sorted);
+      const next = sorted.slice(from);
+      let wake = null;
+      let cancelled = false;
+      const notify = () => wake?.();
+      stream.readers.add(notify);
+      return new ReadableStream({
+        async pull(controller) {
+          while (!cancelled) {
+            if (next.length > 0) {
+              controller.enqueue(encoder.encode(stream.chunks[next.shift()]));
+              return;
+            }
+            const fresh = [...stream.visible].filter((place) => !handed.has(place)).sort((a, b) => a - b);
+            for (const place of fresh) { handed.add(place); next.push(place); }
+            if (fresh.length === 0) await new Promise((resolve) => { wake = resolve; });
+          }
+        },
+        cancel() {
+          cancelled = true;
+          stream.readers.delete(notify);
+          notify();
+        },
+      });
+    },
+  };
+  const bound = (target, key) => {
+    const value = Reflect.get(target, key);
+    return typeof value === "function" ? value.bind(target) : value;
+  };
+  return [{
+    ...durability,
+    async world() {
+      const world = await worldOf();
+      const streams = new Proxy(world.streams, { get: (target, key) => (Object.hasOwn(fake, key) ? fake[key] : bound(target, key)) });
+      return new Proxy(world, { get: (target, key) => (key === "streams" ? streams : bound(target, key)) });
+    },
+  }, seen];
+}
+
+if (durabilityKind !== "memory") {
+  const createLongAgent = createDurableAgentFactory({ harness: scriptedHarness({ steps: 6 }), defaultDurability: async () => memory(), name: "createLongAgent" });
+  // A reader that follows the turn from its start, and a replay after it.
+  const liveAndReplay = async (agent) => {
+    const session = agent.session();
+    const turn = session.prompt("omicron", { messageId: "turn-o" });
+    const { sessionId } = await turn.accepted;
+    const live = readLines(agent.session(sessionId).stream(0), 32, 1000);
+    assert.equal((await turn.result).stopReason, "end_turn");
+    return { live: await live, replay: await readLines(agent.session(sessionId).stream(0), 32) };
+  };
+
+  test("a live reader gets a turn's lines in stored order and under a replay's cursors, though the World can land a batch out of order", async () => {
+    const [durability, seen] = batchesLandOutOfOrder(await durabilityFor());
+    const agent = createLongAgent({ durability });
+    const { live, replay } = await liveAndReplay(agent);
+    assert.equal(replay.length, 8, JSON.stringify(replay));
+    assert.deepEqual(live, replay, "DUR-38: the live reader got what a replay from cursor 0 gets");
+    assert.equal(seen.batches, 0, "no batch went to a World that may land it out of order");
+    await agent.close();
+  });
+
+  test("a World that keeps a batch in order, as Vercel's does, gets a turn's lines in batches", async () => {
+    const { vercel } = await import("../durable/vercel.mjs");
+    const inOrder = Symbol.for("libfx.batchesInOrder");
+    assert.equal(vercel()[inOrder], true, "vercel() says its World keeps a batch in order");
+    const [durability, seen] = batchesLandOutOfOrder({ ...(await durabilityFor()), [inOrder]: true }, { inOrder: true });
+    const agent = createLongAgent({ durability });
+    const { live, replay } = await liveAndReplay(agent);
+    assert.deepEqual(live, replay);
+    assert.ok(seen.batches > 0, "the lines pushed during a write went out in one batch");
     await agent.close();
   });
 }
@@ -1487,11 +1801,154 @@ if (durabilityKind === "memory") {
     assert.equal((await session.prompt("first").result).stopReason, "end_turn");
     const inputs = async () => (await (await agent[Symbol.for("libfx.durableInternals")].openLog(session.id)).read()).filter(({ entry }) => entry.k === "input").length;
     const before = await inputs();
-    const big = "x".repeat(8 * 1024 * 1024);
-    assert.throws(() => session.prompt(big), (error) => error?.code === "FX_INPUT_TOO_LARGE" && error.limit === 8 * 1024 * 1024);
+    const big = "x".repeat(16 * 1024 * 1024);
+    assert.throws(() => session.prompt(big), (error) => error?.code === "FX_INPUT_TOO_LARGE" && error.limit === 16 * 1024 * 1024);
     await assert.rejects(session.steer(big), (error) => error?.code === "FX_INPUT_TOO_LARGE");
     assert.equal(await inputs(), before, "no input was stored");
     await agent.close();
+  });
+
+  // DUR-23, API-42: a harness whose engine frames inputs, as fx's does, has
+  // the core refuse an input that frame cannot hold, which no turn could run,
+  // and only that: image data, which travels beside the frame, does not count.
+  test("an input its engine's frame cannot hold is refused before anything is stored, and image data does not count toward it", async () => {
+    const maxFrameBytes = 4096;
+    // Text counts toward the frame; image data does not.
+    const frameBytes = (input) => 100 + (typeof input === "string" ? input.length : input.reduce((total, block) => total + (block.type === "text" ? block.text.length : 0), 0));
+    const createFramedAgent = createDurableAgentFactory({
+      harness: () => ({ ...scriptedHarness()(), frameBytes, maxFrameBytes }),
+      defaultDurability: async () => memory(),
+      name: "createFramedAgent",
+    });
+    const agent = createFramedAgent({ durability: memory() });
+    const session = agent.session(undefined, { context: { user: "a" } });
+    assert.equal((await session.prompt("first").result).stopReason, "end_turn");
+    const inputs = async () => (await (await agent[Symbol.for("libfx.durableInternals")].openLog(session.id)).read()).filter(({ entry }) => entry.k === "input").length;
+    const before = await inputs();
+    const over = "x".repeat(maxFrameBytes - 100 + 1);
+    assert.throws(() => session.prompt(over), (error) => error instanceof RangeError && error.code === "FX_INPUT_TOO_LARGE" && error.bytes === maxFrameBytes + 1 && error.limit === maxFrameBytes);
+    await assert.rejects(session.steer(over), (error) => error?.code === "FX_INPUT_TOO_LARGE" && error.limit === maxFrameBytes);
+    assert.equal(await inputs(), before, "no input was stored");
+    // Image data far over the frame, with text that fills it, is stored.
+    const image = { type: "image", data: "A".repeat(9 * 1024 * 1024), mimeType: "image/png" };
+    const turn = session.prompt([{ type: "text", text: over.slice(1) }, image]);
+    await turn.accepted;
+    assert.equal(await inputs(), before + 1, "the input with its images was stored");
+    await turn.result;
+    // Past the 16 MiB a session stores for one input, images are refused too.
+    const huge = { ...image, data: "A".repeat(16 * 1024 * 1024) };
+    assert.throws(() => session.prompt([{ type: "text", text: "small" }, huge]), (error) => error?.code === "FX_INPUT_TOO_LARGE" && error.limit === 16 * 1024 * 1024);
+    assert.equal(await inputs(), before + 1);
+    await agent.close();
+  });
+
+  // QUAL-18: the refusal names the cause and what to do (decision D2).
+  test("refusing a second agent of one name says why and what to do", async () => {
+    const shared = memory();
+    const tagged = createDurableAgentFactory({ harness: ({ tag }) => scriptedHarness()(), defaultDurability: async () => shared, defaultShared: true, name: "createDefaultAgent" });
+    const chat = tagged({ tag: "chat" });
+    assert.throws(() => tagged({ tag: "summarizer" }), (error) => error?.code === "FX_AGENT_NAME_IN_USE" && error.agent === "default" &&
+      error.message === "createDefaultAgent() options differ from those of an agent already created without a name in this process; agents created without a name all have the name \"default\", and agents of one name on one store must be copies of one agent, so give each agent its own name, such as createDefaultAgent({ name: \"summarizer\" })");
+    const durability = memory();
+    const support = createTaggedAgent({ durability, name: "support", tag: "acme" });
+    assert.throws(() => createTaggedAgent({ durability, name: "support", tag: "evil" }), (error) => error?.code === "FX_AGENT_NAME_IN_USE" &&
+      error.message === "an agent named \"support\" already runs on this store in this process with other options, and agents of one name on one store must be copies of one agent; give each agent its own name, or each its own store");
+    await support.close();
+    await chat.close();
+  });
+
+  // Decision D1: SEC-2 keeps the refusal unless the runtime that builds the
+  // factory says the process is a development server. The core reads no
+  // environment; sdk/tests/test-durable.mjs checks how Node decides.
+  test("SEC-2: a factory refuses another configuration under a name unless its development() returns true", async () => {
+    const strict = createDurableAgentFactory({ harness: taggedHarness, defaultDurability: async () => memory(), development: () => false, name: "createTaggedAgent" });
+    const loose = createDurableAgentFactory({ harness: taggedHarness, defaultDurability: async () => memory(), development: () => "development", name: "createTaggedAgent" });
+    // Not even where the process environment says development, as a
+    // browser bundle's shim may.
+    const saved = process.env.NODE_ENV;
+    process.env.NODE_ENV = "development";
+    try {
+      for (const create of [createTaggedAgent, strict, loose]) {
+        const durability = memory();
+        const support = create({ durability, name: "support", tag: "acme" });
+        assert.throws(() => create({ durability, name: "support", tag: "evil" }), (error) => error?.code === "FX_AGENT_NAME_IN_USE");
+        await support.close();
+      }
+    } finally {
+      if (saved === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = saved;
+    }
+  });
+
+  test("in development, an agent with other options replaces the one its name had: that one's running turn ends there, and later turns run on the new one", async () => {
+    const durability = memory();
+    const internals = Symbol.for("libfx.durableInternals");
+    const old = createDevTaggedAgent({ durability, name: "support", tag: "old" });
+    const session = old.session();
+    const held = holdStep("first-1");
+    const running = session.prompt("first");
+    const events = [];
+    let fresh;
+    try {
+      await held.holding;
+      fresh = createDevTaggedAgent({ durability, name: "support", tag: "new", onEvent: (event) => events.push(event) });
+    } finally {
+      held.release();
+    }
+    assert.deepEqual(events.filter((event) => event.type === "agent.replaced").map(({ agent, replaced }) => ({ agent, replaced })), [{ agent: "support", replaced: 1 }]);
+    assert.equal((await textOf(running)).text, "first-0 first-1 first-2");
+    assert.deepEqual(openersOf(session.id), ["old"], "the turn the old agent was running ended there");
+    while (old[internals].liveWorkers() > 0) await sleep(5);
+    // A module loaded before still prompts through the old agent; its
+    // turn runs on the new one, as one sent through the new agent does.
+    assert.equal((await textOf(old.session(session.id).prompt("second"))).text, "second-0 second-1 second-2");
+    assert.equal((await textOf(fresh.session(session.id).prompt("third"))).text, "third-0 third-1 third-2");
+    assert.deepEqual(openersOf(session.id), ["old", "new"]);
+    // A third configuration replaces the new one too, and the old agent's
+    // deliveries follow the name to it.
+    const third = createDevTaggedAgent({ durability, name: "support", tag: "third" });
+    while (fresh[internals].liveWorkers() > 0) await sleep(5);
+    assert.equal((await textOf(old.session(session.id).prompt("fourth"))).text, "fourth-0 fourth-1 fourth-2");
+    assert.deepEqual(openersOf(session.id), ["old", "new", "third"]);
+    for (const agent of [old, fresh, third]) await agent.close();
+  });
+
+  test("in development, an agent created without a name replaces an earlier one with other options, on the shared default store", async () => {
+    const shared = memory();
+    const tagged = createDurableAgentFactory({ harness: ({ tag }) => scriptedHarness()(), defaultDurability: async () => shared, defaultShared: true, development: () => true, name: "createDefaultAgent" });
+    const first = tagged({ tag: "key-a" });
+    await first.newSessionId();
+    const events = [];
+    const second = tagged({ tag: "key-b", onEvent: (event) => events.push(event) });
+    assert.equal(events.filter((event) => event.type === "agent.replaced").length, 1);
+    // The earlier agent, now replaced, opens nothing under the name again.
+    const turn = first.session().prompt("hello");
+    assert.equal((await textOf(turn)).text, "hello-0 hello-1 hello-2");
+    for (const agent of [first, second]) await agent.close();
+  });
+
+  // Decision D1: a chain of replacements ends at the newest agent. An agent
+  // created without a durability learns its store only when first used, so
+  // a newer agent on that store, created after it, may be registered first
+  // (`tests/tla/sdk/TenantIsolation.tla` Resolve, ReplacedByNewer).
+  test("in development, an older agent that learns its store after a newer one took it gives way to the newer one", async () => {
+    const shared = memory();
+    const tagged = createDurableAgentFactory({ harness: taggedHarness, defaultDurability: async () => shared, defaultShared: true, development: () => true, name: "createDefaultAgent" });
+    const replaced = [];
+    const watch = (label) => (event) => { if (event.type === "agent.replaced") replaced.push([label, event.replaced]); };
+    // A module loaded before an edit, whose agent takes the default store.
+    const older = tagged({ name: "support", tag: "older", onEvent: watch("older") });
+    // The module after the edit names the store.
+    const newer = tagged({ name: "support", tag: "newer", durability: shared, onEvent: watch("newer") });
+    assert.deepEqual(replaced, [], "neither knows yet that the other is on its store");
+    // A route that loaded the module before uses its agent now.
+    const session = older.session();
+    assert.equal((await textOf(session.prompt("first"))).text, "first-0 first-1 first-2");
+    assert.deepEqual(replaced, [["newer", 1]], "the newer agent replaced the older one");
+    assert.deepEqual(openersOf(session.id), ["newer"], "the turn sent through the older agent ran on the newer one");
+    assert.equal((await textOf(newer.session(session.id).prompt("second"))).text, "second-0 second-1 second-2");
+    assert.deepEqual(openersOf(session.id), ["newer"]);
+    for (const agent of [older, newer]) await agent.close();
   });
 
   test("a session stores its context as it was when the session opened", async () => {
@@ -1512,6 +1969,28 @@ if (durabilityKind === "memory") {
     } finally {
       await agent.close();
     }
+  });
+}
+
+if (durabilityKind === "local") {
+  // Decision D1, as `next dev` reloads a module: the module creates its agent
+  // again on a local() of its own over the same directory, while a route that
+  // loaded the module before still prompts through the old agent, whose
+  // World's queue delivers to it.
+  test("in development, an agent on a new local() over the same directory replaces the old one, and prompts sent through the old one run on it", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-core-reload-"));
+    dirs.push(dir);
+    const internals = Symbol.for("libfx.durableInternals");
+    const old = createDevTaggedAgent({ durability: local({ dir }), name: "support", tag: "old-module" });
+    const first = old.session();
+    assert.equal((await textOf(first.prompt("alpha"))).text, "alpha-0 alpha-1 alpha-2");
+    const fresh = createDevTaggedAgent({ durability: local({ dir }), name: "support", tag: "new-module" });
+    while (old[internals].liveWorkers() > 0) await sleep(5);
+    assert.equal((await textOf(old.session(first.id).prompt("beta"))).text, "beta-0 beta-1 beta-2");
+    assert.equal((await textOf(fresh.session(first.id).prompt("gamma"))).text, "gamma-0 gamma-1 gamma-2");
+    assert.deepEqual(openersOf(first.id), ["old-module", "new-module"]);
+    await old.close();
+    await fresh.close();
   });
 }
 

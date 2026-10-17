@@ -76,9 +76,11 @@ live session as a whole.
 **Binding contracts v2 must keep:**
 - **One writer.** One writing process per session. A contender waits up to 2 s,
   then gets Busy.
-- **Crash safety.** Committed turns survive an fx crash. An unfinished turn is
-  never silently continued after an unclean exit, and asking stays sticky
-  until the turn is resolved (`session_log.zig:38` comment).
+- **Crash safety.** Committed turns survive an fx crash. After an unclean
+  exit, an unfinished turn continues once on its own, with a notice (DUR-87).
+  If fx exits uncleanly again while continuing it, the next resume asks, and
+  asking stays sticky until the turn is resolved (`session_log.zig:38`
+  comment).
 - **Resume by id, by `--resume last` and through the picker.** `--resume last`
   means the newest session of any host.
 - **`-c` returns to the session the interactive app last opened.** `fx ask`

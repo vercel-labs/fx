@@ -64,11 +64,25 @@
 (* under the id its intent names. With WritesWait = FALSE a write runs     *)
 (* ahead too, and runs under two ids (Witness-WriteRunsAhead).             *)
 (*                                                                         *)
+(* A turn's end is two writes: the record that ends it in the chain, then  *)
+(* its turn_end line and the release. A worker that crashes between them   *)
+(* leaves a done turn no reader sees end. With Repair, a worker that finds *)
+(* such a turn, its holder gone without letting the session go, claims the *)
+(* session and writes the missing turn_end; without it nothing reads a     *)
+(* done session again (Witness-NoEndRepair).                               *)
+(*                                                                         *)
+(* With Refused, the harness refuses the turn's input, as fx refuses a     *)
+(* malformed prompt: the turn ends before any record, through an `ended`   *)
+(* entry outside the chain, which even a replaced worker's write lands,    *)
+(* then its turn_end line. A crash between the two needs the same repair   *)
+(* (Witness-NoRefusedRepair); libfx had it only for a turn a record ended, *)
+(* which on this graph is no repair at all.                                *)
+(*                                                                         *)
 (* `act` names each step and its worker, so a driver can replay any path   *)
 (* of the state graph against the real code and compare every state:       *)
 (* tests/tla/drivers/drive.mjs.                                            *)
 (***************************************************************************)
-EXTENDS Naturals, Sequences
+EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS
     Workers,     \* the processes that can run the session
@@ -82,8 +96,12 @@ CONSTANTS
     MaxCutoffs,  \* cut-offs of one step in a row before it is not run again
     CutoffBound, \* whether that bound applies
     Heartbeat,   \* whether a holder renews a short lease while it runs
-    QueueHeld    \* whether only the queue's redelivery of a frozen holder's
+    QueueHeld,   \* whether only the queue's redelivery of a frozen holder's
                  \* message frees its lease
+    Repair,      \* whether a worker writes the turn_end a crashed holder
+                 \* left unwritten
+    Refused      \* whether the harness refuses the turn's input, so it ends
+                 \* before any record
 
 ASSUME Tool \in {"lookup", "write", "send"}
 ASSUME WritesWait \in BOOLEAN
@@ -93,11 +111,15 @@ ASSUME MaxCutoffs \in Nat
 ASSUME CutoffBound \in BOOLEAN
 ASSUME Heartbeat \in BOOLEAN
 ASSUME QueueHeld \in BOOLEAN
+ASSUME Repair \in BOOLEAN
+ASSUME Refused \in BOOLEAN
 ASSUME ~(QueueHeld /\ Heartbeat)
 
 None == "none"
 \* "ahead": a call that ran ahead runs while its intent is on its way.
-Waiting == {"announce", "model1", "ahead", "tool", "model2"}
+\* "ending": the turn's end is in the chain and its turn_end line is not
+\* written yet.
+Waiting == {"announce", "model1", "ahead", "tool", "model2", "ending"}
 \* A deadline while a call waits for its intent writes behind that intent,
 \* in the log's order, so it is Intent and then Deadline.
 Busy == {"model1", "tool", "model2"}
@@ -117,8 +139,9 @@ VARIABLES
     runs,      \* how many times the tool has started
     ids,       \* how many execution ids it started under: each model response
                \* that starts a call names a new one, and a rerun keeps it
-    ui,        \* each line in the UI stream: its writer's epoch, and whether
-               \* that writer still headed the chain when it wrote
+    ui,        \* each line in the UI stream: its writer's epoch, whether
+               \* that writer still headed the chain when it wrote, and
+               \* whether it is the turn's turn_end
     freezes,   \* freezes so far
     froze,     \* whether a worker froze since it last claimed the session
     chain,     \* how many counted writes the chain holds
@@ -132,14 +155,14 @@ VARIABLES
 vars == <<pc, epoch, frozen, lease, progress, runs, ids, ui, freezes, froze, chain, cutoffs, seen, lapse, act>>
 
 TypeOK ==
-    /\ pc \in [Workers -> {"none", "early", "announce", "model1", "ahead", "tool", "model2", "done", "stopped"}]
+    /\ pc \in [Workers -> {"none", "early", "announce", "model1", "ahead", "tool", "model2", "ending", "done", "stopped"}]
     /\ epoch \in [Workers -> 0..MaxEpoch]
     /\ frozen \in [Workers -> BOOLEAN]
     /\ lease \in [holder: Workers \cup {None}, epoch: 0..MaxEpoch, live: BOOLEAN]
     /\ progress \in Progress
     /\ runs \in 0..(MaxEpoch + 1)
     /\ ids \in 0..(MaxEpoch + 1)
-    /\ ui \in Seq([e: 0..MaxEpoch, legit: BOOLEAN])
+    /\ ui \in Seq([e: 0..MaxEpoch, legit: BOOLEAN, end: BOOLEAN])
     /\ freezes \in 0..MaxFreezes
     /\ froze \in [Workers -> BOOLEAN]
     /\ chain \in Nat
@@ -147,7 +170,7 @@ TypeOK ==
     /\ seen \in [Workers -> [chain: Nat, progress: Progress, epoch: 0..MaxEpoch, cutoffs: Nat]]
     /\ lapse \in Workers \cup {"none", "open"}
     /\ act \in [name: {"Init", "Start", "Claim", "Announce", "Model1", "Intent", "ToolEnd", "Model2",
-                       "Freeze", "Wake", "Deadline", "Expire"},
+                       "EndLine", "Freeze", "Wake", "Deadline", "Expire"},
                 w: Workers \cup {None}]
 
 Init ==
@@ -170,8 +193,9 @@ Init ==
 \* A worker's writes count while its claim heads the lease chain.
 Heads(w) == lease.holder = w /\ lease.epoch = epoch[w]
 
-\* A line w writes now.
-Line(w) == [e |-> epoch[w], legit |-> Heads(w)]
+\* A line w writes now, and the turn_end line it writes now.
+Line(w) == [e |-> epoch[w], legit |-> Heads(w), end |-> FALSE]
+EndOf(w) == [e |-> epoch[w], legit |-> Heads(w), end |-> TRUE]
 
 \* A write that does not count may still have put a line in the UI stream.
 MaybeLine(w) == ui' \in {ui, Append(ui, Line(w))}
@@ -183,9 +207,17 @@ ShownAt(lines) == {i \in 1..Len(lines) : \A j \in 1..(i - 1) : lines[j].e <= lin
 \* What w reads now: where the chain stands and how far it recorded the turn.
 Read == [chain |-> chain, progress |-> progress, epoch |-> lease.epoch, cutoffs |-> cutoffs]
 
+\* Whether a reader shows the turn's end.
+EndShown == \E i \in ShownAt(ui) : ui[i].end
+
+\* The work a worker finds when it reads the log: the turn, or, with Repair,
+\* the end of a done turn that no reader shows, its holder never having let
+\* the session go.
+Unfinished == progress # "done" \/ (Repair /\ lease.holder # None /\ ~EndShown)
+
 \* Whether w, reading now, finds work it can claim. With QueueHeld, a frozen
 \* holder's lease is dead only to the delivery its message was handed to.
-CanClaim(w) == progress # "done" /\ (lease.holder = None \/ (~lease.live /\ (~QueueHeld \/ lapse = w)))
+CanClaim(w) == Unfinished /\ (lease.holder = None \/ (~lease.live /\ (~QueueHeld \/ lapse = w)))
 
 \* w receives work for the session, reads the log, and finds no live worker
 \* holding it. It writes its claim and sends its first model request at
@@ -199,7 +231,7 @@ Start(w) ==
     /\ \/ /\ CanClaim(w)
           /\ UNCHANGED lapse
        \/ /\ QueueHeld
-          /\ progress # "done"
+          /\ Unfinished
           /\ lease.holder # None
           /\ ~lease.live
           /\ lapse = "open"
@@ -222,7 +254,8 @@ Claim(w) ==
                /\ lease' = [holder |-> w, epoch |-> seen[w].epoch + 1, live |-> TRUE]
                /\ epoch' = [epoch EXCEPT ![w] = seen[w].epoch + 1]
                /\ chain' = chain + 1
-               /\ pc' = [pc EXCEPT ![w] = "announce"]
+               \* A claim on a done turn only writes its end.
+               /\ pc' = [pc EXCEPT ![w] = IF seen[w].progress = "done" THEN "ending" ELSE "announce"]
                /\ froze' = [froze EXCEPT ![w] = FALSE]
                /\ lapse' = "none"
                /\ UNCHANGED seen
@@ -245,26 +278,33 @@ Claim(w) ==
 \* moves only let the model do more. A step
 \* cut off MaxCutoffs times in a row is not run again: a call is answered
 \* as possibly run, and a model request cancels the turn, whose end only
-\* the chain's head writes.
+\* the chain's head writes. With Refused, a turn that has recorded nothing
+\* ends at once: its `ended` entry is outside the chain, so it lands whether
+\* or not w still heads it.
 Announce(w) ==
     /\ pc[w] = "announce"
     /\ ~frozen[w]
     /\ LET from == seen[w].progress
            spent == CutoffBound /\ seen[w].cutoffs >= MaxCutoffs
            rerun == from = "intent" /\ Idempotent /\ ~spent
-       IN IF spent /\ from \in {"start", "result"}
+       IN IF Refused /\ from = "start"
+          THEN \* turn_start; turn_end follows in EndLine
+               /\ progress' = "done"
+               /\ pc' = [pc EXCEPT ![w] = "ending"]
+               /\ ui' = Append(ui, Line(w))
+               /\ UNCHANGED <<runs, lease, chain, cutoffs, lapse>>
+          ELSE IF spent /\ from \in {"start", "result"}
           THEN /\ UNCHANGED runs
                /\ IF Heads(w)
                      THEN /\ progress' = "done"
-                          /\ pc' = [pc EXCEPT ![w] = "done"]
-                          /\ lease' = [lease EXCEPT !.holder = None, !.live = FALSE]
-                          \* turn_resume, then turn_end
-                          /\ ui' = ui \o <<Line(w), Line(w)>>
+                          \* turn_resume; turn_end follows in EndLine
+                          /\ pc' = [pc EXCEPT ![w] = "ending"]
+                          /\ ui' = Append(ui, Line(w))
                           /\ chain' = chain + 1
                           /\ cutoffs' = 0
-                          /\ lapse' = "none"
+                          /\ UNCHANGED <<lease, lapse>>
                      ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
-                          /\ ui' \in {Append(ui, Line(w)), ui \o <<Line(w), Line(w)>>}
+                          /\ ui' = Append(ui, Line(w))
                           /\ UNCHANGED <<progress, lease, chain, cutoffs, lapse>>
           ELSE /\ pc' = [pc EXCEPT ![w] =
                           CASE from = "start" -> "model1"
@@ -358,24 +398,40 @@ ToolEnd(w) ==
     /\ UNCHANGED <<epoch, frozen, lease, runs, ids, freezes, froze, seen, lapse>>
     /\ act' = [name |-> "ToolEnd", w |-> w]
 
-\* The model answers; the turn ends and the worker lets the session go.
+\* The model answers, and the record that ends the turn lands. Its turn_end
+\* line is a write of its own, EndLine.
 Model2(w) ==
     /\ pc[w] = "model2"
     /\ ~frozen[w]
     /\ IF Heads(w)
           THEN /\ progress' = "done"
-               /\ pc' = [pc EXCEPT ![w] = "done"]
-               /\ lease' = [lease EXCEPT !.holder = None, !.live = FALSE]
-               /\ lapse' = "none"
-               \* the answer's text, then turn_end
-               /\ ui' = ui \o <<Line(w), Line(w)>>
+               /\ pc' = [pc EXCEPT ![w] = "ending"]
+               \* the answer's text
+               /\ ui' = Append(ui, Line(w))
           ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
                /\ MaybeLine(w)
-               /\ UNCHANGED <<progress, lease, lapse>>
+               /\ UNCHANGED progress
     /\ chain' = IF Heads(w) THEN chain + 1 ELSE chain
     /\ cutoffs' = IF Heads(w) THEN 0 ELSE cutoffs
-    /\ UNCHANGED <<epoch, frozen, runs, ids, freezes, froze, seen>>
+    /\ UNCHANGED <<epoch, frozen, lease, runs, ids, freezes, froze, seen, lapse>>
     /\ act' = [name |-> "Model2", w |-> w]
+
+\* w writes the turn's turn_end line, then lets the session go. A worker
+\* another took the session from still writes its line, which readers hide
+\* behind the other's, and then learns it was replaced and stops.
+EndLine(w) ==
+    /\ pc[w] = "ending"
+    /\ ~frozen[w]
+    /\ ui' = Append(ui, EndOf(w))
+    /\ IF Heads(w)
+          THEN /\ pc' = [pc EXCEPT ![w] = "done"]
+               /\ lease' = [lease EXCEPT !.holder = None, !.live = FALSE]
+               /\ chain' = chain + 1
+               /\ lapse' = "none"
+          ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
+               /\ UNCHANGED <<lease, chain, lapse>>
+    /\ UNCHANGED <<epoch, frozen, progress, runs, ids, freezes, froze, cutoffs, seen>>
+    /\ act' = [name |-> "EndLine", w |-> w]
 
 \* w freezes while it waits; its lease no longer counts as alive. With
 \* QueueHeld, the queue gives up on its delivery and will hand its message on.
@@ -457,7 +513,7 @@ Expire(w) ==
 Next ==
     \E w \in Workers :
         \/ Start(w) \/ Claim(w) \/ Announce(w) \/ Model1(w) \/ Intent(w) \/ ToolEnd(w) \/ Model2(w)
-        \/ Freeze(w) \/ Wake(w) \/ Deadline(w) \/ Expire(w)
+        \/ EndLine(w) \/ Freeze(w) \/ Wake(w) \/ Deadline(w) \/ Expire(w)
 
 Spec == Init /\ [][Next]_vars
 
@@ -489,11 +545,38 @@ EveryCallAfterIntent == runs > 0 => progress # "start"
 \* id after a crash lost its intent.
 IdsAtMostOne == ids <= 1
 
-\* Only the chain's head ends the turn.
-DoneByHead == progress = "done" => \E w \in Workers : pc[w] = "done"
+\* Only the chain's head ends the turn. It is about the record that ends a
+\* turn, which only the head writes: a refused turn's `ended` entry is
+\* outside the chain, so a worker replaced while it refused the turn can
+\* write it too, and the refuse graph does not check this.
+DoneByHead == progress = "done" => \E w \in Workers : pc[w] \in {"ending", "done"}
 
 \* No reader hides a line its writer wrote while it headed the chain.
 LegitShown == \A i \in 1..Len(ui) : ui[i].legit => i \in ShownAt(ui)
+
+\* No reader shows the turn end twice unless a worker froze since it
+\* claimed: one whose lease ran out while it was frozen can wake and write
+\* its late turn_end before the worker that took the session over writes
+\* the end it found missing, and the stream refuses neither (the window
+\* NoStaleShown shows). No reader shows the end before the turn ended.
+EndShownOnce == Cardinality({i \in ShownAt(ui) : ui[i].end}) <= 1 \/ \E w \in Workers : froze[w]
+EndAfterDone == EndShown => progress = "done"
+
+\* A step of w's own work, as opposed to a freeze, a wake or the platform's.
+Works(w) ==
+    \/ Start(w) \/ Claim(w) \/ Announce(w) \/ Model1(w) \/ Intent(w) \/ ToolEnd(w) \/ Model2(w)
+    \/ EndLine(w) \/ Deadline(w)
+
+\* A done turn whose end no reader shows never leaves the workers that have
+\* not crashed with nothing to do, while claims are left. Every path is
+\* finite, so each one ends with the turn's end shown, every worker crashed,
+\* or the model's claims spent. Without Repair, a holder that crashes
+\* between the turn's end record and its turn_end line leaves the turn
+\* without an end for good (Witness-NoEndRepair): every worker that reads
+\* the log finds the turn done and nothing to do.
+EndRecoverable ==
+    (progress = "done" /\ ~EndShown /\ lease.epoch < MaxEpoch /\ \E w \in Workers : ~frozen[w])
+        => \E w \in Workers : ~frozen[w] /\ ENABLED Works(w)
 
 Active(w) == pc[w] \in Waiting /\ ~frozen[w]
 

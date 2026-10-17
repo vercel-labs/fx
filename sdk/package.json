@@ -117,6 +117,7 @@
     "fx-term.wasm",
     "*.node",
     "README.md",
+    "docs/",
     "LICENSE"
   ],
   "engines": {

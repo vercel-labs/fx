@@ -56,6 +56,43 @@ if (!fetchAborted) throw new Error("AbortSignal did not abort the stalled fetch"
 await agent.close();
 console.log("core SDK stalled-fetch cancellation passed: AbortSignal stopped fetch and turn.result returned cancelled");
 
+// A failure after libfx's own abort is a cancel, whatever the host's fetch
+// threw; a host AbortError libfx did not cause is an error (API-60, API-63).
+for (const { label, failOnAbort, failAlone, stopReason } of [
+  { label: "a plain Error after the abort", failOnAbort: () => new Error("stream closed"), stopReason: "cancelled" },
+  { label: "the host's own AbortError", failAlone: () => new DOMException("host timeout", "AbortError"), stopReason: "error" },
+]) {
+  let streaming;
+  const started = new Promise((resolve) => { streaming = resolve; });
+  let fail;
+  const engine = await createFxEngine({
+    backend: "wasm",
+    wasm: await readFile(wasmPath),
+    apiKey: "sdk-test-key",
+    async fetch(_url, init) {
+      if (init.method === "GET") return Response.json({ object: "list", data: [] });
+      let body;
+      const stream = new ReadableStream({ start(value) { body = value; } });
+      if (failOnAbort) init.signal.addEventListener("abort", () => body.error(failOnAbort()), { once: true });
+      fail = () => body.error(failAlone());
+      streaming();
+      return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+    },
+  });
+  try {
+    const stalled = engine.prompt("wait forever");
+    void stalled.result.catch(() => {});
+    await Promise.race([started, timeout(`${label} stream`)]);
+    if (failAlone) fail();
+    else stalled.cancel();
+    const result = await Promise.race([stalled.result.catch((error) => ({ stopReason: "error", error })), timeout(`${label} result`)]);
+    assert.equal(result.stopReason, stopReason, `${label}: ${JSON.stringify(result)}`);
+  } finally {
+    await engine.close();
+  }
+}
+console.log("core SDK cancellation classifies stream failures by libfx's own abort");
+
 async function within(promise, label) {
   let timer;
   try {

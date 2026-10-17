@@ -55,9 +55,9 @@ agent.session(sessionId).prompt("Start with the schema.");
 
 - **One turn at a time.** A prompt sent while a turn runs waits behind it, even when it reaches a different server.
 - **Turns finish on their own.** A turn runs to the end whether or not anyone reads its events, and a turn nobody reads holds no connection open: its view starts reading only once you use its events, `readable` or `result`. Stop it with `session.cancel()`, or with the `signal` you passed to `prompt()`.
-- **Steering.** `session.steer(input)` steers the running turn the way the fx CLI does. While the model streams a reply, the steer cuts it short and the turn continues with it. While a tool runs, the steer waits for the tool. A steer sent while a turn waits to start joins that turn, and when no turn runs or waits, the steer becomes the next turn. A steer with images can't join a turn, so the running turn ends at its next safe point and the steer runs next.
+- **Steering.** `session.steer(input)` steers the running turn the way the fx CLI does. While the model streams a reply, the steer cuts it short and the turn continues with it. A steer sent from another server can reach the turn only as the reply ends, and the turn then continues with it after the reply. While a tool runs, the steer waits for the tool. A steer sent while a turn waits to start joins that turn, and when no turn runs or waits, the steer becomes the next turn. A steer with images can't join a turn, so it runs next: the running turn ends `cancelled` at its next safe point, or `end_turn` when the steer reaches it only as the reply ends.
 - **Retries are safe.** Give a prompt or a steer a `messageId`, and a repeated request with the same id runs nothing new. A repeated prompt follows the original turn, and its result has `repeated: true`. One id names one input, so a steer that reuses a prompt's id is rejected with `FX_MESSAGE_ID_IN_USE`. A steer's `user_message` event carries its id as `id` where it joined a turn.
-- **Inputs have a size limit.** A prompt or steer whose input, with the session's `context` and settings, comes to more than 8 MiB of JSON is rejected with `FX_INPUT_TOO_LARGE` before anything is stored. The model can't take a larger one.
+- **Inputs have a size limit.** A prompt or steer is rejected with `FX_INPUT_TOO_LARGE` before anything is stored when its text and other content, image data aside, take more than the engine's 8 MiB prompt frame, or when the input with its images and the session's `context` and settings comes to more than 16 MiB of JSON. The engine can't take a larger one. Images have their own limits, which apply after `resizeImage`.
 
 Each conversation can bring its own settings, which apply to the turns that session object starts:
 
@@ -127,6 +127,8 @@ createFxAgent({ durability: memory() }); // nothing outlives the process
 
 On `local()`, `vercel()` and `world()`, a session id is a Workflow run id, `wrun_` followed by letters and digits. Take it from `turn.accepted` or `await agent.newSessionId()` instead of making one up. On `memory()`, any 1 to 128 letters, digits, `.`, `_` or `-` work.
 
+`local()` keeps the sessions an older libfx saved in its folder in an older file layout: the first time it opens the folder, it moves their files into the layout it reads. If one can't be moved, such as when a different file already has its name, the prompt's `turn.accepted` rejects with `FX_LOCAL_STORE_LAYOUT` naming it, and nothing in the folder changes.
+
 A session stores the conversation, and with each prompt and steer the caller's `context` and the session object's settings. Every process passes its own model, credentials, tools, MCP clients and skills when it creates the agent.
 
 libfx doesn't know who is calling. Anyone with a session's id can prompt, steer, cancel, stream or checkpoint it, so your app must check that the caller may use a session before it opens it. A queue message only names an input libfx already stored: a delivery that names one the session's log doesn't hold runs nothing, and the agent's `onEvent` gets a `session.refused` event. If a session's saved checkpoint came from a different libfx version, tool set or model, the session still loads, and `onEvent` gets a `checkpoint.mismatch` event naming what changed.
@@ -142,7 +144,7 @@ export const coding = createFxAgent({ name: "coding", model: "anthropic/claude-o
 
 A session belongs to the agent that created it, and its turns run only on an agent with that name. A prompt sent through another agent, such as `coding.session(supportSessionId).prompt()`, still runs on `support`, and the sending agent's `onEvent` gets a `session.forwarded` event. An agent created without a name is named `default`.
 
-- Agents with the same name are copies of one agent, such as one on each server, and take turns running its sessions. In one process, every agent with a name on a store must have the same configuration: creating one with different options throws `FX_AGENT_NAME_IN_USE`. Agents created without a name or a durability share the name `default` and the default store, so an app that serves several customers gives each customer's agent its own name. Create an agent once, at module scope, or close it when you're done with it.
+- Agents with the same name are copies of one agent, such as one on each server, and take turns running its sessions. In one process, every agent with a name on a store must have the same configuration: creating one with different options throws `FX_AGENT_NAME_IN_USE`. Agents created without a name or a durability share the name `default` and the default store, so an app with two such agents, or one that serves several customers, gives each agent its own name. Create an agent once, at module scope, or close it when you're done with it. In Node under `NODE_ENV=development`, where a dev server such as `next dev` loads a module again, a new agent with different options replaces the earlier one instead of throwing: turns the earlier agent is running finish, later turns run on the new one, and the new agent's `onEvent` gets an `agent.replaced` event. The newest agent wins even when an earlier one, created without a durability, learns its store only later. In a browser, creating one always throws.
 - Keep names stable. A session keeps the name it was created with, so renaming an agent leaves its sessions with no agent to run them.
 - A process that gets a turn for a name it has no agent for refuses it with an `FX_NO_AGENT` error naming the agent, and the queue delivers it again.
 - Agents share sessions through their durability. Give agents that share sessions the same durability, or none: agents created without one share the default.
@@ -305,7 +307,7 @@ createFxAgent({ model: { id: "anthropic/claude-opus-5.5", effort: "high", fast: 
 
 `effort` and `fast` mean the same as the fx CLI's `--effort` and `--fast` flags. `ultrafast: true` asks for the faster, more expensive service tier on models that offer it. A setting the model doesn't support fails with an error whose `code` names it, such as `LIBFX_MODEL_UNSUPPORTED_EFFORT`.
 
-`listModels({ apiKey })` returns the ids of AI Gateway's language models. Behind a proxy that forwards only chat requests, pass the catalog yourself as `modelCatalog`, and the agent won't fetch it.
+`listModels({ apiKey })` returns the ids of AI Gateway's language models. Behind a proxy that forwards only chat requests, pass the catalog yourself as `modelCatalog`, and the agent won't fetch it. Otherwise an agent fetches the catalog at most once for all its sessions, and only when a turn needs to look up its model.
 
 ## Providers
 
@@ -407,7 +409,7 @@ agent.session().prompt([
 ]);
 ```
 
-A session stores each prompt as JSON before it runs, so a session prompt takes image data as a base64 string. `createFxEngine()` also takes bytes, a `Blob` or a `File`. Each prompt takes up to 8 PNG, JPEG, GIF or WebP images, at most 3.75 MiB each and 6 MiB together. Pass `resizeImage` to downscale or convert prompt images before they're sent.
+A session stores each prompt as JSON before it runs, so a session prompt takes image data as a base64 string. `createFxEngine()` also takes bytes, a `Blob` or a `File`. Each prompt takes up to 8 PNG, JPEG, GIF or WebP images, at most 3.75 MiB each and 6 MiB together. Images travel beside the prompt's 8 MiB frame, so they leave its room for text. Pass `resizeImage` to downscale or convert prompt images before they're sent; the image limits apply to what it returns.
 
 ## Diagnostics
 
@@ -466,7 +468,7 @@ for await (const event of turn) {
   if (event.type === "text_delta") process.stdout.write(event.delta);
 }
 
-const checkpoint = await engine.checkpoint(); // opaque bytes, up to 4 MiB
+const checkpoint = await engine.checkpoint(); // opaque bytes, up to 32 MiB
 await engine.close();
 
 const restored = await createFxEngine({ apiKey: process.env.AI_GATEWAY_API_KEY, model: "anthropic/claude-haiku-5.5", checkpoint });
@@ -504,7 +506,7 @@ The engine sends one `append()` at a time, and everything that happens while one
 
 `prompt()` and `resume()` take `yieldAt`, a time in milliseconds since the epoch: the turn stops before its next model request after that time, with the stop reason `yielded`, and the next `resume()` continues it without telling the model it was interrupted.
 
-A journal or `checkpoint` from a newer libfx fails with `FxJournalVersionError`. `createMemoryPersistence()` is a reference store for tests.
+A journal or `checkpoint` from a newer libfx fails with `FxJournalVersionError`. The conversation keeps its prompts' images, so a load may read a checkpoint of up to 32 MiB and up to 32 MiB of records after it; more fails with `FX_JOURNAL_TOO_LARGE`. `createMemoryPersistence()` is a reference store for tests.
 
 ## Runtimes
 
@@ -513,7 +515,7 @@ A journal or `checkpoint` from a newer libfx fails with `FxJournalVersionError`.
 | Node.js 20+ on macOS or Linux, x64 or arm64 | Native addon. Linux needs glibc 2.34 or newer. |
 | Node.js elsewhere | WebAssembly with JSPI. Some Node versions need `--experimental-wasm-jspi`. |
 | Browsers | WebAssembly with JSPI, from `libfx/browser` |
-| Bun | The same as Node.js. For WebAssembly, use Bun 1.4.2 or newer. |
+| Bun | The same as Node.js. For WebAssembly, use Bun 1.3.10 or newer, except 1.3.14, which can crash when WebAssembly resumes through JSPI. |
 
 The default `backend: "auto"` tries the native addon first. Pass `"native"` or `"wasm"` to require one, and call `getBackendInfo()` to see what would load without creating anything.
 
@@ -550,7 +552,7 @@ Every entry point ships TypeScript types, and the package has no runtime depende
 
 ## For coding agents
 
-- **Docs as Markdown:** [fx.sh/llms.txt](https://fx.sh/llms.txt) indexes every page, and each page has a `.md` version, such as `https://fx.sh/docs/lib/durability.md`. The declarations in `types/` are the exact API.
+- **Docs as Markdown:** the package's `docs/` folder holds the libfx docs as they were when it was built, indexed in `docs/README.md`. [fx.sh/llms.txt](https://fx.sh/llms.txt) indexes the latest pages, and each page has a `.md` version, such as `https://fx.sh/docs/lib/durability.md`. The declarations in `types/` are the exact API.
 - **Agents at module scope:** create each agent once at module scope, not per request, and open `agent.session(id)` for each conversation.
 - **Session ids:** take them from `turn.accepted` or `agent.newSessionId()`. On every durability except `memory()`, an id that isn't a Workflow run id throws.
 - **Side effects:** every tool sets `idempotent`. Set it to `true` only on tools that are safe to run twice, and pass `executionId` to services that take an idempotency key.

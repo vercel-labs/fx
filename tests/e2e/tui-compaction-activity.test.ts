@@ -860,18 +860,19 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
           cmd: command(sessionId), cwd: workspace, env, isolated: true, remainOnExit: true,
           stderrPath: resumedStderr, width: 110, height: 36, startupWaitMs: 0,
         });
+        // DUR-87: after the first crash the turn continues with no user action.
         await resumed.waitForPane((pane) =>
-          pane.includes("fx quit unexpectedly while this response was recovering"), 15_000);
-        expect(gateway.requestCount()).toBe(requestsBeforeRecovery);
-        await resumed.waitForStableComposer(10_000);
-        await resumed.sendText("continue");
+          pane.includes("fx quit unexpectedly before this response finished"), 15_000);
         const recoveryScreen = await resumed.waitForPane((pane) =>
           pane.includes("RECOVERY_SAVED_TURN_67e") || pane.includes("InvalidContextHistoryStart"), 15_000);
         await resumed.waitForStableComposer(10_000);
         if (injectedStaleCheckpoint) {
           expect(recoveryScreen).toContain("InvalidContextHistoryStart");
+          expect(recoveryScreen.replaceAll(/\s+/g, " ")).toContain("New messages are blocked until you reopen the session");
           expect(recoveryScreen).not.toContain("DuplicateImageId");
-          expect(gateway.requestCount()).toBe(requestsBeforeRecovery);
+          // The automatic continuation makes its one request; the save guard
+          // then refuses the stale turn, so nothing below is saved.
+          expect(gateway.requestCount()).toBe(requestsBeforeRecovery + 1);
           expect(savedFrames(eventsPath).filter((frame) => frame.event?.turn_completed).length).toBe(completedAtKill);
         } else {
           expect(recoveryScreen).toContain("RECOVERY_SAVED_TURN_67e");

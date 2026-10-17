@@ -2620,13 +2620,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           },
         });
         await session.waitForComposer(TIMEOUT);
-        // The kill left the owner marker behind, so resume reports the
-        // unclean exit and waits instead of restarting the turn on its own.
-        await session.waitForText(/quit unexpectedly/, TIMEOUT);
-        await Bun.sleep(1_000);
-        expect(resumed.started).toBe(false);
-        expect(queuedGateway.requests).toHaveLength(2);
-        await session.sendText("continue");
+        // The kill left the owner marker behind: this is the turn's first
+        // unclean exit, so resume says so and continues it with no user
+        // action (DUR-87).
+        await session.waitForText(/quit unexpectedly before/, TIMEOUT);
         await waitForCondition(() => resumed.started, "admitted resumed response");
         await session.waitForText("Thinking", TIMEOUT);
         expect(queuedGateway.requests).toHaveLength(3);
@@ -2798,10 +2795,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         },
       });
       await session.waitForComposer(TIMEOUT);
-      // The unclean-exit gate asks before the recovering turn retries.
+      // The first unclean exit continues the recovering turn on its own
+      // (DUR-87), on the same model route.
       await session.waitForText(/quit unexpectedly/, TIMEOUT);
-      expect(queuedGateway.requests).toHaveLength(1);
-      await session.sendText("continue");
       await session.waitForText(finalText, TIMEOUT);
 
       expect(queuedGateway.requests).toHaveLength(2);

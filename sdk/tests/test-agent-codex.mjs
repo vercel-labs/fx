@@ -201,6 +201,8 @@ await assert.rejects(createFxEngine({ ...backendOptions, provider: "codex", mode
 await assert.rejects(createFxEngine({ ...backendOptions, provider: "custom", apiKey: "key" }), /provider must be "gateway", "codex", "grok" or a custom provider/);
 await assert.rejects(createFxEngine({ ...backendOptions, apiKey: "key", credentials: () => ({}) }), /credentials needs provider "codex"/);
 await assert.rejects(createFxEngine({ ...backendOptions, apiKey: "key", onCredentials: () => {} }), /onCredentials needs provider "codex"/);
-await assert.rejects(createFxEngine({ ...backendOptions }), /apiKey is required/);
+// QUAL-18: the error says what is missing and how to pass it.
+await assert.rejects(createFxEngine({ ...backendOptions }), /^TypeError: no AI Gateway credentials were found: pass apiKey, an AI Gateway API key or a Vercel OIDC token, to createFxEngine\(\)$/);
+await assert.rejects(createFxEngine({ ...backendOptions, apiKey: "" }), /^TypeError: apiKey must be a non-empty string$/);
 
 console.log(`${process.versions.bun ? "Bun" : "Node"} ${backend} Codex agent passed`);

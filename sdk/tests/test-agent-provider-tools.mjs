@@ -84,7 +84,10 @@ try {
   const events = [];
   for await (const event of turn) events.push(event);
   assert.equal((await turn.result).stopReason, "end_turn");
-  assert.equal(events.find((event) => event.type === "tool_start")?.name, "web_search");
+  // The stream announces the search before its input; viewers still get one
+  // tool_start, and it carries the query (API-68).
+  const starts = events.filter((event) => event.type === "tool_start");
+  assert.deepEqual(starts, [{ type: "tool_start", id: "search-1", name: "web_search", input: { query: "libfx provider search" } }]);
   const ended = events.find((event) => event.type === "tool_end");
   assert.equal(ended?.name, "web_search");
   assert.equal(ended?.isError, false);

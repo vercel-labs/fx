@@ -36,10 +36,17 @@ const publication_intent_file = "commit.pending.json";
 const manifest_file = "session.json";
 const permission_state_file = "permissions.json";
 const recovery_checkpoint_file = "recovery.json";
-/// Written when resume suppresses a checkpoint's auto-continue after an
-/// unclean exit. Cleared with the checkpoint so suppression stays sticky
-/// until the user resolves the turn instead of re-arming after a clean quit.
+/// Written when resume asks instead of continuing a checkpoint, because fx
+/// exited uncleanly again while it was continuing that turn. Cleared with the
+/// checkpoint so the question stays sticky until the user resolves the turn
+/// instead of re-arming after a clean quit.
 const recovery_asked_file = "recovery.asked";
+/// Names the turn of a checkpoint that an unclean exit already interrupted
+/// once. Resume continues that turn on its own one time; the continuation
+/// keeps the turn id in its own checkpoints, so a second unclean exit finds
+/// this marker and resume asks instead of looping. Cleared with the
+/// checkpoint when the turn resolves.
+const recovery_crashed_file = "recovery.crashed";
 /// Liveness marker naming the live writable owner.
 const owner_live_file = "owner.live";
 const conversation_migration_temp_file = "events.v4.tmp";
@@ -777,8 +784,51 @@ fn writeConversationRecoveryState(
             else => return err,
         };
         clearRecoveryAsked(dir);
+        clearRecoveryCrashed(dir);
         try io_mod.syncVerifiedDir(dir.dir);
     }
+}
+
+fn clearRecoveryCrashed(dir: *io_mod.VerifiedDir) void {
+    dir.dir.deleteFile(io_mod.getIo(), recovery_crashed_file) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => debug_trace.logf("session", "recovery crash marker clear failed err={s}", .{@errorName(err)}),
+    };
+}
+
+/// Records that an unclean exit interrupted the checkpoint turn `turn_id`.
+/// Advisory like owner.live: a failed write only costs the loop guard for
+/// this one turn, never the resume.
+pub fn markRecoveryCrashed(alloc: Allocator, dir: *io_mod.VerifiedDir, turn_id: u64) void {
+    const body = alloc.print("{{\"turn_id\":{d}}}\n", .{turn_id}) catch |err| {
+        debug_trace.logf("session", "recovery crash marker allocation failed err={s}", .{@errorName(err)});
+        return;
+    };
+    defer alloc.free(body);
+    io_mod.durableReplaceVerified(alloc, dir, recovery_crashed_file, body) catch |err| {
+        debug_trace.logf("session", "recovery crash marker write failed err={s}", .{@errorName(err)});
+    };
+}
+
+/// True when an earlier unclean exit already interrupted the checkpoint turn
+/// `turn_id`. A marker that exists but cannot be read counts as a match, so a
+/// damaged marker makes resume ask rather than continue again.
+pub fn recoveryCrashedBefore(alloc: Allocator, dir: *io_mod.VerifiedDir, turn_id: u64) bool {
+    const bytes = readManagedFileAlloc(alloc, dir, recovery_crashed_file, 256) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => {
+            debug_trace.logf("session", "recovery crash marker read failed err={s}", .{@errorName(err)});
+            return true;
+        },
+    };
+    defer alloc.free(bytes);
+    const Marker = struct { turn_id: u64 };
+    const parsed = std.json.parseFromSlice(Marker, alloc, bytes, .{ .ignore_unknown_fields = true }) catch |err| {
+        debug_trace.logf("session", "recovery crash marker parse failed err={s}", .{@errorName(err)});
+        return true;
+    };
+    defer parsed.deinit();
+    return parsed.value.turn_id == turn_id;
 }
 
 fn clearRecoveryAsked(dir: *io_mod.VerifiedDir) void {
@@ -6364,6 +6414,58 @@ test "recovery ask marker stays sticky across resumes and follows the checkpoint
             .recovery_checkpoint_cleared = .{},
         }, 31);
         try std.testing.expect(!recoveryWasAsked(&resumed.log.dir));
+    }
+}
+
+test "recovery crash marker names one turn, survives its continuation, and clears with the checkpoint" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "recovery-crash-marker", 10);
+    defer initial.deinit(alloc);
+    const checkpoint = session_codec.RecoveryCheckpoint{
+        .turn_id = 7,
+        .user = .{ .text = @constCast("continue the request") },
+        .assistant_source = @constCast("partial"),
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 1,
+    };
+    {
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        _ = try loaded.appendEvent(alloc, .{
+            .recovery_checkpoint_set = .{ .checkpoint = checkpoint },
+        }, 20);
+        try std.testing.expect(!recoveryCrashedBefore(alloc, &loaded.log.dir, 7));
+        markRecoveryCrashed(alloc, &loaded.log.dir, 7);
+        try std.testing.expect(recoveryCrashedBefore(alloc, &loaded.log.dir, 7));
+        // Another turn's checkpoint is not the one that crashed.
+        try std.testing.expect(!recoveryCrashedBefore(alloc, &loaded.log.dir, 8));
+    }
+    {
+        var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+        defer resumed.deinit(alloc);
+        try std.testing.expect(recoveryCrashedBefore(alloc, &resumed.log.dir, 7));
+        // The continuation writes its own checkpoints for the same turn; the
+        // marker must survive them, or a crash during the continuation would
+        // look like a first crash and continue again forever.
+        _ = try resumed.appendEvent(alloc, .{
+            .recovery_checkpoint_set = .{ .checkpoint = checkpoint },
+        }, 30);
+        try std.testing.expect(recoveryCrashedBefore(alloc, &resumed.log.dir, 7));
+        // The turn resolves: the marker goes with the checkpoint.
+        _ = try resumed.appendEvent(alloc, .{
+            .recovery_checkpoint_cleared = .{},
+        }, 31);
+        try std.testing.expect(!recoveryCrashedBefore(alloc, &resumed.log.dir, 7));
+        // A damaged marker counts as a match, so resume asks.
+        try io_mod.durableReplaceVerified(alloc, &resumed.log.dir, recovery_crashed_file, "not json");
+        try std.testing.expect(recoveryCrashedBefore(alloc, &resumed.log.dir, 7));
     }
 }
 

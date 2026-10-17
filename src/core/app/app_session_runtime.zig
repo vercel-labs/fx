@@ -77,25 +77,39 @@ const Allocator = std.mem.Allocator;
 const live_session_handoff_timeout_ms: u64 = 2_000;
 const live_session_worker_cancel_timeout_ms: u64 = 5_000;
 
+// Resume notices for a turn an unclean exit interrupted. Each says which
+// case happened: the first exit, which fx continues, or an exit while fx was
+// already continuing the turn, which the user decides (QUAL-18).
+const recovery_first_crash_notice = "fx quit unexpectedly before this response finished. Continuing it now.";
+const recovery_first_crash_uncertain_tool_notice = "fx quit unexpectedly before this response finished. Continuing it now; a tool call may have partly run, so check its result if anything looks wrong.";
+const recovery_repeated_crash_notice = "fx quit unexpectedly again while continuing this response, so it was not restarted. Send \"continue\" to retry it, or a new message to move on.";
+
 const RecoveryAutoContinue = enum {
     auto_continue,
+    /// The previous fx died with this turn in flight for the first time:
+    /// continue it once, with no user action (DUR-87).
+    continue_after_unclean_exit,
     skip_compaction_owned,
     ask_after_unclean_exit,
 };
 
 /// Whether a paused recovery continues on its own after a restart or resume.
-/// A leftover owner marker means the previous process died mid-recovery, and
-/// a leftover asked marker means a prior resume already suppressed this
-/// checkpoint without the user resolving it. Either way the turn is the
-/// user's to retry, not fx's to re-spend.
+/// A leftover owner marker means the previous process died with the turn in
+/// flight. The first such death continues the turn once. A death while that
+/// turn was already being continued means the turn may be what kills fx, so
+/// the user decides; a leftover asked marker keeps that question sticky until
+/// the user resolves the turn.
 fn recoveryAutoContinueDecision(
     checkpoint: session_codec.RecoveryCheckpoint,
     previous_owner_died: bool,
     recovery_asked_before: bool,
+    crashed_before: bool,
 ) RecoveryAutoContinue {
     if (checkpoint.cause == .compaction_prepared) return .skip_compaction_owned;
     if (recovery_asked_before) return .ask_after_unclean_exit;
-    if (previous_owner_died) return .ask_after_unclean_exit;
+    if (previous_owner_died) {
+        return if (crashed_before) .ask_after_unclean_exit else .continue_after_unclean_exit;
+    }
     return .auto_continue;
 }
 
@@ -2522,7 +2536,12 @@ pub fn Runtime(comptime App: type) type {
             // promise an automatic continuation the gate is about to suppress.
             const recovery_decision: ?RecoveryAutoContinue = if (comptime @hasDecl(App, "queueRecoveryCheckpoint"))
                 if (state.recovery_checkpoint) |checkpoint|
-                    recoveryAutoContinueDecision(checkpoint, previousOwnerDied(app), recoveryAskedBefore(app))
+                    recoveryAutoContinueDecision(
+                        checkpoint,
+                        previousOwnerDied(app),
+                        recoveryAskedBefore(app),
+                        recoveryCrashedBefore(app, checkpoint.turn_id),
+                    )
                 else
                     null
             else
@@ -2568,11 +2587,11 @@ pub fn Runtime(comptime App: type) type {
             // resume. Harnesses without a real worker queue opt out via the
             // decl check. A compaction_prepared checkpoint records completed
             // source, not a turn waiting to run; the compaction flow owns it.
-            // A checkpoint left behind by an unclean exit is different: the
-            // interrupted turn may be what killed the process, so the user
-            // decides whether to retry it instead of fx re-spending the turn
-            // on its own, and that suppression stays sticky until the turn
-            // is resolved.
+            // A checkpoint left behind by an unclean exit continues once on
+            // its own (DUR-87). The crash marker is written before the turn
+            // runs, so if the continued turn kills fx too, the next resume
+            // asks instead of re-spending the turn forever, and that question
+            // stays sticky until the turn is resolved.
             if (comptime @hasDecl(App, "queueRecoveryCheckpoint")) {
                 if (state.recovery_checkpoint) |checkpoint| {
                     switch (recovery_decision.?) {
@@ -2584,7 +2603,7 @@ pub fn Runtime(comptime App: type) type {
                         .ask_after_unclean_exit => {
                             debug_trace.logf(
                                 "session",
-                                "event=auto_continue_suppressed reason=unclean_exit turn_id={d}",
+                                "event=auto_continue_suppressed reason=repeated_unclean_exit turn_id={d}",
                                 .{checkpoint.turn_id},
                             );
                             if (comptime @hasField(App, "session_persistence")) {
@@ -2595,10 +2614,22 @@ pub fn Runtime(comptime App: type) type {
                             try app.writeDomainNotice(.{
                                 .topic = "recovery",
                                 .tone = .warning,
-                                .body = "fx quit unexpectedly while this response was recovering, so it was not restarted. Send \"continue\" to retry it, or a new message to move on.",
+                                .body = recovery_repeated_crash_notice,
                             }, true);
                         },
-                        .auto_continue => {
+                        .auto_continue, .continue_after_unclean_exit => |decision| {
+                            if (decision == .continue_after_unclean_exit) {
+                                debug_trace.logf(
+                                    "session",
+                                    "event=auto_continue_after_unclean_exit turn_id={d}",
+                                    .{checkpoint.turn_id},
+                                );
+                                if (comptime @hasField(App, "session_persistence")) {
+                                    if (app.session_persistence.writable) |*loaded| {
+                                        session_log.markRecoveryCrashed(app.alloc, &loaded.log.dir, checkpoint.turn_id);
+                                    }
+                                }
+                            }
                             const queued = continuePausedRecovery(app) catch |err| switch (err) {
                                 error.MissingApiKey => missing: {
                                     try app.writeDomainNotice(.{
@@ -2639,6 +2670,12 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasField(App, "session_persistence")) return false;
             const loaded = if (app.session_persistence.writable) |*value| value else return false;
             return session_log.recoveryWasAsked(&loaded.log.dir);
+        }
+
+        fn recoveryCrashedBefore(app: *App, turn_id: u64) bool {
+            if (comptime !@hasField(App, "session_persistence")) return false;
+            const loaded = if (app.session_persistence.writable) |*value| value else return false;
+            return session_log.recoveryCrashedBefore(app.alloc, &loaded.log.dir, turn_id);
         }
 
         /// The picker lists from the backend this process runs on.
@@ -3152,6 +3189,14 @@ pub fn Runtime(comptime App: type) type {
                     const loaded = if (app.session_persistence.writable) |*value| value else return null;
                     if (!loaded.conversation_writer.turn_open) {
                         loaded.boundary_wedged = false;
+                        // No frames of the turn are in the log: a turn is
+                        // written when it ends, and a reopen discards an
+                        // unfinished one. Its checkpoint still holds the
+                        // user's prompt, so a fresh prompt must close it into
+                        // history instead of dropping it (DUR-23).
+                        if (loaded.state.recovery_checkpoint) |checkpoint| {
+                            break :blk .{ .ready = try checkpoint.dupe(alloc) };
+                        }
                         return null;
                     }
                     if (loaded.state.recovery_checkpoint) |checkpoint| {
@@ -3200,7 +3245,13 @@ pub fn Runtime(comptime App: type) type {
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             if (app.session_persistence.writable) |*loaded| {
-                if (!loaded.conversation_writer.turn_open and current.prior_turn != null) {
+                // A finished prior turn closed the log and cleared its
+                // checkpoint; a checkpoint still present is a turn that has
+                // not reached history yet.
+                if (!loaded.conversation_writer.turn_open and
+                    loaded.state.recovery_checkpoint == null and
+                    current.prior_turn != null)
+                {
                     debug_trace.logf("session", "event=fresh_prompt_prior_already_finished turn_id={d}; skipping interrupted closure", .{request.turn_id});
                     current.prior_turn = null;
                 }
@@ -4807,20 +4858,26 @@ pub fn Runtime(comptime App: type) type {
             // notice and no automatic continuation. Only a checkpoint the gate
             // will actually auto-continue may promise one; a suppressed
             // checkpoint gets the gate's own notice below.
-            const recovery_notice_suppressed = if (recovery_decision) |decision|
-                decision != .auto_continue
-            else
-                checkpoint.cause == .compaction_prepared;
-            if (!recovery_notice_suppressed) {
-                // No attempt counts: there is no budget to count against.
-                const recovery_notice: []const u8 = if (checkpoint.tool_state == .uncertain)
+            const decision: RecoveryAutoContinue = recovery_decision orelse
+                if (checkpoint.cause == .compaction_prepared) .skip_compaction_owned else .auto_continue;
+            const uncertain_tool = checkpoint.tool_state == .uncertain;
+            // No attempt counts: there is no budget to count against.
+            const recovery_notice: ?[]const u8 = switch (decision) {
+                .auto_continue => if (uncertain_tool)
                     "model response recovery paused and continues automatically; inspect the uncertain tool state if anything looks wrong"
                 else
-                    "model response recovery paused and continues automatically";
+                    "model response recovery paused and continues automatically",
+                .continue_after_unclean_exit => if (uncertain_tool)
+                    recovery_first_crash_uncertain_tool_notice
+                else
+                    recovery_first_crash_notice,
+                .skip_compaction_owned, .ask_after_unclean_exit => null,
+            };
+            if (recovery_notice) |notice_body| {
                 try sink.appendNotice(.{
                     .topic = "recovery",
                     .tone = .warning,
-                    .body = recovery_notice,
+                    .body = notice_body,
                 });
             }
         }
@@ -12975,20 +13032,26 @@ fn parseTestRecoveryCheckpoint(alloc: Allocator, cause: []const u8) !session_cod
     return session_codec.parseRecoveryCheckpoint(alloc, parsed.value);
 }
 
-test "recovery auto-continue asks after an unclean exit instead of restarting" {
+test "recovery continues once after an unclean exit and asks after a second one (DUR-87)" {
     const alloc = std.testing.allocator;
     var interrupted = try parseTestRecoveryCheckpoint(alloc, "response_interrupted");
     defer interrupted.deinit(alloc);
-    try std.testing.expectEqual(.auto_continue, recoveryAutoContinueDecision(interrupted, false, false));
-    try std.testing.expectEqual(.ask_after_unclean_exit, recoveryAutoContinueDecision(interrupted, true, false));
+    // Arguments: previous owner died, asked before, crashed before.
+    try std.testing.expectEqual(.auto_continue, recoveryAutoContinueDecision(interrupted, false, false, false));
+    // The first crash continues the turn with no user action.
+    try std.testing.expectEqual(.continue_after_unclean_exit, recoveryAutoContinueDecision(interrupted, true, false, false));
+    // A crash while that turn was being continued asks instead of looping.
+    try std.testing.expectEqual(.ask_after_unclean_exit, recoveryAutoContinueDecision(interrupted, true, false, true));
+    // A clean exit during the continuation is an ordinary paused recovery.
+    try std.testing.expectEqual(.auto_continue, recoveryAutoContinueDecision(interrupted, false, false, true));
     // Suppression stays sticky: a clean quit without a resolution still asks.
-    try std.testing.expectEqual(.ask_after_unclean_exit, recoveryAutoContinueDecision(interrupted, false, true));
-    try std.testing.expectEqual(.ask_after_unclean_exit, recoveryAutoContinueDecision(interrupted, true, true));
+    try std.testing.expectEqual(.ask_after_unclean_exit, recoveryAutoContinueDecision(interrupted, false, true, false));
+    try std.testing.expectEqual(.ask_after_unclean_exit, recoveryAutoContinueDecision(interrupted, true, true, false));
 
     var compaction = try parseTestRecoveryCheckpoint(alloc, "compaction_prepared");
     defer compaction.deinit(alloc);
-    try std.testing.expectEqual(.skip_compaction_owned, recoveryAutoContinueDecision(compaction, false, false));
-    try std.testing.expectEqual(.skip_compaction_owned, recoveryAutoContinueDecision(compaction, true, true));
+    try std.testing.expectEqual(.skip_compaction_owned, recoveryAutoContinueDecision(compaction, false, false, false));
+    try std.testing.expectEqual(.skip_compaction_owned, recoveryAutoContinueDecision(compaction, true, true, true));
 }
 
 test "fresh prompt boundary waits out the cancel finalization window" {
@@ -13045,6 +13108,60 @@ test "fresh prompt boundary waits out the cancel finalization window" {
     }.run, .{&app});
     defer closer.join();
     try std.testing.expect(try Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 10_000) == null);
+}
+
+test "fresh prompt boundary keeps a checkpoint whose turn has no frames in the log (DUR-23)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+
+    // A turn is written to the log when it ends, and a reopen after a crash
+    // discards an unfinished one: the checkpoint alone holds the prompt.
+    try std.testing.expect(!app.session_persistence.writable.?.conversation_writer.turn_open);
+    try Runtime(TestApp).setRecoveryCheckpoint(&app, .{
+        .turn_id = 1,
+        .user = .{ .text = @constCast("interrupted request") },
+        .assistant_source = @constCast("partial answer"),
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 1,
+    });
+    // Before the fix both steps answered "no prior turn", so the next
+    // message (such as "continue") reached the model without the prompt.
+    var ready = (try Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 200)).?;
+    defer ready.deinit(alloc);
+    try std.testing.expectEqualStrings("interrupted request", ready.user.text);
+    const kept = Runtime(TestApp).normalizeFreshPromptPreparation(&app, .{
+        .user = .{ .text = @constCast("continue") },
+        .prior_turn = ready.interruptedTurn(),
+    });
+    try std.testing.expectEqualStrings("interrupted request", kept.prior_turn.?.interrupted.user.text);
+
+    // Once the turn reached history its checkpoint is gone, and a stale
+    // prior turn is dropped instead of saved twice.
+    try Runtime(TestApp).clearRecoveryCheckpoint(&app);
+    try std.testing.expect(try Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 200) == null);
+    const dropped = Runtime(TestApp).normalizeFreshPromptPreparation(&app, .{
+        .user = .{ .text = @constCast("continue") },
+        .prior_turn = ready.interruptedTurn(),
+    });
+    try std.testing.expect(dropped.prior_turn == null);
 }
 
 test "fresh prompt boundary fails fast after the first wedged timeout" {

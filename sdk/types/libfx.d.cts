@@ -314,7 +314,7 @@ export type FxEngineEvent = FxEventBase & (
   | { type: "output.discarded"; reason: "cancelled"; bytes: number }
 );
 
-/** A durable session's diagnostic: a failed write or engine, a takeover, or a function deadline. */
+/** A durable session's diagnostic: a failed write or engine, a takeover, or a function deadline; or, in development, a replaced agent. */
 export type FxSessionEvent = FxEventBase & (
   | { type: "session.error"; sessionId: string; error: FxErrorSummary }
   | { type: "session.fenced"; sessionId: string; epoch: number }
@@ -322,9 +322,14 @@ export type FxSessionEvent = FxEventBase & (
   | { type: "session.forwarded"; sessionId: string; agent: string }
   /** A queue delivery named an input the session's log does not hold, or none at all, so it ran nothing. */
   | { type: "session.refused"; sessionId?: string; messageId?: string; reason: "unknown message" | "malformed message" }
-  /** `cutoffs`: the times in a row the deadline cut off the same step, this one included. */
+  /**
+   * The function's time limit stopped a turn. `cutoffs`: the times in a row the deadline cut off the same step, this
+   * one included, or 0 when the turn yielded at a step boundary and cut nothing off.
+   */
   | { type: "session.deadline"; sessionId: string; epoch: number; cutoffs: number }
   | { type: "ui.error"; sessionId: string; error: string }
+  /** Under `NODE_ENV=development`, this agent replaced `replaced` earlier agents of its name and store with other options. */
+  | { type: "agent.replaced"; agent: string; replaced: number }
 );
 
 /** What an agent passes to `onEvent`: its engines' diagnostics and its sessions'. */

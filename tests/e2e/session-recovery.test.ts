@@ -1339,4 +1339,66 @@ describe("session recovery", () => {
       rmSync(fixture.root, { recursive: true, force: true });
     }
   }, TIMEOUT);
+
+  test("ask resume after a killed ask keeps the interrupted prompt before the new one (DUR-23)", async () => {
+    const fixture = createFixture("fx-ask-killed-prompt-");
+    const prompt = "Draft the quarterly summary.";
+    let started = false;
+    const encoder = new TextEncoder();
+    let hold: ReturnType<typeof setInterval> | undefined;
+    const held = () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        started = true;
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "text-delta", id: "partial", delta: "KILLED_ASK_PARTIAL " })}\n\n`));
+        hold = setInterval(() => {
+          try { controller.enqueue(encoder.encode(": hold\n\n")); } catch { clearInterval(hold); }
+        }, 50);
+      },
+      cancel() { clearInterval(hold); },
+    }), { headers: { "content-type": "text/event-stream" } });
+    const first = startFakeGateway([held]);
+    const second = startFakeGateway([fakeGatewayFinalText("KILLED_ASK_CONTINUED")]);
+    try {
+      const env: Record<string, string> = {};
+      for (const [key, value] of Object.entries({ ...process.env, ...gatewayEnv(fixture, first) })) {
+        if (value !== undefined) env[key] = value;
+      }
+      env.NO_COLOR = "1";
+      env.FX_SOUND = "0";
+      const ask = Bun.spawn([FX_BIN, "ask", "--json", "--auto", prompt], {
+        cwd: fixture.workspace, env, stdin: "ignore", stdout: "ignore", stderr: "ignore",
+      });
+      const sessions = join(fixture.home, ".fx", "sessions");
+      const checkpointed = () => started && existsSync(sessions) &&
+        readdirSync(sessions).some((id) => existsSync(join(sessions, id, "recovery.json")));
+      const deadline = Date.now() + TIMEOUT;
+      while (!checkpointed() && Date.now() < deadline) await Bun.sleep(50);
+      expect(checkpointed()).toBe(true);
+      ask.kill(9);
+      await ask.exited;
+      const sessionId = readdirSync(sessions).find((id) => existsSync(join(sessions, id, "recovery.json")))!;
+
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "continue"], {
+        cwd: fixture.workspace, env: gatewayEnv(fixture, second), timeoutMs: TIMEOUT,
+      });
+      expect(resumed.code).toBe(0);
+      expect(JSON.parse(resumed.stdout).output).toBe("KILLED_ASK_CONTINUED");
+      expect(second.requests).toHaveLength(1);
+      const users = (JSON.parse(second.requests[0]!.body).prompt as Array<{ role: string; content: unknown }>)
+        .filter((message) => message.role === "user")
+        .map((message) => JSON.stringify(message.content));
+      // The interrupted prompt, fx's note that its turn ended early, then the new message.
+      expect(users).toHaveLength(3);
+      expect(users[0]).toContain(prompt);
+      expect(users[1]).toContain("<turn_aborted>");
+      expect(users[2]).toContain("continue");
+      // The interrupted turn is saved history now, not a recovery slot.
+      expect(existsSync(join(sessions, sessionId, "recovery.json"))).toBe(false);
+      expect(readFileSync(join(sessions, sessionId, "events.jsonl"), "utf8")).toContain(prompt);
+    } finally {
+      first.stop();
+      second.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 2);
 });

@@ -3,10 +3,17 @@
 // TenantIsolation.tla, and checks after every step that the code is in a
 // state the model allows.
 //
-//   bun tests/tla/drivers/drive-tenants.mjs [--walks N] [--depth N] [--seed S]
+//   bun tests/tla/drivers/drive-tenants.mjs [--walks N] [--depth N] [--seed S] [--development]
 //
 // `tests/tla/sdk/check.sh` model-checks the spec and writes
-// graphs/tenants-route.dot, the "four" topology with every rule on.
+// graphs/tenants-route.dot, the "four" topology with every rule on, and
+// graphs/tenants-dev.dot, the "shared" topology under Development, which
+// --development walks with agents whose factory says the process is a
+// development server: there acme and evil name their agents "support" on one
+// World, and each one created replaces the other's. Under --development a
+// tenant may also create its agent without a durability, on the factory's
+// default store, which is that World; libfx learns that store when the agent
+// is first used, the model's Resolve step.
 //
 // This process is the shared function. Four tenants each create one agent
 // in it, as the model's Register steps say: acme and evil both name theirs
@@ -38,6 +45,7 @@ const option = (name, fallback) => {
 };
 const walks = Number(option("walks", 40));
 const depth = Number(option("depth", 14));
+const development = args.includes("--development");
 let seed = Number(option("seed", Date.now() % 100000));
 const firstSeed = seed;
 // A small deterministic generator, so a failing walk can be run again.
@@ -49,29 +57,37 @@ const pick = (items) => items[Math.floor(random() * items.length)];
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const { createWorld } = await import(new URL("../../../sdk/durable/node_modules/@workflow/world-local/dist/index.js", import.meta.url).href);
-const graph = await loadGraph(resolve(here, "../sdk/graphs/tenants-route.dot"));
+const graph = await loadGraph(resolve(here, `../sdk/graphs/tenants-${development ? "dev" : "route"}.dot`));
 const durableInternals = Symbol.for("libfx.durableInternals");
+// The process's durable agents, by name, as libfx registers them.
+const agentRegistry = globalThis[Symbol.for("libfx.durableAgents")];
 const encoder = new TextEncoder();
 
-// The "four" topology, as TenantIsolation.tla defines it.
-const tenants = ["acme", "evil", "bob", "carl"];
+// The "four" topology, or under --development the "shared" one, as
+// TenantIsolation.tla defines them.
+const tenants = development ? ["acme", "evil"] : ["acme", "evil", "bob", "carl"];
 const nameOf = { acme: "support", evil: "support", bob: "billing", carl: "support" };
 const keyOf = { acme: "k1", evil: "k1", bob: "k1", carl: "k2" };
-const storeOf = { acme: "A", evil: "B", bob: "A", carl: "C" };
-const stores = ["A", "B", "C"];
+const storeOf = development ? { acme: "A", evil: "A" } : { acme: "A", evil: "B", bob: "A", carl: "C" };
+const stores = development ? ["A"] : ["A", "B", "C"];
 const keyOfStore = { A: "k1", B: "k1", C: "k2" };
 // Comfortably over the limit libfx admits for one input (sdk/durable.js
-// maxInputBytes).
-const oversizeBytes = 9 * 1024 * 1024;
+// maxInputBytes), which this harness, framing nothing, is held to.
+const oversizeBytes = 17 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // The code under test.
 
 // Every turn any agent ran, as the harness saw it.
 const turns = [];
+// The store an agent created without a durability gets: the walk's World A,
+// one for every such agent, as Node hands them one per environment.
+let defaultStore = null;
 const createTenantAgent = createDurableAgentFactory({
   name: "createTenantAgent",
-  defaultDurability: async () => { throw new Error("the driver passes a durability"); },
+  defaultDurability: async () => defaultStore ?? Promise.reject(new Error("no walk is open")),
+  defaultShared: true,
+  development: () => development,
   harness: ({ tenant, storeOfDurability }) => ({
     async open({ sessionId, store, context, durability }) {
       await store.load();
@@ -155,6 +171,7 @@ async function openWalk() {
     labelOf.set(durabilities[st], st);
   }
   const storeOfDurability = (durability) => labelOf.get(durability) ?? "?";
+  defaultStore = durabilities.A;
   // One reader per World, named apart from every tenant's agent.
   const observers = {};
   for (const st of stores) {
@@ -167,9 +184,11 @@ async function openWalk() {
   const sessionOf = {};
   for (const t of tenants) sessionOf[t] = await observers.A.newSessionId();
   const tenantOfSession = new Map(tenants.map((t) => [sessionOf[t], t]));
-  const walk = { base, worlds, durabilities, storeOfDurability, observers, sessionOf, tenantOfSession, agents: {}, refused: new Set(), sent: [] };
+  // `created` holds each tenant's agent, replaced or not, as its app does,
+  // and `replaced` how many agents each one's onEvent heard it replaced.
+  const walk = { base, worlds, durabilities, storeOfDurability, observers, sessionOf, tenantOfSession, created: {}, replaced: {}, refused: new Set(), sent: [] };
   walk.close = async () => {
-    for (const agent of [...Object.values(walk.agents), ...Object.values(observers)]) await agent.close().catch(() => {});
+    for (const agent of [...Object.values(walk.created), ...Object.values(observers)]) await agent.close().catch(() => {});
     for (const st of stores) await Promise.resolve(worlds[st].stored.close?.()).catch(() => {});
     await rm(base, { recursive: true, force: true });
   };
@@ -206,7 +225,16 @@ async function observe(walk) {
   }
   const queue = held.map(({ payload }) => ({ id: idOf(payload.input?.messageId), s: tenantOfSession.get(payload.input?.sessionId) ?? "?", n: payload.input?.agent ?? "none" }));
   const ran = turns.map((turn) => ({ id: idOf(turn.turnId), def: turn.tenant, store: turn.store, ctx: contextOf(turn.context) }));
-  return { agents: Object.keys(walk.agents), refused: [...walk.refused], log, owner, done, queue, ran };
+  // The tenants whose agents libfx has under their names now; one that was
+  // created and is not is the one another tenant's agent replaced. One that
+  // still has the default's store marker has not learned its store.
+  const members = [...agentRegistry.values()].flatMap((group) => group.members).filter((member) => tenants.includes(member.definition?.tenant));
+  const agents = members.map((member) => member.definition.tenant);
+  const unresolved = members.filter((member) => member.defaults !== null && member.store === member.defaults).map((member) => member.definition.tenant);
+  const replacedBy = Object.fromEntries(tenants.map((t) => [t, walk.created[t] && !agents.includes(t) && !walk.refused.has(t)
+    ? agents.find((u) => nameOf[u] === nameOf[t] && keyOf[u] === keyOf[t]) ?? "?"
+    : "none"]));
+  return { agents, refused: [...walk.refused], log, owner, done, queue, ran, replacedBy, unresolved };
 }
 
 // One canonical form for model and code alike: every collection in this
@@ -224,6 +252,8 @@ const viewOf = (state) => canonical({
   done: state.done,
   queue: state.queue.map(({ id, s, n }) => ({ id, s, n })),
   ran: state.ran,
+  replacedBy: state.replacedBy,
+  unresolved: state.unresolved,
 });
 
 // ---------------------------------------------------------------------------
@@ -234,26 +264,53 @@ async function perform(walk, act) {
   switch (act.name) {
     case "Register": {
       const t = act.t;
+      walk.replaced[t] = 0;
       try {
-        const agent = createTenantAgent({ name: nameOf[t], durability: walk.durabilities[storeOf[t]], tenant: t, storeOfDurability: walk.storeOfDurability });
+        // A late agent is created without a durability, on the default
+        // store, and stays unused until its Resolve step.
+        const agent = createTenantAgent({
+          name: nameOf[t],
+          ...(act.late ? {} : { durability: walk.durabilities[storeOf[t]] }),
+          tenant: t,
+          storeOfDurability: walk.storeOfDurability,
+          onEvent: (event) => { if (event.type === "agent.replaced") walk.replaced[t] += event.replaced; },
+        });
+        walk.created[t] = agent;
         // Opens its backend, as its first request does.
-        await agent.newSessionId();
-        walk.agents[t] = agent;
+        if (!act.late) await agent.newSessionId();
       } catch (error) {
         if (error?.code !== "FX_AGENT_NAME_IN_USE") throw error;
+        delete walk.created[t];
         walk.refused.add(t);
         return "register refused";
       }
-      return "register";
+      if (walk.replaced[t] > 0) return "register replaced";
+      return act.late ? "register late" : "register";
+    }
+    case "Resolve": {
+      // Its first use: libfx learns its store, where an agent created on it
+      // may have taken the name meanwhile.
+      const t = act.t;
+      const before = walk.replaced[t];
+      try {
+        await walk.created[t].newSessionId();
+      } catch (error) {
+        if (error?.code !== "FX_AGENT_NAME_IN_USE") throw error;
+        walk.refused.add(t);
+        return "resolve refused";
+      }
+      const listed = [...agentRegistry.values()].some((group) => group.members.some((member) => member.definition?.tenant === t));
+      if (!listed) return "resolve gave way";
+      return walk.replaced[t] > before ? "resolve replaced" : "resolve";
     }
     case "Prompt": {
-      const session = walk.agents[act.t].session(sessionOf[act.t], { context: { tenant: act.t } });
+      const session = walk.created[act.t].session(sessionOf[act.t], { context: { tenant: act.t } });
       await session.prompt(`prompt ${act.id}`, { messageId: `m${act.id}` }).accepted;
       walk.sent.push(act.id);
       return "prompt";
     }
     case "Oversize": {
-      const session = walk.agents[act.t].session(sessionOf[act.t], { context: { tenant: act.t } });
+      const session = walk.created[act.t].session(sessionOf[act.t], { context: { tenant: act.t } });
       const big = "x".repeat(oversizeBytes);
       try {
         if (act.k === "prompt") await session.prompt(big).accepted;
@@ -360,8 +417,9 @@ async function walkOnce(number) {
       if (!act) break;
       await step(act);
     }
-    // The queue's fairness: every message an agent can take reaches it.
-    const deliverable = (act, state) => act.name === "Deliver" && state.agents.some((t) => nameOf[t] === act.n && keyOf[t] === act.key);
+    // The queue's fairness: every message an agent can take reaches it, once
+    // every agent on the default store has been used and so knows its store.
+    const deliverable = (act, state) => act.name === "Resolve" || (act.name === "Deliver" && state.agents.some((t) => nameOf[t] === act.n && keyOf[t] === act.key));
     for (let left = 16; left > 0; left -= 1) {
       const act = chooseAct(frontier, deliverable);
       if (!act) break;
@@ -378,6 +436,9 @@ async function walkOnce(number) {
 for (let number = 1; number <= walks; number += 1) await walkOnce(number);
 const edges = [...graph.next.values()].reduce((total, successors) => total + successors.size, 0);
 console.log(`${walks} walks (seed ${firstSeed}), ${steps} steps (${Object.entries(outcomes).sort().map(([name, count]) => `${count} ${name}`).join(", ")}): ${seenStates.size} of ${graph.states.size} states and ${seenEdges.size} of ${edges} edges, every step one the model allows`);
-for (const outcome of ["register", "register refused", "prompt", "delivered", "forge refused", "forge missed", "oversize refused"]) {
+const wanted = development
+  ? ["register", "register late", "register replaced", "resolve gave way", "resolve replaced", "prompt", "delivered", "forge refused", "oversize refused"]
+  : ["register", "register refused", "prompt", "delivered", "forge refused", "forge missed", "oversize refused"];
+for (const outcome of wanted) {
   assert.ok((outcomes[outcome] ?? 0) > 0, `the walks reach "${outcome}" at least once`);
 }

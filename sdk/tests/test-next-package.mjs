@@ -165,6 +165,16 @@ async function ndjsonUntil(response, done) {
   throw new Error(`the stream ended after ${lines.length} lines without its last event`);
 }
 
+// PKG-10: the bundler builds libfx without warnings, such as webpack's
+// "Critical dependency: the request of a dependency is an expression" for an
+// import() it cannot resolve. Next prints each warning as a paragraph naming
+// the module.
+async function assertNoLibfxWarnings(name) {
+  const log = await readFile(resolve(root, `${name}.log`), "utf8");
+  const warnings = log.split(/\n\s*\n/).filter((block) => /[\\/]libfx[\\/]/.test(block) && /Critical dependency|Module not found|Can't resolve/.test(block));
+  assert.deepEqual(warnings, [], `${name} warned about libfx; see ${root}/${name}.log`);
+}
+
 async function assertBundledNativeAssets(buildDir) {
   if (!webpack) return;
   // A deployment carries the durability modules libfx loads on first use.
@@ -205,6 +215,7 @@ try {
   await exercise(dev, "dev");
   await stop(dev);
   await run(process.execPath, ["--no-experimental-require-module", next, "build", ...bundlerArgs], app, "build");
+  await assertNoLibfxWarnings("build");
   await assertBundledNativeAssets(resolve(app, ".next"));
   const production = await start(app, [next, "start"], "start");
   await exercise(production, "start");
@@ -215,6 +226,7 @@ try {
     output: "standalone", distDir, assetPrefix: "https://cdn.example.test/assets",
   })};\n`);
   await run(process.execPath, ["--no-experimental-require-module", next, "build", ...bundlerArgs], app, "standalone-build");
+  await assertNoLibfxWarnings("standalone-build");
   await assertBundledNativeAssets(resolve(app, distDir));
   const isolated = resolve(root, "isolated");
   await cp(resolve(app, distDir, "standalone"), isolated, { recursive: true, verbatimSymlinks: true });

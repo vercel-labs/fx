@@ -258,6 +258,7 @@ jobs:
           node --experimental-wasm-jspi sdk/tests/test-durable.mjs memory wasm
           env LIBFX_TEST_HOOKS=1 node --experimental-wasm-jspi sdk/tests/test-durable.mjs memory wasm
           node --experimental-wasm-jspi sdk/tests/test-durable.mjs local wasm
+          node --experimental-wasm-jspi sdk/tests/test-durable-local-upgrade.mjs wasm
           node --experimental-wasm-jspi sdk/tests/test-durable-provider-crash.mjs wasm
 
       - name: Type-check the TypeScript declarations
@@ -308,6 +309,7 @@ jobs:
           node sdk/tests/test-durable.mjs memory native
           env LIBFX_TEST_HOOKS=1 node sdk/tests/test-durable.mjs memory native
           node sdk/tests/test-durable.mjs local native
+          node sdk/tests/test-durable-local-upgrade.mjs native
           node sdk/tests/test-durable.mjs world native
           node sdk/tests/test-durable-provider-crash.mjs native
           node sdk/tests/test-durable-core.mjs memory
@@ -371,6 +373,7 @@ jobs:
         run: |
           bun sdk/tests/test-durable.mjs memory native
           bun sdk/tests/test-durable.mjs local native
+          bun sdk/tests/test-durable-local-upgrade.mjs native
           bun sdk/tests/test-durable-core.mjs memory
           bun sdk/tests/test-durable-core.mjs local
 
@@ -390,12 +393,15 @@ jobs:
           bun tests/tla/drivers/drive.mjs cutoff --walks 20 --seed 5
           bun tests/tla/drivers/drive.mjs leased --walks 40 --seed 12
           bun tests/tla/drivers/drive.mjs queue --walks 40 --seed 4
+          bun tests/tla/drivers/drive.mjs refuse --walks 20 --seed 3
           bun tests/tla/drivers/drive-agents.mjs --walks 60 --seed 11
           bun tests/tla/drivers/drive-tenants.mjs --walks 60 --seed 11
+          bun tests/tla/drivers/drive-tenants.mjs --development --walks 40 --seed 11
           bun tests/tla/drivers/drive-steer.mjs ideal --walks 20 --seed 2
           bun tests/tla/drivers/drive-steer.mjs faults --walks 20 --seed 4
           bun tests/tla/drivers/drive-steer.mjs faults --walks 10 --seed 4 --hooks
           bun tests/tla/drivers/drive-steer.mjs faults --walks 10 --seed 6 --backend wasm
+          bun tests/tla/drivers/drive-steer.mjs ideal --walks 30 --seed 5 --backend wasm
 
       - name: Test libfx on a World
         run: |

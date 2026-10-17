@@ -1,7 +1,7 @@
 // fx as a harness of the durable core in durable.js: `createFxAgent` is that
 // core running fx engines. Everything the core needs to know about fx is
 // here; the core itself knows only the harness contract.
-import { coreAnswered, engineInternals, journalMarksWanted, normalizeInstructions, normalizeModelChoice } from "./fx-sdk.js";
+import { catalogMemory, coreAnswered, engineInternals, journalMarksWanted, maxPromptFrameBytes, normalizeInstructions, normalizeModelChoice, promptFrameBytes, turnEndInputs } from "./fx-sdk.js";
 import { createCredentialMemory, credentialMemory } from "./subscription.js";
 
 const encoder = new TextEncoder();
@@ -12,9 +12,11 @@ const durableCheckpointAfterBytes = 64 * 1024;
 /**
  * The fx harness for `createDurableAgentFactory`. `createEngine(options)`
  * returns a `createFxEngine` session, and `defaultApiKey(durability)` the
- * credential when the caller passes none.
+ * credential when the caller passes none. `keySources` says where else than
+ * `apiKey` this runtime looks for that credential, for the error a session
+ * gets when it finds none.
  */
-export function fxHarness({ createEngine, defaultApiKey = async () => undefined }) {
+export function fxHarness({ createEngine, defaultApiKey = async () => undefined, keySources = "" }) {
   return (options) => {
     const { checkpoint, ...engineOptions } = options;
     // `env` is refused here as well as by the engine, so the error names
@@ -25,17 +27,32 @@ export function fxHarness({ createEngine, defaultApiKey = async () => undefined 
     const idempotent = idempotentTools(engineOptions.tools);
     // One for all of this agent's sessions, so they refresh an account once.
     const credentials = createCredentialMemory();
+    // And one for the Gateway catalog, which the agent fetches once (API-15).
+    const catalogs = new Map();
     return {
       ...(checkpoint === undefined ? {} : { seed: snapshotOf(checkpointBytesOf(checkpoint)) }),
       settings: sessionSettings,
-      async open({ sessionId, store, context, settings, durability, ready }) {
+      // What the engine's prompt() measures, so that an input it could never
+      // take is refused before the session stores it.
+      frameBytes: promptFrameBytes,
+      maxFrameBytes: maxPromptFrameBytes,
+      async open({ sessionId, store, context, settings, durability, ready, inputs }) {
         const apiKey = engineOptions.apiKey ?? await defaultApiKey(durability);
+        // Only AI Gateway needs a key; another provider has its own
+        // credentials. The engine would say only that apiKey is missing.
+        if (apiKey === undefined && (engineOptions.provider === undefined || engineOptions.provider === "gateway")) {
+          throw new TypeError(`no AI Gateway credentials were found: pass apiKey to createFxAgent()${keySources}`);
+        }
         const engine = await createEngine({
           ...withSettings(engineOptions, settings),
           ...(apiKey === undefined ? {} : { apiKey }),
-          ...(ready === undefined || engineOptions.tools === undefined ? {} : { tools: claimedTools(engineOptions.tools, ready) }),
+          ...((ready === undefined && inputs === undefined) || engineOptions.tools === undefined ? {} : { tools: workerTools(engineOptions.tools, ready, inputs) }),
+          // The core waits on it before a turn ends as well, so a steer
+          // stored while the last reply streamed continues the turn.
+          ...(inputs === undefined ? {} : { [turnEndInputs]: inputs }),
           sessionId,
           [credentialMemory]: credentials,
+          [catalogMemory]: catalogs,
           // The core folds the session from the marks on each record.
           persistence: { ...store, [journalMarksWanted]: true },
           inputsDurable: true,
@@ -165,13 +182,19 @@ function toolEntries(tools) {
 }
 
 // The tools as a worker runs them: a turn can start before the worker's
-// claim on the session lands, and no tool runs before it does.
-function claimedTools(tools, ready) {
+// claim on the session lands, and no tool runs before it does. A call's
+// result reaches the model only after `inputs()` settles, so the steers
+// stored while it ran are in the model request that carries the result.
+function workerTools(tools, ready, inputs) {
   const claimed = (tool) => (typeof tool?.execute !== "function" ? tool : {
     ...tool,
     async execute(...args) {
-      if (!(await ready)) throw new Error("this worker's claim on the session failed");
-      return tool.execute(...args);
+      if (ready !== undefined && !(await ready)) throw new Error("this worker's claim on the session failed");
+      try {
+        return await tool.execute(...args);
+      } finally {
+        await inputs?.();
+      }
     },
   });
   if (Array.isArray(tools)) return tools.map(claimed);

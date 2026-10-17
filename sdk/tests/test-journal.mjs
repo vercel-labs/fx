@@ -667,7 +667,7 @@ test("a journal that does not fold is refused", async () => {
   await assert.rejects(createFxEngine(options(targetBackend, newer)), /libfx journal was written by a newer fx/);
   const garbled = eventJournal([{ v: 1, seq: 1, turn: 1, type: "turn_committed", data: { kind: "nope" } }]);
   await assert.rejects(createFxEngine(options(targetBackend, garbled)), invalid(/Invalid libfx journal/));
-  const huge = eventJournal([{ ...journal.events.at(-1), seq: 1, turn: 1, padding: "x".repeat(4 * 1024 * 1024) }]);
+  const huge = eventJournal([{ ...journal.events.at(-1), seq: 1, turn: 1, padding: "x".repeat(32 * 1024 * 1024) }]);
   await assert.rejects(
     createFxEngine(options(targetBackend, huge)),
     (error) => /libfx journal is too large/.test(error.message) && error.code === "FX_JOURNAL_TOO_LARGE",

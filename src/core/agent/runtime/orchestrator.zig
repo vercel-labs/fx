@@ -13,6 +13,7 @@ const worker_runtime = @import("../worker_runtime.zig");
 const agent_stream_provider = @import("../stream_provider.zig");
 const session_runtime = @import("../../session/session.zig");
 const session_codec = @import("../../session/session_codec.zig");
+const session_adapter = @import("../../session/session_adapter.zig");
 const result_store = @import("../../session/result_store.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const diagnostics = @import("../../workspace/diagnostics.zig");
@@ -3470,8 +3471,27 @@ const regenerate_tool_recovery_prompt =
     "The previous response ended during an incomplete tool call. fx did not execute that call. Recreate it only if it is still needed.";
 const continue_after_confirmed_tool_recovery_prompt =
     "Continue from the confirmed tool result above without repeating the tool.";
+const continue_after_unknown_tool_recovery_prompt =
+    "Continue from the tool results above. A tool whose result says it may have partly run is not confirmed; do not repeat it automatically.";
 const reconcile_tool_recovery_prompt =
     "Reconcile the available tool evidence above before continuing. Do not repeat the tool unless the evidence proves it is safe.";
+
+/// Whether a result of the tool calls `messages` ends with says the call may
+/// have partly run: fx stopped before its outcome was recorded, so the
+/// result is not a confirmed one.
+fn endsWithUnknownToolOutcome(messages: []const ChatMessage) bool {
+    var index = messages.len;
+    while (index > 0) {
+        index -= 1;
+        const message = messages[index];
+        switch (message.role) {
+            .assistant => return false,
+            .tool => if (std.mem.eql(u8, message.content orelse "", session_adapter.unfinished_tool_output)) return true,
+            .system, .user => {},
+        }
+    }
+    return false;
+}
 
 fn appendRecoveryConversationContext(
     alloc: Allocator,
@@ -3483,7 +3503,12 @@ fn appendRecoveryConversationContext(
         .retry_request, .pause, .stop, .wait_for_connectivity, .probe_liveness => return,
         .continue_response => continue_response_recovery_prompt,
         .regenerate_tool => regenerate_tool_recovery_prompt,
-        .continue_after_confirmed_tool => continue_after_confirmed_tool_recovery_prompt,
+        // A call whose outcome is unknown is never called confirmed (DUR-41,
+        // API-66): the model still hears it may have partly run.
+        .continue_after_confirmed_tool => if (endsWithUnknownToolOutcome(messages.items))
+            continue_after_unknown_tool_recovery_prompt
+        else
+            continue_after_confirmed_tool_recovery_prompt,
         .reconcile_tool => reconcile_tool_recovery_prompt,
     };
     try messages.append(alloc, .{
@@ -3534,6 +3559,45 @@ test "recovery conversation context is chronological and system free" {
         try appendRecoveryConversationContext(alloc, &messages, strategy);
         try std.testing.expectEqual(@as(usize, 1), messages.items.len);
     }
+}
+
+test "a call whose outcome is unknown is not called a confirmed result (DUR-41, API-66)" {
+    const alloc = std.testing.allocator;
+    const call = [_]ToolCall{.{ .id = "call-1", .name = "email", .arguments_json = "{}" }};
+    const Case = struct { output: []const u8, prompt: []const u8 };
+    const cases = [_]Case{
+        // A result recorded as the call finished is confirmed.
+        .{ .output = "sent", .prompt = continue_after_confirmed_tool_recovery_prompt },
+        // The answer fx gives a call a crash left running is not.
+        .{ .output = session_adapter.unfinished_tool_output, .prompt = continue_after_unknown_tool_recovery_prompt },
+    };
+    for (cases) |case| {
+        var messages: std.ArrayList(ChatMessage) = .empty;
+        defer messages.deinit(alloc);
+        try messages.appendSlice(alloc, &.{
+            .{ .role = .user, .content = "send it" },
+            .{ .role = .assistant, .tool_calls = &call },
+            .{ .role = .tool, .content = case.output, .tool_call_id = "call-1", .tool_name = "email" },
+            // The resume notice comes after the results.
+            .{ .role = .user, .content = "Resuming from unexpected session interruption." },
+        });
+        try appendRecoveryConversationContext(alloc, &messages, .continue_after_confirmed_tool);
+        try std.testing.expectEqualStrings(case.prompt, messages.last().?.content.?);
+    }
+    try std.testing.expect(std.mem.find(u8, continue_after_unknown_tool_recovery_prompt, "confirmed tool result") == null);
+
+    // Only the results the request ends with count: a later confirmed step
+    // does not inherit an earlier call's unknown outcome.
+    var messages: std.ArrayList(ChatMessage) = .empty;
+    defer messages.deinit(alloc);
+    try messages.appendSlice(alloc, &.{
+        .{ .role = .assistant, .tool_calls = &call },
+        .{ .role = .tool, .content = session_adapter.unfinished_tool_output, .tool_call_id = "call-1", .tool_name = "email" },
+        .{ .role = .assistant, .tool_calls = &call },
+        .{ .role = .tool, .content = "sent", .tool_call_id = "call-1", .tool_name = "email" },
+    });
+    try appendRecoveryConversationContext(alloc, &messages, .continue_after_confirmed_tool);
+    try std.testing.expectEqualStrings(continue_after_confirmed_tool_recovery_prompt, messages.last().?.content.?);
 }
 
 const ProviderPromptProjection = struct {
@@ -8575,6 +8639,16 @@ fn processQueuedPromptLoop(
             const accepted_partial_assistant = stream_ctx.interruption_source_or(
                 attempt_completion.content orelse "",
             );
+
+            // A response that ends in tool calls leaves no reply for a steer
+            // to cut short, even when the model streamed no arguments for
+            // them: from here a steer waits for the tools and joins after
+            // their results (`tests/tla/sdk/DurableSteer.tla` CallWaits,
+            // NoParkedSteer).
+            // A steer that cut the reply first is the cancel checked below.
+            if (attempt_completion.tool_calls.len > 0) {
+                runtime_assistant_stream.publishTurnPhase(&stream_ctx, .running);
+            }
 
             if (config.cancel_flag.load(.seq_cst)) {
                 runtime_telemetry.traceCancelObserved(step_ctx, false);

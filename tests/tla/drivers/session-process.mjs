@@ -88,6 +88,66 @@ function withoutBackstops(durability) {
   };
 }
 
+// Holds each write to the session stream that carries a turn_end line its
+// worker writes while it heads the session's chain, until the driver lets it
+// go, so a walk can stop a worker between the record that ends its turn and
+// that line (`tests/tla/sdk/DurableSession.tla` EndLine). A replaced
+// worker's late line goes out at once, as the model's MaybeLine has it.
+// Lines before a held one in the same write go out at once.
+function holdEndLines(durability, heads, changed) {
+  const waiting = [];
+  const decoder = new TextDecoder();
+  const isEnd = (chunk) => {
+    try {
+      return JSON.parse(typeof chunk === "string" ? chunk : decoder.decode(chunk)).type === "turn_end";
+    } catch {
+      return false;
+    }
+  };
+  const hold = () => new Promise((go) => {
+    waiting.push(go);
+    changed();
+  });
+  const ends = {
+    get held() { return waiting.length; },
+    release() {
+      for (const go of waiting.splice(0)) go();
+      changed();
+    },
+  };
+  const bound = (target, key) => {
+    const value = Reflect.get(target, key);
+    return typeof value === "function" ? value.bind(target) : value;
+  };
+  return [{
+    ...durability,
+    async world() {
+      const world = await durability.world();
+      const streams = new Proxy(world.streams, {
+        get(target, key) {
+          if (key === "write") {
+            return async (runId, name, chunk) => {
+              if (isEnd(chunk) && (await heads(runId))) await hold();
+              return target.write(runId, name, chunk);
+            };
+          }
+          if (key === "writeMulti") {
+            return async (runId, name, chunks) => {
+              const at = chunks.findIndex(isEnd);
+              if (at < 0 || !(await heads(runId))) return target.writeMulti(runId, name, chunks);
+              if (at > 0) await target.writeMulti(runId, name, chunks.slice(0, at));
+              await hold();
+              return target.writeMulti(runId, name, chunks.slice(at));
+            };
+          }
+          return bound(target, key);
+        },
+      });
+      return new Proxy(world, { get: (target, key) => (key === "streams" ? streams : bound(target, key)) });
+    },
+  }, ends];
+}
+
 // The walk now open, and what of it waits on the driver. Every message to the
 // driver names the walk it comes from, so one a closed walk's agent sends
 // late is dropped.
@@ -109,10 +169,15 @@ const methods = {
     const stored = leasedWorld ? leasedWorld(dir) : durabilityKind === "world" ? await appWorldAt(dir) : durabilityKind === "vercel" ? vercelStorage({ dir }) : queueWorld ? queueWorld.durability : local({ dir });
     // What the driver reads of the held writes: their kind, a lease's
     // holder, and whether one is a frozen worker's renewal.
+    // And how many turn_end lines it holds.
     const postHeld = () => {
-      if (walk === state) post(state, { type: "held", held: state.writes.held.map((entry) => ({ k: entry.k, holder: entry.holder ?? null, renewal: renewals.has(entry) })) });
+      if (walk === state) post(state, { type: "held", held: state.writes.held.map((entry) => ({ k: entry.k, holder: entry.holder ?? null, renewal: renewals.has(entry) })), ends: state.ends.held });
     };
-    const [durability, writes] = holdWrites(withoutBackstops(stored), (entry) => {
+    // Whether the chain's latest lease is one this worker claimed.
+    const heads = async (sessionId) => claims.has((await state.agent[durableInternals].lastLease(sessionId))?.holder);
+    const [ending, ends] = holdEndLines(withoutBackstops(stored), heads, () => queueMicrotask(postHeld));
+    state.ends = ends;
+    const [durability, writes] = holdWrites(ending, (entry) => {
       // The write is held, if it is, once this returns.
       queueMicrotask(postHeld);
       // The first intent of a call that runs ahead waits for the Intent step.
@@ -215,6 +280,11 @@ const methods = {
     await settled;
     walk.postHeld();
   },
+  // The turn_end lines held now go out (`tests/tla/sdk/DurableSession.tla`
+  // EndLine).
+  releaseEnds() {
+    walk.ends.release();
+  },
   // A claim lands: the holder of the last held lease, and the live holders
   // just before it goes out.
   async claim() {
@@ -270,6 +340,7 @@ const methods = {
     if (!state) return;
     walk = null;
     state.writes.release();
+    state.ends.release();
     for (const resolveRequest of state.requests.values()) resolveRequest([{ type: "error", errorText: "walk over" }]);
     for (const resolveCall of state.calls.values()) resolveCall();
     state.requests.clear();

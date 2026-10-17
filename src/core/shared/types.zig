@@ -237,6 +237,9 @@ pub const ToolLifecycleEvent = union(enum) {
         presentation_group_id: ?ToolPresentationGroupId = null,
         tool_name: ?[]const u8,
         activity_kind: ToolActivityKind,
+        /// The call's arguments once the model has sent them all; null
+        /// while it still streams them.
+        arguments_json: ?[]const u8 = null,
     },
     authoritative_started: struct {
         id: ToolLifecycleId,

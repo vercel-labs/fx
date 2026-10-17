@@ -184,10 +184,11 @@ All untrusted values crossing the native boundary are bounded before allocation 
 | Input queue | 8 MiB |
 | Output queue | 8 MiB |
 | Encoded output message | 64 MiB |
-| Fetch request body and serialized metadata | 8 MiB |
-| One attachment | 4 MiB |
-| Pending inbound attachments | 8, totaling at most 8 MiB |
-| Pending outbound attachments | 4, totaling at most 8 MiB |
+| Fetch request body and serialized metadata | 32 MiB |
+| One attachment | 32 MiB |
+| Pending inbound attachments | 8, totaling at most 64 MiB |
+| Pending outbound attachments | 4, totaling at most 64 MiB |
+| Prompt images the core takes from attachments | 4 MiB each, 8 MiB per prompt |
 | Fetch response queue | 8 MiB |
 | Gateway error body | 1 MiB |
 | One output drain | 1 MiB |
@@ -196,7 +197,9 @@ All untrusted values crossing the native boundary are bounded before allocation 
 | ACP history | 100 turns |
 | Agent steps | 64 |
 
-The fetch request budget covers the full model request, including retained history and metadata. The body crosses to Node unencoded beside its metadata, so the transfer adds no separate bound; accepting one tool result does not reserve space for later requests.
+One attachment holds a kernel checkpoint, a journal snapshot or the journal records a session opens from, each up to 32 MiB, since a conversation keeps its prompts' images. A journal opens from a snapshot and its records attached together, so the inbound total is twice that. Prompt images share the table, and the core bounds them as it takes them, below the table's limits.
+
+The fetch request budget covers the full model request, including retained history and metadata. History keeps every image, and the core leaves a request's oldest images out to keep its body within 30 MiB, below the 32 MiB that Claude routes accept. The budget adds 2 MiB for the method, URL and headers, so a request the core trims that way always fits. Text is never left out, so a request whose text alone is over the budget fails with `HostStreamBackpressure` before it reaches `fetch`. The body crosses to Node unencoded beside its metadata, so the transfer adds no separate bound; accepting one tool result does not reserve space for later requests.
 
 Prompt images and kernel checkpoints also cross the boundary unencoded. JavaScript writes each inbound payload with `writeCoreAttachment()` and then sends the ACP frame that references its id, an image block's `_meta.fx.attachment` or `libfx/restore`'s `checkpointAttachment`; the core thread takes the payload once while handling that frame. `libfx/checkpoint` answers with `checkpointAttachment`, and JavaScript takes those bytes with `takeCoreAttachment()`. The attachment table has its own mutex and stores C-allocator copies, so the core thread never touches JavaScript memory. JavaScript discards unconsumed inbound payloads before attaching new ones.
 

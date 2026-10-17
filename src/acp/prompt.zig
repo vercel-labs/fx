@@ -979,6 +979,10 @@ pub fn handlePrompt(
             for (inputs, ids) |input, *id| id.* = input.id;
             try journal.notePlaced(state.alloc, ids);
         }
+        // The crashed turn took these inputs and died before its viewers
+        // heard of them, so they show now, where the turn places them, as a
+        // steer does when a boundary takes it (DUR-23).
+        for (inputs) |input| try publishSteeringReplay(&ctx, input.text, null, input.id);
         journal.dropPendingResume(state.alloc);
         // Calls the crash left running that the host asked to run again do
         // so before the turn continues, and their results replace the answer
@@ -1635,6 +1639,14 @@ fn decodePromptImageData(alloc: Allocator, data_value: std.json.Value) ![]u8 {
     return decoded;
 }
 
+/// The most bytes one image a libfx host attaches beside the prompt frame may
+/// hold, and all of one prompt's attached images together. libfx's own limits
+/// are lower (`maxPromptImageBytes` and `maxPromptImagesBytes` in
+/// `sdk/fx-sdk.js`); these hold a host that skips them, whatever room its
+/// attachment store has for journals.
+const max_attached_image_bytes = 4 * 1024 * 1024;
+const max_attached_images_bytes = 8 * 1024 * 1024;
+
 /// Takes the raw image bytes a libfx host attached beside the prompt frame.
 /// Hosts without an attachment store cannot reference one. Caller owns the
 /// returned bytes.
@@ -1645,7 +1657,7 @@ fn takePromptImageAttachment(
 ) ![]u8 {
     const store = attachments orelse return error.UnsupportedPromptImage;
     const id = host_attachments.idFromJson(value) orelse return error.InvalidPromptImage;
-    const bytes = store.take(alloc, id, image_attachments.max_image_bytes) catch |err| return switch (err) {
+    const bytes = store.take(alloc, id, max_attached_image_bytes) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.AttachmentTooLarge => error.ImageTooLarge,
         error.AttachmentUnavailable => error.InvalidPromptImage,
@@ -1727,6 +1739,7 @@ fn parsePromptInputWithFirstImageId(
         for (pending_images.items) |*pending| pending.deinit(alloc);
         pending_images.deinit(alloc);
     }
+    var attached_image_bytes: usize = 0;
     var omission_summary: context_contract.ContextOmissionSummaryBuilder = .{};
     defer {
         for (omissions.items) |omission| alloc.free(@constCast(omission.source));
@@ -1754,9 +1767,10 @@ fn parsePromptInputWithFirstImageId(
                 if (value != .string or !image_data.validSourceRef(value.string)) return error.InvalidPromptImage;
                 break :ref value.string;
             } else null;
-            const decoded = if (acp_types.fxMetaField(block.object, "attachment")) |attachment| bytes: {
+            const attachment = acp_types.fxMetaField(block.object, "attachment");
+            const decoded = if (attachment) |reference| bytes: {
                 if (block.object.get("data") != null) return error.InvalidPromptImage;
-                break :bytes try takePromptImageAttachment(alloc, attachments, attachment);
+                break :bytes try takePromptImageAttachment(alloc, attachments, reference);
             } else if (block.object.get("data")) |data_value|
                 try decodePromptImageData(alloc, data_value)
             else bytes: {
@@ -1764,6 +1778,12 @@ fn parsePromptInputWithFirstImageId(
                 break :bytes try alloc.alloc(u8, 0);
             };
             errdefer alloc.free(decoded);
+            if (attachment != null) {
+                // Each is at most max_attached_image_bytes, and the sum stops
+                // growing once it passes the total, so it cannot overflow.
+                attached_image_bytes += decoded.len;
+                if (attached_image_bytes > max_attached_images_bytes) return error.ImageTooLarge;
+            }
 
             const image_id = std.math.add(usize, first_image_id, pending_images.items.len) catch
                 return error.ImageIdOverflow;
@@ -1995,6 +2015,7 @@ fn takeSteeringBoundary(
 ) !worker_runtime.SteeringBoundaryResult {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const close_if_empty = kind == .finalizing;
+    if (kind == .finalizing) takeHostInputs(ctx);
     if (comptime host_target.is_wasm) {
         server.noteSteeringBoundary(ctx.state);
         // The host closes its steering when the user cancels the turn, which
@@ -2053,6 +2074,31 @@ fn takeSteeringBoundary(
         try publishSteeringReplay(ctx, text, request_id, input_id);
     }
     return .{ .continue_turn = drained.texts };
+}
+
+/// Before a libfx turn ends, a host that stores the session's inputs itself
+/// hands in the ones it stored since it last read them, so a steer sent while
+/// the reply streamed continues the turn instead of running as a turn of its
+/// own, though no poll or watch told the host of it in time (API-50;
+/// `tests/tla/sdk/DurableSteer.tla` ReadAtEnd). The reply has ended, so a
+/// steer that arrives meanwhile waits for this boundary instead of cutting
+/// anything short. A failed read leaves those inputs stored, and they run
+/// after the turn.
+fn takeHostInputs(ctx: *AcpContext) void {
+    const session = if (ctx.state.active_session) |*value| value else return;
+    const inputs_durable = durable: {
+        session.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer session.session_write_mutex.unlock(io_mod.getIo());
+        const journal = if (session.journal) |*value| value else break :durable false;
+        break :durable journal.inputs_durable;
+    };
+    if (!inputs_durable) return;
+    server.noteSteeringBoundary(ctx.state);
+    const taken = if (comptime host_target.is_wasm)
+        js_host_steering.takeInputs()
+    else
+        awaitHostRequest(ctx.state, ctx.alloc, .inputs, "libfx/take_inputs", session.session_id);
+    taken catch |err| debug_trace.logf("acp", "libfx host inputs not read before the turn ends; any it stored run after it err={s}", .{@errorName(err)});
 }
 
 /// The web core's cooperative pulse while a model reply streams: steering its
@@ -2245,6 +2291,11 @@ fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentati
         ctx.stop_reason = .max_output_tokens;
     } else if (outcome == .failed or outcome == .paused) {
         ctx.stop_reason = .refused;
+    } else if (outcome == .interrupted) {
+        // The session records the turn as interrupted, so it reports
+        // cancelled whatever stopped it, a handoff included: its end never
+        // says end_turn while the journal says otherwise (DUR-64).
+        ctx.stop_reason = .cancelled;
     }
 }
 
@@ -2831,28 +2882,45 @@ fn appendJournalToolIntent(raw_ctx: *anyopaque, progress: agent_runtime.TurnProg
 /// Waits until the host holds every journal event sent so far.
 fn flushJournal(state: *server.ServerState, alloc: Allocator, session_id: []const u8) !void {
     if (comptime host_target.is_wasm) return js_host_journal.flush();
-    const outbound_id = (server.beginOutboundRequest(state, .journal) catch
-        return error.JournalFlushFailed) orelse return error.JournalFlushFailed;
-    var awaiting = true;
-    errdefer if (awaiting) {
+    awaitHostRequest(state, alloc, .journal, "libfx/journal_flush", session_id) catch |err| return switch (err) {
+        error.Cancelled => error.Cancelled,
+        error.HostRequestFailed => error.JournalFlushFailed,
+    };
+}
+
+/// Sends the native host the libfx request `method` for `session_id` and
+/// waits for its answer, which it gives once it has done what `method` asks.
+/// The connection reader handles what the host sends meanwhile, so the host
+/// may send other requests before it answers. A cancel of the turn ends the
+/// wait with `error.Cancelled`.
+fn awaitHostRequest(
+    state: *server.ServerState,
+    alloc: Allocator,
+    kind: server.OutboundKind,
+    method: []const u8,
+    session_id: []const u8,
+) error{ HostRequestFailed, Cancelled }!void {
+    var params: std.Io.Writer.Allocating = .init(alloc);
+    defer params.deinit();
+    params.writer.writeAll("{\"sessionId\":") catch return error.HostRequestFailed;
+    jsonrpc.writeJsonStr(session_id, &params.writer) catch return error.HostRequestFailed;
+    params.writer.writeByte('}') catch return error.HostRequestFailed;
+    const outbound_id = (server.beginOutboundRequest(state, kind) catch
+        return error.HostRequestFailed) orelse return error.HostRequestFailed;
+    state.writer.writeRequest(alloc, .{ .integer = @intCast(outbound_id) }, method, params.written()) catch {
+        // The request may have been partly written, so the host hears it was
+        // cancelled.
         server.cancelOutboundRequest(state, outbound_id);
-        if (server.awaitOutboundResponse(state, outbound_id, .journal)) |owned| {
+        if (server.awaitOutboundResponse(state, outbound_id, kind)) |owned| {
             var abandoned = owned;
             abandoned.deinit(state.alloc);
         }
+        return error.HostRequestFailed;
     };
-    var params: std.Io.Writer.Allocating = .init(alloc);
-    defer params.deinit();
-    try params.writer.writeAll("{\"sessionId\":");
-    try jsonrpc.writeJsonStr(session_id, &params.writer);
-    try params.writer.writeByte('}');
-    state.writer.writeRequest(alloc, .{ .integer = @intCast(outbound_id) }, "libfx/journal_flush", params.written()) catch
-        return error.JournalFlushFailed;
-    var response = server.awaitOutboundResponse(state, outbound_id, .journal) orelse return error.JournalFlushFailed;
-    awaiting = false;
+    var response = server.awaitOutboundResponse(state, outbound_id, kind) orelse return error.HostRequestFailed;
     defer response.deinit(state.alloc);
     if (response.cancelled) return error.Cancelled;
-    if (response.error_json != null or response.result_json == null) return error.JournalFlushFailed;
+    if (response.error_json != null or response.result_json == null) return error.HostRequestFailed;
 }
 
 /// Records the libfx steers the ending turn accepted and never placed, as a
@@ -3230,12 +3298,16 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
             if (ctx.state.cfg.minimal_kernel) server.noteSteeringToolsPhase(ctx.state);
             const tool_name = provisional.tool_name orelse return;
             if (!tool_presentation.isProviderSearchAlias(tool_name)) return;
+            // A libfx viewer gets one tool_start per call, so a search waits
+            // to start until its input is known (API-68).
+            const arguments_json = provisional.arguments_json orelse
+                if (ctx.state.cfg.minimal_kernel) return else "{}";
             var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
             defer arena_state.deinit();
             _ = try ctx.sendToolCallPending(arena_state.allocator(), .{
                 .id = provisional.id.call_id,
                 .name = tool_name,
-                .arguments_json = "{}",
+                .arguments_json = arguments_json,
                 .provenance = .provider_executed,
             });
         },
@@ -4237,6 +4309,54 @@ test "parsePromptInput rejects unusable image attachment references" {
     const invalid_ref = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"sourceRef\":\"bad\\nref\",\"_meta\":{\"fx\":{\"attachment\":3}}}]}";
     try std.testing.expectError(error.InvalidPromptImage, parsePromptInputWithFirstImageId(alloc, invalid_ref, 1, stored.store()));
     try std.testing.expectEqual(@as(usize, 0), stored.taken);
+}
+
+/// Serves `payloads[id - 1]` under each id from 1.
+const TestAttachments = struct {
+    payloads: []const []const u8,
+
+    fn store(self: *TestAttachments) host_attachments.Store {
+        return .{ .context = self, .take_fn = take, .put_fn = TestAttachmentStore.put };
+    }
+
+    fn take(
+        raw: ?*anyopaque,
+        alloc: Allocator,
+        id: host_attachments.Id,
+        max_bytes: usize,
+    ) host_attachments.TakeError![]u8 {
+        const self: *TestAttachments = @ptrCast(@alignCast(raw.?));
+        if (id == 0 or id > self.payloads.len) return error.AttachmentUnavailable;
+        const bytes = self.payloads[id - 1];
+        if (bytes.len > max_bytes) return error.AttachmentTooLarge;
+        return alloc.dupe(u8, bytes);
+    }
+};
+
+test "parsePromptInput bounds the images a host attaches, each and together, whatever its store holds" {
+    const alloc = std.testing.allocator;
+    const largest = try alloc.alloc(u8, max_attached_image_bytes + 1);
+    defer alloc.free(largest);
+    @memset(largest, 0);
+    @memcpy(largest[0..8], "\x89PNG\r\n\x1a\n");
+    const image = largest[0..max_attached_image_bytes];
+    const block = "{\"type\":\"image\",\"mimeType\":\"image/png\",\"_meta\":{\"fx\":{\"attachment\":";
+    const one = "{\"sessionId\":\"s1\",\"prompt\":[" ++ block ++ "1}}}]}";
+    const two = "{\"sessionId\":\"s1\",\"prompt\":[" ++ block ++ "1}}}," ++ block ++ "2}}}]}";
+    const three = "{\"sessionId\":\"s1\",\"prompt\":[" ++ block ++ "1}}}," ++ block ++ "2}}}," ++ block ++ "3}}}]}";
+
+    // Two images of the largest size fill the total.
+    var full: TestAttachments = .{ .payloads = &.{ image, image } };
+    var parsed = try parsePromptInputWithFirstImageId(alloc, two, 1, full.store());
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), parsed.pending_images.len);
+    try std.testing.expectEqual(max_attached_image_bytes, parsed.pending_images[1].bytes.len);
+
+    // One byte more, in another image or in the same one, is refused.
+    var over: TestAttachments = .{ .payloads = &.{ image, image, "\x89PNG\r\n\x1a\n" } };
+    try std.testing.expectError(error.ImageTooLarge, parsePromptInputWithFirstImageId(alloc, three, 1, over.store()));
+    var single: TestAttachments = .{ .payloads = &.{largest} };
+    try std.testing.expectError(error.ImageTooLarge, parsePromptInputWithFirstImageId(alloc, one, 1, single.store()));
 }
 
 test "parsePromptInput preserves resource text and accepts only local absolute file targets" {
