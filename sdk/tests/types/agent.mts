@@ -169,6 +169,7 @@ export async function durabilities(): Promise<void> {
   createFxAgent({ durability: memory() }); // nothing survives the process
   createFxAgent({ durability: memory({ maxDurationMs: 60_000, reserveMs: 5_000 }) });
   createFxAgent({ durability: local({ maxDurationMs: 300_000, reserveMs: 30_000 }) });
+  createFxAgent({ durability: local({ recover: false }) });
   createFxAgent({ durability: vercel({ reserveMs: 10_000 }) });
   createFxAgent({ durability: vercel({ reserveMs: 10_000, leaseMs: 5_000 }) });
   createFxAgent({ durability: vercel() });
@@ -177,6 +178,8 @@ export async function durabilities(): Promise<void> {
   memory({ dir: ".fx/sessions" });
   // @ts-expect-error local() takes no World options
   local({ queueDurable: true });
+  // @ts-expect-error local() recover is a boolean
+  local({ recover: () => true });
   // @ts-expect-error vercel() takes only reserveMs and leaseMs
   vercel({ maxDurationMs: 60_000 });
   // @ts-expect-error durability must come from memory(), local(), vercel(), or world()
@@ -225,11 +228,19 @@ export async function worlds(): Promise<void> {
     alive: (lease) => (lease.host === "worker-1" ? lease.pid === 42 : null),
     gatewayKey: async () => process.env.AI_GATEWAY_API_KEY ?? "",
   });
+  world(fake, {
+    livenessKnown: true,
+    holderInfo: () => ({ pid: 42, host: "worker-1" }),
+    alive: (lease) => (lease.host === "worker-1" ? lease.pid === 42 : null),
+    recover: (writer) => writer.host === "worker-1",
+  });
   const options: WorldOptions = { livenessKnown: false, queueDurable: false };
   world(fake, options);
 
   // @ts-expect-error livenessKnown needs alive()
   world(fake, { livenessKnown: true });
+  // @ts-expect-error recover needs livenessKnown
+  world(fake, { recover: () => true });
   // @ts-expect-error a World needs events, streams, a queue, and createQueueHandler()
   world({});
   // @ts-expect-error alive() answers true, false, or null
@@ -337,6 +348,8 @@ export function events(): void {
       if (event.type === "session.deadline" || event.type === "session.fenced") assertType<Equal<typeof event.epoch, number>>();
       if (event.type === "session.deadline") assertType<Equal<typeof event.cutoffs, number>>();
       if (event.type === "session.forwarded") assertType<Equal<typeof event.agent, string>>();
+      if (event.type === "session.recovered") assertType<Equal<typeof event.sessionId, string>>();
+      if (event.type === "recovery.error") console.log(event.error.message);
       if (event.type === "checkpoint.mismatch") console.log(event.changed.includes("model"), event.current.toolSchemaHash);
       if (event.type === "transport.activity") console.log(event.attempt, event.chunkBytes, event.totalBytes);
       if (event.type === "transport.response") console.log(event.status, event.requestId);

@@ -188,10 +188,12 @@ Read == [chain |-> chain, progress |-> progress, epoch |-> lease.epoch, cutoffs 
 CanClaim(w) == progress # "done" /\ (lease.holder = None \/ (~lease.live /\ (~QueueHeld \/ lapse = w)))
 
 \* w receives work for the session, reads the log, and finds no live worker
-\* holding it. It writes its claim and sends its first model request at
-\* once; nothing it does shows or counts until the claim lands. With
-\* QueueHeld, the work that finds a frozen holder is that holder's message,
-\* which the queue hands to w.
+\* holding it. The work is a queued message or a resume, or, where the queue
+\* ends with its process, a recovery its agent sends as it starts when the
+\* session's last writer died (AgentRouting.tla). It writes its claim and
+\* sends its first model request at once; nothing it does shows or counts
+\* until the claim lands. With QueueHeld, the work that finds a frozen
+\* holder is that holder's message, which the queue hands to w.
 Start(w) ==
     /\ pc[w] \in {"none", "stopped"}
     /\ ~frozen[w]

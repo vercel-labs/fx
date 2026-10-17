@@ -5,8 +5,9 @@
 //
 //   node sdk/tests/test-durable-core.mjs [memory|local|world|queue]
 import { strict as assert } from "node:assert";
+import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDurableAgentFactory, foldSessionLog, memory, wakeHandler } from "../durable.js";
 import { world } from "../durable/world.mjs";
@@ -315,6 +316,37 @@ test("a step cut off at the deadline continues in the next delivery", async () =
   await agent.close();
 });
 
+test("a resume while another worker runs the open turn follows that worker's run of it", async () => {
+  const durability = await durabilityFor();
+  const runner = createAgent({ durability });
+  const viewer = createAgent({ durability });
+  let started;
+  const holding = new Promise((resolve) => { started = resolve; });
+  let release;
+  holds.set("mu-1", { started: () => started(), released: new Promise((resolve) => { release = resolve; }) });
+  try {
+    const session = runner.session();
+    const turn = session.prompt("mu", { messageId: "turn-mu" });
+    await holding;
+    holds.delete("mu-1");
+    // The runner's turn_start and first step are on the stream before the
+    // resume starts.
+    const resumed = viewer.session(session.id).resume();
+    await resumed.accepted;
+    release();
+    const { text, result } = await textOf(resumed);
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(text, "mu-0 mu-1 mu-2", "the resume shows the turn from its first line");
+    assert.equal(resumed.messageId, "turn-mu");
+    assert.equal((await turn.result).stopReason, "end_turn");
+  } finally {
+    holds.delete("mu-1");
+    release?.();
+    await runner.close();
+    await viewer.close();
+  }
+});
+
 test("two agents prompting one session run its turns one at a time, in one history", async () => {
   const durability = await durabilityFor();
   const first = createAgent({ durability });
@@ -392,6 +424,274 @@ if (durabilityKind === "local") {
     assert.deepEqual(openersOf(theirs.id), ["coding"]);
     await support.close();
     await coding.close();
+  });
+}
+
+if (durabilityKind === "local") {
+  // The pid of a process that ran and exited, and a process that runs until
+  // the test stops it: the writers of the sessions these tests leave.
+  const exitedPid = async () => {
+    const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+    await new Promise((resolve) => child.once("exit", resolve));
+    return child.pid;
+  };
+  const runningProcess = async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    await new Promise((resolve) => child.once("spawn", resolve));
+    return { pid: child.pid, stop: () => child.kill() };
+  };
+  const writerOf = (pid, extra = {}) => ({ pid, host: hostname(), cwd: process.cwd(), ...extra });
+  const recovery = (agent) => agent[Symbol.for("libfx.durableInternals")].recovery();
+  const lastLease = (agent, sessionId) => agent[Symbol.for("libfx.durableInternals")].lastLease(sessionId);
+  // A session the process `writer` left in `dir` for agent `agent`, as if it
+  // died there: the prompt it stored, and with `started`, its lease and the
+  // turn's first step. An agent that recovers nothing writes it.
+  const leftSession = async (dir, { writer, agent = "default", started = true, input = "zeta", turnId = "turn-z", later = null }) => {
+    const scribe = createAgent({ durability: local({ dir, recover: false }), name: agent });
+    const sessionId = await scribe.newSessionId();
+    const log = await scribe[Symbol.for("libfx.durableInternals")].openLog(sessionId);
+    const record = (key, data, marks) => ({ k: "record", key, data: Buffer.from(JSON.stringify(data)).toString("base64"), marks });
+    await log.append({ k: "input", key: `prompt:${turnId}`, type: "prompt", messageId: turnId, agent, input, from: writer });
+    if (started) {
+      const lease = await log.append({ k: "lease", a: null, holder: "wkr_left", epoch: 1, expiresAt: null, ...writer });
+      const start = await log.append({ ...record(`${turnId}:start`, { turnId, start: true, input }, [{ start: turnId }]), a: lease });
+      await log.append({ ...record(`${turnId}:0`, { turnId, step: 0, word: `${input}-0` }, []), a: start });
+    }
+    // A prompt another process stored after the writer died.
+    if (later) await log.append({ k: "input", key: "prompt:later", type: "prompt", messageId: "later", agent, input: "later", from: later });
+    await scribe.close();
+    return sessionId;
+  };
+  const newDir = async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-core-recover-"));
+    dirs.push(dir);
+    return dir;
+  };
+  // A session's lines until one `done` accepts, or `ms` passes.
+  const linesUntil = async (session, done, ms = 10_000) => {
+    const reader = session.stream(0).getReader();
+    const lines = [];
+    let buffered = "";
+    const deadline = Date.now() + ms;
+    try {
+      while (!lines.some(done)) {
+        let timer;
+        const left = deadline - Date.now();
+        if (left <= 0) throw new Error(`no line came that ends the wait; saw ${lines.map((line) => line.type).join(" ")}`);
+        const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve({ done: true }), left); });
+        const { value, done: ended } = await Promise.race([reader.read(), timeout]);
+        clearTimeout(timer);
+        if (ended) continue;
+        buffered += decoder.decode(value, { stream: true });
+        for (let index = buffered.indexOf("\n"); index >= 0; index = buffered.indexOf("\n")) {
+          lines.push(JSON.parse(buffered.slice(0, index)));
+          buffered = buffered.slice(index + 1);
+        }
+      }
+    } finally {
+      await reader.cancel().catch(() => {});
+    }
+    return lines;
+  };
+
+  test("an agent that starts continues the turn a dead process left open in its session, with no prompt", async () => {
+    const dir = await newDir();
+    const sessionId = await leftSession(dir, { writer: writerOf(await exitedPid()) });
+    const events = [];
+    const before = ran.length;
+    const agent = createAgent({ durability: local({ dir }), onEvent: (event) => events.push(event) });
+    // Reading the session is the agent's first use, as a client that
+    // reconnects after a restart is.
+    const lines = await linesUntil(agent.session(sessionId), (line) => line.type === "turn_end");
+    assert.deepEqual(lines.map((line) => line.type), ["turn_resume", "text_delta", "text_delta", "turn_end"]);
+    assert.equal(lines.at(-1).stopReason, "end_turn");
+    assert.deepEqual(ran.slice(before), ["turn-z:1", "turn-z:2"], "the turn went on from the step after the last one stored");
+    assert.deepEqual(events.filter((event) => event.type === "session.recovered").map((event) => event.sessionId), [sessionId]);
+    assert.notEqual((await lastLease(agent, sessionId)), null);
+    await agent.close();
+  });
+
+  test("an agent that starts runs a prompt a dead process stored and never delivered", async () => {
+    const dir = await newDir();
+    const sessionId = await leftSession(dir, { writer: writerOf(await exitedPid()), started: false, input: "eta", turnId: "turn-e" });
+    const agent = createAgent({ durability: local({ dir }) });
+    const lines = await linesUntil(agent.session(sessionId), (line) => line.type === "turn_end");
+    assert.deepEqual(lines.map((line) => line.type), ["turn_start", "text_delta", "text_delta", "text_delta", "turn_end"]);
+    assert.equal(lines[0].messageId, "turn-e");
+    await agent.close();
+  });
+
+  test("an agent continues only its own sessions whose last writer died on this machine, started where it was", async () => {
+    const dir = await newDir();
+    const live = await runningProcess();
+    try {
+      const dead = writerOf(await exitedPid());
+      const left = {
+        theirs: await leftSession(dir, { writer: dead, agent: "support" }),
+        running: await leftSession(dir, { writer: writerOf(live.pid) }),
+        elsewhere: await leftSession(dir, { writer: { ...dead, cwd: "/elsewhere" } }),
+        remote: await leftSession(dir, { writer: { ...dead, host: "another-host" } }),
+        // A running process stored a prompt since: its own delivery runs the
+        // session.
+        prompted: await leftSession(dir, { writer: dead, later: writerOf(live.pid) }),
+      };
+      const events = [];
+      const agent = createAgent({ durability: local({ dir }), onEvent: (event) => events.push(event) });
+      await recovery(agent);
+      assert.deepEqual(events.filter((event) => event.type === "session.recovered"), [], "the default agent continued none of them");
+      for (const [name, sessionId] of Object.entries(left)) {
+        assert.equal((await lastLease(agent, sessionId))?.holder, "wkr_left", `${name}: no worker took the session`);
+      }
+      await agent.close();
+      // The session's own agent continues it once it starts.
+      const support = createAgent({ durability: local({ dir }), name: "support", onEvent: (event) => events.push(event) });
+      const lines = await linesUntil(support.session(left.theirs), (line) => line.type === "turn_end");
+      assert.equal(lines.at(-1).stopReason, "end_turn");
+      assert.deepEqual(events.filter((event) => event.type === "session.recovered").map((event) => event.sessionId), [left.theirs]);
+      await support.close();
+    } finally {
+      live.stop();
+    }
+  });
+
+  // local()'s settings on a World of the test's own, which `wrap` changes.
+  const wrappedLocal = async (dir, wrap) => {
+    const { createWorld } = await import(new URL("../durable/node_modules/@workflow/world-local/dist/index.js", import.meta.url).href);
+    const { world: _create, owned: _owned, name: _name, ...settings } = local({ dir });
+    return world(() => wrap(createWorld({ dataDir: dir, recoverActiveRuns: false })), { name: "wrapped", ...settings });
+  };
+
+  test("an agent pages through the sessions it looks at", async () => {
+    const dir = await newDir();
+    const writer = writerOf(await exitedPid());
+    const left = [];
+    for (const word of ["theta", "iota", "kappa"]) left.push(await leftSession(dir, { writer, started: false, input: word, turnId: `turn-${word}` }));
+    // One run a page.
+    const cursors = [];
+    const durability = await wrappedLocal(dir, (instance) => ({
+      ...instance,
+      runs: { ...instance.runs, list: (params) => { cursors.push(params.pagination?.cursor ?? null); return instance.runs.list({ ...params, pagination: { ...params.pagination, limit: 1 } }); } },
+    }));
+    const events = [];
+    const agent = createAgent({ durability, onEvent: (event) => events.push(event) });
+    await recovery(agent);
+    assert.deepEqual(events.filter((event) => event.type === "session.recovered").map((event) => event.sessionId).sort(), [...left].sort());
+    assert.ok(cursors.length >= 3 && cursors[0] === null && cursors.slice(1).every((cursor) => typeof cursor === "string"), `the look went page by page: ${cursors.length} pages`);
+    for (const sessionId of left) {
+      const lines = await linesUntil(agent.session(sessionId), (line) => line.type === "turn_end");
+      assert.equal(lines.find((line) => line.type === "turn_end").stopReason, "end_turn");
+    }
+    await agent.close();
+  });
+
+  test("an agent on a World that cannot list its runs says so, and runs its prompts as before", async () => {
+    const dir = await newDir();
+    const durability = await wrappedLocal(dir, (instance) => ({ ...instance, runs: undefined }));
+    const events = [];
+    const agent = createAgent({ durability, onEvent: (event) => events.push(event) });
+    await recovery(agent);
+    assert.deepEqual(events.filter((event) => event.type === "recovery.error").map((event) => event.error.message), ["the World has no runs.list() to find its sessions with"]);
+    assert.equal((await textOf(agent.session().prompt("lambda"))).text, "lambda-0 lambda-1 lambda-2");
+    await agent.close();
+  });
+
+  test("local({ recover: false }) leaves a dead process's turn for a resume", async () => {
+    const dir = await newDir();
+    const sessionId = await leftSession(dir, { writer: writerOf(await exitedPid()) });
+    assert.throws(() => local({ dir, recover: "no" }), /local\(\) recover must be a boolean/);
+    const agent = createAgent({ durability: local({ dir, recover: false }) });
+    await recovery(agent);
+    await sleep(300);
+    assert.equal((await lastLease(agent, sessionId))?.holder, "wkr_left", "nothing continued the turn");
+    const { text, result } = await textOf(agent.session(sessionId).resume());
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(text, "zeta-1 zeta-2");
+    await agent.close();
+  });
+
+  test("a resume while the agent's recovery runs the turn follows that run of it", async () => {
+    const dir = await newDir();
+    const sessionId = await leftSession(dir, { writer: writerOf(await exitedPid()) });
+    let started;
+    const holding = new Promise((resolve) => { started = resolve; });
+    let release;
+    holds.set("zeta-1", { started: () => started(), released: new Promise((resolve) => { release = resolve; }) });
+    const agent = createAgent({ durability: local({ dir }) });
+    try {
+      await recovery(agent);
+      await holding;
+      holds.delete("zeta-1");
+      // The recovery's turn_resume is on the stream before this resume
+      // starts, and its worker holds the session.
+      const resumed = agent.session(sessionId).resume();
+      await resumed.accepted;
+      release();
+      const { text, result } = await textOf(resumed);
+      assert.equal(result.stopReason, "end_turn");
+      assert.equal(text, "zeta-1 zeta-2");
+      assert.equal(resumed.messageId, "turn-z");
+    } finally {
+      holds.delete("zeta-1");
+      release?.();
+      await agent.close();
+    }
+  });
+
+  test("a recovery queues only which stored input to run, on the agent's own store", async () => {
+    const dir = await newDir();
+    const sessionId = await leftSession(dir, { writer: writerOf(await exitedPid()) });
+    // What the agent asks its World to queue.
+    const queued = [];
+    const durability = await wrappedLocal(dir, (instance) => ({
+      ...instance,
+      queue: (queueName, payload, options) => {
+        queued.push(payload.input);
+        return instance.queue(queueName, payload, options);
+      },
+    }));
+    const agent = createAgent({ durability });
+    await recovery(agent);
+    assert.deepEqual(queued, [{ type: "prompt", messageId: "turn-z", sessionId, agent: "default", store: durability.store }], "the recovery names the open turn's own input, as its lost message did, and carries nothing else");
+    const lines = await linesUntil(agent.session(sessionId), (line) => line.type === "turn_end");
+    assert.equal(lines.at(-1).stopReason, "end_turn");
+    await agent.close();
+  });
+
+  test("a delivery of a kind no sender queues, or of an input the session never stored, runs nothing in a dead process's session", async () => {
+    const dir = await newDir();
+    const sessionId = await leftSession(dir, { writer: writerOf(await exitedPid()) });
+    const refused = [];
+    const agent = createAgent({ durability: local({ dir, recover: false }), onEvent: (event) => { if (event.type === "session.refused") refused.push(event.messageId); } });
+    const internals = agent[Symbol.for("libfx.durableInternals")];
+    const before = ran.length;
+    await internals.deliver({ type: "recover", messageId: "rcv_forged", sessionId, agent: "default" });
+    await internals.deliver({ type: "prompt", messageId: "never-sent", sessionId, agent: "default", input: "forged" });
+    assert.equal(ran.length, before, "nothing ran");
+    assert.deepEqual(refused, ["never-sent"]);
+    assert.equal((await lastLease(agent, sessionId))?.holder, "wkr_left", "no worker took the session");
+    await agent.close();
+  });
+
+  test("an agent recovers only its own store's sessions, beside an agent of its name with another configuration on another folder", async () => {
+    const mine = await newDir();
+    const theirs = await newDir();
+    const writer = writerOf(await exitedPid());
+    const left = { mine: await leftSession(mine, { writer }), theirs: await leftSession(theirs, { writer }) };
+    const recovered = { a: [], b: [] };
+    const watch = (tag) => (event) => { if (event.type === "session.recovered") recovered[tag].push(event.sessionId); };
+    // One process, one name, two configurations: each on a folder, and so a
+    // store, of its own.
+    const a = createTaggedAgent({ durability: local({ dir: mine }), tag: "a", onEvent: watch("a") });
+    const b = createTaggedAgent({ durability: local({ dir: theirs }), tag: "b", onEvent: watch("b") });
+    for (const [agent, sessionId] of [[a, left.mine], [b, left.theirs]]) {
+      const lines = await linesUntil(agent.session(sessionId), (line) => line.type === "turn_end");
+      assert.equal(lines.at(-1).stopReason, "end_turn");
+    }
+    assert.deepEqual(openersOf(left.mine), ["a"], "only the agent on its store ran it");
+    assert.deepEqual(openersOf(left.theirs), ["b"], "only the agent on its store ran it");
+    assert.deepEqual(recovered, { a: [left.mine], b: [left.theirs] });
+    await a.close();
+    await b.close();
   });
 }
 
@@ -1131,6 +1431,8 @@ test("world() checks its options, and an agent names it among the durabilities",
   assert.throws(() => world({}, { alive: true }), /world\(\) alive must be a function/);
   assert.throws(() => world({}, { name: "pg", runInRequest: true }), /pg\(\) runInRequest needs queueLeases/);
   assert.throws(() => world({}, { waitUntil: true }), /world\(\) waitUntil must be a function/);
+  assert.throws(() => world({}, { recover: true }), /world\(\) recover must be a function/);
+  assert.throws(() => world({}, { name: "pg", recover: () => true }), /pg\(\) recover needs livenessKnown/);
   assert.deepEqual([world({}).runInRequest, world({}, { queueLeases: true }).runInRequest, world({}, { queueLeases: true, runInRequest: false }).runInRequest], [false, true, false]);
   // vercel() runs prompts in the request unless its leases are renewed.
   const { vercel } = await import("../durable/vercel.mjs");

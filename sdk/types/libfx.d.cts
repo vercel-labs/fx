@@ -314,7 +314,7 @@ export type FxEngineEvent = FxEventBase & (
   | { type: "output.discarded"; reason: "cancelled"; bytes: number }
 );
 
-/** A durable session's diagnostic: a failed write or engine, a takeover, or a function deadline. */
+/** A durable session's diagnostic: a failed write or engine, a takeover, a function deadline, or a recovery. */
 export type FxSessionEvent = FxEventBase & (
   | { type: "session.error"; sessionId: string; error: FxErrorSummary }
   | { type: "session.fenced"; sessionId: string; epoch: number }
@@ -322,6 +322,10 @@ export type FxSessionEvent = FxEventBase & (
   | { type: "session.forwarded"; sessionId: string; agent: string }
   /** A queue delivery named an input the session's log does not hold, or none at all, so it ran nothing. */
   | { type: "session.refused"; sessionId?: string; messageId?: string; reason: "unknown message" | "malformed message" }
+  /** The agent, as it started, found work a process that died left in the session, and queued it to continue. */
+  | { type: "session.recovered"; sessionId: string }
+  /** The agent, as it started, could not list its sessions to look for work dead processes left. */
+  | { type: "recovery.error"; error: FxErrorSummary }
   /** `cutoffs`: the times in a row the deadline cut off the same step, this one included. */
   | { type: "session.deadline"; sessionId: string; epoch: number; cutoffs: number }
   | { type: "ui.error"; sessionId: string; error: string }
@@ -865,7 +869,10 @@ export interface FxSession {
   readonly id: string | null;
   /** Queues `input` as the session's next turn and returns a view of that turn. */
   prompt(input: FxSessionPromptInput, options?: FxPromptOptions): FxTurn;
-  /** Continues a turn a stopped process left open; its result has the stop reason `idle` when there was none. */
+  /**
+   * Continues a turn a stopped process left open, or follows the worker already continuing it, such as an agent that
+   * recovered it as it started; its result has the stop reason `idle` when there was none.
+   */
   resume(): FxResumeTurn;
   /** Every event the session has produced from `cursor` on, as NDJSON, staying open for the events after them. */
   stream(cursor?: number): ReadableStream<Uint8Array>;

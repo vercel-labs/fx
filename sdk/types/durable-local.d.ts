@@ -12,6 +12,12 @@ export interface LocalOptions {
   maxDurationMs?: number;
   /** How long before the deadline each delivery stops. Default 30000. */
   reserveMs?: number;
+  /**
+   * When an agent starts, it continues the turns, and the prompts not yet delivered, that a process on this machine
+   * started in the same directory left in the agent's sessions when it died. False leaves them for the session's next
+   * prompt or `session.resume()`. Default true.
+   */
+  recover?: boolean;
 }
 
 /** Keeps sessions in files on this machine. A session held by a process that died is free at once. */
