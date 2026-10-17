@@ -4536,24 +4536,24 @@ test "context overflow recovery is typed safe and bounded" {
     ));
 }
 
-/// Size retries allowed in one turn. Each lowers the learned limit, so the
-/// next request leaves out more of its oldest images.
-const max_request_size_retries: u8 = 2;
-
-/// A size rejection is retried without compaction only when the rejected
-/// request carried images the next one can leave out. Anything else falls
-/// through to context overflow recovery.
+/// A size rejection is retried without compaction while the rejected request
+/// carried images, and fewer than the request refused before it, if any.
+/// Each retry lowers the learned limit below the size just refused, which
+/// only leaving out more images can meet, so the count falls with every
+/// retry and the retries end. Anything else falls through to context
+/// overflow recovery.
 fn shouldRetryWithFewerImages(
     failure: agent_stream_provider.Failure,
     images_sent: usize,
-    retries_used: u8,
+    images_last_refused: ?usize,
     replay_safe: bool,
     cancelled: bool,
 ) bool {
+    const fewer = if (images_last_refused) |last| images_sent < last else true;
     return !cancelled and
         replay_safe and
         images_sent > 0 and
-        retries_used < max_request_size_retries and
+        fewer and
         failure.kind == .request_too_large;
 }
 
@@ -4601,15 +4601,20 @@ test "size rejections retry with fewer images only while images remain" {
     const cases = [_]struct {
         failure: agent_stream_provider.Failure,
         images_sent: usize = 3,
-        retries_used: u8 = 0,
+        images_last_refused: ?usize = null,
         replay_safe: bool = true,
         cancelled: bool = false,
         expected: bool,
     }{
         .{ .failure = too_large, .expected = true },
-        .{ .failure = too_large, .retries_used = max_request_size_retries - 1, .expected = true },
-        .{ .failure = too_large, .retries_used = max_request_size_retries, .expected = false },
+        // Any number of retries, while each leaves out more images.
+        .{ .failure = too_large, .images_sent = 3, .images_last_refused = 5, .expected = true },
+        .{ .failure = too_large, .images_sent = 1, .images_last_refused = 2, .expected = true },
+        // One that left out none stops, so the retries always end.
+        .{ .failure = too_large, .images_sent = 3, .images_last_refused = 3, .expected = false },
+        .{ .failure = too_large, .images_sent = 4, .images_last_refused = 3, .expected = false },
         .{ .failure = too_large, .images_sent = 0, .expected = false },
+        .{ .failure = too_large, .images_sent = 0, .images_last_refused = 1, .expected = false },
         .{ .failure = too_large, .replay_safe = false, .expected = false },
         .{ .failure = too_large, .cancelled = true, .expected = false },
         .{ .failure = overflow_text, .expected = false },
@@ -4617,7 +4622,7 @@ test "size rejections retry with fewer images only while images remain" {
     for (cases) |case| try std.testing.expectEqual(case.expected, shouldRetryWithFewerImages(
         case.failure,
         case.images_sent,
-        case.retries_used,
+        case.images_last_refused,
         case.replay_safe,
         case.cancelled,
     ));
@@ -7143,7 +7148,9 @@ fn processQueuedPromptLoop(
         var assistant_prefill_recovery_used = false;
         var skip_next_preflight_refresh = false;
         var context_overflow_recovery: ContextOverflowRecoveryState = .ready;
-        var request_size_retries: u8 = 0;
+        var request_size_retries: usize = 0;
+        // The images the last request refused for its size carried.
+        var request_images_last_refused: ?usize = null;
         var recovery_has_unexecuted_tool_start = false;
         var successful_recovery_strategy: ?model_response_recovery.Strategy = null;
         defer {
@@ -7597,7 +7604,14 @@ fn processQueuedPromptLoop(
                             .tool_steps = finalization.compacted_execution.tool_steps + active_cut.tool_steps,
                             .steering = finalization.compacted_execution.steering + active_cut.steering,
                         };
-                        if (overflow_pending) context_overflow_recovery = .used;
+                        if (overflow_pending) {
+                            context_overflow_recovery = .used;
+                            // The shorter history can fit more images than the
+                            // request last refused for its size carried, so size
+                            // retries count again from the next refusal. This
+                            // happens once per step, so the retries still end.
+                            request_images_last_refused = null;
+                        }
                         compactor.traceEvent(
                             step_ctx,
                             .installed,
@@ -8243,12 +8257,13 @@ fn processQueuedPromptLoop(
                 if (request_cost_for_attempt) |rejected| if (shouldRetryWithFewerImages(
                     failure,
                     request_images_for_attempt,
-                    request_size_retries,
+                    request_images_last_refused,
                     streamReplaySafe(&stream_ctx),
                     config.cancel_flag.load(.seq_cst),
                 )) {
                     const limit = loweredRequestByteLimit(rejected.serialized_bytes);
                     agent.lowerRequestByteLimit(gateway_model, limit);
+                    request_images_last_refused = request_images_for_attempt;
                     request_size_retries += 1;
                     debug_trace.eventf("images", "request_size_retry", step_ctx, "model={s} rejected_bytes={d} images_sent={d} limit_bytes={d} retry={d}", .{
                         gateway_model,

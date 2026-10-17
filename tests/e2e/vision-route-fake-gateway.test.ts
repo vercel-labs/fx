@@ -3397,7 +3397,13 @@ describe("request size budget", () => {
 
   type SizeRequest = { body: string; images: string[]; tools: boolean; status: number };
 
-  function startSizeCappedGateway(rejection: { status: number; body: string }, images: Map<string, string>) {
+  // Refuses every request over `cap`. By default each answer asks for the next
+  // image with read_file; `describe` answers at once instead.
+  function startSizeCappedGateway(
+    rejection: { status: number; body: string },
+    images: Map<string, string>,
+    { cap = SIZE_CAP_BYTES, answer = "read" }: { cap?: number; answer?: "read" | "describe" } = {},
+  ) {
     const byData = new Map([...images].map(([name, data]) => [data, name]));
     const requests: SizeRequest[] = [];
     let issued = 0;
@@ -3415,12 +3421,13 @@ describe("request size budget", () => {
         const parsed = JSON.parse(body) as { tools?: unknown[] };
         const tools = Array.isArray(parsed.tools) && parsed.tools.length > 0;
         const carried = nativeFileParts(body).map((part) => byData.get(part.data.data) ?? "unknown");
-        const status = body.length > SIZE_CAP_BYTES ? rejection.status : 200;
+        const status = body.length > cap ? rejection.status : 200;
         requests.push({ body, images: carried, tools, status });
         if (status !== 200) {
           return new Response(rejection.body, { status, headers: { "content-type": "application/json" } });
         }
         if (!tools) return sseText("Summary: the user asked fx to read six images.");
+        if (answer === "describe") return sseText("done: described the images");
         if (issued < SIZE_IMAGE_COUNT) {
           issued += 1;
           return sseToolCall("read_file", { path: `img0${issued}.png` }, `call_img_${issued}`);
@@ -3498,4 +3505,37 @@ describe("request size budget", () => {
       }
     }, TIMEOUT * 3);
   }
+
+  test("a size limit two retries can't reach still leaves out images instead of compacting", async () => {
+    const root = createIsolatedRoot();
+    const images = writeSizeImages(root.workspace);
+    // Six images of about 1 MB in one prompt against a 1.5 MB limit: each
+    // refusal lowers fx's limit by a quarter, so the request fits only after
+    // a third refusal leaves out all but the newest image.
+    const cap = 1_500_000;
+    const gateway = startSizeCappedGateway({ status: 413, body: payloadTooLargeBody }, images, { cap, answer: "describe" });
+    try {
+      const imageArgs = [...images.keys()].flatMap((name) => ["--image", join(root.workspace, name)]);
+      const result = await runFx(["ask", "--json", "--auto", "--no-color", ...imageArgs, "Describe these images."], {
+        cwd: root.workspace,
+        env: gateway.env(root),
+        timeoutMs: TIMEOUT * 2,
+      });
+      const json = parseFxJson(result);
+      expect(json.output).toContain("done: described the images");
+
+      const rejected = gateway.requests.filter((request) => request.status !== 200);
+      expect(rejected.length).toBeGreaterThan(2);
+      // No summary request: the conversation was not compacted.
+      expect(gateway.requests.every((request) => request.tools)).toBe(true);
+      const accepted = gateway.requests.at(-1)!;
+      expect(accepted.status).toBe(200);
+      expect(accepted.body.length).toBeLessThanOrEqual(cap);
+      expect(accepted.images).toEqual(["img06.png"]);
+      expect(accepted.body).toContain(SIZE_NOTICE);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 3);
 });
