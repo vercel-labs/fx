@@ -6,6 +6,7 @@ const stream_provider = @import("../core/agent/stream_provider.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const versions = @import("../core/gateway/provider_versions.zig");
 const responses_protocol = @import("responses_protocol.zig");
+const gateway_client = @import("client.zig");
 const host_stream = @import("host_stream_provider.zig");
 const host_model_catalog = @import("host_model_catalog.zig");
 const openai_codex = @import("openai_codex.zig");
@@ -109,11 +110,14 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
 
     const opened = try host_stream.openPost(alloc, transport, request, endpoint, headers_buf[0..count], payload);
     defer transport.close(opened.handle);
-    if (opened.status != .ok) return .{ .failed = .{
-        .kind = openai_codex.failureKind(opened.status),
-        .detail = try host_stream.readErrorBody(alloc, transport, opened.handle, request),
-        .ownership = .owned,
-    } };
+    if (opened.status != .ok) {
+        const body = try host_stream.readErrorBody(alloc, transport, opened.handle, request);
+        return .{ .failed = .{
+            .kind = gateway_client.httpFailureKind(alloc, openai_codex.failureKind(opened.status), body),
+            .detail = body,
+            .ownership = .owned,
+        } };
+    }
 
     var reader: host_stream.HostStreamReader = undefined;
     reader.init(transport, opened.handle, request.cancel_flag, request.deadline, request.cooperative_pulse);

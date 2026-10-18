@@ -273,18 +273,14 @@ const AcpContext = struct {
     ) !void {
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
-        try acp_types.writeModelRecoveryInfoUpdate(
-            &out.writer,
-            status,
-            self.state.active_session.?.writable != null,
-        );
+        try acp_types.writeModelRecoveryInfoUpdate(&out.writer, status);
         try self.sendUpdate(out.writer.buffered());
     }
 
     fn clearModelRecoveryStatus(self: *AcpContext) !void {
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
-        try acp_types.writeModelRecoveryInfoUpdate(&out.writer, null, false);
+        try acp_types.writeModelRecoveryInfoUpdate(&out.writer, null);
         try self.sendUpdate(out.writer.buffered());
     }
 

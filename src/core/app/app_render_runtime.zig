@@ -1656,6 +1656,7 @@ pub fn Runtime(comptime App: type) type {
                     .tool_slot => |slot| if (slot.thinking_label != null) .thinking else .tool_marker,
                     .turn_thinking => |thinking| switch (thinking.tone) {
                         .thinking => .thinking,
+                        .live => .live,
                         .neutral => .neutral,
                         .warning => .warning,
                         .success => .success,

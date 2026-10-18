@@ -336,7 +336,7 @@ pub fn streamPrepared(
             break :body try alloc.dupe(u8, "xAI Grok error response exceeded the local limit");
         } else bounded_body;
         return .{ .failed = .{
-            .kind = failureKind(response.head.status),
+            .kind = gateway_client.httpFailureKind(alloc, failureKind(response.head.status), body),
             .detail = body,
             .ownership = .owned,
         } };

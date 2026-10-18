@@ -771,56 +771,6 @@ test "appendTurnSummaryEntry stores classified dim transcript row" {
     try std.testing.expectEqualStrings("\x1b[38;5;245m  2m 10s (↑10k ↓5k)\x1b[0m\n", rendered);
 }
 
-test "recovered route status is transient and final summary stays normal" {
-    const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{
-        .layout = .{
-            .rows = 24,
-            .cols = 80,
-            .content_bottom = 20,
-            .divider_top_row = 21,
-            .input_row = 22,
-            .divider_bottom_row = 23,
-            .hint_row = 24,
-        },
-        .owned_top_row = 1,
-    };
-    defer runtime.deinit(alloc);
-
-    runtime.worker_status.set_route_recovery(.{
-        .kind = .auto_recovered,
-        .succeeded_attempt = 3,
-        .attempt_limit = 3,
-    }, 1_000);
-
-    switch (runtime.activityProjection()) {
-        .turn_thinking => |thinking| {
-            try std.testing.expectEqual(activity_runtime.ActivityProjection.Tone.success, thinking.tone);
-            try std.testing.expectEqualStrings("✓ recovered · attempt 3", thinking.label);
-        },
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
-    try std.testing.expect(!runtime.worker_status.expire_transient(2_499));
-    try std.testing.expect(runtime.worker_status.expire_transient(2_500));
-    try std.testing.expect(runtime.activityProjection() == .none);
-
-    runtime.worker_status.set_route_recovery(.{
-        .kind = .auto_recovered,
-        .succeeded_attempt = 3,
-        .attempt_limit = 3,
-    }, 3_000);
-    _ = try runtime.appendTurnSummaryEntry(alloc, .{
-        .thinking_duration_ms = 15_000,
-        .turn_duration_ms = 130_000,
-        .token_progress = .{ .input_tokens = 10_000, .output_tokens = 5_000 },
-    });
-
-    try std.testing.expect(runtime.activityProjection() == .none);
-    try std.testing.expect(std.mem.find(u8, runtime.entries.items[0].raw_bytes.bytes, ui_render.dim_style) != null);
-    try std.testing.expect(std.mem.find(u8, runtime.entries.items[0].raw_bytes.bytes, "  2m 10s (↑10k ↓5k)") != null);
-    try std.testing.expect(std.mem.find(u8, runtime.entries.items[0].raw_bytes.bytes, "✓ recovered") == null);
-}
-
 test "appendTurnSummaryEntry leaves terminal route status visible" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
@@ -837,7 +787,7 @@ test "appendTurnSummaryEntry leaves terminal route status visible" {
     };
     defer runtime.deinit(alloc);
 
-    runtime.worker_status.set_route_recovery(.{ .kind = .content_filter }, 0);
+    runtime.worker_status.set_route_recovery(.{ .kind = .content_filter });
     _ = try runtime.appendTurnSummaryEntry(alloc, .{
         .thinking_duration_ms = 15_000,
         .turn_duration_ms = 130_000,
@@ -6683,7 +6633,6 @@ pub const TranscriptRuntime = struct {
             if (summary.completed_at_ms > 0) summary.completed_at_ms else io_mod.milliTimestamp(),
         );
         self.markTranscriptContentDirtyFrom(entry_id);
-        if (self.worker_status.clear_recovered_route()) self.render_requests.request(.footer);
         return entry_id;
     }
 

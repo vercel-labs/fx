@@ -90,10 +90,12 @@ pub const AssistantTextDrainResult = enum {
     blocked,
 };
 
-/// Writes one full-detail record for an admitted route recovery transition.
-/// The footer status is transient; this preserves retry and failure history
-/// in the ctrl+o full transcript's detail section.
+/// Writes one full-detail record for a terminal route recovery outcome, which
+/// preserves the failure in the ctrl+o full transcript's detail section. The
+/// recovery module's statuses live only in the status row and refresh every
+/// second, so they are never recorded.
 fn recordRouteRecoveryNotice(app: anytype, status: types.RouteRecoveryStatus) !void {
+    if (status.fromModule() or status.kind == .recovered or status.kind == .failed) return;
     var body: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
     defer body.deinit();
     try writeRouteRecoveryBody(&body.writer, status);
@@ -107,6 +109,7 @@ fn recordRouteRecoveryNotice(app: anytype, status: types.RouteRecoveryStatus) !v
 
 fn routeRecoveryNoticeTone(status: types.RouteRecoveryStatus) types.NoticeTone {
     return switch (status.tone()) {
+        .live => .neutral,
         .warning => .warning,
         .success => .success,
         .danger => .@"error",
@@ -123,12 +126,7 @@ fn writeRouteRecoveryBody(
     try writer.writeAll(status.label(&label_buf));
     try writer.print("\nkind: {s}", .{@tagName(status.kind)});
     if (status.cause) |cause| try writer.print(" · cause: {s}", .{@tagName(cause)});
-    if (status.attempt_limit > 0) {
-        try writer.print(" · attempt: {d}/{d}", .{ status.reportedAttempt(), status.attempt_limit });
-    }
-    if (status.delay_seconds > 0) {
-        try writer.print(" · retry delay: {d}s", .{status.delay_seconds});
-    }
+    if (status.attempt > 0) try writer.print(" · attempt: {d}", .{status.attempt});
     if (status.diagnostic) |diagnostic| {
         try writer.print(" · diagnostic: {s}", .{diagnostic.view()});
     }
@@ -373,10 +371,7 @@ pub fn Runtime(comptime App: type) type {
                 .diff_block,
                 .restore_failed_prompt,
                 => .drop,
-                .route_recovery_status => |status| if (status.action == .paused)
-                    .admit
-                else
-                    .drop,
+                .route_recovery_status => .drop,
                 .command_output_complete => |lifecycle_id| if (cancelledCommandCompletionMatches(presenter, lifecycle_id))
                     .admit
                 else
@@ -847,14 +842,10 @@ pub fn Runtime(comptime App: type) type {
             syncState(app, event_handlers.tool_lifecycle);
 
             const now_ms = io_mod.milliTimestamp();
-            if (app.shell.worker_status_state().expire_transient(now_ms)) {
-                app.shell.render_requests.request(.footer);
-            }
             _ = advanceVisibleAnimation(
                 app,
                 event_handlers.tool_lifecycle,
                 now_ms,
-                std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake),
             );
         }
 
@@ -862,7 +853,6 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             presenter: activity_runtime.LifecyclePresenter,
             now_ms: i64,
-            now_awake: std.Io.Clock.Timestamp,
         ) bool {
             const compaction: @import("../output/compaction_activity.zig").Snapshot = if (comptime @hasDecl(@TypeOf(app.worker), "compactionActivitySnapshot")) app.worker.compactionActivitySnapshot() else .{};
             app.shell.render_requests.observeCompactionRevision(compaction.revision);
@@ -872,22 +862,20 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
             const compaction_active = if (compaction.operation) |op| op.active() and op.visible(now_ms) else false;
-            const status_changed = app.shell.worker_status_state().refresh_route_recovery(now_awake);
-            if (status_changed) app.shell.render_requests.request(.footer);
             if (!compaction_active and !app.stream.active and !app.pacer.hasCompletedAssistantPresentationTail()) {
-                return status_changed;
+                return false;
             }
             if (app.approval_prompt.isActive() or
                 app.question_prompt.isActive() or
                 !app.shell.shimmer_active)
             {
-                return status_changed;
+                return false;
             }
 
             var label_buf: [256]u8 = undefined;
-            _ = activityShimmerLabel(app, presenter, compaction, now_ms, &label_buf) orelse return status_changed;
+            _ = activityShimmerLabel(app, presenter, compaction, now_ms, &label_buf) orelse return false;
             const previous_deadline = app.shell.render_requests.animation_next_deadline_ms;
-            if (!app.shell.render_requests.requestAnimationDue(now_ms)) return status_changed;
+            if (!app.shell.render_requests.requestAnimationDue(now_ms)) return false;
             debug_trace.logf(
                 "frame_schedule",
                 "animation_due previous_ms={d} now_ms={d} interval_ms={d}",
@@ -1148,7 +1136,14 @@ pub fn Runtime(comptime App: type) type {
                             drain_owns_current = false;
                             break :events;
                         }
-                        app.shell.worker_status_state().set_route_recovery(status, io_mod.milliTimestamp());
+                        // The TUI shows nothing for how a request ended,
+                        // recovered or failed; the error itself arrives on
+                        // its own. The status line returns to normal activity.
+                        if (status.kind == .recovered or status.kind == .failed) {
+                            _ = app.shell.worker_status_state().clear_route_recovery();
+                        } else {
+                            app.shell.worker_status_state().set_route_recovery(status);
+                        }
                         app.shell.render_requests.request(.footer);
                         try recordRouteRecoveryNotice(app, status);
                     },
@@ -2351,10 +2346,13 @@ fn tickNoop(app: *FakeApp) !void {
     try Runtime(FakeApp).tick(app, NoopBridge.handlers(app));
 }
 
-fn test_awake_timestamp(milliseconds: i64) std.Io.Clock.Timestamp {
+const testRecoveryText = types.testRecoveryText;
+
+fn testWaitingStatus(attempt: usize) types.RouteRecoveryStatus {
     return .{
-        .clock = .awake,
-        .raw = .fromNanoseconds(@as(i96, milliseconds) * std.time.ns_per_ms),
+        .kind = .waiting,
+        .text = testRecoveryText("Connection lost · next try in 4s · attempt 1 · 3s"),
+        .attempt = attempt,
     };
 }
 
@@ -2634,20 +2632,20 @@ test "manual compaction schedules initial repaint animation and terminal expiry 
     const id = app.worker.compaction.begin(.manual, null, 1_000);
     app.worker.compaction.running(id, .summary);
     const presenter = NoopBridge.lifecyclePresenter(&app);
-    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, presenter, 1_000, test_awake_timestamp(1_000)));
+    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, presenter, 1_000));
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
     try std.testing.expectEqual(@as(usize, 1), app.worker.compaction_reads);
     try std.testing.expect(!app.stream.active);
     app.shell.shimmer_active = true;
     app.shell.render_requests.animation_visible = true;
     app.shell.render_requests.animation_next_deadline_ms = 1_050;
-    try std.testing.expect(Runtime(FakeApp).advanceVisibleAnimation(&app, presenter, 1_050, test_awake_timestamp(1_050)));
+    try std.testing.expect(Runtime(FakeApp).advanceVisibleAnimation(&app, presenter, 1_050));
     try std.testing.expect(app.shell.render_requests.hasReason(.animation));
     app.shell.render_requests.clearReason(.animation);
     app.worker.compaction.settle(id, .{ .outcome = .no_op }, 1_100);
-    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, presenter, 2_599, test_awake_timestamp(2_599)));
+    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, presenter, 2_599));
     try std.testing.expect(!app.worker.compaction.snapshot.operation.?.dismissed);
-    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, presenter, 2_600, test_awake_timestamp(2_600)));
+    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, presenter, 2_600));
     try std.testing.expect(app.worker.compaction.snapshot.operation.?.dismissed);
     try std.testing.expect(!app.stream.active);
 }
@@ -2665,15 +2663,15 @@ test "core.app_worker_runtime advances visible animation exactly at its deadline
     app.shell.render_requests.animation_next_deadline_ms = 1_050;
     const before = app.shell.render_requests.visibleAnimationPhase();
 
-    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, NoopBridge.lifecyclePresenter(&app), 1_049, test_awake_timestamp(1_049)));
+    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, NoopBridge.lifecyclePresenter(&app), 1_049));
     try std.testing.expectEqual(before, app.shell.render_requests.visibleAnimationPhase());
     try std.testing.expect(!app.shell.render_requests.hasReason(.animation));
 
-    try std.testing.expect(Runtime(FakeApp).advanceVisibleAnimation(&app, NoopBridge.lifecyclePresenter(&app), 1_050, test_awake_timestamp(1_050)));
+    try std.testing.expect(Runtime(FakeApp).advanceVisibleAnimation(&app, NoopBridge.lifecyclePresenter(&app), 1_050));
     try std.testing.expectEqual(before, app.shell.render_requests.visibleAnimationPhase());
     try std.testing.expect(app.shell.render_requests.hasReason(.animation));
 
-    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, NoopBridge.lifecyclePresenter(&app), 1_050, test_awake_timestamp(1_050)));
+    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, NoopBridge.lifecyclePresenter(&app), 1_050));
     try std.testing.expectEqual(before, app.shell.render_requests.visibleAnimationPhase());
 }
 
@@ -2694,39 +2692,8 @@ test "core.app_worker_runtime keeps visible animation alive after native history
         &app,
         NoopBridge.lifecyclePresenter(&app),
         1,
-        test_awake_timestamp(1),
     ));
     try std.testing.expect(app.shell.render_requests.hasReason(.animation));
-}
-
-test "core.app_worker_runtime refreshes root retry countdown" {
-    var app = FakeApp.init(std.testing.allocator);
-    defer app.deinit();
-
-    app.stream.active = true;
-    app.shell.shimmer_active = true;
-    app.shell.worker_status_state().set_route_recovery(.{
-        .kind = .auto_retry,
-        .failed_attempt = 1,
-        .attempt_limit = 3,
-        .delay_seconds = 4,
-        .retry_deadline = test_awake_timestamp(4_000),
-    }, 0);
-
-    try std.testing.expect(Runtime(FakeApp).advanceVisibleAnimation(
-        &app,
-        NoopBridge.lifecyclePresenter(&app),
-        0,
-        test_awake_timestamp(3_000),
-    ));
-    switch (app.shell.activityProjection()) {
-        .turn_thinking => |projection| try std.testing.expectEqualStrings(
-            "⚠ Provider unavailable · retrying request in 1s",
-            projection.label,
-        ),
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
-    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
 test "core.app_worker_runtime ticks animation for completed assistant presentation tail only" {
@@ -2801,17 +2768,13 @@ test "core.app_worker_runtime projects route recovery status activity and clears
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
-        .kind = .auto_retry,
-        .failed_attempt = 1,
-        .attempt_limit = 3,
-    } });
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = testWaitingStatus(1) });
     try tickNoop(&app);
 
     switch (app.shell.activityProjection()) {
         .turn_thinking => |thinking| {
             try std.testing.expectEqual(activity_runtime.ActivityProjection.Tone.warning, thinking.tone);
-            try std.testing.expectEqualStrings("⚠ Provider unavailable · retrying request", thinking.label);
+            try std.testing.expectEqualStrings("⚠ Connection lost · next try in 4s · attempt 1 · 3s", thinking.label);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
@@ -2829,11 +2792,7 @@ test "core.app_worker_runtime clears route recovery activity on clear event but 
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
-        .kind = .auto_retry,
-        .failed_attempt = 2,
-        .attempt_limit = 3,
-    } });
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = testWaitingStatus(2) });
     try tickNoop(&app);
     switch (app.shell.activityProjection()) {
         .turn_thinking => {},
@@ -2846,8 +2805,7 @@ test "core.app_worker_runtime clears route recovery activity on clear event but 
 
     try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
         .kind = .terminal_provider_error,
-        .failed_attempt = 3,
-        .attempt_limit = 3,
+        .attempt = 3,
     } });
     try app.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
         .topic = "system",
@@ -2861,21 +2819,14 @@ test "core.app_worker_runtime clears route recovery activity on clear event but 
     }
 }
 
-test "core.app_worker_runtime replaces a due retry with its consumed terminal attempt" {
+test "core.app_worker_runtime replaces a waiting status with its terminal attempt" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
-        .kind = .auto_retry,
-        .failed_attempt = 1,
-        .attempt_limit = 2,
-        .delay_seconds = 4,
-        .retry_deadline = test_awake_timestamp(4_000),
-    } });
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = testWaitingStatus(1) });
     try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
         .kind = .terminal_provider_error,
-        .failed_attempt = 1,
-        .attempt_limit = 2,
+        .attempt = 1,
         .diagnostic = types.ModelFailureDiagnostic.init("TestProviderSerializationFailed"),
     } });
     try app.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
@@ -2894,48 +2845,16 @@ test "core.app_worker_runtime replaces a due retry with its consumed terminal at
     }
 }
 
-test "core.app_worker_runtime recovery pause replaces cancelled waiting status" {
-    var app = FakeApp.init(std.testing.allocator);
-    defer app.deinit();
-    app.stream.active = true;
-
-    app.shell.worker_status_state().set_route_recovery(.{
-        .kind = .auto_retry,
-        .failed_attempt = 2,
-        .attempt_limit = 10,
-        .cause = .system_resumed,
-        .action = .waiting_for_connectivity,
-    }, 0);
-    app.worker.worker_cancel_requested.store(true, .seq_cst);
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
-        .kind = .terminal_provider_error,
-        .failed_attempt = 2,
-        .attempt_limit = 10,
-        .cause = .system_resumed,
-        .action = .paused,
-        .required_action = .continue_later,
-    } });
-    try queueTurnFinished(&app, 1, .paused);
-    try tickNoop(&app);
-
-    switch (app.shell.activityProjection()) {
-        .turn_thinking => |thinking| try std.testing.expectEqualStrings(
-            "⚠ Mac woke from sleep · connection still unavailable · recovery paused · attempt 2 · send a new message when you're ready",
-            thinking.label,
-        ),
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
-}
-
-test "core.app_worker_runtime summary append clears recovered route status without recovered summary" {
+test "core.app_worker_runtime a recovery leaves no status and no recovered summary" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
     app.stream.active = true;
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = testWaitingStatus(2) });
     try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
-        .kind = .auto_recovered,
-        .succeeded_attempt = 3,
-        .attempt_limit = 3,
+        .kind = .recovered,
+        .text = testRecoveryText("Connection lost · retrying · attempt 2 · 5s"),
+        .attempt = 2,
     } });
     try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .compacted_summary = .{
         .summary = try std.heap.c_allocator.dupe(u8, "summary"),
@@ -2969,49 +2888,44 @@ test "core.app_worker_runtime summary append clears recovered route status witho
     try std.testing.expect(std.mem.find(u8, app.shell.lifecycle.entries.items[0].raw_bytes.bytes, "✓ recovered") == null);
 }
 
-test "core.app_worker_runtime records admitted route recovery as a full-detail record" {
+test "core.app_worker_runtime records a terminal route recovery as a full-detail record" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
     try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
-        .kind = .auto_retry,
-        .failed_attempt = 1,
-        .attempt_limit = 3,
+        .kind = .terminal_provider_error,
+        .attempt = 2,
         .cause = .rate_limited,
-        .delay_seconds = 4,
     } });
     try tickNoop(&app);
 
     try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.full_detail_records.items.len);
     const record = app.shell.lifecycle.full_detail_records.items[0].notice;
     try std.testing.expectEqualStrings("recovery", record.topic);
-    try std.testing.expectEqual(types.NoticeTone.warning, record.tone);
+    try std.testing.expectEqual(types.NoticeTone.@"error", record.tone);
     try std.testing.expectEqual(types.NoticeVisibility.full_only, record.visibility);
-    try std.testing.expect(std.mem.find(u8, record.body, "retrying request") != null);
-    try std.testing.expect(std.mem.find(u8, record.body, "kind: auto_retry") != null);
+    try std.testing.expect(std.mem.find(u8, record.body, "stopped after 2 attempts") != null);
+    try std.testing.expect(std.mem.find(u8, record.body, "kind: terminal_provider_error") != null);
     try std.testing.expect(std.mem.find(u8, record.body, "cause: rate_limited") != null);
-    try std.testing.expect(std.mem.find(u8, record.body, "attempt: 1/3") != null);
-    try std.testing.expect(std.mem.find(u8, record.body, "retry delay: 4s") != null);
+    try std.testing.expect(std.mem.find(u8, record.body, "attempt: 2") != null);
     // The record stays out of the transcript entry store.
     try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.entries.items.len);
 }
 
-test "core.app_worker_runtime records recovered route status with success tone" {
+test "core.app_worker_runtime keeps recovery module statuses out of the transcript" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = testWaitingStatus(1) });
     try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
-        .kind = .auto_recovered,
-        .succeeded_attempt = 2,
-        .attempt_limit = 3,
+        .kind = .recovered,
+        .text = testRecoveryText("Connection lost · retrying · attempt 2 · 5s"),
+        .attempt = 2,
     } });
     try tickNoop(&app);
 
-    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.full_detail_records.items.len);
-    const record = app.shell.lifecycle.full_detail_records.items[0].notice;
-    try std.testing.expectEqual(types.NoticeTone.success, record.tone);
-    try std.testing.expect(std.mem.find(u8, record.body, "recovered") != null);
-    try std.testing.expect(std.mem.find(u8, record.body, "attempt: 2/3") != null);
+    try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.full_detail_records.items.len);
+    try std.testing.expect(app.shell.activityProjection() == .none);
 }
 
 test "core.app_worker_runtime skips the recovery record for statuses dropped by cancellation" {
@@ -3022,9 +2936,8 @@ test "core.app_worker_runtime skips the recovery record for statuses dropped by 
     app.worker.worker_cancel_requested.store(true, .seq_cst);
     app.stream.active = true;
     try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
-        .kind = .auto_retry,
-        .failed_attempt = 1,
-        .attempt_limit = 3,
+        .kind = .terminal_provider_error,
+        .attempt = 1,
     } });
     try tickNoop(&app);
     try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.full_detail_records.items.len);
@@ -3037,16 +2950,14 @@ test "writeRouteRecoveryBody omits absent facts" {
 
     try writeRouteRecoveryBody(&body.writer, .{
         .kind = .terminal_provider_error,
-        .failed_attempt = 3,
-        .attempt_limit = 3,
+        .attempt = 3,
         .diagnostic = types.ModelFailureDiagnostic.init("TestProviderSerializationFailed"),
     });
 
     try std.testing.expect(std.mem.find(u8, body.written(), "kind: terminal_provider_error") != null);
-    try std.testing.expect(std.mem.find(u8, body.written(), "attempt: 3/3") != null);
+    try std.testing.expect(std.mem.find(u8, body.written(), "attempt: 3") != null);
     try std.testing.expect(std.mem.find(u8, body.written(), "diagnostic: TestProviderSerializationFailed") != null);
     try std.testing.expect(std.mem.find(u8, body.written(), "cause:") == null);
-    try std.testing.expect(std.mem.find(u8, body.written(), "retry delay:") == null);
 }
 
 test "core.app_worker_runtime projects API status text as sticky status row" {
@@ -3126,9 +3037,7 @@ test "core.app_worker_runtime admitted recovery activates progress without reset
     defer app.deinit();
     try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
         .kind = .terminal_provider_error,
-        .failed_attempt = 1,
-        .attempt_limit = 10,
-        .action = .paused,
+        .attempt = 1,
     } });
     try tickNoop(&app);
     app.shell.command_output_display.touched = true;

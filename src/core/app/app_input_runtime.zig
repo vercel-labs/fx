@@ -3224,11 +3224,6 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeInterrupt(app, "compaction_feedback");
                     return;
                 }
-                if (interrupt_rt.pauseActiveRecovery(app)) {
-                    _ = disarmEscapeClear(app);
-                    _ = disarmEscapeInterrupt(app, "recovery_pause");
-                    return;
-                }
                 // Interrupting active work requires a confirming second Esc
                 // within the gesture window. The first press only arms.
                 const transition = gesture_state.pressEscapeInterrupt(

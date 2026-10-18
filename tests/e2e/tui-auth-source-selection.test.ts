@@ -5326,7 +5326,9 @@ test("native terminal outcomes preserve recovery and incomplete warnings", async
         }
       } else {
         expect(output.output).toBe(limited ? "LIMITED_ANSWER" : "RECOVERED_OK");
-        expect(result.stderr).toContain(limited ? "response hit provider length limit" : "OUTCOME_RETRY");
+        if (limited) expect(result.stderr).toContain("response hit provider length limit");
+        // A retry shows the recovery module's wording, never the provider's detail.
+        else expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
         const detail = await runFx(["session", "--json", "--id", output.session_id], { cwd: profile, env });
         expect(detail.code).toBe(0);
         const history = JSON.parse(detail.stdout).history;

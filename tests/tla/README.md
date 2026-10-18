@@ -1,6 +1,6 @@
 # TLA+ models
 
-TLA+ specifications for fx, checked with TLC, together with the scripts and Bun drivers that check them. CI runs the SDK model. Run the others when you change the behavior they describe.
+TLA+ specifications for fx, checked with TLC, together with the scripts and Bun drivers that check them. CI runs the SDK and recovery models. Run the others when you change the behavior they describe.
 
 | Folder | What it models | Checker |
 |---|---|---|
@@ -10,6 +10,7 @@ TLA+ specifications for fx, checked with TLC, together with the scripts and Bun 
 | `indexer/` | When a scanned root's listing may be reused, merging parallel grep results, the file picker's loading row, and listing snapshots (`src/core/indexer/`). | `indexer/check.sh` |
 | `mcp/` | The MCP-v2 engine (`src/mcp/`): wire format, requests, stdio, version detection, the tool catalog, both HTTP transports, input-required rounds, authorization, subscriptions, elicitation, and the engine. `rules.md` lists the MCP specification rules the models cite by ID. | `mcp/check.sh`, then the drivers in `drivers/mcp/` |
 | `mcp_host/` | fx's MCP host (`src/core/mcp_host/`): host lifecycle, saved credentials, logins shared between processes, sign-in, and elicitation routing. | `mcp_host/check.sh`, `bun test drivers/mcp_host/` |
+| `recovery/` | Recovery for one model request (`src/core/recovery/`): retry waits, the crash-loop guard, resuming after a closed window, the status line, and the save that goes with every send. Eight planted mutations, each a bug fx has had or a promise of the API, must each be caught by its named rule. The turn loop routes each request's network, gateway, and rate-limit failures through the module. fx does not save the module's record yet, so resuming after a closed window and the crash-loop guard are model-checked only. | `recovery/check.sh` |
 | `sdk/` | libfx durable sessions (`DurableSession.tla`), agent names and routing (`AgentRouting.tla`), tenants whose agents share one process (`TenantIsolation.tla`), steering (`DurableSteer.tla`), and the provider credential edge (`ProviderAuth.tla`). `check.sh` also writes the TLC state graphs the drivers walk. | `sdk/check.sh`, then the drivers |
 | `session_manager/` | The session log, turn lifecycle, writer lock, snapshots, fork, subagents, catalog, host wiring, the side-file move, and v1 conversion. `rollout/` holds the models of the changes that moved fx onto the session manager. `system-design.md` is the design record the specs check and defines the `D1` to `D62` decision numbers that code comments cite. | `session_manager/check.sh`, `session_manager/rollout/run.py`, `bun test drivers/session_manager/` |
 | `shell_command/` | How an agent git command is admitted and run (`src/core/shell_command/safe_git.zig`), and one model turn through the shell tool, for the current design and a redesign. | `shell_command/check.sh`, `bun test drivers/shell_command/` |
@@ -72,6 +73,7 @@ tests/tla/indexer/check.sh                              # every config and its e
 tests/tla/acp/check.sh                                  # likewise for acp/, cli/, durable/, shell_command/, terminal/, usage/
 tests/tla/mcp/check.sh                                  # every MCP-v2 model and planted bug
 tests/tla/mcp_host/check.sh                             # every MCP host model, planted bug, and finding
+tests/tla/recovery/check.sh                             # the recovery model and its planted bugs
 tests/tla/sdk/check.sh                                  # the SDK specs; writes the state graphs the drivers walk
 bun tests/tla/drivers/drive.mjs send --walks 40         # one durable-session graph; see .github/workflows/ci.yml for the rest
 bun tests/tla/drivers/drive-agents.mjs --walks 60       # agent routing

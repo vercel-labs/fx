@@ -2,6 +2,7 @@ const std = @import("std");
 const testing_allocator = @import("testing_allocator.zig");
 const text_utils = @import("text_utils.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
+const recovery = @import("../recovery/recovery.zig");
 
 pub const Layout = struct {
     rows: u16,
@@ -307,6 +308,9 @@ pub const RouteRecoveryUnsafeReason = enum {
 };
 
 pub const RouteRecoveryStatusTone = enum {
+    /// The thinking row's own bullet and color, held still: a request that is
+    /// on the wire again. Animating it belongs to the status line.
+    live,
     warning,
     success,
     danger,
@@ -314,8 +318,7 @@ pub const RouteRecoveryStatusTone = enum {
 
 pub const ModelRecoveryCause = enum {
     network_interrupted,
-    /// The network path is provably down; nothing was sent and the turn is
-    /// waiting for connectivity instead of spending retry budget.
+    /// The network path is provably down, so nothing was sent.
     connectivity_lost,
     response_interrupted,
     provider_stream_timeout,
@@ -333,20 +336,11 @@ pub const ModelRecoveryAction = enum {
     regenerating_tool,
     continuing_after_tool,
     reconciling_tool,
+    // Checkpoints saved by older versions may name the next three; fx no
+    // longer writes them, but they still parse.
     waiting_for_connectivity,
-    /// Silence detected; checking liveness before doing anything else.
     checking_liveness,
     paused,
-};
-
-pub const ModelRecoveryRequiredAction = enum {
-    none,
-    continue_later,
-    inspect_uncertain_tool,
-    change_request,
-    /// The same failure repeated at the same progress point; surfaced as a
-    /// broken response instead of an endless restart loop.
-    surface_stall,
 };
 
 pub const ModelFailureDiagnostic = struct {
@@ -368,10 +362,6 @@ pub const ModelFailureDiagnostic = struct {
             .request_limit_reached => "ProviderRequestLimitReached",
             .compaction_prepared => "CompactionPrepared",
         };
-    }
-
-    pub fn forCause(cause: ModelRecoveryCause) ModelFailureDiagnostic {
-        return init(defaultTextForCause(cause));
     }
 
     pub fn init(text: []const u8) ModelFailureDiagnostic {
@@ -427,10 +417,22 @@ pub const RouteRecoveryStatus = struct {
     pub const label_max_bytes: usize = 512;
 
     pub const Kind = enum {
-        auto_retry,
-        auto_recovered,
-        manual_retry_without_fast,
-        manual_recovered_without_fast,
+        // The recovery module's status kinds (`src/core/recovery/recovery.zig`
+        // `Status.Kind`). Its `clear` reaches hosts as the
+        // `clear_route_recovery_status` event instead of a status.
+        waiting,
+        retrying,
+        need_user,
+        /// The request succeeded after the module showed a status. It
+        /// carries only the attempt that succeeded. Hosts that report a
+        /// result show it; the TUI clears its status line.
+        recovered,
+        /// The request ended on an error after the module showed a status,
+        /// with no terminal status of fx's own. It carries only the last
+        /// attempt; the error reaches the host its usual way. Hosts that
+        /// report a result show it; the TUI clears its status line.
+        failed,
+        // Terminal outcomes fx reports itself.
         terminal_provider_error,
         unsafe_assistant_output,
         unsafe_tool_start,
@@ -438,59 +440,148 @@ pub const RouteRecoveryStatus = struct {
     };
 
     kind: Kind,
-    failed_attempt: usize = 0,
-    succeeded_attempt: usize = 0,
-    attempt_limit: usize = 0,
+    /// Set with `need_user`: the prompt the module asks fx to show.
+    need: ?recovery.Status.Need = null,
+    /// The module's wording, shared by every host. Empty for `recovered` and
+    /// for terminal outcomes.
+    text: recovery.Text = .{},
+    /// A form of `text` that fits 46 columns; empty when `text` already does.
+    short: recovery.Text = .{},
+    /// Sends of the request so far, including the first.
+    attempt: usize = 0,
     cause: ?ModelRecoveryCause = null,
-    action: ?ModelRecoveryAction = null,
-    required_action: ModelRecoveryRequiredAction = .none,
-    delay_seconds: u64 = 0,
-    retry_deadline: ?std.Io.Clock.Timestamp = null,
     diagnostic: ?ModelFailureDiagnostic = null,
+    /// With `terminal_provider_error`: the same failure that may never heal
+    /// ended several sends in a row, so fx stopped the request
+    /// (`request_recovery.zig` `repeatedFailure`).
+    repeated: bool = false,
 
+    /// Null for `clear`, which hosts receive as the clear event.
+    pub fn fromRecovery(status: recovery.Status, attempt: usize) ?RouteRecoveryStatus {
+        const kind: Kind = switch (status.kind) {
+            .clear => return null,
+            .waiting => .waiting,
+            .retrying => .retrying,
+            .need_user => .need_user,
+        };
+        return .{
+            .kind = kind,
+            .need = status.need,
+            .text = status.text,
+            .short = status.short,
+            .attempt = attempt,
+        };
+    }
+
+    /// A status the recovery module produced, as opposed to one fx composed.
+    pub fn fromModule(self: RouteRecoveryStatus) bool {
+        return switch (self.kind) {
+            .waiting, .retrying, .need_user => true,
+            .recovered,
+            .failed,
+            .terminal_provider_error,
+            .unsafe_assistant_output,
+            .unsafe_tool_start,
+            .content_filter,
+            => false,
+        };
+    }
+
+    /// What `fx ask --json` reports as `recovery` and ACP as
+    /// `_meta.fx.modelResponseRecovery`. Every key is one word, so both
+    /// spell them the same way, and `need` keeps the module's snake_case
+    /// tags.
+    pub const Report = struct {
+        state: ReportedState,
+        attempt: usize,
+        need: ?recovery.Status.Need = null,
+        /// Omitted when the status has no wording: `recovered` and
+        /// `failed` report only the attempt.
+        message: ?[]const u8 = null,
+
+        pub fn writeJson(self: Report, writer: *std.Io.Writer) !void {
+            try writer.writeAll("{\"state\":");
+            try std.json.Stringify.value(@tagName(self.state), .{}, writer);
+            try writer.print(",\"attempt\":{d}", .{self.attempt});
+            if (self.need) |need| {
+                try writer.writeAll(",\"need\":");
+                try std.json.Stringify.value(@tagName(need), .{}, writer);
+            }
+            if (self.message) |message| {
+                try writer.writeAll(",\"message\":");
+                try std.json.Stringify.value(message, .{}, writer);
+            }
+            try writer.writeByte('}');
+        }
+    };
+
+    /// This status as hosts report it. The message lives in `buf`.
+    pub fn report(self: RouteRecoveryStatus, buf: []u8) Report {
+        const message = self.label(buf);
+        return .{
+            .state = self.reportedState(),
+            .attempt = self.attempt,
+            .need = self.need,
+            .message = if (message.len == 0) null else message,
+        };
+    }
+
+    /// The `state` that `fx ask --json` and ACP report, written as its tag.
+    pub const ReportedState = enum {
+        waiting,
+        retrying,
+        need_user,
+        recovered,
+        /// fx's terminal outcomes.
+        failed,
+        /// A request an earlier fx process was running when it stopped, as
+        /// its saved recovery checkpoint reports it. No live status maps
+        /// here: ACP reports it on session load.
+        interrupted,
+    };
+
+    fn reportedState(self: RouteRecoveryStatus) ReportedState {
+        return switch (self.kind) {
+            .waiting => .waiting,
+            .retrying => .retrying,
+            .need_user => .need_user,
+            .recovered => .recovered,
+            .failed,
+            .terminal_provider_error,
+            .unsafe_assistant_output,
+            .unsafe_tool_start,
+            .content_filter,
+            => .failed,
+        };
+    }
+
+    /// Waiting and "needs you" rows warn; a resend shows the thinking row's
+    /// live style, so a request back on the wire never reads as an alarm.
     pub fn tone(self: RouteRecoveryStatus) RouteRecoveryStatusTone {
         return switch (self.kind) {
-            .auto_recovered,
-            .manual_recovered_without_fast,
-            => .success,
+            .retrying => .live,
+            .waiting, .need_user => .warning,
+            .recovered => .success,
+            .failed,
             .terminal_provider_error,
             .unsafe_assistant_output,
             .unsafe_tool_start,
             .content_filter,
             => .danger,
-            .auto_retry,
-            .manual_retry_without_fast,
-            => .warning,
         };
     }
 
-    pub fn isRecovered(self: RouteRecoveryStatus) bool {
-        return switch (self.kind) {
-            .auto_recovered,
-            .manual_recovered_without_fast,
-            => true,
-            else => false,
-        };
-    }
-
-    pub fn reportedAttempt(self: RouteRecoveryStatus) usize {
-        if (self.isRecovered() and self.succeeded_attempt != 0) {
-            return self.succeeded_attempt;
-        }
-        return self.failed_attempt;
-    }
-
+    /// The module's `text` when set; otherwise fx's own wording for a
+    /// terminal outcome. The result lives in `buf`.
     pub fn label(self: RouteRecoveryStatus, buf: []u8) []const u8 {
+        if (self.text.len > 0) {
+            const len = @min(self.text.len, buf.len);
+            @memcpy(buf[0..len], self.text.bytes[0..len]);
+            return buf[0..len];
+        }
         return switch (self.kind) {
-            .auto_retry => self.recoveryLabel(buf),
-            .auto_recovered => std.mem.print(
-                buf,
-                "✓ recovered · succeeded on attempt {d}",
-                .{self.succeeded_attempt},
-            ) catch "✓ recovered",
-            .manual_retry_without_fast => self.manualRetryLabel(buf),
-            .manual_recovered_without_fast => "✓ recovered · Fast disabled",
-            .terminal_provider_error => self.pausedLabel(buf),
+            .waiting, .retrying, .need_user, .recovered, .failed => "",
+            .terminal_provider_error => self.terminalLabel(buf),
             .unsafe_assistant_output => self.fixedFailureLabel(
                 buf,
                 "Response interrupted",
@@ -503,17 +594,6 @@ pub const RouteRecoveryStatus = struct {
             ),
             .content_filter => self.fixedFailureLabel(buf, "blocked", "content filter"),
         };
-    }
-
-    fn manualRetryLabel(self: RouteRecoveryStatus, buf: []u8) []const u8 {
-        if (self.diagnostic) |diagnostic| {
-            return std.mem.print(
-                buf,
-                "⚠ Provider route unavailable · {s} · continuing without Fast",
-                .{diagnostic.view()},
-            ) catch "⚠ Provider route unavailable · continuing without Fast";
-        }
-        return "⚠ Provider route unavailable · continuing without Fast";
     }
 
     fn fixedFailureLabel(
@@ -532,78 +612,7 @@ pub const RouteRecoveryStatus = struct {
         return std.mem.print(buf, "⚠ {s} · {s}", .{ cause, action }) catch "⚠ Model response failed";
     }
 
-    fn recoveryLabel(self: RouteRecoveryStatus, buf: []u8) []const u8 {
-        const cause = switch (self.cause orelse .provider_unavailable) {
-            .network_interrupted => "Network interrupted",
-            .connectivity_lost => "Connection lost",
-            .response_interrupted => "Response ended early",
-            .provider_stream_timeout => "Gateway stream timed out",
-            .provider_unavailable => "Provider unavailable",
-            .rate_limited => "Rate limited",
-            .system_resumed => "Mac woke from sleep",
-            .authentication => "Authentication refreshed",
-            .request_limit_reached => "Provider request limit reached",
-            .compaction_prepared => "Resuming saved compaction",
-        };
-        const action_value = self.action orelse .retrying_request;
-        const action = switch (action_value) {
-            .retrying_request => "retrying request",
-            .continuing_response => "restarting response",
-            .regenerating_tool => "regenerating unstarted tool",
-            .continuing_after_tool => "continuing after confirmed tool",
-            .reconciling_tool => "checking uncertain tool state",
-            .waiting_for_connectivity => "waiting for connection",
-            .checking_liveness => "checking the connection",
-            .paused => "recovery paused",
-        };
-        // Connectivity waits and liveness probes are un-budgeted: no attempt
-        // counter and no raw error names, just the honest current state.
-        if (action_value == .waiting_for_connectivity or action_value == .checking_liveness) {
-            if (self.delay_seconds > 0) {
-                return std.mem.print(
-                    buf,
-                    "⚠ {s} · {s} · {d}s",
-                    .{ cause, action, self.delay_seconds },
-                ) catch "⚠ Recovering model response";
-            }
-            return std.mem.print(
-                buf,
-                "⚠ {s} · {s}",
-                .{ cause, action },
-            ) catch "⚠ Recovering model response";
-        }
-        if (self.delay_seconds > 0) {
-            if (self.diagnostic) |diagnostic| {
-                return std.mem.print(
-                    buf,
-                    "⚠ {s} · {s} · {s} in {d}s",
-                    .{ cause, diagnostic.humanText(), action, self.delay_seconds },
-                ) catch "⚠ Recovering model response";
-            }
-            return std.mem.print(
-                buf,
-                "⚠ {s} · {s} in {d}s",
-                .{ cause, action, self.delay_seconds },
-            ) catch "⚠ Recovering model response";
-        }
-        if (self.diagnostic) |diagnostic| {
-            return std.mem.print(
-                buf,
-                "⚠ {s} · {s} · {s}",
-                .{ cause, diagnostic.humanText(), action },
-            ) catch "⚠ Recovering model response";
-        }
-        return std.mem.print(
-            buf,
-            "⚠ {s} · {s}",
-            .{ cause, action },
-        ) catch "⚠ Recovering model response";
-    }
-
-    // Display names for paused and terminal recovery states; single source so
-    // the stall and generic branches cannot drift. In-progress resume copy
-    // stays in recoveryLabel, where the wording reads differently mid-flight.
-    fn pausedCauseDisplayName(cause: ModelRecoveryCause) []const u8 {
+    fn causeDisplayName(cause: ModelRecoveryCause) []const u8 {
         return switch (cause) {
             .network_interrupted => "Network interrupted",
             .connectivity_lost => "Connection lost",
@@ -618,163 +627,157 @@ pub const RouteRecoveryStatus = struct {
         };
     }
 
-    fn pausedLabel(self: RouteRecoveryStatus, buf: []u8) []const u8 {
-        if (self.required_action == .surface_stall) {
-            const cause_text: []const u8 = if (self.cause) |cause|
-                pausedCauseDisplayName(cause)
-            else
-                "Response failed";
+    fn terminalLabel(self: RouteRecoveryStatus, buf: []u8) []const u8 {
+        if (self.repeated) {
+            const repeated_name = if (self.cause) |cause| causeDisplayName(cause) else "Response failed";
             if (self.diagnostic) |diagnostic| {
                 return std.mem.print(
                     buf,
                     "⚠ {s} · {s} · kept failing at the same point · stopped",
-                    .{ cause_text, diagnostic.humanText() },
+                    .{ repeated_name, diagnostic.humanText() },
                 ) catch "⚠ Response kept failing at the same point";
             }
             return std.mem.print(
                 buf,
                 "⚠ {s} · kept failing at the same point · stopped",
-                .{cause_text},
+                .{repeated_name},
             ) catch "⚠ Response kept failing at the same point";
         }
-        const cause = self.cause orelse return self.pausedCauseLabel(buf, "Provider unavailable");
-        if (cause == .rate_limited) {
-            if (self.diagnostic) |diagnostic| {
-                return std.mem.print(
-                    buf,
-                    "⚠ Rate limited · {s} · server requested a longer wait · recovery paused · attempt {d}",
-                    .{ diagnostic.view(), self.failed_attempt },
-                ) catch "⚠ Rate limited · recovery paused";
-            }
-            return std.mem.print(
-                buf,
-                "⚠ Rate limited · server requested a longer wait · recovery paused · attempt {d}",
-                .{self.failed_attempt},
-            ) catch "⚠ Rate limited · recovery paused";
-        }
-        if (cause == .system_resumed) {
-            if (self.diagnostic) |diagnostic| {
-                return std.mem.print(
-                    buf,
-                    "⚠ Mac woke from sleep · {s} · connection still unavailable · recovery paused · attempt {d}",
-                    .{ diagnostic.view(), self.failed_attempt },
-                ) catch "⚠ Connection unavailable · recovery paused";
-            }
-            return std.mem.print(
-                buf,
-                "⚠ Mac woke from sleep · connection still unavailable · recovery paused · attempt {d}",
-                .{self.failed_attempt},
-            ) catch "⚠ Connection unavailable · recovery paused";
-        }
-        if (cause == .provider_stream_timeout) {
-            if (self.diagnostic) |diagnostic| {
-                return std.mem.print(
-                    buf,
-                    "⚠ Gateway stream timed out · {s} · automatic retry paused · attempt {d}",
-                    .{ diagnostic.view(), self.failed_attempt },
-                ) catch "⚠ Gateway stream timed out · automatic retry paused";
-            }
-            return std.mem.print(
-                buf,
-                "⚠ Gateway stream timed out · automatic retry paused · attempt {d}",
-                .{self.failed_attempt},
-            ) catch "⚠ Gateway stream timed out · automatic retry paused";
-        }
-        if (cause == .request_limit_reached) {
-            if (self.diagnostic) |diagnostic| {
-                return std.mem.print(
-                    buf,
-                    "⚠ Response paused · {s} · {d}/{d} provider-request safety limit reached",
-                    .{ diagnostic.view(), self.failed_attempt, self.attempt_limit },
-                ) catch "⚠ Response paused · provider-request safety limit reached";
-            }
-            return std.mem.print(
-                buf,
-                "⚠ Response paused · {d}/{d} provider-request safety limit reached",
-                .{ self.failed_attempt, self.attempt_limit },
-            ) catch "⚠ Response paused · provider-request safety limit reached";
-        }
-        return self.pausedCauseLabel(buf, pausedCauseDisplayName(cause));
-    }
-
-    fn pausedCauseLabel(
-        self: RouteRecoveryStatus,
-        buf: []u8,
-        name: []const u8,
-    ) []const u8 {
-        // A lifecycle/safety pause (.paused action) can resume; a terminal
-        // stop (no action) is honest about ending.
-        const state_text: []const u8 = if (self.action == .paused)
-            "recovery paused"
-        else
-            "stopped";
-        const plural: []const u8 = if (self.failed_attempt == 1) "" else "s";
+        const name = if (self.cause) |cause| causeDisplayName(cause) else "Provider unavailable";
+        const plural: []const u8 = if (self.attempt == 1) "" else "s";
         if (self.diagnostic) |diagnostic| {
             return std.mem.print(
                 buf,
-                "⚠ {s} · {s} · {s} after {d} attempt{s}",
-                .{ name, diagnostic.humanText(), state_text, self.failed_attempt, plural },
+                "⚠ {s} · {s} · stopped after {d} attempt{s}",
+                .{ name, diagnostic.humanText(), self.attempt, plural },
             ) catch "⚠ Model response recovery ended";
         }
         return std.mem.print(
             buf,
-            "⚠ {s} · {s} after {d} attempt{s}",
-            .{ name, state_text, self.failed_attempt, plural },
+            "⚠ {s} · stopped after {d} attempt{s}",
+            .{ name, self.attempt, plural },
         ) catch "⚠ Model response recovery ended";
     }
 };
 
-test "route recovery reports the attempt owned by its state" {
-    try std.testing.expectEqual(@as(usize, 3), (RouteRecoveryStatus{
-        .kind = .auto_retry,
-        .failed_attempt = 3,
-        .attempt_limit = 10,
-    }).reportedAttempt());
-    try std.testing.expectEqual(@as(usize, 4), (RouteRecoveryStatus{
-        .kind = .auto_recovered,
-        .failed_attempt = 3,
-        .succeeded_attempt = 4,
-        .attempt_limit = 10,
-    }).reportedAttempt());
+/// Tests build module status text with this. A string longer than
+/// `recovery.Text` holds fails to compile.
+pub fn testRecoveryText(comptime value: []const u8) recovery.Text {
+    if (value.len > recovery.Text.capacity) {
+        @compileError("recovery text is longer than recovery.Text.capacity: " ++ value);
+    }
+    var text: recovery.Text = .{};
+    @memcpy(text.bytes[0..value.len], value);
+    text.len = value.len;
+    return text;
 }
 
-test "route recovery label includes a value-owned diagnostic" {
-    var status = RouteRecoveryStatus{
-        .kind = .auto_retry,
-        .failed_attempt = 4,
-        .attempt_limit = 10,
-        .cause = .provider_unavailable,
-        .action = .retrying_request,
-        .delay_seconds = 4,
-        .diagnostic = ModelFailureDiagnostic.init(
-            "HTTP 503 · no_available_providers: No providers are currently available",
-        ),
+test "route recovery status carries the module's status and labels with its text" {
+    const module: recovery.Status = .{
+        .kind = .need_user,
+        .need = .content_filter,
+        .text = testRecoveryText("Blocked by the content filter · press Esc and rephrase"),
+        .short = testRecoveryText("Blocked by content filter · Esc, then rephrase"),
     };
-    const copied = status;
-    status.diagnostic = null;
+    const status = RouteRecoveryStatus.fromRecovery(module, 3).?;
+    try std.testing.expectEqual(RouteRecoveryStatus.Kind.need_user, status.kind);
+    try std.testing.expectEqual(recovery.Status.Need.content_filter, status.need.?);
+    try std.testing.expectEqual(@as(usize, 3), status.attempt);
+    try std.testing.expect(status.fromModule());
+    try std.testing.expectEqualStrings("Blocked by content filter · Esc, then rephrase", status.short.slice());
 
+    // The label is copied into the caller's buffer, so it outlives the
+    // by-value status it came from.
+    var label_buf: [RouteRecoveryStatus.label_max_bytes]u8 = undefined;
+    const label = status.label(&label_buf);
+    try std.testing.expectEqualStrings("Blocked by the content filter · press Esc and rephrase", label);
+    try std.testing.expectEqual(@intFromPtr(&label_buf), @intFromPtr(label.ptr));
+
+    try std.testing.expect(RouteRecoveryStatus.fromRecovery(.{ .kind = .clear }, 3) == null);
+}
+
+test "route recovery terminal label names the cause, diagnostic, and attempts" {
     var label_buf: [RouteRecoveryStatus.label_max_bytes]u8 = undefined;
     try std.testing.expectEqualStrings(
-        "⚠ Provider unavailable · HTTP 503 · no_available_providers: No providers are currently available · retrying request in 4s",
-        copied.label(&label_buf),
+        "⚠ Provider unavailable · HTTP 503 · no_available_providers: No providers are currently available · stopped after 4 attempts",
+        (RouteRecoveryStatus{
+            .kind = .terminal_provider_error,
+            .attempt = 4,
+            .cause = .provider_unavailable,
+            .diagnostic = ModelFailureDiagnostic.init(
+                "HTTP 503 · no_available_providers: No providers are currently available",
+            ),
+        }).label(&label_buf),
+    );
+    try std.testing.expectEqualStrings(
+        "⚠ Response ended early · stream interrupted · stopped after 1 attempt",
+        (RouteRecoveryStatus{
+            .kind = .terminal_provider_error,
+            .attempt = 1,
+            .cause = .response_interrupted,
+            .diagnostic = ModelFailureDiagnostic.init("StreamInterrupted"),
+        }).label(&label_buf),
+    );
+    try std.testing.expectEqualStrings(
+        "⚠ Tool state needs review · context preserved",
+        (RouteRecoveryStatus{ .kind = .unsafe_tool_start }).label(&label_buf),
     );
 }
 
-test "route recovery labels drop counters and raw error names for connectivity waits" {
-    var status = RouteRecoveryStatus{
-        .kind = .auto_retry,
-        .failed_attempt = 6,
-        .attempt_limit = 10,
-        .cause = .connectivity_lost,
-        .action = .waiting_for_connectivity,
-        .delay_seconds = 32,
-        .diagnostic = ModelFailureDiagnostic.init("ConnectionRefused"),
-    };
+test "a request stopped for repeating the same failure says it kept failing" {
     var label_buf: [RouteRecoveryStatus.label_max_bytes]u8 = undefined;
     try std.testing.expectEqualStrings(
-        "⚠ Connection lost · waiting for connection · 32s",
-        status.label(&label_buf),
+        "⚠ Network interrupted · TlsInitializationFailed · kept failing at the same point · stopped",
+        (RouteRecoveryStatus{
+            .kind = .terminal_provider_error,
+            .attempt = 3,
+            .cause = .network_interrupted,
+            .diagnostic = ModelFailureDiagnostic.init("TlsInitializationFailed"),
+            .repeated = true,
+        }).label(&label_buf),
     );
+    try std.testing.expectEqualStrings(
+        "⚠ Response ended early · stream interrupted · kept failing at the same point · stopped",
+        (RouteRecoveryStatus{
+            .kind = .terminal_provider_error,
+            .attempt = 3,
+            .cause = .response_interrupted,
+            .diagnostic = ModelFailureDiagnostic.init("StreamInterrupted"),
+            .repeated = true,
+        }).label(&label_buf),
+    );
+}
+
+test "recovery reports write the shape fx ask and ACP share" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var label_buf: [RouteRecoveryStatus.label_max_bytes]u8 = undefined;
+
+    const cases = [_]struct { status: RouteRecoveryStatus, json: []const u8 }{
+        .{
+            .status = .{ .kind = .waiting, .text = testRecoveryText("Gateway error · next try in 2s · attempt 1 · 0s"), .attempt = 1 },
+            .json = "{\"state\":\"waiting\",\"attempt\":1,\"message\":\"Gateway error · next try in 2s · attempt 1 · 0s\"}",
+        },
+        .{
+            .status = .{ .kind = .need_user, .need = .content_filter, .text = testRecoveryText("Blocked by the content filter · press Esc and rephrase"), .attempt = 2 },
+            .json = "{\"state\":\"need_user\",\"attempt\":2,\"need\":\"content_filter\",\"message\":\"Blocked by the content filter · press Esc and rephrase\"}",
+        },
+        .{ .status = .{ .kind = .recovered, .attempt = 3 }, .json = "{\"state\":\"recovered\",\"attempt\":3}" },
+        .{ .status = .{ .kind = .failed, .attempt = 2 }, .json = "{\"state\":\"failed\",\"attempt\":2}" },
+        .{
+            .status = .{ .kind = .unsafe_tool_start, .attempt = 1 },
+            .json = "{\"state\":\"failed\",\"attempt\":1,\"message\":\"⚠ Tool state needs review · context preserved\"}",
+        },
+    };
+    for (cases) |case| {
+        out.clearRetainingCapacity();
+        try case.status.report(&label_buf).writeJson(&out.writer);
+        try std.testing.expectEqualStrings(case.json, out.written());
+    }
+
+    out.clearRetainingCapacity();
+    try (RouteRecoveryStatus.Report{ .state = .interrupted, .attempt = 4, .message = "Interrupted turn" }).writeJson(&out.writer);
+    try std.testing.expectEqualStrings("{\"state\":\"interrupted\",\"attempt\":4,\"message\":\"Interrupted turn\"}", out.written());
 }
 
 test "model failure diagnostic translates known transport names only" {
@@ -785,22 +788,6 @@ test "model failure diagnostic translates known transport names only" {
     try std.testing.expectEqualStrings(
         "HTTP 503 · no_available_providers: No providers are currently available",
         ModelFailureDiagnostic.init("HTTP 503 · no_available_providers: No providers are currently available").humanText(),
-    );
-}
-
-test "stalled recovery surfaces as a terminal stop with plain wording" {
-    var status = RouteRecoveryStatus{
-        .kind = .terminal_provider_error,
-        .failed_attempt = 4,
-        .attempt_limit = 10,
-        .cause = .response_interrupted,
-        .required_action = .surface_stall,
-        .diagnostic = ModelFailureDiagnostic.init("StreamInterrupted"),
-    };
-    var label_buf: [RouteRecoveryStatus.label_max_bytes]u8 = undefined;
-    try std.testing.expectEqualStrings(
-        "⚠ Response ended early · stream interrupted · kept failing at the same point · stopped",
-        status.label(&label_buf),
     );
 }
 
@@ -1672,6 +1659,11 @@ pub const ProviderFailureCause = enum {
     gateway_stream_timeout,
     non_retryable,
     rate_limited,
+    /// A provider error whose error event gave neither a code nor a usable
+    /// HTTP status, so fx cannot tell whether a resend can succeed.
+    uncoded_error,
+    /// A stream that finished with an error that no error event explained.
+    unexplained_error_finish,
 };
 
 pub const ProviderServiceTier = enum {

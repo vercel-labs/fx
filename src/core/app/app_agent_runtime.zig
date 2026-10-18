@@ -1260,10 +1260,6 @@ pub fn Runtime(comptime App: type) type {
                 .skill_catalog = catalog,
                 .skill_bindings = bindings,
                 .gateway_retry_count = gateway_retry_count,
-                .recovery_pause_flag = if (comptime @hasField(@TypeOf(app.worker), "worker_recovery_pause_requested"))
-                    &app.worker.worker_recovery_pause_requested
-                else
-                    null,
                 .gateway_chat_url = gateway_chat_url,
                 .advertised_tool_names = tool_projection.advertised_names,
                 .advertised_functions = tool_projection.advertised_functions,

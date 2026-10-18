@@ -1319,18 +1319,8 @@ fn sendPendingRecoveryUpdate(
     try out.writer.writeAll("{\"sessionId\":");
     try writeJsonStr(session_id, &out.writer);
     try out.writer.writeAll(",\"update\":");
-    try acp_types.writeModelRecoveryInfoUpdate(&out.writer, .{
-        .kind = .terminal_provider_error,
-        .failed_attempt = attempt,
-        .attempt_limit = recovery.max_provider_attempts,
-        .cause = recovery.cause,
-        .action = .paused,
-        .required_action = if (recovery.tool_state == .uncertain)
-            .inspect_uncertain_tool
-        else
-            .continue_later,
-        .diagnostic = types.ModelFailureDiagnostic.forCause(recovery.cause),
-    }, true);
+    // A request an earlier fx process was running when it stopped.
+    try acp_types.writeInterruptedModelRecoveryInfoUpdate(&out.writer, attempt);
     try out.writer.writeByte('}');
     try state.writer.writeNotification(
         alloc,

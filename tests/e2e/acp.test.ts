@@ -1620,7 +1620,14 @@ describe("acp: model-independent", () => {
         expect(result.promptResult.result.stopReason).toBe("end_turn");
         expect(gateway.requests).toHaveLength(4);
         const allUpdates = JSON.stringify(result.messages);
-        expect(allUpdates).not.toContain('"state":"paused"');
+        // The module's status shape, then a `recovered` that carries only the
+        // attempt that succeeded.
+        expect(allUpdates).toMatch(
+          /"modelResponseRecovery":\{"state":"waiting","attempt":1,"message":"Connection lost · next try in 1s · attempt 1 · 0s"\}/,
+        );
+        expect(allUpdates).toContain(
+          '"modelResponseRecovery":{"state":"recovered","attempt":4}',
+        );
         // The partial streamed once, then the full replacement (which carries
         // the partial as its prefix) streamed once.
         expect(occurrenceCount(allUpdates, partialText)).toBe(2);
@@ -2335,7 +2342,10 @@ describe("acp: model-independent", () => {
         }
         expect(loadResponse.error).toBeUndefined();
         const loadUpdates = JSON.stringify(loadMessages);
-        expect(loadUpdates).toContain("modelResponseRecovery");
+        // A request the killed process was running loads as `interrupted`.
+        expect(loadUpdates).toMatch(
+          /"modelResponseRecovery":\{"state":"interrupted","attempt":\d+,"message":"Interrupted turn"\}/,
+        );
         expect(loadUpdates).toContain(
           "Preserve this ACP prompt across a process restart.",
         );

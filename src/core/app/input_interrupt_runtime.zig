@@ -133,16 +133,6 @@ pub fn InterruptRuntime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        pub fn pauseActiveRecovery(app: *App) bool {
-            if (!app.stream.active) return false;
-            if (comptime !@hasDecl(@TypeOf(app.worker), "isConnectivityWaitActive")) return false;
-            if (!app.worker.isConnectivityWaitActive()) return false;
-            if (comptime !@hasDecl(@TypeOf(app.worker), "requestRecoveryPause")) return false;
-            app.worker.requestRecoveryPause();
-            debug_trace.logf("input", "model recovery pause requested", .{});
-            return true;
-        }
-
         pub fn traceInterruptRequested(app: *App, source: []const u8) void {
             const approval_active = app.approval_prompt.isActive();
             const question_active = app.question_prompt.isActive();
@@ -202,33 +192,4 @@ test "idle compaction feedback dismissal is scoped and never cancels active work
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
     try std.testing.expect(!app.worker.isCancelRequested());
     try std.testing.expect(!InterruptRuntime(FakeApp).dismissCompactionFeedback(&app));
-}
-
-test "interactive connectivity wait maps try later to recovery pause" {
-    const FakeWorker = struct {
-        connectivity_wait_active: bool = false,
-        pause_requested: bool = false,
-
-        pub fn isConnectivityWaitActive(self: *const @This()) bool {
-            return self.connectivity_wait_active;
-        }
-
-        pub fn requestRecoveryPause(self: *@This()) void {
-            self.pause_requested = true;
-        }
-    };
-    const FakeApp = struct {
-        stream: struct { active: bool } = .{ .active = true },
-        worker: FakeWorker = .{},
-    };
-
-    var app = FakeApp{};
-    app.worker.connectivity_wait_active = true;
-    try std.testing.expect(InterruptRuntime(FakeApp).pauseActiveRecovery(&app));
-    try std.testing.expect(app.worker.pause_requested);
-
-    app.worker.pause_requested = false;
-    app.worker.connectivity_wait_active = false;
-    try std.testing.expect(!InterruptRuntime(FakeApp).pauseActiveRecovery(&app));
-    try std.testing.expect(!app.worker.pause_requested);
 }

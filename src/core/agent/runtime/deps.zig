@@ -273,6 +273,10 @@ pub const AgentRuntimeDeps = struct {
     /// host provides one; ordinary system notices remain unaffected.
     push_context_notice: ?*const fn (ctx: *anyopaque, text: []const u8) anyerror!void = null,
     push_route_recovery_status: *const fn (ctx: *anyopaque, status: types.RouteRecoveryStatus) anyerror!void = discardRouteRecoveryStatus,
+    /// A new model request starts. A host that reports the last request's
+    /// recovery, as `fx ask --json` does, forgets the previous request's
+    /// here. Null: the host keeps no per-request report.
+    begin_route_recovery_request: ?*const fn (ctx: *anyopaque) void = null,
     /// A turn that can never recover hands the user's prompt back to the
     /// composer so nothing typed is lost. Null: host keeps the prompt as-is.
     restore_failed_prompt: ?*const fn (ctx: *anyopaque, prompt: []const u8) anyerror!void = null,
