@@ -29,13 +29,13 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .ask,
         .token = "ask",
-        .usage = "ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--sessions-v2] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>",
+        .usage = "ask [--auto|--full-access] [-m|--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--sessions-v2] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>",
         .summary = "Run one noninteractive request",
         .options = &.{
             .{ .flag = "--auto", .description = "Automatically review unresolved permission requests" },
             .{ .flag = "--full-access", .description = "Disable fx permission checks" },
             .{ .flag = "--yolo", .description = "Alias for --full-access" },
-            .{ .flag = "--model <id>", .description = "Override the model for this request" },
+            .{ .flag = "-m, --model <id>", .description = "Override the model for this request" },
             .{ .flag = "--effort <level>", .description = "Override the reasoning effort for this request" },
             .{ .flag = "--fast", .description = "Enable Fast mode for this request when the model supports it" },
             .{ .flag = "--no-fast", .description = "Disable Fast mode for this request" },
@@ -69,10 +69,10 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .acp,
         .token = "acp",
-        .usage = "acp [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]",
+        .usage = "acp [-m|--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]",
         .summary = "Start an ACP server over stdio",
         .options = &.{
-            .{ .flag = "--model <id>", .description = "Override the default model" },
+            .{ .flag = "-m, --model <id>", .description = "Override the default model" },
             .{ .flag = "--ultrafast", .description = "Request Ultra mode when the model supports it" },
             .{ .flag = "--no-ultrafast", .description = "Disable Ultra mode" },
             .{ .flag = "--log-file <path>", .description = "Write ACP logs to a file" },
@@ -360,7 +360,7 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Override the model provider for an interactive session (gateway, codex, grok, or a configured name)",
     },
     .{
-        .usage = "--model <id>",
+        .usage = "-m, --model <id>",
         .description = "Override the model for an interactive session",
     },
     .{
