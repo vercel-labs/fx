@@ -357,15 +357,20 @@ StartReq(p) ==
 
 \* A new message, or "continue", while a checkpoint is left over: the old turn
 \* becomes interrupted history first (session_log.zig, before a new prompt
-\* replaces the recovery slot), which ends that request.
+\* replaces the recovery slot), which ends that request. A new message also
+\* answers a question instead of Enter (decision 53): the request it asked
+\* about ends the same way, and its record is deleted.
 MoveOn(p) ==
-    /\ ps[p].pc = "idle" /\ CurrentSnap
+    /\ \/ ps[p].pc = "idle"
+       \/ ps[p].pc = "ask" /\ ps[p].pend = NoRec
+    /\ CurrentSnap
     /\ log' = snap
     /\ snap' = 0
     /\ rec' = NoRec
     /\ asked' = FALSE
     /\ fate' = IF fate[snap] = "open" THEN [fate EXCEPT ![snap] = "cancel"] ELSE fate
-    /\ ps' = [ps EXCEPT ![p].q = "none"]
+    /\ ps' = [ps EXCEPT ![p] = [@ EXCEPT !.pc = "idle", !.cur = 0, !.md = 0,
+                 !.q = "none"]]
     /\ ClearClosed(snap)
     /\ UNCHANGED <<owner, lock, copyRec, wall, faults, lastExit, seen>>
 
@@ -567,11 +572,11 @@ Exit(p, how) ==
 
 \* /quit, Ctrl+C twice, or the end of an `fx ask` prompt, with no request
 \* running: deinit deletes owner.live. During a request these cancel it
-\* first (Esc). Quitting at the old-record question leaves the record, since
-\* the module never started.
+\* first (Esc). Quitting at a question leaves the record as it is, so the
+\* next launch asks again.
 Quit(p) ==
     /\ \/ ps[p].pc = "idle"
-       \/ ps[p].pc = "ask" /\ ps[p].q = "old"
+       \/ ps[p].pc = "ask" /\ ps[p].pend = NoRec
     /\ owner' = FALSE
     /\ Exit(p, "quit")
     /\ UNCHANGED <<log, snap, rec, asked, copyRec, wall, faults, fate, seen, closed>>

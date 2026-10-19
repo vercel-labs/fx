@@ -16,7 +16,7 @@ TLA+ specifications for fx, checked with TLC, together with the scripts and Bun 
 | `shell_command/` | How an agent git command is admitted and run (`src/core/shell_command/safe_git.zig`), and one model turn through the shell tool, for the current design and a redesign. | `shell_command/check.sh`, `bun test drivers/shell_command/` |
 | `terminal/` | The in-memory shell snapshot owner (`src/core/terminal/shell_snapshot.zig`) and the lifecycle of hosted terminals. | `terminal/check.sh` |
 | `usage/` | `/usage` refreshes and the shared usage cache (`src/usage/`): `LeanUsage.tla` and `UsageModel.tla`. | `usage/check.sh`, then the drivers in `drivers/usage/` |
-| `drivers/` | The Bun drivers. They run the real fx binary or SDK code, record what happens, and have TLC check each run against its model. `drive.mjs`, `drive-agents.mjs`, `drive-tenants.mjs`, and `drive-steer.mjs` walk the SDK code along the `sdk/` state graphs. `recovery/driver.ts` walks `recovery.zig` along `Recovery.tla`, to every edge of its state graph and along seeded random paths. | See each folder's `check.sh` |
+| `drivers/` | The Bun drivers. They run the real fx binary or SDK code, record what happens, and have TLC check each run against its model. `drive.mjs`, `drive-agents.mjs`, `drive-tenants.mjs`, and `drive-steer.mjs` walk the SDK code along the `sdk/` state graphs. `recovery/driver.ts` walks `recovery.zig` along `Recovery.tla`, to every edge of its state graph and along seeded random paths. `resume/driver.ts` walks the real fx TUI in tmux along `Resume.tla`, one process at a time: launches, messages, finished responses, closes, kills, quits, "continue", and a day passing, checking the files fx keeps, the request on the wire, and the question it asks. It runs only on request. | See each folder's `check.sh` |
 | `lib/` | `tlc.sh`, which finds TLC and Java and runs a table of configs with their expected verdicts, `tlc.py`, which asks `tlc.sh` for TLC and Java on behalf of the Python checkers, and `run-tlc.sh`, which runs TLC once for the drivers. | |
 
 ## Requirements
@@ -75,6 +75,7 @@ tests/tla/mcp/check.sh                                  # every MCP-v2 model and
 tests/tla/mcp_host/check.sh                             # every MCP host model, planted bug, and finding
 tests/tla/recovery/check.sh                             # the recovery models and their planted bugs
 bun tests/tla/drivers/recovery/driver.ts --self-check   # recovery.zig along Recovery.tla, and the driver must reject a planted bug
+bun tests/tla/drivers/resume/driver.ts --walks 20       # the fx TUI along Resume.tla in tmux; on request, not in CI
 tests/tla/sdk/check.sh                                  # the SDK specs; writes the state graphs the drivers walk
 bun tests/tla/drivers/drive.mjs send --walks 40         # one durable-session graph; see .github/workflows/ci.yml for the rest
 bun tests/tla/drivers/drive-agents.mjs --walks 60       # agent routing
