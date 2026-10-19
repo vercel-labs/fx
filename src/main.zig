@@ -734,6 +734,8 @@ const App = struct {
                     return err;
                 };
                 SessionAppRuntime.syncTerminalTitle(&app);
+            } else {
+                SessionAppRuntime.showInterruptedTurnHint(&app);
             }
         }
         const env_disabled = if (io_mod.getenv("FX_AUTO_UPGRADE")) |val|
@@ -4988,6 +4990,7 @@ test {
     _ = @import("core/session/session_commands.zig");
     _ = @import("core/session/session_json.zig");
     _ = @import("core/session/session_store.zig");
+    _ = @import("core/session/resume_decision.zig");
     _ = @import("core/session/session_adapter.zig");
     _ = @import("core/session/session_layout.zig");
     _ = @import("core/session/legacy_background_migration.zig");

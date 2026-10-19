@@ -15,6 +15,8 @@ const mcp_carrier = @import("mcp_carrier.zig");
 const message_carrier = @import("../core/mcp/message_carrier.zig");
 const server = @import("server.zig");
 const session_codec = @import("../core/session/session_codec.zig");
+const session_log = @import("../core/session/session_log.zig");
+const resume_decision = @import("../core/session/resume_decision.zig");
 const session_display_metadata = @import("../core/session/session_display_metadata.zig");
 const session_store = @import("../core/session/session_store.zig");
 const session_adapter = @import("../core/session/session_adapter.zig");
@@ -979,7 +981,7 @@ fn handleRestoreSession(
                 state,
                 alloc,
                 session_id,
-                if (active.writable) |*writable| writable.state.recovery_checkpoint else null,
+                if (active.writable) |*writable| writable else null,
             );
             try sendActiveSessionInfoUpdate(state, alloc);
             return writeLoadSessionResponse(
@@ -1145,7 +1147,7 @@ fn handleRestoreSession(
         state,
         alloc,
         session_id,
-        if (state.active_session.?.writable) |*value| value.state.recovery_checkpoint else null,
+        if (state.active_session.?.writable) |*value| value else null,
     );
     try sendActiveSessionInfoUpdate(state, alloc);
 
@@ -1287,13 +1289,37 @@ fn appendProjectMcpConfigs(
     );
 }
 
+/// Whether the interrupted request crashed fx twice, so the client should
+/// ask before `continueRecovery`. A record bound to another turn resumes
+/// nothing and is deleted here.
+fn pendingRecoveryAsksAfterCrashes(
+    alloc: Allocator,
+    loaded: *session_log.LoadedWritableSession,
+    checkpoint: session_codec.RecoveryCheckpoint,
+) bool {
+    const record = loaded.log.readRecoveryRecord(alloc) catch |err| {
+        debug_trace.logf("acp", "recovery record read failed err={s}", .{@errorName(err)});
+        return false;
+    };
+    const decision = resume_decision.decide(checkpoint, record, loaded.recoveryRecordBinding(), io_mod.milliTimestamp());
+    debug_trace.logf("acp", "event=load_recovery decision={s} record={}", .{ @tagName(decision), record != null });
+    if (decision == .ask_without_record and record != null) {
+        loaded.log.deleteRecoveryRecord() catch |err| {
+            debug_trace.logf("acp", "recovery record delete failed err={s}", .{@errorName(err)});
+        };
+    }
+    return decision == .ask_crash_loop;
+}
+
 fn sendPendingRecoveryUpdate(
     state: *server.ServerState,
     alloc: Allocator,
     session_id: []const u8,
-    checkpoint: ?session_codec.RecoveryCheckpoint,
+    writable: ?*session_log.LoadedWritableSession,
 ) !void {
-    const recovery = checkpoint orelse return;
+    const loaded = writable orelse return;
+    const recovery = loaded.state.recovery_checkpoint orelse return;
+    const crash_loop = pendingRecoveryAsksAfterCrashes(alloc, loaded, recovery);
     try sendUserHistoryTurn(state, alloc, session_id, recovery.user);
     try sendExecutionHistory(state, alloc, session_id, recovery.execution);
     if (recovery.assistant_source.len > 0) {
@@ -1306,7 +1332,7 @@ fn sendPendingRecoveryUpdate(
     try writeJsonStr(session_id, &out.writer);
     try out.writer.writeAll(",\"update\":");
     // A request an earlier fx process was running when it stopped.
-    try acp_types.writeInterruptedModelRecoveryInfoUpdate(&out.writer, attempt);
+    try acp_types.writeInterruptedModelRecoveryInfoUpdate(&out.writer, attempt, crash_loop);
     try out.writer.writeByte('}');
     try state.writer.writeNotification(
         alloc,

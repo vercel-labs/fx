@@ -63,12 +63,14 @@ pub fn writeModelRecoveryInfoUpdate(
 }
 
 /// The `interrupted` update for a saved recovery checkpoint that a session
-/// load replays.
-pub fn writeInterruptedModelRecoveryInfoUpdate(writer: *std.Io.Writer, attempt: usize) !void {
+/// load replays. `crash_loop` reports that the request crashed fx twice, so
+/// the client should ask before `continueRecovery` (decision 55).
+pub fn writeInterruptedModelRecoveryInfoUpdate(writer: *std.Io.Writer, attempt: usize, crash_loop: bool) !void {
     try writer.writeAll(model_recovery_update_prefix);
     try (core_types.RouteRecoveryStatus.Report{
         .state = .interrupted,
         .attempt = attempt,
+        .need = if (crash_loop) .crash_loop else null,
         .message = interrupted_turn_message,
     }).writeJson(writer);
     try writer.writeAll("}}}");
@@ -643,9 +645,16 @@ test "model recovery info update wraps the shared report and is clearable" {
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"modelResponseRecovery\":null") != null);
 
     out.writer.end = 0;
-    try writeInterruptedModelRecoveryInfoUpdate(&out.writer, 3);
+    try writeInterruptedModelRecoveryInfoUpdate(&out.writer, 3, false);
     try std.testing.expectEqualStrings(
         "{\"sessionUpdate\":\"session_info_update\",\"_meta\":{\"fx\":{\"modelResponseRecovery\":{\"state\":\"interrupted\",\"attempt\":3,\"message\":\"Interrupted turn\"}}}}",
+        out.writer.buffered(),
+    );
+
+    out.writer.end = 0;
+    try writeInterruptedModelRecoveryInfoUpdate(&out.writer, 3, true);
+    try std.testing.expectEqualStrings(
+        "{\"sessionUpdate\":\"session_info_update\",\"_meta\":{\"fx\":{\"modelResponseRecovery\":{\"state\":\"interrupted\",\"attempt\":3,\"need\":\"crash_loop\",\"message\":\"Interrupted turn\"}}}}",
         out.writer.buffered(),
     );
 }

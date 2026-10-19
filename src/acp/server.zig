@@ -20,6 +20,8 @@ const secret = @import("../core/auth/secret.zig");
 const auth_runtime = @import("../core/auth/auth_runtime.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
+const close_signals = @import("../core/agent/runtime/close_signals.zig");
+const request_recovery = @import("../core/agent/runtime/request_recovery.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
@@ -895,15 +897,48 @@ pub fn disableSubagentHost(state: *ServerState) void {
     }
 }
 
+/// `fx acp` in a process of its own closes on SIGHUP, SIGTERM, or the end of
+/// stdin: the request in flight keeps its recovery record for the next
+/// `session/load` (decision 48, D26). The wasm host has no signals and keeps
+/// its current shutdown.
+const closes_process = !host_target.is_wasm and switch (@import("builtin").target.os.tag) {
+    .windows, .wasi, .freestanding => false,
+    else => true,
+};
+
 pub fn run(alloc: Allocator, cfg: Config) !void {
-    return runWithTransport(alloc, cfg, jsonrpc.Reader.init(), jsonrpc.Writer.init());
+    if (comptime closes_process) installCloseSignals();
+    return serve(alloc, cfg, jsonrpc.Reader.init(), jsonrpc.Writer.init(), closes_process);
 }
 
+/// For hosts that embed the server, such as libfx: the host owns the
+/// process, so a closed transport cancels the request as before.
 pub fn runWithTransport(
     alloc: Allocator,
     cfg: Config,
     reader_value: jsonrpc.Reader,
     writer_value: jsonrpc.Writer,
+) !void {
+    return serve(alloc, cfg, reader_value, writer_value, false);
+}
+
+fn installCloseSignals() void {
+    if (!close_signals.start("")) return;
+    const action: std.posix.Sigaction = .{
+        .handler = .{ .handler = close_signals.handler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.HUP, &action, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &action, null);
+}
+
+fn serve(
+    alloc: Allocator,
+    cfg: Config,
+    reader_value: jsonrpc.Reader,
+    writer_value: jsonrpc.Writer,
+    close_on_input_end: bool,
 ) !void {
     if (cfg.log_file) |path| {
         try debug_trace.configure(.{ .file_path = path });
@@ -939,10 +974,17 @@ pub fn runWithTransport(
     };
 
     var reader = reader_value;
+    var input_ended = false;
     while (!state.terminate_connection) {
         reapActivePrompt(&state, false);
-        const line_result = reader.readLine(alloc) catch break;
-        if (line_result == null) break;
+        const line_result = reader.readLine(alloc) catch {
+            input_ended = true;
+            break;
+        };
+        if (line_result == null) {
+            input_ended = true;
+            break;
+        }
         const line = switch (line_result.?) {
             .overflow => {
                 state.writer.writeError(alloc, null, .{
@@ -984,6 +1026,13 @@ pub fn runWithTransport(
             }) catch break;
         };
         if (state.terminate_connection) break;
+    }
+    // The client went away with a request in flight, a close like SIGHUP:
+    // its record stays for the next load, so fx exits before the cancel
+    // below would end it.
+    if (close_on_input_end and input_ended and request_recovery.RequestRecovery.closeActive()) {
+        debug_trace.logf("acp", "event=closed_on_input_end", .{});
+        std.process.exit(0);
     }
     // Release any prompt thread parked on a pending approval before
     // state.deinit() joins it, or shutdown deadlocks.

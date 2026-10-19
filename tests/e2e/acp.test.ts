@@ -2411,6 +2411,126 @@ describe("acp: model-independent", () => {
     TIMEOUT,
   );
 
+  // A close saves the request in flight for the next load (decision 48):
+  // SIGHUP, or the client closing stdin (D26).
+  for (const close of ["SIGHUP", "end of input"] as const) test(
+    `ACP ${close} saves the request in flight, and continueRecovery resumes it`,
+    async () => {
+      const root = createIsolatedRoot("fx-acp-close-resume-");
+      const prompt = "Keep this ACP request across a closed window.";
+      const held = heldFakeGatewayFinalText();
+      const gateway = startFakeGateway([held.response, finalText("ACP_RESUMED_AFTER_CLOSE")]);
+      const proc = spawnAcp(root, gateway);
+      try {
+        client = new AcpClient(proc);
+        const sessionId = await startAutoSession(client);
+        sendPrompt(client, 40, prompt);
+        await waitForCondition("held request", () => gateway.requests.length === 1, TIMEOUT);
+        const sessionDir = join(root.home, ".fx", "sessions", sessionId);
+        expect(existsSync(join(sessionDir, "recovery.state"))).toBe(true);
+
+        const exited = client.waitForExit();
+        if (close === "SIGHUP") {
+          proc.kill("SIGHUP");
+          await exited;
+          expect(proc.signalCode).toBe("SIGHUP");
+        } else {
+          proc.stdin!.end();
+          await exited;
+          expect(proc.exitCode).toBe(0);
+        }
+        expect(existsSync(join(sessionDir, "recovery.state"))).toBe(true);
+        expect(existsSync(join(sessionDir, "recovery.json"))).toBe(true);
+
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+        const loaded = await loadSessionUpdates(client, 11, sessionId);
+        expect(loaded).toMatch(
+          /"modelResponseRecovery":\{"state":"interrupted","attempt":\d+,"message":"Interrupted turn"\}/,
+        );
+        const resumed = await continueRecovery(client, TIMEOUT, sessionId);
+        expect(resumed.promptResult.error).toBeUndefined();
+        expect(resumed.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.requests[1]!.body).toContain(prompt);
+        expect(existsSync(join(sessionDir, "recovery.state"))).toBe(false);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        held.dispose();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  // Two deaths with the send in flight: the load tells the client to ask,
+  // and continueRecovery is the user's answer (decision 55).
+  test(
+    "ACP reports a crash loop after two kills in flight, and continueRecovery still resumes",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-crash-loop-");
+      const prompt = "Keep this ACP request across two crashes.";
+      const first = heldFakeGatewayFinalText();
+      const second = heldFakeGatewayFinalText();
+      const gateway = startFakeGateway([
+        first.response,
+        second.response,
+        finalText("ACP_RESUMED_AFTER_CRASH_LOOP"),
+      ]);
+      let proc = spawnAcp(root, gateway);
+      try {
+        client = new AcpClient(proc);
+        const sessionId = await startAutoSession(client);
+        sendPrompt(client, 40, prompt);
+        await waitForCondition("first held request", () => gateway.requests.length === 1, TIMEOUT);
+        let exited = client.waitForExit();
+        proc.kill("SIGKILL");
+        await exited;
+
+        // One death: the load does not ask, and the resent request dies too.
+        proc = spawnAcp(root, gateway);
+        client = new AcpClient(proc);
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+        const once = await loadSessionUpdates(client, 11, sessionId);
+        expect(once).toContain("\"state\":\"interrupted\"");
+        expect(once).not.toContain("crash_loop");
+        client.send({
+          jsonrpc: "2.0",
+          id: 12,
+          method: "session/prompt",
+          params: { sessionId, prompt: [], _meta: { fx: { continueRecovery: true } } },
+        });
+        await waitForCondition("resent held request", () => gateway.requests.length === 2, TIMEOUT);
+        expect(gateway.requests[1]!.body).toContain(prompt);
+        exited = client.waitForExit();
+        proc.kill("SIGKILL");
+        await exited;
+
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 20);
+        const twice = await loadSessionUpdates(client, 21, sessionId);
+        expect(twice).toMatch(
+          /"modelResponseRecovery":\{"state":"interrupted","attempt":\d+,"need":"crash_loop","message":"Interrupted turn"\}/,
+        );
+        const resumed = await continueRecovery(client, TIMEOUT, sessionId);
+        expect(resumed.promptResult.error).toBeUndefined();
+        expect(resumed.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(3);
+        expect(gateway.requests[2]!.body).toContain(prompt);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        first.dispose();
+        second.dispose();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   test(
     "ACP retains interrupted preview when the process dies during a retry",
     async () => {
@@ -11099,3 +11219,34 @@ test.skipIf(!tmuxAvailable())(
   },
   TIMEOUT * 2,
 );
+
+// `fx acp` as its own process, so a test can signal it.
+function spawnAcp(
+  root: ReturnType<typeof createIsolatedRoot>,
+  gateway: ReturnType<typeof startFakeGateway>,
+) {
+  return nodeSpawn(FX_BIN, ["acp"], {
+    cwd: root.workspace,
+    env: { ...process.env, ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+}
+
+// Loads a session and returns the updates sent before the response.
+async function loadSessionUpdates(client: AcpClient, id: number, sessionId: string): Promise<string> {
+  client.send({
+    jsonrpc: "2.0",
+    id,
+    method: "session/load",
+    params: { sessionId, mcpServers: [] },
+  });
+  const messages: any[] = [];
+  while (true) {
+    const message = await client.readLine() as any;
+    if (message.id === id) {
+      expect(message.error).toBeUndefined();
+      return JSON.stringify(messages);
+    }
+    messages.push(message);
+  }
+}

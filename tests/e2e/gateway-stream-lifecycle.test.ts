@@ -5911,6 +5911,58 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 20_000);
 
+  // A closed terminal sends SIGHUP. `fx ask` keeps no recovery record, so it
+  // cancels the request as it does on SIGINT and SIGTERM (decision 48) and
+  // leaves no checkpoint for a later launch to find.
+  test("SIGHUP cancels a headless request and leaves no checkpoint", async () => {
+    const root = createFixtureRoot("headless-sighup");
+    const tracePath = join(root.root, "trace.log");
+    const held = heldFakeGatewayFinalText();
+    let requested = false;
+    const gateway = startGateway(() => {
+      requested = true;
+      return held.response;
+    });
+    const proc = Bun.spawn([FX_BIN, "ask", "--json", "Hold this request open."], {
+      cwd: root.workspace,
+      env: {
+        ...process.env,
+        ...fixtureEnv(root, gateway, tracePath),
+        FX_AUTO_UPGRADE: "0",
+        FX_SOUND: "0",
+      },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      const startDeadline = Date.now() + 10_000;
+      while (!requested) {
+        if (Date.now() >= startDeadline) throw new Error("held request did not start");
+        await Bun.sleep(10);
+      }
+      const signalAt = Date.now();
+      proc.kill("SIGHUP");
+      await proc.exited;
+      expect(Date.now() - signalAt).toBeLessThan(3_000);
+      expect(proc.signalCode).toBe("SIGHUP");
+      const stderr = await new Response(proc.stderr).text();
+      expect(stderr).not.toContain("panic");
+
+      const sessionsRoot = join(root.home, ".fx", "sessions");
+      const ids = readdirSync(sessionsRoot, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name);
+      expect(ids).toHaveLength(1);
+      expect(existsSync(join(sessionsRoot, ids[0]!, "recovery.json"))).toBe(false);
+      expect(existsSync(join(sessionsRoot, ids[0]!, "recovery.state"))).toBe(false);
+    } finally {
+      proc.kill("SIGKILL");
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   test("saved SIGINT retains cancelled shell output for resume without re-execution", async () => {
     const root = createFixtureRoot("saved-cancelled-terminal-replay");
     const firstTracePath = join(root.root, "first-trace.log");

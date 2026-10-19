@@ -124,6 +124,7 @@ const supports_headless_interrupt = switch (std_builtin.target.os.tag) {
 const HeadlessInterruptInstallError = error{HeadlessInterruptBusy};
 const headless_interrupt_exit_code: u8 = 130;
 const headless_termination_exit_code: u8 = 143;
+const headless_hangup_exit_code: u8 = 129;
 
 const headless_interrupt = if (supports_headless_interrupt) struct {
     var coordinator_mutex: std.Io.Mutex = .init;
@@ -148,6 +149,7 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
     fn exitCode() u8 {
         return switch (@as(std.posix.SIG, @fromBackingInt(@intCast(requested_signal.load(.seq_cst))))) {
             std.posix.SIG.TERM => headless_termination_exit_code,
+            std.posix.SIG.HUP => headless_hangup_exit_code,
             else => headless_interrupt_exit_code,
         };
     }
@@ -155,6 +157,9 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
     const Scope = struct {
         old_sigint_action: std.posix.Sigaction = undefined,
         old_sigterm_action: std.posix.Sigaction = undefined,
+        /// A closed terminal cancels the request too: `fx ask` keeps no
+        /// recovery record, so nothing could resume it (decision 48).
+        old_sighup_action: std.posix.Sigaction = undefined,
         installed: bool = false,
 
         fn install(enabled: bool) HeadlessInterruptInstallError!Scope {
@@ -176,6 +181,7 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
             }
             std.posix.sigaction(std.posix.SIG.INT, &action, &scope.old_sigint_action);
             std.posix.sigaction(std.posix.SIG.TERM, &action, &scope.old_sigterm_action);
+            std.posix.sigaction(std.posix.SIG.HUP, &action, &scope.old_sighup_action);
             coordinator_active = true;
             scope.installed = true;
             return scope;
@@ -188,6 +194,7 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
             std.debug.assert(coordinator_active);
             std.posix.sigaction(std.posix.SIG.INT, &self.old_sigint_action, null);
             std.posix.sigaction(std.posix.SIG.TERM, &self.old_sigterm_action, null);
+            std.posix.sigaction(std.posix.SIG.HUP, &self.old_sighup_action, null);
             if (std_builtin.is_test) {
                 if (test_after_restore) |hook| hook();
             }

@@ -47,6 +47,7 @@ const permission_gate = @import("../core/permissions/permission_gate.zig");
 const permission_request = @import("../core/permissions/permission_request.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const session_log = @import("../core/session/session_log.zig");
+const resume_decision = @import("../core/session/resume_decision.zig");
 const session_store = @import("../core/session/session_store.zig");
 const session_adapter = @import("../core/session/session_adapter.zig");
 const libfx_journal = @import("libfx_journal.zig");
@@ -947,6 +948,7 @@ pub fn handlePrompt(
 
     var recovery_checkpoint: ?session_codec.RecoveryCheckpoint = null;
     defer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
+    var recovery_record: ?[32]u8 = null;
     if (session.journal) |*journal| {
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -1002,6 +1004,7 @@ pub fn handlePrompt(
             },
         };
         recovery_checkpoint = try checkpoint.dupe(alloc);
+        recovery_record = continueRecord(alloc, session, writable, checkpoint);
     } else if (session.journal) |*journal| {
         // A new prompt instead of a resume ends the open turn as interrupted.
         if (journal.pending_resume) |pending| {
@@ -1009,11 +1012,22 @@ pub fn handlePrompt(
             journal.dropPendingResume(state.alloc);
         }
     } else if (session.writable) |*writable| {
-        if (writable.conversation_writer.turn_open) {
-            const checkpoint = writable.state.recovery_checkpoint orelse
-                return error.InvalidRecoveryCheckpoint;
-            try persistAcpHistoryTurn(alloc, session, checkpoint.interruptedTurn(), null, null);
+        // A new prompt over a leftover turn saves it into history first:
+        // while the log still has it open, or after a relaunch, when only
+        // the checkpoint holds it (decision 53).
+        if (writable.state.recovery_checkpoint) |checkpoint| {
+            if (writable.conversation_writer.turn_open or checkpoint.cause != .compaction_prepared) {
+                try persistAcpHistoryTurn(alloc, session, checkpoint.interruptedTurn(), null, null);
+            }
+        } else if (writable.conversation_writer.turn_open) {
+            return error.InvalidRecoveryCheckpoint;
         }
+        // The new prompt answers for the request fx did not resend.
+        session.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer session.session_write_mutex.unlock(io_mod.getIo());
+        writable.log.deleteRecoveryRecord() catch |err| {
+            debug_trace.logf("acp", "recovery record delete failed err={s}", .{@errorName(err)});
+        };
     }
 
     if (session.journal) |*journal| {
@@ -1107,6 +1121,7 @@ pub fn handlePrompt(
         .grants = session.session_grants,
         .context_snapshot = context_snapshot,
         .recovery_checkpoint = recovery_checkpoint,
+        .recovery_record = recovery_record,
         .recovery_source_already_presented = recovery_checkpoint != null,
     };
 
@@ -1947,6 +1962,11 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
             .{
                 .set = setRecoveryCheckpoint,
                 .clear = clearRecoveryCheckpoint,
+                .record = .{
+                    .binding = acpRecoveryRecordBinding,
+                    .save = saveAcpRecoveryRecord,
+                    .delete = deleteAcpRecoveryRecord,
+                },
             }
         else if (session.journal != null)
             .{
@@ -3091,6 +3111,54 @@ fn clearRecoveryCheckpoint(raw_ctx: *anyopaque) !void {
         .{ .recovery_checkpoint_cleared = .{} },
         io_mod.milliTimestamp(),
     );
+}
+
+/// The record `continueRecovery` resumes from: only one a launch would resend
+/// at once. Otherwise the client's request is the user's answer, so the
+/// request starts over, which also resets the crash count (decision 55).
+fn continueRecord(
+    alloc: Allocator,
+    session: anytype,
+    writable: *session_log.LoadedWritableSession,
+    checkpoint: session_codec.RecoveryCheckpoint,
+) ?[32]u8 {
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const record = writable.log.readRecoveryRecord(alloc) catch |err| {
+        debug_trace.logf("acp", "recovery record read failed err={s}", .{@errorName(err)});
+        return null;
+    };
+    const decision = resume_decision.decide(checkpoint, record, writable.recoveryRecordBinding(), io_mod.milliTimestamp());
+    debug_trace.logf("acp", "event=continue_recovery decision={s}", .{@tagName(decision)});
+    return if (decision == .auto_continue) record.?.bytes else null;
+}
+
+fn acpRecoveryRecordBinding(raw_ctx: *anyopaque) u32 {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*value| value else return 0;
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const writable = if (session.writable) |*value| value else return 0;
+    return writable.recoveryRecordBinding();
+}
+
+/// Durable on return: the send it covers goes out next.
+fn saveAcpRecoveryRecord(raw_ctx: *anyopaque, bytes: *const [32]u8) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const writable = if (session.writable) |*value| value else return error.SessionPersistenceUnavailable;
+    try writable.log.saveRecoveryRecord(ctx.alloc, bytes);
+}
+
+fn deleteAcpRecoveryRecord(raw_ctx: *anyopaque) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*value| value else return;
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const writable = if (session.writable) |*value| value else return;
+    try writable.log.deleteRecoveryRecord();
 }
 
 /// `recovery_checkpoint.set` for a journaled libfx session: the open turn

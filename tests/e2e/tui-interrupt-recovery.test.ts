@@ -1142,6 +1142,56 @@ while :; do sleep 1; done
     },
     TIMEOUT * 3,
   );
+
+  // Plain `fx` points at an unfinished turn in the session `fx -c` opens,
+  // and stops once that turn finishes (decision 56).
+  test(
+    "plain fx hints at an interrupted turn until it finishes",
+    async () => {
+      const run = resumeRun("fx-interrupted-hint-");
+      const held = newHold();
+      gateway = startFakeGateway([() => heldPartialResponse(held)]);
+      session = await launchResumeFx(run, gateway, "first");
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Work on the report.");
+      await waitForCondition(() => held.started, "held response start");
+      const sessionId = basename(onlySessionDir(run.home));
+      Bun.spawnSync(["kill", "-9", String(session.processPid())]);
+      await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
+      await session.kill();
+      session = null;
+      gateway.stop();
+
+      const idle = startFakeGateway([fakeGatewayFinalText("UNEXPECTED_RESEND")]);
+      gateway = idle;
+      session = await launchResumeFx(run, idle, "plain");
+      await session.waitForText("Interrupted turn · fx -c to continue", TIMEOUT);
+      expect(idle.requests).toHaveLength(0);
+      await session.sendText("/quit");
+      await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
+      await session.kill();
+      session = null;
+      idle.stop();
+
+      // Reopening finishes the turn, so the next plain launch has no hint.
+      const finish = startFakeGateway([fakeGatewayFinalText("FINISHED_AFTER_HINT")]);
+      gateway = finish;
+      session = await launchResumeFx(run, finish, "resume", sessionId);
+      await session.waitForText("FINISHED_AFTER_HINT", TIMEOUT);
+      await session.sendText("/quit");
+      await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
+      await session.kill();
+      session = null;
+
+      session = await launchResumeFx(run, finish, "plain-after");
+      await session.waitForComposer(TIMEOUT);
+      await Bun.sleep(1_000);
+      const scrollback = (await session.captureFullScrollback()).replaceAll(/\s+/g, " ");
+      expect(scrollback).not.toContain("Interrupted turn");
+      expect(readFileSync(join(run.root, "stderr-plain.log"), "utf8")).toBe("");
+    },
+    TIMEOUT * 4,
+  );
 });
 
 type ResumeRun = { root: string; home: string; workspace: string };

@@ -2276,6 +2276,16 @@ pub const Store = struct {
         return .{};
     }
 
+    /// Whether the session left a turn unfinished: its turn snapshot
+    /// (`recovery.json`) is still on disk. Reads one directory entry, so
+    /// plain `fx` can check at startup (decision 56). Errors read as no.
+    pub fn hasUnfinishedTurn(self: Store, session_id: []const u8) bool {
+        var dir = self.openSessionDir(session_id) catch return false;
+        defer dir.close();
+        const stat = dir.dir.statFile(io_mod.getIo(), "recovery.json", .{ .follow_symlinks = false }) catch return false;
+        return stat.kind == .file;
+    }
+
     fn openSessionDir(
         self: Store,
         session_id: []const u8,

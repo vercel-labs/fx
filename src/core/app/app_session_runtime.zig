@@ -47,7 +47,7 @@ const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_title_generation = @import("../session/session_title_generation.zig");
 const session_log = @import("../session/session_log.zig");
-const recovery = @import("../recovery/recovery.zig");
+const resume_decision = @import("../session/resume_decision.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const session_store = @import("../session/session_store.zig");
 const session_catalog_cache = @import("../session/session_catalog_cache.zig");
@@ -78,60 +78,10 @@ const Allocator = std.mem.Allocator;
 const live_session_handoff_timeout_ms: u64 = 2_000;
 const live_session_worker_cancel_timeout_ms: u64 = 5_000;
 
-const RecoveryAutoContinue = enum {
-    auto_continue,
-    skip_compaction_owned,
-    /// No record bound to the checkpoint: nothing was in flight that fx may
-    /// resend on its own (decision 51).
-    ask_without_record,
-    /// The record is more than a day old, or dated in the future.
-    ask_old,
-    /// The recovery module asks first: the request crashed fx twice.
-    ask_crash_loop,
-    /// The request was waiting for the user when fx closed.
-    ask_waiting,
-};
-
-/// A record older than this asks before fx resends its request.
-const resume_max_age_ms: i64 = 24 * std.time.ms_per_hour;
-/// Clock adjustment allowed before a record counts as dated in the future.
-const resume_clock_slack_ms: i64 = std.time.ms_per_min;
-
-/// How a launch treats the checkpoint it found. The recovery record alone
-/// decides (decision 46): a record bound to the checkpoint resumes its
-/// request without a question, unless the record is more than a day old or
-/// the recovery module would ask first. Without one, nothing was in flight
-/// that fx may resend on its own, so the user decides
-/// (`tests/tla/recovery/Resume.tla` NoQuestionAfterCleanClose,
-/// NoQuestionAfterOneDeath, CrashLoopAsks, OldAsks).
-fn recoveryAutoContinueDecision(
-    checkpoint: session_codec.RecoveryCheckpoint,
-    record: ?session_log.RecoveryRecord,
-    binding: u32,
-    now_ms: i64,
-) RecoveryAutoContinue {
-    if (checkpoint.cause == .compaction_prepared) return .skip_compaction_owned;
-    const saved = record orelse return .ask_without_record;
-    // An unreadable record resumes, and the module counts it as one abrupt
-    // death (decision 49).
-    if (recovery.boundTo(saved.bytes)) |bound| {
-        if (bound != binding) return .ask_without_record;
-    }
-    if (now_ms - saved.saved_at_ms > resume_max_age_ms or
-        saved.saved_at_ms - now_ms > resume_clock_slack_ms) return .ask_old;
-    // `step` is pure, so a copy answers what the resumed request will do.
-    var probe: recovery.State = .{};
-    const plan = recovery.step(&probe, .{ .start = .{ .resume_from = saved.bytes } }, 0);
-    if (plan.send != null) return .auto_continue;
-    const status = plan.status orelse return .ask_waiting;
-    const need = status.need orelse return .ask_waiting;
-    return if (need == .crash_loop) .ask_crash_loop else .ask_waiting;
-}
-
 /// The notice a launch shows instead of resending. Until fx asks with its
 /// own prompt, the next message answers: "continue" resends the request
 /// with the interrupted turn, and anything else moves on (decision 53).
-fn resumeQuestion(decision: RecoveryAutoContinue) []const u8 {
+fn resumeQuestion(decision: resume_decision.Decision) []const u8 {
     return switch (decision) {
         .ask_old => "This request was interrupted more than a day ago, so it was not resent. Send \"continue\" to resend it, or a new message to move on.",
         .ask_crash_loop => "This request crashed fx twice, so it was not resent. Send \"continue\" to retry it, or a new message to move on.",
@@ -2130,6 +2080,26 @@ pub fn Runtime(comptime App: type) type {
             return resumeRequestedSessionWithNotice(app, .session);
         }
 
+        /// Plain `fx`, after the session `fx -c` would open left a turn
+        /// unfinished, shows one hint line (decision 56). v1 only: the v2
+        /// store records the session each host last opened on its own.
+        pub fn showInterruptedTurnHint(app: *App) void {
+            if (comptime !@hasField(App, "session_persistence")) return;
+            if (app.session_persistence.v2_store != null) return;
+            const store = app.session_persistence.store orelse return;
+            const id = (store.readRememberedSessionId(app.alloc) catch return) orelse return;
+            defer app.alloc.free(id);
+            if (!store.hasUnfinishedTurn(id)) return;
+            debug_trace.logf("session", "event=interrupted_turn_hint id={s}", .{id});
+            app.writeDomainNotice(.{
+                .topic = "session",
+                .tone = .neutral,
+                .body = "Interrupted turn · fx -c to continue",
+            }, true) catch |err| {
+                debug_trace.logf("session", "interrupted turn hint failed err={s}", .{@errorName(err)});
+            };
+        }
+
         pub fn resumeRequestedSessionAfterUpgrade(
             app: *App,
             version: []const u8,
@@ -2561,7 +2531,7 @@ pub fn Runtime(comptime App: type) type {
 
             // Decide before rendering: the checkpoint replay below must not
             // promise an automatic continuation the gate is about to suppress.
-            const recovery_decision: ?RecoveryAutoContinue = if (comptime @hasDecl(App, "queueRecoveryCheckpoint"))
+            const recovery_decision: ?resume_decision.Decision = if (comptime @hasDecl(App, "queueRecoveryCheckpoint"))
                 if (state.recovery_checkpoint) |checkpoint|
                     recoveryLaunchDecision(app, checkpoint)
                 else
@@ -2668,10 +2638,10 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Reads the recovery record beside the checkpoint and decides.
-        fn recoveryLaunchDecision(app: *App, checkpoint: session_codec.RecoveryCheckpoint) RecoveryAutoContinue {
+        fn recoveryLaunchDecision(app: *App, checkpoint: session_codec.RecoveryCheckpoint) resume_decision.Decision {
             const record = readRecoveryRecord(app);
             const binding = recoveryRecordBinding(app);
-            const decision = recoveryAutoContinueDecision(checkpoint, record, binding, io_mod.milliTimestamp());
+            const decision = resume_decision.decide(checkpoint, record, binding, io_mod.milliTimestamp());
             debug_trace.logf("session", "event=resume_decision decision={s} record={}", .{ @tagName(decision), record != null });
             return decision;
         }
@@ -4879,7 +4849,7 @@ pub fn Runtime(comptime App: type) type {
             sink: anytype,
             state: session_codec.DurableSessionState,
             labels: *HistoricalSessionLabels,
-            recovery_decision: ?RecoveryAutoContinue,
+            recovery_decision: ?resume_decision.Decision,
         ) !void {
             const checkpoint = state.recovery_checkpoint orelse return;
             var has_prior_turns = false;
@@ -13075,47 +13045,6 @@ fn parseTestRecoveryCheckpoint(alloc: Allocator, cause: []const u8) !session_cod
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
     defer parsed.deinit();
     return session_codec.parseRecoveryCheckpoint(alloc, parsed.value);
-}
-
-test "a launch resumes from a record bound to its checkpoint and asks otherwise" {
-    const alloc = std.testing.allocator;
-    var interrupted = try parseTestRecoveryCheckpoint(alloc, "response_interrupted");
-    defer interrupted.deinit(alloc);
-    const now_ms: i64 = 1_800_000_000_000;
-    const binding: u32 = 4;
-
-    // A send was in flight when fx closed or died once.
-    var state: recovery.State = .{};
-    const in_flight = recovery.step(&state, .{ .start = .{ .binding = binding } }, 10).save.?;
-    const saved: session_log.RecoveryRecord = .{ .bytes = in_flight, .saved_at_ms = now_ms - 5_000 };
-    try std.testing.expectEqual(.auto_continue, recoveryAutoContinueDecision(interrupted, saved, binding, now_ms));
-
-    // No record, or one of a turn the log already committed: nothing fx
-    // may resend on its own.
-    try std.testing.expectEqual(.ask_without_record, recoveryAutoContinueDecision(interrupted, null, binding, now_ms));
-    try std.testing.expectEqual(.ask_without_record, recoveryAutoContinueDecision(interrupted, saved, binding + 1, now_ms));
-
-    // More than a day old, or dated in the future.
-    var old = saved;
-    old.saved_at_ms = now_ms - 25 * std.time.ms_per_hour;
-    try std.testing.expectEqual(.ask_old, recoveryAutoContinueDecision(interrupted, old, binding, now_ms));
-    old.saved_at_ms = now_ms + 2 * std.time.ms_per_min;
-    try std.testing.expectEqual(.ask_old, recoveryAutoContinueDecision(interrupted, old, binding, now_ms));
-
-    // An unreadable record resumes, counted as one death.
-    var torn = saved;
-    torn.bytes[31] ^= 0xff;
-    try std.testing.expectEqual(.auto_continue, recoveryAutoContinueDecision(interrupted, torn, binding, now_ms));
-
-    // A second death with the send in flight: the module asks first.
-    var again: recovery.State = .{};
-    const second = recovery.step(&again, .{ .start = .{ .resume_from = in_flight, .binding = binding } }, 10).save.?;
-    const crashed: session_log.RecoveryRecord = .{ .bytes = second, .saved_at_ms = now_ms - 5_000 };
-    try std.testing.expectEqual(.ask_crash_loop, recoveryAutoContinueDecision(interrupted, crashed, binding, now_ms));
-
-    var compaction = try parseTestRecoveryCheckpoint(alloc, "compaction_prepared");
-    defer compaction.deinit(alloc);
-    try std.testing.expectEqual(.skip_compaction_owned, recoveryAutoContinueDecision(compaction, saved, binding, now_ms));
 }
 
 test "fresh prompt boundary waits out the cancel finalization window" {

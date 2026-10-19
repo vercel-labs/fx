@@ -10,7 +10,7 @@ const oauth_transport = @import("../auth/oauth_transport.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
-const request_recovery = @import("../agent/runtime/request_recovery.zig");
+const close_signals = @import("../agent/runtime/close_signals.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const shared_theme = @import("../shared/theme.zig");
@@ -82,60 +82,6 @@ fn tmuxAbnormalExitHandler(sig: std.posix.SIG) callconv(.c) void {
     abnormalExitHandlerWithRestore(tmux_abnormal_exit_restore, sig);
 }
 
-/// SIGHUP and SIGTERM close fx. The handler only wakes `closerMain`, which
-/// saves the model request in flight outside signal context, so the next
-/// launch resumes it without a question (`RequestRecovery.closeActive`,
-/// `tests/tla/recovery/Resume.tla` NoQuestionAfterCleanClose), then restores
-/// the terminal and re-raises as the handler did before. Without that thread,
-/// the handler restores and re-raises itself.
-var close_pipe: [2]std.posix.fd_t = .{ -1, -1 };
-var close_signal: std.atomic.Value(i32) = .init(0);
-var closer_tmux = false;
-var closer_started = false;
-
-/// Must remain async-signal-safe: one atomic exchange and one `write(2)`.
-fn closeSignalHandler(sig: std.posix.SIG) callconv(.c) void {
-    if (close_signal.cmpxchgStrong(0, @intCast(@backingInt(sig)), .seq_cst, .seq_cst) != null) return;
-    const byte = [1]u8{1};
-    _ = std.c.write(close_pipe[1], &byte, 1);
-}
-
-fn closerMain() void {
-    var byte: [1]u8 = undefined;
-    while (true) {
-        const read = std.c.read(close_pipe[0], &byte, 1);
-        if (read == 1) break;
-        if (read < 0 and std.posix.errno(read) == .INTR) continue;
-        return;
-    }
-    const sig: std.posix.SIG = @fromBackingInt(@intCast(close_signal.load(.seq_cst)));
-    const saved = request_recovery.RequestRecovery.closeActive();
-    debug_trace.logf("app", "event=closing signal={d} record_saved={}", .{ close_signal.load(.seq_cst), saved });
-    if (closer_tmux) {
-        abnormalExitHandlerWithRestore(tmux_abnormal_exit_restore, sig);
-    } else {
-        abnormalExitHandlerWithRestore(abnormal_exit_restore, sig);
-    }
-}
-
-/// Starts the closer once per process. False when it cannot run.
-fn startCloser(tmux: bool) bool {
-    if (closer_started) return true;
-    // Close-on-exec, so the commands and servers fx starts do not inherit it.
-    close_pipe = std.Io.Threaded.pipe2(.{ .CLOEXEC = true }) catch return false;
-    closer_tmux = tmux;
-    const thread = std.Thread.spawn(.{}, closerMain, .{}) catch |err| {
-        debug_trace.logf("app", "closer unavailable err={s}", .{@errorName(err)});
-        _ = std.c.close(close_pipe[0]);
-        _ = std.c.close(close_pipe[1]);
-        close_pipe = .{ -1, -1 };
-        return false;
-    };
-    thread.detach();
-    closer_started = true;
-    return true;
-}
-
 /// Install handlers for SIGTERM and SIGHUP so an externally-terminated
 /// fx saves the request in flight and restores terminal state before dying.
 /// SIGINT is not included because raw mode disables terminal-generated
@@ -143,8 +89,9 @@ fn startCloser(tmux: bool) bool {
 pub fn installAbnormalExitHandlers(tmux: ?[]const u8) void {
     if (!shell_runtime.supports_resize_signal) return;
 
-    const handler: std.posix.Sigaction.handler_fn = if (startCloser(tmux != null))
-        closeSignalHandler
+    const restore: []const u8 = if (tmux == null) abnormal_exit_restore else tmux_abnormal_exit_restore;
+    const handler: std.posix.Sigaction.handler_fn = if (close_signals.start(restore))
+        close_signals.handler
     else if (tmux == null)
         abnormalExitHandler
     else

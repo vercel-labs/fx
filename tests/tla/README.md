@@ -54,7 +54,6 @@ Some models describe the next MCP-v2 version, which `src/mcp/` and `src/core/mcp
 
 - In `mcp/`, `Engine`, `EngineTrace`, `HttpModern`, `HttpModernTrace`, `HttpLegacy`, and `StdioConn` say so at the top. `drivers/mcp/labs/engine_lab.zig` does not build against `src/mcp/` yet, so `drivers/mcp/driver.ts` runs its scenarios only with `--next`.
 - In `drivers/mcp_host/`, the tests marked `NEXT_MCP` run only with `FX_TLA_NEXT_MCP=1`.
-- In `recovery/`, the TUI implements `Resume.tla`'s proposed design, but ACP and `fx ask` do not yet: ACP has no SIGHUP or SIGTERM handler, and `fx ask` does not cancel on SIGHUP.
 
 The MCP-v2 models of the two HTTP transports, input-required rounds, authorization, subscriptions, and elicitation are model-checked only. Their traces came from a conformance adapter that is not part of fx. The `drivers/mcp_host/` sign-in tests drive real fx over HTTP against the fake server in `drivers/mcp/fakes/`.
 

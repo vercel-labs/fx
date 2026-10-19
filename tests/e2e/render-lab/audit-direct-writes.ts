@@ -46,6 +46,7 @@ const allowlist: AllowRule[] = [
   rule("src/ui/shell_runtime.zig", "clearTmuxScreenAndHistory", /stdio_(?:acquisition|write)/, "terminal_reset", "tmux pane reset before history cleanup"),
   rule("src/ui/shell_runtime.zig", "enableThemeNotifications", /stdio_(?:acquisition|write)/, "initialization_teardown", "terminal theme notification control"),
   rule("src/core/app/app_lifecycle.zig", "abnormalExitHandlerWithRestore", /(?:fixed_descriptor|raw_fd_write)/, "crash_recovery", "async-signal-safe terminal restoration"),
+  rule("src/core/agent/runtime/close_signals.zig", "closerMain", /fixed_fd_write/, "crash_recovery", "terminal restoration before a close re-raises its signal"),
   rule("src/core/hosts/wasm_panic.zig", "panicToStderr", /debug_print/, "crash_recovery", "WASM panic message before trap"),
   rule("src/ui/shell_runtime.zig", "ensureInteractive", /fixed_descriptor/, "terminal_probe", "TTY capability probe"),
   rule("src/ui/shell_runtime.zig", "(?:query|requestResize)CursorPosition", /stdio_(?:acquisition|write)/, "terminal_probe", "cursor-position query"),
