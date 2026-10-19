@@ -132,6 +132,10 @@ pub const QueuedPrompt = struct {
     /// Present only when an explicit host action resumes a durable paused
     /// model turn. The same ownership rules as the other queued fields apply.
     recovery_checkpoint: ?session_codec.RecoveryCheckpoint = null,
+    /// The recovery record a launch found for the checkpoint's request
+    /// (`src/core/recovery/` `Record`). The job's first model request
+    /// resumes from it; every later one in the turn is new.
+    recovery_record: ?[32]u8 = null,
     /// True when this output surface already contains the checkpoint's
     /// assistant source. Recovery still restores the source for overlap and
     /// persistence, but publishes only novel continuation text.

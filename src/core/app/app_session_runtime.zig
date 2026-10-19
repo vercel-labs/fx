@@ -47,6 +47,7 @@ const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_title_generation = @import("../session/session_title_generation.zig");
 const session_log = @import("../session/session_log.zig");
+const recovery = @import("../recovery/recovery.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const session_store = @import("../session/session_store.zig");
 const session_catalog_cache = @import("../session/session_catalog_cache.zig");
@@ -80,23 +81,63 @@ const live_session_worker_cancel_timeout_ms: u64 = 5_000;
 const RecoveryAutoContinue = enum {
     auto_continue,
     skip_compaction_owned,
-    ask_after_unclean_exit,
+    /// No record bound to the checkpoint: nothing was in flight that fx may
+    /// resend on its own (decision 51).
+    ask_without_record,
+    /// The record is more than a day old, or dated in the future.
+    ask_old,
+    /// The recovery module asks first: the request crashed fx twice.
+    ask_crash_loop,
+    /// The request was waiting for the user when fx closed.
+    ask_waiting,
 };
 
-/// Whether a paused recovery continues on its own after a restart or resume.
-/// A leftover owner marker means the previous process died mid-recovery, and
-/// a leftover asked marker means a prior resume already suppressed this
-/// checkpoint without the user resolving it. Either way the turn is the
-/// user's to retry, not fx's to re-spend.
+/// A record older than this asks before fx resends its request.
+const resume_max_age_ms: i64 = 24 * std.time.ms_per_hour;
+/// Clock adjustment allowed before a record counts as dated in the future.
+const resume_clock_slack_ms: i64 = std.time.ms_per_min;
+
+/// How a launch treats the checkpoint it found. The recovery record alone
+/// decides (decision 46): a record bound to the checkpoint resumes its
+/// request without a question, unless the record is more than a day old or
+/// the recovery module would ask first. Without one, nothing was in flight
+/// that fx may resend on its own, so the user decides
+/// (`tests/tla/recovery/Resume.tla` NoQuestionAfterCleanClose,
+/// NoQuestionAfterOneDeath, CrashLoopAsks, OldAsks).
 fn recoveryAutoContinueDecision(
     checkpoint: session_codec.RecoveryCheckpoint,
-    previous_owner_died: bool,
-    recovery_asked_before: bool,
+    record: ?session_log.RecoveryRecord,
+    binding: u32,
+    now_ms: i64,
 ) RecoveryAutoContinue {
     if (checkpoint.cause == .compaction_prepared) return .skip_compaction_owned;
-    if (recovery_asked_before) return .ask_after_unclean_exit;
-    if (previous_owner_died) return .ask_after_unclean_exit;
-    return .auto_continue;
+    const saved = record orelse return .ask_without_record;
+    // An unreadable record resumes, and the module counts it as one abrupt
+    // death (decision 49).
+    if (recovery.boundTo(saved.bytes)) |bound| {
+        if (bound != binding) return .ask_without_record;
+    }
+    if (now_ms - saved.saved_at_ms > resume_max_age_ms or
+        saved.saved_at_ms - now_ms > resume_clock_slack_ms) return .ask_old;
+    // `step` is pure, so a copy answers what the resumed request will do.
+    var probe: recovery.State = .{};
+    const plan = recovery.step(&probe, .{ .start = .{ .resume_from = saved.bytes } }, 0);
+    if (plan.send != null) return .auto_continue;
+    const status = plan.status orelse return .ask_waiting;
+    const need = status.need orelse return .ask_waiting;
+    return if (need == .crash_loop) .ask_crash_loop else .ask_waiting;
+}
+
+/// The notice a launch shows instead of resending. Until fx asks with its
+/// own prompt, the next message answers: "continue" resends the request
+/// with the interrupted turn, and anything else moves on (decision 53).
+fn resumeQuestion(decision: RecoveryAutoContinue) []const u8 {
+    return switch (decision) {
+        .ask_old => "This request was interrupted more than a day ago, so it was not resent. Send \"continue\" to resend it, or a new message to move on.",
+        .ask_crash_loop => "This request crashed fx twice, so it was not resent. Send \"continue\" to retry it, or a new message to move on.",
+        .ask_waiting => "This request was waiting for you when fx closed, so it was not resent. Send \"continue\" to retry it, or a new message to move on.",
+        .ask_without_record, .auto_continue, .skip_compaction_owned => "This response was interrupted, so it was not restarted. Send \"continue\" to retry it, or a new message to move on.",
+    };
 }
 
 const BackgroundSessionPolicy = enum {
@@ -2522,7 +2563,7 @@ pub fn Runtime(comptime App: type) type {
             // promise an automatic continuation the gate is about to suppress.
             const recovery_decision: ?RecoveryAutoContinue = if (comptime @hasDecl(App, "queueRecoveryCheckpoint"))
                 if (state.recovery_checkpoint) |checkpoint|
-                    recoveryAutoContinueDecision(checkpoint, previousOwnerDied(app), recoveryAskedBefore(app))
+                    recoveryLaunchDecision(app, checkpoint)
                 else
                     null
             else
@@ -2581,21 +2622,18 @@ pub fn Runtime(comptime App: type) type {
                             "event=auto_continue_skipped cause=compaction_prepared",
                             .{},
                         ),
-                        .ask_after_unclean_exit => {
+                        .ask_without_record, .ask_old, .ask_crash_loop, .ask_waiting => |ask| {
                             debug_trace.logf(
                                 "session",
-                                "event=auto_continue_suppressed reason=unclean_exit turn_id={d}",
-                                .{checkpoint.turn_id},
+                                "event=auto_continue_suppressed reason={s} turn_id={d}",
+                                .{ @tagName(ask), checkpoint.turn_id },
                             );
-                            if (comptime @hasField(App, "session_persistence")) {
-                                if (app.session_persistence.writable) |*loaded| {
-                                    session_log.markRecoveryAsked(app.alloc, &loaded.log.dir);
-                                }
-                            }
+                            // A record bound to another turn resumes nothing.
+                            if (ask == .ask_without_record) deleteRecoveryRecordLogged(app);
                             try app.writeDomainNotice(.{
                                 .topic = "recovery",
                                 .tone = .warning,
-                                .body = "fx quit unexpectedly while this response was recovering, so it was not restarted. Send \"continue\" to retry it, or a new message to move on.",
+                                .body = resumeQuestion(ask),
                             }, true);
                         },
                         .auto_continue => {
@@ -2629,16 +2667,58 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        fn previousOwnerDied(app: *App) bool {
-            if (comptime !@hasField(App, "session_persistence")) return false;
-            const loaded = if (app.session_persistence.writable) |*value| value else return false;
-            return loaded.log.previous_owner_died;
+        /// Reads the recovery record beside the checkpoint and decides.
+        fn recoveryLaunchDecision(app: *App, checkpoint: session_codec.RecoveryCheckpoint) RecoveryAutoContinue {
+            const record = readRecoveryRecord(app);
+            const binding = recoveryRecordBinding(app);
+            const decision = recoveryAutoContinueDecision(checkpoint, record, binding, io_mod.milliTimestamp());
+            debug_trace.logf("session", "event=resume_decision decision={s} record={}", .{ @tagName(decision), record != null });
+            return decision;
         }
 
-        fn recoveryAskedBefore(app: *App) bool {
-            if (comptime !@hasField(App, "session_persistence")) return false;
-            const loaded = if (app.session_persistence.writable) |*value| value else return false;
-            return session_log.recoveryWasAsked(&loaded.log.dir);
+        fn readRecoveryRecord(app: *App) ?session_log.RecoveryRecord {
+            if (comptime !@hasField(App, "session_persistence")) return null;
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const loaded = if (app.session_persistence.writable) |*value| value else return null;
+            return loaded.log.readRecoveryRecord(app.alloc) catch |err| {
+                debug_trace.logf("session", "recovery record read failed err={s}", .{@errorName(err)});
+                return null;
+            };
+        }
+
+        /// The binding new recovery records carry; 0 without a writable
+        /// session, which keeps no record.
+        pub fn recoveryRecordBinding(app: *App) u32 {
+            if (comptime !@hasField(App, "session_persistence")) return 0;
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const loaded = if (app.session_persistence.writable) |*value| value else return 0;
+            return loaded.recoveryRecordBinding();
+        }
+
+        pub fn saveRecoveryRecord(app: *App, record: *const [32]u8) !void {
+            if (comptime !@hasField(App, "session_persistence")) return error.SessionPersistenceUnavailable;
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const loaded = if (app.session_persistence.writable) |*value| value else return error.SessionPersistenceUnavailable;
+            try loaded.log.saveRecoveryRecord(app.alloc, record);
+        }
+
+        pub fn deleteRecoveryRecord(app: *App) !void {
+            if (comptime !@hasField(App, "session_persistence")) return;
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const loaded = if (app.session_persistence.writable) |*value| value else return;
+            try loaded.log.deleteRecoveryRecord();
+        }
+
+        /// A leftover record answers nothing once the user moved on, so a
+        /// failed delete is traced, not raised.
+        pub fn deleteRecoveryRecordLogged(app: *App) void {
+            deleteRecoveryRecord(app) catch |err| {
+                debug_trace.logf("session", "recovery record delete failed err={s}", .{@errorName(err)});
+            };
         }
 
         /// The picker lists from the backend this process runs on.
@@ -3119,7 +3199,8 @@ pub fn Runtime(comptime App: type) type {
             defer checkpoint.deinit(std.heap.c_allocator);
 
             app.session.setConversationLanguageFromUserMessage(checkpoint.user.text);
-            return app.queueRecoveryCheckpoint(&checkpoint);
+            const record = if (readRecoveryRecord(app)) |saved| saved.bytes else null;
+            return app.queueRecoveryCheckpoint(&checkpoint, record);
         }
 
         /// Poll cadence and bound for snapshotFreshPromptBoundary's wait for an
@@ -3152,7 +3233,12 @@ pub fn Runtime(comptime App: type) type {
                     const loaded = if (app.session_persistence.writable) |*value| value else return null;
                     if (!loaded.conversation_writer.turn_open) {
                         loaded.boundary_wedged = false;
-                        return null;
+                        // A turn a relaunch did not resend lives only in its
+                        // checkpoint, so the new message saves it into history
+                        // first and "continue" carries it (decision 53). Turns
+                        // that ended cleared their checkpoint before closing.
+                        const leftover = interruptedOnlyInCheckpoint(loaded) orelse return null;
+                        break :blk .{ .ready = try leftover.dupe(alloc) };
                     }
                     if (loaded.state.recovery_checkpoint) |checkpoint| {
                         loaded.boundary_wedged = false;
@@ -3194,13 +3280,24 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// The checkpoint of a turn the log has no record of: no turn is open,
+        /// and the checkpoint names the log's last seq, so the log never saw
+        /// it. The compaction flow owns a prepared compaction's checkpoint.
+        fn interruptedOnlyInCheckpoint(loaded: anytype) ?session_codec.RecoveryCheckpoint {
+            const checkpoint = loaded.state.recovery_checkpoint orelse return null;
+            if (checkpoint.cause == .compaction_prepared) return null;
+            return checkpoint;
+        }
+
         pub fn normalizeFreshPromptPreparation(app: *App, request: worker_runtime.FreshPromptPreparation) worker_runtime.FreshPromptPreparation {
             if (comptime !@hasField(App, "session_persistence")) return request;
             var current = request;
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             if (app.session_persistence.writable) |*loaded| {
-                if (!loaded.conversation_writer.turn_open and current.prior_turn != null) {
+                if (!loaded.conversation_writer.turn_open and current.prior_turn != null and
+                    interruptedOnlyInCheckpoint(loaded) == null)
+                {
                     debug_trace.logf("session", "event=fresh_prompt_prior_already_finished turn_id={d}; skipping interrupted closure", .{request.turn_id});
                     current.prior_turn = null;
                 }
@@ -11615,6 +11712,11 @@ test "session picker cold open paints the persisted catalog before revalidation"
         };
         var writable = try store.startWritableSession(alloc, durable);
         writable.deinit(alloc);
+        // A new session records the current time as its last update, so let
+        // the clock pass this one before starting the next. In the same
+        // millisecond the order would fall back to the session ids.
+        const saved_ms = io_mod.milliTimestamp();
+        while (io_mod.milliTimestamp() <= saved_ms) io_mod.sleep(std.time.ns_per_ms / 4);
     }
     // Publish the on-disk picker catalog, then drop the in-memory copy so the
     // next open is cold, as in a freshly launched process.
@@ -12975,20 +13077,45 @@ fn parseTestRecoveryCheckpoint(alloc: Allocator, cause: []const u8) !session_cod
     return session_codec.parseRecoveryCheckpoint(alloc, parsed.value);
 }
 
-test "recovery auto-continue asks after an unclean exit instead of restarting" {
+test "a launch resumes from a record bound to its checkpoint and asks otherwise" {
     const alloc = std.testing.allocator;
     var interrupted = try parseTestRecoveryCheckpoint(alloc, "response_interrupted");
     defer interrupted.deinit(alloc);
-    try std.testing.expectEqual(.auto_continue, recoveryAutoContinueDecision(interrupted, false, false));
-    try std.testing.expectEqual(.ask_after_unclean_exit, recoveryAutoContinueDecision(interrupted, true, false));
-    // Suppression stays sticky: a clean quit without a resolution still asks.
-    try std.testing.expectEqual(.ask_after_unclean_exit, recoveryAutoContinueDecision(interrupted, false, true));
-    try std.testing.expectEqual(.ask_after_unclean_exit, recoveryAutoContinueDecision(interrupted, true, true));
+    const now_ms: i64 = 1_800_000_000_000;
+    const binding: u32 = 4;
+
+    // A send was in flight when fx closed or died once.
+    var state: recovery.State = .{};
+    const in_flight = recovery.step(&state, .{ .start = .{ .binding = binding } }, 10).save.?;
+    const saved: session_log.RecoveryRecord = .{ .bytes = in_flight, .saved_at_ms = now_ms - 5_000 };
+    try std.testing.expectEqual(.auto_continue, recoveryAutoContinueDecision(interrupted, saved, binding, now_ms));
+
+    // No record, or one of a turn the log already committed: nothing fx
+    // may resend on its own.
+    try std.testing.expectEqual(.ask_without_record, recoveryAutoContinueDecision(interrupted, null, binding, now_ms));
+    try std.testing.expectEqual(.ask_without_record, recoveryAutoContinueDecision(interrupted, saved, binding + 1, now_ms));
+
+    // More than a day old, or dated in the future.
+    var old = saved;
+    old.saved_at_ms = now_ms - 25 * std.time.ms_per_hour;
+    try std.testing.expectEqual(.ask_old, recoveryAutoContinueDecision(interrupted, old, binding, now_ms));
+    old.saved_at_ms = now_ms + 2 * std.time.ms_per_min;
+    try std.testing.expectEqual(.ask_old, recoveryAutoContinueDecision(interrupted, old, binding, now_ms));
+
+    // An unreadable record resumes, counted as one death.
+    var torn = saved;
+    torn.bytes[31] ^= 0xff;
+    try std.testing.expectEqual(.auto_continue, recoveryAutoContinueDecision(interrupted, torn, binding, now_ms));
+
+    // A second death with the send in flight: the module asks first.
+    var again: recovery.State = .{};
+    const second = recovery.step(&again, .{ .start = .{ .resume_from = in_flight, .binding = binding } }, 10).save.?;
+    const crashed: session_log.RecoveryRecord = .{ .bytes = second, .saved_at_ms = now_ms - 5_000 };
+    try std.testing.expectEqual(.ask_crash_loop, recoveryAutoContinueDecision(interrupted, crashed, binding, now_ms));
 
     var compaction = try parseTestRecoveryCheckpoint(alloc, "compaction_prepared");
     defer compaction.deinit(alloc);
-    try std.testing.expectEqual(.skip_compaction_owned, recoveryAutoContinueDecision(compaction, false, false));
-    try std.testing.expectEqual(.skip_compaction_owned, recoveryAutoContinueDecision(compaction, true, true));
+    try std.testing.expectEqual(.skip_compaction_owned, recoveryAutoContinueDecision(compaction, saved, binding, now_ms));
 }
 
 test "fresh prompt boundary waits out the cancel finalization window" {

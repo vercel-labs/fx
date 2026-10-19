@@ -983,6 +983,10 @@ pub fn Runtime(comptime App: type) type {
                 if (app.session_persistence.writable) |*loaded| try loaded.requireWritable();
             }
             if (job.recovery_checkpoint == null) {
+                // A new message answers a resume question, so the record of
+                // the request fx did not resend goes (decision 53). Every
+                // other request deleted its own when it ended.
+                app_session_runtime.Runtime(App).deleteRecoveryRecordLogged(app);
                 if (try app_session_runtime.Runtime(App).snapshotFreshPromptBoundary(app, std.heap.c_allocator)) |value| {
                     var checkpoint = value;
                     defer checkpoint.deinit(std.heap.c_allocator);

@@ -13,8 +13,10 @@
 //! Statuses are pushed under the same lock, so the host sees them in the order
 //! the module produced them.
 //!
-//! This change does not persist `Plan.save`: fx's recovery checkpoint still
-//! owns resume. `Plan.finish` has no record to delete for the same reason.
+//! In hosts that keep a record (`RecoveryRecordEffect`), `Plan.save` becomes
+//! the record before its send goes out, and the record is deleted however the
+//! request ends, unless the request was closed (`closeActive`): then it stays
+//! for the next launch. A crash leaves it as last saved.
 //!
 //! The module retries every transient failure for as long as it lasts. Some
 //! failures may never heal, so fx bounds them here, outside the module: see
@@ -111,6 +113,11 @@ pub const RequestRecovery = struct {
     ticker: ?std.Thread = null,
     ticker_stop: bool = false,
     ticker_wake: std.Io.Condition = .init,
+    /// The record this request saved and has not deleted.
+    record_saved: bool = false,
+    /// `closing` was delivered: the process is exiting and the record stays
+    /// as saved, so every later event is ignored.
+    closed: bool = false,
     /// Single-threaded builds tick from the transport's cooperative pulse.
     inner_pulse: ?agent_stream_provider.CooperativePulse = null,
     next_beat_ms: u64 = 0,
@@ -131,17 +138,58 @@ pub const RequestRecovery = struct {
     /// (`tests/tla/recovery/Recovery.tla` StatusHonest).
     pub fn deinit(self: *RequestRecovery) void {
         self.endSend();
+        unregister(self);
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        // However the request ended, unless it was closed
+        // (`tests/tla/recovery/Resume.tla` NoResumeAfterEnd).
+        if (!self.closed) self.deleteRecordLocked();
         self.clearShownLocked();
     }
 
     /// A new request. `fast` is the request's Fast selection, which makes
-    /// "retrying without Fast" a real option.
-    pub fn start(self: *RequestRecovery, fast: bool) !void {
+    /// "retrying without Fast" a real option. `resume_from` is the record a
+    /// launch found for this request.
+    pub fn start(self: *RequestRecovery, fast: bool, resume_from: ?[32]u8) !void {
         if (self.deps.begin_route_recovery_request) |begin| begin(self.deps.ctx);
-        _ = try self.event(.{ .start = .{ .fast = fast } });
+        const store = self.recordStore();
+        const binding: u32 = if (store) |record| record.binding(self.deps.ctx) else 0;
+        const send = try self.event(.{ .start = .{ .fast = fast, .resume_from = resume_from, .binding = binding } });
+        // A launch queues a resume only when the module resends it at once
+        // (`app_session_runtime.zig` recoveryAutoContinueDecision).
+        if (send == null) return error.ResumeNeedsUser;
+        // After the start, so `closing` never reaches a module that has not
+        // started. A close before this leaves the record as saved, which a
+        // launch counts as one death and still resumes.
+        if (store != null) register(self);
+    }
+
+    /// Delivers `closing` to the root request in flight, when one keeps a
+    /// record, and saves the record so the next launch resumes the request
+    /// without a question. Called once, as fx closes on SIGHUP, SIGTERM, or
+    /// terminal EOF; fx exits next. Returns true when a record was saved.
+    pub fn closeActive() bool {
+        const io = io_mod.getIo();
+        // fx exits either way, so the wait is bounded
+        // (`tests/tla/recovery/Resume.tla` BoundedClosing).
+        if (!lockWithin(&active_mutex, close_wait_ms)) return false;
+        defer active_mutex.unlock(io);
+        const self = active orelse return false;
+        if (!lockWithin(&self.mutex, close_wait_ms)) return false;
+        defer self.mutex.unlock(io);
+        if (self.closed) return false;
+        _ = self.stepLocked(.closing) catch |err| {
+            debug_trace.logf("recovery", "closing status publication failed err={s}", .{@errorName(err)});
+        };
+        self.closed = true;
+        debug_trace.eventf("recovery", "closed", self.trace_ctx, "record_saved={}", .{self.record_saved});
+        return self.record_saved;
+    }
+
+    fn recordStore(self: *const RequestRecovery) ?runtime_deps.RecoveryRecordEffect {
+        const checkpoint = self.deps.recovery_checkpoint orelse return null;
+        return checkpoint.record;
     }
 
     /// Reports a failed send. A transient kind makes the module wait; the
@@ -190,7 +238,7 @@ pub const RequestRecovery = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         _ = try self.stepLocked(.succeeded);
-        if (!self.recovery_shown) return;
+        if (self.closed or !self.recovery_shown) return;
         self.recovery_shown = false;
         self.host_showing = false;
         try self.deps.push_route_recovery_status(self.deps.ctx, .{
@@ -434,8 +482,11 @@ pub const RequestRecovery = struct {
     /// Steps the module and carries out its plan in field order. Returns
     /// the plan's send, which the caller carries out.
     fn stepLocked(self: *RequestRecovery, value: recovery.Event) !?Send {
+        if (self.closed) return null;
         const now_ms = self.nowMs();
         const plan = recovery.step(&self.state, value, now_ms);
+        // The record first: the caller sends next.
+        if (plan.save) |record| self.saveRecordLocked(&record);
         if (plan.send) |send| {
             self.attempts +|= 1;
             self.send = send;
@@ -453,11 +504,36 @@ pub const RequestRecovery = struct {
             });
         }
         if (plan.status) |status| try self.showLocked(status);
-        // A cancelled request recovered nothing.
-        if (plan.finish) |finish| if (finish == .cancelled) {
-            self.recovery_shown = false;
-        };
+        if (plan.finish) |finish| {
+            self.deleteRecordLocked();
+            // A cancelled request recovered nothing.
+            if (finish == .cancelled) self.recovery_shown = false;
+        }
         return plan.send;
+    }
+
+    /// A record that fails to save does not hold the request back: the send
+    /// still goes out, and a record that no longer matches is deleted, so a
+    /// launch asks instead of resuming from it.
+    fn saveRecordLocked(self: *RequestRecovery, record: *const [32]u8) void {
+        const store = self.recordStore() orelse return;
+        store.save(self.deps.ctx, record) catch |err| {
+            debug_trace.logf("recovery", "record save failed err={s}", .{@errorName(err)});
+            self.record_saved = true;
+            self.deleteRecordLocked();
+            return;
+        };
+        self.record_saved = true;
+    }
+
+    fn deleteRecordLocked(self: *RequestRecovery) void {
+        if (!self.record_saved) return;
+        const store = self.recordStore() orelse return;
+        store.delete(self.deps.ctx) catch |err| {
+            debug_trace.logf("recovery", "record delete failed err={s}", .{@errorName(err)});
+            return;
+        };
+        self.record_saved = false;
     }
 
     fn showLocked(self: *RequestRecovery, status: recovery.Status) !void {
@@ -486,6 +562,39 @@ pub const RequestRecovery = struct {
     }
 };
 
+/// How long `closeActive` waits for each lock before fx exits without saving.
+const close_wait_ms: u64 = 1_000;
+
+fn lockWithin(mutex: *std.Io.Mutex, ms: u64) bool {
+    var waited_ms: u64 = 0;
+    while (!mutex.tryLock()) {
+        if (waited_ms >= ms) return false;
+        io_mod.getIo().sleep(.fromNanoseconds(5 * std.time.ns_per_ms), .awake) catch {};
+        waited_ms += 5;
+    }
+    return true;
+}
+
+/// The root request in flight that keeps a record, for `closeActive`. One
+/// process runs one root turn at a time. Lock order: `active_mutex`, then the
+/// request's `mutex`.
+var active_mutex: std.Io.Mutex = .init;
+var active: ?*RequestRecovery = null;
+
+fn register(request: *RequestRecovery) void {
+    const io = io_mod.getIo();
+    active_mutex.lockUncancelable(io);
+    defer active_mutex.unlock(io);
+    active = request;
+}
+
+fn unregister(request: *RequestRecovery) void {
+    const io = io_mod.getIo();
+    active_mutex.lockUncancelable(io);
+    defer active_mutex.unlock(io);
+    if (active == request) active = null;
+}
+
 // Tests.
 
 const support = @import("tests/support.zig");
@@ -508,7 +617,7 @@ test "a transient failure waits with the module's status, then resends" {
     var request = RequestRecovery.init(&deps, &cancel_flag, .{});
     defer request.deinit();
 
-    try request.start(false);
+    try request.start(false, null);
     try std.testing.expectEqual(@as(u16, 1), request.attempt());
     try std.testing.expectEqual(@as(usize, 0), fake.route_recovery_statuses.items.len);
 
@@ -526,6 +635,103 @@ test "a transient failure waits with the module's status, then resends" {
     try std.testing.expect(std.mem.startsWith(u8, retrying.text.slice(), "Connection lost · retrying · attempt 2 · "));
 }
 
+fn recordingFake() support.FakeAgentRuntimeDeps {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    fake.enable_recovery_checkpoint = true;
+    fake.enable_recovery_record = true;
+    return fake;
+}
+
+test "the record is saved before each send and deleted when the request ends" {
+    var fake = recordingFake();
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+
+    try request.start(false, null);
+    try std.testing.expectEqual(@as(?u32, 7), recovery.boundTo(fake.recovery_record.?));
+    try request.failed(.{ .kind = .dropped });
+    const before_resend = fake.recovery_record_saves;
+    _ = (try request.waitForSend()).?;
+    try std.testing.expect(fake.recovery_record_saves > before_resend);
+    try request.succeeded();
+    try std.testing.expectEqual(@as(?[32]u8, null), fake.recovery_record);
+}
+
+test "a closed request keeps a clean record and ignores what follows" {
+    var fake = recordingFake();
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    {
+        var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+        defer request.deinit();
+        try request.start(false, null);
+        try std.testing.expect(RequestRecovery.closeActive());
+        const saved = fake.recovery_record.?;
+        // A late outcome after the close changes nothing.
+        try request.succeeded();
+        try request.cancel();
+        try std.testing.expectEqual(saved, fake.recovery_record.?);
+        try std.testing.expect(!RequestRecovery.closeActive());
+    }
+    // The request ended without deleting the record, and left the registry.
+    try std.testing.expect(fake.recovery_record != null);
+    try std.testing.expectEqual(@as(usize, 0), fake.recovery_record_deletes);
+    try std.testing.expect(!RequestRecovery.closeActive());
+
+    // The next launch resumes from it with no death counted.
+    var probe: recovery.State = .{};
+    const plan = recovery.step(&probe, .{ .start = .{ .resume_from = fake.recovery_record.? } }, 0);
+    try std.testing.expect(plan.send != null);
+    try std.testing.expectEqual(@as(u8, 0), probe.abrupt_deaths);
+}
+
+test "Esc and every other end delete the record" {
+    var fake = recordingFake();
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    {
+        var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+        defer request.deinit();
+        try request.start(false, null);
+        try request.cancel();
+        try std.testing.expectEqual(@as(?[32]u8, null), fake.recovery_record);
+    }
+    {
+        // fx's own stop, a terminal error, or an error exit: deinit deletes.
+        var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+        try request.start(false, null);
+        try std.testing.expect(fake.recovery_record != null);
+        request.deinit();
+        try std.testing.expectEqual(@as(?[32]u8, null), fake.recovery_record);
+    }
+}
+
+test "a launch resumes the request from its record" {
+    var fake = recordingFake();
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var closed_record: [32]u8 = undefined;
+    {
+        var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+        defer request.deinit();
+        try request.start(false, null);
+        try std.testing.expect(RequestRecovery.closeActive());
+        closed_record = fake.recovery_record.?;
+    }
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+    try request.start(false, closed_record);
+    const shown = fake.route_recovery_statuses.items[fake.route_recovery_statuses.items.len - 1];
+    try std.testing.expect(std.mem.startsWith(u8, shown.text.slice(), "Resuming the interrupted request · attempt 2 · "));
+    try std.testing.expectEqual(@as(?u32, 7), recovery.boundTo(fake.recovery_record.?));
+}
+
 test "the first output clears the status and success reports the recovery" {
     var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
     defer fake.deinit();
@@ -534,7 +740,7 @@ test "the first output clears the status and success reports the recovery" {
     var request = RequestRecovery.init(&deps, &cancel_flag, .{});
     defer request.deinit();
 
-    try request.start(false);
+    try request.start(false, null);
     try request.failed(.{ .kind = .server });
     _ = (try request.waitForSend()).?;
     const shown = fake.route_recovery_statuses.items.len;
@@ -563,7 +769,7 @@ test "responding from two threads at once delivers one responding" {
     var request = RequestRecovery.init(&deps, &cancel_flag, .{});
     defer request.deinit();
 
-    try request.start(false);
+    try request.start(false, null);
     for (0..50) |_| {
         try request.failed(.{ .kind = .dropped });
         _ = (try request.waitForSend()).?;
@@ -584,7 +790,7 @@ test "a healthy request shows nothing and reports no recovery" {
     var request = RequestRecovery.init(&deps, &cancel_flag, .{});
     defer request.deinit();
 
-    try request.start(true);
+    try request.start(true, null);
     request.responding();
     try request.succeeded();
     try std.testing.expectEqual(@as(usize, 0), fake.route_recovery_statuses.items.len);
@@ -600,7 +806,7 @@ test "Esc during a wait stops waiting and cancel clears the status" {
     var request = RequestRecovery.init(&deps, &cancel_flag, .{});
     defer request.deinit();
 
-    try request.start(false);
+    try request.start(false, null);
     try request.failed(.{ .kind = .rate_limited, .retry_after_ms = 20_000 });
     try std.testing.expect(cancel_flag.load(.seq_cst));
     try std.testing.expect(try request.waitForSend() == null);
@@ -621,7 +827,7 @@ test "three server errors in a row with Fast on resend without Fast" {
     var request = RequestRecovery.init(&deps, &cancel_flag, .{});
     defer request.deinit();
 
-    try request.start(true);
+    try request.start(true, null);
     for (0..2) |_| {
         try request.failed(.{ .kind = .server });
         try std.testing.expectEqual(Send{}, (try request.waitForSend()).?);
@@ -646,7 +852,7 @@ test "a server's Retry-After is honored up to the 30 second ceiling" {
     var request = RequestRecovery.init(&deps, &cancel_flag, .{});
     defer request.deinit();
 
-    try request.start(false);
+    try request.start(false, null);
     try request.failed(.{ .kind = .server, .retry_after_ms = 3_000 });
     try std.testing.expectEqualStrings("Gateway error · next try in 3s · attempt 1 · 0s", fake.route_recovery_statuses.items[0].text.slice());
     var started_ms = request.nowMs();
@@ -668,7 +874,7 @@ test "the countdown refreshes once a second while waiting" {
     var request = RequestRecovery.init(&deps, &cancel_flag, .{});
     defer request.deinit();
 
-    try request.start(false);
+    try request.start(false, null);
     try request.failed(.{ .kind = .rate_limited, .retry_after_ms = 3_000 });
     _ = (try request.waitForSend()).?;
     var buf: [8][]const u8 = undefined;
@@ -689,7 +895,7 @@ test "the in-flight ticker keeps the retrying status counting" {
     request.ticker_enabled = true;
     defer request.deinit();
 
-    try request.start(false);
+    try request.start(false, null);
     try request.failed(.{ .kind = .dropped });
     _ = (try request.waitForSend()).?;
     const io = io_mod.getIo();
@@ -724,7 +930,7 @@ test "the same repeating failure on three sends in a row stops the request" {
     var request = RequestRecovery.init(&deps, &cancel_flag, .{});
     defer request.deinit();
 
-    try request.start(false);
+    try request.start(false, null);
     for (0..repeat_stop_sends - 1) |_| {
         request.beginSend();
         request.endSend();
@@ -754,7 +960,7 @@ test "unclear failures of different classes in a row still stop the request" {
         var request = RequestRecovery.init(&deps, &cancel_flag, .{});
         defer request.deinit();
 
-        try request.start(false);
+        try request.start(false, null);
         for (endings, 0..) |ending, index| {
             request.beginSend();
             request.endSend();
@@ -779,7 +985,7 @@ test "a request gets its sends without Fast before a repeating failure stops it"
 
     // Three gateway errors with Fast: the module would drop Fast next, so
     // the third does not stop the request.
-    try request.start(true);
+    try request.start(true, null);
     const server: Failure = .{ .kind = .server };
     for (0..repeat_stop_sends) |_| {
         request.beginSend();
@@ -813,7 +1019,7 @@ test "the stop looks ahead through the module's whole run toward dropping Fast" 
     var request = RequestRecovery.init(&deps, &cancel_flag, .{});
     defer request.deinit();
 
-    try request.start(true);
+    try request.start(true, null);
     const dropped: Failure = .{ .kind = .dropped };
     const server: Failure = .{ .kind = .server };
     for (0..repeat_stop_sends - 1) |_| {
@@ -865,7 +1071,7 @@ test "start tells the host a new request begins" {
     var request = RequestRecovery.init(&deps, &cancel_flag, .{});
     defer request.deinit();
 
-    try request.start(false);
+    try request.start(false, null);
     try std.testing.expectEqual(@as(usize, 1), Host.begun);
 }
 
@@ -893,7 +1099,7 @@ test "another ending or new response progress starts the repeat count over" {
         .{ .repeating = .{ .missing_finish, 12 } },
         .{ .repeating = .{ .tls_setup, 12 } },
     };
-    try request.start(false);
+    try request.start(false, null);
     const dropped: Failure = .{ .kind = .dropped };
     for (endings) |ending| {
         request.beginSend();
@@ -916,7 +1122,7 @@ test "an error after a status reports failed and every exit clears the status" {
     {
         var request = RequestRecovery.init(&deps, &cancel_flag, .{});
         defer request.deinit();
-        try request.start(false);
+        try request.start(false, null);
         try request.failed(.{ .kind = .server });
         _ = (try request.waitForSend()).?;
         request.endWithError();
@@ -931,7 +1137,7 @@ test "an error after a status reports failed and every exit clears the status" {
     {
         var request = RequestRecovery.init(&deps, &cancel_flag, .{});
         defer request.deinit();
-        try request.start(false);
+        try request.start(false, null);
         try request.failed(.{ .kind = .dropped });
         // fx's terminal status reports the result itself.
         try request.replaceStatus(.{ .kind = .terminal_provider_error, .attempt = 1 });
@@ -945,7 +1151,7 @@ test "an error after a status reports failed and every exit clears the status" {
         // clears the status it still shows.
         var request = RequestRecovery.init(&deps, &cancel_flag, .{});
         defer request.deinit();
-        try request.start(false);
+        try request.start(false, null);
         try request.failed(.{ .kind = .dropped });
     }
     try std.testing.expectEqual(@as(usize, 1), fake.route_recovery_clear_count);

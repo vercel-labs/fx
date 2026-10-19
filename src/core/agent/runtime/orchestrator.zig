@@ -6658,6 +6658,8 @@ fn processQueuedPromptLoop(
     else
         .none;
     var restore_recovery_source = job.recovery_checkpoint != null;
+    // Only the first request of a resumed job resumes from the record.
+    var resume_record = job.recovery_record;
     var step: usize = 0;
     agent_steps_loop: while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
         current_step_index = step + 1;
@@ -6805,7 +6807,8 @@ fn processQueuedPromptLoop(
         // reports `failed` first.
         defer request_recovery.deinit();
         errdefer request_recovery.endWithError();
-        try request_recovery.start(route_fast_mode);
+        try request_recovery.start(route_fast_mode, resume_record);
+        resume_record = null;
 
         while (true) {
             if (reset_stream_for_next_attempt) {

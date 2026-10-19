@@ -13,6 +13,7 @@ const provider_set = @import("../gateway/provider_set.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
+const request_recovery = @import("../agent/runtime/request_recovery.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
@@ -341,6 +342,12 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         app.releaseTerminal();
         if (err == error.TerminalInputClosed) {
             app_needs_deinit = false;
+            // The terminal went away, a close like SIGHUP: the request in
+            // flight keeps its record for the next launch, so fx exits
+            // without the shutdown that would cancel it (decision 48).
+            if (comptime !cooperative) {
+                if (request_recovery.RequestRecovery.closeActive()) return .{ .exit = 0 };
+            }
             if (comptime cooperative) {
                 app.deinit();
             } else {

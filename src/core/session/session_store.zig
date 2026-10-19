@@ -2565,7 +2565,7 @@ pub const Store = struct {
             .writer_lock = writer_lock,
             .session_id = owned_id,
         };
-        writable.trackOwnerLiveness(alloc);
+        writable.removeRetiredMarkers();
         const loaded = self.migrateLegacyWithoutCache(
             alloc,
             &writable,
@@ -2700,7 +2700,7 @@ pub const Store = struct {
             .writer_lock = writer_lock,
             .session_id = owned_id,
         };
-        writable.trackOwnerLiveness(alloc);
+        writable.removeRetiredMarkers();
         return writable;
     }
 

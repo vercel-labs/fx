@@ -651,6 +651,12 @@ pub const FakeAgentRuntimeDeps = struct {
     last_credential_refresh_expected_account: ?[]u8 = null,
     enable_interactive_notices: bool = false,
     enable_recovery_checkpoint: bool = false,
+    /// With `enable_recovery_checkpoint`, also keep a recovery record.
+    enable_recovery_record: bool = false,
+    recovery_record: ?[32]u8 = null,
+    recovery_record_saves: usize = 0,
+    recovery_record_deletes: usize = 0,
+    recovery_record_binding: u32 = 7,
     /// Returned by every session writer check; null confirms the writer.
     session_writer_error: ?anyerror = null,
     session_writer_checks: usize = 0,
@@ -774,6 +780,11 @@ pub const FakeAgentRuntimeDeps = struct {
             .recovery_checkpoint = if (self.enable_recovery_checkpoint) .{
                 .set = setRecoveryCheckpoint,
                 .clear = clearRecoveryCheckpoint,
+                .record = if (self.enable_recovery_record) .{
+                    .binding = recoveryRecordBinding,
+                    .save = saveRecoveryRecord,
+                    .delete = deleteRecoveryRecord,
+                } else null,
             } else null,
             .confirm_session_writer = confirmSessionWriter,
             .propagate_grant = @This().propagateGrant,
@@ -813,6 +824,23 @@ pub const FakeAgentRuntimeDeps = struct {
     fn clearRecoveryCheckpoint(raw: *anyopaque) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         self.recovery_checkpoint_clears += 1;
+    }
+
+    fn recoveryRecordBinding(raw: *anyopaque) u32 {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        return self.recovery_record_binding;
+    }
+
+    fn saveRecoveryRecord(raw: *anyopaque, bytes: *const [32]u8) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.recovery_record_saves += 1;
+        self.recovery_record = bytes.*;
+    }
+
+    fn deleteRecoveryRecord(raw: *anyopaque) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.recovery_record_deletes += 1;
+        self.recovery_record = null;
     }
 
     fn setRecoveryCheckpoint(

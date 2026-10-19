@@ -36,12 +36,15 @@ const publication_intent_file = "commit.pending.json";
 const manifest_file = "session.json";
 const permission_state_file = "permissions.json";
 const recovery_checkpoint_file = "recovery.json";
-/// Written when resume suppresses a checkpoint's auto-continue after an
-/// unclean exit. Cleared with the checkpoint so suppression stays sticky
-/// until the user resolves the turn instead of re-arming after a clean quit.
-const recovery_asked_file = "recovery.asked";
-/// Liveness marker naming the live writable owner.
-const owner_live_file = "owner.live";
+/// The recovery module's record for the model request in flight, beside the
+/// turn snapshot in `recovery.json`. It alone decides whether a launch
+/// resends that request (`tests/tla/recovery/Resume.tla` Bound).
+const recovery_record_file = "recovery.state";
+/// `src/core/recovery/` `Record`.
+pub const recovery_record_len = 32;
+/// Markers older versions wrote to guess whether the last exit was clean.
+/// The record replaced them, and an open deletes leftovers.
+const retired_marker_files = [_][]const u8{ "owner.live", "recovery.asked" };
 const conversation_migration_temp_file = "events.v4.tmp";
 const conversation_migration_backup_file = "events.v3.backup";
 const checkpoint_file = "checkpoint.json";
@@ -768,48 +771,28 @@ fn writeConversationRecoveryState(
             recovery_checkpoint_file,
             bound_bytes,
         );
-        // A fresh checkpoint is a new recovery state; any prior suppression
-        // belonged to the turn it replaces.
-        clearRecoveryAsked(dir);
     } else {
         dir.dir.deleteFile(io_mod.getIo(), recovery_checkpoint_file) catch |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
         };
-        clearRecoveryAsked(dir);
+        // A record never outlives the snapshot it resumes. Requests delete
+        // their own when they end; this covers a delete that failed.
+        dir.dir.deleteFile(io_mod.getIo(), recovery_record_file) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
         try io_mod.syncVerifiedDir(dir.dir);
     }
 }
 
-fn clearRecoveryAsked(dir: *io_mod.VerifiedDir) void {
-    dir.dir.deleteFile(io_mod.getIo(), recovery_asked_file) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => debug_trace.logf("session", "recovery ask marker clear failed err={s}", .{@errorName(err)}),
-    };
-}
-
-/// Records that resume suppressed this checkpoint's auto-continue once.
-/// Advisory like owner.live: write failures degrade to a single suppression
-/// instead of blocking the resume.
-pub fn markRecoveryAsked(alloc: Allocator, dir: *io_mod.VerifiedDir) void {
-    const body = alloc.print("{{\"asked_at_ms\":{d}}}\n", .{io_mod.milliTimestamp()}) catch |err| {
-        debug_trace.logf("session", "recovery ask marker allocation failed err={s}", .{@errorName(err)});
-        return;
-    };
-    defer alloc.free(body);
-    io_mod.durableReplaceVerified(alloc, dir, recovery_asked_file, body) catch |err| {
-        debug_trace.logf("session", "recovery ask marker write failed err={s}", .{@errorName(err)});
-    };
-}
-
-/// True when a prior resume already suppressed this checkpoint. Read at
-/// decision time; the marker is written mid-session, after the open.
-pub fn recoveryWasAsked(dir: *io_mod.VerifiedDir) bool {
-    return entryExists(dir, recovery_asked_file) catch |err| blk: {
-        debug_trace.logf("session", "recovery ask marker probe failed err={s}", .{@errorName(err)});
-        break :blk false;
-    };
-}
+/// A saved recovery record and when it was written.
+pub const RecoveryRecord = struct {
+    bytes: [recovery_record_len]u8,
+    /// The file's modification time, ms since the epoch. The record holds
+    /// durations only, so the 24-hour rule reads this.
+    saved_at_ms: i64,
+};
 
 /// Inline tool-result output budget for the durable recovery checkpoint.
 /// Larger outputs live in the session's result store and the checkpoint
@@ -3126,54 +3109,79 @@ pub const WritableSessionDir = struct {
     dir: io_mod.VerifiedDir,
     writer_lock: ?io_mod.TimedAdvisoryLock,
     session_id: []u8,
-    /// True when a leftover owner marker was present at open time: the
-    /// previous owning process exited without deinit (crash or kill). A
-    /// still-live parked owner produces the same signal, so callers must
-    /// treat it as a reason to be careful, never as proof of corruption.
-    previous_owner_died: bool = false,
 
     pub fn deinit(self: *WritableSessionDir, alloc: Allocator) void {
-        self.clearOwnerLiveness();
         if (self.writer_lock) |*lock| lock.release();
         self.dir.close();
         alloc.free(self.session_id);
         self.* = undefined;
     }
 
-    /// Records this process as the live owner of the session directory. The
-    /// marker is written on every writable open and removed by deinit while
-    /// the writer lock is still held, so a leftover marker means the previous
-    /// owner died. Advisory only: probe and write failures degrade to no
-    /// signal rather than blocking the open.
-    pub fn trackOwnerLiveness(self: *WritableSessionDir, alloc: Allocator) void {
-        self.previous_owner_died = entryExists(&self.dir, owner_live_file) catch |err| blk: {
-            debug_trace.logf("session", "owner liveness probe failed id={s} err={s}", .{ self.session_id, @errorName(err) });
-            break :blk false;
-        };
-        const body = alloc.print("{{\"pid\":{d},\"opened_at_ms\":{d}}}\n", .{
-            std.c.getpid(),
-            io_mod.milliTimestamp(),
-        }) catch |err| {
-            debug_trace.logf("session", "owner liveness mark allocation failed id={s} err={s}", .{ self.session_id, @errorName(err) });
-            return;
-        };
-        defer alloc.free(body);
-        io_mod.durableReplaceVerified(alloc, &self.dir, owner_live_file, body) catch |err| {
-            debug_trace.logf("session", "owner liveness mark failed id={s} err={s}", .{ self.session_id, @errorName(err) });
+    /// Deletes the markers older versions left, naming each in the trace.
+    /// Best effort: a marker that stays decides nothing.
+    pub fn removeRetiredMarkers(self: *WritableSessionDir) void {
+        var removed = false;
+        for (retired_marker_files) |name| {
+            self.dir.dir.deleteFile(io_mod.getIo(), name) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => {
+                    debug_trace.logf("session", "retired marker removal failed id={s} file={s} err={s}", .{ self.session_id, name, @errorName(err) });
+                    continue;
+                },
+            };
+            removed = true;
+            debug_trace.logf("session", "event=retired_marker_removed id={s} file={s}", .{ self.session_id, name });
+        }
+        if (!removed) return;
+        io_mod.syncVerifiedDir(self.dir.dir) catch |err| {
+            debug_trace.logf("session", "retired marker removal sync failed id={s} err={s}", .{ self.session_id, @errorName(err) });
         };
     }
 
-    fn clearOwnerLiveness(self: *WritableSessionDir) void {
-        self.dir.dir.deleteFile(io_mod.getIo(), owner_live_file) catch |err| switch (err) {
+    /// Replaces the recovery record. Durable on return, because the send it
+    /// covers goes out next (`tests/tla/recovery/Resume.tla`
+    /// SaveDurableBeforeSend). Only the writer-lock holder writes it
+    /// (OneResumer).
+    pub fn saveRecoveryRecord(
+        self: *WritableSessionDir,
+        alloc: Allocator,
+        record: *const [recovery_record_len]u8,
+    ) !void {
+        if (self.isParked()) return error.SessionWriterParked;
+        try io_mod.durableReplaceVerified(alloc, &self.dir, recovery_record_file, record);
+    }
+
+    /// The saved recovery record, or null when there is none. A file that
+    /// is not exactly one record reads as zeros, which the recovery module
+    /// counts as unreadable.
+    pub fn readRecoveryRecord(self: *WritableSessionDir, alloc: Allocator) !?RecoveryRecord {
+        var file = openManagedFile(&self.dir, recovery_record_file, .read_only) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer file.close(io_mod.getIo());
+        const stat = try file.stat(io_mod.getIo());
+        var record: RecoveryRecord = .{
+            .bytes = @splat(0),
+            .saved_at_ms = @intCast(@divFloor(stat.mtime.nanoseconds, std.time.ns_per_ms)),
+        };
+        const bytes = io_mod.readFileToEnd(alloc, &file, recovery_record_len + 1) catch |err| switch (err) {
+            error.StreamTooLong => return record,
+            else => return err,
+        };
+        defer alloc.free(bytes);
+        if (bytes.len == recovery_record_len) @memcpy(&record.bytes, bytes);
+        return record;
+    }
+
+    /// Deletes the recovery record: its request ended.
+    pub fn deleteRecoveryRecord(self: *WritableSessionDir) !void {
+        if (self.isParked()) return error.SessionWriterParked;
+        self.dir.dir.deleteFile(io_mod.getIo(), recovery_record_file) catch |err| switch (err) {
             error.FileNotFound => return,
-            else => {
-                debug_trace.logf("session", "owner liveness clear failed id={s} err={s}", .{ self.session_id, @errorName(err) });
-                return;
-            },
+            else => return err,
         };
-        io_mod.syncVerifiedDir(self.dir.dir) catch |err| {
-            debug_trace.logf("session", "owner liveness clear sync failed id={s} err={s}", .{ self.session_id, @errorName(err) });
-        };
+        try io_mod.syncVerifiedDir(self.dir.dir);
     }
 
     fn isParked(self: *const WritableSessionDir) bool {
@@ -3351,6 +3359,14 @@ pub const LoadedWritableSession = struct {
             try alloc.dupe(u8, title)
         else
             null;
+    }
+
+    /// The binding a recovery record carries for the open turn: the seq
+    /// `recovery.json` is written for, so a launch can tell a record of the
+    /// open turn from one of a turn the log already committed
+    /// (`tests/tla/recovery/Resume.tla` Bound).
+    pub fn recoveryRecordBinding(self: *const LoadedWritableSession) u32 {
+        return @truncate(self.conversation_writer.last_seq);
     }
 
     pub fn appendEvent(
@@ -4086,7 +4102,7 @@ pub const Root = struct {
             .writer_lock = writer_lock,
             .session_id = session_id,
         };
-        writable.trackOwnerLiveness(alloc);
+        writable.removeRetiredMarkers();
         var writable_owned = true;
         errdefer if (writable_owned) writable.deinit(alloc);
         var loaded = try createNativeSession(
@@ -4225,7 +4241,7 @@ pub const Root = struct {
             .writer_lock = writer_lock,
             .session_id = owned_id,
         };
-        writable.trackOwnerLiveness(alloc);
+        writable.removeRetiredMarkers();
         return writable;
     }
 
@@ -4782,41 +4798,24 @@ test "conversation writer rolls back failed sync and refuses uncertain continuat
     }
 }
 
-test "owner liveness marker reports unclean exit and clears on clean close" {
+test "an open deletes the markers older versions left" {
     const alloc = std.testing.allocator;
     var temp = try TempRoot.init(alloc);
     defer temp.deinit(alloc);
-    var initial = try testState(alloc, "owner-liveness", 10);
+    var initial = try testState(alloc, "retired-markers", 10);
     defer initial.deinit(alloc);
-
-    // A fresh start sees no leftover marker and writes its own while open.
     {
         var started = try temp.root.startConversationSession(alloc, initial, .{});
-        try std.testing.expect(!started.log.previous_owner_died);
-        try std.testing.expect(try entryExists(&started.log.dir, owner_live_file));
         started.deinit(alloc);
     }
-    // The clean close removed the marker, so the next open sees no death.
-    {
-        var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{ .session_lock_deadline_ms = 0 });
-        try std.testing.expect(!resumed.log.previous_owner_died);
-        resumed.deinit(alloc);
-    }
-    // A leftover marker simulates an owner that never reached deinit.
     {
         var dir = try openSessionDir(&temp.root.sessions.?, initial.id, .writable);
         defer dir.close();
-        try io_mod.durableReplaceVerified(alloc, &dir, owner_live_file, "{\"pid\":0,\"opened_at_ms\":1}\n");
+        for (retired_marker_files) |name| try io_mod.durableReplaceVerified(alloc, &dir, name, "{}\n");
     }
-    {
-        var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{ .session_lock_deadline_ms = 0 });
-        try std.testing.expect(resumed.log.previous_owner_died);
-        resumed.deinit(alloc);
-    }
-    // A clean close after the detection clears the signal again.
-    var reopened = try temp.root.resumeForWrite(alloc, initial.id, .{ .session_lock_deadline_ms = 0 });
-    try std.testing.expect(!reopened.log.previous_owner_died);
-    reopened.deinit(alloc);
+    var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{ .session_lock_deadline_ms = 0 });
+    defer resumed.deinit(alloc);
+    for (retired_marker_files) |name| try std.testing.expect(!try entryExists(&resumed.log.dir, name));
 }
 
 test "parked session refuses history and control mutations" {
@@ -5725,7 +5724,6 @@ test "root starts a cache-free conversation session" {
     var saw_writer_lock = false;
     var saw_permissions = false;
     var saw_usage = false;
-    var saw_owner_live = false;
     var iterator = loaded.log.dir.dir.iterate();
     while (try iterator.next(std.testing.io)) |entry| {
         count += 1;
@@ -5734,15 +5732,13 @@ test "root starts a cache-free conversation session" {
         if (std.mem.eql(u8, entry.name, "session.lock")) saw_writer_lock = true;
         if (std.mem.eql(u8, entry.name, "permissions.json")) saw_permissions = true;
         if (std.mem.eql(u8, entry.name, "usage-v2.json")) saw_usage = true;
-        if (std.mem.eql(u8, entry.name, owner_live_file)) saw_owner_live = true;
     }
-    try std.testing.expectEqual(@as(usize, 5), count);
+    try std.testing.expectEqual(@as(usize, 4), count);
     try std.testing.expect(saw_events);
     try std.testing.expect(saw_metadata);
     try std.testing.expect(saw_writer_lock);
     try std.testing.expect(saw_permissions);
     try std.testing.expect(!saw_usage);
-    try std.testing.expect(saw_owner_live);
 }
 
 test "root session creation stays outside discovery while preparing" {
@@ -5873,7 +5869,7 @@ test "conversation writer appends without duplicating live history" {
     var count: usize = 0;
     var iterator = loaded.log.dir.dir.iterate();
     while (try iterator.next(std.testing.io)) |_| count += 1;
-    try std.testing.expectEqual(@as(usize, 5), count);
+    try std.testing.expectEqual(@as(usize, 4), count);
 }
 
 test "cache-free conversation session resumes from metadata and JSONL" {
@@ -6320,11 +6316,11 @@ test "cache-free recovery checkpoint resumes and clears independently" {
     try std.testing.expectEqual(@as(?session_codec.RecoveryCheckpoint, null), cleared.recovery_checkpoint);
 }
 
-test "recovery ask marker stays sticky across resumes and follows the checkpoint lifecycle" {
+test "the recovery record round-trips and goes with its checkpoint" {
     const alloc = std.testing.allocator;
     var temp = try TempRoot.init(alloc);
     defer temp.deinit(alloc);
-    var initial = try testState(alloc, "recovery-ask-marker", 10);
+    var initial = try testState(alloc, "recovery-record", 10);
     defer initial.deinit(alloc);
     const checkpoint = session_codec.RecoveryCheckpoint{
         .turn_id = 7,
@@ -6338,33 +6334,32 @@ test "recovery ask marker stays sticky across resumes and follows the checkpoint
         .max_provider_attempts = 3,
         .consumed_provider_attempts = 1,
     };
-    {
-        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
-        defer loaded.deinit(alloc);
-        _ = try loaded.appendEvent(alloc, .{
-            .recovery_checkpoint_set = .{ .checkpoint = checkpoint },
-        }, 20);
-        try std.testing.expect(!recoveryWasAsked(&loaded.log.dir));
-        markRecoveryAsked(alloc, &loaded.log.dir);
-        try std.testing.expect(recoveryWasAsked(&loaded.log.dir));
-    }
-    // The marker survives a clean close: a later resume still sees it.
-    {
-        var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
-        defer resumed.deinit(alloc);
-        try std.testing.expect(recoveryWasAsked(&resumed.log.dir));
-        // A fresh checkpoint resets the suppression.
-        _ = try resumed.appendEvent(alloc, .{
-            .recovery_checkpoint_set = .{ .checkpoint = checkpoint },
-        }, 30);
-        try std.testing.expect(!recoveryWasAsked(&resumed.log.dir));
-        // Clearing the checkpoint clears the marker.
-        markRecoveryAsked(alloc, &resumed.log.dir);
-        _ = try resumed.appendEvent(alloc, .{
-            .recovery_checkpoint_cleared = .{},
-        }, 31);
-        try std.testing.expect(!recoveryWasAsked(&resumed.log.dir));
-    }
+    var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    try std.testing.expect(try loaded.log.readRecoveryRecord(alloc) == null);
+
+    var bytes: [recovery_record_len]u8 = undefined;
+    for (&bytes, 0..) |*byte, index| byte.* = @intCast(index + 1);
+    _ = try loaded.appendEvent(alloc, .{
+        .recovery_checkpoint_set = .{ .checkpoint = checkpoint },
+    }, 20);
+    try loaded.log.saveRecoveryRecord(alloc, &bytes);
+    const saved = (try loaded.log.readRecoveryRecord(alloc)).?;
+    try std.testing.expectEqualSlices(u8, &bytes, &saved.bytes);
+    try std.testing.expect(saved.saved_at_ms > 0);
+
+    // A file of another size reads as zeros, which the module counts as
+    // unreadable.
+    try io_mod.durableReplaceVerified(alloc, &loaded.log.dir, recovery_record_file, bytes[0..7]);
+    const short = (try loaded.log.readRecoveryRecord(alloc)).?;
+    const zeros: [recovery_record_len]u8 = @splat(0);
+    try std.testing.expectEqualSlices(u8, &zeros, &short.bytes);
+
+    // Clearing the checkpoint deletes the record with it.
+    try loaded.log.saveRecoveryRecord(alloc, &bytes);
+    _ = try loaded.appendEvent(alloc, .{ .recovery_checkpoint_cleared = .{} }, 21);
+    try std.testing.expect(try loaded.log.readRecoveryRecord(alloc) == null);
+    try loaded.log.deleteRecoveryRecord();
 }
 
 test "recovery checkpoint spills oversized tool outputs and reload restores them" {

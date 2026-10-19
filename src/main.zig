@@ -1440,18 +1440,27 @@ const App = struct {
         return true;
     }
 
+    /// `record` is the recovery record a launch found for the checkpoint's
+    /// request; the job's first request resumes from it.
     pub fn queueRecoveryCheckpoint(
         self: *App,
         checkpoint: *const session_codec.RecoveryCheckpoint,
+        record: ?[32]u8,
     ) !bool {
-        if (!try self.snapshotAndQueuePrompt(
+        var queued = try self.snapshotPrompt(
             checkpoint.user.text,
             &.{},
             checkpoint,
             null,
             checkpoint.turn_id,
             false,
-        )) return false;
+        );
+        queued.recovery_record = record;
+        {
+            errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
+            try self.worker.enqueuePrompt(std.heap.c_allocator, queued);
+        }
+        HerdrAppRuntime.reportWorking(self);
         WorkerAppRuntime.beginRecoveryPresentation(self);
         WorkerAppRuntime.syncState(
             self,

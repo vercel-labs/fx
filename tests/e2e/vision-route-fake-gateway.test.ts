@@ -3337,8 +3337,11 @@ test.skipIf(!tmuxAvailable())("TUI recovery retains images through failure and c
     rmSync(input);
     session = await TmuxSession.create({ cmd: `${FX_BIN} --resume ${id}`, cwd: root.workspace, env, isolated: true, remainOnExit: true });
     await session.waitForStableComposer(TIMEOUT);
-    // A pending recovery checkpoint continues automatically on resume.
-    await session.waitForText(/continues\s+automatically/, TIMEOUT);
+    // The failed turn kept its checkpoint but no request was in flight, so
+    // resume waits for the user, and "continue" carries the turn and its
+    // image (tests/tla/recovery/Resume.tla, decisions 51 and 53).
+    await session.waitForText(/not\s+restarted/, TIMEOUT);
+    await session.sendText("continue");
     await session.waitForText("TUI_RECOVERY_IMAGE_COMPLETE", TIMEOUT);
     await session.waitForStableComposer(TIMEOUT);
     expect(nativeFileParts(gateway.chatRequests[2]!.body)[0]!.data.data).toBe(original);

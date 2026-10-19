@@ -923,9 +923,10 @@ fn snapshotLeaf(path: []const u8, id: []const u8) ?[]const u8 {
 // ---------------------------------------------------------------------------
 // Fingerprint (D60)
 
-/// Files that are not a session's content: locks, liveness and caches,
-/// which v1 rewrites without changing the session.
-const not_content = [_][]const u8{ lock_file, "owner.live", "recovery.asked", "commit.lock", "history-cache.bin" };
+/// Files that are not a session's content: locks, liveness, caches and the
+/// recovery record of the request in flight, which v1 rewrites without
+/// changing the session. Older versions wrote the two markers.
+const not_content = [_][]const u8{ lock_file, "owner.live", "recovery.asked", "recovery.state", "commit.lock", "history-cache.bin" };
 
 /// SHA-256 over the member's content files, by name, as lowercase hex: its
 /// top-level files but `not_content`, its registry and its client files.

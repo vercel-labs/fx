@@ -57,6 +57,9 @@ pub const Start = struct {
     resume_from: ?Record = null,
     /// The request uses the Fast route, so dropping Fast is a real option.
     fast: bool = false,
+    /// fx's id for the work this request belongs to. The record carries it,
+    /// so a launch can tell a record from finished work (`boundTo`).
+    binding: u32 = 0,
 };
 
 pub const Failure = struct {
@@ -157,6 +160,8 @@ pub const State = struct {
     offline_step: u8 = 0,
     /// Abrupt deaths found with a send in flight, for the crash-loop guard.
     abrupt_deaths: u8 = 0,
+    /// `Start.binding`, saved with the record.
+    binding: u32 = 0,
     /// Jitter state, seeded from `now_ms` at `start` so replays stay exact.
     seed: u32 = 1,
     /// Request time carried over from earlier fx processes.
@@ -212,6 +217,7 @@ const short_columns = 46;
 fn onStart(state: *State, start: Start, now_ms: u64) Plan {
     if (start.resume_from) |bytes| {
         if (decode(bytes)) |saved| return resumeFrom(state, saved, start.fast, now_ms);
+        return resumeUnreadable(state, start, now_ms);
     }
     state.* = .{
         .phase = .sending,
@@ -219,8 +225,35 @@ fn onStart(state: *State, start: Start, now_ms: u64) Plan {
         .seed = seedFrom(now_ms),
         .started_ms = now_ms,
         .fast = start.fast,
+        .binding = start.binding,
     };
     return .{ .save = encode(state, now_ms), .send = .{} };
+}
+
+/// A record that does not decode, torn by a crash during its save, damaged,
+/// or written by another version, belongs to a request fx was running. It
+/// counts as one abrupt death, so a request that keeps killing fx during its
+/// own save still reaches the crash-loop question, and the request resumes
+/// (`tests/tla/recovery/Recovery.tla` CrashLoopAsks).
+fn resumeUnreadable(state: *State, start: Start, now_ms: u64) Plan {
+    state.* = .{
+        .phase = .sending,
+        .attempt = 1,
+        .abrupt_deaths = 1,
+        .seed = seedFrom(now_ms),
+        .started_ms = now_ms,
+        .fast = start.fast,
+        .binding = start.binding,
+        .retry_label = .resuming,
+    };
+    if (state.abrupt_deaths >= crash_loop_after) return askUser(state, .crash_loop, now_ms);
+    return sendNow(state, now_ms, .{});
+}
+
+/// The binding a readable record carries, or null when it does not decode.
+pub fn boundTo(record: Record) ?u32 {
+    const saved = decode(record) orelse return null;
+    return saved.binding;
 }
 
 /// A record left by SIGHUP or SIGTERM resumes without a question, and so does
@@ -470,8 +503,8 @@ fn waitingStatus(state: *const State, now_ms: u64) Status {
 fn retryingStatus(state: *const State, now_ms: u64) Status {
     const elapsed = Clock.of(elapsedMs(state, now_ms) / 1000);
     const text = switch (state.retry_label) {
-        .compacting => textOf("Conversation too long · compacting, then retrying", .{}),
-        .resuming => textOf("Resuming the interrupted request · attempt {d}", .{state.attempt}),
+        .compacting => textOf("Conversation too long · compacting, then retrying · {s}", .{elapsed.slice()}),
+        .resuming => textOf("Resuming the interrupted request · attempt {d} · {s}", .{ state.attempt, elapsed.slice() }),
         .after_sign_in => textOf("Signed in · retrying · attempt {d} · {s}", .{ state.attempt, elapsed.slice() }),
         .after_user => textOf("Retrying · attempt {d} · {s}", .{ state.attempt, elapsed.slice() }),
         .after_failure => if (state.cause == .server and state.flags.no_fast)
@@ -582,7 +615,8 @@ fn refresh(state: *State, status: Status) Plan {
 //  10     streak kind (0 none)
 //  11     offline step
 //  12..15 request time so far, ms, little endian
-//  16..19 reserved, zero: no wait is saved, because a relaunch resends at once
+//  16..19 Start.binding, little endian (no wait is saved: a relaunch resends
+//         at once)
 //  20..23 jitter seed, little endian
 //  24..27 reserved, zero
 //  28..31 CRC-32 of bytes 0 to 27, little endian
@@ -602,6 +636,7 @@ fn encode(state: *const State, now_ms: u64) Record {
     record[11] = state.offline_step;
     const elapsed = std.math.cast(u32, elapsedMs(state, now_ms)) orelse std.math.maxInt(u32);
     std.mem.writeInt(u32, record[12..16], elapsed, .little);
+    std.mem.writeInt(u32, record[16..20], state.binding, .little);
     std.mem.writeInt(u32, record[20..24], state.seed, .little);
     std.mem.writeInt(u32, record[28..32], std.hash.Crc32.hash(record[0..28]), .little);
     return record;
@@ -612,9 +647,6 @@ fn encode(state: *const State, now_ms: u64) Record {
 fn decode(record: Record) ?State {
     if (std.mem.readInt(u32, record[28..32], .little) != std.hash.Crc32.hash(record[0..28])) return null;
     if (record[0] != record_version) return null;
-    for (record[16..20]) |byte| {
-        if (byte != 0) return null;
-    }
     for (record[24..28]) |byte| {
         if (byte != 0) return null;
     }
@@ -638,6 +670,7 @@ fn decode(record: Record) ?State {
         .backoff_step = record[8],
         .offline_step = record[11],
         .abrupt_deaths = record[7],
+        .binding = std.mem.readInt(u32, record[16..20], .little),
         .seed = if (seed == 0) 1 else seed,
         .carried_ms = std.mem.readInt(u32, record[12..16], .little),
     };
@@ -851,7 +884,7 @@ test "too long compacts once at once, then waits for the user" {
     const compact = fail(&state, .too_long, 1_000);
     try testing.expect(compact.save != null);
     try testing.expectEqual(Send{ .compact_first = true }, compact.send.?);
-    try testing.expectEqualStrings("Conversation too long · compacting, then retrying", compact.status.?.text.slice());
+    try testing.expectEqualStrings("Conversation too long · compacting, then retrying · 1s", compact.status.?.text.slice());
 
     const ask = fail(&state, .too_long, 2_000);
     try testing.expect(ask.send == null);
@@ -1013,21 +1046,57 @@ test "records round-trip and damaged records start fresh" {
         try testing.expect(decode(damaged) == null);
     }
 
-    var fresh: State = .{};
+    // A damaged record counts one abrupt death and resumes.
+    var resumed: State = .{};
     var damaged = record;
     damaged[5] ^= 0xff;
-    const plan = step(&fresh, .{ .start = .{ .resume_from = damaged } }, 0);
-    try testing.expectEqual(@as(u16, 1), fresh.attempt);
+    const plan = step(&resumed, .{ .start = .{ .resume_from = damaged, .binding = 9 } }, 0);
+    try testing.expectEqual(@as(u8, 1), resumed.abrupt_deaths);
+    try testing.expectEqual(@as(u32, 9), resumed.binding);
     try testing.expectEqual(Send{}, plan.send.?);
-    try testing.expect(plan.status == null);
+    try testing.expect(startsWith(plan.status.?.text.slice(), "Resuming the interrupted request · attempt 2 · "));
 }
 
-test "a record from an unknown version starts fresh" {
+test "a torn record and then a death in flight ask once" {
+    var state: State = .{};
+    var record = startNew(&state, 0, false).save.?;
+    record[31] ^= 0xff;
+
+    state = .{};
+    const first = step(&state, .{ .start = .{ .resume_from = record } }, 50);
+    try testing.expect(first.send != null);
+    record = first.save.?;
+
+    state = .{};
+    const second = step(&state, .{ .start = .{ .resume_from = record } }, 50);
+    try testing.expect(second.send == null);
+    try testing.expectEqual(Status.Need.crash_loop, second.status.?.need.?);
+}
+
+test "the record carries the request's binding" {
+    var state: State = .{};
+    const record = step(&state, .{ .start = .{ .binding = 0xfeed_beef } }, 0).save.?;
+    try testing.expectEqual(@as(?u32, 0xfeed_beef), boundTo(record));
+    var torn = record;
+    torn[30] ^= 0x01;
+    try testing.expectEqual(@as(?u32, null), boundTo(torn));
+
+    // The binding survives a failure, a relaunch, and the next save.
+    const waiting = fail(&state, .server, 1_000).save.?;
+    state = .{};
+    const resumed = step(&state, .{ .start = .{ .resume_from = waiting } }, 10);
+    try testing.expectEqual(@as(?u32, 0xfeed_beef), boundTo(resumed.save.?));
+}
+
+test "a record from an unknown version counts as unreadable" {
     var state: State = .{};
     var record = startNew(&state, 0, false).save.?;
     record[0] = record_version + 1;
     std.mem.writeInt(u32, record[28..32], std.hash.Crc32.hash(record[0..28]), .little);
     try testing.expect(decode(record) == null);
+    state = .{};
+    _ = step(&state, .{ .start = .{ .resume_from = record } }, 0);
+    try testing.expectEqual(@as(u8, 1), state.abrupt_deaths);
 }
 
 test "every status fits, and every short form fits 46 columns" {

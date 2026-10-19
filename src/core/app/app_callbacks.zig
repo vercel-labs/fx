@@ -338,6 +338,11 @@ pub fn Bindings(comptime App: type) type {
                         .{
                             .set = agentSetRecoveryCheckpoint,
                             .clear = agentClearRecoveryCheckpoint,
+                            .record = .{
+                                .binding = agentRecoveryRecordBinding,
+                                .save = agentSaveRecoveryRecord,
+                                .delete = agentDeleteRecoveryRecord,
+                            },
                         }
                     else
                         null
@@ -1212,6 +1217,21 @@ pub fn Bindings(comptime App: type) type {
         fn agentClearRecoveryCheckpoint(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app_session_runtime.Runtime(App).clearRecoveryCheckpoint(app);
+        }
+
+        fn agentRecoveryRecordBinding(ctx: *anyopaque) u32 {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            return app_session_runtime.Runtime(App).recoveryRecordBinding(app);
+        }
+
+        fn agentSaveRecoveryRecord(ctx: *anyopaque, record: *const [32]u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try app_session_runtime.Runtime(App).saveRecoveryRecord(app, record);
+        }
+
+        fn agentDeleteRecoveryRecord(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try app_session_runtime.Runtime(App).deleteRecoveryRecord(app);
         }
 
         fn agentAppendTurnPiece(ctx: *anyopaque, progress: agent_runtime.TurnProgress) anyerror!void {

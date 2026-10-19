@@ -11,14 +11,12 @@
 // change only what the lab keeps around the module; at fx's stop the driver
 // also asks a copy of the module whether its next send would differ.
 //
-// Torn records are skipped unless --next is given: the model counts a torn
-// record as one abrupt death, and recovery.zig still starts fresh from one,
-// so --next fails until recovery.zig takes that rule.
+// Torn records are walked like any other state: the model and the module both
+// count one as an abrupt death and resume (Recovery.tla TornStart).
 //
 // Usage (from the repository root):
 //   bun tests/tla/drivers/recovery/driver.ts
 //   bun tests/tla/drivers/recovery/driver.ts --self-check
-//   bun tests/tla/drivers/recovery/driver.ts --next
 //   bun tests/tla/drivers/recovery/driver.ts --walks 1000 --steps 80 --seed 7
 //
 // Exit codes: 0 every walk matched, 1 a mismatch (or a self-check that was
@@ -61,7 +59,6 @@ function option(name: string, fallback: number): number {
 }
 
 const options = {
-  next: flag("--next"),
   selfCheck: flag("--self-check"),
   walks: option("--walks", 300),
   steps: option("--steps", 60),
@@ -185,11 +182,7 @@ function makeWalks(graph: Graph, fast: boolean, seed: number): Walk[] {
     let at = graph.init;
     for (let i = 0; i < options.steps; i += 1) {
       const s = graph.states.get(at)!;
-      const edges = (graph.next.get(at) ?? []).filter((edge) => {
-        if (edge.to === at) return false;
-        const t = graph.states.get(edge.to)!;
-        return options.next || t.disk.ph !== "torn";
-      });
+      const edges = (graph.next.get(at) ?? []).filter((edge) => edge.to !== at);
       if (edges.length === 0) break;
       const weights = edges.map((candidate) => 1 / (1 + (taken.get(candidate.label) ?? 0)));
       let pick = random() * weights.reduce((sum, weight) => sum + weight, 0);
@@ -212,13 +205,12 @@ function makeWalks(graph: Graph, fast: boolean, seed: number): Walk[] {
 // the edge's source, then the edge. Every model transition is checked against
 // the module at least once.
 function edgeWalks(graph: Graph, fast: boolean): Walk[] {
-  const allowed = (id: string) => options.next || graph.states.get(id)!.disk.ph !== "torn";
   const parent = new Map<string, { from: string; label: string } | null>([[graph.init, null]]);
   const queue = [graph.init];
   for (let at = 0; at < queue.length; at += 1) {
     const id = queue[at]!;
     for (const edge of graph.next.get(id) ?? []) {
-      if (edge.to === id || parent.has(edge.to) || !allowed(edge.to)) continue;
+      if (edge.to === id || parent.has(edge.to)) continue;
       parent.set(edge.to, { from: id, label: edge.label });
       queue.push(edge.to);
     }
@@ -226,7 +218,7 @@ function edgeWalks(graph: Graph, fast: boolean): Walk[] {
   const walks: Walk[] = [];
   for (const id of queue) {
     for (const edge of graph.next.get(id) ?? []) {
-      if (edge.to === id || !allowed(edge.to)) continue;
+      if (edge.to === id) continue;
       const hops: { from: string; to: string; label: string }[] = [{ from: id, to: edge.to, label: edge.label }];
       for (let at = id; parent.get(at); at = parent.get(at)!.from) {
         const link = parent.get(at)!;
@@ -374,12 +366,9 @@ const walks = [
 ];
 const results = runLab(lab, walks, out, "recovery_lab");
 const outcome = check(walks, graphs, results, false);
-let ok = report(options.next ? "module, torn records included (--next)" : "module", walks, outcome);
+let ok = report("module", walks, outcome);
 const coverage = [...outcome.seen.entries()].sort((a, b) => b[1] - a[1]).map(([label, count]) => `${label} ${count}`).join(", ");
 console.log(`steps per action: ${coverage}`);
-if (options.next && !ok) {
-  console.log("expected until recovery.zig counts a torn record as one abrupt death");
-}
 
 if (options.selfCheck) {
   // A planted defect in the module: a transient failure resends at once.

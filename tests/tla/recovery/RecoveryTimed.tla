@@ -25,18 +25,16 @@ ASSUME /\ Ceiling \in 1..10 /\ SendTicks \in 1..5 /\ HealTicks \in Nat
 VARIABLES
     waitLeft,    \* ticks until the wait's deadline; 0 when not waiting
     fresh,       \* the status line changed since the last tick
-    clockLabel,  \* the retrying status shows the elapsed time
     sendAge,     \* ticks the current send has been on the wire
     healAge      \* ticks of a healthy world with fx running and nobody asked
 
-timeVars == <<waitLeft, fresh, clockLabel, sendAge, healAge>>
+timeVars == <<waitLeft, fresh, sendAge, healAge>>
 tvars == <<vars, timeVars>>
 
 TTypeOK ==
     /\ TypeOK
     /\ waitLeft \in 0..(Ceiling + 1)
     /\ fresh \in BOOLEAN
-    /\ clockLabel \in BOOLEAN
     /\ sendAge \in 0..SendTicks
     /\ healAge \in 0..(HealTicks + 1)
 
@@ -63,24 +61,16 @@ Follow(A, hinted) ==
                      ELSE IF phase' = "waiting" THEN {waitLeft}
                      ELSE {0}
     /\ fresh' = (fresh \/ status' # status \/ NewSend)
-    \* "Resuming the interrupted request" and "compacting, then retrying"
-    \* show no elapsed time (recovery.zig retryingStatus): after a relaunch,
-    \* after Enter on the crash-loop question, and for the compacted send.
-    \* That is a known gap; see StatusFresh.
-    /\ clockLabel' = IF NewSend
-                        THEN /\ alive /\ ~sendCompact'
-                             /\ ~(phase = "need_user" /\ need = "crash_loop")
-                        ELSE clockLabel
     /\ sendAge' = IF inflight' /\ inflight THEN sendAge ELSE 0
     /\ healAge' = IF faults' > faults \/ ~alive' THEN 0 ELSE healAge
 
 \* The status line must change at this tick: the countdown while waiting,
 \* the elapsed time while a retry is on the wire (recovery.zig onTick).
-\* clockLabel is the known gap StatusFresh describes, not an accepted rule.
+\* Every retrying text carries that time, the resuming and compacting ones
+\* included (recovery.zig retryingStatus).
 MustRefresh ==
     \/ phase = "waiting"
     \/ phase = "working" /\ inflight /\ ~flowing /\ status = "retrying"
-       /\ clockLabel
 
 \* One second passes while fx runs the request. The answer to a send comes
 \* within SendTicks.
@@ -93,16 +83,15 @@ Tick ==
     /\ IF phase = "waiting" /\ waitLeft <= 1
           \* `tick` reaches the deadline: save, send, status retrying.
           THEN /\ TimerFires
-               /\ waitLeft' = 0 /\ fresh' = TRUE /\ clockLabel' = TRUE
+               /\ waitLeft' = 0 /\ fresh' = TRUE
           \* Planted defect frozen_countdown: the status is not redrawn.
           ELSE /\ UNCHANGED vars
                /\ waitLeft' = IF phase = "waiting" THEN waitLeft - 1 ELSE 0
                /\ fresh' = (MustRefresh /\ Bug # "frozen_countdown")
-               /\ UNCHANGED clockLabel
 
 TInit ==
     /\ Init
-    /\ waitLeft = 0 /\ fresh = TRUE /\ clockLabel = TRUE
+    /\ waitLeft = 0 /\ fresh = TRUE
     /\ sendAge = 0 /\ healAge = 0
 
 \* Every Recovery.tla step except TimerFires, which only a Tick may take.
@@ -138,16 +127,6 @@ WaitBounded == waitLeft <= Ceiling
 \* While a status is shown and nothing is flowing, it changes every tick:
 \* the countdown while waiting, the elapsed time while a retry is on the
 \* wire (recovery.zig onTick).
-\*
-\* Known gap, which the implementation must close: the approved wording for
-\* "Resuming the interrupted request · attempt N" and "Conversation too
-\* long · compacting, then retrying" has no clock (recovery.zig
-\* retryingStatus), so those statuses do not change for as long as their
-\* send is on the wire: after a relaunch, after Enter on the crash-loop
-\* question, and for the compacted send. That breaks "never looks dead".
-\* MustRefresh exempts them only through clockLabel, so the check stays
-\* green until the wording gets a clock; then drop clockLabel from
-\* MustRefresh. Without the exemption, the correct model fails StatusFresh.
 StatusFresh == (alive /\ ~flowing /\ MustRefresh) => fresh
 
 \* Once the world is healthy, with fx running and nobody asked, the request

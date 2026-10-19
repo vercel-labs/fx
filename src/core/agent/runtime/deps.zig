@@ -52,6 +52,21 @@ pub const RecoveryCheckpointEffect = struct {
     /// Terminally dead turns clear the durable checkpoint so a later resume
     /// cannot resurrect a turn the product already called stopped.
     clear: *const fn (ctx: *anyopaque) anyerror!void,
+    /// Where the request in flight keeps its recovery record, so a launch
+    /// can resume it. Null in hosts that resume nothing.
+    record: ?RecoveryRecordEffect = null,
+};
+
+/// The recovery module's record (`src/core/recovery/` `Record`) for the
+/// model request in flight, kept beside the checkpoint.
+pub const RecoveryRecordEffect = struct {
+    /// The binding new records carry, which ties them to the checkpoint.
+    binding: *const fn (ctx: *anyopaque) u32,
+    /// Replaces the record. Durable on return, because the send it covers
+    /// goes out next.
+    save: *const fn (ctx: *anyopaque, record: *const [32]u8) anyerror!void,
+    /// Deletes the record: its request ended.
+    delete: *const fn (ctx: *anyopaque) anyerror!void,
 };
 
 /// Presentation only. Called outside history publication's worker critical section.

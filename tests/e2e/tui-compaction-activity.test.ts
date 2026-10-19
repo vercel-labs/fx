@@ -860,8 +860,11 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
           cmd: command(sessionId), cwd: workspace, env, isolated: true, remainOnExit: true,
           stderrPath: resumedStderr, width: 110, height: 36, startupWaitMs: 0,
         });
+        // The kill landed during a tool, after the request that asked for it
+        // ended, so no recovery record says a send was in flight: fx asks
+        // instead of resending (tests/tla/recovery/Resume.tla, decision 51).
         await resumed.waitForPane((pane) =>
-          pane.includes("fx quit unexpectedly while this response was recovering"), 15_000);
+          pane.includes("This response was interrupted, so it was not restarted"), 15_000);
         expect(gateway.requestCount()).toBe(requestsBeforeRecovery);
         await resumed.waitForStableComposer(10_000);
         await resumed.sendText("continue");

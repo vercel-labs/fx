@@ -2625,18 +2625,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
             FX_MODEL: MODEL,
           },
         });
-        await session.waitForComposer(TIMEOUT);
-        // The kill left the owner marker behind, so resume reports the
-        // unclean exit and waits instead of restarting the turn on its own.
-        await session.waitForText(/quit unexpectedly/, TIMEOUT);
-        await Bun.sleep(1_000);
-        expect(resumed.started).toBe(false);
-        expect(queuedGateway.requests).toHaveLength(2);
-        await session.sendText("continue");
+        // Killing the tmux session sends SIGHUP, a close: fx saved the
+        // request in flight, so the reopen resends it on its own
+        // (tests/tla/recovery/Resume.tla NoQuestionAfterCleanClose).
         await waitForCondition(() => resumed.started, "admitted resumed response");
-        await session.waitForText("Thinking", TIMEOUT);
+        // The resent request shows its own progress, with a clock, before any
+        // response text.
+        await session.waitForText("Resuming the interrupted request", TIMEOUT);
         expect(queuedGateway.requests).toHaveLength(3);
-        expect(await session.capturePane()).toContain("Thinking");
+        expect(await session.capturePane()).toContain("Resuming the interrupted request");
 
         if (outcome === "finish") {
           resumed.release?.();
@@ -2645,12 +2642,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           await session.sendInterruptEscapePair(TIMEOUT);
           await session.waitForText("What can fx do differently?", TIMEOUT);
         }
-        await session.waitForPane((pane) => !pane.includes("Thinking") && hasEmptyComposer(pane), TIMEOUT);
+        await session.waitForPane((pane) =>
+          !pane.includes("Thinking") && !pane.includes("Resuming the interrupted request") &&
+          hasEmptyComposer(pane), TIMEOUT);
         const scrollback = await session.captureFullScrollback();
         expect(scrollback.split(prompt).length - 1).toBe(1);
         expect(scrollback.split("└ Read before.txt").length - 1).toBe(1);
         expect(scrollback.split(finalText).length - 1).toBe(outcome === "finish" ? 1 : 0);
         expect(queuedGateway.requests).toHaveLength(3);
+        expect(scrollback).not.toContain("not restarted");
         expect(session.isAlive()).toBe(true);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         expect(readFileSync(resumedStderr, "utf8")).toBe("");
@@ -2803,11 +2803,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_MODEL: directFastModel,
         },
       });
-      await session.waitForComposer(TIMEOUT);
-      // The unclean-exit gate asks before the recovering turn retries.
-      await session.waitForText(/quit unexpectedly/, TIMEOUT);
-      expect(queuedGateway.requests).toHaveLength(1);
-      await session.sendText("continue");
+      // Killing the tmux session sends SIGHUP, a close during the backoff:
+      // the reopen resends at once, without a question.
       await session.waitForText(finalText, TIMEOUT);
 
       expect(queuedGateway.requests).toHaveLength(2);
