@@ -1,6 +1,6 @@
 # TLA+ models
 
-TLA+ specifications for fx, checked with TLC, together with the scripts and Bun drivers that check them. CI runs the SDK and recovery models. Run the others when you change the behavior they describe.
+TLA+ specifications for fx, checked with TLC, together with the scripts and Bun drivers that check them. CI runs the SDK and recovery models, and the recovery driver. Run the others when you change the behavior they describe.
 
 | Folder | What it models | Checker |
 |---|---|---|
@@ -10,13 +10,13 @@ TLA+ specifications for fx, checked with TLC, together with the scripts and Bun 
 | `indexer/` | When a scanned root's listing may be reused, merging parallel grep results, the file picker's loading row, and listing snapshots (`src/core/indexer/`). | `indexer/check.sh` |
 | `mcp/` | The MCP-v2 engine (`src/mcp/`): wire format, requests, stdio, version detection, the tool catalog, both HTTP transports, input-required rounds, authorization, subscriptions, elicitation, and the engine. `rules.md` lists the MCP specification rules the models cite by ID. | `mcp/check.sh`, then the drivers in `drivers/mcp/` |
 | `mcp_host/` | fx's MCP host (`src/core/mcp_host/`): host lifecycle, saved credentials, logins shared between processes, sign-in, and elicitation routing. | `mcp_host/check.sh`, `bun test drivers/mcp_host/` |
-| `recovery/` | Recovery for one model request (`src/core/recovery/`): retry waits, the crash-loop guard, resuming after a closed window, the status line, and the save that goes with every send. Eight planted mutations, each a bug fx has had or a promise of the API, must each be caught by its named rule. The turn loop routes each request's network, gateway, and rate-limit failures through the module. fx does not save the module's record yet, so resuming after a closed window and the crash-loop guard are model-checked only. | `recovery/check.sh` |
+| `recovery/` | Recovery for one model request (`src/core/recovery/`) and fx carrying out its plans (`src/core/agent/runtime/request_recovery.zig`): retry waits, the status line, the durable save before every send, torn records, the crash-loop guard, resuming after a close, deleting the record at every end, late outcomes, compaction, and fx's stop for unclear failures with its lookahead toward dropping Fast. `RecoveryTimed.tla` adds a discrete clock for the 30-second wait cap, a status that changes every second, and a bounded time to finish once the world heals. `Resume.tla` covers closing and resuming a request across process exits: two fx processes on one session, its files as abstract cells, closes (SIGHUP, SIGTERM, terminal EOF), quits, kills, crashes, the 24-hour rule, and /fork. Its `today-*` configs model fx as it ships, and each fails the rule its bug breaks. Every planted defect must be caught by its named rule and by no other (`isolate.sh`). fx does not save the module's record yet, so the record, closing, and resume are model-checked only. | `recovery/check.sh`, then `drivers/recovery/driver.ts` |
 | `sdk/` | libfx durable sessions (`DurableSession.tla`), agent names and routing (`AgentRouting.tla`), tenants whose agents share one process (`TenantIsolation.tla`), steering (`DurableSteer.tla`), and the provider credential edge (`ProviderAuth.tla`). `check.sh` also writes the TLC state graphs the drivers walk. | `sdk/check.sh`, then the drivers |
 | `session_manager/` | The session log, turn lifecycle, writer lock, snapshots, fork, subagents, catalog, host wiring, the side-file move, and v1 conversion. `rollout/` holds the models of the changes that moved fx onto the session manager. `system-design.md` is the design record the specs check and defines the `D1` to `D62` decision numbers that code comments cite. | `session_manager/check.sh`, `session_manager/rollout/run.py`, `bun test drivers/session_manager/` |
 | `shell_command/` | How an agent git command is admitted and run (`src/core/shell_command/safe_git.zig`), and one model turn through the shell tool, for the current design and a redesign. | `shell_command/check.sh`, `bun test drivers/shell_command/` |
 | `terminal/` | The in-memory shell snapshot owner (`src/core/terminal/shell_snapshot.zig`) and the lifecycle of hosted terminals. | `terminal/check.sh` |
 | `usage/` | `/usage` refreshes and the shared usage cache (`src/usage/`): `LeanUsage.tla` and `UsageModel.tla`. | `usage/check.sh`, then the drivers in `drivers/usage/` |
-| `drivers/` | The Bun drivers. They run the real fx binary or SDK code, record what happens, and have TLC check each run against its model. `drive.mjs`, `drive-agents.mjs`, `drive-tenants.mjs`, and `drive-steer.mjs` walk the SDK code along the `sdk/` state graphs. | See each folder's `check.sh` |
+| `drivers/` | The Bun drivers. They run the real fx binary or SDK code, record what happens, and have TLC check each run against its model. `drive.mjs`, `drive-agents.mjs`, `drive-tenants.mjs`, and `drive-steer.mjs` walk the SDK code along the `sdk/` state graphs. `recovery/driver.ts` walks `recovery.zig` along `Recovery.tla`, to every edge of its state graph and along seeded random paths. | See each folder's `check.sh` |
 | `lib/` | `tlc.sh`, which finds TLC and Java and runs a table of configs with their expected verdicts, `tlc.py`, which asks `tlc.sh` for TLC and Java on behalf of the Python checkers, and `run-tlc.sh`, which runs TLC once for the drivers. | |
 
 ## Requirements
@@ -54,6 +54,7 @@ Some models describe the next MCP-v2 version, which `src/mcp/` and `src/core/mcp
 
 - In `mcp/`, `Engine`, `EngineTrace`, `HttpModern`, `HttpModernTrace`, `HttpLegacy`, and `StdioConn` say so at the top. `drivers/mcp/labs/engine_lab.zig` does not build against `src/mcp/` yet, so `drivers/mcp/driver.ts` runs its scenarios only with `--next`.
 - In `drivers/mcp_host/`, the tests marked `NEXT_MCP` run only with `FX_TLA_NEXT_MCP=1`.
+- In `recovery/`, `Resume.tla` apart from its `today-*` configs models a proposed closing and resume design that fx does not implement, and `Recovery.tla` counts a torn record as one abrupt death, which `recovery.zig` does not do yet. `drivers/recovery/driver.ts` walks torn records only with `--next`, which fails until it does.
 
 The MCP-v2 models of the two HTTP transports, input-required rounds, authorization, subscriptions, and elicitation are model-checked only. Their traces came from a conformance adapter that is not part of fx. The `drivers/mcp_host/` sign-in tests drive real fx over HTTP against the fake server in `drivers/mcp/fakes/`.
 
@@ -73,7 +74,8 @@ tests/tla/indexer/check.sh                              # every config and its e
 tests/tla/acp/check.sh                                  # likewise for acp/, cli/, durable/, shell_command/, terminal/, usage/
 tests/tla/mcp/check.sh                                  # every MCP-v2 model and planted bug
 tests/tla/mcp_host/check.sh                             # every MCP host model, planted bug, and finding
-tests/tla/recovery/check.sh                             # the recovery model and its planted bugs
+tests/tla/recovery/check.sh                             # the recovery models and their planted bugs
+bun tests/tla/drivers/recovery/driver.ts --self-check   # recovery.zig along Recovery.tla, and the driver must reject a planted bug
 tests/tla/sdk/check.sh                                  # the SDK specs; writes the state graphs the drivers walk
 bun tests/tla/drivers/drive.mjs send --walks 40         # one durable-session graph; see .github/workflows/ci.yml for the rest
 bun tests/tla/drivers/drive-agents.mjs --walks 60       # agent routing

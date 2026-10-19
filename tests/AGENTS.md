@@ -82,7 +82,7 @@ Every TLA+ spec, its TLC checker, the Bun drivers that walk code along a spec, a
 - Give each folder a `check.sh` that runs every config and exits non-zero when one misses its expected verdict. Configs that must fail, such as witnesses and planted mutations, are part of that contract, so encode their verdicts in `check.sh`. Source `../lib/tlc.sh` and list each config with its verdict for `tlc_verdicts`, rather than finding TLC yourself. A Python checker gets Java and the jar from `toolchain()` in `lib/tlc.py`.
 - Put Bun drivers in `tests/tla/drivers/<area>/`. They run the code under test, from `zig-out/bin/fx` or by relative import, and have TLC check each run. Use `drivers/lib/tlc.ts` to run TLC and `drivers/lib/context.ts` for the binary, the output folder, and the `tests/e2e/` helpers. Every fx process a driver starts sets `FX_SOUND=0`. Generated output, such as `tests/tla/sdk/graphs/`, goes to the temp folder or is ignored by git.
 - A model of code that has not landed says so at the top, and the drivers that need that code run only behind an explicit flag, such as `--next` or `FX_TLA_NEXT_MCP=1`. `tests/tla/README.md` lists them. Remove the flag in the change that lands the code.
-- When a change alters behavior that a spec models, update the spec in the same change and run its checker. CI runs the `sdk/` model and its drivers and the `recovery/` model; run the others yourself.
+- When a change alters behavior that a spec models, update the spec in the same change and run its checker. CI runs the `sdk/` and `recovery/` models and their drivers; run the others yourself.
 - A new model, checker, or driver gets a row in `tests/tla/README.md`.
 
 ## Cite tests and specs from `src/`
