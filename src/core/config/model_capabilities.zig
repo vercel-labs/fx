@@ -394,3 +394,110 @@ test "generic fallback capabilities contain no vendor policy" {
     const fallback = capabilitiesForModel("anthropic/claude-any");
     try std.testing.expect(fallback.context_window == null);
 }
+
+/// Pure decision for a requested reasoning effort: returns an owned
+/// rejection message naming the model's advertised efforts, or null when the
+/// effort is usable. Caller frees the returned slice.
+pub fn effortRejection(
+    alloc: std.mem.Allocator,
+    capabilities: Capabilities,
+    effort: types.ReasoningEffort,
+    model: []const u8,
+) std.mem.Allocator.Error!?[]u8 {
+    if (reasoningEffortSupported(capabilities, effort)) return null;
+    if (capabilities.reasoning_efforts.len == 0) {
+        return try alloc.dupe(u8, "Reasoning effort is unavailable for the active model");
+    }
+    var set: std.ArrayList(u8) = .empty;
+    defer set.deinit(alloc);
+    for (capabilities.reasoning_efforts.slice(), 0..) |option, index| {
+        if (index > 0) try set.appendSlice(alloc, ", ");
+        try set.appendSlice(alloc, option.label());
+    }
+    return try alloc.print(
+        "Reasoning effort \"{s}\" is not available for model \"{s}\" (available: {s})",
+        .{ effort.label(), model, set.items },
+    );
+}
+
+test "effortRejection accepts default and advertised efforts" {
+    const alloc = std.testing.allocator;
+    const capabilities = Capabilities{
+        .reasoning_efforts = .fromSlice(&.{
+            types.ReasoningEffort.literal("low"),
+            types.ReasoningEffort.literal("high"),
+        }),
+    };
+    try std.testing.expectEqual(@as(?[]u8, null), try effortRejection(alloc, capabilities, .auto, "provider/model"));
+    try std.testing.expectEqual(@as(?[]u8, null), try effortRejection(alloc, capabilities, .literal("high"), "provider/model"));
+}
+
+test "effortRejection names the advertised set" {
+    const alloc = std.testing.allocator;
+    const capabilities = Capabilities{
+        .reasoning_efforts = .fromSlice(&.{
+            types.ReasoningEffort.literal("low"),
+            types.ReasoningEffort.literal("high"),
+        }),
+    };
+    const rejection = (try effortRejection(alloc, capabilities, .literal("max"), "provider/model")).?;
+    defer alloc.free(rejection);
+    try std.testing.expect(std.mem.find(u8, rejection, "\"max\"") != null);
+    try std.testing.expect(std.mem.find(u8, rejection, "provider/model") != null);
+    try std.testing.expect(std.mem.find(u8, rejection, "low, high") != null);
+}
+
+test "effortRejection reports models without advertised efforts" {
+    const alloc = std.testing.allocator;
+    const rejection = (try effortRejection(alloc, .{}, .literal("high"), "provider/plain")).?;
+    defer alloc.free(rejection);
+    try std.testing.expectEqualStrings("Reasoning effort is unavailable for the active model", rejection);
+}
+
+/// Pure decision for requested Fast mode: returns an owned rejection
+/// message naming the model, or null when the model offers a fast path. An
+/// intrinsically fast model already satisfies the request. Caller frees the
+/// returned slice.
+pub fn fastRejection(
+    alloc: std.mem.Allocator,
+    capabilities: Capabilities,
+    model: []const u8,
+) std.mem.Allocator.Error!?[]u8 {
+    if (capabilities.supports_fast_mode or capabilities.intrinsic_fast) return null;
+    return try alloc.print("Fast mode is not available for model \"{s}\"", .{model});
+}
+
+test "fastRejection accepts models with a fast path" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqual(@as(?[]u8, null), try fastRejection(alloc, .{ .supports_fast_mode = true }, "provider/model"));
+    try std.testing.expectEqual(@as(?[]u8, null), try fastRejection(alloc, .{ .intrinsic_fast = true }, "provider/model-fast"));
+}
+
+test "fastRejection names models without a fast path" {
+    const alloc = std.testing.allocator;
+    const rejection = (try fastRejection(alloc, .{}, "provider/plain")).?;
+    defer alloc.free(rejection);
+    try std.testing.expectEqualStrings("Fast mode is not available for model \"provider/plain\"", rejection);
+}
+
+/// Pure capability policy: ultrafast is an opt-in Gateway OpenAI catalog lane.
+/// Caller frees a non-null rejection message.
+pub fn ultrafastRejection(
+    alloc: std.mem.Allocator,
+    provider: model_provider.ProviderId,
+    capabilities: Capabilities,
+    model: []const u8,
+) std.mem.Allocator.Error!?[]u8 {
+    if (provider == .gateway and capabilities.supports_ultrafast_mode) return null;
+    return try alloc.print("Ultrafast mode is not available for model \"{s}\"", .{model});
+}
+
+test "ultrafastRejection accepts only Gateway models with the catalog capability" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqual(@as(?[]u8, null), try ultrafastRejection(alloc, .gateway, .{ .supports_ultrafast_mode = true }, "openai/model"));
+    const rejection = (try ultrafastRejection(alloc, .codex, .{ .supports_ultrafast_mode = true }, "openai/model")).?;
+    defer alloc.free(rejection);
+    try std.testing.expect(std.mem.find(u8, rejection, "openai/model") != null);
+    const unavailable = (try ultrafastRejection(alloc, .gateway, .{}, "openai/model")).?;
+    defer alloc.free(unavailable);
+}

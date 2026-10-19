@@ -18,6 +18,7 @@ const provider_runtime = @import("../app/provider_runtime.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
+const launch_selection = @import("launch_selection.zig");
 const render_request = @import("../../ui/render_request.zig");
 
 const freeStringList = collections.freeStringList;
@@ -875,6 +876,116 @@ pub fn Commands(comptime App: type) type {
 
         pub fn selectEffortFromSettings(app: *App, effort: types.ReasoningEffort) !void {
             try applyEffort(app, effort, false, true);
+        }
+
+        /// Checks launch `--model`, `--fast`, `--ultrafast` and `--effort`
+        /// flags once, after the first catalog load finishes. Launch never
+        /// waits for the catalog, so the first frame shows the requested
+        /// selection; this replaces whatever the catalog rules out and prints
+        /// a notice for each change. Corrections last for this process only:
+        /// saved settings and session preferences are not rewritten.
+        pub fn applyLaunchCheck(app: *App) !void {
+            if (comptime !@hasField(App, "model_cache") or !@hasField(App, "session_persistence")) return;
+            const pending = app.session_persistence.launch_check orelse return;
+            if (app.model_cache.isLoading()) return;
+            app.session_persistence.launch_check = null;
+            defer pending.deinit(app.alloc);
+
+            const provider = provider_runtime.provider(app);
+            if (pending.model) |raw| {
+                if (try checkLaunchModel(app, provider, raw, pending.turn)) return;
+            }
+            const model = provider_runtime.model(app);
+            const listed: ?model_capabilities.Capabilities = if (app.model_cache.metadataForModel(model)) |metadata|
+                model_capabilities.resolveCapabilities(model, metadata)
+            else
+                null;
+            if (pending.turn.ultrafast and app.worker.agent_turn_settings.ultrafast_mode) {
+                if (try launch_selection.checkTurnOptions(app.alloc, provider, model, listed, .{ .ultrafast = true })) |rejection| {
+                    defer rejection.deinit(app.alloc);
+                    try applyUltrafastMode(app, false, false, false);
+                    app.session_persistence.process_ultrafast_override = null;
+                    try writeLaunchCorrection(app, "ultrafast", rejection.message, ". Using normal speed.");
+                }
+            }
+            if (pending.turn.fast and app.fast_mode) {
+                if (try launch_selection.checkTurnOptions(app.alloc, provider, model, listed, .{ .fast = true })) |rejection| {
+                    defer rejection.deinit(app.alloc);
+                    try applyFastMode(app, false, false, false);
+                    app.session_persistence.process_fast_override = null;
+                    try writeLaunchCorrection(app, "fast", rejection.message, ". Using normal speed.");
+                }
+            }
+            if (pending.turn.effort) |effort| {
+                if (app.effort.eql(effort)) {
+                    if (try launch_selection.checkTurnOptions(app.alloc, provider, model, listed, .{ .effort = effort })) |rejection| {
+                        defer rejection.deinit(app.alloc);
+                        try applyEffort(app, .auto, false, false);
+                        app.session_persistence.process_effort_override = null;
+                        try writeLaunchCorrection(app, "effort", rejection.message, ". Using the default effort.");
+                    }
+                }
+            }
+        }
+
+        /// Resolves or rejects the launch `--model` text. Returns true when
+        /// it was rejected and the configured model, with its saved speed and
+        /// effort, replaced the launch selection.
+        fn checkLaunchModel(app: *App, provider: model_provider.ProviderId, raw: []const u8, turn: launch_selection.TurnOptions) !bool {
+            // A model chosen before the catalog arrived wins.
+            if (!std.mem.eql(u8, provider_runtime.model(app), raw)) return false;
+            var ids = (try app.model_cache.snapshotCachedModelIds(app.alloc)) orelse return false;
+            defer freeStringList(app.alloc, &ids);
+            const rejects_unknown = provider == .gateway and app.model_cache.listsEveryAvailableModel();
+            const check = try launch_selection.checkModel(app.alloc, ids.items, rejects_unknown, raw);
+            defer check.deinit(app.alloc);
+            switch (check) {
+                .unchanged => return false,
+                .resolved => |id| {
+                    if (!std.mem.eql(u8, id, raw)) {
+                        try setResolvedModelRuntime(app, id);
+                        try replaceProcessModelOverride(app, id);
+                    }
+                    return false;
+                },
+                .rejected => |rejection| {
+                    const configured = app.session_persistence.workspace_preferences orelse return false;
+                    try setResolvedModelRuntime(app, configured.model);
+                    try replaceProcessModelOverride(app, null);
+                    // Speed and effort flags were asked of the rejected model.
+                    if (turn.fast or turn.ultrafast) {
+                        if (app.fast_mode != configured.fast_mode) {
+                            try applyFastMode(app, configured.fast_mode, false, false);
+                        }
+                        if (app.worker.agent_turn_settings.ultrafast_mode != configured.ultrafast_mode) {
+                            try applyUltrafastMode(app, configured.ultrafast_mode, false, false);
+                        }
+                        app.session_persistence.process_fast_override = null;
+                        app.session_persistence.process_ultrafast_override = null;
+                    }
+                    if (turn.effort != null) {
+                        try applyEffort(app, configured.effort, false, false);
+                        app.session_persistence.process_effort_override = null;
+                    }
+                    const suffix = try app.alloc.print(" Using {s} instead.", .{configured.model});
+                    defer app.alloc.free(suffix);
+                    try writeLaunchCorrection(app, "model", rejection.message, suffix);
+                    return true;
+                },
+            }
+        }
+
+        fn replaceProcessModelOverride(app: *App, model: ?[]const u8) !void {
+            const owned = if (model) |value| try app.alloc.dupe(u8, value) else null;
+            if (app.session_persistence.process_model_override) |old| app.alloc.free(old);
+            app.session_persistence.process_model_override = owned;
+        }
+
+        fn writeLaunchCorrection(app: *App, topic: []const u8, message: []const u8, suffix: []const u8) !void {
+            const body = try app.alloc.print("{s}{s}", .{ message, suffix });
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{ .topic = topic, .tone = .warning, .body = body }, true);
+            app.shell.render_requests.request(.footer);
         }
 
         pub fn selectModelFromPicker(

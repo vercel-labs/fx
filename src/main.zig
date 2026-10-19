@@ -41,6 +41,7 @@ const app_worker_runtime = @import("core/app/app_worker_runtime.zig");
 const app_workspace_runtime = @import("core/app/app_workspace_runtime.zig");
 const app_callbacks = @import("core/app/app_callbacks.zig");
 const app_commands = @import("core/app/app_commands.zig");
+const session_commands = @import("core/session/session_commands.zig");
 const change_tracker_mod = @import("core/workspace/change_tracker.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
 const statusline_identity = @import("core/workspace/statusline_identity.zig");
@@ -3154,6 +3155,7 @@ const App = struct {
         );
 
         if (try self.model_cache.pollLoadTransition()) {
+            try session_commands.Commands(App).applyLaunchCheck(self);
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
         if (try app_commands.Handlers(App).collectUsageDashboardFacts(self)) {
@@ -4977,6 +4979,7 @@ test {
     _ = @import("core/workspace/record_tape.zig");
     _ = @import("core/session/session.zig");
     _ = @import("core/session/session_commands.zig");
+    _ = @import("core/session/launch_selection.zig");
     _ = @import("core/session/session_json.zig");
     _ = @import("core/session/session_store.zig");
     _ = @import("core/session/session_adapter.zig");

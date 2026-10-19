@@ -154,6 +154,8 @@ const CapabilityResolverState = enum {
 pub const CapabilityResolver = struct {
     catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty,
     state: CapabilityResolverState = .idle,
+    /// How the retained catalog was obtained; null when none is retained.
+    provenance: ?model_catalog.Provenance = null,
     last_attempt_ms: i64 = 0,
     requested_access: ?model_catalog.AccessMetadata = null,
     provider_id: ?model_provider.ProviderId = null,
@@ -192,6 +194,7 @@ pub const CapabilityResolver = struct {
                     if (self.catalog.items.len > 0) debug_trace.logf("gateway", "dropping model catalog after access changed entries={d}", .{self.catalog.items.len});
                     model_catalog.freeModelCatalog(alloc, &self.catalog);
                     self.catalog = .empty;
+                    self.provenance = null;
                 }
                 if (self.catalog.items.len == 0) self.state = .failed;
                 debug_trace.logf("gateway", "model catalog refresh failed category={t} retained={}", .{ failed.failure.category, self.state == .ready });
@@ -200,6 +203,7 @@ pub const CapabilityResolver = struct {
         };
         model_catalog.freeModelCatalog(alloc, &self.catalog);
         self.catalog = loaded.catalog;
+        self.provenance = loaded.provenance;
         self.state = .ready;
         self.last_attempt_ms = now;
         self.requested_access = requested;
@@ -252,17 +256,34 @@ pub const CapabilityResolver = struct {
         model: []const u8,
         fallback: model_capabilities.Capabilities,
     ) model_capabilities.Capabilities {
-        if (self.state == .ready) {
-            for (self.catalog.items) |entry| {
-                if (std.mem.eql(u8, entry.id, model)) {
-                    return model_capabilities.mergeCapabilities(
-                        fallback,
-                        model_catalog_metadata.fromCatalogEntry(entry),
-                    );
-                }
+        return self.listed(model, fallback) orelse fallback;
+    }
+
+    /// Capabilities of a model the retained catalog lists, or null when no
+    /// catalog is retained or it does not list the model.
+    pub fn listed(
+        self: *const CapabilityResolver,
+        model: []const u8,
+        fallback: model_capabilities.Capabilities,
+    ) ?model_capabilities.Capabilities {
+        if (self.state != .ready) return null;
+        for (self.catalog.items) |entry| {
+            if (std.mem.eql(u8, entry.id, model)) {
+                return model_capabilities.mergeCapabilities(
+                    fallback,
+                    model_catalog_metadata.fromCatalogEntry(entry),
+                );
             }
         }
-        return fallback;
+        return null;
+    }
+
+    /// True when the retained catalog came from an authenticated request, so
+    /// a model it does not list is not available.
+    pub fn listsEveryAvailableModel(self: *const CapabilityResolver) bool {
+        if (self.state != .ready) return false;
+        const provenance = self.provenance orelse return false;
+        return provenance.listsEveryAvailableModel();
     }
 
     pub fn catalogEntries(self: *const CapabilityResolver) ?[]const model_catalog.ModelCatalogEntry {
@@ -280,6 +301,7 @@ pub const CapabilityResolver = struct {
         model_catalog.freeModelCatalog(alloc, &self.catalog);
         self.catalog = owned_catalog.*;
         owned_catalog.* = .empty;
+        self.provenance = .{ .access = model_catalog.AccessMetadata.init(access) };
         self.state = .ready;
         self.last_attempt_ms = io_mod.milliTimestamp();
         self.requested_access = .init(access);

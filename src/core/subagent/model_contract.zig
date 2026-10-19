@@ -97,7 +97,9 @@ fn collectScoredMatches(
         if (out.items.len == max_model_match_candidates) break;
         if (require_substring and !containsIgnoreCase(id, query)) continue;
         if (session_commands.fuzzyModelScore(id, query) != target_score) continue;
-        try out.append(alloc, try alloc.dupe(u8, id));
+        const owned = try alloc.dupe(u8, id);
+        errdefer alloc.free(owned);
+        try out.append(alloc, owned);
     }
     return out.toOwnedSlice(alloc);
 }

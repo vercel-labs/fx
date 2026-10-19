@@ -36,6 +36,7 @@ const io_mod = @import("../shared/io.zig");
 const select_watch = @import("../shared/select_watch.zig");
 const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const session_title_generation = @import("../session/session_title_generation.zig");
+const launch_selection = @import("../session/launch_selection.zig");
 const compactor = @import("../compactor/compactor.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -1616,6 +1617,87 @@ pub fn runPromptCapture(alloc: Allocator, prompt: []const u8, auto_permission: b
     });
 }
 
+const LaunchCheck = union(enum) {
+    /// Owned catalog ID when `--model` resolved to a different ID, else null.
+    accepted: ?[]const u8,
+    rejected: launch_selection.Rejection,
+};
+
+/// Checks `--model`, `--fast`, `--ultrafast` and `--effort` against the
+/// provider's catalog before the first request, using the catalog load the
+/// first turn would make anyway. Without a catalog only Ultrafast, which
+/// always needs a verified capability, can be rejected.
+fn checkLaunchSelection(alloc: Allocator, ctx: *AskContext, options: RunOptions) !LaunchCheck {
+    const turn_options = launch_selection.TurnOptions.fromFlags(
+        options.fast_override,
+        options.ultrafast_override,
+        options.effort_override,
+    );
+    if (options.model_override == null and !turn_options.any()) return .{ .accepted = null };
+
+    const bundle = ctx.cfg.provider_set.select(ctx.provider);
+    if (bundle.model_catalog) |catalog_provider| {
+        ctx.capability_resolver.refreshIfDue(ctx.alloc, catalog_provider, .{
+            .access = ctx.model_catalog_access,
+            .endpoint = ctx.cfg.gateway_models_path,
+            .cancel_flag = ctx.cancelFlag(),
+        }) catch |err| switch (err) {
+            // The turn reports the cancellation.
+            error.Cancelled => return .{ .accepted = null },
+        };
+    }
+
+    var resolved: ?[]const u8 = null;
+    errdefer if (resolved) |model| alloc.free(model);
+    if (options.model_override) |raw| model: {
+        const entries = ctx.capability_resolver.catalogEntries() orelse break :model;
+        var ids = try model_catalog.projectModelIds(alloc, entries);
+        defer {
+            for (ids.items) |id| alloc.free(id);
+            ids.deinit(alloc);
+        }
+        const rejects_unknown = ctx.provider == .gateway and ctx.capability_resolver.listsEveryAvailableModel();
+        switch (try launch_selection.checkModel(alloc, ids.items, rejects_unknown, raw)) {
+            .unchanged => {},
+            .resolved => |id| if (std.mem.eql(u8, id, ctx.model)) alloc.free(id) else {
+                resolved = id;
+            },
+            .rejected => |rejection| return .{ .rejected = rejection },
+        }
+    }
+
+    const model = resolved orelse ctx.model;
+    const listed = ctx.capability_resolver.listed(model, bundle.fallbackModelCapabilities(model));
+    if (try launch_selection.checkTurnOptions(alloc, ctx.provider, model, listed, turn_options)) |rejection| {
+        if (resolved) |id| alloc.free(id);
+        return .{ .rejected = rejection };
+    }
+    return .{ .accepted = resolved };
+}
+
+/// JSON output reports the rejection through its `error` code alone, like
+/// every other `fx ask --json` failure; other modes explain it on stderr.
+fn launchRejectionResult(
+    alloc: Allocator,
+    ctx: *AskContext,
+    options: RunOptions,
+    rejection: launch_selection.Rejection,
+) !PromptRunResult {
+    // The terminal presentation has drawn the prompt with line wrap off;
+    // restore the terminal so the message starts on its own line and wraps.
+    if (ctx.presenter) |presenter| try presenter.finish();
+    if (!options.output_mode.capturesJson()) {
+        try options.deps.write_stderr(options.deps.stderr_ctx, "fx ask: ");
+        try options.deps.write_stderr(options.deps.stderr_ctx, rejection.message);
+        try options.deps.write_stderr(options.deps.stderr_ctx, "\n");
+    }
+    return .{
+        .exit_code = 1,
+        .assistant_output = try alloc.dupe(u8, ""),
+        .error_code = rejection.code.errorCode(),
+    };
+}
+
 fn missingCredentialResult(
     alloc: Allocator,
     options: RunOptions,
@@ -1725,6 +1807,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
 
     var owned_resumed_model: ?[]u8 = null;
     defer if (owned_resumed_model) |model| alloc.free(model);
+    var owned_launch_model: ?[]const u8 = null;
+    defer if (owned_launch_model) |model| alloc.free(model);
     var ctx = AskContext.init(alloc, cfg, options.deps, startup.workspace_root);
     defer ctx.deinit();
     ctx.use_process_interrupt_flag = options.deps.install_headless_interrupt;
@@ -1889,6 +1973,19 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             credential.gatewayTeam(),
             credential.accountId(),
         );
+    }
+
+    switch (try checkLaunchSelection(alloc, &ctx, options)) {
+        .accepted => |resolved| if (resolved) |model| {
+            owned_launch_model = model;
+            ctx.model = model;
+        },
+        .rejected => |rejection| {
+            defer rejection.deinit(alloc);
+            const discarded = discardFreshSession(&ctx, "rejected launch");
+            debug_trace.logf("ask", "launch flags rejected code={s} fresh_session_discarded={}", .{ rejection.code.errorCode(), discarded });
+            return launchRejectionResult(alloc, &ctx, options, rejection);
+        },
     }
 
     const restored_image_catalog = try ctx.session.snapshotImageCatalog(alloc, &.{});
@@ -2276,16 +2373,24 @@ fn takeToolCallRecords(ctx: *AskContext, alloc: Allocator) ![]ToolCallRecord {
 }
 
 fn finalizeFreshAuthSession(ctx: *AskContext, result: *PromptRunResult) void {
+    if (result.auth_failure == null or result.step_count != 0) return;
+    if (!discardFreshSession(ctx, "auth")) return;
+    if (result.session_id.len > 0) ctx.alloc.free(result.session_id);
+    result.session_id = &.{};
+}
+
+/// Discards a fresh, unresumed session that never recorded a turn, so a run
+/// that stops before its first turn leaves no empty session behind. Returns
+/// true when the session was discarded.
+fn discardFreshSession(ctx: *AskContext, reason: []const u8) bool {
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
-    if (result.auth_failure == null or
-        ctx.requested_resume != null or
+    if (ctx.requested_resume != null or
         ctx.session.historyLen() != 0 or
-        result.step_count != 0 or
         ctx.store == null or
         ctx.writable == null)
     {
-        return;
+        return false;
     }
 
     if (ctx.writable.?.state.recovery_checkpoint != null) {
@@ -2296,10 +2401,10 @@ fn finalizeFreshAuthSession(ctx: *AskContext, result: *PromptRunResult) void {
         ) catch |err| {
             debug_trace.logf(
                 "ask",
-                "fresh auth session retained because recovery checkpoint clear failed err={s}",
-                .{@errorName(err)},
+                "fresh {s} session retained because recovery checkpoint clear failed err={s}",
+                .{ reason, @errorName(err) },
             );
-            return;
+            return false;
         };
     }
 
@@ -2314,9 +2419,7 @@ fn finalizeFreshAuthSession(ctx: *AskContext, result: *PromptRunResult) void {
         ctx,
         &loaded,
     );
-    if (disposition != .discarded) return;
-    if (result.session_id.len > 0) ctx.alloc.free(result.session_id);
-    result.session_id = &.{};
+    return disposition == .discarded;
 }
 
 fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {

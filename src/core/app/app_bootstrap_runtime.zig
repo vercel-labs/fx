@@ -13,6 +13,7 @@ const credentials = @import("../auth/credentials.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const model_provider = @import("../config/model_provider.zig");
+const launch_selection = @import("../session/launch_selection.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -544,6 +545,15 @@ pub fn Runtime(comptime App: type) type {
                 launch_overrides.fast,
                 launch_overrides.provider,
             );
+            if (comptime @hasField(App, "session_persistence")) {
+                // The first frame shows the requested selection; it is checked
+                // when the background catalog load finishes.
+                app.session_persistence.launch_check = try launch_selection.Pending.init(
+                    app.alloc,
+                    launch_overrides.model,
+                    .fromFlags(launch_overrides.fast, launch_overrides.ultrafast, launch_overrides.effort),
+                );
+            }
             app.permission_engine.mode = startup.permission_mode;
             app.permission_engine.replaceRules(app.alloc, startup.takePermissionRules());
             app.agent_step_limit = startup.agent_step_limit;

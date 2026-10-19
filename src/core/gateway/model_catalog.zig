@@ -117,6 +117,13 @@ pub const Provenance = struct {
     access: AccessMetadata,
     anonymous_fallback_used: bool = false,
     fallback_failure: ?Failure = null,
+
+    /// True when an authenticated request produced the catalog, so a model it
+    /// does not list is not available to this credential. A public or
+    /// anonymous-fallback catalog can hide private models.
+    pub fn listsEveryAvailableModel(self: Provenance) bool {
+        return self.access.level == .authenticated and !self.anonymous_fallback_used;
+    }
 };
 
 pub const FailedOutcome = struct {
@@ -930,4 +937,22 @@ test "featured deepseek slot prefers the pro variant at equal recency" {
     try std.testing.expectEqualStrings("deepseek/deepseek-v4-pro", curated.items[0].id);
     try std.testing.expectEqualStrings("deepseek/deepseek-v4", curated.items[1].id);
     try std.testing.expectEqualStrings("deepseek/deepseek-v4-flash", curated.items[2].id);
+}
+
+test "only an authenticated catalog without anonymous fallback lists every available model" {
+    const authenticated: AccessMetadata = .{
+        .level = .authenticated,
+        .source = null,
+        .public_only_reason = null,
+        .private_models_may_be_hidden = false,
+    };
+    const public_only: AccessMetadata = .{
+        .level = .public_only,
+        .source = null,
+        .public_only_reason = null,
+        .private_models_may_be_hidden = true,
+    };
+    try std.testing.expect((Provenance{ .access = authenticated }).listsEveryAvailableModel());
+    try std.testing.expect(!(Provenance{ .access = public_only }).listsEveryAvailableModel());
+    try std.testing.expect(!(Provenance{ .access = authenticated, .anonymous_fallback_used = true }).listsEveryAvailableModel());
 }
