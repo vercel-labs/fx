@@ -342,7 +342,7 @@ pub const Store = struct {
             fn summary(_: *@This(), _: []const u8) !void {}
         };
         var sink: Sink = .{ .alloc = alloc, .history = &history };
-        try replay(.{ .store = store, .id = child_id }, alloc, alloc, .start, null, ReplaySink.init(&sink));
+        try replay(.{ .store = store, .id = child_id }, alloc, alloc, .start, null, &sink);
         return history.toOwnedSlice(alloc);
     }
 
@@ -1979,7 +1979,7 @@ pub const Session = struct {
             fn summary(_: *@This(), _: []const u8) !void {}
         };
         var sink: Sink = .{ .alloc = alloc, .visitor = visitor };
-        try replay(self.source(), alloc, alloc, .start, null, ReplaySink.init(&sink));
+        try replay(self.source(), alloc, alloc, .start, null, &sink);
     }
 
     /// A prompt a fork can start before: the turn it opened and its text.
@@ -3243,7 +3243,7 @@ fn restoreFrom(src: Source, alloc: Allocator, sa: Allocator, state: sm.State, nu
         if (compacted.keep_from_turn) |turn| from = .{ .at = try src.findTurnStart(sa, cursor, turn) };
     }
     var sink: RestoreSink = .{ .alloc = alloc, .history = &history, .numbers = numbers };
-    try replay(src, alloc, sa, from, skip_offset, ReplaySink.init(&sink));
+    try replay(src, alloc, sa, from, skip_offset, &sink);
     restored.history = try history.toOwnedSlice(alloc);
     return restored;
 }
@@ -3274,7 +3274,7 @@ fn detailHistory(src: Source, alloc: Allocator) ![]types.HistoryTurn {
         history.deinit(alloc);
     }
     var sink: DetailSink = .{ .alloc = alloc, .history = &history };
-    try replay(src, alloc, alloc, .start, null, ReplaySink.init(&sink));
+    try replay(src, alloc, alloc, .start, null, &sink);
     return history.toOwnedSlice(alloc);
 }
 
@@ -3368,39 +3368,7 @@ fn lastStarted(entry: sm.Entry) ?u64 {
     };
 }
 
-// Borrows its context for the synchronous replay call. Turn callbacks take
-// ownership even on failure; summary bytes remain owned by the current page.
-const ReplaySink = struct {
-    context: *anyopaque,
-    turn_fn: *const fn (*anyopaque, types.HistoryTurn, ?u64) anyerror!void,
-    summary_fn: *const fn (*anyopaque, []const u8) anyerror!void,
-
-    fn init(sink: anytype) ReplaySink {
-        const SinkPtr = @TypeOf(sink);
-        const Callbacks = struct {
-            fn turn(context: *anyopaque, value: types.HistoryTurn, number: ?u64) anyerror!void {
-                const typed: SinkPtr = @ptrCast(@alignCast(context));
-                return typed.turn(value, number);
-            }
-
-            fn summary(context: *anyopaque, data: []const u8) anyerror!void {
-                const typed: SinkPtr = @ptrCast(@alignCast(context));
-                return typed.summary(data);
-            }
-        };
-        return .{ .context = @ptrCast(sink), .turn_fn = Callbacks.turn, .summary_fn = Callbacks.summary };
-    }
-
-    fn turn(sink: ReplaySink, value: types.HistoryTurn, number: ?u64) anyerror!void {
-        return sink.turn_fn(sink.context, value, number);
-    }
-
-    fn summary(sink: ReplaySink, data: []const u8) anyerror!void {
-        return sink.summary_fn(sink.context, data);
-    }
-};
-
-noinline fn replay(
+fn replay(
     src: Source,
     alloc: Allocator,
     sa: Allocator,
@@ -3408,7 +3376,7 @@ noinline fn replay(
     skip_offset: ?u64,
     /// Takes each finished turn, even when it fails: `turn(value, number)`,
     /// and each compaction's stored data where its line sits: `summary(data)`.
-    sink: ReplaySink,
+    sink: anytype,
 ) !void {
     var builder = session_log.ConversationTurnBuilder.init(alloc);
     defer builder.deinit();
