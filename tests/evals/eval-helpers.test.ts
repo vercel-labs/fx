@@ -49,6 +49,7 @@ describe("eval helpers", () => {
     async () => {
       let modelRequests = 0;
       const gateway = Bun.serve({
+        hostname: "127.0.0.1",
         port: 0,
         idleTimeout: 0,
         fetch(req) {

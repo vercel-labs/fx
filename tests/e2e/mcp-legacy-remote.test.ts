@@ -615,6 +615,7 @@ describe("version-scoped legacy MCP remote transports", () => {
       async () => {
         let targetRequests = 0;
         const target = Bun.serve({
+          hostname: "127.0.0.1",
           port: 0,
           fetch() {
             targetRequests += 1;

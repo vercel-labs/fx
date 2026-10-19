@@ -97,6 +97,7 @@ export function startLegacyStreamableHttpFixture(
   }
 
   const server = Bun.serve({
+    hostname: "127.0.0.1",
     port: 0,
     async fetch(request) {
       const url = new URL(request.url);
@@ -733,6 +734,7 @@ export function startLegacyHttpSseFixture(
   const delimiter = options.bareCr ? "\r" : "\n";
 
   const server = Bun.serve({
+    hostname: "127.0.0.1",
     port: 0,
     async fetch(request) {
       const url = new URL(request.url);
