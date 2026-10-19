@@ -567,7 +567,7 @@ const current_inventory = [_]EntrypointInventory{
     },
     .{
         .entrypoint = .subagent,
-        .assembly_path = "subagent.agent_adapter.run -> execution.runNormalAgentTurn -> agent_runtime dependencies",
+        .assembly_path = "subagent.agent_adapter.run -> agent_runtime dependencies",
         .static_context = "reuses the launching surface's project-context snapshot bytes and its system and skill prompt sections; child delivery state starts empty so scoped tool-target deltas are re-evaluated for the child",
         .transient_context = "tool_runtime transient context each model step over the child SessionRuntime with noninteractive output callbacks and no live user question path",
         .tools = "identical to the launching surface's own gateway tool advertisement: permission-filtered builtins, deferred MCP discovery tools, and the subagent tool for nested children",
@@ -751,7 +751,7 @@ test "entrypoint context inventory snapshot documents current deltas" {
         \\  drift_status: intentional
         \\  drift: ACP JSON-RPC session updates and refusal mapping differ from terminal output by protocol contract
         \\- entrypoint: subagent
-        \\  assembly_path: subagent.agent_adapter.run -> execution.runNormalAgentTurn -> agent_runtime dependencies
+        \\  assembly_path: subagent.agent_adapter.run -> agent_runtime dependencies
         \\  static_context: reuses the launching surface's project-context snapshot bytes and its system and skill prompt sections; child delivery state starts empty so scoped tool-target deltas are re-evaluated for the child
         \\  transient_context: tool_runtime transient context each model step over the child SessionRuntime with noninteractive output callbacks and no live user question path
         \\  tools: identical to the launching surface's own gateway tool advertisement: permission-filtered builtins, deferred MCP discovery tools, and the subagent tool for nested children

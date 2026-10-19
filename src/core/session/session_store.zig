@@ -2,7 +2,6 @@ const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const config_runtime = @import("../config/config_runtime.zig");
-const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
@@ -269,27 +268,6 @@ pub const OpenSubagentControlError = error{
     SessionStoreUnavailable,
     PrivateStatePermissionsUnsupported,
     SessionChildStoreFailed,
-};
-pub const LoadSubagentBootstrapError = error{
-    OutOfMemory,
-    InvalidSessionId,
-    SessionNotFound,
-    SessionPathUnsafe,
-    SessionMetadataUnavailable,
-};
-pub const ListSubagentControlIdsError = error{
-    OutOfMemory,
-    SessionStoreUnavailable,
-};
-pub const SubagentBootstrapMetadata = struct {
-    name: []u8,
-    preferences: session_codec.DurableSessionPreferences,
-
-    pub fn deinit(self: *SubagentBootstrapMetadata, alloc: Allocator) void {
-        alloc.free(self.name);
-        self.preferences.deinit(alloc);
-        self.* = undefined;
-    }
 };
 pub const ResumableSessionContinuation = store_types.ResumableSessionContinuation;
 pub const ResumableSessionPage = store_types.ResumableSessionPage;
@@ -1491,152 +1469,6 @@ pub const Store = struct {
         candidate.deinit(alloc);
     }
 
-    /// Returns owned session metadata needed to initialize a control record.
-    /// This validates ordinary-session visibility without replaying transcript history.
-    pub fn loadSubagentBootstrapMetadata(
-        self: Store,
-        alloc: Allocator,
-        session_id: []const u8,
-    ) LoadSubagentBootstrapError!SubagentBootstrapMetadata {
-        validateSessionId(session_id) catch return error.InvalidSessionId;
-        var session_dir = self.openSessionDir(session_id) catch |err| return switch (err) {
-            error.InvalidSessionId => error.InvalidSessionId,
-            error.SessionNotFound => error.SessionNotFound,
-            error.SessionPathUnsafe => error.SessionPathUnsafe,
-            else => error.SessionMetadataUnavailable,
-        };
-        defer session_dir.close();
-        var candidate = classifyReadOnlyCandidate(
-            alloc,
-            &session_dir,
-            session_id,
-        ) catch |err| return switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.SessionNotFound => error.SessionNotFound,
-            error.SessionPathUnsafe => error.SessionPathUnsafe,
-            else => error.SessionMetadataUnavailable,
-        };
-        defer candidate.deinit(alloc);
-
-        const name_source = candidate.summary.title orelse session_id;
-        const name = try alloc.dupe(u8, name_source);
-        errdefer alloc.free(name);
-        return .{
-            .name = name,
-            .preferences = switch (candidate.storage) {
-                .conversation => self.loadConversationPreferences(
-                    alloc,
-                    &session_dir,
-                    session_id,
-                ) catch |err| return switch (err) {
-                    error.OutOfMemory => error.OutOfMemory,
-                    error.SessionNotFound => error.SessionNotFound,
-                    error.SessionPathUnsafe => error.SessionPathUnsafe,
-                    else => error.SessionMetadataUnavailable,
-                },
-                .schema_v3 => self.loadSubagentManifestPreferences(
-                    alloc,
-                    &session_dir,
-                    session_id,
-                ) catch |err| return switch (err) {
-                    error.OutOfMemory => error.OutOfMemory,
-                    error.SessionNotFound => error.SessionNotFound,
-                    error.SessionPathUnsafe => error.SessionPathUnsafe,
-                    else => error.SessionMetadataUnavailable,
-                },
-                .legacy_v1, .legacy_v2 => self.loadSubagentLegacyPreferences(
-                    alloc,
-                    candidate.summary.workspace_root orelse self.workspace_root,
-                ) catch |err| return switch (err) {
-                    error.OutOfMemory => error.OutOfMemory,
-                    else => error.SessionMetadataUnavailable,
-                },
-            },
-        };
-    }
-
-    fn loadConversationPreferences(
-        self: Store,
-        alloc: Allocator,
-        session_dir: *io_mod.VerifiedDir,
-        session_id: []const u8,
-    ) !session_codec.DurableSessionPreferences {
-        _ = self;
-        var file = openSessionFile(session_dir, "session.json", .read_only) catch |err| switch (err) {
-            error.FileNotFound => return error.SessionNotFound,
-            error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
-            else => return err,
-        };
-        defer file.close(io_mod.getIo());
-        const bytes = try io_mod.readFileToEnd(
-            alloc,
-            &file,
-            session_codec.max_session_metadata_bytes,
-        );
-        defer alloc.free(bytes);
-        var metadata = try session_codec.decodeSessionMetadata(alloc, bytes);
-        defer metadata.deinit();
-        if (!std.mem.eql(u8, metadata.value.id, session_id)) {
-            return error.InvalidSessionMetadata;
-        }
-        return .{
-            .provider = model_provider.parse(metadata.value.provider) orelse
-                return error.InvalidSessionMetadata,
-            .model = try alloc.dupe(u8, metadata.value.model),
-            .effort = core_types.ReasoningEffort.parse(metadata.value.effort) orelse
-                return error.InvalidSessionMetadata,
-            .fast_mode = metadata.value.fast_mode,
-            .ultrafast_mode = metadata.value.ultrafast_mode orelse false,
-        };
-    }
-
-    fn loadSubagentManifestPreferences(
-        self: Store,
-        alloc: Allocator,
-        session_dir: *io_mod.VerifiedDir,
-        session_id: []const u8,
-    ) !session_codec.DurableSessionPreferences {
-        _ = self;
-        var file = openSessionFile(session_dir, "session.json", .read_only) catch |err| switch (err) {
-            error.FileNotFound => return error.SessionNotFound,
-            error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
-            else => return err,
-        };
-        defer file.close(io_mod.getIo());
-        const bytes = try io_mod.readFileToEnd(
-            alloc,
-            &file,
-            session_projection.manifest_max_bytes,
-        );
-        defer alloc.free(bytes);
-        var manifest = try session_projection.decodeManifest(alloc, bytes);
-        defer manifest.deinit(alloc);
-        if (!std.mem.eql(u8, manifest.id, session_id)) return error.InvalidSessionFormat;
-        return manifest.preferences.dupe(alloc);
-    }
-
-    fn loadSubagentLegacyPreferences(
-        self: Store,
-        alloc: Allocator,
-        workspace_root: []const u8,
-    ) !session_codec.DurableSessionPreferences {
-        var detailed = try config_runtime.loadMergedSettingsDetailedFromHome(
-            alloc,
-            self.home_dir,
-            workspace_root,
-        );
-        defer detailed.deinit(alloc);
-        return .{
-            .model = try alloc.dupe(
-                u8,
-                detailed.settings.models.get(.gateway) orelse "anthropic/claude-opus-4.7",
-            ),
-            .effort = detailed.settings.effort orelse .auto,
-            .fast_mode = detailed.settings.fast_mode orelse false,
-            .ultrafast_mode = detailed.settings.ultrafast_mode orelse false,
-        };
-    }
-
     fn attachWritableChildCapability(
         self: Store,
         alloc: Allocator,
@@ -1810,35 +1642,6 @@ pub const Store = struct {
         var dir = try self.openSessionDir(session_id);
         defer dir.close();
         return discovery.classifyFencedLegacyCandidate(alloc, &dir, session_id, cancelled);
-    }
-
-    /// Invalidates the derived resume catalog after managed child ownership
-    /// changes. The relationship index remains the canonical authority.
-    /// Returns owned IDs for every readable ordinary session. Caller frees each
-    /// ID and the list with the allocator passed here.
-    pub fn listSubagentControlSessionIds(
-        self: Store,
-        alloc: Allocator,
-    ) ListSubagentControlIdsError!std.ArrayList([]u8) {
-        const scan = self.scanSessionSummariesWithDiagnostics(alloc, .read_only_list, false) catch |err| {
-            return switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                else => error.SessionStoreUnavailable,
-            };
-        };
-        var summaries = scan.summaries;
-        defer freeSummaries(alloc, &summaries);
-        var ids: std.ArrayList([]u8) = .empty;
-        errdefer {
-            for (ids.items) |id| alloc.free(id);
-            ids.deinit(alloc);
-        }
-        for (summaries.items) |summary| {
-            const id = try alloc.dupe(u8, summary.id);
-            errdefer alloc.free(id);
-            try ids.append(alloc, id);
-        }
-        return ids;
     }
 
     /// Lists readable sessions for this store's workspace newest-first. Caller frees each item and the list.
