@@ -13,20 +13,16 @@ pub fn Runtime(comptime App: type) type {
             transport: mcp_menu_state.AddTransport,
         ) !void {
             const form = app.mcp.menuView().add_form;
-            var tokens: std.ArrayList([]const u8) = .empty;
-            defer tokens.deinit(app.alloc);
-            switch (transport) {
-                .local => {
-                    try tokens.appendSlice(app.alloc, &.{ form.name.items, form.target.items });
-                    var arguments = std.mem.tokenizeAny(u8, form.arguments.items, " \t");
-                    while (arguments.next()) |argument| try tokens.append(app.alloc, argument);
+            var arguments: std.ArrayList([]const u8) = .empty;
+            defer arguments.deinit(app.alloc);
+            const intent = switch (transport) {
+                .local => local: {
+                    var words = std.mem.tokenizeAny(u8, form.arguments.items, " \t");
+                    while (words.next()) |argument| try arguments.append(app.alloc, argument);
+                    break :local try mcp_command_provider.localIntent(form.name.items, form.target.items, arguments.items);
                 },
-                .http => try tokens.appendSlice(
-                    app.alloc,
-                    &.{ "--transport", "http", form.name.items, form.target.items },
-                ),
-            }
-            const intent = try mcp_command_provider.parseAddIntent(tokens.items);
+                .http => try mcp_command_provider.httpIntent(form.name.items, form.target.items),
+            };
             var result = try builtin_mcp.addProfileServer(app.alloc, intent);
             defer result.deinit(app.alloc);
             try app.mcp.setMenuFeedback(app.alloc, "Saved MCP server; reconnecting…");

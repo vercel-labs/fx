@@ -109,11 +109,7 @@ pub fn isWebFetchToolName(tool_name: []const u8) bool {
 }
 
 pub fn permissionModeLabel(mode: PermissionMode) []const u8 {
-    return switch (mode) {
-        .ask => "ask",
-        .auto => "auto",
-        .yolo => "yolo",
-    };
+    return mode.label();
 }
 
 /// Human-readable name; permissionModeLabel retains the persisted and wire value.
@@ -1996,7 +1992,8 @@ test "PermissionEngine stores deduplicates clears replaces and deinitializes own
 test "permissionModeLabel maps active permission mode labels" {
     try std.testing.expectEqualStrings("ask", permissionModeLabel(.ask));
     try std.testing.expectEqualStrings("auto", permissionModeLabel(.auto));
-    try std.testing.expectEqualStrings("yolo", permissionModeLabel(.yolo));
+    try std.testing.expectEqualStrings("full-access", permissionModeLabel(.yolo));
+    try std.testing.expectEqual(PermissionMode.yolo, PermissionMode.parse(permissionModeLabel(.yolo)).?);
     try std.testing.expectEqualStrings("full access", permissionModeDisplayLabel(.yolo));
 }
 

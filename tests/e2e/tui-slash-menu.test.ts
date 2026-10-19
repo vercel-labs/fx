@@ -181,13 +181,13 @@ async function waitForStatuslineValue(
   let latest: unknown;
   while (Date.now() < deadline) {
     if (existsSync(settingsPath)) {
-      latest = JSON.parse(readFileSync(settingsPath, "utf8")).statusLine?.[key];
+      latest = JSON.parse(readFileSync(settingsPath, "utf8")).status_line?.[key];
       if (latest === expected) return;
     }
     await Bun.sleep(100);
   }
   throw new Error(
-    `Timed out waiting for statusLine.${key}=${expected}; last=${JSON.stringify(latest)}`,
+    `Timed out waiting for status_line.${key}=${expected}; last=${JSON.stringify(latest)}`,
   );
 }
 
@@ -869,7 +869,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       gateway.stop();
       gateway = startFakeGateway([]);
       session = await TmuxSession.create({
-        cmd: `${FX_BIN} resume ${sessionIds[0]}`,
+        cmd: `${FX_BIN} --resume ${sessionIds[0]}`,
         cwd: resumedWorkspace,
         env: {
           ...env,
@@ -962,7 +962,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       gateway.stop();
       gateway = startFakeGateway([]);
       session = await TmuxSession.create({
-        cmd: `${FX_BIN} resume ${sessionIds[0]}`,
+        cmd: `${FX_BIN} --resume ${sessionIds[0]}`,
         cwd: workspace,
         env: {
           HOME: home,
@@ -1796,7 +1796,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Right");
       grid = await waitForStatuslineMenu(session, "Context");
       pane = grid.join("\n");
-      expect(pane).not.toContain("saved to user settings");
+      expect(pane).not.toContain("saved to global settings");
       expect(pane).not.toMatch(/[*✓!✗⊘i] statusline:/);
       await waitForStatuslineValue(settingsPath, "session", true);
 
@@ -1804,7 +1804,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Right");
       grid = await waitForStatuslineMenu(session, "Workspace");
       pane = grid.join("\n");
-      expect(pane).not.toContain("saved to user settings");
+      expect(pane).not.toContain("saved to global settings");
       await waitForStatuslineValue(settingsPath, "workspace", true);
 
       await session.sendKeys("Escape");
@@ -2343,7 +2343,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           VERCEL_OIDC_TOKEN: undefined,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: currentModel,
           FX_AUTO_UPGRADE: "0",
           FX_RECORD: fixture.tapePath,
@@ -2519,7 +2519,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           VERCEL_OIDC_TOKEN: undefined,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: currentModel,
           FX_AUTO_UPGRADE: "0",
         },
@@ -2653,7 +2653,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           VERCEL_OIDC_TOKEN: undefined,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: modelIds[0],
           FX_AUTO_UPGRADE: "0",
         },
@@ -2704,7 +2704,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           VERCEL_OIDC_TOKEN: undefined,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: "openai/gpt-4o",
           FX_AUTO_UPGRADE: "0",
         },
@@ -2776,7 +2776,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
             VERCEL_OIDC_TOKEN: undefined,
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
             FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
             FX_MODEL: currentModel,
             FX_AUTO_UPGRADE: "0",
           },

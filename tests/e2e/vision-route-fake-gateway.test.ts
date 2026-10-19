@@ -1434,7 +1434,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             firstJson.session_id,
             "Continue with the saved native image context.",
           ],
@@ -1563,7 +1563,7 @@ describe("Vision route fake Gateway", () => {
               "--json",
               "--auto",
               "--no-color",
-              "--resume-id",
+              "--resume",
               savedJson.session_id,
               `Reread ${entry.name} image.`,
             ],
@@ -1949,7 +1949,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             firstJson.session_id,
             "--image",
             secondImagePath,
@@ -1972,7 +1972,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             firstJson.session_id,
             "Reread only the second historical image.",
           ],
@@ -2070,7 +2070,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             sessionId,
             "--image",
             newImagePath,
@@ -2116,7 +2116,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             sessionId,
             "Reread only the second repaired legacy image.",
           ],
@@ -2453,7 +2453,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             savedJson.session_id,
             "Inspect both saved images.",
           ],
@@ -2539,7 +2539,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             savedJson.session_id,
             "Inspect all saved images.",
           ],
@@ -3315,7 +3315,7 @@ for (const sourceChange of ["removed", "changed", "saved snapshot missing", "sav
       else if (sourceChange === "changed") writeMarkedImage(input, "REPLACEMENT_MUST_NOT_BE_USED");
       else if (sourceChange === "saved snapshot missing") rmSync(snapshot);
       else writeFileSync(snapshot, "corrupted saved bytes");
-      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", id, "--continue-recovery"], options);
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", id, "--continue-recovery"], options);
       if (sourceChange.startsWith("saved snapshot")) {
         expect(resumed.code).toBe(1);
         expect(resumed.stdout).toContain(sourceChange.endsWith("missing") ? "MissingImageSnapshot" : "ImageSnapshotCorrupt");

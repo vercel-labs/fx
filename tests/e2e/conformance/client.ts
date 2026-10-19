@@ -161,7 +161,7 @@ try {
         VERCEL_OIDC_TOKEN: "",
         FX_AUTO_UPGRADE: "0",
         FX_DISABLE_KEYCHAIN: "1",
-        FX_E2E_MCP_AUTH_AUTOMATE: "1",
+        FX_TEST_MCP_AUTH_AUTOMATE: "1",
         ...(scenarioContext.client_secret
           ? {
               FX_MCP_CONFORMANCE_CLIENT_SECRET:
@@ -171,7 +171,7 @@ try {
         FX_GATEWAY_BASE_URL: gateway.baseUrl,
         FX_GATEWAY_CHAT_URL: gateway.chatUrl,
         FX_MODEL: FAKE_GATEWAY_MODEL,
-        FX_SKIP_ONBOARDING: "1",
+        FX_TEST_SKIP_ONBOARDING: "1",
         FX_SOUND: "0",
         NO_COLOR: "1",
       },

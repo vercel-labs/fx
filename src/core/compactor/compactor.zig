@@ -60,6 +60,7 @@ pub const resetTrace = trace.reset;
 pub const default_percent = settings.default_percent;
 pub const isValidPercent = settings.isValidPercent;
 pub const resolvePercent = settings.resolvePercent;
+pub const parsePercent = settings.parsePercent;
 
 // Saved checkpoints, read back when a session is loaded or shown.
 pub const modelText = checkpoint.modelText;

@@ -24,9 +24,9 @@ const tmuxTest = test.skipIf(!tmuxAvailable());
 const ISOLATED_KEYS = [
   "AI_GATEWAY_API_KEY",
   "VERCEL_OIDC_TOKEN",
-  "FX_E2E_GATEWAY_CHAT_URL",
-  "FX_E2E_GATEWAY_MODELS_URL",
-  "FX_E2E_GATEWAY_CREDITS_URL",
+  "FX_TEST_GATEWAY_CHAT_URL",
+  "FX_TEST_GATEWAY_MODELS_URL",
+  "FX_TEST_GATEWAY_CREDITS_URL",
 ] as const;
 
 test("pane exit matching requires the expected observed status", () => {
@@ -172,9 +172,9 @@ tmuxTest("tmux launch scrubs stale overrides without storing explicit credential
     const observed = JSON.parse(readFileSync(resultPath, "utf8"));
     expect(observed.AI_GATEWAY_API_KEY).toBe(explicitCredential);
     expect(observed.VERCEL_OIDC_TOKEN).toBeNull();
-    expect(observed.FX_E2E_GATEWAY_CHAT_URL).toBeNull();
-    expect(observed.FX_E2E_GATEWAY_MODELS_URL).toBeNull();
-    expect(observed.FX_E2E_GATEWAY_CREDITS_URL).toBeNull();
+    expect(observed.FX_TEST_GATEWAY_CHAT_URL).toBeNull();
+    expect(observed.FX_TEST_GATEWAY_MODELS_URL).toBeNull();
+    expect(observed.FX_TEST_GATEWAY_CREDITS_URL).toBeNull();
 
     const startCommand = execFileSync(
       "tmux",

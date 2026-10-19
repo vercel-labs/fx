@@ -16,8 +16,8 @@ pub fn resolve(
 ) versions.Error!versions.Version {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     const override_name = switch (provider) {
-        .codex => "FX_E2E_CODEX_CLIENT_VERSION",
-        .grok => "FX_E2E_GROK_CLIENT_VERSION",
+        .codex => "FX_TEST_CODEX_CLIENT_VERSION",
+        .grok => "FX_TEST_GROK_CLIENT_VERSION",
     };
     if (io_mod.getenv(override_name)) |value| {
         return versions.Version.parse(value) orelse error.ProviderVersionUnavailable;
@@ -99,8 +99,8 @@ const LookupOperation = struct {
 /// environment. Borrowed; static or environment-owned.
 pub fn versionUrl(provider: versions.Provider) error{ProviderVersionUnavailable}![]const u8 {
     const override_name = switch (provider) {
-        .codex => "FX_E2E_CODEX_VERSION_URL",
-        .grok => "FX_E2E_GROK_VERSION_URL",
+        .codex => "FX_TEST_CODEX_VERSION_URL",
+        .grok => "FX_TEST_GROK_VERSION_URL",
     };
     if (io_mod.getenv(override_name)) |value| {
         if (!gateway_client.isLoopbackHttpUrl(value)) return error.ProviderVersionUnavailable;

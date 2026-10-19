@@ -1,4 +1,5 @@
 const std = @import("std");
+const profile_paths = @import("../../core/shared/profile_paths.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const mcp_health = @import("../../core/mcp/health.zig");
 const mcp_menu_state = @import("../../core/mcp/menu_state.zig");
@@ -294,7 +295,7 @@ fn composeBrowseRow(
 
 fn composeInfoRow(alloc: Allocator, row_index: u16, width: u16) !std.ArrayList(u8) {
     return switch (row_index) {
-        0 => composeFactRow(alloc, "Profile config", "~/.fx/mcp.json", width),
+        0 => composeFactRow(alloc, "Profile config", profile_paths.displayText("~/.fx/mcp.json"), width),
         1 => composeFactRow(alloc, "Project config", "<workspace>/.mcp.json", width),
         2 => composeTextRow(alloc, "servers: s add Slack · a add · r reload · enter inspect", width, ui_render.dim_style, 2),
         3 => composeTextRow(alloc, "project trust: p approve all · z reset", width, ui_render.dim_style, 2),
@@ -426,7 +427,7 @@ fn composeDetailsRow(
         0 => .{ .label = "Server", .value = server.configured_name },
         1 => .{ .label = "State", .value = serverStateLabel(server.*) },
         2 => .{ .label = "Source", .value = switch (server.source) {
-            .profile => "Profile · ~/.fx/mcp.json",
+            .profile => profile_paths.displayText("Profile · ~/.fx/mcp.json"),
             .workspace => "Project · .mcp.json",
             .acp => "ACP session",
         } },

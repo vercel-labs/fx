@@ -105,11 +105,11 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
   const env = {
     PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
     TERM: "xterm-256color", AI_GATEWAY_API_KEY: "synthetic-compaction-key",
-    FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1", FX_SKIP_ONBOARDING: "1",
+    FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1", FX_TEST_SKIP_ONBOARDING: "1",
     FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_MODEL: FAKE_GATEWAY_MODEL,
     FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
   };
   let sessionId = "";
   let eventsPath = "";
@@ -637,11 +637,11 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
     const env: Record<string, string> = {
       PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
       TERM: "xterm-256color", AI_GATEWAY_API_KEY: "fake-compaction-key",
-      FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1", FX_E2E_DISABLE_DOTENV: "1",
+      FX_DISABLE_KEYCHAIN: "1", FX_TEST_SKIP_ONBOARDING: "1", FX_E2E_DISABLE_DOTENV: "1",
       FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_PERMISSION_MODE: "full-access",
       FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl,
-      FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-      FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
     };
     const command = `/usr/bin/env -i ${Object.entries(env)
       .map(([key, value]) => shellQuote(`${key}=${value}`)).join(" ")} ${shellQuote(binary)}`;
@@ -776,12 +776,12 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       const env: Record<string, string> = {
         PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
         TERM: "xterm-256color", AI_GATEWAY_API_KEY: "fake-compaction-key",
-        FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1", FX_E2E_DISABLE_DOTENV: "1",
+        FX_DISABLE_KEYCHAIN: "1", FX_TEST_SKIP_ONBOARDING: "1", FX_E2E_DISABLE_DOTENV: "1",
         FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_PERMISSION_MODE: "full-access",
         FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "input,worker,session,agent,compaction,images,gateway",
         FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl,
-        FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
       };
       const command = (sessionId: string) => `/usr/bin/env -i ${Object.entries(env)
         .map(([key, value]) => shellQuote(`${key}=${value}`)).join(" ")} ${shellQuote(binary)} --resume ${shellQuote(sessionId)}`;

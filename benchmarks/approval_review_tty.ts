@@ -433,7 +433,6 @@ try {
       FX_SYNC_UPDATES: "1",
       FX_TRACE_LOG: tracePath,
       FX_TRACE_SCOPES: "permission,input,frame_render,terminal_diff",
-      NO_COLOR: "1",
     },
     stderrPath,
     width: 120,

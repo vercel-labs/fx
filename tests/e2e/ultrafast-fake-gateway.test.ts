@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -76,11 +77,22 @@ function solCatalogModel() {
 }
 
 function writeProfileSettings(root: IsolatedRoot, settings: Record<string, unknown>) {
+  const path = join(root.home, ".fx", "settings.json");
+  // Keep the session backend a test chose with useSessionsV2.
+  const experimental = existsSync(path) ? JSON.parse(readFileSync(path, "utf8")).experimental : undefined;
   writeFileSync(
-    join(root.home, ".fx", "settings.json"),
-    `${JSON.stringify({ session_titles: false, ...settings })}\n`,
+    path,
+    `${JSON.stringify({ session_titles: false, ...(experimental ? { experimental } : {}), ...settings })}\n`,
     { mode: 0o600 },
   );
+}
+
+/// Keeps the root's sessions in v2 or v1 through `experimental.sessions_v2`,
+/// the way users choose the backend.
+function useSessionsV2(root: IsolatedRoot, on: boolean) {
+  const path = join(root.home, ".fx", "settings.json");
+  const current = existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : {};
+  writeFileSync(path, `${JSON.stringify({ ...current, experimental: { sessions_v2: on } })}\n`, { mode: 0o600 });
 }
 
 function createIsolatedRoot(settings: Record<string, unknown> = {}): IsolatedRoot {
@@ -104,13 +116,13 @@ function fakeGatewayEnv(
     AI_GATEWAY_API_KEY: "ultrafast-fake-key",
     VERCEL_OIDC_TOKEN: undefined,
     FX_DISABLE_KEYCHAIN: "1",
-    FX_SKIP_ONBOARDING: "1",
+    FX_TEST_SKIP_ONBOARDING: "1",
     FX_AUTO_UPGRADE: "0",
     FX_SOUND: "0",
     FX_GATEWAY_BASE_URL: gateway.baseUrl,
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_PROVIDER: "gateway",
     FX_MODEL: ULTRA_MODEL,
     FX_FAST: undefined,
@@ -344,6 +356,20 @@ describe("ultrafast fake Gateway", () => {
           args: ["--no-ultrafast"],
           ultrafast: false,
         },
+        {
+          name: "the last CLI flag wins when it turns Ultrafast off",
+          settings: {},
+          extraEnv: {},
+          args: ["--ultrafast", "--no-ultrafast"],
+          ultrafast: false,
+        },
+        {
+          name: "the last CLI flag wins when it turns Ultrafast on",
+          settings: {},
+          extraEnv: {},
+          args: ["--no-ultrafast", "--ultrafast"],
+          ultrafast: true,
+        },
         { name: "workspace on", settings: { ultrafast_mode: false }, workspace: true, extraEnv: {}, args: [], ultrafast: true },
         { name: "workspace off", settings: { ultrafast_mode: true }, workspace: false, extraEnv: {}, args: [], ultrafast: false },
         { name: "environment overrides workspace", settings: { ultrafast_mode: false }, workspace: true, extraEnv: { FX_ULTRAFAST: "0" }, args: [], ultrafast: false },
@@ -383,32 +409,6 @@ describe("ultrafast fake Gateway", () => {
           gateway.stop();
           rmSync(root.root, { recursive: true, force: true });
         }
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "ask rejects conflicting Ultrafast flags before any POST",
-    async () => {
-      const root = createIsolatedRoot();
-      const gateway = startFakeGateway([], { models: [ultrafastCatalogModel()] });
-      try {
-        const result = await runFx(
-          ["ask", "--auto", "--no-save", "--ultrafast", "--no-ultrafast", "Conflicting flags must not spend."],
-          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway), timeoutMs: TIMEOUT },
-        );
-        expect(result.code, result.stderr).toBe(1);
-        expect(result.stdout).toBe("");
-        expect(result.stderr).toMatch(/ultrafast/i);
-        expect(result.stderr).not.toMatch(/panic|segmentation fault|aborted/i);
-        expect(gateway.requests).toEqual([]);
-        expect(gateway.classifierRequests).toEqual([]);
-        expect(gateway.evaluationRequests).toEqual([]);
-        expect(gateway.titleRequests).toEqual([]);
-      } finally {
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
       }
     },
     TIMEOUT,
@@ -483,7 +483,7 @@ describe("ultrafast fake Gateway", () => {
 
   for (const backend of ["0", "1"]) {
     test(
-      `a saved session retains Ultrafast until an explicit CLI disable with FX_SESSIONS_V2=${backend}`,
+      `a saved session retains Ultrafast until an explicit CLI disable with sessions v2 ${backend === "1" ? "on" : "off"}`,
       async () => {
         const root = createIsolatedRoot({ ultrafast_mode: true, models: { gateway: ULTRA_MODEL } });
         const gateway = startFakeGateway(
@@ -495,7 +495,8 @@ describe("ultrafast fake Gateway", () => {
           { models: [ultrafastCatalogModel()] },
         );
         try {
-          const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined, FX_SESSIONS_V2: backend });
+          useSessionsV2(root, backend === "1");
+          const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined });
           const saved = await runFx(
             ["ask", "--auto", "--json", "Save the paid-tier preference."],
             { cwd: root.workspace, env, timeoutMs: TIMEOUT },
@@ -812,7 +813,7 @@ describe("ultrafast fake Gateway", () => {
 
   for (const backend of ["0", "1"]) {
     test(
-      `ACP saves Ultrafast enable and disable across load and resume with FX_SESSIONS_V2=${backend}`,
+      `ACP saves Ultrafast enable and disable across load and resume with sessions v2 ${backend === "1" ? "on" : "off"}`,
       async () => {
         const root = createIsolatedRoot({ ultrafast_mode: false, models: { gateway: ULTRA_MODEL } });
         const gateway = startFakeGateway(
@@ -823,7 +824,8 @@ describe("ultrafast fake Gateway", () => {
           ],
           { models: [ultrafastCatalogModel()] },
         );
-        const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined, FX_SESSIONS_V2: backend });
+        useSessionsV2(root, backend === "1");
+        const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined });
         let client = AcpClient.create(root.workspace, env);
         try {
           const sessionId = await startAcpSession(client);
@@ -949,7 +951,8 @@ describe("ultrafast fake Gateway", () => {
         return finishWithServiceTier(`ULTRA_PARENT_${round}`, round < 3 ? "ultrafast" : "standard");
       }, { models: [ultrafastCatalogModel()] });
       try {
-        const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined, FX_SESSIONS_V2: "1" });
+        useSessionsV2(root, true);
+        const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined });
         let sessionId: string | undefined;
         for (const round of [1, 2, 3]) {
           const result = await runFx(
@@ -1061,7 +1064,8 @@ describe("ultrafast fake Gateway", () => {
           { models: [ultrafastCatalogModel()] },
         );
         const stderrPath = join(root.root, "stderr.txt");
-        const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined, FX_SESSIONS_V2: "1" });
+        useSessionsV2(root, true);
+        const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined });
         let session: TmuxSession | null = null;
         try {
           session = await TmuxSession.create({ cwd: root.workspace, isolated: true, stderrPath, env });
@@ -1452,14 +1456,15 @@ describe("ACP speed options", () => {
 
   for (const backend of ["0", "1"]) {
     test(
-      `saves Fast across resume with FX_SESSIONS_V2=${backend}`,
+      `saves Fast across resume with sessions v2 ${backend === "1" ? "on" : "off"}`,
       async () => {
         const root = createIsolatedRoot({ models: { gateway: FAST_ONLY_MODEL } });
         const gateway = startFakeGateway(
           [fakeGatewayFinalText("saved fast"), fakeGatewayFinalText("resumed fast"), fakeGatewayFinalText("resumed standard")],
           { models: speedCatalog() },
         );
-        const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined, FX_SESSIONS_V2: backend });
+        useSessionsV2(root, backend === "1");
+        const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined });
         let client = AcpClient.create(root.workspace, env);
         try {
           const sessionId = await startAcpSession(client);

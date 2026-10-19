@@ -946,7 +946,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         [
           "ask",
           "--auto",
-          "--resume-id",
+          "--resume",
           sessionId,
           "Continue the amended review session.",
         ],

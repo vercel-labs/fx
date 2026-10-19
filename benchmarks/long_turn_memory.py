@@ -80,7 +80,7 @@ def main():
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     env = {k: v for k, v in os.environ.items() if not k.startswith(("FX_", "OPENAI_", "GROK_", "XAI_", "AI_GATEWAY_", "VERCEL_"))}
     base_url = f"http://127.0.0.1:{server.server_port}"
-    env.update(HOME=str(home), AI_GATEWAY_API_KEY="fixture-key", FX_GATEWAY_BASE_URL=base_url, FX_E2E_GATEWAY_CHAT_URL=base_url + "/chat", FX_E2E_GATEWAY_MODELS_URL=base_url + "/coding-agent/v1/models", FX_MODEL="openai/gpt-5.5", FX_MAX_AGENT_STEPS="0")
+    env.update(HOME=str(home), AI_GATEWAY_API_KEY="fixture-key", FX_GATEWAY_BASE_URL=base_url, FX_TEST_GATEWAY_CHAT_URL=base_url + "/chat", FX_TEST_GATEWAY_MODELS_URL=base_url + "/coding-agent/v1/models", FX_MODEL="openai/gpt-5.5", FX_MAX_AGENT_STEPS="0")
 
     def limits():
         resource.setrlimit(resource.RLIMIT_AS, (args.limit_mib * 1024**2,) * 2)

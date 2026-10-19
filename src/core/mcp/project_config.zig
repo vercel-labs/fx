@@ -5,6 +5,7 @@
 //! moved into `McpRuntime`.
 
 const std = @import("std");
+const profile_paths = @import("../shared/profile_paths.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const mcp_auth = @import("mcp_auth.zig");
 const mcp_contract = @import("mcp_contract.zig");
@@ -186,7 +187,7 @@ pub fn renderWorkspaceDiagnostic(
 }
 
 fn diagnosticFile(diagnostic: WorkspaceDiagnostic) []const u8 {
-    return if (diagnostic.profile) "~/.fx/mcp.json" else ".mcp.json";
+    return if (diagnostic.profile) profile_paths.displayText("~/.fx/mcp.json") else ".mcp.json";
 }
 
 pub const WorkspaceParseResult = struct {

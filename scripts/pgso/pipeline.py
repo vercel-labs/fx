@@ -319,10 +319,9 @@ def _runtime_environment(paths: PipelinePaths) -> dict[str, str]:
     environment.update(
         {
             "FX_AUTO_UPGRADE": "0",
-            "FX_SKIP_ONBOARDING": "1",
+            "FX_TEST_SKIP_ONBOARDING": "1",
             "FX_SOUND": "0",
             "HOME": str(paths.runtime_home),
-            "NO_COLOR": "1",
         }
     )
     return environment

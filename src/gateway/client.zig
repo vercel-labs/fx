@@ -227,9 +227,9 @@ const gateway_transfer_buffer_bytes: usize = 256 * 1024;
 const provider_failure_detail_max_bytes: usize = 600;
 // Covers a 4 MiB string at worst-case JSON escaping plus SSE framing.
 const max_sse_event_line_bytes: usize = 32 * 1024 * 1024;
-const e2e_gateway_chat_url_env = "FX_E2E_GATEWAY_CHAT_URL";
-const e2e_gateway_models_url_env = "FX_E2E_GATEWAY_MODELS_URL";
-const e2e_gateway_credits_url_env = "FX_E2E_GATEWAY_CREDITS_URL";
+const e2e_gateway_chat_url_env = "FX_TEST_GATEWAY_CHAT_URL";
+const e2e_gateway_models_url_env = "FX_TEST_GATEWAY_MODELS_URL";
+const e2e_gateway_credits_url_env = "FX_TEST_GATEWAY_CREDITS_URL";
 const default_gateway_base_url = "https://ai-gateway.vercel.sh";
 pub const vercel_ai_gateway_team_header = "x-vercel-ai-gateway-team";
 pub const vercel_gateway_extended_time_header = "x-vercel-gateway-extended-time";

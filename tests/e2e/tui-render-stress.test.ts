@@ -56,7 +56,7 @@ async function launch(
   const tracePath = join(workDir, "trace.log");
 
   const s = await TmuxSession.create({
-    cmd: `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_SKIP_ONBOARDING=1 ${FX_BIN}`,
+    cmd: `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_TEST_SKIP_ONBOARDING=1 ${FX_BIN}`,
     cwd: workDir,
     width,
     height,

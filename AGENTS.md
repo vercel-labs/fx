@@ -130,17 +130,20 @@ CI fails on a missing or stale entry.
 
 Do not scatter help text or argument parsing across multiple files.
 
+Use the `fx-cli-shape` skill (`.fx/skills/fx-cli-shape/SKILL.md`) when you add, rename, remove, or review a user-facing control: a command, argument, flag, setting, env var, slash command, JSON output field, or exit code. It covers which mechanism to use, the name on every surface, and the controls that need a maintainer's approval.
+
 ## Configuration and State
 
 Profile configuration and runtime state lives under `~/.fx/`. Project `.fx.json` contains committed project defaults only.
 
 Config precedence (highest wins):
 
-1. Environment variables such as `FX_PROVIDER`, `FX_MODEL`, `FX_PERMISSION_MODE`, and `FX_MAX_AGENT_STEPS`
-2. `~/.fx/settings.json` → `workspaces["<workspace_path>"]` (profile workspace overrides)
-3. `~/.fx/settings.json` top-level (profile global settings)
-4. `<workspace>/.fx.json` (committed project defaults)
-5. Built-in defaults
+1. Command-line flags, where a command supports them
+2. Environment variables such as `FX_PROVIDER`, `FX_MODEL`, `FX_PERMISSION_MODE`, and `FX_MAX_AGENT_STEPS`
+3. `~/.fx/settings.json` → `workspaces["<workspace_path>"]` (profile workspace overrides)
+4. `~/.fx/settings.json` top-level (profile global settings)
+5. `<workspace>/.fx.json` (committed project defaults)
+6. Built-in defaults
 
 Project `.fx.json` accepts only repo-safe defaults: `max_agent_steps`, `max_tool_result_bytes`, `context`, `provider_order`, and `provider_strict`, parsed by `parseProjectSafeFields` in `src/core/config/config_runtime.zig`. The project layer never parses profile-owned keys, such as provider and model selection, permissions, and interface preferences.
 

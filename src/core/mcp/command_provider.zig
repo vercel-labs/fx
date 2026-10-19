@@ -2,6 +2,8 @@ const std = @import("std");
 const mcp_contract = @import("mcp_contract.zig");
 const project_config = @import("project_config.zig");
 const streamable_http = @import("streamable_http.zig");
+const cli_flags = @import("../cli/cli_flags.zig");
+const builtin_commands = @import("../../builtins/commands.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -69,28 +71,44 @@ pub fn removeProfileServerUnavailable(
     return error.McpProfileMutationUnavailable;
 }
 
-pub fn parseAddIntent(tokens: []const []const u8) AddIntentError!AddIntent {
-    if (tokens.len == 0) return error.McpAddUsage;
-    if (tokens.len == 1 and std.mem.eql(u8, tokens[0], "slack")) return .slack;
-    if (std.mem.eql(u8, tokens[0], "--transport")) {
-        if (tokens.len != 4 or !std.mem.eql(u8, tokens[1], "http")) {
-            return error.McpAddUsage;
-        }
-        if (!isValidServerName(tokens[2])) return error.McpInvalidServerName;
-        streamable_http.validateEndpoint(tokens[3]) catch return error.McpConfigInvalidUrl;
-        return .{ .http = .{ .name = tokens[2], .url = tokens[3] } };
+/// Reads the arguments of `fx mcp add` and `/mcp add`: `slack`,
+/// `NAME COMMAND [ARGS...]`, or `--transport http NAME URL`. Flags go before
+/// the name, through the shared parser; the words after a command belong to
+/// it, flags included.
+pub fn parseAddIntent(args: []const [:0]const u8) AddIntentError!AddIntent {
+    var parser: cli_flags.Parser = .initPrefix(&builtin_commands.mcp_transport_options, args);
+    var http = false;
+    while (parser.next() catch return error.McpAddUsage) |item| {
+        // http is the one transport --transport names.
+        if (!std.mem.eql(u8, item.option.value.?, "http")) return error.McpAddUsage;
+        http = true;
     }
-    if (tokens.len < 2) return error.McpAddUsage;
-    if (!isValidServerName(tokens[0])) return error.McpInvalidServerName;
-    return .{ .local = .{
-        .name = tokens[0],
-        .command = tokens[1],
-        .args = tokens[2..],
-    } };
+    const words = args[parser.index..];
+    if (http) {
+        if (words.len != 2) return error.McpAddUsage;
+        return httpIntent(words[0], words[1]);
+    }
+    if (words.len == 1 and std.mem.eql(u8, words[0], "slack")) return .slack;
+    if (words.len < 2) return error.McpAddUsage;
+    return localIntent(words[0], words[1], @ptrCast(words[2..]));
+}
+
+/// A remote server named `name` at `url`.
+pub fn httpIntent(name: []const u8, url: []const u8) AddIntentError!AddIntent {
+    if (!isValidServerName(name)) return error.McpInvalidServerName;
+    streamable_http.validateEndpoint(url) catch return error.McpConfigInvalidUrl;
+    return .{ .http = .{ .name = name, .url = url } };
+}
+
+/// A server named `name` that fx starts as `command args...`.
+pub fn localIntent(name: []const u8, command: []const u8, args: []const []const u8) AddIntentError!AddIntent {
+    if (!isValidServerName(name)) return error.McpInvalidServerName;
+    return .{ .local = .{ .name = name, .command = command, .args = args } };
 }
 
 pub fn isValidServerName(name: []const u8) bool {
-    if (name.len == 0) return false;
+    // A leading dash would make a flag, such as a mistyped scope, a name.
+    if (name.len == 0 or name[0] == '-') return false;
     for (name) |byte| {
         if (std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-') continue;
         return false;

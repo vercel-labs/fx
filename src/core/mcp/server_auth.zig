@@ -564,7 +564,7 @@ fn advanceAuthGenerationLocked(server: *McpServer) void {
 
 pub fn automatedAuthorizationEnabled(endpoint: []const u8) bool {
     if (!mcp_auth.isLoopbackEndpoint(endpoint)) return false;
-    const value = io_mod.getenv("FX_E2E_MCP_AUTH_AUTOMATE") orelse return false;
+    const value = io_mod.getenv("FX_TEST_MCP_AUTH_AUTOMATE") orelse return false;
     return std.mem.eql(u8, value, "1") or
         std.ascii.eqlIgnoreCase(value, "true");
 }

@@ -1628,8 +1628,8 @@ async function launchFx(
 ): Promise<void> {
   const environment = [
     options.gatewayApiKey ? `AI_GATEWAY_API_KEY=${shQuote(options.gatewayApiKey)}` : null,
-    options.gatewayChatUrl ? `FX_E2E_GATEWAY_CHAT_URL=${shQuote(options.gatewayChatUrl)}` : null,
-    options.gatewayModelsUrl ? `FX_E2E_GATEWAY_MODELS_URL=${shQuote(options.gatewayModelsUrl)}` : null,
+    options.gatewayChatUrl ? `FX_TEST_GATEWAY_CHAT_URL=${shQuote(options.gatewayChatUrl)}` : null,
+    options.gatewayModelsUrl ? `FX_TEST_GATEWAY_MODELS_URL=${shQuote(options.gatewayModelsUrl)}` : null,
     options.permissionMode ? `FX_PERMISSION_MODE=${shQuote(options.permissionMode)}` : null,
   ].filter((entry): entry is string => entry !== null).join(" ");
   const environmentPrefix = environment.length > 0 ? `${environment} ` : "";
@@ -2113,7 +2113,7 @@ class RenderLabTmux {
       "-u",
       "VERCEL_OIDC_TOKEN",
       "FX_DISABLE_KEYCHAIN=1",
-      "FX_SKIP_ONBOARDING=1",
+      "FX_TEST_SKIP_ONBOARDING=1",
       `HOME=${shQuote(opts.fixture.home)}`,
       `ZDOTDIR=${shQuote(opts.fixture.zdotdir)}`,
       `HISTFILE=${shQuote(opts.fixture.histfile)}`,
@@ -2320,7 +2320,7 @@ function testEnv(fixture: Fixture, manifest: RenderLabManifest): NodeJS.ProcessE
   delete env.AI_GATEWAY_API_KEY;
   delete env.VERCEL_OIDC_TOKEN;
   env.FX_DISABLE_KEYCHAIN = "1";
-  env.FX_SKIP_ONBOARDING = "1";
+  env.FX_TEST_SKIP_ONBOARDING = "1";
   env.HOME = fixture.home;
   env.ZDOTDIR = fixture.zdotdir;
   env.HISTFILE = fixture.histfile;

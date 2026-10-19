@@ -2385,6 +2385,13 @@ pub const McpRuntime = struct {
         return health.render(alloc, snapshot);
     }
 
+    /// The `listServersAndTools` snapshot as JSON. The caller owns the bytes.
+    pub fn listServersAndToolsJson(self: *McpRuntime, alloc: Allocator) ![]u8 {
+        var snapshot = try self.snapshotHealth(alloc, operation_control.monotonicMillis(io_mod.getIo()));
+        defer snapshot.deinit(alloc);
+        return health.renderJson(alloc, snapshot);
+    }
+
     pub fn listResources(
         self: *McpRuntime,
         alloc: Allocator,

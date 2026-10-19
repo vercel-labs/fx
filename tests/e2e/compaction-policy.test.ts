@@ -34,7 +34,7 @@ for (const userHeavy of [false, true]) test(`automatic compaction ${userHeavy ? 
     AI_GATEWAY_API_KEY: "synthetic-compaction-policy", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
     FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: model,
     FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
   };
   async function ask(args: string[], label: string, prompt?: string) {
     const stdout = join(root, `${label}.stdout`), stderr = join(root, `${label}.stderr`);
@@ -57,7 +57,7 @@ for (const userHeavy of [false, true]) test(`automatic compaction ${userHeavy ? 
     expect(seededUser.content[0].text).toBe(originalUser);
     const sessionDir = join(home, ".fx/sessions", seed.session_id), log = join(sessionDir, "events.jsonl"), before = readFileSync(log);
     phase = "continue";
-    const result = await ask(["--resume-id", seed.session_id, "Continue the saved task without losing its pending check."], "continue");
+    const result = await ask(["--resume", seed.session_id, "Continue the saved task without losing its pending check."], "continue");
     expect(result.output).toBe("CONTINUED_FROM_COMMITTED_MEMORY");
     // The turn is only a user message and a final reply, which both stay, so
     // there is nothing for the model to summarize.
@@ -106,7 +106,7 @@ for (const userHeavy of [false, true]) test(`automatic compaction ${userHeavy ? 
     expect(record).toContain("Assistant reference 7000:");
     expect(record).toContain("PENDING_CHECK=transport-resume");
     expect(continuedText.split("Continue the saved task without losing its pending check.").length - 1).toBe(1);
-    const reopened = await ask(["--resume-id", seed.session_id, "Continue after this fresh process restart."], "reopen");
+    const reopened = await ask(["--resume", seed.session_id, "Continue after this fresh process restart."], "reopen");
     expect(reopened.output).toBe("CONTINUED_FROM_COMMITTED_MEMORY");
     expect(summaryCalls).toBe(0);
     expect(bodies.at(-1)).toContain("VERIFIED_VALUE=73");

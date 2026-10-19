@@ -16,7 +16,7 @@ const Allocator = std.mem.Allocator;
 pub const issuer = "https://vercel.com";
 pub const client_id_env = "FX_OAUTH_CLIENT_ID";
 pub const default_client_id = "cl_zzh5hiOZbwJ9bfqEcYqPIJv3TaPaEYL0";
-const e2e_issuer_url_env = "FX_E2E_OAUTH_ISSUER_URL";
+const e2e_issuer_url_env = "FX_TEST_OAUTH_ISSUER_URL";
 pub const auth_file_name = profile_paths.auth_file_name;
 const schema_version: i64 = 1;
 const max_auth_file_bytes: usize = 64 * 1024;
@@ -167,7 +167,7 @@ const MutationLockProbe = struct {
 };
 
 fn signalE2ELockContention(fx_dir: std.Io.Dir) void {
-    const enabled = io_mod.getenv("FX_E2E_AUTH_LOCK_CONTENTION") orelse return;
+    const enabled = io_mod.getenv("FX_TEST_AUTH_LOCK_CONTENTION") orelse return;
     if (!std.mem.eql(u8, enabled, "1")) return;
     var file = fx_dir.createFile(io_mod.getIo(), e2e_lock_contention_file_name, .{
         .truncate = true,
@@ -640,14 +640,14 @@ pub fn load(alloc: Allocator) !?Session {
         }
         return loadKeychainWithoutProfile(alloc);
     }
-    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| {
+    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{ .iterate = true }) catch |err| {
         debug_trace.logf("auth", "session load failed step=open_home err={s}", .{@errorName(err)});
         if (err == error.FileNotFound) return null;
         return session_presence.storageError(auth_file_name, err);
     };
     defer home_dir.close(io_mod.getIo());
 
-    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
+    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.rootName(), .{
         .iterate = true,
         .follow_symlinks = false,
     }) catch |err| {
@@ -727,7 +727,7 @@ pub fn beginExistingMutation() !?Mutation {
 fn beginExistingNativeMutation() !?Mutation {
     const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var home_dir = io_mod.VerifiedDir{
-        .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| return session_presence.storageError(auth_file_name, err),
+        .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{ .iterate = true }) catch |err| return session_presence.storageError(auth_file_name, err),
     };
     defer home_dir.close();
 
@@ -759,11 +759,11 @@ fn loadKeychainWithoutProfile(alloc: Allocator) !?Session {
 fn beginMutation() !Mutation {
     const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var home_dir = io_mod.VerifiedDir{
-        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
+        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{ .iterate = true }),
     };
     defer home_dir.close();
 
-    const fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.root_dir_name);
+    const fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.rootName());
     return lockMutation(fx_dir);
 }
 
@@ -816,7 +816,7 @@ fn lockMutationWithBackend(
 }
 
 fn openExistingPrivateFxDir(home_dir: *io_mod.VerifiedDir) !io_mod.VerifiedDir {
-    var dir = try home_dir.dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
+    var dir = try home_dir.dir.openDir(io_mod.getIo(), profile_paths.rootName(), .{
         .iterate = true,
         .follow_symlinks = false,
     });

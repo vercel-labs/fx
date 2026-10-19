@@ -1261,7 +1261,7 @@ const SlackBridgeConfig = struct { origin: []const u8, scope: []u8 };
 fn slack_bridge_config(alloc: Allocator, endpoint: []const u8, client_config: ClientConfig) !?SlackBridgeConfig {
     const configured_client = client_config.client_id orelse return null;
     if (!std.mem.eql(u8, configured_client, fx_slack_client_id)) return null;
-    const origin = io_mod.getenv("FX_E2E_SLACK_ORIGIN") orelse "https://fx.sh";
+    const origin = io_mod.getenv("FX_TEST_SLACK_ORIGIN") orelse "https://fx.sh";
     const fixture = !std.mem.eql(u8, origin, "https://fx.sh");
     if (fixture) {
         if (!std.mem.startsWith(u8, origin, "http://127.0.0.1:")) return error.InvalidSlackTestOrigin;

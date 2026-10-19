@@ -25,10 +25,10 @@ const AUTH_ENV_KEYS = [
 ] as const;
 const DEFAULT_UNSET_ENV_KEYS = [
   ...AUTH_ENV_KEYS,
-  "FX_E2E_GATEWAY_CHAT_URL",
-  "FX_E2E_GATEWAY_MODELS_URL",
-  "FX_E2E_GATEWAY_CREDITS_URL",
-  "FX_E2E_UPGRADE_BASE_URL",
+  "FX_TEST_GATEWAY_CHAT_URL",
+  "FX_TEST_GATEWAY_MODELS_URL",
+  "FX_TEST_GATEWAY_CREDITS_URL",
+  "FX_TEST_UPGRADE_BASE_URL",
   "FX_PERMISSION_MODE",
 ] as const;
 const MIRRORED_ENV_KEYS = [
@@ -629,7 +629,7 @@ export class TmuxSession {
     );
     const defaultArgs = [
       ["FX_DISABLE_KEYCHAIN", "1"],
-      ["FX_SKIP_ONBOARDING", "1"],
+      ["FX_TEST_SKIP_ONBOARDING", "1"],
       ["FX_SOUND", "0"],
     ].flatMap(([key, value]) =>
       Object.prototype.hasOwnProperty.call(env, key) ? [] : [shellQuote(`${key}=${value}`)]
@@ -652,7 +652,7 @@ export class TmuxSession {
     const processEnv = {
       ...process.env,
       FX_DISABLE_KEYCHAIN: "1",
-      FX_SKIP_ONBOARDING: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
       FX_SOUND: process.env.FX_SOUND ?? "0",
     };
     for (const key of DEFAULT_UNSET_ENV_KEYS) delete processEnv[key];

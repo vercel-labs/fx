@@ -33,7 +33,7 @@ export function fxEnv(f: Fixture, extra: Record<string, string> = {}): Record<st
     FX_NO_OPEN_BROWSER: "1",
     FX_AUTO_UPGRADE: "0",
     FX_SOUND: "0",
-    FX_SKIP_ONBOARDING: "1",
+    FX_TEST_SKIP_ONBOARDING: "1",
     FX_E2E_DISABLE_DOTENV: "1",
     FX_TRACE_LOG: f.traceLog,
     AI_GATEWAY_API_KEY: "fake-mcp-v2-model-key",

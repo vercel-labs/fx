@@ -502,7 +502,7 @@ pub const ProfileStore = struct {
     ) !ProfileStore {
         try options.validate();
         var home_dir = io_mod.VerifiedDir{
-            .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{
+            .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{
                 .iterate = true,
                 .follow_symlinks = false,
             }),
@@ -510,7 +510,7 @@ pub const ProfileStore = struct {
         defer home_dir.close();
         var fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(
             &home_dir,
-            profile_paths.root_dir_name,
+            profile_paths.rootName(),
         );
         errdefer fx_dir.close();
         var sessions_dir = try io_mod.openOrCreateVerifiedPrivateDir(
@@ -524,7 +524,7 @@ pub const ProfileStore = struct {
         var joined: usize = 0;
         errdefer for (display_outside_paths[0..joined]) |path| alloc.free(path);
         for (outside_roots, &display_outside_paths) |root_name, *path| {
-            path.* = try std.Io.Dir.path.join(alloc, &.{ home, profile_paths.root_dir_name, root_name });
+            path.* = try profile_paths.rootPath(alloc, home, &.{root_name});
             joined += 1;
         }
         return .{
