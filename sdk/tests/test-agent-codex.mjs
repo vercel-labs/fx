@@ -120,8 +120,10 @@ const assertNoSecrets = (value, secrets) => {
     assert.equal(models.headers.get("authorization"), `Bearer ${access}`, "the model list uses the same credentials");
     assert.equal(models.headers.get("chatgpt-account-id"), accountId);
   }
-  assert.ok(asked.some((request) => request.sessionId === sessionId), "credentials() learns which session the request is for");
-  assert.ok(asked.length > 0 && asked.every((request) => request.provider === "codex"), "credentials() learns the provider");
+  // The model-list request carries no session header, and still names it.
+  assert.ok(asked.length > 1, "the model list and the reply each ask for credentials");
+  assert.deepEqual(asked.filter((request) => request.sessionId !== sessionId), [], "every credentials() call names the session, as providers.mdx says");
+  assert.ok(asked.every((request) => request.provider === "codex"), "credentials() learns the provider");
   assertNoSecrets(events, [access, "rt-1"]);
 }
 
@@ -155,17 +157,29 @@ const assertNoSecrets = (value, secrets) => {
   assertNoSecrets(events, [first, second, "rt-1", "rt-2"]);
 }
 
-// 3. Credentials about to expire are refreshed before the request.
+// 3. Credentials about to expire are refreshed before the request. The model
+// list, whose headers name no session, refreshes them, and refreshLock and
+// onCredentials still learn the session, so a host can key both by it.
 {
   const expiring = jwt("expiring", 60);
   const fresh = jwt("fresh", tenDays);
   const world = codexWorld({ refreshedToken: fresh });
-  const { result } = await runTurn({ fetch: world.fetch, credentials: () => ({ accessToken: expiring, refreshToken: "rt-1" }) });
+  const locked = [];
+  const saved = [];
+  const { result } = await runTurn({
+    fetch: world.fetch,
+    credentials: () => ({ accessToken: expiring, refreshToken: "rt-1" }),
+    refreshLock: (info, refresh) => { locked.push(info); return refresh(); },
+    onCredentials: (credentials, info) => { saved.push({ accessToken: credentials.accessToken, info }); },
+  });
   assert.equal(result.stopReason, "end_turn");
   assert.equal(world.log.filter((entry) => entry.url === "https://auth.openai.com/oauth/token").length, 1);
   for (const entry of world.log.filter((entry) => entry.url.startsWith("https://chatgpt.com/"))) {
     assert.equal(entry.headers.get("authorization"), `Bearer ${fresh}`, "no Codex request uses the expiring token");
   }
+  const sessionId = replyRequests(world.log)[0].headers.get("session-id");
+  assert.deepEqual(locked, [{ provider: "codex", sessionId }], "refreshLock names the session");
+  assert.deepEqual(saved, [{ accessToken: fresh, info: { provider: "codex", sessionId } }], "onCredentials names the session");
 }
 
 // 5. A durable session asks for its own session's credentials.
@@ -189,6 +203,7 @@ const assertNoSecrets = (value, secrets) => {
     assert.equal((await turn.result).stopReason, "end_turn");
     assert.equal(text, "libfx ok");
     assert.ok(asked.includes(sessionId), "credentials() is asked for the durable session's own credentials");
+    assert.deepEqual(asked.filter((id) => id !== sessionId), [], "every credentials() call, the model list's included, names the session");
     assert.equal(replyRequests(world.log)[0].headers.get("session-id"), sessionId);
     assert.equal(world.log.some((entry) => entry.url.includes("ai-gateway.vercel.sh")), false);
   } finally {
@@ -201,7 +216,9 @@ await assert.rejects(createFxEngine({ ...backendOptions, provider: "codex", mode
 await assert.rejects(createFxEngine({ ...backendOptions, provider: "custom", apiKey: "key" }), /provider must be "gateway", "codex", "grok" or a custom provider/);
 await assert.rejects(createFxEngine({ ...backendOptions, apiKey: "key", credentials: () => ({}) }), /credentials needs provider "codex"/);
 await assert.rejects(createFxEngine({ ...backendOptions, apiKey: "key", onCredentials: () => {} }), /onCredentials needs provider "codex"/);
-await assert.rejects(createFxEngine({ ...backendOptions }), /apiKey is required/);
+// QUAL-18: the error says what is missing and how to pass it.
+await assert.rejects(createFxEngine({ ...backendOptions }), /^TypeError: no AI Gateway credentials were found: pass apiKey, an AI Gateway API key or a Vercel OIDC token, to createFxEngine\(\)$/);
+await assert.rejects(createFxEngine({ ...backendOptions, apiKey: "" }), /^TypeError: apiKey must be a non-empty string$/);
 
 // fx's default model is an AI Gateway id, which Codex doesn't serve, so a
 // Codex agent must name its model, and nothing is requested without one.

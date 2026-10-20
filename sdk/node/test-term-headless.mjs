@@ -65,6 +65,13 @@ while (!readGrid().includes("𝒇x")) {
   if (performance.now() >= startupDeadline) throw new Error(`timed out waiting for fx-term startup:\n${readGrid()}`);
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
+// fx reads the size on every pass of its loop; an idle terminal reports
+// only the one size it has, not a diagnostic a frame.
+await new Promise((resolve) => setTimeout(resolve, 500));
+const idleSizeEvents = events.filter((event) => event.type === "terminal.size");
+if (idleSizeEvents.length !== 1) {
+  throw new Error(`an idle terminal reported its size ${idleSizeEvents.length} times in 500ms; expected once`);
+}
 runtime.write("/model sdk/accepted-model\r");
 const modelDeadline = performance.now() + 5000;
 while (!(events.some((event) => event.type === "config.changed" && event.configId === "model") &&
@@ -88,6 +95,17 @@ while (!readGrid().includes("streamed response")) {
 }
 await flushTerminal();
 const grid = readGrid();
+// The configStore saved the model and the mode: fx says nothing about a
+// user settings file this host doesn't have.
+const notSaved = grid.split("\n").filter((line) => /not saved/.test(line));
+if (notSaved.length) throw new Error(`terminal said accepted settings were not saved:\n${notSaved.join("\n")}`);
+const savedModeBeforeReset = config.get("mode");
+runtime.write("/permissions reset\r");
+const resetDeadline = performance.now() + 5000;
+while (config.get("mode") !== "ask") {
+  if (performance.now() >= resetDeadline) throw new Error(`/permissions reset did not save mode ask to configStore (mode=${config.get("mode")}):\n${readGrid()}`);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
 runtime.write("/exit\r");
 
 const exitCode = await Promise.race([
@@ -104,10 +122,24 @@ if (terminal.buffer.active.baseY !== 0 || terminal.buffer.active.viewportY !== 0
 if (!events.some((event) => event.type === "terminal.size" && event.cols === 96 && event.rows === 30)) throw new Error("terminal.size event did not report headless xterm geometry");
 if (config.get("model") !== "sdk/accepted-model") throw new Error("accepted terminal model was not persisted through configStore");
 if (!events.some((event) => event.type === "config.changed" && event.configId === "model" && event.value === "sdk/accepted-model" && event.source === "terminal")) throw new Error("terminal model command did not emit config.changed");
-if (config.get("mode") !== "auto") throw new Error("accepted terminal mode was not persisted through configStore");
+if (savedModeBeforeReset !== "auto") throw new Error("accepted terminal mode was not persisted through configStore");
 if (!events.some((event) => event.type === "config.changed" && event.configId === "mode" && event.value === "auto" && event.source === "terminal")) throw new Error("terminal mode command did not emit config.changed");
 if (!grid.includes("streamed response")) throw new Error(`terminal prompt did not render streamed gateway text:\n${grid}`);
 if (requestedModel !== "sdk/accepted-model") throw new Error(`terminal prompt used unexpected accepted model: ${requestedModel}`);
 if (!(firstChunkAt >= startedAt)) throw new Error("terminal fetch did not produce a first stream chunk");
+// The DiagnosticEvent table's transport events, for the terminal's model
+// request: a start and its response, paired by attempt, with no query.
+const starts = events.filter((event) => event.type === "transport.start" && event.method === "POST");
+const responses = events.filter((event) => event.type === "transport.response");
+if (!starts.length) throw new Error(`no transport.start for the model request: ${JSON.stringify(events.map((event) => event.type))}`);
+for (const start of starts) {
+  const response = responses.find((event) => event.attempt === start.attempt);
+  if (!response || response.status !== 200 || !(response.elapsedMs >= 0)) {
+    throw new Error(`request ${start.attempt} has no transport.response with status 200: ${JSON.stringify(responses)}`);
+  }
+  if (!start.endpoint.startsWith("https://") || start.endpoint.includes("?")) {
+    throw new Error(`transport.start endpoint should be an origin and path: ${start.endpoint}`);
+  }
+}
 
 console.log("headless xterm smoke passed: shared fx frame used the 96x30 host cell grid");

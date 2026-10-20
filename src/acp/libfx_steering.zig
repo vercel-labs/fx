@@ -271,6 +271,14 @@ pub const Runtime = struct {
         cancel_flag.store(true, .seq_cst);
     }
 
+    /// Whether the user cancelled the running turn, as opposed to a steer
+    /// that set the cancel flag to interrupt it.
+    pub fn userCancelled(self: *Runtime) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return self.user_cancelled;
+    }
+
     /// Removes the queued libfx inputs, which the model never saw, and returns
     /// their ids in order, owned by `result_alloc`. Called as a turn ends, so
     /// a journaled session records them as withdrawn while they still belong

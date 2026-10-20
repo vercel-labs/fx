@@ -6,7 +6,9 @@ import { createServer } from "node:http";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const directory = resolve(process.argv[2]);
+// The directory sdk/scripts/package-libfx.mjs wrote, with libfx in libfx/.
+const dist = resolve(process.argv[2]);
+const directory = join(dist, "libfx");
 const entries = [
   ["esm", await import(pathToFileURL(join(directory, "node.js")).href)],
   ["cjs", createRequire(import.meta.url)(join(directory, "node.cjs"))],

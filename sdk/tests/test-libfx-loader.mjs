@@ -131,6 +131,9 @@ for (const [options, errorType, message] of [
   [{ apiKey: "loader-key", model: 1 }, TypeError, "model"],
   [{ apiKey: "x".repeat(65_537) }, RangeError, "65536"],
   [{ apiKey: "loader-key", model: "x".repeat(1_025) }, RangeError, "1024"],
+  // A callback that isn't a function is refused, not called later.
+  [{ apiKey: "loader-key", fetch: "x" }, TypeError, "fetch must be a function"],
+  [{ apiKey: "loader-key", onEvent: "log everything" }, TypeError, "onEvent must be a function"],
 ]) {
   await assert.rejects(
     createFxEngine({ backend: "native", nativeAddon: realNativeAddon, ...options }),
@@ -148,10 +151,14 @@ const savedPromising = WebAssembly.promising;
 try {
   Object.defineProperty(WebAssembly, "Suspending", { configurable: true, value: undefined });
   Object.defineProperty(WebAssembly, "promising", { configurable: true, value: undefined });
+  // backend "wasm" never tries the native addon, so its error doesn't say
+  // that none was found.
   await assert.rejects(
     createFxEngine({ nativeAddon: nativeUrl, backend: "wasm", apiKey: "loader-key" }),
     (error) => error?.code === "LIBFX_JSPI_REQUIRED" &&
-      error.message.includes("--experimental-wasm-jspi"),
+      error.message.includes("--experimental-wasm-jspi") &&
+      error.message.includes('The "wasm" backend requires JavaScript Promise Integration') &&
+      !error.message.includes("No compatible native addon was found"),
   );
   await assert.rejects(
     createFxEngine({ nativeAddon: realNativeAddon, apiKey: "loader-key", instructions: "x".repeat(65_537) }),

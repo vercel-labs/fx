@@ -11,6 +11,7 @@ const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
+const input_history_runtime = @import("input_history_runtime.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
 
 pub const PendingPhase = enum {
@@ -1248,7 +1249,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             const outcome = app.prompt_history.recordAccepted(
                 app.alloc,
                 io_mod.milliTimestamp(),
-                app.workspace_root,
+                input_history_runtime.HistoryRuntime(App).promptHistoryRoot(app),
                 text,
             );
             if (outcome != .warning) return;

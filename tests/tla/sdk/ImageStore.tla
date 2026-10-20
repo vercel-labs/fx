@@ -22,21 +22,32 @@
 (* retry's input lands too, naming an image the store may never have got   *)
 (* (ImageStore-RetryLands.cfg).                                            *)
 (*                                                                         *)
-(* The session keeps only its newest Window images. When a turn enters the *)
-(* history, the core drops each image older than the window: it keeps the  *)
-(* name and gives up the bytes, and a checkpoint saves it by name alone.   *)
-(* An open counts the history alone, as that turn's end did, and stages    *)
-(* the named images inside the window and the open turn's. With LiveWindow *)
-(* = FALSE the core keeps every image (ImageStore-KeepAll.cfg); with       *)
-(* WindowAtOpen = FALSE an open stages every named image, so one the store *)
-(* lost outside the window fails it (ImageStore-NeedAll.cfg).              *)
+(* One model request carries at most RequestImages images, of at most      *)
+(* RequestBytes together, its newest; it leaves every older one out. Image  *)
+(* Big takes two units of bytes, every other one. The session keeps only   *)
+(* its newest images, as many as fit its window of WindowImages images and *)
+(* WindowBytes, which is the request's budget: so the model sees the images *)
+(* it would see if the session kept them all (RequestSeesAll), and the     *)
+(* session holds no more than one request carries (HeldFitsRequest). A     *)
+(* window smaller than the budget drops images a request carries           *)
+(* (ImageStore-WindowShort.cfg); one larger, as the window of 4,096 images *)
+(* before it was the budget, holds and stages more (ImageStore-            *)
+(* WindowPastRequest.cfg). When a turn enters the history, the core drops  *)
+(* each image older than the window: it keeps the name and gives up the    *)
+(* bytes, and a checkpoint saves it by name alone. An open counts the      *)
+(* history alone, as that turn's end did, and stages the named images      *)
+(* inside the window and the open turn's. With LiveWindow = FALSE the core *)
+(* keeps every image (ImageStore-KeepAll.cfg); with WindowAtOpen = FALSE   *)
+(* an open stages every named image, so one the store lost outside the     *)
+(* window fails it (ImageStore-NeedAll.cfg).                               *)
 (*                                                                         *)
 (* With Tools a turn's host tool may return an image. The engine stores it  *)
 (* before it hands the result to the core, whose next record names it; a   *)
 (* store that refuses it leaves it in the result, held inline. The window  *)
 (* counts it as any image, and once it leaves it keeps the name of its     *)
 (* bytes; with CountInline = FALSE the window never counts it, so the      *)
-(* session holds more than Window images (ImageStore-InlineUncounted.cfg). *)
+(* session holds more than one request carries                             *)
+(* (ImageStore-InlineUncounted.cfg).                                       *)
 (* With ToolStoreFirst = FALSE the result reaches the core while the write *)
 (* is in flight (ImageStore-ToolBeforeStore.cfg). A tool image joins the   *)
 (* window with its turn, as the prompt's does, and an open stages every    *)
@@ -66,7 +77,11 @@ CONSTANTS
     FailOnMissing,  \* whether an open that misses an image fails
     MaxRetries,     \* bound on retries of prompts the log holds
     DropRepeats,    \* whether the log drops a retried prompt's input
-    Window,         \* the newest images the session keeps
+    RequestImages,  \* the most images one model request carries
+    RequestBytes,   \* the most bytes of images one model request carries
+    Big,            \* the image that takes two units of bytes
+    WindowImages,   \* the most images the session keeps: RequestImages but in a witness
+    WindowBytes,    \* the most bytes of images it keeps: RequestBytes but in a witness
     LiveWindow,     \* whether the core drops images older than the window
     WindowAtOpen,   \* whether an open stages only the window's images
     CountInline,    \* whether the window counts a tool image held inline
@@ -77,10 +92,13 @@ ASSUME N \in Nat /\ MaxFaults \in Nat /\ MaxCrashes \in Nat /\ MaxLoss \in Nat
 ASSUME Old \in BOOLEAN /\ Durable \in BOOLEAN /\ StoreFirst \in BOOLEAN
 ASSUME MarkOnlyStored \in BOOLEAN /\ FailOnMissing \in BOOLEAN
 ASSUME MaxRetries \in Nat /\ DropRepeats \in BOOLEAN
-ASSUME Window \in Nat \ {0} /\ LiveWindow \in BOOLEAN /\ WindowAtOpen \in BOOLEAN
+ASSUME RequestImages \in Nat \ {0} /\ RequestBytes \in Nat \ {0}
+ASSUME WindowImages \in Nat \ {0} /\ WindowBytes \in Nat \ {0}
+ASSUME LiveWindow \in BOOLEAN /\ WindowAtOpen \in BOOLEAN
 ASSUME CountInline \in BOOLEAN
 ASSUME Tools \in BOOLEAN /\ ToolStoreFirst \in BOOLEAN
 ASSUME "o" \notin Imgs
+ASSUME Big \in Imgs
 
 Prompts == 1..N
 None == "none"
@@ -165,13 +183,26 @@ Init ==
 
 \* The images the saved history names.
 Named == {saved[k].i : k \in {j \in 1..Len(saved) : saved[j].ref}}
+\* An image's bytes, in units, and those of a sequence of images; a request
+\* and the window count them alike, as base64.
+Size(i) == IF i = Big THEN 2 ELSE 1
+RECURSIVE Bytes(_)
+Bytes(s) == IF s = << >> THEN 0 ELSE Size(Head(s).i) + Bytes(Tail(s))
+\* Whether images k to n of s fit a budget of `images` and `bytes`.
+Fits(s, k, n, images, bytes) == Cardinality(k..n) <= images /\ Bytes(SubSeq(s, k, n)) <= bytes
 \* Whether image k of s is one the window keeps when it counts the first n:
 \* it counts every image, a tool image the store refused, held inline,
 \* too, and keeps every image past the first n. With CountInline = FALSE it
 \* counts only images with a name, which a refused tool image lacks.
 WindowKeeps(s, k, n) ==
-    IF CountInline THEN Cardinality(k..n) <= Window
-    ELSE ~s[k].named \/ Cardinality({j \in k..n : s[j].named}) <= Window
+    IF CountInline THEN Fits(s, k, n, WindowImages, WindowBytes)
+    ELSE LET named == SelectSeq(SubSeq(s, k, n), LAMBDA e : e.named)
+         IN ~s[k].named \/ (Len(named) <= WindowImages /\ Bytes(named) <= WindowBytes)
+\* Whether a model request carries image k of s, the core's history and
+\* open turn, were every image held: it carries its newest that fit its
+\* budget, whether held inline or not. The rest of the request only makes it
+\* carry fewer.
+RequestCarries(s, k) == Fits(s, k, Len(s), RequestImages, RequestBytes)
 \* A turn has started and not ended: its images are the last saved, from
 \* turnAt on, and it has not entered the history the window counts.
 OpenTurn == \E p \in Prompts : ph[p] = "started"
@@ -514,14 +545,21 @@ FailsOnlyOnLossInWindow ==
     up = "failed" =>
         \E k \in 1..Len(saved) : saved[k].ref /\ WindowKeeps(saved, k, Counted) /\ saved[k].i \in lostImgs
 
-\* An open core holds at most Window images between turns, counting each it
-\* holds inline, as a tool image the store refused.
-WindowBound ==
-    (up = "open" /\ ~OpenTurn) => Cardinality({k \in 1..Len(mem) : ~mem[k].dropped}) <= Window
+\* Between turns an open core holds no more than one model request carries,
+\* counting each image it holds inline, as a tool image the store refused:
+\* so an open stages at most that much for the history.
+HeldFitsRequest ==
+    (up = "open" /\ ~OpenTurn) =>
+        LET held == SelectSeq(mem, LAMBDA e : ~e.dropped)
+        IN Len(held) <= RequestImages /\ Bytes(held) <= RequestBytes
 
-\* An open core keeps exactly its newest Window named images between turns:
-\* each older one is dropped, keeping its name. A running turn's images join
-\* the window once the turn enters the history.
+\* The model sees the images it would see if the session kept every one:
+\* each image a request carries is one the core holds.
+RequestSeesAll == up = "open" => \A k \in 1..Len(mem) : RequestCarries(mem, k) => ~mem[k].dropped
+
+\* An open core keeps exactly the newest named images its window holds
+\* between turns: each older one is dropped, keeping its name. A running
+\* turn's images join the window once the turn enters the history.
 WindowHeld ==
     (up = "open" /\ ~OpenTurn) => \A k \in 1..Len(mem) : mem[k].dropped = ~WindowKeeps(mem, k, Len(mem))
 

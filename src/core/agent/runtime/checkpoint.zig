@@ -21,7 +21,15 @@ const naming_version: u16 = 3;
 const json_only_version: u16 = 1;
 const header_bytes: usize = 4 + 2 + 2 + 4 + Sha256.digest_length;
 const length_bytes: usize = 4;
-pub const max_checkpoint_bytes: usize = 4 * 1024 * 1024;
+/// The most bytes one kernel checkpoint holds, and with it one journal load
+/// and one snapshot (`journal.zig`). A session whose host keeps an image store
+/// names the images it stored there, so only their names count here. Without
+/// one, history keeps every prompt's images inline, while a model request
+/// leaves the oldest out past its 30 MiB budget (`request_image_budget.zig`),
+/// so such a session runs until its history reaches this limit. That is twice
+/// the largest prompt libfx accepts: an 8 MiB frame and 8 MiB of base64
+/// images.
+pub const max_checkpoint_bytes: usize = 32 * 1024 * 1024;
 pub const max_history_turns: usize = 1024;
 
 pub const Error = Allocator.Error || error{

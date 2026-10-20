@@ -5,6 +5,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const permissions = @import("../permissions/permissions.zig");
 const render_request = @import("../../ui/render_request.zig");
+const runtime_profile = @import("../hosts/runtime_profile.zig");
 const session_commands = @import("../session/session_commands.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
@@ -155,6 +156,9 @@ pub fn Runtime(comptime App: type) type {
                 app,
                 livePermissionSnapshot(app),
             );
+            if (comptime @hasDecl(App, "persistAcceptedPermissionMode")) {
+                try app.persistAcceptedPermissionMode(.ask);
+            }
             try finalizeModePreference(app);
         }
 
@@ -234,6 +238,16 @@ pub fn Runtime(comptime App: type) type {
             const mode = app.permission_engine.mode;
             if (comptime @hasDecl(App, "persistPermissionModePreference")) {
                 try app.persistPermissionModePreference(mode);
+                return;
+            }
+            // A JavaScript host has no user settings file; the mode went to
+            // its configStore (`persistAcceptedPermissionMode`).
+            if (comptime runtime_profile.allows(App, .js_host_config)) {
+                debug_trace.logf(
+                    "host_config",
+                    "user_settings_skipped id=mode reason=host_config_store",
+                    .{},
+                );
                 return;
             }
 

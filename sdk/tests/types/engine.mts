@@ -79,7 +79,8 @@ export async function engine(): Promise<FxEngine> {
   for await (const _ of turn) {}
   const result = await turn.result;
   assertType<Equal<typeof result, FxEngineTurnResult>>();
-  assertType<Equal<typeof result.stopReason, "end_turn" | "max_output_tokens" | "max_model_turns" | "refused" | "cancelled">>();
+  assertType<Equal<typeof result.stopReason, "end_turn" | "max_output_tokens" | "max_model_turns" | "refused" | "cancelled" | "yielded">>();
+  if (result.stopReason === "refused") console.log(result.error?.message);
 
   agent.prompt([
     { type: "text", text: "What does this screenshot show?" },
@@ -180,7 +181,11 @@ class SessionStore implements Persistence {
     return { journal: this.#records.map(({ cursor, data }) => ({ cursor, data })) };
   }
 
-  async append({ expected, idempotencyKey, data }: { expected: string | null; idempotencyKey: string; data: Uint8Array }): Promise<{ cursor: string }> {
+  async append({ expected, idempotencyKey, data, marks }: Parameters<Persistence["append"]>[0]): Promise<{ cursor: string }> {
+    // A store that tracks turns learns how each one ended.
+    for (const mark of marks ?? []) {
+      if ("end" in mark) assertType<Equal<typeof mark.stopReason, "end_turn" | "max_output_tokens" | "max_model_turns" | "refused" | "cancelled" | "yielded" | "error" | undefined>>();
+    }
     const stored = this.#records.find((record) => record.key === idempotencyKey);
     if (stored) return { cursor: stored.cursor };
     const head = this.#records.at(-1)?.cursor ?? null;
@@ -255,7 +260,12 @@ export async function events(): Promise<void> {
       seen.push(event);
       if (event.type === "transport.retry") console.log(event.nextAttempt);
       if (event.type === "checkpoint.save") console.log(event.through, event.bytes);
+      if (event.type === "checkpoint.error") {
+        assertType<Equal<typeof event.code, "FX_CHECKPOINT_TOO_LARGE" | undefined>>();
+        assertType<Equal<typeof event.skipped, "too_large" | "too_many_turns" | "invalid" | undefined>>();
+      }
       if (event.type === "journal.error") console.log(event.error);
+      if (event.type === "turn.notice") assertType<Equal<typeof event.text, string>>();
       // @ts-expect-error session events come from createFxAgent(), not an engine
       if (event.type === "session.error") console.log(event);
     },

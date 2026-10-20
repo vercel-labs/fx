@@ -61,7 +61,44 @@ pub fn build_for(definition: *const definitions.Definition, alloc: Allocator, re
             break;
         }
     };
-    return codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity });
+    // A model declared without tool use is offered no tools; one whose
+    // metadata says nothing about it still is.
+    var data = request;
+    if (data.tool_choice == .auto) if (definition.model(request.model)) |metadata| {
+        if (metadata.supports_tool_use) |tools| {
+            if (!tools) data.tool_choice = .none;
+        }
+    };
+    return codec.build_request(alloc, data, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity });
+}
+
+test "a model declared without tool use is offered no tools" {
+    const alloc = std.testing.allocator;
+    var registry = try definitions.Registry.parse_json(alloc,
+        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"},"model_metadata":{"with-tools":{"supports_tool_use":true},"text-only":{"supports_tool_use":false},"undeclared":{"max_output_tokens":128}}}}
+    );
+    defer registry.deinit(alloc);
+    const definition = registry.get("local").?;
+    for ([_]struct { model: []const u8, tools: bool }{
+        .{ .model = "with-tools", .tools = true },
+        .{ .model = "text-only", .tools = false },
+        .{ .model = "undeclared", .tools = true },
+        .{ .model = "unlisted", .tools = true },
+    }) |case| {
+        const request: streams.RequestData = .{
+            .model = case.model,
+            .instructions = &.{},
+            .messages = &.{.{ .role = .user, .content = "hi" }},
+            .tools = .{ .additional_functions = &.{.{ .name = "lookup", .description = "Look up a key." }} },
+            .tool_choice = .auto,
+            .provider_options = .{},
+        };
+        const body = try build_for(definition, alloc, request);
+        defer alloc.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.tools, parsed.value.object.get("tools") != null);
+    }
 }
 
 pub fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {

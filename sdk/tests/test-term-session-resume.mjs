@@ -34,12 +34,14 @@ const mockFetch = async (_input, init) => {
 const records = new Map();
 let nextRevision = 1;
 let commits = 0;
+let commitCalls = 0;
 const sessionStore = {
   load(id) {
     const record = records.get(id);
     return record ? { bytes: record.bytes.slice(), revision: record.revision } : null;
   },
   commit(id, bytes, expectedRevision) {
+    commitCalls += 1;
     const current = records.get(id);
     if (current?.revision !== expectedRevision) {
       const error = new Error("session revision conflict");
@@ -93,6 +95,7 @@ async function waitFor(predicate, label, diagnostics = () => "") {
 
 async function start(args = []) {
   const capture = createTerminalCapture();
+  const events = [];
   const runtime = await createFxTerminal({
   backend: "wasm",
     wasm,
@@ -101,13 +104,14 @@ async function start(args = []) {
     env: { AI_GATEWAY_API_KEY: "term-session-test-key", FX_THEME: "dark" },
     fetch: mockFetch,
     sessionStore,
+    onEvent(event) { events.push(event); },
   });
   await waitFor(
     () => capture.text().includes(args.length ? "session resumed" : "Run /help for commands"),
     "fx-term startup",
     () => `output=${JSON.stringify(capture.text().slice(-1000))}`,
   );
-  return { capture, runtime };
+  return { capture, runtime, events };
 }
 
 async function exit(runtime, label) {
@@ -144,6 +148,39 @@ if (!restoredBeforeInput.includes("ZXQJ")) {
 if (fetchCalls !== 1) throw new Error("restore triggered an unexpected gateway request");
 await exit(second.runtime, "second terminal");
 
+// Another writer saves the conversation; this terminal's next commit carries
+// a stale revision. The store's FX_SESSION_REVISION_CONFLICT reaches the app
+// and the user, the record stays as the store has it, and fx stops saving.
+const third = await start(["--resume", "last"]);
+const [sessionId] = records.keys();
+const otherWriter = { ...records.get(sessionId), revision: "other-writer" };
+records.set(sessionId, otherWriter);
+const callsBefore = commitCalls;
+third.runtime.write("a turn after another writer saved\r");
+await waitFor(
+  () => third.events.some((event) => event.type === "session.persist_error"),
+  "the conflict diagnostic",
+  () => `commitCalls=${commitCalls}, events=${JSON.stringify(third.events.map((event) => event.type))}`,
+);
+const conflict = third.events.find((event) => event.type === "session.persist_error");
+if (conflict.sessionId !== sessionId || conflict.error?.code !== "FX_SESSION_REVISION_CONFLICT") {
+  throw new Error(`session.persist_error should name the session and carry the store's error: ${JSON.stringify({ sessionId: conflict.sessionId, code: conflict.error?.code })}`);
+}
+await waitFor(
+  () => third.capture.text().includes("this conversation was saved elsewhere"),
+  "the conflict notice",
+  () => `output=${JSON.stringify(third.capture.text().slice(-1500))}`,
+);
+const callsAfterConflict = commitCalls;
+if (callsAfterConflict !== callsBefore + 1) throw new Error(`expected one refused commit, got ${callsAfterConflict - callsBefore}`);
+const fetchesBefore = fetchCalls;
+third.runtime.write("one more turn\r");
+await waitFor(() => fetchCalls > fetchesBefore, "the next reply");
+await new Promise((resolve) => setTimeout(resolve, 200));
+if (commitCalls !== callsAfterConflict) throw new Error(`fx kept committing after the conflict (${commitCalls - callsAfterConflict} more)`);
+if (records.get(sessionId) !== otherWriter) throw new Error("a commit replaced the other writer's record");
+await exit(third.runtime, "conflicting terminal");
+
 // A snapshot published libfx 0.0.13 saved, before v1 sessions were removed
 // (D63): its bytes load unchanged, the conversation replays, and the next
 // turn sends the model the restored history.
@@ -169,4 +206,4 @@ if (!requestBodies.at(-1).includes("remember the plum orchard")) {
 }
 await exit(restored.runtime, "restored terminal");
 
-console.log(`term session resume passed: commits=${commits}, records=${records.size}, restored_prompt=true, restored_reply=true, libfx_0.0.13_snapshot=true`);
+console.log(`term session resume passed: commits=${commits}, records=${records.size}, restored_prompt=true, restored_reply=true, conflict_reported=true, libfx_0.0.13_snapshot=true`);

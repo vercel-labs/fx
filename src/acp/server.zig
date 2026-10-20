@@ -182,6 +182,9 @@ pub const OutboundKind = enum {
     mcp_message,
     /// libfx journal flush: the host answers once it holds every event.
     journal,
+    /// libfx inputs: the host answers once it has handed in the inputs it
+    /// stored since it last read them.
+    inputs,
 };
 
 pub const OutboundResponse = struct {
@@ -1727,6 +1730,24 @@ const invalid_checkpoint_meta: jsonrpc.RpcError = .{
     .message = "Invalid libfx checkpoint meta",
 };
 
+/// `agent.checkpoint()`'s answers for a conversation past what a checkpoint
+/// holds: the limit it passed and what still works (QUAL-18). `sdk/fx-sdk.js`
+/// gives them the code `FX_CHECKPOINT_TOO_LARGE` by how their text starts.
+const checkpoint_too_large: jsonrpc.RpcError = .{
+    .code = ErrorCode.invalid_request,
+    .message = std.fmt.comptimePrint(
+        "libfx checkpoint is too large: the conversation is over the {d} MiB a checkpoint holds; this engine goes on with it, and a new conversation can be saved again",
+        .{agent_checkpoint.max_checkpoint_bytes / (1024 * 1024)},
+    ),
+};
+const checkpoint_too_many_turns: jsonrpc.RpcError = .{
+    .code = ErrorCode.invalid_request,
+    .message = std.fmt.comptimePrint(
+        "libfx checkpoint is too large: the conversation has more than the {d} turns a checkpoint holds; this engine goes on with it, and a new conversation can be saved again",
+        .{agent_checkpoint.max_history_turns},
+    ),
+};
+
 fn handleKernelCheckpoint(
     state: *ServerState,
     alloc: Allocator,
@@ -1748,8 +1769,13 @@ fn handleKernelCheckpoint(
     };
     const meta = checkpointMetaParam(parsed.value) orelse return state.writer.writeError(alloc, msg.id, invalid_checkpoint_meta);
     const store = state.cfg.host_attachments orelse return state.writer.writeError(alloc, msg.id, unavailable);
-    const bytes = active.session_rt.agent.checkpoint(alloc, meta) catch
-        return state.writer.writeError(alloc, msg.id, unavailable);
+    const bytes = active.session_rt.agent.checkpoint(alloc, meta) catch |err| return state.writer.writeError(alloc, msg.id, switch (err) {
+        error.CheckpointTooLarge => if (active.session_rt.agent.history.items.len > agent_checkpoint.max_history_turns)
+            checkpoint_too_many_turns
+        else
+            checkpoint_too_large,
+        else => unavailable,
+    });
     defer alloc.free(bytes);
     // The checkpoint leaves as raw bytes beside the response frame.
     const attachment = store.put(bytes) catch |err| switch (err) {
@@ -2021,9 +2047,10 @@ fn writeImagesNeeded(state: *ServerState, alloc: Allocator, id: ?jsonrpc.Request
 }
 
 /// The most images, and image bytes, a host may stage for one open: those of
-/// the largest image window, the newest images a session keeps, and those of
-/// the open turn, which the window leaves out and which holds one prompt's
-/// images at most.
+/// the largest image window, the newest images a session keeps, as many as
+/// one model request carries, and those of the open turn, which the window
+/// leaves out and which holds one prompt's images at most. The window counts
+/// its images' base64, so the bytes staged for it, decoded, are fewer.
 /// An open that needs more, because its open turn's tools returned images
 /// beyond one prompt's, may stage what it reported missing
 /// (`ActiveSessionState.staging_needed`).

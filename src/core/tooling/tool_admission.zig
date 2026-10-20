@@ -1006,6 +1006,18 @@ fn automaticReviewOutcome(
     file_authorization: ?file_mutation_contract.FileExecutionAuthorization,
 ) !command_admission.PermissionOutcome {
     if (!input.auto_classifier.enabled()) {
+        // A browser workspace with permission "prompt" asked fx to gate its
+        // commands, and the browser has no reviewer, so no review can ever
+        // clear one. The action goes to the user, as in ask mode, instead
+        // of being held without a way to run.
+        if (input.host_sandbox_default == .prompt) {
+            debug_trace.logf(
+                "permission",
+                "event=auto_review_skipped tool_name={s} reason=reviewer_unconfigured fallback=ask host=js_workspace_prompt call_id={s}",
+                .{ call.name, call.id },
+            );
+            return .{ .decision = .permission_required };
+        }
         return reviewerUnavailableOutcome(call, .reviewer_unconfigured);
     }
     const review_turn = input.permission_review_turn orelse
@@ -6005,6 +6017,9 @@ test "js host workspace sandbox default is lowest priority and prompt disables i
         explicitly_allowed.execution_authority.?.run_command.shell_allowed.source,
     );
 
+    // "prompt" turns the sandbox default off. Auto mode has no reviewer in
+    // the browser, so the command needs the user's approval instead of
+    // being held as review-unavailable.
     input.permission_rules = .{};
     input.host_sandbox_default = .prompt;
     const prompted = try requestPermissionOutcome(
@@ -6014,9 +6029,22 @@ test "js host workspace sandbox default is lowest priority and prompt disables i
         .auto,
         &.{},
     );
-    try std.testing.expectEqual(ToolPermissionDecision.deny, prompted.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.review_unavailable, prompted.denial_reason.?);
+    try std.testing.expectEqual(ToolPermissionDecision.permission_required, prompted.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.permission_required, prompted.denial_reason.?);
+    try std.testing.expect(prompted.auto_review_failure == null);
     try std.testing.expect(prompted.execution_authority == null);
+
+    // Without the browser workspace, a missing reviewer still holds the action.
+    input.host_sandbox_default = .none;
+    const held = try requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        call,
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(ToolPermissionDecision.deny, held.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.review_unavailable, held.denial_reason.?);
 }
 
 test "built-in structured review sends exact arguments without redundant schema" {

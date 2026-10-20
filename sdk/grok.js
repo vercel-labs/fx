@@ -88,7 +88,7 @@ export async function refreshGrokCredentials(credentials, { fetch, signal } = {}
     ...(Number.isFinite(tokens.expires_in) ? { expiresAt: Date.now() + tokens.expires_in * 1000 } : {}),
   });
   if (await grokAccountId(next.accessToken, { fetch, signal }) !== credentials.accountId) {
-    throw grokError("LIBFX_GROK_ACCOUNT_CHANGED", "The refreshed Grok token belongs to a different account");
+    throw grokError("LIBFX_GROK_ACCOUNT_CHANGED", "The refreshed Grok credentials belong to a different xAI account, and the refresh token is now spent: sign the user in again");
   }
   return next;
 }

@@ -9,7 +9,9 @@
 // inline as an older libfx saved it. Then the walk opens an engine on it and
 // makes the prompts it chooses, each with image a or b; a turn's tool may
 // return image a or b as well, which the engine stores before the core gets
-// the result. Every image write
+// the result. Every engine keeps the model's window of images and bytes,
+// where image b takes twice the bytes of the others, so a window edge of
+// either kind drops an image. Every image write
 // waits until the driver lets it land or fail; every model request waits
 // until the driver ends its turn. A crash leaves the engine behind at once:
 // its writes in flight never land, and nothing it does later reaches the
@@ -45,8 +47,17 @@ const addon = resolve(here, "../../../zig-out/lib/libfx.node");
 const wasm = backend === "wasm" ? await readFile(resolve(here, "../../../zig-out/bin/fx-core.wasm")) : undefined;
 const quietMs = 150;
 const stepTimeoutMs = 10_000;
-// The model's window, which every engine the walk opens keeps too.
-const windowImages = Number(/^\s*Window = (\d+)$/m.exec(await readFile(resolve(here, "../sdk/ImageStore-drive.cfg"), "utf8"))[1]);
+// The model's window, which every engine the walk opens keeps too: its
+// images, and its bytes in units, where image `big` takes two units and each
+// other image one. A unit is the base64 of `unitBytes` bytes, which the
+// window counts as a model request does.
+const driveConfig = await readFile(resolve(here, "../sdk/ImageStore-drive.cfg"), "utf8");
+const constant = (name) => new RegExp(`^\\s*${name} = "?(\\w+)"?$`, "m").exec(driveConfig)?.[1];
+const windowImages = Number(constant("WindowImages"));
+const windowUnits = Number(constant("WindowBytes"));
+const big = constant("Big");
+if (!(windowImages > 0) || !(windowUnits > 0) || !big) throw new Error("ImageStore-drive.cfg needs WindowImages, WindowBytes and Big");
+const unitBytes = 4800;
 const imageWindow = Symbol.for("libfx.imageWindow");
 const decoder = new TextDecoder();
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
@@ -62,10 +73,14 @@ const random = () => {
   return seed / 2147483648;
 };
 
-// The model's images, as PNG bytes the kernel accepts, each its own.
+// The model's images, as PNG bytes the kernel accepts, each its own, of one
+// unit or two. A unit is a multiple of 3 bytes, so its base64 takes exactly
+// 4 bytes for every 3 and two units take twice one's.
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=", "base64");
 const labels = ["o", "a", "b"];
-const bytesOf = Object.fromEntries(labels.map((label) => [label, new Uint8Array(Buffer.concat([png, Buffer.from(`image-${label}-`.repeat(400))]))]));
+const unitsOf = (label) => (label === big ? 2 : 1);
+const bytesOf = Object.fromEntries(labels.map((label) => [label, new Uint8Array(Buffer.concat([png, Buffer.alloc(unitsOf(label) * unitBytes - png.length, `image-${label}-`)]))]));
+const windowBytes = windowUnits * unitBytes / 3 * 4;
 const base64Of = Object.fromEntries(labels.map((label) => [label, Buffer.from(bytesOf[label]).toString("base64")]));
 const nameOf = Object.fromEntries(await Promise.all(labels.map(async (label) => [label, Buffer.from(await crypto.subtle.digest("SHA-256", bytesOf[label])).toString("hex")])));
 const labelOfName = Object.fromEntries(labels.map((label) => [nameOf[label], label]));
@@ -220,7 +235,7 @@ async function harness(n) {
     persistence,
     checkpointAfterBytes: 0,
     tools: [shot],
-    [imageWindow]: { images: windowImages },
+    [imageWindow]: { images: windowImages, bytes: windowBytes },
   });
 
   // The session an older libfx saved: its image inline, in a record and in a

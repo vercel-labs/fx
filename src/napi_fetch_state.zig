@@ -182,6 +182,17 @@ pub fn is_active(phase: Phase, handle: Handle) bool {
     };
 }
 
+/// The capacity a fetch buffer keeps for the next request once its bytes
+/// are handed over or dropped. A request's body may be 32 MiB, so a buffer
+/// that kept its capacity would hold that much for as long as its runtime
+/// lives.
+pub const retained_buffer_bytes = 64 * 1024;
+
+/// Empties `buffer`, keeping its capacity only up to `retained_buffer_bytes`.
+pub fn clearBuffer(buffer: *std.ArrayList(u8), alloc: std.mem.Allocator) void {
+    if (buffer.capacity > retained_buffer_bytes) buffer.clearAndFree(alloc) else buffer.clearRetainingCapacity();
+}
+
 fn stale(phase: Phase, handle: Handle) Decision {
     return .{
         .phase = phase,
@@ -511,4 +522,22 @@ test "N-API fetch consumption replays failure and old new handle transitions" {
     _ = trace.apply(.cancel);
     _ = trace.apply(.{ .consumed = 3 });
     try std.testing.expect(trace.last_consumed_handle == null);
+}
+
+test "N-API fetch buffers give back a large request's capacity and keep a small one's" {
+    const alloc = std.testing.allocator;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(alloc);
+    try buffer.ensureTotalCapacityPrecise(alloc, 32 * 1024 * 1024);
+    buffer.appendSliceAssumeCapacity("a large request body");
+    clearBuffer(&buffer, alloc);
+    try std.testing.expectEqual(@as(usize, 0), buffer.items.len);
+    try std.testing.expectEqual(@as(usize, 0), buffer.capacity);
+
+    try buffer.ensureTotalCapacityPrecise(alloc, retained_buffer_bytes);
+    buffer.appendSliceAssumeCapacity("a small request body");
+    const kept = buffer.capacity;
+    clearBuffer(&buffer, alloc);
+    try std.testing.expectEqual(@as(usize, 0), buffer.items.len);
+    try std.testing.expectEqual(kept, buffer.capacity);
 }

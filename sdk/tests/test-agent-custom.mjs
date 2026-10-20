@@ -228,16 +228,20 @@ const assertNoGateway = (log) => assert.equal(log.some((entry) => entry.url.incl
     onEvent: (event) => events.push(event),
   });
   let sessionId;
+  let result;
   try {
     const turn = agent.session().prompt("say ok");
     ({ sessionId } = await turn.accepted);
     for await (const event of turn) streamed.push(event);
-    assert.notEqual((await turn.result).stopReason, "end_turn");
+    result = await turn.result;
+    assert.equal(result.stopReason, "refused");
   } finally {
     await agent.close();
   }
   assert.equal(chatRequests(world.log)[0].headers.get("authorization"), `Bearer ${key}`, "the key reached the server");
-  assert.match(JSON.stringify(streamed), /bad credential Bearer \*{14}/, "the error reaches the turn with the key masked");
+  // The provider's error is the refused turn's reason, not reply text (API-48, QUAL-18).
+  assert.match(result.error?.message ?? "", /^HTTP 403: .*bad credential Bearer \*{14}/, "the error reaches the turn's result with the key masked");
+  assert.deepEqual(streamed.filter((event) => event.type === "text_delta"), [], "the provider's error is not streamed as the reply");
   // Everything the session saved: its log, with byte payloads as text, and its UI stream.
   const stored = await durability.create().session(sessionId);
   const log = JSON.stringify(await stored.readSince(0), (_, value) => value instanceof Uint8Array ? Buffer.from(value).toString("latin1") : value);
@@ -249,8 +253,33 @@ const assertNoGateway = (log) => assert.equal(log.some((entry) => entry.url.incl
   await reader.cancel();
   // Undoes \u escapes at any depth of JSON nesting, so an escaped copy counts.
   const decoded = (text) => text.replace(/\\+u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
-  for (const [where, text] of [["the stream", JSON.stringify(streamed)], ["the events", JSON.stringify(events)], ["the saved log", log], ["the saved UI stream", ui]]) {
+  for (const [where, text] of [["the stream", JSON.stringify(streamed)], ["the result", JSON.stringify(result)], ["the events", JSON.stringify(events)], ["the saved log", log], ["the saved UI stream", ui]]) {
     assert.equal(decoded(text).includes(key), false, `${where} must not repeat the key`);
+  }
+}
+
+// 6b. A key the server rejects is not refreshed: the turn ends refused with
+// the server's own error in its result, as providers.mdx says.
+{
+  const world = server({ answer: () => Response.json({ error: { message: "invalid api key for this router", type: "invalid_request_error" } }, { status: 401 }) });
+  const { result, text } = await runTurn({ fetch: world.fetch, credentials: () => ({ apiKey: "sk-rejected" }) });
+  assert.equal(result.stopReason, "refused");
+  assert.match(result.error?.message ?? "", /HTTP 401: .*invalid api key for this router/, "the turn's error carries the server's message");
+  assert.equal(text, "", "the server's error is not streamed as the reply");
+  assert.equal(chatRequests(world.log).length, 1, "a rejected key is not sent again");
+}
+
+// 6c. A model declared without tool use is offered no tools; one declared
+// with it is offered the agent's tools.
+{
+  const tools = [{ name: "lookup", description: "Looks up a key", inputSchema: { type: "object" }, execute: () => "beta" }];
+  const models = { "text-model": { supportsToolUse: false }, "tool-model": { supportsToolUse: true } };
+  for (const [model, offered] of [["text-model", []], ["tool-model", ["lookup"]]]) {
+    const world = server();
+    const { result } = await runTurn({ fetch: world.fetch, provider: { ...provider, models }, model, tools });
+    assert.equal(result.stopReason, "end_turn");
+    const body = JSON.parse(chatRequests(world.log)[0].body);
+    assert.deepEqual((body.tools ?? []).map((tool) => tool.function?.name), offered, `${model} is offered ${offered.length ? offered.join(", ") : "no tools"}`);
   }
 }
 

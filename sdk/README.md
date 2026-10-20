@@ -54,10 +54,10 @@ agent.session(sessionId).prompt("Start with the schema.");
 ```
 
 - **One turn at a time.** A prompt sent while a turn runs waits behind it, even when it reaches a different server.
-- **Turns finish on their own.** A turn runs to the end whether or not anyone reads its events, and a turn nobody reads holds no connection open: its view starts reading only once you use its events, `readable` or `result`. Stop it with `session.cancel()`, or with the `signal` you passed to `prompt()`.
-- **Steering.** `session.steer(input)` steers the running turn the way the fx CLI does. While the model streams a reply, the steer cuts it short and the turn continues with it. While a tool runs, the steer waits for the tool. A steer sent while a turn waits to start joins that turn, and when no turn runs or waits, the steer becomes the next turn. A steer with images can't join a turn, so the running turn ends at its next safe point and the steer runs next. Its images are saved once with the session before the steer is sent, as a prompt's are, and a steer whose image can't be saved throws the store's error.
+- **Turns finish on their own.** A turn runs to the end whether or not anyone reads its events, and a turn nobody reads holds no connection open: its view starts reading only once you use its events, `readable` or `result`. Stop it with `session.cancel()`, or with the `signal` you passed to `prompt()`. A turn whose end is already being saved has ended: a cancel then stops nothing, and the turn's result and its `turn_end` line say what that end says.
+- **Steering.** `session.steer(input)` steers the running turn the way the fx CLI does. While the model streams a reply, the steer cuts it short and the turn continues with it. A steer sent from another server can reach the turn only as the reply ends, and the turn then continues with it after the reply. Once that last reply has ended and the turn has taken its last steers, a new steer becomes the next turn, even while the turn's end is still being saved. While a tool runs, the steer waits for the tool. A steer sent while a turn waits to start joins that turn, and when no turn runs or waits, the steer becomes the next turn. A steer with images can't join a turn, so it runs next: the running turn ends `cancelled` at its next safe point, or `end_turn` when the steer reaches it only as the reply ends. A turn it ended `cancelled` has the steer's `messageId` as `endedBySteer`, in its result and its `turn_end` line, so an app can tell it from a turn `cancel()` ended, which has none. The record that ends the turn names the steer too, so the turn's end still has it when its process stopped before writing that line. Its images are saved once with the session before the steer is sent, as a prompt's are, and a steer whose image can't be saved throws the store's error.
 - **Retries are safe.** Give a prompt or a steer a `messageId`, and a repeated request with the same id runs nothing new. A repeated prompt follows the original turn, and its result has `repeated: true`. One id names one input, so a steer that reuses a prompt's id is rejected with `FX_MESSAGE_ID_IN_USE`. A steer's `user_message` event carries its id as `id` where it joined a turn.
-- **Inputs have a size limit.** A prompt or steer whose input, with the session's `context` and settings, comes to more than 8 MiB of JSON is rejected with `FX_INPUT_TOO_LARGE` before anything is stored. The model can't take a larger one.
+- **Inputs have a size limit.** A prompt or steer is rejected with `FX_INPUT_TOO_LARGE` before anything is stored when its text and other content, image data aside, take more than the engine's 8 MiB prompt frame, which the engine can't take, or when what the session stores for it comes to more than 16 MiB: the input with each image named, and the session's `context` and settings, as JSON, and the bytes of its images. Images have their own limits, which apply after `resizeImage`.
 - **A refused prompt is never stored.** `prompt()` checks a prompt as the engine's `prompt()` does and throws a `TypeError` or `RangeError` for one libfx would refuse, such as an empty prompt, base64 that isn't canonical, an image whose bytes aren't its type, or more than 8 images. A prompt whose `signal` aborts before the prompt is stored isn't stored either, and its turn ends `cancelled`.
 
 Each conversation can bring its own settings, which apply to the turns that session object starts:
@@ -76,7 +76,7 @@ A turn's result says how it ended:
 const { stopReason, usage, error } = await turn.result;
 ```
 
-`stopReason` is `end_turn`, `max_output_tokens`, `max_model_turns`, `refused` or `cancelled`. It's `error` when the turn failed, with the reason in `error`, and `unknown` when the process running it stopped before recording how it ended.
+`stopReason` is `end_turn`, `max_output_tokens`, `max_model_turns`, `refused` or `cancelled`. It's `error` when the turn failed, with the reason in `error`. The record that ends a turn says how it ended, so a turn whose process stopped right after that record still reports it. That record also holds the turn's reply: the worker that writes the turn's end for the stopped process first streams, as one `text_delta`, the part of the reply the stream doesn't show yet. A finished reply is saved just before the turn's end, so a process that stopped between the two leaves the turn open with its reply: the worker that resumes it ends the turn with that reply without asking the model again, and streams the part of it the stream doesn't show the same way. A turn that took a steer after its reply was saved asks the model again instead, with the steer. Only a turn an earlier libfx ended reports `unknown`, since its record doesn't say. A turn the provider refused has the provider's error in `error` too. A cancelled turn ends every tool call it started with a `tool_end`.
 
 ### Streaming to a browser
 
@@ -126,11 +126,13 @@ createFxAgent({ durability: local({ dir: ".fx/sessions" }) });
 createFxAgent({ durability: memory() }); // nothing outlives the process
 ```
 
-On `local()`, `vercel()` and `world()`, a session id is a Workflow run id, `wrun_` followed by letters and digits. Take it from `turn.accepted` or `await agent.newSessionId()` instead of making one up. On `memory()`, any 1 to 128 letters, digits, `.`, `_` or `-` work.
+On `local()`, `vercel()` and `world()`, a session id is a Workflow run id, `wrun_` followed by letters and digits. Take it from `turn.accepted` or `await agent.newSessionId()` instead of making one up: `agent.session()` throws a `TypeError` with the code `FX_SESSION_ID_INVALID` for any other id. On `memory()`, any 1 to 128 letters, digits, `.`, `_` or `-` work.
+
+`local()` keeps the sessions an older libfx saved in its folder in an older file layout: the first time it opens the folder, it moves their files into the layout it reads. If one can't be moved, such as when a different file already has its name, the prompt's `turn.accepted` rejects with `FX_LOCAL_STORE_LAYOUT` naming it, and nothing in the folder changes.
 
 A session stores the conversation, and with each prompt and steer the caller's `context` and the session object's settings. Every process passes its own model, credentials, tools, MCP clients and skills when it creates the agent.
 
-libfx doesn't know who is calling. Anyone with a session's id can prompt, steer, cancel, stream or checkpoint it, so your app must check that the caller may use a session before it opens it. A queue message only names an input libfx already stored: a delivery that names one the session's log doesn't hold runs nothing, and the agent's `onEvent` gets a `session.refused` event. If a session's saved checkpoint came from a different libfx version, tool set or model, the session still loads, and `onEvent` gets a `checkpoint.mismatch` event naming what changed.
+libfx doesn't know who is calling. Anyone with a session's id can prompt, steer, cancel, stream or checkpoint it, so your app must check that the caller may use a session before it opens it. A queue message only names an input libfx already stored: a delivery that names one the session's log doesn't hold runs nothing, and the agent's `onEvent` gets a `session.refused` event. If a session's saved checkpoint came from a different libfx version, tool set or model, or a session that has saved no checkpoint yet last ran on a different model, the session still loads, and `onEvent` gets a `checkpoint.mismatch` event naming what changed.
 
 ### Several agents
 
@@ -143,7 +145,7 @@ export const coding = createFxAgent({ name: "coding", model: "anthropic/claude-o
 
 A session belongs to the agent that created it, and its turns run only on an agent with that name. A prompt sent through another agent, such as `coding.session(supportSessionId).prompt()`, still runs on `support`, and the sending agent's `onEvent` gets a `session.forwarded` event. An agent created without a name is named `default`.
 
-- Agents with the same name are copies of one agent, such as one on each server, and take turns running its sessions. In one process, every agent with a name on a store must have the same configuration: creating one with different options throws `FX_AGENT_NAME_IN_USE`. Agents created without a name or a durability share the name `default` and the default store, so an app that serves several customers gives each customer's agent its own name. Create an agent once, at module scope, or close it when you're done with it.
+- Agents with the same name are copies of one agent, such as one on each server, and take turns running its sessions. In one process, every agent with a name on a store must have the same configuration: creating one with different options throws `FX_AGENT_NAME_IN_USE`. Agents created without a name or a durability share the name `default` and the default store, so an app with two such agents, or one that serves several customers, gives each agent its own name. Create an agent once, at module scope, or close it when you're done with it. In Node under `NODE_ENV=development`, where a dev server such as `next dev` loads a module again, a new agent with different options replaces the earlier one instead of throwing: turns the earlier agent is running finish, later turns run on the new one, and the new agent's `onEvent` gets an `agent.replaced` event. The newest agent wins even when an earlier one, created without a durability, learns its store only later. In a browser, creating one always throws.
 - Keep names stable. A session keeps the name it was created with, so renaming an agent leaves its sessions with no agent to run them.
 - A process that gets a turn for a name it has no agent for refuses it with an `FX_NO_AGENT` error naming the agent, and the queue delivers it again.
 - Agents share sessions through their durability. Give agents that share sessions the same durability, or none: agents created without one share the default.
@@ -182,7 +184,7 @@ That's all. When no other invocation holds the session, `prompt()` runs the turn
 - When a turn gets within 30 seconds of the function's time limit, libfx stops it, and the next invocation continues it. `vercel({ reserveMs })` from `libfx/durable-vercel` changes that margin.
 - A function holds its session for as long as Vercel Queues keeps the turn's message for it, so nothing is written while a turn runs to show the function is alive. If the function's process exits mid-turn, Vercel runs the same delivery again about a second later, and that invocation continues the turn.
 - A function that stops without its process exiting holds the message until the queue's hold on it runs out, up to five minutes. A prompt sent to the session meanwhile continues the turn at that function's time limit, if that comes sooner. `vercel({ leaseMs: 15_000 })` bounds that case: the function renews a 15-second lease on its session every 5 seconds, and the session frees about 15 seconds after the last renewal. With it, every prompt goes through the queue instead of running in the request.
-- A function that only stalled and wakes up after that is refused at its next write, so two processes never write one session.
+- A function that only stalled and wakes up after that is refused at its next write, so two processes never write one session. Once its own clock says its lease ran out, it also adds nothing to the session's stream until a lease write of its own lands, so a function another one replaced adds nothing past a write it had already started.
 
 ### Tools that change things
 
@@ -240,6 +242,8 @@ export const agent = createFxAgent({
 A World that delivers queue messages over HTTP needs `agent.wakeHandler()`, or `wakeHandler()` for several agents, at the address it posts to. Workflow's Postgres World 5.0.2 posts every message to `/.well-known/workflow/v1/flow` on your app. `world()` takes options for what libfx can't learn from the World itself, such as how long a lease lasts and whether the queue keeps a message across crashes. The `WorldOptions` type documents each one.
 
 On a World with Workflow's in-band writer fence, libfx writes each claim and record so that the World itself refuses a write from a worker another has replaced, and nothing of it is stored. libfx finds the fence in the World's capabilities, so there's nothing to configure. On a World without it, libfx detects the replaced worker after its write instead, and the session's log ignores what that worker wrote.
+
+A stream cursor counts the lines before it, so a World must put each stream chunk after every chunk the stream holds when it lands. The World `local()` bundles does. Workflow's file system World, `@workflow/world-local` 5.1.1, places a chunk where its write started instead: passed to `world()`, a line that a stalled function had already started writing when another took its session over can land ahead of lines a reader has, and move the cursor of every line after it.
 
 ## Tools
 
@@ -306,7 +310,7 @@ createFxAgent({ model: { id: "anthropic/claude-opus-5.5", effort: "high", fast: 
 
 `effort` and `fast` mean the same as the fx CLI's `--effort` and `--fast` flags. `ultrafast: true` asks for the faster, more expensive service tier on models that offer it. A setting the model doesn't support fails with an error whose `code` names it, such as `LIBFX_MODEL_UNSUPPORTED_EFFORT`.
 
-`listModels({ apiKey })` returns the ids of AI Gateway's language models. Behind a proxy that forwards only chat requests, pass the catalog yourself as `modelCatalog`, and the agent won't fetch it.
+`listModels({ apiKey })` returns the ids of AI Gateway's language models. Behind a proxy that forwards only chat requests, pass the catalog yourself as `modelCatalog`, and the agent won't fetch it. Otherwise an agent fetches the catalog at most once for all its sessions, and only when a turn needs to look up its model.
 
 ## Providers
 
@@ -410,11 +414,11 @@ agent.session().prompt([
 ]);
 ```
 
-A session stores each prompt as JSON before it runs, so a session prompt takes image data as a base64 string. `createFxEngine()` also takes bytes, a `Blob` or a `File`. A session saves each image once, named by its SHA-256, before it stores the prompt, and the saved conversation refers to it by that name, so images don't count toward the 4 MiB the session's own checkpoints hold. Images a host tool returns are saved the same way; one that can't be saved stays in the tool's result, held inline. A session keeps its newest 4,096 images, up to 512 MiB of them; an older image leaves the conversation, and the model sees a note in its place. A checkpoint you take with `checkpoint()` carries the images' bytes, within its 4 MiB. An engine with a `persistence` store of its own keeps images inside its records and checkpoints, so they count toward that 4 MiB; for a conversation with many images, use a session with [durability](#durability). libfx never deletes a saved image; it lasts as long as the session's storage. Each prompt takes up to 8 PNG, JPEG, GIF or WebP images, at most 3.75 MiB each and 6 MiB together. Pass `resizeImage` to downscale or convert prompt images before they're sent.
+A session stores each prompt as JSON before it runs, so a session prompt takes image data as a base64 string. `createFxEngine()` also takes bytes, a `Blob` or a `File`. A session saves each image once, named by its SHA-256, before it stores the prompt, and the saved conversation refers to it by that name, so images don't count toward the 32 MiB the session's own checkpoints hold. Images a host tool returns are saved the same way; one that can't be saved stays in the tool's result, held inline. A session keeps as many of its newest images as one model request carries, at most 100, whose base64 takes at most 30 MiB. A request leaves older images out anyway, so the model sees the images it would see if the session kept them all. An older image leaves the conversation, and the model sees a note in its place. Opening a session reads from the store only the images it keeps and those of a turn it left open, several at a time. A checkpoint you take with `checkpoint()` carries the bytes of the images the session keeps, within its 32 MiB, and the names of the older ones. An engine with a `persistence` store of its own keeps images inside its records and checkpoints, so they count toward that 32 MiB; for a conversation with many images, use a session with [durability](#durability). libfx never deletes a saved image, including one that left the conversation; it lasts as long as the session's storage. Each prompt takes up to 8 PNG, JPEG, GIF or WebP images, at most 3.75 MiB each and 6 MiB together. Images travel beside the prompt's 8 MiB frame, so they leave its room for text. Pass `resizeImage` to downscale or convert prompt images before they're sent; the image limits apply to what it returns.
 
 ## Diagnostics
 
-`onEvent` receives diagnostics apart from the model's output: request timing and retries, and session events such as `session.deadline` when a turn stops for a function's time limit. The `FxAgentEvent` type lists them all.
+`onEvent` receives diagnostics apart from the model's output: request timing and retries, notices fx gives beside a reply as `turn.notice`, such as an Ultrafast tier the provider didn't confirm, and session events such as `session.deadline` when a turn stops for a function's time limit. The `FxAgentEvent` type lists them all.
 
 ## Instrumentation hooks
 
@@ -469,7 +473,7 @@ for await (const event of turn) {
   if (event.type === "text_delta") process.stdout.write(event.delta);
 }
 
-const checkpoint = await engine.checkpoint(); // opaque bytes, up to 4 MiB
+const checkpoint = await engine.checkpoint(); // opaque bytes, up to 32 MiB
 await engine.close();
 
 const restored = await createFxEngine({ apiKey: process.env.AI_GATEWAY_API_KEY, model: "anthropic/claude-haiku-5.5", checkpoint });
@@ -479,7 +483,7 @@ An engine differs from a session:
 
 - On AI Gateway, it needs an `apiKey`.
 - One prompt runs at a time, and breaking out of a turn's events cancels the turn.
-- The turn itself has `cancel()` and `steer()`. Like a session's steer, it cuts a streaming reply short and waits for a running tool, and it takes text only.
+- The turn itself has `cancel()` and `steer()`. Like a session's steer, it cuts a streaming reply short and waits for a running tool, and it takes text only. With a `persistence` store, a turn whose end is already on its way to the store has ended, as with a session: `cancel()` then stops nothing, and the result says what that end says.
 
 To have the engine record the conversation as it runs, pass a `persistence` store instead of a checkpoint. A new engine on the same store can then `resume()` a turn the last process left open. A store needs two methods and can add a third, and the bytes are opaque, so it never has to understand them:
 
@@ -501,13 +505,15 @@ interface JournalRecord {
 }
 ```
 
-Reject an `append()` whose `expected` isn't the last stored cursor with `FxFencedError`, so two processes can't write the same conversation. If your store keeps entries of its own after the last record, return the cursor the next `append()` should name as `head`. When a resumed turn left a tool call running, `resume({ onAmbiguous })` lets you return `"rerun"` to run it again under the same `executionId`. A resumed turn first sends, as `text_delta`, the reply the last process had started, since the new engine's host saw none of it. If that process stopped after the turn's final reply was stored but before the turn's end was, `resume()` then ends the turn with that reply instead of asking the model again.
+Reject an `append()` whose `expected` isn't the last stored cursor with `FxFencedError`, so two processes can't write the same conversation. The engine whose append you fence stops: its turn rejects with your `FxFencedError`, and so does each later call, and it sends no model request carrying what you refused, however long the refusal takes. If your store keeps entries of its own after the last record, return the cursor the next `append()` should name as `head`. When a resumed turn left a tool call running, `resume({ onAmbiguous })` lets you return `"rerun"` to run it again under the same `executionId`. A resumed turn first sends, as `text_delta`, the reply the last process had started, since the new engine's host saw none of it. If that process stopped after the turn's final reply was stored but before the turn's end was, `resume()` then ends the turn with that reply instead of asking the model again, unless the turn took a steer after the reply was stored.
 
-The engine sends one `append()` at a time, and everything that happens while one is in flight goes in the next record. `barrier` is `true` when something waits for the record, such as a tool call with effects, or a turn's `result`, which resolves only once the record that ends the turn is stored and rejects if that record can't be stored. A store may acknowledge a record with `barrier: false` before it is durable, as long as it keeps records in order and acknowledges a barrier only once it and every record before it are durable. Set `marks: true` to receive each record's `marks`, which say where turns start (`{ start: turnId }`), yield and end, and which inputs a turn took (`{ accepted: id }`), so a store can track turns without reading records.
+The engine sends one `append()` at a time, and everything that happens while one is in flight goes in the next record. `barrier` is `true` when something waits for the record, such as a tool call with effects, or a turn's `result`, which resolves only once the record that ends the turn is stored and rejects if that record can't be stored. A store may acknowledge a record with `barrier: false` before it is durable, as long as it keeps records in order and acknowledges a barrier only once it and every record before it are durable. A model request after a tool call waits for your answer to the record that holds the call's result, barrier or not, so it never goes out once you refused that record. Set `marks: true` to receive each record's `marks`, which say where turns start (`{ start: turnId }`), yield and end, with how a turn ended (`{ end: true, stopReason }`), and which inputs a turn took (`{ accepted: id }`), so a store can track turns without reading records.
 
 `prompt()` and `resume()` take `yieldAt`, a time in milliseconds since the epoch: the turn stops before its next model request after that time, with the stop reason `yielded`, and the next `resume()` continues it without telling the model it was interrupted.
 
-A journal or `checkpoint` from a newer libfx fails with `FxJournalVersionError`. `createMemoryPersistence()` is a reference store for tests.
+A journal or `checkpoint` from a newer libfx fails with `FxJournalVersionError`. An engine's own store keeps the conversation's images inline, where a session saves them by name, so a load may read a checkpoint of up to 32 MiB and up to 32 MiB of records after it; more fails with `FX_JOURNAL_TOO_LARGE`. Once a conversation is past what a checkpoint holds, 32 MiB or 1,024 turns, `checkpoint()` rejects with `FX_CHECKPOINT_TOO_LARGE` and the engine goes on; an engine with a store saves no more checkpoints, and `onEvent` gets a `checkpoint.error` with that code after each turn. `createMemoryPersistence()` is a reference store for tests.
+
+A checkpoint records the libfx version, a hash of the tool set and the model it was taken with, so a restore can tell when one changed. It holds no credentials, instructions or tools, and restoring it doesn't choose the model: pass them again.
 
 ## Runtimes
 
@@ -516,11 +522,19 @@ A journal or `checkpoint` from a newer libfx fails with `FxJournalVersionError`.
 | Node.js 20+ on macOS or Linux, x64 or arm64 | Native addon. Linux needs glibc 2.34 or newer. |
 | Node.js elsewhere | WebAssembly with JSPI. Some Node versions need `--experimental-wasm-jspi`. |
 | Browsers | WebAssembly with JSPI, from `libfx/browser` |
-| Bun | The same as Node.js. For WebAssembly, use Bun 1.4.2 or newer. |
+| Bun | The same as Node.js. For WebAssembly, use Bun 1.3.10 or newer, except 1.3.14, which can crash when WebAssembly resumes through JSPI. |
 
-The default `backend: "auto"` tries the native addon first. Pass `"native"` or `"wasm"` to require one, and call `getBackendInfo()` to see what would load without creating anything.
+Each platform's native addon ships as a version of libfx of its own, such as `libfx@0.0.15-0.linux-x64` beside `libfx@0.0.15`. libfx lists them as optional dependencies under the names `libfx-linux-x64`, `libfx-linux-arm64`, `libfx-darwin-x64` and `libfx-darwin-arm64`, so `npm install libfx` downloads only the one for the machine it runs on, and so do pnpm and Bun. No version range you write for libfx matches one of these versions. Install on the platform that runs the app: `node_modules` copied from a Mac into a Linux container has no Linux addon. Without its addon, such as with `npm install --omit=optional` or on a musl Linux, libfx runs on WebAssembly.
 
-Next.js works in Node.js route handlers, with webpack or Turbopack, and doesn't need `serverExternalPackages`. CommonJS apps can `require("libfx")`. With TypeScript's `moduleResolution: "bundler"`, add `"node"` to `customConditions` to get the Node.js types.
+The default `backend: "auto"` tries the native addon first. Pass `"native"` or `"wasm"` to require one, and call `getBackendInfo()` to see what would load without creating anything. A `wasm` URL whose server answers with an error, such as a 404 for a file it doesn't serve, rejects with `LIBFX_WASM_LOAD_FAILED`, naming the URL and the status.
+
+A process runs at most 64 native runtimes at once, across its worker threads. A durable session's turn holds one while it runs, and an engine from `createFxEngine()` holds one until it closes. When agents contend for them, no agent holds more than its share, so one agent's turns can't keep another's off the native addon:
+
+- One agent is a name on a store, as queue deliveries tell agents apart. An agent's copies count as one, and so does an agent that replaced another under `NODE_ENV=development`. The engines that one JavaScript realm, such as the main thread or a worker, creates with `createFxEngine()` outside an agent count together as one more agent.
+- An agent may take another native runtime while it holds fewer than 64 divided by the number of agents holding them, itself included, rounded down. The last free runtime is kept for an agent that holds none, so an agent alone holds at most 63, and a new agent's turn always starts natively.
+- An engine beyond its agent's share, with `backend: "auto"` or `"native"`, runs on WebAssembly instead, and `onEvent` gets a `runtime.fallback` event. Without JSPI, where WebAssembly can't run, `createFxEngine()` rejects with `LIBFX_NATIVE_LIMIT`, naming the limit, and a durable session's turn ends with that error. libfx never waits for a native runtime to free.
+
+Next.js works in Node.js route handlers, with webpack or Turbopack, and doesn't need `serverExternalPackages`: the build copies the addon into the output, so a Vercel deployment carries it. CommonJS apps can `require("libfx")`. With TypeScript's `moduleResolution: "bundler"`, add `"node"` to `customConditions` to get the Node.js types.
 
 ## The fx terminal in a browser
 
@@ -537,6 +551,8 @@ await terminal.interactive;
 
 This is the fx CLI's interface compiled to WebAssembly. Your page supplies storage for its sessions, settings and sign-in, and can give it a workspace that runs commands. See [Terminal](https://fx.sh/docs/lib/terminal).
 
+The terminal's `onEvent` gets the `transport.*` diagnostics an agent's does, and `terminal.size` only when the size changes. When the session store refuses a save with `FX_SESSION_REVISION_CONFLICT`, the store keeps its record, fx says on screen that it stopped saving the conversation, and `onEvent` gets `session.persist_error`. A workspace that breaks the version 1 rules is refused: fx runs without it, says so, and `onEvent` gets `workspace.invalid` naming the rule. With `permission: "prompt"`, fx asks before a command it would otherwise review, in `auto` mode too, since the browser has no safety reviewer.
+
 ## Entry points
 
 | Import | What's in it |
@@ -549,11 +565,11 @@ This is the fx CLI's interface compiled to WebAssembly. Your page supplies stora
 | `libfx/mcp` | `createMcpAdapter` |
 | `libfx/skills`, `libfx/skills/node` | `createSkillsAdapter`, and `loadSkillFile` for Node.js and Bun |
 
-Every entry point ships TypeScript types, and the package has no runtime dependencies.
+Every entry point ships TypeScript types. libfx has no runtime dependencies; its native addons are optional dependencies, one version of libfx for each platform.
 
 ## For coding agents
 
-- **Docs as Markdown:** [fx.sh/llms.txt](https://fx.sh/llms.txt) indexes every page, and each page has a `.md` version, such as `https://fx.sh/docs/lib/durability.md`. The declarations in `types/` are the exact API.
+- **Docs as Markdown:** the package's `docs/` folder holds the libfx docs as they were when it was built, indexed in `docs/README.md`. [fx.sh/llms.txt](https://fx.sh/llms.txt) indexes the latest pages, and each page has a `.md` version, such as `https://fx.sh/docs/lib/durability.md`. The declarations in `types/` are the exact API.
 - **Agents at module scope:** create each agent once at module scope, not per request, and open `agent.session(id)` for each conversation.
 - **Session ids:** take them from `turn.accepted` or `agent.newSessionId()`. On every durability except `memory()`, an id that isn't a Workflow run id throws.
 - **Side effects:** every tool sets `idempotent`. Set it to `true` only on tools that are safe to run twice, and pass `executionId` to services that take an idempotency key.
@@ -562,6 +578,10 @@ Every entry point ships TypeScript types, and the package has no runtime depende
 - **Credentials:** keep keys and ChatGPT or Grok credentials on the server, and the object `startSignIn()` returns too.
 - **Checking a setup:** `getBackendInfo()` reports which backend would load without creating anything or making requests.
 - **Changing libfx:** the source is in the [fx repository](https://github.com/vercel-labs/fx) under `sdk/`. Its `AGENTS.md` files name the tests each change needs.
+
+## Upgrading from 0.0.14
+
+libfx no longer carries every platform's native addon. The addons are optional dependencies, one version of libfx per platform, which npm installs for the machine that runs `npm install`. Nothing changes in your code.
 
 ## Upgrading from 0.0.13
 

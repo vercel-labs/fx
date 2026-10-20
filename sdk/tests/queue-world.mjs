@@ -161,9 +161,10 @@ function withInBandFence(stored, { settleMs = 0 } = {}) {
  * The durability, a World at `dir` with that queue passed to world(), and its
  * broker. With `inBandFence`, `true` or `{ settleMs }`, the World has the
  * in-band writer fence, and `fence.creates` holds what each create was asked.
+ * `open(dir)` creates the World, world-local from `sdk/durable` by default.
  */
-export async function queueWorldAt(dir, { retryMs = 20, inBandFence = false, ...options } = {}) {
-  const stored = createWorld({ dataDir: dir, recoverActiveRuns: false });
+export async function queueWorldAt(dir, { retryMs = 20, inBandFence = false, open = (dataDir) => createWorld({ dataDir, recoverActiveRuns: false }), ...options } = {}) {
+  const stored = open(dir);
   await stored.start();
   const broker = createBroker({ retryMs });
   const fence = inBandFence ? withInBandFence(stored, inBandFence === true ? {} : inBandFence) : null;

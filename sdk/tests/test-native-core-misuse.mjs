@@ -99,7 +99,8 @@ assert.throws(
   (error) => error.code === "LIBFX_NATIVE_BACKPRESSURE",
 );
 addon.writeCore(core, Buffer.alloc(0));
-// Attachments carry raw prompt images and checkpoints beside ACP frames.
+// Attachments carry raw prompt images, checkpoints and journals beside ACP
+// frames.
 for (const id of [0, -1, 1.5, 2 ** 32, "1"]) {
   assert.throws(() => addon.writeCoreAttachment(core, id, Buffer.from("x")), {
     name: "TypeError",
@@ -107,9 +108,18 @@ for (const id of [0, -1, 1.5, 2 ** 32, "1"]) {
   });
 }
 assert.throws(
-  () => addon.writeCoreAttachment(core, 1, Buffer.alloc(4 * 1024 * 1024 + 1)),
+  () => addon.writeCoreAttachment(core, 1, Buffer.alloc(32 * 1024 * 1024 + 1)),
   (error) => error.code === "LIBFX_INVALID_ARGUMENT",
 );
+// A journal's records and its snapshot, each as large as one may be, fill
+// the table's bytes.
+addon.writeCoreAttachment(core, 1, Buffer.alloc(32 * 1024 * 1024));
+addon.writeCoreAttachment(core, 2, Buffer.alloc(32 * 1024 * 1024));
+assert.throws(
+  () => addon.writeCoreAttachment(core, 3, Buffer.from("x")),
+  (error) => error.code === "LIBFX_NATIVE_BACKPRESSURE",
+);
+addon.discardCoreAttachments(core);
 addon.writeCoreAttachment(core, 1, Buffer.from("first"));
 assert.throws(
   () => addon.writeCoreAttachment(core, 1, Buffer.from("again")),

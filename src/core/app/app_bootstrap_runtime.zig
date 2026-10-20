@@ -715,6 +715,22 @@ pub fn Runtime(comptime App: type) type {
                     };
                 }
             }
+            if (comptime @hasDecl(App, "workspaceHostRefusal")) {
+                // fx runs without a workspace adapter it refused; the host's
+                // onEvent gets `workspace.invalid` with the rule it broke.
+                if (app.workspaceHostRefusal()) |err| {
+                    const workspace_body = try app.alloc.print(
+                        "refused the host's workspace adapter ({s}), so commands can't run; the host's workspace.invalid diagnostic names the rule it broke",
+                        .{@errorName(err)},
+                    );
+                    defer app.alloc.free(workspace_body);
+                    try app.writeDomainNotice(.{
+                        .topic = "workspace",
+                        .tone = .warning,
+                        .body = workspace_body,
+                    }, true);
+                }
+            }
 
             if (app.requested_resume == null) {
                 try deps.begin_fresh_persisted_session(app);

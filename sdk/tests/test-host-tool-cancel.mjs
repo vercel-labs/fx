@@ -104,11 +104,22 @@ async function exerciseCancellation(settlement, closeBeforeSettle) {
       model: "cancel/model",
     });
     const turn = agent.prompt("wait", { signal: controller.signal });
-    const drain = (async () => { for await (const _event of turn) {} })();
+    const turnEvents = [];
+    const drain = (async () => { for await (const event of turn) turnEvents.push(event); })();
     await withTimeout(toolStarted, "tool start");
     controller.abort();
     const [result] = await withTimeout(Promise.all([turn.result, drain]), "cancelled turn and event stream");
     assert.equal(result.stopReason, "cancelled");
+    // Every call the cancelled turn showed starting ends, with the end the
+    // core gave it (API-48).
+    const starts = turnEvents.filter((event) => event.type === "tool_start");
+    const ends = turnEvents.filter((event) => event.type === "tool_end");
+    assert.deepEqual(ends.map((event) => event.id), starts.map((event) => event.id), "each tool_start of a cancelled turn has a tool_end with its id");
+    assert.ok(ends.every((event) => event.isError === true && event.name === "wait"), "the cancelled call ends failed");
+    if (settlement !== "before-start") {
+      assert.equal(starts.length, 1, "the running call was shown");
+      assert.match(ends[0].content ?? "", /Cancelled/, "its end carries the core's own result");
+    }
     assert.equal(toolCalls, settlement === "before-start" ? 0 : 1);
     assert.equal(toolSignalAborted, settlement !== "before-start");
     assert.equal(modelRequests, 1);

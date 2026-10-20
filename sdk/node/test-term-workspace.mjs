@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { spawnSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,7 +8,11 @@ import { createFxTerminal, supportsJspi, xtermAdapter } from "../node.js";
 
 const { Terminal } = xtermHeadless;
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
-const wasmPath = resolve(process.argv[2] || resolve(scriptDir, "../../zig-out/bin/fx-term.wasm"));
+// `--approval-phase` runs only the approval check, in a child process the main
+// run can time out: an fx-term that blocks its one thread never returns.
+const approvalPhase = process.argv[2] === "--approval-phase";
+const wasmPath = resolve(process.argv[approvalPhase ? 3 : 2] || resolve(scriptDir, "../../zig-out/bin/fx-term.wasm"));
+const approvalMode = approvalPhase ? process.argv[4] : undefined;
 if (!supportsJspi()) process.exit(2);
 
 const terminal = new Terminal({ cols: 100, rows: 34, allowProposedApi: true, scrollback: 3000 });
@@ -225,6 +230,11 @@ const fetch = async (_url, init = {}) => {
   throw new Error(`unexpected gateway request: ${JSON.stringify(body)}`);
 };
 
+if (approvalPhase) {
+  await runApprovalPhase(approvalMode);
+  process.exit(0);
+}
+
 let stderr = "";
 const runtime = await createFxTerminal({
   backend: "wasm",
@@ -281,4 +291,144 @@ if (!checkedBrowserCapabilityContext) throw new Error("browser capability contex
 if (execCalls.join(",") !== "printf adapter-success,generate-truncated-output,timeout-command,hold-command") {
   throw new Error(`unexpected workspace exec calls: ${execCalls.join(",")}`);
 }
-console.log("headless workspace passed: capability refusal, success, truncation, timeout, Ctrl-C abort, and strict invalid boundaries mapped through the host adapter");
+
+const approvalTimeoutMs = 30_000;
+// Ask mode, and auto mode, which has no reviewer in the browser: a "prompt"
+// workspace asks either way rather than holding the command.
+for (const mode of ["ask", "auto"]) {
+  const approval = spawnSync(
+    process.execPath,
+    ["--experimental-wasm-jspi", fileURLToPath(import.meta.url), "--approval-phase", wasmPath, mode],
+    { encoding: "utf8", timeout: approvalTimeoutMs },
+  );
+  if (approval.error?.code === "ETIMEDOUT" || approval.signal) {
+    throw new Error(`fx-term stopped running while a "prompt" workspace waited for approval in ${mode} mode (no answer within ${approvalTimeoutMs}ms):\n${approval.stdout}\n${approval.stderr}`);
+  }
+  if (approval.error) throw approval.error;
+  if (approval.status !== 0 || !approval.stdout.includes(`approval phase passed in ${mode} mode`)) {
+    throw new Error(`approval phase in ${mode} mode failed with ${approval.status}:\n${approval.stdout}\n${approval.stderr}`);
+  }
+}
+await checkRefusedWorkspace();
+console.log("headless workspace passed: capability refusal, success, truncation, timeout, Ctrl-C abort, strict invalid boundaries, a \"prompt\" approval in ask and auto mode mapped through the host adapter, and a refused adapter reported");
+
+// A workspace that breaks the version 1 contract is refused: fx runs without
+// it, tells the user so, and the app hears which rule it broke.
+async function checkRefusedWorkspace() {
+  const refusedTerminal = new Terminal({ cols: 160, rows: 34, allowProposedApi: true, scrollback: 3000 });
+  const refusedEvents = [];
+  const refusedExecs = [];
+  const refusedRuntime = await createFxTerminal({
+    backend: "wasm",
+    wasm: await readFile(wasmPath),
+    terminal: xtermAdapter(refusedTerminal),
+    env: { AI_GATEWAY_API_KEY: "workspace-key" },
+    fetch: async () => new Response(JSON.stringify(catalog), { status: 200, headers: { "content-type": "application/json" } }),
+    configStore: { get(id) { return config.get(id) ?? null; }, set() {} },
+    onEvent(event) { refusedEvents.push(event); },
+    workspace: {
+      info: { ...workspace.info, cwd: "/workspace/src" },
+      permission: "allow-sandboxed",
+      exec({ command }) { refusedExecs.push(command); return { stdout: "", stderr: "", exitCode: 0 }; },
+    },
+  });
+  const refusedGrid = () => {
+    const lines = [];
+    for (let row = 0; row < refusedTerminal.buffer.active.length; row += 1) {
+      lines.push(refusedTerminal.buffer.active.getLine(row)?.translateToString(true) ?? "");
+    }
+    return lines.join("\n");
+  };
+  const deadline = performance.now() + 5000;
+  while (!refusedGrid().includes("Run /help for commands") || !refusedGrid().includes("refused the host's workspace adapter")) {
+    await new Promise((done) => refusedTerminal.write("", done));
+    if (performance.now() >= deadline) throw new Error(`the terminal did not say it refused the workspace adapter:\n${refusedGrid()}`);
+    await new Promise((done) => setTimeout(done, 10));
+  }
+  const invalid = refusedEvents.find((event) => event.type === "workspace.invalid");
+  if (invalid?.reason !== "workspace.info.cwd must equal workspace.info.root") {
+    throw new Error(`expected a workspace.invalid diagnostic naming the cwd rule, got ${JSON.stringify(invalid)}`);
+  }
+  refusedRuntime.write("/exit\r");
+  const exitCode = await Promise.race([
+    refusedRuntime.exited,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("refused-workspace runtime exit timeout")), 5000)),
+  ]);
+  if (exitCode !== 0) throw new Error(`refused-workspace fx-term exited with ${exitCode}`);
+  if (refusedExecs.length) throw new Error(`a refused workspace ran commands: ${JSON.stringify(refusedExecs)}`);
+}
+
+// A "prompt" workspace: fx-term has one thread, so the approval wait itself
+// must draw the prompt and read the answer. exec runs only after the user
+// approves, and exactly once.
+async function runApprovalPhase(mode) {
+  const approvalTerminal = new Terminal({ cols: 100, rows: 34, allowProposedApi: true, scrollback: 3000 });
+  const approvalConfig = new Map([["model", "test/workspace-model"], ["mode", mode]]);
+  const approvalExecs = [];
+  let approved = false;
+  let approvalStderr = "";
+  const approvalRuntime = await createFxTerminal({
+    backend: "wasm",
+    wasm: await readFile(wasmPath),
+    terminal: xtermAdapter(approvalTerminal),
+    env: { AI_GATEWAY_API_KEY: "workspace-key" },
+    async fetch(_url, init = {}) {
+      if ((init.method || "GET") === "GET") {
+        return new Response(JSON.stringify(catalog), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      const body = JSON.parse(requestDecoder.decode(init.body));
+      if (toolResult(body, "workspace-approval")) {
+        requireResult(body, "workspace-approval", ["approved-output", "exit_code=0"]);
+        return textResponse("approval record checked");
+      }
+      if (latestUserText(body).includes("workspace approval")) return toolCall("workspace-approval", "printf approved-output");
+      throw new Error(`unexpected gateway request: ${JSON.stringify(body)}`);
+    },
+    configStore: { get(id) { return approvalConfig.get(id) ?? null; }, set(id, value) { approvalConfig.set(id, value); } },
+    stderr(chunk) { approvalStderr += stderrDecoder.decode(chunk, { stream: true }); },
+    workspace: {
+      info: workspace.info,
+      permission: "prompt",
+      exec({ command }) {
+        approvalExecs.push({ command, approved });
+        return { stdout: "approved-output\n", stderr: "", exitCode: 0 };
+      },
+    },
+  });
+  const approvalGrid = () => {
+    const lines = [];
+    for (let row = 0; row < approvalTerminal.buffer.active.length; row += 1) {
+      lines.push(approvalTerminal.buffer.active.getLine(row)?.translateToString(true) ?? "");
+    }
+    return lines.join("\n");
+  };
+  const approvalWait = async (predicate, label) => {
+    const deadline = performance.now() + 10_000;
+    while (!predicate()) {
+      await new Promise((done) => approvalTerminal.write("", done));
+      if (performance.now() >= deadline) throw new Error(`timed out waiting for ${label}:\n${approvalStderr}\n${approvalGrid()}`);
+      await new Promise((done) => setTimeout(done, 10));
+    }
+  };
+
+  await approvalWait(() => approvalGrid().includes("𝒇x"), "startup");
+  approvalRuntime.write("workspace approval\r");
+  await approvalWait(() => {
+    const screen = approvalGrid();
+    return screen.includes("Permission needed") && /1\. Yes/.test(screen) && /3\. No/.test(screen);
+  }, "the approval prompt");
+  if (approvalExecs.length !== 0) throw new Error(`exec ran before the approval: ${JSON.stringify(approvalExecs)}`);
+  approved = true;
+  approvalRuntime.write("\r");
+  await approvalWait(() => approvalGrid().includes("approval record checked"), "the answer after approval");
+  if (approvalExecs.length !== 1 || !approvalExecs[0].approved || approvalExecs[0].command !== "printf approved-output") {
+    throw new Error(`unexpected approved exec calls: ${JSON.stringify(approvalExecs)}`);
+  }
+  approvalRuntime.write("/exit\r");
+  const approvalExit = await Promise.race([
+    approvalRuntime.exited,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("approval runtime exit timeout")), 5000)),
+  ]);
+  if (approvalExit !== 0) throw new Error(`fx-term exited with ${approvalExit} after the approval`);
+  console.log(`approval phase passed in ${mode} mode`);
+}

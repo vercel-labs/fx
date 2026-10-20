@@ -8,6 +8,10 @@ import { dirname, join, resolve, sep } from "node:path";
 import { serializeError } from "./package-report.mjs";
 
 const packageDir = resolve(process.argv[2]);
+// This machine's addon version, under the alias libfx installs it as,
+// wherever the package manager put it beside libfx.
+const nativeName = `libfx-${process.platform}-${process.arch}`;
+const nativeDir = dirname(createRequire(join(packageDir, "package.json")).resolve(`${nativeName}/package.json`));
 const { nodeFileTrace } = createRequire(import.meta.url)(resolve(process.argv[3]));
 const artifactRoot = process.env.LIBFX_TEST_ARTIFACT_ROOT || tmpdir();
 await mkdir(artifactRoot, { recursive: true });
@@ -88,6 +92,7 @@ try {
     const isolated = join(root, `${format}-isolated`);
     const entry = format === "esm" ? "entry.mjs" : "entry.cjs";
     await cp(packageDir, join(source, "node_modules/libfx"), { recursive: true });
+    await cp(nativeDir, join(source, "node_modules", nativeName), { recursive: true });
     const load = format === "esm" ? 'import * as sdk from "libfx";' : 'const sdk = require("libfx");';
     await writeFile(join(source, entry), `${load}\n(${exercise.toString()})(sdk).catch(error => { console.error(error); process.exitCode = 1; });\n`);
     const result = { format, control: await run(entry, source, `${format}-control`) };

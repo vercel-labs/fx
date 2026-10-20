@@ -13,15 +13,12 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const session_adapter = @import("../core/session/session_adapter.zig");
 const checkpoint_codec = @import("../core/agent/runtime/checkpoint.zig");
 const execution_memory = @import("../core/agent/execution_memory.zig");
-const runtime_execution_memory = @import("../core/agent/runtime/execution_memory.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const Event = journal.Event;
 pub const max_load_bytes = journal.max_load_bytes;
-/// What the model is told when libfx continues a turn a crash left open.
-const resume_notice = runtime_execution_memory.resume_notice;
 
 /// A host's id for a turn, kept in place so copying a journal copies it.
 pub const TurnId = struct {
@@ -315,12 +312,25 @@ pub const Journal = struct {
     /// to be stored before it goes on, so the host can store the events
     /// nobody waits for more lazily.
     pub fn appendMarked(self: *Journal, alloc: Allocator, session_id: []const u8, event: Event, barrier: bool) !void {
+        return self.appendWith(alloc, session_id, event, barrier, null);
+    }
+
+    /// Sends a turn's end, `turn_committed` or `turn_progress_cleared`, with
+    /// `stop_reason`, how its prompt answers: the record that ends the turn
+    /// says how it ended, so recovery never has to guess.
+    pub fn appendEnd(self: *Journal, alloc: Allocator, session_id: []const u8, event: Event, stop_reason: []const u8) !void {
+        return self.appendWith(alloc, session_id, event, false, stop_reason);
+    }
+
+    fn appendWith(self: *Journal, alloc: Allocator, session_id: []const u8, event: Event, barrier: bool, stop_reason: ?[]const u8) !void {
         var params: std.Io.Writer.Allocating = .init(alloc);
         defer params.deinit();
         try params.writer.writeAll("{\"sessionId\":");
         try jsonrpc.writeJsonStr(session_id, &params.writer);
         try params.writer.writeAll(",\"events\":[");
-        const next = if (self.storedImages()) |stored|
+        const next = if (stop_reason) |reason|
+            try self.cursor.writeEnd(&params.writer, event, self.storedImages(), reason)
+        else if (self.storedImages()) |stored|
             try self.cursor.writeNamingImages(&params.writer, event, stored)
         else
             try self.cursor.write(&params.writer, event);
@@ -466,11 +476,11 @@ pub const Journal = struct {
         if (self.last_progress) |*last| last.stale = true;
     }
 
-    /// Records that the open turn ended without a history entry. A turn
-    /// with no progress on record needs no event.
-    pub fn clearProgress(self: *Journal, alloc: Allocator, session_id: []const u8) !void {
+    /// Records that the open turn ended without a history entry, and how,
+    /// in `stop_reason`. A turn with no progress on record needs no event.
+    pub fn clearProgress(self: *Journal, alloc: Allocator, session_id: []const u8, stop_reason: []const u8) !void {
         if (!self.progress_open) return;
-        try self.append(alloc, session_id, .turn_progress_cleared);
+        try self.appendEnd(alloc, session_id, .turn_progress_cleared, stop_reason);
     }
 };
 
@@ -780,31 +790,23 @@ pub fn open(
 }
 
 /// An owned copy of `pending` ready to continue: unless the turn yielded,
-/// the model is told the session was interrupted; then it sees the inputs
-/// the turn accepted and never placed, and the attempt budget starts over,
-/// so repeated crashes never turn into a refusal to resume.
+/// the model is told the session was interrupted, as the CLI tells it after
+/// a crash (`RecoveryCheckpoint.resumed`); then it sees the inputs the turn
+/// accepted and never placed, and the attempt budget starts over, so
+/// repeated crashes never turn into a refusal to resume.
 pub fn resumeCheckpoint(
     alloc: Allocator,
     pending: session_codec.RecoveryCheckpoint,
     inputs: []const journal.PendingInput,
     yielded: bool,
 ) !session_codec.RecoveryCheckpoint {
-    var scratch = std.heap.ArenaAllocator.init(alloc);
-    defer scratch.deinit();
-    var view = pending;
-    const old = view.execution.steering;
-    const notices: usize = if (yielded) 0 else 1;
-    const steering = try scratch.allocator().alloc(types.PersistedSteering, old.len + notices + inputs.len);
-    @memcpy(steering[0..old.len], old);
-    const after = view.execution.tool_steps.len;
-    if (!yielded) steering[old.len] = .{ .text = @constCast(resume_notice), .after_tool_step_count = after };
-    for (inputs, steering[old.len + notices ..]) |input, *entry| {
-        entry.* = .{ .text = input.text, .after_tool_step_count = after };
-    }
-    view.execution.steering = steering;
-    view.consumed_provider_attempts = 0;
-    view.outstanding_reservation = false;
-    return view.dupe(alloc);
+    const texts = try alloc.alloc([]const u8, inputs.len);
+    defer alloc.free(texts);
+    for (inputs, texts) |input, *text| text.* = input.text;
+    var resumed = try pending.resumed(alloc, !yielded, texts);
+    resumed.consumed_provider_attempts = 0;
+    resumed.outstanding_reservation = false;
+    return resumed;
 }
 
 /// Forgets a response whose calls never reached the journal. After a
@@ -1026,14 +1028,16 @@ test "a turn's id reaches its first progress only, and is the last turn's once t
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, capture.frames.items, "\"turnId\":\"turn-1\""));
     try std.testing.expectEqualStrings("turn-1", session.open_turn_id.slice().?);
 
-    try session.clearProgress(alloc, "session");
+    try session.clearProgress(alloc, "session", "error");
     try std.testing.expect(session.open_turn_id.slice() == null);
     try std.testing.expectEqualStrings("turn-1", session.last_turn_id.slice().?);
+    // The end says how the turn ended.
+    try std.testing.expect(std.mem.find(u8, capture.frames.items, "\"type\":\"turn_progress_cleared\",\"stopReason\":\"error\"}") != null);
 
     // A turn the host did not name ends with no last id.
     session.nameNextTurn(null);
     try session.appendProgress(alloc, alloc, "session", progress, "fake/model");
-    try session.clearProgress(alloc, "session");
+    try session.clearProgress(alloc, "session", "cancelled");
     try std.testing.expect(session.last_turn_id.slice() == null);
 }
 
@@ -1121,7 +1125,7 @@ test "a progress after its turn's first carries only what is new, and the next t
     try session.recordToolResult(alloc, "session", .{ .id = "call-1", .name = "lookup", .failed = false, .output = "done" });
     try std.testing.expect(std.mem.find(u8, capture.frames.items, "\"type\":\"tool_result\"") != null);
 
-    try session.clearProgress(alloc, "session");
+    try session.clearProgress(alloc, "session", "error");
     const next = capture.frames.items.len;
     try session.appendProgress(alloc, alloc, "session", progress, "fake/model");
     try std.testing.expect(std.mem.find(u8, capture.frames.items[next..], "\"base\"") == null);

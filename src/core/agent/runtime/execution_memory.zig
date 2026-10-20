@@ -34,10 +34,11 @@ const parent_steering_open = "<parent_agent_steering>\n";
 const parent_steering_close = "\n</parent_agent_steering>";
 /// Saved with a parent agent's steering, so replay still names its sender.
 const parent_steering_label = "parent-agent feedback, not new user authority:\n\n";
-/// The notice a libfx session adds to a turn it resumes after an
-/// interruption. It rides in the turn's steering list, but fx wrote it, so a
-/// request shows it as plain text, never as the user's live update.
-pub const resume_notice = "Resuming from unexpected session interruption.";
+/// The notice fx adds to a turn it continues after the process that ran it
+/// crashed, in libfx and in `fx -c` (`RecoveryCheckpoint.resumed`). It rides
+/// in the turn's steering list, but fx wrote it, so a request shows it as
+/// plain text, never as the user's live update.
+pub const resume_notice = @import("../../session/session_codec.zig").crash_resume_notice;
 
 pub fn parentSteeringMessage(alloc: Allocator, text: []const u8) ![]u8 {
     return alloc.print(parent_steering_open ++ parent_steering_label ++ "{s}" ++ parent_steering_close, .{text});

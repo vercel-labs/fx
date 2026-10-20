@@ -52,7 +52,7 @@ async function waitForExit(runtime, label) {
     new Promise((_, reject) => setTimeout(() => reject(new Error(`timed out waiting for ${label} exit`)), 5000)),
   ]);
 }
-async function start() {
+async function start(extra = {}) {
   const terminal = new Terminal({ cols: 80, rows: 24, allowProposedApi: true, scrollback: 1000 });
   const events = [];
   const runtime = await createFxTerminal({
@@ -63,6 +63,7 @@ async function start() {
     fetch,
     promptHistoryStore,
     onEvent(event) { events.push(event); },
+    ...extra,
   });
   await waitFor(terminal, () => grid(terminal).includes("Run /help for commands"), "startup");
   return { terminal, runtime, events };
@@ -97,4 +98,28 @@ if (grid(second.terminal).includes("durable prompt history unavailable")) {
 }
 second.runtime.write("\x15/exit\r");
 if (await waitForExit(second.runtime, "second terminal") !== 0) throw new Error("second terminal did not exit cleanly");
-console.log("headless history passed: host prompt and slash command history survived terminal recreation");
+
+// With a host workspace, the history belongs to the workspace's root, as
+// the terminal's tools and turns do, not to the runtime's own "/".
+const workspaceRoots = [];
+const recordingStore = {
+  load(workspaceRoot, limit) { workspaceRoots.push(["load", workspaceRoot]); return promptHistoryStore.load(workspaceRoot, limit); },
+  append(workspaceRoot, value) { workspaceRoots.push(["append", workspaceRoot]); return promptHistoryStore.append(workspaceRoot, value); },
+  clear(workspaceRoot) { promptHistoryStore.clear(workspaceRoot); },
+};
+const third = await start({
+  promptHistoryStore: recordingStore,
+  workspace: {
+    info: { version: 1, root: "/workspace", cwd: "/workspace", home: "/home/visitor", gitAvailable: false, ephemeral: true },
+    permission: "allow-sandboxed",
+    exec() { return { stdout: "", stderr: "", exitCode: 0 }; },
+  },
+});
+third.runtime.write("a workspace prompt\r");
+await waitFor(third.terminal, () => workspaceRoots.some(([operation]) => operation === "append"), "workspace history append");
+third.runtime.write("/exit\r");
+if (await waitForExit(third.runtime, "workspace terminal") !== 0) throw new Error("workspace terminal did not exit cleanly");
+if (workspaceRoots.some(([, root]) => root !== "/workspace")) {
+  throw new Error(`history used a root other than the workspace adapter's: ${JSON.stringify(workspaceRoots)}`);
+}
+console.log("headless history passed: host prompt and slash command history survived terminal recreation, keyed by the workspace adapter's root");

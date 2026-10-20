@@ -31,6 +31,17 @@ const server = createServer((request, response) => {
       response.end(JSON.stringify({ object: "list", data: [{ id: "provider-tools/model", type: "language", tags: ["tool-use"] }] }));
       return;
     }
+    // The provider starts a search and never finishes the response.
+    if (body.includes("stall the search")) {
+      const name = JSON.parse(body).tools?.find((tool) => tool.type === "provider")?.name;
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write([
+        `data: ${JSON.stringify({ type: "tool-input-start", id: "search-2", toolName: name })}`,
+        `data: ${JSON.stringify({ type: "tool-call", toolCallId: "search-2", toolName: name, input: { query: "never answered" }, providerExecuted: true })}`,
+        "",
+      ].join("\n\n"));
+      return;
+    }
 
     modelRequests += 1;
     const payload = JSON.parse(body);
@@ -84,7 +95,10 @@ try {
   const events = [];
   for await (const event of turn) events.push(event);
   assert.equal((await turn.result).stopReason, "end_turn");
-  assert.equal(events.find((event) => event.type === "tool_start")?.name, "web_search");
+  // The stream announces the search before its input; viewers still get one
+  // tool_start, and it carries the query (API-68).
+  const starts = events.filter((event) => event.type === "tool_start");
+  assert.deepEqual(starts, [{ type: "tool_start", id: "search-1", name: "web_search", input: { query: "libfx provider search" } }]);
   const ended = events.find((event) => event.type === "tool_end");
   assert.equal(ended?.name, "web_search");
   assert.equal(ended?.isError, false);
@@ -100,6 +114,33 @@ try {
   assert.equal((await restored.result).stopReason, "end_turn");
   assert.equal(restoredText, "restored");
   assert.equal(modelRequests, 2);
+  await agent.close();
+
+  // A search the cancel cuts off still ends: a tool_end with its id, failed,
+  // and no search result, since the provider gave none (API-48).
+  agent = await createFxEngine(options());
+  const stalled = agent.prompt("stall the search");
+  const stalledEvents = [];
+  for await (const event of stalled) {
+    stalledEvents.push(event);
+    if (event.type === "tool_start") stalled.cancel();
+  }
+  assert.equal((await stalled.result).stopReason, "cancelled");
+  assert.deepEqual(stalledEvents.filter((event) => event.type.startsWith("tool_")).map(({ type, id, isError }) => ({ type, id, isError })), [
+    { type: "tool_start", id: "search-2", isError: undefined },
+    { type: "tool_end", id: "search-2", isError: true },
+  ]);
+  assert.doesNotMatch(stalledEvents.find((event) => event.type === "tool_end").content ?? "", /never answered|sourced-result/);
+  await agent.close();
+
+  // web_search is the only provider tool; another is refused naming it,
+  // before any request (QUAL-18).
+  const before = modelRequests;
+  await assert.rejects(
+    createFxEngine({ ...options(), tools: [{ name: "image_generation", providerExecuted: true }] }),
+    (error) => error instanceof TypeError && /image_generation/.test(error.message) && /web_search is the only provider tool/.test(error.message),
+  );
+  assert.equal(modelRequests, before);
   console.log(`${backend} provider-executed tool integration passed`);
 } finally {
   await agent?.close().catch(() => {});

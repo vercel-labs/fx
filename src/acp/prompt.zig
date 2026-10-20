@@ -177,6 +177,8 @@ test "a libfx prompt holds at most its limit of images and image bytes" {
     try std.testing.expect(!fitsLibfxPrompt(&over));
 }
 
+const content_filter_failure_message = "The provider's content filter stopped the response; rephrase the prompt or choose another model";
+
 fn promptExecutionFailure(err: anyerror) anyerror!TerminalOutcome {
     return switch (err) {
         error.ModelImageCapabilityUnavailable,
@@ -239,6 +241,33 @@ const AgentMessageKind = enum {
     operational,
 };
 
+/// A journaled turn's end, which the runtime reports before the turn's stop
+/// reason is decided: it calls `propagate_history_turn`, or clears the turn's
+/// progress, then `finalize_turn`. The end reaches the journal from
+/// `finalizeTurn`, saying how the turn ended in the record that ends it, so a
+/// crash can never leave an end whose outcome a later record would have told
+/// (DUR-20, `tests/tla/sdk/DurableSession.tla` EndSaysHow). Nothing the host
+/// sees comes between: the prompt's answer, `finish_prompt`, and the turn's
+/// end hook all follow `finalize_turn`.
+const HeldJournalEnd = struct {
+    /// The runtime cleared the turn's progress: it ends without a history
+    /// entry, or before the interrupted one it then commits.
+    cleared: bool = false,
+    /// The history entry the turn ends with, owned by the context's allocator.
+    turn: ?HistoryTurn = null,
+};
+
+/// How a journaled turn whose prompt fails ended, as libfx reports one.
+const journal_failed_stop_reason = "error";
+
+/// Whether the web core's host says the user cancelled the running turn. Its
+/// cancel aborts the turn's model request at once, while the core reads the
+/// cancel itself only once it reads its input again, so without this a turn
+/// whose request the cancel cut short would end in the journal as failed.
+fn hostCancelled() bool {
+    return if (comptime host_target.is_wasm) js_host_steering.cancelled() else false;
+}
+
 const AcpContext = struct {
     alloc: Allocator,
     state: *server.ServerState,
@@ -250,6 +279,8 @@ const AcpContext = struct {
     message_id: acp_types.MessageIdBuffer = undefined,
     message_kind: ?AgentMessageKind = null,
     stop_reason: acp_types.StopReason = .end_turn,
+    /// The provider's content filter stopped a response of this turn.
+    content_filtered: bool = false,
     auto_classifier: permission_auto_classifier.Classifier =
         permission_auto_classifier.Classifier.disabled(),
     /// Mode and permission policy captured at prompt dispatch so mid-turn
@@ -258,11 +289,74 @@ const AcpContext = struct {
     captured_permission_mode: ?PermissionMode = null,
     current_prompt_input: ?*ParsedPromptInput = null,
     observer: ?*observation.Observer = null,
+    /// The running turn's end in a journaled session, held from where the
+    /// runtime ends the turn until `finalizeTurn` decides how it ended.
+    held_end: HeldJournalEnd = .{},
+    /// How the turn's end that went to the journal says the turn ended;
+    /// null until it went. The prompt answers that (`answeredStopReason`).
+    recorded_end: ?acp_types.StopReason = null,
 
     fn deinitPublishedToolCalls(self: *AcpContext) void {
         var keys = self.published_tool_calls.keyIterator();
         while (keys.next()) |key| self.alloc.free(key.*);
         self.published_tool_calls.deinit(self.alloc);
+    }
+
+    /// Writes the turn's end the runtime reported, held until now, saying
+    /// it ended with `stop_reason`: the cleared progress, then the history
+    /// entry, as the runtime reported them, each handing back first the
+    /// steers the turn never placed. Nothing is held afterwards, whether or
+    /// not the writes succeed.
+    fn writeHeldJournalEnd(self: *AcpContext, stop_reason: []const u8) !void {
+        const held = self.held_end;
+        self.held_end = .{};
+        defer if (held.turn) |turn| types.freeHistoryTurn(self.alloc, turn);
+        if (!held.cleared and held.turn == null) return;
+        const session = if (self.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
+        if (held.cleared) {
+            session.session_write_mutex.lockUncancelable(io_mod.getIo());
+            defer session.session_write_mutex.unlock(io_mod.getIo());
+            const journal = if (session.journal) |*value| value else return error.SessionPersistenceUnavailable;
+            try handBackUnplacedSteersLocked(self.alloc, self.state.alloc, session, journal);
+            try journal.clearProgress(self.alloc, session.session_id, stop_reason);
+        }
+        if (held.turn) |turn| try persistAcpHistoryTurn(self.alloc, session, turn, self.current_prompt_input, self.state.alloc, stop_reason);
+    }
+
+    /// Frees an end that never reached the journal, which only a prompt that
+    /// failed before it could write it leaves.
+    fn dropHeldJournalEnd(self: *AcpContext) void {
+        if (!self.held_end.cleared and self.held_end.turn == null) return;
+        debug_trace.logf("session", "event=libfx_journal_turn_end_dropped cleared={} committed={} reason=prompt_ended_first", .{ self.held_end.cleared, self.held_end.turn != null });
+        if (self.held_end.turn) |turn| types.freeHistoryTurn(self.alloc, turn);
+        self.held_end = .{};
+    }
+
+    /// Writes the held end saying the turn ended with `stop_reason`, which
+    /// the prompt then answers, whatever cancel comes after.
+    fn recordHeldJournalEnd(self: *AcpContext, stop_reason: acp_types.StopReason) !void {
+        if (self.held_end.cleared or self.held_end.turn != null) self.recorded_end = stop_reason;
+        try self.writeHeldJournalEnd(stop_reason.jsonString());
+    }
+
+    /// How the running turn ended, as its end in the journal says: the stop
+    /// reason `finalizeTurn` decided, or cancelled once the user cancelled
+    /// the turn, whatever stopped it.
+    fn journalStopReason(self: *AcpContext) acp_types.StopReason {
+        const session = if (self.state.active_session) |*value| value else return self.stop_reason;
+        if (session.steering.userCancelled() or hostCancelled()) return .cancelled;
+        return self.stop_reason;
+    }
+
+    /// What the prompt answers once its turn ended. A turn whose end went to
+    /// the journal ended as that end says: a cancel that came after it was
+    /// written stopped nothing, so the answer, the journal and every viewer
+    /// agree (DUR-20, DUR-64; `tests/tla/durable/Resumption.tla`
+    /// ResultSaysHow). Otherwise a cancel answers cancelled, whatever
+    /// stopped the turn.
+    fn answeredStopReason(self: *const AcpContext, cancel_flag: *const std.atomic.Value(bool)) acp_types.StopReason {
+        if (self.recorded_end) |recorded| return recorded;
+        return if (cancel_flag.load(.seq_cst)) .cancelled else self.stop_reason;
     }
 
     fn sendUpdate(self: *AcpContext, update_json: []const u8) !void {
@@ -298,15 +392,23 @@ const AcpContext = struct {
     }
 
     /// A notice the client shows outside the conversation (ACP v1).
-    fn sendNotice(self: *AcpContext, text: []const u8) !void {
+    fn sendNotice(self: *AcpContext, severity: []const u8, text: []const u8) !void {
         const plain = try stripAnsiAlloc(self.alloc, text);
         defer if (plain.ptr != text.ptr) self.alloc.free(plain);
         // The tag is for the model; a notice's title stands alone.
         const title = std.mem.trimStart(u8, std.mem.cutPrefix(u8, plain, "[context]") orelse plain, " ");
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
-        try acp_types.writeNotice(&out.writer, "info", if (title.len > 0) title else plain);
+        try acp_types.writeNotice(&out.writer, severity, if (title.len > 0) title else plain);
         try self.sendUpdate(out.writer.buffered());
+    }
+
+    /// Text fx adds beside a libfx turn's reply. A libfx host streams the
+    /// reply as the model wrote it, so the text goes as a notice instead; a
+    /// blank separator is dropped (API-48).
+    fn sendLibfxNotice(self: *AcpContext, text: []const u8) !void {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len > 0) try self.sendNotice("info", trimmed);
     }
 
     fn sendModelRecoveryStatus(
@@ -978,6 +1080,7 @@ pub fn handlePrompt(
         .current_prompt_input = &prompt_input,
     };
     defer ctx.deinitPublishedToolCalls();
+    defer ctx.dropHeldJournalEnd();
 
     var hook_bridge: libfx_hooks.Bridge = undefined;
     if (session.observer_hooks) |hook_config| {
@@ -1017,6 +1120,10 @@ pub fn handlePrompt(
             for (inputs, ids) |input, *id| id.* = input.id;
             try journal.notePlaced(state.alloc, ids);
         }
+        // The crashed turn took these inputs and died before its viewers
+        // heard of them, so they show now, where the turn places them, as a
+        // steer does when a boundary takes it (DUR-23).
+        for (inputs) |input| try publishSteeringReplay(&ctx, input.text, null, input.id);
         journal.dropPendingResume(state.alloc);
         // Calls the crash left running that the host asked to run again do
         // so before the turn continues, and their results replace the answer
@@ -1038,9 +1145,10 @@ pub fn handlePrompt(
             },
         };
     } else if (session.journal) |*journal| {
-        // A new prompt instead of a resume ends the open turn as interrupted.
+        // A new prompt instead of a resume ends the open turn as interrupted,
+        // which a turn's end reports as cancelled.
         if (journal.pending_resume) |pending| {
-            try persistAcpHistoryTurn(alloc, session, pending.interruptedTurn(), null, null);
+            try persistAcpHistoryTurn(alloc, session, pending.interruptedTurn(), null, null, acp_types.StopReason.cancelled.jsonString());
             journal.dropPendingResume(state.alloc);
         }
     }
@@ -1175,23 +1283,39 @@ pub fn handlePrompt(
         }
         if (err == error.NonInteractivePermissionRequired) {
             ctx.stop_reason = .refused;
-        } else if (err == error.Cancelled and session.cancel_flag.load(.seq_cst)) {
+        } else if (err == error.Cancelled and (session.cancel_flag.load(.seq_cst) or hostCancelled())) {
             // A cancel that arrived while a journal barrier was pending ends
             // the turn as interrupted, as a cancel anywhere else does.
             ctx.stop_reason = .cancelled;
             // If the commit fails, the turn still ends below.
+            ctx.recordHeldJournalEnd(.cancelled) catch |end_err| {
+                debug_trace.logf("session", "event=libfx_journal_turn_end_failed err={s} turn_err={s}", .{ @errorName(end_err), @errorName(err) });
+            };
             commitCancelledJournalTurn(alloc, state.alloc, session, &prompt_input) catch |commit_err| {
                 debug_trace.logf("session", "event=libfx_journal_interrupted_commit_failed err={s}", .{@errorName(commit_err)});
             };
         } else {
             // The turn's own failure is the one to report.
-            endJournalTurn(alloc, state.alloc, session) catch |end_err| {
+            ctx.writeHeldJournalEnd(journal_failed_stop_reason) catch |end_err| {
                 debug_trace.logf("session", "event=libfx_journal_turn_end_failed err={s} turn_err={s}", .{ @errorName(end_err), @errorName(err) });
             };
+            _ = endJournalTurn(alloc, state.alloc, session, journal_failed_stop_reason) catch |end_err| ended: {
+                debug_trace.logf("session", "event=libfx_journal_turn_end_failed err={s} turn_err={s}", .{ @errorName(end_err), @errorName(err) });
+                break :ended false;
+            };
+            // A libfx host shows this message as the turn's error (QUAL-18).
+            if (err == error.ModelError and ctx.content_filtered and state.cfg.minimal_kernel) return .{ .rpc_error = .{
+                .code = ErrorCode.internal_error,
+                .message = content_filter_failure_message,
+            } };
             return promptExecutionFailure(err);
         }
     };
-    try endJournalTurn(alloc, state.alloc, session);
+    // `finalizeTurn` wrote the turn's end; one the runtime reported without
+    // it, or a turn that ended with no end yet, ends now.
+    const ended = ctx.journalStopReason();
+    try ctx.recordHeldJournalEnd(ended);
+    if (try endJournalTurn(alloc, state.alloc, session, ended.jsonString())) ctx.recorded_end = ended;
     prompt_input.retainImageSnapshots();
     completeAcpTitleTask(state, session);
     try sessions.sendActiveSessionInfoUpdate(state, alloc);
@@ -1199,9 +1323,7 @@ pub fn handlePrompt(
 
     // A steer's interrupt the turn finished before reaching is not a cancel.
     if (state.cfg.minimal_kernel) server.releaseSteeringInterrupt(state);
-    if (session.cancel_flag.load(.seq_cst)) {
-        ctx.stop_reason = .cancelled;
-    }
+    ctx.stop_reason = ctx.answeredStopReason(&session.cancel_flag);
 
     return .{ .stop_reason = ctx.stop_reason };
 }
@@ -1641,6 +1763,16 @@ fn decodePromptImageData(alloc: Allocator, data_value: std.json.Value) ![]u8 {
     return decoded;
 }
 
+/// The most bytes one image a libfx host attaches beside the prompt frame may
+/// hold, and all of one prompt's attached images together. libfx's own limits
+/// are lower (`maxPromptImageBytes` and `maxPromptImagesBytes` in
+/// `sdk/fx-sdk.js`); these hold a host that skips them, whatever room its
+/// attachment store has for journals. A libfx kernel session also holds each
+/// prompt to libfx's count and total (`fitsLibfxPrompt`), which an open's
+/// staging counts on; only this bounds each image.
+const max_attached_image_bytes = 4 * 1024 * 1024;
+const max_attached_images_bytes = 8 * 1024 * 1024;
+
 /// Takes the raw image bytes a libfx host attached beside the prompt frame.
 /// Hosts without an attachment store cannot reference one. Caller owns the
 /// returned bytes.
@@ -1651,7 +1783,7 @@ fn takePromptImageAttachment(
 ) ![]u8 {
     const store = attachments orelse return error.UnsupportedPromptImage;
     const id = host_attachments.idFromJson(value) orelse return error.InvalidPromptImage;
-    const bytes = store.take(alloc, id, image_attachments.max_image_bytes) catch |err| return switch (err) {
+    const bytes = store.take(alloc, id, max_attached_image_bytes) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.AttachmentTooLarge => error.ImageTooLarge,
         error.AttachmentUnavailable => error.InvalidPromptImage,
@@ -1734,6 +1866,7 @@ fn parsePromptInputWithFirstImageId(
         for (pending_images.items) |*pending| pending.deinit(alloc);
         pending_images.deinit(alloc);
     }
+    var attached_image_bytes: usize = 0;
     var omission_summary: context_contract.ContextOmissionSummaryBuilder = .{};
     defer {
         for (omissions.items) |omission| alloc.free(@constCast(omission.source));
@@ -1761,9 +1894,10 @@ fn parsePromptInputWithFirstImageId(
                 if (value != .string or !image_data.validSourceRef(value.string)) return error.InvalidPromptImage;
                 break :ref value.string;
             } else null;
-            const decoded = if (acp_types.fxMetaField(block.object, "attachment")) |attachment| bytes: {
+            const attachment = acp_types.fxMetaField(block.object, "attachment");
+            const decoded = if (attachment) |reference| bytes: {
                 if (block.object.get("data") != null) return error.InvalidPromptImage;
-                break :bytes try takePromptImageAttachment(alloc, attachments, attachment);
+                break :bytes try takePromptImageAttachment(alloc, attachments, reference);
             } else if (block.object.get("data")) |data_value|
                 try decodePromptImageData(alloc, data_value)
             else bytes: {
@@ -1771,6 +1905,12 @@ fn parsePromptInputWithFirstImageId(
                 break :bytes try alloc.alloc(u8, 0);
             };
             errdefer alloc.free(decoded);
+            if (attachment != null) {
+                // Each is at most max_attached_image_bytes, and the sum stops
+                // growing once it passes the total, so it cannot overflow.
+                attached_image_bytes += decoded.len;
+                if (attached_image_bytes > max_attached_images_bytes) return error.ImageTooLarge;
+            }
             // A host with an image store names the bytes it stored first.
             const stored_name: ?session_codec.ImageName = if (acp_types.fxMetaField(block.object, "stored")) |value| name: {
                 if (value != .string or decoded.len == 0) return error.InvalidPromptImage;
@@ -2004,6 +2144,7 @@ fn takeSteeringBoundary(
 ) !worker_runtime.SteeringBoundaryResult {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const close_if_empty = kind == .finalizing;
+    if (kind == .finalizing) takeHostInputs(ctx);
     if (comptime host_target.is_wasm) {
         server.noteSteeringBoundary(ctx.state);
         // The host closes its steering when the user cancels the turn, which
@@ -2062,6 +2203,31 @@ fn takeSteeringBoundary(
         try publishSteeringReplay(ctx, text, request_id, input_id);
     }
     return .{ .continue_turn = drained.texts };
+}
+
+/// Before a libfx turn ends, a host that stores the session's inputs itself
+/// hands in the ones it stored since it last read them, so a steer sent while
+/// the reply streamed continues the turn instead of running as a turn of its
+/// own, though no poll or watch told the host of it in time (API-50;
+/// `tests/tla/sdk/DurableSteer.tla` ReadAtEnd). The reply has ended, so a
+/// steer that arrives meanwhile waits for this boundary instead of cutting
+/// anything short. A failed read leaves those inputs stored, and they run
+/// after the turn.
+fn takeHostInputs(ctx: *AcpContext) void {
+    const session = if (ctx.state.active_session) |*value| value else return;
+    const inputs_durable = durable: {
+        session.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer session.session_write_mutex.unlock(io_mod.getIo());
+        const journal = if (session.journal) |*value| value else break :durable false;
+        break :durable journal.inputs_durable;
+    };
+    if (!inputs_durable) return;
+    server.noteSteeringBoundary(ctx.state);
+    const taken = if (comptime host_target.is_wasm)
+        js_host_steering.takeInputs()
+    else
+        awaitHostRequest(ctx.state, ctx.alloc, .inputs, "libfx/take_inputs", session.session_id);
+    taken catch |err| debug_trace.logf("acp", "libfx host inputs not read before the turn ends; any it stored run after it err={s}", .{@errorName(err)});
 }
 
 /// The web core's cooperative pulse while a model reply streams: steering its
@@ -2242,10 +2408,21 @@ fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentati
         ctx.stop_reason = .max_output_tokens;
     } else if (outcome == .failed or outcome == .paused) {
         ctx.stop_reason = .refused;
+    } else if (outcome == .interrupted) {
+        // The session records the turn as interrupted, so it reports
+        // cancelled whatever stopped it, a handoff included: its end never
+        // says end_turn while the journal says otherwise (DUR-64).
+        ctx.stop_reason = .cancelled;
     }
+    // A journaled turn's end, held since the runtime reported it, reaches
+    // the journal saying how the turn ended, before anything else the host
+    // hears of the turn's end.
+    try ctx.recordHeldJournalEnd(ctx.journalStopReason());
     // The core reports no more tool events once a turn finishes, so close
     // what it left open, as the terminal transcript does at the same point.
-    const cancel_requested = if (ctx.state.active_session) |*session| session.cancel_flag.load(.seq_cst) else false;
+    // A journaled turn's calls read as its recorded end says: a cancel that
+    // came after that end was written stopped nothing.
+    const cancel_requested = if (ctx.recorded_end) |recorded| recorded == .cancelled else if (ctx.state.active_session) |*session| session.cancel_flag.load(.seq_cst) else false;
     ctx.finishOpenToolCalls(unfinishedToolCallText(outcome, cancel_requested));
 }
 
@@ -2795,15 +2972,22 @@ fn toolUpdateContentText(result: ToolExecutionResult) []const u8 {
 
 fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    if (ctx.state.active_session) |*session| {
-        try persistAcpHistoryTurn(
-            ctx.alloc,
-            session,
-            turn,
-            ctx.current_prompt_input,
-            ctx.state.alloc,
-        );
+    const session = if (ctx.state.active_session) |*value| value else return;
+    if (session.journal != null) {
+        // The turn's end waits for `finalizeTurn`, which knows how it ended
+        // (`HeldJournalEnd`). An end held already goes first, as it stands.
+        if (ctx.held_end.turn != null) try ctx.recordHeldJournalEnd(ctx.journalStopReason());
+        ctx.held_end.turn = try types.dupeHistoryTurn(ctx.alloc, turn);
+        return;
     }
+    try persistAcpHistoryTurn(
+        ctx.alloc,
+        session,
+        turn,
+        ctx.current_prompt_input,
+        ctx.state.alloc,
+        null,
+    );
 }
 
 /// `AgentRuntimeDeps.append_turn_piece` on v2: the pieces finished so far,
@@ -2866,31 +3050,50 @@ fn appendJournalToolIntent(raw_ctx: *anyopaque, progress: agent_runtime.TurnProg
     if (waits) return flushJournal(ctx.state, ctx.alloc, session.session_id);
 }
 
-/// Waits until the host holds every journal event sent so far.
+/// Waits until the host's store accepted every journal event sent so far:
+/// durably for those sent marked barriers (`appendWith`), and for the rest
+/// in whatever way the store acknowledges a record that is no barrier.
 fn flushJournal(state: *server.ServerState, alloc: Allocator, session_id: []const u8) !void {
     if (comptime host_target.is_wasm) return js_host_journal.flush();
-    const outbound_id = (server.beginOutboundRequest(state, .journal) catch
-        return error.JournalFlushFailed) orelse return error.JournalFlushFailed;
-    var awaiting = true;
-    errdefer if (awaiting) {
+    awaitHostRequest(state, alloc, .journal, "libfx/journal_flush", session_id) catch |err| return switch (err) {
+        error.Cancelled => error.Cancelled,
+        error.HostRequestFailed => error.JournalFlushFailed,
+    };
+}
+
+/// Sends the native host the libfx request `method` for `session_id` and
+/// waits for its answer, which it gives once it has done what `method` asks.
+/// The connection reader handles what the host sends meanwhile, so the host
+/// may send other requests before it answers. A cancel of the turn ends the
+/// wait with `error.Cancelled`.
+fn awaitHostRequest(
+    state: *server.ServerState,
+    alloc: Allocator,
+    kind: server.OutboundKind,
+    method: []const u8,
+    session_id: []const u8,
+) error{ HostRequestFailed, Cancelled }!void {
+    var params: std.Io.Writer.Allocating = .init(alloc);
+    defer params.deinit();
+    params.writer.writeAll("{\"sessionId\":") catch return error.HostRequestFailed;
+    jsonrpc.writeJsonStr(session_id, &params.writer) catch return error.HostRequestFailed;
+    params.writer.writeByte('}') catch return error.HostRequestFailed;
+    const outbound_id = (server.beginOutboundRequest(state, kind) catch
+        return error.HostRequestFailed) orelse return error.HostRequestFailed;
+    state.writer.writeRequest(alloc, .{ .integer = @intCast(outbound_id) }, method, params.written()) catch {
+        // The request may have been partly written, so the host hears it was
+        // cancelled.
         server.cancelOutboundRequest(state, outbound_id);
-        if (server.awaitOutboundResponse(state, outbound_id, .journal)) |owned| {
+        if (server.awaitOutboundResponse(state, outbound_id, kind)) |owned| {
             var abandoned = owned;
             abandoned.deinit(state.alloc);
         }
+        return error.HostRequestFailed;
     };
-    var params: std.Io.Writer.Allocating = .init(alloc);
-    defer params.deinit();
-    try params.writer.writeAll("{\"sessionId\":");
-    try jsonrpc.writeJsonStr(session_id, &params.writer);
-    try params.writer.writeByte('}');
-    state.writer.writeRequest(alloc, .{ .integer = @intCast(outbound_id) }, "libfx/journal_flush", params.written()) catch
-        return error.JournalFlushFailed;
-    var response = server.awaitOutboundResponse(state, outbound_id, .journal) orelse return error.JournalFlushFailed;
-    awaiting = false;
+    var response = server.awaitOutboundResponse(state, outbound_id, kind) orelse return error.HostRequestFailed;
     defer response.deinit(state.alloc);
     if (response.cancelled) return error.Cancelled;
-    if (response.error_json != null or response.result_json == null) return error.JournalFlushFailed;
+    if (response.error_json != null or response.result_json == null) return error.HostRequestFailed;
 }
 
 /// Records the libfx steers the ending turn accepted and never placed, as a
@@ -2908,24 +3111,28 @@ fn handBackUnplacedSteersLocked(alloc: Allocator, backing: Allocator, session: *
     if (ids.len > 0) debug_trace.logf("acp", "handed back unplaced libfx steers count={d}", .{ids.len});
 }
 
-/// Ends a journaled turn in the journal as it ended in the session. One that
-/// failed left no history entry, so its progress is cleared: resuming is for
-/// turns a stopped process left open. Inputs it took and never placed are
-/// settled. `session_alloc` owns the journal's state.
-fn endJournalTurn(alloc: Allocator, session_alloc: Allocator, session: *server.ActiveSessionState) !void {
+/// Ends a journaled turn in the journal as it ended in the session, with
+/// `stop_reason`, how its prompt answers. One that failed left no history
+/// entry, so its progress is cleared: resuming is for turns a stopped
+/// process left open. Inputs it took and never placed are settled.
+/// `session_alloc` owns the journal's state. Returns whether it wrote the
+/// turn's end.
+fn endJournalTurn(alloc: Allocator, session_alloc: Allocator, session: *server.ActiveSessionState, stop_reason: []const u8) !bool {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
-    const journal = if (session.journal) |*value| value else return;
+    const journal = if (session.journal) |*value| value else return false;
     try handBackUnplacedSteersLocked(alloc, session_alloc, session, journal);
-    if (journal.progress_open) {
+    const ends = journal.progress_open;
+    if (ends) {
         debug_trace.logf("session", "event=libfx_journal_turn_closed reason=ended_without_commit", .{});
-        try journal.clearProgress(alloc, session.session_id);
+        try journal.clearProgress(alloc, session.session_id, stop_reason);
     }
     try journal.endUnplaced(alloc, session_alloc, session.session_id);
     if (journal.takeCancelledProgress()) |checkpoint| {
         var unused = checkpoint;
         unused.deinit(session_alloc);
     }
+    return ends;
 }
 
 /// Commits the turn whose barrier a cancel interrupted as interrupted, from
@@ -2944,7 +3151,7 @@ fn commitCancelledJournalTurn(alloc: Allocator, session_alloc: Allocator, sessio
         break :cancelled checkpoint;
     };
     defer cancelled.deinit(session_alloc);
-    try persistAcpHistoryTurn(alloc, session, cancelled.interruptedTurn(), prompt_input, session_alloc);
+    try persistAcpHistoryTurn(alloc, session, cancelled.interruptedTurn(), prompt_input, session_alloc, acp_types.StopReason.cancelled.jsonString());
 }
 
 fn sessionChildCapability(session: *server.ActiveSessionState) ?*session_child_store.SessionChildCapability {
@@ -2953,13 +3160,15 @@ fn sessionChildCapability(session: *server.ActiveSessionState) ?*session_child_s
 }
 
 /// `hand_back_alloc`, set when the running turn ends, owns its queued
-/// steering, which is handed back first.
+/// steering, which is handed back first. In a journaled session the commit
+/// says how the turn ended with `stop_reason`.
 fn persistAcpHistoryTurn(
     alloc: Allocator,
     session: *server.ActiveSessionState,
     turn: HistoryTurn,
     current_prompt_input: ?*ParsedPromptInput,
     hand_back_alloc: ?Allocator,
+    stop_reason: ?[]const u8,
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -2970,7 +3179,10 @@ fn persistAcpHistoryTurn(
         // The running turn's own end hands back its unplaced steers; ending
         // an earlier turn for a new prompt does not.
         if (hand_back_alloc) |backing| try handBackUnplacedSteersLocked(alloc, backing, session, journal);
-        try journal.append(alloc, session.session_id, .{ .turn_committed = prepared });
+        if (stop_reason) |reason|
+            try journal.appendEnd(alloc, session.session_id, .{ .turn_committed = prepared }, reason)
+        else
+            try journal.append(alloc, session.session_id, .{ .turn_committed = prepared });
     }
     if (comptime host_target.is_wasm) {
         session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
@@ -3072,7 +3284,12 @@ fn commitContextCompaction(
 /// `recovery_checkpoint.set` for a journaled libfx session: the open turn
 /// so far reaches the host before each model request.
 /// The first progress of a turn is a barrier: it holds the prompt, or a
-/// resumed turn's answers for calls a crash left running.
+/// resumed turn's answers for calls a crash left running. Every progress
+/// before a model request once the turn took a step is waited for too, but
+/// only for the store's answer, not marked a barrier: the request carries
+/// the step, such as a tool's result, so it never goes out once the store
+/// refused the progress that holds it (DUR-30), and it still runs ahead of
+/// the commit when the store answers before the record is durable (DUR-18).
 ///
 /// When the host gave the turn a time to stop at and it has passed, the
 /// progress before a model request is where the turn yields: the journal
@@ -3081,7 +3298,7 @@ fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryChe
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
     var yields = false;
-    const barrier = barrier: {
+    const waits = waits: {
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
         const journal = if (session.journal) |*value| value else return error.SessionPersistenceUnavailable;
@@ -3094,11 +3311,17 @@ fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryChe
             try journal.appendMarked(ctx.alloc, session.session_id, .turn_yielded, true);
             yields = true;
         }
-        const barrier = journal.barrier_next_progress or yields;
+        // A model request goes out after this progress: the turn's next
+        // step, or compaction's, which carries the turn so far too.
+        const before_request = checkpoint.outstanding_reservation or checkpoint.cause == .compaction_prepared;
+        const took_step = checkpoint.execution.tool_steps.len > 0 or checkpoint.assistant_source.len > 0;
+        const waits = journal.barrier_next_progress or yields or (before_request and took_step);
         journal.barrier_next_progress = false;
-        break :barrier barrier;
+        break :waits waits;
     };
-    if (barrier) flushJournal(ctx.state, ctx.alloc, session.session_id) catch |err| {
+    // The host marks nothing a barrier for this wait: the events that need
+    // one went to it marked (`appendWith`).
+    if (waits) flushJournal(ctx.state, ctx.alloc, session.session_id) catch |err| {
         // The turn commits from this progress as interrupted.
         if (err == error.Cancelled) try keepCancelledProgress(ctx.state.alloc, session, checkpoint);
         return err;
@@ -3127,13 +3350,11 @@ fn keepCancelledProgress(session_alloc: Allocator, session: *server.ActiveSessio
 fn clearJournalProgress(raw_ctx: *anyopaque) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
-    session.session_write_mutex.lockUncancelable(io_mod.getIo());
-    defer session.session_write_mutex.unlock(io_mod.getIo());
-    const journal = if (session.journal) |*value| value else return error.SessionPersistenceUnavailable;
-    // The turn ends here, cancelled or stopped: the steers it never placed
-    // are withdrawn while they still belong to it, before the clear ends it.
-    try handBackUnplacedSteersLocked(ctx.alloc, ctx.state.alloc, session, journal);
-    try journal.clearProgress(ctx.alloc, session.session_id);
+    if (session.journal == null) return error.SessionPersistenceUnavailable;
+    // The turn ends here, cancelled or stopped. The clear that ends it waits
+    // for `finalizeTurn`, which knows how (`HeldJournalEnd`); then the steers
+    // it never placed are withdrawn while they still belong to it.
+    ctx.held_end.cleared = true;
 }
 
 /// Stores grants on the active ACP session without persisting them.
@@ -3167,11 +3388,13 @@ fn pushRouteRecoveryStatus(
     status: types.RouteRecoveryStatus,
 ) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    if (status.kind == .content_filter) ctx.content_filtered = true;
     try ctx.sendModelRecoveryStatus(status);
 }
 
 fn pushText(raw_ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    if (emission == .operational and ctx.state.cfg.minimal_kernel) return ctx.sendLibfxNotice(emission.operational) catch {};
     const text, const message_id = switch (emission) {
         .assistant_started => {
             ctx.message_kind = null;
@@ -3202,12 +3425,16 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
             if (ctx.state.cfg.minimal_kernel) server.noteSteeringToolsPhase(ctx.state);
             const tool_name = provisional.tool_name orelse return;
             if (!tool_presentation.isProviderSearchAlias(tool_name)) return;
+            // A libfx viewer gets one tool_start per call, so a search waits
+            // to start until its input is known (API-68).
+            const arguments_json = provisional.arguments_json orelse
+                if (ctx.state.cfg.minimal_kernel) return else "{}";
             var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
             defer arena_state.deinit();
             _ = try ctx.sendToolCallPending(arena_state.allocator(), .{
                 .id = provisional.id.call_id,
                 .name = tool_name,
-                .arguments_json = "{}",
+                .arguments_json = arguments_json,
                 .provenance = .provider_executed,
             });
         },
@@ -3232,6 +3459,7 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
 
 fn pushSystemNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    if (ctx.state.cfg.minimal_kernel) return ctx.sendLibfxNotice(text) catch {};
     ctx.sendAgentText(ctx.operationalMessageId(), text) catch {};
 }
 
@@ -3241,7 +3469,7 @@ fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     if (!try session.session_rt.claimContextNotice(ctx.alloc, text)) return;
     // ACP v1 Session Notices where the client shows them;
     // otherwise a message, as ACP allows.
-    if (ctx.state.client_notices) return ctx.sendNotice(text) catch {};
+    if (ctx.state.client_notices) return ctx.sendNotice("info", text) catch {};
     try pushSystemNotice(raw_ctx, text);
 }
 
@@ -3261,11 +3489,48 @@ fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u
     else
         null;
     defer if (owned_message) |message| ctx.alloc.free(message);
+    if (ctx.state.cfg.minimal_kernel) {
+        // The provider's error is why a libfx turn ends refused: its host
+        // reports it in the turn's result, not as reply text. A rejection of
+        // credentials the host adds keeps the server's body, which reached
+        // the core with them masked; any other stays detail-free.
+        const host_masked = if (credential_source) |source| source == .host_managed else false;
+        const shown = if (owned_message != null and !host_masked) "" else detail;
+        const message = try libfxHttpErrorText(ctx.alloc, status, shown, owned_message);
+        defer ctx.alloc.free(message);
+        return ctx.sendNotice("error", message) catch {};
+    }
     const msg = owned_message orelse if (detail.len > 0)
         std.mem.print(&buf, "HTTP {d}: {s}", .{ @backingInt(status), detail }) catch "HTTP error"
     else
         std.mem.print(&buf, "HTTP {d}", .{@backingInt(status)}) catch "HTTP error";
     ctx.sendAgentText(ctx.operationalMessageId(), msg) catch {};
+}
+
+/// A provider's HTTP error as a libfx turn reports it: the server's own body
+/// after the status, behind fx's reading of an authentication failure when
+/// there is one. Caller owns the result.
+fn libfxHttpErrorText(alloc: Allocator, status: std.http.Status, detail: []const u8, auth_text: ?[]const u8) ![]u8 {
+    const code = @backingInt(status);
+    if (auth_text) |text| {
+        if (detail.len == 0) return alloc.dupe(u8, text);
+        return alloc.print("{s}: {s}", .{ text, detail });
+    }
+    if (detail.len == 0) return alloc.print("HTTP {d}", .{code});
+    return alloc.print("HTTP {d}: {s}", .{ code, detail });
+}
+
+test "a libfx turn's HTTP error keeps the server's own message" {
+    const alloc = std.testing.allocator;
+    const plain = try libfxHttpErrorText(alloc, .bad_request, "{\"error\":{\"message\":\"bad\"}}", null);
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings("HTTP 400: {\"error\":{\"message\":\"bad\"}}", plain);
+    const auth = try libfxHttpErrorText(alloc, .unauthorized, "invalid api key", "host managed authentication failed · HTTP 401");
+    defer alloc.free(auth);
+    try std.testing.expectEqualStrings("host managed authentication failed · HTTP 401: invalid api key", auth);
+    const bare = try libfxHttpErrorText(alloc, .too_many_requests, "", null);
+    defer alloc.free(bare);
+    try std.testing.expectEqualStrings("HTTP 429", bare);
 }
 
 fn formatToolExecutionError(_: *anyopaque, arena: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
@@ -4174,6 +4439,54 @@ test "parsePromptInput rejects unusable image attachment references" {
     const invalid_ref = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"sourceRef\":\"bad\\nref\",\"_meta\":{\"fx\":{\"attachment\":3}}}]}";
     try std.testing.expectError(error.InvalidPromptImage, parsePromptInputWithFirstImageId(alloc, invalid_ref, 1, stored.store()));
     try std.testing.expectEqual(@as(usize, 0), stored.taken);
+}
+
+/// Serves `payloads[id - 1]` under each id from 1.
+const TestAttachments = struct {
+    payloads: []const []const u8,
+
+    fn store(self: *TestAttachments) host_attachments.Store {
+        return .{ .context = self, .take_fn = take, .put_fn = TestAttachmentStore.put };
+    }
+
+    fn take(
+        raw: ?*anyopaque,
+        alloc: Allocator,
+        id: host_attachments.Id,
+        max_bytes: usize,
+    ) host_attachments.TakeError![]u8 {
+        const self: *TestAttachments = @ptrCast(@alignCast(raw.?));
+        if (id == 0 or id > self.payloads.len) return error.AttachmentUnavailable;
+        const bytes = self.payloads[id - 1];
+        if (bytes.len > max_bytes) return error.AttachmentTooLarge;
+        return alloc.dupe(u8, bytes);
+    }
+};
+
+test "parsePromptInput bounds the images a host attaches, each and together, whatever its store holds" {
+    const alloc = std.testing.allocator;
+    const largest = try alloc.alloc(u8, max_attached_image_bytes + 1);
+    defer alloc.free(largest);
+    @memset(largest, 0);
+    @memcpy(largest[0..8], "\x89PNG\r\n\x1a\n");
+    const image = largest[0..max_attached_image_bytes];
+    const block = "{\"type\":\"image\",\"mimeType\":\"image/png\",\"_meta\":{\"fx\":{\"attachment\":";
+    const one = "{\"sessionId\":\"s1\",\"prompt\":[" ++ block ++ "1}}}]}";
+    const two = "{\"sessionId\":\"s1\",\"prompt\":[" ++ block ++ "1}}}," ++ block ++ "2}}}]}";
+    const three = "{\"sessionId\":\"s1\",\"prompt\":[" ++ block ++ "1}}}," ++ block ++ "2}}}," ++ block ++ "3}}}]}";
+
+    // Two images of the largest size fill the total.
+    var full: TestAttachments = .{ .payloads = &.{ image, image } };
+    var parsed = try parsePromptInputWithFirstImageId(alloc, two, 1, full.store());
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), parsed.pending_images.len);
+    try std.testing.expectEqual(max_attached_image_bytes, parsed.pending_images[1].bytes.len);
+
+    // One byte more, in another image or in the same one, is refused.
+    var over: TestAttachments = .{ .payloads = &.{ image, image, "\x89PNG\r\n\x1a\n" } };
+    try std.testing.expectError(error.ImageTooLarge, parsePromptInputWithFirstImageId(alloc, three, 1, over.store()));
+    var single: TestAttachments = .{ .payloads = &.{largest} };
+    try std.testing.expectError(error.ImageTooLarge, parsePromptInputWithFirstImageId(alloc, one, 1, single.store()));
 }
 
 test "parsePromptInput preserves resource text and accepts only local absolute file targets" {
@@ -5356,6 +5669,56 @@ test "ACP finalization maps failed turns and provider length" {
         try deps.finalize_turn(deps.ctx, 8, case.outcome, case.disposition);
 
         try std.testing.expectEqual(case.expected, ctx.stop_reason);
+    }
+}
+
+const JournalFrames = struct {
+    frames: std.ArrayList(u8) = .empty,
+
+    fn write(raw: ?*anyopaque, frame: []const u8) !void {
+        const self: *JournalFrames = @ptrCast(@alignCast(raw.?));
+        try self.frames.appendSlice(std.testing.allocator, frame);
+    }
+};
+
+test "a journaled turn's prompt answers as the end it wrote says, whatever cancel comes after" {
+    const cases = [_]struct {
+        journaled: bool,
+        cancel_first: bool,
+        recorded: ?[]const u8,
+        answered: acp_types.StopReason,
+    }{
+        // A cancel the turn has before its end is written is in that end.
+        .{ .journaled = true, .cancel_first = true, .recorded = "\"stopReason\":\"cancelled\"", .answered = .cancelled },
+        // One that comes once the end was written stops nothing (DUR-20).
+        .{ .journaled = true, .cancel_first = false, .recorded = "\"stopReason\":\"end_turn\"", .answered = .end_turn },
+        // With no journal, a late cancel still answers cancelled.
+        .{ .journaled = false, .cancel_first = false, .recorded = null, .answered = .cancelled },
+    };
+    for (cases) |case| {
+        const alloc = std.testing.allocator;
+        var capture: JournalFrames = .{};
+        defer capture.frames.deinit(alloc);
+        var writer = jsonrpc.Writer.initCallback(&capture, JournalFrames.write);
+        var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+        defer state.deinit();
+        state.cfg.minimal_kernel = true;
+        const session = &state.active_session.?;
+        if (case.journaled) session.journal = .{ .writer = &writer };
+        var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
+        defer ctx.dropHeldJournalEnd();
+        const deps = agentRuntimeDeps(&ctx);
+
+        try deps.propagate_history_turn(deps.ctx, .{ .assistant = .{ .user = .{ .text = @constCast("hello") }, .assistant = @constCast("hi") } });
+        if (case.cancel_first) session.steering.cancelForUser(&session.cancel_flag);
+        try deps.finalize_turn(deps.ctx, 8, .completed, null);
+        if (!case.cancel_first) session.steering.cancelForUser(&session.cancel_flag);
+
+        if (case.recorded) |recorded| {
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, capture.frames.items, "\"type\":\"turn_committed\""));
+            try std.testing.expect(std.mem.find(u8, capture.frames.items, recorded) != null);
+        }
+        try std.testing.expectEqual(case.answered, ctx.answeredStopReason(&session.cancel_flag));
     }
 }
 

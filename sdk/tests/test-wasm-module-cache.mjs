@@ -5,7 +5,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { createFxEngine, supportsJspi } from "../node.js";
+import { createFxEngine, createFxTerminal, supportsJspi } from "../node.js";
 
 if (!supportsJspi()) {
   console.error("Node JSPI is disabled. Run with --experimental-wasm-jspi");
@@ -23,11 +23,25 @@ await writeFile(secondPath, wasmBytes);
 await writeFile(retryPath, wasmBytes);
 
 const requestBodies = [];
+// WebAssembly the server answers for; any other .wasm path is a 404.
+const servedWasm = new Map();
 const server = createServer((request, response) => {
   let body = "";
   request.setEncoding("utf8");
   request.on("data", (chunk) => { body += chunk; });
   request.on("end", () => {
+    const { pathname } = new URL(request.url, "http://127.0.0.1");
+    if (request.method === "GET" && pathname.endsWith(".wasm")) {
+      const bytes = servedWasm.get(pathname);
+      if (!bytes) {
+        response.writeHead(404, { "content-type": "text/plain" });
+        response.end("not found");
+        return;
+      }
+      response.writeHead(200, { "content-type": "application/octet-stream" });
+      response.end(bytes);
+      return;
+    }
     if (request.method === "GET") {
       response.writeHead(200, { "content-type": "application/json" });
       response.end('{"object":"list","data":[]}');
@@ -128,6 +142,29 @@ try {
   const recoveredRead = await create(missingPath);
   await recoveredRead.close();
   assert.equal(compileCalls, 5, "a rejected file read must be removed so the next attempt retries");
+
+  // QUAL-18: a wasm URL that answers an error page names the URL and the
+  // status, for the agent and the terminal alike, and compiles nothing. The
+  // URL's query, which can hold a signed URL's token, stays out of the error.
+  const missingUrl = `http://127.0.0.1:${server.address().port}/assets/fx-core.wasm`;
+  const assertWasmNotFound = (error) => {
+    assert.equal(error?.code, "LIBFX_WASM_LOAD_FAILED", `unexpected error: ${error?.stack ?? error}`);
+    assert.equal(error.status, 404);
+    assert.ok(error.message.includes(missingUrl) && error.message.includes("HTTP 404"), error.message);
+    assert.ok(!error.message.includes("signed-wasm-token") && !error.url.includes("signed-wasm-token"), error.message);
+    return true;
+  };
+  await assert.rejects(createFxEngine(options(missingUrl)), assertWasmNotFound);
+  await assert.rejects(createFxTerminal({
+    backend: "wasm",
+    wasm: `${missingUrl}?token=signed-wasm-token`,
+    terminal: { cols: 80, rows: 24, write() {}, onData() {}, onResize() {} },
+  }), assertWasmNotFound);
+  assert.equal(compileCalls, 5, "an error page must not reach the compiler");
+  servedWasm.set("/assets/fx-core.wasm", wasmBytes);
+  const servedLater = await create(missingUrl);
+  await servedLater.close();
+  assert.equal(compileCalls, 6, "a refused URL must be removed so the next attempt fetches it again");
 
   await Promise.all(agents.map((agent) => agent.close()));
   assert.ok(signals.every(({ signal }) => signal instanceof AbortSignal));

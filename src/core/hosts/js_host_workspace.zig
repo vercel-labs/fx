@@ -97,6 +97,14 @@ const ImportedHost = struct {
     }
 };
 
+/// Why fx has no workspace from the host: there is none, or fx refused it.
+pub const InfoError = Allocator.Error || error{
+    WorkspaceUnavailable,
+    InvalidContract,
+    WorkspaceHostFailure,
+    WorkspaceInfoTooSmall,
+};
+
 pub const ExecuteError = Allocator.Error || error{
     InvalidWorkspaceInput,
     InvalidWorkspaceResult,
@@ -189,7 +197,7 @@ pub fn Adapter(comptime Host: type) type {
             return execute(alloc, command, cwd, timeout_ms);
         }
 
-        pub fn loadInfo(alloc: Allocator) !Info {
+        pub fn loadInfo(alloc: Allocator) InfoError!Info {
             return switch (Host.workspaceAvailable()) {
                 0 => error.WorkspaceUnavailable,
                 1 => loadAvailableInfo(alloc),
@@ -197,7 +205,7 @@ pub fn Adapter(comptime Host: type) type {
             };
         }
 
-        fn loadAvailableInfo(alloc: Allocator) !Info {
+        fn loadAvailableInfo(alloc: Allocator) InfoError!Info {
             var buffer: [max_info_bytes]u8 = undefined;
             const result = Host.workspaceInfo(&buffer, buffer.len);
             if (result < 0) return switch (result) {
@@ -371,9 +379,18 @@ pub fn Adapter(comptime Host: type) type {
 pub fn HostRuntime(comptime Host: type) type {
     return struct {
         workspace_info: ?Info = null,
+        /// Why fx refused the host's workspace adapter, which it runs
+        /// without; null when it took the adapter or the host has none.
+        refusal: ?InfoError = null,
 
-        pub fn init(alloc: Allocator) !@This() {
+        pub fn init(alloc: Allocator) InfoError!@This() {
             return .{ .workspace_info = try Adapter(Host).loadInfo(alloc) };
+        }
+
+        /// A runtime with no workspace, for a host whose adapter `init`
+        /// could not take.
+        pub fn without(err: InfoError) @This() {
+            return .{ .refusal = if (err == error.WorkspaceUnavailable) null else err };
         }
 
         pub fn available(self: *const @This()) bool {
@@ -498,6 +515,26 @@ test "workspace info accepts the bounded v1 browser contract" {
     try std.testing.expect(!info.git_available);
     try std.testing.expect(info.ephemeral);
     try std.testing.expectEqual(Permission.allow_sandboxed, info.permission);
+}
+
+test "workspace runtime remembers a refused adapter but not an absent one" {
+    defer {
+        FakeInfoHost.available_result = 1;
+        FakeInfoHost.info_json = valid_info_json;
+    }
+    FakeInfoHost.info_json =
+        "{\"version\":1,\"root\":\"/workspace\",\"cwd\":\"/workspace/src\",\"home\":\"/home/visitor\",\"git\":false,\"ephemeral\":true,\"permission\":\"prompt\"}";
+    const refused = HostRuntime(FakeInfoHost).init(std.testing.allocator) catch |err|
+        HostRuntime(FakeInfoHost).without(err);
+    try std.testing.expect(!refused.available());
+    try std.testing.expect(refused.executor() == null);
+    try std.testing.expectEqual(@as(?InfoError, error.InvalidContract), refused.refusal);
+
+    FakeInfoHost.available_result = 0;
+    const absent = HostRuntime(FakeInfoHost).init(std.testing.allocator) catch |err|
+        HostRuntime(FakeInfoHost).without(err);
+    try std.testing.expect(!absent.available());
+    try std.testing.expectEqual(@as(?InfoError, null), absent.refusal);
 }
 
 test "workspace runtime keeps one validated metadata and executor snapshot" {

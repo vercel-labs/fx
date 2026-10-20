@@ -321,18 +321,32 @@ try {
     }, events);
   }
 
-  // Unconfirmed serving appends a warning to the streamed text.
+  // Unconfirmed serving is reported apart from the reply, which streams as
+  // the model wrote it (API-48).
   {
     const gateway = mockGateway(null);
+    const events = [];
     await withAgent(gateway, { model: supportedModel, ultrafast: true }, async (agent) => {
-      await runPrompt(
-        agent,
-        "say ok",
-        "okUltrafast was requested, but Gateway did not confirm it was served; this response may have used a standard or lower tier.\n",
-      );
+      await runPrompt(agent, "say ok", "ok");
       assert.equal(gateway.state.chatBodies.length, 1);
       assertUltrafastRoute(gateway.state.chatBodies[0]);
-    });
+      assert.deepEqual(events.filter((event) => event.type === "turn.notice").map((event) => [event.sessionId, event.text]), [
+        [agent.sessionId, "Ultrafast was requested, but Gateway did not confirm it was served; this response may have used a standard or lower tier."],
+      ]);
+    }, events);
+  }
+
+  // With backend auto, a model setting the native backend refuses is not
+  // tried again on WebAssembly, which reads the same catalog.
+  if (backend === "native") {
+    const gateway = mockGateway();
+    await assertCreationRejects(gateway, {
+      backend: "auto",
+      // Read only if creation falls back.
+      wasm: resolve(scriptDir, "../../zig-out/bin/fx-core.wasm"),
+      model: { id: unsupportedModel, ultrafast: true },
+    }, (error) => error.code === "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST" && error.model === unsupportedModel);
+    assert.equal(gateway.state.catalogFetches, 1, "one catalog request");
   }
 
   // Both modes validate independently at creation. For a model supporting

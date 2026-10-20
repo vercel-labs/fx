@@ -52,7 +52,7 @@
     },
     "./wasm": {
       "types": "./types/wasm.d.ts",
-      "default": "./fx-sdk.js"
+      "default": "./wasm.js"
     },
     "./durable-local": {
       "types": "./types/durable-local.d.ts",
@@ -92,6 +92,7 @@
     "node.js",
     "node.cjs",
     "fx-sdk.js",
+    "wasm.js",
     "tool-observation.js",
     "durable.js",
     "fx-harness.js",
@@ -115,10 +116,30 @@
     "skills-node.js",
     "fx-core.wasm",
     "fx-term.wasm",
-    "*.node",
     "README.md",
+    "docs/",
     "LICENSE"
   ],
+  "optionalDependencies": {
+    "libfx-darwin-arm64": "npm:libfx@0.0.0-0.darwin-arm64",
+    "libfx-darwin-x64": "npm:libfx@0.0.0-0.darwin-x64",
+    "libfx-linux-arm64": "npm:libfx@0.0.0-0.linux-arm64",
+    "libfx-linux-x64": "npm:libfx@0.0.0-0.linux-x64"
+  },
+  "peerDependenciesMeta": {
+    "libfx-darwin-arm64": {
+      "optional": true
+    },
+    "libfx-darwin-x64": {
+      "optional": true
+    },
+    "libfx-linux-arm64": {
+      "optional": true
+    },
+    "libfx-linux-x64": {
+      "optional": true
+    }
+  },
   "engines": {
     "node": ">=20"
   },

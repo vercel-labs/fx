@@ -26,9 +26,6 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const sdkDir = fileURLToPath(new URL("..", import.meta.url));
 const fixturesDir = fileURLToPath(new URL("./types/", import.meta.url));
 
-// fx-sdk.js exports these for libfx's own modules; they are not public API.
-const wasmInternals = new Set(["checkPromptInput", "coreAnswered", "engineInternals", "journalMarksWanted", "normalizeAgentOptions", "normalizeInstructions", "normalizeModelChoice", "persistenceImages", "resumeOutputShown"]);
-
 // Each specifier as a consumer resolves it, the declaration file it must
 // reach, and the module whose runtime exports that file must match. node.cjs
 // is built from node.js (sdk/scripts/build-node-cjs.mjs), so the `require`
@@ -41,7 +38,7 @@ const entries = [
   { specifier: "libfx/node", resolution: "node16", mode: "import", types: "types/node.d.ts", runtime: "node.js" },
   { specifier: "libfx/node", resolution: "node16", mode: "require", types: "types/node.d.cts", runtime: "node.js" },
   { specifier: "libfx/browser", resolution: "node16", mode: "import", types: "types/browser.d.ts", runtime: "browser.js" },
-  { specifier: "libfx/wasm", resolution: "node16", mode: "import", types: "types/wasm.d.ts", runtime: "fx-sdk.js", hidden: wasmInternals },
+  { specifier: "libfx/wasm", resolution: "node16", mode: "import", types: "types/wasm.d.ts", runtime: "wasm.js" },
   { specifier: "libfx/durable-local", resolution: "node16", mode: "import", types: "types/durable-local.d.ts", runtime: "durable/local.mjs" },
   { specifier: "libfx/durable-vercel", resolution: "node16", mode: "import", types: "types/durable-vercel.d.ts", runtime: "durable/vercel.mjs" },
   { specifier: "libfx/durable-world", resolution: "node16", mode: "import", types: "types/durable-world.d.ts", runtime: "durable/world.mjs" },

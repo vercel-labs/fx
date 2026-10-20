@@ -6099,6 +6099,63 @@ test "processQueuedPrompt asks the model again when a steer waits at a saved rep
     );
 }
 
+test "processQueuedPrompt delivers a saved reply after a crash with no notice in its history, and asks again for inputs the resume restored" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "The saved answer" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    const config = fixture.config();
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    const settled = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 1];
+    try std.testing.expectEqual(types.ModelRecoveryAction.delivering_response, settled.action);
+
+    // The process crashed: the resume tells the model, but delivering the
+    // saved reply asks it nothing, so the turn's history is the turn as the
+    // reply saw it (`tests/tla/durable/Resumption.tla` ModelToldEveryTime).
+    var crashed = try settled.resumed(alloc, true, &.{});
+    defer crashed.deinit(alloc);
+    var delivered_gateway = FakeGateway.init(alloc, &.{});
+    defer delivered_gateway.deinit();
+    var delivered_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer delivered_hooks.deinit();
+    var delivered_job = fixture.job();
+    delivered_job.recovery_checkpoint = crashed;
+
+    try runFakePrompt(&delivered_gateway, &delivered_hooks, config, delivered_job);
+
+    try std.testing.expectEqual(@as(usize, 0), delivered_gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), delivered_hooks.history_turns.items.len);
+    const delivered = delivered_hooks.history_turns.items[0].assistant;
+    try std.testing.expectEqualStrings("The saved answer", delivered.assistant);
+    for (delivered.execution.steering) |steering| {
+        try std.testing.expect(!std.mem.eql(u8, steering.text, session_codec.crash_resume_notice));
+    }
+
+    // A steer the turn accepted after its reply was saved, which the resume
+    // restored, never reached that reply: the turn asks the model with it,
+    // and with the notice.
+    var steered = try settled.resumed(alloc, true, &.{"and mention plums"});
+    defer steered.deinit(alloc);
+    const steered_completions = [_]FakeCompletion{.{ .content = "Plums too" }};
+    var steered_gateway = FakeGateway.init(alloc, &steered_completions);
+    defer steered_gateway.deinit();
+    var steered_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer steered_hooks.deinit();
+    var steered_job = fixture.job();
+    steered_job.recovery_checkpoint = steered;
+
+    try runFakePrompt(&steered_gateway, &steered_hooks, config, steered_job);
+
+    try std.testing.expectEqual(@as(usize, 1), steered_gateway.request_bodies.items.len);
+    try expectBodyContainsInOrder(&steered_gateway, 0, &.{ session_codec.crash_resume_notice, "and mention plums" });
+    try std.testing.expectEqualStrings("Plums too", steered_hooks.history_turns.items[0].assistant.assistant);
+}
+
 test "processQueuedPrompt preserves the provider-executed subset of mixed failed tools" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{

@@ -302,6 +302,28 @@ try {
         "priced Sol true", "Astra false", "unpriced Sol rejection",
       ]), `unexpected browser Ultrafast cases ${JSON.stringify(evaluated.result.value)}`);
       console.log("browser core ultrafast routing and eligibility passed");
+
+      // QUAL-18: a wasm URL that answers 404 says so, for both surfaces.
+      const missing = await withTimeout(command("Runtime.evaluate", {
+        awaitPromise: true,
+        returnByValue: true,
+        expression: `(async () => {
+          const { createFxEngine, createFxTerminal } = await import('/sdk/browser.js');
+          const settle = (promise) => promise.then(() => null, (error) => ({ code: error.code, status: error.status, message: error.message }));
+          return {
+            engine: await settle(createFxEngine({ wasm: '/zig-out/bin/missing-fx-core.wasm', apiKey: 'browser-missing-wasm-key' })),
+            terminal: await settle(createFxTerminal({ wasm: '/zig-out/bin/missing-fx-term.wasm',
+              terminal: { cols: 80, rows: 24, write() {}, onData() {}, onResize() {} } })),
+          };
+        })()`,
+      }, sessionId), "browser missing wasm case timed out", 15000);
+      expect(!missing.exceptionDetails, missing.exceptionDetails?.text || "browser missing wasm exception");
+      for (const [surface, file] of [["engine", "missing-fx-core.wasm"], ["terminal", "missing-fx-term.wasm"]]) {
+        const error = missing.result.value[surface];
+        expect(error?.code === "LIBFX_WASM_LOAD_FAILED" && error.status === 404, `${surface}: unexpected missing wasm error ${JSON.stringify(error)}`);
+        expect(error.message.includes(`http://127.0.0.1:${port}/zig-out/bin/${file}`) && error.message.includes("HTTP 404"), `${surface}: ${error.message}`);
+      }
+      console.log("browser missing wasm URL passed");
     } finally {
       await command("Target.closeTarget", { targetId });
     }

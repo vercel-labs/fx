@@ -1159,6 +1159,11 @@ const JsHostSessionStore = struct {
 const JsHostSessionOwner = struct {
     state: session_codec.DurableSessionState,
     revision: ?[]u8,
+    /// The host store refused a commit with FX_SESSION_REVISION_CONFLICT:
+    /// the record moved past `revision`, so every later commit would be
+    /// refused the same way. fx stops saving this conversation and keeps
+    /// the record the store has.
+    conflicted: bool = false,
 
     fn deinit(self: *JsHostSessionOwner, alloc: Allocator) void {
         self.state.deinit(alloc);
@@ -2847,20 +2852,32 @@ pub fn Runtime(comptime App: type) type {
                     patch.model != null and patch.fast_mode != null;
             }
 
-            var settings_attempt = config_runtime.attemptUserPreferences(
-                app.alloc,
-                patch.userSettingsPatch(),
-            );
-            switch (settings_attempt) {
-                .outcome => |outcome| {
-                    result.settings_outcome = outcome;
-                    settings_attempt = undefined;
-                },
-                .failure => |failure| {
-                    result.settings_error = failure.err;
-                    result.settings_failure_cleanup = failure.cleanup;
-                    settings_attempt = undefined;
-                },
+            // A JavaScript host has no user settings file. The model a
+            // command accepted went to the host's configStore before this
+            // commit (`persistAcceptedModel`), so a failed write of a file
+            // the host never had is not reported as the model going unsaved.
+            if (runtime_profile.allows(App, .js_host_config) and patch.model != null) {
+                debug_trace.logf(
+                    "host_config",
+                    "user_settings_skipped id=model reason=host_config_store",
+                    .{},
+                );
+            } else {
+                var settings_attempt = config_runtime.attemptUserPreferences(
+                    app.alloc,
+                    patch.userSettingsPatch(),
+                );
+                switch (settings_attempt) {
+                    .outcome => |outcome| {
+                        result.settings_outcome = outcome;
+                        settings_attempt = undefined;
+                    },
+                    .failure => |failure| {
+                        result.settings_error = failure.err;
+                        result.settings_failure_cleanup = failure.cleanup;
+                        settings_attempt = undefined;
+                    },
+                }
             }
             if (result.settings_error == null) {
                 applyPreferencePatch(
@@ -4915,7 +4932,15 @@ pub fn Runtime(comptime App: type) type {
                 defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
                 if (app.session_persistence.v2) |v2| {
                     try v2.commitCompaction(summary, active_prefix != null, retained_from);
-                } else if (app.session_persistence.js_host_session) |*owner| {
+                } else if (app.session_persistence.js_host_session) |*owner| compact: {
+                    if (owner.conflicted) {
+                        debug_trace.logf(
+                            "session",
+                            "event=js_host_session_commit outcome=skipped reason=revision_conflict boundary=compaction id={s}",
+                            .{owner.state.id},
+                        );
+                        break :compact;
+                    }
                     var next = try snapshotCurrentState(app, owner.state, io_mod.milliTimestamp());
                     var next_owned = true;
                     defer if (next_owned) next.deinit(app.alloc);
@@ -4958,6 +4983,14 @@ pub fn Runtime(comptime App: type) type {
                 value
             else
                 return;
+            if (owner.conflicted) {
+                debug_trace.logf(
+                    "session",
+                    "event=js_host_session_commit outcome=skipped reason=revision_conflict boundary={s} id={s}",
+                    .{ boundary, owner.state.id },
+                );
+                return;
+            }
             var next = snapshotCurrentState(
                 app,
                 owner.state,
@@ -4987,6 +5020,7 @@ pub fn Runtime(comptime App: type) type {
                         @errorName(err),
                     },
                 );
+                if (err == error.SessionRevisionConflict) reportJsHostSessionConflict(app, owner);
                 return;
             };
 
@@ -4995,6 +5029,25 @@ pub fn Runtime(comptime App: type) type {
             owner.state = next;
             owner.revision = revision;
             next_owned = false;
+        }
+
+        /// The store kept a newer record than this terminal last saw, so no
+        /// later commit can succeed. Says so once and stops saving; the app
+        /// hears the same from the store's error (`session.persist_error`).
+        fn reportJsHostSessionConflict(app: *App, owner: *JsHostSessionOwner) void {
+            owner.conflicted = true;
+            if (comptime !@hasDecl(App, "writeDomainNotice")) return;
+            app.writeDomainNotice(.{
+                .topic = "session",
+                .tone = .warning,
+                .body = "this conversation was saved elsewhere, such as in another tab, so turns from here on are not saved (FX_SESSION_REVISION_CONFLICT); open it again to continue from the saved copy",
+            }, true) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "event=js_host_session_conflict_notice outcome=dropped id={s} err={s}",
+                    .{ owner.state.id, @errorName(err) },
+                );
+            };
         }
 
         fn snapshotCurrentState(
@@ -6171,6 +6224,26 @@ test "js-host completed and interrupted turns propagate revisions preserve owner
         "revision-next",
         app.session_persistence.js_host_session.?.revision.?,
     );
+    // The conflict reaches the user once (sdk/AGENTS.md: a session revision
+    // conflict is not swallowed), and fx stops saving: every later commit,
+    // a compaction's included, would carry the same stale revision.
+    try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
+    try std.testing.expect(std.mem.find(u8, app.notices.items[0], "session: this conversation was saved elsewhere") != null);
+    try std.testing.expect(std.mem.find(u8, app.notices.items[0], "FX_SESSION_REVISION_CONFLICT") != null);
+    fake.commit_error = null;
+    const third_turn = try session_runtime.makeAssistantTurn(alloc, "third prompt", "third reply");
+    defer session_runtime.freeHistoryTurn(alloc, third_turn);
+    try Runtime(TestApp).appendHistoryTurn(&app, third_turn);
+    Runtime(TestApp).commitJsHostSnapshotEnabled(&app, "history_turn");
+    const summary: types.CompactedSummaryHistoryTurn = .{
+        .summary = @constCast("<context_handoff>after the conflict</context_handoff>"),
+        .removed_turn_count = 1,
+        .compaction_count = 1,
+    };
+    try Runtime(TestApp).commitContextCompaction(&app, summary, null, null);
+    try std.testing.expectEqual(@as(usize, 2), fake.commit_count);
+    try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.committed_state.?.history.len);
 
     const previous_id = try alloc.dupe(u8, app.session_persistence.js_host_session.?.state.id);
     defer alloc.free(previous_id);

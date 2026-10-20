@@ -28,7 +28,8 @@ for (const [surface, listModels] of [["node", listNodeModels], ["browser", listB
   assert.deepEqual(models, ["a/model", "z/model"]);
   assert.equal(calls, 1, `${surface} listModels must perform one explicit request`);
 
-  await assert.rejects(listModels({}), (error) => error instanceof TypeError && error.message.includes("apiKey"));
+  // QUAL-18: the error says what is missing and how to pass it.
+  await assert.rejects(listModels({}), (error) => error instanceof TypeError && error.message === "no AI Gateway credentials were found: pass apiKey, an AI Gateway API key or a Vercel OIDC token, to listModels()");
   let httpErrorCancelled = 0;
   await assert.rejects(
     listModels({

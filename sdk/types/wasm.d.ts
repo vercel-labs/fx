@@ -1,4 +1,4 @@
-// `libfx/wasm` (fx-sdk.js): the WebAssembly SDK with no packaged asset paths,
+// `libfx/wasm` (wasm.js): the WebAssembly SDK with no packaged asset paths,
 // so every factory takes its `wasm` explicitly.
 import type { FxEngine, FxEngineOptions, FxTerminal, FxTerminalOptions, FxWasmSource } from "./libfx.cjs";
 

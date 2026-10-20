@@ -3,7 +3,7 @@ import { strict as assert } from "node:assert";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxEngine, supportsJspi } from "../node.js";
+import { createFxAgent, createFxEngine, memory, supportsJspi } from "../node.js";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const backend = process.argv[2] || "native";
@@ -94,6 +94,27 @@ async function runPrompt(agent) {
     },
   );
   assert.equal(gateway.state.catalogFetches, 1);
+}
+
+// An agent's first turn ends with that error, and it names the model and the
+// setting as the engine's does.
+{
+  const gateway = mockGateway();
+  const agent = createFxAgent({ ...baseOptions, durability: memory(), fetch: gateway.fetch, model: { id: "sdk/core-model", effort: "max" } });
+  try {
+    const turn = agent.session().prompt("say ok");
+    for await (const _ of turn) {}
+    const { stopReason, error } = await turn.result;
+    assert.equal(stopReason, "error");
+    assert.deepEqual({ code: error?.code, model: error?.model, capability: error?.capability }, {
+      code: "LIBFX_MODEL_UNSUPPORTED_EFFORT",
+      model: "sdk/core-model",
+      capability: "effort",
+    });
+    assert.equal(gateway.state.chatBodies.length, 0);
+  } finally {
+    await agent.close();
+  }
 }
 
 // A model without reasoning effort options rejects any named effort.

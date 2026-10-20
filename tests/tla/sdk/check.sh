@@ -1,8 +1,8 @@
 #!/bin/sh
 # Model-checks DurableSession.tla, PromptIntake.tla, ImageStore.tla,
-# DurableSteer.tla and AgentRouting.tla with TLC, confirms each witness is
-# violated, and writes the state graphs the drivers in ../drivers/ walk
-# against the code.
+# DurableSteer.tla, UiStream.tla, AgentRouting.tla and TenantIsolation.tla
+# with TLC, confirms each witness is violated, and writes the state graphs
+# the drivers in ../drivers/ walk against the code.
 #
 # Needs Java 11+ and tla2tools.jar:
 #   brew install openjdk
@@ -15,11 +15,13 @@
 #   bun ../drivers/drive.mjs write && bun ../drivers/drive.mjs cutoff
 #   bun ../drivers/drive.mjs leased   # the Heartbeat graph, on a World without liveness
 #   bun ../drivers/drive.mjs queue    # the QueueHeld graph, on a World whose queue shows it
+#   bun ../drivers/drive.mjs refuse   # the Refused graph: a turn that ends before any record
 #   bun ../drivers/drive-intake.mjs   # prompts with images
 #   bun ../drivers/drive-images.mjs   # images stored once, across crashes and reopens
 #   bun ../drivers/drive-agents.mjs   # AgentRouting
 #   bun ../drivers/drive-steer.mjs ideal && bun ../drivers/drive-steer.mjs faults   # DurableSteer
 #   bun ../drivers/drive-tenants.mjs   # TenantIsolation
+#   bun ../drivers/drive-uistream.mjs   # UiStream, a takeover on libfx's bundled world-local
 set -eu
 cd "$(dirname "$0")"
 
@@ -37,7 +39,7 @@ work="$(mktemp -d "${TMPDIR:-/tmp}/libfx-model-tlc.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 mkdir -p graphs
 status=0
-for tool in send lookup write cutoff leased queue; do
+for tool in send lookup write cutoff leased queue refuse; do
     echo "== DurableSession ($tool)"
     if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup \
         -metadir "$work/$tool" -dump dot,actionlabels "graphs/$tool" \
@@ -46,6 +48,20 @@ for tool in send lookup write cutoff leased queue; do
     fi
     grep -E 'distinct states|depth of' "$work/$tool.log"
 done
+# The send graph with SavesReply: a turn's answer is saved before its end, so
+# a crash between them leaves the turn open with its answer, and the worker
+# that resumes it ends it with that answer, asking the model nothing, or with
+# Restarts restarts it after a notice. With LateCancel the user may cancel the
+# turn while the record that ends it is on its way. No driver walks it: a
+# driver would have to hold the record that ends a turn apart from the one
+# that saved its answer, which the engine may send as one.
+echo "== DurableSession (saved)"
+if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup \
+    -metadir "$work/saved" -config DurableSession-saved.cfg DurableSession.tla > "$work/saved.log" 2>&1; then
+    cat "$work/saved.log"; status=1
+else
+    grep -E 'distinct states|depth of' "$work/saved.log"
+fi
 # Each witness must break the invariant named after it: it shows the model
 # reaches that state. NoSelfStop breaks TwoActiveNeedsFreeze: without the
 # self-stop, two workers are active at once with no freeze at all.
@@ -61,10 +77,43 @@ done
 # that intent lands has the model ask again, under a new execution id.
 # WriteRunsAhead breaks OneExecutionId: a write that ran ahead the same way
 # would run under two ids, which is why a write waits for its intent.
+# NoEndRepair breaks EndRecoverable: without Repair, a holder that crashes
+# between a turn's end record and its turn_end line leaves a done turn no
+# reader sees end, and every worker that reads the log finds nothing to do.
+# NoRefusedRepair breaks it the same way for a turn the harness refused,
+# which ends through an `ended` entry and no record: libfx repaired only a
+# turn a record ended, which on the refuse graph is no repair at all.
+# NoEndHow breaks EndSaysHow: when the record that ends a turn does not say
+# how, as before libfx recorded it, the worker that writes a crashed
+# holder's missing turn_end can only say unknown. NoRefusedHow breaks it
+# the same way for a refused turn's `ended` entry.
+# NoReplyRepair breaks ReplyShownOnce: when the record that ends a turn does
+# not hold its reply, as before libfx put it there, a holder that crashed
+# while its answer's last text lines were on their way leaves the reply cut
+# short, and the worker that writes its missing turn_end cannot finish it.
+# LeasedStaleShown breaks StaleShownPerFreeze, which the leased graph checks:
+# when a woken worker whose renewed lease ran out writes before a renewal of
+# its own lands, as before libfx waited for one, more of a replaced worker's
+# late lines show between its successor's claim and first line than the one
+# it had on its way when it froze.
+# NoResumeFill breaks ReplyShownOnceUnlessLate, which the saved graph checks:
+# when the worker that ends a resumed turn with its saved answer shows only
+# its turn_end, as the engine streams none of that answer, the answer stays
+# as cut short as the crashed holder's lines left it.
+# NoReplyAtLine breaks it too: when a resumed worker restarted the answer
+# after a notice and died after the record that ends the turn, a worker that
+# reads the turn's text only whole or from the last turn_resume line, as
+# libfx did, finds no start of the answer there and shows all of it again.
+# NoEndDecides breaks EndSaysHow: when a cancel that came while the record
+# that ends the turn was on its way is answered, as libfx answered it, the
+# turn_end says cancelled while the log says the turn ended end_turn.
 for pair in UiInOrder:UiInOrder NoStaleShown:NoStaleShown NotTwoActive:NotTwoActive \
     NoSelfStop:TwoActiveNeedsFreeze NoClaimFence:EffectsAtMostOnce NoCutoffBound:HandoffsBounded \
     LeasedTwoActive:NotTwoActive LookupRunsAhead:EveryCallAfterIntent LookupNewId:IdsAtMostOne \
-    WriteRunsAhead:OneExecutionId; do
+    WriteRunsAhead:OneExecutionId NoEndRepair:EndRecoverable NoRefusedRepair:EndRecoverable \
+    NoEndHow:EndSaysHow NoRefusedHow:EndSaysHow NoReplyRepair:ReplyShownOnce \
+    LeasedStaleShown:StaleShownPerFreeze NoResumeFill:ReplyShownOnceUnlessLate \
+    NoReplyAtLine:ReplyShownOnceUnlessLate NoEndDecides:EndSaysHow; do
     witness="${pair%%:*}" invariant="${pair#*:}"
     if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/w-$witness" \
         -config "Witness-$witness.cfg" DurableSession.tla 2>&1 | grep -q -E "Invariant $invariant is violated"; then
@@ -88,16 +137,67 @@ done
 # Each witness turns one rule off and must break the property it protects:
 # without Interrupt a steer waits on a streaming reply, without HandBack a
 # cancel loses a steer that never reached the model, without JoinBeforeStart
-# a steer sent before the first turn starts runs as a turn of its own, and
-# without Dedupe a retried steer reaches the model twice.
+# a steer sent before the first turn starts runs as a turn of its own,
+# without Dedupe a retried steer reaches the model twice, without
+# ReadAfterTool a steer stored while a tool runs misses the request after
+# its result when the worker has not read the log since, without
+# CallWaits a steer sent once a reply ended in a tool call ends the turn and
+# runs as a turn of its own, without ReadAtEnd so does one another server
+# stores while the last reply streams, and without LateRunsNext a steer
+# stored after the turn's last read is lost when the worker counts it as
+# taken by the ending turn.
 for pair in NoInterrupt:NoSteerWaitsOnReply NoHandBack:NothingLost \
-    NoJoinBeforeStart:PreStartJoins NoDedupe:AtMostOnce; do
+    NoJoinBeforeStart:PreStartJoins NoDedupe:AtMostOnce NoReadAfterTool:SteerInNextRequest \
+    NoCallWait:NoParkedSteer NoReadAtEnd:NoParkedSteer NoLateRunsNext:LateSteerRunsNext; do
     witness="${pair%%:*}" invariant="${pair#*:}"
     if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/sw-$witness" \
         -config "SteerWitness-$witness.cfg" DurableSteer.tla 2>&1 | grep -q -E "Invariant $invariant is violated"; then
         echo "== steer witness $witness reached"
     else
         echo "== steer witness $witness NOT reached" >&2; status=1
+    fi
+done
+
+# UiStream.tla: a session's UI stream as a reader in another process sees it
+# while a worker writes it. libfx writes each line before the next unless
+# the World keeps a batch's order, as Vercel's does: on either World the
+# live reader gets what a replay gets. The Batched witness writes batches to
+# a World that writes a batch's chunks in parallel, as libfx did on
+# world-local, and the live reader gets a line under another cursor than a
+# replay gives it. The takeover config freezes the first worker with a write
+# on its way while a second takes over, on a World that places a chunk where
+# it lands, as memory() and Vercel's do: the late chunk lands after what
+# readers have. The local-takeover config does the same on libfx's bundled
+# world-local, which lands a chunk only at the place after the newest, and
+# its graph is the one drive-uistream.mjs walks. The LateLine witness places
+# a chunk where its write started, as world-local 5.1.1 does: the late chunk
+# goes ahead of lines a reader already has. The StaleName witness names a
+# chunk just before it lands but lands it there even when another chunk
+# landed since, as a writer frozen between the two would. The fill config is
+# the local-takeover one where the second worker ends the turn with the
+# reply the first one saved: it reads the stream once its turn_resume is
+# visible and writes the parts readers lack, and readers show each part
+# once. The FillTwice witness does that where a chunk's place is fixed when
+# its write starts: the first worker's late part shows ahead of the second's
+# lines, after the second read the stream without it, so it shows twice.
+for config in local vercel takeover local-takeover fill; do
+    echo "== UiStream ($config)"
+    dump=""
+    [ "$config" = local-takeover ] && dump="-dump dot,actionlabels graphs/ui-local-takeover"
+    # shellcheck disable=SC2086 # $dump is two words or none
+    if ! "$java" -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup -metadir "$work/ui-$config" $dump \
+        -config "UiStream-$config.cfg" UiStream.tla > "$work/ui-$config.log" 2>&1; then
+        cat "$work/ui-$config.log"; status=1; continue
+    fi
+    grep -E 'distinct states|depth of' "$work/ui-$config.log"
+done
+for pair in Batched:LiveIsReplay LateLine:LiveIsReplay StaleName:LiveIsReplay FillTwice:FillShowsOnce; do
+    witness="${pair%%:*}" invariant="${pair#*:}"
+    if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/uw-$witness" \
+        -config "UiStreamWitness-$witness.cfg" UiStream.tla 2>&1 | grep -q -E "Invariant $invariant is violated"; then
+        echo "== ui witness $witness reached"
+    else
+        echo "== ui witness $witness NOT reached" >&2; status=1
     fi
 done
 
@@ -160,9 +260,14 @@ done
 # that stages every named image fails on one the window had dropped.
 # ToolBeforeStore breaks NoDanglingRef: a tool result handed to the core
 # while its image write is in flight leaves a record naming an image the
-# store does not hold. InlineUncounted breaks WindowBound: a window that
-# never counts a tool image the store refused holds more than Window images.
-for pair in SendBeforeStore:NoDanglingRef NameUnstored:NoDanglingRef DropMissing:OpenExact RetryLands:NoDanglingRef KeepAll:WindowHeld NeedAll:FailsOnlyOnLossInWindow ToolBeforeStore:NoDanglingRef InlineUncounted:WindowBound; do
+# store does not hold. InlineUncounted breaks HeldFitsRequest: a window that
+# never counts a tool image the store refused holds more than one model
+# request carries. WindowShort breaks RequestSeesAll: a window with fewer
+# bytes than a request's budget drops an image the request carries.
+# WindowPastRequest breaks HeldFitsRequest: a window of more images than a
+# request carries, as before the window was the budget, holds and stages
+# images no request carries.
+for pair in SendBeforeStore:NoDanglingRef NameUnstored:NoDanglingRef DropMissing:OpenExact RetryLands:NoDanglingRef KeepAll:WindowHeld NeedAll:FailsOnlyOnLossInWindow ToolBeforeStore:NoDanglingRef InlineUncounted:HeldFitsRequest WindowShort:RequestSeesAll WindowPastRequest:HeldFitsRequest; do
     witness="${pair%%:*}" invariant="${pair#*:}"
     if "$java" -cp "$jar" tlc2.TLC -workers auto -cleanup -metadir "$work/images-$witness" \
         -config "ImageStore-$witness.cfg" ImageStore.tla 2>&1 | grep -q -F "Invariant $invariant is violated"; then
@@ -217,24 +322,35 @@ done
 # TrustBody runs a forged delivery, ShareName runs one tenant's prompt on
 # another's agent, RouteByName strands a prompt on another store,
 # NoAdmission stores an oversized input, and Today, every rule off as libfx
-# was before them, runs a prompt in another tenant's store.
-echo "== TenantIsolation (route)"
-if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup \
-    -metadir "$work/tenants-route" -dump dot,actionlabels graphs/tenants-route \
-    -config TenantIsolation-route.cfg TenantIsolation.tla > "$work/tenants-route.log" 2>&1; then
-    cat "$work/tenants-route.log"; status=1
-else
-    grep -E 'distinct states|depth of' "$work/tenants-route.log"
-fi
-if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/tenants-drains" \
-    -config TenantIsolation-drains.cfg TenantIsolation.tla > "$work/tenants-drains.log" 2>&1; then
-    echo "== TenantIsolation (drains): SentRuns holds"
-else
-    cat "$work/tenants-drains.log"; status=1
-fi
+# was before them, runs a prompt in another tenant's store. The dev graph,
+# two tenants on one store under NODE_ENV=development, is what
+# ../drivers/drive-tenants.mjs --development walks. DevReplaces shows a
+# replaced agent's prompt running on its replacement, DevOtherStore that a
+# replacement on another store under the same key leaves it unrun, and
+# DevOldestWins that without NewestWins an agent created on the default store
+# that learns its store late replaces a newer agent there, as libfx did.
+for config in route dev; do
+    echo "== TenantIsolation ($config)"
+    if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup \
+        -metadir "$work/tenants-$config" -dump dot,actionlabels "graphs/tenants-$config" \
+        -config "TenantIsolation-$config.cfg" TenantIsolation.tla > "$work/tenants-$config.log" 2>&1; then
+        cat "$work/tenants-$config.log"; status=1
+    else
+        grep -E 'distinct states|depth of' "$work/tenants-$config.log"
+    fi
+done
+for config in drains dev-drains; do
+    if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/tenants-$config" \
+        -config "TenantIsolation-$config.cfg" TenantIsolation.tla > "$work/tenants-$config.log" 2>&1; then
+        echo "== TenantIsolation ($config): SentRuns holds"
+    else
+        cat "$work/tenants-$config.log"; status=1
+    fi
+done
 for pair in "TrustBody:Invariant OnlySentRuns is violated" "ShareName:Invariant RunsOnSenderAgent is violated" \
     "RouteByName:Temporal properties were violated" "NoAdmission:Invariant StoredWithinLimit is violated" \
-    "Today:Invariant RunsInSenderStore is violated"; do
+    "Today:Invariant RunsInSenderStore is violated" "DevReplaces:Invariant RunsOnSenderAgent is violated" \
+    "DevOtherStore:Temporal properties were violated" "DevOldestWins:Invariant ReplacedByNewer is violated"; do
     witness="${pair%%:*}" verdict="${pair#*:}"
     if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/tw-$witness" \
         -config "TenantWitness-$witness.cfg" TenantIsolation.tla 2>&1 | grep -q -F "$verdict"; then

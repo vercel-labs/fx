@@ -13,12 +13,31 @@
 import { parentPort, workerData } from "node:worker_threads";
 import { sharedSet } from "./shared-set.mjs";
 
-const { w, liveBuffer, announcedBuffer, tool, toolFlags, runsAhead, durabilityKind, leaseMs, streamQuietMs, backend, addon, wasm, hooks } = workerData;
+const { w, liveBuffer, announcedBuffer, tool, toolFlags, runsAhead, durabilityKind, leaseMs, streamQuietMs, backend, addon, wasm, hooks, refused } = workerData;
 // Set before libfx loads, which keeps a set it finds.
 globalThis[Symbol.for("libfx.liveHolders")] = sharedSet(liveBuffer);
 const announced = sharedSet(announcedBuffer);
 
 const { createFxAgent } = await import("../../../sdk/node.js");
+const { foldSessionLog } = await import("../../../sdk/durable.js");
+// On the refuse graph, an fx agent whose prompt() stores a prompt fx refuses,
+// as an earlier libfx's did: its harness has no checkPrompt, so the worker
+// refuses the prompt only when its turn runs.
+const createAgent = refused ? await (async () => {
+  const { createDurableAgentFactory } = await import("../../../sdk/durable.js");
+  const { fxHarness } = await import("../../../sdk/fx-harness.js");
+  const { createFxEngine } = await import("../../../sdk/node.js");
+  const fx = fxHarness({ createEngine: createFxEngine });
+  return createDurableAgentFactory({
+    name: "createFxAgent",
+    label: "fx agent",
+    defaultDurability: async () => { throw new Error("each walk gives its agent a durability"); },
+    harness: (options) => {
+      const { checkPrompt: _checkPrompt, ...unchecked } = fx(options);
+      return unchecked;
+    },
+  });
+})() : createFxAgent;
 const { local } = await import("../../../sdk/durable/local.mjs");
 const { holdWrites } = await import("../../../sdk/tests/hold-writes.mjs");
 // The fixture checks its events at the exit of its process, which a thread
@@ -88,6 +107,97 @@ function withoutBackstops(durability) {
   };
 }
 
+// Holds each write to the session stream that carries a turn_end line, or a
+// text_delta line of the answer, that its worker writes while it heads the
+// session's chain, until the driver lets it go, so a walk can stop a worker
+// between the record that ends its turn and those lines
+// (`tests/tla/sdk/DurableSession.tla` Model2, EndLine). Each held line goes
+// out by itself, in order: `releaseText(k)` lets the first k text lines go,
+// as Model2 lands the record with them, and `release()` every line until
+// the worker's turn_end, as EndLine. A replaced worker's late lines go out
+// at once, as the model's Model2 and MaybeLine have it.
+function holdEndLines(durability, heads, changed) {
+  const waiting = [];
+  // Set by release(): every held line goes out until a turn_end has.
+  let draining = false;
+  const decoder = new TextDecoder();
+  const kindOf = (chunk) => {
+    try {
+      const type = JSON.parse(typeof chunk === "string" ? chunk : decoder.decode(chunk)).type;
+      return type === "turn_end" ? "end" : type === "text_delta" ? "text" : null;
+    } catch {
+      return null;
+    }
+  };
+  const hold = (kind) => (draining ? Promise.resolve() : new Promise((go) => {
+    waiting.push({ kind, go });
+    changed();
+  }));
+  const went = (kind) => {
+    if (kind === "end") draining = false;
+  };
+  const ends = {
+    get held() { return waiting.filter((entry) => entry.kind === "end").length; },
+    get texts() { return waiting.filter((entry) => entry.kind === "text").length; },
+    release() {
+      draining = true;
+      for (const { go } of waiting.splice(0)) go();
+      changed();
+    },
+    // Each text line is written only once the one before it is, so the next
+    // one is waited for.
+    async releaseText(count) {
+      for (let released = 0; released < count; released += 1) {
+        const started = Date.now();
+        while (!waiting.some((entry) => entry.kind === "text")) {
+          if (Date.now() - started > 2000) return;
+          await sleep(5);
+        }
+        const [entry] = waiting.splice(waiting.findIndex((item) => item.kind === "text"), 1);
+        entry.go();
+        changed();
+      }
+    },
+  };
+  const bound = (target, key) => {
+    const value = Reflect.get(target, key);
+    return typeof value === "function" ? value.bind(target) : value;
+  };
+  return [{
+    ...durability,
+    async world() {
+      const world = await durability.world();
+      const streams = new Proxy(world.streams, {
+        get(target, key) {
+          if (key === "write") {
+            return async (runId, name, chunk) => {
+              const kind = kindOf(chunk);
+              if (kind === null || !(await heads(runId))) return target.write(runId, name, chunk);
+              await hold(kind);
+              const written = await target.write(runId, name, chunk);
+              went(kind);
+              return written;
+            };
+          }
+          if (key === "writeMulti") {
+            return async (runId, name, chunks) => {
+              if (!chunks.some((chunk) => kindOf(chunk) !== null) || !(await heads(runId))) return target.writeMulti(runId, name, chunks);
+              for (const chunk of chunks) {
+                const kind = kindOf(chunk);
+                if (kind !== null) await hold(kind);
+                await target.writeMulti(runId, name, [chunk]);
+                if (kind !== null) went(kind);
+              }
+            };
+          }
+          return bound(target, key);
+        },
+      });
+      return new Proxy(world, { get: (target, key) => (key === "streams" ? streams : bound(target, key)) });
+    },
+  }, ends];
+}
+
 // The walk now open, and what of it waits on the driver. Every message to the
 // driver names the walk it comes from, so one a closed walk's agent sends
 // late is dropped.
@@ -109,10 +219,15 @@ const methods = {
     const stored = leasedWorld ? leasedWorld(dir) : durabilityKind === "world" ? await appWorldAt(dir) : durabilityKind === "vercel" ? vercelStorage({ dir }) : queueWorld ? queueWorld.durability : local({ dir });
     // What the driver reads of the held writes: their kind, a lease's
     // holder, and whether one is a frozen worker's renewal.
+    // And how many turn_end and answer text lines it holds.
     const postHeld = () => {
-      if (walk === state) post(state, { type: "held", held: state.writes.held.map((entry) => ({ k: entry.k, holder: entry.holder ?? null, renewal: renewals.has(entry) })) });
+      if (walk === state) post(state, { type: "held", held: state.writes.held.map((entry) => ({ k: entry.k, holder: entry.holder ?? null, renewal: renewals.has(entry) })), ends: state.ends.held, texts: state.ends.texts });
     };
-    const [durability, writes] = holdWrites(withoutBackstops(stored), (entry) => {
+    // Whether the chain's latest lease is one this worker claimed.
+    const heads = async (sessionId) => claims.has((await state.agent[durableInternals].lastLease(sessionId))?.holder);
+    const [ending, ends] = holdEndLines(withoutBackstops(stored), heads, () => queueMicrotask(postHeld));
+    state.ends = ends;
+    const [durability, writes] = holdWrites(ending, (entry) => {
       // The write is held, if it is, once this returns.
       queueMicrotask(postHeld);
       // The first intent of a call that runs ahead waits for the Intent step.
@@ -132,7 +247,7 @@ const methods = {
     state.writes = writes;
     state.broker = queueWorld?.broker ?? null;
     state.postHeld = postHeld;
-    state.agent = createFxAgent({
+    state.agent = createAgent({
       ...(observedHooks ? { hooks: observedHooks } : {}),
       backend,
       nativeAddon: addon,
@@ -215,6 +330,22 @@ const methods = {
     await settled;
     walk.postHeld();
   },
+  // The lines held now go out, and so does each this worker writes until
+  // its turn_end (`tests/tla/sdk/DurableSession.tla` EndLine).
+  releaseEnds() {
+    walk.ends.release();
+  },
+  // The first `count` held text lines of the answer go out
+  // (`tests/tla/sdk/DurableSession.tla` Model2).
+  async releaseText({ count }) {
+    await walk.ends.releaseText(count);
+  },
+  // Whether the log holds the end of the session's turn.
+  async turnEnded({ sessionId }) {
+    const log = await walk.agent[durableInternals].openLog(sessionId);
+    const state = foldSessionLog(await log.read());
+    return state.openTurn === null && state.lastTurnId !== null;
+  },
   // A claim lands: the holder of the last held lease, and the live holders
   // just before it goes out.
   async claim() {
@@ -270,6 +401,7 @@ const methods = {
     if (!state) return;
     walk = null;
     state.writes.release();
+    state.ends.release();
     for (const resolveRequest of state.requests.values()) resolveRequest([{ type: "error", errorText: "walk over" }]);
     for (const resolveCall of state.calls.values()) resolveCall();
     state.requests.clear();

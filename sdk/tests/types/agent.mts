@@ -83,7 +83,10 @@ export async function sessionsAndTurns(agent: FxAgent): Promise<void> {
   assertType<Equal<typeof result.stopReason, FxStopReason | "error" | "unknown">>();
   assertType<Equal<typeof result.usage, FxUsage | undefined>>();
   assertType<Equal<typeof result.repeated, true | undefined>>();
-  if (result.stopReason === "error") console.log(result.error?.name, result.error?.message, result.error?.code);
+  assertType<Equal<typeof result.endedBySteer, string | undefined>>();
+  if (result.stopReason === "error") console.log(result.error?.name, result.error?.message, result.error?.code, result.error?.model, result.error?.capability);
+  // A turn a steer with images ended, told apart from one the user cancelled.
+  if (result.stopReason === "cancelled") console.log(result.endedBySteer === undefined ? "cancelled" : `steered by ${result.endedBySteer}`);
   console.log(result.epoch);
 
   for await (const event of retried) {
@@ -153,7 +156,7 @@ export function readLine(text: string): string | undefined {
     case "turn_resume":
       return line.sessionId;
     case "turn_end":
-      return `${line.messageId} ${line.stopReason} ${line.cursor ?? "-"} ${line.epoch ?? "-"}`;
+      return `${line.messageId} ${line.stopReason} ${line.endedBySteer ?? "-"} ${line.cursor ?? "-"} ${line.epoch ?? "-"}`;
     case "idle":
       return line.requestId;
     case "text_delta":

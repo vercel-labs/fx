@@ -46,6 +46,13 @@
 //! first progress carries the host's id for the turn in `turnId`. A steer
 //! belongs to the turn it arrives in; a follow-up waits for the turn that
 //! runs it.
+//!
+//! A turn's end, its `turn_committed` or `turn_progress_cleared`, says how
+//! the turn ended in `stopReason`: the stop reason its prompt answers with,
+//! or `error` for a prompt that fails. A crash before that answer reaches
+//! the host leaves the host its turn's outcome (DUR-20). An fx reads only
+//! the fields it knows, so the field leaves the event at version 1; an end
+//! an earlier fx wrote has none.
 const std = @import("std");
 const types = @import("../../shared/types.zig");
 const testing_allocator = @import("../../shared/testing_allocator.zig");
@@ -170,16 +177,36 @@ pub const Cursor = struct {
 
     /// Writes `event` as one JSON object and returns the cursor after it.
     pub fn write(self: Cursor, writer: *std.Io.Writer, event: Event) !Cursor {
-        return self.writeWith(writer, event, null);
+        return self.writeWith(writer, event, null, null);
     }
 
     /// Like `write`, but names the images `stored` holds instead of writing
     /// their bytes.
     pub fn writeNamingImages(self: Cursor, writer: *std.Io.Writer, event: Event, stored: *const session_codec.StoredImages) !Cursor {
-        return self.writeWith(writer, event, stored);
+        return self.writeWith(writer, event, stored, null);
     }
 
-    fn writeWith(self: Cursor, writer: *std.Io.Writer, event: Event, stored: ?*const session_codec.StoredImages) !Cursor {
+    /// Writes a turn's end, `turn_committed` or `turn_progress_cleared`,
+    /// with `stop_reason`, how the turn ended. Names the images `stored`
+    /// holds when it is set.
+    pub fn writeEnd(
+        self: Cursor,
+        writer: *std.Io.Writer,
+        event: Event,
+        stored: ?*const session_codec.StoredImages,
+        stop_reason: []const u8,
+    ) !Cursor {
+        std.debug.assert(event == .turn_committed or event == .turn_progress_cleared);
+        return self.writeWith(writer, event, stored, stop_reason);
+    }
+
+    fn writeWith(
+        self: Cursor,
+        writer: *std.Io.Writer,
+        event: Event,
+        stored: ?*const session_codec.StoredImages,
+        stop_reason: ?[]const u8,
+    ) !Cursor {
         try writer.print("{{\"v\":{d},\"seq\":{d},\"turn\":{d},\"type\":\"{s}\"", .{
             event.eventVersion(stored),
             self.next_seq,
@@ -260,6 +287,10 @@ pub const Cursor = struct {
                 }
                 try writer.writeByte('}');
             },
+        }
+        if (stop_reason) |reason| {
+            try writer.writeAll(",\"stopReason\":");
+            try std.json.Stringify.value(reason, .{}, writer);
         }
         try writer.writeByte('}');
         return .{
@@ -1904,6 +1935,47 @@ test "an event that names no image is version 1, byte for byte" {
     _ = try (Cursor{}).writeNamingImages(&named.writer, .{ .turn_committed = turn }, &stored);
     try std.testing.expectEqualStrings(plain.written(), named.written());
     try std.testing.expect(std.mem.startsWith(u8, named.written(), "{\"v\":1,"));
+}
+
+test "a turn's end says how it ended at version 1, and folds as an end without it does, after a snapshot too" {
+    const alloc = std.testing.allocator;
+    const first = try testTurn(alloc, "list files", "two files");
+    defer types.freeHistoryTurn(alloc, first);
+    var progress = try testProgress(alloc, "read one");
+    defer progress.deinit(alloc);
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    var cursor: Cursor = .{};
+    try out.writer.writeByte('[');
+    cursor = try cursor.write(&out.writer, .{ .turn_progress = .{ .checkpoint = progress, .turn_id = "turn-a" } });
+    try out.writer.writeByte(',');
+    cursor = try cursor.writeEnd(&out.writer, .{ .turn_committed = first }, null, "end_turn");
+    try out.writer.writeByte(',');
+    cursor = try cursor.write(&out.writer, .{ .turn_progress = .{ .checkpoint = progress, .turn_id = "turn-b" } });
+    try out.writer.writeByte(',');
+    const tail_from = out.written().len;
+    cursor = try cursor.writeEnd(&out.writer, .turn_progress_cleared, null, "cancelled");
+    try out.writer.writeByte(']');
+    const written = out.written();
+    try std.testing.expect(std.mem.find(u8, written, "\"type\":\"turn_committed\"") != null);
+    try std.testing.expect(std.mem.find(u8, written, ",\"stopReason\":\"end_turn\"}") != null);
+    try std.testing.expect(std.mem.find(u8, written, "{\"v\":1,\"seq\":4,\"turn\":2,\"type\":\"turn_progress_cleared\",\"stopReason\":\"cancelled\"}") != null);
+
+    var folded = try fold(alloc, written);
+    defer folded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), folded.history.len);
+    try std.testing.expect(folded.open_turn == null);
+    try std.testing.expectEqualStrings("turn-b", folded.last_turn_id.?);
+    try std.testing.expectEqual(Cursor{ .next_seq = 5, .turn = 2 }, folded.cursor);
+
+    // A snapshot through the third event, then the cleared end after it.
+    const tail = try std.mem.concat(alloc, u8, &.{ "[", written[tail_from..] });
+    defer alloc.free(tail);
+    var resumed = try foldFrom(alloc, tail, .{ .history = &.{first}, .cursor = .{ .next_seq = 4, .turn = 2 } });
+    defer resumed.deinit(alloc);
+    try std.testing.expect(resumed.open_turn == null);
+    try std.testing.expectEqual(folded.cursor, resumed.cursor);
 }
 
 test "one fold names every image the host did not stage" {

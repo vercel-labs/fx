@@ -438,6 +438,11 @@ const App = struct {
         return null;
     }
 
+    pub fn workspaceHostRefusal(self: *const Self) ?js_host_workspace.InfoError {
+        if (comptime host_profile.js_host_workspace) return self.workspace_host.refusal;
+        return null;
+    }
+
     pub fn promptPolicy(_: *const Self) prompt_policy.Policy {
         return builtin_context.prompt_policy;
     }
@@ -504,6 +509,24 @@ const App = struct {
             app_callbacks.Bindings(App).workerEventHandlers(self),
         );
         try self.flushRequestedFrame();
+    }
+
+    /// One round of a blocking wait, such as an approval prompt, on the
+    /// single-threaded host: draw and handle input, then suspend until input
+    /// arrives or the idle poll elapses so the page keeps running. False when
+    /// fx is exiting or the host failed, which ends the wait.
+    pub fn cooperativeWait(self: *Self) bool {
+        if (comptime !host_target.is_wasm) return false;
+        self.cooperativeTransportPulse() catch |err| {
+            debug_trace.logf("worker", "event=cooperative_wait_failed stage=pulse err={s}", .{@errorName(err)});
+            return false;
+        };
+        if (self.should_exit) return false;
+        _ = self.terminal.pollInput(idle_wasm_poll_timeout_ms) catch |err| {
+            debug_trace.logf("worker", "event=cooperative_wait_failed stage=poll err={s}", .{@errorName(err)});
+            return false;
+        };
+        return true;
     }
 
     pub fn secretStore(self: *const Self) host.SecretStore {
@@ -656,7 +679,7 @@ const App = struct {
                 if (err != error.WorkspaceUnavailable) {
                     debug_trace.logf("workspace", "js host workspace unavailable err={s}", .{@errorName(err)});
                 }
-                break :blk .{};
+                break :blk js_host_workspace.Runtime.without(err);
             };
         }
         if (comptime host_profile.js_host_prompt_history) {
@@ -4938,6 +4961,7 @@ test {
     _ = @import("mcp/mcp.zig");
     _ = @import("core/mcp_host/runtime.zig");
     _ = @import("napi_fetch_state.zig");
+    _ = @import("napi_runtime_shares.zig");
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");
     _ = @import("gateway/chat_completions_protocol.zig");

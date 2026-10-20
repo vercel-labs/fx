@@ -2,6 +2,7 @@ const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const image_data = @import("../images/image_data.zig");
+const request_image_budget = @import("../agent/runtime/request_image_budget.zig");
 const session = @import("session.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
@@ -133,6 +134,19 @@ pub const TurnAuthority = struct {
     }
 };
 
+/// What the model is told when a turn continues after the process that ran
+/// it crashed (DUR-42). libfx's engine and the CLI both add it through
+/// `RecoveryCheckpoint.resumed`.
+pub const crash_resume_notice = "Resuming from unexpected session interruption.";
+
+/// What `RecoveryCheckpoint.resumed` added after a turn's own steering for
+/// one resume: the crash notice, then the inputs the turn accepted and never
+/// placed.
+pub const ResumeAdditions = struct {
+    notice: bool = false,
+    inputs: usize = 0,
+};
+
 pub const RecoveryCheckpoint = struct {
     version: u8 = 2,
     disposition: enum { continuable, history_only } = .continuable,
@@ -151,6 +165,22 @@ pub const RecoveryCheckpoint = struct {
     max_provider_attempts: usize,
     consumed_provider_attempts: usize,
     outstanding_reservation: bool = false,
+    /// What the resume this copy is for added to `execution.steering`
+    /// (`resumed`). Never persisted: a checkpoint saved later in the turn
+    /// keeps those entries as steering the turn took.
+    resume_added: ResumeAdditions = .{},
+
+    /// Whether resuming this checkpoint ends its turn with the reply saved
+    /// just before the turn ended, asking the model nothing
+    /// (`tests/tla/durable/Resumption.tla` SavedAnswerNotRequested). Inputs
+    /// the resume added never reached that reply, so the turn goes on to ask
+    /// the model with them.
+    pub fn deliversSavedResponse(self: RecoveryCheckpoint) bool {
+        return self.action == .delivering_response and
+            self.tool_state == .none and
+            self.resume_added.inputs == 0 and
+            std.mem.trim(u8, self.assistant_source, " \t\r\n").len > 0;
+    }
 
     /// Borrows the checkpoint's exact user and uncommitted response suffix.
     pub fn interruptedTurn(self: RecoveryCheckpoint) types.HistoryTurn {
@@ -160,6 +190,30 @@ pub const RecoveryCheckpoint = struct {
             .execution = self.execution,
             .terminal_reason = .failed,
         } };
+    }
+
+    /// An owned copy that continues after the steps the turn already took.
+    /// When `crashed`, the model is told the process crashed and the turn is
+    /// resuming (`crash_resume_notice`); then it sees `inputs`, texts the
+    /// turn accepted and never placed, in order. `resume_added` says what
+    /// was added, so a turn that delivers its saved reply instead of asking
+    /// the model keeps none of it.
+    pub fn resumed(self: RecoveryCheckpoint, alloc: Allocator, crashed: bool, inputs: []const []const u8) !RecoveryCheckpoint {
+        const old = self.execution.steering;
+        const notices: usize = @intFromBool(crashed);
+        const steering = try alloc.alloc(types.PersistedSteering, old.len + notices + inputs.len);
+        defer alloc.free(steering);
+        @memcpy(steering[0..old.len], old);
+        const after = self.execution.tool_steps.len;
+        if (crashed) steering[old.len] = .{ .text = @constCast(crash_resume_notice), .after_tool_step_count = after };
+        for (inputs, steering[old.len + notices ..]) |text, *entry| {
+            entry.* = .{ .text = @constCast(text), .after_tool_step_count = after };
+        }
+        // `dupe` copies the steering, so this view only borrows it.
+        var view = self;
+        view.execution.steering = steering;
+        view.resume_added = .{ .notice = crashed, .inputs = inputs.len };
+        return view.dupe(alloc);
     }
 
     pub fn deinit(self: *RecoveryCheckpoint, alloc: Allocator) void {
@@ -196,6 +250,7 @@ pub const RecoveryCheckpoint = struct {
             .max_provider_attempts = self.max_provider_attempts,
             .consumed_provider_attempts = self.consumed_provider_attempts,
             .outstanding_reservation = self.outstanding_reservation,
+            .resume_added = self.resume_added,
         };
     }
 };
@@ -629,28 +684,35 @@ pub fn checkpointNamesImages(checkpoint: RecoveryCheckpoint, delta: ?ExecutionCo
     return executionNamesImages(checkpoint.execution, delta orelse .{}, stored);
 }
 
-/// The images a libfx session with an image store keeps: its newest, at most
-/// `max_images` of them holding at most `max_bytes`. An open stages these from
-/// the host's store, with the open turn's, which the window leaves out. Older
-/// images leave the session and keep only their names, so a session never
-/// grows past what it can reopen.
+/// The images a libfx session with an image store keeps: its newest, as many
+/// as one model request carries (`request_image_budget.zig`), at most
+/// `max_images` of them whose base64 takes at most `max_bytes`. A request
+/// leaves every older image out anyway, newest first being what it keeps, so
+/// the model sees the images it would see if the session kept them all. An
+/// open stages these from the host's store, with the open turn's, which the
+/// window leaves out. Older images leave the session and keep only their
+/// names, so a session never grows past what it can reopen.
 pub const ImageWindow = struct {
-    max_images: usize = 4096,
-    max_bytes: usize = 512 * 1024 * 1024,
+    max_images: usize = request_image_budget.default_max_request_images,
+    max_bytes: usize = request_image_budget.default_max_request_bytes,
 
     /// How many of the oldest images leave the window. `sizes` holds each
-    /// image's bytes, oldest first, or null for one that already left, which
-    /// keeps it and every older one out. Once an image does not fit, it and
-    /// every older one leave.
+    /// image's decoded bytes, oldest first, or null for one that already
+    /// left, which keeps it and every older one out. Each counts as the
+    /// base64 a request carries for it (`image_data.encodedImageBytes`).
+    /// Once an image does not fit, it and every older one leave.
     pub fn oldestOutside(self: ImageWindow, sizes: []const ?usize) usize {
         var kept: usize = 0;
         var bytes: usize = 0;
         var start = sizes.len;
         while (start > 0) : (start -= 1) {
             const size = sizes[start - 1] orelse break;
-            if (kept == self.max_images or size > self.max_bytes - bytes) break;
+            // A size a record gives may be any number; one whose base64
+            // overflows fits no window.
+            const encoded = image_data.encodedImageBytes(size) orelse break;
+            if (kept == self.max_images or encoded > self.max_bytes - bytes) break;
             kept += 1;
-            bytes += size;
+            bytes += encoded;
         }
         return start;
     }
@@ -5503,18 +5565,75 @@ test "inline image bytes round trip through the history turn codec" {
 }
 
 test "the image window keeps the newest images that fit, and drops every older one" {
+    // Sizes are decoded bytes; the window counts their base64, 4 bytes for
+    // every 3 or part of 3.
     const window: ImageWindow = .{ .max_images = 3, .max_bytes = 100 };
     try std.testing.expectEqual(@as(usize, 0), window.oldestOutside(&.{}));
-    try std.testing.expectEqual(@as(usize, 0), window.oldestOutside(&.{ 10, 20, 30 }));
+    try std.testing.expectEqual(@as(usize, 0), window.oldestOutside(&.{ 12, 24, 30 }));
     // Three images at most: the oldest of four leaves.
-    try std.testing.expectEqual(@as(usize, 1), window.oldestOutside(&.{ 10, 20, 30, 40 }));
-    // 100 bytes at most: 60 does not fit beside 40 and 30, so it and the
-    // 5 before it leave, though 5 alone would fit.
-    try std.testing.expectEqual(@as(usize, 2), window.oldestOutside(&.{ 5, 60, 30, 40 }));
+    try std.testing.expectEqual(@as(usize, 1), window.oldestOutside(&.{ 3, 3, 3, 3 }));
+    // 100 bytes of base64 at most: 45 and 30 decoded bytes take 60 and 40,
+    // which fit exactly; one byte more takes 4 more and does not.
+    try std.testing.expectEqual(@as(usize, 0), window.oldestOutside(&.{ 45, 30 }));
+    try std.testing.expectEqual(@as(usize, 1), window.oldestOutside(&.{ 45, 31 }));
+    // 45 does not fit beside 30 and 15, so it and the 3 before it leave,
+    // though 3 alone would fit.
+    try std.testing.expectEqual(@as(usize, 2), window.oldestOutside(&.{ 3, 45, 30, 15 }));
     // An image already dropped keeps every older one out.
-    try std.testing.expectEqual(@as(usize, 2), window.oldestOutside(&.{ 10, null, 30, 40 }));
-    // An image larger than the whole window leaves too.
-    try std.testing.expectEqual(@as(usize, 1), window.oldestOutside(&.{101}));
+    try std.testing.expectEqual(@as(usize, 2), window.oldestOutside(&.{ 3, null, 3, 3 }));
+    // An image larger than the whole window leaves too, and so does one
+    // whose base64 would overflow.
+    try std.testing.expectEqual(@as(usize, 0), window.oldestOutside(&.{75}));
+    try std.testing.expectEqual(@as(usize, 1), window.oldestOutside(&.{76}));
+    try std.testing.expectEqual(@as(usize, 1), window.oldestOutside(&.{std.math.maxInt(usize)}));
+}
+
+test "the image window is one model request's image budget, at both of its edges" {
+    const window: ImageWindow = .{};
+    try std.testing.expectEqual(request_image_budget.default_max_request_images, window.max_images);
+    try std.testing.expectEqual(request_image_budget.default_max_request_bytes, window.max_bytes);
+    // 100 images, and no more.
+    const small: [request_image_budget.default_max_request_images + 1]?usize = @splat(12);
+    try std.testing.expectEqual(@as(usize, 0), window.oldestOutside(small[1..]));
+    try std.testing.expectEqual(@as(usize, 1), window.oldestOutside(&small));
+    // 30 MiB of base64 is 22.5 MiB decoded: that fits, one byte more does not.
+    const fills = request_image_budget.default_max_request_bytes / 4 * 3;
+    try std.testing.expectEqual(@as(usize, 0), window.oldestOutside(&.{fills}));
+    try std.testing.expectEqual(@as(usize, 1), window.oldestOutside(&.{fills + 1}));
+    // Photos of 3 MiB take 4 MiB of base64 each: seven fit, and of ten the
+    // three oldest leave.
+    const photos: [10]?usize = @splat(3 * 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, 3), window.oldestOutside(&photos));
+}
+
+test "every image a model request carries is one the image window keeps" {
+    // A request leaves out its oldest images until it fits its budget,
+    // counting the rest of the request too, so it carries the newest few the
+    // window keeps, or fewer; never one the session dropped.
+    var prng = std.Random.DefaultPrng.init(0x1f17);
+    const random = prng.random();
+    const window: ImageWindow = .{};
+    var decoded: [160]?usize = undefined;
+    var encoded: [160]usize = undefined;
+    for (0..2000) |_| {
+        const count = random.uintLessThan(usize, decoded.len + 1);
+        // Mostly screenshots, with a few photos up to the 5 MiB of base64
+        // one image may take.
+        const largest: usize = if (random.boolean()) 512 * 1024 else 3_932_160;
+        var images_bytes: usize = 0;
+        for (decoded[0..count], encoded[0..count]) |*size, *base64| {
+            const value = 1 + random.uintLessThan(usize, largest);
+            size.* = value;
+            base64.* = image_data.encodedImageBytes(value).?;
+            images_bytes += base64.*;
+        }
+        // Text, tools and the JSON around each image, and a request limit a
+        // rejection may have lowered.
+        const other_bytes = random.uintLessThan(usize, 2 * 1024 * 1024) + count * 128;
+        const limits: request_image_budget.Limits = .{ .max_request_bytes = request_image_budget.default_max_request_bytes - random.uintLessThan(usize, 8 * 1024 * 1024) };
+        const withheld = request_image_budget.oldestImagesToWithhold(encoded[0..count], images_bytes + other_bytes, limits);
+        try std.testing.expect(withheld >= window.oldestOutside(decoded[0..count]));
+    }
 }
 
 test "a dropped image parses only as a name without bytes" {
@@ -5751,6 +5870,98 @@ test "recovery checkpoint round trips while legacy state stays absent" {
     try std.testing.expectEqual(model_provider.ProviderId.gateway, legacy_state.preferences.provider);
     try std.testing.expect(!legacy_state.preferences.ultrafast_mode);
     try std.testing.expectEqual(@as(?RecoveryCheckpoint, null), legacy_state.recovery_checkpoint);
+}
+
+test "a resumed checkpoint tells the model after its steps that the crashed turn is resuming (DUR-42)" {
+    const alloc = std.testing.allocator;
+    var steps = [_]types.ToolExecutionStep{ .{}, .{} };
+    var steering = [_]types.PersistedSteering{.{ .text = @constCast("use file B"), .after_tool_step_count = 1 }};
+    const checkpoint = RecoveryCheckpoint{
+        .turn_id = 7,
+        .user = .{ .text = @constCast("fix the build") },
+        .assistant_source = @constCast(""),
+        .execution = .{ .tool_steps = &steps, .steering = &steering },
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("openai/gpt-test") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 10,
+        .consumed_provider_attempts = 3,
+    };
+    const Case = struct { crashed: bool, inputs: []const []const u8, expected: []const []const u8 };
+    const cases = [_]Case{
+        // The CLI after a crash: the notice follows the steps already taken.
+        .{ .crashed = true, .inputs = &.{}, .expected = &.{ "use file B", crash_resume_notice } },
+        // libfx after a crash, with inputs the turn accepted and never placed.
+        .{ .crashed = true, .inputs = &.{"and B2"}, .expected = &.{ "use file B", crash_resume_notice, "and B2" } },
+        // A turn that stopped on purpose, such as a libfx deadline yield.
+        .{ .crashed = false, .inputs = &.{"and B2"}, .expected = &.{ "use file B", "and B2" } },
+    };
+    for (cases) |case| {
+        var resumed = try checkpoint.resumed(alloc, case.crashed, case.inputs);
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqual(case.expected.len, resumed.execution.steering.len);
+        for (case.expected, resumed.execution.steering, 0..) |text, item, index| {
+            try std.testing.expectEqualStrings(text, item.text);
+            const after: usize = if (index == 0) 1 else steps.len;
+            try std.testing.expectEqual(after, item.after_tool_step_count);
+        }
+        // The rest of the turn is unchanged, the attempt budget included.
+        try std.testing.expectEqual(@as(u64, 7), resumed.turn_id);
+        try std.testing.expectEqualStrings("fix the build", resumed.user.text);
+        try std.testing.expectEqual(steps.len, resumed.execution.tool_steps.len);
+        try std.testing.expectEqual(@as(usize, 3), resumed.consumed_provider_attempts);
+        // It says what it added, for this resume only.
+        try std.testing.expectEqual(ResumeAdditions{ .notice = case.crashed, .inputs = case.inputs.len }, resumed.resume_added);
+    }
+    try std.testing.expectEqual(@as(usize, 1), checkpoint.execution.steering.len);
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
+        fn run(failing: Allocator, source: RecoveryCheckpoint) !void {
+            var resumed = try source.resumed(failing, true, &.{"and B2"});
+            resumed.deinit(failing);
+        }
+    }.run, .{checkpoint});
+}
+
+test "a saved reply is delivered on resume unless the resume restored inputs it never saw" {
+    const alloc = std.testing.allocator;
+    var steering = [_]types.PersistedSteering{.{ .text = @constCast("use file B"), .after_tool_step_count = 0 }};
+    const saved = RecoveryCheckpoint{
+        .turn_id = 7,
+        .user = .{ .text = @constCast("fix the build") },
+        .assistant_source = @constCast("Fixed it."),
+        .execution = .{ .steering = &steering },
+        .cause = .network_interrupted,
+        .action = .delivering_response,
+        .authority = .{ .provider = .gateway, .model = @constCast("openai/gpt-test") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 10,
+        .consumed_provider_attempts = 1,
+    };
+    try std.testing.expect(saved.deliversSavedResponse());
+    // After a crash the notice is added, and the reply is still delivered.
+    var crashed = try saved.resumed(alloc, true, &.{});
+    defer crashed.deinit(alloc);
+    try std.testing.expect(crashed.deliversSavedResponse());
+    // A steer the turn accepted after its reply was saved goes to the model.
+    var steered = try saved.resumed(alloc, true, &.{"and B2"});
+    defer steered.deinit(alloc);
+    try std.testing.expect(!steered.deliversSavedResponse());
+    // A reply that is blank, or a response that left a call uncertain, is
+    // never delivered.
+    var blank = saved;
+    blank.assistant_source = @constCast(" \n");
+    try std.testing.expect(!blank.deliversSavedResponse());
+    var uncertain = saved;
+    uncertain.tool_state = .uncertain;
+    try std.testing.expect(!uncertain.deliversSavedResponse());
+    // What a resume added is not saved with the checkpoint.
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writeRecoveryCheckpoint(&encoded.writer, steered);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "resume_added") == null);
 }
 
 test "recovery checkpoint accepts the exact composer byte limit" {

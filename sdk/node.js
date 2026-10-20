@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from "node:crypto";
 import { access, readFile } from "node:fs/promises";
 import { closeSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -20,6 +21,7 @@ import {
   fxSdkApiVersion,
   listModels,
   normalizeAgentOptions,
+  runtimeAgent,
   supportsJspi,
   xtermAdapter,
 } from "./fx-sdk.js";
@@ -59,16 +61,54 @@ function bundledAssetUrl(asset) {
   return new URL(asset.href.slice(__webpack_public_path__.length), __webpack_base_uri__);
 }
 
-function jspiFallbackError(surface, nativeError) {
-  const nativeDetail = nativeError ? ` Native loading failed: ${nativeError.message}.` : " No compatible native addon was found.";
-  const error = new Error(
-    `libfx could not start the ${surface} backend.${nativeDetail} ` +
-    "The WebAssembly fallback requires JavaScript Promise Integration (JSPI). " +
-    "Run Node with --experimental-wasm-jspi or install a libfx package containing a compatible native addon.",
-  );
+// With `backend: "wasm"`, libfx never tries the native addon, so the error
+// says so rather than that none was found.
+function jspiFallbackError(surface, nativeError, wasmChosen = false) {
+  const message = wasmChosen
+    ? `libfx could not start the ${surface} backend. The "wasm" backend requires JavaScript Promise Integration (JSPI). ` +
+      'Run Node with --experimental-wasm-jspi, or use backend "auto" to run on the native addon where it is installed.'
+    : `libfx could not start the ${surface} backend.${nativeError ? ` Native loading failed: ${nativeError.message}.` : " No compatible native addon was found."} ` +
+      "The WebAssembly fallback requires JavaScript Promise Integration (JSPI). " +
+      "Run Node with --experimental-wasm-jspi or install a libfx package containing a compatible native addon.";
+  const error = new Error(message);
   error.code = "LIBFX_JSPI_REQUIRED";
   error.cause = nativeError;
   return error;
+}
+
+// No native runtime for this engine: all of the process's are in use, or
+// its agent holds its share of them (src/napi_runtime_shares.zig). Its turns
+// run on WebAssembly then, where that can run.
+const nativeLimit = (error) => error?.code === "LIBFX_NATIVE_LIMIT";
+
+function nativeLimitError(nativeError) {
+  const error = new Error(
+    `${nativeError.message}, and WebAssembly, which runs its turns then, requires JavaScript Promise Integration (JSPI): ` +
+    "run Node with --experimental-wasm-jspi",
+    { cause: nativeError },
+  );
+  error.code = "LIBFX_NATIVE_LIMIT";
+  return error;
+}
+
+// One key for each agent counted toward the native runtimes' shares: a
+// durable agent's name on its store, so its copies and an agent that
+// replaced it in development count as one, and a World's store names the
+// same agent in every worker thread; and the engines one JavaScript realm
+// creates outside an agent, together. The addon takes it as a SHA-256, so
+// it is bounded whatever the name of the store.
+const realmKey = (globalThis[Symbol.for("libfx.realmKey")] ??= randomUUID());
+const memoryStores = (globalThis[Symbol.for("libfx.memoryStoreKeys")] ??= { keys: new WeakMap(), next: 0 });
+function storeKeyOf(store) {
+  if (typeof store === "string") return store;
+  if (store === null || typeof store !== "object") return `default:${realmKey}`;
+  let key = memoryStores.keys.get(store);
+  if (key === undefined) memoryStores.keys.set(store, key = `memory:${realmKey}:${memoryStores.next++}`);
+  return key;
+}
+function runtimeShareKey(agent) {
+  const identity = agent ? `agent\0${agent.name}\0${storeKeyOf(agent.store)}` : `engines\0${realmKey}`;
+  return createHash("sha256").update(identity).digest("hex");
 }
 
 async function loadNativeCandidate(candidate) {
@@ -79,7 +119,9 @@ async function loadNativeCandidate(candidate) {
       // Bundlers trace the asset URL; Node must load the native file at runtime.
       return Reflect.apply(nodeRequire, undefined, [fileURLToPath(candidate)]);
     }
-    const imported = await import(candidate.href);
+    // The app names this module at run time, so a bundler must leave the
+    // import to Node rather than turn it into a context of every file.
+    const imported = await import(/* webpackIgnore: true */ /* turbopackIgnore: true */ candidate.href);
     return imported.default ?? imported;
   }
   if (typeof candidate === "object") return candidate.default ?? candidate;
@@ -89,37 +131,49 @@ async function loadNativeCandidate(candidate) {
   if (candidate.endsWith(".node")) {
     return Reflect.apply(nodeRequire, undefined, [isAbsolute(candidate) ? candidate : resolve(candidate)]);
   }
-  const imported = await import(candidate.startsWith("file:") ? candidate : pathToFileURL(candidate).href);
+  const imported = await import(/* webpackIgnore: true */ /* turbopackIgnore: true */ candidate.startsWith("file:") ? candidate : pathToFileURL(candidate).href);
   return imported.default ?? imported;
 }
 
-function defaultNativeCandidate() {
-  // Local path bindings let deployment tracers retain these assets in the generated CommonJS entry.
+// Each platform's addon is a version of libfx of its own, such as
+// libfx@0.0.15-0.linux-x64, that libfx installs as the optional dependency
+// `libfx-<platform>`, an npm alias; npm, pnpm and Bun install it only on its
+// platform (PKG-2). Its module exports
+// `new URL("./libfx.<platform>.node", import.meta.url)`, so a bundler copies
+// the addon into its output and rewrites the URL, and tracers keep the file
+// (PKG-10). The imports name each alias literally, with no bundler hints,
+// so that bundlers follow them: Turbopack keeps only the build machine's
+// branch, and Next.js's webpack turns the packages that aren't installed into
+// empty modules because package.json lists them in `peerDependenciesMeta`.
+// Returns the alias and the URL its module exports, or null on a platform
+// with no addon.
+async function platformAddon() {
   if (process.platform === "linux" && process.arch === "x64") {
-    const asset = new URL("./libfx.linux-x64.node", import.meta.url);
-    if (asset.protocol === "") return fileURLToPath(bundledAssetUrl(asset));
-    const path = fileURLToPath(asset);
-    return path;
+    return { name: "libfx-linux-x64", url: (await import("libfx-linux-x64")).default };
   }
   if (process.platform === "linux" && process.arch === "arm64") {
-    const asset = new URL("./libfx.linux-arm64.node", import.meta.url);
-    if (asset.protocol === "") return fileURLToPath(bundledAssetUrl(asset));
-    const path = fileURLToPath(asset);
-    return path;
+    return { name: "libfx-linux-arm64", url: (await import("libfx-linux-arm64")).default };
   }
   if (process.platform === "darwin" && process.arch === "x64") {
-    const asset = new URL("./libfx.darwin-x64.node", import.meta.url);
-    if (asset.protocol === "") return fileURLToPath(bundledAssetUrl(asset));
-    const path = fileURLToPath(asset);
-    return path;
+    return { name: "libfx-darwin-x64", url: (await import("libfx-darwin-x64")).default };
   }
   if (process.platform === "darwin" && process.arch === "arm64") {
-    const asset = new URL("./libfx.darwin-arm64.node", import.meta.url);
-    if (asset.protocol === "") return fileURLToPath(bundledAssetUrl(asset));
-    const path = fileURLToPath(asset);
-    return path;
+    return { name: "libfx-darwin-arm64", url: (await import("libfx-darwin-arm64")).default };
   }
   return null;
+}
+
+function platformPackageName() {
+  const platform = `${process.platform}-${process.arch}`;
+  return ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"].includes(platform) ? `libfx-${platform}` : null;
+}
+
+// The platform package is missing: npm skipped it, as with `--omit=optional`,
+// a different libc or node_modules copied from another machine.
+function platformPackageMissing(name, cause) {
+  const error = new Error(`${name} is not installed; it holds libfx's native addon for ${process.platform}-${process.arch}`, cause ? { cause } : undefined);
+  if (typeof cause?.code === "string") error.code = cause.code;
+  return error;
 }
 
 function validateNativeBackend(backend) {
@@ -180,15 +234,22 @@ async function loadAndValidateNativeCandidate(candidate, artifactMissing = false
 }
 
 async function discoverNativeBackend() {
-  const candidate = defaultNativeCandidate();
-  if (!candidate) {
+  const name = platformPackageName();
+  if (!name) {
     return { backend: null, error: null, failure: "unsupported" };
   }
+  let candidate;
   try {
+    const { url } = await platformAddon();
+    // webpack leaves an empty module for a package that isn't installed.
+    if (!(url instanceof URL)) {
+      return { backend: null, error: null, probeError: platformPackageMissing(name), failure: "missing" };
+    }
+    candidate = nativeCandidateFilePath(url);
     await access(candidate);
   } catch (error) {
     if (missingArtifact(error)) {
-      return { backend: null, error: null, probeError: error, failure: "missing" };
+      return { backend: null, error: null, probeError: candidate ? error : platformPackageMissing(name, error), failure: "missing" };
     }
     return { backend: null, error, failure: "load" };
   }
@@ -229,7 +290,12 @@ function wasmFilePath(input) {
     if (input.protocol === "") input = bundledAssetUrl(input);
     if (input.protocol === "file:") return fileURLToPath(input);
   }
-  if (typeof input === "string" && !URL.canParse(input)) return resolve(input);
+  if (typeof input === "string") {
+    if (!URL.canParse(input)) return resolve(input);
+    // A file: URL string is read from disk, as a file: URL is: fetch() has
+    // no file: support.
+    if (new URL(input).protocol === "file:") return fileURLToPath(input);
+  }
   return null;
 }
 
@@ -375,6 +441,7 @@ function createNativeCoreRuntime(addon, options) {
     ...(fast === undefined ? {} : { fast }),
     ...(ultrafast === undefined ? {} : { ultrafast }),
     ...(gatewayChatUrl === undefined ? {} : { gatewayChatUrl }),
+    share: runtimeShareKey(options[runtimeAgent]),
   });
   let readyFd;
   let readySocket;
@@ -627,6 +694,9 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
 
   let nativeError;
   let nativeAttempted = false;
+  // The addon had no runtime for this engine to spare, so it runs on
+  // WebAssembly, with backend "native" as with "auto" (R3-D1).
+  let overLimit = false;
   if (backend !== "wasm") {
     const native = await resolveNativeBackend(nativeAddon);
     nativeError = native.error;
@@ -637,12 +707,16 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
         return await native.backend[nativeMethod](runtimeOptions);
       } catch (error) {
         nativeError = error;
-        if (backend === "native" || error?.code === "LIBFX_MODEL_UNSUPPORTED_FAST" ||
+        overLimit = surface === "agent" && nativeLimit(error);
+        // WebAssembly reads the same catalog, so it would refuse the model
+        // setting too.
+        if (!overLimit && (backend === "native" || error?.code === "LIBFX_MODEL_UNSUPPORTED_FAST" ||
           error?.code === "LIBFX_MODEL_UNSUPPORTED_EFFORT" ||
-          typeof error?.code === "string" && error.code.startsWith("LIBFX_MODEL_METADATA_")) throw error;
+          error?.code === "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST" ||
+          typeof error?.code === "string" && error.code.startsWith("LIBFX_MODEL_METADATA_"))) throw error;
       }
     }
-    if (backend === "native") {
+    if (backend === "native" && !overLimit) {
       const error = nativeError ?? new Error(`native addon does not provide ${nativeMethod}()`);
       error.code ??= "LIBFX_NATIVE_UNAVAILABLE";
       throw error;
@@ -650,8 +724,14 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
   }
 
   if (!supportsJspi()) {
+    if (overLimit) throw nativeLimitError(nativeError);
     if (nativeAttempted) throw nativeError;
-    throw jspiFallbackError(surface, nativeError);
+    throw jspiFallbackError(surface, nativeError, backend === "wasm");
+  }
+  if (overLimit) {
+    try {
+      runtimeOptions.onEvent?.({ type: "runtime.fallback", timestamp: performance.now(), backend: "wasm", code: nativeError.code, message: nativeError.message });
+    } catch {}
   }
   const wasmSource = runtimeOptions.wasm ?? defaultWasm;
   return wasmFactory({ ...runtimeOptions, wasm: await wasmInput(wasmSource) });
@@ -680,6 +760,8 @@ export async function createFxEngine(options = {}) {
 // live, as agents passed one durability do, so they can send each other's
 // prompts on.
 const environments = new Map();
+// The process's environment, read at run time (see `development` below).
+const processEnv = process.env;
 function environmentDurability() {
   const dir = process.env.VERCEL ? null : process.env.FX_SESSIONS_DIR || resolve(tmpdir(), "libfx", "sessions");
   const key = dir ?? "vercel";
@@ -712,6 +794,15 @@ export const createFxAgent = createDurableAgentFactory({
   defaultDurability: environmentDurability,
   // One durability per environment, so agents created without one share it.
   defaultShared: true,
+  // local() or vercel(), so session ids are run ids.
+  defaultWorld: true,
+  // A dev server such as `next dev` loads a module again and so creates its
+  // agents again: there the newest replaces the agent its name had. Read
+  // each time, as a process may set it after loading libfx, and through
+  // `processEnv`: a bundler replaces `process.env.NODE_ENV` with the mode
+  // it builds in, as Bun does when it builds node.cjs, which would make
+  // every process that loads that build a development server (SEC-2).
+  development: () => processEnv.NODE_ENV === "development",
   harness: fxHarness({
     createEngine: createFxEngine,
     // An explicit key, then the durability's own credential, such as a
@@ -719,6 +810,7 @@ export const createFxAgent = createDurableAgentFactory({
     defaultApiKey: async (durability) => process.env.AI_GATEWAY_API_KEY ||
       (await Promise.resolve(durability?.gatewayKey?.()).catch(() => undefined)) ||
       process.env.VERCEL_OIDC_TOKEN || undefined,
+    keySources: ", set AI_GATEWAY_API_KEY or VERCEL_OIDC_TOKEN in the environment, or give its durability a gatewayKey()",
   }),
 });
 

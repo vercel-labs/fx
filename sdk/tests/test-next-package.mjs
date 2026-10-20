@@ -11,8 +11,10 @@ import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { serializeError } from "./package-report.mjs";
+import { nativeAlias, nativePackageBeside, nativePlatform } from "./package-siblings.mjs";
 
 const tarball = resolve(process.argv[2]);
+const nativeTarball = nativePackageBeside(tarball);
 const next15 = process.argv.includes("--next15");
 const webpack = next15 || process.argv.includes("--webpack");
 const bundlerArgs = webpack && !next15 ? ["--webpack"] : [];
@@ -165,6 +167,16 @@ async function ndjsonUntil(response, done) {
   throw new Error(`the stream ended after ${lines.length} lines without its last event`);
 }
 
+// PKG-10: the bundler builds libfx without warnings, such as webpack's
+// "Critical dependency: the request of a dependency is an expression" for an
+// import() it cannot resolve. Next prints each warning as a paragraph naming
+// the module.
+async function assertNoLibfxWarnings(name) {
+  const log = await readFile(resolve(root, `${name}.log`), "utf8");
+  const warnings = log.split(/\n\s*\n/).filter((block) => /[\\/]libfx[\\/]/.test(block) && /Critical dependency|Module not found|Can't resolve/.test(block));
+  assert.deepEqual(warnings, [], `${name} warned about libfx; see ${root}/${name}.log`);
+}
+
 async function assertBundledNativeAssets(buildDir) {
   if (!webpack) return;
   // A deployment carries the durability modules libfx loads on first use.
@@ -175,10 +187,16 @@ async function assertBundledNativeAssets(buildDir) {
     assert.ok(file, `the durable route must trace the emitted durable/${name}.mjs`);
     await access(resolve(durableDir, file));
   }
+  // PKG-2, PKG-10: webpack copies the addon of the platform package npm
+  // installed, and only that one, into the build.
   const routeDir = resolve(buildDir, "server/app/api/fx");
   const trace = JSON.parse(await readFile(resolve(routeDir, "route.js.nft.json"), "utf8"));
   for (const platform of ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"]) {
     const file = trace.files.find((path) => path.includes(`/static/media/libfx.${platform}.`) && path.endsWith(".node"));
+    if (platform !== nativePlatform) {
+      assert.equal(file, undefined, `the build carries the ${platform} addon, which this machine doesn't install`);
+      continue;
+    }
     assert.ok(file, `webpack must trace the emitted ${platform} addon, not externalize libfx`);
     await access(resolve(routeDir, file));
   }
@@ -191,6 +209,13 @@ try {
   manifest.dependencies.libfx = "file:./libfx.tgz";
   if (next15) manifest.dependencies.next = "15.5.25";
   await writeFile(resolve(app, "package.json"), JSON.stringify(manifest, null, 2));
+  // libfx's optional dependency on this machine's addon version, the alias
+  // libfx-<platform>, resolves to the tarball beside libfx's instead of the
+  // registry, and pnpm links it beside libfx as it would a registry install
+  // (PKG-2).
+  assert.ok(nativeTarball, `no ${nativeAlias} tarball beside ${tarball}`);
+  await cp(nativeTarball, resolve(app, "libfx-native.tgz"));
+  await writeFile(resolve(app, "pnpm-workspace.yaml"), `overrides:\n  "${nativeAlias}": "file:./libfx-native.tgz"\n`);
   await run(process.env.PNPM_BIN || "pnpm", ["install", "--no-frozen-lockfile", "--ignore-scripts"], app, "install");
   const require = createRequire(resolve(app, "package.json"));
   if (!next15) {
@@ -205,6 +230,7 @@ try {
   await exercise(dev, "dev");
   await stop(dev);
   await run(process.execPath, ["--no-experimental-require-module", next, "build", ...bundlerArgs], app, "build");
+  await assertNoLibfxWarnings("build");
   await assertBundledNativeAssets(resolve(app, ".next"));
   const production = await start(app, [next, "start"], "start");
   await exercise(production, "start");
@@ -215,6 +241,7 @@ try {
     output: "standalone", distDir, assetPrefix: "https://cdn.example.test/assets",
   })};\n`);
   await run(process.execPath, ["--no-experimental-require-module", next, "build", ...bundlerArgs], app, "standalone-build");
+  await assertNoLibfxWarnings("standalone-build");
   await assertBundledNativeAssets(resolve(app, distDir));
   const isolated = resolve(root, "isolated");
   await cp(resolve(app, distDir, "standalone"), isolated, { recursive: true, verbatimSymlinks: true });

@@ -3,8 +3,8 @@ import { strict as assert } from "node:assert";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxEngine, supportsJspi } from "../node.js";
-import { createFxEngine as createSharedAgent } from "../fx-sdk.js";
+import { createFxEngine, createMemoryPersistence, supportsJspi } from "../node.js";
+import { createFxEngine as createSharedAgent, maxPromptFrameBytes, promptFrameBytes } from "../fx-sdk.js";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const backend = process.argv[2] || "native";
@@ -17,6 +17,7 @@ if (backend === "wasm" && !supportsJspi()) {
 }
 
 const encoded = new TextEncoder();
+const sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 // A real 1x1 PNG, plus a helper that builds a PNG-sniffable payload with an
 // exact base64 length for limit probing (the kernel sniffs magic bytes only).
 const pngData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
@@ -253,16 +254,17 @@ for (const resizeImage of [undefined, (image) => image]) {
       if (mode === "throw") throw new Error("resize failed");
       if (mode === "invalid") return { bytes: "not bytes", mimeType };
       if (mode === "oversized") return { bytes: new Uint8Array(4 * 1024 * 1024), mimeType };
-      if (mode === "fill") return { bytes: new Uint8Array(3 * 1024 * 1024), mimeType };
+      if (mode === "over") return { bytes: new Uint8Array(3.5 * 1024 * 1024), mimeType };
       return { bytes, mimeType };
     },
   });
   const image = [{ type: "image", data: pngData, mimeType: "image/png" }];
-  // Hook output within the image budgets still counts toward the frame bound.
-  mode = "fill";
+  // Hook output counts toward the image budgets: two images of 3.5 MiB are
+  // more than the 6 MiB a prompt's images may hold.
+  mode = "over";
   await assert.rejects(
     agent.prompt([...image, ...image]).result,
-    (error) => error instanceof RangeError && /frame limit/.test(error.message),
+    (error) => error instanceof RangeError && /prompt images exceed/.test(error.message),
   );
   mode = "throw";
   await assert.rejects(agent.prompt(image).result, /resize failed/);
@@ -393,15 +395,57 @@ for (const resizeImage of [undefined, (image) => image]) {
   assert.deepEqual(files, [{ type: "file", mediaType: "image/png", data: { type: "data", data: pngData } }]);
   await restored.close();
 
-  // Oversized and empty restore checkpoints fail with the same errors on both backends.
+  // Oversized and empty restore checkpoints fail with the same errors on both
+  // backends. One at the 32 MiB limit reaches the core, which finds it is not
+  // a checkpoint.
   await assert.rejects(
-    createAgent(mockGateway(), { model: "sdk/vision-model", checkpoint: new Uint8Array(4 * 1024 * 1024 + 1) }),
+    createAgent(mockGateway(), { model: "sdk/vision-model", checkpoint: new Uint8Array(32 * 1024 * 1024 + 1) }),
     (error) => error.message === "libfx checkpoint is too large",
+  );
+  await assert.rejects(
+    createAgent(mockGateway(), { model: "sdk/vision-model", checkpoint: new Uint8Array(32 * 1024 * 1024) }),
+    (error) => error.message === "Invalid or non-fresh libfx checkpoint",
   );
   await assert.rejects(
     createAgent(mockGateway(), { model: "sdk/vision-model", checkpoint: new Uint8Array(0) }),
     (error) => error.message === "Invalid or non-fresh libfx checkpoint",
   );
+}
+
+// QUAL-18: a conversation past the 32 MiB a checkpoint holds gets none.
+// checkpoint() says so, naming the limit, with a code, an engine on a store
+// reports the save it skips after a turn (checkpoint.error), and the engine
+// goes on. Each prompt's two images are 6 MiB of distinct bytes.
+{
+  const imageOf = (fill) => {
+    const raw = Buffer.alloc(3 * 1024 * 1024, fill);
+    Buffer.from(pngData, "base64").copy(raw);
+    return { type: "image", data: raw.toString("base64"), mimeType: "image/png" };
+  };
+  const events = [];
+  const agent = await createAgent(mockGateway(), {
+    model: "sdk/vision-model",
+    persistence: createMemoryPersistence(),
+    checkpointAfterBytes: 0,
+    onEvent: (event) => { if (event.type.startsWith("checkpoint.")) events.push(event); },
+  });
+  let refusal = null;
+  for (let turn = 1; turn <= 8 && refusal === null; turn += 1) {
+    assert.equal((await runPrompt(agent, [{ type: "text", text: `turn ${turn}` }, imageOf(2 * turn), imageOf(2 * turn + 1)])).stopReason, "end_turn");
+    refusal = await agent.checkpoint().then(() => null, (error) => error);
+  }
+  assert.ok(refusal, "checkpoint() refuses a conversation over 32 MiB");
+  assert.equal(refusal.code, "FX_CHECKPOINT_TOO_LARGE");
+  assert.match(refusal.message, /^libfx checkpoint is too large: the conversation is over the 32 MiB a checkpoint holds/);
+  for (let waited = 0; !events.some((event) => event.type === "checkpoint.error") && waited < 5000; waited += 20) await sleep(20);
+  const skipped = events.filter((event) => event.type === "checkpoint.error");
+  assert.equal(skipped.length, 1, JSON.stringify(events.map(({ type, skipped: reason }) => ({ type, reason }))));
+  assert.equal(skipped[0].code, "FX_CHECKPOINT_TOO_LARGE");
+  assert.equal(skipped[0].skipped, "too_large");
+  assert.match(skipped[0].message, /32 MiB/);
+  assert.ok(events.some((event) => event.type === "checkpoint.save"), "the turns before it saved checkpoints");
+  assert.equal((await runPrompt(agent, "still here")).stopReason, "end_turn");
+  await agent.close();
 }
 
 // An idle checkpoint is sent before a later prompt, while one queued behind it
@@ -552,21 +596,6 @@ for (const resizeImage of [undefined, (image) => image]) {
     (error) => error instanceof RangeError && /prompt images exceed/.test(error.message),
   );
 
-  // The model request carries images base64 encoded, so text and encoded
-  // images share the 8 MiB frame bound on both backends. Exactly 8 MiB of
-  // encoded image data passes the image budgets but not that bound once text
-  // and the envelope are added, as base64 or as raw bytes.
-  const quarter = pngWithEncodedLength(4 * 1024 * 1024);
-  for (const data of [quarter, Buffer.from(quarter, "base64")]) {
-    assert.throws(
-      () => agent.prompt([
-        { type: "text", text: "boundary" },
-        { type: "image", data, mimeType: "image/png" },
-        { type: "image", data, mimeType: "image/png" },
-      ]),
-      (error) => error instanceof RangeError && /frame limit/.test(error.message),
-    );
-  }
   assert.throws(
     () => agent.prompt("x".repeat(9 * 1024 * 1024)),
     (error) => error instanceof RangeError && /frame limit/.test(error.message),
@@ -584,17 +613,6 @@ for (const resizeImage of [undefined, (image) => image]) {
   );
   assert.equal(readMixed, false);
 
-  // Two Blobs that fill the image budget exactly also fill the frame bound
-  // once encoded, so they fail before any Blob read.
-  const boundaryBlob = new Blob([Buffer.alloc(3 * 1024 * 1024)], { type: "image/png" });
-  assert.throws(
-    () => agent.prompt([
-      { type: "image", data: boundaryBlob },
-      { type: "image", data: boundaryBlob },
-    ]),
-    (error) => error instanceof RangeError && /frame limit/.test(error.message),
-  );
-
   class LyingBlob extends Blob {
     get size() { return 1; }
     async arrayBuffer() { return new ArrayBuffer(4 * 1024 * 1024); }
@@ -605,6 +623,62 @@ for (const resizeImage of [undefined, (image) => image]) {
   assert.equal(gateway.state.catalogFetches, 0);
   assert.equal(gateway.state.chatBodies.length, 0);
   await agent.close();
+}
+
+// API-42: images travel beside the 8 MiB frame, so images that fill the
+// 6 MiB budget leave the frame its room for text, on both backends: as base64,
+// raw bytes or Blobs, with text that fills the frame exactly, they reach the
+// model. One byte more text is refused before anything is sent. Each case
+// gets its own engine, since a conversation's requests carry its history.
+{
+  const quarter = pngWithEncodedLength(4 * 1024 * 1024);
+  const raw = Buffer.from(quarter, "base64");
+  const frameOf = (text) => promptFrameBytes([{ type: "text", text }, { type: "image", data: quarter, mimeType: "image/png" }, { type: "image", data: quarter, mimeType: "image/png" }]);
+  const fill = "x".repeat(maxPromptFrameBytes - frameOf(""));
+  assert.equal(frameOf(fill), maxPromptFrameBytes);
+  for (const [label, data, text] of [["base64", quarter, fill], ["bytes", raw, "two images"], ["Blob", new Blob([raw], { type: "image/png" }), "two images"]]) {
+    const gateway = mockGateway();
+    const agent = await createAgent(gateway, { model: "sdk/vision-model" });
+    const image = { type: "image", data, ...(data instanceof Blob ? {} : { mimeType: "image/png" }) };
+    if (text === fill) {
+      assert.throws(
+        () => agent.prompt([{ type: "text", text: `${fill}x` }, image, image]),
+        (error) => error instanceof RangeError && /frame limit/.test(error.message),
+      );
+    }
+    assert.equal((await runPrompt(agent, [{ type: "text", text }, image, image])).stopReason, "end_turn", label);
+    assert.equal(gateway.state.chatBodies.length, 1, label);
+    const [body] = gateway.state.chatBodies;
+    assert.deepEqual(fileParts(body).map((part) => part.data.data.length), [quarter.length, quarter.length], label);
+    assert.ok(JSON.stringify(body.prompt).includes(text), `${label}: the text reached the model`);
+    await agent.close();
+  }
+}
+
+// DUR-23 and API-42: a journaled session whose prompt filled the image budget
+// opens again with its images in history and takes the next prompt, from the
+// checkpoint its turn saved, or from the records alone when the store keeps
+// no checkpoints.
+{
+  const quarter = pngWithEncodedLength(4 * 1024 * 1024);
+  const image = { type: "image", data: quarter, mimeType: "image/png" };
+  for (const checkpoints of [true, false]) {
+    const label = checkpoints ? "from a checkpoint" : "from the records";
+    const store = createMemoryPersistence();
+    const persistence = checkpoints ? store : { load: () => store.load(), append: (record) => store.append(record) };
+    const gateway = mockGateway();
+    const first = await createAgent(gateway, { model: "sdk/vision-model", persistence });
+    assert.equal((await runPrompt(first, [{ type: "text", text: "two images" }, image, image])).stopReason, "end_turn", label);
+    await first.close();
+    const saved = store.checkpoint !== null;
+    const second = await createAgent(gateway, { model: "sdk/vision-model", persistence });
+    const result = await runPrompt(second, "and now?");
+    assert.equal(result.stopReason, "end_turn", `${label}: ${result.error?.message}`);
+    assert.equal(gateway.state.chatBodies.length, 2, label);
+    assert.deepEqual(fileParts(gateway.state.chatBodies[1]).map((part) => part.data.data.length), [quarter.length, quarter.length], `${label}: the history keeps the images`);
+    assert.equal(saved, checkpoints, `${label}: the first turn's end saved a checkpoint`);
+    await second.close();
+  }
 }
 
 // The SDK decodes base64 itself, so non-canonical base64 throws before the
@@ -1118,8 +1192,10 @@ for (const [index, mimeType] of mediaTypes.entries()) {
   assert.equal(reads, 0);
 }
 
-// Aggregate image budgets and the complete ACP envelope both fall back to refs.
-// A mixed prompt preserves the unreferenced image, not an arbitrarily wider limit.
+// Aggregate image budgets fall back to refs. A mixed prompt preserves the
+// unreferenced image, not an arbitrarily wider limit. Images that fit the
+// budgets keep their data: they travel beside the frame, so the frame never
+// needs a ref in their place.
 {
   let reads = 0;
   class UnreadBlob extends Blob {
@@ -1130,8 +1206,7 @@ for (const [index, mimeType] of mediaTypes.entries()) {
   const blob = new UnreadBlob([Buffer.alloc(3.5 * 1024 * 1024)], { type: "image/png" });
   const cases = [
     [ { data: half, sourceRef: "host:aggregate-1" }, { data: half, sourceRef: "host:aggregate-2" } ],
-    [ { data: quarter, sourceRef: "host:envelope-1" }, { data: quarter, sourceRef: "host:envelope-2" } ],
-    [ { data: blob, sourceRef: "host:blob-frame-1" }, { data: blob, sourceRef: "host:blob-frame-2" } ],
+    [ { data: blob, sourceRef: "host:blob-aggregate-1" }, { data: blob, sourceRef: "host:blob-aggregate-2" } ],
     [ { data: half }, { data: half, sourceRef: "host:mixed" } ],
   ];
   for (const images of cases) {
@@ -1154,6 +1229,20 @@ for (const [index, mimeType] of mediaTypes.entries()) {
     await agent.close();
   }
   assert.equal(reads, 0);
+  let wire;
+  const gateway = mockGateway();
+  const agent = await createAgent(gateway, {
+    model: "sdk/vision-model",
+    onEvent(event) { if (event.type === "acp.send" && event.message?.method === "session/prompt") wire = event.message.params.prompt; },
+  });
+  const kept = ["host:kept-1", "host:kept-2"].map((sourceRef) => ({ type: "image", mimeType: "image/png", data: quarter, sourceRef }));
+  assert.equal((await runPrompt(agent, kept)).stopReason, "end_turn");
+  for (const [index, image] of kept.entries()) {
+    assert.equal(wire[index].sourceRef, image.sourceRef);
+    assert.ok(Number.isSafeInteger(wire[index]._meta?.fx?.attachment) && wire[index]._meta.fx.attachment > 0);
+  }
+  assert.deepEqual(fileParts(gateway.state.chatBodies[0]).map((part) => part.data.data.length), [quarter.length, quarter.length]);
+  await agent.close();
 }
 
 // Refs count toward the existing eight-image bound; 512 UTF-8 bytes of valid
@@ -1273,7 +1362,8 @@ for (const [index, mimeType] of mediaTypes.entries()) {
     { images: [image(quarter), image(quarter)], error: /typed tool result exceeds the result limit/ },
     { images: [image(undefined)], error: /invalid tool image/ },
     ...["", "host\x00bad", "é".repeat(257), "\ud800"].map((sourceRef) => ({ images: [image(undefined, sourceRef)], error: /sourceRef/ })),
-    { images: Array.from({ length: 9 }, () => image(undefined, "host:ninth")), error: /invalid typed tool result/ },
+    // QUAL-18: the error names the limit the result broke.
+    { images: Array.from({ length: 9 }, () => image(undefined, "host:ninth")), error: /a libfx\.tool-result holds at most 8 images, and this one has 9/ },
   ];
   for (const scenario of cases) {
     const gateway = mockGateway((body, step) => {

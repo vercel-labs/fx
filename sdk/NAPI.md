@@ -112,7 +112,7 @@ Each handle is a JavaScript object wrapped around a `RuntimeHandle`. It is brand
 
 Creating a core performs these steps:
 
-1. Atomically reserve one of 64 process-wide runtime slots.
+1. Read the bounded `share` option, the key of the agent the runtime is for, and reserve one of 64 process-wide runtime slots for it under one lock. `src/napi_runtime_shares.zig` decides: while slots are contended, no agent holds more than its share, 64 divided by the number of agents holding slots, and the last free slot is kept for an agent that holds none. A runtime created without `share` counts toward the limit only. A refused reservation throws `LIBFX_NATIVE_LIMIT` at once and never waits; the JavaScript loader then runs that engine on WebAssembly. Destruction releases the slot, as does any failure later in creation.
 2. Read and copy bounded configuration strings from the JavaScript options object.
 3. Validate the Gateway endpoint.
 4. Allocate a `Runtime` and bounded fetch bridge using Zig's C allocator.
@@ -184,10 +184,11 @@ All untrusted values crossing the native boundary are bounded before allocation 
 | Input queue | 8 MiB |
 | Output queue | 8 MiB |
 | Encoded output message | 64 MiB |
-| Fetch request body and serialized metadata | 8 MiB |
-| One attachment | 4 MiB |
-| Pending inbound attachments | 8, totaling at most 8 MiB |
-| Pending outbound attachments | 4, totaling at most 8 MiB |
+| Fetch request body and serialized metadata | 32 MiB |
+| One attachment | 32 MiB |
+| Pending inbound attachments | 8, totaling at most 64 MiB |
+| Pending outbound attachments | 4, totaling at most 64 MiB |
+| Prompt images the core takes from attachments | 4 MiB each, 8 MiB per prompt |
 | Fetch response queue | 8 MiB |
 | Gateway error body | 1 MiB |
 | One output drain | 1 MiB |
@@ -196,7 +197,9 @@ All untrusted values crossing the native boundary are bounded before allocation 
 | ACP history | 100 turns |
 | Agent steps | 64 |
 
-The fetch request budget covers the full model request, including retained history and metadata. The body crosses to Node unencoded beside its metadata, so the transfer adds no separate bound; accepting one tool result does not reserve space for later requests.
+One attachment holds a kernel checkpoint, a journal snapshot or the journal records a session opens from, each up to 32 MiB, since an engine's own store keeps a conversation's images inline. A journal opens from a snapshot and its records attached together, so the inbound total is twice that. Prompt images share the table, and the core bounds them as it takes them, below the table's limits. So do the images a durable session saves by name: an open stages the ones the session needs from its image store with `libfx/journal_images`, in batches the table holds. Those are the images one model request carries, at most 100 whose base64 takes at most 30 MiB, and the images of a turn the session left open; JavaScript reads up to 8 at once from the store while it stages the batch before. Older ones keep only their names, and the store keeps their bytes.
+
+The fetch request budget covers the full model request, including retained history and metadata. An engine's history keeps every image, and a durable session's keeps the newest a request carries. The core leaves a request's oldest images out to keep its body within 30 MiB, below the 32 MiB that Claude routes accept, or within a lower limit it learned from a provider's refusal. The budget adds 2 MiB for the method, URL and headers. Every provider the addon builds, Codex, Grok and configured providers included, also declares the largest body the bridge carries beside the longest URL and API key the addon accepts, and the core keeps a request within the smaller of the two limits, so a request the core trims that way always fits. Text is never left out, so a request whose text alone is over the budget fails with `HostStreamBackpressure` before it reaches `fetch`. The body crosses to Node unencoded beside its metadata, so the transfer adds no separate bound; accepting one tool result does not reserve space for later requests. Once JavaScript takes a request, or the request is dropped, the bridge frees each request buffer whose capacity is over 64 KiB, and the response buffer likewise when the response closes, so a runtime that once sent a large request doesn't keep that much memory.
 
 Prompt images and kernel checkpoints also cross the boundary unencoded. JavaScript writes each inbound payload with `writeCoreAttachment()` and then sends the ACP frame that references its id, an image block's `_meta.fx.attachment` or `libfx/restore`'s `checkpointAttachment`; the core thread takes the payload once while handling that frame. `libfx/checkpoint` answers with `checkpointAttachment`, and JavaScript takes those bytes with `takeCoreAttachment()`. The attachment table has its own mutex and stores C-allocator copies, so the core thread never touches JavaScript memory. JavaScript discards unconsumed inbound payloads before attaching new ones.
 
@@ -239,11 +242,13 @@ Consequently:
 - publishing must preserve provenance and use the exact tested artifacts;
 - addon load failures must not be mistaken for a safe sandbox boundary.
 
-The JavaScript loader uses literal references to the four packaged
-`libfx.<platform>-<arch>.node` names and selects the matching supported tuple.
-Local package assembly renames `zig-out/lib/libfx.node` to that tuple's package
-name. The loader validates `libfxApiVersion` and the expected export shape
-before use. `backend: "native"` fails closed if a compatible addon is
+The JavaScript loader imports the four addon versions by the aliases libfx
+installs them under, `libfx-linux-x64`, `libfx-linux-arm64`,
+`libfx-darwin-x64` and `libfx-darwin-arm64`, literally, and selects the
+matching supported tuple. Each one's module exports the URL of its
+`libfx.<platform>-<arch>.node`. Local package assembly puts
+`zig-out/lib/libfx.node` in that tuple's version. The loader validates
+`libfxApiVersion` and the expected export shape before use. `backend: "native"` fails closed if a compatible addon is
 unavailable. `backend: "auto"` may fall back to WebAssembly when JSPI is
 available. Explicit `nativeAddon` objects, paths, and URLs remain separate from
 packaged discovery.
@@ -266,26 +271,38 @@ zig build -Dnapi-surface=core -Doptimize=ReleaseSafe
 
 The N-API artifact currently forces `ReleaseSafe` in `build.zig`; the command-line optimization value does not change that module's mode. Retaining safety checks is intentional for code processing untrusted JavaScript and protocol input.
 
-Published packages contain one addon for each supported tuple:
+Each supported tuple's addon is published as a version of libfx of its own,
+which libfx lists as an exact-version optional dependency under an npm alias,
+so an install downloads only the machine's addon and no package but libfx
+exists on npm. For libfx `0.0.15`:
 
-- `linux-x64`;
-- `linux-arm64`;
-- `darwin-x64`;
-- `darwin-arm64`.
+- `libfx-linux-x64`: `libfx@0.0.15-0.linux-x64` (`os: linux`, `cpu: x64`, `libc: glibc`);
+- `libfx-linux-arm64`: `libfx@0.0.15-0.linux-arm64` (`os: linux`, `cpu: arm64`, `libc: glibc`);
+- `libfx-darwin-x64`: `libfx@0.0.15-0.darwin-x64` (`os: darwin`, `cpu: x64`);
+- `libfx-darwin-arm64`: `libfx@0.0.15-0.darwin-arm64` (`os: darwin`, `cpu: arm64`).
 
-`package-libfx.mjs` requires exactly those four names when assembling a
-publishable multi-platform package. It rejects missing, duplicate, or
-unexpected addon names. Package assembly also generates a self-contained
-`node.cjs` from the dependency-free ESM source with package-relative module
-URLs. The publish workflow builds and tests each addon on its native runner
-before combining the artifacts with both WebAssembly surfaces, the README, and
-the Apache-2.0 license.
+A dev build `0.0.15-dev.7.gabc` comes with `0.0.15-0.linux-x64.dev.7.gabc` and
+so on (`sdk/scripts/companion-version.mjs`). The prerelease starts with the
+number 0, which sorts below every other prerelease of that version and below
+the release, so no range an app writes for libfx resolves to an addon version.
+
+`package-libfx.mjs` requires exactly the four addons
+`libfx.<platform>-<arch>.node` when assembling publishable packages. It
+rejects missing, duplicate, or unexpected addon names. Package assembly also
+generates a self-contained `node.cjs` from the dependency-free ESM source with
+package-relative module URLs. The publish workflow builds and tests each addon
+on its native runner before packaging each in its platform package, and libfx
+with `fx-core.wasm`, `fx-term.wasm`, the README, the docs and the Apache-2.0
+license.
 
 Package assembly and Next tests run without npm publishing credentials. The
-OIDC publisher uploads the tested archive. The workflow then downloads that
-immutable registry version, compares it byte-for-byte with the archive, and
-exercises its Node entrypoints and Next development, production, and isolated
-deployment output. Failed package qualification blocks publication. Next
+OIDC publisher uploads the tested archives, the addon versions before the
+release, under a dist-tag of their own (`addon`, or `addon-dev` on the dev
+channel) so that `latest` and `dev` only ever name a release. The
+workflow then downloads each immutable registry
+version and compares it byte-for-byte with its archive. Pull request CI
+exercises the packages' Node entrypoints and Next development, production, and
+isolated deployment output. Failed package qualification blocks publication. Next
 logs and structured results are retained as workflow artifacts, including
 on failure.
 
@@ -295,7 +312,9 @@ The Next and Vercel harnesses retain completed scenarios and structured errors
 when qualification fails, and report success only after cleanup succeeds.
 
 Live Vercel qualification is a separate release check. Run
-`node sdk/tests/test-vercel-package.mjs <tarball>` before publication, then run
+`node sdk/tests/test-vercel-package.mjs <tarball>`, with libfx's tarball and
+the `linux-x64` addon version's tarball `npm pack` wrote beside it, before publication,
+then run
 the same command with the immutable npm version afterward. Repeat both checks
 with `--webpack` for Next.js 16 webpack and `--next15` for Next.js 15 webpack;
 the default is Next.js 16 Turbopack. The local `test-next-package.mjs` harness
@@ -316,7 +335,7 @@ Native errors use stable codes where JavaScript needs to distinguish failure cla
 | Code | Meaning |
 | --- | --- |
 | `LIBFX_INVALID_ARGUMENT` | Missing, mistyped, oversized, invalid, or forged input. |
-| `LIBFX_NATIVE_LIMIT` | The process-wide runtime limit was reached. |
+| `LIBFX_NATIVE_LIMIT` | The process-wide runtime limit was reached, or the agent `share` names holds its share of it. |
 | `LIBFX_NATIVE_BACKPRESSURE` | The bounded input queue cannot accept more bytes. |
 | `LIBFX_NATIVE_CLOSED` | An operation targeted a closed runtime. |
 | `LIBFX_NATIVE_OOM` | Native allocation failed. |

@@ -134,8 +134,10 @@ const assertNoSecrets = (value, secrets) => {
     assert.equal(enrichment.headers.get("authorization"), "Bearer at-first");
     assert.equal(enrichment.headers.get("x-userid"), null, "only the subscription proxy hears the account id");
   }
-  assert.ok(asked.some((request) => request.sessionId === sessionId), "credentials() learns which session the request is for");
-  assert.ok(asked.length > 0 && asked.every((request) => request.provider === "grok"), "credentials() learns the provider");
+  // The model-list requests carry no session header, and still name it.
+  assert.ok(asked.length > 1, "the model list and the reply each ask for credentials");
+  assert.deepEqual(asked.filter((request) => request.sessionId !== sessionId), [], "every credentials() call names the session, as providers.mdx says");
+  assert.ok(asked.every((request) => request.provider === "grok"), "credentials() learns the provider");
   assertNoSecrets(events, ["at-first", "rt-1"]);
 }
 
@@ -171,15 +173,24 @@ const assertNoSecrets = (value, secrets) => {
   assertNoSecrets(events, ["at-rejected", "at-second", "rt-1", "rt-2"]);
 }
 
-// 3. Credentials about to expire are refreshed before the request.
+// 3. Credentials about to expire are refreshed before the request, and the
+// host saves them under the session, even when the model-list request, which
+// names no session in its headers, is the one that refreshed them.
 {
   const world = grokWorld({ refreshedToken: "at-fresh" });
-  const { result } = await runTurn({ fetch: world.fetch, credentials: () => credentialsFor("at-expiring", { expiresAt: Date.now() + 60_000 }) });
+  const saved = [];
+  const { result } = await runTurn({
+    fetch: world.fetch,
+    credentials: () => credentialsFor("at-expiring", { expiresAt: Date.now() + 60_000 }),
+    onCredentials: (credentials, info) => { saved.push({ accessToken: credentials.accessToken, info }); },
+  });
   assert.equal(result.stopReason, "end_turn");
   assert.equal(world.log.filter((entry) => entry.url === tokenUrl).length, 1);
   for (const entry of world.log.filter((entry) => entry.url.startsWith("https://cli-chat-proxy.grok.com/"))) {
     assert.equal(entry.headers.get("authorization"), "Bearer at-fresh", "no Grok request uses the expiring token");
   }
+  const sessionId = replyRequests(world.log)[0].headers.get("x-grok-conv-id");
+  assert.deepEqual(saved, [{ accessToken: "at-fresh", info: { provider: "grok", sessionId } }], "onCredentials names the session");
 }
 
 // 4. A refresh that comes back for another account is never used or saved.
@@ -195,6 +206,12 @@ const assertNoSecrets = (value, secrets) => {
   assert.ok(outcome.error || outcome.result.stopReason !== "end_turn", "the turn does not finish on another account's token");
   assert.equal(saved.length, 0, "the host never receives another account's credentials");
   assert.ok(world.log.some((entry) => entry.url === userinfoUrl), "the refreshed token was checked");
+  // xAI accepts a refresh token once: the refused refresh is not sent again,
+  // and the turn says why, with the code providers.mdx's errors carry.
+  assert.equal(world.log.filter((entry) => entry.url === tokenUrl).length, 1, "the refused refresh ran once");
+  assert.equal(replyRequests(world.log).length, 1, "the rejected request was not sent again");
+  assert.equal(outcome.error?.code, "LIBFX_GROK_ACCOUNT_CHANGED", `the turn's error names the account change: ${outcome.error?.message}`);
+  assert.match(outcome.error.message, /different xAI account/);
   for (const entry of world.log.filter((entry) => entry.url.startsWith("https://cli-chat-proxy.grok.com/"))) {
     assert.notEqual(entry.headers.get("authorization"), "Bearer at-other", "no Grok request uses another account's token");
   }
@@ -220,6 +237,7 @@ const assertNoSecrets = (value, secrets) => {
     assert.equal((await turn.result).stopReason, "end_turn");
     assert.equal(text, "libfx on grok");
     assert.ok(asked.includes(sessionId), "credentials() is asked for the durable session's own credentials");
+    assert.deepEqual(asked.filter((id) => id !== sessionId), [], "every credentials() call, the model list's included, names the session");
     assert.equal(replyRequests(world.log)[0].headers.get("x-grok-conv-id"), sessionId);
     assert.equal(world.log.some((entry) => entry.url.includes("ai-gateway.vercel.sh")), false);
   } finally {
@@ -322,7 +340,9 @@ const assertNoSecrets = (value, secrets) => {
     return world.fetch(input, init);
   };
   let held = Promise.resolve();
-  const refreshLock = (_info, refresh) => {
+  const locked = [];
+  const refreshLock = (info, refresh) => {
+    locked.push(info);
     const run = held.then(refresh);
     held = run.catch(() => {});
     return run;
@@ -350,6 +370,9 @@ const assertNoSecrets = (value, secrets) => {
     }
     assert.equal(world.log.filter((entry) => entry.url === tokenUrl).length, 1, "servers that share a lock refresh an account once");
     assert.equal(replyRequests(world.log).filter((entry) => entry.headers.get("authorization") === "Bearer at-renewed").length, 2);
+    // So a host can key the lock by the session's account, as providers.mdx does.
+    const sessionIds = await Promise.all(turns.map(async (turn) => (await turn.accepted).sessionId));
+    assert.ok(locked.length > 0 && locked.every((info) => info.provider === "grok" && sessionIds.includes(info.sessionId)), `refreshLock names the session: ${JSON.stringify(locked)}`);
   } finally {
     await Promise.all(servers.map((agent) => agent.close()));
   }

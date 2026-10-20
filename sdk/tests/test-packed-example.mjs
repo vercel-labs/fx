@@ -11,6 +11,8 @@ import { fileURLToPath } from "node:url";
 const backend = process.argv[3] || "native";
 const format = process.argv[4] || "esm";
 if (process.argv[2] !== "--installed") {
+  // Not in the consumer, where this file runs again.
+  const { nativeAlias, nativePackageBeside } = await import("./package-siblings.mjs");
   const temp = await mkdtemp(resolve(tmpdir(), "libfx-packed-"));
   function run(command, args, cwd) {
     const result = spawnSync(command, args, { cwd, encoding: "utf8", timeout: 120_000 });
@@ -19,13 +21,19 @@ if (process.argv[2] !== "--installed") {
     return result.stdout;
   }
   try {
+    // libfx's directory or tarball, as sdk/scripts/package-libfx.mjs and
+    // `npm pack` write them: this machine's addon version sits beside it. It
+    // installs under the alias the registry would give it, so libfx's
+    // optional dependency on the addon version is the one given here.
     const input = resolve(process.argv[2]);
     const consumer = resolve(temp, "consumer");
     await mkdir(consumer);
     await writeFile(resolve(consumer, "package.json"), '{"private":true,"type":"module"}\n');
-    const archive = input.endsWith(".tgz") ? input : resolve(temp,
-      JSON.parse(run("npm", ["pack", input, "--ignore-scripts", "--pack-destination", temp, "--json"], temp))[0].filename);
-    run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", archive], consumer);
+    const archive = (path) => path.endsWith(".tgz") ? path : resolve(temp,
+      JSON.parse(run("npm", ["pack", path, "--ignore-scripts", "--pack-destination", temp, "--json"], temp))[0].filename);
+    const packages = [["libfx", input], [nativeAlias, nativePackageBeside(input)]]
+      .filter(([, path]) => path).map(([name, path]) => `${name}@file:${archive(path)}`);
+    run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", ...packages], consumer);
     await cp(fileURLToPath(import.meta.url), resolve(consumer, "example.mjs"));
     console.log(run(process.execPath, [...process.execArgv, "example.mjs", "--installed", backend, format], consumer).trim());
   } finally {
@@ -132,6 +140,28 @@ if (process.argv[2] !== "--installed") {
     } finally {
       delete process.env.FX_SESSIONS_DIR;
       await rm(sessionsDir, { recursive: true, force: true });
+    }
+    // The terminal runs from the WebAssembly libfx carries.
+    if (backend === "wasm") {
+      const listeners = new Set();
+      let output = 0;
+      const terminal = {
+        cols: 80, rows: 24,
+        write(bytes) { output += bytes.byteLength; },
+        onData(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+        onResize(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+      };
+      const runtime = await createFxTerminal({
+        terminal,
+        nativeAddon: false,
+        fetch: (input, init) => fetch(init?.method === "GET" ? `http://127.0.0.1:${server.address().port}/models` : String(input), init),
+        env: { AI_GATEWAY_API_KEY: "packed-key", FX_SOUND: "0" },
+      });
+      await runtime.interactive;
+      assert.ok(output > 0, "the terminal drew its interface");
+      runtime.abort();
+      assert.equal(await runtime.exited, 130);
+      assert.equal(listeners.size, 0);
     }
     console.log(`${format} ${backend} packed libfx example passed`);
   } finally {

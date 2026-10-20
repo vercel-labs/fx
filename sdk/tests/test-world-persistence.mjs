@@ -121,13 +121,6 @@ async function storedEvents(world, runId) {
   return journal.flatMap((record) => JSON.parse(new TextDecoder().decode(record.data)).events);
 }
 
-async function until(check, message, ms = 5000) {
-  for (const deadline = Date.now() + ms; !(await check());) {
-    if (Date.now() > deadline) throw new Error(message);
-    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
-  }
-}
-
 // world-local's queue teardown calls undici's Agent.close(), which Bun's
 // built-in undici lacks. Only that known failure is skipped, and only on Bun.
 async function closeWorld(world) {
@@ -228,14 +221,15 @@ test("a second process on the session fences the first, and its late write is no
   const store = worldPersistence(world);
   const first = await createAgent(store);
   await run(first, "one");
-  // turn.result does not wait for the turn's last appends, so the takeover
-  // waits for the commit to reach the World.
-  await until(async () => (await storedEvents(world, store.runId)).some((event) => event.type === "turn_committed"), "the first turn never committed");
+  // turn.result resolves only once the record that ends the turn is stored
+  // (DUR-20), so the takeover finds the first turn committed.
+  assert.ok((await storedEvents(world, store.runId)).some((event) => event.type === "turn_committed"), "the first turn's end is stored before its result");
 
   const second = await createAgent(worldPersistence(world, { runId: store.runId }));
   await run(second, "two");
   await second.close();
-  const fenced = (error) => error.code === "FX_JOURNAL_APPEND_FAILED" && error.cause instanceof FxFencedError;
+  // A fenced turn rejects with the store's own fence (DUR-30).
+  const fenced = (error) => error instanceof FxFencedError && error.code === "FX_FENCED";
   await assert.rejects(run(first, "three"), fenced);
   await first.close();
 

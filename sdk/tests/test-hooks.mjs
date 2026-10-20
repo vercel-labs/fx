@@ -385,7 +385,8 @@ for (const wrapped of [false, true]) {
     },
   });
   try {
-    await assert.rejects(drain(engine.prompt("never delivered")), /journal|append/i);
+    // The turn rejects with the store's fence, also one it carries as the cause.
+    await assert.rejects(drain(engine.prompt("never delivered")), (error) => error.code === "FX_FENCED" && error.message === "fenced");
     assert.equal(eventsOf(events, "journal.commit").length, 0);
     assert.equal(eventsOf(events, "model.start").length, 0);
     assert.equal(eventsOf(events, "journal.error")[0].data.fenced, true);

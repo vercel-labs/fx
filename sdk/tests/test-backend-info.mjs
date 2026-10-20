@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createFxEngine, createFxTerminal, getBackendInfo } from "../node.js";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
@@ -106,10 +106,14 @@ try {
     (error) => error?.code === "ERR_MODULE_NOT_FOUND",
   );
 
+  // PKG-2: the addon comes from this platform's addon version of libfx,
+  // libfx-<platform>, which the repository's sdk/ doesn't have installed.
   const defaultMissing = await getBackendInfo({ backend: "native" });
   assert.equal(defaultMissing.backend, "unavailable");
   assert.equal(defaultMissing.attempts[0].reason.code, "LIBFX_NATIVE_ARTIFACT_MISSING");
-  assert.equal(defaultMissing.attempts[0].reason.causeCode, "ENOENT");
+  assert.equal(defaultMissing.attempts[0].reason.causeCode, "ERR_MODULE_NOT_FOUND");
+  assert.equal(defaultMissing.attempts[0].reason.message,
+    `native addon artifact was not found: libfx-${process.platform}-${process.arch} is not installed; it holds libfx's native addon for ${process.platform}-${process.arch}`);
   await assert.rejects(
     createFxEngine({ backend: "native", apiKey: "missing-default-key" }),
     (error) => error?.code === "LIBFX_NATIVE_UNAVAILABLE",
@@ -186,6 +190,14 @@ try {
     (error) => error?.code === "ERR_INVALID_FILE_URL_HOST",
   );
   assert.equal((await getBackendInfo({ backend: "auto", nativeAddon: false, wasm: coreWasm })).backend, "wasm-jspi");
+
+  // A file: URL string is read from disk, as a file: URL is; fetch() has no
+  // file: support.
+  const coreWasmHref = pathToFileURL(coreWasm).href;
+  assert.equal((await getBackendInfo({ backend: "wasm", wasm: coreWasmHref })).backend, "wasm-jspi");
+  const hrefEngine = await createFxEngine({ backend: "wasm", wasm: coreWasmHref, apiKey: "file-href-key" });
+  assert.ok((await hrefEngine.checkpoint()).length > 0, "an engine starts from a file: URL string");
+  await hrefEngine.close();
 
   const missingWasmInfo = await getBackendInfo({ backend: "wasm", wasm: missingWasm });
   assert.equal(missingWasmInfo.backend, "unavailable");

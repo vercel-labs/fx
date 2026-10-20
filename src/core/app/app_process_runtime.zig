@@ -41,10 +41,21 @@ pub fn Runtime(comptime App: type) type {
             const work = (try app.worker.tryTakeNextWork(std.heap.c_allocator)) orelse return;
             defer worker_runtime.freeWorkItem(std.heap.c_allocator, work);
             defer app.worker.finishProcessing();
+            // No other thread answers a blocking approval here, so the wait
+            // runs this host's loop until the user answers.
+            if (comptime @hasDecl(App, "cooperativeWait")) {
+                app.worker.cooperative_wait = .{ .context = @ptrCast(app), .wait_fn = cooperativeWait };
+            }
+            defer app.worker.cooperative_wait = null;
             processCooperativeWork(app, event_handlers, flush_frame, work) catch |err| {
                 settleCompactionWorkFailure(&app.worker, work, err);
                 return err;
             };
+        }
+
+        fn cooperativeWait(context: *anyopaque) bool {
+            const app: *App = @ptrCast(@alignCast(context));
+            return app.cooperativeWait();
         }
 
         fn processCooperativeWork(

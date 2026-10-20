@@ -5,6 +5,7 @@ import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createFxEngine, supportsJspi } from "../node.js";
+import { createFxEngine as createCoreEngine, turnEndInputs } from "../fx-sdk.js";
 import { testHooks } from "./hooks-fixture.mjs";
 
 const backend = process.argv[2] || "native";
@@ -149,4 +150,74 @@ try {
   await agent?.close().catch(() => {});
   server.closeAllConnections();
   await new Promise((resolveClose) => server.close(resolveClose));
+}
+
+// The read of stored inputs before a turn ends, on WebAssembly: the
+// `fx_take_inputs` import awaits the runtime's `takeInputs`. A cancel ends the
+// wait on a running turn's read. A turn that is no longer current can take no
+// steer, so it reads nothing and never waits, whatever the read would do.
+if (backend === "wasm") {
+  let handler;
+  let exit;
+  let promptId = null;
+  let takeInputs;
+  let reads = 0;
+  const runtime = {
+    exited: new Promise((resolveExit) => { exit = resolveExit; }),
+    setLineHandler(value) { handler = value; },
+    write(data) {
+      const message = JSON.parse(data);
+      const deliver = (value) => queueMicrotask(() => handler(value));
+      if (message.method === "initialize") deliver({ id: message.id, result: {} });
+      if (message.method === "libfx/new") deliver({ id: message.id, result: { sessionId: "session" } });
+      // The core answers the prompt when the test says.
+      if (message.method === "session/prompt") promptId = message.id;
+    },
+    abortHostEffects() {},
+    closeStdin() { exit(0); },
+  };
+  const engine = await createCoreEngine({
+    apiKey: "steering-key",
+    runtimeFactory: (runtimeOptions) => {
+      takeInputs = runtimeOptions.takeInputs;
+      return runtime;
+    },
+    // A read of the store that never answers.
+    [turnEndInputs]: () => {
+      reads += 1;
+      return new Promise(() => {});
+    },
+  });
+  const settles = (promise) => Promise.race([
+    promise.then(() => "settled", () => "settled"),
+    new Promise((resolveWait) => setTimeout(() => resolveWait("waiting"), 100)),
+  ]);
+  let answered = false;
+  const answer = () => {
+    if (answered || promptId === null) return;
+    answered = true;
+    handler({ id: promptId, result: { stopReason: "cancelled" } });
+  };
+  try {
+    assert.equal(await settles(takeInputs()), "settled", "with no turn running, the read waits");
+    assert.equal(reads, 0, "with no turn running, the store was read");
+    const turn = engine.prompt("read before the end");
+    while (promptId === null) await new Promise((resolveWait) => setTimeout(resolveWait, 5));
+    const running = takeInputs();
+    assert.equal(await settles(running), "waiting", "the running turn's read did not wait on the store");
+    assert.equal(reads, 1);
+    turn.cancel();
+    assert.equal(await settles(running), "settled", "the cancel did not end the running turn's read");
+    // Cancelled, and the core has not answered its prompt yet.
+    assert.equal(await settles(takeInputs()), "settled", "a cancelled turn's read waits on the store");
+    assert.equal(reads, 1, "a cancelled turn read the store");
+    answer();
+    assert.equal((await turn.result).stopReason, "cancelled");
+    assert.equal(await settles(takeInputs()), "settled", "after the turn, the read waits");
+    assert.equal(reads, 1, "after the turn, the store was read");
+  } finally {
+    answer();
+    await engine.close().catch(() => {});
+  }
+  console.log("wasm turn-end read waits only for a running turn");
 }

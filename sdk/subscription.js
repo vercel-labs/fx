@@ -125,6 +125,19 @@ export function needsRefresh(credentials, nowMs) {
 export const credentialMemory = Symbol.for("libfx.credentialMemory");
 
 /**
+ * Set on the error of a refresh that failed. The provider accepts a refresh
+ * token once, so the request it was for fails with it and is not sent again.
+ */
+export const refreshFailed = Symbol.for("libfx.refreshFailed");
+
+function markRefreshFailed(error) {
+  if (error !== null && typeof error === "object") {
+    try { error[refreshFailed] = true; } catch {}
+  }
+  throw error;
+}
+
+/**
  * Refresh state for `createSubscriptionAuthorizer()`. An agent gives the same
  * memory to every session's engine, so its sessions refresh an account once.
  */
@@ -137,12 +150,14 @@ export function createCredentialMemory() {
  * supplies credentials; `onCredentials(next, { provider, sessionId })` receives
  * refreshed ones once for each session that uses them, so the host can save them.
  * `refreshLock({ provider, sessionId }, refresh)` runs `refresh` while the host
- * holds a lock on the account, for a host with several servers.
+ * holds a lock on the account, for a host with several servers. A request
+ * whose headers name no session, such as a turn's model-list request, is for
+ * `sessionId()`, the engine's session.
  *
  * Each spec: `{ provider, matches(endpoint), sessionId(headers), normalize(value),
  * refresh(credentials, { fetch, signal }), authorize(headers, endpoint, credentials) }`.
  */
-export function createSubscriptionAuthorizer(specs, { credentials, onCredentials, refreshLock, fetch, now = Date.now, memory = createCredentialMemory() }) {
+export function createSubscriptionAuthorizer(specs, { credentials, onCredentials, refreshLock, fetch, now = Date.now, memory = createCredentialMemory(), sessionId: engineSession = () => undefined }) {
   if (typeof credentials !== "function") throw new TypeError("a subscription provider needs a credentials() function");
   if (onCredentials !== undefined && typeof onCredentials !== "function") {
     throw new TypeError("onCredentials must be a function");
@@ -188,7 +203,7 @@ export function createSubscriptionAuthorizer(specs, { credentials, onCredentials
         return latest;
       }
     }
-    const next = await spec.refresh(current, { fetch, signal });
+    const next = await spec.refresh(current, { fetch, signal }).catch(markRefreshFailed);
     remember(spec, supplied, next);
     await save(spec, next, sessionId);
     return next;
@@ -236,7 +251,7 @@ export function createSubscriptionAuthorizer(specs, { credentials, onCredentials
     specFor: (endpoint) => specs.find((spec) => spec.matches(endpoint)),
     /** Sends one request with credentials, refreshing once after a 401. */
     async fetch(spec, endpoint, hostFetch, input, init = {}) {
-      const sessionId = spec.sessionId(new Headers(init.headers)) || undefined;
+      const sessionId = spec.sessionId(new Headers(init.headers)) || engineSession() || undefined;
       const { used } = await current(spec, sessionId, init.signal);
       const response = await hostFetch(input, withCredentials(spec, endpoint, init, used));
       if (response.status !== 401 || used.refreshToken === undefined) return withoutCredentials(response, used);

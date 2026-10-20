@@ -2,9 +2,25 @@
 // Drives real libfx, with its Zig kernel loaded through the native addon or
 // WebAssembly, along paths of the TLC state graph of DurableSession.tla, and
 // checks after every step that the code is in a state the model allows.
+// Each turn_end line a worker writes waits for the walk's EndLine step, so a
+// walk can crash a worker between the record that ends its turn and that
+// line, and check that another worker writes the end it left missing, with
+// the stop reason that record holds. The answer streams as the graph's
+// ReplyParts text lines, which wait as well: Model2 lands the record with
+// the first of them, as many as the walk picks, and the driver compares the
+// parts of the answer each shown line carries with the model's, so a worker
+// that writes a missing end must first show the rest of the answer, once.
 //
-//   bun tests/tla/drivers/drive.mjs [send|lookup|write|cutoff|leased|queue] [--walks N] [--seed S] [--backend native|wasm]
+//   bun tests/tla/drivers/drive.mjs [send|lookup|write|cutoff|leased|queue|refuse] [--walks N] [--seed S] [--backend native|wasm]
 //     [--durability local|world|vercel] [--hooks]
+//
+// The refuse graph is the send graph with Refused: the prompt is one fx
+// refuses, a text block with no text, so its turn ends before any record,
+// through an `ended` entry, and its turn_end line waits for EndLine like
+// any other. An fx agent's prompt() refuses that prompt before storing
+// anything, so the walk's agents are fx agents without that check, as an
+// earlier libfx that stored such a prompt was; the worker refuses it when
+// its turn runs.
 //
 // The lookup and cutoff graphs run a lookup, which starts before its intent
 // is stored: the driver holds that intent's record, so the call runs while
@@ -59,8 +75,12 @@ const option = (name, fallback) => {
   const index = args.indexOf(`--${name}`);
   return index >= 0 ? args[index + 1] : fallback;
 };
-const graphName = args.find((arg) => ["send", "lookup", "write", "cutoff", "leased", "queue"].includes(arg)) ?? "send";
-const tool = graphName === "cutoff" ? "lookup" : graphName === "leased" || graphName === "queue" ? "send" : graphName;
+const graphName = args.find((arg) => ["send", "lookup", "write", "cutoff", "leased", "queue", "refuse"].includes(arg)) ?? "send";
+const tool = graphName === "cutoff" ? "lookup" : ["leased", "queue", "refuse"].includes(graphName) ? "send" : graphName;
+// The walk's prompt: one that asks for the tool, or on the refuse graph one
+// the harness refuses before its engine stores anything.
+const refused = graphName === "refuse";
+const promptInput = refused ? [{ type: "text" }] : `use ${tool}`;
 // The tool as the host declares it, and whether its calls run ahead.
 const toolFlags = { lookup: { idempotent: true }, write: { idempotent: true, writes: true }, send: { idempotent: false } }[tool];
 const runsAhead = tool === "lookup";
@@ -90,15 +110,41 @@ const addon = resolve(here, "../../../zig-out/lib/libfx.node");
 const wasm = backend === "wasm" ? await readFile(resolve(here, "../../../zig-out/bin/fx-core.wasm")) : undefined;
 const Workers = ["A", "B"];
 
-// The epochs of the lines every reader shows, by the spec's ShownAt: each
-// line no earlier line outranks.
-const shownEpochs = (lines) => {
+// The model's answer streams as the graph's ReplyParts text lines, part k
+// being `replyWords[k - 1]`.
+const graphConfig = await readFile(resolve(here, "../sdk", `DurableSession-${graphName}.cfg`), "utf8");
+const replyParts = Number(/ReplyParts = (\d+)/.exec(graphConfig)?.[1]);
+assert.ok(Number.isSafeInteger(replyParts) && replyParts >= 1, `DurableSession-${graphName}.cfg sets ReplyParts`);
+const replyWords = Array.from({ length: replyParts }, (_, index) => `part${index + 1} `);
+// The model leaves out a claim that would pass MaxEpoch: it is not taken
+// where the walk may stand in a state whose chain has not moved since the
+// worker read it, so that the claim would count.
+const maxEpoch = Number(/MaxEpoch = (\d+)/.exec(graphConfig)?.[1]);
+assert.ok(Number.isSafeInteger(maxEpoch), `DurableSession-${graphName}.cfg sets MaxEpoch`);
+const claimPastBound = (state, w) => state.pc[w] === "early" && state.seen[w].epoch >= maxEpoch && state.chain === state.seen[w].chain;
+// The parts of the answer a text line carries: the run of parts its text is,
+// or a line no model state has.
+const partsOf = (delta) => {
+  for (let from = 0; from < replyWords.length; from += 1) {
+    for (let to = from; to < replyWords.length; to += 1) {
+      if (replyWords.slice(from, to + 1).join("") === delta) return Array.from({ length: to - from + 1 }, (_, index) => from + index + 1);
+    }
+  }
+  return [`?${JSON.stringify(delta)}`];
+};
+
+// The lines every reader shows, by the spec's ShownAt: each line no earlier
+// line outranks, as its epoch, with the parts of the answer it carries after
+// a "t", and an "e" and the stop reason it says after a turn_end's (the
+// spec's EndSaysHow and ReplyShownOnce).
+const lineView = (epoch, end, how, text) => `${epoch}${text.length > 0 ? `t${text.join("")}` : ""}${end ? `e:${how}` : ""}`;
+const shownLines = (lines) => {
   let high = 0;
   const shown = [];
   for (const line of lines) {
     if (line.e < high) continue;
     high = line.e;
-    shown.push(line.e);
+    shown.push(lineView(line.e, line.end, line.how, line.text));
   }
   return shown;
 };
@@ -106,7 +152,7 @@ const shownEpochs = (lines) => {
 // leased World, whether a lease stands too: a woken worker's renewal may or
 // may not have landed, and only the lease tells those states apart.
 const view = (state) => JSON.stringify({
-  pc: state.pc, frozen: state.frozen, runs: state.runs, ids: state.ids, ui: shownEpochs(state.ui), ...(leased ? { live: state.live ?? state.lease.live } : {}),
+  pc: state.pc, frozen: state.frozen, runs: state.runs, ids: state.ids, ui: shownLines(state.ui), ...(leased ? { live: state.live ?? state.lease.live } : {}),
 });
 const sameAct = (a, b) => a.name === b.name && a.w === b.w;
 
@@ -145,7 +191,7 @@ const pending = new Map();
 const servers = {};
 for (const w of Workers) {
   const server = new Worker(new URL("./session-process.mjs", import.meta.url), {
-    workerData: { w, liveBuffer, announcedBuffer, tool, toolFlags, runsAhead, durabilityKind, leaseMs, streamQuietMs, backend, addon, wasm, hooks },
+    workerData: { w, liveBuffer, announcedBuffer, tool, toolFlags, runsAhead, durabilityKind, leaseMs, streamQuietMs, backend, addon, wasm, hooks, refused },
     // The hooks fixture turns on with the flag in its own process's argv.
     ...(hooks ? { argv: ["--hooks"] } : {}),
   });
@@ -191,6 +237,10 @@ async function harness() {
   // Each worker's held writes: its claims on the session, a call's first
   // intent, and a frozen leased worker's renewals.
   const held = { A: [], B: [] };
+  // How many turn_end lines, and text lines of the answer, each worker's
+  // writes hold.
+  const endsHeld = { A: 0, B: 0 };
+  const textsHeld = { A: 0, B: 0 };
   // On the queue's World, the message a frozen holder's delivery held, which
   // the queue delivers again.
   const lapsed = { A: null, B: null };
@@ -206,7 +256,11 @@ async function harness() {
     if (index >= 0) list.splice(index, 1);
   };
   report = (w, message) => {
-    if (message.type === "held") held[w] = message.held;
+    if (message.type === "held") {
+      held[w] = message.held;
+      endsHeld[w] = message.ends ?? 0;
+      textsHeld[w] = message.texts ?? 0;
+    }
     else if (message.type === "request") requests.push({ w, id: message.id, kind: message.kind });
     else if (message.type === "request-gone") remove(requests, requests.find((entry) => entry.w === w && entry.id === message.id));
     else if (message.type === "call") {
@@ -241,12 +295,15 @@ async function harness() {
     if (claimed[w] === null) return "none";
     if (fenced[w] > claimed[w].fenced) return "stopped";
     if (lines.some((line) => line.type === "turn_end" && line.epoch === claimed[w].epoch)) return "done";
+    // Its turn's end is in the log and its turn_end line waits, behind any
+    // text of the answer it still writes.
+    if (endsHeld[w] > 0 || textsHeld[w] > 0) return "ending";
     const request = requests.find((entry) => entry.w === w);
     if (request) return request.kind;
     if (calls.some((entry) => entry.w === w)) return held[w].some((entry) => entry.k === "record") ? "ahead" : "tool";
     return "busy";
   };
-  const waiting = (w) => requests.some((entry) => entry.w === w) || calls.some((entry) => entry.w === w);
+  const waiting = (w) => requests.some((entry) => entry.w === w) || calls.some((entry) => entry.w === w) || endsHeld[w] > 0 || textsHeld[w] > 0;
   const newHolders = (before) => [...liveHolders].filter((holder) => !before.has(holder));
 
   async function observe() {
@@ -282,7 +339,7 @@ async function harness() {
       frozen: { ...frozen },
       runs,
       ids: executions.size,
-      ui: lines.filter((line) => modeledLines.has(line.type)).map((line) => line.epoch ?? 0),
+      ui: lines.filter((line) => modeledLines.has(line.type)).map((line) => lineView(line.epoch ?? 0, line.type === "turn_end", line.stopReason, line.type === "text_delta" ? partsOf(line.delta) : [])),
       ...(leased ? { live: sessionId ? await call("A", "leaseStands", { sessionId }) : false } : {}),
     };
   }
@@ -298,7 +355,7 @@ async function harness() {
       const head = sessionId ? await leaseHolder(w) : null;
       const handedOn = Workers.find((v) => v !== w && lapsed[v] && holders[v].includes(head));
       if (!sessionId) {
-        sessionId = await call(w, "prompt", { text: `use ${tool}`, messageId: "turn-1" });
+        sessionId = await call(w, "prompt", { text: promptInput, messageId: "turn-1" });
       } else if (handedOn) {
         // The queue hands the frozen holder's message to w.
         await call(w, "adopt", { message: lapsed[handedOn] });
@@ -334,9 +391,19 @@ async function harness() {
       // A response that calls the tool names a new call id, as a model's does.
       answer(request, name === "Model1"
         ? [{ type: "tool-call", toolCallId: `call-${(modelCalls += 1)}`, toolName: tool, input: { key: "alpha" } }, finish("tool-calls")]
-        : [{ type: "text-delta", id: "answer", delta: "done" }, finish("stop")]);
+        : [...replyWords.map((delta) => ({ type: "text-delta", id: "answer", delta })), finish("stop")]);
       if (name === "Model1") await until(() => calls.some((entry) => entry.w === w) || stopped());
-      else await until(async () => stopped() || (await streamLines()).some((line) => line.type === "turn_end" && line.epoch === claimed[w].epoch));
+      else {
+        // The record that ends the turn lands while the answer's text lines
+        // and its turn_end line wait; then the first of those text lines,
+        // as many as the walk picks, land too.
+        await until(async () => stopped() || ((endsHeld[w] > 0 || textsHeld[w] > 0) && (await call(w, "turnEnded", { sessionId }))));
+        if (!stopped()) await call(w, "releaseText", { count: Math.floor(random() * (replyParts + 1)) });
+      }
+    } else if (name === "EndLine") {
+      // w's turn_end line goes out, then its release.
+      await call(w, "releaseEnds");
+      await until(async () => stopped() || (await streamLines()).some((line) => line.type === "turn_end" && line.epoch === claimed[w].epoch));
     } else if (name === "Intent") {
       // The intent of w's call that ran ahead lands. Where w still heads the
       // chain its call goes on; where it was replaced the write is refused,
@@ -386,7 +453,7 @@ async function harness() {
         if (reclaimed()) took = true;
         if (held[w].length > 0) return false;
         if (took && waiting(w)) return true;
-        if (await ended()) return (took = true);
+        if (endsHeld[w] > 0 || (await ended())) return (took = true);
         return fenced[w] > fencedBefore;
       });
       if (took) {
@@ -452,6 +519,8 @@ for (let walk = 1; walk <= walks; walk += 1) {
           // same worker, so a Deadline that only releases the session is a
           // path the code cannot take.
           if (act.name === "Deadline" && graph.states.get(to).pc[act.w] === "none") continue;
+          // A claim the code may land past the model's bound.
+          if (act.name === "Claim" && [...current].some((id) => claimPastBound(graph.states.get(id), act.w))) continue;
           let option = options.find((item) => sameAct(item.act, act));
           if (!option) options.push(option = { act, fresh: false });
           if (!covered.has(`${from}>${to}`)) option.fresh = true;

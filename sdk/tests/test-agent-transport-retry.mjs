@@ -162,3 +162,59 @@ try {
 }
 
 console.log(`${process.versions.bun ? "Bun" : "Node"} ${backend} Agent retry-event cancellation stopped transport retry`);
+
+// The provider's errors and fx's notices are not the reply: text_delta carries
+// only what the model wrote (API-48). A refused turn says why in its result,
+// and a content filter's error says it was the filter (QUAL-18).
+const finishFrame = (reason) => `data: {"type":"finish","finishReason":{"unified":"${reason}","raw":"${reason}"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n\n`;
+const replies = [
+  () => Response.json({ error: { message: "scripted failure 400", type: "demo_error" } }, { status: 400 }),
+  () => new Response(`data: {"type":"text-delta","delta":"I can't help with that."}\n\n${finishFrame("content-filter")}data: [DONE]\n\n`, { status: 200, headers: { "content-type": "text/event-stream" } }),
+  () => new Response(`data: {"type":"text-delta","delta":"this reply ran out of room"}\n\n${finishFrame("length")}data: [DONE]\n\n`, { status: 200, headers: { "content-type": "text/event-stream" } }),
+];
+let replyCalls = 0;
+const noticeEvents = [];
+const noticeAgent = await createFxEngine({
+  backend,
+  nativeAddon: resolve(scriptDir, "../../zig-out/lib/libfx.node"),
+  ...(backend === "wasm"
+    ? { wasm: await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm")) }
+    : {}),
+  fetch: async (_url, init) => {
+    if (init.method === "GET") return catalogResponse();
+    return replies[replyCalls++]();
+  },
+  apiKey: "transport-notice-key",
+  model: "transport-retry/model",
+  onEvent(event) { noticeEvents.push(event); },
+});
+const replyText = async (turn) => {
+  let text = "";
+  for await (const event of turn) if (event.type === "text_delta") text += event.delta;
+  return text;
+};
+
+try {
+  const refused = noticeAgent.prompt("fail with HTTP 400");
+  assert.equal(await replyText(refused), "", "the provider's HTTP error body is not streamed as text_delta");
+  assert.deepEqual(await refused.result, {
+    stopReason: "refused",
+    usage: {},
+    error: { name: "Error", message: 'HTTP 400: {"error":{"message":"scripted failure 400","type":"demo_error"}}' },
+  }, "a refused turn says why in its result");
+
+  const filtered = noticeAgent.prompt("trip the content filter");
+  assert.equal(await replyText(filtered).catch(() => "rejected"), "rejected");
+  await assert.rejects(filtered.result, /content filter/, "a content-filtered turn's error says it was filtered");
+
+  const limited = noticeAgent.prompt("run out of room");
+  assert.equal(await replyText(limited), "this reply ran out of room", "fx's length notice is not appended to the reply");
+  assert.equal((await limited.result).stopReason, "max_output_tokens");
+  const notices = noticeEvents.filter((event) => event.type === "turn.notice");
+  assert.deepEqual(notices.map((event) => [event.sessionId, event.text]), [[noticeAgent.sessionId, "response hit provider length limit; output may be incomplete"]], "the notice reaches onEvent instead");
+  assert.equal(replyCalls, 3, "each turn made one model request");
+} finally {
+  await noticeAgent.close();
+}
+
+console.log(`${process.versions.bun ? "Bun" : "Node"} ${backend} Agent provider errors and notices stay out of the reply`);

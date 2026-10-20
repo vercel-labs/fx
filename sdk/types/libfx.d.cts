@@ -30,6 +30,10 @@ export interface FxErrorSummary {
   name: string;
   message: string;
   code?: string | number;
+  /** For an unsupported model setting: the model. */
+  model?: string;
+  /** For an unsupported model setting: `effort`, `fast`, or `ultrafast`. */
+  capability?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -261,8 +265,8 @@ export interface FxUsage {
   reasoningTokens?: number;
 }
 
-/** Why an engine turn ended. */
-export type FxStopReason = "end_turn" | "max_output_tokens" | "max_model_turns" | "refused" | "cancelled";
+/** Why an engine turn ended. `yielded` is a turn that stopped at its `yieldAt` before its next model request; `resume()` continues it. */
+export type FxStopReason = "end_turn" | "max_output_tokens" | "max_model_turns" | "refused" | "cancelled" | "yielded";
 
 // ---------------------------------------------------------------------------
 // Diagnostics
@@ -282,6 +286,11 @@ export interface FxCheckpointMeta {
 /** A runtime diagnostic an engine passes to `onEvent`, separate from model output. */
 export type FxEngineEvent = FxEventBase & (
   | { type: "runtime.start" }
+  /**
+   * On Node.js, the process's native runtimes were all in use, or this engine's agent held its share of them, so
+   * the engine runs on WebAssembly. `message` says which.
+   */
+  | { type: "runtime.fallback"; backend: "wasm"; code: "LIBFX_NATIVE_LIMIT"; message: string }
   | { type: "runtime.ready" }
   | { type: "runtime.exit"; code: number }
   | { type: "acp.send"; message: unknown }
@@ -307,14 +316,17 @@ export type FxEngineEvent = FxEventBase & (
   | { type: "journal.append"; events: number }
   | { type: "journal.error"; error: string }
   | { type: "checkpoint.save"; through: string; bytes: number }
-  | { type: "checkpoint.error"; error: string; message: string }
-  /** A checkpoint saved under a different libfx version, tool set, or model still loaded. */
+  /** A checkpoint save failed, or, with `skipped`, the core saved none because the conversation is past a checkpoint's limits (`code: "FX_CHECKPOINT_TOO_LARGE"`), so each load reads every record since the last checkpoint. */
+  | { type: "checkpoint.error"; error: string; message: string; code?: "FX_CHECKPOINT_TOO_LARGE"; skipped?: "too_large" | "too_many_turns" | "invalid" }
+  /** A checkpoint saved under a different libfx version, tool set, or model still loaded; or a session that has saved no checkpoint yet last ran on another model, as its records say (`saved` then holds only `model`). */
   | { type: "checkpoint.mismatch"; sessionId: string; changed: Array<keyof FxCheckpointMeta>; saved: unknown; current: FxCheckpointMeta }
   | { type: "output.backpressure"; bufferedBytes: number; bufferedEvents: number }
   | { type: "output.discarded"; reason: "cancelled"; bytes: number }
+  /** A notice fx gives beside a turn's reply, such as an Ultrafast tier the provider did not confirm. It is never part of the reply. */
+  | { type: "turn.notice"; sessionId: string; text: string }
 );
 
-/** A durable session's diagnostic: a failed write or engine, a takeover, or a function deadline. */
+/** A durable session's diagnostic: a failed write or engine, a takeover, or a function deadline; or, in development, a replaced agent. */
 export type FxSessionEvent = FxEventBase & (
   | { type: "session.error"; sessionId: string; error: FxErrorSummary }
   | { type: "session.fenced"; sessionId: string; epoch: number }
@@ -322,9 +334,14 @@ export type FxSessionEvent = FxEventBase & (
   | { type: "session.forwarded"; sessionId: string; agent: string }
   /** A queue delivery named an input the session's log does not hold, or none at all, so it ran nothing. */
   | { type: "session.refused"; sessionId?: string; messageId?: string; reason: "unknown message" | "malformed message" }
-  /** `cutoffs`: the times in a row the deadline cut off the same step, this one included. */
+  /**
+   * The function's time limit stopped a turn. `cutoffs`: the times in a row the deadline cut off the same step, this
+   * one included, or 0 when the turn yielded at a step boundary and cut nothing off.
+   */
   | { type: "session.deadline"; sessionId: string; epoch: number; cutoffs: number }
   | { type: "ui.error"; sessionId: string; error: string }
+  /** Under `NODE_ENV=development`, this agent replaced `replaced` earlier agents of its name and store with other options. */
+  | { type: "agent.replaced"; agent: string; replaced: number }
 );
 
 /** What an agent passes to `onEvent`: its engines' diagnostics and its sessions'. */
@@ -455,12 +472,15 @@ export type FxBackendChoice = "auto" | "native" | "wasm";
 /** A Wasm asset in browsers and on `libfx/wasm`: a URL string, a `Response`, bytes, a compiled module, or a promise of one of the last three. */
 export type FxWasmSource = string | Response | FxBytes | FxWasmModule | Promise<Response | FxBytes | FxWasmModule>;
 
-/** A Wasm asset on Node.js: a path, a URL, a `Response`, bytes, a compiled module, or a promise of an HTTP(S) URL string, a `Response`, bytes, or a module. */
+/** A Wasm asset on Node.js: a path, a URL or URL string, read from disk when it is a `file:` URL, a `Response`, bytes, a compiled module, or a promise of an HTTP(S) URL string, a `Response`, bytes, or a module. */
 export type FxNodeWasmSource = string | URL | Response | FxBytes | FxWasmModule | Promise<string | Response | FxBytes | FxWasmModule>;
 
 /** Backend selection on Node.js. */
 export interface FxNodeBackendOptions {
-  /** `"auto"` tries the native addon, then Wasm; `"native"` requires N-API; `"wasm"` requires Wasm and JSPI. */
+  /**
+   * `"auto"` tries the native addon, then Wasm; `"native"` requires N-API; `"wasm"` requires Wasm and JSPI. With
+   * `"auto"` or `"native"`, an engine the native runtime limit or its agent's share of it keeps off N-API runs on Wasm.
+   */
   backend?: FxBackendChoice;
   /** Trusted host configuration: the native addon module, its path or URL, or `false` to disable native loading. */
   nativeAddon?: string | URL | false | object;
@@ -491,10 +511,11 @@ export interface PersistenceLoadResult {
   head?: string | null;
 }
 
-/** What one record tells a store that set `marks: true` about turns: a turn started, ended or yielded, or an input was accepted. Other marks may appear; a store keeps or ignores them. */
+/** What one record tells a store that set `marks: true` about turns: a turn started, ended and how, or yielded, or an input was accepted. Other marks may appear; a store keeps or ignores them. */
 export type FxJournalMark =
   | { start: string }
-  | { end: true }
+  /** `stopReason` is how the turn ended: its stop reason, or `error` when its prompt failed. A record an earlier libfx wrote has none. */
+  | { end: true; stopReason?: FxStopReason | "error" }
   | { yield: true }
   | { accepted: string }
   | { step: string };
@@ -505,7 +526,7 @@ export interface Persistence {
   load(): Promise<PersistenceLoadResult>;
   /**
    * Stores one record and resolves to its cursor. Reject with an `FxFencedError` when `expected` is not the last stored record's cursor.
-   * `barrier` is true when libfx waits for the record before it goes on, such as before a tool call with effects. A store may resolve a record with `barrier: false` before it is durable, if it keeps records in order and resolves one with `barrier: true` only once it and every record before it are durable.
+   * `barrier` is true when libfx waits for the record before it goes on, such as before a tool call with effects, or for the record that ends a turn, which the turn's `result` waits for. A store may resolve a record with `barrier: false` before it is durable, if it keeps records in order and resolves one with `barrier: true` only once it and every record before it are durable.
    */
   append(input: { expected: string | null; idempotencyKey: string; data: Uint8Array; barrier: boolean; marks?: FxJournalMark[] }): Promise<{ cursor: string }>;
   /** Stores a checkpoint covering the records through `through`. */
@@ -570,6 +591,8 @@ export interface FxResumeOptions {
 export interface FxEngineTurnResult {
   stopReason: FxStopReason;
   usage: FxUsage;
+  /** With `refused`: the provider's error. */
+  error?: FxErrorSummary;
 }
 
 /** A steer: resolves to `{ id }` once accepted, and carries the same `id` at once. */
@@ -580,7 +603,7 @@ export interface FxEngineTurn {
   /** The turn's id. */
   readonly id: string | null;
   readonly result: Promise<FxEngineTurnResult>;
-  /** Stops the turn. `{ reason: "handoff" }` stores nothing more, so the next agent continues it; it needs persistence. */
+  /** Stops the turn. `{ reason: "handoff" }` stores nothing more, so the next agent continues it; it needs persistence. A turn whose end is on its way to the store has ended, and this stops nothing. */
   cancel(options?: { reason?: "handoff" }): void;
   /** Appends guidance at the next safe model boundary. */
   steer(input: FxSteeringInput, id?: string): FxSteer;
@@ -602,7 +625,7 @@ export interface FxEngine {
   resume(options?: FxResumeOptions): FxEngineTurn | null;
   /** Queues text to run as its own turn once the current turn ends, or at once when none is running. */
   followUp(input: FxSteeringInput): FxFollowUp;
-  /** The conversation as opaque, bounded, versioned bytes, when no prompt is running. */
+  /** The conversation as opaque, bounded, versioned bytes, when no prompt is running. Rejects with `code: "FX_CHECKPOINT_TOO_LARGE"` once the conversation is past what a checkpoint holds, 32 MiB or 1024 turns; the engine goes on. */
   checkpoint(): Promise<Uint8Array>;
   close(): Promise<void>;
 }
@@ -644,7 +667,7 @@ export interface FxGatewayProvider {
 /** Runs on a user's plan instead of AI Gateway. */
 interface FxSubscriptionProvider<Provider extends "codex" | "grok"> {
   provider: Provider;
-  /** Credentials for the provider's requests, asked for in whichever process runs the turn. `sessionId` is set for model requests and absent for the model list. */
+  /** Credentials for the provider's requests, asked for in whichever process runs the turn. `sessionId` names the session the request is for, the model list's included. */
   credentials: (request: { provider: Provider; sessionId?: string }) => FxProviderCredentials | Promise<FxProviderCredentials>;
   /** Receives credentials libfx refreshed, so the host can save them. */
   onCredentials?: (credentials: FxProviderCredentials, info: { provider: Provider; sessionId?: string }) => void | Promise<void>;
@@ -796,7 +819,7 @@ export interface FxAccepted {
 /** How a durable turn ended. */
 export interface FxTurnResult {
   messageId: string;
-  /** `error` when the turn failed, with the reason in `error`; `unknown` when the process that ran it stopped before writing how it ended. */
+  /** `error` when the turn failed, with the reason in `error`. A turn whose process stopped after its end was saved reports how the session's log says it ended; `unknown` only when an earlier libfx saved that end, which does not say. */
   stopReason: FxStopReason | "error" | "unknown";
   /** Absent when the result is a failure read from the session's log rather than from the turn's end. */
   usage?: FxUsage;
@@ -805,6 +828,8 @@ export interface FxTurnResult {
   epoch?: number;
   /** Set when a `prompt()` with an already accepted `messageId` reports that turn's outcome. */
   repeated?: true;
+  /** Set on a turn that ended `cancelled` so a steer with images could run as the next turn: that steer's `messageId`, which its own turn has. A turn `cancel()` ended has none. */
+  endedBySteer?: string;
 }
 
 /** What `session.resume()` resolves to when no turn was left open. */
@@ -852,6 +877,8 @@ export type FxStreamLine = (
     usage?: FxUsage;
     error?: FxErrorSummary;
     repeated?: true;
+    /** As `FxTurnResult.endedBySteer`. */
+    endedBySteer?: string;
   }
   | { type: "idle"; requestId: string }
 ) & {
@@ -881,7 +908,7 @@ export interface FxSession {
    * join a turn: the running one ends at its next safe point and the steer runs next.
    */
   steer(input: FxSessionPromptInput, options?: FxSteerOptions): Promise<FxSteered>;
-  /** Cancels the running turn. */
+  /** Cancels the running turn. A turn whose end is already being saved has ended, as that end says, and this stops nothing. */
   cancel(): Promise<void>;
   /** The session's history as opaque bytes, read without changing the session. */
   checkpoint(): Promise<Uint8Array>;
@@ -987,7 +1014,13 @@ export interface FxWorkspace {
   readFile?(request: { path: string; signal: AbortSignal }): string | FxBytes | null | undefined | Promise<string | FxBytes | null | undefined>;
 }
 
-/** A diagnostic a terminal runtime passes to `onEvent`. */
+/**
+ * A diagnostic a terminal runtime passes to `onEvent`: the `runtime.*` and `transport.*` events an engine reports,
+ * where `attempt` numbers the terminal's requests; `terminal.size` when fx reads a size it has not reported yet;
+ * `terminal.resize`; the stores' `config.*` and `history.*`; `session.persist_error` with `sessionId` and the
+ * `error` the session store threw, after which a revision conflict stops fx saving that conversation; and
+ * `workspace.invalid` with the `reason` fx refused the workspace adapter.
+ */
 export interface FxTerminalEvent {
   type: string;
   timestamp: number;

@@ -6,8 +6,12 @@ import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { nativeAlias, nativePackageBeside, nativePlatform } from "./package-siblings.mjs";
 
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
+// Where the native addon is installed: in this platform's addon version of
+// libfx, under the alias libfx installs it as (PKG-2).
+const nativePackage = join("node_modules", nativeAlias);
 const captureLimit = 8 * 1024 * 1024;
 
 function parseArgs(argv) {
@@ -93,15 +97,19 @@ async function packageIdentity(packageDir, input, inputType) {
   };
 }
 
+// libfx with this machine's addon version from beside it, where
+// sdk/scripts/package-libfx.mjs and `npm pack` put it, under its alias.
 async function installPackage(input, consumerDir, npmBin) {
   const inputStat = await stat(input);
+  const native = nativePackageBeside(input);
   await mkdir(join(consumerDir, "node_modules"), { recursive: true });
   await writeFile(join(consumerDir, "package.json"), '{"name":"libfx-resilience-consumer","private":true,"type":"module"}\n');
   if (inputStat.isDirectory()) {
     await cp(input, join(consumerDir, "node_modules", "libfx"), { recursive: true });
+    if (native) await cp(native, join(consumerDir, nativePackage), { recursive: true });
     return "staged-directory-copy";
   }
-  const npmArgs = ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", input];
+  const npmArgs = ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", `libfx@file:${input}`, ...(native ? [`${nativeAlias}@file:${native}`] : [])];
   const npmIsJavaScript = npmBin.endsWith(".js") || npmBin.endsWith(".cjs");
   await runProcess({
     label: "tarball installation",
@@ -276,7 +284,7 @@ async function installedWorkerMain() {
     assert.equal(reason.code, config.mode === "fault-missing-addon"
       ? "LIBFX_NATIVE_ARTIFACT_MISSING"
       : "LIBFX_NATIVE_LOAD_FAILED");
-    if (config.mode === "fault-missing-addon") assert.equal(reason.causeCode, "ENOENT");
+    if (config.mode === "fault-missing-addon") assert.equal(reason.causeCode, "ERR_MODULE_NOT_FOUND");
     else assert.equal(reason.causeCode, "ERR_DLOPEN_FAILED");
     const factoryError = await expectedError(() => esm.createFxEngine({ backend: "native", apiKey: "test-placeholder" }));
     assert.ok(factoryError.code, "factory error must preserve a code");
@@ -823,6 +831,8 @@ async function makeConsumer(root, name, sourcePackage) {
   await mkdir(join(consumer, "node_modules"), { recursive: true });
   await writeFile(join(consumer, "package.json"), '{"name":"libfx-resilience-consumer","private":true,"type":"module"}\n');
   await cp(sourcePackage, join(consumer, "node_modules", "libfx"), { recursive: true });
+  const native = join(dirname(dirname(sourcePackage)), nativePackage);
+  await cp(native, join(consumer, nativePackage), { recursive: true });
   await writeFile(join(consumer, "worker.mjs"), workerSource);
   return consumer;
 }
@@ -889,12 +899,12 @@ async function main() {
     });
     stages.push({ name: "cjs-happy", status: "PASS", result: cjsBaseline.parsed });
 
-    const nativeFile = `libfx.${process.platform}-${process.arch}.node`;
+    // A missing addon is a platform package npm didn't install, as with
+    // `--omit=optional`.
     for (const mode of ["fault-missing-addon", "fault-corrupt-addon"]) {
       const consumer = await makeConsumer(tempRoot, mode, basePackage);
-      const addonPath = join(consumer, "node_modules", "libfx", nativeFile);
-      if (mode === "fault-missing-addon") await rm(addonPath);
-      else await writeFile(addonPath, "not a native addon");
+      if (mode === "fault-missing-addon") await rm(join(consumer, nativePackage), { recursive: true });
+      else await writeFile(join(consumer, nativePackage, `libfx.${nativePlatform}.node`), "not a native addon");
       const outcome = await runWorker({ consumer, config: { mode }, timeoutMs: options.faultTimeoutMs });
       stages.push({ name: mode, status: "PASS_EXPECTED_FAULT", result: outcome.parsed });
     }
