@@ -14,6 +14,38 @@ const io_mod = @import("io.zig");
 /// threads (the underlying std pool is internally mutex-guarded).
 const default_ttl_ms: i64 = 30_000;
 
+/// Loads trust roots before std.http.Client can attempt its own Keychain scan.
+/// A confined macOS process can read public CA roots without permission to read
+/// the System keychain, which may also contain private credentials.
+pub fn prepareTls(client: *std.http.Client, uri: std.Uri) !void {
+    if (std.http.Client.Protocol.fromUri(uri) != .tls) return;
+    const io = client.io;
+    {
+        try client.ca_bundle_lock.lockShared(io);
+        defer client.ca_bundle_lock.unlockShared(io);
+        if (client.now != null) return;
+    }
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    defer bundle.deinit(client.allocator);
+    const now = std.Io.Clock.real.now(io);
+    bundle.rescan(client.allocator, io, now) catch |err| {
+        if (builtin.os.tag != .macos or (err != error.AccessDenied and err != error.PermissionDenied))
+            return error.CertificateBundleLoadFailure;
+        // Discard a partial scan. The fallback contains public roots only;
+        // custom Keychain trust is unavailable under this confinement.
+        bundle.deinit(client.allocator);
+        bundle = .empty;
+        bundle.addCertsFromFilePathAbsolute(client.allocator, io, now, "/etc/ssl/cert.pem") catch
+            return error.CertificateBundleLoadFailure;
+        if (bundle.map.count() == 0) return error.CertificateBundleLoadFailure;
+    };
+    try client.ca_bundle_lock.lock(io);
+    defer client.ca_bundle_lock.unlock(io);
+    if (client.now != null) return;
+    client.now = now;
+    std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
+}
+
 pub const HttpPool = struct {
     client: std.http.Client,
     /// std checks server certificates against `client.now` and reads it
@@ -88,7 +120,7 @@ pub const HttpPool = struct {
         if (protocol == .tls) {
             // Client.connect skips the TLS preamble that Client.request
             // performs; Tls.create requires ca_bundle loaded and now set.
-            self.ensureTlsReady() catch |err| {
+            prepareTls(&self.client, uri) catch |err| {
                 debug_trace.logf("gateway", "pool_warm result=error stage=tls_init err={s}", .{@errorName(err)});
                 return;
             };
@@ -108,27 +140,6 @@ pub const HttpPool = struct {
         self.client.connection_pool.release(conn, io);
         self.noteActivity();
         debug_trace.logf("gateway", "pool_warm result=ok elapsed_ms={d}", .{io_mod.milliTimestamp() - started});
-    }
-
-    /// Mirrors the cert-bundle preamble of std.http.Client.request so direct
-    /// Client.connect calls are safe. Concurrent with real requests by lock.
-    fn ensureTlsReady(self: *HttpPool) !void {
-        const client = &self.client;
-        const io = client.io;
-        {
-            try client.ca_bundle_lock.lockShared(io);
-            defer client.ca_bundle_lock.unlockShared(io);
-            if (client.now != null) return;
-        }
-        var bundle: std.crypto.Certificate.Bundle = .empty;
-        defer bundle.deinit(client.allocator);
-        const now = std.Io.Clock.real.now(io);
-        bundle.rescan(client.allocator, io, now) catch return error.CertificateBundleLoadFailure;
-        try client.ca_bundle_lock.lock(io);
-        defer client.ca_bundle_lock.unlock(io);
-        if (client.now != null) return; // a concurrent request loaded it first
-        client.now = now;
-        std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
     }
 
     /// Spawns the warmer on a detached thread, at most once per pool.
@@ -166,6 +177,7 @@ pub const HttpPool = struct {
         uri: std.Uri,
         options: std.http.Client.RequestOptions,
     ) std.http.Client.RequestError!std.http.Client.Request {
+        try prepareTls(&self.client, uri);
         self.refreshTlsClock();
         const io = self.client.io;
         self.setup_lock.lockSharedUncancelable(io);
@@ -237,6 +249,53 @@ pub const HttpPool = struct {
         };
     }
 };
+
+test "TLS trust loads public roots when the System keychain is denied" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    var vtable = std.testing.io.vtable.*;
+    vtable.dirOpenFile = struct {
+        fn open(userdata: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+            if (std.mem.eql(u8, path, "/Library/Keychains/System.keychain")) return error.PermissionDenied;
+            return std.testing.io.vtable.dirOpenFile(userdata, dir, path, options);
+        }
+    }.open;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = io };
+    defer client.deinit();
+    const uri = try std.Uri.parse("https://example.com");
+    try prepareTls(&client, uri);
+    try std.testing.expect(client.now != null);
+    try std.testing.expect(client.ca_bundle.map.count() > 0);
+    const now = client.now;
+    const count = client.ca_bundle.map.count();
+    try prepareTls(&client, uri);
+    try std.testing.expectEqual(now, client.now);
+    try std.testing.expectEqual(count, client.ca_bundle.map.count());
+}
+
+test "TLS trust fails closed when both Keychain and public roots are denied" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    var vtable = std.testing.io.vtable.*;
+    vtable.dirOpenFile = struct {
+        fn open(_: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+            return error.PermissionDenied;
+        }
+    }.open;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = io };
+    defer client.deinit();
+    try std.testing.expectError(error.CertificateBundleLoadFailure, prepareTls(&client, try std.Uri.parse("https://example.com")));
+    try std.testing.expectEqual(null, client.now);
+    try std.testing.expectEqual(0, client.ca_bundle.map.count());
+}
+
+test "plain HTTP does not require certificate store access" {
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    try prepareTls(&client, try std.Uri.parse("http://localhost"));
+    try std.testing.expectEqual(null, client.now);
+    try std.testing.expectEqual(0, client.ca_bundle.map.count());
+}
 
 test "warm and drain tolerate malformed urls without touching the pool" {
     var pool = HttpPool.init(std.testing.allocator);
