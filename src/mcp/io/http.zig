@@ -337,6 +337,8 @@ pub const Client = struct {
             .headers = .{ .content_type = if (body != null) .{ .override = "application/json" } else .default, .accept_encoding = .{ .override = "identity" } },
             .extra_headers = headers,
             .redirect_behavior = .unhandled,
+            // A pooled connection the server already closed drops the call unsent (`tests/e2e/mcp-http.test.ts` "fixed-length json responses complete on one-shot connections with FX_MCP_ENGINE=v2").
+            .keep_alive = false,
         }) catch return .{ .how = .broken };
         defer req.deinit();
         req.accept_encoding = identity_only;
@@ -399,6 +401,8 @@ pub const Client = struct {
             .headers = .{ .content_type = if (body != null) .{ .override = content_type } else .default, .accept_encoding = .{ .override = "identity" } },
             .extra_headers = headers,
             .redirect_behavior = .unhandled,
+            // Never reuse a pooled connection, for the same reason as `run`.
+            .keep_alive = false,
         }) catch return none;
         defer req.deinit();
         req.accept_encoding = identity_only;

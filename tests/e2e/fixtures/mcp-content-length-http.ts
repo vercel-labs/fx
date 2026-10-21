@@ -160,5 +160,12 @@ function responseFor(message: ContentLengthHttpRequest["message"]) {
       },
     };
   }
+  if (message.method === "subscriptions/listen") {
+    return {
+      jsonrpc: "2.0",
+      id: message.id,
+      error: { code: -32601, message: "Method not found" },
+    };
+  }
   throw new Error(`unsupported MCP method: ${message.method}`);
 }

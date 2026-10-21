@@ -402,12 +402,16 @@ describe("modern MCP Streamable HTTP", () => {
     ]);
   }, 25_000);
 
-  for (
+  for (const engine of ["v1", "v2"] as const) for (
     const responseType of ["json", "sse"] as const satisfies readonly ContentLengthResponseType[]
   ) {
-    test(`fixed-length ${responseType} responses complete on one-shot connections`, async () => {
+    const engineLabel = engine === "v2" ? " with FX_MCP_ENGINE=v2" : "";
+    test(`fixed-length ${responseType} responses complete on one-shot connections${engineLabel}`, async () => {
       contentLengthFixture = await startContentLengthMcpHttpFixture(responseType);
-      const root = createRoot(`content-length-${responseType}`, contentLengthFixture);
+      const root = createRoot(
+        `content-length-${responseType}${engine === "v2" ? "-v2" : ""}`,
+        contentLengthFixture,
+      );
       gateway = startToolGateway(`Fixed-length ${responseType} complete.`);
 
       const result = await runFx(
@@ -420,7 +424,10 @@ describe("modern MCP Streamable HTTP", () => {
         ],
         {
           cwd: root.workspace,
-          env: fixtureEnv(root, gateway),
+          env: {
+            ...fixtureEnv(root, gateway),
+            ...(engine === "v2" ? { FX_MCP_ENGINE: "v2" } : {}),
+          },
           timeoutMs: 20_000,
         },
       );
@@ -437,8 +444,12 @@ describe("modern MCP Streamable HTTP", () => {
         `Fixed-length ${responseType} complete.`,
       );
       expect(contentLengthFixture.failure).toBeUndefined();
+      const methods = contentLengthFixture.requests.map((entry) => entry.message.method);
+      // MCP-v2 also asks to listen for list changes, which the fixture declines.
       expect(
-        contentLengthFixture.requests.map((entry) => entry.message.method),
+        engine === "v2"
+          ? methods.filter((method) => method !== "subscriptions/listen")
+          : methods,
       ).toEqual(["server/discover", "tools/list", "tools/call"]);
       for (const request of contentLengthFixture.requests) {
         expect(request.headers.connection).toBe("close");
