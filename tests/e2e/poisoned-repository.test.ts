@@ -253,6 +253,248 @@ describe("poisoned repository", () => {
   );
 
   test(
+    "a git command in the default shell profile runs no repository program",
+    async () => {
+      const fixture = poisonedRepository();
+      // The default `user` profile is the one the shell tool uses unless the
+      // model asks for `clean`, and it is the profile a poisoned repository
+      // must not reach either: fx runs these commands through safe git, and
+      // refuses the shapes it cannot.
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("status-default", "shell", {
+          request: { action: "run", command: "git status --short", yield_time_ms: 30_000 },
+        }),
+        fakeGatewayToolCall("status-ignored", "shell", {
+          request: { action: "run", command: "git status --short --ignored", yield_time_ms: 30_000 },
+        }),
+        fakeGatewayToolCall("log-default", "shell", {
+          request: { action: "run", command: "git log --oneline -n 2", yield_time_ms: 30_000 },
+        }),
+        fakeGatewayToolCall("fetch", "shell", {
+          request: { action: "run", command: "git fetch origin", yield_time_ms: 30_000 },
+        }),
+        fakeGatewayFinalText("inspection complete"),
+      ], { classifierResponses: [] });
+      gateways.push(gateway);
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Inspect the repository."],
+        { cwd: fixture.workspace, env: fxEnv(fixture, gateway), timeoutMs: TIMEOUT },
+      );
+      expect(result.code, result.stderr).toBe(0);
+      expect(result.stderr).not.toMatch(/panic|error/i);
+      expect(sentinelRuns(fixture)).toEqual([]);
+      expect(gateway.classifierRequests).toHaveLength(0);
+
+      const bodies = gateway.requests.map((request: { body: string }) => request.body);
+      expect(toolResult(bodies[1]!, "status-default")).toContain("M alpha-tracked.txt");
+      expect(toolResult(bodies[2]!, "status-ignored")).toContain("M alpha-tracked.txt");
+      expect(toolResult(bodies[3]!, "log-default")).toContain("fixture commit");
+      expect(toolResult(bodies[4]!, "fetch")).toContain("fx did not run this git command");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a missing object does not make fx lazy fetch a repository's transport program",
+    async () => {
+      const fixture = poisonedRepository();
+      // A partial clone fetches a missing object from its promisor remote on
+      // demand, and that fetch starts the transport program the remote's
+      // config names. `git show` reaches for a blob.
+      const blob = git(fixture, ["rev-parse", "HEAD:alpha-tracked.txt"]).trim();
+      rmSync(join(fixture.workspace, ".git", "objects", blob.slice(0, 2), blob.slice(2)), { force: true });
+      const transport = join(fixture.base, "transport.sh");
+      writeFileSync(transport, `#!/bin/sh\necho "ran $0 $*" >> '${fixture.log}'\nexit 0\n`);
+      chmodSync(transport, 0o755);
+      for (const [key, value] of [
+        ["remote.origin.url", "file:///fixture-origin"],
+        ["remote.origin.promisor", "true"],
+        ["remote.origin.partialclonefilter", "blob:none"],
+        ["remote.origin.uploadpack", transport],
+        ["remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"],
+      ]) git(fixture, ["config", key!, value!]);
+
+      // The control proves the route is live: plain git starts the program.
+      // The control run is expected to fail, because the transport program
+      // does not speak the upload-pack protocol.
+      writeFileSync(fixture.log, "");
+      Bun.spawnSync(["git", "show", "HEAD"], {
+        cwd: fixture.workspace,
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          HOME: fixture.home,
+          GIT_CONFIG_NOSYSTEM: "1",
+          LC_ALL: "C",
+        },
+      });
+      expect(sentinelRuns(fixture).length).toBeGreaterThan(0);
+
+      // Start the fx run from an empty log, so the assertion below measures
+      // only what fx did.
+      writeFileSync(fixture.log, "");
+
+      // Written another way, the same inspection goes to review and runs in
+      // the shell, where the agent environment stops the lazy fetch.
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("show", "shell", {
+          request: { action: "run", command: "git show HEAD", yield_time_ms: 30_000 },
+        }),
+        fakeGatewayToolCall("show-reworded", "shell", {
+          request: { action: "run", command: "cd notes && git show HEAD", yield_time_ms: 30_000 },
+        }),
+        fakeGatewayFinalText("inspection complete"),
+      ], { classifierResponses: [] });
+      gateways.push(gateway);
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Inspect the repository."],
+        { cwd: fixture.workspace, env: fxEnv(fixture, gateway), timeoutMs: TIMEOUT },
+      );
+      expect(result.code, result.stderr).toBe(0);
+      expect(sentinelRuns(fixture)).toEqual([]);
+      expect(gateway.classifierRequests).toHaveLength(1);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a repository format cannot make git show run a signature verifier",
+    async () => {
+      const fixture = poisonedRepository();
+      const verifierLog = join(fixture.base, "verifier.log");
+      const verifierRuns = () =>
+        existsSync(verifierLog) ? readFileSync(verifierLog, "utf8").split("\n").filter(Boolean) : [];
+
+      // A commit that carries a signature header, so git actually asks the
+      // verifier instead of answering "no signature" on its own.
+      const tree = git(fixture, ["rev-parse", "HEAD^{tree}"]).trim();
+      const parent = git(fixture, ["rev-parse", "HEAD"]).trim();
+      const body = [
+        `tree ${tree}`,
+        `parent ${parent}`,
+        "author fixture <fixture@example.invalid> 1700000000 +0000",
+        "committer fixture <fixture@example.invalid> 1700000000 +0000",
+        "gpgsig -----BEGIN PGP SIGNATURE-----",
+        " ",
+        " iQEcBAABAgAGBQJfaketoken",
+        " -----END PGP SIGNATURE-----",
+        "",
+        "signed-looking commit",
+        "",
+      ].join("\n");
+      const hashed = Bun.spawnSync(
+        ["/bin/sh", "-c", `printf '%s' '${body}' | git hash-object -t commit -w --stdin`],
+        {
+          cwd: fixture.workspace,
+          env: {
+            PATH: process.env.PATH ?? "/usr/bin:/bin",
+            HOME: fixture.home,
+            GIT_CONFIG_NOSYSTEM: "1",
+            LC_ALL: "C",
+          },
+        },
+      );
+      const signed = hashed.stdout.toString().trim();
+      expect(signed).toMatch(/^[0-9a-f]{40}$/);
+
+      const verifier = join(fixture.base, "verifier.sh");
+      writeFileSync(verifier, `#!/bin/sh\necho "ran $0 $*" >> '${verifierLog}'\nexit 1\n`);
+      chmodSync(verifier, 0o755);
+      // `%G?` asks for verification, so git runs the configured verifier.
+      git(fixture, ["config", "format.pretty", "%G?"]);
+      git(fixture, ["config", "gpg.program", verifier]);
+
+      // The control proves the route is live: plain git starts the verifier.
+      rmSync(verifierLog, { force: true });
+      Bun.spawnSync(["git", "show", signed], {
+        cwd: fixture.workspace,
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          HOME: fixture.home,
+          GIT_CONFIG_NOSYSTEM: "1",
+          LC_ALL: "C",
+        },
+      });
+      expect(verifierRuns().length).toBeGreaterThan(0);
+
+      rmSync(verifierLog, { force: true });
+      // Written another way, or with a format that asks for the check itself,
+      // the inspection goes to review and runs in the shell, where the agent
+      // environment sets the format aside and empties the verifier.
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("show", "shell", {
+          request: { action: "run", command: `git show ${signed}`, yield_time_ms: 30_000 },
+        }),
+        fakeGatewayToolCall("show-reworded", "shell", {
+          request: { action: "run", command: `cd notes && git show ${signed}`, yield_time_ms: 30_000 },
+        }),
+        fakeGatewayToolCall("log-signature", "shell", {
+          request: { action: "run", command: `git log -1 --format='%G? %s' ${signed}`, yield_time_ms: 30_000 },
+        }),
+        fakeGatewayFinalText("inspection complete"),
+      ], { classifierResponses: [] });
+      gateways.push(gateway);
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Inspect the repository."],
+        { cwd: fixture.workspace, env: fxEnv(fixture, gateway), timeoutMs: TIMEOUT },
+      );
+      expect(result.code, result.stderr).toBe(0);
+      expect(verifierRuns()).toEqual([]);
+      expect(sentinelRuns(fixture)).toEqual([]);
+      expect(gateway.classifierRequests).toHaveLength(2);
+      const last = gateway.requests[gateway.requests.length - 1]!.body;
+      expect(toolResult(last, "show-reworded")).toContain("signed-looking commit");
+      expect(toolResult(last, "log-signature")).toContain("signed-looking commit");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "git written another way, or in a terminal session, runs no repository program",
+    async () => {
+      const fixture = poisonedRepository();
+      // None of these is a shape safe git runs directly, so each goes to
+      // review and then runs in the shell, where the agent environment turns
+      // off the repository's programs for every git it starts.
+      const run = (id: string, command: string, extra: Record<string, unknown> = {}) =>
+        fakeGatewayToolCall(id, "shell", {
+          request: { action: "run", command, yield_time_ms: 30_000, ...extra },
+        });
+      const gateway = startFakeGateway([
+        run("cd-status", "cd notes && git status --short"),
+        run("dash-c-status", "git -C notes status --short"),
+        run("chain", "git status --short && git diff --stat"),
+        run("log-patch", "git log -p -n 1"),
+        run("blame", "git blame alpha-tracked.txt"),
+        run("tty-status", "git status --short", { tty: true }),
+        fakeGatewayFinalText("inspection complete"),
+      ]);
+      gateways.push(gateway);
+
+      // A terminal session needs a saved session; HOME is the fixture's own.
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "Inspect the repository."],
+        { cwd: fixture.workspace, env: fxEnv(fixture, gateway), timeoutMs: TIMEOUT },
+      );
+      expect(result.code, result.stderr).toBe(0);
+      expect(result.stderr).not.toMatch(/panic|error/i);
+      expect(sentinelRuns(fixture)).toEqual([]);
+      expect(gateway.classifierRequests).toHaveLength(6);
+
+      const last = gateway.requests[gateway.requests.length - 1]!.body;
+      expect(toolResult(last, "cd-status")).toContain("alpha-tracked.txt");
+      expect(toolResult(last, "dash-c-status")).toContain("alpha-tracked.txt");
+      expect(toolResult(last, "chain")).toContain("alpha-tracked.txt");
+      expect(toolResult(last, "log-patch")).toContain("+needle tracked one");
+      expect(toolResult(last, "blame")).toContain("needle tracked two");
+      expect(toolResult(last, "tty-status")).toContain("alpha-tracked.txt");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "fx pr snapshots the repository without running its programs",
     async () => {
       const fixture = poisonedRepository();

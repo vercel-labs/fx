@@ -1,93 +1,106 @@
 ---- MODULE GitAdmission ----
 \* fx's route for an agent git command, from planning through admission to
-\* execution, over every permission mode, shell environment, command form and
-\* repository state (src/core/shell_command/safe_git.zig).
+\* execution, over every permission mode, shell environment, command form,
+\* git version and repository state (src/core/shell_command/safe_git.zig).
 \*
-\* Contract (AGENTS.md): safe git runs the direct read-only status,
-\* diff and log forms in an environment other than the user's own shell. In
-\* auto mode a git command safe git refuses is returned to the agent unrun.
-\* Shell-run git (the default user environment, auto mode's routine
-\* commands) uses the repository's full config; that exposure is documented.
+\* Contract (AGENTS.md): in auto mode safe git runs the read-only status,
+\* diff, log and show forms it can express directly, in every shell profile,
+\* and holds a planned command in a repository it cannot read. Every other
+\* agent git inspection runs in a shell under the agent environment, which
+\* turns off the programs a repository's config names for reading on git 2.31
+\* and later. The documented exposure is a repository fx cannot read and git
+\* older than 2.31.
 EXTENDS Naturals, Sequences
 
-CONSTANT HoldEnabled
+CONSTANTS HoldEnabled, EnvEnabled
 
 Modes == {"auto", "ask"}
 Envs == {"clean", "user"}
-Cmds == {"status", "status_other", "diff", "log"}
+\* status, diff and log stand for the forms safe git runs directly
+\* (status --short, diff --stat, log --oneline -n 3). status_other is a shape
+\* it cannot express, such as `git diff HEAD`. reworded is an inspection that
+\* is not written as plain git, such as `cd sub && git status`.
+Cmds == {"status", "status_other", "diff", "log", "reworded"}
 Repos == {"clean", "poisoned", "unreadable", "mismatch", "notrepo"}
 \* Repository states whose own config names a program.
 Poisoned == {"poisoned", "unreadable", "mismatch"}
-\* Forms the planner sends to safe git (status --short, diff --stat,
-\* log --oneline -n 3); status_other is `git status --ignored`.
 Allowlisted == {"status", "diff", "log"}
+\* Commands whose first word is `git`, which the planner reads.
+GitFirst == {"status", "status_other", "diff", "log"}
 \* Safe git refuses when it cannot read the config or git would pick
 \* another repository.
 Refuses == {"unreadable", "mismatch"}
-\* Auto mode's routine-command rule runs any `git status` form unreviewed.
-Reversible == {"status", "status_other"}
-\* Forms that run a repository program under plain git: status refreshes the
-\* index (fsmonitor, clean filter); diff also runs the external diff driver.
-\* `git log --oneline` runs none.
-FiresInPlain == {"status", "status_other", "diff"}
+\* Forms that run a repository program under plain git. `git log --oneline`
+\* runs none.
+FiresInPlain == Cmds \ {"log"}
 Verdicts == {"clear", "caution"}
 
-VARIABLES mode, env, cmd, repo, verdict, plan, route, fired, pc, history
-vars == <<mode, env, cmd, repo, verdict, plan, route, fired, pc, history>>
+VARIABLES mode, env, cmd, repo, newgit, verdict, plan, route, fired, pc, history
+vars == <<mode, env, cmd, repo, newgit, verdict, plan, route, fired, pc, history>>
 
 Init ==
     /\ mode \in Modes /\ env \in Envs /\ cmd \in Cmds /\ repo \in Repos
+    \* Whether git reads `GIT_CONFIG_COUNT` (2.31 and later).
+    /\ newgit \in BOOLEAN
     \* The security reviewer's verdict, used only on the review route.
     /\ verdict \in Verdicts
     /\ plan = "none" /\ route = "none" /\ fired = FALSE
     /\ pc = "plan" /\ history = <<>>
 
 \* Safe git is prepared before the arguments are checked, so a refusal wins.
+\* Outside auto mode, and for a command the planner does not read as git, the
+\* shell decides.
 PlanResult ==
-    IF env = "user" \/ mode # "auto" THEN "dynamic_shell"
+    IF mode # "auto" \/ cmd \notin GitFirst THEN "dynamic_shell"
     ELSE IF repo \in Refuses THEN "unsafe_git"
-    ELSE IF cmd \notin Allowlisted THEN "unsupported_argument"
+    ELSE IF cmd \notin Allowlisted THEN (IF newgit THEN "unsupported_argument" ELSE "unsafe_git")
     ELSE "direct"
 
+\* No git command is a routine auto command, so everything that is neither
+\* direct nor held goes to review.
 AdmitResult ==
     IF plan = "direct" THEN "direct"
     ELSE IF mode = "ask" THEN "prompt"
     ELSE IF plan = "unsafe_git" /\ HoldEnabled THEN "held"
-    ELSE IF cmd \in Reversible THEN "approved_shell"
     ELSE "review"
 
 Plan ==
     /\ pc = "plan" /\ plan' = PlanResult /\ pc' = "admit"
     /\ history' = Append(history, "Plan")
-    /\ UNCHANGED <<mode, env, cmd, repo, verdict, route, fired>>
+    /\ UNCHANGED <<mode, env, cmd, repo, newgit, verdict, route, fired>>
 
 Admit ==
     /\ pc = "admit" /\ route' = AdmitResult /\ pc' = "execute"
     /\ history' = Append(history, "Admit")
-    /\ UNCHANGED <<mode, env, cmd, repo, verdict, plan, fired>>
+    /\ UNCHANGED <<mode, env, cmd, repo, newgit, verdict, plan, fired>>
 
-\* Plain git, reached unreviewed or through a review that clears, runs the
-\* repository's programs; safe git, a held command, a prompt and a cautioned
-\* review run none.
-RunsPlainGit == route = "approved_shell" \/ (route = "review" /\ verdict = "clear")
+\* The agent environment turns off the repository's programs for a shell-run
+\* git when git reads it and fx can read the config.
+EnvProtects == EnvEnabled /\ newgit /\ repo \notin Refuses
+
+\* A review that clears runs the command in the shell; safe git, a held
+\* command, a prompt and a cautioned review run none.
+RunsShellGit == route = "review" /\ verdict = "clear"
 Execute ==
     /\ pc = "execute"
-    /\ fired' = (RunsPlainGit /\ repo \in Poisoned /\ cmd \in FiresInPlain)
+    /\ fired' = (RunsShellGit /\ repo \in Poisoned /\ cmd \in FiresInPlain /\ ~EnvProtects)
     /\ pc' = "done" /\ history' = Append(history, "Execute")
-    /\ UNCHANGED <<mode, env, cmd, repo, verdict, plan, route>>
+    /\ UNCHANGED <<mode, env, cmd, repo, newgit, verdict, plan, route>>
 
 Next == Plan \/ Admit \/ Execute
 Spec == Init /\ [][Next]_vars
 
 TypeOK ==
-    /\ mode \in Modes /\ env \in Envs /\ cmd \in Cmds /\ repo \in Repos /\ verdict \in Verdicts
+    /\ mode \in Modes /\ env \in Envs /\ cmd \in Cmds /\ repo \in Repos
+    /\ newgit \in BOOLEAN /\ verdict \in Verdicts
     /\ pc \in {"plan", "admit", "execute", "done"}
     /\ fired \in BOOLEAN
 
-\* G1: in auto mode, a command safe git refused never reaches plain git.
-HoldSafety == (pc = "done" /\ mode = "auto" /\ plan = "unsafe_git") => route # "approved_shell"
+\* G1: in auto mode, a command safe git refused is held, never run.
+HoldSafety == (pc = "done" /\ mode = "auto" /\ plan = "unsafe_git") => route = "held"
 \* Safe git never runs a repository program.
 DirectNeverFires == route = "direct" => ~fired
-\* Programs run only on the documented shell path.
-ExposureOnlyDocumented == fired => (route \in {"approved_shell", "review"} /\ (env = "user" \/ cmd \notin Allowlisted))
+\* Programs run only on the documented exposure.
+ExposureOnlyDocumented ==
+    fired => (route = "review" /\ (repo \in Refuses \/ ~newgit))
 ====

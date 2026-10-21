@@ -494,16 +494,122 @@ pub fn loadRepositoryEveryInclude(arena: Allocator, context: *const Context) All
     return loader.result();
 }
 
+/// Whether the repository config marks a remote as a promisor, the way a
+/// partial clone does. git fetches a missing object from such a remote on
+/// demand, and that fetch starts the transport program the remote's config
+/// names. `extensions.partialClone` names the promisor remote in the spelling
+/// older git wrote.
+pub fn usesPromisorRemote(loaded: Loaded) bool {
+    var legacy: ?[]const u8 = null;
+    for (loaded.entries) |loaded_entry| {
+        const entry = loaded_entry.entry;
+        if (std.mem.eql(u8, entry.section, "extensions") and
+            entry.subsection == null and
+            std.mem.eql(u8, entry.name, "partialclone"))
+        {
+            legacy = entry.value;
+        }
+    }
+    for (loaded.entries) |loaded_entry| {
+        const entry = loaded_entry.entry;
+        if (!std.mem.eql(u8, entry.section, "remote")) continue;
+        const name = entry.subsection orelse continue;
+        if (std.mem.eql(u8, entry.name, "promisor") and (parseBool(entry.value) orelse false)) return true;
+        if (legacy) |legacy_name| {
+            if (std.mem.eql(u8, legacy_name, name)) return true;
+        }
+    }
+    return false;
+}
+
 /// Distinct filter driver names with a `clean`, `smudge` or `process`
 /// command. Memory belongs to `arena`.
 pub fn filterDriverNames(arena: Allocator, loaded: Loaded) Allocator.Error![]const []const u8 {
+    return driverNames(arena, loaded, "filter", &.{ "clean", "smudge", "process" });
+}
+
+/// Distinct diff driver names with a `textconv` program. Memory belongs to
+/// `arena`.
+pub fn textconvDriverNames(arena: Allocator, loaded: Loaded) Allocator.Error![]const []const u8 {
+    return driverNames(arena, loaded, "diff", &.{"textconv"});
+}
+
+/// Distinct diff driver names with an external diff `command`. Memory
+/// belongs to `arena`.
+pub fn diffCommandDriverNames(arena: Allocator, loaded: Loaded) Allocator.Error![]const []const u8 {
+    return driverNames(arena, loaded, "diff", &.{"command"});
+}
+
+/// Whether the loaded config names a `diff.external` program.
+pub fn namesExternalDiff(loaded: Loaded) bool {
+    return setsKey(loaded, "diff", "external");
+}
+
+/// Whether the loaded config sets `format.pretty`, which can name a signature
+/// placeholder that makes git start a verifier.
+pub fn setsFormatPretty(loaded: Loaded) bool {
+    return setsKey(loaded, "format", "pretty");
+}
+
+/// Whether the loaded config names a program git starts to reach a remote:
+/// `remote.<name>.uploadpack` or `receivepack`, `core.sshCommand`,
+/// `core.gitProxy`, `core.askPass`, a credential helper, or a protocol
+/// allowance such as one that permits `ext::` transports.
+pub fn namesTransportProgram(loaded: Loaded) bool {
+    for (loaded.entries) |loaded_entry| {
+        const entry = loaded_entry.entry;
+        const section = entry.section;
+        const name = entry.name;
+        if (std.mem.eql(u8, section, "remote") and
+            (std.mem.eql(u8, name, "uploadpack") or std.mem.eql(u8, name, "receivepack"))) return true;
+        if (std.mem.eql(u8, section, "core") and entry.subsection == null and
+            (std.mem.eql(u8, name, "sshcommand") or std.mem.eql(u8, name, "gitproxy") or std.mem.eql(u8, name, "askpass"))) return true;
+        if (std.mem.eql(u8, section, "credential") and std.mem.eql(u8, name, "helper")) return true;
+        if (std.mem.eql(u8, section, "protocol") and std.mem.eql(u8, name, "allow")) return true;
+    }
+    return false;
+}
+
+/// Distinct full keys of the signature verifiers the loaded config names:
+/// `gpg.program` and `gpg.<format>.program`. Memory belongs to `arena`.
+pub fn gpgProgramKeys(arena: Allocator, loaded: Loaded) Allocator.Error![]const []const u8 {
+    var keys: std.ArrayList([]const u8) = .empty;
+    for (loaded.entries) |loaded_entry| {
+        const entry = loaded_entry.entry;
+        if (!std.mem.eql(u8, entry.section, "gpg") or !std.mem.eql(u8, entry.name, "program")) continue;
+        const key = if (entry.subsection) |format|
+            try arena.print("gpg.{s}.program", .{format})
+        else
+            "gpg.program";
+        for (keys.items) |known| {
+            if (std.mem.eql(u8, known, key)) break;
+        } else try keys.append(arena, key);
+    }
+    return keys.toOwnedSlice(arena);
+}
+
+fn setsKey(loaded: Loaded, section: []const u8, name: []const u8) bool {
+    for (loaded.entries) |loaded_entry| {
+        const entry = loaded_entry.entry;
+        if (entry.subsection == null and std.mem.eql(u8, entry.section, section) and std.mem.eql(u8, entry.name, name)) return true;
+    }
+    return false;
+}
+
+fn driverNames(
+    arena: Allocator,
+    loaded: Loaded,
+    section: []const u8,
+    programs: []const []const u8,
+) Allocator.Error![]const []const u8 {
     var names: std.ArrayList([]const u8) = .empty;
     for (loaded.entries) |loaded_entry| {
         const entry = loaded_entry.entry;
-        if (!std.mem.eql(u8, entry.section, "filter")) continue;
+        if (!std.mem.eql(u8, entry.section, section)) continue;
         const name = entry.subsection orelse continue;
-        const program = std.mem.eql(u8, entry.name, "clean") or std.mem.eql(u8, entry.name, "smudge") or std.mem.eql(u8, entry.name, "process");
-        if (!program) continue;
+        for (programs) |program| {
+            if (std.mem.eql(u8, entry.name, program)) break;
+        } else continue;
         for (names.items) |known| {
             if (std.mem.eql(u8, known, name)) break;
         } else try names.append(arena, name);

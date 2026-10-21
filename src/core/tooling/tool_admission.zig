@@ -2097,6 +2097,17 @@ fn defaultRunCommandPermissionOutcome(
     const command_ctx = runCommandContext(input, arena, call) catch {
         return .{ .decision = .permission_required };
     };
+    // A user-profile alias or function can redefine `git`, and the plan would
+    // run the trusted executable in its place. That command keeps the review
+    // path instead, as every other redefined routine name does. Unknown
+    // startup names do not divert: review would run plain git here, and the
+    // hardened executable is the safe reading of an unknown shell.
+    if (command_ctx.environment == .user and
+        command_effect.isGitCommand(command_ctx.command) and
+        shell_snapshot.processOwner().definesAnyWord(command_ctx.command))
+    {
+        return .{ .decision = .permission_required };
+    }
     return switch (command_admission.defaultForRunCommand(
         arena,
         command_ctx,
@@ -2106,9 +2117,9 @@ fn defaultRunCommandPermissionOutcome(
             .decision = .once,
             .execution_authority = .{ .run_command = .{ .direct_only = fingerprint } },
         },
-        // Review cannot see a repository's git config, and the routine-command
-        // rule would run plain git, so an automatic git command that fx could
-        // not make safe does not run at all.
+        // Review cannot see a repository's git config, so an automatic git
+        // command that neither safe git nor the agent environment can make
+        // safe, such as a fetch, does not run at all.
         .approval_required => |reason| if (reason == .unsafe_git and permission_mode == .auto)
             .{ .tool_failure = unsafe_git_hold_output }
         else
@@ -5339,7 +5350,7 @@ test "exhausted review transport preserves deterministic auto lanes" {
         .{
             .id = "safe-after-budget",
             .name = "shell",
-            .arguments_json = "{\"action\":\"run\",\"command\":\"git status --short --branch\"}",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"zig build test\"}",
         },
         .auto,
         &.{},
@@ -5682,7 +5693,7 @@ test "routine commands that a user alias or function redefines go to review" {
     const routine = try requestPermissionOutcome(
         input,
         arena_state.allocator(),
-        .{ .id = "routine", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"git status --short\"}" },
+        .{ .id = "routine", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"zig build test\"}" },
         .auto,
         &.{},
     );
@@ -5690,6 +5701,26 @@ test "routine commands that a user alias or function redefines go to review" {
         command_admission.ShellAuthorizationSource.auto_mode,
         routine.execution_authority.?.run_command.shell_allowed.source,
     );
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+
+    // A git command is planned through safe git instead of the routine-command
+    // rule, so it is either the hardened direct route or a hold, and it never
+    // reaches the reviewer.
+    const planned = try requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        .{ .id = "planned-git", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"git status --short\"}" },
+        .auto,
+        &.{},
+    );
+    if (planned.execution_authority) |authority| {
+        switch (authority.run_command) {
+            .direct_only => {},
+            .shell_allowed => return error.TestUnexpectedShellAuthority,
+        }
+    } else {
+        try std.testing.expectEqualStrings(unsafe_git_hold_output, planned.tool_failure.?);
+    }
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }
 
@@ -5717,7 +5748,7 @@ test "routine commands go to review while the snapshot has fallen back" {
     const outcome = try requestPermissionOutcome(
         input,
         arena_state.allocator(),
-        .{ .id = "fallback", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"git status --short\"}" },
+        .{ .id = "fallback", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"npm install\"}" },
         .auto,
         &.{},
     );
@@ -5745,8 +5776,6 @@ test "known reversible auto commands bypass the reviewer" {
     );
     for ([_][]const u8{
         "node -v && npm -v",
-        "git status --short --branch",
-        "git fetch origin main",
         "npm install 2>&1",
         "npm run dev",
         "zig build test",
@@ -5770,6 +5799,41 @@ test "known reversible auto commands bypass the reviewer" {
     }
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
 
+    // No git command reaches the routine-command rule, and a fetch never runs
+    // on fx's own authority.
+    const fetch = try requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        .{ .id = "held-git", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"git fetch origin main\"}" },
+        .auto,
+        &.{},
+    );
+    try std.testing.expect(fetch.execution_authority == null);
+    try std.testing.expectEqualStrings(unsafe_git_hold_output, fetch.tool_failure.?);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+
+    // A shape safe git cannot express goes to review and then runs under the
+    // agent environment. A host whose git fx cannot use, or whose git ignores
+    // that environment, holds it instead.
+    const graph = try requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        .{ .id = "reviewed-git", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"git log --graph -n 5\"}" },
+        .auto,
+        &.{},
+    );
+    if (graph.execution_authority) |authority| {
+        try std.testing.expectEqual(
+            command_admission.ShellAuthorizationSource.auto_classifier,
+            authority.run_command.shell_allowed.source,
+        );
+        try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    } else {
+        try std.testing.expectEqualStrings(unsafe_git_hold_output, graph.tool_failure.?);
+        try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    }
+    const calls_before_tty = fake.calls;
+
     const tty = try requestPermissionOutcome(
         input,
         arena_state.allocator(),
@@ -5781,7 +5845,7 @@ test "known reversible auto commands bypass the reviewer" {
         .auto,
         &.{},
     );
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(calls_before_tty + 1, fake.calls);
     try std.testing.expectEqual(
         command_admission.ShellAuthorizationSource.auto_classifier,
         tty.execution_authority.?.run_command.shell_allowed.source,

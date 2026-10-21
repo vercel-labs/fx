@@ -93,7 +93,10 @@ fn reversibleAutoStage(raw_tokens: []const command_lex.ArgvToken) bool {
     if (std.mem.eql(u8, executable, "which")) {
         return words.len > 0 and allOperands(words);
     }
-    if (std.mem.eql(u8, executable, "git")) return reversibleGit(words);
+    // No git command is a routine auto command. Every one is planned through
+    // safe git, which either runs it with the repository's programs turned off
+    // or refuses it.
+    if (std.mem.eql(u8, executable, "git")) return false;
     if (std.mem.eql(u8, executable, "npm")) return reversibleNpm(words);
     if (std.mem.eql(u8, executable, "bun")) return reversiblePackageRunner(words);
     if (std.mem.eql(u8, executable, "pnpm")) return reversiblePackageRunner(words);
@@ -124,25 +127,15 @@ fn allOperands(tokens: []const command_lex.ArgvToken) bool {
     return true;
 }
 
-fn reversibleGit(words: []const command_lex.ArgvToken) bool {
-    if (words.len == 0) return false;
-    const subcommand = words[0].value;
-    if (std.mem.eql(u8, subcommand, "status")) return true;
-    if (std.mem.eql(u8, subcommand, "remote")) {
-        return words.len == 2 and std.mem.eql(u8, words[1].value, "-v");
-    }
-    if (std.mem.eql(u8, subcommand, "worktree")) {
-        return words.len >= 2 and std.mem.eql(u8, words[1].value, "list");
-    }
-    if (std.mem.eql(u8, subcommand, "fetch")) {
-        for (words[1..]) |word| {
-            if (std.mem.eql(u8, word.value, "--prune") or
-                std.mem.eql(u8, word.value, "-p") or
-                std.mem.eql(u8, word.value, "--prune-tags")) return false;
-        }
-        return true;
-    }
-    return false;
+/// True when the command's first word is `git`. A repository's own config can
+/// name programs git starts for even its read-only subcommands, so `auto` mode
+/// plans every non-interactive git command through safe git rather than run it
+/// as plain git in a shell. This is a shape test on the text, matching how the
+/// planner and the routine-command rule already read a command's first word.
+pub fn isGitCommand(command: []const u8) bool {
+    const trimmed = std.mem.trim(u8, command, " \t\n");
+    if (!std.mem.startsWith(u8, trimmed, "git")) return false;
+    return trimmed.len == 3 or trimmed[3] == ' ' or trimmed[3] == '\t';
 }
 
 fn reversibleNpm(words: []const command_lex.ArgvToken) bool {
@@ -197,10 +190,6 @@ test "known reversible auto commands exclude destructive and hidden effects" {
         "node -v",
         "node -v && npm -v",
         "which node npm && node -v",
-        "git status --short --branch",
-        "git remote -v",
-        "git worktree list --porcelain",
-        "git fetch origin main",
         "npm install 2>&1",
         "npm run dev",
         "zig build test",
@@ -229,11 +218,39 @@ test "known reversible auto commands exclude destructive and hidden effects" {
             false,
         ));
     }
+    // No git command is a routine auto command: a repository's own config can
+    // name programs git starts for even a read-only subcommand, so every one
+    // goes through safe git.
+    for ([_][]const u8{
+        "git status",
+        "git status --short --branch",
+        "git remote -v",
+        "git worktree list --porcelain",
+        "git fetch origin main",
+        "git diff --stat",
+        "git log --oneline -n 5",
+    }) |command| {
+        try std.testing.expect(!try knownReversibleAutoCommand(
+            std.testing.allocator,
+            command,
+            false,
+        ));
+    }
     try std.testing.expect(!try knownReversibleAutoCommand(
         std.testing.allocator,
         "npm run dev",
         true,
     ));
+}
+
+test "git command shape is the first word" {
+    try std.testing.expect(isGitCommand("git status --short"));
+    try std.testing.expect(isGitCommand("git"));
+    try std.testing.expect(isGitCommand("  git\tlog -n 5"));
+    try std.testing.expect(!isGitCommand("gitui"));
+    try std.testing.expect(!isGitCommand("cd repo && git status"));
+    try std.testing.expect(!isGitCommand("/usr/bin/git status"));
+    try std.testing.expect(!isGitCommand("echo git status"));
 }
 
 const LsSymlinkSemantics = enum {
@@ -259,7 +276,9 @@ pub const ApprovalReason = enum {
     command_owned_input,
     unknown_command,
     planning_failure,
-    /// fx could not apply its git safety settings in this directory.
+    /// fx will not run this git command: plain git could start a program the
+    /// repository's own config names, and fx could not turn every one of them
+    /// off here.
     unsafe_git,
 };
 
@@ -767,24 +786,46 @@ fn planGit(
     git: *GitResolver,
 ) std.mem.Allocator.Error!StageAdmission {
     if (words.len < 2) return .{ .approval_required = .command_owned_input };
-    const subcommand: safe_git.Subcommand = if (std.mem.eql(u8, words[1], "status"))
+    const subcommand = words[1];
+
+    // A network command can start a program the repository's config names:
+    // `remote.<name>.uploadpack`, `core.sshCommand`, `credential.helper` and
+    // `core.gitProxy`. `-c` cannot turn those off without also disabling the
+    // user's own ssh and credential configuration, and git keeps a
+    // repository's `uploadpack` over the agent environment's, so fx does not
+    // run a fetch on its own.
+    if (std.mem.eql(u8, subcommand, "fetch")) return .{ .approval_required = .unsafe_git };
+
+    const planned: safe_git.Subcommand = if (std.mem.eql(u8, subcommand, "status"))
         .status
-    else if (std.mem.eql(u8, words[1], "diff"))
+    else if (std.mem.eql(u8, subcommand, "diff"))
         .diff
-    else if (std.mem.eql(u8, words[1], "log"))
+    else if (std.mem.eql(u8, subcommand, "log"))
         .log
+    else if (std.mem.eql(u8, subcommand, "show"))
+        .show
     else
         return .{ .approval_required = .command_owned_input };
+
     const ready = switch (try git.get(alloc)) {
         .ready => |ready| ready,
         .refused => return .{ .approval_required = .unsafe_git },
     };
-    return switch (subcommand) {
+    return switch (planned) {
         .status => planGitStatus(alloc, ready, words[2..]),
         .diff => planGitDiff(alloc, ready, words[2..]),
         .log => planGitLog(alloc, ready, words[2..]),
+        .show => planGitShow(alloc, ready, words[2..]),
         .branch, .rev_parse => unreachable,
     };
+}
+
+/// A shape safe git cannot express goes to review like any other command. It
+/// then runs in the shell, where `safe_git.appendAgentEnvironment` turns off
+/// the programs the repository's config names for every git it starts. git
+/// older than 2.31 ignores that environment, so there the shape is held.
+fn unsupportedGitShape(ready: safe_git.Ready) StageAdmission {
+    return .{ .approval_required = if (ready.honors_config_environment) .unsupported_argument else .unsafe_git };
 }
 
 fn directGit(ready: safe_git.Ready, argv: []const []const u8) StageAdmission {
@@ -807,16 +848,20 @@ fn planGitStatus(
             "--short"
         else if (std.mem.eql(u8, argument, "-b"))
             "--branch"
+        else if (std.mem.eql(u8, argument, "-uno"))
+            "--untracked-files=no"
         else if (std.mem.eql(u8, argument, "--short") or
             std.mem.eql(u8, argument, "--branch") or
+            std.mem.eql(u8, argument, "--ignored") or
             std.mem.eql(u8, argument, "--porcelain") or
             std.mem.eql(u8, argument, "--porcelain=v1") or
+            std.mem.eql(u8, argument, "--porcelain=v2") or
             std.mem.eql(u8, argument, "--untracked-files=no") or
             std.mem.eql(u8, argument, "--untracked-files=normal") or
             std.mem.eql(u8, argument, "--untracked-files=all"))
             argument
         else
-            return .{ .approval_required = .unsupported_argument };
+            return unsupportedGitShape(ready);
         try argv.append(alloc, canonical);
     }
     return directGit(ready, try argv.toOwnedSlice(alloc));
@@ -844,13 +889,13 @@ fn planGitDiff(
             std.mem.eql(u8, argument, "--check") or
             std.mem.eql(u8, argument, "--no-renames")))
         {
-            return .{ .approval_required = .unsupported_argument };
+            return unsupportedGitShape(ready);
         }
         try argv.append(alloc, argument);
     }
     const operands = if (index < arguments.len) arguments[index + 1 ..] else &.{};
     if (operands.len > max_git_pathspecs) {
-        return .{ .approval_required = .unsupported_argument };
+        return unsupportedGitShape(ready);
     }
     try argv.append(alloc, "--");
     try argv.appendSlice(alloc, operands);
@@ -871,7 +916,7 @@ fn planGitLog(
         const argument = arguments[index];
         if (std.mem.eql(u8, argument, "-n")) {
             if (index + 1 >= arguments.len or !boundedDecimal(arguments[index + 1], max_git_log_count)) {
-                return .{ .approval_required = .unsupported_argument };
+                return unsupportedGitShape(ready);
             }
             try argv.appendSlice(alloc, arguments[index .. index + 2]);
             index += 1;
@@ -879,7 +924,7 @@ fn planGitLog(
         }
         if (std.mem.startsWith(u8, argument, "--max-count=")) {
             if (!boundedDecimal(argument["--max-count=".len..], max_git_log_count)) {
-                return .{ .approval_required = .unsupported_argument };
+                return unsupportedGitShape(ready);
             }
             try argv.append(alloc, argument);
             continue;
@@ -894,17 +939,65 @@ fn planGitLog(
             std.mem.eql(u8, argument, "--decorate=short") or
             std.mem.eql(u8, argument, "--decorate=no")))
         {
-            return .{ .approval_required = .unsupported_argument };
+            return unsupportedGitShape(ready);
         }
         try argv.append(alloc, argument);
     }
     const operands = if (index < arguments.len) arguments[index + 1 ..] else &.{};
     if (operands.len > max_git_pathspecs) {
-        return .{ .approval_required = .unsupported_argument };
+        return unsupportedGitShape(ready);
     }
     try argv.append(alloc, "--");
     try argv.appendSlice(alloc, operands);
     return directGit(ready, try argv.toOwnedSlice(alloc));
+}
+
+/// `git show` reads one revision with the repository's diff drivers and
+/// signature verification turned off. Operands are revisions, never pathspecs,
+/// so every one is checked against a conservative revision shape.
+fn planGitShow(
+    alloc: std.mem.Allocator,
+    ready: safe_git.Ready,
+    arguments: []const []const u8,
+) std.mem.Allocator.Error!StageAdmission {
+    var argv: std.ArrayList([]const u8) = .empty;
+    try safe_git.appendCommand(alloc, &argv, ready, .show);
+    try argv.append(alloc, "--color=never");
+
+    const max_git_show_revisions = 2;
+    var revisions: usize = 0;
+    for (arguments) |argument| {
+        if (std.mem.eql(u8, argument, "--stat") or
+            std.mem.eql(u8, argument, "--shortstat") or
+            std.mem.eql(u8, argument, "--oneline") or
+            std.mem.eql(u8, argument, "--summary") or
+            std.mem.eql(u8, argument, "--name-only") or
+            std.mem.eql(u8, argument, "--name-status") or
+            std.mem.eql(u8, argument, "--no-renames") or
+            std.mem.eql(u8, argument, "--no-patch") or
+            std.mem.eql(u8, argument, "-s"))
+        {
+            try argv.append(alloc, argument);
+            continue;
+        }
+        if (!isGitRevision(argument) or revisions == max_git_show_revisions) {
+            return unsupportedGitShape(ready);
+        }
+        try argv.append(alloc, argument);
+        revisions += 1;
+    }
+    return directGit(ready, try argv.toOwnedSlice(alloc));
+}
+
+/// A revision-shaped operand: no leading dash, and only the characters a ref,
+/// an object id or a revision suffix uses.
+fn isGitRevision(argument: []const u8) bool {
+    if (argument.len == 0 or argument[0] == '-') return false;
+    for (argument) |byte| switch (byte) {
+        'a'...'z', 'A'...'Z', '0'...'9', '.', '_', '/', '-', '@', '^', '~' => {},
+        else => return false,
+    };
+    return true;
 }
 
 fn boundedDecimal(value: []const u8, maximum: usize) bool {
@@ -1023,8 +1116,9 @@ test "planner canonicalizes pwd to a fixed physical path" {
 }
 
 /// Planner tests use a fixed safe-git result, so they do not depend on the
-/// host's git. `safe_git.zig` tests the real preparation.
-const test_git: GitSource = .{ .fixed = .{ .ready = .{ .executable = "/usr/bin/git", .filter_names = &.{} } } };
+/// host's git. `safe_git.zig` tests the real preparation. The fixed result
+/// takes `--no-lazy-fetch`, as every git from 2.45 does.
+const test_git: GitSource = .{ .fixed = .{ .ready = .{ .executable = "/usr/bin/git", .filter_names = &.{}, .no_lazy_fetch = true } } };
 
 fn expectDirect(command: []const u8, target_os: std.Target.Os.Tag) !Admission {
     const admission = try planWithGit(
@@ -1231,13 +1325,15 @@ test "planner returns stable reasons for approval-bearing forms" {
         .{ .command = "wc --files0-from=paths", .reason = .unsupported_argument },
         .{ .command = "git -C other status", .reason = .command_owned_input },
         .{ .command = "git push origin HEAD", .reason = .command_owned_input },
-        .{ .command = "git status --ignored", .reason = .unsupported_argument },
+        .{ .command = "git fetch origin", .reason = .unsafe_git },
+        .{ .command = "git status --porcelain=v3", .reason = .unsupported_argument },
         .{ .command = "git status --short -- src", .reason = .unsupported_argument },
         .{ .command = "git diff --ext-diff", .reason = .unsupported_argument },
         .{ .command = "git diff HEAD", .reason = .unsupported_argument },
         .{ .command = "git log -p", .reason = .unsupported_argument },
         .{ .command = "git log -n 1001", .reason = .unsupported_argument },
         .{ .command = "git log --format='%x00'", .reason = .unsupported_argument },
+        .{ .command = "git show --format=%H", .reason = .unsupported_argument },
         .{ .command = "cat -n README.md", .reason = .unsupported_argument },
         .{ .command = "cat README.md", .reason = .unsupported_argument },
         .{ .command = "cat /tmp/.ssh/id_ed25519", .reason = .unsupported_argument },
@@ -1365,6 +1461,7 @@ test "planner pins read-only git inspection to hardened argv and environment" {
         "/usr/bin/git",
         "--no-pager",
         "--no-optional-locks",
+        "--no-lazy-fetch",
         "-c",
         "core.fsmonitor=false",
         "-c",
@@ -1384,7 +1481,7 @@ test "planner pins read-only git inspection to hardened argv and environment" {
 }
 
 test "planner blanks repository filters and falls back to review when safe git refuses" {
-    const with_filter: GitSource = .{ .fixed = .{ .ready = .{ .executable = "/usr/bin/git", .filter_names = &.{"evil"} } } };
+    const with_filter: GitSource = .{ .fixed = .{ .ready = .{ .executable = "/usr/bin/git", .filter_names = &.{"evil"}, .no_lazy_fetch = true } } };
     var admission = try planWithGit(std.testing.allocator, "git status --short", "/workspace", false, .linux, with_filter);
     defer admission.deinit(std.testing.allocator);
     const argv = admission.direct_read_only.stages[0].argv;
@@ -1403,7 +1500,52 @@ test "planner blanks repository filters and falls back to review when safe git r
     }
     // Subcommands that are never auto-run keep their own reason.
     try expectApprovalWithGit("git push origin HEAD", false, .linux, .command_owned_input, refused);
-    try expectApprovalWithGit("git status --ignored", false, .linux, .unsupported_argument, test_git);
+    // An inspection shape safe git cannot express goes to review, and runs
+    // under the agent environment; a fetch never runs on fx's own authority.
+    try expectApprovalWithGit("git status --porcelain=v3", false, .linux, .unsupported_argument, test_git);
+    try expectApprovalWithGit("git fetch origin", false, .linux, .unsafe_git, test_git);
+    // git older than 2.31 ignores the agent environment, so the shape is held.
+    const old_git: GitSource = .{ .fixed = .{ .ready = .{
+        .executable = "/usr/bin/git",
+        .filter_names = &.{},
+        .no_lazy_fetch = false,
+        .honors_config_environment = false,
+    } } };
+    try expectApprovalWithGit("git status --porcelain=v3", false, .linux, .unsafe_git, old_git);
+    try expectApprovalWithGit("git diff HEAD", false, .linux, .unsafe_git, old_git);
+}
+
+test "planner pins git show to hardened argv and revision operands" {
+    var admission = try expectDirect("git show --stat HEAD", .linux);
+    defer admission.deinit(std.testing.allocator);
+    const stage = admission.direct_read_only.stages[0];
+
+    try std.testing.expectEqual(EnvironmentProfile.git_read_only, stage.environment_profile);
+    try expectArgv(&.{
+        "/usr/bin/git",
+        "--no-pager",
+        "--no-optional-locks",
+        "--no-lazy-fetch",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "log.showSignature=false",
+        "show",
+        "--pretty=medium",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--ignore-submodules=all",
+        "--color=never",
+        "--stat",
+        "HEAD",
+    }, stage.argv);
+
+    // A revision that carries a path or a format string is not a shape fx runs
+    // directly, so it goes to review.
+    try expectApprovalWithGit("git show HEAD:src/main.zig", false, .linux, .unsupported_argument, test_git);
+    try expectApprovalWithGit("git show --format=%H", false, .linux, .unsupported_argument, test_git);
 }
 
 test "planner limits bounded readers to pipeline input" {
