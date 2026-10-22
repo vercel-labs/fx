@@ -566,6 +566,49 @@ describe("fx ask presentation", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
+    "TTY request error renders below the prompt and wraps",
+    async () => {
+      const root = createRoot();
+      const restricted =
+        "Your team has restricted access to this provider. Contact the owner of the account for more details. Providers considered: wafer";
+      const gateway = startFakeGateway([
+        new Response(
+          JSON.stringify({
+            error: {
+              message: restricted,
+              type: "no_providers_available",
+              param: { name: "RestrictedProvidersError", message: restricted },
+            },
+          }),
+          { status: 403, headers: { "content-type": "application/json" } },
+        ),
+      ]);
+      gateways.push(gateway);
+
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--no-save", "Check the request error."]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 40,
+        height: 20,
+        remainOnExit: true,
+      });
+      sessions.push(session);
+
+      await session.waitForText("__FX_EXIT_", TIMEOUT);
+      const rows = (await session.captureFullScrollback()).split("\n").map((row) => row.trimEnd());
+      expect(rows).toContain("__FX_EXIT_1__");
+      expect(rows).toContain("┃ Check the request error.");
+      expect(rows.filter((row) => row.includes("Check the request error."))).toHaveLength(1);
+      // The error is wider than 40 columns; compare it without the wrap points.
+      expect(rows.join("").replace(/\s/g, "")).toContain("APIaccessdenied·HTTP403·Provider:wafer");
+      expect(gateway.requests).toHaveLength(1);
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "--no-color keeps the TTY layout without fx styles or hyperlinks",
     async () => {
       const root = createRoot();
