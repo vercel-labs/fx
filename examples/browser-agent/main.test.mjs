@@ -29,9 +29,9 @@ async function page({ key = '', fail = false, stopReason = 'stop', duringFetch }
       return 'hello'
     },
   })
-  const sdk = new SyntheticModule(['createFxAgent', 'supportsJspi'], function () {
+  const sdk = new SyntheticModule(['createFxEngine', 'supportsJspi'], function () {
     this.setExport('supportsJspi', () => true)
-    this.setExport('createFxAgent', async (options) => {
+    this.setExport('createFxEngine', async (options) => {
       const agent = {
         options, closed: false,
         async close() { this.closed = true },
