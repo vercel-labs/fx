@@ -57,28 +57,57 @@ fn safer_alternative_for_risk(risk: DestructiveEffect) []const u8 {
     };
 }
 
-/// Returns an informational annotation for non-error non-zero exit codes.
+/// Returns what a non-zero exit code means when it is an ordinary answer
+/// rather than an error, such as `grep` finding no matches. Leading
+/// `cd <dir> &&` steps are skipped only when stderr is empty, because a
+/// failed `cd` ends the chain with exit 1 and writes to stderr.
 pub fn semantic_exit_annotation(command_text: []const u8, exit_code: i64, stderr_text: []const u8) ?[]const u8 {
     if (exit_code == 0) return null;
 
-    const analysis = command_classification.analysis_command_tail(command_text);
+    const command = if (stderr_text.len == 0) peelCdPrefixes(command_text) else command_text;
+    const analysis = command_classification.analysis_command_tail(command);
     const terminal = command_classification.terminal_exit_segment(analysis) orelse return null;
     const base = command_classification.base_command_token(terminal) orelse return null;
 
     if (is_pattern_matcher(base)) {
-        return if (exit_code == 1) "note: no matches found" else null;
+        return if (exit_code == 1) "no matches found" else null;
     }
     if (std.mem.eql(u8, base, "find")) {
         if (exit_code != 1 or !looks_like_find_access_issue(stderr_text)) return null;
-        return "note: some paths could not be read";
+        return "some paths could not be read";
     }
     if (std.mem.eql(u8, base, "diff") or std.mem.eql(u8, base, "cmp")) {
-        return if (exit_code == 1) "note: compared files differ" else null;
+        return if (exit_code == 1) "compared files differ" else null;
     }
     if (std.mem.eql(u8, base, "test") or std.mem.eql(u8, base, "[")) {
-        return if (exit_code == 1) "note: condition evaluated false" else null;
+        return if (exit_code == 1) "condition evaluated false" else null;
     }
     return null;
+}
+
+/// Returns `command` without leading `cd <dir> &&` steps whose directory is
+/// one plain word. Anything else, including a quoted directory, is returned
+/// unchanged.
+fn peelCdPrefixes(command: []const u8) []const u8 {
+    var rest = command;
+    while (true) {
+        const cd = command_classification.next_token(rest, 0) orelse return rest;
+        if (!std.mem.eql(u8, cd.text, "cd")) return rest;
+        const dir = command_classification.next_token(rest, cd.end) orelse return rest;
+        if (!isPlainPathWord(dir.text)) return rest;
+        const operator = command_classification.next_token(rest, dir.end) orelse return rest;
+        if (!std.mem.eql(u8, operator.text, "&&")) return rest;
+        rest = rest[operator.end..];
+    }
+}
+
+fn isPlainPathWord(word: []const u8) bool {
+    if (word.len == 0) return false;
+    for (word) |ch| {
+        if (std.ascii.isAlphanumeric(ch)) continue;
+        if (std.mem.findScalar(u8, "/._-~+:@,%=", ch) == null) return false;
+    }
+    return true;
 }
 
 fn destructive_effect_in_analysis(command: []const u8) ?DestructiveEffect {
@@ -765,7 +794,7 @@ test "command risk note detects command after sequence boundary" {
 }
 
 test "semantic annotation explains grep exit one" {
-    try std.testing.expectEqualStrings("note: no matches found", semantic_exit_annotation("grep foo bar", 1, "").?);
+    try std.testing.expectEqualStrings("no matches found", semantic_exit_annotation("grep foo bar", 1, "").?);
 }
 
 test "semantic annotation leaves grep real errors alone" {
@@ -777,8 +806,8 @@ test "semantic annotation leaves zero exits alone" {
 }
 
 test "semantic annotation explains find partial access" {
-    try std.testing.expectEqualStrings("note: some paths could not be read", semantic_exit_annotation("find /tmp -name foo", 1, "find: /tmp/private: Permission denied").?);
-    try std.testing.expectEqualStrings("note: some paths could not be read", semantic_exit_annotation("find /tmp -name foo", 1, "find: /tmp/private: Operation not permitted").?);
+    try std.testing.expectEqualStrings("some paths could not be read", semantic_exit_annotation("find /tmp -name foo", 1, "find: /tmp/private: Permission denied").?);
+    try std.testing.expectEqualStrings("some paths could not be read", semantic_exit_annotation("find /tmp -name foo", 1, "find: /tmp/private: Operation not permitted").?);
 }
 
 test "semantic annotation leaves find usage errors alone" {
@@ -787,31 +816,31 @@ test "semantic annotation leaves find usage errors alone" {
 }
 
 test "semantic annotation explains diff differences" {
-    try std.testing.expectEqualStrings("note: compared files differ", semantic_exit_annotation("diff a b", 1, "").?);
+    try std.testing.expectEqualStrings("compared files differ", semantic_exit_annotation("diff a b", 1, "").?);
 }
 
 test "semantic annotation explains test false" {
-    try std.testing.expectEqualStrings("note: condition evaluated false", semantic_exit_annotation("test -f foo", 1, "").?);
+    try std.testing.expectEqualStrings("condition evaluated false", semantic_exit_annotation("test -f foo", 1, "").?);
 }
 
 test "semantic annotation explains bracket alias false" {
-    try std.testing.expectEqualStrings("note: condition evaluated false", semantic_exit_annotation("[ -f foo ]", 1, "").?);
+    try std.testing.expectEqualStrings("condition evaluated false", semantic_exit_annotation("[ -f foo ]", 1, "").?);
 }
 
 test "semantic annotation handles wrapped grep" {
-    try std.testing.expectEqualStrings("note: no matches found", semantic_exit_annotation("timeout 5 grep foo bar.txt", 1, "").?);
+    try std.testing.expectEqualStrings("no matches found", semantic_exit_annotation("timeout 5 grep foo bar.txt", 1, "").?);
 }
 
 test "semantic annotation uses last pipe segment" {
-    try std.testing.expectEqualStrings("note: no matches found", semantic_exit_annotation("diff a b | grep changed", 1, "").?);
+    try std.testing.expectEqualStrings("no matches found", semantic_exit_annotation("diff a b | grep changed", 1, "").?);
 }
 
 test "semantic annotation uses last sequence segment" {
-    try std.testing.expectEqualStrings("note: no matches found", semantic_exit_annotation("ls -la; grep foo bar.txt", 1, "").?);
+    try std.testing.expectEqualStrings("no matches found", semantic_exit_annotation("ls -la; grep foo bar.txt", 1, "").?);
 }
 
 test "semantic annotation uses last newline segment" {
-    try std.testing.expectEqualStrings("note: no matches found", semantic_exit_annotation("ls -la\ngrep foo bar.txt", 1, "").?);
+    try std.testing.expectEqualStrings("no matches found", semantic_exit_annotation("ls -la\ngrep foo bar.txt", 1, "").?);
 }
 
 test "semantic annotation ignores default last pipe segment" {
@@ -822,12 +851,29 @@ test "semantic annotation declines short circuit commands" {
     try std.testing.expect(semantic_exit_annotation("grep foo bar && echo done", 1, "") == null);
 }
 
+test "semantic annotation skips leading cd steps when stderr is empty" {
+    try std.testing.expectEqualStrings("no matches found", semantic_exit_annotation("cd /repo && grep -rn foo src", 1, "").?);
+    try std.testing.expectEqualStrings("no matches found", semantic_exit_annotation("cd ~/repo && cd sub-dir && rg foo", 1, "").?);
+    try std.testing.expectEqualStrings("compared files differ", semantic_exit_annotation("cd /repo && diff a b", 1, "").?);
+}
+
+test "semantic annotation keeps a cd chain unexplained when cd may have failed" {
+    // A failed cd also exits 1, and it says so on stderr.
+    try std.testing.expect(semantic_exit_annotation("cd /missing && grep foo bar", 1, "cd: no such file or directory: /missing") == null);
+    // Only cd is skipped: a silent `test` could be the step that failed.
+    try std.testing.expect(semantic_exit_annotation("cd /repo && test -f a && grep foo a", 1, "") == null);
+    try std.testing.expect(semantic_exit_annotation("cd \"/my repo\" && grep foo bar", 1, "") == null);
+    try std.testing.expect(semantic_exit_annotation("cd $DIR && grep foo bar", 1, "") == null);
+    try std.testing.expect(semantic_exit_annotation("cd /repo&&grep foo bar", 1, "") == null);
+    try std.testing.expect(semantic_exit_annotation("cd && grep foo bar", 1, "") == null);
+}
+
 test "semantic annotation declines background commands" {
     try std.testing.expect(semantic_exit_annotation("true & grep foo bar", 1, "") == null);
 }
 
 test "semantic annotation ignores quoted pipe" {
-    try std.testing.expectEqualStrings("note: no matches found", semantic_exit_annotation("grep 'foo|bar' baz", 1, "").?);
+    try std.testing.expectEqualStrings("no matches found", semantic_exit_annotation("grep 'foo|bar' baz", 1, "").?);
 }
 
 test "semantic annotation ignores unknown base command" {
