@@ -222,8 +222,6 @@ pub fn parse(
     return profile;
 }
 
-/// Whether an agent in `role` may use `tool` under `profile`. `*` covers every
-/// tool except `subagent` for a subagent, and `!name` wins over everything.
 /// Whether `profile` lets an agent use `tool`. `*` covers every tool,
 /// `subagent` included, for main and subagents alike.
 pub fn allowsTool(profile: *const Profile, tool: []const u8) bool {
