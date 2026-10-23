@@ -54,6 +54,12 @@
 (* as possibly run, and a model request cancels the turn. With             *)
 (* CutoffBound = FALSE it is run again forever (Witness-NoCutoffBound).    *)
 (*                                                                         *)
+(* A step whose worker crashes partway through, as one that runs the       *)
+(* process out of memory does each time, is cut off as well: a claim that  *)
+(* takes the session over from a holder that never released it counts one  *)
+(* cut-off toward the same bound. With CrashCuts = FALSE such a step is    *)
+(* run again after every crash (Witness-NoCrashBound).                     *)
+(*                                                                         *)
 (* The tool is one of three kinds. A "lookup" is idempotent and does not   *)
 (* write, so its call runs ahead: it starts at once and its intent follows *)
 (* it to the chain. A crash before that intent lands loses the call, and   *)
@@ -81,6 +87,8 @@ CONSTANTS
     ClaimFenced, \* whether a claim on a stale read is refused
     MaxCutoffs,  \* cut-offs of one step in a row before it is not run again
     CutoffBound, \* whether that bound applies
+    CrashCuts,   \* whether a takeover from a holder that never released
+                 \* cuts the step off too
     Heartbeat,   \* whether a holder renews a short lease while it runs
     QueueHeld    \* whether only the queue's redelivery of a frozen holder's
                  \* message frees its lease
@@ -91,6 +99,7 @@ ASSUME SelfStop \in BOOLEAN
 ASSUME ClaimFenced \in BOOLEAN
 ASSUME MaxCutoffs \in Nat
 ASSUME CutoffBound \in BOOLEAN
+ASSUME CrashCuts \in BOOLEAN
 ASSUME Heartbeat \in BOOLEAN
 ASSUME QueueHeld \in BOOLEAN
 ASSUME ~(QueueHeld /\ Heartbeat)
@@ -225,14 +234,19 @@ Claim(w) ==
                /\ pc' = [pc EXCEPT ![w] = "announce"]
                /\ froze' = [froze EXCEPT ![w] = FALSE]
                /\ lapse' = "none"
-               /\ UNCHANGED seen
-          ELSE /\ UNCHANGED <<lease, epoch, chain, froze, lapse>>
+               \* A lease its holder never released was left by a worker that
+               \* stopped partway through the turn's step. That cuts the step
+               \* off once, as a deadline does, and w's read of the log after
+               \* its claim counts it.
+               /\ cutoffs' = IF CrashCuts /\ lease.holder # None THEN cutoffs + 1 ELSE cutoffs
+               /\ seen' = [seen EXCEPT ![w].cutoffs = cutoffs']
+          ELSE /\ UNCHANGED <<lease, epoch, chain, froze, lapse, cutoffs>>
                /\ IF CanClaim(w)
                      THEN /\ pc' = [pc EXCEPT ![w] = "early"]
                           /\ seen' = [seen EXCEPT ![w] = Read]
                      ELSE /\ pc' = [pc EXCEPT ![w] = "none"]
                           /\ UNCHANGED seen
-    /\ UNCHANGED <<frozen, progress, runs, ids, ui, freezes, cutoffs>>
+    /\ UNCHANGED <<frozen, progress, runs, ids, ui, freezes>>
     /\ act' = [name |-> "Claim", w |-> w]
 
 \* w writes turn_start or turn_resume and waits for it to land, then
@@ -240,12 +254,14 @@ Claim(w) ==
 \* running is rerun only when it is safe to run twice, under the execution id
 \* its intent names; otherwise the model is told it may have partly run,
 \* which is stored as the call's result, its viewers see the call end with
-\* that answer, and the turn goes on to the answer. The records this writes are left out
-\* of `chain`: in the code it follows its claim at once, and fewer chain
-\* moves only let the model do more. A step
-\* cut off MaxCutoffs times in a row is not run again: a call is answered
-\* as possibly run, and a model request cancels the turn, whose end only
-\* the chain's head writes.
+\* that answer, and the turn goes on to the answer. Its line and a rerun's
+\* records are left out of `chain`: in the code they follow its claim at
+\* once, and fewer chain moves only let the model do more. A call answered
+\* as possibly run is a record of the turn's progress and moves the chain,
+\* so a worker that read the log before it cannot claim on that read and
+\* run the call again. A step cut off MaxCutoffs times in a row is not run
+\* again: a call is answered as possibly run, and a model request cancels
+\* the turn, whose end only the chain's head writes.
 Announce(w) ==
     /\ pc[w] = "announce"
     /\ ~frozen[w]
@@ -274,12 +290,14 @@ Announce(w) ==
                \* then tool_start for a rerun, or tool_end for a call answered
                \* as possibly run
                /\ ui' = IF from = "intent" THEN ui \o <<Line(w), Line(w)>> ELSE Append(ui, Line(w))
-               \* a call answered as possibly run is the turn's next record
+               \* a call answered as possibly run is the turn's next record,
+               \* which moves the chain as any record does
                /\ IF from = "intent" /\ ~rerun /\ Heads(w)
                      THEN /\ progress' = "result"
                           /\ cutoffs' = 0
-                     ELSE UNCHANGED <<progress, cutoffs>>
-               /\ UNCHANGED <<lease, chain, lapse>>
+                          /\ chain' = chain + 1
+                     ELSE UNCHANGED <<progress, cutoffs, chain>>
+               /\ UNCHANGED <<lease, lapse>>
     /\ UNCHANGED <<epoch, frozen, ids, freezes, froze, seen>>
     /\ act' = [name |-> "Announce", w |-> w]
 
@@ -467,9 +485,17 @@ Spec == Init /\ [][Next]_vars
 \* A call with effects never starts twice.
 EffectsAtMostOnce == Tool = "send" => runs <= 1
 
-\* The deadline cuts off one step at most MaxCutoffs times in a row: the
-\* delivery after that does not run it again.
-HandoffsBounded == cutoffs <= MaxCutoffs
+\* A step is cut off at most MaxCutoffs times in a row, by the deadline or by
+\* a worker that stopped partway: after that, no worker heading the chain
+\* runs it again. A worker that knew so can still stop before it acts, so
+\* the count itself can pass the bound.
+HandoffsBounded == \A w \in Workers : pc[w] \in Busy /\ Heads(w) => cutoffs < MaxCutoffs
+
+\* A write starts at most MaxCutoffs times: once, and again only after each
+\* cut-off of its call, by a deadline or by a worker that stopped partway,
+\* up to the bound. Without CrashCuts it runs again after every crash
+\* (Witness-NoCrashBound).
+RunsBounded == Tool = "write" => runs <= MaxCutoffs
 
 \* A write or a send starts only after its intent counts in the chain.
 CallAfterIntent == Tool \in {"write", "send"} => (runs > 0 => progress # "start")

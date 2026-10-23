@@ -240,14 +240,15 @@ const liveHolders = (globalThis[Symbol.for("libfx.liveHolders")] ??= new Set());
 // while that cancel runs before the session can run no more turns.
 const maxHarnessStops = 3;
 const maxCancelStops = 2;
-// Times in a row the deadline may cut off the same step of a turn, with no
-// record between, before the next delivery stops running it again.
+// Times in a row the same step of a turn may be cut off, with no record
+// between, by the deadline or by its worker stopping partway, before the
+// next delivery stops running it again.
 const maxCutoffs = 3;
 
 // ---------------------------------------------------------------------------
 // The session log, folded. Pure: the same entries always fold the same way.
 
-// How many times in a row the deadline cut off an open turn's step. A
+// How many times in a row an open turn's step was cut off. A
 // harness that marks its records with the step a turn is at counts the
 // cut-offs while that step stays the same, since continuing a cut-off step
 // can write a record with no progress in it. For one that marks no steps,
@@ -318,7 +319,7 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
   // How many times each turn's engine stopped under it.
   const stops = new Map();
   const failed = new Map();
-  // Deadline cut-offs in a row of the open turn's step.
+  // Cut-offs in a row of the open turn's step.
   let cut = noCutoffs;
   let maxCursor = 0;
   const consume = (id) => {
@@ -358,6 +359,13 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
         if ((entry.a ?? null) !== head) break;
         head = cursor;
         if (entry.k === "lease") {
+          // A worker that took the lease over from one that never released
+          // it found that worker stopped partway through the open turn's
+          // step, as a crash stops it: that cuts the step off as the
+          // deadline does. A holder renewing its own lease takes nothing
+          // over, and with no turn open the next turn's start counts afresh.
+          // (tests/tla/sdk/DurableSession.tla Claim, RunsBounded)
+          if (lease && lease.holder !== entry.holder) cut = afterCutoff(cut);
           lease = { holder: entry.holder, epoch: entry.epoch, expiresAt: entry.expiresAt ?? null, pid: entry.pid, host: entry.host, delivery: entry.delivery, cursor };
           if (Number.isSafeInteger(entry.epoch) && entry.epoch > epoch) epoch = entry.epoch;
         } else if (entry.k === "release") {
@@ -2050,8 +2058,10 @@ class SessionWorker {
           // It lands before the turn goes on, so any line the replaced
           // worker writes after it ranks below it and stays hidden.
           await ui.settle();
-          // A step the deadline cut off maxCutoffs times in a row would be
-          // cut off forever. A cut-off call is not run again, so the model
+          // A step cut off maxCutoffs times in a row, by the deadline or by
+          // its worker stopping partway, would be cut off forever, and one
+          // that crashes its process takes the sessions sharing it down
+          // each time. A cut-off call is not run again, so the model
           // hears it may have partly run; a model request ends the turn,
           // cancelled, as a turn whose engine keeps stopping does.
           spent = state.openTurn?.id === messageId && state.cutoffs >= maxCutoffs;

@@ -1818,6 +1818,42 @@ if (durabilityKind === "memory") {
     assert.equal(ownerOf({ k: "checkpoint", through: "7", data: "saved" }), "default");
     assert.equal(ownerOf({ k: "checkpoint", through: "7", data: "saved", agent: "support" }, input("m9", "coding")), "support");
   });
+
+  test("a lease taken over from a worker that never released it cuts the open turn's step off, as the deadline does", () => {
+    // Each chained entry continues the one before it, as the workers that
+    // wrote them in turn would.
+    const logOf = (entries) => {
+      let head = null;
+      return entries.map((entry, index) => {
+        const cursor = String(index + 1);
+        if (entry.k !== "lease" && entry.k !== "release" && entry.k !== "record") return { cursor, entry };
+        const chained = { ...entry, a: head };
+        head = cursor;
+        return { cursor, entry: chained };
+      });
+    };
+    const cutoffsOf = (...entries) => foldSessionLog(logOf(entries)).cutoffs;
+    const lease = (holder, epoch) => ({ k: "lease", holder, epoch, expiresAt: 1, pid: 1, host: "test" });
+    const begun = [
+      { k: "input", key: "t1:prompt", type: "prompt", messageId: "t1" },
+      lease("w1", 1),
+      { k: "record", data: "a", marks: [{ start: "t1" }, { step: "1:none" }] },
+    ];
+    const sameStep = { k: "record", data: "b", marks: [{ step: "1:none" }] };
+    const nextStep = { k: "record", data: "c", marks: [{ step: "2:none" }] };
+    // A holder renewing its own lease takes nothing over.
+    assert.equal(cutoffsOf(...begun, lease("w1", 1)), 0);
+    // Each worker that finds the one before it stopped partway cuts the step
+    // off once, with records of that same step between or not.
+    assert.equal(cutoffsOf(...begun, lease("w2", 2)), 1);
+    assert.equal(cutoffsOf(...begun, lease("w2", 2), sameStep, lease("w3", 3), lease("w4", 4)), 3);
+    // Takeovers and the deadline count together.
+    assert.equal(cutoffsOf(...begun, lease("w2", 2), { k: "release", holder: "w2", cutoff: "t1" }, lease("w3", 3), lease("w4", 4)), 3);
+    // A claim after a release takes nothing over.
+    assert.equal(cutoffsOf(...begun, { k: "release", holder: "w1" }, lease("w2", 2)), 0);
+    // The count is of one step: a record of the next one starts it over.
+    assert.equal(cutoffsOf(...begun, lease("w2", 2), lease("w3", 3), nextStep, lease("w4", 4)), 1);
+  });
 }
 
 if (durabilityKind === "queue") {
