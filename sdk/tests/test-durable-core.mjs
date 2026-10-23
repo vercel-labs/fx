@@ -183,7 +183,7 @@ function scriptedTurn(body, onHandoff) {
   void result.catch(() => {});
   return {
     result,
-    steer: async () => {},
+    steer: (text) => refuseSteer(text) ?? Promise.resolve(),
     cancel(options = {}) {
       if (options.reason === "handoff") onHandoff();
       cancelled = true;
@@ -200,6 +200,15 @@ function scriptedTurn(body, onHandoff) {
   };
 }
 
+// Steers a turn refuses, as fx's engine refuses text over its steering
+// limit: text starting "too long" with a throw, and "queue full" with a
+// rejection; null for any other.
+function refuseSteer(text) {
+  if (typeof text !== "string") return null;
+  if (text.startsWith("too long")) throw new RangeError("steering text is too long");
+  return text.startsWith("queue full") ? Promise.reject(new Error("steering queue is full")) : null;
+}
+
 // A turn that starts once `before` resolves.
 function chain(before, next) {
   let turn = null;
@@ -209,7 +218,7 @@ function chain(before, next) {
   void result.catch(() => {});
   return {
     result,
-    steer: async (...args) => (await ready).steer(...args),
+    steer: (...args) => refuseSteer(args[0]) ?? ready.then((value) => value.steer(...args)),
     // A turn whose start was refused has nothing to cancel.
     cancel: (options) => { ready.then((value) => value.cancel(options), () => {}); },
     async *[Symbol.asyncIterator]() { yield* await ready; },
@@ -436,6 +445,33 @@ function holdStep(word) {
 
 // How long a test waits for a cancel to reach the log.
 const landMs = durabilityKind === "memory" ? 50 : 400;
+
+for (const [how, text] of [["a throw", "too long"], ["a rejection", "queue full"]]) {
+  test(`steers a turn refuses with ${how} each run as a turn of their own, and the session goes on`, async () => {
+    const agent = createAgent({ durability: await durabilityFor() });
+    const session = agent.session();
+    const tag = text.replace(" ", "-");
+    const held = holdStep("carrier-1");
+    const running = session.prompt("carrier", { messageId: `turn-carrier-${tag}` });
+    await held.holding;
+    // The running turn refuses both. The first then opens a turn of its own
+    // and the second joins it there, where the turn refuses it as it starts.
+    await session.steer(`${text} 1`, { messageId: `steer-${tag}-1` });
+    await session.steer(`${text} 2`, { messageId: `steer-${tag}-2` });
+    await sleep(landMs);
+    held.release();
+    assert.equal((await running.result).stopReason, "end_turn");
+    const after = await session.prompt("after carrier", { messageId: `turn-after-${tag}` }).result;
+    assert.equal(after.stopReason, "end_turn", "the session takes prompts after them");
+    const turns = prompted.filter((id) => id.endsWith(tag) || id.startsWith(`steer-${tag}`));
+    assert.deepEqual(turns, [`turn-carrier-${tag}`, `steer-${tag}-1`, `steer-${tag}-2`, `turn-after-${tag}`]);
+    // A refusal that failed the delivery would run the step it cut off again.
+    for (const id of [`steer-${tag}-1`, `steer-${tag}-2`]) {
+      assert.deepEqual(ran.filter((step) => step.startsWith(`${id}:`)), [0, 1, 2].map((step) => `${id}:${step}`), `each step of ${id} ran once`);
+    }
+    await agent.close();
+  });
+}
 
 test("a turn that ends before writing a record runs once, and the session goes on", async () => {
   const agent = createAgent({ durability: await durabilityFor() });

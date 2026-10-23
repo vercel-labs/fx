@@ -1564,7 +1564,8 @@ function messageEntries(state, message) {
 }
 
 // Whether a steer's input can join a turn: text. One with images or
-// resources runs as its own turn, after the running one hands off to it.
+// resources runs as its own turn, after the running one hands off to it, as
+// does text the turn refuses (see `drive`).
 const joinable = (input) => typeof input === "string" || (Array.isArray(input) && input.every((block) => block?.type === "text"));
 
 // Whether `message` reuses the id of the session's other kind of input: one
@@ -2219,9 +2220,12 @@ class SessionWorker {
     let polling = false;
     let again = false;
     let stopped = false;
-    // A text steer joins the turn. Any other ends it at its next safe point
-    // and, never taken, runs as the next turn, as the fx CLI hands off; the
-    // steers after that one join its turn.
+    // A text steer joins the turn. Any other, or one the turn refuses, such
+    // as text over the engine's steering limit, ends it at its next safe
+    // point and, never taken, runs as the next turn, as the fx CLI hands off;
+    // the steers after that one join its turn. A refusal may be thrown or a
+    // rejection: either way no record accepts the steer, so the log still
+    // holds it for the next turn, and every delivery refuses it the same way.
     let ending = false;
     const endTurn = () => {
       if (ending) return;
@@ -2232,8 +2236,15 @@ class SessionWorker {
       // One id names one input, so a steer with this turn's id is its own
       // opener or one that reused the id, which the log never runs.
       if (steer.messageId === messageId) return;
-      if (!joinable(steer.input)) endTurn();
-      else if (!ending) void turn.steer(steer.input, steer.messageId).catch(() => {});
+      if (!joinable(steer.input)) return endTurn();
+      if (ending) return;
+      let steered;
+      try {
+        steered = turn.steer(steer.input, steer.messageId);
+      } catch {
+        return endTurn();
+      }
+      void Promise.resolve(steered).catch(endTurn);
     };
     const apply = async () => {
       if (stopped) return;
@@ -2586,8 +2597,10 @@ function turnView({ messageId, resumeRequest = null, start }) {
  * next worker continues it. A turn may have `endForSteer()`, which ends it
  * at its next safe point, at once while its model streams a reply, for a
  * steer that cannot join it; without it, such a steer waits for the turn to
- * end. Either way the steer runs as the next turn. A turn stops before a
- * model request once `yieldAt` has passed, with the stop reason `yielded`.
+ * end. Either way the steer runs as the next turn. A steer the turn refuses,
+ * when `steer()` throws or rejects, cannot join it either. A turn stops
+ * before a model request once `yieldAt` has passed, with the stop reason
+ * `yielded`.
  *
  * An input the harness refuses only once a turn runs it is a turn that ends
  * with an error.
@@ -3037,15 +3050,16 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
         /**
          * Guidance for the running turn, or the next turn when none runs: it
          * cuts a streaming reply short, waits for a running tool, and joins a
-         * turn waiting to start. A steer with images or resources cannot
-         * join a turn: the running one ends at its next safe point and the
-         * steer runs next. With `messageId`, a retried call adds nothing;
-         * one id names one input of the session, prompt or steer: reusing a
-         * prompt's id throws `FX_MESSAGE_ID_IN_USE`, or, where the queue
-         * outlives the process and the sender reads no log, the worker drops
-         * the steer and emits a `session.error` with that code. Resolves once
-         * the steer is stored, with its id, which the stream's events for it
-         * carry.
+         * turn waiting to start. A steer with images or resources, or one
+         * the turn refuses, such as text over the fx engine's 64 KiB
+         * steering limit, cannot join a turn: the running one ends at its
+         * next safe point and the steer runs next. With `messageId`, a
+         * retried call adds nothing; one id names one input of the session,
+         * prompt or steer: reusing a prompt's id throws
+         * `FX_MESSAGE_ID_IN_USE`, or, where the queue outlives the process
+         * and the sender reads no log, the worker drops the steer and emits
+         * a `session.error` with that code. Resolves once the steer is
+         * stored, with its id, which the stream's events for it carry.
          */
         async steer(input, steerOptions = {}) {
           if (typeof input === "string" ? input.length === 0 : !Array.isArray(input) || input.length === 0) {
