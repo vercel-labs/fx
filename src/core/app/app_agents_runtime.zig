@@ -948,6 +948,8 @@ pub fn Runtime(comptime App: type) type {
         /// every later turn through it as main does (D31).
         /// `tla/ChildSession.tla` SingleWriter.
         fn attachSession(app: *App, agent: *AppAgent, child: *ChildAgent) !void {
+            // A cooperative host starts no subagents (`startAgentWorkerThread`).
+            if (comptime app_process_runtime.cooperativeHost(App)) return error.SubagentHostUnavailable;
             const host = hostOf(app, child) orelse return error.SubagentHostUnavailable;
             const session = try host.openChildSession(child.id);
             try app_session_runtime.Runtime(App).attachChildV2Session(app, agent, session);
@@ -1251,7 +1253,10 @@ pub fn Runtime(comptime App: type) type {
             settings.fast_mode = child.agent.worker.agent_turn_settings.fast_mode;
             settings.ultrafast_mode = settings.ultrafast_mode and run.admission.ultrafast_mode;
             child.agent.worker.agent_turn_settings = settings;
-            child.agent.child_run = run;
+            var owned = run;
+            // Its tool calls and hooks name it, as a subagent turn's do.
+            if (owned.subagent_id == 0) owned.subagent_id = debug_trace.nextSubagentId();
+            child.agent.child_run = owned;
         }
 
         /// Saves and closes `agent`'s session. When the user quit from this

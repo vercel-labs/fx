@@ -1530,6 +1530,11 @@ pub fn Runtime(comptime App: type) type {
             const prompt_policy = app.promptPolicy(agent);
             const workspace = turnWorkspace(app);
             const child_run = childRun(agent);
+            // Work the parent started runs as a subagent turn, as it does
+            // without a child agent: the parent's steering is labeled as
+            // its feedback, and the reviewer judges it against the root
+            // user's requests.
+            const parent_run: ?*agents.ChildRun = if (child_run) |run| (if (run.startedByParent()) run else null) else null;
             return .{
                 .system_prompt = if (child_run) |run|
                     if (run.system_prompt.len > 0) run.system_prompt else prompt_policy.system_prompt
@@ -1565,6 +1570,11 @@ pub fn Runtime(comptime App: type) type {
                 .access_scope = workspace.access_scope,
                 .session_child_capability = session_child_capability,
                 .context_limits = if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
+                .origin = if (parent_run != null) .subagent else .root,
+                .root_user_intent_context = if (parent_run) |run| run.root_user_intent_context else "",
+                .root_user_messages = if (parent_run) |run| run.root_user_messages else &.{},
+                .root_user_evidence_complete = if (parent_run) |run| run.root_user_evidence_complete else false,
+                .subagent_id = if (parent_run) |run| run.subagent_id else 0,
             };
         }
     };
