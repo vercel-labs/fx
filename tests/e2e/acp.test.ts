@@ -907,6 +907,8 @@ test.each(["empty", "unrelated"])("configured provider ACP preserves explicit mo
     if (created.error) throw new Error(JSON.stringify(created));
     const provider = created.result.configOptions.find((option: any) => option.id === "provider");
     expect(provider.currentValue).toBe("local");
+    expect(provider.category).toBe("model_config");
+    expect(created.result.configOptions.find((option: any) => option.category === "model").id).toBe("model");
     expect(provider.options.map((option: any) => option.value)).toContain("remote");
     const switched = await client.request("session/set_config_option", { configId: "provider", value: "remote" }) as any;
     if (switched.error) throw new Error(JSON.stringify(switched));
@@ -922,6 +924,7 @@ test.each(["empty", "unrelated"])("configured provider ACP preserves explicit mo
     if (loaded.error) throw new Error(JSON.stringify(loaded));
     const current = loaded.result.configOptions.find((option: any) => option.id === "provider").currentValue;
     expect(current).toBe("remote");
+    expect(loaded.result.configOptions.find((option: any) => option.category === "model").id).toBe("model");
     const roundTrip = await client.request("session/set_config_option", { configId: "provider", value: current }) as any;
     expect(roundTrip.error).toBeUndefined();
     expect(fixture.requests).toHaveLength(1);
