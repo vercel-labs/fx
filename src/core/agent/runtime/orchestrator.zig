@@ -7743,6 +7743,8 @@ fn processQueuedPromptLoop(
                 .admission = .{ .context = &provider_admission, .admit_fn = ProviderAdmission.admit },
                 .cancel_flag = config.cancel_flag,
                 .provider_attempt_owner = .agent,
+                .permission_mode = permissionModeForAction(job.permission_mode, snapshotRootPermissionMode(deps), null),
+                .workspace_root = config.workspace_root,
             };
             stream_result = streamMainCompletion(deps, arena, model_request) catch |err| {
                 parent_turn_delivery.observeGatewayDelivery(

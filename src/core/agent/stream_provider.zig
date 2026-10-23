@@ -250,6 +250,11 @@ pub const ModelRequest = struct {
     admission: Admission = .{},
     cancel_flag: *std.atomic.Value(bool),
     provider_attempt_owner: ProviderAttemptOwner = .transport,
+    /// The permission mode in effect for this request. Only a provider that runs
+    /// tools itself reads it; side calls such as titles leave the strictest mode.
+    permission_mode: types.PermissionMode = .ask,
+    /// The session's workspace, for a provider that runs tools in it.
+    workspace_root: ?[]const u8 = null,
 
     pub fn data(self: ModelRequest) RequestData {
         return .{

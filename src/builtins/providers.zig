@@ -6,6 +6,8 @@ const openai_codex_permission_reviewer = @import("../gateway/openai_codex_permis
 const xai_grok = @import("../gateway/xai_grok.zig");
 const xai_grok_models = @import("../gateway/xai_grok_models.zig");
 const xai_grok_permission_reviewer = @import("../gateway/xai_grok_permission_reviewer.zig");
+const claude_cli = @import("../gateway/claude_cli.zig");
+const claude_cli_models = @import("../gateway/claude_cli_models.zig");
 const provider_catalog = @import("../core/auth/provider_catalog.zig");
 const chat_completions = @import("../gateway/chat_completions.zig");
 const configured_provider = @import("../core/config/configured_provider.zig");
@@ -34,5 +36,14 @@ pub const native = provider_set.Set{
         .cli_model_catalog = xai_grok_models.cli_model_catalog_provider,
         .model_catalog = xai_grok_models.model_catalog_provider,
         .permission_reviewer = xai_grok_permission_reviewer.provider,
+    },
+    .claude = .{
+        .presentation = provider_catalog.find(.claude),
+        .auth_strategy = .claude_cli,
+        .title_model = claude_cli_models.title_model,
+        .fallback_model_capabilities_fn = claude_cli_models.capabilities,
+        .agent_stream = claude_cli.agent_stream_provider,
+        .cli_model_catalog = claude_cli_models.cli_model_catalog_provider,
+        .model_catalog = claude_cli_models.model_catalog_provider,
     },
 };

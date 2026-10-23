@@ -42,6 +42,15 @@ pub const entries = [_]Entry{
         .subscription = true,
         .login_source = .grok_subscription,
     },
+    .{
+        .id = .claude,
+        .slug = "claude",
+        .name = "Claude",
+        .route_name = "Claude subscription",
+        .description = "Claude Pro or Max subscription through the Claude Code CLI",
+        .subscription = true,
+        .login_source = .claude_cli,
+    },
 };
 
 pub fn parse(value: []const u8) ?model_provider.ProviderId {
@@ -82,4 +91,13 @@ test "auth provider catalog uses the model provider identity and explicit aliase
     try std.testing.expect(parse("unknown") == null);
     try std.testing.expect(find(.codex).subscription);
     try std.testing.expect(find(.grok).subscription);
+}
+
+test "claude is a subscription provider that signs in through the Claude CLI" {
+    try std.testing.expectEqual(model_provider.ProviderId.claude, parse("claude").?);
+    try std.testing.expectEqual(model_provider.ProviderId.claude, parse("CLAUDE").?);
+    const entry = find(.claude);
+    try std.testing.expect(entry.subscription);
+    try std.testing.expectEqual(types.CredentialSource.claude_cli, entry.login_source);
+    try std.testing.expectEqualStrings("Claude subscription", label(.claude));
 }

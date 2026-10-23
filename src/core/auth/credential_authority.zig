@@ -30,6 +30,7 @@ pub fn derive(
         => hash.update("\x00slot\x00"),
         .chatgpt_subscription,
         .grok_subscription,
+        .claude_cli,
         => {
             const account = account_id orelse return null;
             if (account.len == 0) return null;
@@ -50,6 +51,9 @@ test "credential authority uses account identity for provider subscriptions" {
     try std.testing.expect(!first.eql(other));
     try std.testing.expect(derive(.chatgpt_subscription, null) == null);
     try std.testing.expect(derive(.grok_subscription, "") == null);
+    try std.testing.expect(derive(.claude_cli, null) == null);
+    try std.testing.expect(derive(.claude_cli, "org-1").?.eql(derive(.claude_cli, "org-1").?));
+    try std.testing.expect(!derive(.claude_cli, "org-1").?.eql(derive(.claude_cli, "org-2").?));
     try std.testing.expect(@sizeOf(Identity) == 32);
     _ = types.CredentialSource;
 }
