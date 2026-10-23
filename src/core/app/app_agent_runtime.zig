@@ -1,5 +1,6 @@
 const std = @import("std");
 const agents = @import("../agents/agents.zig");
+const profiles = @import("../profiles/profiles.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const runtime_deps = @import("../agent/runtime/deps.zig");
 const auto_classifier = @import("../permissions/auto_classifier.zig");
@@ -491,8 +492,23 @@ pub fn Runtime(comptime App: type) type {
             }
             ctx.model_capability_resolver = app_callbacks.Bindings(App).modelCapabilityResolver(agent);
             ctx.model_override_resolver = app_callbacks.Bindings(App).modelOverrideResolver(agent);
+            // An instance whose profile names its MCP servers uses only those.
+            // A subagent's run replaces this with its own view below.
+            if (comptime agents.hasAgentField(App, "profile") and agents.hasAgentField(App, "role")) {
+                if (agent.role == .instance and profiles.setsMcpServers(&agent.profile.profile)) {
+                    ctx.mcp_access = .{ .servers = .{ .context = @ptrCast(&agent.profile.profile), .allows_fn = profileAllowsMcpServer } };
+                }
+            }
             if (childRun(agent)) |run| applyChildToolContext(app, &ctx, run);
             return ctx;
+        }
+
+        /// Whether the instance profile at `raw` allows MCP server `server`.
+        /// The profile is fixed once the instance launches, so worker threads
+        /// read it as it is.
+        fn profileAllowsMcpServer(raw: *const anyopaque, server: []const u8) bool {
+            const profile: *const profiles.Profile = @ptrCast(@alignCast(raw));
+            return profiles.allowsMcpServer(profile, server);
         }
 
         fn respondToMcpInput(
