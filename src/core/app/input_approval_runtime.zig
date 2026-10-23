@@ -1,4 +1,5 @@
 const std = @import("std");
+const agents = @import("../agents/agents.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const edit_contract = @import("../input/editor_state.zig");
 const input_action = @import("../input/input_action.zig");
@@ -23,6 +24,7 @@ const ToolPermissionDecision = types.ToolPermissionDecision;
 
 pub fn ApprovalRuntime(comptime App: type) type {
     return struct {
+        const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
         const interrupt = input_interrupt_runtime.InterruptRuntime(App);
 
         fn requestActiveSurfaceFrame(app: *App) void {
@@ -31,9 +33,10 @@ pub fn ApprovalRuntime(comptime App: type) type {
 
         pub fn handlePermissionAction(
             app: *App,
+            agent: *AppAgent,
             action: approval_decision.Action,
         ) !bool {
-            return switch (try handlePermissionActionWithLimit(app, action, null)) {
+            return switch (try handlePermissionActionWithLimit(app, agent, action, null)) {
                 .consumed => true,
                 .ignored => false,
                 .limit_exceeded => unreachable,
@@ -42,18 +45,20 @@ pub fn ApprovalRuntime(comptime App: type) type {
 
         pub fn handlePermissionActionBounded(
             app: *App,
+            agent: *AppAgent,
             action: approval_decision.Action,
             max_len: usize,
         ) !edit_contract.ByteResult {
-            return handlePermissionActionWithLimit(app, action, max_len);
+            return handlePermissionActionWithLimit(app, agent, action, max_len);
         }
 
         fn handlePermissionActionWithLimit(
             app: *App,
+            agent: *AppAgent,
             action: approval_decision.Action,
             max_len: ?usize,
         ) !edit_contract.ByteResult {
-            const event = try applyDecisionAction(app, action, max_len);
+            const event = try applyDecisionAction(app, agent, action, max_len);
             switch (event) {
                 .none => return .ignored,
                 .redraw => {
@@ -61,7 +66,7 @@ pub fn ApprovalRuntime(comptime App: type) type {
                     return .consumed;
                 },
                 .decision => |decision| {
-                    try submitPermissionChoice(app, decision);
+                    try submitPermissionChoice(app, agent, decision);
                     return .consumed;
                 },
                 .limit_exceeded => return .limit_exceeded,
@@ -70,16 +75,18 @@ pub fn ApprovalRuntime(comptime App: type) type {
 
         pub fn routeApprovalEscapeAction(
             app: *App,
+            agent: *AppAgent,
             action: input_action.Action,
             focused_edit: ?approval_decision.DraftAction,
         ) !void {
             app.input_runtime.vertical_navigation.reset();
             app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
-            const amending = app.approval_prompt.isAmending();
+            const amending = agent.approval_prompt.isAmending();
             if (amending) {
                 if (focused_edit) |edit| {
                     _ = try applyDecisionAction(
                         app,
+                        agent,
                         .{ .edit_draft = edit },
                         null,
                     );
@@ -92,6 +99,7 @@ pub fn ApprovalRuntime(comptime App: type) type {
                     if (!amending) {
                         _ = try applyDecisionAction(
                             app,
+                            agent,
                             .{ .move_choice = .previous },
                             null,
                         );
@@ -102,6 +110,7 @@ pub fn ApprovalRuntime(comptime App: type) type {
                     if (!amending) {
                         _ = try applyDecisionAction(
                             app,
+                            agent,
                             .{ .move_choice = .next },
                             null,
                         );
@@ -111,6 +120,7 @@ pub fn ApprovalRuntime(comptime App: type) type {
                 .history_up, .cursor_up => {
                     _ = try applyDecisionAction(
                         app,
+                        agent,
                         .{ .move_choice = .previous },
                         null,
                     );
@@ -119,26 +129,28 @@ pub fn ApprovalRuntime(comptime App: type) type {
                 .history_down, .cursor_down => {
                     _ = try applyDecisionAction(
                         app,
+                        agent,
                         .{ .move_choice = .next },
                         null,
                     );
                     requestActiveSurfaceFrame(app);
                 },
-                .mouse_wheel => |direction| try handleApprovalWheel(app, direction),
+                .mouse_wheel => |direction| try handleApprovalWheel(app, agent, direction),
                 else => {},
             }
         }
 
         fn applyDecisionAction(
             app: *App,
+            agent: *AppAgent,
             action: approval_decision.Action,
             max_len: ?usize,
         ) !approval_decision.Event {
-            const amendment_allowed: ?bool = if (app.approval_prompt.request) |request|
+            const amendment_allowed: ?bool = if (agent.approval_prompt.request) |request|
                 request.amendment_allowed
             else
                 null;
-            return app.approval_prompt.decision.apply(
+            return agent.approval_prompt.decision.apply(
                 app.alloc,
                 action,
                 amendment_allowed,
@@ -146,24 +158,24 @@ pub fn ApprovalRuntime(comptime App: type) type {
             );
         }
 
-        fn clearApprovalPrompt(app: *App, reason: []const u8) void {
-            app.approval_prompt.clearWithReason(app.alloc, reason);
+        fn clearApprovalPrompt(app: *App, agent: *AppAgent, reason: []const u8) void {
+            agent.approval_prompt.clearWithReason(app.alloc, reason);
             app.approval_screen.clear();
         }
 
-        fn clearApprovalPromptAfterSubmission(app: *App) void {
-            app.approval_prompt.clearAfterAcceptedSubmission(app.alloc);
+        fn clearApprovalPromptAfterSubmission(app: *App, agent: *AppAgent) void {
+            agent.approval_prompt.clearAfterAcceptedSubmission(app.alloc);
             app.approval_screen.clear();
         }
 
-        fn handleApprovalWheel(app: *App, direction: input_action.MouseWheel) !void {
-            const request = app.approval_prompt.request orelse return;
+        fn handleApprovalWheel(app: *App, agent: *AppAgent, direction: input_action.MouseWheel) !void {
+            const request = agent.approval_prompt.request orelse return;
             const commit = app.approval_screen.screen_commit orelse return;
             if (!(try approval_screen.needsScreen(
                 app.alloc,
                 request.view(),
                 app.shell.layout,
-                app.worker.queuedPromptCount(),
+                agent.worker.queuedPromptCount(),
             )) or
                 commit.request_id != request.id or
                 !commit.document_scrollable)
@@ -176,23 +188,22 @@ pub fn ApprovalRuntime(comptime App: type) type {
             requestActiveSurfaceFrame(app);
         }
 
-        fn submitPermissionChoice(app: *App, decision: ToolPermissionDecision) !void {
+        fn submitPermissionChoice(app: *App, agent: *AppAgent, decision: ToolPermissionDecision) !void {
             debug_trace.logf(
                 "permission",
                 "approval response submitted request_id={d} decision={s}",
-                .{ app.approval_prompt.request.?.id, @tagName(decision) },
+                .{ agent.approval_prompt.request.?.id, @tagName(decision) },
             );
-            if (app.approval_prompt.rule_management != null) {
-                try submitRuleManagementChoice(app, decision);
+            if (agent.approval_prompt.rule_management != null) {
+                try submitRuleManagementChoice(app, agent, decision);
                 return;
             }
-            if (try submitSubagentPermissionChoice(app, decision)) return;
             var affirmative_claimed = false;
             if (decision != .deny and
-                app.approval_prompt.request.?.file != null)
+                agent.approval_prompt.request.?.file != null)
             {
                 admitPendingApprovalResize(app);
-                const approval = app.approval_prompt.projection().?;
+                const approval = agent.approval_prompt.projection().?;
                 const ready = if (comptime @hasField(App, "terminal"))
                     approval_screen.fileApprovalAffirmativeReady(
                         &app.shell,
@@ -210,7 +221,7 @@ pub fn ApprovalRuntime(comptime App: type) type {
                         "permission",
                         "file_approval_confirmation_blocked request_id={d} decision={s}",
                         .{
-                            app.approval_prompt.request.?.id,
+                            agent.approval_prompt.request.?.id,
                             @tagName(decision),
                         },
                     );
@@ -224,7 +235,7 @@ pub fn ApprovalRuntime(comptime App: type) type {
                         "permission",
                         "file_approval_confirmation_blocked request_id={d} decision={s} reason=resize_interlock",
                         .{
-                            app.approval_prompt.request.?.id,
+                            agent.approval_prompt.request.?.id,
                             @tagName(decision),
                         },
                     );
@@ -235,18 +246,27 @@ pub fn ApprovalRuntime(comptime App: type) type {
             defer if (affirmative_claimed) {
                 releaseApprovalAffirmative(app);
             };
-            const request_id = app.approval_prompt.request.?.id;
-            var response = try app.approval_prompt.decision.materializeResponse(
+            const request_id = agent.approval_prompt.request.?.id;
+            var response = try agent.approval_prompt.decision.materializeResponse(
                 app.alloc,
                 decision,
             );
             var response_submitted = false;
             errdefer if (!response_submitted) response.deinit();
-            const result = app.worker.submitPermissionResponse(request_id, response);
+            // A subagent's approval main's screen shows is answered here, on
+            // main's screen, and its answer goes to that subagent's worker
+            // (D34).
+            const lent = if (comptime @hasDecl(App, "lentApproval")) app.lentApproval() else null;
+            const worker = if (lent) |subagent| subagent.worker else &agent.worker;
+            const result = worker.submitPermissionResponse(request_id, response);
             response_submitted = true;
             switch (result) {
                 .accepted => {
-                    clearApprovalPromptAfterSubmission(app);
+                    if (comptime @hasDecl(App, "screenAgentId")) {
+                        const asker = if (lent) |subagent| subagent.id else subagentIdOf(app, agent);
+                        if (asker) |id| debug_trace.eventf("procesor", "approval_answered", .{}, "agent={s} screen={s}", .{ id, app.screenAgentId() });
+                    }
+                    clearApprovalPromptAfterSubmission(app, agent);
                     app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
                     requestActiveSurfaceFrame(app);
                 },
@@ -256,16 +276,17 @@ pub fn ApprovalRuntime(comptime App: type) type {
 
         fn submitRuleManagementChoice(
             app: *App,
+            agent: *AppAgent,
             decision: ToolPermissionDecision,
         ) !void {
-            if (comptime !@hasField(App, "session") or
-                !@hasField(App, "session_persistence") or
+            if (comptime !agents.hasAgentField(App, "session") or
+                !agents.hasAgentField(App, "session_persistence") or
                 !@hasDecl(App, "writeDomainNotice"))
             {
                 return error.RuleManagementUnavailable;
             } else {
                 if (decision == .deny) {
-                    clearApprovalPromptAfterSubmission(app);
+                    clearApprovalPromptAfterSubmission(app, agent);
                     try app.writeDomainNotice(.{
                         .topic = "permissions",
                         .tone = .neutral,
@@ -274,8 +295,8 @@ pub fn ApprovalRuntime(comptime App: type) type {
                     requestActiveSurfaceFrame(app);
                     return;
                 }
-                const managed = app.approval_prompt.rule_management orelse return;
-                var current = try app.session.snapshotPermissionState(app.alloc);
+                const managed = agent.approval_prompt.rule_management orelse return;
+                var current = try agent.session.snapshotPermissionState(app.alloc);
                 defer current.deinit(app.alloc);
                 const result = try session_permission_state.apply(
                     app.alloc,
@@ -288,10 +309,11 @@ pub fn ApprovalRuntime(comptime App: type) type {
                         defer next.deinit(app.alloc);
                         try app_session_runtime.Runtime(App).commitPermissionState(
                             app,
+                            agent,
                             next,
                         );
-                        app.session.replacePermissionStateOwned(app.alloc, &next);
-                        clearApprovalPromptAfterSubmission(app);
+                        agent.session.replacePermissionStateOwned(app.alloc, &next);
+                        clearApprovalPromptAfterSubmission(app, agent);
                         try app.writeDomainNotice(.{
                             .topic = "permissions",
                             .tone = .neutral,
@@ -299,7 +321,7 @@ pub fn ApprovalRuntime(comptime App: type) type {
                         }, true);
                     },
                     .stale => {
-                        clearApprovalPrompt(app, "rule_management_stale");
+                        clearApprovalPrompt(app, agent, "rule_management_stale");
                         try app.writeDomainNotice(.{
                             .topic = "permissions",
                             .tone = .warning,
@@ -307,7 +329,7 @@ pub fn ApprovalRuntime(comptime App: type) type {
                         }, true);
                     },
                     .full => {
-                        clearApprovalPrompt(app, "rule_management_full");
+                        clearApprovalPrompt(app, agent, "rule_management_full");
                         try app.writeDomainNotice(.{
                             .topic = "permissions",
                             .tone = .warning,
@@ -315,7 +337,7 @@ pub fn ApprovalRuntime(comptime App: type) type {
                         }, true);
                     },
                     .invalid => {
-                        clearApprovalPrompt(app, "rule_management_invalid");
+                        clearApprovalPrompt(app, agent, "rule_management_invalid");
                         try app.writeDomainNotice(.{
                             .topic = "permissions",
                             .tone = .@"error",
@@ -327,110 +349,30 @@ pub fn ApprovalRuntime(comptime App: type) type {
             }
         }
 
-        fn submitSubagentPermissionChoice(
-            app: *App,
-            decision: ToolPermissionDecision,
-        ) !bool {
-            if (comptime !@hasField(App, "session_persistence")) return false;
-            const host = app_session_runtime.Runtime(App).subagentHost(app) orelse {
-                debug_trace.logf("subagent", "approval response ignored reason=host_unavailable", .{});
-                return false;
-            };
-            const loaded_pending = host.pendingApprovalRequest(app.alloc) catch |err| {
-                debug_trace.logf(
-                    "subagent",
-                    "approval response failed reason=request_load err={s}",
-                    .{@errorName(err)},
-                );
-                return true;
-            };
-            var pending = loaded_pending orelse {
-                debug_trace.logf("subagent", "approval response ignored reason=request_unavailable", .{});
-                return false;
-            };
-            defer pending.deinit(app.alloc);
-            const request_id = app.approval_prompt.request.?.id;
-            if (pending.request.view().id != request_id) {
-                debug_trace.logf(
-                    "subagent",
-                    "approval response ignored reason=request_mismatch presented={d} pending={d}",
-                    .{ request_id, pending.request.view().id },
-                );
-                return false;
-            }
-            var response = try app.approval_prompt.decision.materializeResponse(
-                app.alloc,
-                decision,
-            );
-            defer response.deinit();
-            const resolved = host.resolveApproval(.{
-                .request_id = pending.request_id,
-                .child_id = pending.child_id,
-                .decision = response.decision,
-                .feedback = response.feedback,
-                .timestamp_ms = io_mod.milliTimestamp(),
-            }) catch |err| {
-                const stale = err == error.RequestNotFound or
-                    err == error.StaleRequest or err == error.WrongChild;
-                debug_trace.logf(
-                    "subagent",
-                    "main approval response failed request_id={s} child_id={s} outcome={s}",
-                    .{ pending.request_id, pending.child_id, @errorName(err) },
-                );
-                if (stale) {
-                    clearApprovalPrompt(app, "subagent_approval_stale");
-                    requestActiveSurfaceFrame(app);
-                }
-                return true;
-            };
-            if (resolved == .accepted) {
-                debug_trace.logf(
-                    "subagent",
-                    "approval response accepted request_id={s} child_id={s} decision={s}",
-                    .{ pending.request_id, pending.child_id, @tagName(decision) },
-                );
-                clearApprovalPromptAfterSubmission(app);
-                requestActiveSurfaceFrame(app);
-            } else {
-                clearApprovalPrompt(app, "subagent_approval_first_response_won");
-                requestActiveSurfaceFrame(app);
-            }
-            return true;
+        fn subagentIdOf(app: *App, agent: *AppAgent) ?[]const u8 {
+            if (comptime !@hasDecl(App, "subagentIdOf")) return null;
+            return app.subagentIdOf(agent);
         }
 
-        pub fn cancelApprovalOperation(app: *App) !void {
-            if (app_session_runtime.Runtime(App).subagentHost(app)) |host| {
-                if (try host.pendingApprovalRequest(app.alloc)) |loaded| {
-                    var pending = loaded;
-                    defer pending.deinit(app.alloc);
-                    if (app.approval_prompt.request) |request| {
-                        if (pending.request.view().id == request.id) {
-                            _ = host.resolveApproval(.{
-                                .request_id = pending.request_id,
-                                .child_id = pending.child_id,
-                                .decision = .deny,
-                                .timestamp_ms = io_mod.milliTimestamp(),
-                            }) catch {};
-                            clearApprovalPrompt(app, "subagent_approval_dismissed");
-                            requestActiveSurfaceFrame(app);
-                            return;
-                        }
-                    }
-                }
+        pub fn cancelApprovalOperation(app: *App, agent: *AppAgent) !void {
+            // A subagent's approval main's screen shows is cancelled in that
+            // subagent's context, as its own screen would cancel it (D34).
+            if (comptime @hasDecl(App, "answerLentApproval")) {
+                if (try app.answerLentApproval(agent, cancelApprovalOperation)) return;
             }
-            const already_cancelled = app.worker.isCancelRequested();
+            const already_cancelled = agent.worker.isCancelRequested();
             if (!already_cancelled) {
-                debug_trace.logf("input", "cancel approval operation queued={d}", .{app.worker.queuedPromptCount()});
-                interrupt.traceInterruptRequested(app, "input_approval");
+                debug_trace.logf("input", "cancel approval operation queued={d}", .{agent.worker.queuedPromptCount()});
+                interrupt.traceInterruptRequested(app, agent, "input_approval");
             }
-            app.worker.cancelApprovalTurn();
+            agent.worker.cancelApprovalTurn();
 
-            clearApprovalPrompt(app, "cancelled");
+            clearApprovalPrompt(app, agent, "cancelled");
             app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
 
-            if (!already_cancelled and app.stream.active) {
+            if (!already_cancelled and agent.stream.active) {
                 app.pacer.clear(app.alloc);
-                app.stopStream();
+                app.stopStream(agent);
             }
             requestActiveSurfaceFrame(app);
         }
@@ -464,7 +406,10 @@ test "approval wheel keeps scrolling a committed command review after review syn
     };
     const WheelApp = struct {
         alloc: std.mem.Allocator,
-        approval_prompt: approval_prompt.ApprovalPrompt = .{},
+        main_agent: struct {
+            approval_prompt: approval_prompt.ApprovalPrompt = .{},
+            worker: WheelWorker = .{},
+        } = .{},
         approval_screen: interaction_state.ApprovalScreenState = .{},
         shell: struct {
             layout: types.Layout = .{
@@ -478,10 +423,13 @@ test "approval wheel keeps scrolling a committed command review after review syn
             },
             render_requests: render_request.RenderRequestState = .{},
         } = .{},
-        worker: WheelWorker = .{},
 
         fn deinit(self: *@This()) void {
-            self.approval_prompt.deinit(self.alloc);
+            self.agent().approval_prompt.deinit(self.alloc);
+        }
+
+        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+            return &self.main_agent;
         }
     };
 
@@ -492,12 +440,12 @@ test "approval wheel keeps scrolling a committed command review after review syn
         .id = 42,
         .label = "shell.run " ++ text_utils.repeat("x", 2_400),
     };
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, request));
+    try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, request));
     try std.testing.expect(try approval_screen.needsScreen(
         alloc,
         request,
         app.shell.layout,
-        app.worker.queuedPromptCount(),
+        app.agent().worker.queuedPromptCount(),
     ));
     app.approval_screen.recordScreenCommit(request.id, .{
         .request_id = request.id,
@@ -509,8 +457,8 @@ test "approval wheel keeps scrolling a committed command review after review syn
         .document_scrollable = true,
     });
 
-    try std.testing.expect(!app.approval_prompt.syncReview(null));
-    try ApprovalRuntime(WheelApp).handleApprovalWheel(&app, .up);
+    try std.testing.expect(!app.agent().approval_prompt.syncReview(null));
+    try ApprovalRuntime(WheelApp).handleApprovalWheel(&app, (&app).agent(), .up);
     try std.testing.expectEqual(@as(usize, 3), app.approval_screen.document_scroll_rows);
     try std.testing.expect(app.shell.render_requests.hasReason(.modal));
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const agents = @import("../agents/agents.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
@@ -28,47 +29,57 @@ fn settleCompactionWorkFailure(worker: *worker_runtime.WorkerRuntime, work: work
 
 pub fn Runtime(comptime App: type) type {
     return struct {
-        pub fn startWorkerThread(app: *App) !void {
-            app.worker_thread = try std.Thread.spawn(.{}, workerThreadMain, .{app});
+        const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
+        pub fn startWorkerThread(app: *App, agent: *AppAgent) !void {
+            agent.worker_thread = try std.Thread.spawn(.{}, workerThreadMain, .{app});
+        }
+
+        /// Starts `agent`'s own worker thread, which runs main's worker loop
+        /// for that agent's conversation.
+        pub fn startAgentWorkerThread(app: *App, agent: *agents.Agent) !void {
+            agent.worker_thread = try std.Thread.spawn(.{}, agentWorkerThreadMain, .{ app, agent });
         }
 
         /// Starts one queued prompt on a single-threaded host. Prompt admission
         /// is presented before agent work can suspend on host transport.
         pub fn processNextCooperativePrompt(
             app: *App,
+            agent: *AppAgent,
             event_handlers: app_worker_runtime.WorkerEventHandlers,
             flush_frame: *const fn (*App) anyerror!void,
         ) !void {
-            const work = (try app.worker.tryTakeNextWork(std.heap.c_allocator)) orelse return;
+            const work = (try agent.worker.tryTakeNextWork(std.heap.c_allocator)) orelse return;
             defer worker_runtime.freeWorkItem(std.heap.c_allocator, work);
-            defer app.worker.finishProcessing();
-            processCooperativeWork(app, event_handlers, flush_frame, work) catch |err| {
-                settleCompactionWorkFailure(&app.worker, work, err);
+            defer agent.worker.finishProcessing();
+            processCooperativeWork(app, agent, event_handlers, flush_frame, work) catch |err| {
+                settleCompactionWorkFailure(&agent.worker, work, err);
                 return err;
             };
         }
 
         fn processCooperativeWork(
             app: *App,
+            agent: *AppAgent,
             event_handlers: app_worker_runtime.WorkerEventHandlers,
             flush_frame: *const fn (*App) anyerror!void,
             work: worker_runtime.WorkItem,
         ) !void {
             try app_worker_runtime.Runtime(App).tick(
                 app,
+                agent,
                 event_handlers,
             );
             try flush_frame(app);
 
             var failure_provenance: ?compaction_activity.ErrorProvenance = null;
-            app.processQueuedWork(work, &failure_provenance) catch |err| {
-                settleCompactionWorkFailure(&app.worker, work, err);
+            app.processQueuedWork(agent, work, &failure_provenance) catch |err| {
+                settleCompactionWorkFailure(&agent.worker, work, err);
                 if (compactionErrorHandled(work, failure_provenance, err)) {
                     compactor.traceLog(true, "interactive error retained err={s}", .{@errorName(err)});
                 } else if (err != error.RouteRecoveryStopped) {
                     const body = try formatErrorBody(std.heap.c_allocator, "request failed", err);
                     defer std.heap.c_allocator.free(body);
-                    try app.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
+                    try agent.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
                         .topic = "system",
                         .tone = .@"error",
                         .body = body,
@@ -140,10 +151,19 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn workerThreadMain(app: *App) void {
-            workerLoop(app) catch |err| {
+            // This thread runs main's turns.
+            runWorkerLoop(app, &app.main_agent);
+        }
+
+        fn agentWorkerThreadMain(app: *App, agent: *agents.Agent) void {
+            runWorkerLoop(app, agent);
+        }
+
+        fn runWorkerLoop(app: *App, agent: *AppAgent) void {
+            workerLoop(app, agent) catch |err| {
                 const body = formatErrorBody(std.heap.c_allocator, "worker loop crashed", err) catch return;
                 defer std.heap.c_allocator.free(body);
-                app.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
+                agent.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
                     .topic = "system",
                     .tone = .@"error",
                     .body = body,
@@ -151,21 +171,21 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
-        fn workerLoop(app: *App) !void {
+        fn workerLoop(app: *App, agent: *AppAgent) !void {
             while (true) {
-                const work = (try app.worker.waitAndTakeNextWork(std.heap.c_allocator)) orelse return;
+                const work = (try agent.worker.waitAndTakeNextWork(std.heap.c_allocator)) orelse return;
 
                 defer worker_runtime.freeWorkItem(std.heap.c_allocator, work);
-                defer app.worker.finishProcessing();
+                defer agent.worker.finishProcessing();
                 var failure_provenance: ?compaction_activity.ErrorProvenance = null;
-                app.processQueuedWork(work, &failure_provenance) catch |err| {
-                    settleCompactionWorkFailure(&app.worker, work, err);
+                app.processQueuedWork(agent, work, &failure_provenance) catch |err| {
+                    settleCompactionWorkFailure(&agent.worker, work, err);
                     if (compactionErrorHandled(work, failure_provenance, err)) {
                         compactor.traceLog(true, "interactive error retained err={s}", .{@errorName(err)});
                     } else if (err != error.RouteRecoveryStopped) {
                         const body = try formatErrorBody(std.heap.c_allocator, "request failed", err);
                         defer std.heap.c_allocator.free(body);
-                        try app.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
+                        try agent.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
                             .topic = "system",
                             .tone = .@"error",
                             .body = body,
@@ -213,8 +233,14 @@ test "compaction activity error routing requires exact operation and turn proven
 }
 
 const DummyApp = struct {
-    worker: ?void = null,
-    worker_thread: ?std.Thread = null,
+    main_agent: struct {
+        worker: ?void = null,
+        worker_thread: ?std.Thread = null,
+    } = .{},
+
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
+    }
 };
 
 test "formatToolExecutionError includes tool name" {
@@ -321,8 +347,10 @@ test "formatToolExecutionError generic error has no detail" {
 }
 
 const TestWorkerApp = struct {
-    worker: worker_runtime.WorkerRuntime = .{},
-    worker_thread: ?std.Thread = null,
+    main_agent: struct {
+        worker: worker_runtime.WorkerRuntime = .{},
+        worker_thread: ?std.Thread = null,
+    } = .{},
     first_process_error: ?anyerror = null,
     shutdown_after_count: usize = 1,
     processed_count: usize = 0,
@@ -330,17 +358,17 @@ const TestWorkerApp = struct {
     saw_recovery_prompt: bool = false,
 
     fn deinit(self: *TestWorkerApp) void {
-        if (self.worker_thread) |thread| {
-            self.worker.requestShutdown();
+        if (self.agent().worker_thread) |thread| {
+            self.agent().worker.requestShutdown();
             thread.join();
-            self.worker_thread = null;
+            self.agent().worker_thread = null;
         }
-        self.worker.deinit(std.heap.c_allocator);
+        self.agent().worker.deinit(std.heap.c_allocator);
     }
 
-    fn processQueuedWork(self: *TestWorkerApp, work: worker_runtime.WorkItem, _: *?compaction_activity.ErrorProvenance) !void {
+    fn processQueuedWork(self: *TestWorkerApp, _: anytype, work: worker_runtime.WorkItem, _: *?compaction_activity.ErrorProvenance) !void {
         self.processed_count += 1;
-        if (self.processed_count >= self.shutdown_after_count) self.worker.requestShutdown();
+        if (self.processed_count >= self.shutdown_after_count) self.agent().worker.requestShutdown();
         if (self.processed_count == 1) {
             if (self.first_process_error) |err| return err;
         }
@@ -349,6 +377,10 @@ const TestWorkerApp = struct {
             .prompt => |job| std.mem.eql(u8, job.prompt, "recovery"),
             .compact_context => false,
         };
+    }
+
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
     }
 };
 
@@ -367,22 +399,22 @@ fn makeQueuedPrompt(alloc: std.mem.Allocator, text: []const u8) !worker_runtime.
 fn queuePrompt(app: *TestWorkerApp, text: []const u8) !void {
     const prompt = try makeQueuedPrompt(std.heap.c_allocator, text);
     errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, prompt);
-    try app.worker.enqueuePrompt(std.heap.c_allocator, prompt);
+    try app.agent().worker.enqueuePrompt(std.heap.c_allocator, prompt);
 }
 
 test "startWorkerThread processes queued prompt and exits on shutdown" {
     var app = TestWorkerApp{};
     defer app.deinit();
 
-    try Runtime(TestWorkerApp).startWorkerThread(&app);
+    try Runtime(TestWorkerApp).startWorkerThread(&app, (&app).agent());
     try queuePrompt(&app, "hello");
 
-    const thread = app.worker_thread.?;
+    const thread = app.agent().worker_thread.?;
     thread.join();
-    app.worker_thread = null;
+    app.agent().worker_thread = null;
 
     try std.testing.expectEqual(@as(usize, 1), app.processed_count);
-    const snapshot = try app.worker.snapshotState(std.testing.allocator);
+    const snapshot = try app.agent().worker.snapshotState(std.testing.allocator);
     defer snapshot.deinit(std.testing.allocator);
     try std.testing.expect(!snapshot.processing);
     try std.testing.expectEqual(@as(usize, 0), snapshot.queued_count);
@@ -392,14 +424,14 @@ test "worker thread reports queued prompt failures as worker events" {
     var app = TestWorkerApp{ .first_process_error = error.SyntaxError };
     defer app.deinit();
 
-    try Runtime(TestWorkerApp).startWorkerThread(&app);
+    try Runtime(TestWorkerApp).startWorkerThread(&app, (&app).agent());
     try queuePrompt(&app, "bad json");
 
-    const thread = app.worker_thread.?;
+    const thread = app.agent().worker_thread.?;
     thread.join();
-    app.worker_thread = null;
+    app.agent().worker_thread = null;
 
-    var events = app.worker.takeEvents();
+    var events = app.agent().worker.takeEvents();
     defer events.deinit(std.heap.c_allocator);
     defer for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
 
@@ -438,22 +470,22 @@ test "worker continues after project context selector failures" {
 
         try queuePrompt(&app, "selector failure");
         try queuePrompt(&app, "recovery");
-        try Runtime(TestWorkerApp).startWorkerThread(&app);
+        try Runtime(TestWorkerApp).startWorkerThread(&app, (&app).agent());
 
-        const thread = app.worker_thread.?;
+        const thread = app.agent().worker_thread.?;
         thread.join();
-        app.worker_thread = null;
+        app.agent().worker_thread = null;
 
         try std.testing.expectEqual(@as(usize, 2), app.processed_count);
         try std.testing.expectEqual(@as(usize, 1), app.successful_count);
         try std.testing.expect(app.saw_recovery_prompt);
 
-        const snapshot = try app.worker.snapshotState(std.testing.allocator);
+        const snapshot = try app.agent().worker.snapshotState(std.testing.allocator);
         defer snapshot.deinit(std.testing.allocator);
         try std.testing.expect(!snapshot.processing);
         try std.testing.expectEqual(@as(usize, 0), snapshot.queued_count);
 
-        var events = app.worker.takeEvents();
+        var events = app.agent().worker.takeEvents();
         defer events.deinit(std.heap.c_allocator);
         defer for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
 

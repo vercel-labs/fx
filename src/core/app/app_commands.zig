@@ -1,5 +1,6 @@
 const std = @import("std");
 const profile_paths = @import("../shared/profile_paths.zig");
+const agents = @import("../agents/agents.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
@@ -113,7 +114,7 @@ fn persistUserPreferences(
 }
 
 fn clearSessionForClearCommand(app: anytype) !void {
-    try app.clearSession();
+    try app.clearSession(agents.screenAgentOf(app));
 }
 
 noinline fn parseWorkspaceCommand(rest: []const u8) !?workspace_commands.Action {
@@ -138,13 +139,13 @@ noinline fn parseWorkspaceCommand(rest: []const u8) !?workspace_commands.Action 
 }
 
 noinline fn tryBeginWorkspaceMutation(app: anytype) bool {
-    if (app.stream.active) return false;
-    return app.worker.tryHoldTurnStart();
+    if (agents.screenAgentOf(app).stream.active) return false;
+    return agents.screenAgentOf(app).worker.tryHoldTurnStart();
 }
 
 fn refreshWorkspaceAvailabilityForList(app: anytype) !void {
     if (!tryBeginWorkspaceMutation(app)) return;
-    defer app.worker.releaseTurnStartHold();
+    defer agents.screenAgentOf(app).worker.releaseTurnStartHold();
     if (comptime @hasDecl(@TypeOf(app.*), "refreshWorkspaceAccess")) {
         _ = try app.refreshWorkspaceAccess();
     }
@@ -195,7 +196,7 @@ fn handleWorkspaceCommand(app: anytype, rest: []const u8) !void {
         }, true);
         return;
     }
-    defer app.worker.releaseTurnStartHold();
+    defer agents.screenAgentOf(app).worker.releaseTurnStartHold();
 
     var failure_phase: workspace_commands.FailurePhase = .stage;
     var result = workspace_commands.execute(
@@ -265,12 +266,13 @@ fn writeWorkspaceSnapshot(
 
 fn requestResumeExit(app: anytype) void {
     const App = @TypeOf(app.*);
-    app_session_runtime.Runtime(App).requestResumeHandoff(app);
+    app_session_runtime.Runtime(App).requestResumeHandoff(agents.screenAgentOf(app));
     app.should_exit = true;
 }
 
 pub fn Handlers(comptime App: type) type {
     return struct {
+        const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
         pub fn route(app: *App, cmd: []const u8) !void {
             const handlers = commandHandlers(app);
             try command_router.route(app.slashRegistry(), &handlers, cmd);
@@ -282,6 +284,8 @@ pub fn Handlers(comptime App: type) type {
                 .quit = commandQuit,
                 .clear_screen = commandClearScreen,
                 .new_session = commandNewSession,
+                .launch_instance = commandLaunchInstance,
+                .close_instance = commandCloseInstance,
                 .reset_session = commandResetSession,
                 .resume_session = commandResumeSession,
                 .fork_session = commandForkSession,
@@ -324,7 +328,7 @@ pub fn Handlers(comptime App: type) type {
         }
 
         /// What the MCP host and `/mcp` have to say, and the reload a `/mcp` change asked for.
-        fn closeOtherMenusForMcp(app: *App) void {
+        fn closeOtherMenusForMcp(app: *App, agent: *AppAgent) void {
             closeModelMenuIfPresent(app);
             closeHelpMenuIfPresent(app);
             closeInlineCommandMenusIfPresent(app);
@@ -334,14 +338,14 @@ pub fn Handlers(comptime App: type) type {
                     app.input_runtime.settings_menu.close();
                 }
             }
-            if (comptime @hasField(App, "session_persistence")) {
-                app.session_persistence.session_picker.active = false;
+            if (comptime agents.hasAgentField(App, "session_persistence")) {
+                agent.session_persistence.session_picker.active = false;
             }
         }
 
-        pub fn collectMcpHostFacts(app: *App) !void {
+        pub fn collectMcpHostFacts(app: *App, agent: *AppAgent) !void {
             if (comptime !@hasDecl(App, "takeMcpHostNotices")) return;
-            app.applyMcpHostReload() catch |err| {
+            app.applyMcpHostReload(agent) catch |err| {
                 debug_trace.logf("mcp", "MCP reload failed err={s}", .{@errorName(err)});
                 try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = "The MCP config changed, but fx couldn't load it again. Your current servers are still active." }, true);
             };
@@ -433,12 +437,30 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandResetSession(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try app.resetSession();
+            try app.resetSession(agents.screenAgentOf(app));
         }
 
         fn commandNewSession(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try app.newSession();
+            try app.newSession(agents.screenAgentOf(app));
+        }
+
+        /// `/launch [profile]` starts another instance on the host with a
+        /// fresh session, in `profile` or the launch profile, and shows it
+        /// (D47).
+        fn commandLaunchInstance(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime !@hasDecl(App, "launchInstance")) return;
+            const name = std.mem.trim(u8, rest, " \t\r\n");
+            try app.launchInstance(if (name.len == 0) null else name);
+        }
+
+        /// `/close` closes the instance on screen; closing the last one ends
+        /// fx (D50).
+        fn commandCloseInstance(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime !@hasDecl(App, "closeInstanceOnScreen")) return;
+            try app.closeInstanceOnScreen();
         }
 
         fn commandResumeSession(ctx: *anyopaque) !void {
@@ -451,7 +473,7 @@ pub fn Handlers(comptime App: type) type {
                 }, true);
                 return;
             }
-            try app_session_runtime.Runtime(App).openSessionPicker(app);
+            try app_session_runtime.Runtime(App).openSessionPicker(app, agents.screenAgentOf(app));
         }
 
         fn commandForkSession(ctx: *anyopaque) !void {
@@ -464,7 +486,7 @@ pub fn Handlers(comptime App: type) type {
                 }, true);
                 return;
             }
-            try app_session_runtime.Runtime(App).openForkMenu(app);
+            try app_session_runtime.Runtime(App).openForkMenu(app, agents.screenAgentOf(app));
         }
 
         fn commandRenameSession(ctx: *anyopaque, rest: []const u8) !void {
@@ -494,7 +516,7 @@ pub fn Handlers(comptime App: type) type {
         fn commandLogin(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "runLoginCommand")) {
-                try app.runLoginCommand();
+                try app.runLoginCommand(agents.screenAgentOf(app));
             } else {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -507,7 +529,7 @@ pub fn Handlers(comptime App: type) type {
         fn commandLogout(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "runLogoutCommand")) {
-                try app.runLogoutCommand(rest);
+                try app.runLogoutCommand(agents.screenAgentOf(app), rest);
             } else {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -520,7 +542,7 @@ pub fn Handlers(comptime App: type) type {
         fn commandProvider(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "runProviderCommand")) {
-                try app.runProviderCommand();
+                try app.runProviderCommand(agents.screenAgentOf(app));
             } else {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
@@ -534,7 +556,7 @@ pub fn Handlers(comptime App: type) type {
         /// writes nothing to the transcript.
         fn commandShowStatus(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            openInfoPanel(app, try session_commands.Commands(App).openStatusSnapshot(app));
+            openInfoPanel(app, try session_commands.Commands(App).openStatusSnapshot(app, agents.screenAgentOf(app)));
         }
 
         /// Shows `snapshot` in place of any other footer menu. Takes ownership.
@@ -555,9 +577,11 @@ pub fn Handlers(comptime App: type) type {
             const panel = &app.input_runtime.info_panel;
             if (!panel.active) return false;
             const shown = if (panel.snapshot) |*snapshot| snapshot else return false;
+            // The panel shows the agent on screen, so it refreshes from it.
+            const agent = agents.screenAgentOf(app);
             const next = (switch (shown.kind()) {
-                .status => try session_commands.Commands(App).refreshedStatusSnapshot(app, shown),
-                .permissions => try session_commands.Commands(App).refreshedPermissionsSnapshot(app, shown),
+                .status => try session_commands.Commands(App).refreshedStatusSnapshot(app, agent, shown),
+                .permissions => try session_commands.Commands(App).refreshedPermissionsSnapshot(app, agent, shown),
             }) orelse return false;
             panel.replace(next);
             return true;
@@ -570,19 +594,21 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandManageImages(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try image_commands.Commands(App).managePending(app, rest);
+            try image_commands.Commands(App).managePending(app, agents.screenAgentOf(app), rest);
         }
 
         fn commandHandleModel(ctx: *anyopaque, query: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try session_commands.Commands(App).handleModel(app, query);
+            try session_commands.Commands(App).handleModel(app, agents.screenAgentOf(app), query);
         }
 
         /// Bare `/effort` opens the menu of the current model's reasoning
         /// effort levels; `/effort <level>` applies one.
         fn commandHandleEffort(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            switch (try session_commands.Commands(App).handleEffort(app, rest)) {
+            // `/effort` sets the agent on screen's effort, as `/model` sets its model.
+            const agent = agents.screenAgentOf(app);
+            switch (try session_commands.Commands(App).handleEffort(app, agent, rest)) {
                 .done => {},
                 .open_menu => |capabilities| {
                     if (comptime @hasField(App, "skills")) app.skills.closeMenu();
@@ -590,7 +616,7 @@ pub fn Handlers(comptime App: type) type {
                     closeHelpMenuIfPresent(app);
                     app.input_runtime.settings_menu.close();
                     closeInlineCommandMenusIfPresent(app);
-                    try app.input_runtime.effort_menu.open(app.alloc, provider_runtime.model(app), capabilities, app.effort);
+                    try app.input_runtime.effort_menu.open(app.alloc, provider_runtime.modelOf(app, agent), capabilities, agent.effort);
                     app.shell.render_requests.request(.footer);
                 },
             }
@@ -600,17 +626,18 @@ pub fn Handlers(comptime App: type) type {
         /// transcript; a subcommand changes the mode or a saved-session rule.
         fn commandHandlePermissions(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
+            const agent = agents.screenAgentOf(app);
             if (std.mem.trim(u8, rest, " \t").len == 0) {
-                openInfoPanel(app, try session_commands.Commands(App).openPermissionsSnapshot(app));
+                openInfoPanel(app, try session_commands.Commands(App).openPermissionsSnapshot(app, agent));
                 return;
             }
-            if (try handlePermissionRuleManagement(app, rest)) return;
-            try session_commands.Commands(App).handlePermissions(app, rest);
+            if (try handlePermissionRuleManagement(app, agent, rest)) return;
+            try session_commands.Commands(App).handlePermissions(app, agent, rest);
         }
 
-        fn handlePermissionRuleManagement(app: *App, rest: []const u8) !bool {
-            if (comptime !@hasField(App, "approval_prompt") or
-                !@hasField(App, "session_persistence") or
+        fn handlePermissionRuleManagement(app: *App, agent: *AppAgent, rest: []const u8) !bool {
+            if (comptime !agents.hasAgentField(App, "approval_prompt") or
+                !agents.hasAgentField(App, "session_persistence") or
                 !@hasDecl(App, "preparePermissionStateAction"))
             {
                 return false;
@@ -621,7 +648,7 @@ pub fn Handlers(comptime App: type) type {
                 const revoke = std.ascii.eqlIgnoreCase(action.word, "revoke");
                 if (!remember and !revoke) return false;
                 debug_trace.logf("permission", "event=rule_management_begin action={s}", .{action.word});
-                if (app_session_runtime.Runtime(App).activeSessionId(app) == null) {
+                if (app_session_runtime.Runtime(App).activeSessionId(agent) == null) {
                     try writePermissionManagementNotice(
                         app,
                         .@"error",
@@ -630,7 +657,7 @@ pub fn Handlers(comptime App: type) type {
                     return true;
                 }
                 debug_trace.logf("permission", "event=rule_management_session_ready", .{});
-                if (app.approval_prompt.isActive()) {
+                if (agent.approval_prompt.isActive()) {
                     try writePermissionManagementNotice(
                         app,
                         .warning,
@@ -640,7 +667,7 @@ pub fn Handlers(comptime App: type) type {
                 }
 
                 debug_trace.logf("permission", "event=rule_management_snapshot_start", .{});
-                var snapshot = try app.session.snapshotPermissionState(app.alloc);
+                var snapshot = try agent.session.snapshotPermissionState(app.alloc);
                 defer snapshot.deinit(app.alloc);
                 debug_trace.logf("permission", "event=rule_management_snapshot_done rules={d}", .{snapshot.rules.items.len});
                 if (remember) {
@@ -669,6 +696,7 @@ pub fn Handlers(comptime App: type) type {
                     defer arena_state.deinit();
                     debug_trace.logf("permission", "event=rule_management_prepare_start tool={s}", .{tool_word.word});
                     const prepared = app.preparePermissionStateAction(
+                        agent,
                         arena_state.allocator(),
                         .{
                             .id = "permission-rule-management",
@@ -688,7 +716,7 @@ pub fn Handlers(comptime App: type) type {
                         snapshot,
                         prepared.key,
                     );
-                    try app.approval_prompt.syncRuleManagement(
+                    try agent.approval_prompt.syncRuleManagement(
                         app.alloc,
                         .{
                             .id = debug_trace.nextStepId(),
@@ -742,7 +770,7 @@ pub fn Handlers(comptime App: type) type {
                     );
                     return true;
                 };
-                try app.approval_prompt.syncRuleManagement(
+                try agent.approval_prompt.syncRuleManagement(
                     app.alloc,
                     .{
                         .id = debug_trace.nextStepId(),
@@ -800,7 +828,7 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandHandleAllowlist(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try session_commands.Commands(App).handleAllowlist(app, rest);
+            try session_commands.Commands(App).handleAllowlist(app, agents.screenAgentOf(app), rest);
         }
 
         fn commandShowStats(ctx: *anyopaque) !void {
@@ -889,7 +917,7 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandUndoLast(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            const result = app.change_tracker.undoLast(std.heap.c_allocator);
+            const result = agents.screenAgentOf(app).change_tracker.undoLast(std.heap.c_allocator);
             const msg = switch (result) {
                 .restored => |path| blk: {
                     var display_path = try text_utils.encodeTerminalSafe(
@@ -952,7 +980,7 @@ pub fn Handlers(comptime App: type) type {
             // `/mcp` alone opens the menu, and `/mcp VERB` runs the verbs
             // `fx mcp` has.
             if (command.len > 0) return app.runMcpVerbs(command);
-            closeOtherMenusForMcp(app);
+            closeOtherMenusForMcp(app, agents.screenAgentOf(app));
             app.openMcpHostMenu();
             app.shell.render_requests.request(.footer);
         }
@@ -974,7 +1002,7 @@ pub fn Handlers(comptime App: type) type {
                 .list => {
                     const generation = try app.requestSkillsRefresh();
                     try app.skills.queueRefreshAction(app.alloc, generation, .list);
-                    try collectSkillsRefreshFacts(app);
+                    try collectSkillsRefreshFacts(app, agents.screenAgentOf(app));
                     return;
                 },
                 .show => |name| {
@@ -984,16 +1012,16 @@ pub fn Handlers(comptime App: type) type {
                         generation,
                         .{ .show = name },
                     );
-                    try collectSkillsRefreshFacts(app);
+                    try collectSkillsRefreshFacts(app, agents.screenAgentOf(app));
                     return;
                 },
                 .install, .create, .remove, .path, .usage => {},
             };
-            try executeSkillsCommand(app, provider, command);
-            try collectSkillsRefreshFacts(app);
+            try executeSkillsCommand(app, agents.screenAgentOf(app), provider, command);
+            try collectSkillsRefreshFacts(app, agents.screenAgentOf(app));
         }
 
-        pub fn collectSkillsRefreshFacts(app: *App) !void {
+        pub fn collectSkillsRefreshFacts(app: *App, agent: *AppAgent) !void {
             var ready = app.skills.takeReadyRefreshAction() orelse return;
             defer ready.deinit(app.alloc);
             if (!ready.succeeded) {
@@ -1008,14 +1036,16 @@ pub fn Handlers(comptime App: type) type {
                 return;
             }
             switch (ready.action) {
-                .startup_notice => try app_bootstrap_runtime.Runtime(App).writeSkillDiagnosticsNotice(app),
+                .startup_notice => try app_bootstrap_runtime.Runtime(App).writeSkillDiagnosticsNotice(app, agent),
                 .list => try executeSkillsCommand(
                     app,
+                    agent,
                     app.skillsCommandProvider(),
                     .list,
                 ),
                 .show => |name| try executeSkillsCommand(
                     app,
+                    agent,
                     app.skillsCommandProvider(),
                     .{ .show = name },
                 ),
@@ -1029,10 +1059,11 @@ pub fn Handlers(comptime App: type) type {
 
         fn executeSkillsCommand(
             app: *App,
+            agent: *AppAgent,
             provider: skill_commands.Provider,
             command: skill_commands.Command,
         ) !void {
-            try writeSkillDiagnosticNotice(app);
+            try writeSkillDiagnosticNotice(app, agent);
 
             switch (command) {
                 .install => |install| {
@@ -1093,7 +1124,7 @@ pub fn Handlers(comptime App: type) type {
             };
         }
 
-        fn writeSkillDiagnosticNotice(app: *App) !void {
+        fn writeSkillDiagnosticNotice(app: *App, agent: *AppAgent) !void {
             if (app.skills.diagnostics.len == 0) return;
 
             var out: std.Io.Writer.Allocating = .init(app.alloc);
@@ -1101,8 +1132,8 @@ pub fn Handlers(comptime App: type) type {
             try skill_runtime.writeDiagnosticSummary(app.alloc, &out.writer, app.skills.diagnostics);
             const body = try out.toOwnedSlice();
             defer app.alloc.free(body);
-            if (comptime @hasField(App, "session") and @hasDecl(@TypeOf(app.session), "claimContextNotice")) {
-                _ = try app.session.claimContextNotice(app.alloc, body);
+            if (comptime agents.hasAgentField(App, "session") and @hasDecl(@TypeOf(agent.session), "claimContextNotice")) {
+                _ = try agent.session.claimContextNotice(app.alloc, body);
             }
             try app.writeDomainNotice(.{
                 .topic = "skills",
@@ -1197,7 +1228,7 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandCopyLast(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            const last_reply = app.session.lastAssistantReply() orelse {
+            const last_reply = agents.screenAgentOf(app).session.lastAssistantReply() orelse {
                 try app.writeDomainNotice(.{
                     .topic = "clipboard",
                     .tone = .neutral,
@@ -1234,7 +1265,7 @@ pub fn Handlers(comptime App: type) type {
         fn commandCompactHistory(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "request_context_compaction")) {
-                return app.request_context_compaction();
+                return app.request_context_compaction(agents.screenAgentOf(app));
             }
             try app.writeDomainNotice(.{
                 .topic = "context",
@@ -1307,12 +1338,12 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandHandleFast(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try session_commands.Commands(App).handleFast(app, rest);
+            try session_commands.Commands(App).handleFast(app, agents.screenAgentOf(app), rest);
         }
 
         fn commandHandleUltrafast(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try session_commands.Commands(App).handleUltrafast(app, rest);
+            try session_commands.Commands(App).handleUltrafast(app, agents.screenAgentOf(app), rest);
         }
 
         fn commandHandleStatusline(ctx: *anyopaque, rest: []const u8) !void {
@@ -1487,7 +1518,8 @@ fn buildTraceReport(app: anytype) ![]u8 {
     }});
     try out.writer.print("model: {s}\n", .{provider_runtime.model(app)});
     if (app.fast_mode) try out.writer.writeAll("fast_mode: on\n");
-    const perm_label = permissions.permissionModeLabel(app.permission_engine.mode);
+    const permission_view = app_permission_runtime.Runtime(App).viewOf(app, agents.screenAgentOf(app));
+    const perm_label = permissions.permissionModeLabel(permission_view.mode);
     try out.writer.print("permission_mode: {s}\n", .{perm_label});
     try out.writer.print("workspace: {s}\n", .{app.workspace_root});
 
@@ -1495,20 +1527,20 @@ fn buildTraceReport(app: anytype) ![]u8 {
     try writeProblemsSummary(&out.writer, app, app.alloc);
     try writeLastShutdownSection(&out.writer, app.alloc);
     try writeCompactionSummary(&out.writer, app.alloc);
-    try writeLastInterruptedDetail(&out.writer, app.session.agent.history.items, app.alloc);
+    try writeLastInterruptedDetail(&out.writer, agents.screenAgentOf(app).session.agent.history.items, app.alloc);
     try writeSessionTitleSummary(&out.writer, app, app.alloc);
     try writeNetworkCallsSummary(&out.writer);
     try writeModelCatalogSummary(&out.writer, app);
-    try writeToolCallsSummary(&out.writer, app.alloc, app.session.agent.history.items);
-    try writePermissionsSummary(&out.writer, app.permission_engine.grants.items);
+    try writeToolCallsSummary(&out.writer, app.alloc, agents.screenAgentOf(app).session.agent.history.items);
+    try writePermissionsSummary(&out.writer, permission_view.grants.items);
     try writeRuntimeContextSummary(&out.writer, app, app.alloc);
     try writeRendererState(&out.writer, app, app.alloc);
     try writeRendererEvents(&out.writer, app.alloc);
 
-    if (app.shell.entries.items.len > 0) {
+    if (app.shell.notebook.entries.items.len > 0) {
         try out.writer.writeAll("\n## Transcript Timeline\n");
         try out.writer.writeAll("ansi stripped; only obvious secrets masked\n");
-        try writeTranscriptTimeline(&out.writer, app.alloc, app.shell.entries.items);
+        try writeTranscriptTimeline(&out.writer, app.alloc, app.shell.notebook.entries.items);
     } else {
         try out.writer.writeAll("\n## Transcript Timeline\n(empty)\n");
     }
@@ -1569,13 +1601,13 @@ fn writeTraceTextNeutralized(writer: *std.Io.Writer, text: []const u8) !void {
 fn writeCurrentStateSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !void {
     const App = @TypeOf(app.*);
     try writer.writeAll("\n## Current State\n");
-    if (comptime @hasField(App, "session_persistence")) {
-        if (app_session_runtime.Runtime(App).activeSessionId(app)) |id| {
+    if (comptime agents.hasAgentField(App, "session_persistence")) {
+        if (app_session_runtime.Runtime(App).activeSessionId(agents.screenAgentOf(app))) |id| {
             try writer.print("session_id: {s}\n", .{id});
         }
         const session_dir =
             try app_session_runtime.Runtime(App).activeSessionDisplayPath(
-                app,
+                agents.screenAgentOf(app),
                 alloc,
             );
         if (session_dir) |dir| {
@@ -1584,17 +1616,17 @@ fn writeCurrentStateSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem
         }
     }
     if (comptime @hasField(App, "agent_step_limit")) try writer.print("agent_step_limit: {d}\n", .{app.agent_step_limit});
-    if (comptime @hasField(App, "effort")) try writer.print("effort: {s}\n", .{app.effort.label()});
-    if (comptime @hasField(App, "total_input_tokens") and @hasField(App, "total_output_tokens")) {
-        try writer.print("tokens_total: {d}->{d}\n", .{ app.total_input_tokens, app.total_output_tokens });
+    if (comptime agents.hasAgentField(App, "effort")) try writer.print("effort: {s}\n", .{agents.screenAgentOf(app).effort.label()});
+    if (comptime agents.hasAgentField(App, "total_input_tokens") and agents.hasAgentField(App, "total_output_tokens")) {
+        try writer.print("tokens_total: {d}->{d}\n", .{ agents.loadTotal(&agents.screenAgentOf(app).total_input_tokens), agents.loadTotal(&agents.screenAgentOf(app).total_output_tokens) });
     }
-    if (comptime @hasField(App, "total_web_search_requests")) {
-        try writer.print("web_search_requests_total: {d}\n", .{app.total_web_search_requests});
+    if (comptime agents.hasAgentField(App, "total_web_search_requests")) {
+        try writer.print("web_search_requests_total: {d}\n", .{agents.loadTotal(&agents.screenAgentOf(app).total_web_search_requests)});
     }
     try writeAuthStateSummary(writer, app);
     try writeProcessSummary(writer, alloc);
-    if (comptime @hasField(App, "worker")) {
-        const snapshot = app.worker.snapshotState(alloc) catch null;
+    if (comptime agents.hasAgentField(App, "worker")) {
+        const snapshot = agents.screenAgentOf(app).worker.snapshotState(alloc) catch null;
         if (snapshot) |state| {
             defer state.deinit(alloc);
             try writer.print("worker: processing={s} queued={d} cancel={s}\n", .{ boolLabel(state.processing), state.queued_count, boolLabel(state.cancel_requested) });
@@ -1604,7 +1636,7 @@ fn writeCurrentStateSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem
                 try writer.writeByte('\n');
             }
         }
-        const pending_questions = app.worker.snapshotPendingQuestionBatch(alloc) catch null;
+        const pending_questions = agents.screenAgentOf(app).worker.snapshotPendingQuestionBatch(alloc) catch null;
         if (pending_questions) |questions| {
             defer questions.deinit(alloc);
             try writer.print("pending_questions: {d}\n", .{questions.entries.len});
@@ -1619,12 +1651,12 @@ fn writeCurrentStateSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem
             }
         }
     }
-    if (comptime @hasField(App, "pending_images")) {
-        if (app.pending_images.items.len > 0) {
-            try writer.print("pending_images: {d}\n", .{app.pending_images.items.len});
-            for (app.pending_images.items, 0..) |image, idx| {
+    if (comptime agents.hasAgentField(App, "pending_images")) {
+        if (agents.screenAgentOf(app).pending_images.items.len > 0) {
+            try writer.print("pending_images: {d}\n", .{agents.screenAgentOf(app).pending_images.items.len});
+            for (agents.screenAgentOf(app).pending_images.items, 0..) |image, idx| {
                 if (idx >= 3) {
-                    try writer.print("  ... {d} more pending images\n", .{app.pending_images.items.len - idx});
+                    try writer.print("  ... {d} more pending images\n", .{agents.screenAgentOf(app).pending_images.items.len - idx});
                     break;
                 }
                 try writer.print("  - media={s} path=", .{image.media_type});
@@ -1633,25 +1665,25 @@ fn writeCurrentStateSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem
             }
         }
     }
-    if (comptime @hasField(App, "context_enabled") and @hasField(App, "context_snapshot")) {
+    if (comptime @hasField(App, "context_enabled") and agents.hasAgentField(App, "context_snapshot")) {
         try writer.print("project_context: enabled={s}", .{boolLabel(app.context_enabled)});
-        const context_bytes = app.context_snapshot.modelVisibleBytes();
+        const context_bytes = agents.screenAgentOf(app).context_snapshot.modelVisibleBytes();
         if (context_bytes.len > 0) try writer.print(" bytes={d}", .{context_bytes.len}) else try writer.writeAll(" not_loaded");
         try writer.writeByte('\n');
     }
     try writeDebugEnvSummary(writer, alloc);
-    if (comptime @hasField(App, "stream")) {
+    if (comptime agents.hasAgentField(App, "stream")) {
         try writer.print("stream: active={s} chunks={d} reads={d} lists={d} writes={d} edits={d} commands={d} subagents={d}", .{
-            boolLabel(app.stream.active),
-            app.stream.chunks,
-            app.stream.read_count,
-            app.stream.list_count,
-            app.stream.write_count,
-            app.stream.edit_count,
-            app.stream.command_count,
-            app.stream.subagent_count,
+            boolLabel(agents.screenAgentOf(app).stream.active),
+            agents.screenAgentOf(app).stream.chunks,
+            agents.screenAgentOf(app).stream.read_count,
+            agents.screenAgentOf(app).stream.list_count,
+            agents.screenAgentOf(app).stream.write_count,
+            agents.screenAgentOf(app).stream.edit_count,
+            agents.screenAgentOf(app).stream.command_count,
+            agents.screenAgentOf(app).stream.subagent_count,
         });
-        if (app.stream.last_activity_kind) |kind| try writer.print(" last_activity={s}", .{@tagName(kind)});
+        if (agents.screenAgentOf(app).stream.last_activity_kind) |kind| try writer.print(" last_activity={s}", .{@tagName(kind)});
         try writer.writeByte('\n');
     }
     try writer.print("terminal: {d} cols x {d} rows\n", .{ app.shell.layout.cols, app.shell.layout.rows });
@@ -1799,16 +1831,16 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
     try writer.writeAll("\n## Problems\n");
     var count: usize = 0;
 
-    const state = app.worker.snapshotState(alloc) catch null;
+    const state = agents.screenAgentOf(app).worker.snapshotState(alloc) catch null;
     if (state) |snapshot| {
         defer snapshot.deinit(alloc);
-        if (snapshot.processing or app.stream.active) {
+        if (snapshot.processing or agents.screenAgentOf(app).stream.active) {
             count += 1;
-            try writer.print("- report captured an active turn; state may be partial processing={s} stream_active={s} queued={d}\n", .{ boolLabel(snapshot.processing), boolLabel(app.stream.active), snapshot.queued_count });
+            try writer.print("- report captured an active turn; state may be partial processing={s} stream_active={s} queued={d}\n", .{ boolLabel(snapshot.processing), boolLabel(agents.screenAgentOf(app).stream.active), snapshot.queued_count });
         }
     }
 
-    if (lastInterruptedTurn(app.session.agent.history.items)) |entry| {
+    if (lastInterruptedTurn(agents.screenAgentOf(app).session.agent.history.items)) |entry| {
         count += 1;
         try writer.writeAll("- interrupted turn");
         if (entry.tool_call) |call| try writer.print(" in_flight_tool={s}", .{traceToolDisplayName(call.name)});
@@ -1816,12 +1848,12 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
         try writer.writeByte('\n');
     }
 
-    if (comptime @hasField(App, "session_persistence")) {
-        const Persistence = @TypeOf(app.session_persistence);
+    if (comptime agents.hasAgentField(App, "session_persistence")) {
+        const Persistence = @TypeOf(agents.screenAgentOf(app).session_persistence);
         if (comptime @hasField(Persistence, "title_generation")) {
-            const TitleGeneration = @TypeOf(app.session_persistence.title_generation);
+            const TitleGeneration = @TypeOf(agents.screenAgentOf(app).session_persistence.title_generation);
             if (comptime @hasField(TitleGeneration, "last")) {
-                const last = &app.session_persistence.title_generation.last;
+                const last = &agents.screenAgentOf(app).session_persistence.title_generation.last;
                 if (last.status == .failed or last.status == .dropped) {
                     count += 1;
                     try writer.print("- session title generation {s}", .{@tagName(last.status)});
@@ -1973,26 +2005,26 @@ fn writeCompactionSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator) !voi
 /// explain why a session has no generated title even when FX_TRACE was off.
 fn writeSessionTitleSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !void {
     const App = @TypeOf(app.*);
-    if (comptime !@hasField(App, "session_persistence")) return;
-    const Persistence = @TypeOf(app.session_persistence);
+    if (comptime !agents.hasAgentField(App, "session_persistence")) return;
+    const Persistence = @TypeOf(agents.screenAgentOf(app).session_persistence);
     if (comptime !@hasField(Persistence, "title_generation")) return;
-    const TitleGeneration = @TypeOf(app.session_persistence.title_generation);
+    const TitleGeneration = @TypeOf(agents.screenAgentOf(app).session_persistence.title_generation);
     if (comptime !@hasField(TitleGeneration, "last")) return;
 
     try writer.writeAll("\n## Session Title\n");
     if (comptime @hasField(App, "session_title_generation")) {
         try writer.print("setting: {s}\n", .{boolLabel(app.session_title_generation)});
     }
-    if (comptime @hasField(App, "session_title")) {
-        if (app.session_title.items.len > 0) {
+    if (comptime agents.hasAgentField(App, "session_title")) {
+        if (agents.screenAgentOf(app).session_title.items.len > 0) {
             try writer.writeAll("title: ");
-            try writeMaskedInline(writer, alloc, app.session_title.items);
+            try writeMaskedInline(writer, alloc, agents.screenAgentOf(app).session_title.items);
             try writer.writeByte('\n');
         } else {
             try writer.writeAll("title: (none)\n");
         }
     }
-    const generation = &app.session_persistence.title_generation;
+    const generation = &agents.screenAgentOf(app).session_persistence.title_generation;
     if (generation.task) |task| {
         try writer.print("generation: status=running session={s} model={s}", .{ task.session_id, task.model });
         if (task.started_at_ms > 0) {
@@ -2105,9 +2137,9 @@ fn writeRendererState(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Alloc
     try writer.print(
         "transcript: bytes={d} entries={d} last_rendered_cols={d} dirty={s} has_painted={s} commit_state={s} committed_start_line={d} pending_compact={s}\n",
         .{
-            app.shell.transcript.items.len,
-            app.shell.entries.items.len,
-            app.shell.last_rendered_cols,
+            app.shell.notebook.transcript.items.len,
+            app.shell.notebook.entries.items.len,
+            app.shell.notebook.last_rendered_cols,
             boolLabel(app.shell.transcript_band_dirty),
             boolLabel(app.shell.has_painted_transcript),
             @tagName(transcript_commit.state),
@@ -2121,7 +2153,7 @@ fn writeRendererState(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Alloc
     );
     try writer.print(
         "replaceable: active={s} row={d} start={d}\n",
-        .{ boolLabel(app.shell.replaceable_last_line), app.shell.replaceable_row, app.shell.replaceable_start },
+        .{ boolLabel(app.shell.notebook.replaceable_last_line), app.shell.replaceable_row, app.shell.notebook.replaceable_start },
     );
 
     const grid = app.shell.shadow_vt orelse {
@@ -2811,12 +2843,18 @@ test "workspace slash parser preserves paths with spaces and rejects incomplete 
 test "workspace mutation admission rejects queue-zero processing gap" {
     const alloc = std.testing.allocator;
     var app = struct {
-        stream: struct { active: bool = false } = .{},
-        worker: worker_runtime.WorkerRuntime = .{},
-    }{};
-    defer app.worker.deinit(alloc);
+        main_agent: struct {
+            stream: struct { active: bool = false } = .{},
+            worker: worker_runtime.WorkerRuntime = .{},
+        } = .{},
 
-    try app.worker.enqueuePrompt(alloc, .{
+        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+            return &self.main_agent;
+        }
+    }{};
+    defer app.agent().worker.deinit(alloc);
+
+    try app.agent().worker.enqueuePrompt(alloc, .{
         .prompt = try alloc.dupe(u8, "active turn"),
         .images = &.{},
         .model = try alloc.dupe(u8, "test-model"),
@@ -2825,22 +2863,24 @@ test "workspace mutation admission rejects queue-zero processing gap" {
         .history = try alloc.alloc(types.HistoryTurn, 0),
         .grants = try alloc.alloc(types.PermissionGrant, 0),
     });
-    const active = (try app.worker.waitAndTakeNextPrompt(alloc)).?;
+    const active = (try app.agent().worker.waitAndTakeNextPrompt(alloc)).?;
     defer worker_runtime.freeQueuedPrompt(alloc, active);
 
-    try std.testing.expectEqual(@as(usize, 0), app.worker.queuedPromptCount());
+    try std.testing.expectEqual(@as(usize, 0), app.agent().worker.queuedPromptCount());
     try std.testing.expect(!tryBeginWorkspaceMutation(&app));
 
-    app.worker.finishProcessing();
+    app.agent().worker.finishProcessing();
     try std.testing.expect(tryBeginWorkspaceMutation(&app));
-    app.worker.releaseTurnStartHold();
+    app.agent().worker.releaseTurnStartHold();
 }
 
 test "workspace list refresh waits for an idle turn" {
     const alloc = std.testing.allocator;
     const TestApp = struct {
-        stream: struct { active: bool = false } = .{},
-        worker: worker_runtime.WorkerRuntime = .{},
+        main_agent: struct {
+            stream: struct { active: bool = false } = .{},
+            worker: worker_runtime.WorkerRuntime = .{},
+        } = .{},
         available: bool = true,
         active: bool = true,
         index_refresh_count: usize = 0,
@@ -2851,18 +2891,22 @@ test "workspace list refresh waits for an idle turn" {
             self.index_refresh_count += 1;
             return true;
         }
+
+        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+            return &self.main_agent;
+        }
     };
     var app = TestApp{};
-    defer app.worker.deinit(alloc);
+    defer app.agent().worker.deinit(alloc);
 
-    app.stream.active = true;
+    app.agent().stream.active = true;
     try refreshWorkspaceAvailabilityForList(&app);
     try std.testing.expect(app.available);
     try std.testing.expect(app.active);
     try std.testing.expectEqual(@as(usize, 0), app.index_refresh_count);
 
-    app.stream.active = false;
-    try app.worker.enqueuePrompt(alloc, .{
+    app.agent().stream.active = false;
+    try app.agent().worker.enqueuePrompt(alloc, .{
         .prompt = try alloc.dupe(u8, "active turn"),
         .images = &.{},
         .model = try alloc.dupe(u8, "test-model"),
@@ -2871,7 +2915,7 @@ test "workspace list refresh waits for an idle turn" {
         .history = try alloc.alloc(types.HistoryTurn, 0),
         .grants = try alloc.alloc(types.PermissionGrant, 0),
     });
-    const queued = (try app.worker.waitAndTakeNextPrompt(alloc)).?;
+    const queued = (try app.agent().worker.waitAndTakeNextPrompt(alloc)).?;
     defer worker_runtime.freeQueuedPrompt(alloc, queued);
 
     try refreshWorkspaceAvailabilityForList(&app);
@@ -2879,7 +2923,7 @@ test "workspace list refresh waits for an idle turn" {
     try std.testing.expect(app.active);
     try std.testing.expectEqual(@as(usize, 0), app.index_refresh_count);
 
-    app.worker.finishProcessing();
+    app.agent().worker.finishProcessing();
     try refreshWorkspaceAvailabilityForList(&app);
     try std.testing.expect(!app.available);
     try std.testing.expect(!app.active);
@@ -2892,14 +2936,16 @@ test "workspace list reports refresh rejection without replacing access" {
     const TestApp = struct {
         alloc: std.mem.Allocator,
         workspace_root: []const u8 = "/tmp/workspace",
-        stream: struct { active: bool = false } = .{},
-        worker: worker_runtime.WorkerRuntime = .{},
+        main_agent: struct {
+            stream: struct { active: bool = false } = .{},
+            worker: worker_runtime.WorkerRuntime = .{},
+        } = .{},
         access: Access = .{},
         transcript: std.ArrayList(u8) = .empty,
         last_tone: ?types.NoticeTone = null,
 
         fn deinit(self: *@This()) void {
-            self.worker.deinit(self.alloc);
+            self.agent().worker.deinit(self.alloc);
             self.transcript.deinit(self.alloc);
         }
 
@@ -2918,6 +2964,10 @@ test "workspace list reports refresh rejection without replacing access" {
         noinline fn writeDomainNotice(self: *@This(), notice: types.SemanticNotice, _: bool) !void {
             self.last_tone = notice.tone;
             try self.transcript.appendSlice(self.alloc, notice.body);
+        }
+
+        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+            return &self.main_agent;
         }
     };
 
@@ -3029,7 +3079,7 @@ fn stripAnsiEscapes(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
 fn handleRenameCommand(app: anytype, rest: []const u8) !void {
     const App = @TypeOf(app.*);
     const SessionRuntime = app_session_runtime.Runtime(App);
-    SessionRuntime.renameActiveSession(app, rest) catch |err| {
+    SessionRuntime.renameActiveSession(app, agents.screenAgentOf(app), rest) catch |err| {
         if (err == error.EmptyTitle) {
             // Usage lines name the command; a topic tag would repeat it.
             try app.writeDomainNotice(
@@ -3065,7 +3115,7 @@ fn handleRenameCommand(app: anytype, rest: []const u8) !void {
     };
 
     app.shell.render_requests.request(.footer);
-    const title = SessionRuntime.cachedSessionTitle(app) orelse "";
+    const title = SessionRuntime.cachedSessionTitle(agents.screenAgentOf(app)) orelse "";
     const msg = try app.alloc.print("renamed to \"{s}\"", .{title});
     defer app.alloc.free(msg);
     try app.writeDomainNotice(.{ .topic = "session", .tone = .neutral, .body = msg }, true);
@@ -3245,12 +3295,12 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     const App = @TypeOf(app.*);
     var snapshot: settings_catalog.Snapshot = .{};
     if (comptime provider_runtime.supported(App)) snapshot.model = provider_runtime.model(app);
-    if (comptime @hasField(App, "effort")) snapshot.effort = app.effort.displayLabel();
+    if (comptime agents.hasAgentField(App, "effort")) snapshot.effort = agents.screenAgentOf(app).effort.displayLabel();
     if (comptime @hasField(App, "fast_mode")) snapshot.fast_mode = app.fast_mode;
-    if (comptime @hasField(App, "worker") and
-        @hasField(@TypeOf(app.worker), "agent_turn_settings"))
+    if (comptime agents.hasAgentField(App, "worker") and
+        @hasField(@TypeOf(agents.screenAgentOf(app).worker), "agent_turn_settings"))
     {
-        snapshot.ultrafast_mode = app.worker.agent_turn_settings.ultrafast_mode;
+        snapshot.ultrafast_mode = agents.screenAgentOf(app).worker.agent_turn_settings.ultrafast_mode;
     }
     if (comptime @hasDecl(App, "resolvedModelCapabilities") and provider_runtime.supported(App)) {
         const capabilities = app.resolvedModelCapabilities(provider_runtime.model(app));
@@ -3258,7 +3308,7 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
         snapshot.supports_fast_mode = capabilities.supports_fast_mode;
         snapshot.supports_ultrafast_mode = capabilities.supports_ultrafast_mode;
     }
-    if (comptime @hasField(App, "permission_engine")) snapshot.permission_mode = @tagName(app.permission_engine.mode);
+    if (comptime @hasField(App, "permission_engine")) snapshot.permission_mode = @tagName(app_permission_runtime.Runtime(App).viewOf(app, agents.screenAgentOf(app)).mode);
     if (comptime @hasField(App, "input_runtime")) {
         snapshot.startup_scrollback = app.input_runtime.settings_menu.startup_scrollback;
         if (comptime @hasField(@TypeOf(app.input_runtime), "slash_menu_categories")) {
@@ -3390,22 +3440,23 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
                 try app.writeDomainNotice(.{ .topic = "effort", .tone = .neutral, .body = message }, true);
                 return;
             }
-            try session_commands.Commands(@TypeOf(app.*)).selectEffortFromSettings(app, effort);
+            try session_commands.Commands(@TypeOf(app.*)).selectEffortFromSettings(app, agents.screenAgentOf(app), effort);
         },
         .fast_mode => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
-            if (enabled != app.fast_mode) try session_commands.Commands(@TypeOf(app.*)).toggleFast(app);
+            if (enabled != app.fast_mode) try session_commands.Commands(@TypeOf(app.*)).toggleFast(app, agents.screenAgentOf(app));
         },
         .ultrafast_mode => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
-            if (enabled != app.worker.agent_turn_settings.ultrafast_mode) {
+            if (enabled != agents.screenAgentOf(app).worker.agent_turn_settings.ultrafast_mode) {
                 try session_commands.Commands(@TypeOf(app.*)).handleUltrafast(
                     app,
+                    agents.screenAgentOf(app),
                     if (enabled) "on" else "off",
                 );
             }
         },
-        .permission_mode => try session_commands.Commands(@TypeOf(app.*)).handlePermissions(app, change.value),
+        .permission_mode => try session_commands.Commands(@TypeOf(app.*)).handlePermissions(app, agents.screenAgentOf(app), change.value),
         .sound_level => try handleNotificationsCommand(app, change.value),
         .startup_scrollback => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
@@ -3493,11 +3544,12 @@ test "sound command parses toggle and off/on/max levels" {
 }
 
 const ClearCommandFakeApp = struct {
+    main_agent: struct {} = .{},
     clear_count: usize = 0,
     new_count: usize = 0,
     reset_count: usize = 0,
 
-    fn clearSession(self: *ClearCommandFakeApp) !void {
+    fn clearSession(self: *ClearCommandFakeApp, _: anytype) !void {
         self.clear_count += 1;
     }
 
@@ -3508,23 +3560,32 @@ const ClearCommandFakeApp = struct {
     fn resetSession(self: *ClearCommandFakeApp) !void {
         self.reset_count += 1;
     }
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
+    }
 };
 
 const QuitCommandFakeApp = struct {
     should_exit: bool = false,
-    session_persistence: app_session_runtime.Persistence = .{},
+    main_agent: struct {
+        session_persistence: app_session_runtime.Persistence = .{},
+    } = .{},
+
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
+    }
 };
 
 test "quit command requests resume handoff before exit" {
     var app = QuitCommandFakeApp{};
-    defer app.session_persistence.deinit(std.testing.allocator);
+    defer app.agent().session_persistence.deinit(std.testing.allocator);
 
     requestResumeExit(&app);
 
     try std.testing.expect(app.should_exit);
     try std.testing.expectEqual(
         app_session_runtime.ResumeHandoffIntent.requested,
-        app.session_persistence.resume_handoff_intent,
+        app.agent().session_persistence.resume_handoff_intent,
     );
 }
 
@@ -3543,7 +3604,9 @@ const ClipboardCommandFakeApp = struct {
         }
     };
 
-    session: Session = .{},
+    main_agent: struct {
+        session: Session = .{},
+    } = .{},
     copy_outcome: CopyOutcome = .copied,
     copy_calls: usize = 0,
     copied_text: ?[]const u8 = null,
@@ -3578,6 +3641,10 @@ const ClipboardCommandFakeApp = struct {
         self.last_tone = notice.tone;
         self.last_body = notice.body;
     }
+
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
+    }
 };
 
 const SkillsInstallReplayApp = struct {
@@ -3602,6 +3669,7 @@ const SkillsInstallReplayApp = struct {
         }
     };
 
+    main_agent: struct {} = .{},
     alloc: std.mem.Allocator,
     input_runtime: FakeInputRuntime = .{},
     skills: skill_runtime.Runtime = .{},
@@ -3630,11 +3698,16 @@ const SkillsInstallReplayApp = struct {
         self.last_tone = notice.tone;
         _ = try self.shell.appendSemanticNotice(self.alloc, notice);
     }
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
+    }
 };
 
 const ChangeCommandFakeApp = struct {
     alloc: std.mem.Allocator,
-    change_tracker: change_tracker_mod.ChangeTracker = .{},
+    main_agent: struct {
+        change_tracker: change_tracker_mod.ChangeTracker = .{},
+    } = .{},
     transcript: std.ArrayList(u8) = .empty,
 
     fn deinit(self: *ChangeCommandFakeApp) void {
@@ -3648,6 +3721,10 @@ const ChangeCommandFakeApp = struct {
         _: bool,
     ) !void {
         try self.transcript.appendSlice(self.alloc, notice.body);
+    }
+
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
     }
 };
 
@@ -3867,12 +3944,18 @@ test "trace auth summary preserves missing and loaded status text" {
 test "trace session title summary reports the retained generation outcome" {
     const alloc = std.testing.allocator;
     var app = struct {
-        session_persistence: app_session_runtime.Persistence = .{},
-        session_title: std.ArrayList(u8) = .empty,
+        main_agent: struct {
+            session_persistence: app_session_runtime.Persistence = .{},
+            session_title: std.ArrayList(u8) = .empty,
+        } = .{},
         session_title_generation: bool = true,
+
+        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+            return &self.main_agent;
+        }
     }{};
-    defer app.session_persistence.deinit(alloc);
-    defer app.session_title.deinit(alloc);
+    defer app.agent().session_persistence.deinit(alloc);
+    defer app.agent().session_title.deinit(alloc);
 
     var idle: std.Io.Writer.Allocating = .init(alloc);
     defer idle.deinit();
@@ -3882,7 +3965,7 @@ test "trace session title summary reports the retained generation outcome" {
     try std.testing.expect(std.mem.find(u8, idle.written(), "title: (none)") != null);
     try std.testing.expect(std.mem.find(u8, idle.written(), "generation: status=none") != null);
 
-    const generation = &app.session_persistence.title_generation;
+    const generation = &app.agent().session_persistence.title_generation;
     generation.last.status = .failed;
     generation.last.reason = .transport_error;
     generation.last.detail = "ConnectionRefused";
@@ -3902,7 +3985,7 @@ test "trace session title summary reports the retained generation outcome" {
     generation.last.status = .installed;
     generation.last.reason = null;
     generation.last.detail = "";
-    try app.session_title.appendSlice(alloc, "Fix renderer lag");
+    try app.agent().session_title.appendSlice(alloc, "Fix renderer lag");
 
     var installed: std.Io.Writer.Allocating = .init(alloc);
     defer installed.deinit();
@@ -4323,7 +4406,7 @@ test "app_commands routes clear through carry-forward session reset" {
 
 test "copy command routes exact reply bytes through the host clipboard" {
     var app = ClipboardCommandFakeApp{
-        .session = .{ .reply = "reply\nwith exact bytes" },
+        .main_agent = .{ .session = .{ .reply = "reply\nwith exact bytes" } },
     };
 
     try Handlers(ClipboardCommandFakeApp).commandCopyLast(@ptrCast(&app));
@@ -4343,7 +4426,7 @@ test "copy command reports missing replies and host failures" {
     try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
     try std.testing.expectEqualStrings("No assistant reply to copy.", app.last_body.?);
 
-    app.session.reply = "reply";
+    app.agent().session.reply = "reply";
     for ([_]ClipboardCommandFakeApp.CopyOutcome{ .unavailable, .failed }) |outcome| {
         app.copy_outcome = outcome;
         app.last_tone = null;
@@ -4378,22 +4461,22 @@ test "skills install groups command notice fragments for entry replay" {
     defer alloc.free(args);
     try Handlers(SkillsInstallReplayApp).commandHandleSkills(@ptrCast(&app), args);
 
-    try std.testing.expectEqual(@as(usize, 2), app.shell.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), app.shell.notebook.entries.items.len);
     try std.testing.expectEqual(@as(usize, 2), app.write_count);
     try std.testing.expectEqual(@as(usize, 1), app.reload_count);
     try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
-    try std.testing.expect(app.shell.entries.items[0] == .semantic_notice);
-    try std.testing.expect(app.shell.entries.items[1] == .semantic_notice);
-    try std.testing.expectEqualStrings("skills", app.shell.entries.items[0].semantic_notice.topic);
+    try std.testing.expect(app.shell.notebook.entries.items[0] == .semantic_notice);
+    try std.testing.expect(app.shell.notebook.entries.items[1] == .semantic_notice);
+    try std.testing.expectEqualStrings("skills", app.shell.notebook.entries.items[0].semantic_notice.topic);
     const installing_body = try alloc.print("Installing from {s}...", .{pack_dir});
     defer alloc.free(installing_body);
-    try std.testing.expectEqualStrings(installing_body, app.shell.entries.items[0].semantic_notice.body);
+    try std.testing.expectEqualStrings(installing_body, app.shell.notebook.entries.items[0].semantic_notice.body);
     try std.testing.expectEqualStrings(
         "Installed: root-skill\nInstalled: nested-skill",
-        app.shell.entries.items[1].semantic_notice.body,
+        app.shell.notebook.entries.items[1].semantic_notice.body,
     );
 
-    const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.entries.items, 80, .{});
+    const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.notebook.entries.items, 80, .{});
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.startsWith(u8, rendered, "* skills: Installing from "));
     try std.testing.expect(std.mem.find(u8, rendered, "\n\n* skills: Installed: root-skill") != null);
@@ -4411,7 +4494,7 @@ test "help command opens the catalog without writing transcript output" {
     try std.testing.expect(!app.skills.menu.active);
     try std.testing.expect(app.input_runtime.help_menu.active);
     try std.testing.expectEqual(@as(usize, 0), app.write_count);
-    try std.testing.expectEqual(@as(usize, 0), app.shell.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.shell.notebook.entries.items.len);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
@@ -4442,7 +4525,7 @@ test "skills list opens menu without transcript inventory" {
     try std.testing.expectEqual(@as(usize, 0), app.skills.menu.selected_index);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 
-    const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.entries.items, 80, .{});
+    const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.notebook.entries.items, 80, .{});
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.find(u8, rendered, "Visible skills (") == null);
 }
@@ -4464,16 +4547,16 @@ test "skills list keeps a bounded discovery warning in the full transcript only"
     try Handlers(SkillsInstallReplayApp).commandHandleSkills(@ptrCast(&app), "list");
 
     try std.testing.expectEqual(@as(usize, 1), app.write_count);
-    try std.testing.expectEqual(@as(usize, 1), app.shell.entries.items.len);
-    try std.testing.expect(app.shell.entries.items[0] == .semantic_notice);
-    const notice = app.shell.entries.items[0].semantic_notice;
+    try std.testing.expectEqual(@as(usize, 1), app.shell.notebook.entries.items.len);
+    try std.testing.expect(app.shell.notebook.entries.items[0] == .semantic_notice);
+    const notice = app.shell.notebook.entries.items[0].semantic_notice;
     try std.testing.expectEqualStrings("skills", notice.topic);
     try std.testing.expectEqual(types.NoticeTone.warning, notice.tone);
     try std.testing.expectEqual(types.NoticeVisibility.full_only, notice.visibility);
     try std.testing.expect(std.mem.find(u8, notice.body, "skill discovery warning:") != null);
     try std.testing.expect(std.mem.find(u8, notice.body, "hostile&#x0a;path/body-sentinel") != null);
     try std.testing.expect(std.mem.find(u8, notice.body, "metadata is invalid (missing_name)") != null);
-    const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.entries.items, 80, .{});
+    const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.notebook.entries.items, 80, .{});
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.find(u8, rendered, "skill discovery warning:") == null);
 }
@@ -4577,7 +4660,7 @@ test "skills remove prefers a managed match after a workspace duplicate" {
 
     try Handlers(SkillsInstallReplayApp).commandHandleSkills(@ptrCast(&app), "remove review");
 
-    const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.entries.items, 80, .{});
+    const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.notebook.entries.items, 80, .{});
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.find(u8, rendered, "Removed skill 'review'.") != null);
     try std.testing.expectEqual(@as(usize, 1), app.reload_count);
@@ -4604,7 +4687,7 @@ test "skills show missing name keeps not found notice" {
     try std.testing.expectEqual(@as(usize, 1), app.reload_count);
     try std.testing.expectEqual(@as(usize, 1), app.write_count);
     try std.testing.expect(!app.skills.menu.active);
-    const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.entries.items, 80, .{});
+    const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.notebook.entries.items, 80, .{});
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.find(u8, rendered, "Skill 'missing' not found.") != null);
 }

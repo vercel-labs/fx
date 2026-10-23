@@ -4,6 +4,7 @@ const permission_request = @import("../permissions/permission_request.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
 const runtime_deps = @import("../agent/runtime/deps.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
+const agents = @import("../agents/agents.zig");
 const authority_mod = @import("authority.zig");
 const approval_registry_mod = @import("approval_registry.zig");
 const child_state = @import("child_state.zig");
@@ -19,10 +20,93 @@ const session_permission_state = @import("../permissions/session_permission_stat
 const session_store = @import("../session/session_store.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
+const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
+const mcp_access = @import("../mcp/access_policy.zig");
 const types = @import("../shared/types.zig");
 const history_range = @import("../shared/history_range.zig");
 
 const Allocator = std.mem.Allocator;
+
+/// The MCP view a subagent may use now, taken from its freshly resolved live
+/// authority, which this consumes. The subagent engine and child agents both
+/// use it.
+pub fn liveMcpViewFrom(
+    alloc: Allocator,
+    authority: *authority_mod.Snapshot,
+) !tool_mcp_runtime.ResolvedLiveView {
+    defer authority.deinit(alloc);
+    const view = authority.mcp_view orelse return error.McpRuntimeUnavailable;
+    authority.mcp_view = null;
+    return .{
+        .authority_generation = mcp_access.authorityGeneration(view),
+        .action_authority_generation = authority.generation,
+        .view = view,
+    };
+}
+
+/// Decides one tool call against a subagent's live authority, resolved fresh
+/// from `resolver` for `child_id`. The child engine and child agents both use
+/// it, so a subagent is held to its admission's tools and integrations
+/// whichever runs its turn: a name outside them, such as `subagent`, is
+/// unavailable.
+/// `user_mode` decides a turn no work of main's started (`Resolver.resolveForUser`).
+pub fn resolveLiveToolActionFor(
+    resolver: *authority_mod.Resolver,
+    child_id: []const u8,
+    user_mode: ?types.PermissionMode,
+    alloc: Allocator,
+    call: types.ToolCall,
+    workspace_root: []const u8,
+    target: []const u8,
+    target_kind: tool_dispatch.PermissionTargetKind,
+) !runtime_deps.ResolvedLiveToolAuthority {
+    const snapshot = if (user_mode) |mode|
+        try resolver.resolveForUser(alloc, child_id, mode)
+    else
+        try resolver.resolve(alloc, child_id);
+    const decision = try authority_mod.decideToolAuthority(
+        alloc,
+        snapshot.view(),
+        workspace_root,
+        call.name,
+        target,
+        target_kind,
+    );
+    const permission_state = try alloc.create(session_permission_state.State);
+    permission_state.* = snapshot.permission_state;
+    return .{
+        .authority = .{
+            .generation = snapshot.generation,
+            .root_id = snapshot.root_id,
+            .tools = snapshot.tools,
+            .integrations = snapshot.integrations,
+            .rules = snapshot.rules,
+            .grants = snapshot.grants,
+            .permission_state = permission_state,
+            .permission_mode = snapshot.permission_mode,
+        },
+        .decision = switch (decision) {
+            .allow => .allow,
+            .ask => .ask,
+            .deny => .deny,
+            .unavailable => .unavailable,
+        },
+    };
+}
+
+test "a hosted run's turn context leaves saving to the child's own agent" {
+    var turn = TurnContext.initHosted(std.testing.allocator, 8);
+    defer turn.deinit();
+    try std.testing.expect(turn.isHosted());
+    try turn.beginTurn();
+    try std.testing.expectError(error.ChildCapabilityUnavailable, turn.childCapability());
+    const saved: types.HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("task"), .work_id = @constCast("work-1") },
+        .assistant = @constCast("answer"),
+    } };
+    try std.testing.expectError(error.SessionCommitFailed, turn.commit("work-1", saved));
+    try std.testing.expect(!turn.committed);
+}
 
 test "child compaction preserves work identity and permits final commit" {
     const alloc = std.testing.allocator;
@@ -88,6 +172,14 @@ pub const ServiceError = error{
 
 pub const Services = struct {
     context: ?*anyopaque = null,
+    /// Binds a run's turn to the child agent that will run it, setting its
+    /// `hosted_worker` and `hosted_release`. Absent where the host runs turns
+    /// itself. Blocks until bound.
+    bind_fn: ?*const fn (
+        ?*anyopaque,
+        *TurnContext,
+        *std.atomic.Value(bool),
+    ) ServiceError!void = null,
     capture_fn: *const fn (
         ?*anyopaque,
         Allocator,
@@ -100,6 +192,12 @@ pub const Services = struct {
         domain.AdmissionSnapshot,
         *std.atomic.Value(bool),
     ) ServiceError!RunOutcome,
+
+    /// Binds `turn` to its child agent's worker, where the host has one.
+    pub fn bind(self: Services, turn: *TurnContext, cancel: *std.atomic.Value(bool)) ServiceError!void {
+        const bind_fn = self.bind_fn orelse return;
+        return bind_fn(self.context, turn, cancel);
+    }
 
     pub fn capture(
         self: Services,
@@ -131,13 +229,23 @@ pub const TurnContext = struct {
     alloc: Allocator,
     runtime: session.SessionRuntime,
     worker: worker_runtime.WorkerRuntime = .{},
+    /// In the interactive app, the child agent's own worker runs the turn, so
+    /// approvals, cancel, and steering go to it instead of `worker`.
+    hosted_worker: ?*worker_runtime.WorkerRuntime = null,
+    /// Counts this turn as using its child agent until `deinit`, so the agent
+    /// is not freed while a slot thread still holds its worker.
+    hosted_release: ?*std.atomic.Value(u32) = null,
     managed_executions: managed_execution.Runtime,
-    /// The child session the turn writes, through the adapter (D22).
-    child: *session_adapter.Session,
+    /// The child session the turn writes, through the adapter (D22). Null
+    /// for a hosted run, whose child's own agent saves its turns (D31).
+    child: ?*session_adapter.Session,
     live_authority: ?*authority_mod.Resolver = null,
     approval_registry: ?*approval_registry_mod.Registry = null,
     approval_worker_route: ?approval_registry_mod.WorkerRoute = null,
     child_id: ?[]const u8 = null,
+    /// The name the parent gave the child, such as `reviewer`, or null for a
+    /// one-off. Borrowed for the turn.
+    child_name: ?[]const u8 = null,
     active_work_id: ?[]const u8 = null,
     phase_context: ?*anyopaque = null,
     phase_fn: ?*const fn (
@@ -147,6 +255,8 @@ pub const TurnContext = struct {
         child_state.Phase,
     ) anyerror!void = null,
     live_metrics: ?*live_metrics.LiveMetrics = null,
+    /// This child's event queue, which only the main loop drains (D14).
+    /// Borrowed from the subagent host for the turn.
     failure_diagnostic: ?types.ModelFailureDiagnostic = null,
     committed: bool = false,
 
@@ -174,7 +284,25 @@ pub const TurnContext = struct {
         };
     }
 
+    /// A run whose child's own agent holds the session (D31): the host keeps
+    /// the run's admission, approvals, phases, and result, and the agent saves
+    /// its turns itself, so nothing here touches the session.
+    pub fn initHosted(alloc: Allocator, max_history_turns: usize) TurnContext {
+        return .{
+            .alloc = alloc,
+            .runtime = .{ .max_history_turns = max_history_turns },
+            .managed_executions = managed_execution.Runtime.init(alloc),
+            .child = null,
+        };
+    }
+
+    /// True when the child's own agent holds the session.
+    pub fn isHosted(self: *const TurnContext) bool {
+        return self.child == null;
+    }
+
     pub fn deinit(self: *TurnContext) void {
+        if (self.hosted_release) |count| _ = count.fetchSub(1, .release);
         self.managed_executions.deinit();
         self.worker.deinit(self.alloc);
         self.runtime.deinit(self.alloc);
@@ -201,17 +329,20 @@ pub const TurnContext = struct {
     /// Opens the child's turn on disk as its work starts, so a body its
     /// tools store is a blob of a session on disk (D44).
     pub fn beginTurn(self: *TurnContext) !void {
-        try self.child.beginTurn();
+        // A hosted run's turns are opened by the child's own agent.
+        const child = self.child orelse return;
+        try child.beginTurn();
     }
 
     pub fn childCapability(
         self: *TurnContext,
     ) !*session_child_store.SessionChildCapability {
-        return self.child.childCapability();
+        const child = self.child orelse return error.ChildCapabilityUnavailable;
+        return child.childCapability();
     }
 
     pub fn workerRuntime(self: *TurnContext) *worker_runtime.WorkerRuntime {
-        return &self.worker;
+        return self.hosted_worker orelse &self.worker;
     }
 
     pub fn managedExecutionRuntime(self: *TurnContext) *managed_execution.Runtime {
@@ -276,7 +407,7 @@ pub const TurnContext = struct {
             ),
             .grants = grant_offer orelse &.{grant},
         };
-        return self.worker.requestPermissionBlockingObserved(
+        return self.workerRuntime().requestPermissionBlockingObserved(
             alloc,
             request,
             review,
@@ -321,35 +452,17 @@ pub const TurnContext = struct {
         target_kind: tool_dispatch.PermissionTargetKind,
     ) !runtime_deps.ResolvedLiveToolAuthority {
         const self: *TurnContext = @ptrCast(@alignCast(raw));
-        const snapshot = try self.resolveLiveAuthority(alloc);
-        const decision = try authority_mod.decideToolAuthority(
+        const resolver = self.live_authority orelse return error.HostAuthorityUnavailable;
+        return resolveLiveToolActionFor(
+            resolver,
+            self.child_id orelse return error.ChildNotAttached,
+            null,
             alloc,
-            snapshot.view(),
+            call,
             workspace_root,
-            call.name,
             target,
             target_kind,
         );
-        const permission_state = try alloc.create(session_permission_state.State);
-        permission_state.* = snapshot.permission_state;
-        return .{
-            .authority = .{
-                .generation = snapshot.generation,
-                .root_id = snapshot.root_id,
-                .tools = snapshot.tools,
-                .integrations = snapshot.integrations,
-                .rules = snapshot.rules,
-                .grants = snapshot.grants,
-                .permission_state = permission_state,
-                .permission_mode = snapshot.permission_mode,
-            },
-            .decision = switch (decision) {
-                .allow => .allow,
-                .ask => .ask,
-                .deny => .deny,
-                .unavailable => .unavailable,
-            },
-        };
     }
 
     fn recordToolActivity(
@@ -408,6 +521,8 @@ pub const TurnContext = struct {
     }
 
     pub fn commit(self: *TurnContext, work_id: []const u8, turn: types.HistoryTurn) CommitError!void {
+        // The child's own agent saves a hosted run's turns (D31).
+        if (self.child == null) return error.SessionCommitFailed;
         if (self.committed) return error.TurnAlreadyCommitted;
         try self.appendCommittedHistory(work_id, turn);
         self.committed = true;
@@ -428,7 +543,7 @@ pub const TurnContext = struct {
         var prepared_owned = true;
         defer if (prepared_owned) session.freeHistoryTurn(self.alloc, prepared);
         // The work id rides on the turn.
-        const child = self.child;
+        const child = self.child orelse return error.SessionCommitFailed;
         child.prepareTurn(&prepared) catch |err| return commitFailed(child, work_id, "prepare", err);
         child.commitTurn(prepared, self.runtime.languageSnapshot()) catch |err| return commitFailed(child, work_id, "commit", err);
         self.runtime.commitPreparedHistoryEntry(self.alloc, prepared);
@@ -441,6 +556,8 @@ pub const TurnContext = struct {
         active_prefix: ?types.AssistantHistoryTurn,
         retained_from: ?types.ContextHistoryCut,
     ) !void {
+        // The child's own agent compacts a hosted run's session (D31).
+        const child = self.child orelse return error.SessionCommitFailed;
         var prefix: ?types.HistoryTurn = if (active_prefix) |value|
             try session.dupeHistoryTurn(self.alloc, .{ .assistant = value })
         else
@@ -452,7 +569,7 @@ pub const TurnContext = struct {
         const prepared = try session.prepareCompactedHistory(self.alloc, self.runtime.agent.history.items, summary, retained_from orelse .{ .turns = history_range.rawHistoryTurnCount(self.runtime.agent.history.items) });
         errdefer types.freeHistoryTurnSlice(self.alloc, prepared);
         // The active prefix reaches the log with the turn's commit.
-        try self.child.commitCompaction(summary, prefix != null, retained_from);
+        try child.commitCompaction(summary, prefix != null, retained_from);
         self.runtime.commitCompactedHistory(self.alloc, prepared);
     }
 };
@@ -493,4 +610,71 @@ test "subagent failure capture is bounded and keeps the first cause without allo
     try std.testing.expect(std.unicode.utf8ValidateSlice(long.view()));
     const unsafe = failureDiagnosticValue("provider_http_error", "unsafe\x1b[31m");
     try std.testing.expectEqualStrings("provider_http_error", unsafe.view());
+}
+
+test "a subagent's tool calls are decided against its admission, whichever engine runs its turn" {
+    // Hiding a tool from the model does not stop a call to it. This shared
+    // decision is what refuses any tool the host does not grant, for the
+    // subagent engine and for child agents alike. `subagent` is decided like
+    // any other tool the host grants (D32).
+    const Host = struct {
+        fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) authority_mod.HostResolveError!authority_mod.HostAuthority {
+            return authority_mod.HostAuthority.capture(alloc, &.{ "read_file", "subagent" }, &.{}, .{}, &.{}) catch
+                return error.OutOfMemory;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    const store = parent.stateStore();
+    var registry = try child_state.Registry.init(alloc, parent.parent.id());
+    defer registry.deinit(alloc);
+    var work = child_state.ActiveWork{
+        .id = try alloc.dupe(u8, "work-one"),
+        .message = try alloc.dupe(u8, "review"),
+        .permission_mode = .ask,
+        .created_at_ms = 1,
+    };
+    defer work.deinit(alloc);
+    try registry.appendPersistent(alloc, "authority-child", "worker", "", work);
+    try store.save(alloc, registry);
+    var resolver = authority_mod.Resolver{
+        .children = &parent.children,
+        .root_id = parent.parent.id(),
+        .host = .{ .resolve_fn = Host.resolve },
+    };
+
+    // The decision's authority borrows its allocator, as the agent runtime's
+    // per-action arena does.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const Case = struct { name: []const u8, available: bool };
+    for ([_]Case{
+        .{ .name = "subagent", .available = true },
+        .{ .name = "write_file", .available = false },
+        .{ .name = "read_file", .available = true },
+    }) |case| {
+        const resolved = try resolveLiveToolActionFor(
+            &resolver,
+            "authority-child",
+            null,
+            arena.allocator(),
+            .{ .id = "call-1", .name = case.name, .arguments_json = "{}" },
+            home,
+            "",
+            .none,
+        );
+        errdefer std.debug.print("tool {s}: decision {s}\n", .{ case.name, @tagName(resolved.decision) });
+        try std.testing.expectEqual(case.available, resolved.decision != .unavailable);
+        try std.testing.expectEqual(types.PermissionMode.ask, resolved.authority.permission_mode);
+    }
+    try std.testing.expectError(
+        error.ChildNotAttached,
+        resolveLiveToolActionFor(&resolver, "missing-child", null, arena.allocator(), .{ .id = "call-2", .name = "read_file", .arguments_json = "{}" }, home, "", .none),
+    );
 }

@@ -48,7 +48,7 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
       session = await TmuxSession.create();
       await session.waitForComposer(10_000);
       await session.sendText("/help");
-      const pane = await session.waitForText("Commands 38", 5_000);
+      const pane = await session.waitForText("Commands 40", 5_000);
       expect(pane).toContain("[All]");
       expect(pane).toContain("tab category");
       expect(pane).toContain("enter open");
@@ -861,14 +861,15 @@ describe.skipIf(SKIP_TMUX)("tui: standard terminal variables", () => {
         });
         await session.waitForComposer(TIMEOUT);
         await session.sendText("/help");
-        await session.waitForPane((pane) => pane.includes("/model"), TIMEOUT);
+        // A row on the menu's first page, which the visible rows always show.
+        await session.waitForPane((pane) => pane.includes("/status"), TIMEOUT);
         screens.push(await session.captureFullScrollbackEscapes());
         await session.kill();
         session = null;
       }
       expect(screens[0]).toMatch(colorSgr);
       expect(screens[1]).not.toMatch(colorSgr);
-      expect(screens[1]).toContain("/model");
+      expect(screens[1]).toContain("/status");
     },
     TIMEOUT * 2,
   );

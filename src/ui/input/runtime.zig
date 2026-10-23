@@ -2268,8 +2268,10 @@ test "input escape parser preserves double escape meta behavior" {
     try expectEscapeAction("\x1b[B", moveEscape(.paragraph_down, false));
     try expectEscapeAction("\x1bOA", moveEscape(.paragraph_up, false));
     try expectEscapeAction("\x1bOB", moveEscape(.paragraph_down, false));
-    try expectEscapeAction("\x1b[D", moveEscape(.word_left, false));
-    try expectEscapeAction("\x1b[C", moveEscape(.word_right, false));
+    // Meta-prefixed Left and Right are Alt+←/→, which switch agents (D9);
+    // Alt+B and Alt+F keep the word jump.
+    try expectEscapeAction("\x1b[D", .{ .switch_agent = .previous });
+    try expectEscapeAction("\x1b[C", .{ .switch_agent = .next });
     try expectEscapeAction("\x1bb", .word_left);
     try expectEscapeAction("\x1bd", .{ .composer_shortcut = .delete_word_right });
 
@@ -3558,8 +3560,8 @@ test "input escape parser handles ESC f as word_right" {
     try std.testing.expectEqual(@as(u8, 0), stage);
 }
 
-test "input escape parser handles alt+arrow as word jump" {
-    // ESC[1;3D — Alt+Left
+test "input escape parser maps alt+arrow to the agent switch" {
+    // ESC[1;3D — Alt+Left: the previous agent (D9)
     var stage: u8 = 1;
     var param: u16 = 0;
     var param2: u16 = 0;
@@ -3567,10 +3569,10 @@ test "input escape parser handles alt+arrow as word jump" {
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '1'));
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, ';'));
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '3'));
-    try std.testing.expectEqual(@as(?InputEscapeAction, moveEscape(.word_left, false)), consumeInputEscapeByte(&stage, &param, &param2, 'D'));
+    try std.testing.expectEqual(@as(?InputEscapeAction, .{ .switch_agent = .previous }), consumeInputEscapeByte(&stage, &param, &param2, 'D'));
     try std.testing.expectEqual(@as(u8, 0), stage);
 
-    // ESC[1;3C — Alt+Right
+    // ESC[1;3C — Alt+Right: the next agent
     stage = 1;
     param = 0;
     param2 = 0;
@@ -3578,8 +3580,21 @@ test "input escape parser handles alt+arrow as word jump" {
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '1'));
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, ';'));
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '3'));
-    try std.testing.expectEqual(@as(?InputEscapeAction, moveEscape(.word_right, false)), consumeInputEscapeByte(&stage, &param, &param2, 'C'));
+    try std.testing.expectEqual(@as(?InputEscapeAction, .{ .switch_agent = .next }), consumeInputEscapeByte(&stage, &param, &param2, 'C'));
     try std.testing.expectEqual(@as(u8, 0), stage);
+
+    // ESC[1;4C — Shift+Alt+Right keeps selecting by word.
+    stage = 1;
+    param = 0;
+    param2 = 0;
+    for ("[1;4") |byte| try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, byte));
+    try std.testing.expectEqual(@as(?InputEscapeAction, moveEscape(.word_right, true)), consumeInputEscapeByte(&stage, &param, &param2, 'C'));
+
+    // With no other agent, the switch falls back to the word jump.
+    try std.testing.expectEqual(
+        @as(?input_action.ShortcutAction, .{ .move = .{ .kind = .word_left, .extend_selection = false } }),
+        shortcuts.fromEscapeAction(.{ .switch_agent = .previous }),
+    );
 }
 
 test "input escape parser handles double-ESC as meta prefix for arrows" {

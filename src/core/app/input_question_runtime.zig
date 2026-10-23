@@ -1,5 +1,6 @@
 const std = @import("std");
 const question_prompt = @import("../agent/question_prompt.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const edit_contract = @import("../input/editor_state.zig");
 const gesture_state = @import("../input/gesture_state.zig");
@@ -11,10 +12,11 @@ const input_interrupt_runtime = @import("input_interrupt_runtime.zig");
 
 pub fn QuestionRuntime(comptime App: type) type {
     return struct {
+        const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
         const interrupt = input_interrupt_runtime.InterruptRuntime(App);
 
-        pub fn handleQuestionAction(app: *App, action: question_prompt.Action) !bool {
-            return switch (try handleQuestionActionWithLimit(app, action, null)) {
+        pub fn handleQuestionAction(app: *App, agent: *AppAgent, action: question_prompt.Action) !bool {
+            return switch (try handleQuestionActionWithLimit(app, agent, action, null)) {
                 .consumed => true,
                 .ignored => false,
                 .limit_exceeded => unreachable,
@@ -23,21 +25,23 @@ pub fn QuestionRuntime(comptime App: type) type {
 
         pub fn handleQuestionActionBounded(
             app: *App,
+            agent: *AppAgent,
             action: question_prompt.Action,
             max_len: usize,
         ) !edit_contract.ByteResult {
-            return handleQuestionActionWithLimit(app, action, max_len);
+            return handleQuestionActionWithLimit(app, agent, action, max_len);
         }
 
         fn handleQuestionActionWithLimit(
             app: *App,
+            agent: *AppAgent,
             action: question_prompt.Action,
             max_len: ?usize,
         ) !edit_contract.ByteResult {
             const event = if (max_len) |limit|
-                try app.question_prompt.applyBounded(app.alloc, action, limit)
+                try agent.question_prompt.applyBounded(app.alloc, action, limit)
             else
-                try app.question_prompt.apply(app.alloc, action);
+                try agent.question_prompt.apply(app.alloc, action);
             switch (event) {
                 .none => return if (questionActionConsumesNoop(action)) .consumed else .ignored,
                 .redraw, .decision => {
@@ -45,54 +49,66 @@ pub fn QuestionRuntime(comptime App: type) type {
                     return .consumed;
                 },
                 .all_decided => {
-                    try submitQuestionBatch(app);
+                    try submitQuestionBatch(app, agent);
                     return .consumed;
                 },
                 .cancelled => {
-                    try cancelQuestionPrompt(app);
+                    try cancelQuestionPrompt(app, agent);
                     return .consumed;
                 },
                 .limit_exceeded => return .limit_exceeded,
             }
         }
 
-        pub fn cancelQuestionPrompt(app: *App) !void {
-            const route_recovery = isRouteRecoveryPrompt(app);
-            const mcp_elicitation = isMcpElicitationPrompt(app);
-            interrupt.traceInterruptRequested(app, "input_question");
+        pub fn cancelQuestionPrompt(app: *App, agent: *AppAgent) !void {
+            if (comptime @hasDecl(App, "answerLentQuestion")) {
+                if (try app.answerLentQuestion(cancelQuestionPrompt)) return;
+            }
+            const route_recovery = isRouteRecoveryPrompt(agent);
+            const mcp_elicitation = isMcpElicitationPrompt(agent);
+            interrupt.traceInterruptRequested(app, agent, "input_question");
             if (!route_recovery) {
-                if (comptime @hasDecl(@TypeOf(app.worker), "requestInteractiveCancel")) {
-                    app.worker.requestInteractiveCancel();
+                if (comptime @hasDecl(@TypeOf(agent.worker), "requestInteractiveCancel")) {
+                    agent.worker.requestInteractiveCancel();
                 } else {
-                    app.worker.requestCancel();
+                    agent.worker.requestCancel();
                 }
             }
             app.pacer.clear(app.alloc);
-            if (!route_recovery and !mcp_elicitation) try finalizeQuestionTranscript(app, true);
-            try app.worker.submitQuestionBatchAnswer(std.heap.c_allocator, null);
-            app.question_prompt.discard(app.alloc, "cancelled");
+            if (!route_recovery and !mcp_elicitation) try finalizeQuestionTranscript(app, agent, true);
+            try agent.worker.submitQuestionBatchAnswer(std.heap.c_allocator, null);
+            agent.question_prompt.discard(app.alloc, "cancelled");
             app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
             const gesture_transition = gesture_state.disarmEscapeClear(
                 app.input_runtime.gestures,
             );
             app.input_runtime.gestures = gesture_transition.next;
-            app.stopStream();
+            app.stopStream(agent);
             app.shell.render_requests.request(.modal);
         }
 
-        pub fn submitQuestionBatch(app: *App) !void {
+        pub fn submitQuestionBatch(app: *App, agent: *AppAgent) !void {
+            if (comptime @hasDecl(App, "answerLentQuestion")) {
+                if (try app.answerLentQuestion(submitQuestionBatch)) return;
+            }
+            if (comptime @hasDecl(App, "screenAgentId")) {
+                debug_trace.eventf("procesor", "question_answered", .{}, "agent={s} screen={s}", .{
+                    app.subagentIdOf(agent) orelse "main",
+                    app.screenAgentId(),
+                });
+            }
             var labels: std.ArrayList([]const u8) = .empty;
             defer labels.deinit(app.alloc);
-            try labels.ensureTotalCapacity(app.alloc, app.question_prompt.entries.items.len);
-            for (app.question_prompt.entries.items) |entry| {
+            try labels.ensureTotalCapacity(app.alloc, agent.question_prompt.entries.items.len);
+            for (agent.question_prompt.entries.items) |entry| {
                 labels.appendAssumeCapacity(entry.answer.?);
             }
 
-            if (!isRouteRecoveryPrompt(app) and !isMcpElicitationPrompt(app)) {
-                try finalizeQuestionTranscript(app, false);
+            if (!isRouteRecoveryPrompt(agent) and !isMcpElicitationPrompt(agent)) {
+                try finalizeQuestionTranscript(app, agent, false);
             }
-            try app.worker.submitQuestionBatchAnswer(std.heap.c_allocator, labels.items);
-            app.question_prompt.resetAfterSubmission(app.alloc);
+            try agent.worker.submitQuestionBatchAnswer(std.heap.c_allocator, labels.items);
+            agent.question_prompt.resetAfterSubmission(app.alloc);
             app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
             app.shell.render_requests.request(.modal);
         }
@@ -101,26 +117,26 @@ pub fn QuestionRuntime(comptime App: type) type {
             app.shell.render_requests.request(.modal);
         }
 
-        fn isRouteRecoveryPrompt(app: *App) bool {
-            const Worker = @TypeOf(app.worker);
+        fn isRouteRecoveryPrompt(agent: *AppAgent) bool {
+            const Worker = @TypeOf(agent.worker);
             if (comptime @hasDecl(Worker, "pendingQuestionBatchSource")) {
-                return app.worker.pendingQuestionBatchSource() == worker_runtime.QuestionPromptSource.route_recovery;
+                return agent.worker.pendingQuestionBatchSource() == worker_runtime.QuestionPromptSource.route_recovery;
             }
             return false;
         }
 
-        fn isMcpElicitationPrompt(app: *App) bool {
-            const Worker = @TypeOf(app.worker);
+        fn isMcpElicitationPrompt(agent: *AppAgent) bool {
+            const Worker = @TypeOf(agent.worker);
             if (comptime @hasDecl(Worker, "pendingQuestionBatchSource")) {
-                return app.worker.pendingQuestionBatchSource() == worker_runtime.QuestionPromptSource.mcp_elicitation;
+                return agent.worker.pendingQuestionBatchSource() == worker_runtime.QuestionPromptSource.mcp_elicitation;
             }
             return false;
         }
 
-        fn finalizeQuestionTranscript(app: *App, cancelled: bool) !void {
+        fn finalizeQuestionTranscript(app: *App, agent: *AppAgent, cancelled: bool) !void {
             const text = try question_ui.composeQuestionResolutions(
                 app.alloc,
-                &app.question_prompt,
+                &agent.question_prompt,
                 cancelled,
                 app.shell.layout.cols,
             );
@@ -138,39 +154,40 @@ pub fn QuestionRuntime(comptime App: type) type {
 
         pub fn routeQuestionEscapeAction(
             app: *App,
+            agent: *AppAgent,
             action: input_action.Action,
             question_action: ?question_prompt.Action,
         ) !void {
             app.input_runtime.vertical_navigation.reset();
             app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
             if (question_action) |typed| {
-                if (try handleQuestionAction(app, typed)) return;
+                if (try handleQuestionAction(app, agent, typed)) return;
             }
-            if (app.question_prompt.isFreeformSelected()) {
+            if (agent.question_prompt.isFreeformSelected()) {
                 switch (action) {
                     .cursor_up => {
                         // At the top of the freeform draft, Up leaves the
                         // slot and resumes option navigation.
-                        if (!moveFreeformCursorVertical(app, .up)) {
-                            app.question_prompt.moveChoice(-1);
+                        if (!moveFreeformCursorVertical(app, agent, .up)) {
+                            agent.question_prompt.moveChoice(-1);
                         }
                         try rerenderQuestionBlock(app);
                         return;
                     },
                     .cursor_down => {
-                        if (!moveFreeformCursorVertical(app, .down)) {
-                            app.question_prompt.moveChoice(1);
+                        if (!moveFreeformCursorVertical(app, agent, .down)) {
+                            agent.question_prompt.moveChoice(1);
                         }
                         try rerenderQuestionBlock(app);
                         return;
                     },
                     .history_up => {
-                        app.question_prompt.moveChoice(-1);
+                        agent.question_prompt.moveChoice(-1);
                         try rerenderQuestionBlock(app);
                         return;
                     },
                     .history_down => {
-                        app.question_prompt.moveChoice(1);
+                        agent.question_prompt.moveChoice(1);
                         try rerenderQuestionBlock(app);
                         return;
                     },
@@ -180,15 +197,15 @@ pub fn QuestionRuntime(comptime App: type) type {
 
             switch (action) {
                 .history_up, .cursor_up => {
-                    app.question_prompt.moveChoice(-1);
+                    agent.question_prompt.moveChoice(-1);
                     try rerenderQuestionBlock(app);
                 },
                 .history_down, .cursor_down => {
-                    app.question_prompt.moveChoice(1);
+                    agent.question_prompt.moveChoice(1);
                     try rerenderQuestionBlock(app);
                 },
                 .cursor_left, .word_left => {
-                    switch (app.question_prompt.retreatToPrevious()) {
+                    switch (agent.question_prompt.retreatToPrevious()) {
                         .redraw => try rerenderQuestionBlock(app),
                         else => {},
                     }
@@ -202,9 +219,10 @@ pub fn QuestionRuntime(comptime App: type) type {
 
         fn moveFreeformCursorVertical(
             app: *App,
+            agent: *AppAgent,
             direction: question_freeform_layout.Direction,
         ) bool {
-            const view = app.question_prompt.freeformCursorView() orelse return false;
+            const view = agent.question_prompt.freeformCursorView() orelse return false;
             const movement = question_freeform_layout.moveCursor(
                 view.buffer,
                 view.cursor,
@@ -215,7 +233,7 @@ pub fn QuestionRuntime(comptime App: type) type {
                 direction,
                 view.preferred_column,
             );
-            app.question_prompt.applyFreeformCursorMove(
+            agent.question_prompt.applyFreeformCursorMove(
                 movement.cursor,
                 movement.preferred_column,
             );

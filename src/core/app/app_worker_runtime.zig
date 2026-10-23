@@ -1,8 +1,11 @@
 const std = @import("std");
 const session_notices = @import("../session/session.zig");
+const agents = @import("../agents/agents.zig");
 const credentials = @import("../auth/credentials.zig");
 const activity_status = @import("../output/activity_status.zig");
+const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const app_agents_runtime = @import("app_agents_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
@@ -134,12 +137,18 @@ test "shutdown settles queued and pacer-owned finishes exactly once" {
     const session_adapter = @import("../session/session_adapter.zig");
     const ShutdownApp = struct {
         alloc: std.mem.Allocator,
-        session: session_runtime.SessionRuntime = .{ .max_history_turns = 8 },
-        session_persistence: app_session_runtime.Persistence = .{},
-        worker: worker_runtime.WorkerRuntime = .{},
         pacer: assistant_pacer.AssistantPacer = .{},
-        total_input_tokens: u64 = 7,
-        total_output_tokens: u64 = 11,
+        main_agent: struct {
+            total_input_tokens: u64 = 7,
+            total_output_tokens: u64 = 11,
+            session: session_runtime.SessionRuntime = .{ .max_history_turns = 8 },
+            session_persistence: app_session_runtime.Persistence = .{},
+            worker: worker_runtime.WorkerRuntime = .{},
+        } = .{},
+
+        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+            return &self.main_agent;
+        }
     };
     const Ownership = struct {
         references: usize = 0,
@@ -168,13 +177,13 @@ test "shutdown settles queued and pacer-owned finishes exactly once" {
         const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
         defer alloc.free(root);
         var app: ShutdownApp = .{ .alloc = alloc };
-        defer app.session.deinit(alloc);
-        defer app.session_persistence.deinit(alloc);
-        defer app.worker.deinit(std.heap.c_allocator);
+        defer app.agent().session.deinit(alloc);
+        defer app.agent().session_persistence.deinit(alloc);
+        defer app.agent().worker.deinit(std.heap.c_allocator);
         defer app.pacer.deinit(alloc);
-        _ = try app.session_persistence.adoptStore(alloc, try session_adapter.Store.open(alloc, root));
+        _ = try app.agent().session_persistence.adoptStore(alloc, try session_adapter.Store.open(alloc, root));
         var model = "test-model".*;
-        app.session_persistence.v2 = try session_adapter.Session.create(alloc, app.session_persistence.v2_store.?, root, .app, .{
+        app.agent().session_persistence.v2 = try session_adapter.Session.create(alloc, app.agent().session_persistence.v2_store.?, root, .app, .{
             .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
             .language = .literal("en"),
             .permission_state = .{},
@@ -196,33 +205,33 @@ test "shutdown settles queued and pacer-owned finishes exactly once" {
             try app.pacer.enqueue(alloc, "unrendered tail");
             try std.testing.expect(try app.pacer.deferFinish(alloc, finished));
         } else {
-            try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = finished });
+            try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = finished });
         }
         // A later queued finish must follow the pacer-owned turn. Neither a
         // begin nor a presentation event may invoke UI or admit another prompt.
-        try app.worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = .{ .text = @constCast("later prompt") } });
-        try app.worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{ .text = @constCast("do not render") } });
-        try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .assistant = .{
+        try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = .{ .text = @constCast("later prompt") } });
+        try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{ .text = @constCast("do not render") } });
+        try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .assistant = .{
             .user = .{ .text = @constCast("later prompt") },
             .assistant = @constCast("later answer"),
         } } } });
-        app.worker.requestShutdown();
-        app_session_runtime.Runtime(ShutdownApp).recordShutdownFailure(&app, error.PreviousSessionSaveFailed);
-        try std.testing.expectEqual(@as(usize, 0), app.session.historyLen());
+        app.agent().worker.requestShutdown();
+        app_session_runtime.Runtime(ShutdownApp).recordShutdownFailure((&app).agent(), error.PreviousSessionSaveFailed);
+        try std.testing.expectEqual(@as(usize, 0), app.agent().session.historyLen());
 
-        try Runtime(ShutdownApp).settleFinishedPromptsForShutdown(&app);
-        try Runtime(ShutdownApp).settleFinishedPromptsForShutdown(&app);
-        try std.testing.expectEqual(@as(usize, 2), app.session.historyLen());
+        try Runtime(ShutdownApp).settleFinishedPromptsForShutdown(&app, (&app).agent());
+        try Runtime(ShutdownApp).settleFinishedPromptsForShutdown(&app, (&app).agent());
+        try std.testing.expectEqual(@as(usize, 2), app.agent().session.historyLen());
         try std.testing.expectEqual(@as(usize, 1), ownership.transfers);
         try std.testing.expectEqual(@as(usize, 0), ownership.references);
-        try std.testing.expectEqual(@as(usize, 0), app.worker.worker_events.items.len);
+        try std.testing.expectEqual(@as(usize, 0), app.agent().worker.worker_events.items.len);
         try std.testing.expect(app.pacer.deferred_turn == null);
         // Close the session before reloading so only what it saved can pass.
-        const id = try alloc.dupe(u8, app.session_persistence.v2.?.id());
+        const id = try alloc.dupe(u8, app.agent().session_persistence.v2.?.id());
         defer alloc.free(id);
-        app.session_persistence.v2.?.close();
-        app.session_persistence.v2 = null;
-        const resumed = try session_adapter.Session.resumeSession(alloc, app.session_persistence.v2_store.?, .{ .id = id }, root, .app);
+        app.agent().session_persistence.v2.?.close();
+        app.agent().session_persistence.v2 = null;
+        const resumed = try session_adapter.Session.resumeSession(alloc, app.agent().session_persistence.v2_store.?, .{ .id = id }, root, .app);
         defer resumed.close();
         var loaded = try resumed.restore(alloc);
         defer loaded.deinit(alloc);
@@ -325,6 +334,7 @@ fn batchSegmentIsInterrupted(events: []const WorkerEvent, cancelled_turn_id: ?u6
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
         fn cancelledToolStartAdmission(
             presenter: activity_runtime.LifecyclePresenter,
             id: types.ToolLifecycleId,
@@ -396,47 +406,47 @@ pub fn Runtime(comptime App: type) type {
 
         /// After the worker joins, persist finished turns without presenting output
         /// or admitting work. The pacer owns the finish preceding queued events.
-        pub fn settleFinishedPromptsForShutdown(app: *App) !void {
-            try settleDeferredFinish(app);
+        pub fn settleFinishedPromptsForShutdown(app: *App, agent: *AppAgent) !void {
+            try settleDeferredFinish(app, agent);
 
             var batch = DetachedWorkerEventBatch.init(
                 std.heap.c_allocator,
-                app.worker.takeEvents(),
+                agent.worker.takeEvents(),
             );
             defer batch.deinit();
             while (batch.claim()) |event| {
                 defer worker_runtime.freeWorkerEvent(batch.alloc, event);
                 switch (event) {
-                    .finish_prompt => |finished| try persistFinishedPrompt(app, finished),
+                    .finish_prompt => |finished| try persistFinishedPrompt(app, agent, finished),
                     else => debug_trace.logf("worker", "shutdown worker event dropped kind={s}", .{@tagName(event)}),
                 }
             }
         }
 
-        fn persistFinishedPrompt(app: *App, finished: types.FinishedPrompt) !void {
-            const appended = if (comptime @hasField(App, "session"))
-                app_session_runtime.Runtime(App).appendFinishedPrompt(app, finished)
+        fn persistFinishedPrompt(app: *App, agent: *AppAgent, finished: types.FinishedPrompt) !void {
+            const appended = if (comptime agents.hasAgentField(App, "session"))
+                app_session_runtime.Runtime(App).appendFinishedPrompt(app, agent, finished)
             else
                 app.appendFinishedPrompt(finished);
             appended catch |err| {
-                app_session_runtime.Runtime(App).recordShutdownFailure(app, err);
+                app_session_runtime.Runtime(App).recordShutdownFailure(agent, err);
                 return err;
             };
         }
 
-        fn settleDeferredFinish(app: *App) !void {
+        fn settleDeferredFinish(app: *App, agent: *AppAgent) !void {
             if (comptime !@hasField(@TypeOf(app.pacer), "deferred_turn")) return;
             if (app.pacer.deferred_turn) |finished| {
                 app.pacer.deferred_turn = null;
                 app.pacer.deferred_started_ns = null;
                 defer types.freeFinishedPrompt(app.alloc, finished);
-                try persistFinishedPrompt(app, finished);
+                try persistFinishedPrompt(app, agent, finished);
             }
         }
 
-        fn preserveFinishedAfterDrainFailure(app: *App, batch: *DetachedWorkerEventBatch, may_persist: bool) void {
+        fn preserveFinishedAfterDrainFailure(app: *App, agent: *AppAgent, batch: *DetachedWorkerEventBatch, may_persist: bool) void {
             var can_persist = may_persist;
-            if (can_persist) settleDeferredFinish(app) catch {
+            if (can_persist) settleDeferredFinish(app, agent) catch {
                 can_persist = false;
             };
             while (batch.claim()) |event| {
@@ -444,7 +454,7 @@ pub fn Runtime(comptime App: type) type {
                 switch (event) {
                     .finish_prompt => |finished| {
                         if (can_persist) {
-                            persistFinishedPrompt(app, finished) catch {
+                            persistFinishedPrompt(app, agent, finished) catch {
                                 can_persist = false;
                             };
                         } else {
@@ -456,9 +466,9 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        pub fn authorizeInteractiveAdmission(app: *App) !bool {
-            if (comptime @hasDecl(@TypeOf(app.worker), "interactiveAdmissionSnapshot")) {
-                switch (app.worker.interactiveAdmissionSnapshot()) {
+        pub fn authorizeInteractiveAdmission(app: *App, agent: *AppAgent) !bool {
+            if (comptime @hasDecl(@TypeOf(agent.worker), "interactiveAdmissionSnapshot")) {
+                switch (agent.worker.interactiveAdmissionSnapshot()) {
                     .open => return true,
                     .stopped => return false,
                     .finalization_failed => {
@@ -472,42 +482,43 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        pub fn syncQueuedPromptModel(app: *App, model: []const u8) !void {
-            try app.worker.syncQueuedPromptModel(std.heap.c_allocator, model);
+        pub fn syncQueuedPromptModel(agent: *AppAgent, model: []const u8) !void {
+            try agent.worker.syncQueuedPromptModel(std.heap.c_allocator, model);
         }
 
-        pub fn syncQueuedPromptPermissionSnapshot(app: *App, snapshot: worker_runtime.PermissionSnapshot) void {
-            app.worker.syncQueuedPromptPermissionSnapshot(snapshot);
+        pub fn syncQueuedPromptPermissionSnapshot(agent: *AppAgent, snapshot: worker_runtime.PermissionSnapshot) void {
+            agent.worker.syncQueuedPromptPermissionSnapshot(snapshot);
         }
 
         pub fn syncQueuedPromptPermissionState(
             app: *App,
+            agent: *AppAgent,
             snapshot: worker_runtime.PermissionSnapshot,
         ) !void {
-            try app.worker.syncQueuedPromptPermissionState(
+            try agent.worker.syncQueuedPromptPermissionState(
                 std.heap.c_allocator,
-                app.permission_engine.grants.items,
+                app_permission_runtime.Runtime(App).grantsOf(app, agent),
                 snapshot,
             );
         }
 
-        pub fn propagateHistoryTurn(app: *App, turn: types.HistoryTurn, max_history_turns: usize) !void {
+        pub fn propagateHistoryTurn(app: *App, agent: *AppAgent, turn: types.HistoryTurn, max_history_turns: usize) !void {
             if (comptime @hasDecl(App, "propagateHistoryTurn")) {
                 try app.propagateHistoryTurn(turn);
                 return;
             }
-            try app.worker.propagateHistoryTurn(std.heap.c_allocator, turn, max_history_turns);
+            try agent.worker.propagateHistoryTurn(std.heap.c_allocator, turn, max_history_turns);
         }
 
         pub fn commitContextCompaction(
-            app: *App,
+            agent: *AppAgent,
             summary: types.CompactedSummaryHistoryTurn,
             active_prefix: ?types.AssistantHistoryTurn,
             retained_from: ?types.ContextHistoryCut,
             max_history_turns: usize,
         ) !void {
-            if (comptime @hasDecl(@TypeOf(app.worker), "commitContextCompaction")) {
-                try app.worker.commitContextCompaction(
+            if (comptime @hasDecl(@TypeOf(agent.worker), "commitContextCompaction")) {
+                try agent.worker.commitContextCompaction(
                     std.heap.c_allocator,
                     summary,
                     active_prefix,
@@ -519,37 +530,37 @@ pub fn Runtime(comptime App: type) type {
             return error.ContextCompactionPersistenceUnavailable;
         }
 
-        pub fn propagateGrant(app: *App, tool_name: []const u8, target_path: []const u8) !void {
+        pub fn propagateGrant(app: *App, agent: *AppAgent, tool_name: []const u8, target_path: []const u8) !void {
             if (comptime @hasDecl(App, "propagateGrant")) {
                 try app.propagateGrant(tool_name, target_path);
                 return;
             }
-            try app.worker.propagateGrant(std.heap.c_allocator, tool_name, target_path);
+            try agent.worker.propagateGrant(std.heap.c_allocator, tool_name, target_path);
         }
 
-        pub fn pushEvent(app: *App, event: WorkerEvent) !void {
+        pub fn pushEvent(app: *App, agent: *AppAgent, event: WorkerEvent) !void {
             if (comptime @hasDecl(App, "pushWorkerEvent")) {
                 const owned = try worker_runtime.dupeWorkerEvent(std.heap.c_allocator, event);
                 errdefer worker_runtime.freeWorkerEvent(std.heap.c_allocator, owned);
                 try app.pushWorkerEvent(owned);
                 return;
             }
-            try app.worker.pushEvent(std.heap.c_allocator, event);
+            try agent.worker.pushEvent(std.heap.c_allocator, event);
         }
 
-        pub fn pushOwnedEvent(app: *App, event: WorkerEvent) !void {
+        pub fn pushOwnedEvent(app: *App, agent: *AppAgent, event: WorkerEvent) !void {
             if (comptime @hasDecl(App, "pushWorkerEvent")) {
                 try app.pushWorkerEvent(event);
                 return;
             }
-            try app.worker.pushOwnedEvent(std.heap.c_allocator, event);
+            try agent.worker.pushOwnedEvent(std.heap.c_allocator, event);
         }
 
-        pub fn pushText(app: *App, text: []const u8) !void {
+        pub fn pushText(app: *App, agent: *AppAgent, text: []const u8) !void {
             if (comptime @hasDecl(App, "pushText")) {
-                try app.pushText(text);
+                try app.pushText(agent, text);
             } else {
-                try pushEvent(app, .{ .assistant_presentation = .{
+                try pushEvent(app, agent, .{ .assistant_presentation = .{
                     .text = @constCast(text),
                 } });
             }
@@ -562,20 +573,21 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
-        pub fn pushTable(app: *App, table: assistant_presentation.TablePayload) !void {
-            try pushEvent(app, .{ .assistant_presentation = .{ .table = table } });
+        pub fn pushTable(app: *App, agent: *AppAgent, table: assistant_presentation.TablePayload) !void {
+            try pushEvent(app, agent, .{ .assistant_presentation = .{ .table = table } });
         }
 
-        pub fn pushCodeBlock(app: *App, block: assistant_presentation.CodeBlockPayload) !void {
-            try pushEvent(app, .{ .assistant_presentation = .{ .code_block = block } });
+        pub fn pushCodeBlock(app: *App, agent: *AppAgent, block: assistant_presentation.CodeBlockPayload) !void {
+            try pushEvent(app, agent, .{ .assistant_presentation = .{ .code_block = block } });
         }
 
-        pub fn pushThematicRule(app: *App) !void {
-            try pushEvent(app, .{ .assistant_presentation = .thematic_rule });
+        pub fn pushThematicRule(app: *App, agent: *AppAgent) !void {
+            try pushEvent(app, agent, .{ .assistant_presentation = .thematic_rule });
         }
 
         pub fn pushCommandOutput(
             app: *App,
+            agent: *AppAgent,
             lifecycle_id: ?types.ToolLifecycleId,
             stream: command_output_content.Stream,
             chunk: []const u8,
@@ -586,29 +598,30 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             if (comptime @hasDecl(App, "pushCommandOutput")) {
-                try app.pushCommandOutput(stream, chunk);
+                try app.pushCommandOutput(stream, stream.agent(), chunk);
                 return;
             }
-            try pushEvent(app, .{ .command_output = .{
+            try pushEvent(app, agent, .{ .command_output = .{
                 .lifecycle_id = lifecycle_id,
                 .stream = stream,
                 .text = @constCast(chunk),
             } });
         }
 
-        pub fn pushCommandOutputComplete(app: *App, lifecycle_id: ?types.ToolLifecycleId) !void {
-            try pushEvent(app, .{ .command_output_complete = lifecycle_id });
+        pub fn pushCommandOutputComplete(app: *App, agent: *AppAgent, lifecycle_id: ?types.ToolLifecycleId) !void {
+            try pushEvent(app, agent, .{ .command_output_complete = lifecycle_id });
         }
 
         pub fn pushToolLifecycle(
             app: *App,
+            agent: *AppAgent,
             event: types.ToolLifecycleEvent,
         ) !void {
-            try pushEvent(app, .{ .tool_lifecycle = event });
+            try pushEvent(app, agent, .{ .tool_lifecycle = event });
         }
 
-        pub fn pushWebSearchProgress(app: *App, call_id: []const u8, progress: types.WebSearchProgress) !void {
-            const turn_id = app.worker.activeTurnId();
+        pub fn pushWebSearchProgress(app: *App, agent: *AppAgent, call_id: []const u8, progress: types.WebSearchProgress) !void {
+            const turn_id = agent.worker.activeTurnId();
             if (turn_id == 0 or call_id.len == 0) {
                 debug_trace.logf(
                     "ui_activity",
@@ -619,14 +632,14 @@ pub fn Runtime(comptime App: type) type {
             }
             const label = try formatWebSearchProgress(std.heap.c_allocator, progress);
             defer std.heap.c_allocator.free(label);
-            try pushToolLifecycle(app, .{ .progress = .{
+            try pushToolLifecycle(app, agent, .{ .progress = .{
                 .id = .{ .turn_id = turn_id, .call_id = call_id },
                 .text = label,
             } });
         }
 
-        pub fn pushWebFetchProgress(app: *App, call_id: []const u8, progress: types.WebFetchProgress) !void {
-            const turn_id = app.worker.activeTurnId();
+        pub fn pushWebFetchProgress(app: *App, agent: *AppAgent, call_id: []const u8, progress: types.WebFetchProgress) !void {
+            const turn_id = agent.worker.activeTurnId();
             if (turn_id == 0 or call_id.len == 0) {
                 debug_trace.logf(
                     "ui_activity",
@@ -637,55 +650,61 @@ pub fn Runtime(comptime App: type) type {
             }
             const label = try formatWebFetchProgress(std.heap.c_allocator, progress);
             defer std.heap.c_allocator.free(label);
-            try pushToolLifecycle(app, .{ .progress = .{
+            try pushToolLifecycle(app, agent, .{ .progress = .{
                 .id = .{ .turn_id = turn_id, .call_id = call_id },
                 .text = label,
             } });
         }
 
-        pub fn pushSemanticNotice(app: *App, notice: types.SemanticNotice) !void {
-            try pushEvent(app, .{ .semantic_notice = notice });
+        pub fn pushSemanticNotice(app: *App, agent: *AppAgent, notice: types.SemanticNotice) !void {
+            try pushEvent(app, agent, .{ .semantic_notice = notice });
         }
 
-        pub fn pushDiffBlock(app: *App, payload: diff_mod.DiffEntryPayload) !void {
-            try pushOwnedEvent(app, .{ .diff_block = payload });
+        pub fn pushDiffBlock(app: *App, agent: *AppAgent, payload: diff_mod.DiffEntryPayload) !void {
+            try pushOwnedEvent(app, agent, .{ .diff_block = payload });
         }
 
         pub fn syncState(
             app: *App,
+            agent: *AppAgent,
             presenter: activity_runtime.LifecyclePresenter,
         ) void {
-            const snapshot = app.worker.snapshotState(app.alloc) catch return;
+            const snapshot = agent.worker.snapshotState(app.alloc) catch return;
             defer snapshot.deinit(app.alloc);
 
-            const was_approval_active = app.approval_prompt.isActive();
-            const worker_pending_request = if (snapshot.pending_permission_request) |*request|
+            const was_approval_active = agent.approval_prompt.isActive();
+            // Every agent's approval comes from its own worker, a subagent's
+            // as main's (D34). A subagent's is labeled with its name, on its
+            // own screen and when main's screen shows it.
+            const in_child = isSubagent(app, agent);
+            var pending_request: ?permission_request.PermissionRequest = if (snapshot.pending_permission_request) |*request|
                 request.view()
             else
                 null;
-            var owned_child_pending = if (worker_pending_request == null)
-                if (app_session_runtime.Runtime(App).subagentHost(app)) |host|
-                    host.pendingApprovalRequest(app.alloc) catch null
-                else
-                    null
-            else
-                null;
-            defer if (owned_child_pending) |*pending| pending.deinit(app.alloc);
-            const child_pending_request: ?permission_request.PermissionRequest =
-                if (owned_child_pending) |*pending| pending.request.view() else null;
-            const pending_request = worker_pending_request orelse child_pending_request;
-            const management_active = if (comptime @hasField(
-                @TypeOf(app.approval_prompt),
-                "rule_management",
-            ))
-                app.approval_prompt.rule_management != null
+            if (comptime @hasDecl(App, "subagentDisplayName")) {
+                if (in_child) if (pending_request) |*view| {
+                    view.origin = .{ .subagent = app.subagentDisplayName(subagentIdOf(app, agent).?) };
+                };
+            }
+            // An approval lent between main and a subagent stays as it is
+            // until main gets its own or the subagent stops waiting on it.
+            const keep_lent = if (comptime @hasDecl(App, "keepLentApproval"))
+                app.keepLentApproval(agent, pending_request)
             else
                 false;
-            const approval_changed = if (management_active and pending_request == null)
+            const management_active = if (comptime @hasField(
+                @TypeOf(agent.approval_prompt),
+                "rule_management",
+            ))
+                agent.approval_prompt.rule_management != null
+            else
+                false;
+            const approval_changed = if (keep_lent or (management_active and pending_request == null))
                 false
             else
-                app.approval_prompt.syncRequest(app.alloc, pending_request) catch false;
-            const review_changed = if (comptime @hasDecl(@TypeOf(app.approval_prompt), "syncReview")) blk: {
+                agent.approval_prompt.syncRequest(app.alloc, pending_request) catch false;
+            const review_changed = if (comptime @hasDecl(@TypeOf(agent.approval_prompt), "syncReview")) blk: {
+                if (keep_lent) break :blk false;
                 const review = if (comptime @hasField(@TypeOf(snapshot), "pending_permission_review"))
                     if (snapshot.pending_permission_review) |pending|
                         if (pending_request) |request|
@@ -696,41 +715,52 @@ pub fn Runtime(comptime App: type) type {
                         null
                 else
                     null;
-                break :blk app.approval_prompt.syncReview(review);
+                break :blk agent.approval_prompt.syncReview(review);
             } else false;
+            if (approval_changed and in_child and agent.approval_prompt.isActive()) {
+                debug_trace.eventf("procesor", "approval_requested", .{}, "agent={s}", .{subagentIdOf(app, agent).?});
+            }
+            // The approval screen shows the agent on screen, so a hidden
+            // agent's change leaves it be.
             if (comptime @hasField(App, "approval_screen")) {
                 const file_review_changed = review_changed and
                     (pending_request == null or pending_request.?.file != null);
-                if (approval_changed or file_review_changed) {
+                if ((approval_changed or file_review_changed) and !offScreen(app, agent)) {
                     app.approval_screen.clear();
                 }
             }
             if (approval_changed or review_changed) {
                 app.shell.render_requests.request(.modal);
             }
-            if (!was_approval_active and app.approval_prompt.isActive()) {
+            if (!was_approval_active and agent.approval_prompt.isActive()) {
                 if (comptime @hasDecl(App, "dispatchAttentionRequired")) {
                     app.dispatchAttentionRequired(snapshot.active_turn_id, .permission);
                 }
             }
 
-            if (app.question_prompt.isActive()) {
-                if (app.worker.snapshotPendingQuestionBatch(app.alloc) catch return) |question_snapshot| {
+            // A subagent's question lent to main's prompt is its worker's, not
+            // main's; the agents runtime ends it when that worker stops asking.
+            const lent_question = if (comptime @hasDecl(App, "questionLentToMain"))
+                app.questionLentToMain() and !isSubagent(app, agent)
+            else
+                false;
+            if (agent.question_prompt.isActive() and !lent_question) {
+                if (agent.worker.snapshotPendingQuestionBatch(app.alloc) catch return) |question_snapshot| {
                     question_snapshot.deinit(app.alloc);
                 } else {
-                    app.question_prompt.discard(app.alloc, "worker_cleared");
+                    agent.question_prompt.discard(app.alloc, "worker_cleared");
                     app.shell.render_requests.request(.modal);
                 }
             }
 
-            const modal_active = app.approval_prompt.isActive() or app.question_prompt.isActive();
+            const modal_active = agent.approval_prompt.isActive() or agent.question_prompt.isActive();
             const worker_events_pending = if (comptime @hasField(@TypeOf(snapshot), "pending_event_count"))
                 snapshot.pending_event_count > 0
             else
                 false;
             const cancellation_stops_turn = snapshot.cancel_requested and
                 !snapshot.cancel_continues_turn;
-            const visible_worker_active = app.stream.active and
+            const visible_worker_active = agent.stream.active and
                 !cancellation_stops_turn and
                 (snapshot.processing or
                     worker_events_pending or
@@ -740,41 +770,62 @@ pub fn Runtime(comptime App: type) type {
             if (!modal_active and
                 !visible_worker_active and
                 !awaiting_tool_terminal and
-                app.stream.active)
+                agent.stream.active)
             {
                 // The worker can become idle before its final UI events reach
                 // this thread. Keep any open command block until the queued
                 // turn boundary finalizes it instead of discarding output.
-                app.stream = .{};
+                agent.stream = .{};
                 app.shell.render_requests.request(.footer);
-            } else if (modal_active and !app.stream.active) {
-                app.stream.active = true;
-                app.stream.turn_started_ms = io_mod.milliTimestamp();
+            } else if (modal_active and !agent.stream.active) {
+                agent.stream.active = true;
+                agent.stream.turn_started_ms = io_mod.milliTimestamp();
                 app.shell.render_requests.request(.footer);
             }
             // Waiting on an approval or question is not thinking: freeze the
             // elapsed clock for the duration of the wait.
-            activity_status.syncWaitingClock(&app.stream, modal_active, io_mod.milliTimestamp());
+            activity_status.syncWaitingClock(&agent.stream, modal_active, io_mod.milliTimestamp());
 
             if (comptime @hasField(App, "program_status")) {
-                reportProgramStatus(app, !cancellation_stops_turn and
-                    (app.stream.active or snapshot.processing or snapshot.queued_count > 0));
+                reportProgramStatus(app, agent, !cancellation_stops_turn and
+                    (agent.stream.active or snapshot.processing or snapshot.queued_count > 0));
             }
+        }
+
+        /// The session id of subagent `agent`, or null for main.
+        fn subagentIdOf(app: *App, agent: *AppAgent) ?[]const u8 {
+            if (comptime !@hasDecl(App, "subagentIdOf")) return null;
+            return app.subagentIdOf(agent);
+        }
+
+        /// True when `agent` is a subagent's, on screen or not.
+        fn isSubagent(_: *const App, agent: *const AppAgent) bool {
+            if (comptime !@hasField(App, "screen_owner")) return false;
+            return agent.role == .subagent;
+        }
+
+        /// True when `agent` is not the one on screen. What fx shows app-wide,
+        /// such as the terminal's program status, follows the agent on screen.
+        fn offScreen(app: *const App, agent: *const AppAgent) bool {
+            if (comptime !@hasField(App, "agent_on_screen")) return false;
+            const on_screen: *const agents.Agent = if (app.agent_on_screen) |child| &child.agent else &app.main_agent;
+            return agent != on_screen;
         }
 
         /// Tells the terminal what the user would see: a decision prompt,
         /// running work, or the result of the last turn.
-        fn reportProgramStatus(app: *App, busy: bool) void {
-            if (comptime @hasDecl(@TypeOf(app.worker), "compactionActivitySnapshot")) {
-                app.program_status.noteCompaction(app.worker.compactionActivitySnapshot());
+        fn reportProgramStatus(app: *App, agent: *AppAgent, busy: bool) void {
+            if (offScreen(app, agent)) return;
+            if (comptime @hasDecl(@TypeOf(agent.worker), "compactionActivitySnapshot")) {
+                app.program_status.noteCompaction(agent.worker.compactionActivitySnapshot());
             }
-            const activity: program_status.Activity = if (app.approval_prompt.isActive())
+            const activity: program_status.Activity = if (agent.approval_prompt.isActive())
                 .{ .blocked = .{
                     .kind = .permission,
-                    .message = if (app.approval_prompt.request) |*request| request.view().label else "",
+                    .message = if (agent.approval_prompt.request) |*request| request.view().label else "",
                 } }
-            else if (app.question_prompt.isActive())
-                .{ .blocked = .{ .kind = .question, .message = activeQuestionText(app) } }
+            else if (agent.question_prompt.isActive())
+                .{ .blocked = .{ .kind = .question, .message = activeQuestionText(app, agent) } }
             else if (busy)
                 .working
             else
@@ -787,13 +838,14 @@ pub fn Runtime(comptime App: type) type {
             app.writeProgramStatus(report);
         }
 
-        fn activeQuestionText(app: *const App) []const u8 {
-            const projection = app.question_prompt.projection() orelse return "";
+        fn activeQuestionText(_: *const App, agent: *const AppAgent) []const u8 {
+            const projection = agent.question_prompt.projection() orelse return "";
             const entry = projection.current_entry orelse return "";
             return entry.question;
         }
 
-        fn noteTurnStarted(app: *App) void {
+        fn noteTurnStarted(app: *App, agent: *AppAgent) void {
+            if (offScreen(app, agent)) return;
             if (comptime @hasField(App, "program_status")) app.program_status.noteTurnStarted();
         }
 
@@ -805,15 +857,17 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn tick(
             app: *App,
+            agent: *AppAgent,
             event_handlers: WorkerEventHandlers,
         ) !void {
-            if (!try authorizeInteractiveAdmission(app)) return;
-            try drainEvents(app, event_handlers);
-            syncState(app, event_handlers.tool_lifecycle);
+            if (!try authorizeInteractiveAdmission(app, agent)) return;
+            try drainEvents(app, agent, event_handlers);
+            syncState(app, agent, event_handlers.tool_lifecycle);
 
             const now_ms = io_mod.milliTimestamp();
             _ = advanceVisibleAnimation(
                 app,
+                agent,
                 event_handlers.tool_lifecycle,
                 now_ms,
             );
@@ -821,29 +875,30 @@ pub fn Runtime(comptime App: type) type {
 
         fn advanceVisibleAnimation(
             app: *App,
+            agent: *AppAgent,
             presenter: activity_runtime.LifecyclePresenter,
             now_ms: i64,
         ) bool {
-            const compaction: @import("../output/compaction_activity.zig").Snapshot = if (comptime @hasDecl(@TypeOf(app.worker), "compactionActivitySnapshot")) app.worker.compactionActivitySnapshot() else .{};
+            const compaction: @import("../output/compaction_activity.zig").Snapshot = if (comptime @hasDecl(@TypeOf(agent.worker), "compactionActivitySnapshot")) agent.worker.compactionActivitySnapshot() else .{};
             app.shell.render_requests.observeCompactionRevision(compaction.revision);
-            if (comptime @hasDecl(@TypeOf(app.worker), "expireCompactionActivity")) {
+            if (comptime @hasDecl(@TypeOf(agent.worker), "expireCompactionActivity")) {
                 if (compaction.operation) |op| {
-                    if (app.worker.expireCompactionActivity(op.id, compaction.revision, now_ms)) app.shell.render_requests.request(.footer);
+                    if (agent.worker.expireCompactionActivity(op.id, compaction.revision, now_ms)) app.shell.render_requests.request(.footer);
                 }
             }
             const compaction_active = if (compaction.operation) |op| op.active() and op.visible(now_ms) else false;
-            if (!compaction_active and !app.stream.active and !app.pacer.hasCompletedAssistantPresentationTail()) {
+            if (!compaction_active and !agent.stream.active and !app.pacer.hasCompletedAssistantPresentationTail()) {
                 return false;
             }
-            if (app.approval_prompt.isActive() or
-                app.question_prompt.isActive() or
+            if (agent.approval_prompt.isActive() or
+                agent.question_prompt.isActive() or
                 !app.shell.shimmer_active)
             {
                 return false;
             }
 
             var label_buf: [256]u8 = undefined;
-            _ = activityShimmerLabel(app, presenter, compaction, now_ms, &label_buf) orelse return false;
+            _ = activityShimmerLabel(app, agent, presenter, compaction, now_ms, &label_buf) orelse return false;
             const previous_deadline = app.shell.render_requests.animation_next_deadline_ms;
             if (!app.shell.render_requests.requestAnimationDue(now_ms)) return false;
             debug_trace.logf(
@@ -856,6 +911,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn activityShimmerLabel(
             app: *App,
+            agent: *AppAgent,
             presenter: activity_runtime.LifecyclePresenter,
             compaction: @import("../output/compaction_activity.zig").Snapshot,
             now_ms: i64,
@@ -865,28 +921,40 @@ pub fn Runtime(comptime App: type) type {
                 .turn_thinking => |thinking| if (thinking.tone != .thinking) return null,
                 .none, .tool_slot => {},
             }
-            switch (activity_status.compactionProjection(buf, compaction, app.stream, now_ms)) {
+            switch (activity_status.compactionProjection(buf, compaction, agent.stream, now_ms)) {
                 .turn_thinking => |thinking| return if (thinking.tone == .thinking) thinking.label else null,
                 .none, .tool_slot => {},
             }
             // Existence guard only: pass no clock so the label skips the counter.
-            if (!app.stream.active and app.pacer.hasCompletedAssistantPresentationTail()) {
+            if (!agent.stream.active and app.pacer.hasCompletedAssistantPresentationTail()) {
                 return activity_status.buildTurnLabel(buf, .{ .active = true }, 0);
             }
-            if (activity_status.buildTurnLabel(buf, app.stream, 0)) |label| return label;
-            if (app.stream.last_activity_kind == .ask) return ui_render.ask_activity_label;
+            if (activity_status.buildTurnLabel(buf, agent.stream, 0)) |label| return label;
+            if (agent.stream.last_activity_kind == .ask) return ui_render.ask_activity_label;
             switch (presenter.snapshot().activity) {
                 .tool_slot => |slot| return slot.fallback_label,
                 .none, .turn_thinking => {},
             }
-            return activity_status.buildProgressLabel(buf, app.stream);
+            return activity_status.buildProgressLabel(buf, agent.stream);
         }
 
-        fn drainEvents(app: *App, handlers: WorkerEventHandlers) !void {
-            errdefer if (comptime @hasDecl(@TypeOf(app.worker), "failPendingHistoryPublication")) {
-                app.worker.failPendingHistoryPublication(error.HistoryPublicationDeliveryFailed);
+        /// Logs a `procesor` trace line for one of main's events. Only a worker
+        /// the app named logs anything.
+        fn traceMainEvent(app: *App, comptime line: []const u8, event: WorkerEvent, reason: ?[]const u8) void {
+            if (comptime !@hasField(@TypeOf(agents.screenAgentOf(app).worker), "trace_agent")) return;
+            const agent = agents.screenAgentOf(app).worker.trace_agent orelse return;
+            if (reason) |why| {
+                debug_trace.eventf("procesor", line, .{}, "agent={s} kind={s} reason={s}", .{ agent, worker_runtime.traceKind(event), why });
+            } else {
+                debug_trace.eventf("procesor", line, .{}, "agent={s} kind={s}", .{ agent, worker_runtime.traceKind(event) });
+            }
+        }
+
+        fn drainEvents(app: *App, agent: *AppAgent, handlers: WorkerEventHandlers) !void {
+            errdefer if (comptime @hasDecl(@TypeOf(agent.worker), "failPendingHistoryPublication")) {
+                agent.worker.failPendingHistoryPublication(error.HistoryPublicationDeliveryFailed);
             };
-            const taken = app.worker.takeEventBatch();
+            const taken = agent.worker.takeEventBatch();
             var batch = DetachedWorkerEventBatch.init(
                 std.heap.c_allocator,
                 taken.events,
@@ -907,7 +975,7 @@ pub fn Runtime(comptime App: type) type {
             defer batch.deinit();
 
             var can_persist_finished = true;
-            errdefer preserveFinishedAfterDrainFailure(app, &batch, can_persist_finished);
+            errdefer preserveFinishedAfterDrainFailure(app, agent, &batch, can_persist_finished);
 
             var interrupted_segment = batchSegmentIsInterrupted(batch.events.items, taken.cancelled_turn_id);
             var first_event = true;
@@ -937,11 +1005,12 @@ pub fn Runtime(comptime App: type) type {
                                 "cancelled worker event dropped kind={s}",
                                 .{@tagName(event)},
                             );
+                            traceMainEvent(app, "agent_event_dropped", event, "cancelled");
                             continue;
                         },
                         .defer_until_closure => {
                             try retainClaimedEventAndSuffix(
-                                app,
+                                agent,
                                 &batch,
                                 "cancelled_tool_closure_pending",
                             );
@@ -954,27 +1023,27 @@ pub fn Runtime(comptime App: type) type {
                 switch (event) {
                     .begin_prompt => |prompt| {
                         if (!try requireAssistantTextDrain(handlers)) {
-                            try retainClaimedEventAndSuffix(app, &batch, "assistant_text_drain_blocked");
+                            try retainClaimedEventAndSuffix(agent, &batch, "assistant_text_drain_blocked");
                             drain_owns_current = false;
                             break :events;
                         }
-                        resetStream(app, true);
-                        noteTurnStarted(app);
-                        app.stream.active = true;
-                        app.stream.turn_started_ms = io_mod.milliTimestamp();
+                        resetStream(app, agent, true);
+                        noteTurnStarted(app, agent);
+                        agent.stream.active = true;
+                        agent.stream.turn_started_ms = io_mod.milliTimestamp();
                         app.shell.render_requests.request(.footer);
                         try handlers.write_user_prompt(handlers.ctx, prompt);
                     },
                     .begin_prompt_with_skill_bindings => |begin| {
                         if (!try requireAssistantTextDrain(handlers)) {
-                            try retainClaimedEventAndSuffix(app, &batch, "assistant_text_drain_blocked");
+                            try retainClaimedEventAndSuffix(agent, &batch, "assistant_text_drain_blocked");
                             drain_owns_current = false;
                             break :events;
                         }
-                        resetStream(app, true);
-                        noteTurnStarted(app);
-                        app.stream.active = true;
-                        app.stream.turn_started_ms = io_mod.milliTimestamp();
+                        resetStream(app, agent, true);
+                        noteTurnStarted(app, agent);
+                        agent.stream.active = true;
+                        agent.stream.turn_started_ms = io_mod.milliTimestamp();
                         app.shell.render_requests.request(.footer);
                         if (handlers.write_user_prompt_with_skill_bindings) |write_bound_prompt| {
                             try write_bound_prompt(handlers.ctx, begin.prompt, begin.skill_bindings, begin.skill_display_spans);
@@ -984,49 +1053,49 @@ pub fn Runtime(comptime App: type) type {
                     },
                     .begin_presented_prompt => |turn_id| {
                         if (!try requireAssistantTextDrain(handlers)) {
-                            try retainClaimedEventAndSuffix(app, &batch, "assistant_text_drain_blocked");
+                            try retainClaimedEventAndSuffix(agent, &batch, "assistant_text_drain_blocked");
                             drain_owns_current = false;
                             break :events;
                         }
-                        resetStream(app, true);
-                        noteTurnStarted(app);
-                        app.stream.active = true;
-                        app.stream.turn_started_ms = io_mod.milliTimestamp();
+                        resetStream(app, agent, true);
+                        noteTurnStarted(app, agent);
+                        agent.stream.active = true;
+                        agent.stream.turn_started_ms = io_mod.milliTimestamp();
                         app.shell.render_requests.request(.footer);
                         if (comptime @hasDecl(App, "acceptPresentedPrompt")) {
-                            try App.acceptPresentedPrompt(app, turn_id);
+                            try App.acceptPresentedPrompt(app, agent, turn_id);
                         } else {
                             return error.PresentedPromptUnsupported;
                         }
                     },
                     .begin_resumed_prompt => {
                         if (!try requireAssistantTextDrain(handlers)) {
-                            try retainClaimedEventAndSuffix(app, &batch, "assistant_text_drain_blocked");
+                            try retainClaimedEventAndSuffix(agent, &batch, "assistant_text_drain_blocked");
                             drain_owns_current = false;
                             break :events;
                         }
-                        resetStream(app, true);
-                        noteTurnStarted(app);
-                        app.stream.active = true;
-                        app.stream.turn_started_ms = io_mod.milliTimestamp();
+                        resetStream(app, agent, true);
+                        noteTurnStarted(app, agent);
+                        agent.stream.active = true;
+                        agent.stream.turn_started_ms = io_mod.milliTimestamp();
                         app.shell.render_requests.request(.footer);
                         try handlers.semantic_notice(handlers.ctx, session_notices.resumed_request_notice);
                     },
                     .append_user_feedback => |text| {
                         if (!try requireAssistantTextDrain(handlers)) {
-                            try retainClaimedEventAndSuffix(app, &batch, "assistant_text_drain_blocked");
+                            try retainClaimedEventAndSuffix(agent, &batch, "assistant_text_drain_blocked");
                             drain_owns_current = false;
                             break :events;
                         }
                         try handlers.write_user_prompt(handlers.ctx, .{ .text = text });
-                        if (app.stream.active and app.stream.phase != .thinking) {
-                            app.stream.phase = .thinking;
+                        if (agent.stream.active and agent.stream.phase != .thinking) {
+                            agent.stream.phase = .thinking;
                             app.shell.render_requests.request(.footer);
                         }
                     },
                     .assistant_presentation => |presentation| {
                         if (presentation.requiresTextDrain() and !try requireAssistantTextDrain(handlers)) {
-                            try retainClaimedEventAndSuffix(app, &batch, "assistant_text_drain_blocked");
+                            try retainClaimedEventAndSuffix(agent, &batch, "assistant_text_drain_blocked");
                             drain_owns_current = false;
                             break :events;
                         }
@@ -1066,6 +1135,7 @@ pub fn Runtime(comptime App: type) type {
                                 }
                             },
                         }
+                        traceMainEvent(app, "agent_event_applied", event, null);
                     },
                     .notification => |notification| {
                         if (comptime @hasDecl(App, "queueNotification")) {
@@ -1074,28 +1144,31 @@ pub fn Runtime(comptime App: type) type {
                     },
                     .question_requested => {
                         if (!try requireAssistantTextDrain(handlers)) {
-                            try retainClaimedEventAndSuffix(app, &batch, "assistant_text_drain_blocked");
+                            try retainClaimedEventAndSuffix(agent, &batch, "assistant_text_drain_blocked");
                             drain_owns_current = false;
                             break :events;
                         }
-                        const pending_question = app.worker.snapshotPendingQuestionBatch(app.alloc) catch |err| {
-                            try retainClaimedEventAndSuffix(app, &batch, "assistant_text_drain_blocked");
+                        const pending_question = agent.worker.snapshotPendingQuestionBatch(app.alloc) catch |err| {
+                            try retainClaimedEventAndSuffix(agent, &batch, "assistant_text_drain_blocked");
                             drain_owns_current = false;
                             return err;
                         };
                         if (pending_question) |question_snapshot| {
                             defer question_snapshot.deinit(app.alloc);
-                            const was_active = app.question_prompt.isActive();
-                            app.question_prompt.syncFrom(app.alloc, question_snapshot.entries) catch |err| {
-                                try retainClaimedEventAndSuffix(app, &batch, "assistant_text_drain_blocked");
+                            if (comptime @hasDecl(App, "returnLentQuestion")) {
+                                if (!isSubagent(app, agent)) app.returnLentQuestion();
+                            }
+                            const was_active = agent.question_prompt.isActive();
+                            agent.question_prompt.syncFrom(app.alloc, question_snapshot.entries) catch |err| {
+                                try retainClaimedEventAndSuffix(agent, &batch, "assistant_text_drain_blocked");
                                 drain_owns_current = false;
                                 return err;
                             };
-                            if (!was_active and app.question_prompt.isActive()) {
+                            if (!was_active and agent.question_prompt.isActive()) {
                                 app.shell.render_requests.request(.modal);
                                 if (comptime @hasDecl(App, "dispatchAttentionRequired")) {
                                     app.dispatchAttentionRequired(
-                                        app.worker.activeTurnId(),
+                                        agent.worker.activeTurnId(),
                                         switch (question_snapshot.source) {
                                             .agent_question, .mcp_elicitation => .question,
                                             .route_recovery => .route_recovery,
@@ -1104,10 +1177,11 @@ pub fn Runtime(comptime App: type) type {
                                 }
                             }
                         }
+                        traceMainEvent(app, "agent_event_applied", event, null);
                     },
                     .open_model_picker => {
                         if (!try requireAssistantTextDrain(handlers)) {
-                            try retainClaimedEventAndSuffix(app, &batch, "assistant_text_drain_blocked");
+                            try retainClaimedEventAndSuffix(agent, &batch, "assistant_text_drain_blocked");
                             drain_owns_current = false;
                             break :events;
                         }
@@ -1116,7 +1190,7 @@ pub fn Runtime(comptime App: type) type {
                     },
                     .semantic_notice => |notice| {
                         if (!try requireAssistantTextDrain(handlers)) {
-                            try retainClaimedEventAndSuffix(app, &batch, "assistant_text_drain_blocked");
+                            try retainClaimedEventAndSuffix(agent, &batch, "assistant_text_drain_blocked");
                             drain_owns_current = false;
                             break :events;
                         }
@@ -1127,7 +1201,7 @@ pub fn Runtime(comptime App: type) type {
                     },
                     .route_recovery_status => |status| {
                         if (!try requireAssistantTextDrain(handlers)) {
-                            try retainClaimedEventAndSuffix(app, &batch, "assistant_text_drain_blocked");
+                            try retainClaimedEventAndSuffix(agent, &batch, "assistant_text_drain_blocked");
                             drain_owns_current = false;
                             break :events;
                         }
@@ -1141,12 +1215,17 @@ pub fn Runtime(comptime App: type) type {
                             app.shell.worker_status_state().set_route_recovery(status);
                         }
                         // A request that starts waiting for a sign-in opens it,
-                        // once; signing in continues the request.
+                        // once; signing in continues the request. Only the
+                        // agent on screen opens it: the sign-in shows on the
+                        // screen and continues the request of the agent there.
                         if (!was_waiting_for_sign_in and app.shell.worker_status_state().waitsForSignIn()) {
-                            if (comptime @hasDecl(App, "beginRecoverySignIn")) try app.beginRecoverySignIn();
+                            if (comptime @hasDecl(App, "beginRecoverySignIn")) {
+                                if (agent == app.screenAgent()) try app.beginRecoverySignIn(agent);
+                            }
                         }
                         app.shell.render_requests.request(.footer);
                         try recordRouteRecoveryNotice(app, status);
+                        if (comptime agents.hasAgentField(App, "child_run")) app_agents_runtime.Runtime(App).noteChildFailure(app, agent, status);
                     },
                     .clear_route_recovery_status => {
                         if (app.shell.worker_status_state().clear_route_recovery()) {
@@ -1158,7 +1237,7 @@ pub fn Runtime(comptime App: type) type {
                     // today. The batch drain frees the payload.
                     .provider_resolved => {},
                     .api_status_text => |text| {
-                        resetStream(app, false);
+                        resetStream(app, agent, false);
                         app.shell.worker_status_state().set_api(text, .danger);
                         app.shell.render_requests.request(.footer);
                     },
@@ -1172,18 +1251,18 @@ pub fn Runtime(comptime App: type) type {
                         try handlers.command_output_complete(handlers.ctx, lifecycle_id);
                     },
                     .turn_token_update => |update| {
-                        applyTurnTokenProgress(app, update);
+                        applyTurnTokenProgress(app, agent, update);
                     },
                     .turn_phase_update => |update| {
-                        applyTurnPhase(app, update);
+                        applyTurnPhase(app, agent, update);
                     },
                     .diff_block => |payload| {
                         drain_owns_current = false;
                         try handlers.diff_block(handlers.ctx, payload);
                     },
                     .context_compaction => |value| {
-                        if (comptime @hasDecl(@TypeOf(app.worker), "resolveContextCompaction")) {
-                            app.worker.resolveContextCompaction(
+                        if (comptime @hasDecl(@TypeOf(agent.worker), "resolveContextCompaction")) {
+                            agent.worker.resolveContextCompaction(
                                 std.heap.c_allocator,
                                 value,
                                 handlers.ctx,
@@ -1197,27 +1276,27 @@ pub fn Runtime(comptime App: type) type {
                         switch (lifecycle) {
                             .provisional, .authoritative_started => {
                                 if (!try requireAssistantTextDrain(handlers)) {
-                                    try retainClaimedEventAndSuffix(app, &batch, "assistant_text_drain_blocked");
+                                    try retainClaimedEventAndSuffix(agent, &batch, "assistant_text_drain_blocked");
                                     drain_owns_current = false;
                                     break :events;
                                 }
                             },
                             .progress, .terminal, .turn_finished => {},
                         }
-                        try applyToolLifecycle(app, handlers.tool_lifecycle, lifecycle);
+                        try applyToolLifecycle(app, agent, handlers.tool_lifecycle, lifecycle);
                     },
                     .finish_prompt => |finished| {
                         var accepted = false;
                         errdefer if (!accepted) {
-                            settleDeferredFinish(app) catch {
+                            settleDeferredFinish(app, agent) catch {
                                 can_persist_finished = false;
                             };
-                            if (can_persist_finished) persistFinishedPrompt(app, finished) catch {
+                            if (can_persist_finished) persistFinishedPrompt(app, agent, finished) catch {
                                 can_persist_finished = false;
                             };
                         };
                         try flushPendingCommandOutputAtTurnBoundary(app, handlers);
-                        resetStream(app, false);
+                        resetStream(app, agent, false);
                         app.shell.render_requests.request(.footer);
                         const delivery = try handlers.append_history_turn(handlers.ctx, finished);
                         accepted = true;
@@ -1234,13 +1313,13 @@ pub fn Runtime(comptime App: type) type {
                     },
                     .error_text => |notice| {
                         if (!try requireAssistantTextDrain(handlers)) {
-                            try retainClaimedEventAndSuffix(app, &batch, "assistant_text_drain_blocked");
+                            try retainClaimedEventAndSuffix(agent, &batch, "assistant_text_drain_blocked");
                             drain_owns_current = false;
                             break :events;
                         }
-                        resetStream(app, false);
+                        resetStream(app, agent, false);
                         if (comptime @hasField(App, "program_status")) {
-                            if (notice.tone == .@"error") app.program_status.noteFailure();
+                            if (notice.tone == .@"error" and !offScreen(app, agent)) app.program_status.noteFailure();
                         }
                         app.shell.render_requests.request(.footer);
                         try handlers.error_text(handlers.ctx, notice);
@@ -1302,12 +1381,12 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn retainClaimedEventAndSuffix(
-            app: *App,
+            agent: *AppAgent,
             batch: *DetachedWorkerEventBatch,
             reason: []const u8,
         ) !void {
             const retained = batch.claimedAndRemaining();
-            try app.worker.prependOwnedEvents(batch.alloc, retained);
+            try agent.worker.prependOwnedEvents(batch.alloc, retained);
             batch.markClaimedAndRemainingTransferred();
             debug_trace.logf(
                 "worker",
@@ -1318,6 +1397,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn applyToolLifecycle(
             app: *App,
+            agent: *AppAgent,
             presenter: activity_runtime.LifecyclePresenter,
             lifecycle: types.ToolLifecycleEvent,
         ) !void {
@@ -1330,17 +1410,21 @@ pub fn Runtime(comptime App: type) type {
                 lifecycle,
             );
             if (comptime @hasField(App, "program_status")) {
-                if (lifecycle == .turn_finished) app.program_status.noteTurnFinished(lifecycle.turn_finished.outcome);
+                if (lifecycle == .turn_finished and !offScreen(app, agent)) app.program_status.noteTurnFinished(lifecycle.turn_finished.outcome);
+            }
+            if (comptime agents.hasAgentField(App, "child_run")) {
+                if (lifecycle == .turn_finished) app_agents_runtime.Runtime(App).noteChildTurnFinished(app, agent, lifecycle.turn_finished.outcome);
             }
             if (transition.applied_activity_kind) |kind| {
-                applyToolActivity(&app.stream, kind);
+                applyToolActivity(&agent.stream, kind);
             }
-            if (comptime @hasField(App, "session_persistence")) {
+            if (comptime agents.hasAgentField(App, "session_persistence")) {
                 switch (lifecycle) {
                     .terminal => {
                         if (transition.terminal_record) |record| {
                             app_session_runtime.Runtime(App).recordToolTerminal(
                                 app,
+                                agent,
                                 lifecycle,
                                 record.captured_command,
                             );
@@ -1351,16 +1435,16 @@ pub fn Runtime(comptime App: type) type {
             }
 
             const focused_activity_kind = transition.snapshot.focused_activity_kind;
-            if (tool_work_active) app.stream.phase = .running;
-            app.stream.last_activity_kind = focused_activity_kind;
+            if (tool_work_active) agent.stream.phase = .running;
+            agent.stream.last_activity_kind = focused_activity_kind;
             if (transition.focus_changed()) {
                 app.shell.render_requests.requestAnimationReset();
             }
             app.shell.render_requests.request(.footer);
         }
 
-        fn resetStream(app: *App, clear_route_recovery: bool) void {
-            app.stream = .{};
+        fn resetStream(app: *App, agent: *AppAgent, clear_route_recovery: bool) void {
+            agent.stream = .{};
             if (clear_route_recovery and app.shell.worker_status_state().clear()) {
                 app.shell.render_requests.request(.footer);
             }
@@ -1383,11 +1467,11 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        fn applyTurnTokenProgress(app: *App, update: types.TurnTokenProgress) void {
-            if (!app.stream.active) return;
+        fn applyTurnTokenProgress(app: *App, agent: *AppAgent, update: types.TurnTokenProgress) void {
+            if (!agent.stream.active) return;
 
-            const changed = !std.meta.eql(app.stream.token_progress, update);
-            app.stream.token_progress = update;
+            const changed = !std.meta.eql(agent.stream.token_progress, update);
+            agent.stream.token_progress = update;
 
             // An armed animation tick already repaints the label within 50ms.
             const animation_armed = app.shell.render_requests.animation_visible and
@@ -1395,13 +1479,13 @@ pub fn Runtime(comptime App: type) type {
             if (changed and !animation_armed) app.shell.render_requests.request(.footer);
         }
 
-        fn applyTurnPhase(app: *App, update: types.TurnPhaseUpdate) void {
-            if (!app.stream.active or update.turn_id != app.worker.activeTurnId()) return;
-            if (update.step_id < app.stream.phase_step_id) return;
+        fn applyTurnPhase(app: *App, agent: *AppAgent, update: types.TurnPhaseUpdate) void {
+            if (!agent.stream.active or update.turn_id != agent.worker.activeTurnId()) return;
+            if (update.step_id < agent.stream.phase_step_id) return;
 
-            const changed = app.stream.phase != update.phase;
-            app.stream.phase = update.phase;
-            app.stream.phase_step_id = update.step_id;
+            const changed = agent.stream.phase != update.phase;
+            agent.stream.phase = update.phase;
+            agent.stream.phase_step_id = update.step_id;
             if (changed) app.shell.render_requests.request(.footer);
         }
     };
@@ -1926,13 +2010,15 @@ const FakeSubagents = struct {
 
 const FakeApp = struct {
     alloc: std.mem.Allocator,
-    session_persistence: app_session_runtime.Persistence = .{},
-    worker: FakeWorker = .{},
-    approval_prompt: FakeApprovalPrompt = .{},
+    main_agent: struct {
+        approval_prompt: FakeApprovalPrompt = .{},
+        question_prompt: FakeQuestionPrompt = .{},
+        session_persistence: app_session_runtime.Persistence = .{},
+        worker: FakeWorker = .{},
+        stream: types.StreamState = .{},
+    } = .{},
     approval_screen: interaction_state.ApprovalScreenState = .{},
-    question_prompt: FakeQuestionPrompt = .{},
     input_runtime: InputRuntime = .{},
-    stream: types.StreamState = .{},
     shell: FakeShell = .{},
     pacer: FakePacer = .{},
     subagents: FakeSubagents = .{},
@@ -1961,9 +2047,9 @@ const FakeApp = struct {
         for (self.persisted_finishes.items) |finished| types.freeFinishedPrompt(self.alloc, finished);
         self.persisted_finishes.deinit(self.alloc);
         self.program_status_reports.deinit(self.alloc);
-        self.session_persistence.deinit(self.alloc);
-        self.worker.deinit();
-        self.approval_prompt.deinit(self.alloc);
+        self.agent().session_persistence.deinit(self.alloc);
+        self.agent().worker.deinit();
+        self.agent().approval_prompt.deinit(self.alloc);
         self.input_runtime.deinit(self.alloc);
         self.shell.deinit(self.alloc);
         self.subagents.deinit(self.alloc);
@@ -2047,6 +2133,10 @@ const FakeApp = struct {
             self.program_status_capture_failed = true;
         };
     }
+
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
+    }
 };
 
 fn expectProgramStatusReports(app: *FakeApp, expected: []const u8) !void {
@@ -2063,12 +2153,12 @@ test "core.app_worker_runtime program status follows decision prompts to the tur
     try tickNoop(&app);
     try expectProgramStatusReports(&app, "\x1b]7501;state=idle:app=fx\x1b\\");
 
-    app.worker.processing = true;
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = .{ .text = @constCast("push it") } });
+    app.agent().worker.processing = true;
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = .{ .text = @constCast("push it") } });
     try tickNoop(&app);
     try expectProgramStatusReports(&app, "\x1b]7501;state=working:app=fx\x1b\\");
 
-    app.worker.pending_permission_request = .{ .label = "shell.run git push" };
+    app.agent().worker.pending_permission_request = .{ .label = "shell.run git push" };
     try tickNoop(&app);
     try tickNoop(&app);
     try expectProgramStatusReports(
@@ -2076,27 +2166,27 @@ test "core.app_worker_runtime program status follows decision prompts to the tur
         "\x1b]7501;state=blocked:kind=permission:app=fx:msg=c2hlbGwucnVuIGdpdCBwdXNo\x1b\\",
     );
 
-    app.worker.pending_permission_request = null;
-    app.worker.pending_question = true;
-    app.question_prompt.question = "Which branch?";
-    try app.worker.pushEvent(std.heap.c_allocator, .question_requested);
+    app.agent().worker.pending_permission_request = null;
+    app.agent().worker.pending_question = true;
+    app.agent().question_prompt.question = "Which branch?";
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .question_requested);
     try tickNoop(&app);
     try expectProgramStatusReports(&app, "\x1b]7501;state=blocked:kind=question:app=fx:msg=V2hpY2ggYnJhbmNoPw==\x1b\\");
 
-    app.worker.pending_question = false;
+    app.agent().worker.pending_question = false;
     try tickNoop(&app);
     try expectProgramStatusReports(&app, "\x1b]7501;state=working:app=fx\x1b\\");
 
     try queueTurnFinished(&app, 1, .completed);
-    app.worker.processing = false;
+    app.agent().worker.processing = false;
     try tickNoop(&app);
     try expectProgramStatusReports(&app, "\x1b]7501;state=done:app=fx\x1b\\");
 
     // Work that starts no turn and reports no result settles as idle instead
     // of reporting the earlier result again.
-    app.worker.processing = true;
+    app.agent().worker.processing = true;
     try tickNoop(&app);
-    app.worker.processing = false;
+    app.agent().worker.processing = false;
     try tickNoop(&app);
     try expectProgramStatusReports(
         &app,
@@ -2104,26 +2194,26 @@ test "core.app_worker_runtime program status follows decision prompts to the tur
     );
 
     // A failed `/compact` reports an error although no turn ran.
-    app.worker.processing = true;
-    const compaction = app.worker.compaction.begin(.manual, null, 0);
+    app.agent().worker.processing = true;
+    const compaction = app.agent().worker.compaction.begin(.manual, null, 0);
     try tickNoop(&app);
-    app.worker.compaction.settle(compaction, @import("../output/compaction_activity.zig").failure(error.ConnectionRefused, .summary, false), 1);
-    app.worker.processing = false;
+    app.agent().worker.compaction.settle(compaction, @import("../output/compaction_activity.zig").failure(error.ConnectionRefused, .summary, false), 1);
+    app.agent().worker.processing = false;
     try tickNoop(&app);
     try expectProgramStatusReports(
         &app,
         "\x1b]7501;state=working:app=fx\x1b\\\x1b]7501;state=error:app=fx\x1b\\",
     );
 
-    app.worker.processing = true;
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = .{ .text = @constCast("again") } });
+    app.agent().worker.processing = true;
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = .{ .text = @constCast("again") } });
     try tickNoop(&app);
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
         .topic = "system",
         .tone = .@"error",
         .body = "request failed: ConnectionRefused",
     } });
-    app.worker.processing = false;
+    app.agent().worker.processing = false;
     try tickNoop(&app);
     try expectProgramStatusReports(
         &app,
@@ -2132,9 +2222,9 @@ test "core.app_worker_runtime program status follows decision prompts to the tur
 
     // An approval prompt that opens outside a turn does not bring the
     // reported error back once it closes.
-    app.worker.pending_permission_request = .{ .label = "Remember allow for this saved session" };
+    app.agent().worker.pending_permission_request = .{ .label = "Remember allow for this saved session" };
     try tickNoop(&app);
-    app.worker.pending_permission_request = null;
+    app.agent().worker.pending_permission_request = null;
     try tickNoop(&app);
     try expectProgramStatusReports(
         &app,
@@ -2302,8 +2392,8 @@ const PacedTranscriptBridge = struct {
         self.record('U');
         self.pacer_pending_when_user_prompt_written = self.pacer.hasPending();
         self.assistant_present_when_user_prompt_written =
-            self.app.shell.lifecycle.entries.items.len > 0 and
-            self.app.shell.lifecycle.entries.items[self.app.shell.lifecycle.entries.items.len - 1] == .assistant_turn;
+            self.app.shell.lifecycle.notebook.entries.items.len > 0 and
+            self.app.shell.lifecycle.notebook.entries.items[self.app.shell.lifecycle.notebook.entries.items.len - 1] == .assistant_turn;
     }
 
     fn drainAssistantText(raw: *anyopaque) !AssistantTextDrainResult {
@@ -2348,7 +2438,7 @@ const PacedTranscriptBridge = struct {
 };
 
 fn tickNoop(app: *FakeApp) !void {
-    try Runtime(FakeApp).tick(app, NoopBridge.handlers(app));
+    try Runtime(FakeApp).tick(app, app.agent(), NoopBridge.handlers(app));
 }
 
 const testRecoveryText = types.testRecoveryText;
@@ -2362,7 +2452,7 @@ fn testWaitingStatus(attempt: usize) types.RouteRecoveryStatus {
 }
 
 fn queueLifecycle(app: *FakeApp, event: types.ToolLifecycleEvent) !void {
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .tool_lifecycle = event });
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .tool_lifecycle = event });
 }
 
 fn queueToolStart(
@@ -2444,11 +2534,11 @@ test "detached worker batch frees claimed current and unvisited suffix exactly o
 test "core.app_worker_runtime fatal admission rejects tick before work" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.admission_snapshot = .{ .finalization_failed = .{
+    app.agent().worker.admission_snapshot = .{ .finalization_failed = .{
         .turn_id = 31,
         .outcome = .failed,
     } };
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{
         .text = @constCast("pending"),
     } });
 
@@ -2458,18 +2548,18 @@ test "core.app_worker_runtime fatal admission rejects tick before work" {
     );
 
     try std.testing.expect(app.should_exit);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.events.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.agent().worker.events.items.len);
 }
 
 test "core.app_worker_runtime fatal linearization blocks the next frame admission" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    try std.testing.expect(try Runtime(FakeApp).authorizeInteractiveAdmission(&app));
+    try std.testing.expect(try Runtime(FakeApp).authorizeInteractiveAdmission(&app, (&app).agent()));
 
     const Render = struct {
         fn frame(inner: *FakeApp) !void {
-            inner.worker.admission_snapshot = .{ .finalization_failed = .{
+            inner.agent().worker.admission_snapshot = .{ .finalization_failed = .{
                 .turn_id = 32,
                 .outcome = .failed,
             } };
@@ -2477,14 +2567,14 @@ test "core.app_worker_runtime fatal linearization blocks the next frame admissio
         }
     };
 
-    if (try Runtime(FakeApp).authorizeInteractiveAdmission(&app)) {
+    if (try Runtime(FakeApp).authorizeInteractiveAdmission(&app, (&app).agent())) {
         try Render.frame(&app);
     }
     try std.testing.expectEqual(@as(usize, 1), app.frame_commits);
 
     try std.testing.expectError(
         error.TurnFinalizationDeliveryFailed,
-        Runtime(FakeApp).authorizeInteractiveAdmission(&app),
+        Runtime(FakeApp).authorizeInteractiveAdmission(&app, (&app).agent()),
     );
     try std.testing.expectEqual(@as(usize, 1), app.frame_commits);
     try std.testing.expect(app.should_exit);
@@ -2494,10 +2584,10 @@ test "core.app_worker_runtime pushes worker events" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    try Runtime(FakeApp).pushText(&app, "hello");
+    try Runtime(FakeApp).pushText(&app, (&app).agent(), "hello");
 
-    try std.testing.expectEqual(@as(usize, 1), app.worker.events.items.len);
-    try std.testing.expectEqualStrings("hello", app.worker.events.items[0].assistant_presentation.text);
+    try std.testing.expectEqual(@as(usize, 1), app.agent().worker.events.items.len);
+    try std.testing.expectEqualStrings("hello", app.agent().worker.events.items[0].assistant_presentation.text);
 }
 
 test "core.app_worker_runtime assistant chunk trace is metadata only" {
@@ -2526,7 +2616,7 @@ test "core.app_worker_runtime assistant chunk trace is metadata only" {
     var app = FakeApp.init(alloc);
     defer app.deinit();
     const secret = "FX_ASSISTANT_CHUNK_SECRET";
-    try Runtime(FakeApp).pushText(&app, secret);
+    try Runtime(FakeApp).pushText(&app, (&app).agent(), secret);
     try tickNoop(&app);
     debug_trace.shutdown();
 
@@ -2556,14 +2646,14 @@ test "core.app_worker_runtime applies turn token input as absolute set" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    app.worker.processing = true;
-    app.stream.active = true;
-    app.stream.token_progress.input_tokens = 99;
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .turn_token_update = .{ .input_tokens = 10 } });
+    app.agent().worker.processing = true;
+    app.agent().stream.active = true;
+    app.agent().stream.token_progress.input_tokens = 99;
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .turn_token_update = .{ .input_tokens = 10 } });
 
     try tickNoop(&app);
 
-    try std.testing.expectEqual(@as(u64, 10), app.stream.token_progress.input_tokens);
+    try std.testing.expectEqual(@as(u64, 10), app.agent().stream.token_progress.input_tokens);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
@@ -2571,14 +2661,14 @@ test "core.app_worker_runtime applies turn token output as an absolute snapshot"
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    app.worker.processing = true;
-    app.stream.active = true;
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .turn_token_update = .{ .output_tokens = 3 } });
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .turn_token_update = .{ .output_tokens = 4 } });
+    app.agent().worker.processing = true;
+    app.agent().stream.active = true;
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .turn_token_update = .{ .output_tokens = 3 } });
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .turn_token_update = .{ .output_tokens = 4 } });
 
     try tickNoop(&app);
 
-    try std.testing.expectEqual(@as(u64, 4), app.stream.token_progress.output_tokens);
+    try std.testing.expectEqual(@as(u64, 4), app.agent().stream.token_progress.output_tokens);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
@@ -2586,20 +2676,20 @@ test "core.app_worker_runtime applies only current monotonic turn phase updates"
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    app.worker.processing = true;
-    app.worker.active_turn_id = 7;
-    app.stream.active = true;
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .turn_phase_update = .{
+    app.agent().worker.processing = true;
+    app.agent().worker.active_turn_id = 7;
+    app.agent().stream.active = true;
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .turn_phase_update = .{
         .turn_id = 7,
         .step_id = 12,
         .phase = .generating,
     } });
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .turn_phase_update = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .turn_phase_update = .{
         .turn_id = 7,
         .step_id = 11,
         .phase = .running,
     } });
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .turn_phase_update = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .turn_phase_update = .{
         .turn_id = 6,
         .step_id = 13,
         .phase = .running,
@@ -2607,8 +2697,8 @@ test "core.app_worker_runtime applies only current monotonic turn phase updates"
 
     try tickNoop(&app);
 
-    try std.testing.expectEqual(types.TurnPhase.generating, app.stream.phase);
-    try std.testing.expectEqual(@as(u64, 12), app.stream.phase_step_id);
+    try std.testing.expectEqual(types.TurnPhase.generating, app.agent().stream.phase);
+    try std.testing.expectEqual(@as(u64, 12), app.agent().stream.phase_step_id);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
@@ -2616,10 +2706,10 @@ test "core.app_worker_runtime next admitted model step returns running to thinki
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    app.worker.processing = true;
-    app.worker.active_turn_id = 7;
-    app.stream = .{ .active = true, .phase = .running, .phase_step_id = 12 };
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .turn_phase_update = .{
+    app.agent().worker.processing = true;
+    app.agent().worker.active_turn_id = 7;
+    app.agent().stream = .{ .active = true, .phase = .running, .phase_step_id = 12 };
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .turn_phase_update = .{
         .turn_id = 7,
         .step_id = 13,
         .phase = .thinking,
@@ -2627,39 +2717,39 @@ test "core.app_worker_runtime next admitted model step returns running to thinki
 
     try tickNoop(&app);
 
-    try std.testing.expectEqual(types.TurnPhase.thinking, app.stream.phase);
-    try std.testing.expectEqual(@as(u64, 13), app.stream.phase_step_id);
+    try std.testing.expectEqual(types.TurnPhase.thinking, app.agent().stream.phase);
+    try std.testing.expectEqual(@as(u64, 13), app.agent().stream.phase_step_id);
 }
 
 test "manual compaction schedules initial repaint animation and terminal expiry without a stream" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    const id = app.worker.compaction.begin(.manual, null, 1_000);
-    app.worker.compaction.running(id, .summary);
+    const id = app.agent().worker.compaction.begin(.manual, null, 1_000);
+    app.agent().worker.compaction.running(id, .summary);
     const presenter = NoopBridge.lifecyclePresenter(&app);
-    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, presenter, 1_000));
+    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, (&app).agent(), presenter, 1_000));
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
-    try std.testing.expectEqual(@as(usize, 1), app.worker.compaction_reads);
-    try std.testing.expect(!app.stream.active);
+    try std.testing.expectEqual(@as(usize, 1), app.agent().worker.compaction_reads);
+    try std.testing.expect(!app.agent().stream.active);
     app.shell.shimmer_active = true;
     app.shell.render_requests.animation_visible = true;
     app.shell.render_requests.animation_next_deadline_ms = 1_050;
-    try std.testing.expect(Runtime(FakeApp).advanceVisibleAnimation(&app, presenter, 1_050));
+    try std.testing.expect(Runtime(FakeApp).advanceVisibleAnimation(&app, (&app).agent(), presenter, 1_050));
     try std.testing.expect(app.shell.render_requests.hasReason(.animation));
     app.shell.render_requests.clearReason(.animation);
-    app.worker.compaction.settle(id, .{ .outcome = .no_op }, 1_100);
-    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, presenter, 2_599));
-    try std.testing.expect(!app.worker.compaction.snapshot.operation.?.dismissed);
-    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, presenter, 2_600));
-    try std.testing.expect(app.worker.compaction.snapshot.operation.?.dismissed);
-    try std.testing.expect(!app.stream.active);
+    app.agent().worker.compaction.settle(id, .{ .outcome = .no_op }, 1_100);
+    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, (&app).agent(), presenter, 2_599));
+    try std.testing.expect(!app.agent().worker.compaction.snapshot.operation.?.dismissed);
+    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, (&app).agent(), presenter, 2_600));
+    try std.testing.expect(app.agent().worker.compaction.snapshot.operation.?.dismissed);
+    try std.testing.expect(!app.agent().stream.active);
 }
 
 test "core.app_worker_runtime advances visible animation exactly at its deadline" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    app.stream = .{
+    app.agent().stream = .{
         .active = true,
         .last_activity_kind = .ask,
     };
@@ -2668,15 +2758,15 @@ test "core.app_worker_runtime advances visible animation exactly at its deadline
     app.shell.render_requests.animation_next_deadline_ms = 1_050;
     const before = app.shell.render_requests.visibleAnimationPhase();
 
-    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, NoopBridge.lifecyclePresenter(&app), 1_049));
+    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app), 1_049));
     try std.testing.expectEqual(before, app.shell.render_requests.visibleAnimationPhase());
     try std.testing.expect(!app.shell.render_requests.hasReason(.animation));
 
-    try std.testing.expect(Runtime(FakeApp).advanceVisibleAnimation(&app, NoopBridge.lifecyclePresenter(&app), 1_050));
+    try std.testing.expect(Runtime(FakeApp).advanceVisibleAnimation(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app), 1_050));
     try std.testing.expectEqual(before, app.shell.render_requests.visibleAnimationPhase());
     try std.testing.expect(app.shell.render_requests.hasReason(.animation));
 
-    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, NoopBridge.lifecyclePresenter(&app), 1_050));
+    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app), 1_050));
     try std.testing.expectEqual(before, app.shell.render_requests.visibleAnimationPhase());
 }
 
@@ -2684,7 +2774,7 @@ test "core.app_worker_runtime keeps visible animation alive after native history
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    app.stream = .{
+    app.agent().stream = .{
         .active = true,
         .last_activity_kind = .ask,
     };
@@ -2695,6 +2785,7 @@ test "core.app_worker_runtime keeps visible animation alive after native history
 
     try std.testing.expect(Runtime(FakeApp).advanceVisibleAnimation(
         &app,
+        (&app).agent(),
         NoopBridge.lifecyclePresenter(&app),
         1,
     ));
@@ -2720,12 +2811,12 @@ test "core.app_worker_runtime ticks animation for completed assistant presentati
 
     app.shell.render_requests.animation_next_deadline_ms = 1;
     app.pacer.completed_assistant_presentation_tail = true;
-    app.question_prompt.active = true;
+    app.agent().question_prompt.active = true;
     try tickNoop(&app);
     try std.testing.expect(!app.shell.render_requests.hasReason(.animation));
 
-    app.question_prompt.active = false;
-    app.approval_prompt.force_active = true;
+    app.agent().question_prompt.active = false;
+    app.agent().approval_prompt.force_active = true;
     app.shell.render_requests.animation_next_deadline_ms = 1;
     try tickNoop(&app);
     try std.testing.expect(!app.shell.render_requests.hasReason(.animation));
@@ -2735,45 +2826,45 @@ test "core.app_worker_runtime ignores turn token updates when stream inactive" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .turn_token_update = .{ .input_tokens = 10, .output_tokens = 4 } });
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .turn_token_update = .{ .input_tokens = 10, .output_tokens = 4 } });
 
     try tickNoop(&app);
 
-    try std.testing.expectEqual(types.TurnTokenProgress{}, app.stream.token_progress);
-    try std.testing.expect(!app.stream.active);
+    try std.testing.expectEqual(types.TurnTokenProgress{}, app.agent().stream.token_progress);
+    try std.testing.expect(!app.agent().stream.active);
 }
 
 test "core.app_worker_runtime resets turn token counters on begin and finish" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    app.stream = .{
+    app.agent().stream = .{
         .active = true,
         .token_progress = .{ .input_tokens = 10, .output_tokens = 20 },
     };
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = try types.dupeUserTurn(std.heap.c_allocator, .{ .text = @constCast("next"), .images = &.{} }) });
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = try types.dupeUserTurn(std.heap.c_allocator, .{ .text = @constCast("next"), .images = &.{} }) });
     try tickNoop(&app);
-    try std.testing.expectEqual(types.TurnTokenProgress{}, app.stream.token_progress);
+    try std.testing.expectEqual(types.TurnTokenProgress{}, app.agent().stream.token_progress);
     try std.testing.expect(!app.shell.render_requests.blocksFrameCommit());
 
-    app.stream = .{
+    app.agent().stream = .{
         .active = true,
         .token_progress = .{ .input_tokens = 30, .output_tokens = 40 },
     };
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .compacted_summary = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .compacted_summary = .{
         .summary = try std.heap.c_allocator.dupe(u8, "summary"),
         .removed_turn_count = 1,
         .compaction_count = 1,
     } } } });
     try tickNoop(&app);
-    try std.testing.expectEqual(types.TurnTokenProgress{}, app.stream.token_progress);
+    try std.testing.expectEqual(types.TurnTokenProgress{}, app.agent().stream.token_progress);
 }
 
 test "core.app_worker_runtime projects route recovery status activity and clears it on begin" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = testWaitingStatus(1) });
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = testWaitingStatus(1) });
     try tickNoop(&app);
 
     switch (app.shell.activityProjection()) {
@@ -2786,7 +2877,7 @@ test "core.app_worker_runtime projects route recovery status activity and clears
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 
     app.shell.render_requests.clearReason(.footer);
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = try types.dupeUserTurn(std.heap.c_allocator, .{ .text = @constCast("next"), .images = &.{} }) });
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = try types.dupeUserTurn(std.heap.c_allocator, .{ .text = @constCast("next"), .images = &.{} }) });
     try tickNoop(&app);
 
     try std.testing.expect(app.shell.activityProjection() == .none);
@@ -2797,22 +2888,22 @@ test "core.app_worker_runtime clears route recovery activity on clear event but 
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = testWaitingStatus(2) });
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = testWaitingStatus(2) });
     try tickNoop(&app);
     switch (app.shell.activityProjection()) {
         .turn_thinking => {},
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
 
-    try app.worker.pushEvent(std.heap.c_allocator, .clear_route_recovery_status);
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .clear_route_recovery_status);
     try tickNoop(&app);
     try std.testing.expect(app.shell.activityProjection() == .none);
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
         .kind = .terminal_provider_error,
         .attempt = 3,
     } });
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
         .topic = "system",
         .tone = .@"error",
         .body = "request failed",
@@ -2828,13 +2919,13 @@ test "core.app_worker_runtime replaces a waiting status with its terminal attemp
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = testWaitingStatus(1) });
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = testWaitingStatus(1) });
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
         .kind = .terminal_provider_error,
         .attempt = 1,
         .diagnostic = types.ModelFailureDiagnostic.init("TestProviderSerializationFailed"),
     } });
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
         .topic = "system",
         .tone = .@"error",
         .body = "request failed",
@@ -2854,14 +2945,14 @@ test "core.app_worker_runtime a recovery leaves no status and no recovered summa
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    app.stream.active = true;
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = testWaitingStatus(2) });
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
+    app.agent().stream.active = true;
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = testWaitingStatus(2) });
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
         .kind = .recovered,
         .text = testRecoveryText("Connection lost · retrying · attempt 2 · 5s"),
         .attempt = 2,
     } });
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .compacted_summary = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .compacted_summary = .{
         .summary = try std.heap.c_allocator.dupe(u8, "summary"),
         .removed_turn_count = 1,
         .compaction_count = 1,
@@ -2883,29 +2974,29 @@ test "core.app_worker_runtime a recovery leaves no status and no recovered summa
     var handlers = NoopBridge.handlers(&app);
     handlers.ctx = @ptrCast(&app);
     handlers.append_history_turn = Capture.history;
-    try Runtime(FakeApp).tick(&app, handlers);
+    try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
 
-    try std.testing.expect(!app.stream.active);
+    try std.testing.expect(!app.agent().stream.active);
     try std.testing.expect(app.shell.activityProjection() == .none);
-    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.entries.items.len);
-    try std.testing.expect(std.mem.find(u8, app.shell.lifecycle.entries.items[0].raw_bytes.bytes, ui_render.dim_style) != null);
-    try std.testing.expect(std.mem.find(u8, app.shell.lifecycle.entries.items[0].raw_bytes.bytes, "  2m 10s (↑10k ↓5k)") != null);
-    try std.testing.expect(std.mem.find(u8, app.shell.lifecycle.entries.items[0].raw_bytes.bytes, "✓ recovered") == null);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.notebook.entries.items.len);
+    try std.testing.expect(std.mem.find(u8, app.shell.lifecycle.notebook.entries.items[0].raw_bytes.bytes, ui_render.dim_style) != null);
+    try std.testing.expect(std.mem.find(u8, app.shell.lifecycle.notebook.entries.items[0].raw_bytes.bytes, "  2m 10s (↑10k ↓5k)") != null);
+    try std.testing.expect(std.mem.find(u8, app.shell.lifecycle.notebook.entries.items[0].raw_bytes.bytes, "✓ recovered") == null);
 }
 
 test "core.app_worker_runtime records a terminal route recovery as a full-detail record" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
         .kind = .terminal_provider_error,
         .attempt = 2,
         .cause = .rate_limited,
     } });
     try tickNoop(&app);
 
-    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.full_detail_records.items.len);
-    const record = app.shell.lifecycle.full_detail_records.items[0].notice;
+    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.notebook.full_detail_records.items.len);
+    const record = app.shell.lifecycle.notebook.full_detail_records.items[0].notice;
     try std.testing.expectEqualStrings("recovery", record.topic);
     try std.testing.expectEqual(types.NoticeTone.@"error", record.tone);
     try std.testing.expectEqual(types.NoticeVisibility.full_only, record.visibility);
@@ -2914,22 +3005,22 @@ test "core.app_worker_runtime records a terminal route recovery as a full-detail
     try std.testing.expect(std.mem.find(u8, record.body, "cause: rate_limited") != null);
     try std.testing.expect(std.mem.find(u8, record.body, "attempt: 2") != null);
     // The record stays out of the transcript entry store.
-    try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.notebook.entries.items.len);
 }
 
 test "core.app_worker_runtime keeps recovery module statuses out of the transcript" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = testWaitingStatus(1) });
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = testWaitingStatus(1) });
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
         .kind = .recovered,
         .text = testRecoveryText("Connection lost · retrying · attempt 2 · 5s"),
         .attempt = 2,
     } });
     try tickNoop(&app);
 
-    try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.full_detail_records.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.notebook.full_detail_records.items.len);
     try std.testing.expect(app.shell.activityProjection() == .none);
 }
 
@@ -2937,15 +3028,15 @@ test "core.app_worker_runtime skips the recovery record for statuses dropped by 
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    app.worker.processing = true;
-    app.worker.worker_cancel_requested.store(true, .seq_cst);
-    app.stream.active = true;
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
+    app.agent().worker.processing = true;
+    app.agent().worker.worker_cancel_requested.store(true, .seq_cst);
+    app.agent().stream.active = true;
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
         .kind = .terminal_provider_error,
         .attempt = 1,
     } });
     try tickNoop(&app);
-    try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.full_detail_records.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.notebook.full_detail_records.items.len);
 }
 
 test "writeRouteRecoveryBody omits absent facts" {
@@ -2969,7 +3060,7 @@ test "core.app_worker_runtime projects API status text as sticky status row" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .api_status_text = try std.heap.c_allocator.dupe(u8, "⚠ API access denied · HTTP 403 · Provider: wafer") });
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .api_status_text = try std.heap.c_allocator.dupe(u8, "⚠ API access denied · HTTP 403 · Provider: wafer") });
     try tickNoop(&app);
 
     switch (app.shell.activityProjection()) {
@@ -2980,7 +3071,7 @@ test "core.app_worker_runtime projects API status text as sticky status row" {
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = try types.dupeUserTurn(std.heap.c_allocator, .{ .text = @constCast("next"), .images = &.{} }) });
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = try types.dupeUserTurn(std.heap.c_allocator, .{ .text = @constCast("next"), .images = &.{} }) });
     try tickNoop(&app);
     try std.testing.expect(app.shell.activityProjection() == .none);
 }
@@ -2989,7 +3080,7 @@ test "core.app_worker_runtime suppresses route recovery activity while question 
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
         .kind = .content_filter,
     } });
     try tickNoop(&app);
@@ -2998,7 +3089,7 @@ test "core.app_worker_runtime suppresses route recovery activity while question 
     var input = InputRuntime{};
     defer input.deinit(std.testing.allocator);
     const ctx = render_input.RenderContext{
-        .stream = app.stream,
+        .stream = app.agent().stream,
         .has_api_key = true,
         .model = "gpt-5.1",
         .question = .{
@@ -3016,24 +3107,24 @@ test "core.app_worker_runtime drops turn token updates during cancellation" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    app.worker.processing = true;
-    app.worker.worker_cancel_requested.store(true, .seq_cst);
-    app.stream.active = true;
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .turn_token_update = .{ .input_tokens = 10, .output_tokens = 4 } });
+    app.agent().worker.processing = true;
+    app.agent().worker.worker_cancel_requested.store(true, .seq_cst);
+    app.agent().stream.active = true;
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .turn_token_update = .{ .input_tokens = 10, .output_tokens = 4 } });
 
     try tickNoop(&app);
 
-    try std.testing.expectEqual(types.TurnTokenProgress{}, app.stream.token_progress);
+    try std.testing.expectEqual(types.TurnTokenProgress{}, app.agent().stream.token_progress);
 }
 
 test "core.app_worker_runtime syncState does not start activity for idle queued prompt" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    app.worker.queued_count = 1;
-    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
+    app.agent().worker.queued_count = 1;
+    Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
 
-    try std.testing.expect(!app.stream.active);
+    try std.testing.expect(!app.agent().stream.active);
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
 }
 
@@ -3041,10 +3132,10 @@ test "core.app_worker_runtime syncState does not start activity for idle process
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    app.worker.processing = true;
-    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
+    app.agent().worker.processing = true;
+    Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
 
-    try std.testing.expect(!app.stream.active);
+    try std.testing.expect(!app.agent().stream.active);
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
 }
 
@@ -3052,17 +3143,17 @@ test "core.app_worker_runtime syncState preserves already visible processing act
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    app.worker.processing = true;
-    app.stream = .{
+    app.agent().worker.processing = true;
+    app.agent().stream = .{
         .active = true,
         .token_progress = .{ .input_tokens = 8, .output_tokens = 13 },
     };
 
-    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
+    Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
 
-    try std.testing.expect(app.stream.active);
-    try std.testing.expectEqual(@as(u64, 8), app.stream.token_progress.input_tokens);
-    try std.testing.expectEqual(@as(u64, 13), app.stream.token_progress.output_tokens);
+    try std.testing.expect(app.agent().stream.active);
+    try std.testing.expectEqual(@as(u64, 8), app.agent().stream.token_progress.input_tokens);
+    try std.testing.expectEqual(@as(u64, 13), app.agent().stream.token_progress.output_tokens);
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
 }
 
@@ -3070,29 +3161,29 @@ test "core.app_worker_runtime syncState preserves activity when cancellation con
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    app.worker.processing = true;
-    app.worker.worker_cancel_requested.store(true, .seq_cst);
-    app.worker.cancel_continues_turn = true;
-    app.stream = .{
+    app.agent().worker.processing = true;
+    app.agent().worker.worker_cancel_requested.store(true, .seq_cst);
+    app.agent().worker.cancel_continues_turn = true;
+    app.agent().stream = .{
         .active = true,
         .phase = .generating,
         .token_progress = .{ .input_tokens = 8, .output_tokens = 13 },
     };
 
-    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
+    Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
 
-    try std.testing.expect(app.stream.active);
-    try std.testing.expectEqual(types.TurnPhase.generating, app.stream.phase);
-    try std.testing.expectEqual(@as(u64, 13), app.stream.token_progress.output_tokens);
+    try std.testing.expect(app.agent().stream.active);
+    try std.testing.expectEqual(types.TurnPhase.generating, app.agent().stream.phase);
+    try std.testing.expectEqual(@as(u64, 13), app.agent().stream.token_progress.output_tokens);
 }
 
 test "core.app_worker_runtime syncState preserves footer until cancelled tool terminal" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    app.worker.processing = true;
-    app.worker.worker_cancel_requested.store(true, .seq_cst);
-    app.stream.active = true;
+    app.agent().worker.processing = true;
+    app.agent().worker.worker_cancel_requested.store(true, .seq_cst);
+    app.agent().stream.active = true;
     const lifecycle_id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "command" };
     _ = try app.shell.applyToolLifecycle(std.testing.allocator, .{ .authoritative_started = .{
         .id = lifecycle_id,
@@ -3102,18 +3193,18 @@ test "core.app_worker_runtime syncState preserves footer until cancelled tool te
     } });
     app.shell.render_requests.clearReason(.footer);
 
-    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
+    Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
 
-    try std.testing.expect(app.stream.active);
+    try std.testing.expect(app.agent().stream.active);
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
 
     _ = try app.shell.applyToolLifecycle(std.testing.allocator, .{ .terminal = .{
         .id = lifecycle_id,
         .outcome = .{ .kind = .cancelled, .summary = "Cancelled sleep 30" },
     } });
-    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
+    Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
 
-    try std.testing.expect(!app.stream.active);
+    try std.testing.expect(!app.agent().stream.active);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
@@ -3141,6 +3232,7 @@ test "core.app_worker_runtime queued command completion preserves three thousand
     ) |stream, index| {
         try Runtime(FakeApp).pushCommandOutput(
             &app,
+            (&app).agent(),
             lifecycle_id,
             stream,
             chunks[index].items,
@@ -3179,7 +3271,7 @@ test "core.app_worker_runtime queued command completion preserves three thousand
             );
             self.output_count += 1;
             if (self.output_count == 4) {
-                try Runtime(FakeApp).pushCommandOutputComplete(self.app, id);
+                try Runtime(FakeApp).pushCommandOutputComplete(self.app, (self.app).agent(), id);
             }
         }
 
@@ -3200,13 +3292,13 @@ test "core.app_worker_runtime queued command completion preserves three thousand
     handlers.command_output = Capture.output;
     handlers.command_output_complete = Capture.outputComplete;
 
-    app.stream.active = true;
-    try Runtime(FakeApp).tick(&app, handlers);
+    app.agent().stream.active = true;
+    try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
 
-    try std.testing.expect(app.stream.active);
+    try std.testing.expect(app.agent().stream.active);
     try std.testing.expect(app.shell.command_output_display.touched);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.events.items.len);
-    var block = &app.shell.lifecycle.command_output_blocks.items[0];
+    try std.testing.expectEqual(@as(usize, 1), app.agent().worker.events.items.len);
+    var block = &app.shell.lifecycle.notebook.command_output_blocks.items[0];
     try std.testing.expectEqual(@as(usize, 3_000), block.total_lines);
     try std.testing.expectEqual(@as(usize, 2_995), block.total_lines - 5);
     try std.testing.expectEqualStrings("stdout-a", block.lines.items[0].text);
@@ -3215,9 +3307,9 @@ test "core.app_worker_runtime queued command completion preserves three thousand
     try std.testing.expectEqualStrings("unterminated", block.lines.items[2_999].text);
     try std.testing.expect(!block.lines.items[2_999].terminated);
 
-    try Runtime(FakeApp).tick(&app, handlers);
+    try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
 
-    block = &app.shell.lifecycle.command_output_blocks.items[0];
+    block = &app.shell.lifecycle.notebook.command_output_blocks.items[0];
     try std.testing.expectEqual(@as(usize, 3_000), block.total_lines);
     try std.testing.expectEqualStrings("unterminated", block.lines.items[2_999].text);
 }
@@ -3237,9 +3329,9 @@ test "core.app_worker_runtime syncState mirrors approvals without opening a pend
         .{ .op = .deletion, .old_line = 2, .text = &removed },
         .{ .op = .addition, .new_line = 2, .text = &added },
     };
-    app.worker.processing = true;
-    app.worker.pending_permission_review = &review;
-    app.worker.pending_permission_request = .{
+    app.agent().worker.processing = true;
+    app.agent().worker.pending_permission_review = &review;
+    app.agent().worker.pending_permission_request = .{
         .label = "edit_file note.txt",
         .file = .{
             .kind = .edit,
@@ -3254,44 +3346,44 @@ test "core.app_worker_runtime syncState mirrors approvals without opening a pend
             .scope = .workspace_files,
         },
     };
-    app.worker.pending_question = true;
+    app.agent().worker.pending_question = true;
 
-    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
+    Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
 
     path[0] = 'N';
     removed[0] = 'B';
     added[0] = 'A';
     lines[0].old_line = 9;
 
-    try std.testing.expect(app.stream.active);
-    try std.testing.expect(app.approval_prompt.isActive());
-    try std.testing.expect(!app.question_prompt.isActive());
-    try std.testing.expectEqual(@as(usize, 0), app.question_prompt.sync_count);
+    try std.testing.expect(app.agent().stream.active);
+    try std.testing.expect(app.agent().approval_prompt.isActive());
+    try std.testing.expect(!app.agent().question_prompt.isActive());
+    try std.testing.expectEqual(@as(usize, 0), app.agent().question_prompt.sync_count);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
     try std.testing.expect(app.shell.render_requests.hasReason(.modal));
     try std.testing.expectEqualStrings(
         "edit_file note.txt",
-        app.approval_prompt.request.?.label,
+        app.agent().approval_prompt.request.?.label,
     );
     try std.testing.expectEqualStrings(
         "note.txt",
-        app.approval_prompt.request.?.file.?.preview.path,
+        app.agent().approval_prompt.request.?.file.?.preview.path,
     );
     try std.testing.expectEqualStrings(
         "before",
-        app.approval_prompt.request.?.file.?.preview.lines[0].text,
+        app.agent().approval_prompt.request.?.file.?.preview.lines[0].text,
     );
     try std.testing.expectEqual(
         @as(?u32, 2),
-        app.approval_prompt.request.?.file.?.preview.lines[0].old_line,
+        app.agent().approval_prompt.request.?.file.?.preview.lines[0].old_line,
     );
-    try std.testing.expect(app.approval_prompt.review == &review);
+    try std.testing.expect(app.agent().approval_prompt.review == &review);
     try std.testing.expectEqual(
-        app.approval_prompt.request.?.id,
-        app.approval_prompt.review_request_id,
+        app.agent().approval_prompt.request.?.id,
+        app.agent().approval_prompt.review_request_id,
     );
 
-    const approval_id = app.approval_prompt.request.?.id;
+    const approval_id = app.agent().approval_prompt.request.?.id;
     app.approval_screen.scrollDocument(4);
     app.approval_screen.recordScreenCommit(approval_id, .{
         .request_id = approval_id,
@@ -3302,25 +3394,25 @@ test "core.app_worker_runtime syncState mirrors approvals without opening a pend
         .changed_or_notice_visible = true,
         .document_scrollable = true,
     });
-    app.worker.pending_permission_review = &replacement_review;
-    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
+    app.agent().worker.pending_permission_review = &replacement_review;
+    Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
 
-    try std.testing.expect(app.approval_prompt.review == &replacement_review);
+    try std.testing.expect(app.agent().approval_prompt.review == &replacement_review);
     try std.testing.expectEqual(@as(usize, 0), app.approval_screen.document_scroll_rows);
     try std.testing.expect(app.approval_screen.screen_commit == null);
 
     app.shell.render_requests.clearReason(.footer);
     app.shell.render_requests.clearReason(.modal);
-    app.worker.processing = false;
-    app.worker.pending_permission_request = null;
-    app.worker.pending_question = false;
-    app.question_prompt.active = true;
-    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
+    app.agent().worker.processing = false;
+    app.agent().worker.pending_permission_request = null;
+    app.agent().worker.pending_question = false;
+    app.agent().question_prompt.active = true;
+    Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
 
-    try std.testing.expect(!app.stream.active);
-    try std.testing.expect(!app.approval_prompt.isActive());
-    try std.testing.expect(!app.question_prompt.isActive());
-    try std.testing.expectEqual(@as(usize, 1), app.question_prompt.clear_count);
+    try std.testing.expect(!app.agent().stream.active);
+    try std.testing.expect(!app.agent().approval_prompt.isActive());
+    try std.testing.expect(!app.agent().question_prompt.isActive());
+    try std.testing.expectEqual(@as(usize, 1), app.agent().question_prompt.clear_count);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
     try std.testing.expect(app.shell.render_requests.hasReason(.modal));
 }
@@ -3329,19 +3421,19 @@ test "core.app_worker_runtime syncState clears a completed approval" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    app.worker.processing = true;
-    app.worker.pending_permission_request = .{
+    app.agent().worker.processing = true;
+    app.agent().worker.pending_permission_request = .{
         .id = 42,
         .label = "shell.run test",
     };
-    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
-    try std.testing.expect(app.approval_prompt.isActive());
+    Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
+    try std.testing.expect(app.agent().approval_prompt.isActive());
 
-    app.worker.processing = false;
-    app.worker.pending_permission_request = null;
-    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
+    app.agent().worker.processing = false;
+    app.agent().worker.pending_permission_request = null;
+    Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
 
-    try std.testing.expect(!app.approval_prompt.isActive());
+    try std.testing.expect(!app.agent().approval_prompt.isActive());
     try std.testing.expect(app.shell.render_requests.hasReason(.modal));
 }
 
@@ -3351,39 +3443,39 @@ test "core.app_worker_runtime syncState freezes the turn clock while an approval
 
     // A turn is processing when an approval opens: the elapsed clock must
     // freeze so approval wait time is not counted as thinking.
-    app.worker.processing = true;
-    app.worker.pending_permission_request = .{
+    app.agent().worker.processing = true;
+    app.agent().worker.pending_permission_request = .{
         .id = 7,
         .label = "shell.run test",
     };
-    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
-    try std.testing.expect(app.approval_prompt.isActive());
-    try std.testing.expect(app.stream.active);
-    try std.testing.expect(app.stream.waiting_since_ms > 0);
+    Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
+    try std.testing.expect(app.agent().approval_prompt.isActive());
+    try std.testing.expect(app.agent().stream.active);
+    try std.testing.expect(app.agent().stream.waiting_since_ms > 0);
 
     // Approval resolved but the turn keeps processing: the freeze releases and
     // the running clock resumes with no wait state left behind.
-    app.worker.pending_permission_request = null;
-    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
-    try std.testing.expect(!app.approval_prompt.isActive());
-    try std.testing.expect(app.stream.active);
-    try std.testing.expectEqual(@as(i64, 0), app.stream.waiting_since_ms);
+    app.agent().worker.pending_permission_request = null;
+    Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
+    try std.testing.expect(!app.agent().approval_prompt.isActive());
+    try std.testing.expect(app.agent().stream.active);
+    try std.testing.expectEqual(@as(i64, 0), app.agent().stream.waiting_since_ms);
 }
 
 test "core.app_worker_runtime emits permission attention once when approval opens" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
-    app.worker.active_turn_id = 73;
+    app.agent().worker.processing = true;
+    app.agent().worker.active_turn_id = 73;
 
-    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
+    Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
     try std.testing.expectEqual(@as(usize, 0), app.attention_count);
 
-    app.worker.pending_permission_request = .{
+    app.agent().worker.pending_permission_request = .{
         .id = 1,
         .label = "run command",
     };
-    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
+    Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
     try std.testing.expectEqual(@as(usize, 1), app.attention_count);
     try std.testing.expectEqual(@as(u64, 73), app.last_attention_turn_id);
     try std.testing.expectEqual(
@@ -3391,12 +3483,12 @@ test "core.app_worker_runtime emits permission attention once when approval open
         app.last_attention_kind,
     );
 
-    app.worker.pending_permission_request = .{
+    app.agent().worker.pending_permission_request = .{
         .id = 2,
         .label = "replacement",
     };
-    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
-    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
+    Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
+    Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
     try std.testing.expectEqual(@as(usize, 1), app.attention_count);
 }
 
@@ -3413,14 +3505,14 @@ test "core.app_worker_runtime emits question and route recovery attention only f
     for (cases) |case| {
         var app = FakeApp.init(std.testing.allocator);
         defer app.deinit();
-        app.worker.processing = true;
-        app.worker.active_turn_id = 81;
-        app.worker.pending_question = true;
-        app.worker.pending_question_source = case.source;
-        try app.worker.pushEvent(std.heap.c_allocator, .question_requested);
-        try app.worker.pushEvent(std.heap.c_allocator, .question_requested);
+        app.agent().worker.processing = true;
+        app.agent().worker.active_turn_id = 81;
+        app.agent().worker.pending_question = true;
+        app.agent().worker.pending_question_source = case.source;
+        try app.agent().worker.pushEvent(std.heap.c_allocator, .question_requested);
+        try app.agent().worker.pushEvent(std.heap.c_allocator, .question_requested);
 
-        try Runtime(FakeApp).tick(&app, NoopBridge.handlers(&app));
+        try Runtime(FakeApp).tick(&app, (&app).agent(), NoopBridge.handlers(&app));
 
         try std.testing.expectEqual(@as(usize, 1), app.attention_count);
         try std.testing.expectEqual(@as(u64, 81), app.last_attention_turn_id);
@@ -3429,11 +3521,11 @@ test "core.app_worker_runtime emits question and route recovery attention only f
 
     var invalid = FakeApp.init(std.testing.allocator);
     defer invalid.deinit();
-    invalid.worker.processing = true;
-    invalid.worker.pending_question = true;
-    invalid.question_prompt.activate_on_sync = false;
-    try invalid.worker.pushEvent(std.heap.c_allocator, .question_requested);
-    try Runtime(FakeApp).tick(&invalid, NoopBridge.handlers(&invalid));
+    invalid.agent().worker.processing = true;
+    invalid.agent().worker.pending_question = true;
+    invalid.agent().question_prompt.activate_on_sync = false;
+    try invalid.agent().worker.pushEvent(std.heap.c_allocator, .question_requested);
+    try Runtime(FakeApp).tick(&invalid, (&invalid).agent(), NoopBridge.handlers(&invalid));
     try std.testing.expectEqual(@as(usize, 0), invalid.attention_count);
 }
 
@@ -3441,19 +3533,19 @@ test "core.app_worker_runtime syncState clears a completed question" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    app.worker.processing = true;
-    app.question_prompt.active = true;
-    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
+    app.agent().worker.processing = true;
+    app.agent().question_prompt.active = true;
+    Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
 
-    try std.testing.expect(!app.question_prompt.isActive());
-    try std.testing.expectEqual(@as(usize, 1), app.question_prompt.clear_count);
+    try std.testing.expect(!app.agent().question_prompt.isActive());
+    try std.testing.expectEqual(@as(usize, 1), app.agent().question_prompt.clear_count);
     try std.testing.expect(app.shell.render_requests.hasReason(.modal));
 }
 
 test "core.app_worker_runtime cancellation ignores late tool progress before turn finalization" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
+    app.agent().worker.processing = true;
 
     const lifecycle_id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "visible-call" };
     try queueToolStart(&app, lifecycle_id.turn_id, lifecycle_id.call_id, "read_file");
@@ -3465,7 +3557,7 @@ test "core.app_worker_runtime cancellation ignores late tool progress before tur
     );
     defer std.testing.allocator.free(label_before);
 
-    app.worker.worker_cancel_requested.store(true, .seq_cst);
+    app.agent().worker.worker_cancel_requested.store(true, .seq_cst);
     try queueLifecycle(&app, .{ .progress = .{
         .id = lifecycle_id,
         .text = "late progress",
@@ -3479,13 +3571,13 @@ test "core.app_worker_runtime cancellation ignores late tool progress before tur
 test "core.app_worker_runtime cancellation defers split tool lifecycle until terminal closure" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
-    app.worker.worker_cancel_requested.store(true, .seq_cst);
+    app.agent().worker.processing = true;
+    app.agent().worker.worker_cancel_requested.store(true, .seq_cst);
 
     const lifecycle_id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "late-call" };
     try queueToolStart(&app, lifecycle_id.turn_id, lifecycle_id.call_id, "read_file");
     try tickNoop(&app);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.events.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.agent().worker.events.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.shell.toolActivityRecordCount());
 
     try queueLifecycle(&app, .{ .progress = .{
@@ -3493,12 +3585,12 @@ test "core.app_worker_runtime cancellation defers split tool lifecycle until ter
         .text = "late progress",
     } });
     try tickNoop(&app);
-    try std.testing.expectEqual(@as(usize, 2), app.worker.events.items.len);
+    try std.testing.expectEqual(@as(usize, 2), app.agent().worker.events.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.shell.toolActivityRecordCount());
 
     try queueToolTerminal(&app, lifecycle_id.turn_id, lifecycle_id.call_id, .cancelled, "Cancelled read");
     try tickNoop(&app);
-    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.agent().worker.events.items.len);
     const entry_id = app.shell.toolActivityRecord(lifecycle_id).?.entry_id;
     const label = app.shell.toolStatusEntryLabel(entry_id) orelse return error.TestExpectedEqual;
     try std.testing.expect(std.mem.find(u8, label, "Cancelled read") != null);
@@ -3513,8 +3605,8 @@ test "core.app_worker_runtime cancellation defers split tool lifecycle until ter
 test "core.app_worker_runtime cancellation drops tool starts after interrupted turn finalization" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
-    app.worker.worker_cancel_requested.store(true, .seq_cst);
+    app.agent().worker.processing = true;
+    app.agent().worker.worker_cancel_requested.store(true, .seq_cst);
 
     try queueTurnFinished(&app, 1, .interrupted);
     try tickNoop(&app);
@@ -3522,21 +3614,21 @@ test "core.app_worker_runtime cancellation drops tool starts after interrupted t
 
     try queueToolStart(&app, 1, "late-call", "read_file");
     try tickNoop(&app);
-    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.agent().worker.events.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.shell.toolActivityRecordCount());
 }
 
 test "core.app_worker_runtime cancellation admits terminal closure for visible tool" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
+    app.agent().worker.processing = true;
 
     const lifecycle_id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "visible-call" };
     try queueToolStart(&app, lifecycle_id.turn_id, lifecycle_id.call_id, "read_file");
     try tickNoop(&app);
     const entry_id = app.shell.toolActivityRecord(lifecycle_id).?.entry_id;
 
-    app.worker.worker_cancel_requested.store(true, .seq_cst);
+    app.agent().worker.worker_cancel_requested.store(true, .seq_cst);
     try queueToolTerminal(&app, lifecycle_id.turn_id, lifecycle_id.call_id, .cancelled, "Cancelled read");
     try queueTurnFinished(&app, lifecycle_id.turn_id, .interrupted);
     try tickNoop(&app);
@@ -3548,16 +3640,16 @@ test "core.app_worker_runtime cancellation admits terminal closure for visible t
 test "core.app_worker_runtime cancellation suppresses payloads but retains turn finalization" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
-    app.worker.worker_cancel_requested.store(true, .seq_cst);
+    app.agent().worker.processing = true;
+    app.agent().worker.worker_cancel_requested.store(true, .seq_cst);
 
     try queueToolStart(&app, 1, "call", "read_file");
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{
         .text = @constCast("hidden"),
     } });
     try queueToolTerminal(&app, 1, "call", .cancelled, "Cancelled read");
     try queueTurnFinished(&app, 1, .interrupted);
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{
         .turn = .{ .compacted_summary = .{
             .summary = @constCast("history"),
             .removed_turn_count = 1,
@@ -3586,7 +3678,7 @@ test "core.app_worker_runtime cancellation suppresses payloads but retains turn 
     handlers.append_text = Capture.text;
     handlers.append_history_turn = Capture.history;
 
-    try Runtime(FakeApp).tick(&app, handlers);
+    try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
 
     try std.testing.expectEqual(@as(usize, 0), capture.text_count);
     try std.testing.expectEqual(@as(usize, 1), capture.history_count);
@@ -3598,9 +3690,9 @@ test "core.app_worker_runtime cancellation suppresses payloads but retains turn 
 test "core.app_worker_runtime cancellation snapshot stays coupled to detached event prefix" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.worker_cancel_requested.store(true, .seq_cst);
-    app.worker.reset_cancel_after_take_events = true;
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{
+    app.agent().worker.worker_cancel_requested.store(true, .seq_cst);
+    app.agent().worker.reset_cancel_after_take_events = true;
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{
         .text = @constCast("late text"),
     } });
 
@@ -3617,21 +3709,21 @@ test "core.app_worker_runtime cancellation snapshot stays coupled to detached ev
     handlers.ctx = @ptrCast(&capture);
     handlers.append_text = Capture.text;
 
-    try Runtime(FakeApp).tick(&app, handlers);
+    try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
 
-    try std.testing.expect(!app.worker.worker_cancel_requested.load(.seq_cst));
+    try std.testing.expect(!app.agent().worker.worker_cancel_requested.load(.seq_cst));
     try std.testing.expectEqual(@as(usize, 0), capture.text_count);
 }
 
 test "core.app_worker_runtime publishes rendered block before opening tool entries" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
+    app.agent().worker.processing = true;
 
     var bridge = PacedTranscriptBridge.init(&app);
     defer bridge.deinit();
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{
         .assistant_presentation = .{ .text = @constCast("assistant before tools") },
     });
     try queueLifecycle(&app, .{ .provisional = .{
@@ -3641,34 +3733,34 @@ test "core.app_worker_runtime publishes rendered block before opening tool entri
     } });
     try queueToolStart(&app, 1, "grep_b", "grep");
 
-    try Runtime(FakeApp).tick(&app, bridge.handlers());
+    try Runtime(FakeApp).tick(&app, (&app).agent(), bridge.handlers());
 
     try std.testing.expectEqual(@as(usize, 2), bridge.drain_count);
     try std.testing.expect(!bridge.pacer.hasPending());
-    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
-    try std.testing.expectEqual(@as(usize, 3), app.shell.lifecycle.entries.items.len);
-    try std.testing.expect(app.shell.lifecycle.entries.items[0] == .assistant_turn);
-    try std.testing.expect(app.shell.lifecycle.entries.items[1] == .raw_bytes);
-    try std.testing.expect(app.shell.lifecycle.entries.items[2] == .raw_bytes);
+    try std.testing.expectEqual(@as(usize, 0), app.agent().worker.events.items.len);
+    try std.testing.expectEqual(@as(usize, 3), app.shell.lifecycle.notebook.entries.items.len);
+    try std.testing.expect(app.shell.lifecycle.notebook.entries.items[0] == .assistant_turn);
+    try std.testing.expect(app.shell.lifecycle.notebook.entries.items[1] == .raw_bytes);
+    try std.testing.expect(app.shell.lifecycle.notebook.entries.items[2] == .raw_bytes);
     try std.testing.expectEqualStrings(
         "assistant before tools",
-        app.shell.lifecycle.entries.items[0].assistant_turn.segments.text.items,
+        app.shell.lifecycle.notebook.entries.items[0].assistant_turn.segments.text.items,
     );
     try std.testing.expectEqual(
         transcript_runtime.RawEntryClass.tool_status,
-        app.shell.lifecycle.entries.items[1].raw_bytes.class,
+        app.shell.lifecycle.notebook.entries.items[1].raw_bytes.class,
     );
     try std.testing.expectEqual(
         transcript_runtime.RawEntryClass.tool_status,
-        app.shell.lifecycle.entries.items[2].raw_bytes.class,
+        app.shell.lifecycle.notebook.entries.items[2].raw_bytes.class,
     );
     try std.testing.expectEqualStrings(
         "● read_file\x1b[0m\n",
-        app.shell.lifecycle.entries.items[1].raw_bytes.bytes,
+        app.shell.lifecycle.notebook.entries.items[1].raw_bytes.bytes,
     );
     try std.testing.expectEqualStrings(
         "● grep\x1b[0m\n",
-        app.shell.lifecycle.entries.items[2].raw_bytes.bytes,
+        app.shell.lifecycle.notebook.entries.items[2].raw_bytes.bytes,
     );
     try std.testing.expectEqual(@as(usize, 2), app.shell.lifecyclePinCount());
 }
@@ -3676,26 +3768,26 @@ test "core.app_worker_runtime publishes rendered block before opening tool entri
 test "core.app_worker_runtime structural separator preserves running phase during tool composition" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
-    app.stream = .{
+    app.agent().worker.processing = true;
+    app.agent().stream = .{
         .active = true,
         .phase = .running,
     };
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{
         .assistant_presentation = .{ .text = @constCast("\n") },
     });
 
     try tickNoop(&app);
 
-    try std.testing.expectEqual(types.TurnPhase.running, app.stream.phase);
+    try std.testing.expectEqual(types.TurnPhase.running, app.agent().stream.phase);
 }
 
 test "core.app_worker_runtime provisional tool start switches generating to running" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
-    app.stream = .{
+    app.agent().worker.processing = true;
+    app.agent().stream = .{
         .active = true,
         .phase = .generating,
     };
@@ -3708,70 +3800,70 @@ test "core.app_worker_runtime provisional tool start switches generating to runn
 
     try tickNoop(&app);
 
-    try std.testing.expectEqual(types.TurnPhase.running, app.stream.phase);
+    try std.testing.expectEqual(types.TurnPhase.running, app.agent().stream.phase);
     try std.testing.expectEqual(
         @as(?types.ToolActivityKind, .read),
-        app.stream.last_activity_kind,
+        app.agent().stream.last_activity_kind,
     );
 }
 
 test "core.app_worker_runtime lifecycle boundary survives an incomplete assistant ANSI tail exactly once" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
+    app.agent().worker.processing = true;
 
     var bridge = PacedTranscriptBridge.init(&app);
     defer bridge.deinit();
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{
         .assistant_presentation = .{ .text = @constCast("visible\x1b[1") },
     });
     try queueToolStart(&app, 1, "read_a", "read_file");
 
-    try Runtime(FakeApp).tick(&app, bridge.handlers());
+    try Runtime(FakeApp).tick(&app, (&app).agent(), bridge.handlers());
 
     try std.testing.expectEqual(@as(usize, 1), bridge.drain_count);
-    try std.testing.expectEqual(@as(usize, 2), app.shell.lifecycle.entries.items.len);
-    try std.testing.expect(app.shell.lifecycle.entries.items[0] == .assistant_turn);
-    try std.testing.expect(app.shell.lifecycle.entries.items[1] == .raw_bytes);
+    try std.testing.expectEqual(@as(usize, 2), app.shell.lifecycle.notebook.entries.items.len);
+    try std.testing.expect(app.shell.lifecycle.notebook.entries.items[0] == .assistant_turn);
+    try std.testing.expect(app.shell.lifecycle.notebook.entries.items[1] == .raw_bytes);
     try std.testing.expectEqual(@as(usize, 1), app.shell.toolActivityRecordCount());
     try std.testing.expectEqual(@as(usize, 1), app.shell.lifecyclePinCount());
-    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.agent().worker.events.items.len);
 }
 
 test "app worker drains prior paced batch without splitting assistant turn" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
+    app.agent().worker.processing = true;
 
     var bridge = PacedTranscriptBridge.init(&app);
     defer bridge.deinit();
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{
         .assistant_presentation = .{ .text = @constCast("paced before start") },
     });
-    try Runtime(FakeApp).tick(&app, bridge.handlers());
+    try Runtime(FakeApp).tick(&app, (&app).agent(), bridge.handlers());
     try bridge.tickPacer(0);
 
     try std.testing.expect(!bridge.pacer.hasPending());
-    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.notebook.entries.items.len);
     try std.testing.expectEqualStrings(
         "paced before start",
-        app.shell.lifecycle.entries.items[0].assistant_turn.segments.text.items,
+        app.shell.lifecycle.notebook.entries.items[0].assistant_turn.segments.text.items,
     );
 
     try queueToolStart(&app, 1, "later", "read_file");
-    try Runtime(FakeApp).tick(&app, bridge.handlers());
+    try Runtime(FakeApp).tick(&app, (&app).agent(), bridge.handlers());
 
     try std.testing.expectEqual(@as(usize, 1), bridge.drain_count);
-    try std.testing.expectEqual(@as(usize, 2), app.shell.lifecycle.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), app.shell.lifecycle.notebook.entries.items.len);
     try std.testing.expectEqualStrings(
         "paced before start",
-        app.shell.lifecycle.entries.items[0].assistant_turn.segments.text.items,
+        app.shell.lifecycle.notebook.entries.items[0].assistant_turn.segments.text.items,
     );
     try std.testing.expectEqual(
         transcript_runtime.RawEntryClass.tool_status,
-        app.shell.lifecycle.entries.items[1].raw_bytes.class,
+        app.shell.lifecycle.notebook.entries.items[1].raw_bytes.class,
     );
     try std.testing.expect(!bridge.pacer.hasPending());
 }
@@ -3779,115 +3871,115 @@ test "app worker drains prior paced batch without splitting assistant turn" {
 test "core.app_worker_runtime question boundary drains paced text before opening the prompt" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
+    app.agent().worker.processing = true;
 
     var bridge = PacedTranscriptBridge.init(&app);
     defer bridge.deinit();
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{
         .assistant_presentation = .{ .text = @constCast("paced before question") },
     });
-    try Runtime(FakeApp).tick(&app, bridge.handlers());
+    try Runtime(FakeApp).tick(&app, (&app).agent(), bridge.handlers());
     try bridge.tickPacer(0);
     try std.testing.expect(!bridge.pacer.hasPending());
 
-    app.worker.pending_question = true;
-    try app.worker.pushEvent(std.heap.c_allocator, .question_requested);
-    try Runtime(FakeApp).tick(&app, bridge.handlers());
+    app.agent().worker.pending_question = true;
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .question_requested);
+    try Runtime(FakeApp).tick(&app, (&app).agent(), bridge.handlers());
 
     try std.testing.expectEqual(@as(usize, 1), bridge.drain_count);
-    try std.testing.expect(app.question_prompt.isActive());
-    try std.testing.expectEqual(@as(usize, 1), app.question_prompt.sync_count);
+    try std.testing.expect(app.agent().question_prompt.isActive());
+    try std.testing.expectEqual(@as(usize, 1), app.agent().question_prompt.sync_count);
     try std.testing.expect(!bridge.pacer.hasPending());
-    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.notebook.entries.items.len);
     try std.testing.expectEqualStrings(
         "paced before question",
-        app.shell.lifecycle.entries.items[0].assistant_turn.segments.text.items,
+        app.shell.lifecycle.notebook.entries.items[0].assistant_turn.segments.text.items,
     );
 }
 
 test "core.app_worker_runtime prompt boundary drains paced text before writing the user card" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
+    app.agent().worker.processing = true;
 
     var bridge = PacedTranscriptBridge.init(&app);
     defer bridge.deinit();
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{
         .assistant_presentation = .{ .text = @constCast("paced before prompt") },
     });
-    try Runtime(FakeApp).tick(&app, bridge.handlers());
+    try Runtime(FakeApp).tick(&app, (&app).agent(), bridge.handlers());
     try bridge.tickPacer(0);
     try std.testing.expect(!bridge.pacer.hasPending());
 
-    app.stream = .{
+    app.agent().stream = .{
         .active = true,
         .token_progress = .{ .input_tokens = 10, .output_tokens = 20 },
     };
-    try app.worker.pushEvent(std.heap.c_allocator, .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{
         .begin_prompt = try types.dupeUserTurn(std.heap.c_allocator, .{
             .text = @constCast("next prompt"),
             .images = &.{},
         }),
     });
-    try Runtime(FakeApp).tick(&app, bridge.handlers());
+    try Runtime(FakeApp).tick(&app, (&app).agent(), bridge.handlers());
 
     try std.testing.expectEqual(@as(usize, 1), bridge.drain_count);
     try std.testing.expectEqual(@as(usize, 1), bridge.user_prompt_count);
     try std.testing.expect(!bridge.pacer_pending_when_user_prompt_written);
     try std.testing.expect(!bridge.pacer.hasPending());
-    try std.testing.expect(app.stream.active);
-    try std.testing.expectEqual(types.TurnTokenProgress{}, app.stream.token_progress);
-    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.entries.items.len);
+    try std.testing.expect(app.agent().stream.active);
+    try std.testing.expectEqual(types.TurnTokenProgress{}, app.agent().stream.token_progress);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.notebook.entries.items.len);
     try std.testing.expectEqualStrings(
         "paced before prompt",
-        app.shell.lifecycle.entries.items[0].assistant_turn.segments.text.items,
+        app.shell.lifecycle.notebook.entries.items[0].assistant_turn.segments.text.items,
     );
 }
 
 test "core.app_worker_runtime feedback boundary drains paced text before writing the user card" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
-    app.stream = .{ .active = true, .phase = .generating };
+    app.agent().worker.processing = true;
+    app.agent().stream = .{ .active = true, .phase = .generating };
     app.shell.render_requests.clearReason(.footer);
 
     var bridge = PacedTranscriptBridge.init(&app);
     defer bridge.deinit();
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{
         .assistant_presentation = .{ .text = @constCast("cancelled response tail") },
     });
-    try app.worker.pushEvent(std.heap.c_allocator, .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{
         .append_user_feedback = @constCast("steer now"),
     });
 
-    try Runtime(FakeApp).tick(&app, bridge.handlers());
+    try Runtime(FakeApp).tick(&app, (&app).agent(), bridge.handlers());
 
     try std.testing.expectEqual(@as(usize, 1), bridge.drain_count);
     try std.testing.expectEqual(@as(usize, 1), bridge.user_prompt_count);
     try std.testing.expect(!bridge.pacer_pending_when_user_prompt_written);
     try std.testing.expect(bridge.assistant_present_when_user_prompt_written);
     try std.testing.expect(!bridge.pacer.hasPending());
-    try std.testing.expectEqual(types.TurnPhase.thinking, app.stream.phase);
+    try std.testing.expectEqual(types.TurnPhase.thinking, app.agent().stream.phase);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
-    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.notebook.entries.items.len);
     try std.testing.expectEqualStrings(
         "cancelled response tail",
-        app.shell.lifecycle.entries.items[0].assistant_turn.segments.text.items,
+        app.shell.lifecycle.notebook.entries.items[0].assistant_turn.segments.text.items,
     );
 }
 
 test "core.app_worker_runtime blocked prompt drain retains the prompt before reset or write" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
-    app.stream = .{
+    app.agent().worker.processing = true;
+    app.agent().stream = .{
         .active = true,
         .token_progress = .{ .input_tokens = 10, .output_tokens = 20 },
     };
-    try app.worker.pushEvent(std.heap.c_allocator, .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{
         .begin_prompt = try types.dupeUserTurn(std.heap.c_allocator, .{
             .text = @constCast("next prompt"),
             .images = &.{},
@@ -3915,26 +4007,26 @@ test "core.app_worker_runtime blocked prompt drain retains the prompt before res
     handlers.drain_assistant_text = Capture.drain;
     handlers.write_user_prompt = Capture.writeUserPrompt;
 
-    try Runtime(FakeApp).tick(&app, handlers);
+    try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
     try std.testing.expectEqual(@as(usize, 1), capture.drain_count);
     try std.testing.expectEqual(@as(usize, 0), capture.user_prompt_count);
-    try std.testing.expectEqual(@as(u64, 10), app.stream.token_progress.input_tokens);
-    try std.testing.expectEqual(@as(u64, 20), app.stream.token_progress.output_tokens);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.events.items.len);
-    try std.testing.expect(app.worker.events.items[0] == .begin_prompt);
+    try std.testing.expectEqual(@as(u64, 10), app.agent().stream.token_progress.input_tokens);
+    try std.testing.expectEqual(@as(u64, 20), app.agent().stream.token_progress.output_tokens);
+    try std.testing.expectEqual(@as(usize, 1), app.agent().worker.events.items.len);
+    try std.testing.expect(app.agent().worker.events.items[0] == .begin_prompt);
 
-    try Runtime(FakeApp).tick(&app, handlers);
+    try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
     try std.testing.expectEqual(@as(usize, 2), capture.drain_count);
     try std.testing.expectEqual(@as(usize, 1), capture.user_prompt_count);
-    try std.testing.expect(app.stream.active);
-    try std.testing.expectEqual(types.TurnTokenProgress{}, app.stream.token_progress);
-    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
+    try std.testing.expect(app.agent().stream.active);
+    try std.testing.expectEqual(types.TurnTokenProgress{}, app.agent().stream.token_progress);
+    try std.testing.expectEqual(@as(usize, 0), app.agent().worker.events.items.len);
 }
 
 test "core.app_worker_runtime lifecycle updates and turn finalization do not drain paced text" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
+    app.agent().worker.processing = true;
 
     try queueToolStart(&app, 1, "call", "read_file");
     try tickNoop(&app);
@@ -3960,7 +4052,7 @@ test "core.app_worker_runtime lifecycle updates and turn finalization do not dra
     try queueToolTerminal(&app, 1, "call", .completed, "Read");
     try queueTurnFinished(&app, 1, .completed);
 
-    try Runtime(FakeApp).tick(&app, handlers);
+    try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
 
     try std.testing.expectEqual(@as(usize, 0), capture.drain_count);
     try std.testing.expectEqual(@as(usize, 0), app.shell.lifecyclePinCount());
@@ -3971,12 +4063,12 @@ test "core.app_worker_runtime blocked assistant drain retains current event and 
     defer app.deinit();
 
     try queueToolStart(&app, 1, "blocked", "read_file");
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .semantic_notice = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .semantic_notice = .{
         .topic = "system",
         .tone = .information,
         .body = "notice",
     } });
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .semantic_notice = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .semantic_notice = .{
         .topic = "context",
         .tone = .warning,
         .body = "context",
@@ -4006,29 +4098,29 @@ test "core.app_worker_runtime blocked assistant drain retains current event and 
     handlers.drain_assistant_text = Capture.drain;
     handlers.semantic_notice = Capture.notice;
 
-    try Runtime(FakeApp).tick(&app, handlers);
+    try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
     try std.testing.expectEqual(@as(usize, 0), capture.notice_count);
     try std.testing.expectEqual(@as(usize, 0), capture.context_notice_count);
     try std.testing.expectEqual(@as(usize, 0), app.shell.toolActivityRecordCount());
-    try std.testing.expectEqual(@as(usize, 3), app.worker.events.items.len);
-    try std.testing.expect(app.worker.events.items[0] == .tool_lifecycle);
-    try std.testing.expect(app.worker.events.items[1] == .semantic_notice);
-    try std.testing.expect(app.worker.events.items[2] == .semantic_notice);
-    try std.testing.expectEqual(types.NoticeVisibility.full_only, app.worker.events.items[2].semantic_notice.visibility);
+    try std.testing.expectEqual(@as(usize, 3), app.agent().worker.events.items.len);
+    try std.testing.expect(app.agent().worker.events.items[0] == .tool_lifecycle);
+    try std.testing.expect(app.agent().worker.events.items[1] == .semantic_notice);
+    try std.testing.expect(app.agent().worker.events.items[2] == .semantic_notice);
+    try std.testing.expectEqual(types.NoticeVisibility.full_only, app.agent().worker.events.items[2].semantic_notice.visibility);
 
-    try Runtime(FakeApp).tick(&app, handlers);
+    try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
 
     try std.testing.expectEqual(@as(usize, 2), capture.notice_count);
     try std.testing.expectEqual(@as(usize, 1), capture.context_notice_count);
     try std.testing.expectEqual(@as(usize, 1), app.shell.toolActivityRecordCount());
     try std.testing.expectEqual(@as(usize, 1), app.shell.lifecyclePinCount());
-    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.agent().worker.events.items.len);
 }
 
 test "core.app_worker_runtime retains a thematic rule until paced text drains" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    try app.worker.pushEvent(std.heap.c_allocator, .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{
         .assistant_presentation = .thematic_rule,
     });
 
@@ -4053,15 +4145,15 @@ test "core.app_worker_runtime retains a thematic rule until paced text drains" {
     handlers.drain_assistant_text = Capture.drain;
     handlers.append_thematic_rule = Capture.appendThematicRule;
 
-    try Runtime(FakeApp).tick(&app, handlers);
+    try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
     try std.testing.expectEqual(@as(usize, 0), capture.rule_count);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.events.items.len);
-    try std.testing.expect(app.worker.events.items[0] == .assistant_presentation);
-    try std.testing.expect(app.worker.events.items[0].assistant_presentation == .thematic_rule);
+    try std.testing.expectEqual(@as(usize, 1), app.agent().worker.events.items.len);
+    try std.testing.expect(app.agent().worker.events.items[0] == .assistant_presentation);
+    try std.testing.expect(app.agent().worker.events.items[0].assistant_presentation == .thematic_rule);
 
-    try Runtime(FakeApp).tick(&app, handlers);
+    try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
     try std.testing.expectEqual(@as(usize, 1), capture.rule_count);
-    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.agent().worker.events.items.len);
 }
 
 test "core.app_worker_runtime model picker event drains before one callback and modal request" {
@@ -4098,9 +4190,9 @@ test "core.app_worker_runtime model picker event drains before one callback and 
     handlers.ctx = @ptrCast(&capture);
     handlers.drain_assistant_text = Capture.drain;
     handlers.open_model_picker = Capture.open;
-    try app.worker.pushEvent(std.heap.c_allocator, .open_model_picker);
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .open_model_picker);
 
-    try Runtime(FakeApp).tick(&app, handlers);
+    try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
 
     try std.testing.expectEqualStrings("DO", capture.order[0..capture.order_len]);
     try std.testing.expectEqual(@as(usize, 1), capture.open_count);
@@ -4121,16 +4213,16 @@ test "core.app_worker_runtime assistant drain preserves callback errors before l
 
     try std.testing.expectError(
         error.InjectedPacerEmitFailure,
-        Runtime(FakeApp).tick(&app, handlers),
+        Runtime(FakeApp).tick(&app, (&app).agent(), handlers),
     );
     try std.testing.expectEqual(@as(usize, 0), app.shell.toolActivityRecordCount());
-    try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.notebook.entries.items.len);
 }
 
 test "core.app_worker_runtime semantic notice handler failure returns through drain cleanup" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    try app.worker.pushEvent(
+    try app.agent().worker.pushEvent(
         std.heap.c_allocator,
         .{ .semantic_notice = .{
             .topic = "permissions",
@@ -4139,7 +4231,7 @@ test "core.app_worker_runtime semantic notice handler failure returns through dr
             .visibility = .full_only,
         } },
     );
-    try app.worker.pushEvent(
+    try app.agent().worker.pushEvent(
         std.heap.c_allocator,
         .{ .semantic_notice = .{
             .topic = "system",
@@ -4167,25 +4259,25 @@ test "core.app_worker_runtime semantic notice handler failure returns through dr
 
     try std.testing.expectError(
         error.InjectedSemanticNoticeTranscriptFailure,
-        Runtime(FakeApp).tick(&app, handlers),
+        Runtime(FakeApp).tick(&app, (&app).agent(), handlers),
     );
     try std.testing.expectEqual(@as(usize, 0), capture.suffix_count);
-    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.agent().worker.events.items.len);
 }
 
 test "core.app_worker_runtime text turn finishes after its rendered block" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
+    app.agent().worker.processing = true;
 
     var bridge = PacedTranscriptBridge.init(&app);
     defer bridge.deinit();
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{
         .assistant_presentation = .{ .text = @constCast("slow") },
     });
     try queueTurnFinished(&app, 1, .completed);
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{
         .turn = .{ .compacted_summary = .{
             .summary = @constCast("history"),
             .removed_turn_count = 1,
@@ -4193,19 +4285,19 @@ test "core.app_worker_runtime text turn finishes after its rendered block" {
         } },
     } });
 
-    try Runtime(FakeApp).tick(&app, bridge.handlers());
+    try Runtime(FakeApp).tick(&app, (&app).agent(), bridge.handlers());
 
     try std.testing.expectEqual(@as(usize, 0), bridge.drain_count);
     try std.testing.expectEqual(@as(usize, 1), bridge.history_count);
     try std.testing.expectEqual(@as(usize, 0), bridge.finish_count);
-    try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.notebook.entries.items.len);
     try std.testing.expect(bridge.pacer.hasPending());
     try std.testing.expect(bridge.pacer.deferred_turn != null);
 
     try bridge.tickPacer(0);
     try std.testing.expectEqualStrings(
         "slow",
-        app.shell.lifecycle.entries.items[0].assistant_turn.segments.text.items,
+        app.shell.lifecycle.notebook.entries.items[0].assistant_turn.segments.text.items,
     );
     try std.testing.expectEqual(@as(usize, 1), bridge.finish_count);
     try std.testing.expect(bridge.pacer.deferred_turn == null);
@@ -4215,15 +4307,15 @@ test "core.app_worker_runtime text turn finishes after its rendered block" {
 test "core.app_worker_runtime queued begin waits for deferred completed turn summary" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
+    app.agent().worker.processing = true;
 
     var bridge = PacedTranscriptBridge.init(&app);
     defer bridge.deinit();
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{
         .assistant_presentation = .{ .text = @constCast("prior answer") },
     });
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{
         .turn = .{ .assistant = .{
             .user = .{ .text = @constCast("prior prompt"), .images = &.{} },
             .assistant = @constCast("prior answer"),
@@ -4235,11 +4327,11 @@ test "core.app_worker_runtime queued begin waits for deferred completed turn sum
         },
         .terminal_outcome = .completed,
     } });
-    try app.worker.pushEvent(std.heap.c_allocator, .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{
         .begin_prompt = .{ .text = @constCast("queued prompt"), .images = &.{} },
     });
 
-    try Runtime(FakeApp).tick(&app, bridge.handlers());
+    try Runtime(FakeApp).tick(&app, (&app).agent(), bridge.handlers());
 
     try std.testing.expectEqualStrings("FU", bridge.orderSlice());
     try std.testing.expectEqual(@as(usize, 1), bridge.finish_count);
@@ -4251,7 +4343,7 @@ test "core.app_worker_runtime queued begin waits for deferred completed turn sum
 test "core.app_worker_runtime split batches finalize lifecycle before history" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
+    app.agent().worker.processing = true;
 
     try queueToolStart(&app, 1, "split", "read_file");
     try queueToolTerminal(&app, 1, "split", .completed, "Read");
@@ -4262,7 +4354,7 @@ test "core.app_worker_runtime split batches finalize lifecycle before history" {
     try std.testing.expectEqual(@as(usize, 0), app.shell.toolActivityRecordCount());
     try std.testing.expectEqual(@as(usize, 0), app.shell.lifecyclePinCount());
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{
         .turn = .{ .compacted_summary = .{
             .summary = @constCast("history"),
             .removed_turn_count = 1,
@@ -4289,7 +4381,7 @@ test "core.app_worker_runtime split batches finalize lifecycle before history" {
     handlers.ctx = @ptrCast(&capture);
     handlers.append_history_turn = Capture.history;
 
-    try Runtime(FakeApp).tick(&app, handlers);
+    try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
 
     try std.testing.expectEqual(@as(usize, 1), capture.history_count);
     try std.testing.expect(capture.saw_finalized_fence);
@@ -4298,20 +4390,20 @@ test "core.app_worker_runtime split batches finalize lifecycle before history" {
 test "core.app_worker_runtime reset before drain fences interrupted prefix and keeps next turn live" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
-    app.worker.worker_cancel_requested.store(true, .seq_cst);
+    app.agent().worker.processing = true;
+    app.agent().worker.worker_cancel_requested.store(true, .seq_cst);
 
     try queueToolStart(&app, 1, "cancelled", "read_file");
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{
         .text = @constCast("late turn one"),
     } });
     try queueToolTerminal(&app, 1, "cancelled", .cancelled, "Cancelled");
     try queueTurnFinished(&app, 1, .interrupted);
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = try types.dupeUserTurn(
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = try types.dupeUserTurn(
         std.heap.c_allocator,
         .{ .text = @constCast("next"), .images = &.{} },
     ) });
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{
         .text = @constCast("turn two"),
     } });
     try queueToolStart(&app, 2, "active", "run_command");
@@ -4331,8 +4423,8 @@ test "core.app_worker_runtime reset before drain fences interrupted prefix and k
     handlers.ctx = @ptrCast(&capture);
     handlers.append_text = Capture.text;
 
-    app.worker.worker_cancel_requested.store(false, .seq_cst);
-    try Runtime(FakeApp).tick(&app, handlers);
+    app.agent().worker.worker_cancel_requested.store(false, .seq_cst);
+    try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
 
     try std.testing.expect(!capture.late_text_seen);
     try std.testing.expect(capture.next_text_seen);
@@ -4344,13 +4436,13 @@ test "core.app_worker_runtime reset before drain fences interrupted prefix and k
     );
     try std.testing.expectEqual(@as(usize, 1), app.shell.activeToolActivityCount());
     try std.testing.expectEqual(@as(usize, 1), app.shell.lifecyclePinCount());
-    try std.testing.expectEqual(types.ToolActivityKind.command, app.stream.last_activity_kind.?);
+    try std.testing.expectEqual(types.ToolActivityKind.command, app.agent().stream.last_activity_kind.?);
 }
 
 test "core.app_worker_runtime reducer error settles batch and skips suffix" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
+    app.agent().worker.processing = true;
 
     try queueToolStart(&app, 1, "call", "read_file");
     try queueLifecycle(&app, .{ .progress = .{
@@ -4373,16 +4465,16 @@ test "core.app_worker_runtime reducer error settles batch and skips suffix" {
 test "core.app_worker_runtime cancellation leaves an earlier completed segment drainable" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
-    app.worker.active_turn_id = 2;
-    app.worker.worker_cancel_requested.store(true, .seq_cst);
+    app.agent().worker.processing = true;
+    app.agent().worker.active_turn_id = 2;
+    app.agent().worker.worker_cancel_requested.store(true, .seq_cst);
     try queueToolStart(&app, 1, "completed-call", "read_file");
     try queueToolTerminal(&app, 1, "completed-call", .completed, "Read");
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{ .text = @constCast("earlier completed answer") } });
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{ .text = @constCast("earlier completed answer") } });
     try queueTurnFinished(&app, 1, .completed);
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = .{ .text = @constCast("later request") } });
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .turn_phase_update = .{ .turn_id = 2, .step_id = 1, .phase = .thinking } });
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{ .text = @constCast("cancelled later answer") } });
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = .{ .text = @constCast("later request") } });
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .turn_phase_update = .{ .turn_id = 2, .step_id = 1, .phase = .thinking } });
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{ .text = @constCast("cancelled later answer") } });
     try queueTurnFinished(&app, 2, .interrupted);
     const Capture = struct {
         fn text(raw: *anyopaque, bytes: []const u8) !void {
@@ -4393,8 +4485,8 @@ test "core.app_worker_runtime cancellation leaves an earlier completed segment d
     var handlers = NoopBridge.handlers(&app);
     handlers.ctx = &app;
     handlers.append_text = Capture.text;
-    try Runtime(FakeApp).tick(&app, handlers);
-    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
+    try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
+    try std.testing.expectEqual(@as(usize, 0), app.agent().worker.events.items.len);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "earlier completed answer") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "cancelled later answer") == null);
 }
@@ -4402,13 +4494,13 @@ test "core.app_worker_runtime cancellation leaves an earlier completed segment d
 test "core.app_worker_runtime reducer failure preserves a completed turn in the suffix" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
+    app.agent().worker.processing = true;
     try queueToolStart(&app, 1, "call", "read_file");
     try queueLifecycle(&app, .{ .progress = .{
         .id = .{ .turn_id = 1, .call_id = "call" },
         .text = "Reading",
     } });
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .assistant = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .assistant = .{
         .user = .{ .text = @constCast("accepted request") },
         .assistant = @constCast("completed answer"),
     } } } });
@@ -4422,8 +4514,8 @@ test "core.app_worker_runtime failed turn terminalizes tool lifecycle before err
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    app.worker.processing = true;
-    app.stream.active = true;
+    app.agent().worker.processing = true;
+    app.agent().stream.active = true;
     try queueToolStart(&app, 1, "call_1", "read_file");
     try queueLifecycle(&app, .{ .progress = .{
         .id = .{ .turn_id = 1, .call_id = "call_1" },
@@ -4434,17 +4526,17 @@ test "core.app_worker_runtime failed turn terminalizes tool lifecycle before err
     const entry_id = app.shell.focusedToolEntryId().?;
 
     try queueTurnFinished(&app, 1, .failed);
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
         .topic = "system",
         .tone = .@"error",
         .body = "request failed",
     } });
-    app.worker.processing = false;
+    app.agent().worker.processing = false;
 
     try tickNoop(&app);
 
-    try std.testing.expect(!app.stream.active);
-    try std.testing.expect(app.stream.last_activity_kind == null);
+    try std.testing.expect(!app.agent().stream.active);
+    try std.testing.expect(app.agent().stream.last_activity_kind == null);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
     try std.testing.expectEqual(@as(usize, 0), app.shell.toolActivityRecordCount());
     try std.testing.expectEqual(@as(usize, 0), app.shell.lifecyclePinCount());
@@ -4480,8 +4572,8 @@ test "core.app_worker_runtime error text resets active stream and requests foote
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.error_saw_drain = self.drain_count == 1;
             self.saw_reset_stream =
-                !self.app.stream.active and
-                self.app.stream.last_activity_kind == null;
+                !self.app.agent().stream.active and
+                self.app.agent().stream.last_activity_kind == null;
             self.saw_footer_request =
                 self.app.shell.render_requests.hasReason(.footer);
         }
@@ -4492,19 +4584,19 @@ test "core.app_worker_runtime error text resets active stream and requests foote
     handlers.drain_assistant_text = Capture.drain;
     handlers.error_text = Capture.errorText;
 
-    app.worker.processing = true;
-    app.stream = .{
+    app.agent().worker.processing = true;
+    app.agent().stream = .{
         .active = true,
         .phase = .generating,
         .last_activity_kind = .ask,
     };
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
         .topic = "system",
         .tone = .@"error",
         .body = "request failed",
     } });
 
-    try Runtime(FakeApp).tick(&app, handlers);
+    try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
 
     try std.testing.expectEqual(@as(usize, 1), capture.drain_count);
     try std.testing.expect(capture.error_saw_drain);
@@ -4549,55 +4641,55 @@ test "core.app_worker_runtime blocked error drain retains the error and suffix i
     handlers.error_text = Capture.errorText;
     handlers.write_user_prompt = Capture.feedback;
 
-    app.worker.processing = true;
-    app.stream = .{
+    app.agent().worker.processing = true;
+    app.agent().stream = .{
         .active = true,
         .phase = .generating,
         .last_activity_kind = .ask,
     };
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
         .topic = "system",
         .tone = .@"error",
         .body = "request failed",
     } });
-    try app.worker.pushEvent(std.heap.c_allocator, .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{
         .append_user_feedback = @constCast("after error"),
     });
 
-    try Runtime(FakeApp).tick(&app, handlers);
+    try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
 
     try std.testing.expectEqual(@as(usize, 1), capture.drain_count);
     try std.testing.expectEqual(@as(usize, 0), capture.error_count);
     try std.testing.expectEqual(@as(usize, 0), capture.feedback_count);
-    try std.testing.expect(app.stream.active);
-    try std.testing.expectEqual(@as(usize, 2), app.worker.events.items.len);
-    try std.testing.expect(app.worker.events.items[0] == .error_text);
-    try std.testing.expect(app.worker.events.items[1] == .append_user_feedback);
+    try std.testing.expect(app.agent().stream.active);
+    try std.testing.expectEqual(@as(usize, 2), app.agent().worker.events.items.len);
+    try std.testing.expect(app.agent().worker.events.items[0] == .error_text);
+    try std.testing.expect(app.agent().worker.events.items[1] == .append_user_feedback);
 
-    try Runtime(FakeApp).tick(&app, handlers);
+    try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
 
     try std.testing.expectEqual(@as(usize, 3), capture.drain_count);
     try std.testing.expectEqual(@as(usize, 1), capture.error_count);
     try std.testing.expectEqual(@as(usize, 1), capture.feedback_count);
-    try std.testing.expect(!app.stream.active);
-    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
+    try std.testing.expect(!app.agent().stream.active);
+    try std.testing.expectEqual(@as(usize, 0), app.agent().worker.events.items.len);
 }
 
 test "core.app_worker_runtime tick drains events and updates thinking state" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    app.worker.processing = true;
-    app.stream.active = true;
+    app.agent().worker.processing = true;
+    app.agent().stream.active = true;
     try queueToolStart(&app, 1, "command", "run_command");
     try queueToolStart(&app, 1, "read", "read_file");
 
     try tickNoop(&app);
 
-    try std.testing.expect(app.stream.active);
-    try std.testing.expectEqual(@as(usize, 2), app.stream.chunks);
-    try std.testing.expectEqual(@as(usize, 1), app.stream.command_count);
-    try std.testing.expectEqual(@as(usize, 1), app.stream.read_count);
+    try std.testing.expect(app.agent().stream.active);
+    try std.testing.expectEqual(@as(usize, 2), app.agent().stream.chunks);
+    try std.testing.expectEqual(@as(usize, 1), app.agent().stream.command_count);
+    try std.testing.expectEqual(@as(usize, 1), app.agent().stream.read_count);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
@@ -4612,18 +4704,18 @@ test "core.app_worker_runtime writes queued approval feedback after a tool termi
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.user_count += 1;
             self.saw_feedback = std.mem.eql(u8, prompt.text, "read it after writing");
-            self.stream_remained_active = self.app.stream.active and
-                self.app.stream.token_progress.output_tokens == 7;
+            self.stream_remained_active = self.app.agent().stream.active and
+                self.app.agent().stream.token_progress.output_tokens == 7;
         }
     };
 
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
-    app.stream = .{ .active = true, .token_progress = .{ .output_tokens = 7 } };
+    app.agent().worker.processing = true;
+    app.agent().stream = .{ .active = true, .token_progress = .{ .output_tokens = 7 } };
     try queueToolStart(&app, 1, "call_feedback", "write_file");
     try queueToolTerminal(&app, 1, "call_feedback", .completed, "Wrote note.txt");
-    try app.worker.pushEvent(std.heap.c_allocator, .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{
         .append_user_feedback = @constCast("read it after writing"),
     });
 
@@ -4631,7 +4723,7 @@ test "core.app_worker_runtime writes queued approval feedback after a tool termi
     var handlers = NoopBridge.handlers(&app);
     handlers.ctx = @ptrCast(&capture);
     handlers.write_user_prompt = Capture.user;
-    try Runtime(FakeApp).tick(&app, handlers);
+    try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
 
     try std.testing.expectEqual(@as(usize, 1), capture.user_count);
     try std.testing.expect(capture.saw_feedback);
@@ -4643,7 +4735,7 @@ test "core.app_worker_runtime drains diff block through bridge handler" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    try Runtime(FakeApp).pushDiffBlock(&app, .{
+    try Runtime(FakeApp).pushDiffBlock(&app, (&app).agent(), .{
         .preview = try c_alloc.dupe(u8, "diff preview"),
     });
 
@@ -4677,7 +4769,7 @@ test "core.app_worker_runtime drains diff block through bridge handler" {
     var capture = Capture{};
     defer capture.deinit(std.testing.allocator);
 
-    try Runtime(FakeApp).tick(&app, .{
+    try Runtime(FakeApp).tick(&app, (&app).agent(), .{
         .ctx = @ptrCast(&capture),
         .tool_lifecycle = NoopBridge.lifecyclePresenter(&app),
         .write_user_prompt = Capture.user,
@@ -4702,10 +4794,10 @@ test "core.app_worker_runtime failure before diff transfer leaves batch ownershi
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    try app.worker.pushEvent(c_alloc, .{ .assistant_presentation = .{
+    try app.agent().worker.pushEvent(c_alloc, .{ .assistant_presentation = .{
         .text = @constCast("fail"),
     } });
-    try Runtime(FakeApp).pushDiffBlock(&app, .{
+    try Runtime(FakeApp).pushDiffBlock(&app, (&app).agent(), .{
         .preview = try c_alloc.dupe(u8, "diff preview"),
     });
 
@@ -4730,7 +4822,7 @@ test "core.app_worker_runtime failure before diff transfer leaves batch ownershi
 
     try std.testing.expectError(
         error.InjectedBeforeDiffTransfer,
-        Runtime(FakeApp).tick(&app, handlers),
+        Runtime(FakeApp).tick(&app, (&app).agent(), handlers),
     );
     try std.testing.expectEqual(@as(usize, 0), capture.diff_count);
 }
@@ -4740,10 +4832,10 @@ test "core.app_worker_runtime diff receiver cleans transferred payload on error"
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    try Runtime(FakeApp).pushDiffBlock(&app, .{
+    try Runtime(FakeApp).pushDiffBlock(&app, (&app).agent(), .{
         .preview = try c_alloc.dupe(u8, "diff preview"),
     });
-    try app.worker.pushEvent(c_alloc, .{ .error_text = .{
+    try app.agent().worker.pushEvent(c_alloc, .{ .error_text = .{
         .topic = "system",
         .tone = .@"error",
         .body = "suffix",
@@ -4773,7 +4865,7 @@ test "core.app_worker_runtime diff receiver cleans transferred payload on error"
 
     try std.testing.expectError(
         error.InjectedAfterDiffTransfer,
-        Runtime(FakeApp).tick(&app, handlers),
+        Runtime(FakeApp).tick(&app, (&app).agent(), handlers),
     );
     try std.testing.expectEqual(@as(usize, 1), capture.diff_count);
     try std.testing.expectEqual(@as(usize, 0), capture.suffix_count);
@@ -4829,36 +4921,36 @@ test "core.app_worker_runtime records accepted command output once and drops rej
     handlers.command_output_complete = Capture.outputComplete;
 
     capture.fail_output = true;
-    try Runtime(FakeApp).pushCommandOutput(&app, lifecycle_id, .stdout, "rejected\n");
+    try Runtime(FakeApp).pushCommandOutput(&app, (&app).agent(), lifecycle_id, .stdout, "rejected\n");
     try std.testing.expectError(
         error.InjectedCommandOutputFailure,
-        Runtime(FakeApp).tick(&app, handlers),
+        Runtime(FakeApp).tick(&app, (&app).agent(), handlers),
     );
-    try std.testing.expect(app.session_persistence.pending_cancelled_command == null);
+    try std.testing.expect(app.agent().session_persistence.pending_cancelled_command == null);
 
     capture.fail_output = false;
     try queueToolStart(&app, lifecycle_id.turn_id, lifecycle_id.call_id, "run_command");
-    try Runtime(FakeApp).pushCommandOutput(&app, lifecycle_id, .stdout, "stdout-one\n");
-    try Runtime(FakeApp).pushCommandOutput(&app, lifecycle_id, .stderr, "stderr-one\n");
-    try Runtime(FakeApp).pushCommandOutput(&app, lifecycle_id, .stdout, "stdout-two\n");
-    try Runtime(FakeApp).pushCommandOutput(&app, lifecycle_id, .stderr, "stderr-two\n");
-    try Runtime(FakeApp).pushCommandOutputComplete(&app, lifecycle_id);
-    try Runtime(FakeApp).tick(&app, handlers);
+    try Runtime(FakeApp).pushCommandOutput(&app, (&app).agent(), lifecycle_id, .stdout, "stdout-one\n");
+    try Runtime(FakeApp).pushCommandOutput(&app, (&app).agent(), lifecycle_id, .stderr, "stderr-one\n");
+    try Runtime(FakeApp).pushCommandOutput(&app, (&app).agent(), lifecycle_id, .stdout, "stdout-two\n");
+    try Runtime(FakeApp).pushCommandOutput(&app, (&app).agent(), lifecycle_id, .stderr, "stderr-two\n");
+    try Runtime(FakeApp).pushCommandOutputComplete(&app, (&app).agent(), lifecycle_id);
+    try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
 
     try std.testing.expectEqual(@as(usize, 4), capture.chunk_count);
     try std.testing.expectEqual(@as(usize, 1), capture.completion_count);
-    try std.testing.expect(app.session_persistence.pending_cancelled_command == null);
+    try std.testing.expect(app.agent().session_persistence.pending_cancelled_command == null);
 
-    app.worker.worker_cancel_requested.store(true, .seq_cst);
-    try Runtime(FakeApp).pushCommandOutput(&app, lifecycle_id, .stdout, "late-stdout\n");
-    try Runtime(FakeApp).pushCommandOutput(&app, lifecycle_id, .stderr, "late-stderr\n");
-    try Runtime(FakeApp).pushCommandOutputComplete(&app, lifecycle_id);
-    try Runtime(FakeApp).pushCommandOutputComplete(&app, null);
-    try Runtime(FakeApp).pushCommandOutputComplete(&app, .{ .turn_id = 5, .call_id = "other" });
+    app.agent().worker.worker_cancel_requested.store(true, .seq_cst);
+    try Runtime(FakeApp).pushCommandOutput(&app, (&app).agent(), lifecycle_id, .stdout, "late-stdout\n");
+    try Runtime(FakeApp).pushCommandOutput(&app, (&app).agent(), lifecycle_id, .stderr, "late-stderr\n");
+    try Runtime(FakeApp).pushCommandOutputComplete(&app, (&app).agent(), lifecycle_id);
+    try Runtime(FakeApp).pushCommandOutputComplete(&app, (&app).agent(), null);
+    try Runtime(FakeApp).pushCommandOutputComplete(&app, (&app).agent(), .{ .turn_id = 5, .call_id = "other" });
     try queueToolTerminal(&app, lifecycle_id.turn_id, lifecycle_id.call_id, .cancelled, "Cancelled run_command");
-    try Runtime(FakeApp).pushCommandOutputComplete(&app, lifecycle_id);
+    try Runtime(FakeApp).pushCommandOutputComplete(&app, (&app).agent(), lifecycle_id);
     try queueTurnFinished(&app, lifecycle_id.turn_id, .interrupted);
-    try Runtime(FakeApp).tick(&app, handlers);
+    try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
 
     try std.testing.expectEqual(@as(usize, 4), capture.chunk_count);
     try std.testing.expectEqual(@as(usize, 2), capture.completion_count);
@@ -4892,7 +4984,7 @@ test "core.app_worker_runtime finalizes open command output at the turn boundary
         true,
     );
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{
         .turn = .{ .compacted_summary = .{
             .summary = @constCast("finished"),
             .removed_turn_count = 1,
@@ -4931,12 +5023,12 @@ test "core.app_worker_runtime finalizes open command output at the turn boundary
     handlers.ctx = @ptrCast(&capture);
     handlers.command_output_complete = Capture.outputComplete;
 
-    try Runtime(FakeApp).tick(&app, handlers);
+    try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
 
     try std.testing.expectEqual(@as(usize, 1), capture.completions);
-    try std.testing.expect(app.shell.lifecycle.command_output_display.open_command_block == null);
-    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.command_output_blocks.items.len);
-    try std.testing.expect(app.shell.lifecycle.command_output_blocks.items[0].entry_id != null);
+    try std.testing.expect(app.shell.lifecycle.notebook.command_output_display.open_command_block == null);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.notebook.command_output_blocks.items.len);
+    try std.testing.expect(app.shell.lifecycle.notebook.command_output_blocks.items[0].entry_id != null);
 }
 
 test "core.app_worker_runtime idle sync preserves command output pending its turn boundary" {
@@ -4963,27 +5055,27 @@ test "core.app_worker_runtime idle sync preserves command output pending its tur
         "retained output\n",
         true,
     );
-    app.stream.active = true;
-    app.worker.processing = false;
+    app.agent().stream.active = true;
+    app.agent().worker.processing = false;
 
-    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
+    Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
 
-    try std.testing.expect(!app.stream.active);
-    try std.testing.expect(app.shell.lifecycle.command_output_display.open_command_block != null);
-    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.command_output_blocks.items.len);
+    try std.testing.expect(!app.agent().stream.active);
+    try std.testing.expect(app.shell.lifecycle.notebook.command_output_display.open_command_block != null);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.notebook.command_output_blocks.items.len);
 }
 
 test "core.app_worker_runtime blocks frame attempts until worker event batch settles" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
+    app.agent().worker.processing = true;
 
     const lifecycle_id = types.ToolLifecycleId{ .turn_id = 9, .call_id = "cmd-9" };
     try queueToolStart(&app, lifecycle_id.turn_id, lifecycle_id.call_id, "run_command");
-    try Runtime(FakeApp).pushCommandOutput(&app, lifecycle_id, .stdout, "one\n");
-    try Runtime(FakeApp).pushCommandOutputComplete(&app, lifecycle_id);
+    try Runtime(FakeApp).pushCommandOutput(&app, (&app).agent(), lifecycle_id, .stdout, "one\n");
+    try Runtime(FakeApp).pushCommandOutputComplete(&app, (&app).agent(), lifecycle_id);
     try queueToolTerminal(&app, lifecycle_id.turn_id, lifecycle_id.call_id, .failed, "failed");
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
         .topic = "system",
         .tone = .@"error",
         .body = "request failed",
@@ -5034,7 +5126,7 @@ test "core.app_worker_runtime blocks frame attempts until worker event batch set
     handlers.command_output_complete = Capture.outputComplete;
     handlers.error_text = Capture.err;
 
-    try Runtime(FakeApp).tick(&app, handlers);
+    try Runtime(FakeApp).tick(&app, (&app).agent(), handlers);
 
     try std.testing.expectEqual(@as(usize, 3), capture.reentrant_checks);
     try std.testing.expectEqual(capture.reentrant_checks, capture.blocked_checks);
@@ -5069,9 +5161,9 @@ test "core.app_worker_runtime cancelled drain skips diff block" {
     const c_alloc = std.heap.c_allocator;
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.worker_cancel_requested.store(true, .seq_cst);
+    app.agent().worker.worker_cancel_requested.store(true, .seq_cst);
 
-    try Runtime(FakeApp).pushDiffBlock(&app, .{
+    try Runtime(FakeApp).pushDiffBlock(&app, (&app).agent(), .{
         .preview = try c_alloc.dupe(u8, "diff preview"),
     });
 
@@ -5096,7 +5188,7 @@ test "core.app_worker_runtime cancelled drain skips diff block" {
     };
     var capture = Capture{};
 
-    try Runtime(FakeApp).tick(&app, .{
+    try Runtime(FakeApp).tick(&app, (&app).agent(), .{
         .ctx = @ptrCast(&capture),
         .tool_lifecycle = NoopBridge.lifecyclePresenter(&app),
         .write_user_prompt = Capture.user,
@@ -5119,7 +5211,7 @@ test "worker finish delivery separates unaccepted work from committed presentati
     for ([_]bool{ false, true }) |committed| {
         var app = FakeApp.init(std.testing.allocator);
         defer app.deinit();
-        app.worker.processing = true;
+        app.agent().worker.processing = true;
         const Capture = struct {
             app: *FakeApp,
             committed: bool,
@@ -5135,23 +5227,23 @@ test "worker finish delivery separates unaccepted work from committed presentati
         handlers.ctx = &capture;
         handlers.append_history_turn = Capture.history;
         for ([_][]const u8{ "first answer", "second answer" }) |answer| {
-            try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .assistant = .{
+            try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .assistant = .{
                 .user = .{ .text = @constCast("request") },
                 .assistant = @constCast(answer),
             } } } });
         }
-        try std.testing.expectError(error.InjectedDeliveryFailure, Runtime(FakeApp).tick(&app, handlers));
+        try std.testing.expectError(error.InjectedDeliveryFailure, Runtime(FakeApp).tick(&app, (&app).agent(), handlers));
         try std.testing.expectEqual(@as(usize, 2), app.persisted_finishes.items.len);
         try std.testing.expectEqualStrings("first answer", app.persisted_finishes.items[0].turn.assistant.assistant);
         try std.testing.expectEqualStrings("second answer", app.persisted_finishes.items[1].turn.assistant.assistant);
-        try std.testing.expectEqual(@as(?anyerror, null), app.session_persistence.shutdown_failure);
+        try std.testing.expectEqual(@as(?anyerror, null), app.agent().session_persistence.shutdown_failure);
     }
 }
 
 test "unaccepted worker finish records save failure and stops the detached suffix" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
-    app.worker.processing = true;
+    app.agent().worker.processing = true;
     app.finish_persistence_error = error.InputOutput;
     const Capture = struct {
         fn history(_: *anyopaque, _: types.FinishedPrompt) !HistoryDelivery {
@@ -5161,13 +5253,13 @@ test "unaccepted worker finish records save failure and stops the detached suffi
     var handlers = NoopBridge.handlers(&app);
     handlers.append_history_turn = Capture.history;
     for (0..2) |_| {
-        try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .assistant = .{
+        try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .assistant = .{
             .user = .{ .text = @constCast("request") },
             .assistant = @constCast("answer"),
         } } } });
     }
-    try std.testing.expectError(error.InjectedDeliveryFailure, Runtime(FakeApp).tick(&app, handlers));
-    try std.testing.expectEqual(@as(?anyerror, error.InputOutput), app.session_persistence.shutdown_failure);
+    try std.testing.expectError(error.InjectedDeliveryFailure, Runtime(FakeApp).tick(&app, (&app).agent(), handlers));
+    try std.testing.expectEqual(@as(?anyerror, error.InputOutput), app.agent().session_persistence.shutdown_failure);
     try std.testing.expectEqual(@as(usize, 0), app.persisted_finishes.items.len);
-    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.agent().worker.events.items.len);
 }

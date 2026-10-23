@@ -104,6 +104,7 @@ pub const Projection = struct {
     current_entry: ?EntryProjection,
     current_index: usize,
     entry_count: usize,
+    asker: []const u8 = "",
 
     pub fn isFreeformSelected(self: Projection) bool {
         const entry = self.current_entry orelse return false;
@@ -117,6 +118,9 @@ pub const QuestionPrompt = struct {
     active: bool = false,
     entries: std.ArrayList(OwnedQuestionEntry) = .empty,
     current_index: u8 = 0,
+    /// The subagent that asked, while main's screen shows its question (D23);
+    /// empty for the agent's own. Borrowed from the subagent.
+    asker: []const u8 = "",
 
     pub fn deinit(self: *QuestionPrompt, alloc: Allocator) void {
         self.discard(alloc, "deinit");
@@ -146,6 +150,7 @@ pub const QuestionPrompt = struct {
             .current_entry = current_entry,
             .current_index = current_index,
             .entry_count = self.entries.items.len,
+            .asker = self.asker,
         };
     }
 

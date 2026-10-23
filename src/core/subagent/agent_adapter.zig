@@ -31,6 +31,9 @@ const types = @import("../shared/types.zig");
 const diff_mod = @import("../output/diff.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
+const profiles = @import("../profiles/profiles.zig");
+const authority_mod = @import("authority.zig");
+const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_host = @import("tool_host.zig");
 const child_state = @import("child_state.zig");
 
@@ -129,14 +132,7 @@ const Context = struct {
     ) !tool_mcp_runtime.ResolvedLiveView {
         const self: *Context = @ptrCast(@alignCast(raw));
         var authority = try self.turn.resolveLiveAuthority(alloc);
-        defer authority.deinit(alloc);
-        const view = authority.mcp_view orelse return error.McpRuntimeUnavailable;
-        authority.mcp_view = null;
-        return .{
-            .authority_generation = mcp_access.authorityGeneration(view),
-            .action_authority_generation = authority.generation,
-            .view = view,
-        };
+        return execution.liveMcpViewFrom(alloc, &authority);
     }
 };
 
@@ -257,21 +253,28 @@ pub fn run(
             .provider_strict = admission.provider == .gateway and config.tool_context.provider_strict,
         },
     };
-    const child_tool_names = try withoutSubagentNames(
+    // The profile the child started in, cached when its admission resolved.
+    // The child is shown only the built-in tools it allows, the ones its live
+    // authority lets it call.
+    const profile = childProfile(turn.live_authority, turn.child_id);
+    const child_tool_names = try childToolNames(
         arena,
         config.advertised_tool_names,
+        config.tool_context.tool_registry,
+        .{ .profile = profile },
     );
-    const child_functions = try withoutSubagentFunctions(
+    const child_functions = try childFunctions(
         arena,
         config.advertised_functions,
+        config.tool_context.tool_registry,
+        .{ .profile = profile },
     );
-    const child_system_prompt = if (message.system_prompt_overlay.len == 0)
-        config.system_prompt
-    else
-        arena.print(
-            "{s}\n\n<subagent_instructions>\n{s}\n</subagent_instructions>",
-            .{ config.system_prompt, message.system_prompt_overlay },
-        ) catch return error.OutOfMemory;
+    const child_system_prompt = childSystemPrompt(
+        arena,
+        profile,
+        config.system_prompt,
+        message.system_prompt_overlay,
+    ) catch return error.OutOfMemory;
     debug_trace.eventf(
         "subagent",
         "trace_identity",
@@ -366,40 +369,81 @@ test "subagent finalization preserves every outcome and fails closed on absence"
     }
 }
 
-fn withoutSubagentNames(
-    alloc: Allocator,
-    names: []const []const u8,
-) ![]const []const u8 {
-    var count: usize = 0;
-    for (names) |name| {
-        if (!std.mem.eql(u8, name, "subagent")) count += 1;
-    }
-    const filtered = try alloc.alloc([]const u8, count);
-    var index: usize = 0;
-    for (names) |name| {
-        if (std.mem.eql(u8, name, "subagent")) continue;
-        filtered[index] = name;
-        index += 1;
-    }
-    return filtered;
+/// The profile child `child_id` started in, cached when its admission resolved.
+pub fn childProfile(resolver: ?*authority_mod.Resolver, child_id: ?[]const u8) ?*const profiles.Profile {
+    const value = resolver orelse return null;
+    const cache = value.profiles orelse return null;
+    return cache.find(child_id orelse return null);
 }
 
-fn withoutSubagentFunctions(
+/// A child's system prompt: `base`, or its profile's prompt in its place or
+/// added to it, then the run's `<subagent_instructions>` overlay. Returns
+/// `base` itself when neither changes it.
+pub fn childSystemPrompt(
+    alloc: Allocator,
+    profile: ?*const profiles.Profile,
+    base: []const u8,
+    overlay: []const u8,
+) Allocator.Error![]const u8 {
+    const base_prompt = if (profile) |value| try profiles.systemPrompt(alloc, value, base) else base;
+    if (overlay.len == 0) return base_prompt;
+    return alloc.print(
+        "{s}\n\n<subagent_instructions>\n{s}\n</subagent_instructions>",
+        .{ base_prompt, overlay },
+    );
+}
+
+/// Which built-in tools a child is shown. MCP and dynamic tools follow its
+/// integrations instead.
+pub const Shown = union(enum) {
+    /// The old engine's: the ones its profile allows, never `subagent`,
+    /// because it has no host for a child's own subagents.
+    profile: ?*const profiles.Profile,
+    /// The interactive app's: the ones its run was admitted with, its
+    /// parent's narrowed by its profile, so it is never shown a tool its
+    /// parent lacks (`Profiles.tla` NoElevation). `subagent` is among them
+    /// only once it has its own host to start subagents on (D32).
+    admitted: struct { tools: []const []const u8, starts_subagents: bool },
+};
+
+fn childSees(registry: tool_dispatch.Registry, shown: Shown, name: []const u8) bool {
+    const subagent = std.mem.eql(u8, name, "subagent");
+    switch (shown) {
+        .profile => |profile| {
+            if (subagent) return false;
+            const value = profile orelse return true;
+            if (registry.lookup(name) == null) return true;
+            return profiles.allowsTool(value, name);
+        },
+        .admitted => |admitted| {
+            if (subagent and !admitted.starts_subagents) return false;
+            if (registry.lookup(name) == null) return true;
+            for (admitted.tools) |tool| if (std.mem.eql(u8, tool, name)) return true;
+            return false;
+        },
+    }
+}
+
+pub fn childToolNames(
+    alloc: Allocator,
+    names: []const []const u8,
+    registry: tool_dispatch.Registry,
+    shown: Shown,
+) ![]const []const u8 {
+    var kept: std.ArrayList([]const u8) = .empty;
+    for (names) |name| if (childSees(registry, shown, name)) try kept.append(alloc, name);
+    return kept.items;
+}
+
+pub fn childFunctions(
     alloc: Allocator,
     functions: []const model_tool_schema.FunctionSchema,
+    registry: tool_dispatch.Registry,
+    shown: Shown,
 ) ![]const model_tool_schema.FunctionSchema {
-    var count: usize = 0;
-    for (functions) |function| {
-        if (!std.mem.eql(u8, function.name, "subagent")) count += 1;
-    }
-    const filtered = try alloc.alloc(model_tool_schema.FunctionSchema, count);
-    var index: usize = 0;
-    for (functions) |function| {
-        if (std.mem.eql(u8, function.name, "subagent")) continue;
-        filtered[index] = function;
-        index += 1;
-    }
-    return filtered;
+    var kept: std.ArrayList(model_tool_schema.FunctionSchema) = .empty;
+    for (functions) |function| if (childSees(registry, shown, function.name)) try kept.append(alloc, function);
+    return kept.items;
 }
 
 fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
@@ -940,7 +984,9 @@ fn reportUsage(raw: *anyopaque, usage: types.Usage) void {
 /// own (D92). The parent's total leaves the child's out.
 fn recordUsage(raw: *anyopaque, usage: types.Usage) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
-    try context.turn.child.recordUsage(usage);
+    // A hosted run has no session here; its own agent saves its usage.
+    const child = context.turn.child orelse return;
+    try child.recordUsage(usage);
 }
 
 fn publishCommittedFileHandoff(_: *anyopaque, _: file_mutation.CommittedFileHandoff) agent_runtime.SecondaryPublicationReport {
@@ -1038,4 +1084,16 @@ fn pushLiveOutputChunk(
         .stream = stream,
         .text = @constCast(text),
     } });
+}
+
+test "a child's system prompt wraps the run's overlay and keeps the base alone without one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const base = "base prompt";
+    const alone = try childSystemPrompt(arena.allocator(), null, base, "");
+    try std.testing.expectEqual(base.ptr, alone.ptr);
+    try std.testing.expectEqualStrings(
+        "base prompt\n\n<subagent_instructions>\nbe brief\n</subagent_instructions>",
+        try childSystemPrompt(arena.allocator(), null, base, "be brief"),
+    );
 }

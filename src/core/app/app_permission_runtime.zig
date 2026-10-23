@@ -1,4 +1,5 @@
 const std = @import("std");
+const agents = @import("../agents/agents.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -69,18 +70,157 @@ const YoloWarning = struct {
 
 pub fn Runtime(comptime App: type) type {
     return struct {
-        /// Session-scoped mode change: applies the mode and syncs queued
-        /// prompts without touching the persisted preference.
-        pub fn setMode(app: *App, mode: types.PermissionMode) void {
+        const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
+        /// Whether this app runs subagents with modes of their own (D31).
+        const own_mode_supported = blk: {
+            if (!@hasField(App, "main_agent") or !@hasField(App, "screen_owner")) break :blk false;
+            const Agent = @FieldType(App, "main_agent");
+            break :blk @hasField(Agent, "permission_mode") and @hasField(Agent, "child_run");
+        };
+
+        /// Whether this app keeps each instance's permission mode and session
+        /// approvals on the instance (D56). Test apps without instances keep
+        /// them on the engine.
+        const per_instance = own_mode_supported and
+            @hasField(AppAgent, "session_grants") and @hasField(AppAgent, "role");
+
+        /// Whether `agent` is a subagent, whose permission mode is its own
+        /// (D31).
+        fn isSubagent(app: anytype, agent: anytype) bool {
+            if (comptime !own_mode_supported) return false;
+            if (comptime @hasField(AppAgent, "role")) return agent.role == .subagent;
+            return agent != &app.main_agent;
+        }
+
+        /// The instance whose permission mode and session approvals `agent`
+        /// uses: itself, or the first slot for a subagent, as before
+        /// instances (D55, D56). Tool checks on worker threads ask here, so it
+        /// names the slot rather than walking the instances; after the first
+        /// instance closes the slot stays valid and empty (D57).
+        fn permissionOwner(app: anytype, agent: anytype) @TypeOf(agent) {
+            if (isSubagent(app, agent)) return &app.main_agent;
+            return agent;
+        }
+
+        /// Instance `owner`'s own mode (D56), or the engine's in an app
+        /// without instances.
+        fn instanceMode(app: anytype, owner: anytype) types.PermissionMode {
+            if (comptime per_instance) return owner.permission_mode orelse .ask;
+            return app.permission_engine.mode;
+        }
+
+        fn lockAuthority(app: anytype) void {
             if (comptime @hasField(@TypeOf(app.permission_state), "authority_mutex")) {
                 app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
             }
-            app.permission_engine.mode = mode;
+        }
+
+        fn unlockAuthority(app: anytype) void {
             if (comptime @hasField(@TypeOf(app.permission_state), "authority_mutex")) {
                 app.permission_state.authority_mutex.unlock(io_mod.getIo());
             }
+        }
+
+        /// The permission mode of the agent on screen, for main-loop screen
+        /// code (D43).
+        pub fn currentMode(app: anytype) types.PermissionMode {
+            return modeOf(app, agents.screenAgentOf(app));
+        }
+
+        /// `agent`'s permission mode: an instance's own (D56), or a
+        /// subagent's own (D31): the one chosen on its screen, else the one
+        /// its run was admitted with, else the first instance's.
+        pub fn modeOf(app: anytype, agent: anytype) types.PermissionMode {
+            if (comptime !@hasField(App, "permission_engine")) return .ask;
+            if (comptime own_mode_supported) if (isSubagent(app, agent)) {
+                if (agent.permission_mode) |own| return own;
+                if (agent.child_run) |*run| return run.admission.permission_mode;
+            };
+            return instanceMode(app, permissionOwner(app, agent));
+        }
+
+        /// Sets instance `agent`'s mode at startup or launch, before its
+        /// worker runs, so without the lock or a queue sync (D51, D56).
+        pub fn initMode(app: *App, agent: *AppAgent, mode: types.PermissionMode) void {
+            if (comptime per_instance) {
+                agent.permission_mode = mode;
+            } else {
+                app.permission_engine.mode = mode;
+            }
+        }
+
+        /// The session approvals `agent`'s tool calls use (D56).
+        pub fn grantsOf(app: anytype, agent: anytype) []const types.PermissionGrant {
+            if (comptime per_instance) return permissionOwner(app, agent).session_grants.items;
+            return app.permission_engine.grants.items;
+        }
+
+        /// Records an "always" approval from `agent`'s turn on its
+        /// permission owner (D56).
+        pub fn allowForSession(app: *App, agent: *AppAgent, tool_name: []const u8, target_path: []const u8) !void {
+            lockAuthority(app);
+            defer unlockAuthority(app);
+            if (comptime per_instance) {
+                try permissions.allowToolForSession(app.alloc, &permissionOwner(app, agent).session_grants, tool_name, target_path);
+            } else {
+                try app.permission_engine.allow(app.alloc, tool_name, target_path);
+            }
+        }
+
+        /// Drops `agent`'s session approvals when its session ends: they
+        /// last one session, and only its own end (D56).
+        pub fn clearSessionGrants(app: *App, agent: *AppAgent) void {
+            lockAuthority(app);
+            defer unlockAuthority(app);
+            if (comptime per_instance) {
+                permissions.clearAllowedTools(app.alloc, &permissionOwner(app, agent).session_grants);
+            } else {
+                app.permission_engine.clear(app.alloc);
+            }
+        }
+
+        /// Frees `agent`'s session approvals when the agent goes. Its
+        /// worker has stopped, so nothing else reads them.
+        pub fn deinitSessionGrants(app: *App, agent: *AppAgent) void {
+            if (comptime !per_instance) return;
+            permissions.clearAllowedTools(app.alloc, &agent.session_grants);
+            agent.session_grants.deinit(app.alloc);
+        }
+
+        /// The permission state `agent`'s screen reports: its permission
+        /// owner's mode and approvals over the host's rules (D56). Borrowed;
+        /// never deinit it.
+        pub fn viewOf(app: anytype, agent: anytype) permissions.PermissionEngine {
+            if (comptime !per_instance) return app.permission_engine;
+            const owner = permissionOwner(app, agent);
+            return .{
+                .mode = instanceMode(app, owner),
+                .grants = owner.session_grants,
+                .rules = app.permission_engine.rules,
+            };
+        }
+
+        /// Session-scoped mode change: applies the mode and syncs queued
+        /// prompts without touching the persisted preference. On a subagent
+        /// it sets that subagent's own mode, which its live checks resolve on
+        /// each tool call (D31).
+        pub fn setMode(app: *App, agent: *AppAgent, mode: types.PermissionMode) void {
+            if (comptime own_mode_supported) if (isSubagent(app, agent)) {
+                app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+                agent.permission_mode = mode;
+                app.permission_state.authority_mutex.unlock(io_mod.getIo());
+                debug_trace.eventf("procesor", "agent_permission_mode_set", .{}, "mode={s}", .{@tagName(mode)});
+                return;
+            };
+            lockAuthority(app);
+            if (comptime per_instance) {
+                agent.permission_mode = mode;
+            } else {
+                app.permission_engine.mode = mode;
+            }
+            unlockAuthority(app);
             updateYoloWarningForMode(app);
-            syncQueuedPermissionSnapshot(app);
+            syncQueuedPermissionSnapshot(app, agent);
         }
 
         pub fn initializeYoloWarning(app: *App) void {
@@ -111,62 +251,70 @@ pub fn Runtime(comptime App: type) type {
             persistYoloAcknowledgment(app);
         }
 
-        /// Snapshots the live permission state owned by this runtime.
-        pub fn livePermissionSnapshot(app: *App) worker_runtime.PermissionSnapshot {
-            if (comptime @hasField(@TypeOf(app.permission_state), "authority_mutex")) {
-                app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
-            }
-            defer if (comptime @hasField(@TypeOf(app.permission_state), "authority_mutex")) {
-                app.permission_state.authority_mutex.unlock(io_mod.getIo());
-            };
+        /// Snapshots `agent`'s live permission state: its permission owner's
+        /// mode (D56).
+        pub fn livePermissionSnapshot(app: *App, agent: anytype) worker_runtime.PermissionSnapshot {
+            lockAuthority(app);
+            defer unlockAuthority(app);
             return .{
-                .mode = app.permission_engine.mode,
+                .mode = instanceMode(app, permissionOwner(app, agent)),
             };
         }
 
-        pub fn selectMode(app: *App, mode: types.PermissionMode) !void {
-            setMode(app, mode);
+        pub fn selectMode(app: *App, agent: *AppAgent, mode: types.PermissionMode) !void {
+            setMode(app, agent, mode);
             if (comptime @hasDecl(App, "persistAcceptedPermissionMode")) {
                 try app.persistAcceptedPermissionMode(mode);
             }
             try finalizeModePreference(app);
         }
 
-        pub fn toggleMode(app: *App) !void {
+        pub fn toggleMode(app: *App, agent: *AppAgent) !void {
             if (comptime !@hasField(App, "permission_engine")) return;
-            try selectMode(app, switch (app.permission_engine.mode) {
+            try selectMode(app, agent, switch (modeOf(app, agent)) {
                 .ask => .auto,
                 .auto => .yolo,
                 .yolo => .ask,
             });
         }
 
-        pub fn reset(app: *App) !void {
-            if (comptime @hasField(@TypeOf(app.permission_state), "authority_mutex")) {
-                app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+        /// `/permissions reset` on `agent`'s screen: its permission owner goes
+        /// back to ask with no session approvals (D56).
+        pub fn reset(app: *App, agent: *AppAgent) !void {
+            lockAuthority(app);
+            if (comptime per_instance) {
+                const owner = permissionOwner(app, agent);
+                owner.permission_mode = .ask;
+                permissions.clearAllowedTools(app.alloc, &owner.session_grants);
+            } else {
+                app.permission_engine.mode = .ask;
+                app.permission_engine.clear(app.alloc);
             }
-            app.permission_engine.mode = .ask;
             updateYoloWarningForMode(app);
-            app.permission_engine.clear(app.alloc);
-            if (comptime @hasField(@TypeOf(app.permission_state), "authority_mutex")) {
-                app.permission_state.authority_mutex.unlock(io_mod.getIo());
-            }
+            unlockAuthority(app);
             try app_worker_runtime.Runtime(App).syncQueuedPromptPermissionState(
                 app,
-                livePermissionSnapshot(app),
+                agent,
+                livePermissionSnapshot(app, agent),
             );
             try finalizeModePreference(app);
         }
 
-        fn syncQueuedPermissionSnapshot(app: *App) void {
+        fn syncQueuedPermissionSnapshot(app: *App, agent: *AppAgent) void {
             app_worker_runtime.Runtime(App).syncQueuedPromptPermissionSnapshot(
-                app,
-                livePermissionSnapshot(app),
+                agent,
+                livePermissionSnapshot(app, agent),
             );
         }
 
+        /// Arms the full-access warning when the instance on screen is in
+        /// full access.
         fn updateYoloWarningForMode(app: *App) void {
-            if (app.permission_engine.mode == .yolo and
+            const mode = if (comptime per_instance)
+                instanceMode(app, permissionOwner(app, agents.screenAgentOf(app)))
+            else
+                app.permission_engine.mode;
+            if (mode == .yolo and
                 !app.permission_state.yolo_acknowledged)
             {
                 app.permission_state.yolo_warning.arm();
@@ -225,13 +373,13 @@ pub fn Runtime(comptime App: type) type {
             debug_trace.logf(
                 "permission",
                 "interactive_permission_mode_selected mode={s}",
-                .{permissions.permissionModeLabel(app.permission_engine.mode)},
+                .{permissions.permissionModeLabel(currentMode(app))},
             );
             app.shell.render_requests.request(.footer);
         }
 
         fn persistModePreference(app: *App) !void {
-            const mode = app.permission_engine.mode;
+            const mode = currentMode(app);
             if (comptime @hasDecl(App, "persistPermissionModePreference")) {
                 try app.persistPermissionModePreference(mode);
                 return;
@@ -307,7 +455,9 @@ const TestApp = struct {
     alloc: std.mem.Allocator,
     permission_engine: permissions.PermissionEngine = .{},
     permission_state: State = .{},
-    worker: TestWorker = .{},
+    main_agent: struct {
+        worker: TestWorker = .{},
+    } = .{},
     shell: struct {
         render_requests: render_request.RenderRequestState = .{},
     } = .{},
@@ -327,11 +477,11 @@ const TestApp = struct {
         self.permission_commit_snapshot = .{
             .engine_mode = self.permission_engine.mode,
             .engine_grant_count = self.permission_engine.grants.items.len,
-            .synced_mode = self.worker.synced_mode,
-            .mode_sync_count = self.worker.mode_sync_count,
-            .synced_state_mode = self.worker.synced_state_mode,
-            .synced_state_grant_count = self.worker.synced_state_grant_count,
-            .state_sync_count = self.worker.state_sync_count,
+            .synced_mode = self.agent().worker.synced_mode,
+            .mode_sync_count = self.agent().worker.mode_sync_count,
+            .synced_state_mode = self.agent().worker.synced_state_mode,
+            .synced_state_grant_count = self.agent().worker.synced_state_grant_count,
+            .state_sync_count = self.agent().worker.state_sync_count,
         };
     }
 
@@ -339,17 +489,21 @@ const TestApp = struct {
         self.yolo_acknowledgment_commit_count += 1;
         return self.yolo_acknowledgment_commit_succeeds;
     }
+
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
+    }
 };
 
 fn expectPersistentModeSelection(mode: types.PermissionMode) !void {
     var app = TestApp{ .alloc = std.testing.allocator };
     defer app.deinit();
 
-    try Runtime(TestApp).selectMode(&app, mode);
+    try Runtime(TestApp).selectMode(&app, (&app).agent(), mode);
 
     try std.testing.expectEqual(mode, app.permission_engine.mode);
-    try std.testing.expectEqual(@as(?types.PermissionMode, mode), app.worker.synced_mode);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.mode_sync_count);
+    try std.testing.expectEqual(@as(?types.PermissionMode, mode), app.agent().worker.synced_mode);
+    try std.testing.expectEqual(@as(usize, 1), app.agent().worker.mode_sync_count);
     try std.testing.expectEqual(@as(usize, 1), app.permission_mode_preference_commit_count);
     try std.testing.expectEqual(@as(?types.PermissionMode, mode), app.last_preference_permission_mode);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
@@ -379,7 +533,7 @@ test "yolo acknowledgment follows the first committed warning frame" {
     var app = TestApp{ .alloc = std.testing.allocator };
     defer app.deinit();
 
-    try Runtime(TestApp).selectMode(&app, .yolo);
+    try Runtime(TestApp).selectMode(&app, (&app).agent(), .yolo);
     try std.testing.expect(app.permission_state.yolo_warning.active);
     try std.testing.expect(!app.permission_state.yolo_acknowledged);
 
@@ -423,7 +577,7 @@ test "failed yolo acknowledgment is attempted at most once per process" {
     };
     defer app.deinit();
 
-    Runtime(TestApp).setMode(&app, .yolo);
+    Runtime(TestApp).setMode(&app, (&app).agent(), .yolo);
     Runtime(TestApp).noteFrameCommitted(&app, 100, true);
     Runtime(TestApp).noteFrameCommitted(&app, 200, true);
 
@@ -436,11 +590,11 @@ test "app_permission_runtime toggleMode cycles ask auto yolo and persists" {
     var app = TestApp{ .alloc = std.testing.allocator };
     defer app.deinit();
 
-    try Runtime(TestApp).toggleMode(&app);
+    try Runtime(TestApp).toggleMode(&app, (&app).agent());
 
     try std.testing.expectEqual(types.PermissionMode.auto, app.permission_engine.mode);
-    try std.testing.expectEqual(@as(?types.PermissionMode, .auto), app.worker.synced_mode);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.mode_sync_count);
+    try std.testing.expectEqual(@as(?types.PermissionMode, .auto), app.agent().worker.synced_mode);
+    try std.testing.expectEqual(@as(usize, 1), app.agent().worker.mode_sync_count);
     try std.testing.expectEqual(@as(usize, 1), app.permission_mode_preference_commit_count);
     try std.testing.expectEqual(@as(?types.PermissionMode, .auto), app.last_preference_permission_mode);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
@@ -448,20 +602,20 @@ test "app_permission_runtime toggleMode cycles ask auto yolo and persists" {
     try std.testing.expectEqual(@as(?types.PermissionMode, .auto), app.permission_commit_snapshot.?.synced_mode);
 
     app.shell.render_requests.clearReason(.footer);
-    try Runtime(TestApp).toggleMode(&app);
+    try Runtime(TestApp).toggleMode(&app, (&app).agent());
 
     try std.testing.expectEqual(types.PermissionMode.yolo, app.permission_engine.mode);
-    try std.testing.expectEqual(@as(?types.PermissionMode, .yolo), app.worker.synced_mode);
+    try std.testing.expectEqual(@as(?types.PermissionMode, .yolo), app.agent().worker.synced_mode);
     try std.testing.expectEqual(@as(usize, 2), app.permission_mode_preference_commit_count);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
     try std.testing.expectEqual(@as(usize, 2), app.permission_commit_snapshot.?.mode_sync_count);
     try std.testing.expectEqual(@as(?types.PermissionMode, .yolo), app.permission_commit_snapshot.?.synced_mode);
 
     app.shell.render_requests.clearReason(.footer);
-    try Runtime(TestApp).toggleMode(&app);
+    try Runtime(TestApp).toggleMode(&app, (&app).agent());
 
     try std.testing.expectEqual(types.PermissionMode.ask, app.permission_engine.mode);
-    try std.testing.expectEqual(@as(?types.PermissionMode, .ask), app.worker.synced_mode);
+    try std.testing.expectEqual(@as(?types.PermissionMode, .ask), app.agent().worker.synced_mode);
     try std.testing.expectEqual(@as(usize, 3), app.permission_mode_preference_commit_count);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
@@ -470,11 +624,11 @@ test "app_permission_runtime setMode syncs queued prompts without persisting" {
     var app = TestApp{ .alloc = std.testing.allocator };
     defer app.deinit();
 
-    Runtime(TestApp).setMode(&app, .auto);
+    Runtime(TestApp).setMode(&app, (&app).agent(), .auto);
 
     try std.testing.expectEqual(types.PermissionMode.auto, app.permission_engine.mode);
-    try std.testing.expectEqual(@as(?types.PermissionMode, .auto), app.worker.synced_mode);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.mode_sync_count);
+    try std.testing.expectEqual(@as(?types.PermissionMode, .auto), app.agent().worker.synced_mode);
+    try std.testing.expectEqual(@as(usize, 1), app.agent().worker.mode_sync_count);
     try std.testing.expectEqual(@as(usize, 0), app.permission_mode_preference_commit_count);
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
 }
@@ -485,16 +639,16 @@ test "app_permission_runtime reset clears grants before syncing permission state
     app.permission_engine.mode = .auto;
     try app.permission_engine.allow(std.testing.allocator, "run_command", "/tmp/workspace::git status");
 
-    try Runtime(TestApp).reset(&app);
+    try Runtime(TestApp).reset(&app, (&app).agent());
 
     try std.testing.expectEqual(types.PermissionMode.ask, app.permission_engine.mode);
     try std.testing.expectEqual(@as(usize, 0), app.permission_engine.grants.items.len);
-    try std.testing.expectEqual(@as(?types.PermissionMode, .ask), app.worker.synced_state_mode);
-    try std.testing.expectEqual(@as(usize, 0), app.worker.synced_state_grant_count);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.state_sync_count);
+    try std.testing.expectEqual(@as(?types.PermissionMode, .ask), app.agent().worker.synced_state_mode);
+    try std.testing.expectEqual(@as(usize, 0), app.agent().worker.synced_state_grant_count);
+    try std.testing.expectEqual(@as(usize, 1), app.agent().worker.state_sync_count);
     try std.testing.expectEqual(@as(usize, 1), app.permission_mode_preference_commit_count);
     try std.testing.expectEqual(@as(?types.PermissionMode, .ask), app.last_preference_permission_mode);
-    try std.testing.expectEqual(@as(usize, 0), app.worker.mode_sync_count);
+    try std.testing.expectEqual(@as(usize, 0), app.agent().worker.mode_sync_count);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 
     const snapshot = app.permission_commit_snapshot.?;

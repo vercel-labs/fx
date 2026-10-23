@@ -232,6 +232,9 @@ pub const Context = struct {
     /// that require a live user (like `ask_user_question`) short-circuit
     /// in that case.
     interactive: bool = true,
+    /// Lets a turn that is not interactive still ask the user questions: a
+    /// subagent's, whose questions show on its own screen and on main's (D23).
+    ask_user_questions: bool = false,
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     lifecycle_scope: hooks.Scope = .{
         .kind = .interactive,
@@ -1193,8 +1196,8 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .output_chunk_ctx = ctx.output_chunk_ctx,
         .on_output_chunk = ctx.on_output_chunk,
         .command_timeout_ms = ctx.command_timeout_ms,
-        .ask_question_ctx = if (ctx.interactive) ctx.worker else null,
-        .ask_question_batch = if (ctx.interactive) requestQuestionBatchWithWorker else null,
+        .ask_question_ctx = if (ctx.interactive or ctx.ask_user_questions) ctx.worker else null,
+        .ask_question_batch = if (ctx.interactive or ctx.ask_user_questions) requestQuestionBatchWithWorker else null,
         .web_fetch_runtime = ctx.web_fetch_runtime,
         .web_fetch_artifact_store = ctx.web_fetch_artifact_store,
         .web_fetch_artifact_error = ctx.web_fetch_artifact_error,

@@ -23,6 +23,8 @@ const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const model_provider = @import("../config/model_provider.zig");
+const profiles = @import("../profiles/profiles.zig");
+const app_profile_runtime = @import("../app/app_profile_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const doctor_runtime = @import("doctor_runtime.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
@@ -158,12 +160,19 @@ pub const LaunchModifiers = struct {
     /// `--permission-mode` and its shortcuts; never saved.
     permission_override: ?types.PermissionMode = null,
 
+    /// `--profile <name>`: the agent profile main runs in. Owned.
+    profile_name: ?[]u8 = null,
+    /// `--instances <n>`: how many fx instances the host opens at startup,
+    /// each with its own session (D47).
+    instances: ?usize = null,
+
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
         for (self.additional_directories) |path| alloc.free(path);
         if (self.additional_directories.len > 0) alloc.free(self.additional_directories);
         if (self.model_override) |model| alloc.free(model);
         if (self.provider_order_override) |order| freeProviderOrderOverride(alloc, order);
+        if (self.profile_name) |name| alloc.free(name);
         self.* = .{};
     }
 
@@ -495,6 +504,8 @@ const LaunchFlag = enum {
     auto,
     full_access,
     yolo,
+    profile,
+    instances,
 };
 
 const launch_flag_ids = cli_flags.idTable(LaunchFlag, &builtin_commands.launch_options);
@@ -529,6 +540,7 @@ fn parseLaunchFlags(alloc: Allocator, args: []const [:0]const u8, comptime mode:
     errdefer {
         if (modifiers.model_override) |model| alloc.free(model);
         if (modifiers.provider_order_override) |order| freeProviderOrderOverride(alloc, order);
+        if (modifiers.profile_name) |name| alloc.free(name);
     }
 
     var prompt: ?[]const u8 = null;
@@ -583,6 +595,18 @@ fn parseLaunchFlags(alloc: Allocator, args: []const [:0]const u8, comptime mode:
             .ask => modifiers.permission_override = .ask,
             .auto => modifiers.permission_override = .auto,
             .full_access, .yolo => modifiers.permission_override = .yolo,
+            .profile => {
+                if (value.len == 0) return error.MissingProfileValue;
+                if (!profiles.validName(value)) return error.InvalidProfileName;
+                const owned = try alloc.dupe(u8, value);
+                if (modifiers.profile_name) |old| alloc.free(old);
+                modifiers.profile_name = owned;
+            },
+            .instances => {
+                const count = std.fmt.parseUnsigned(usize, value, 10) catch return error.InvalidInstancesValue;
+                if (count == 0) return error.InvalidInstancesValue;
+                modifiers.instances = count;
+            },
         }
     }
 
@@ -1371,6 +1395,15 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
     };
     switch (parsed_launch) {
         .interactive => |launch| {
+            if (launch.modifiers.profile_name) |name| {
+                if (try app_profile_runtime.launchFailure(alloc, name)) |message| {
+                    defer alloc.free(message);
+                    try writeStderr(deps, message);
+                    var rejected = launch;
+                    rejected.deinit(alloc);
+                    return .handled_failure;
+                }
+            }
             try writeMcpProfileWarningIfPresent(alloc, cfg, deps);
             return .{ .interactive = launch };
         },
@@ -1403,6 +1436,10 @@ fn runNonInteractiveWithDeps(
         .acp => global_args.modifiers.hasOnlyUltrafastOverride(),
         else => false,
     };
+    if (global_args.modifiers.profile_name != null) {
+        try writeStderr(deps, "fx: --profile applies to interactive sessions\n");
+        return usage_failure;
+    }
     if (global_args.modifiers.hasModelOverrides() and !acp_ultrafast_override) {
         try writeModelModifierUsage(alloc, deps, parsed_command, global_args.modifiers);
         return usage_failure;
@@ -3750,6 +3787,9 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
         error.MissingModelValue => "--model requires a model id",
+        error.MissingProfileValue => "--profile requires a profile name",
+        error.InvalidProfileName => "--profile names use lowercase letters, digits, '-', or '_'",
+        error.InvalidInstancesValue => "--instances takes a whole number of at least 1",
         error.InvalidEffortValue => "--effort value is not a valid reasoning effort",
         error.InvalidProviderValue => "--provider accepts gateway, codex, grok, or a configured provider name",
         error.InvalidProviderOrderValue => "--provider-order accepts comma-separated provider slugs (letters, digits, '-')",

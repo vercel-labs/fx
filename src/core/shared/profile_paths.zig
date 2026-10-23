@@ -8,6 +8,7 @@ pub const chatgpt_auth_file_name = "chatgpt-auth.json";
 pub const grok_auth_file_name = "grok-auth.json";
 pub const api_key_file_name = "api-key";
 pub const sessions_dir_name = "sessions";
+const hosts_dir_name = "hosts";
 /// Side folders older v2 sessions kept (D27): v1's per-session layout, one
 /// folder per session id. A session moves out on its first open (D47).
 pub const session_files_dir_name = "session-files";
@@ -153,6 +154,14 @@ pub fn managedSkillsDir(alloc: Allocator, home: []const u8) ![]u8 {
     return rootPath(alloc, home, &.{managed_skills_dir_name});
 }
 
+/// Agent profiles, one folder each. A repository keeps its own under
+/// `<workspace>/.fx/agents`.
+pub const agents_dir_name = "agents";
+
+pub fn agentsDir(alloc: Allocator, home: []const u8) ![]u8 {
+    return std.Io.Dir.path.join(alloc, &.{ home, root_dir_name, agents_dir_name });
+}
+
 pub fn authPath(alloc: Allocator, home: []const u8) ![]u8 {
     return rootPath(alloc, home, &.{auth_file_name});
 }
@@ -167,6 +176,12 @@ pub fn apiKeyPath(alloc: Allocator, home: []const u8) ![]u8 {
 
 pub fn sessionsDir(alloc: Allocator, home: []const u8) ![]u8 {
     return rootPath(alloc, home, &.{sessions_dir_name});
+}
+
+/// The host records, which list the sessions that ran together in one fx
+/// process (D58).
+pub fn hostsDir(alloc: Allocator, home: []const u8) ![]u8 {
+    return std.Io.Dir.path.join(alloc, &.{ home, root_dir_name, hosts_dir_name });
 }
 
 pub fn promptHistoryPath(alloc: Allocator, home: []const u8) ![]u8 {
