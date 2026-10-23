@@ -199,6 +199,29 @@ test "character boundaries group terminal character continuations" {
     try std.testing.expectEqual(@as(usize, 1), previousCharacterStart(family, 1 + "👨‍👩‍👧‍👦".len));
 }
 
+test "character boundaries group Thai base characters with their marks" {
+    // Base consonant + above-vowel + tone mark forms one editing character.
+    const cluster = "\u{0E01}\u{0E31}\u{0E49}";
+    try std.testing.expectEqual(cluster.len, nextCharacterEnd(cluster, 0));
+    try std.testing.expectEqual(@as(usize, 0), previousCharacterStart(cluster, cluster.len));
+
+    // Stacked marks chain onto the same base (SARA U + MAI EK).
+    const stacked = "\u{0E19}\u{0E38}\u{0E49}\u{0E01}";
+    try std.testing.expectEqual("\u{0E19}\u{0E38}\u{0E49}".len, nextCharacterEnd(stacked, 0));
+    try std.testing.expectEqual(@as(usize, 0), previousCharacterStart(stacked, "\u{0E19}\u{0E38}\u{0E49}".len));
+
+    // SARA AM is spacing, so it starts a new editing character even after a
+    // tone mark; the tone mark stays grouped with the base.
+    const sara_am = "\u{0E19}\u{0E49}\u{0E33}";
+    try std.testing.expectEqual("\u{0E19}\u{0E49}".len, nextCharacterEnd(sara_am, 0));
+    try std.testing.expectEqual("\u{0E19}\u{0E49}".len, previousCharacterStart(sara_am, sara_am.len));
+
+    // Spacing characters do not absorb a following mark.
+    const spaced = "\u{0E01}\u{0E02}";
+    try std.testing.expectEqual(@as(usize, 3), nextCharacterEnd(spaced, 0));
+    try std.testing.expectEqual(@as(usize, 6), nextCharacterEnd(spaced, 3));
+}
+
 test "character boundaries preserve ascii and precomposed utf8" {
     const text = "AéB";
     try std.testing.expectEqual(@as(usize, 1), nextCharacterEnd(text, 0));
