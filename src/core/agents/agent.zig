@@ -21,13 +21,13 @@ const tool_set = @import("../tooling/tool_set.zig");
 pub const max_history_turns: usize = 8;
 
 /// What an agent is to its host: a top-level fx instance, or a subagent an
-/// instance or another subagent started (D45, D46).
+/// instance or another subagent started.
 pub const Role = enum { instance, subagent };
 
 pub const Agent = struct {
     /// The app that owns this agent, opaque because this folder never
     /// imports the app. Set when the app creates the agent; null for the
-    /// first instance, which the app finds as its `main_agent` field (D43).
+    /// first instance, which the app finds as its `main_agent` field.
     app: ?*anyopaque = null,
     session: session_runtime.SessionRuntime = session_runtime.SessionRuntime.init(max_history_turns),
     session_persistence: app_session_runtime.Persistence = .{},
@@ -37,17 +37,17 @@ pub const Agent = struct {
     approval_prompt: approval_prompt.ApprovalPrompt = .{},
     question_prompt: question_prompt.QuestionPrompt = .{},
     /// The work id the next prompt queued for this agent carries: main's
-    /// message to a subagent, so its saved turn can be found (D31). Set only
+    /// message to a subagent, so its saved turn can be found. Set only
     /// while that prompt is queued. Borrowed.
     prompt_work_id: ?[]const u8 = null,
     /// This agent's own permission mode. An instance's is always set: at
-    /// startup or launch, then from its screen (D56). A subagent's is null
-    /// until chosen on its screen (D31). Written under the app's permission
+    /// startup or launch, then from its screen. A subagent's is null
+    /// until chosen on its screen. Written under the app's permission
     /// authority lock, which its readers on other threads take.
     permission_mode: ?types.PermissionMode = null,
     /// An instance's session approvals: what "always" allowed in its current
-    /// session (D56). A subagent records none; its go to the first
-    /// instance's, as before instances (D55). Each entry owns its strings,
+    /// session. A subagent records none; its go to the first
+    /// instance's, as before instances. Each entry owns its strings,
     /// allocated with the app's allocator. Guarded by the app's permission
     /// authority lock.
     session_grants: std.ArrayList(types.PermissionGrant) = .empty,
@@ -66,7 +66,7 @@ pub const Agent = struct {
     total_input_tokens: u64 = 0,
     total_output_tokens: u64 = 0,
     total_web_search_requests: u64 = 0,
-    /// A top-level instance, every one alike, or a subagent (D45).
+    /// A top-level instance, every one alike, or a subagent.
     role: Role = .instance,
     /// A subagent's current run, which sets its turns' model, effort, and
     /// authority. Null for an instance. Owned.

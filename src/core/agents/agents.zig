@@ -58,7 +58,7 @@ pub fn loadTotal(total: *const u64) u64 {
 
 /// Asserts, in debug and test builds, that the main loop's own thread is
 /// calling once the loop runs: whose transcript the screen holds is the
-/// loop's to know, never a worker's (D43). fx builds keep no frame pointers
+/// loop's to know, never a worker's. fx builds keep no frame pointers
 /// or unwind tables, so the panic names this file's anchor and the reader's
 /// return address `caller`, which a driver symbolizes.
 pub fn assertLoopThread(caller: usize) void {
@@ -68,7 +68,7 @@ pub fn assertLoopThread(caller: usize) void {
 }
 
 /// The agent whose transcript `app`'s screen holds, for main-loop screen
-/// code only (D43). A test app that has no screen answers with its own agent.
+/// code only. A test app that has no screen answers with its own agent.
 pub fn screenAgentOf(app: anytype) @TypeOf(&app.main_agent) {
     if (comptime !@hasField(@TypeOf(app.*), "screen_owner")) return app.agent();
     assertLoopThread(@returnAddress());

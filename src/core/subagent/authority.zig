@@ -131,8 +131,8 @@ pub const HostResolver = struct {
         Allocator,
         []const u8,
     ) HostResolveError!HostAuthority,
-    /// The permission mode the user chose on a child's own screen, if any
-    /// (D31). It wins over the child's profile and the work's mode, as main's
+    /// The permission mode the user chose on a child's own screen, if any.
+    /// It wins over the child's profile and the work's mode, as main's
     /// choice wins over its launch profile.
     child_permission_mode_fn: ?*const fn (?*anyopaque, []const u8) ?types.PermissionMode = null,
 
@@ -285,9 +285,9 @@ pub const Resolver = struct {
     }
 
     /// The authority of a turn on child `child_id` that no work of main's
-    /// started, such as one the user typed on its screen (D31): the same as
+    /// started, such as one the user typed on its screen: the same as
     /// a run's, with `permission_mode` in place of the work's. The child's
-    /// profile still narrows its tools, and its own mode still wins (D24).
+    /// profile still narrows its tools, and its own mode still wins.
     pub fn resolveForUser(
         self: *Resolver,
         alloc: Allocator,
@@ -347,7 +347,7 @@ pub const Resolver = struct {
             } else null;
             break :blk .{
                 .generation = registry.generation,
-                // The profile's own mode wins, even looser than main's (D24).
+                // The profile's own mode wins, even looser than main's.
                 .permission_mode = self.host.childPermissionMode(child_id) orelse if (profile) |value|
                     profiles.permissionMode(value, mode)
                 else
@@ -530,7 +530,7 @@ fn cloneStrings(alloc: Allocator, values: []const []const u8) ![][]u8 {
 }
 
 /// The host's tools a child may use: all of them, `subagent` included, or with
-/// a profile only those it allows (D32).
+/// a profile only those it allows.
 fn cloneKeptTools(
     alloc: Allocator,
     values: []const []const u8,
@@ -543,7 +543,7 @@ fn cloneKeptTools(
 /// servers it allows.
 /// Keeps only the MCP servers `profile` allows, and their tools, so a
 /// profiled child cannot even find the others, as its integrations cannot
-/// name them (D24).
+/// name them.
 fn narrowMcpView(alloc: Allocator, view: *mcp_access.View, profile: *const profiles.Profile) !void {
     // Both kept lists are allocated before anything in `view` moves or is
     // freed, so a failed allocation leaves `view` whole for its owner to free.
@@ -588,7 +588,7 @@ fn cloneIntegrations(
 }
 
 /// A tool the child keeps: its parent's, unless its profile leaves it out.
-/// `subagent` is kept like any other, so a child starts its own (D32); the
+/// `subagent` is kept like any other, so a child starts its own; the
 /// parent's set bounds it, so nesting never widens what an agent may do.
 fn keepTool(profile: ?*const profiles.Profile, name: []const u8) bool {
     const value = profile orelse return true;
@@ -792,7 +792,7 @@ test "authority capture permits registry access and rejects changed work" {
                     if (change == .permission) types.PermissionMode.auto else types.PermissionMode.ask,
                     snapshot.permission_mode,
                 );
-                // A child keeps `subagent` like any tool its parent holds (D32).
+                // A child keeps `subagent` like any tool its parent holds.
                 try std.testing.expectEqual(@as(usize, 2), snapshot.tools.len);
                 try std.testing.expectEqualStrings("read_file", snapshot.tools[0]);
                 try std.testing.expectEqualStrings("subagent", snapshot.tools[1]);
@@ -876,7 +876,7 @@ test "a subagent's profile narrows its tools, integrations, MCP view, and mode, 
     try std.testing.expectEqualStrings("github", profiled.mcp_view.?.servers[0].name);
     try std.testing.expectEqual(@as(usize, 1), profiled.mcp_view.?.tools.len);
     try std.testing.expectEqualStrings("github_issue", profiled.mcp_view.?.tools[0].name);
-    // The profile's own mode wins, even looser than the parent's (D24).
+    // The profile's own mode wins, even looser than the parent's.
     try std.testing.expectEqual(types.PermissionMode.auto, profiled.permission_mode);
 
     // Saving the profile again does not change a child that started in it.
@@ -941,7 +941,7 @@ test "a turn no work started is limited by the child's profile and the user's mo
     try std.testing.expectError(error.ChildNotAttached, resolver.resolve(alloc, "profiled-child"));
 
     // A turn the user typed is still narrowed by the profile, whose own
-    // mode wins (D24).
+    // mode wins.
     var profiled = try resolver.resolveForUser(alloc, "profiled-child", .ask);
     defer profiled.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), profiled.tools.len);
@@ -956,8 +956,8 @@ test "a turn no work started is limited by the child's profile and the user's mo
 
     try std.testing.expectError(error.ChildNotAttached, resolver.resolveForUser(alloc, "missing-child", .ask));
 
-    // A mode the user chose on a child's own screen wins over its profile's
-    // (D31), and leaves other children alone.
+    // A mode the user chose on a child's own screen wins over its profile's,
+    // and leaves other children alone.
     const Own = struct {
         fn mode(_: ?*anyopaque, child_id: []const u8) ?types.PermissionMode {
             return if (std.mem.eql(u8, child_id, "profiled-child")) .yolo else null;

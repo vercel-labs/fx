@@ -1965,7 +1965,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Loads saved session `session_id` into `agent`, as startup's resume
-        /// does, for an instance that resuming a host brings back (D58). Run
+        /// does, for an instance that resuming a host brings back. Run
         /// it in `agent`'s screen context, so its conversation draws into
         /// its own transcript. The first instance's startup alone sets the
         /// terminal's replay anchor and the remembered session.
@@ -2345,7 +2345,7 @@ pub fn Runtime(comptime App: type) type {
             );
             agent.effort = state.preferences.effort;
             // Its own fast mode from its saved preferences, which started from
-            // main's (D36). The child is in context, so this is its own slot.
+            // main's. The child is in context, so this is its own slot.
             if (comptime @hasField(App, "fast_mode")) {
                 app.fast_mode = state.preferences.fast_mode;
                 agent.worker.syncQueuedPromptFastMode(state.preferences.fast_mode);
@@ -3096,7 +3096,7 @@ pub fn Runtime(comptime App: type) type {
                 },
             }
             // A subagent keeps no workspace seed for new sessions: its
-            // preferences live in its own session alone (D31).
+            // preferences live in its own session alone.
             const subagent = if (comptime @hasField(App, "screen_owner")) agent.role == .subagent else false;
             if (result.settings_error == null and !subagent) {
                 applyPreferencePatch(
@@ -3389,7 +3389,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// The host of the agent in context: main's for main, a subagent's
-        /// own for a subagent, where its `subagent` calls go (D32).
+        /// own for a subagent, where its `subagent` calls go.
         pub fn ownSubagentHost(agent: *AppAgent) ?*subagent_tool_host.Runtime {
             if (comptime !agents.hasAgentField(App, "session_persistence")) return null;
             return agent.session_persistence.subagent_host;
@@ -4112,7 +4112,7 @@ pub fn Runtime(comptime App: type) type {
 
         /// Builds the notebook of the agent in context from `history`, as
         /// resume builds main's: for a subagent's agent the first time this
-        /// process shows its conversation (D1). The projection is installed
+        /// process shows its conversation. The projection is installed
         /// into a scratch transcript and only its slot is moved in, so the
         /// screen, which shows another agent, is untouched.
         pub fn rebuildChildView(app: *App, agent: *AppAgent, history: []const types.HistoryTurn) !void {
@@ -5155,7 +5155,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// The permission mode the user chose on subagent `child_id`'s own
-        /// screen, if any (D31). Main's authority lock guards it and the list
+        /// screen, if any. Main's authority lock guards it and the list
         /// of subagents, for the slot and worker threads that resolve here.
         fn subagentOwnPermissionMode(raw: ?*anyopaque, child_id: []const u8) ?types.PermissionMode {
             if (comptime !@hasField(App, "child_agents")) return null;
@@ -5185,10 +5185,10 @@ pub fn Runtime(comptime App: type) type {
             return null;
         }
 
-        /// A subagent's authority as the parent of its own subagents (D32):
+        /// A subagent's authority as the parent of its own subagents:
         /// its own, as the host that started it resolves it, so a nested
-        /// subagent never holds what its parent lacks (`Profiles.tla`
-        /// NoElevation). The mode is not part of it, because each of its
+        /// subagent never holds what its parent lacks. The mode is not part of
+        /// it, because each of its
         /// subagents' work carries the mode it was sent under.
         fn subagentRootAuthority(
             alloc: Allocator,
@@ -5278,7 +5278,7 @@ pub fn Runtime(comptime App: type) type {
             const prepared = try session_runtime.prepareCompactedHistory(app.alloc, agent.session.agent.history.items, summary, retained_from orelse .{ .turns = history_range.rawHistoryTurnCount(agent.session.agent.history.items) });
             var prepared_owned = true;
             defer if (prepared_owned) types.freeHistoryTurnSlice(app.alloc, prepared);
-            // A child's own agent holds its session (D31), so its compaction
+            // A child's own agent holds its session, so its compaction
             // is saved here like main's.
             if (comptime agents.hasAgentField(App, "session_persistence")) {
                 agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());

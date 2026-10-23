@@ -546,8 +546,8 @@ fn runOne(slot: *Slot) OneOutcome {
         return fallbackOutcome(owner.alloc, "unknown", .failed);
 
     // In the interactive app the child's own agent holds its session and
-    // saves its turns, as main does (D31); only fx ask and ACP open it for a
-    // run. `tla/ChildSession.tla` SingleWriter.
+    // saves its turns, as main does; only fx ask and ACP open it for a
+    // run.
     const hosted = owner.services.bind_fn != null;
     var child: ?OpenChild = if (hosted) null else OpenChild.open(owner, slot.child_id, snapshot.instructions) catch |err|
         return failedOutcome(work_id, "session_resume", err);
@@ -676,7 +676,7 @@ fn newChildSeed(owner: *Owner, children: *child_state.V2Children, child_id: []co
 }
 
 /// Opens child `child_id`'s session for its own agent, which holds it until
-/// main's session ends (D31), with the same recovery a run's open does. The
+/// main's session ends, with the same recovery a run's open does. The
 /// caller owns the session.
 pub fn openChildForAgent(owner: *Owner, child_id: []const u8) !*session_adapter.Session {
     const instructions = try childInstructions(owner, child_id);

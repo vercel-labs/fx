@@ -1,4 +1,4 @@
-//! The host record (D49, D58): which sessions ran together in one fx
+//! The host record: which sessions ran together in one fx
 //! process, so resuming one of them brings the others back. One JSON file
 //! per host in `~/.fx/hosts/`, named by the host's group id, listing the
 //! open instances' session ids in launch order. Session files never change.
@@ -40,7 +40,7 @@ pub const Restore = struct {
 /// Which sessions come back with `resumed`, or null when no record lists it.
 /// The newest record that lists `resumed` wins. Each of its other sessions
 /// comes back only when no newer record lists it: a session resumed into
-/// another host since then belongs to that host's group now (D58).
+/// another host since then belongs to that host's group now.
 pub fn chooseRestore(alloc: Allocator, records: []const Record, resumed: []const u8) !?Restore {
     var chosen: ?usize = null;
     for (records, 0..) |record, index| {
@@ -256,7 +256,9 @@ test "restoring a session brings back its newest group, minus sessions that move
     try std.testing.expectEqualStrings("b", tie.group_id);
 }
 
-/// Checks what D58 asks of `chooseRestore` for `resumed` over `records`.
+/// Checks `chooseRestore` for `resumed` over `records`: the newest record
+/// that lists `resumed` wins, and it brings back that record's other
+/// sessions in order, except any a newer record lists.
 fn expectRestore(alloc: Allocator, records: []const Record, resumed: []const u8) !void {
     var result = try chooseRestore(alloc, records, resumed);
     defer if (result) |*value| value.deinit(alloc);

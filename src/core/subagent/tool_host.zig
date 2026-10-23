@@ -232,7 +232,7 @@ pub const Runtime = struct {
     }
 
     /// Opens child `child_id`'s session for its own agent to hold, as main
-    /// holds its own (D31). The caller owns it.
+    /// holds its own. The caller owns it.
     pub fn openChildSession(self: *Runtime, child_id: []const u8) !*session_adapter.Session {
         return managed_owner.openChildForAgent(&self.managed, child_id);
     }
@@ -291,8 +291,8 @@ pub const Runtime = struct {
 
     /// Admits a turn the user starts on child `child_id`'s own screen,
     /// captured as a run's admission is, from the child's saved preferences,
-    /// so its profile and main's live permissions limit it the same way
-    /// (D31). The registry is not changed: no work of main's is started, and
+    /// so its profile and main's live permissions limit it the same way.
+    /// The registry is not changed: no work of main's is started, and
     /// a run main sends meanwhile waits for the turn to end. A one-off ran a
     /// single task for main and takes no turns of the user's. The caller owns
     /// the result.

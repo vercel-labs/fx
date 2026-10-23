@@ -920,7 +920,7 @@ pub fn Runtime(comptime App: type) type {
             max_input_len: usize,
         ) !ResolvedEscapeRoute {
             // With no other agent to switch to, Alt+←/→ keep the word jump
-            // their composer shortcut carries (D26).
+            // their composer shortcut carries.
             const resolved: input_action.Action = if (decoded == .switch_agent and !canSwitchAgents(app))
                 if (composer_shortcut) |shortcut| .{ .composer_shortcut = shortcut } else .ignore
             else

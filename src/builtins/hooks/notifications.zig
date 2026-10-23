@@ -254,8 +254,8 @@ fn Runtime(comptime App: type) type {
 
         /// Queues a cue on the first slot's worker queue. Only interactive
         /// scopes, which are main's turns, are enabled, and the turn-end hook
-        /// runs on the worker of the turn that ended (D43). The main loop
-        /// still drains that queue after the first instance closes (D57).
+        /// runs on the worker of the turn that ended. The main loop
+        /// still drains that queue after the first instance closes.
         fn enqueue(app: *App, notification: Notification) void {
             app.main_agent.worker.pushEvent(std.heap.c_allocator, .{ .notification = notification }) catch |err| {
                 debug_trace.logf(

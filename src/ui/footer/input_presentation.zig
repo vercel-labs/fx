@@ -227,7 +227,7 @@ fn questionInteractionHint(
 
     // Batch progress rides the hint row, right-aligned like the rest of the
     // footer chrome; a lone question needs no counter. A subagent's question
-    // on main's screen names the subagent there (D23).
+    // on main's screen names the subagent there.
     if (projection.entry_count > 1 or projection.asker.len > 0) {
         var counter_buf: [96]u8 = undefined;
         const counter = if (projection.asker.len > 0 and projection.entry_count > 1)

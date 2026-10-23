@@ -163,7 +163,7 @@ pub const LaunchModifiers = struct {
     /// `--profile <name>`: the agent profile main runs in. Owned.
     profile_name: ?[]u8 = null,
     /// `--instances <n>`: how many fx instances the host opens at startup,
-    /// each with its own session (D47).
+    /// each with its own session.
     instances: ?usize = null,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {

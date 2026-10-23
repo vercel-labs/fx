@@ -29,8 +29,7 @@ const subagent_tool = "subagent";
 const wildcard = "*";
 
 pub const Source = enum { home, project, builtin };
-/// Whether an agent is main or a subagent. A subagent's `*` never covers
-/// `subagent`, because nested subagents are not supported.
+/// Whether an agent is main or a subagent.
 pub const Role = enum { main, subagent };
 pub const PromptMode = enum { append, replace };
 
@@ -151,7 +150,7 @@ pub fn validName(name: []const u8) bool {
 }
 
 /// fx's own profiles: `main` and `agent`, each with every tool, so a subagent
-/// starts subagents of its own unless its profile leaves `subagent` out (D32).
+/// starts subagents of its own unless its profile leaves `subagent` out.
 /// Neither sets a mode, so each runs under its parent's.
 pub fn builtin(name: []const u8) ?Profile {
     if (std.mem.eql(u8, name, main_name)) return .{
@@ -226,7 +225,7 @@ pub fn parse(
 /// Whether an agent in `role` may use `tool` under `profile`. `*` covers every
 /// tool except `subagent` for a subagent, and `!name` wins over everything.
 /// Whether `profile` lets an agent use `tool`. `*` covers every tool,
-/// `subagent` included, for main and subagents alike (D32).
+/// `subagent` included, for main and subagents alike.
 pub fn allowsTool(profile: *const Profile, tool: []const u8) bool {
     return listAllows(profile.tools, tool, false);
 }
@@ -413,7 +412,7 @@ test "a profile's settings, tools, and prompt parse from profile.json and prompt
     try testing.expectEqual(@as(usize, 0), profile.ignored.len);
 }
 
-test "a repository's profile cannot set the permission mode, and unknown keys are reported (PR4, PR13)" {
+test "a repository's profile cannot set the permission mode, and unknown keys are reported" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const profile = try testParse(arena_state.allocator(), .project,
@@ -427,7 +426,7 @@ test "a repository's profile cannot set the permission mode, and unknown keys ar
     try testing.expectEqual(IgnoredReason.unknown_key, profile.ignored[1].reason);
 }
 
-test "the user's own profile sets the mode, and a profile without one inherits its parent's (PR5, PR6)" {
+test "the user's own profile sets the mode, and a profile without one inherits its parent's" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const own = try testParse(arena_state.allocator(), .home,
@@ -461,7 +460,7 @@ test "a profile without a description, with bad JSON, or with a bad value is ref
     try testing.expectError(error.InvalidProfile, parse(arena, "Bad Name", .home, "{\"description\": \"x\"}", "", &failure));
 }
 
-test "fx's main and agent profiles have every tool, subagent included (PR3, D32)" {
+test "fx's main and agent profiles have every tool, subagent included" {
     const main = builtin(main_name).?;
     const agent = builtin(agent_name).?;
     try testing.expect(allowsTool(&main, "subagent"));
@@ -472,7 +471,7 @@ test "fx's main and agent profiles have every tool, subagent included (PR3, D32)
     try testing.expect(builtin("reviewer") == null);
 }
 
-test "a profile's * covers every tool, subagent included, and only !subagent leaves it out (PR7, PR8, D32)" {
+test "a profile's * covers every tool, subagent included, and only !subagent leaves it out" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const all = try testParse(arena_state.allocator(), .home,
@@ -492,7 +491,7 @@ test "a profile's * covers every tool, subagent included, and only !subagent lea
     try testing.expect(!allowsTool(&none, "read_file"));
 }
 
-test "a profile's prompt adds to fx's prompt, or replaces it when the profile says so (PR10)" {
+test "a profile's prompt adds to fx's prompt, or replaces it when the profile says so" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -513,7 +512,7 @@ fn writeTestProfile(dir: std.Io.Dir, sub_path: []const u8, json: []const u8) !vo
     try file.writeStreamingAll(io_mod.getIo(), json);
 }
 
-test "a name resolves from the user's profiles, then the repository's, then fx's (PR1, PR2, PR11)" {
+test "a name resolves from the user's profiles, then the repository's, then fx's" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

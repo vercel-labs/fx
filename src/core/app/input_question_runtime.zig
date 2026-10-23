@@ -92,7 +92,7 @@ pub fn QuestionRuntime(comptime App: type) type {
                 if (try app.answerLentQuestion(submitQuestionBatch)) return;
             }
             if (comptime @hasDecl(App, "screenAgentId")) {
-                debug_trace.eventf("procesor", "question_answered", .{}, "agent={s} screen={s}", .{
+                debug_trace.eventf("host", "question_answered", .{}, "agent={s} screen={s}", .{
                     app.subagentIdOf(agent) orelse "main",
                     app.screenAgentId(),
                 });
