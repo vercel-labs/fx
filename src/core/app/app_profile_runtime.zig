@@ -21,9 +21,17 @@ pub const ProfileTools = struct {
 };
 
 /// The message for a `--profile` that cannot be used, or null when it loads.
-/// Resolves from the same home and workspace that startup uses. Caller owns
-/// the message.
+/// Caller owns the message.
 pub fn launchFailure(alloc: std.mem.Allocator, name: []const u8) !?[]u8 {
+    const reason = try failureReason(alloc, name) orelse return null;
+    defer alloc.free(reason);
+    return try alloc.print("fx: {s}\n", .{reason});
+}
+
+/// Why profile `name` cannot be loaded, such as "no profile named 'x'.
+/// Profiles: agent, main", or null when it loads. Resolves from the same home
+/// and workspace that startup uses. Caller owns the reason.
+pub fn failureReason(alloc: std.mem.Allocator, name: []const u8) !?[]u8 {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -32,7 +40,7 @@ pub fn launchFailure(alloc: std.mem.Allocator, name: []const u8) !?[]u8 {
     var failure: ?[]const u8 = null;
     _ = profiles.load(arena, roots, name, &failure) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return try alloc.print("fx: {s}\n", .{failure orelse @errorName(err)}),
+        else => return try alloc.dupe(u8, failure orelse @errorName(err)),
     };
     return null;
 }

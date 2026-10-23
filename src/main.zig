@@ -3234,8 +3234,14 @@ const App = struct {
     pub fn launchInstance(self: *App, profile_name: ?[]const u8) !void {
         const child = InstancesAppRuntime.launch(self, profile_name) catch |err| {
             debug_trace.logf("host", "instance launch failed profile={s} err={s}", .{ profile_name orelse "default", @errorName(err) });
-            var body_buf: [200]u8 = undefined;
-            const body = std.mem.print(&body_buf, "Couldn't start another fx instance: {s}.", .{@errorName(err)}) catch "Couldn't start another fx instance.";
+            // A profile that won't load says why, as `fx --profile` does.
+            const reason = if (profile_name) |name| app_profile_runtime.failureReason(self.alloc, name) catch null else null;
+            defer if (reason) |text| self.alloc.free(text);
+            var body_buf: [512]u8 = undefined;
+            const body = if (reason) |text|
+                std.mem.print(&body_buf, "Couldn't start another fx instance: {s}", .{text}) catch "Couldn't start another fx instance."
+            else
+                std.mem.print(&body_buf, "Couldn't start another fx instance: {s}.", .{@errorName(err)}) catch "Couldn't start another fx instance.";
             try self.writeDomainNotice(.{ .topic = "instances", .tone = .@"error", .body = body }, true);
             return;
         };

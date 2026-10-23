@@ -262,6 +262,13 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.sendKeys("M-Right");
         const second = await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
         expect(shownAnswers(second)).toEqual([]);
+
+        // A profile that won't load says why and opens nothing.
+        await session.sendText("/launch nosuch");
+        const refused = await session.waitForPane((pane) => pane.includes("no profile named 'nosuch'"), 15_000);
+        expect(refused).toContain("Couldn't start another fx instance: no profile named 'nosuch'. Profiles:");
+        expect(refused).not.toContain("ProfileNotFound");
+        expect(refused).toContain("fx 2/2");
       });
     },
     TIMEOUT,
