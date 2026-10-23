@@ -107,6 +107,33 @@ async function withHost(
 
 const ANSWERS = ["A", "B", "C", "D"].map((letter) => `HOST_ANSWER_${letter}`);
 
+// The tools a request offered the model, by name.
+function toolNames(body: string): string[] {
+  const request = JSON.parse(body) as { tools?: Array<{ name?: string }> };
+  return (request.tools ?? []).map((tool) => tool.name ?? "");
+}
+
+// Whether the request's last message is a tool result, so the model's call
+// has been answered.
+function answered(body: string): boolean {
+  const request = JSON.parse(body) as { prompt?: Array<{ role?: string }> };
+  return request.prompt?.at(-1)?.role === "tool";
+}
+
+function call(id: string, tool: string, input: object): Response {
+  return fakeGatewaySse([
+    { type: "tool-call", toolCallId: id, toolName: tool, input },
+    { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+  ]);
+}
+
+// Saves agent profile `name` under the test home's `~/.fx/agents`.
+function writeProfile(home: string, name: string, profile: object) {
+  const dir = join(home, ".fx", "agents", name);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "profile.json"), JSON.stringify(profile));
+}
+
 const COMMAND_APPROVAL_PROMPT = "Would you like to run the following command?";
 
 // The saved session in `sessions/v2/<id>` whose files hold `marker`, by id.
@@ -640,4 +667,129 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "a launched instance's subagent works under that instance",
+    async () => {
+      const bodies = await withHost((body) => {
+        const texts = userTexts(body).join("\n");
+        if (texts.includes("TREE_TASK")) {
+          if (answered(body)) return text("tree_child_done", "TREE_CHILD_DONE");
+          return call("tree_touch", "shell", { request: { action: "run", yield_time_ms: 30_000, timeout_ms: 600_000, command: "touch tree-marker" } });
+        }
+        if (texts.includes("TREE_USER")) {
+          if (answered(body)) return text("tree_main_final", "TREE_MAIN_FINAL");
+          return call("tree_sub", "subagent", { request: { action: "message", agent: "helper", message: "TREE_TASK make the marker" } });
+        }
+        return answerByLetter(body);
+      }, { instances: 2, env: { FX_PERMISSION_MODE: "full-access" } }, async ({ workspace, session }) => {
+        await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+        await session.sendKeys("M-Right");
+        await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+        await session.waitForComposer(15_000);
+        await session.sendText("TREE_USER start a helper");
+        await session.waitForText("TREE_MAIN_FINAL", 45_000);
+        // The subagent fx 2 started ran its command, so its tree has
+        // fx 2's authority rather than none.
+        expect(existsSync(join(workspace, "tree-marker"))).toBe(true);
+      });
+      const child = bodies.filter((body) => userTexts(body).join("\n").includes("TREE_TASK"));
+      expect(child.length).toBeGreaterThan(0);
+      expect(toolNames(child[0])).toContain("shell");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent without a profile copies its instance, and one with a profile gets what the profile says",
+    async () => {
+      let home = "";
+      const bodies = await withHost((body) => {
+        const texts = userTexts(body).join("\n");
+        if (texts.includes("TREE_PLAIN_TASK")) return text("plain_done", "TREE_PLAIN_DONE");
+        if (texts.includes("TREE_BUILDER_TASK")) return text("builder_done", "TREE_BUILDER_DONE");
+        const last = userTexts(body).at(-1) ?? "";
+        if (last.includes("TREE_USER_PLAIN")) {
+          if (answered(body)) return text("plain_final", "TREE_PLAIN_FINAL");
+          return call("plain_sub", "subagent", { request: { action: "message", agent: "plain", message: "TREE_PLAIN_TASK" } });
+        }
+        if (last.includes("TREE_USER_BUILDER")) {
+          if (answered(body)) return text("builder_final", "TREE_BUILDER_FINAL");
+          return call("builder_sub", "subagent", { request: { action: "message", agent: "builder", profile: "builder", message: "TREE_BUILDER_TASK" } });
+        }
+        return answerByLetter(body);
+      }, { env: { FX_PERMISSION_MODE: "full-access" } }, async ({ home: testHome, session }) => {
+        home = testHome;
+        writeProfile(home, "noshell", { description: "Everything but the shell", tools: ["*", "!shell"] });
+        writeProfile(home, "builder", { description: "Builds things with every tool", tools: ["*"] });
+        await session.sendText("/launch noshell");
+        await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+        await session.waitForComposer(15_000);
+        await session.sendText("TREE_USER_PLAIN start a plain helper");
+        await session.waitForText("TREE_PLAIN_FINAL", 45_000);
+        await session.waitForComposer(15_000);
+        await session.sendText("TREE_USER_BUILDER start a builder");
+        await session.waitForText("TREE_BUILDER_FINAL", 45_000);
+      });
+      const holding = (marker: string) => bodies.filter((body) => userTexts(body).join("\n").includes(marker));
+      // fx 2 runs in its profile, without the shell.
+      const instance = holding("TREE_USER_PLAIN").filter((body) => !userTexts(body).join("\n").includes("TREE_PLAIN_TASK"));
+      expect(instance.length).toBeGreaterThan(0);
+      expect(toolNames(instance[0])).not.toContain("shell");
+      // With no profile, its subagent is a copy of it.
+      const plain = holding("TREE_PLAIN_TASK");
+      expect(plain.length).toBeGreaterThan(0);
+      expect(toolNames(plain[0])).not.toContain("shell");
+      expect(toolNames(plain[0])).toContain("read_file");
+      // With a profile, the profile decides, even past fx 2's tools.
+      const builder = holding("TREE_BUILDER_TASK");
+      expect(builder.length).toBeGreaterThan(0);
+      expect(toolNames(builder[0])).toContain("shell");
+    },
+    TIMEOUT,
+  );
+
+
+  test(
+    "a launched instance's subagent asks on that instance's screen, not the first's",
+    async () => {
+      await withHost((body) => {
+        const texts = userTexts(body).join("\n");
+        if (texts.includes("TREE_LEND_TASK")) {
+          if (answered(body)) return text("lend_child_done", "TREE_LEND_CHILD_DONE");
+          return call("lend_write", "write_file", { path: "lent.txt", content: "TREE_LENT\n" });
+        }
+        if (texts.includes("TREE_LEND_USER")) {
+          if (answered(body)) return text("lend_main_done", "TREE_LEND_MAIN_DONE");
+          return call("lend_sub", "subagent", { request: { action: "message", agent: "writer", profile: "writer", message: "TREE_LEND_TASK" } });
+        }
+        return answerByLetter(body);
+      }, { instances: 2 }, async ({ home, workspace, session }) => {
+        writeProfile(home, "writer", { description: "Writes one file", tools: ["read_file", "write_file"], permission_mode: "ask" });
+        await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+        await session.sendKeys("M-Right");
+        await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+        await session.waitForComposer(15_000);
+        await session.sendText("TREE_LEND_USER write the file");
+        // fx 2's own screen, shown by its conversation, holds its subagent's
+        // approval, which replaces the footer while it waits.
+        await session.waitForPane((pane) => pane.includes("TREE_LEND_USER") && pane.includes("Subagent writer needs permission"), 30_000);
+
+        // The first instance shows only the note that it waits.
+        await session.sendKeys("M-Left");
+        const first = await session.waitForPane((pane) => pane.includes("fx 1/2") && pane.includes("writer needs approval"), 15_000);
+        expect(first).not.toContain("Subagent writer needs permission");
+
+        // Back on fx 2, the answer there reaches the subagent.
+        expect(first).not.toContain("TREE_LEND_USER");
+        await session.sendKeys("M-Right");
+        await session.waitForPane((pane) => pane.includes("TREE_LEND_USER") && pane.includes("Subagent writer needs permission"), 15_000);
+        await session.sendKeys("1");
+        await session.waitForText("TREE_LEND_MAIN_DONE", 30_000);
+        expect(readFileSync(join(workspace, "lent.txt"), "utf8")).toBe("TREE_LENT\n");
+      });
+    },
+    TIMEOUT,
+  );
+
 });

@@ -5151,7 +5151,51 @@ pub fn Runtime(comptime App: type) type {
                 .context = app,
                 .resolve_fn = resolveSubagentAuthority,
                 .child_permission_mode_fn = subagentOwnPermissionMode,
+                .base_fn = resolveSubagentBase,
             };
+        }
+
+        /// fx's own tools, MCP integrations, and MCP view, before any
+        /// profile, for a subagent whose profile decides them. Configured
+        /// denies still remove tools here, as they do for every agent.
+        fn resolveSubagentBase(
+            raw: ?*anyopaque,
+            alloc: Allocator,
+            root_id: []const u8,
+        ) subagent_authority.HostResolveError!subagent_authority.HostAuthority {
+            const app: *App = @ptrCast(@alignCast(raw.?));
+            if (comptime @hasField(@TypeOf(app.permission_state), "authority_mutex")) {
+                app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+            }
+            defer if (comptime @hasField(@TypeOf(app.permission_state), "authority_mutex")) {
+                app.permission_state.authority_mutex.unlock(io_mod.getIo());
+            };
+            const integrations = if (comptime @hasDecl(App, "snapshotMcpToolNames"))
+                try app.snapshotMcpToolNames(alloc)
+            else
+                try alloc.alloc([]u8, 0);
+            defer {
+                for (integrations) |name| alloc.free(name);
+                alloc.free(integrations);
+            }
+            const rules: types.PermissionRuleSet = if (comptime @hasField(App, "permission_engine")) app.permission_engine.rules else .{};
+            var mcp_view: ?mcp_access.View = if (comptime @hasDecl(App, "snapshotMcpAccessView"))
+                try app.snapshotMcpAccessView(alloc, root_id, root_id, rules)
+            else
+                null;
+            defer if (mcp_view) |*view| view.deinit(alloc);
+            return subagent_tool_host.captureHostAuthorityWithMcpView(
+                alloc,
+                .{
+                    .tool_set = if (comptime @hasDecl(App, "baseToolSet")) app.baseToolSet() else app.toolAdvertisementSet(&app.main_agent),
+                    .mode = .full,
+                },
+                integrations,
+                rules,
+                &.{},
+                .{},
+                if (mcp_view) |*view| view else null,
+            );
         }
 
         /// The permission mode the user chose on subagent `child_id`'s own
@@ -5169,10 +5213,8 @@ pub fn Runtime(comptime App: type) type {
             return null;
         }
 
-        /// Resolves a subagent's authority from the root session, which is
-        /// always main's, whichever thread asks.
         /// The resolver of the host that started subagent `root_id`, when
-        /// `root_id` is a subagent rather than main.
+        /// `root_id` is a subagent rather than an instance.
         fn parentResolverOf(app: *App, root_id: []const u8) ?*subagent_authority.Resolver {
             if (comptime !@hasField(App, "child_agents")) return null;
             app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
@@ -5181,6 +5223,21 @@ pub fn Runtime(comptime App: type) type {
                 if (!std.mem.eql(u8, child.id, root_id)) continue;
                 const host = child.parent_host orelse return null;
                 return host.authorityResolver();
+            }
+            return null;
+        }
+
+        /// The instance whose own session is `root_id`, the first or a launched
+        /// one, or null. Call under the authority lock, which guards the list
+        /// of hosted agents.
+        fn instanceWithSession(app: *App, root_id: []const u8) ?*AppAgent {
+            if (app.main_agent.session_persistence.v2) |v2| if (std.mem.eql(u8, v2.id(), root_id)) return &app.main_agent;
+            if (comptime @hasField(App, "child_agents")) {
+                for (app.child_agents.items) |child| {
+                    if (child.agent.role != .instance) continue;
+                    const v2 = child.agent.session_persistence.v2 orelse continue;
+                    if (std.mem.eql(u8, v2.id(), root_id)) return &child.agent;
+                }
             }
             return null;
         }
@@ -5218,19 +5275,17 @@ pub fn Runtime(comptime App: type) type {
         ) subagent_authority.HostResolveError!subagent_authority.HostAuthority {
             const app: *App = @ptrCast(@alignCast(raw.?));
             if (parentResolverOf(app, root_id)) |parent| return subagentRootAuthority(alloc, parent, root_id);
-            // The root's authority is main's, whichever thread resolves it: a
+            // The root is an instance, the first or a launched one, and its
+            // tree starts from its authority, whichever thread resolves it: a
             // slot thread capturing an admission, or a child's worker checking
-            // a tool call. Main's launch profile narrows its tools here too.
+            // a tool call. The instance's own profile narrows its tools here too.
             if (comptime @hasField(@TypeOf(app.permission_state), "authority_mutex")) {
                 app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
             }
             defer if (comptime @hasField(@TypeOf(app.permission_state), "authority_mutex")) {
                 app.permission_state.authority_mutex.unlock(io_mod.getIo());
             };
-            const active_id = if (app.main_agent.session_persistence.v2) |v2| v2.id() else return error.HostAuthorityUnavailable;
-            if (!std.mem.eql(u8, active_id, root_id)) {
-                return error.HostAuthorityUnavailable;
-            }
+            const instance = instanceWithSession(app, root_id) orelse return error.HostAuthorityUnavailable;
             const integrations = if (comptime @hasDecl(App, "snapshotMcpToolNames"))
                 try app.snapshotMcpToolNames(alloc)
             else
@@ -5249,23 +5304,30 @@ pub fn Runtime(comptime App: type) type {
             else
                 null;
             defer if (mcp_view) |*view| view.deinit(alloc);
-            var permission_state = app.main_agent.session.snapshotPermissionState(alloc) catch |err| switch (err) {
+            var permission_state = instance.session.snapshotPermissionState(alloc) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.HostAuthorityUnavailable,
             };
             defer permission_state.deinit(alloc);
-            return subagent_tool_host.captureHostAuthorityWithMcpView(
+            var authority = try subagent_tool_host.captureHostAuthorityWithMcpView(
                 alloc,
                 .{
-                    .tool_set = app.toolAdvertisementSet(&app.main_agent),
+                    .tool_set = app.toolAdvertisementSet(instance),
                     .mode = .full,
                 },
                 integrations,
                 if (comptime @hasField(App, "permission_engine")) app.permission_engine.rules else .{},
-                if (comptime @hasField(App, "permission_engine")) app_permission_runtime.Runtime(App).grantsOf(app, &app.main_agent) else &.{},
+                if (comptime @hasField(App, "permission_engine")) app_permission_runtime.Runtime(App).grantsOf(app, instance) else &.{},
                 permission_state,
                 if (mcp_view) |*view| view else null,
             );
+            errdefer authority.deinit(alloc);
+            // The instance's own profile narrows the MCP servers its tree starts
+            // from, as it narrows the tools above.
+            if (comptime agents.hasAgentField(App, "profile")) {
+                try subagent_authority.narrowHostToMcpServers(alloc, &authority, &instance.profile.profile);
+            }
+            return authority;
         }
 
         pub fn commitContextCompaction(

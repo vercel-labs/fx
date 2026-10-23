@@ -53,10 +53,12 @@ pub const Profile = struct {
     effort: ?types.ReasoningEffort = null,
     /// Null means the agent runs under its parent's mode.
     permission_mode: ?types.PermissionMode = null,
-    /// Tool names. `*` means every tool and `!name` removes one.
-    tools: []const []const u8 = &.{wildcard},
-    /// MCP server names, matched the same way as `tools`.
-    mcp_servers: []const []const u8 = &.{wildcard},
+    /// Tool names. `*` means every tool fx has and `!name` removes one.
+    /// Set, it decides the agent's tools, even ones its parent lacks;
+    /// null, the agent has its parent's.
+    tools: ?[]const []const u8 = null,
+    /// MCP server names, matched and inherited the same way as `tools`.
+    mcp_servers: ?[]const []const u8 = null,
     prompt: []const u8 = "",
     prompt_mode: PromptMode = .append,
     ignored: []const Ignored = &.{},
@@ -149,9 +151,9 @@ pub fn validName(name: []const u8) bool {
     return true;
 }
 
-/// fx's own profiles: `main` and `agent`, each with every tool, so a subagent
-/// starts subagents of its own unless its profile leaves `subagent` out.
-/// Neither sets a mode, so each runs under its parent's.
+/// fx's own profiles: `main` and `agent`. Neither sets tools, MCP servers,
+/// or a mode, so an agent in either is a copy of the one that started it,
+/// and an instance in `main` has every tool fx has.
 pub fn builtin(name: []const u8) ?Profile {
     if (std.mem.eql(u8, name, main_name)) return .{
         .name = main_name,
@@ -162,7 +164,6 @@ pub fn builtin(name: []const u8) ?Profile {
         .name = agent_name,
         .description = "A general subagent with every tool",
         .source = .builtin,
-        .tools = &.{wildcard},
     };
     return null;
 }
@@ -223,13 +224,28 @@ pub fn parse(
 }
 
 /// Whether `profile` lets an agent use `tool`. `*` covers every tool,
-/// `subagent` included, for main and subagents alike.
+/// `subagent` included, for main and subagents alike. A profile that sets
+/// no tools allows every one, leaving its parent's in place.
 pub fn allowsTool(profile: *const Profile, tool: []const u8) bool {
-    return listAllows(profile.tools, tool, false);
+    const tools = profile.tools orelse return true;
+    return listAllows(tools, tool, false);
 }
 
 pub fn allowsMcpServer(profile: *const Profile, server: []const u8) bool {
-    return listAllows(profile.mcp_servers, server, false);
+    const servers = profile.mcp_servers orelse return true;
+    return listAllows(servers, server, false);
+}
+
+/// Whether `profile` decides its agent's tools rather than inheriting its
+/// parent's.
+pub fn setsTools(profile: *const Profile) bool {
+    return profile.tools != null;
+}
+
+/// Whether `profile` decides its agent's MCP servers rather than inheriting
+/// its parent's.
+pub fn setsMcpServers(profile: *const Profile) bool {
+    return profile.mcp_servers != null;
 }
 
 /// The mode an agent in `profile` runs under: the profile's own, or its
@@ -458,13 +474,15 @@ test "a profile without a description, with bad JSON, or with a bad value is ref
     try testing.expectError(error.InvalidProfile, parse(arena, "Bad Name", .home, "{\"description\": \"x\"}", "", &failure));
 }
 
-test "fx's main and agent profiles have every tool, subagent included" {
+test "fx's main and agent profiles decide nothing, so an agent in either copies its parent" {
     const main = builtin(main_name).?;
     const agent = builtin(agent_name).?;
     try testing.expect(allowsTool(&main, "subagent"));
     try testing.expect(allowsTool(&main, "write_file"));
     try testing.expect(allowsTool(&agent, "subagent"));
     try testing.expect(allowsTool(&agent, "write_file"));
+    try testing.expect(!setsTools(&main) and !setsTools(&agent));
+    try testing.expect(!setsMcpServers(&main) and !setsMcpServers(&agent));
     try testing.expect(main.permission_mode == null and agent.permission_mode == null);
     try testing.expect(builtin("reviewer") == null);
 }
@@ -487,6 +505,12 @@ test "a profile's * covers every tool, subagent included, and only !subagent lea
         \\{"description": "None", "tools": []}
     , "");
     try testing.expect(!allowsTool(&none, "read_file"));
+    try testing.expect(setsTools(&none));
+    const unset = try testParse(arena_state.allocator(), .home,
+        \\{"description": "Unset"}
+    , "");
+    try testing.expect(!setsTools(&unset) and !setsMcpServers(&unset));
+    try testing.expect(allowsTool(&unset, "shell"));
 }
 
 test "a profile's prompt adds to fx's prompt, or replaces it when the profile says so" {

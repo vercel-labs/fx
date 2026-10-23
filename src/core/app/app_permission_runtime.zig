@@ -92,12 +92,16 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// The instance whose permission mode and session approvals `agent`
-        /// uses: itself, or the first slot for a subagent, as before
-        /// instances. Tool checks on worker threads ask here, so it
-        /// names the slot rather than walking the instances; after the first
-        /// instance closes the slot stays valid and empty.
+        /// uses: itself, or for a subagent the instance at the top of its
+        /// tree. Tool checks on worker threads ask here, so it reads the
+        /// root the subagent recorded before its first turn rather than
+        /// walking the instances. A subagent not yet bound to a host uses
+        /// the first slot, which stays valid after the first instance closes.
         fn permissionOwner(app: anytype, agent: anytype) @TypeOf(agent) {
-            if (isSubagent(app, agent)) return &app.main_agent;
+            if (isSubagent(app, agent)) {
+                if (comptime @hasField(@TypeOf(agent.*), "root_instance")) if (agent.root_instance) |root| return root;
+                return &app.main_agent;
+            }
             return agent;
         }
 
@@ -128,7 +132,7 @@ pub fn Runtime(comptime App: type) type {
 
         /// `agent`'s permission mode: an instance's own, or a
         /// subagent's own: the one chosen on its screen, else the one
-        /// its run was admitted with, else the first instance's.
+        /// its run was admitted with, else its root instance's.
         pub fn modeOf(app: anytype, agent: anytype) types.PermissionMode {
             if (comptime !@hasField(App, "permission_engine")) return .ask;
             if (comptime own_mode_supported) if (isSubagent(app, agent)) {
