@@ -130,7 +130,7 @@ On `local()`, `vercel()` and `world()`, a session id is a Workflow run id, `wrun
 
 A session stores the conversation, and with each prompt and steer the caller's `context` and the session object's settings. Every process passes its own model, credentials, tools, MCP clients and skills when it creates the agent.
 
-libfx doesn't know who is calling. Anyone with a session's id can prompt, steer, cancel, stream or checkpoint it, so your app must check that the caller may use a session before it opens it. A queue message only names an input libfx already stored: a delivery that names one the session's log doesn't hold runs nothing, and the agent's `onEvent` gets a `session.refused` event. If a session's saved checkpoint came from a different libfx version, tool set or model, the session still loads, and `onEvent` gets a `checkpoint.mismatch` event naming what changed.
+libfx doesn't know who is calling. Anyone with a session's id can prompt, steer, cancel, stream or checkpoint it, so your app must check that the caller may use a session before it opens it. A queue message only names an input libfx already stored: a delivery that names one the session's log doesn't hold, or that reaches an agent other than the one its input was sent through, runs nothing and isn't sent on, and the agent's `onEvent` gets a `session.refused` event. If a session's saved checkpoint came from a different libfx version, tool set or model, the session still loads, and `onEvent` gets a `checkpoint.mismatch` event naming what changed.
 
 ### Several agents
 

@@ -320,8 +320,11 @@ export type FxSessionEvent = FxEventBase & (
   | { type: "session.fenced"; sessionId: string; epoch: number }
   /** A message for a session of the agent `agent` reached this one, which sent it on. */
   | { type: "session.forwarded"; sessionId: string; agent: string }
-  /** A queue delivery named an input the session's log does not hold, or none at all, so it ran nothing. */
-  | { type: "session.refused"; sessionId?: string; messageId?: string; reason: "unknown message" | "malformed message" }
+  /**
+   * A queue delivery named an input the session's log does not hold, or none at all, or reached an agent other than
+   * the one its input was sent through, so it ran nothing and sent nothing on.
+   */
+  | { type: "session.refused"; sessionId?: string; messageId?: string; reason: "unknown message" | "malformed message" | "misrouted message" }
   /** `cutoffs`: the times in a row the deadline cut off the same step, this one included. */
   | { type: "session.deadline"; sessionId: string; epoch: number; cutoffs: number }
   | { type: "ui.error"; sessionId: string; error: string }

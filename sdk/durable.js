@@ -1516,6 +1516,9 @@ function deliveredMessage(backend, delivered) {
 // Whether the session's log holds the input `message` names, or names it
 // among those a turn already took.
 const knownMessage = (state, message) => state.inputKeys.has(`${message.type}:${message.messageId}`) || state.consumed.has(message.messageId);
+// The input entry the log holds for `message`, or undefined once the log no
+// longer shows it, as after a checkpoint. Pure.
+const storedInput = (entries, message) => entries.find(({ entry }) => entry?.k === "input" && entry.key === `${message.type}:${message.messageId}`)?.entry;
 
 // The most a durable input may hold: its content blocks with its caller's
 // context and its session object's settings, as JSON. The engine refuses a
@@ -1707,9 +1710,18 @@ class SessionWorker {
     const deadline = this.backend.deadline() ?? (this.backend.maxDurationMs === null ? null : Date.now() + this.backend.maxDurationMs);
     // A session runs only on the agent it belongs to, the one its first
     // stored input names. A message that reached another agent, as one sent
-    // to another agent's session does, goes on to it.
+    // to another agent's session does, goes on to it, but only from the
+    // agent its sender sent it through, which its stored input names. A
+    // delivery that reached any other agent was never queued there, so it is
+    // refused, and nothing goes on that the owner already has
+    // (`tests/tla/sdk/TenantIsolation.tla` Take).
     const owner = state.agent ?? agentOf(message);
     if (owner !== this.agent.name) {
+      const stored = storedInput(entries, message);
+      if (stored !== undefined && agentOf(stored) !== this.agent.name) {
+        this.agent.emit("session.refused", { sessionId: this.sessionId, messageId: message.messageId, reason: "misrouted message" });
+        return undefined;
+      }
       await this.backend.queue.send(queuedMessage({ ...message, agent: owner }, this.backend.store), {
         idempotencyKey: `${message.sessionId}:${message.type}:${message.messageId}:to:${owner}`,
       });

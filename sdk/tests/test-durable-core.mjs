@@ -2093,6 +2093,41 @@ if (durabilityKind === "queue") {
     await stored.close();
   });
 
+  test("a delivery that reached an agent its input was not sent through is refused, and nothing is sent on", async () => {
+    const { stored, sent, durability } = await routeWorld("tenants");
+    const refused = [];
+    const onEvent = (event) => { if (event.type === "session.refused") refused.push(event); };
+    const support = createTaggedAgent({ durability, name: "support", tag: "support" });
+    const coding = createTaggedAgent({ durability, name: "coding", tag: "coding", onEvent });
+    const billing = createTaggedAgent({ durability, name: "billing", tag: "billing", onEvent });
+    const session = support.session();
+    // One input sent through the session's own agent, and one through another.
+    const own = session.prompt("own", { messageId: "own-1" });
+    await own.accepted;
+    const [ownMessage] = sent.splice(0);
+    assert.equal((await post(wakeHandler(), ownMessage.payload)).status, 200);
+    assert.equal((await own.result).stopReason, "end_turn");
+    const via = coding.session(session.id).prompt("via", { messageId: "via-1" });
+    await via.accepted;
+    const [viaMessage] = sent.splice(0);
+    assert.equal(viaMessage.payload.input.agent, "coding", "the sender queued it to its own agent");
+    // A delivery of either that names another agent was never queued there.
+    const misrouted = (message, agent) => ({ ...message.payload, input: { ...message.payload.input, agent } });
+    assert.equal((await post(wakeHandler(), misrouted(ownMessage, "coding"))).status, 200);
+    assert.equal((await post(wakeHandler(), misrouted(viaMessage, "billing"))).status, 200);
+    assert.deepEqual(refused.map(({ messageId, reason }) => [messageId, reason]), [["own-1", "misrouted message"], ["via-1", "misrouted message"]]);
+    assert.deepEqual(sent, [], "nothing was sent on");
+    // The agent it was sent through sends it on, and it runs on the owner.
+    assert.equal((await post(wakeHandler(), viaMessage.payload)).status, 200);
+    const [forwarded] = sent.splice(0);
+    assert.equal(forwarded?.payload.input.agent, "support", "the input's own agent sent it on to the owner");
+    assert.equal((await post(wakeHandler(), forwarded.payload)).status, 200);
+    assert.equal((await via.result).stopReason, "end_turn");
+    assert.deepEqual([...new Set(openersOf(session.id))], ["support"], "only the owner ran the session");
+    for (const agent of [support, coding, billing]) await agent.close();
+    await stored.close();
+  });
+
   test("a second copy of libfx in the process keeps one agent per name on a store, and its route reaches the first copy's agents", async () => {
     const copy = await import(new URL("../durable.js?second-copy", import.meta.url).href);
     assert.notEqual(copy.wakeHandler, wakeHandler, "a separate module instance");
