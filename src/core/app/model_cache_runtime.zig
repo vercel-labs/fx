@@ -1,4 +1,6 @@
 const std = @import("std");
+const auth_runtime = @import("../auth/auth_runtime.zig");
+const model_provider = @import("../config/model_provider.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
@@ -175,6 +177,7 @@ pub const model_provider_filter_count = @typeInfo(ModelProviderFilter).@"enum".f
 pub const ModelMenuItem = struct {
     id: []u8,
     provider: []const u8,
+    execution_provider: ?model_provider.ProviderId = null,
     capabilities: model_capabilities.Capabilities,
 
     fn deinit(self: ModelMenuItem, alloc: Allocator) void {
@@ -269,6 +272,20 @@ pub const ModelMenu = struct {
         return try alloc.dupe(u8, item.id);
     }
 
+    pub fn selectProviderModel(self: *ModelMenu, provider: model_provider.ProviderId, model: []const u8) bool {
+        for (0..self.filteredItemCount()) |index| {
+            const item = self.itemAt(index).?;
+            if (item.execution_provider) |target| {
+                if (target.same_authority(provider) and std.mem.eql(u8, item.id, model)) {
+                    self.selected_index = index;
+                    self.window_start = list_window.updateEdgeStart(0, self.filteredItemCount(), index, list_window.default_max_picker_rows);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     fn clearSnapshot(self: *ModelMenu, alloc: Allocator) void {
         for (self.items.items) |item| item.deinit(alloc);
         self.items.deinit(alloc);
@@ -315,7 +332,8 @@ fn modelMenuItemMatches(
     const query_text = std.mem.trim(u8, query, " \t\r\n");
     return query_text.len == 0 or
         text_utils.containsIgnoreCase(item.id, query_text) or
-        text_utils.containsIgnoreCase(item.provider, query_text);
+        text_utils.containsIgnoreCase(item.provider, query_text) or
+        (if (item.execution_provider) |provider| text_utils.containsIgnoreCase(provider.label(), query_text) else false);
 }
 
 fn providerFilter(provider: []const u8) ModelProviderFilter {
@@ -372,6 +390,8 @@ pub const Runtime = struct {
     outcome: CatalogOutcome = .{},
     from_profile_settings: bool = false,
     menu: ModelMenu = .{},
+    menu_provider: ?model_provider.ProviderId = null,
+    discoveries: std.ArrayList(*auth_runtime.ProviderPreparation) = .empty,
 
     pub fn init(alloc: Allocator, models_path: []const u8) Self {
         return .{
@@ -381,6 +401,7 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.stopDiscovery();
         self.cancelAndJoin();
         self.discardStagedLocked();
         self.menu.deinit(self.alloc);
@@ -592,6 +613,53 @@ pub const Runtime = struct {
         return self.state == .loading;
     }
 
+    fn stopDiscovery(self: *Self) void {
+        for (self.discoveries.items) |task| task.requestCancel();
+        for (self.discoveries.items) |task| task.deinit();
+        self.discoveries.deinit(self.alloc);
+        self.discoveries = .empty;
+    }
+
+    fn reapCancelledDiscoveries(self: *Self) void {
+        var index: usize = 0;
+        while (index < self.discoveries.items.len) {
+            const task = self.discoveries.items[index];
+            if (task.cancel_requested.load(.seq_cst) and task.done.load(.acquire) and
+                (task.failure == null or task.discovery_notice_reported))
+            {
+                _ = self.discoveries.orderedRemove(index);
+                task.deinit();
+            } else index += 1;
+        }
+    }
+
+    pub fn pendingDiscoveryFailure(self: *Self) ?*auth_runtime.ProviderPreparation {
+        for (self.discoveries.items) |task| {
+            if (!task.done.load(.acquire) or task.discovery_notice_reported) continue;
+            const failure = task.failure orelse continue;
+            if (failure == error.Cancelled) {
+                task.discovery_notice_reported = true;
+                continue;
+            }
+            return task;
+        }
+        return null;
+    }
+
+    pub fn beginDiscovery(self: *Self, provider: model_provider.ProviderId) void {
+        for (self.discoveries.items) |task| task.requestCancel();
+        self.reapCancelledDiscoveries();
+        self.menu_provider = provider;
+    }
+
+    pub fn discoverProvider(self: *Self, auth: *const auth_runtime.Runtime, input: auth_runtime.ProviderPreparationInput) !void {
+        try self.discoveries.ensureUnusedCapacity(self.alloc, 1);
+        var discovery = input;
+        discovery.discovery_only = true;
+        const task = try auth_runtime.ProviderPreparation.start(self.alloc, auth, discovery);
+        self.discoveries.appendAssumeCapacity(task);
+    }
+
     pub fn openMenu(self: *Self) !void {
         self.finishThreadIfDone();
         self.mutex.lockUncancelable(io_mod.getIo());
@@ -605,6 +673,9 @@ pub const Runtime = struct {
     }
 
     pub fn closeMenu(self: *Self) void {
+        for (self.discoveries.items) |task| {
+            if (!task.done.load(.acquire)) task.requestCancel();
+        }
         self.menu.deinit(self.alloc);
     }
 
@@ -616,11 +687,19 @@ pub const Runtime = struct {
     /// refreshes an open menu. Call it where no borrowed catalog id is held.
     pub fn pollLoadTransition(self: *Self) !bool {
         self.finishThreadIfDone();
+        self.reapCancelledDiscoveries();
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         if (self.staged) |staged| {
             self.staged = null;
             self.applyFetchLocked(staged).record();
+        }
+        for (self.discoveries.items) |task| {
+            if (task.thread != null and task.done.load(.acquire)) {
+                task.thread.?.join();
+                task.thread = null;
+                self.completion_pending = true;
+            }
         }
         if (!self.completion_pending) return false;
 
@@ -894,21 +973,74 @@ pub const Runtime = struct {
 
     fn refreshMenuLocked(self: *Self, menu: *ModelMenu) !void {
         if (!menu.active) return;
+        var next: ModelMenu = .{ .active = true };
+        errdefer next.deinit(self.alloc);
+        next.setQuery(menu.query());
         switch (self.state) {
             .idle, .loading => {
-                menu.clearSnapshot(self.alloc);
-                menu.load_state = .loading;
+                next.clearSnapshot(self.alloc);
+                next.load_state = .loading;
             },
             .failed => {
-                menu.clearSnapshot(self.alloc);
+                next.clearSnapshot(self.alloc);
                 // A retry runs behind the failed state; the picker shows it.
-                menu.load_state = if (self.fetch_in_flight) .loading else .failed;
+                next.load_state = if (self.fetch_in_flight) .loading else .failed;
             },
-            .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items),
+            .ready => try hydrateMenuSnapshot(self.alloc, &next, self.catalog.items),
         }
-        menu.catalog_state = modelMenuCatalogState(self.outcome, self.from_profile_settings);
+        next.catalog_state = modelMenuCatalogState(self.outcome, self.from_profile_settings);
+        for (next.items.items) |*item| {
+            item.execution_provider = self.menu_provider;
+            item.provider = executionModelVendor(item.id, self.menu_provider);
+        }
+        for (self.discoveries.items) |task| {
+            if (!task.done.load(.acquire) or task.cancel_requested.load(.seq_cst)) continue;
+            const result = task.catalog orelse continue;
+            if (result != .catalog) continue;
+            for (result.catalog.items) |entry| {
+                const id = try self.alloc.dupe(u8, entry.id);
+                errdefer self.alloc.free(id);
+                try next.items.append(self.alloc, .{
+                    .id = id,
+                    .provider = executionModelVendor(id, task.input.target()),
+                    .execution_provider = task.input.target(),
+                    .capabilities = model_capabilities.resolveCapabilities(id, model_catalog_metadata.fromCatalogEntry(entry)),
+                });
+            }
+        }
+        if (next.items.items.len > 0) {
+            next.load_state = .ready;
+        } else {
+            for (self.discoveries.items) |task| {
+                if (!task.done.load(.acquire) and !task.cancel_requested.load(.seq_cst)) {
+                    next.load_state = .loading;
+                    break;
+                }
+            }
+        }
+        if (modelProviderFilterAvailable(next.items.items, menu.providerFilter())) next.provider_index = menu.provider_index;
+        const count = next.filteredItemCount();
+        next.selected_index = @min(menu.selected_index, count -| 1);
+        if (menu.itemAt(menu.selected_index)) |previous| {
+            for (0..count) |index| {
+                const item = next.itemAt(index).?;
+                if (sameMenuModel(item.*, previous.*)) {
+                    next.selected_index = index;
+                    break;
+                }
+            }
+        }
+        next.window_start = (menu.window_start + next.selected_index) -| menu.selected_index;
+        menu.deinit(self.alloc);
+        menu.* = next;
     }
 };
+
+fn sameMenuModel(first: ModelMenuItem, second: ModelMenuItem) bool {
+    if (!std.mem.eql(u8, first.id, second.id)) return false;
+    if (first.execution_provider) |provider| return if (second.execution_provider) |other| provider.same_authority(other) else false;
+    return second.execution_provider == null;
+}
 
 fn boolLabel(value: bool) []const u8 {
     return if (value) "true" else "false";
@@ -1003,6 +1135,15 @@ fn hydrateMenuSnapshot(
     menu.provider_index = @backingInt(filter);
     menu.selected_index = selected_index;
     menu.window_start = window_start;
+}
+
+fn executionModelVendor(model: []const u8, provider: ?model_provider.ProviderId) []const u8 {
+    if (provider) |target| switch (target) {
+        .codex => return "openai",
+        .grok => return "xai",
+        .gateway, .configured => {},
+    };
+    return modelProvider(model);
 }
 
 fn modelProvider(model: []const u8) []const u8 {
@@ -2178,4 +2319,171 @@ test "model cache request resolution records lookup misses for the trace report"
     try std.testing.expect(events[2].failed);
     try std.testing.expectEqualStrings("outcome=cache_failed model=zai/glm-5.2", events[1].detail());
     try std.testing.expectEqualStrings("outcome=cache_unavailable model=zai/glm-5.2", events[2].detail());
+}
+
+test "unified model picker keeps duplicate IDs distinct without activating discovered credentials" {
+    const alloc = std.testing.allocator;
+    var auth: auth_runtime.Runtime = .{};
+    defer auth.deinit(alloc);
+    var runtime = Runtime.init(alloc, "/models");
+    defer runtime.deinit();
+    var active = try testCatalog(alloc, "shared/model");
+    defer model_catalog.freeModelCatalog(alloc, &active);
+    runtime.adoptOwnedCatalog(authenticatedCatalogAccess("active-key", null), &active);
+    runtime.beginDiscovery(.gateway);
+    var catalog: RefreshCatalog = .{ .fallback_model = "shared/model" };
+    try runtime.discoverProvider(&auth, .{
+        .intent = .{ .provider = .{ .target = .codex, .allow_login = false, .origin = .manual } },
+        .catalog_provider = catalog.provider(),
+        .models_path = "/models",
+        .candidate = .{ .source = .chatgpt_subscription, .token = @constCast("discovered-key") },
+    });
+    const task = runtime.discoveries.items[0];
+    const deadline = io_mod.milliTimestamp() + 5000;
+    while (!task.done.load(.acquire) and io_mod.milliTimestamp() < deadline) io_mod.sleep(std.time.ns_per_ms);
+    try std.testing.expect(task.done.load(.acquire));
+    try runtime.openMenu();
+    try std.testing.expectEqual(@as(usize, 2), runtime.menu.filteredItemCount());
+    try std.testing.expect(runtime.menu.itemAt(0).?.execution_provider.?.eql(.gateway));
+    try std.testing.expect(runtime.menu.itemAt(1).?.execution_provider.?.eql(.codex));
+    runtime.menu.selected_index = 1;
+    _ = try runtime.pollLoadTransition();
+    try std.testing.expect(runtime.menu.itemAt(runtime.menu.selected_index).?.execution_provider.?.eql(.codex));
+    runtime.setMenuQuery("codex");
+    try std.testing.expectEqual(@as(usize, 1), runtime.menu.filteredItemCount());
+    try std.testing.expect(auth.credentialSource() == null);
+    try std.testing.expect(!auth.providerPreparationPending());
+    runtime.closeMenu();
+    try std.testing.expect(!runtime.menu.active);
+    try std.testing.expectEqual(@as(usize, 1), runtime.catalog.items.len);
+    try std.testing.expect(auth.credentialSource() == null);
+}
+
+test "unified model picker dismissal cancels discovery without replacing the active catalog" {
+    const Blocked = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        fn fetch(raw: ?*anyopaque, _: Allocator, input: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.entered.store(true, .release);
+            while (!input.cancel_flag.?.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
+            return .{ .failure = .{ .category = .cancellation } };
+        }
+    };
+    const alloc = std.testing.allocator;
+    var auth: auth_runtime.Runtime = .{};
+    defer auth.deinit(alloc);
+    var blocked: Blocked = .{};
+    var runtime = Runtime.init(alloc, "/models");
+    defer runtime.deinit();
+    var active = try testCatalog(alloc, "active/model");
+    defer model_catalog.freeModelCatalog(alloc, &active);
+    runtime.adoptOwnedCatalog(authenticatedCatalogAccess("active-key", null), &active);
+    runtime.beginDiscovery(.gateway);
+    try runtime.discoverProvider(&auth, .{
+        .intent = .{ .provider = .{ .target = .codex, .allow_login = false, .origin = .manual } },
+        .catalog_provider = .{ .context = &blocked, .fetch_fn = Blocked.fetch },
+        .models_path = "/models",
+        .candidate = .{ .source = .chatgpt_subscription, .token = @constCast("discovered-key") },
+    });
+    try runtime.openMenu();
+    const deadline = io_mod.milliTimestamp() + 5000;
+    while (!blocked.entered.load(.acquire) and io_mod.milliTimestamp() < deadline) io_mod.sleep(std.time.ns_per_ms);
+    try std.testing.expect(blocked.entered.load(.acquire));
+    runtime.closeMenu();
+    const task = runtime.discoveries.items[0];
+    try std.testing.expect(task.cancel_requested.load(.seq_cst));
+    while (!task.done.load(.acquire) and io_mod.milliTimestamp() < deadline) io_mod.sleep(std.time.ns_per_ms);
+    try std.testing.expect(task.done.load(.acquire));
+    _ = try runtime.pollLoadTransition();
+    try std.testing.expect(!runtime.menu.active);
+    try std.testing.expectEqualStrings("active/model", runtime.catalog.items[0].id);
+    try std.testing.expect(auth.credentialSource() == null);
+}
+
+test "model discovery reopening does not wait for a cancelled worker and reaps it after completion" {
+    const Blocked = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        fn fetch(raw: ?*anyopaque, _: Allocator, _: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
+            return .{ .failure = .{ .category = .cancellation } };
+        }
+    };
+    const Reopen = struct {
+        runtime: *Runtime,
+        returned: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.runtime.beginDiscovery(.gateway);
+            self.returned.store(true, .release);
+        }
+    };
+    const alloc = std.testing.allocator;
+    var auth: auth_runtime.Runtime = .{};
+    defer auth.deinit(alloc);
+    var blocked: Blocked = .{};
+    var runtime = Runtime.init(alloc, "/models");
+    defer runtime.deinit();
+    defer blocked.release.store(true, .release);
+    runtime.beginDiscovery(.gateway);
+    try runtime.discoverProvider(&auth, .{
+        .intent = .{ .provider = .{ .target = .codex, .allow_login = false, .origin = .manual } },
+        .catalog_provider = .{ .context = &blocked, .fetch_fn = Blocked.fetch },
+        .models_path = "/models",
+        .candidate = .{ .source = .chatgpt_subscription, .token = @constCast("key") },
+    });
+    const task = runtime.discoveries.items[0];
+    var deadline = io_mod.milliTimestamp() + 5000;
+    while (!blocked.entered.load(.acquire) and io_mod.milliTimestamp() < deadline) io_mod.sleep(std.time.ns_per_ms);
+    try std.testing.expect(blocked.entered.load(.acquire));
+    var reopen: Reopen = .{ .runtime = &runtime };
+    const thread = try std.Thread.spawn(.{}, Reopen.run, .{&reopen});
+    defer {
+        blocked.release.store(true, .release);
+        thread.join();
+    }
+    deadline = io_mod.milliTimestamp() + 5000;
+    while (!reopen.returned.load(.acquire) and io_mod.milliTimestamp() < deadline) io_mod.sleep(std.time.ns_per_ms);
+    try std.testing.expect(reopen.returned.load(.acquire));
+    try std.testing.expect(!task.done.load(.acquire));
+    try std.testing.expect(task.cancel_requested.load(.seq_cst));
+    blocked.release.store(true, .release);
+    deadline = io_mod.milliTimestamp() + 5000;
+    while (!task.done.load(.acquire) and io_mod.milliTimestamp() < deadline) io_mod.sleep(std.time.ns_per_ms);
+    try std.testing.expect(task.done.load(.acquire));
+    _ = try runtime.pollLoadTransition();
+    try std.testing.expectEqual(@as(usize, 0), runtime.discoveries.items.len);
+}
+
+test "unified model picker restores duplicate provider identity and filters bare subscription IDs by vendor" {
+    const alloc = std.testing.allocator;
+    var auth: auth_runtime.Runtime = .{};
+    defer auth.deinit(alloc);
+    var runtime = Runtime.init(alloc, "/models");
+    defer runtime.deinit();
+    var active = try testCatalog(alloc, "shared-model");
+    defer model_catalog.freeModelCatalog(alloc, &active);
+    runtime.adoptOwnedCatalog(authenticatedCatalogAccess("active-key", null), &active);
+    runtime.beginDiscovery(.grok);
+    var catalog: RefreshCatalog = .{ .fallback_model = "shared-model" };
+    try runtime.discoverProvider(&auth, .{
+        .intent = .{ .provider = .{ .target = .codex, .allow_login = false, .origin = .manual } },
+        .catalog_provider = catalog.provider(),
+        .models_path = "/models",
+        .candidate = .{ .source = .chatgpt_subscription, .token = @constCast("key") },
+    });
+    const task = runtime.discoveries.items[0];
+    const deadline = io_mod.milliTimestamp() + 5000;
+    while (!task.done.load(.acquire) and io_mod.milliTimestamp() < deadline) io_mod.sleep(std.time.ns_per_ms);
+    try std.testing.expect(task.done.load(.acquire));
+    try runtime.openMenu();
+    try std.testing.expectEqual(@as(usize, 1), modelMenuFilteredItemCount(runtime.menu.items.items, .openai, ""));
+    try std.testing.expectEqual(@as(usize, 1), modelMenuFilteredItemCount(runtime.menu.items.items, .xai, ""));
+    runtime.closeMenu();
+    try runtime.openMenu();
+    runtime.setMenuQuery("shared-model");
+    try std.testing.expect(runtime.menu.selectProviderModel(.codex, "shared-model"));
+    try std.testing.expect(runtime.menu.itemAt(runtime.menu.selected_index).?.execution_provider.?.eql(.codex));
+    try std.testing.expect(!runtime.menu.selectProviderModel(.gateway, "shared-model"));
 }

@@ -885,6 +885,10 @@ pub fn Commands(comptime App: type) type {
             ultrafast_mode: bool,
         ) !void {
             try setResolvedModelRuntime(app, model);
+            try applyModelPickerOptions(app, model, effort, fast_mode, ultrafast_mode);
+        }
+
+        pub fn applyModelPickerOptions(app: *App, model: []const u8, effort: types.ReasoningEffort, fast_mode: bool, ultrafast_mode: bool) !void {
             var patch = app_session_runtime.SessionPreferencePatch{
                 .provider = provider_runtime.provider(app),
                 .model = model,

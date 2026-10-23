@@ -15,10 +15,13 @@ const provider_catalog = @import("../auth/provider_catalog.zig");
 const auth_transition = @import("../auth/auth_transition.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
+const model_capabilities = @import("../config/model_capabilities.zig");
+const model_catalog_metadata = @import("../gateway/model_catalog_metadata.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const picker_state = @import("../input/picker_state.zig");
 const provider_picker_runtime = @import("provider_picker_runtime.zig");
 const types = @import("../shared/types.zig");
+const session_commands = @import("../session/session_commands.zig");
 
 fn oauthAuthEnabled(comptime App: type) bool {
     return runtime_profile.allows(App, .native_auth) or
@@ -42,14 +45,27 @@ fn selectCatalogModel(
     entries: []const model_catalog.ModelCatalogEntry,
     primary: ?[]const u8,
     secondary: ?[]const u8,
+    require_primary: bool,
 ) ?[]const u8 {
-    for ([_]?[]const u8{ primary, secondary }) |maybe_candidate| {
+    for ([_]?[]const u8{ primary, if (require_primary) null else secondary }) |maybe_candidate| {
         const candidate = maybe_candidate orelse continue;
         for (entries) |entry| {
             if (std.mem.eql(u8, candidate, entry.id)) return entry.id;
         }
     }
-    return if (entries.len > 0) entries[0].id else null;
+    return if (!require_primary and entries.len > 0) entries[0].id else null;
+}
+
+fn pickerCatalogOptionsSupported(entries: []const model_catalog.ModelCatalogEntry, model: []const u8, options: auth_runtime.ModelPickerOptions) bool {
+    for (entries) |entry| {
+        if (!std.mem.eql(u8, entry.id, model)) continue;
+        const capabilities = model_capabilities.resolveCapabilities(model, model_catalog_metadata.fromCatalogEntry(entry));
+        return model_capabilities.reasoningEffortSupported(capabilities, options.effort) and
+            (!options.fast or capabilities.supports_fast_mode) and
+            (!options.ultrafast or capabilities.supports_ultrafast_mode) and
+            !(options.fast and options.ultrafast);
+    }
+    return false;
 }
 
 fn optionalGatewayApiKey(credential: anytype) ?[]const u8 {
@@ -375,7 +391,7 @@ pub fn Runtime(comptime App: type) type {
                 .available_sources = app.auth.pickerView().available_sources,
             });
             if (candidates[0]) |target| {
-                try startProviderSwitch(app, target, false, .manual, candidates[1]);
+                try startProviderSwitch(app, target, false, .manual, candidates[1], null);
                 return;
             }
             try app.writeDomainNotice(.{
@@ -1121,8 +1137,58 @@ pub fn Runtime(comptime App: type) type {
             allow_login: bool,
             intent: ProviderSwitchIntent,
         ) !void {
-            try startProviderSwitch(app, target, allow_login, intent, null);
+            try startProviderSwitch(app, target, allow_login, intent, null, null);
         }
+
+        pub fn discoverModelProviders(app: *App) !void {
+            if (comptime !runtime_profile.allows(App, .native_auth) or
+                !@hasField(App, "provider_selection") or !@hasDecl(App, "providerCatalog") or
+                !@hasField(App, "auth")) return;
+            if (comptime @TypeOf(app.auth) != auth_runtime.Runtime) return;
+            if (app.auth.isHostManaged()) return;
+            const current = provider_runtime.provider(app);
+            app.model_cache.beginDiscovery(current);
+            var settings = try config_runtime.loadMergedSettings(app.alloc, app.workspace_root);
+            defer settings.deinit(app.alloc);
+            for ([_]model_provider.ProviderId{ .gateway, .codex, .grok }) |target| {
+                if (target.eql(current)) continue;
+                try discoverModelProvider(app, target, settings.credential_source);
+            }
+            for (app.provider_selection.definitions.definitions) |definition| {
+                const target = try model_provider.parse(definition.id).?.bind(app.provider_selection.definitions);
+                if (!target.eql(current)) try discoverModelProvider(app, target, null);
+            }
+        }
+
+        fn discoverModelProvider(app: *App, target: model_provider.ProviderId, preferred: ?credentials.Source) !void {
+            const catalog = app.providerCatalog(target) orelse return;
+            try app.model_cache.discoverProvider(&app.auth, .{
+                .intent = .{ .provider = .{ .target = target, .allow_login = false, .origin = .manual } },
+                .catalog_provider = catalog,
+                .models_path = app.model_cache.models_path,
+                .preferred_source = if (target == .gateway) preferred else null,
+            });
+        }
+
+        pub fn selectProviderModel(app: *App, target: model_provider.ProviderId, model: []const u8, effort: types.ReasoningEffort, fast: bool, ultrafast: bool) !void {
+            if (hostManagesAuth(app)) {
+                try app.writeDomainNotice(.{ .topic = "provider", .tone = .warning, .body = "Provider switching is unavailable in this host." }, true);
+                return;
+            }
+            try startProviderSwitch(app, target, false, .manual, null, .{
+                .model = model,
+                .effort = effort,
+                .fast = fast,
+                .ultrafast = ultrafast,
+            });
+        }
+
+        const PickerSelection = struct {
+            model: []const u8,
+            effort: types.ReasoningEffort,
+            fast: bool,
+            ultrafast: bool,
+        };
 
         fn startProviderSwitch(
             app: *App,
@@ -1130,6 +1196,7 @@ pub fn Runtime(comptime App: type) type {
             allow_login: bool,
             intent: ProviderSwitchIntent,
             fallback: ?model_provider.ProviderId,
+            picker: ?PickerSelection,
         ) !void {
             if (comptime !provider_runtime.supported(App) or
                 !@hasDecl(App, "providerCatalog") or
@@ -1194,8 +1261,9 @@ pub fn Runtime(comptime App: type) type {
                 .catalog_provider = catalog_provider,
                 .models_path = app.model_cache.models_path,
                 .preferred_source = if (target == .gateway) settings.credential_source else null,
-                .primary_model = if (intent == .post_oauth and provider_runtime.provider(app).eql(target)) provider_runtime.model(app) else null,
+                .primary_model = if (picker) |selection| selection.model else if (intent == .post_oauth and provider_runtime.provider(app).eql(target)) provider_runtime.model(app) else null,
                 .preferred_model = if (intent == .post_oauth) settings.models.get(target) else io_mod.getenv("FX_MODEL") orelse settings.models.get(target),
+                .picker_options = if (picker) |selection| .{ .effort = selection.effort, .fast = selection.fast, .ultrafast = selection.ultrafast } else null,
             });
         }
 
@@ -1241,8 +1309,31 @@ pub fn Runtime(comptime App: type) type {
             }, true);
         }
 
+        pub fn collectModelDiscoveryFailures(app: *App) !void {
+            if (comptime !@hasField(App, "model_cache") or host_target.is_wasm) return;
+            if (comptime !@hasDecl(@TypeOf(app.model_cache), "pendingDiscoveryFailure")) return;
+            while (app.model_cache.pendingDiscoveryFailure()) |task| {
+                const target = task.input.target();
+                const failure = task.failure.?;
+                const recovery = switch (target) {
+                    .gateway => "fx login",
+                    .codex => "fx login codex",
+                    .grok => "fx login grok",
+                    .configured => "/provider",
+                };
+                const body = if (credentials.refreshPersistenceUncertain(failure))
+                    try app.alloc.print("{s} credential refresh could not be saved safely. The retained session may no longer be usable. Run {s} to sign in again, then reopen /model. The current provider is unchanged.", .{ provider_catalog.label(target), recovery })
+                else
+                    try app.alloc.print("{s} model discovery failed ({s}). Check /provider, then reopen /model. The current provider is unchanged.", .{ provider_catalog.label(target), @errorName(failure) });
+                defer app.alloc.free(body);
+                try app.writeDomainNotice(.{ .topic = "auth", .tone = .warning, .body = body }, true);
+                task.discovery_notice_reported = true;
+            }
+        }
+
         pub fn collectProviderPreparationFacts(app: *App) !void {
             if (comptime !@hasDecl(@TypeOf(app.auth), "takeProviderPreparation") or host_target.is_wasm) return;
+            try collectModelDiscoveryFailures(app);
             if (pendingPromptNeedsAdoption(app)) return;
             const task = app.auth.takeProviderPreparation() orelse return;
             defer task.deinit();
@@ -1270,7 +1361,7 @@ pub fn Runtime(comptime App: type) type {
             }
             if (task.input.intent == .provider) {
                 if (task.input.intent.provider.fallback) |target| {
-                    try startProviderSwitch(app, target, false, .manual, null);
+                    try startProviderSwitch(app, target, false, .manual, null, null);
                     if (app.auth.providerPreparationPending()) return;
                 }
             }
@@ -1343,14 +1434,20 @@ pub fn Runtime(comptime App: type) type {
                 },
             };
             defer model_catalog.freeModelCatalog(app.alloc, &catalog);
-            const selected_model = selectCatalogModel(catalog.items, task.input.primary_model, task.input.preferred_model) orelse {
+            const selected_model = selectCatalogModel(catalog.items, task.input.primary_model, task.input.preferred_model, task.input.picker_options != null) orelse {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .@"error",
-                    .body = providerFailureMessage(intent, "The target provider returned no supported models. The current provider is unchanged.", "Subscription sign-in completed, but its model catalog returned no supported models. The current provider is unchanged."),
+                    .body = if (task.input.picker_options != null) "The selected model is no longer available. The current provider is unchanged." else providerFailureMessage(intent, "The target provider returned no supported models. The current provider is unchanged.", "Subscription sign-in completed, but its model catalog returned no supported models. The current provider is unchanged."),
                 }, true);
                 return false;
             };
+            if (task.input.picker_options) |options| {
+                if (!pickerCatalogOptionsSupported(catalog.items, selected_model, options)) {
+                    try app.writeDomainNotice(.{ .topic = "model", .tone = .warning, .body = "The selected model options are no longer available. The current provider is unchanged." }, true);
+                    return false;
+                }
+            }
             var credential = task.credential;
             task.credential = null;
             defer if (credential) |*value| value.deinit(app.alloc);
@@ -1358,7 +1455,7 @@ pub fn Runtime(comptime App: type) type {
             var owned_model = try app.alloc.dupe(u8, selected_model);
             defer app.alloc.free(owned_model);
 
-            if (auth_transition.provider_work_busy(app.stream.active, app.worker.queuedPromptCount())) {
+            if (auth_transition.provider_work_busy(app.stream.active or pendingPromptBlocksPreparation(app), app.worker.queuedPromptCount())) {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .warning,
@@ -1375,6 +1472,10 @@ pub fn Runtime(comptime App: type) type {
             app.provider_selection.adoptOwned(target, &owned_model);
             if (credential) |*value| _ = app.auth.adoptCredential(app.alloc, value);
 
+            if (task.input.picker_options) |options| {
+                try session_commands.Commands(App).applyModelPickerOptions(app, provider_runtime.model(app), options.effort, options.fast, options.ultrafast);
+                return true;
+            }
             const body = try app.alloc.print(
                 "Switched to {s} with {s}.",
                 .{ provider_catalog.label(target), provider_runtime.model(app) },
@@ -2175,10 +2276,10 @@ test "post OAuth catalog selection keeps valid current then saved then first" {
         .{ .id = @constCast("saved"), .model_type = @constCast("language") },
     };
 
-    try std.testing.expectEqualStrings("current", selectCatalogModel(&entries, "current", "saved").?);
-    try std.testing.expectEqualStrings("saved", selectCatalogModel(&entries, "missing", "saved").?);
-    try std.testing.expectEqualStrings("first", selectCatalogModel(&entries, "missing", "also-missing").?);
-    try std.testing.expect(selectCatalogModel(&.{}, "current", "saved") == null);
+    try std.testing.expectEqualStrings("current", selectCatalogModel(&entries, "current", "saved", false).?);
+    try std.testing.expectEqualStrings("saved", selectCatalogModel(&entries, "missing", "saved", false).?);
+    try std.testing.expectEqualStrings("first", selectCatalogModel(&entries, "missing", "also-missing", false).?);
+    try std.testing.expect(selectCatalogModel(&.{}, "current", "saved", false) == null);
 }
 
 const TestModelCache = struct {
@@ -3681,4 +3782,37 @@ test "quitting during the launch lookup waits for its worker" {
     try std.testing.expect(auth.beginStartupCredentialLoad(.{ .provider = .gateway, .preferred = .ai_gateway_api_key }));
     auth.deinit(alloc);
     try std.testing.expect(!auth.startupCredentialPending());
+}
+
+test "unified model picker rejects a disappeared selection instead of activating a different model" {
+    const entries = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("first"), .model_type = @constCast("language") },
+        .{ .id = @constCast("chosen"), .model_type = @constCast("language") },
+    };
+    try std.testing.expectEqualStrings("chosen", selectCatalogModel(&entries, "chosen", "first", true).?);
+    try std.testing.expect(selectCatalogModel(&entries, "disappeared", "first", true) == null);
+    try std.testing.expectEqualStrings("first", selectCatalogModel(&entries, "disappeared", "first", false).?);
+}
+
+test "unified model picker revalidates effort and speed against the prepared target catalog" {
+    const high = [_]types.ReasoningEffort{types.ReasoningEffort.literal("high")};
+    var entry: model_catalog.ModelCatalogEntry = .{
+        .id = @constCast("target-model"),
+        .model_type = @constCast("language"),
+        .has_reasoning = true,
+        .reasoning_efforts = .fromOwnedSlice(@constCast(&high)),
+        .supports_fast_mode = true,
+        .supports_ultrafast_mode = true,
+    };
+    const options: auth_runtime.ModelPickerOptions = .{ .effort = types.ReasoningEffort.literal("high"), .fast = true, .ultrafast = false };
+    try std.testing.expect(pickerCatalogOptionsSupported(&.{entry}, "target-model", options));
+    const low = [_]types.ReasoningEffort{types.ReasoningEffort.literal("low")};
+    entry.reasoning_efforts = .fromOwnedSlice(@constCast(&low));
+    try std.testing.expect(!pickerCatalogOptionsSupported(&.{entry}, "target-model", options));
+    entry.reasoning_efforts = .fromOwnedSlice(@constCast(&high));
+    entry.supports_fast_mode = false;
+    try std.testing.expect(!pickerCatalogOptionsSupported(&.{entry}, "target-model", options));
+    entry.supports_ultrafast_mode = false;
+    try std.testing.expect(!pickerCatalogOptionsSupported(&.{entry}, "target-model", .{ .effort = .auto, .fast = false, .ultrafast = true }));
+    try std.testing.expect(pickerCatalogOptionsSupported(&.{entry}, "target-model", .{ .effort = .auto, .fast = false, .ultrafast = false }));
 }

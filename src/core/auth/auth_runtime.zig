@@ -948,6 +948,8 @@ pub const ProviderPreparationIntent = union(enum) {
     },
 };
 
+pub const ModelPickerOptions = struct { effort: types.ReasoningEffort, fast: bool, ultrafast: bool };
+
 pub const ProviderPreparationInput = struct {
     intent: ProviderPreparationIntent,
     catalog_provider: model_catalog.Provider,
@@ -956,6 +958,8 @@ pub const ProviderPreparationInput = struct {
     primary_model: ?[]const u8 = null,
     preferred_model: ?[]const u8 = null,
     candidate: ?credentials.Credential = null,
+    picker_options: ?ModelPickerOptions = null,
+    discovery_only: bool = false,
 
     pub fn target(self: ProviderPreparationInput) model_provider.ProviderId {
         return switch (self.intent) {
@@ -980,8 +984,9 @@ pub const ProviderPreparation = struct {
     credential: ?credentials.Credential = null,
     catalog: ?model_catalog.ProviderResult = null,
     failure: ?anyerror = null,
+    discovery_notice_reported: bool = false,
 
-    fn start(alloc: Allocator, runtime: *const Runtime, input: ProviderPreparationInput) !*ProviderPreparation {
+    pub fn start(alloc: Allocator, runtime: *const Runtime, input: ProviderPreparationInput) !*ProviderPreparation {
         const self = try alloc.create(ProviderPreparation);
         self.* = .{
             .alloc = alloc,
@@ -1009,6 +1014,23 @@ pub const ProviderPreparation = struct {
         if (self.input.candidate) |candidate| {
             self.credential = candidate;
             self.input.candidate = null;
+        } else if (!self.host_managed and self.input.discovery_only) {
+            const resolution = credentials.resolveForProvider(
+                self.alloc,
+                .{ .context = self, .execute_fn = executeCancellable },
+                self.secret_store,
+                .discovery,
+                self.input.target(),
+                self.input.preferred_source,
+            ) catch |err| {
+                self.failure = err;
+                return;
+            };
+            self.credential = resolution.credential;
+            if (resolution.failure) |failure| {
+                if (self.credential == null or credentials.refreshPersistenceUncertain(failure.err)) self.failure = failure.err;
+            }
+            if (self.credential == null) return;
         } else if (!self.host_managed) {
             self.credential = prepareCredential(
                 self.alloc,
@@ -5202,4 +5224,141 @@ test "request-path credential verification stamp gates only within the window" {
 
     request_path_verified_ms.store(stampNowMs() -% request_path_verified_window_ms -% 1, .seq_cst);
     try std.testing.expect(!requestPathCredentialVerifiedRecently(.fx_login));
+}
+
+test "model discovery refreshes expired sessions for catalogs and preserves rejected sessions" {
+    const codex_store = @import("chatgpt_session.zig");
+    const grok_store = @import("grok_session.zig");
+    const gateway_store = @import("oauth_session.zig");
+    const Refresh = struct {
+        target: model_provider.ProviderId,
+        accepted: bool,
+        access_token: []const u8,
+        token_requests: usize = 0,
+
+        fn execute(raw: ?*anyopaque, alloc: Allocator, request: oauth_transport.Request) !oauth_transport.Response {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (request.method == .get) {
+                return .{ .disposition = .accepted, .body = try alloc.dupe(u8, if (self.target == .gateway)
+                    "{\"issuer\":\"https://vercel.com\",\"device_authorization_endpoint\":\"https://vercel.com/oauth/device\",\"token_endpoint\":\"https://vercel.com/oauth/token\"}"
+                else
+                    "{\"sub\":\"test-account\"}") };
+            }
+            self.token_requests += 1;
+            if (!self.accepted) return .{ .disposition = .rejected, .body = try alloc.dupe(u8, "{\"error\":\"invalid_grant\"}") };
+            return .{ .disposition = .accepted, .body = try alloc.print(
+                "{{\"access_token\":\"{s}\",\"refresh_token\":\"rotated-refresh\",\"expires_in\":3600,\"token_type\":\"Bearer\",\"scope\":\"openid offline_access\"}}",
+                .{self.access_token},
+            ) };
+        }
+    };
+    const Catalog = struct {
+        expected_token: []const u8,
+        prepared: PreparationTestCatalog = .{},
+        fn fetch(raw: ?*anyopaque, alloc: Allocator, input: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            switch (input.access) {
+                .authenticated => |access| if (!std.mem.eql(u8, access.credential, self.expected_token))
+                    return .{ .failure = .{ .category = .authentication } },
+                else => return .{ .failure = .{ .category = .authentication } },
+            }
+            return PreparationTestCatalog.fetch(&self.prepared, alloc, input);
+        }
+    };
+    const Saved = struct {
+        fn check(comptime Store: type, alloc: Allocator, accepted: bool, fresh_token: []const u8) !void {
+            var persisted = (try Store.load(alloc)).?;
+            defer persisted.deinit(alloc);
+            try std.testing.expectEqualStrings(if (accepted) fresh_token else "expired-access", persisted.access_token);
+            try std.testing.expectEqualStrings(if (accepted) "rotated-refresh" else "original-refresh", persisted.refresh_token);
+            if (accepted) {
+                try std.testing.expect(persisted.expires_at_ms > io_mod.milliTimestamp());
+            } else try std.testing.expectEqual(@as(i64, 1), persisted.expires_at_ms);
+        }
+    };
+    const alloc = std.testing.allocator;
+    const payload = "{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"test-account\"}}";
+    var encoded: [256]u8 = undefined;
+    const encoded_payload = std.base64.url_safe_no_pad.Encoder.encode(&encoded, payload);
+    const fresh_token = try alloc.print("header.{s}.signature", .{encoded_payload});
+    defer alloc.free(fresh_token);
+    for ([_]model_provider.ProviderId{ .gateway, .codex, .grok }) |target| {
+        for ([_]bool{ true, false }) |accepted| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "");
+            defer alloc.free(home);
+            var env = std.process.Environ.Map.init(alloc);
+            defer env.deinit();
+            try env.put("HOME", home);
+            io_mod.setEnvironMap(&env);
+            defer io_mod.resetEnvironForTest();
+            switch (target) {
+                .gateway => {
+                    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+                    var file = try tmp.dir.createFile(io_mod.getIo(), ".fx/auth.json", .{ .permissions = .fromMode(0o600) });
+                    defer file.close(io_mod.getIo());
+                    try file.writeStreamingAll(
+                        io_mod.getIo(),
+                        "{\"version\":1,\"issuer\":\"https://vercel.com\",\"client_id\":\"client\",\"access_token\":\"expired-access\",\"refresh_token\":\"original-refresh\",\"expires_at_ms\":1,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\",\"team_slug\":\"test-team\",\"team_id\":\"test-team-id\"}",
+                    );
+                },
+                .codex => try codex_store.saveNewSession(alloc, .{ .access_token = @constCast("expired-access"), .refresh_token = @constCast("original-refresh"), .expires_at_ms = 1, .account_id = @constCast("test-account") }),
+                .grok => try grok_store.saveNewSession(alloc, .{ .access_token = @constCast("expired-access"), .refresh_token = @constCast("original-refresh"), .expires_at_ms = 1, .account_id = @constCast("test-account") }),
+                .configured => unreachable,
+            }
+            var refresh: Refresh = .{ .target = target, .accepted = accepted, .access_token = fresh_token };
+            var runtime: Runtime = .{ .oauth_transport = .{ .context = &refresh, .execute_fn = Refresh.execute } };
+            defer runtime.deinit(alloc);
+            var catalog: Catalog = .{ .expected_token = fresh_token };
+            catalog.prepared.release.store(true, .release);
+            const task = try ProviderPreparation.start(alloc, &runtime, .{
+                .intent = .{ .provider = .{ .target = target, .allow_login = false, .origin = .manual } },
+                .catalog_provider = .{ .context = &catalog, .fetch_fn = Catalog.fetch },
+                .models_path = "/models",
+                .preferred_source = if (target == .gateway) .fx_login else null,
+                .discovery_only = true,
+            });
+            defer task.deinit();
+            try waitForPreparationTest(&task.done);
+            try std.testing.expect(refresh.token_requests > 0);
+            if (accepted) {
+                try std.testing.expect(task.failure == null);
+                try std.testing.expect(task.catalog != null);
+                try std.testing.expect(task.catalog.? == .catalog);
+                try std.testing.expect(task.catalog.?.catalog.items.len > 0);
+                try std.testing.expectEqualStrings(fresh_token, task.credential.?.token);
+                const refresh_count = refresh.token_requests;
+                refresh.accepted = false;
+                const next = try ProviderPreparation.start(alloc, &runtime, task.input);
+                defer next.deinit();
+                try waitForPreparationTest(&next.done);
+                try std.testing.expect(next.failure == null);
+                try std.testing.expect(next.catalog != null and next.catalog.? == .catalog);
+                try std.testing.expectEqualStrings(fresh_token, next.credential.?.token);
+                try std.testing.expectEqual(refresh_count, refresh.token_requests);
+            } else {
+                try std.testing.expect(task.failure != null);
+                try std.testing.expect(task.catalog == null);
+                try std.testing.expect(!catalog.prepared.entered.load(.acquire));
+            }
+            switch (target) {
+                .gateway => try Saved.check(gateway_store, alloc, accepted, fresh_token),
+                .codex => try Saved.check(codex_store, alloc, accepted, fresh_token),
+                .grok => try Saved.check(grok_store, alloc, accepted, fresh_token),
+                .configured => unreachable,
+            }
+            if (!accepted and target != .gateway) {
+                var explicit = try credentials.resolveForProvider(alloc, runtime.oauth_transport, runtime.secret_store, .refresh_if_needed, target, null);
+                defer if (explicit.credential) |*credential| credential.deinit(alloc);
+                try std.testing.expect(explicit.failure != null);
+                switch (target) {
+                    .codex => try std.testing.expect((try codex_store.load(alloc)) == null),
+                    .grok => try std.testing.expect((try grok_store.load(alloc)) == null),
+                    .gateway, .configured => unreachable,
+                }
+            }
+            try std.testing.expect(runtime.credentialSource() == null);
+        }
+    }
 }

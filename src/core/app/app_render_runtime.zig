@@ -558,7 +558,7 @@ pub fn Runtime(comptime App: type) type {
                     },
                     .effort => {
                         const target = if (app.input_runtime.picker.hasPendingModelPickerSelection()) app.input_runtime.picker.model_picker_pending_model.items else provider_runtime.model(app);
-                        const capabilities = model_capabilities.resolveForApp(App, app, target);
+                        const capabilities = input_completion_runtime.CompletionRuntime(App).pickerModelCapabilities(app, target);
                         const effort_count = model_capabilities.reasoningEffortOptionCount(capabilities);
                         for (0..effort_count) |i| {
                             effort_picker_values_buf[i] = model_capabilities.reasoningEffortAtIndex(capabilities, i);

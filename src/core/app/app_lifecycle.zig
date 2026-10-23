@@ -2492,13 +2492,6 @@ test "shutdown cleanup erases from footer frame top after frame commit" {
     try std.testing.expect(std.mem.find(u8, bytes, "\x1b[21;1H\x1b[J") != null);
 }
 
-test "startup credential modes select a refresh policy, never a narrower source set" {
-    const modes = @typeInfo(CredentialLoadMode).@"enum".field_names;
-    try std.testing.expectEqual(@as(usize, 2), modes.len);
-    try std.testing.expectEqualStrings("stored", modes[0]);
-    try std.testing.expectEqualStrings("refresh_if_needed", modes[1]);
-}
-
 test "loadStartupState applies core env overrides" {
     var env = try TestEnv.install(std.testing.allocator, &.{
         .{ .key = "FX_MODEL", .value = "  env-model  " },

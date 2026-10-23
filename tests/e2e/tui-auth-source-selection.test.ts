@@ -16,7 +16,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-helpers";
+import { FX_BIN, REPO_ROOT, runFx, providerVersionTestEnv, createIsolatedTestHome, cleanupIsolatedTestHome } from "../evals/eval-helpers";
 import { fakeResponsesTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 import { readTapeFrames } from "./render-lab/tape";
 import { equivalentPngEncodings, solidPng } from "./fixtures/image-encoding";
@@ -4726,6 +4726,283 @@ tmuxTest(
   },
   60_000,
 );
+
+tmuxTest("unified model picker cancels while other provider discovery is pending", async () => {
+  const testHome = createIsolatedTestHome();
+  const testStderr = join(testHome, "stderr.log");
+  let release!: () => void;
+  let codexStarted!: () => void;
+  let grokStarted!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const codexRequested = new Promise<void>((resolve) => { codexStarted = resolve; });
+  const grokRequested = new Promise<void>((resolve) => { grokStarted = resolve; });
+  const codex = startFakeChatGptOAuth({ modelsResponse: async () => { codexStarted(); await held; } });
+  const grok = startFakeGrokOAuth({ modelsResponse: async () => { grokStarted(); await held; } });
+  const testGateway = startFakeGateway([fakeGatewayFinalText("PICKER_PENDING_CANCEL_RESPONSE")]);
+  try {
+    writeSeededChatGptLogin(testHome, codex.accessToken);
+    writeSeededGrokLogin(testHome, grok.initialAccessToken);
+    const settingsPath = join(testHome, ".fx", "settings.json");
+    writeFileSync(settingsPath, JSON.stringify({ provider: "gateway", models: { gateway: FAKE_GATEWAY_MODEL } }) + "\n", { mode: 0o600 });
+    session = await startFx(testHome, testStderr, testGateway, undefined, undefined, {
+      ...codex.env, ...grok.env, FX_MODEL: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    const before = readFileSync(settingsPath, "utf8");
+    await session.sendText("/model");
+    await Promise.all([codexRequested, grokRequested]);
+    await session.waitForPane((pane) => pane.includes("Models") && pane.includes(FAKE_GATEWAY_MODEL), TIMEOUT);
+    await session.sendKeys("Escape");
+    await session.waitForPane((pane) => !pane.includes("esc close"), TIMEOUT);
+    await session.sendText("Answer without waiting for the other provider catalogs.");
+    await session.waitForText("PICKER_PENDING_CANCEL_RESPONSE", TIMEOUT);
+    expect(readFileSync(settingsPath, "utf8")).toBe(before);
+    expect(testGateway.requests).toHaveLength(1);
+    expect(codex.requests.find((request) => request.path === "/chatgpt/models")?.authorization).toBe(`Bearer ${codex.accessToken}`);
+    expect(grok.requests.find((request) => request.path === "/v1/models")?.authorization).toBe(`Bearer ${grok.initialAccessToken}`);
+    expect(codex.requests.some((request) => request.method === "POST")).toBe(false);
+    expect(grok.requests.some((request) => request.method === "POST")).toBe(false);
+    release();
+    await session.sendText("/quit");
+    await session.waitForSessionEnd(TIMEOUT);
+    expect(readFileSync(testStderr, "utf8")).toBe("");
+  } finally {
+    release();
+    await session?.kill();
+    session = null;
+    testGateway.stop();
+    codex.stop();
+    grok.stop();
+    cleanupIsolatedTestHome(testHome);
+  }
+}, 60_000);
+
+for (const target of ["codex", "grok"] as const) {
+  tmuxTest(`unified model picker cancels without switching and persists ${target} options`, async () => {
+    const testHome = createIsolatedTestHome();
+    const testStderr = join(testHome, "stderr.log");
+    const testGateway = startFakeGateway([fakeGatewayFinalText("PICKER_CANCEL_STILL_GATEWAY")]);
+    const codex = startFakeChatGptOAuth();
+    const grok = startFakeGrokOAuth();
+    const model = target === "codex" ? "gpt-5.6-sol" : "grok-4.6";
+    const effort = target === "codex" ? "max" : "xhigh";
+    const responseText = target === "codex" ? "CHATGPT_DIRECT_RESPONSE" : "GROK_DIRECT_RESPONSE";
+    const env = { ...codex.env, ...grok.env, FX_MODEL: undefined };
+    try {
+      writeSeededChatGptLogin(testHome, codex.accessToken);
+      writeSeededGrokLogin(testHome, grok.initialAccessToken);
+      const settingsPath = join(testHome, ".fx", "settings.json");
+      writeFileSync(settingsPath, JSON.stringify({
+        provider: "gateway",
+        models: { gateway: FAKE_GATEWAY_MODEL, codex: "gpt-5.4-mini", grok: "grok-4.20" },
+      }) + "\n", { mode: 0o600 });
+      session = await startFx(testHome, testStderr, testGateway, undefined, undefined, env);
+      await session.waitForComposer(TIMEOUT);
+      const before = readFileSync(settingsPath, "utf8");
+      await session.sendText("/model");
+      await session.waitForPane((pane) => pane.includes("Models") &&
+        pane.includes("gpt-5.6-sol") && pane.includes("grok-4.6") && pane.includes(FAKE_GATEWAY_MODEL), TIMEOUT);
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("esc close"), TIMEOUT);
+      expect(readFileSync(settingsPath, "utf8")).toBe(before);
+      await session.sendText("Answer with the original provider after cancelling discovery.");
+      await session.waitForText("PICKER_CANCEL_STILL_GATEWAY", TIMEOUT);
+      expect(testGateway.requests).toHaveLength(1);
+      expect(codex.requests.filter((request) => request.path === "/chatgpt/responses")).toHaveLength(0);
+      expect(grok.requests.filter((request) => request.path === "/v1/responses")).toHaveLength(0);
+
+      await session.sendText("/model");
+      await session.waitForText("Models", TIMEOUT);
+      await session.sendLiteralText(model);
+      await session.waitForPane((pane) => pane.includes(model) && !pane.includes(FAKE_GATEWAY_MODEL), TIMEOUT);
+      await session.sendKeys("Enter");
+      await session.waitForText("auto", TIMEOUT);
+      await session.sendLiteralText(effort);
+      await session.sendKeys("Enter");
+      await session.waitForText("normal", TIMEOUT);
+      await session.sendLiteralText(target === "codex" ? "fast" : "normal");
+      await session.sendKeys("Enter");
+      await session.waitForText(`Switched to ${model}`, TIMEOUT);
+      await session.sendText("Use the model and options chosen from the unified picker.");
+      await session.waitForText(responseText, TIMEOUT);
+      const requests = target === "codex"
+        ? codex.requests.filter((request) => request.path === "/chatgpt/responses")
+        : grok.requests.filter((request) => request.path === "/v1/responses");
+      expect(requests).toHaveLength(1);
+      expect(requests[0]!.authorization).toBe(`Bearer ${target === "codex" ? codex.accessToken : grok.initialAccessToken}`);
+      const body = JSON.parse(requests[0]!.body!);
+      expect(body.model).toBe(model);
+      expect(body.reasoning?.effort).toBe(effort);
+      if (target === "codex") expect(body.service_tier).toBe("priority");
+      expect(testGateway.requests).toHaveLength(1);
+      const saved = JSON.parse(readFileSync(settingsPath, "utf8"));
+      expect(saved.provider).toBe(target);
+      expect(saved.models[target]).toBe(model);
+      expect(saved.models.gateway).toBe(FAKE_GATEWAY_MODEL);
+      expect(saved.effort).toBe(effort);
+      await session.sendText("/quit");
+      await session.waitForSessionEnd(TIMEOUT);
+      expect(readFileSync(testStderr, "utf8")).toBe("");
+      session = await startFx(testHome, testStderr, testGateway, undefined, undefined, env);
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Use the persisted picker choice after restarting.");
+      await session.waitForText(responseText, TIMEOUT);
+      const restarted = target === "codex"
+        ? codex.requests.filter((request) => request.path === "/chatgpt/responses")
+        : grok.requests.filter((request) => request.path === "/v1/responses");
+      expect(restarted).toHaveLength(2);
+      const restartedBody = JSON.parse(restarted[1]!.body!);
+      expect(restartedBody.model).toBe(model);
+      expect(restartedBody.reasoning?.effort).toBe(effort);
+      if (target === "codex") expect(restartedBody.service_tier).toBe("priority");
+      expect(testGateway.requests).toHaveLength(1);
+      await session.sendText("/quit");
+      await session.waitForSessionEnd(TIMEOUT);
+      expect(readFileSync(testStderr, "utf8")).toBe("");
+    } finally {
+      await session?.kill();
+      session = null;
+      testGateway.stop();
+      codex.stop();
+      grok.stop();
+      cleanupIsolatedTestHome(testHome);
+    }
+  }, 60_000);
+}
+
+for (const target of ["gateway", "codex"] as const) {
+  tmuxTest(`unified model picker routes duplicate model IDs to ${target}`, async () => {
+    const testHome = createIsolatedTestHome();
+    const testStderr = join(testHome, "stderr.log");
+    const sharedModel = "shared-picker-model";
+    const testGateway = startFakeGateway([fakeGatewayFinalText("DUPLICATE_GATEWAY_RESPONSE")], {
+      models: () => [{ id: sharedModel, type: "language", tags: ["tool-use"] }],
+    });
+    const codex = startFakeChatGptOAuth();
+    const grok = startFakeGrokOAuth();
+    codex.setModels([{
+      slug: sharedModel, visibility: "list", supported_in_api: true,
+      supported_reasoning_levels: [], additional_speed_tiers: [],
+      input_modalities: ["text"], context_window: 128_000,
+    }, {
+      slug: "gpt-5.6-luna", visibility: "list", supported_in_api: true,
+      supported_reasoning_levels: [{ effort: "medium" }], additional_speed_tiers: [],
+      input_modalities: ["text"], context_window: 272_000,
+    }]);
+    try {
+      writeSeededChatGptLogin(testHome, codex.accessToken);
+      writeSeededGrokLogin(testHome, grok.initialAccessToken);
+      const settingsPath = join(testHome, ".fx", "settings.json");
+      writeFileSync(settingsPath, JSON.stringify({
+        provider: "grok", models: { grok: "grok-4.20", gateway: sharedModel, codex: sharedModel },
+      }) + "\n", { mode: 0o600 });
+      session = await startFx(testHome, testStderr, testGateway, undefined, undefined, {
+        ...codex.env, ...grok.env, FX_MODEL: undefined,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("/model");
+      await session.waitForPane((pane) => pane.includes(`[gateway] ${sharedModel}`) &&
+        pane.includes(`[codex] ${sharedModel}`), TIMEOUT);
+      await session.sendLiteralText(sharedModel);
+      const filtered = await session.waitForPane((pane) => pane.includes(`[gateway] ${sharedModel}`) &&
+        pane.includes(`[codex] ${sharedModel}`) && !pane.includes("grok-4.20"), TIMEOUT);
+      const rows = filtered.split("\n").filter((line) => /\[(gateway|codex)\]/.test(line));
+      expect(rows).toHaveLength(2);
+      const index = rows.findIndex((line) => line.includes(`[${target}]`));
+      expect(index).toBeGreaterThanOrEqual(0);
+      for (let i = 0; i < index; i++) await session.sendKeys("Down");
+      await session.sendKeys("Enter");
+      await session.waitForText(`Switched to ${sharedModel}`, TIMEOUT);
+      await session.sendText("Answer using the provider selected for this duplicate ID.");
+      await session.waitForText(target === "gateway" ? "DUPLICATE_GATEWAY_RESPONSE" : "CHATGPT_DIRECT_RESPONSE", TIMEOUT);
+      const direct = codex.requests.filter((request) => request.path === "/chatgpt/responses");
+      expect(testGateway.requests).toHaveLength(target === "gateway" ? 1 : 0);
+      expect(direct).toHaveLength(target === "codex" ? 1 : 0);
+      expect(grok.requests.filter((request) => request.path === "/v1/responses")).toHaveLength(0);
+      if (target === "gateway") {
+        expect(testGateway.requests[0]!.headers.get("ai-language-model-id")).toBe(sharedModel);
+        expect(testGateway.requests[0]!.headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
+      } else {
+        expect(JSON.parse(direct[0]!.body!).model).toBe(sharedModel);
+        expect(direct[0]!.authorization).toBe(`Bearer ${codex.accessToken}`);
+      }
+      const saved = JSON.parse(readFileSync(settingsPath, "utf8"));
+      expect(saved.provider).toBe(target);
+      expect(saved.models[target]).toBe(sharedModel);
+      await session.sendText("/quit");
+      await session.waitForSessionEnd(TIMEOUT);
+      expect(readFileSync(testStderr, "utf8")).toBe("");
+    } finally {
+      await session?.kill();
+      session = null;
+      testGateway.stop();
+      codex.stop();
+      grok.stop();
+      cleanupIsolatedTestHome(testHome);
+    }
+  }, 60_000);
+}
+
+tmuxTest("unified model picker refuses cross-provider activation while work is active", async () => {
+  const testHome = createIsolatedTestHome();
+  const testStderr = join(testHome, "stderr.log");
+  let release!: () => void;
+  let started!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const requested = new Promise<void>((resolve) => { started = resolve; });
+  const testGateway = startFakeGateway([async () => {
+    started();
+    await held;
+    return fakeGatewayFinalText("PICKER_BUSY_ORIGINAL_RESPONSE");
+  }, fakeGatewayFinalText("PICKER_BUSY_RECOVERED")]);
+  const codex = startFakeChatGptOAuth();
+  const grok = startFakeGrokOAuth();
+  try {
+    writeSeededChatGptLogin(testHome, codex.accessToken);
+    writeSeededGrokLogin(testHome, grok.initialAccessToken);
+    const settingsPath = join(testHome, ".fx", "settings.json");
+    writeFileSync(settingsPath, JSON.stringify({
+      provider: "gateway", models: { gateway: FAKE_GATEWAY_MODEL, codex: "gpt-5.4-mini", grok: "grok-4.20" },
+    }) + "\n", { mode: 0o600 });
+    session = await startFx(testHome, testStderr, testGateway, undefined, undefined, {
+      ...codex.env, ...grok.env, FX_MODEL: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    const before = readFileSync(settingsPath, "utf8");
+    await session.sendText("Keep the original provider response open.");
+    await requested;
+    await session.sendText("/model");
+    await session.waitForPane((pane) => pane.includes("Models") && pane.includes("gpt-5.6-luna"), TIMEOUT);
+    await session.sendLiteralText("gpt-5.6-luna");
+    await session.sendKeys("Enter");
+    await session.waitForText("medium", TIMEOUT);
+    await session.sendLiteralText("medium");
+    await session.sendKeys("Enter");
+    await session.waitForText("Provider switching is unavailable until active and queued work finishes.", TIMEOUT);
+    expect(readFileSync(settingsPath, "utf8")).toBe(before);
+    expect(codex.requests.filter((request) => request.path === "/chatgpt/responses")).toHaveLength(0);
+    release();
+    await session.waitForText("PICKER_BUSY_ORIGINAL_RESPONSE", TIMEOUT);
+    await session.sendText("Continue with the unchanged provider after the rejected switch.");
+    await session.waitForText("PICKER_BUSY_RECOVERED", TIMEOUT);
+    expect(testGateway.requests).toHaveLength(2);
+    expect(testGateway.requests.map((request) => request.headers.get("ai-language-model-id")))
+      .toEqual([FAKE_GATEWAY_MODEL, FAKE_GATEWAY_MODEL]);
+    expect(codex.requests.filter((request) => request.path === "/chatgpt/responses")).toHaveLength(0);
+    expect(grok.requests.filter((request) => request.path === "/v1/responses")).toHaveLength(0);
+    await session.sendText("/quit");
+    await session.waitForSessionEnd(TIMEOUT);
+    expect(readFileSync(testStderr, "utf8")).toBe("");
+  } finally {
+    release();
+    await session?.kill();
+    session = null;
+    testGateway.stop();
+    codex.stop();
+    grok.stop();
+    cleanupIsolatedTestHome(testHome);
+  }
+}, 60_000);
 
 tmuxTest(
   "Grok model selection uses provider-advertised context and effort metadata",

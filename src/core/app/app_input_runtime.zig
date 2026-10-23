@@ -1892,6 +1892,7 @@ pub fn Runtime(comptime App: type) type {
         /// the background, so models released mid-session appear once it lands.
         fn openModelMenu(app: *App) !void {
             if (comptime @hasDecl(App, "revalidateModelCache")) app.revalidateModelCache();
+            try app_auth_runtime.Runtime(App).discoverModelProviders(app);
             try app.model_cache.openMenu();
         }
 
@@ -2067,13 +2068,16 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn applyInlineSettingsModelSelection(app: *App) !void {
-            const selected = (try app.model_cache.menu.selectedModelAlloc(app.alloc)) orelse return;
+            if (app.model_cache.menu.load_state != .ready) return;
+            const item = app.model_cache.menu.itemAt(app.model_cache.menu.selected_index) orelse return;
+            const selected = try app.alloc.dupe(u8, item.id);
             defer app.alloc.free(selected);
-            try session_commands.Commands(App).selectModelFromPicker(
+            try completion_rt.applyProviderModelSelection(
                 app,
+                item.execution_provider,
                 selected,
-                app.effort,
-                app.fast_mode,
+                if (model_capabilities.reasoningEffortSupported(item.capabilities, app.effort)) app.effort else .auto,
+                item.capabilities.supports_fast_mode and app.fast_mode,
                 false,
             );
             app.model_cache.closeMenu();
@@ -2295,10 +2299,13 @@ pub fn Runtime(comptime App: type) type {
         fn submitModelMenuSelection(app: *App) !bool {
             if (comptime !@hasField(App, "model_cache")) return false;
             if (!app.model_cache.menu.active) return false;
-            const selected = (try app.model_cache.menu.selectedModelAlloc(app.alloc)) orelse {
+            const item = app.model_cache.menu.itemAt(app.model_cache.menu.selected_index) orelse {
                 app.shell.render_requests.request(.footer);
                 return true;
             };
+            const target = item.execution_provider;
+            const capabilities = item.capabilities;
+            const selected = try app.alloc.dupe(u8, item.id);
             defer app.alloc.free(selected);
 
             // Ctrl+P and `/model` both continue into the inline effort and
@@ -2309,7 +2316,7 @@ pub fn Runtime(comptime App: type) type {
             app.model_cache.closeMenu();
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
-            try completion_rt.beginExactModelSelection(app, selected);
+            try completion_rt.beginProviderModelSelection(app, target, selected, capabilities);
             return true;
         }
 
@@ -15352,4 +15359,227 @@ test "app input bridge loads the most recent durable history in chronological or
     try std.testing.expectEqual(@as(usize, 100), app.input_runtime.composer_history.count());
     try std.testing.expectEqualStrings("prompt-1", app.input_runtime.composer_history.entryText(0).?);
     try std.testing.expectEqualStrings("prompt-100", app.input_runtime.composer_history.entryText(99).?);
+}
+
+test "unified model picker uses target capabilities and Escape does not change the active model" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try openRoutingModelMenu(&app, &.{"other-provider/model"});
+    const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("target-tier")};
+    app.model_cache.menu.items.items[0].execution_provider = .codex;
+    app.model_cache.menu.items.items[0].capabilities = .{
+        .reasoning_efforts = .fromSlice(&efforts),
+        .supports_fast_mode = true,
+    };
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+    try std.testing.expectEqual(picker_state.ModelPickerStage.effort, app.input_runtime.picker.model_picker_stage);
+    const completion = input_completion_runtime.CompletionRuntime(RoutingFakeApp);
+    const capabilities = completion.pickerModelCapabilities(&app, "other-provider/model");
+    try std.testing.expectEqualStrings("target-tier", capabilities.reasoning_efforts.values[0].label());
+    try std.testing.expect(capabilities.supports_fast_mode);
+    try std.testing.expect(app.input_runtime.picker.model_picker_target.?.provider.eql(.codex));
+    try Runtime(RoutingFakeApp).resolveEscape(&app, true, 1);
+    try std.testing.expectEqualStrings("test/model", app.selected_model.items);
+    try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
+}
+
+test "unified model picker never applies another provider model in an unsupported host" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try openRoutingModelMenu(&app, &.{"other-provider/model"});
+    app.model_cache.menu.items.items[0].execution_provider = .codex;
+    app.model_cache.menu.items.items[0].capabilities = .{};
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+    try std.testing.expectEqualStrings("test/model", app.selected_model.items);
+    try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
+}
+
+test "unified model picker settings selection preserves the draft and execution provider" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "model");
+    app.input_runtime.edit_state.cursor = 2;
+    app.input_runtime.settings_menu.open();
+    try openRoutingModelMenu(&app, &.{"shared-model"});
+    app.model_cache.menu.items.items[0].execution_provider = .codex;
+    app.model_cache.menu.items.items[0].capabilities = .{};
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+    try std.testing.expectEqualStrings("test/model", app.selected_model.items);
+    try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
+    try std.testing.expectEqualStrings("model", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 2), app.input_runtime.edit_state.cursor);
+    try std.testing.expect(app.input_runtime.settings_menu.active);
+    try std.testing.expect(!app.model_cache.menu.active);
+}
+
+test "unified model picker backtracking restores the execution provider for duplicate IDs" {
+    const catalog_mod = @import("../gateway/model_catalog.zig");
+    const Catalog = struct {
+        fn makeEntries(alloc: std.mem.Allocator) !std.ArrayList(catalog_mod.ModelCatalogEntry) {
+            var entries: std.ArrayList(catalog_mod.ModelCatalogEntry) = .empty;
+            errdefer catalog_mod.freeModelCatalog(alloc, &entries);
+            const id = try alloc.dupe(u8, "shared-model");
+            errdefer alloc.free(id);
+            const kind = try alloc.dupe(u8, "language");
+            errdefer alloc.free(kind);
+            var efforts: std.ArrayList(types.ReasoningEffort) = .empty;
+            errdefer efforts.deinit(alloc);
+            try efforts.append(alloc, types.ReasoningEffort.literal("high"));
+            try entries.append(alloc, .{ .id = id, .model_type = kind, .has_reasoning = true, .reasoning_efforts = efforts });
+            return entries;
+        }
+        fn fetch(_: ?*anyopaque, alloc: std.mem.Allocator, _: catalog_mod.FetchInput) std.mem.Allocator.Error!catalog_mod.ProviderResult {
+            return .{ .catalog = try makeEntries(alloc) };
+        }
+    };
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    var auth: auth_runtime.Runtime = .{};
+    defer auth.deinit(alloc);
+    var active = try Catalog.makeEntries(alloc);
+    defer catalog_mod.freeModelCatalog(alloc, &active);
+    app.model_cache.adoptOwnedCatalog(.{ .public_only = .no_credential }, &active);
+    app.model_cache.beginDiscovery(.gateway);
+    try app.model_cache.discoverProvider(&auth, .{
+        .intent = .{ .provider = .{ .target = .codex, .allow_login = false, .origin = .manual } },
+        .catalog_provider = .{ .fetch_fn = Catalog.fetch },
+        .models_path = "/models",
+        .candidate = .{ .source = .chatgpt_subscription, .token = @constCast("key") },
+    });
+    const task = app.model_cache.discoveries.items[0];
+    const deadline = io_mod.milliTimestamp() + 5000;
+    while (!task.done.load(.acquire) and io_mod.milliTimestamp() < deadline) io_mod.sleep(std.time.ns_per_ms);
+    try std.testing.expect(task.done.load(.acquire));
+    try app.model_cache.openMenu();
+    app.model_cache.menu.selected_index = 1;
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+    try std.testing.expectEqual(picker_state.ModelPickerStage.effort, app.input_runtime.picker.model_picker_stage);
+    try std.testing.expect(try input_completion_runtime.CompletionRuntime(RoutingFakeApp).stepBackModelPicker(&app));
+    try std.testing.expect(app.model_cache.menu.active);
+    try std.testing.expectEqualStrings("shared-model", app.model_cache.menu.query());
+    try std.testing.expect(app.model_cache.menu.itemAt(app.model_cache.menu.selected_index).?.execution_provider.?.eql(.codex));
+    try std.testing.expectEqualStrings("test/model", app.selected_model.items);
+}
+
+fn adoptRoutingPickerCatalog(app: *RoutingFakeApp, model: ?[]const u8, efforts: []const types.ReasoningEffort, fast: bool) !void {
+    const catalog_mod = @import("../gateway/model_catalog.zig");
+    var catalog: std.ArrayList(catalog_mod.ModelCatalogEntry) = .empty;
+    defer catalog_mod.freeModelCatalog(app.alloc, &catalog);
+    if (model) |name| {
+        const id = try app.alloc.dupe(u8, name);
+        errdefer app.alloc.free(id);
+        const kind = try app.alloc.dupe(u8, "language");
+        errdefer app.alloc.free(kind);
+        var owned_efforts: std.ArrayList(types.ReasoningEffort) = .empty;
+        errdefer owned_efforts.deinit(app.alloc);
+        try owned_efforts.appendSlice(app.alloc, efforts);
+        try catalog.append(app.alloc, .{ .id = id, .model_type = kind, .has_reasoning = efforts.len > 0, .reasoning_efforts = owned_efforts, .supports_fast_mode = fast });
+    }
+    app.model_cache.adoptOwnedCatalog(.{ .public_only = .no_credential }, &catalog);
+    app.model_cache.menu_provider = .gateway;
+}
+
+test "unified model picker effort-only selection does not inherit the current Fast mode" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    const model = "effort-only-model";
+    const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("high")};
+    app.setGatewayControls(model, &efforts, false);
+    app.fast_mode = true;
+    try adoptRoutingPickerCatalog(&app, model, &efforts, false);
+    try app.model_cache.openMenu();
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+    try feedRoutingBytes(&app, "high");
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 101);
+    try std.testing.expectEqualStrings(model, app.selected_model.items);
+    try std.testing.expect(app.effort.eql(types.ReasoningEffort.literal("high")));
+    try std.testing.expect(!app.fast_mode);
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+}
+
+test "unified model picker rejects same-provider catalog changes before any mutation" {
+    const Change = enum { removed_model, removed_effort, removed_fast };
+    for ([_]Change{ .removed_model, .removed_effort, .removed_fast }) |change| {
+        const alloc = std.testing.allocator;
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        const model = "catalog-selected-model";
+        const high = [_]types.ReasoningEffort{types.ReasoningEffort.literal("high")};
+        const low = [_]types.ReasoningEffort{types.ReasoningEffort.literal("low")};
+        app.setGatewayControls(model, &high, change == .removed_fast);
+        const initial_effort = app.effort;
+        const initial_fast = app.fast_mode;
+        try adoptRoutingPickerCatalog(&app, model, &high, change == .removed_fast);
+        try app.model_cache.openMenu();
+        try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+        try feedRoutingBytes(&app, "high");
+        if (change == .removed_fast) {
+            try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 101);
+            try std.testing.expectEqual(picker_state.ModelPickerStage.fast, app.input_runtime.picker.model_picker_stage);
+        }
+        try adoptRoutingPickerCatalog(&app, if (change == .removed_model) null else model, if (change == .removed_effort) &low else &high, false);
+        try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 102);
+        try std.testing.expectEqualStrings("test/model", app.selected_model.items);
+        try std.testing.expect(app.effort.eql(initial_effort));
+        try std.testing.expectEqual(initial_fast, app.fast_mode);
+        try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
+        try std.testing.expect(std.mem.find(u8, app.notice_body.items, "current selection is unchanged") != null);
+    }
+}
+
+test "explicit manual model IDs remain selectable without a catalog entry" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try adoptRoutingPickerCatalog(&app, null, &.{}, false);
+    try input_completion_runtime.CompletionRuntime(RoutingFakeApp).applyProviderModelSelection(&app, null, "manual-model", .auto, false, false);
+    try std.testing.expectEqualStrings("manual-model", app.selected_model.items);
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+}
+
+test "model discovery persistence uncertainty is reported once even across cancellation and reopen" {
+    const Catalog = struct {
+        fn fetch(_: ?*anyopaque, _: std.mem.Allocator, _: @import("../gateway/model_catalog.zig").FetchInput) std.mem.Allocator.Error!@import("../gateway/model_catalog.zig").ProviderResult {
+            return .{ .catalog = .empty };
+        }
+    };
+    for ([_]anyerror{ error.CredentialRefreshPersistenceUncertain, error.OAuthSessionCleanupUncertain }) |failure| {
+        const alloc = std.testing.allocator;
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        const target: @import("../config/model_provider.zig").ProviderId = if (failure == error.OAuthSessionCleanupUncertain) .gateway else .codex;
+        const task = try alloc.create(auth_runtime.ProviderPreparation);
+        task.* = .{
+            .alloc = alloc,
+            .input = .{ .intent = .{ .provider = .{ .target = target, .allow_login = false, .origin = .manual } }, .catalog_provider = .{ .fetch_fn = Catalog.fetch }, .models_path = "", .discovery_only = true },
+            .transport = @import("../auth/oauth_transport.zig").unavailable_provider,
+            .secret_store = @import("../hosts/host.zig").unavailable_secret_store,
+            .host_managed = false,
+            .done = .init(true),
+            .failure = failure,
+        };
+        var transferred = false;
+        errdefer if (!transferred) task.deinit();
+        task.input.models_path = try alloc.dupe(u8, "/models");
+        try app.model_cache.discoveries.append(alloc, task);
+        transferred = true;
+        app.model_cache.beginDiscovery(.gateway);
+        _ = try app.model_cache.pollLoadTransition();
+        try std.testing.expectEqual(@as(usize, 1), app.model_cache.discoveries.items.len);
+        try app_auth_runtime.Runtime(RoutingFakeApp).collectModelDiscoveryFailures(&app);
+        try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
+        try std.testing.expect(std.mem.find(u8, app.notice_body.items, "retained session may no longer be usable") != null);
+        try std.testing.expect(std.mem.find(u8, app.notice_body.items, if (target == .codex) "fx login codex" else "fx login") != null);
+        try app_auth_runtime.Runtime(RoutingFakeApp).collectModelDiscoveryFailures(&app);
+        try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
+        _ = try app.model_cache.pollLoadTransition();
+        try std.testing.expectEqual(@as(usize, 0), app.model_cache.discoveries.items.len);
+        try std.testing.expectEqualStrings("test/model", app.selected_model.items);
+        try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
+    }
 }

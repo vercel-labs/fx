@@ -244,11 +244,10 @@ pub fn catalogAccessForCredentialAndAccount(
 /// injected host port; Core retains the stable user-facing source name.
 pub const stored_key_backend_label = if (builtin.target.os.tag == .macos) "macOS Keychain" else "profile file";
 
-/// Both modes resolve the same source set; the mode selects only whether an expired
-/// fx login session is refreshed first.
-pub const LoadMode = enum { stored, refresh_if_needed };
+/// Discovery refreshes expired sessions without retiring them on refresh failure.
+pub const LoadMode = enum { stored, refresh_if_needed, discovery };
 
-const FxLoginRefreshMode = enum { if_needed, force };
+const FxLoginRefreshMode = enum { if_needed, force, discovery };
 
 pub const missing_credential_message = "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
 pub const missing_interactive_credential_message = "fx needs access to Vercel AI Gateway. Run /login to sign in, /provider to use an API key, or set AI_GATEWAY_API_KEY.";
@@ -348,6 +347,10 @@ pub const FxLoginReadStatus = enum {
     absent,
     unavailable,
 };
+
+pub fn refreshPersistenceUncertain(err: anyerror) bool {
+    return err == error.CredentialRefreshPersistenceUncertain or err == error.OAuthSessionCleanupUncertain;
+}
 
 pub const LoadFailure = struct {
     source: Source,
@@ -459,11 +462,12 @@ pub fn resolvePreferring(
     const stored = loadSource(alloc, transport, secret_store, .stored_key) catch |err| blk: {
         if (err == error.OutOfMemory) return err;
         status = .unavailable;
-        failure = .{ .source = .stored_key, .err = err };
+        if (mode != .discovery or failure == null or !refreshPersistenceUncertain(failure.?.err))
+            failure = .{ .source = .stored_key, .err = err };
         debug_trace.logf("auth", "stored key load failed err={s} status={t}", .{ @errorName(err), status });
         break :blk null;
     };
-    if (stored) |credential| return .{ .credential = credential, .fx_login_status = fx_login_status };
+    if (stored) |credential| return .{ .credential = credential, .fx_login_status = fx_login_status, .failure = if (mode == .discovery) failure else null };
     return .{ .stored_key_status = status, .fx_login_status = fx_login_status, .failure = failure };
 }
 
@@ -493,6 +497,7 @@ fn loadFxLoginForPrecedence(
     return switch (mode) {
         .stored => loadStoredFxLoginCredential(alloc),
         .refresh_if_needed => loadFxLoginCredential(alloc, transport),
+        .discovery => refreshFxLoginCredentialLocked(alloc, transport, .discovery),
     };
 }
 
@@ -510,14 +515,17 @@ fn loadPreferredSource(
         .fx_login => switch (mode) {
             .stored => loadStoredFxLoginCredential(alloc),
             .refresh_if_needed => loadFxLoginCredential(alloc, transport),
+            .discovery => refreshFxLoginCredentialLocked(alloc, transport, .discovery),
         },
         .chatgpt_subscription => switch (mode) {
             .stored => loadStoredChatGptCredential(alloc),
             .refresh_if_needed => loadChatGptCredential(alloc, transport, .if_needed),
+            .discovery => loadChatGptCredential(alloc, transport, .discovery),
         },
         .grok_subscription => switch (mode) {
             .stored => loadStoredGrokCredential(alloc),
             .refresh_if_needed => loadGrokCredential(alloc, transport, .if_needed),
+            .discovery => loadGrokCredential(alloc, transport, .discovery),
         },
         else => loadSource(alloc, transport, secret_store, source),
     };
@@ -772,7 +780,7 @@ fn refreshFxLoginCredentialLocked(
 
     var refreshed_at_ms: ?i64 = null;
     if (mode == .force or session.expired(io_mod.milliTimestamp())) {
-        try refreshFxSession(alloc, transport, &mutation, &session);
+        try refreshFxSessionWithRetirement(alloc, transport, &mutation, &session, mode != .discovery);
         refreshed_at_ms = io_mod.milliTimestamp();
     }
     return takeCredentialFromSession(&session, refreshed_at_ms);
@@ -783,6 +791,16 @@ pub fn refreshFxSession(
     transport: oauth_transport.Provider,
     mutation: *oauth_session.Mutation,
     session: *oauth_session.Session,
+) !void {
+    try refreshFxSessionWithRetirement(alloc, transport, mutation, session, true);
+}
+
+fn refreshFxSessionWithRetirement(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    mutation: *oauth_session.Mutation,
+    session: *oauth_session.Session,
+    retire_on_failure: bool,
 ) !void {
     try mutation.requireWritable();
     const issuer_url = session.issuer;
@@ -798,29 +816,29 @@ pub fn refreshFxSession(
         session.refresh_token,
     ) catch |err| {
         if (err == error.InvalidOAuthResponse) {
-            debug_trace.logf("auth", "retiring fx login session reason={s}", .{@errorName(err)});
-            try retire_fx_session(alloc, mutation);
+            debug_trace.logf("auth", "fx login refresh invalid retire={} reason={s}", .{ retire_on_failure, @errorName(err) });
+            if (retire_on_failure) try retire_fx_session(alloc, mutation);
             return error.NoRefreshToken;
         }
         if (refresh_rejection_requires_sign_in(err)) {
-            debug_trace.logf("auth", "retiring terminal fx login session reason={s}", .{@errorName(err)});
-            try retire_fx_session(alloc, mutation);
+            debug_trace.logf("auth", "fx login refresh rejected retire={} reason={s}", .{ retire_on_failure, @errorName(err) });
+            if (retire_on_failure) try retire_fx_session(alloc, mutation);
         }
         return err;
     };
     defer refreshed.deinit(alloc);
 
     const rotated_refresh_token = refreshed.refresh_token orelse {
-        debug_trace.logf("auth", "retiring fx login session reason=NoRefreshToken", .{});
-        try retire_fx_session(alloc, mutation);
+        debug_trace.logf("auth", "fx login refresh missing rotation retire={}", .{retire_on_failure});
+        if (retire_on_failure) try retire_fx_session(alloc, mutation);
         return error.NoRefreshToken;
     };
     const expires_at_ms = oauth.expiry_timestamp_ms(
         io_mod.milliTimestamp(),
         refreshed.expires_in,
     ) catch |err| {
-        debug_trace.logf("auth", "retiring fx login session reason={s}", .{@errorName(err)});
-        try retire_fx_session(alloc, mutation);
+        debug_trace.logf("auth", "fx login refresh invalid retire={} reason={s}", .{ retire_on_failure, @errorName(err) });
+        if (retire_on_failure) try retire_fx_session(alloc, mutation);
         return error.NoRefreshToken;
     };
 
@@ -836,8 +854,8 @@ pub fn refreshFxSession(
         .team_id = session.team_id,
     };
     mutation.save(alloc, replacement) catch |err| {
-        debug_trace.logf("auth", "retiring fx login session after refresh save failed err={s}", .{@errorName(err)});
-        retire_fx_session(alloc, mutation) catch |cleanup_err| {
+        debug_trace.logf("auth", "fx login refresh save failed retire={} err={s}", .{ retire_on_failure, @errorName(err) });
+        if (retire_on_failure) retire_fx_session(alloc, mutation) catch |cleanup_err| {
             debug_trace.logf("auth", "fx login session retirement failed err={s}", .{@errorName(cleanup_err)});
         };
         return error.OAuthSessionCleanupUncertain;
@@ -1643,4 +1661,26 @@ test "a disabled store still reports why the fx login was silent" {
     try std.testing.expect(resolution.credential == null);
     try std.testing.expectEqual(FxLoginReadStatus.unavailable, resolution.fx_login_status);
     try std.testing.expectEqual(StoredKeyReadStatus.not_attempted, resolution.stored_key_status);
+}
+
+test "discovery preserves refresh persistence uncertainty when a stored key succeeds" {
+    const alloc = std.testing.allocator;
+    var fixture = try ExpiredFxLoginFixture.install(alloc);
+    defer fixture.deinit();
+    const auth_path = try std.Io.Dir.path.join(alloc, &.{ fixture.home, ".fx", "auth.json" });
+    defer alloc.free(auth_path);
+    var refresh = FxLoginRefreshProbe{
+        .token_disposition = .accepted,
+        .token_body = "{\"access_token\":\"new-access\",\"refresh_token\":\"rotated-refresh\",\"expires_in\":3600,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}",
+        .auth_path_to_make_read_only = auth_path,
+    };
+    var store = SecretStoreFixture{ .value = "fallback-key" };
+    var resolution = try resolveForProvider(alloc, refresh.provider(), store.provider(), .discovery, .gateway, null);
+    defer if (resolution.credential) |*credential| credential.deinit(alloc);
+    try std.testing.expectEqualStrings("fallback-key", resolution.credential.?.token);
+    try std.testing.expectEqual(Source.stored_key, resolution.credential.?.source);
+    try std.testing.expectEqual(error.OAuthSessionCleanupUncertain, resolution.failure.?.err);
+    var retained = (try oauth_session.load(alloc)).?;
+    defer retained.deinit(alloc);
+    try std.testing.expectEqualStrings("rejected-refresh", retained.refresh_token);
 }

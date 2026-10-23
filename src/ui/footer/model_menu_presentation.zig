@@ -291,7 +291,7 @@ fn modelFactsColumn(projection: ModelMenuProjection, width: u16) ?usize {
     var longest_name_width: usize = 8;
     for (projection.items) |item| {
         facts_width = @max(facts_width, compactFactsWidth(item.capabilities));
-        longest_name_width = @max(longest_name_width, display_width.visibleWidth(item.id));
+        longest_name_width = @max(longest_name_width, display_width.visibleWidth(item.id) + (if (item.execution_provider) |provider| display_width.visibleWidth(provider.label()) + 3 else @as(usize, 0)));
     }
     if (facts_width == 0 or content_width < indent_width + 8 + 2 + facts_width) return null;
     const natural_column = indent_width + longest_name_width + 2;
@@ -320,7 +320,12 @@ fn composeTitleRow(
     const facts_start = facts_column orelse content_width;
     const show_facts = facts.items.len > 0 and facts_start >= prefix_width + 8 + 2;
     const id_budget = if (show_facts) facts_start - prefix_width - 2 else content_width -| prefix_width;
-    try row_text.appendSingleLineMiddleEllipsized(alloc, &row, item.id, id_budget);
+    const title = if (item.execution_provider) |provider|
+        try alloc.print("[{s}] {s}", .{ provider.label(), item.id })
+    else
+        try alloc.dupe(u8, item.id);
+    defer alloc.free(title);
+    try row_text.appendSingleLineMiddleEllipsized(alloc, &row, title, id_budget);
     if (selected) try row.appendSlice(alloc, ui_render.reset_style);
 
     if (show_facts) {
@@ -860,4 +865,21 @@ test "model menu keeps only compact facts beside the model" {
     try std.testing.expect(std.mem.find(u8, title.items, "Reasoning") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "Vision") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "Tools") == null);
+}
+
+test "unified model picker labels execution providers for identical model IDs" {
+    const alloc = std.testing.allocator;
+    var item: model_cache_runtime.ModelMenuItem = .{
+        .id = @constCast("same-model"),
+        .provider = "openai",
+        .execution_provider = .gateway,
+        .capabilities = .{},
+    };
+    var gateway = try composeTitleRow(alloc, item, false, null, 32);
+    defer gateway.deinit(alloc);
+    item.execution_provider = .codex;
+    var codex = try composeTitleRow(alloc, item, false, null, 32);
+    defer codex.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, gateway.items, "[gateway] same-model") != null);
+    try std.testing.expect(std.mem.find(u8, codex.items, "[codex] same-model") != null);
 }

@@ -29,6 +29,7 @@ const browser_login_timeout_seconds: i64 = 5 * 60;
 
 pub const RefreshMode = enum {
     if_needed,
+    discovery,
     force,
     stored,
 };
@@ -374,7 +375,7 @@ pub fn loadAccess(
     defer session.deinit(alloc);
 
     if (mode == .force or session.expired(io_mod.milliTimestamp())) {
-        try refreshSession(alloc, transport, &mutation, &session);
+        try refreshSession(alloc, transport, &mutation, &session, mode != .discovery);
     }
     return takeAccess(&session);
 }
@@ -396,6 +397,7 @@ fn refreshSession(
     transport: oauth_transport.Provider,
     mutation: *chatgpt_session.Mutation,
     session: *chatgpt_session.Session,
+    retire_on_failure: bool,
 ) !void {
     try mutation.requireWritable();
     var body: std.Io.Writer.Allocating = .init(alloc);
@@ -409,8 +411,8 @@ fn refreshSession(
         error.CredentialRefreshRejected,
         error.InvalidChatGptOAuthResponse,
         => {
-            debug_trace.logf("auth", "retiring terminal Codex session reason={s}", .{@errorName(err)});
-            try retire_refresh_session(mutation);
+            debug_trace.logf("auth", "Codex refresh rejected retire={} reason={s}", .{ retire_on_failure, @errorName(err) });
+            if (retire_on_failure) try retire_refresh_session(mutation);
             return error.CredentialRefreshRejected;
         },
         else => return err,
@@ -419,15 +421,15 @@ fn refreshSession(
 
     var replacement = refresh_replacement(alloc, &token, session.*) catch |err| {
         if (err == error.OutOfMemory) return err;
-        debug_trace.logf("auth", "retiring unusable Codex refresh reason={s}", .{@errorName(err)});
-        try retire_refresh_session(mutation);
+        debug_trace.logf("auth", "unusable Codex refresh retire={} reason={s}", .{ retire_on_failure, @errorName(err) });
+        if (retire_on_failure) try retire_refresh_session(mutation);
         if (err == error.ChatGptAccountChanged) return err;
         return error.CredentialRefreshRejected;
     };
     errdefer replacement.deinit(alloc);
     mutation.save(alloc, replacement) catch |err| {
-        debug_trace.logf("auth", "retiring Codex session after refresh save failed err={s}", .{@errorName(err)});
-        retire_refresh_session(mutation) catch |cleanup_err| {
+        debug_trace.logf("auth", "Codex refresh save failed retire={} err={s}", .{ retire_on_failure, @errorName(err) });
+        if (retire_on_failure) retire_refresh_session(mutation) catch |cleanup_err| {
             debug_trace.logf("auth", "Codex session retirement failed err={s}", .{@errorName(cleanup_err)});
         };
         return error.CredentialRefreshPersistenceUncertain;

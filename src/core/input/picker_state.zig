@@ -6,6 +6,8 @@ const editor_state = @import("editor_state.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
+const model_provider = @import("../config/model_provider.zig");
+const model_capabilities = @import("../config/model_capabilities.zig");
 
 pub const ModelPickerStage = enum {
     model,
@@ -140,6 +142,7 @@ pub const State = struct {
     model_completion_window_start: usize = 0,
     model_completion_anchor_current: bool = false,
     model_picker_stage: ModelPickerStage = .model,
+    model_picker_target: ?struct { provider: model_provider.ProviderId, capabilities: model_capabilities.Capabilities } = null,
     model_picker_pending_model: std.ArrayList(u8) = .empty,
     model_picker_effort_index: usize = 0,
     model_picker_effort_window_start: usize = 0,
@@ -466,6 +469,7 @@ pub const State = struct {
     }
 
     pub fn clearModelPickerFlow(self: *State) void {
+        self.model_picker_target = null;
         self.model_picker_stage = .model;
         self.model_picker_pending_model.clearRetainingCapacity();
         self.model_picker_effort_index = 0;
