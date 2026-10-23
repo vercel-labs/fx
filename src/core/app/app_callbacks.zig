@@ -1242,14 +1242,15 @@ pub fn Bindings(comptime App: type) type {
             retained_from: ?types.ContextHistoryCut,
         ) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
-            const app = appOf(agent);
             if (comptime runtime_profile.allows(App, .cooperative_agent)) {
+                // The bridge's context is the agent, as for every other
+                // worker bridge callback.
                 try agent.worker.publishContextCompaction(std.heap.c_allocator, .{
                     .summary = summary,
                     .active_prefix = active_prefix,
                     .retained_from = retained_from,
                     .max_history_turns = agent.session.max_history_turns,
-                }, app, workerBridgeContextCompaction);
+                }, @ptrCast(agent), workerBridgeContextCompaction);
                 return;
             }
             try app_worker_runtime.Runtime(App).commitContextCompaction(
