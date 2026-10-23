@@ -2076,10 +2076,10 @@ export function checkPromptInput(input, { resizeImage } = {}) {
   return normalized;
 }
 
-// Image bytes travel beside the frame as attachment references, but the model
-// request carries them base64 encoded and the native host caps that request at
-// 8 MiB. Images therefore count at their encoded size, the same budget they
-// had inside the frame. With countImages false, only the frame counts.
+// Image bytes travel beside the frame as attachment references, but they
+// still count at their base64 size, so a prompt keeps the budget it had when
+// its images traveled inside the frame. With countImages false, only the
+// frame counts.
 function promptFrameSize(prompt, countImages = true) {
   const encodedImageBytes = countImages ? promptImageDataBytes(prompt) : 0;
   const projected = prompt.map((block) => block.type !== "image" ? block : {

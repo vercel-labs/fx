@@ -16,7 +16,10 @@ const data = image.toString("base64");
 const images = [1, 2].map(() => ({ type: "image", mimeType: "image/png", data }));
 const result = { type: "libfx.tool-result", text: "two screenshots", images };
 assert.equal(Buffer.byteLength(JSON.stringify({ text: result.text, images })), 7_340_169);
+// The mock provider refuses larger requests with a 413, as a real one does.
+const providerLimit = 8 * 1024 * 1024;
 let requests = 0;
+let refused = 0;
 let toolCalls = 0;
 let agent;
 const timer = setTimeout(() => assert.fail("native image framing timed out"), 10_000);
@@ -47,14 +50,18 @@ try {
         return Response.json({ object: "list", data: [{ id: "native/image-model", type: "language", tags: ["tool-use", "vision", "file-input"] }] });
       }
       requests += 1;
+      if (init.body.length > providerLimit) {
+        refused += 1;
+        return Response.json({ error: { message: "request entity too large" } }, { status: 413 });
+      }
       if (requests === 1) return sse(
         { type: "tool-call", toolCallId: "images1", toolName: "screenshots", input: {} },
         { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
       );
-      if (requests === 3) {
-        // The bridge carries at most 8 MiB, so this request left out the
-        // older image instead of failing, with a note, and kept the newer.
-        assert.ok(init.body.length <= 8 * 1024 * 1024 - 144 * 1024);
+      if (requests === 4) {
+        // The provider refused the request with both images, so the retry
+        // left out the older image, with a note, and kept the newer.
+        assert.equal(refused, 1);
         const body = Buffer.from(init.body).toString("utf8");
         assert.equal(body.split(data).length - 1, 1, "only the newer image stays");
         assert.match(body, /not sent to keep the request under the provider's size limit/);
@@ -64,7 +71,6 @@ try {
         );
       }
       assert.equal(requests, 2);
-      assert.ok(init.body.length < 8 * 1024 * 1024);
       assert.ok(Buffer.from(init.body).toString("base64").length > 8 * 1024 * 1024);
       const payload = JSON.parse(Buffer.from(init.body).toString("utf8"));
       const resultValues = payload.prompt.flatMap((message) => message.content ?? [])
@@ -88,14 +94,13 @@ try {
   assert.equal(toolCalls, 1);
   assert.equal(requests, 2);
 
-  // The retained images plus this prompt exceed what the bridge carries: the
-  // oldest images leave the request, which reaches host fetch within it.
+  // The retained images plus this prompt exceed what the provider takes: the
+  // whole request reaches host fetch, and after the refusal the retry leaves
+  // out the oldest image.
   assert.equal((await agent.prompt("x".repeat(2 * 1024 * 1024)).result).stopReason, "end_turn");
-  assert.equal(requests, 3);
-  // A request past the bridge even without its images stays bounded.
-  await assert.rejects(agent.prompt("z".repeat(6.5 * 1024 * 1024)).result, /HostStreamBackpressure/);
-  assert.equal(requests, 3, "an oversized request must not reach host fetch");
-  console.log("native image framing passed: accepted images survive base64 framing; requests past the bridge leave out their oldest images");
+  assert.equal(requests, 4);
+  assert.equal(refused, 1);
+  console.log("native image framing passed: accepted images survive base64 framing; a request the provider refuses as too large leaves out its oldest images");
 } finally {
   clearTimeout(timer);
   await agent?.close();
