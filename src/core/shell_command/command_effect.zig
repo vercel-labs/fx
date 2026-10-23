@@ -80,15 +80,20 @@ fn isUnsupportedAutoControlOperator(token: command_lex.ArgvToken) bool {
 }
 
 /// `tokens` without a trailing unquoted `2>&1`, the one redirection a
-/// review-free stage may end with.
+/// review-free stage may end with. The shell reads `2` as a file descriptor
+/// only when it is written bare and touches `>&`: `\2>&1` and `2 >&1` pass
+/// `2` to the command and redirect standard output instead.
 fn withoutStderrToStdout(tokens: []const command_lex.ArgvToken) []const command_lex.ArgvToken {
-    if (tokens.len >= 3 and
-        !tokens[tokens.len - 3].quoted and
-        !tokens[tokens.len - 2].quoted and
-        !tokens[tokens.len - 1].quoted and
-        std.mem.eql(u8, tokens[tokens.len - 3].value, "2") and
-        std.mem.eql(u8, tokens[tokens.len - 2].value, ">&") and
-        std.mem.eql(u8, tokens[tokens.len - 1].value, "1"))
+    if (tokens.len < 3) return tokens;
+    const descriptor = tokens[tokens.len - 3];
+    const operator = tokens[tokens.len - 2];
+    const target = tokens[tokens.len - 1];
+    if (std.mem.eql(u8, descriptor.raw, "2") and
+        descriptor.end == operator.start and
+        !operator.quoted and
+        !target.quoted and
+        std.mem.eql(u8, operator.value, ">&") and
+        std.mem.eql(u8, target.value, "1"))
     {
         return tokens[0 .. tokens.len - 3];
     }
@@ -360,6 +365,13 @@ test "known reversible auto commands exclude destructive and hidden effects" {
         "git fetch --prun#e",
         "npm install react@^18",
         "npm test x##",
+        // The shell reads `2` as a file descriptor only when it is bare and
+        // touches `>&`. Each of these passes `2` to git as an argument and
+        // redirects standard output.
+        "git status \\2>&1",
+        "git status\t\\2>&1",
+        "git status 2 >&1",
+        "git status '2'>&1",
     }) |command| {
         try std.testing.expect(!try knownReversibleAutoCommand(
             std.testing.allocator,

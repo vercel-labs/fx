@@ -1222,6 +1222,44 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "a trailing 2>&1 stays review free only when the shell reads 2 as a file descriptor",
+    async () => {
+      const root = createIsolatedRoot();
+      runGit(root.workspace, ["init", "-q"]);
+      const gateway = startGateway(
+        [
+          cleanCommandCall("git status 2>&1", "bare_descriptor"),
+          (body) => {
+            expect(toolResultText(body, "bare_descriptor")).toContain("\"exit_code\":0");
+            // The shell passes `2` to git as an argument for both of these.
+            return cleanCommandCall("git status \\2>&1", "escaped_descriptor");
+          },
+          (body) => {
+            expect(toolResultText(body, "escaped_descriptor", "execution-denied")).toContain("review_caution");
+            return cleanCommandCall("git status 2 >&1", "spaced_descriptor");
+          },
+          (body) => {
+            expect(toolResultText(body, "spaced_descriptor", "execution-denied")).toContain("review_caution");
+            return fakeGatewayFinalText("descriptor forms checked");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("caution", "escaped_descriptor_review"),
+          fakeGatewayPermissionDecision("caution", "spaced_descriptor_review"),
+        ],
+      );
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Check the repository status."],
+        { cwd: root.workspace, env: gatewayEnv(root, gateway), timeoutMs: TIMEOUT },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(2);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "git fetch from a repository that names a remote helper remains reviewer owned",
     async () => {
       const root = createIsolatedRoot();
