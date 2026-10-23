@@ -57,6 +57,14 @@ pub const ChildRun = struct {
 
     /// Ends the run in flight and releases its slot thread. Neither borrowed
     /// pointer is used after this.
+    /// Whether the parent agent started this run, as work it waits on, rather
+    /// than the user from the subagent's own screen. Its turns are the
+    /// parent's subagent turns: steering in them is the parent's feedback,
+    /// never new user authority.
+    pub fn startedByParent(self: *const ChildRun) bool {
+        return self.work_id.len > 0;
+    }
+
     pub fn finish(self: *ChildRun, outcome: Completion.Outcome) void {
         const completion = self.completion orelse return;
         self.turn = null;

@@ -31,31 +31,40 @@ pub fn markLoopThread() void {
 
 /// An agent's token and search totals are written by its worker during a
 /// turn and read by the main loop at any time, so every access that can
-/// overlap a running turn goes through these.
+/// overlap a running turn goes through these. A single-threaded build has
+/// no such overlap, and its targets may lack 64-bit atomics.
 pub fn storeTotal(total: *u64, value: u64) void {
+    if (comptime builtin.single_threaded) {
+        total.* = value;
+        return;
+    }
     @atomicStore(u64, total, value, .monotonic);
 }
 
 /// Adds to a total, saturating as `+|=` does.
 pub fn addTotal(total: *u64, value: u64) void {
+    if (comptime builtin.single_threaded) {
+        total.* +|= value;
+        return;
+    }
     var current = @atomicLoad(u64, total, .monotonic);
     while (@cmpxchgWeak(u64, total, current, current +| value, .monotonic, .monotonic)) |seen| current = seen;
 }
 
 pub fn loadTotal(total: *const u64) u64 {
+    if (comptime builtin.single_threaded) return total.*;
     return @atomicLoad(u64, total, .monotonic);
 }
 
 /// Asserts, in debug and test builds, that the main loop's own thread is
 /// calling once the loop runs: whose transcript the screen holds is the
 /// loop's to know, never a worker's (D43). fx builds keep no frame pointers
-/// or unwind tables, so before the panic it prints this file's anchor and the
-/// reader's return address `caller`, which a driver symbolizes.
+/// or unwind tables, so the panic names this file's anchor and the reader's
+/// return address `caller`, which a driver symbolizes.
 pub fn assertLoopThread(caller: usize) void {
     if (comptime !(builtin.is_test or builtin.optimize == .debug)) return;
     if (!loop_started.load(.acquire) or on_loop_thread) return;
-    std.debug.print("screen read off the loop thread: anchor=0x{x} ret=0x{x}\n", .{ @intFromPtr(&markLoopThread), caller });
-    @panic("screen read off the loop thread (D43)");
+    std.debug.panic("screen read off the loop thread: anchor=0x{x} ret=0x{x}", .{ @intFromPtr(&markLoopThread), caller });
 }
 
 /// The agent whose transcript `app`'s screen holds, for main-loop screen

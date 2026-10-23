@@ -27,6 +27,11 @@ fn settleCompactionWorkFailure(worker: *worker_runtime.WorkerRuntime, work: work
     }
 }
 
+/// Whether `App` runs its agent on the main loop, without worker threads.
+pub fn cooperativeHost(comptime App: type) bool {
+    return @hasDecl(App, "host_profile") and App.host_profile.cooperative_agent;
+}
+
 pub fn Runtime(comptime App: type) type {
     return struct {
         const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
@@ -35,8 +40,10 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Starts `agent`'s own worker thread, which runs main's worker loop
-        /// for that agent's conversation.
+        /// for that agent's conversation. A cooperative host runs no agent
+        /// threads, so it hosts only its first agent.
         pub fn startAgentWorkerThread(app: *App, agent: *agents.Agent) !void {
+            if (comptime cooperativeHost(App)) return error.AgentThreadsUnavailable;
             agent.worker_thread = try std.Thread.spawn(.{}, agentWorkerThreadMain, .{ app, agent });
         }
 
