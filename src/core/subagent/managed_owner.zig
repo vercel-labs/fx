@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const approval_registry = @import("approval_registry.zig");
+const agents = @import("../agents/agents.zig");
 const authority = @import("authority.zig");
 const child_state = @import("child_state.zig");
 const domain = @import("domain.zig");
@@ -36,6 +37,9 @@ const Slot = struct {
     cancel: std.atomic.Value(bool) = .init(false),
     shutdown: std.atomic.Value(bool) = .init(false),
     worker: ?*worker_runtime.WorkerRuntime = null,
+    /// True when `worker` is the child agent's own, which runs its later
+    /// turns too: stopping the turn cancels it instead of shutting it down.
+    hosted: bool = false,
     work_id: ?[]const u8 = null,
     route_refs: usize = 0,
     waiters: usize = 0,
@@ -295,7 +299,7 @@ pub const Owner = struct {
             if (!std.mem.eql(u8, slot.child_id, child_id)) continue;
             if (slot.completion != .running) return;
             slot.cancel.store(true, .seq_cst);
-            if (slot.worker) |worker| worker.requestCancel();
+            stopTurn(slot, .cancel);
             return;
         }
         return error.ChildUnavailable;
@@ -311,7 +315,7 @@ pub const Owner = struct {
                 if (candidate.completion == .running) {
                     candidate.cancel.store(true, .seq_cst);
                     // Stop approval waits without changing explicit cancellation to interruption.
-                    if (candidate.worker) |worker| worker.requestShutdown();
+                    stopTurn(candidate, .shutdown);
                 }
                 candidate.waiters += 1;
                 break :blk candidate;
@@ -354,7 +358,7 @@ pub const Owner = struct {
         for (self.slots.items) |slot| {
             slot.shutdown.store(true, .seq_cst);
             slot.cancel.store(true, .seq_cst);
-            if (slot.worker) |worker| worker.requestShutdown();
+            stopTurn(slot, .shutdown);
         }
         self.mutex.unlock(io_mod.getIo());
 
@@ -541,23 +545,40 @@ fn runOne(slot: *Slot) OneOutcome {
     const work_id = owner.alloc.dupe(u8, snapshot.active.id) catch
         return fallbackOutcome(owner.alloc, "unknown", .failed);
 
-    var child = OpenChild.open(owner, slot.child_id, snapshot.instructions) catch |err|
+    // In the interactive app the child's own agent holds its session and
+    // saves its turns, as main does (D31); only fx ask and ACP open it for a
+    // run. `tla/ChildSession.tla` SingleWriter.
+    const hosted = owner.services.bind_fn != null;
+    var child: ?OpenChild = if (hosted) null else OpenChild.open(owner, slot.child_id, snapshot.instructions) catch |err|
         return failedOutcome(work_id, "session_resume", err);
-    defer child.close(owner.alloc);
-    var turn = child.turn(owner.alloc, owner.max_history_turns) catch |err|
-        return failedOutcome(work_id, "turn_initialization", err);
+    defer if (child) |*value| value.close(owner.alloc);
+    var turn = if (child) |*value| value.turn(owner.alloc, owner.max_history_turns) catch |err|
+        return failedOutcome(work_id, "turn_initialization", err) else execution.TurnContext.initHosted(owner.alloc, owner.max_history_turns);
     defer turn.deinit();
+    var hosted_preferences: ?session_codec.DurableSessionPreferences = if (child == null)
+        readChildPreferences(owner, slot.child_id) catch |err| return failedOutcome(work_id, "preferences", err)
+    else
+        null;
+    defer if (hosted_preferences) |*value| value.deinit(owner.alloc);
     turn.live_authority = owner.authority_resolver;
     turn.approval_registry = owner.approvals;
     turn.child_id = slot.child_id;
+    turn.child_name = if (snapshot.name.len > 0) snapshot.name else null;
     turn.active_work_id = snapshot.active.id;
     turn.phase_context = owner;
     turn.phase_fn = Owner.phaseTransition;
     turn.live_metrics = &slot.metrics;
+    // The interactive app runs the turn on the child's own agent. Bound before
+    // `slot.worker` is read, so cancel, steering, and approvals reach it.
+    owner.services.bind(&turn, &slot.cancel) catch |err| return if (err == error.Cancelled) .{
+        .work_id = work_id,
+        .outcome = .cancelled,
+    } else failedOutcome(work_id, "hosted_agent", err);
     owner.mutex.lockUncancelable(io_mod.getIo());
     slot.worker = turn.workerRuntime();
+    slot.hosted = turn.hosted_worker != null;
     slot.work_id = turn.active_work_id;
-    if (slot.cancel.load(.seq_cst)) slot.worker.?.requestShutdown();
+    if (slot.cancel.load(.seq_cst)) stopTurn(slot, .shutdown);
     owner.mutex.unlock(io_mod.getIo());
     turn.approval_worker_route = workerRoute(slot);
     defer detachWorker(slot);
@@ -565,14 +586,14 @@ fn runOne(slot: *Slot) OneOutcome {
     var message = snapshot.active.queuedMessage(
         owner.alloc,
         owner.state_store.parent_id,
-        child.session.childInstructions(),
+        if (child) |*value| value.session.childInstructions() else snapshot.instructions,
     ) catch |err| return failedOutcome(work_id, "message_preparation", err);
     defer message.deinit(owner.alloc);
     const admission = owner.services.capture(owner.alloc, .{
         .child_id = slot.child_id,
         .parent_id = owner.state_store.parent_id,
         .source_id = owner.state_store.parent_id,
-        .preferences = turnPreferencesForDurable(child.preferences),
+        .preferences = turnPreferencesForDurable(if (child) |*value| value.preferences else hosted_preferences.?),
     }) catch |err| return if (err == error.Cancelled) .{
         .work_id = work_id,
         .outcome = .cancelled,
@@ -628,6 +649,53 @@ fn runOne(slot: *Slot) OneOutcome {
     };
 }
 
+/// A child's saved preferences, read without opening its session. Caller
+/// owns.
+pub fn readChildPreferences(owner: *Owner, child_id: []const u8) !session_codec.DurableSessionPreferences {
+    const children = owner.children;
+    return children.parent.store.childPreferences(owner.alloc, child_id) catch |err| switch (err) {
+        // A child's log starts on its first open, which the agent does after
+        // this run is admitted; until then its preferences are the seed that
+        // open writes.
+        error.NotFound => (try newChildSeed(owner, children, child_id)).preferences,
+        else => return err,
+    };
+}
+
+/// The preferences and language a new v2 child's log starts with: its
+/// seed, or the parent's current preferences without one. Caller owns the
+/// preferences.
+fn newChildSeed(owner: *Owner, children: *child_state.V2Children, child_id: []const u8) !child_state.V2Children.ChildSeed {
+    return (try children.seedFor(owner.alloc, child_id)) orelse blk: {
+        debug_trace.logf("subagent", "child seed unavailable child_id={s} using=parent_preferences", .{child_id});
+        break :blk .{
+            .preferences = try children.parent.currentPreferences(owner.alloc),
+            .language = types.ConversationLanguage.default(),
+        };
+    };
+}
+
+/// Opens child `child_id`'s session for its own agent, which holds it until
+/// main's session ends (D31), with the same recovery a run's open does. The
+/// caller owns the session.
+pub fn openChildForAgent(owner: *Owner, child_id: []const u8) !*session_adapter.Session {
+    const instructions = try childInstructions(owner, child_id);
+    defer if (instructions.len > 0) owner.alloc.free(instructions);
+    var opened = try OpenChild.open(owner, child_id, instructions);
+    opened.preferences.deinit(owner.alloc);
+    return opened.session;
+}
+
+/// The instructions the registry keeps for a persistent child, or empty.
+fn childInstructions(owner: *Owner, child_id: []const u8) ![]u8 {
+    var lock = owner.state_store.acquireLock();
+    defer lock.release();
+    var registry = try owner.state_store.load(owner.alloc);
+    defer registry.deinit(owner.alloc);
+    const child = registry.findById(child_id) orelse return error.ChildUnavailable;
+    return if (child.instructions().len == 0) &.{} else try owner.alloc.dupe(u8, child.instructions());
+}
+
 /// The child session one work item runs in (D22).
 const OpenChild = struct {
     session: *session_adapter.Session,
@@ -637,13 +705,7 @@ const OpenChild = struct {
     /// names with the seed its admission left (D34).
     fn open(owner: *Owner, child_id: []const u8, instructions: []const u8) !OpenChild {
         const children = owner.children;
-        var seed = (try children.seedFor(owner.alloc, child_id)) orelse blk: {
-            debug_trace.logf("subagent", "child seed unavailable child_id={s} using=parent_preferences", .{child_id});
-            break :blk child_state.V2Children.ChildSeed{
-                .preferences = try children.parent.currentPreferences(owner.alloc),
-                .language = types.ConversationLanguage.default(),
-            };
-        };
+        var seed = try newChildSeed(owner, children, child_id);
         defer seed.preferences.deinit(owner.alloc);
         const session = try session_adapter.Session.openChild(
             owner.alloc,
@@ -741,17 +803,35 @@ fn detachWorker(slot: *Slot) void {
         slot.route_changed.waitUncancelable(io_mod.getIo(), &owner.mutex);
     }
     slot.worker = null;
+    slot.hosted = false;
     slot.work_id = null;
     owner.mutex.unlock(io_mod.getIo());
+}
+
+/// Stops the slot's turn: `.cancel` interrupts it, and `.shutdown` also ends
+/// its approval waits. A hosted turn's worker runs the child's later turns
+/// too, so either one cancels the turn and declines a pending approval
+/// instead.
+/// Call with the owner's lock held.
+fn stopTurn(slot: *Slot, how: enum { cancel, shutdown }) void {
+    const worker = slot.worker orelse return;
+    if (slot.hosted) return worker.requestTurnCancel();
+    switch (how) {
+        .cancel => worker.requestCancel(),
+        .shutdown => worker.requestShutdown(),
+    }
 }
 
 const RunSnapshot = struct {
     active: child_state.ActiveWork,
     instructions: []u8,
+    /// The name the parent gave a persistent child, or empty for a one-off.
+    name: []u8,
 
     fn deinit(self: *RunSnapshot, alloc: Allocator) void {
         self.active.deinit(alloc);
         if (self.instructions.len > 0) alloc.free(self.instructions);
+        if (self.name.len > 0) alloc.free(self.name);
         self.* = undefined;
     }
 };
@@ -772,14 +852,17 @@ fn loadRunSnapshot(owner: *Owner, child_id: []const u8) !RunSnapshot {
         &.{}
     else
         try owner.alloc.dupe(u8, child.instructions());
+    errdefer if (instructions.len > 0) owner.alloc.free(instructions);
+    const name: []u8 = if (child.agentName()) |value| try owner.alloc.dupe(u8, value) else &.{};
     return .{
         .active = owned_active,
         .instructions = instructions,
+        .name = name,
     };
 }
 
 /// Borrows the child's durable preferences; a persisted disable stays disabled.
-fn turnPreferencesForDurable(
+pub fn turnPreferencesForDurable(
     preferences: session_codec.DurableSessionPreferences,
 ) execution.TurnPreferences {
     return .{
@@ -921,7 +1004,7 @@ const CancellationJoinTest = struct {
         self.owner.mutex.lockUncancelable(io_mod.getIo());
         defer self.owner.mutex.unlock(io_mod.getIo());
         self.slot.cancel.store(true, .seq_cst);
-        if (self.slot.worker) |worker| worker.requestShutdown();
+        stopTurn(self.slot, .shutdown);
     }
 
     fn wait(event: *std.Io.Event) !void {

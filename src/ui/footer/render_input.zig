@@ -414,6 +414,11 @@ pub const RenderContext = struct {
     usage_menu: UsageMenuProjection = .{},
     workspace_menu: WorkspaceMenuProjection = .{},
     upgrade_status: []const u8 = "",
+    /// The subagent on screen, named before the status line; empty on main's
+    /// screen (D27).
+    agent_label: []const u8 = "",
+    /// A hidden agent waiting on an answer, shown on the right (D11).
+    waiting_note: []const u8 = "",
     /// What MCP has to say, after everything else on the right.
     mcp_status: []const u8 = "",
     danger_status: []const u8 = "",

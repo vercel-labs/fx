@@ -226,14 +226,24 @@ fn questionInteractionHint(
     }
 
     // Batch progress rides the hint row, right-aligned like the rest of the
-    // footer chrome; a lone question needs no counter.
-    if (projection.entry_count > 1) {
-        var counter_buf: [32]u8 = undefined;
-        const counter = std.mem.print(
-            &counter_buf,
-            "Question {d} of {d}",
-            .{ projection.current_index + 1, projection.entry_count },
-        ) catch "";
+    // footer chrome; a lone question needs no counter. A subagent's question
+    // on main's screen names the subagent there (D23).
+    if (projection.entry_count > 1 or projection.asker.len > 0) {
+        var counter_buf: [96]u8 = undefined;
+        const counter = if (projection.asker.len > 0 and projection.entry_count > 1)
+            std.mem.print(&counter_buf, "{s} asks · Question {d} of {d}", .{
+                projection.asker,
+                projection.current_index + 1,
+                projection.entry_count,
+            }) catch ""
+        else if (projection.asker.len > 0)
+            std.mem.print(&counter_buf, "{s} asks", .{projection.asker}) catch ""
+        else
+            std.mem.print(
+                &counter_buf,
+                "Question {d} of {d}",
+                .{ projection.current_index + 1, projection.entry_count },
+            ) catch "";
         const base_width = display_width.visibleWidth(base);
         const counter_width = display_width.visibleWidth(counter);
         if (counter.len > 0 and base_width + counter_width + 2 <= width) {
@@ -502,6 +512,11 @@ pub fn composeHintRow(
         width,
         &hint_buf,
     );
+    var labeled_buf: [max_status_line_len + 128]u8 = undefined;
+    const labeled_hint_line = if (ctx.agent_label.len > 0)
+        std.mem.print(&labeled_buf, "{s} · {s}", .{ ctx.agent_label, base_hint_line }) catch base_hint_line
+    else
+        base_hint_line;
     var hint_line = if (question_hint) |hint|
         hint
     else if (ctx.ctrl_c_pending)
@@ -509,7 +524,7 @@ pub fn composeHintRow(
     else if (auth_hint) |hint|
         hint
     else
-        base_hint_line;
+        labeled_hint_line;
 
     const width_usize: usize = width;
     const danger_text = dangerStatusText(approval_active, ctx, width);
@@ -544,6 +559,8 @@ pub fn composeHintRow(
         ""
     else if (danger_text.len > 0)
         danger_text
+    else if (ctx.waiting_note.len > 0)
+        ctx.waiting_note
     else if (ctx.upgrade_status.len > 0)
         ctx.upgrade_status
     else

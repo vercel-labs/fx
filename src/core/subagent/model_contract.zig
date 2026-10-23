@@ -1,6 +1,7 @@
 const std = @import("std");
 const domain = @import("domain.zig");
 const types = @import("../shared/types.zig");
+const profiles = @import("../profiles/profiles.zig");
 const session_commands = @import("../session/session_commands.zig");
 
 const Allocator = std.mem.Allocator;
@@ -108,6 +109,7 @@ pub const RunInput = struct {
     task: []const u8,
     model: ?[]const u8 = null,
     effort: ?[]const u8 = null,
+    profile: ?[]const u8 = null,
 };
 pub const MessageInput = struct {
     agent: []const u8,
@@ -115,20 +117,23 @@ pub const MessageInput = struct {
     message: []const u8,
     model: ?[]const u8 = null,
     effort: ?[]const u8 = null,
+    profile: ?[]const u8 = null,
 };
 pub const RequestInput = union(Action) {
     run: RunInput,
     message: MessageInput,
 };
 
-/// Creation-time routing overrides carried by a request. Both default to the
-/// parent's values; overrides apply only when a child session is created.
+/// Creation-time overrides carried by a request. Model and effort default to
+/// the profile's, then the parent's; the profile defaults to fx's `agent`.
+/// Overrides apply only when a child session is created.
 pub const Override = struct {
     model: ?[]const u8 = null,
     effort: ?types.ReasoningEffort = null,
+    profile: ?[]const u8 = null,
 
     pub fn present(self: Override) bool {
-        return self.model != null or self.effort != null;
+        return self.model != null or self.effort != null or self.profile != null;
     }
 };
 
@@ -137,6 +142,7 @@ pub const Request = union(Action) {
         task: []u8,
         model: ?[]u8 = null,
         effort: ?types.ReasoningEffort = null,
+        profile: ?[]u8 = null,
     },
     message: struct {
         agent: []u8,
@@ -144,18 +150,21 @@ pub const Request = union(Action) {
         message: []u8,
         model: ?[]u8 = null,
         effort: ?types.ReasoningEffort = null,
+        profile: ?[]u8 = null,
     },
     pub fn deinit(self: *Request, alloc: Allocator) void {
         switch (self.*) {
             .run => |value| {
                 alloc.free(value.task);
                 if (value.model) |model| alloc.free(model);
+                if (value.profile) |profile| alloc.free(profile);
             },
             .message => |value| {
                 alloc.free(value.agent);
                 if (value.instructions) |instructions| alloc.free(instructions);
                 alloc.free(value.message);
                 if (value.model) |model| alloc.free(model);
+                if (value.profile) |profile| alloc.free(profile);
             },
         }
         self.* = undefined;
@@ -175,8 +184,8 @@ pub const Request = union(Action) {
     /// Borrows from the request; the request must outlive the returned value.
     pub fn override(self: Request) Override {
         return switch (self) {
-            .run => |value| .{ .model = value.model, .effort = value.effort },
-            .message => |value| .{ .model = value.model, .effort = value.effort },
+            .run => |value| .{ .model = value.model, .effort = value.effort, .profile = value.profile },
+            .message => |value| .{ .model = value.model, .effort = value.effort, .profile = value.profile },
         };
     }
 };
@@ -189,6 +198,7 @@ pub const ValidationError = error{
     InvalidMessage,
     InvalidModel,
     InvalidEffort,
+    InvalidProfile,
 };
 
 pub fn validateRequest(
@@ -199,12 +209,16 @@ pub fn validateRequest(
         .run => |value| blk: {
             try validateText(value.task, domain.max_prompt_bytes, error.InvalidTask);
             const effort = try validateOverrideText(value.model, value.effort);
+            try validateProfile(value.profile);
             const task = try alloc.dupe(u8, value.task);
             errdefer alloc.free(task);
+            const model = try dupeOptional(alloc, value.model);
+            errdefer if (model) |owned| alloc.free(owned);
             break :blk .{ .run = .{
                 .task = task,
-                .model = try dupeOptional(alloc, value.model),
+                .model = model,
                 .effort = effort,
+                .profile = try dupeOptional(alloc, value.profile),
             } };
         },
         .message => |value| blk: {
@@ -218,6 +232,7 @@ pub fn validateRequest(
             }
             try validateText(value.message, domain.max_message_bytes, error.InvalidMessage);
             const effort = try validateOverrideText(value.model, value.effort);
+            try validateProfile(value.profile);
             const agent = try alloc.dupe(u8, value.agent);
             errdefer alloc.free(agent);
             const instructions = if (value.instructions) |instructions|
@@ -227,12 +242,15 @@ pub fn validateRequest(
             errdefer if (instructions) |owned| alloc.free(owned);
             const message = try alloc.dupe(u8, value.message);
             errdefer alloc.free(message);
+            const model = try dupeOptional(alloc, value.model);
+            errdefer if (model) |owned| alloc.free(owned);
             break :blk .{ .message = .{
                 .agent = agent,
                 .instructions = instructions,
                 .message = message,
-                .model = try dupeOptional(alloc, value.model),
+                .model = model,
                 .effort = effort,
+                .profile = try dupeOptional(alloc, value.profile),
             } };
         },
     };
@@ -248,6 +266,10 @@ fn validateOverrideText(
         return types.ReasoningEffort.parse(raw) orelse error.InvalidEffort;
     }
     return null;
+}
+
+fn validateProfile(profile: ?[]const u8) ValidationError!void {
+    if (profile) |name| if (!profiles.validName(name)) return error.InvalidProfile;
 }
 
 /// Returns an owned copy the caller frees, or null. Never fails on null.
@@ -346,6 +368,12 @@ pub fn requestFingerprint(request: Request) [32]u8 {
             hash.update(effort.label());
         } else {
             hash.update("\x00");
+        }
+        // A profile adds its own section, so a request without one keeps the
+        // fingerprint it had before profiles existed.
+        if (override.profile) |profile| {
+            hash.update("\x00\x02");
+            hash.update(profile);
         }
     }
     return hash.finalResult();
@@ -596,4 +624,19 @@ test "terminal result omits scheduler identities and phases" {
     try std.testing.expect(std.mem.find(u8, encoded, "operation_id") == null);
     try std.testing.expect(std.mem.find(u8, encoded, "child_id") == null);
     try std.testing.expect(std.mem.find(u8, encoded, "status") == null);
+}
+
+test "a subagent request's profile is checked and changes its fingerprint only when present" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidProfile, validateRequest(alloc, .{ .run = .{ .task = "review", .profile = "Bad Name" } }));
+    var plain = try validateRequest(alloc, .{ .run = .{ .task = "review" } });
+    defer plain.deinit(alloc);
+    var profiled = try validateRequest(alloc, .{ .run = .{ .task = "review", .profile = "reviewer" } });
+    defer profiled.deinit(alloc);
+    var named = try validateRequest(alloc, .{ .message = .{ .agent = "lead", .message = "go", .profile = "reviewer" } });
+    defer named.deinit(alloc);
+    try std.testing.expect(!plain.override().present());
+    try std.testing.expectEqualStrings("reviewer", profiled.override().profile.?);
+    try std.testing.expectEqualStrings("reviewer", named.override().profile.?);
+    try std.testing.expect(!std.mem.eql(u8, &requestFingerprint(plain), &requestFingerprint(profiled)));
 }

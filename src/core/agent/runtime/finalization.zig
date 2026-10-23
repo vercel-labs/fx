@@ -199,7 +199,7 @@ pub fn finishAssistantTerminalWithExecution(
     const context_execution = try finalization.persistedExecution(projection_arena.allocator(), execution);
     const completed_summary = summary.finish();
     var turn: HistoryTurn = .{ .assistant = .{
-        .user = .{ .text = job.prompt, .images = job.images },
+        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id },
         .assistant = @constCast(assistant_text),
         .provider_replay = replay,
         .execution = context_execution,

@@ -1,4 +1,6 @@
 const std = @import("std");
+const agents = @import("../agents/agents.zig");
+const session_codec = @import("../session/session_codec.zig");
 const builtin = @import("builtin");
 const model_provider = @import("../config/model_provider.zig");
 const http_pool = @import("../shared/http_pool.zig");
@@ -82,8 +84,15 @@ pub fn supported(comptime App: type) bool {
         (builtin.is_test and @hasField(App, "selected_model"));
 }
 
+/// The model of the agent on screen, for main-loop screen code (D43).
 pub fn model(app: anytype) []const u8 {
+    return modelOf(app, screenAgentIfTracked(app));
+}
+
+/// `agent`'s model: a subagent's own choice (D31), else the app's selection.
+pub fn modelOf(app: anytype, agent: anytype) []const u8 {
     const App = @TypeOf(app.*);
+    if (subagentPreferences(app, agent)) |preferences| return preferences.model;
     if (comptime @hasField(App, "provider_selection")) {
         return app.provider_selection.selection().model;
     }
@@ -93,8 +102,47 @@ pub fn model(app: anytype) []const u8 {
     @compileError("app must own provider_selection");
 }
 
+/// Whether `App` runs subagents whose model choice is their own (D31).
+fn tracksSubagentPreferences(comptime App: type) bool {
+    if (!@hasField(App, "main_agent") or !@hasField(App, "screen_owner")) return false;
+    const Agent = @FieldType(App, "main_agent");
+    if (!@hasField(Agent, "session_persistence")) return false;
+    return @hasField(@FieldType(Agent, "session_persistence"), "session_preferences");
+}
+
+/// The agent on screen when `app` runs subagents with their own model
+/// choices, else nothing to ask about.
+fn screenAgentIfTracked(app: anytype) if (tracksSubagentPreferences(@TypeOf(app.*))) @TypeOf(&app.main_agent) else void {
+    if (comptime !tracksSubagentPreferences(@TypeOf(app.*))) return {};
+    return agents.screenAgentOf(app);
+}
+
+/// A subagent's own model choice, kept in its own session's preferences
+/// (D31): set when `agent` is a subagent with its session attached. Main's
+/// is the app's selection.
+fn subagentPreferences(app: anytype, agent: anytype) ?*const session_codec.DurableSessionPreferences {
+    if (comptime !tracksSubagentPreferences(@TypeOf(app.*))) return null;
+    if (agent == &app.main_agent) return null;
+    if (agent.session_persistence.session_preferences) |*preferences| return preferences;
+    return null;
+}
+
+fn subagentPreferencesMut(app: anytype, agent: anytype) ?*session_codec.DurableSessionPreferences {
+    if (comptime !tracksSubagentPreferences(@TypeOf(app.*))) return null;
+    if (agent == &app.main_agent) return null;
+    if (agent.session_persistence.session_preferences) |*preferences| return preferences;
+    return null;
+}
+
+/// The provider of the agent on screen, for main-loop screen code (D43).
 pub fn provider(app: anytype) model_provider.ProviderId {
+    return providerOf(app, screenAgentIfTracked(app));
+}
+
+/// `agent`'s provider: a subagent's own choice (D31), else the app's.
+pub fn providerOf(app: anytype, agent: anytype) model_provider.ProviderId {
     const App = @TypeOf(app.*);
+    if (subagentPreferences(app, agent)) |preferences| return preferences.provider;
     if (comptime @hasField(App, "provider_selection")) {
         return app.provider_selection.selection().provider;
     }
@@ -109,6 +157,12 @@ pub fn provider(app: anytype) model_provider.ProviderId {
 
 pub fn replaceModel(app: anytype, value: []const u8) !void {
     const App = @TypeOf(app.*);
+    if (subagentPreferencesMut(app, screenAgentIfTracked(app))) |preferences| {
+        const owned = try app.alloc.dupe(u8, value);
+        app.alloc.free(preferences.model);
+        preferences.model = owned;
+        return;
+    }
     if (comptime @hasField(App, "provider_selection")) {
         return app.provider_selection.replaceModel(value);
     }
@@ -129,6 +183,11 @@ pub fn replaceSelection(
     value: []const u8,
 ) !void {
     const App = @TypeOf(app.*);
+    if (subagentPreferencesMut(app, screenAgentIfTracked(app))) |preferences| {
+        try replaceModel(app, value);
+        preferences.provider = selected_provider;
+        return;
+    }
     if (comptime @hasField(App, "provider_selection")) {
         return app.provider_selection.replaceSelection(selected_provider, value);
     }

@@ -25,8 +25,8 @@ const DecodeError = error{
 
 /// Fields each action takes. The flat model schema for this tool in
 /// src/builtins/tools.zig advertises exactly these, which a test there checks.
-pub const run_fields = [_][]const u8{ "action", "task", "model", "effort" };
-pub const message_fields = [_][]const u8{ "action", "agent", "instructions", "message", "model", "effort" };
+pub const run_fields = [_][]const u8{ "action", "task", "model", "effort", "profile" };
+pub const message_fields = [_][]const u8{ "action", "agent", "instructions", "message", "model", "effort", "profile" };
 
 /// Where a rejected call went wrong, so the correction can name it.
 const Problem = struct {
@@ -131,6 +131,7 @@ fn validationErrorCode(err: model_contract.ValidationError) []const u8 {
         error.InvalidMessage => "invalid_message",
         error.InvalidModel => "invalid_model",
         error.InvalidEffort => "invalid_effort",
+        error.InvalidProfile => "invalid_profile",
     };
 }
 
@@ -152,6 +153,7 @@ fn parseRoot(value: std.json.Value, problem: *Problem) DecodeError!model_contrac
             .task = try requiredString(request, "task", problem),
             .model = try optionalString(request, "model", problem),
             .effort = try optionalString(request, "effort", problem),
+            .profile = try optionalString(request, "profile", problem),
         } };
     }
     if (std.mem.eql(u8, action, "message")) {
@@ -163,6 +165,7 @@ fn parseRoot(value: std.json.Value, problem: *Problem) DecodeError!model_contrac
             .message = try requiredString(request, "message", problem),
             .model = try optionalString(request, "model", problem),
             .effort = try optionalString(request, "effort", problem),
+            .profile = try optionalString(request, "profile", problem),
         } };
     }
     return error.InvalidEnum;

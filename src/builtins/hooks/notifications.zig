@@ -1,4 +1,5 @@
 const std = @import("std");
+const agents = @import("../../core/agents/agents.zig");
 const agent_runtime = @import("../../core/agent/agent_runtime.zig");
 const hooks = @import("../../core/hooks/hooks.zig");
 const notification_contract = @import("../../core/notifications/notification_contract.zig");
@@ -212,7 +213,7 @@ fn Runtime(comptime App: type) type {
                 .scope = .{
                     .kind = .interactive,
                     .workspace_root = app.workspace_root,
-                    .session_id = app_session_runtime.Runtime(App).activeSessionId(app),
+                    .session_id = app_session_runtime.Runtime(App).activeSessionId(agents.screenAgentOf(app)),
                 },
                 .outcome_allocator = app.alloc,
             }, .{
@@ -251,8 +252,12 @@ fn Runtime(comptime App: type) type {
             enqueue(app, .{ .kind = .attention_required });
         }
 
+        /// Queues a cue on the first slot's worker queue. Only interactive
+        /// scopes, which are main's turns, are enabled, and the turn-end hook
+        /// runs on the worker of the turn that ended (D43). The main loop
+        /// still drains that queue after the first instance closes (D57).
         fn enqueue(app: *App, notification: Notification) void {
-            app.worker.pushEvent(std.heap.c_allocator, .{ .notification = notification }) catch |err| {
+            app.main_agent.worker.pushEvent(std.heap.c_allocator, .{ .notification = notification }) catch |err| {
                 debug_trace.logf(
                     "notifications",
                     "interactive notification enqueue failed kind={s} err={s}",

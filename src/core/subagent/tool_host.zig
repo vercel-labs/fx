@@ -2,17 +2,20 @@ const std = @import("std");
 const execution_observation = @import("../agent/runtime/observation.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const approval_registry = @import("approval_registry.zig");
+const agents = @import("../agents/agents.zig");
 const authority = @import("authority.zig");
 const child_state = @import("child_state.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
 const managed_owner = @import("managed_owner.zig");
+const session_adapter = @import("../session/session_adapter.zig");
 const live_metrics = @import("live_metrics.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const model_contract = @import("model_contract.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const profiles = @import("../profiles/profiles.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -43,6 +46,13 @@ pub const Defaults = struct {
 
 pub const ChildRunner = struct {
     context: ?*anyopaque = null,
+    /// Where the host runs each child turn on a child agent of its own:
+    /// binds the run's turn to that agent's worker before it starts.
+    bind_fn: ?*const fn (
+        ?*anyopaque,
+        *execution.TurnContext,
+        *std.atomic.Value(bool),
+    ) execution.ServiceError!void = null,
     run_fn: *const fn (
         ?*anyopaque,
         *execution.TurnContext,
@@ -127,14 +137,6 @@ pub const ManagedExecutionResult = struct {
     final_status: ?types.SubagentStatus = null,
 };
 
-pub const ApprovalResolveOptions = struct {
-    request_id: []const u8,
-    child_id: []const u8,
-    decision: types.ToolPermissionDecision,
-    feedback: ?[]const u8 = null,
-    timestamp_ms: i64,
-};
-
 pub const Runtime = struct {
     alloc: Allocator,
     /// The parent's children, borrowed until deinit (D22).
@@ -144,6 +146,8 @@ pub const Runtime = struct {
     child_runner: ChildRunner,
     approvals: approval_registry.Registry,
     authority_resolver: authority.Resolver,
+    /// The profile each child started in, for its authority and prompt.
+    profile_cache: ?authority.ProfileCache = null,
     managed: managed_owner.Owner,
     admission_mutex: std.Io.Mutex = .init,
     yielded_mutex: std.Io.Mutex = .init,
@@ -182,10 +186,12 @@ pub const Runtime = struct {
         runtime.approvals = .{
             .alloc = alloc,
         };
+        runtime.profile_cache = .{ .alloc = alloc };
         runtime.authority_resolver = .{
             .children = children,
             .root_id = runtime.root_id,
             .host = host_authority,
+            .profiles = &runtime.profile_cache.?,
         };
         runtime.managed = runtime.managedOwnerValue();
         errdefer runtime.approvals.deinit();
@@ -199,6 +205,7 @@ pub const Runtime = struct {
         self.yielded.deinit(self.alloc);
         self.managed.deinit();
         self.approvals.deinit();
+        if (self.profile_cache) |*cache| cache.deinit();
         self.alloc.free(self.root_id);
         const alloc = self.alloc;
         self.* = undefined;
@@ -224,27 +231,104 @@ pub const Runtime = struct {
         self.managed.approvals = &self.approvals;
     }
 
-    pub fn pendingApprovalRequest(
-        self: *Runtime,
-        alloc: Allocator,
-    ) !?approval_registry.PendingRequest {
-        return self.approvals.firstPendingRequest(alloc, self.root_id);
+    /// Opens child `child_id`'s session for its own agent to hold, as main
+    /// holds its own (D31). The caller owns it.
+    pub fn openChildSession(self: *Runtime, child_id: []const u8) !*session_adapter.Session {
+        return managed_owner.openChildForAgent(&self.managed, child_id);
     }
 
-    pub fn resolveApproval(
+    pub const ChildListing = struct {
+        id: []u8,
+        /// The name its parent gave it, or empty for a one-off.
+        name: []u8,
+    };
+
+    /// The root's subagents in the order they started, after a restart too.
+    /// Free with `freeChildListing`.
+    pub fn listChildren(self: *Runtime, alloc: Allocator) ![]ChildListing {
+        var lock = self.managed.state_store.acquireLock();
+        defer lock.release();
+        var registry = try self.managed.state_store.load(alloc);
+        defer registry.deinit(alloc);
+        const listing = try alloc.alloc(ChildListing, registry.children.len);
+        var filled: usize = 0;
+        errdefer freeChildListing(alloc, listing[0..filled]);
+        for (registry.children) |child| {
+            const id = try alloc.dupe(u8, child.id);
+            errdefer alloc.free(id);
+            listing[filled] = .{ .id = id, .name = try alloc.dupe(u8, child.agentName() orelse "") };
+            filled += 1;
+        }
+        return listing;
+    }
+
+    pub fn freeChildListing(alloc: Allocator, listing: []ChildListing) void {
+        for (listing) |entry| {
+            alloc.free(entry.id);
+            alloc.free(entry.name);
+        }
+        alloc.free(listing);
+    }
+
+    /// A child's saved conversation, read without opening it. The caller
+    /// owns the turns (`types.freeHistoryTurnSlice`).
+    pub fn childHistory(self: *Runtime, alloc: Allocator, child_id: []const u8) ![]types.HistoryTurn {
+        return self.children.parent.store.childHistory(alloc, child_id);
+    }
+
+    /// What a turn the user starts on a subagent's own screen runs under.
+    pub const UserTurnAdmission = struct {
+        admission: domain.AdmissionSnapshot,
+        /// The child's instructions, for its system prompt. Owned.
+        instructions: []u8,
+
+        pub fn deinit(self: *UserTurnAdmission, alloc: Allocator) void {
+            self.admission.deinit(alloc);
+            alloc.free(self.instructions);
+            self.* = undefined;
+        }
+    };
+
+    /// Admits a turn the user starts on child `child_id`'s own screen,
+    /// captured as a run's admission is, from the child's saved preferences,
+    /// so its profile and main's live permissions limit it the same way
+    /// (D31). The registry is not changed: no work of main's is started, and
+    /// a run main sends meanwhile waits for the turn to end. A one-off ran a
+    /// single task for main and takes no turns of the user's. The caller owns
+    /// the result.
+    pub fn admitUserTurn(
         self: *Runtime,
-        options: ApprovalResolveOptions,
-    ) approval_registry.Error!approval_registry.ResolveResult {
-        return switch (try self.approvals.resolve(
-            options.request_id,
-            options.child_id,
-            options.decision,
-            options.feedback,
-            options.timestamp_ms,
-        )) {
-            .accepted => .accepted,
-            .rejected => .rejected,
+        alloc: Allocator,
+        child_id: []const u8,
+        permission_mode: types.PermissionMode,
+    ) !UserTurnAdmission {
+        const instructions = blk: {
+            var lock = self.managed.state_store.acquireLock();
+            defer lock.release();
+            var registry = try self.managed.state_store.load(alloc);
+            defer registry.deinit(alloc);
+            const child = registry.findById(child_id) orelse return error.ChildUnavailable;
+            if (child.agentName() == null) return error.OneOffChild;
+            break :blk try alloc.dupe(u8, child.instructions());
         };
+        errdefer alloc.free(instructions);
+        var preferences = try managed_owner.readChildPreferences(&self.managed, child_id);
+        defer preferences.deinit(self.managed.alloc);
+        var snapshot = try self.authority_resolver.resolveForUser(alloc, child_id, permission_mode);
+        defer snapshot.deinit(alloc);
+        const admission = try admissionFrom(alloc, .{
+            .child_id = child_id,
+            .parent_id = self.managed.state_store.parent_id,
+            .source_id = self.managed.state_store.parent_id,
+            .preferences = managed_owner.turnPreferencesForDurable(preferences),
+        }, &snapshot);
+        return .{ .admission = admission, .instructions = instructions };
+    }
+
+    /// The resolver that decides a child's tools and permissions, for a
+    /// turn's live authority.
+    pub fn authorityResolver(self: *Runtime) *authority.Resolver {
+        return &self.authority_resolver;
     }
 
     pub fn issueOperationIdentity(
@@ -286,10 +370,31 @@ pub const Runtime = struct {
                         .error_code = "caller_unavailable",
                     });
                 }
-                const resolved_model: ?[]const u8 = switch (try resolveOverrideModel(alloc, request.override(), options)) {
+                // A new child's profile sets its model and effort unless the
+                // request names them. Loading it here refuses an unknown
+                // profile, or one that would nest subagents, before any child
+                // exists.
+                var profile_arena = std.heap.ArenaAllocator.init(alloc);
+                defer profile_arena.deinit();
+                var profiled = options;
+                var model_override = request.override();
+                if (model_override.profile) |name| {
+                    const profile = switch (try loadChildProfile(profile_arena.allocator(), name)) {
+                        .rejected => |failure| break :blk try self.encodeManaged(alloc, failure),
+                        .loaded => |value| value,
+                    };
+                    if (model_override.model == null) model_override.model = profile.model;
+                    if (model_override.effort == null) {
+                        if (profile.effort) |effort| profiled.defaults.effort = effort;
+                    }
+                }
+                const resolved_model: ?[]const u8 = switch (try resolveOverrideModel(alloc, model_override, profiled)) {
                     .rejected => |failure| break :blk try self.encodeManaged(alloc, failure),
                     .accepted => |model| model,
                 };
+                if (request.override().model == null) {
+                    if (model_override.model) |raw| profiled.defaults.model = resolved_model orelse raw;
+                }
                 var admission_arena = std.heap.ArenaAllocator.init(self.alloc);
                 defer admission_arena.deinit();
                 var queued_receipt: ?ManagedExecutionResult = null;
@@ -308,7 +413,7 @@ pub const Runtime = struct {
                         admission_alloc,
                         request.*,
                         operation_id,
-                        options,
+                        profiled,
                         resolved_model,
                     );
                     defer admitted.deinit(admission_alloc);
@@ -370,7 +475,7 @@ pub const Runtime = struct {
                                 alloc,
                                 ready.child_id,
                                 operation_id,
-                                effectiveDefaults(options.defaults, request.override(), resolved_model),
+                                effectiveDefaults(profiled.defaults, request.override(), resolved_model),
                                 options.progress,
                                 options.cancel_flag,
                                 options.steering_worker,
@@ -395,6 +500,30 @@ pub const Runtime = struct {
                 }
             },
         };
+    }
+
+    const ChildProfile = union(enum) {
+        loaded: profiles.Profile,
+        rejected: model_contract.Result,
+    };
+
+    /// Loads the profile a new child asks for, from the fx home and the
+    /// current directory, as `fx --profile` does. The result and any message
+    /// belong to `arena`.
+    fn loadChildProfile(arena: Allocator, name: []const u8) !ChildProfile {
+        const workspace_root = io_mod.realpathAlloc(arena, ".") catch null;
+        const roots = try profiles.Roots.init(arena, io_mod.homeDir(), workspace_root);
+        var failure: ?[]const u8 = null;
+        const profile = profiles.load(arena, roots, name, &failure) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{ .rejected = .{ .ok = false, .error_code = "profile_unavailable", .result = failure } },
+        };
+        debug_trace.eventf("profile", "profile_admitted", .{}, "name={s} source={s} mode={s}", .{
+            profile.name,
+            @tagName(profile.source),
+            if (profile.permission_mode) |mode| @tagName(mode) else "inherit",
+        });
+        return .{ .loaded = profile };
     }
 
     const OverrideModelResolution = union(enum) {
@@ -474,6 +603,7 @@ pub const Runtime = struct {
             .state_store = self.childStateStore(),
             .services = .{
                 .context = self,
+                .bind_fn = if (self.child_runner.bind_fn != null) bindChild else null,
                 .capture_fn = captureAdmission,
                 .run_fn = runChild,
             },
@@ -617,6 +747,7 @@ pub const Runtime = struct {
                 const child_id = try session_store.generateSessionId(alloc);
                 defer alloc.free(child_id);
                 try registry.appendOneOff(alloc, child_id, active);
+                if (request.override().profile) |name| try registry.setProfile(alloc, child_id, name);
                 try self.managed.state_store.save(alloc, registry);
                 try self.ensureManagedChildSession(child_id, active.id, defaults);
                 return managedAdmissionReady(
@@ -671,6 +802,7 @@ pub const Runtime = struct {
                     message.instructions orelse "",
                     active,
                 );
+                if (request.override().profile) |name| try registry.setProfile(alloc, child_id, name);
                 try self.managed.state_store.save(alloc, registry);
                 try self.ensureManagedChildSession(child_id, active.id, defaults);
                 return managedAdmissionReady(
@@ -1461,7 +1593,7 @@ const OverrideResolverFixture = struct {
     fn run(raw: ?*anyopaque, turn: *execution.TurnContext, message: domain.QueuedMessage, _: domain.AdmissionSnapshot, _: *std.atomic.Value(bool)) execution.ServiceError!execution.RunOutcome {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
         self.runs += 1;
-        var preferences = turn.child.currentPreferences(std.testing.allocator) catch return error.ProviderFailed;
+        var preferences = turn.child.?.currentPreferences(std.testing.allocator) catch return error.ProviderFailed;
         defer preferences.deinit(std.testing.allocator);
         self.observed_model = std.testing.allocator.dupe(u8, preferences.model) catch return error.ProviderFailed;
         if (!turn.worker.beginDirectProcessing(1)) return error.ProviderFailed;
@@ -1831,6 +1963,16 @@ fn captureAdmission(
     var snapshot = self.authority_resolver.resolve(alloc, request.child_id) catch
         return error.AdmissionFailed;
     defer snapshot.deinit(alloc);
+    return admissionFrom(alloc, request, &snapshot);
+}
+
+/// A child's admission from its resolved authority and `request`'s saved
+/// preferences.
+fn admissionFrom(
+    alloc: Allocator,
+    request: execution.CaptureRequest,
+    snapshot: *const authority.Snapshot,
+) execution.ServiceError!domain.AdmissionSnapshot {
     return domain.captureAdmission(alloc, .{
         .parent_id = request.parent_id,
         .source_id = request.source_id,
@@ -1853,6 +1995,16 @@ fn captureAdmission(
         error.OutOfMemory => error.OutOfMemory,
         else => error.AdmissionFailed,
     };
+}
+
+fn bindChild(
+    raw: ?*anyopaque,
+    turn: *execution.TurnContext,
+    cancel: *std.atomic.Value(bool),
+) execution.ServiceError!void {
+    const self: *Runtime = @ptrCast(@alignCast(raw.?));
+    const bind_fn = self.child_runner.bind_fn orelse return;
+    return bind_fn(self.child_runner.context, turn, cancel);
 }
 
 fn runChild(

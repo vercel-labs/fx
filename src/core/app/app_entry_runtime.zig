@@ -1,5 +1,6 @@
 const std = @import("std");
 const profile_paths = @import("../shared/profile_paths.zig");
+const agents = @import("../agents/agents.zig");
 const builtin = @import("builtin");
 const app_lifecycle = @import("app_lifecycle.zig");
 const app_process_runtime = @import("app_process_runtime.zig");
@@ -228,6 +229,9 @@ fn unavailableCliDispatch(_: ?*anyopaque, _: Allocator, _: []const [:0]const u8,
 
 /// The exit for an interactive launch whose app could not start.
 fn initFailure(deps: RunDeps, launch: *cli_surface.InteractiveLaunch, alloc: Allocator, err: anyerror) anyerror!RunOutcome {
+    // This thread is the main loop's: the only one besides agents' workers
+    // that reads an agent (design section 10).
+    agents.markLoopThread();
     switch (err) {
         error.NotATerminal => {
             writeStderr(deps, "fx requires an interactive terminal (TTY).\n");
@@ -328,7 +332,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
     };
     // `App.init` built the app in a local and copied it here: whatever holds
     // a pointer to the app needs this address instead.
-    if (@hasDecl(App, "rebindAfterInit")) app.rebindAfterInit();
+    if (@hasDecl(App, "rebindAfterInit")) app.rebindAfterInit(&app.main_agent);
     var app_needs_deinit = true;
     defer if (app_needs_deinit) {
         if (comptime cooperative) {
@@ -341,7 +345,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
     };
     if (comptime !cooperative) {
         if (resume_requested) app.startResumedSessionWarmup();
-        if (@hasDecl(App, "configureNotifications")) try app.configureNotifications();
+        if (@hasDecl(App, "configureNotifications")) try app.configureNotifications(&app.main_agent);
         if (@hasDecl(App, "playStartupSound")) app.playStartupSound();
         if (@hasDecl(App, "startAutoUpgrade")) app.startAutoUpgrade();
         if (@hasDecl(App, "startFileIndex")) app.startFileIndex();
@@ -350,8 +354,9 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
             reportUnexpectedInteractiveError(deps, err);
             return err;
         };
+        if (@hasDecl(App, "launchStartupInstances")) app.launchStartupInstances();
         app.startModelCacheWarmup();
-        if (resume_requested and @hasDecl(App, "startPendingResume")) app.startPendingResume();
+        if (resume_requested and @hasDecl(App, "startPendingResume")) app.startPendingResume(&app.main_agent);
     }
 
     app.run() catch |err| {
@@ -519,14 +524,14 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
 }
 
 fn startWorkerThread(comptime App: type, app: *App, deps: RunDeps) !void {
-    if (!@hasField(App, "worker_thread")) {
+    if (!agents.hasAgentField(App, "worker_thread")) {
         const start = deps.start_worker_thread orelse return error.MissingWorkerThreadDependency;
         return start(deps.worker_ctx, @ptrCast(app));
     }
     if (deps.start_worker_thread) |start| {
         return start(deps.worker_ctx, @ptrCast(app));
     }
-    try app_process_runtime.Runtime(App).startWorkerThread(app);
+    try app_process_runtime.Runtime(App).startWorkerThread(app, &app.main_agent);
 }
 
 fn runIfRequestedDefault(_: ?*anyopaque, alloc: Allocator, args: []const [:0]const u8, cfg: cli_surface.Config) !cli_surface.RunResult {
@@ -812,6 +817,7 @@ fn startWorkerThreadForTest(ctx: ?*anyopaque, _: *anyopaque) !void {
 }
 
 const TestApp = struct {
+    main_agent: struct {} = .{},
     requested_resume: ?cli_surface.ResumeTarget = null,
     terminal_released: bool = false,
 
@@ -883,7 +889,7 @@ const TestApp = struct {
         appendTestEvent("file-index");
     }
 
-    pub fn rebindAfterInit(_: *TestApp) void {
+    pub fn rebindAfterInit(_: *TestApp, _: anytype) void {
         appendTestEvent("rebind-after-init");
     }
 
@@ -894,6 +900,9 @@ const TestApp = struct {
     fn run(_: *TestApp) !void {
         appendTestEvent("run");
         if (active_capture.?.run_error) |err| return err;
+    }
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
     }
 };
 
