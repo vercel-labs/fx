@@ -1525,7 +1525,8 @@ describe("MCP login", () => {
     // the stand-in does; Slack doesn't list it.
     expect(opened.searchParams.get("scope")!.split(" ").filter((x) => x !== "offline_access").sort()).toEqual([
       "channels:history", "channels:read", "channels:write", "chat:write", "emoji:read", "files:write",
-      "groups:history", "im:history", "mpim:history", "search:read.public", "search:read.users", "users:read",
+      "groups:history", "groups:read", "im:history", "im:read", "mpim:history", "mpim:read",
+      "search:read.im", "search:read.mpim", "search:read.private", "search:read.public", "search:read.users", "users:read",
     ]);
     expect(auth.requests.some((r) => r.path.startsWith("/api/slack/"))).toBe(false);
     expect(auth.tokenExchanges).toBe(1);

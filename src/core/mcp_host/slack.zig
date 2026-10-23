@@ -20,7 +20,7 @@ pub const client_id = "12364000946.12017137861236";
 pub const callback_port: u16 = 3118;
 
 /// The user scopes fx's Slack app has; it may ask for no others.
-pub const scopes = "channels:history channels:read channels:write chat:write emoji:read files:write groups:history im:history mpim:history search:read.public search:read.users users:read";
+pub const scopes = "channels:history channels:read channels:write chat:write emoji:read files:write groups:history groups:read im:history im:read mpim:history mpim:read search:read.im search:read.mpim search:read.private search:read.public search:read.users users:read";
 
 /// Whether `url` is Slack's MCP server.
 pub fn isSlack(url: ?[]const u8) bool {
