@@ -340,6 +340,85 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "a configured command deny holds for every command in a line",
+    async () => {
+      const root = createIsolatedRoot();
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({
+          sandbox: "none",
+          // The example rule from the permissions page of the manual.
+          permission: { bash: { "git push *": "deny" } },
+        }),
+      );
+      const remote = join(root.root, "remote.git");
+      runGit(root.root, ["init", "-q", "--bare", remote]);
+      runGit(root.workspace, ["init", "-q", "-b", "main"]);
+      writeFileSync(join(root.workspace, "notes.txt"), "hello\n");
+      runGit(root.workspace, ["add", "notes.txt"]);
+      runGit(root.workspace, [
+        "-c",
+        "user.name=Example",
+        "-c",
+        "user.email=example@example.com",
+        "commit",
+        "-q",
+        "-m",
+        "first",
+      ]);
+      runGit(root.workspace, ["remote", "add", "origin", remote]);
+
+      const expectDenied = (body: string, id: string) =>
+        expect(toolResultText(body, id, "execution-denied")).toContain("policy_denied");
+      const gateway = startGateway(
+        [
+          commandCall("cd . && git push origin HEAD:main", "deny_and"),
+          (body) => {
+            expectDenied(body, "deny_and");
+            return commandCall("echo start; git push origin HEAD:main", "deny_semicolon");
+          },
+          (body) => {
+            expectDenied(body, "deny_semicolon");
+            return commandCall("(git push origin HEAD:main)", "deny_subshell");
+          },
+          (body) => {
+            expectDenied(body, "deny_subshell");
+            // Quoted text is an argument, not a command, so the rule leaves it alone.
+            return commandCall('echo "git push origin main"', "quoted_text");
+          },
+          (body) => {
+            expect(toolResultText(body, "quoted_text")).toContain("git push origin main");
+            return fakeGatewayFinalText("deny rule checked");
+          },
+        ],
+        [fakeGatewayPermissionDecision("clear", "quoted_review")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Push my work."],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(0);
+      expect(result.stdout).toContain("deny rule checked");
+      // The rule decides before review, so no denied line reaches the reviewer.
+      expect(
+        gateway.classifierRequests.filter(({ body }) => body.includes("HEAD:main")),
+      ).toHaveLength(0);
+      const pushed = Bun.spawnSync(
+        ["/usr/bin/git", "--git-dir", remote, "rev-parse", "--verify", "-q", "main"],
+        { stdout: "pipe", stderr: "pipe" },
+      );
+      expect(pushed.exitCode, "the remote must not receive a push").not.toBe(0);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a configured safe command bypasses automatic review",
     async () => {
       const root = createIsolatedRoot();

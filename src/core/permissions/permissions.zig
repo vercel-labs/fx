@@ -2,6 +2,7 @@ const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const command_environment = @import("../execution/command_environment.zig");
+const command_lex = @import("../shell_command/command_lex.zig");
 
 const io_mod = @import("../shared/io.zig");
 const pathing = @import("../workspace/pathing.zig");
@@ -1619,10 +1620,16 @@ fn permissionPatternMatchesTarget(pattern: []const u8, candidate: []const u8) bo
 }
 
 fn ruleTargetMatches(permission: []const u8, action: RuleDecision, pattern: []const u8, candidate: []const u8) bool {
-    if (action != .allow or
-        !std.mem.eql(u8, permission, "bash"))
-    {
-        return permissionPatternMatchesTarget(pattern, candidate);
+    if (!std.mem.eql(u8, permission, "bash")) return permissionPatternMatchesTarget(pattern, candidate);
+    if (action != .allow) {
+        if (permissionPatternMatchesTarget(pattern, candidate)) return true;
+        // A deny or ask rule names a command, so it also holds for that
+        // command inside a list such as `cd repo && git push`.
+        var commands = command_lex.list_commands(candidate);
+        while (commands.next()) |command| {
+            if (permissionPatternMatchesTarget(pattern, command)) return true;
+        }
+        return false;
     }
 
     if (!containsWildcard(pattern)) return std.mem.eql(u8, pattern, candidate);
