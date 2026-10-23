@@ -51,6 +51,10 @@ USE_FLAGS = (
 
 OUTLINE_PARTITIONS = 2
 
+# Each outliner input first goes through `ir_size.py expand-constant-exprs`,
+# and each output through `ir_size.py check-outlined`: the outliner can fold a
+# constant nested in a constant expression into a parameter that carries a
+# different constant (see ir_size.py).
 IR_OUTLINER_FLAGS = (
     "-passes=iroutliner",
 )
@@ -74,7 +78,7 @@ BENCHMARK_USE_FLAGS = (
     "-pgo-kind=pgo-instr-use-pipeline",
     "-pgo-cold-func-opt=minsize",
     "-profile-summary-cutoff-cold=990000",
-    f"-passes={PROFILE_PREPARATION_PASSES},default<O2>,mergefunc,iroutliner",
+    f"-passes={PROFILE_PREPARATION_PASSES},default<O2>,mergefunc",
 )
 
 FX_MACHINE_OUTLINER_FLAGS = (
@@ -383,6 +387,20 @@ def ir_size_argv(
     )
 
 
+def check_outlined_argv(
+    toolchain: Toolchain,
+    source: pathlib.Path,
+) -> tuple[str, ...]:
+    return (
+        sys.executable,
+        str(toolchain.ir_size),
+        "--libllvm",
+        str(toolchain.libllvm),
+        "check-outlined",
+        str(source),
+    )
+
+
 def instrumentation_argv(
     toolchain: Toolchain,
     paths: PipelinePaths,
@@ -404,18 +422,13 @@ def profile_use_argv(
 ) -> tuple[str, ...]:
     profile = profile_path or paths.merged_profile
     flags = USE_FLAGS if paths.selector == "fx" else BENCHMARK_USE_FLAGS
-    output = (
-        paths.profile_use_base_bitcode
-        if paths.selector == "fx"
-        else paths.profile_use_bitcode
-    )
     return (
         str(toolchain.opt),
         *flags,
         f"-profile-file={profile}",
         str(paths.bitcode),
         "-o",
-        str(output),
+        str(paths.profile_use_base_bitcode),
     )
 
 
@@ -1300,15 +1313,21 @@ def apply_profile(
         log_path=paths.logs / "profile-use.json",
         require_empty_stderr=True,
     )
-    if paths.selector != "fx":
-        _require_nonempty_file(paths.profile_use_bitcode, "profile-use bitcode")
-        rewrite_sparse_constants(toolchain, paths)
-        return paths.profile_use_bitcode
-
     _require_nonempty_file(
         paths.profile_use_base_bitcode,
         "whole-program profile-use bitcode",
     )
+    if paths.selector != "fx":
+        _outline_without_folded_constants(
+            toolchain,
+            paths,
+            paths.profile_use_base_bitcode,
+            paths.profile_use_bitcode,
+            "profile-use",
+        )
+        rewrite_sparse_constants(toolchain, paths)
+        return paths.profile_use_bitcode
+
     original_symbols = _defined_external_symbols(
         toolchain,
         paths.profile_use_base_bitcode,
@@ -1327,15 +1346,13 @@ def apply_profile(
     for index, (split, outlined) in enumerate(
         zip(paths.outline_split_bitcodes, paths.outlined_bitcodes)
     ):
-        run_checked(
-            outline_ir_argv(toolchain, split, outlined),
-            cwd=paths.root,
-            env=os.environ.copy(),
-            timeout_s=900,
-            log_path=paths.logs / f"outline-profile-use-{index}.json",
-            require_empty_stderr=True,
+        _outline_without_folded_constants(
+            toolchain,
+            paths,
+            split,
+            outlined,
+            f"profile-use-{index}",
         )
-        _require_nonempty_file(outlined, "outlined IR partition")
     run_checked(
         link_outlined_ir_argv(toolchain, paths),
         cwd=paths.root,
@@ -1366,6 +1383,42 @@ def apply_profile(
             f"before={original_symbols}, after={outlined_symbols}"
         )
     return paths.profile_use_bitcode
+
+
+def _outline_without_folded_constants(
+    toolchain: Toolchain,
+    paths: PipelinePaths,
+    source: pathlib.Path,
+    output: pathlib.Path,
+    name: str,
+) -> None:
+    expanded = source.with_name(source.name + ".expanded.bc")
+    run_checked(
+        ir_size_argv(toolchain, "expand-constant-exprs", source, expanded),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=900,
+        log_path=paths.logs / f"expand-constant-exprs-{name}.json",
+        require_empty_stderr=True,
+    )
+    _require_bitcode_header(expanded)
+    run_checked(
+        outline_ir_argv(toolchain, expanded, output),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=900,
+        log_path=paths.logs / f"outline-{name}.json",
+        require_empty_stderr=True,
+    )
+    _require_nonempty_file(output, "outlined IR")
+    run_checked(
+        check_outlined_argv(toolchain, output),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=900,
+        log_path=paths.logs / f"check-outlined-{name}.json",
+        require_empty_stderr=True,
+    )
 
 
 def verify_release_safe_ir(ir_path: pathlib.Path) -> None:

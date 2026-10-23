@@ -3,6 +3,8 @@
 
     ir_size.py --libllvm <libLLVM.dylib> outline-helpers <in.bc> <out.bc>
     ir_size.py --libllvm <libLLVM.dylib> sparse-constants <in.bc> <out.bc>
+    ir_size.py --libllvm <libLLVM.dylib> expand-constant-exprs <in.bc> <out.bc>
+    ir_size.py --libllvm <libLLVM.dylib> check-outlined <in.bc>
 
 outline-helpers marks small shared std helpers as noinline: the allocator's
 slice free, remap, and aligned allocation, the writer's write, writeAll, and
@@ -19,8 +21,27 @@ padding undef }` copied into the result. Copying undefined bytes is refined
 by leaving the destination bytes unchanged, so only the defined bytes are
 stored. Run `opt -passes=globaldce,verify` afterwards to drop dead constants.
 
-Both commands print a JSON summary on stdout and exit nonzero when the input
-cannot be read. outline-helpers also fails when no allocator free helper
+expand-constant-exprs rebuilds each constant expression an instruction uses
+as an operand, such as `getelementptr (i8, ptr @g, i64 16)`, as an
+instruction of its own. LLVM's IR outliner does not see constants nested in
+a constant expression when it matches regions, so two regions that differ
+only in an instruction's constant, one with 16 and one with 8898, can share a
+parameter that also replaces the nested 16: the second region then reads
+`@g + 8898`. With the expressions rebuilt as instructions, every constant is
+an operand the outliner compares. Run it on each partition right before
+`opt -passes=iroutliner`, with no pass between that could fold them back.
+PHI nodes, landing pads, call targets, and intrinsic calls keep their
+expressions: the outliner never moves an intrinsic call or a PHI's incoming
+constant into a region, and a call target must stay a direct callee.
+
+check-outlined fails when an outlined function holds a constant expression
+that the outliner rebuilt from a parameter: an instruction LLVM named
+`constexpr`, or a constant expression with a non-constant operand. After
+expand-constant-exprs neither should exist, so any hit is a form this guard
+does not cover.
+
+Every command prints a JSON summary on stdout and exits nonzero when the
+input cannot be read. outline-helpers also fails when no allocator free helper
 matches, because that means std naming changed and the pass went stale.
 """
 from __future__ import annotations
@@ -50,6 +71,9 @@ STRUCT, ARRAY, INTEGER, POINTER = 10, 11, 8, 12
 FLOATS = (1, 2, 3)
 INTERNAL_LINKAGE, PRIVATE_LINKAGE = 8, 9
 FUNCTION_INDEX = 0xFFFFFFFF
+GET_ELEMENT_PTR = 29
+CASTS = {30: "trunc", 39: "ptrtoint", 40: "inttoptr", 41: "bitcast", 60: "addrspacecast", 69: "ptrtoaddr"}
+OUTLINED_PREFIX = "outlined_ir_func"
 
 
 class PassError(Exception):
@@ -116,6 +140,24 @@ class Llvm:
         self.GetEnumAttrAt = f("LLVMGetEnumAttributeAtIndex", P, P, C.c_uint, C.c_uint)
         self.CallSiteEnumAttr = f("LLVMGetCallSiteEnumAttribute", P, P, C.c_uint, C.c_uint)
         self.EnumAttrValue = f("LLVMGetEnumAttributeValue", C.c_ulonglong, P)
+        self.FirstBlock = f("LLVMGetFirstBasicBlock", P, P)
+        self.NextBlock = f("LLVMGetNextBasicBlock", P, P)
+        self.FirstInstruction = f("LLVMGetFirstInstruction", P, P)
+        self.NextInstruction = f("LLVMGetNextInstruction", P, P)
+        self.NumOperands = f("LLVMGetNumOperands", C.c_int, P)
+        self.SetOperand = f("LLVMSetOperand", None, P, C.c_uint, P)
+        self.IsAConstantExpr = f("LLVMIsAConstantExpr", P, P)
+        self.ConstOpcode = f("LLVMGetConstOpcode", C.c_int, P)
+        self.IsAPHINode = f("LLVMIsAPHINode", P, P)
+        self.IsALandingPad = f("LLVMIsALandingPadInst", P, P)
+        self.IsAInvoke = f("LLVMIsAInvokeInst", P, P)
+        self.IsACallBr = f("LLVMIsACallBrInst", P, P)
+        self.IsAIntrinsic = f("LLVMIsAIntrinsicInst", P, P)
+        self.GEPSourceType = f("LLVMGetGEPSourceElementType", P, P)
+        self.GEPNoWrapFlags = f("LLVMGEPGetNoWrapFlags", C.c_uint, P)
+        self.BuildGEPNoWrap = f("LLVMBuildGEPWithNoWrapFlags", P, P, P, P, C.POINTER(P), C.c_uint, C.c_char_p, C.c_uint)
+        self.BuildCast = f("LLVMBuildCast", P, P, C.c_int, P, P, C.c_char_p)
+        self.BuildFreeze = f("LLVMBuildFreeze", P, P, P, C.c_char_p)
 
     def _fn(self, name, res, *args):
         fn = getattr(self.lib, name)
@@ -284,17 +326,138 @@ def sparse_constants(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> 
     return summary
 
 
+def _instructions(llvm: Llvm, fn):
+    block = llvm.FirstBlock(fn)
+    while block:
+        inst = llvm.FirstInstruction(block)
+        while inst:
+            following = llvm.NextInstruction(inst)
+            yield inst
+            inst = following
+        block = llvm.NextBlock(block)
+
+
+def _expandable_operands(llvm: Llvm, inst) -> range:
+    count = llvm.NumOperands(inst)
+    if llvm.IsAPHINode(inst) or llvm.IsALandingPad(inst) or llvm.IsAIntrinsic(inst):
+        return range(0)
+    if llvm.IsACallInst(inst) or llvm.IsAInvoke(inst) or llvm.IsACallBr(inst):
+        # The last operand is the callee.
+        return range(count - 1)
+    return range(count)
+
+
+def _rebuild(llvm: Llvm, builder, expression, before, summary: dict):
+    """An instruction before `before` computing `expression`, or None when its
+    opcode is not one this pass rebuilds. The builder folds an instruction
+    whose operands are all constants back into an expression, so each one is
+    built on a frozen placeholder and then given the constant."""
+    opcode = llvm.ConstOpcode(expression)
+    if opcode != GET_ELEMENT_PTR and opcode not in CASTS:
+        summary["kept_expressions"] += 1
+        return None
+    operands = []
+    for i in range(llvm.NumOperands(expression)):
+        operand = llvm.GetOperand(expression, i)
+        if llvm.IsAConstantExpr(operand):
+            operand = _rebuild(llvm, builder, operand, before, summary) or operand
+        operands.append(operand)
+    llvm.PositionBefore(builder, before)
+    placeholder = llvm.BuildFreeze(builder, operands[0], b"")
+    if opcode == GET_ELEMENT_PTR:
+        indices = (P * (len(operands) - 1))(*operands[1:])
+        inst = llvm.BuildGEPNoWrap(
+            builder,
+            llvm.GEPSourceType(expression),
+            placeholder,
+            indices,
+            len(operands) - 1,
+            b"pgso.expr",
+            llvm.GEPNoWrapFlags(expression),
+        )
+    else:
+        inst = llvm.BuildCast(builder, opcode, placeholder, llvm.TypeOf(expression), b"pgso.expr")
+    if not inst or inst == placeholder:
+        raise PassError(f"constant expression with opcode {opcode} did not become an instruction")
+    llvm.SetOperand(inst, 0, operands[0])
+    llvm.Erase(placeholder)
+    summary["rebuilt_instructions"] += 1
+    return inst
+
+
+def expand_constant_exprs(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> dict:
+    ctx, mod = llvm.load(source)
+    builder = llvm.CreateBuilder(ctx)
+    summary = {"pass": "expand-constant-exprs", "rewritten_operands": 0, "rebuilt_instructions": 0, "kept_expressions": 0}
+    fn = llvm.FirstFunction(mod)
+    while fn:
+        if not llvm.IsDeclaration(fn):
+            for inst in _instructions(llvm, fn):
+                for index in _expandable_operands(llvm, inst):
+                    operand = llvm.GetOperand(inst, index)
+                    if not llvm.IsAConstantExpr(operand):
+                        continue
+                    rebuilt = _rebuild(llvm, builder, operand, inst, summary)
+                    if rebuilt:
+                        llvm.SetOperand(inst, index, rebuilt)
+                        summary["rewritten_operands"] += 1
+        fn = llvm.NextFunction(fn)
+    llvm.save(mod, output)
+    return summary
+
+
+def _holds_parameter(llvm: Llvm, expression) -> bool:
+    for i in range(llvm.NumOperands(expression)):
+        operand = llvm.GetOperand(expression, i)
+        if not llvm.IsConstant(operand):
+            return True
+        if llvm.IsAConstantExpr(operand) and _holds_parameter(llvm, operand):
+            return True
+    return False
+
+
+def check_outlined(llvm: Llvm, source: pathlib.Path) -> dict:
+    _, mod = llvm.load(source)
+    summary = {"pass": "check-outlined", "outlined_functions": 0}
+    findings = []
+    fn = llvm.FirstFunction(mod)
+    while fn:
+        name = llvm.name(fn)
+        if not llvm.IsDeclaration(fn) and name.startswith(OUTLINED_PREFIX):
+            summary["outlined_functions"] += 1
+            for inst in _instructions(llvm, fn):
+                if llvm.name(inst).startswith("constexpr"):
+                    findings.append(f"{name}: rebuilt constant expression {llvm.name(inst)}")
+                for index in range(llvm.NumOperands(inst)):
+                    operand = llvm.GetOperand(inst, index)
+                    if llvm.IsAConstantExpr(operand) and _holds_parameter(llvm, operand):
+                        findings.append(f"{name}: constant expression with a parameter operand")
+        fn = llvm.NextFunction(fn)
+    if findings:
+        raise PassError("IR outliner folded a nested constant into a parameter: " + "; ".join(findings[:8]))
+    return summary
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--libllvm", required=True, type=pathlib.Path)
-    parser.add_argument("command", choices=("outline-helpers", "sparse-constants"))
+    parser.add_argument("command", choices=("outline-helpers", "sparse-constants", "expand-constant-exprs", "check-outlined"))
     parser.add_argument("source", type=pathlib.Path)
-    parser.add_argument("output", type=pathlib.Path)
+    parser.add_argument("output", type=pathlib.Path, nargs="?")
     args = parser.parse_args(argv)
+    if (args.output is None) != (args.command == "check-outlined"):
+        parser.error("check-outlined takes only an input; the other commands need an output")
     try:
         llvm = Llvm(args.libllvm)
-        run = outline_helpers if args.command == "outline-helpers" else sparse_constants
-        summary = run(llvm, args.source, args.output)
+        if args.command == "check-outlined":
+            summary = check_outlined(llvm, args.source)
+        else:
+            run = {
+                "outline-helpers": outline_helpers,
+                "sparse-constants": sparse_constants,
+                "expand-constant-exprs": expand_constant_exprs,
+            }[args.command]
+            summary = run(llvm, args.source, args.output)
     except (OSError, PassError) as error:
         sys.stderr.write(f"ir_size: {error}\n")
         return 1

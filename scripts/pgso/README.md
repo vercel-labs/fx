@@ -79,6 +79,15 @@ Generated IR helpers are kept in one dense linker cluster ordered by their
 hottest profiled caller so outlining does not scatter startup code across cold
 pages.
 
+LLVM's IR outliner does not compare constants nested inside a constant
+expression. Two regions that differ only in an instruction's constant can share
+one parameter that also replaces a nested constant, so one of them reads the
+wrong address. Before each outliner run, `ir_size.py expand-constant-exprs`
+rebuilds the constant expressions that instructions use as instructions, so the
+outliner compares every constant. Afterwards, `ir_size.py check-outlined` fails
+the run if an outlined function still holds a constant expression the outliner
+rebuilt from a parameter. Benchmark candidates take the same two steps.
+
 Two size passes in [`ir_size.py`](ir_size.py) run through the pinned LLVM C
 library. Right after Zig emits bitcode, `outline-helpers` marks small shared
 std helpers `noinline`: the allocator's slice `free`, `remap`, and aligned
