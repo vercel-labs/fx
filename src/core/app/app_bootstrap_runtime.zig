@@ -541,7 +541,7 @@ pub fn Runtime(comptime App: type) type {
                 launch_overrides.fast,
                 launch_overrides.provider,
             );
-            // Every later instance starts from what the first did (D47).
+            // Every later instance starts from what the first did.
             if (comptime @hasField(App, "instances")) {
                 try app.instances.seed.capturePreferences(
                     app.alloc,

@@ -66,7 +66,7 @@ pub const ShortcutAction = union(enum) {
     insert_newline,
 };
 
-/// Which way Alt+←/→ moves through the agents (D9).
+/// Which way Alt+←/→ moves through the agents.
 pub const SwitchDirection = enum { next, previous };
 
 /// Typed result of UI-owned terminal escape decoding.

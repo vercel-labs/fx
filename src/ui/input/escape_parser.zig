@@ -81,7 +81,7 @@ fn modifiedArrowAction(byte: u8, modifiers: u16, meta_prefixed: bool) ?InputEsca
         else => null,
     };
     if (meta_prefixed or (modifiers & alt_modifier) != 0) {
-        // Alt+←/→ switch agents (D9); with Shift or Ctrl they keep the word
+        // Alt+←/→ switch agents; with Shift or Ctrl they keep the word
         // jump and selection.
         const switches = (modifiers & (shift_modifier | ctrl_modifier)) == 0;
         return switch (byte) {

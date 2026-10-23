@@ -401,8 +401,8 @@ pub const Shown = union(enum) {
     profile: ?*const profiles.Profile,
     /// The interactive app's: the ones its run was admitted with, its
     /// parent's narrowed by its profile, so it is never shown a tool its
-    /// parent lacks (`Profiles.tla` NoElevation). `subagent` is among them
-    /// only once it has its own host to start subagents on (D32).
+    /// parent lacks. `subagent` is among them
+    /// only once it has its own host to start subagents on.
     admitted: struct { tools: []const []const u8, starts_subagents: bool },
 };
 

@@ -118,7 +118,7 @@ pub const QuestionPrompt = struct {
     active: bool = false,
     entries: std.ArrayList(OwnedQuestionEntry) = .empty,
     current_index: u8 = 0,
-    /// The subagent that asked, while main's screen shows its question (D23);
+    /// The subagent that asked, while main's screen shows its question;
     /// empty for the agent's own. Borrowed from the subagent.
     asker: []const u8 = "",
 

@@ -105,7 +105,7 @@ pub const SteeringBoundaryResult = union(enum) {
 pub const QueuedPrompt = struct {
     turn_id: u64 = 0,
     /// The work id of main's message this prompt brings to a subagent. Its
-    /// turn is saved with it, and main finds the answer by it (D31). Owned.
+    /// turn is saved with it, and main finds the answer by it. Owned.
     work_id: ?[]u8 = null,
     steering_receipt: ?*SteeringReceipt = null,
     /// Runtime-derived delivery state. The worker retains ownership in every state.
@@ -533,7 +533,7 @@ pub const WorkerEventBatch = struct {
 pub const WorkerRuntime = struct {
     worker_mutex: std.Io.Mutex = .init,
     worker_cond: std.Io.Condition = .init,
-    /// Agent name for `procesor` trace lines. Only the app's main agent sets
+    /// Agent name for `host` trace lines. Only the app's main agent sets
     /// it; other workers log nothing.
     trace_agent: ?[]const u8 = null,
     /// Set once the first event logged this agent's registration. Startup
@@ -583,7 +583,7 @@ pub const WorkerRuntime = struct {
     /// carries a receipt, goes back to the subagent host when the turn ends
     /// without taking it, and the host delivers it as new work. Any other
     /// steering left over, such as the user's, runs as the next turn, as it
-    /// does on main (D31).
+    /// does on main.
     hands_back_leftover_feedback: bool = false,
     pending_question_shared: ?OwnedQuestionBatch = null,
     pending_question_response: QuestionResponse = .pending,
@@ -846,9 +846,9 @@ pub const WorkerRuntime = struct {
         if (self.trace_agent) |agent| {
             if (!self.trace_registered) {
                 self.trace_registered = true;
-                debug_trace.eventf("procesor", "agent_registered", .{}, "agent={s} parent=none", .{agent});
+                debug_trace.eventf("host", "agent_registered", .{}, "agent={s} parent=none", .{agent});
             }
-            debug_trace.eventf("procesor", "agent_event_queued", .{}, "agent={s} kind={s}", .{ agent, traceKind(event) });
+            debug_trace.eventf("host", "agent_event_queued", .{}, "agent={s} kind={s}", .{ agent, traceKind(event) });
         }
         self.applyActiveToolTransitionLocked(tool_transition);
         self.applyToolBoundaryPhaseLocked(event);
@@ -2543,7 +2543,7 @@ pub const WorkerRuntime = struct {
         };
         // Under the same lock as every other queued event's line.
         if (self.trace_agent) |agent| {
-            debug_trace.eventf("procesor", "agent_event_queued", .{}, "agent={s} kind={s}", .{ agent, traceKind(.question_requested) });
+            debug_trace.eventf("host", "agent_event_queued", .{}, "agent={s} kind={s}", .{ agent, traceKind(.question_requested) });
         }
         owns_pending_question = false;
         self.worker_cond.broadcast(io_mod.getIo());
@@ -2610,7 +2610,7 @@ pub const WorkerRuntime = struct {
     /// True while the worker waits on an answer to its question batch.
     /// Whether a permission request waits on the user's decision. The loop
     /// checks it for a hidden agent, whose worker queues no event while it
-    /// waits, so that agent's approval prompt still shows (D34).
+    /// waits, so that agent's approval prompt still shows.
     pub fn awaitsPermissionDecision(self: *WorkerRuntime) bool {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
@@ -3949,7 +3949,7 @@ pub fn freeSkillDisplaySpans(alloc: std.mem.Allocator, spans: []SkillDisplaySpan
     if (spans.len > 0) alloc.free(spans);
 }
 
-/// The `procesor` trace kind of a worker event: `text` adds transcript
+/// The `host` trace kind of a worker event: `text` adds transcript
 /// content, `ask` requests an answer, and everything else is `other`.
 pub fn traceKind(event: WorkerEvent) []const u8 {
     return switch (event) {

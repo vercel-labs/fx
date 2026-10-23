@@ -437,7 +437,7 @@ pub fn Bindings(comptime App: type) type {
             return worker_token;
         }
 
-        /// Resolves models for `agent`, under its own turn settings (D43).
+        /// Resolves models for `agent`, under its own turn settings.
         pub fn modelCapabilityResolver(agent: *AppAgent) model_capabilities.Resolver {
             return .{
                 .ctx = @ptrCast(agent),
@@ -445,7 +445,7 @@ pub fn Bindings(comptime App: type) type {
             };
         }
 
-        /// Resolves a subagent's model override for the agent starting it (D43).
+        /// Resolves a subagent's model override for the agent starting it.
         pub fn modelOverrideResolver(agent: *AppAgent) subagent_tool_host.ModelOverrideResolver {
             return .{
                 .context = @ptrCast(agent),
@@ -753,7 +753,7 @@ pub fn Bindings(comptime App: type) type {
                     items.git_branch = identity.git_branch;
                 }
             }
-            // Under the provider of the agent whose subagent this is (D43).
+            // Under the provider of the agent whose subagent this is.
             const caps = if (comptime @hasDecl(App, "resolvedModelCapabilitiesOf"))
                 app.resolvedModelCapabilitiesOf(agent, status.model)
             else

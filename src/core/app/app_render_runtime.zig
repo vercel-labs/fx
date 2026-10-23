@@ -740,7 +740,7 @@ pub fn Runtime(comptime App: type) type {
                     (if (comptime @hasDecl(@TypeOf(app.auth), "startupCredentialPending")) app.auth.startupCredentialPending() else false),
                 .model = visible_model,
                 .pending_images = agent.pending_images.items,
-                // The agent on screen's own mode (D31).
+                // The agent on screen's own mode.
                 .permission_mode = app_permission_runtime.Runtime(App).currentMode(app),
                 .steering_messages = steering.messages,
                 .steering_waits_for_boundary = steering.waits_for_boundary,

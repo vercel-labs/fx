@@ -674,7 +674,7 @@ pub fn Runtime(comptime App: type) type {
 
             const was_approval_active = agent.approval_prompt.isActive();
             // Every agent's approval comes from its own worker, a subagent's
-            // as main's (D34). A subagent's is labeled with its name, on its
+            // as main's. A subagent's is labeled with its name, on its
             // own screen and when main's screen shows it.
             const in_child = isSubagent(app, agent);
             var pending_request: ?permission_request.PermissionRequest = if (snapshot.pending_permission_request) |*request|
@@ -718,7 +718,7 @@ pub fn Runtime(comptime App: type) type {
                 break :blk agent.approval_prompt.syncReview(review);
             } else false;
             if (approval_changed and in_child and agent.approval_prompt.isActive()) {
-                debug_trace.eventf("procesor", "approval_requested", .{}, "agent={s}", .{subagentIdOf(app, agent).?});
+                debug_trace.eventf("host", "approval_requested", .{}, "agent={s}", .{subagentIdOf(app, agent).?});
             }
             // The approval screen shows the agent on screen, so a hidden
             // agent's change leaves it be.
@@ -938,15 +938,15 @@ pub fn Runtime(comptime App: type) type {
             return activity_status.buildProgressLabel(buf, agent.stream);
         }
 
-        /// Logs a `procesor` trace line for one of main's events. Only a worker
+        /// Logs a `host` trace line for one of main's events. Only a worker
         /// the app named logs anything.
         fn traceMainEvent(app: *App, comptime line: []const u8, event: WorkerEvent, reason: ?[]const u8) void {
             if (comptime !@hasField(@TypeOf(agents.screenAgentOf(app).worker), "trace_agent")) return;
             const agent = agents.screenAgentOf(app).worker.trace_agent orelse return;
             if (reason) |why| {
-                debug_trace.eventf("procesor", line, .{}, "agent={s} kind={s} reason={s}", .{ agent, worker_runtime.traceKind(event), why });
+                debug_trace.eventf("host", line, .{}, "agent={s} kind={s} reason={s}", .{ agent, worker_runtime.traceKind(event), why });
             } else {
-                debug_trace.eventf("procesor", line, .{}, "agent={s} kind={s}", .{ agent, worker_runtime.traceKind(event) });
+                debug_trace.eventf("host", line, .{}, "agent={s} kind={s}", .{ agent, worker_runtime.traceKind(event) });
             }
         }
 

@@ -39,8 +39,7 @@ pub const ScreenSlot = struct {
     pacer: AssistantPacer = .{},
     draft: composer_stash.State = .{},
     /// The agent's fast mode while it is out of context: `App.fast_mode`
-    /// always holds the one of the agent in context, as in a second fx
-    /// (D36).
+    /// always holds the one of the agent in context, as in a second fx.
     fast_mode: bool = false,
 
     pub fn deinit(self: *ScreenSlot, alloc: Allocator) void {
@@ -62,17 +61,16 @@ pub const ChildAgent = struct {
     /// only once none is left.
     bound: std.atomic.Value(u32) = .init(0),
     /// Whether this process has built the agent's notebook from its saved
-    /// conversation (D1). Later turns append to it live (D20).
+    /// conversation. Later turns append to it live.
     view_built: bool = false,
     /// Whether this agent holds its own session, opened on its first run in
-    /// this process and kept until main's session ends (D31).
+    /// this process and kept until main's session ends.
     session_attached: bool = false,
-    /// The host that started it: main's, or its parent subagent's own
-    /// (D32). Its session opens through it, and its own subagents'
+    /// The host that started it: main's, or its parent subagent's own.
+    /// Its session opens through it, and its own subagents'
     /// authority comes from that host's resolver. Written on the main loop
     /// and read by resolvers on other threads, both under main's authority
-    /// lock. Borrowed: that host outlives it (`ChildSession.tla`
-    /// ParentOutlivesChildren).
+    /// lock. Borrowed: that host outlives it.
     parent_host: ?*subagent_tool_host.Runtime = null,
     /// The name its parent gave it, such as `reviewer`, from its first run.
     /// Empty for a one-off. Owned.
@@ -86,7 +84,7 @@ pub const ChildAgent = struct {
     }
 
     /// The footer's name for it on its own screen, marked done while none of
-    /// its turns is going (D10). Valid until the next call; only the main
+    /// its turns is going. Valid until the next call; only the main
     /// loop paints.
     pub fn footerLabel(self: *ChildAgent) []const u8 {
         if (self.workGoing()) return self.displayName();
@@ -206,7 +204,7 @@ fn orderByListing(children: []*ChildAgent, listing: anytype) void {
     }
 }
 
-/// The app `agent` belongs to (D43). A subagent records its app when the app
+/// The app `agent` belongs to. A subagent records its app when the app
 /// creates it; main is the app's `main_agent` field, so it needs no record.
 pub fn appOf(comptime App: type, agent: *@FieldType(App, "main_agent")) *App {
     if (comptime @hasField(@FieldType(App, "main_agent"), "app")) {
@@ -220,12 +218,11 @@ pub fn appOf(comptime App: type, agent: *@FieldType(App, "main_agent")) *App {
 /// k-th later one in launch order.
 const OrderEntry = struct { role: agents.Role, root: usize = 0 };
 
-/// The switch order (D48) over the first instance and `entries`, written to
+/// The switch order over the first instance and `entries`, written to
 /// `out` as positions: 0 for the first instance, k + 1 for `entries[k]`. The
 /// instances come in launch order, each followed by the subagents in its
 /// tree in the order they started. `out.len` is `entries.len + 1`, and every
 /// subagent's root is the first instance or one in `entries`.
-/// `tla/Host.tla` SwitchListOrder.
 fn switchOrder(entries: []const OrderEntry, out: []usize) void {
     std.debug.assert(out.len == entries.len + 1);
     var next: usize = 0;
@@ -296,7 +293,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Handles the work of every hidden agent that has any, each in its
-        /// own context, so it keeps working while another is on screen (D20):
+        /// own context, so it keeps working while another is on screen:
         /// main while a subagent is on screen, and every subagent but the one
         /// on screen. The agent on screen is handled in the loop's own context.
         pub fn tickChildren(
@@ -331,7 +328,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Readies the subagent on screen for a turn the user starts there, as
-        /// main always is (D31): its worker running and its own session
+        /// main always is: its worker running and its own session
         /// attached. While none of its turns is going it gets a run admitted
         /// for the user's turn, so its profile and main's live permissions
         /// limit that turn as they limit main's runs. While one is going, the
@@ -339,18 +336,18 @@ pub fn Runtime(comptime App: type) type {
         /// main. A subagent never runs a turn without a run.
         pub fn prepareOwnTurn(app: *App, agent: *AppAgent) !void {
             const child = app.agent_on_screen orelse return;
-            // An instance takes its own turns as the first one does (D45).
+            // An instance takes its own turns as the first one does.
             if (child.agent.role == .instance) return;
             if (child.agent.worker_thread == null) _ = try ensureChild(app, child.id);
             if (!child.session_attached) try attachSession(app, agent, child);
             if (child.agent.child_run == null or !turnGoing(app, child)) try admitOwnTurn(app, agent, child);
-            debug_trace.eventf("procesor", "input_routed", .{}, "agent={s}", .{child.id});
+            debug_trace.eventf("host", "input_routed", .{}, "agent={s}", .{child.id});
         }
 
         /// Gives `run` the user's earlier requests to the subagent in context,
         /// the verified evidence its permission reviewer weighs with the turn's
         /// own prompt: the turns the user typed, never the ones main sent,
-        /// which carry main's work id (D31). A compacted conversation may have
+        /// which carry main's work id. A compacted conversation may have
         /// dropped some, so its evidence is then incomplete.
         fn setUserRequests(app: *App, agent: *AppAgent, run: *agents.ChildRun) !void {
             var requests: std.ArrayList([]u8) = .empty;
@@ -388,7 +385,7 @@ pub fn Runtime(comptime App: type) type {
             errdefer run.deinit(app.alloc);
             try setUserRequests(app, agent, &run);
             installChildRun(app, child, run);
-            debug_trace.eventf("procesor", "own_turn_admitted", .{}, "agent={s} model={s} permission_mode={s}", .{
+            debug_trace.eventf("host", "own_turn_admitted", .{}, "agent={s} model={s} permission_mode={s}", .{
                 child.id,
                 child.agent.child_run.?.admission.model,
                 @tagName(child.agent.child_run.?.admission.permission_mode),
@@ -397,7 +394,7 @@ pub fn Runtime(comptime App: type) type {
 
         /// While main is on screen with no question or approval showing, a
         /// hidden subagent's question is lent to main's prompt, named for the
-        /// subagent, so it shows on main's screen too (D23). It goes back
+        /// subagent, so it shows on main's screen too. It goes back
         /// before anything but the input that edits it touches it.
         pub fn lendQuestion(app: *App) void {
             if (app.agent_on_screen != null or app.question_lender != null) return;
@@ -408,7 +405,7 @@ pub fn Runtime(comptime App: type) type {
                 std.mem.swap(question_prompt.QuestionPrompt, &app.main_agent.question_prompt, &child.agent.question_prompt);
                 app.main_agent.question_prompt.asker = child.displayName();
                 app.question_lender = child;
-                debug_trace.eventf("procesor", "question_lent", .{}, "agent={s}", .{child.id});
+                debug_trace.eventf("host", "question_lent", .{}, "agent={s}", .{child.id});
                 app.shell.render_requests.request(.modal);
                 return;
             }
@@ -451,7 +448,7 @@ pub fn Runtime(comptime App: type) type {
 
         /// While main is on screen with no approval or question showing, a
         /// hidden subagent's approval is lent to main's prompt, so it shows on
-        /// main's screen too (D18, D34). Its request comes from its own
+        /// main's screen too. Its request comes from its own
         /// worker and stays labeled with its name. It goes back when the
         /// subagent is shown, main gets its own, or the subagent stops
         /// waiting (`keepLentApproval`). A rule a subagent's
@@ -465,7 +462,7 @@ pub fn Runtime(comptime App: type) type {
                 if (!prompt.isActive() or prompt.rule_management != null) continue;
                 std.mem.swap(@TypeOf(child.agent.approval_prompt), &app.main_agent.approval_prompt, prompt);
                 app.approval_lender = child;
-                debug_trace.eventf("procesor", "approval_lent", .{}, "agent={s}", .{child.id});
+                debug_trace.eventf("host", "approval_lent", .{}, "agent={s}", .{child.id});
                 app.shell.render_requests.request(.modal);
                 return;
             }
@@ -525,14 +522,14 @@ pub fn Runtime(comptime App: type) type {
         /// subagents main's session started before a restart first.
         pub fn canSwitch(app: *App) bool {
             syncChildList(app) catch |err| {
-                debug_trace.logf("procesor", "child list sync failed err={s}", .{@errorName(err)});
+                debug_trace.logf("host", "child list sync failed err={s}", .{@errorName(err)});
             };
             return app.child_agents.items.len > 0;
         }
 
         /// Puts every subagent in the subagent host's registry in the switch
         /// list, in the order they started, so a subagent from before a
-        /// restart can be shown too (D10, D12). One added here starts its
+        /// restart can be shown too. One added here starts its
         /// worker on its first run.
         fn syncChildList(app: *App) !void {
             const host = app_session_runtime.Runtime(App).subagentHost(app) orelse return;
@@ -546,9 +543,8 @@ pub fn Runtime(comptime App: type) type {
             orderByListing(app.child_agents.items, listing);
         }
 
-        /// Puts the next or previous agent on screen (D9). The list is main,
-        /// then the subagents in the order they started, wrapping at both ends
-        /// (D12), as `Procesor.tla` `SwitchWalksOrder` checks.
+        /// Puts the next or previous agent on screen. The list is main,
+        /// then the subagents in the order they started, wrapping at both ends.
         pub fn switchAgent(app: *App, direction: input_action.SwitchDirection) !void {
             var list: std.ArrayList(?*ChildAgent) = .empty;
             defer list.deinit(app.alloc);
@@ -565,11 +561,10 @@ pub fn Runtime(comptime App: type) type {
             try show(app, list.items[target]);
         }
 
-        /// The order Alt+←/→ walks (D48): the instances in launch order,
+        /// The order Alt+←/→ walks: the instances in launch order,
         /// the first one as null, each followed by the subagents in its tree
         /// in the order they started. With one instance this is main, then
         /// every subagent in start order, as before instances existed.
-        /// `tla/Host.tla` SwitchListOrder.
         pub fn switchList(app: *App, out: *std.ArrayList(?*ChildAgent)) !void {
             const hosted = app.child_agents.items;
             const entries = try app.alloc.alloc(OrderEntry, hosted.len);
@@ -588,15 +583,14 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        /// Whether the first instance, kept in `main_agent`, still runs
-        /// (D57).
+        /// Whether the first instance, kept in `main_agent`, still runs.
         pub fn firstOpen(app: anytype) bool {
             if (comptime !@hasField(App, "instances")) return true;
             return app.instances.first_open;
         }
 
         /// The first instance still open: `main_agent` until it closes, then
-        /// the earliest launched one still running (D57). Everything that
+        /// the earliest launched one still running. Everything that
         /// means "the first instance" asks here. Null only once every
         /// instance has closed, while the host ends.
         pub fn firstInstance(app: anytype) ?*AppAgent {
@@ -627,7 +621,7 @@ pub fn Runtime(comptime App: type) type {
 
         /// The footer's name for the agent on screen: a subagent's own label,
         /// or an instance's place among the instances while there are
-        /// several, the first one included (D45). Empty for a single
+        /// several, the first one included. Empty for a single
         /// instance, as before instances existed. Valid until the next call.
         pub fn footerLabelOnScreen(app: *App) []const u8 {
             if (app.agent_on_screen) |child| if (child.agent.role == .subagent) return child.footerLabel();
@@ -645,7 +639,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// The instance whose tree subagent `child` is in: the one that
-        /// started it, or started the subagent that did (D46).
+        /// started it, or started the subagent that did.
         pub fn rootInstance(app: *App, child: *const ChildAgent) *AppAgent {
             var current = child;
             while (true) {
@@ -673,15 +667,15 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// A subagent's approval or question is lent to main's screen only
-        /// when main's tree holds it: an instance's are its own (D45), and a
+        /// when main's tree holds it: an instance's are its own, and a
         /// subagent of another instance belongs to that instance.
         fn lendsToMain(app: *App, child: *const ChildAgent) bool {
             return child.agent.role == .subagent and rootInstance(app, child) == &app.main_agent;
         }
 
         /// Puts `target`, or main when null, on screen, then clears the
-        /// terminal and redraws the arriving agent's conversation from the top
-        /// (D22). Neither agent's work stops (`Procesor.tla` `SwitchKeepsWork`).
+        /// terminal and redraws the arriving agent's conversation from the top.
+        /// Neither agent's work stops.
         pub fn show(app: *App, target: ?*ChildAgent) !void {
             const from = app.agent_on_screen;
             if (from == target) return;
@@ -689,26 +683,26 @@ pub fn Runtime(comptime App: type) type {
             if (target) |child| {
                 if (!child.view_built) buildSavedView(app, agents.screenAgentOf(app), child);
                 // Its own session, so what changes on its screen, such as its
-                // model, is saved to it, as in a second fx (D31). Its worker
-                // still starts with its first message (D30).
+                // model, is saved to it, as in a second fx. Its worker
+                // still starts with its first message.
                 if (!child.session_attached) attachSession(app, agents.screenAgentOf(app), child) catch |err| {
-                    debug_trace.logf("procesor", "session not opened on show agent={s} err={s}", .{ child.id, @errorName(err) });
+                    debug_trace.logf("host", "session not opened on show agent={s} err={s}", .{ child.id, @errorName(err) });
                 };
             }
-            debug_trace.eventf("procesor", "agent_switched", .{}, "agent={s} from={s}", .{ nameOf(target), nameOf(from) });
+            debug_trace.eventf("host", "agent_switched", .{}, "agent={s} from={s}", .{ nameOf(target), nameOf(from) });
             try app.shell.requestTerminalReset(&app.metrics);
             app.shell.render_requests.request(.footer);
-            debug_trace.eventf("procesor", "screen_reprinted", .{}, "agent={s} entries={d}", .{
+            debug_trace.eventf("host", "screen_reprinted", .{}, "agent={s} entries={d}", .{
                 nameOf(target),
                 app.shell.notebook.entries.items.len,
             });
         }
 
         /// Builds the view of a subagent shown before it has run in this
-        /// process from its saved conversation (D1). Runs with it on screen.
+        /// process from its saved conversation. Runs with it on screen.
         /// The first view of the subagent in context, as a second fx would
         /// open it: its saved conversation, as on resume, or fx's welcome when
-        /// it has none yet, as on a fresh start (D31).
+        /// it has none yet, as on a fresh start.
         fn buildView(app: *App, agent: *AppAgent, history: []const types.HistoryTurn) !void {
             if (history.len > 0) return app_session_runtime.Runtime(App).rebuildChildView(app, agent, history);
             const welcome = try ui_render.welcomeMessage(app.alloc);
@@ -723,21 +717,21 @@ pub fn Runtime(comptime App: type) type {
             // the host that started it.
             if (child.agent.role == .instance) {
                 buildView(app, agent, child.agent.session.agent.history.items) catch |err| {
-                    debug_trace.logf("procesor", "instance view failed agent={s} err={s}", .{ child.id, @errorName(err) });
+                    debug_trace.logf("host", "instance view failed agent={s} err={s}", .{ child.id, @errorName(err) });
                 };
                 return;
             }
             const host = hostOf(app, child) orelse return;
             const history = host.childHistory(app.alloc, child.id) catch |err| {
-                debug_trace.logf("procesor", "saved view unavailable agent={s} err={s}", .{ child.id, @errorName(err) });
+                debug_trace.logf("host", "saved view unavailable agent={s} err={s}", .{ child.id, @errorName(err) });
                 return;
             };
             defer types.freeHistoryTurnSlice(app.alloc, history);
             buildView(app, agent, history) catch |err| {
-                debug_trace.logf("procesor", "saved view failed agent={s} err={s}", .{ child.id, @errorName(err) });
+                debug_trace.logf("host", "saved view failed agent={s} err={s}", .{ child.id, @errorName(err) });
                 return;
             };
-            debug_trace.eventf("procesor", "agent_view_rebuilt", .{}, "agent={s} turns={d}", .{ child.id, history.len });
+            debug_trace.eventf("host", "agent_view_rebuilt", .{}, "agent={s} turns={d}", .{ child.id, history.len });
         }
 
         /// Moves the composer's draft and the screen's transcript and paced
@@ -784,8 +778,7 @@ pub fn Runtime(comptime App: type) type {
         /// saved, its session closes, and its state is freed. Runs before main's
         /// persistence closes, because a child borrows main's session store.
         /// The list is in start order, so walking it backwards closes each
-        /// subagent's own subagents before it (`ChildSession.tla`
-        /// ParentOutlivesChildren).
+        /// subagent's own subagents before it.
         pub fn shutdownChildren(app: *App) void {
             attach(app, null);
             closeMailbox(app);
@@ -857,11 +850,11 @@ pub fn Runtime(comptime App: type) type {
                 // replaces the child's installed run, which that turn reads.
                 if (post.run != null) if (findChild(app, post.turn.child_id orelse "")) |child| if (turnGoing(app, child)) {
                     held.append(mailbox_alloc, post) catch {
-                        debug_trace.eventf("procesor", "child_handoff_failed", .{}, "agent={s} kind=run reason=OutOfMemory", .{child.id});
+                        debug_trace.eventf("host", "child_handoff_failed", .{}, "agent={s} kind=run reason=OutOfMemory", .{child.id});
                         post.state.store(.failed, .release);
                         continue;
                     };
-                    if (!post.held) debug_trace.eventf("procesor", "child_run_held", .{}, "agent={s} reason=turn_going", .{child.id});
+                    if (!post.held) debug_trace.eventf("host", "child_run_held", .{}, "agent={s} reason=turn_going", .{child.id});
                     post.held = true;
                     continue;
                 };
@@ -870,7 +863,7 @@ pub fn Runtime(comptime App: type) type {
                 if (taken) |_| {
                     post.state.store(.taken, .release);
                 } else |err| {
-                    debug_trace.eventf("procesor", "child_handoff_failed", .{}, "agent={s} kind={s} reason={s}", .{ post.turn.child_id orelse "", kind, @errorName(err) });
+                    debug_trace.eventf("host", "child_handoff_failed", .{}, "agent={s} kind={s} reason={s}", .{ post.turn.child_id orelse "", kind, @errorName(err) });
                     post.state.store(.failed, .release);
                 }
             }
@@ -886,7 +879,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Records the host that started `child`: main's, or its parent
-        /// subagent's own (D32). Resolvers on other threads read it under
+        /// subagent's own. Resolvers on other threads read it under
         /// main's authority lock.
         fn setParentHost(app: *App, child: *ChildAgent, host: *subagent_tool_host.Runtime) void {
             app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
@@ -906,7 +899,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// The host that started `child`, where its session and history
-        /// are: main's unless a subagent of main's started it (D32).
+        /// are: main's unless a subagent of main's started it.
         fn hostOf(app: *App, child: *const ChildAgent) ?*subagent_tool_host.Runtime {
             return child.parent_host orelse app_session_runtime.Runtime(App).subagentHost(app);
         }
@@ -938,15 +931,14 @@ pub fn Runtime(comptime App: type) type {
                 finishRun(&child.agent.child_run.?, .failed);
                 return err;
             };
-            debug_trace.eventf("procesor", "child_run_started", .{}, "agent={s} work_id={s}", .{ child.id, child.agent.child_run.?.work_id });
+            debug_trace.eventf("host", "child_run_started", .{}, "agent={s} work_id={s}", .{ child.id, child.agent.child_run.?.work_id });
         }
 
         const Start = struct { post: *Post, child: *ChildAgent };
 
         /// Opens the child's session, with the same recovery as a run's
         /// open, and attaches it to the child's agent in context, which saves
-        /// every later turn through it as main does (D31).
-        /// `tla/ChildSession.tla` SingleWriter.
+        /// every later turn through it as main does.
         fn attachSession(app: *App, agent: *AppAgent, child: *ChildAgent) !void {
             // A cooperative host starts no subagents (`startAgentWorkerThread`).
             if (comptime app_process_runtime.cooperativeHost(App)) return error.SubagentHostUnavailable;
@@ -954,22 +946,22 @@ pub fn Runtime(comptime App: type) type {
             const session = try host.openChildSession(child.id);
             try app_session_runtime.Runtime(App).attachChildV2Session(app, agent, session);
             child.session_attached = true;
-            debug_trace.eventf("procesor", "child_session_opened", .{}, "agent={s} turns={d}", .{ child.id, agent.session.agent.history.items.len });
+            debug_trace.eventf("host", "child_session_opened", .{}, "agent={s} turns={d}", .{ child.id, agent.session.agent.history.items.len });
         }
 
         fn startInContext(start: Start, app: *App, agent: *agents.Agent) anyerror!void {
             const post = start.post;
             if (!start.child.session_attached) try attachSession(app, agent, start.child);
-            // The child's own session holds its conversation (D31). The first
-            // run in this process shows it, after a restart too (D1).
+            // The child's own session holds its conversation. The first
+            // run in this process shows it, after a restart too.
             if (!start.child.view_built) {
                 const history = agent.session.agent.history.items;
                 try buildView(app, agent, history);
                 start.child.view_built = true;
-                debug_trace.eventf("procesor", "agent_view_rebuilt", .{}, "agent={s} turns={d}", .{ start.child.id, history.len });
+                debug_trace.eventf("host", "agent_view_rebuilt", .{}, "agent={s} turns={d}", .{ start.child.id, history.len });
             }
             // The worker writes the message's card when its turn begins. The
-            // turn carries main's work id, so it is saved with it (D31).
+            // turn carries main's work id, so it is saved with it.
             agent.prompt_work_id = start.child.agent.child_run.?.work_id;
             defer agent.prompt_work_id = null;
             if (!try app.enqueuePrompt(agent, post.message)) return error.PromptNotAdmitted;
@@ -980,7 +972,7 @@ pub fn Runtime(comptime App: type) type {
             const child = findChild(app, id) orelse try addChild(app, id);
             if (child.agent.worker_thread == null) {
                 try app_process_runtime.Runtime(App).startAgentWorkerThread(app, &child.agent);
-                debug_trace.eventf("procesor", "agent_started", .{}, "agent={s}", .{id});
+                debug_trace.eventf("host", "agent_started", .{}, "agent={s}", .{id});
             }
             return child;
         }
@@ -993,14 +985,14 @@ pub fn Runtime(comptime App: type) type {
             child.* = .{ .id = try app.alloc.dupe(u8, id), .agent = .{ .app = @ptrCast(app), .role = .subagent } };
             errdefer app.alloc.free(child.id);
             {
-                // Resolvers on other threads read the list (D31).
+                // Resolvers on other threads read the list.
                 app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
                 defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
                 try app.child_agents.append(app.alloc, child);
             }
             // Registered here, with main as its parent, rather than by its
             // worker's first event.
-            debug_trace.eventf("procesor", "agent_registered", .{}, "agent={s} parent=main", .{child.id});
+            debug_trace.eventf("host", "agent_registered", .{}, "agent={s} parent=main", .{child.id});
             child.agent.worker.trace_agent = child.id;
             child.agent.worker.trace_registered = true;
             child.agent.worker.hands_back_leftover_feedback = true;
@@ -1008,7 +1000,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Adds a new top-level instance, last among the hosted agents, with a
-        /// placeholder id until its session names it (D45).
+        /// placeholder id until its session names it.
         pub fn addInstance(app: *App) !*ChildAgent {
             const child = try app.alloc.create(ChildAgent);
             errdefer app.alloc.destroy(child);
@@ -1028,15 +1020,15 @@ pub fn Runtime(comptime App: type) type {
             child.id = id;
             child.agent.worker.trace_agent = child.id;
             child.agent.worker.trace_registered = true;
-            debug_trace.eventf("procesor", "agent_registered", .{}, "agent={s} parent=host", .{child.id});
+            debug_trace.eventf("host", "agent_registered", .{}, "agent={s} parent=host", .{child.id});
         }
 
         /// Closes instance `child` and every subagent in its tree: their
         /// workers stop, a run in flight ends cancelled, and their sessions
         /// are saved and closed, each subagent's before the agent that started
-        /// it (`tla/ChildSession.tla` ParentOutlivesChildren). When one of
+        /// it. When one of
         /// them is on screen, the next instance is shown first. The rest of
-        /// the host keeps running (`tla/Host.tla` Close).
+        /// the host keeps running.
         pub fn closeInstance(app: *App, child: *ChildAgent) !void {
             try closeTree(app, &child.agent, child, nextInstanceAfter(app, child), child.id);
             dropHosted(app, child);
@@ -1045,7 +1037,7 @@ pub fn Runtime(comptime App: type) type {
         /// Closes the first instance and every subagent in its tree, as
         /// `closeInstance` closes a launched one. The next instance in launch
         /// order takes over, the host keeps running, and the first's slot
-        /// stays closed (D52, D57, `tla/Host.tla` Close). Call only while
+        /// stays closed. Call only while
         /// another instance runs.
         pub fn closeFirstInstance(app: *App) !void {
             const next = instanceAfterFirst(app) orelse return error.LastInstance;
@@ -1062,7 +1054,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Moves a resume request made on a subagent's screen to the instance
-        /// whose tree holds it, whose session is the one to resume (D57).
+        /// whose tree holds it, whose session is the one to resume.
         pub fn liftResumeIntent(app: *App) void {
             for (app.child_agents.items) |child| {
                 if (child.agent.role != .subagent) continue;
@@ -1076,7 +1068,7 @@ pub fn Runtime(comptime App: type) type {
         /// Shows `next` when instance `root`, which `hosted` holds or null for
         /// the first, or a subagent of its tree is on screen, then stops and
         /// drops every subagent in the tree, each before the agent that
-        /// started it (`tla/ChildSession.tla` ParentOutlivesChildren). The
+        /// started it. The
         /// instance's own turn is cancelled; its teardown is the caller's.
         fn closeTree(app: *App, root: *AppAgent, hosted: ?*ChildAgent, next: ?*ChildAgent, label: []const u8) !void {
             var tree: std.ArrayList(*ChildAgent) = .empty;
@@ -1105,7 +1097,7 @@ pub fn Runtime(comptime App: type) type {
                 if (entry.agent.child_run) |*run| finishRun(run, .cancelled);
             }
             root.worker.requestCancel();
-            debug_trace.eventf("procesor", "instance_closed", .{}, "agent={s} subagents={d}", .{ label, tree.items.len });
+            debug_trace.eventf("host", "instance_closed", .{}, "agent={s} subagents={d}", .{ label, tree.items.len });
             var index = tree.items.len;
             while (index > 0) {
                 index -= 1;
@@ -1170,22 +1162,21 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Ends the run once its turn is saved. The child's own agent saves
-        /// every turn to its own session, as main does (D31), so this runs
+        /// every turn to its own session, as main does, so this runs
         /// after the save, on the main loop in the child's context. Only the
         /// turn carrying the run's work id ends it: the parent finds its
         /// answer by that id, and a turn the user started carries none.
-        /// `tla/ChildSession.tla` TakenFindsTurn.
         pub fn commitChildTurn(_: *App, agent: *AppAgent, finished: types.FinishedPrompt) void {
             if (comptime !@hasField(App, "screen_owner")) return;
             if (agent.role != .subagent) return;
             // A subagent never runs a turn without a run installed.
             const run = if (agent.child_run) |*value| value else return;
             const saved_work = session_mod.historyTurnWorkId(finished.turn);
-            debug_trace.eventf("procesor", "child_turn_saved", .{}, "agent={s} work_id={s}", .{ run.child_id, saved_work orelse "none" });
+            debug_trace.eventf("host", "child_turn_saved", .{}, "agent={s} work_id={s}", .{ run.child_id, saved_work orelse "none" });
             if (!run.inFlight()) return;
             if (!std.mem.eql(u8, saved_work orelse return, run.work_id)) return;
             const outcome = finished.terminal_outcome orelse .completed;
-            debug_trace.eventf("procesor", "child_turn_committed", .{}, "agent={s} work_id={s} outcome={s}", .{ run.child_id, run.work_id, @tagName(outcome) });
+            debug_trace.eventf("host", "child_turn_committed", .{}, "agent={s} work_id={s} outcome={s}", .{ run.child_id, run.work_id, @tagName(outcome) });
             endRun(run, outcome);
         }
 
@@ -1221,7 +1212,7 @@ pub fn Runtime(comptime App: type) type {
         /// Ends `run` and releases its slot thread, tracing how it ended.
         fn finishRun(run: *agents.ChildRun, outcome: agents.ChildRunCompletion.Outcome) void {
             if (!run.inFlight()) return;
-            debug_trace.eventf("procesor", "child_run_ended", .{}, "agent={s} work_id={s} outcome={s}", .{ run.child_id, run.work_id, @tagName(outcome) });
+            debug_trace.eventf("host", "child_run_ended", .{}, "agent={s} work_id={s} outcome={s}", .{ run.child_id, run.work_id, @tagName(outcome) });
             run.finish(outcome);
         }
 
@@ -1249,7 +1240,7 @@ pub fn Runtime(comptime App: type) type {
             if (child.agent.child_run) |*previous| previous.deinit(app.alloc);
             var settings = (firstInstance(app) orelse &app.main_agent).worker.agent_turn_settings;
             settings.effort = run.admission.effort;
-            // Its own fast mode, not main's (D36).
+            // Its own fast mode, not main's.
             settings.fast_mode = child.agent.worker.agent_turn_settings.fast_mode;
             settings.ultrafast_mode = settings.ultrafast_mode and run.admission.ultrafast_mode;
             child.agent.worker.agent_turn_settings = settings;
@@ -1261,7 +1252,7 @@ pub fn Runtime(comptime App: type) type {
 
         /// Saves and closes `agent`'s session. When the user quit from this
         /// instance's screen, keeps the resume command it makes for the exit
-        /// to print (D57).
+        /// to print.
         fn finalizeInstancePersistence(app: *App, agent: *agents.Agent) void {
             const Session = app_session_runtime.Runtime(App);
             if (comptime @hasField(App, "instances")) {
@@ -1382,8 +1373,8 @@ test "the switch list follows the registry's start order, with an unlisted agent
     try std.testing.expectEqualDeep([4][]const u8{ "first", "second", "new", "stray" }, order);
 }
 
-/// Checks what `tla/Host.tla` SwitchListOrder asks of `order` over
-/// `entries`: every agent once, the first instance first, the instances in
+/// Checks the switch order `order` over `entries`: every agent once, the
+/// first instance first, the instances in
 /// launch order, and each subagent in its own instance's group, after the
 /// ones of that group that started before it.
 fn expectSwitchOrder(entries: []const OrderEntry, order: []const usize) !void {

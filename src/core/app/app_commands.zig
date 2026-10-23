@@ -446,8 +446,7 @@ pub fn Handlers(comptime App: type) type {
         }
 
         /// `/launch [profile]` starts another instance on the host with a
-        /// fresh session, in `profile` or the launch profile, and shows it
-        /// (D47).
+        /// fresh session, in `profile` or the launch profile, and shows it.
         fn commandLaunchInstance(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime !@hasDecl(App, "launchInstance")) return;
@@ -456,7 +455,7 @@ pub fn Handlers(comptime App: type) type {
         }
 
         /// `/close` closes the instance on screen; closing the last one ends
-        /// fx (D50).
+        /// fx.
         fn commandCloseInstance(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime !@hasDecl(App, "closeInstanceOnScreen")) return;

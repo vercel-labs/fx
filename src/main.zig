@@ -576,26 +576,26 @@ const App = struct {
     /// The agent the main loop is working for. Null means main, so `App` can
     /// move by value before the loop starts; a visit to main while a
     /// subagent is on screen points it at `main_agent`. Read only through
-    /// `screenAgent` (D43).
+    /// `screenAgent`.
     screen_owner: ?*agents.Agent = null,
     /// Every agent the app runs besides the first instance: the other
     /// instances, in launch order, and the subagents, in the order they
-    /// started, each marked by its role (D45, D46). Owned by
+    /// started, each marked by its role. Owned by
     /// `app_agents_runtime`.
     child_agents: std.ArrayList(*app_agents_runtime.ChildAgent) = .empty,
     /// What every instance starts from, and how many startup opens. Owned
     /// by `app_instances_runtime`.
     instances: app_instances_runtime.State = .{},
-    /// The subagent on screen, or null while main is (D9). Owned by
+    /// The subagent on screen, or null while main is. Owned by
     /// `app_agents_runtime.zig`, which moves screens between agents.
     agent_on_screen: ?*app_agents_runtime.ChildAgent = null,
     /// Main's transcript, paced text, and draft while a subagent is on screen.
     main_screen: app_agents_runtime.ScreenSlot = .{},
     /// The subagent whose question main's prompt holds, while main is on
-    /// screen (D23). Owned by `app_agents_runtime.zig`.
+    /// screen. Owned by `app_agents_runtime.zig`.
     question_lender: ?*app_agents_runtime.ChildAgent = null,
     /// The subagent whose approval main's prompt holds, while main is on
-    /// screen (D18, D34). Owned by `app_agents_runtime.zig`.
+    /// screen. Owned by `app_agents_runtime.zig`.
     approval_lender: ?*app_agents_runtime.ChildAgent = null,
     /// Runs the subagent host hands to child agents. Owned by
     /// `app_agents_runtime`.
@@ -723,7 +723,7 @@ const App = struct {
         errdefer app.deinit();
         if (launch.modifiers.profile_name != null) try ProfileAppRuntime.applyLaunchMode(&app);
         // The first instance is launched; startup opens the rest once the
-        // app has its final address (D47).
+        // app has its final address.
         try app.instances.seed.captureProfile(alloc, launch.modifiers.profile_name);
         app.instances.launched = 1;
         app.instances.startup_count = launch.modifiers.instances orelse app_instances_runtime.testHookCount();
@@ -760,7 +760,7 @@ const App = struct {
                     launch.resume_refusal = SessionAppRuntime.conversionRefusal(&app.main_agent, alloc, err);
                     return err;
                 };
-                // Resuming brings the session's whole host back (D49, D58):
+                // Resuming brings the session's whole host back:
                 // with the startup instances, or once the picker has chosen.
                 if (picks) app.instances.restore_on_pick = true else app.instances.restore_pending = true;
                 SessionAppRuntime.syncTerminalTitle(&app, &app.main_agent);
@@ -912,7 +912,7 @@ const App = struct {
     pub fn shutdownForProcessExit(self: *App) app_session_runtime.ShutdownOutcome {
         // Shutdown is main's own; its subagents stop in stopChildren and
         // shutdownChildren. Main is named here, not found as the agent on
-        // screen, so quitting from a subagent's screen stops main (D43).
+        // screen, so quitting from a subagent's screen stops main.
         const main_agent = &self.main_agent;
         var shutdown_trace = app_lifecycle.ShutdownStageTrace.init();
         // Failed startups (no TTY, too small) never earn a shutdown report.
@@ -950,12 +950,12 @@ const App = struct {
         self.usage_dashboard.deinit();
         InputSubmitRuntime.clearPendingSubmission(self, main_agent, "shutdown");
         InputSubmitRuntime.discardLaunchPrompt(self, "shutdown");
-        // Quitting from a subagent's screen resumes its instance (D57).
+        // Quitting from a subagent's screen resumes its instance.
         AgentsAppRuntime.liftResumeIntent(self);
         // Children close first: they borrow main's session store.
         AgentsAppRuntime.shutdownChildren(self);
         // The resume command is the first instance's, or the launched
-        // instance's the user quit from, which its teardown kept (D57).
+        // instance's the user quit from, which its teardown kept.
         const resume_handoff = SessionAppRuntime.finalizePersistenceWithResumeHandoff(self, main_agent) orelse
             self.instances.takeExitHandoff();
         const shutdown_failure = main_agent.session_persistence.shutdown_failure;
@@ -998,7 +998,7 @@ const App = struct {
     pub fn deinit(self: *App) void {
         // Shutdown is main's own; its subagents stop in stopChildren and
         // shutdownChildren. Main is named here, not found as the agent on
-        // screen, so quitting from a subagent's screen stops main (D43).
+        // screen, so quitting from a subagent's screen stops main.
         const main_agent = &self.main_agent;
         var shutdown_trace = app_lifecycle.ShutdownStageTrace.init();
         // Only real interactive sessions earn a shutdown report; failed
@@ -1481,8 +1481,8 @@ const App = struct {
     }
 
     pub fn resumeSelectedSession(self: *App, agent: *agents.Agent) !bool {
-        // The startup picker resumes a whole host (D58); an in-app
-        // `/resume` brings back only the session chosen (D53).
+        // The startup picker resumes a whole host; an in-app
+        // `/resume` brings back only the session chosen.
         const startup_pick = self.instances.restore_on_pick and agent == &self.main_agent and
             SessionAppRuntime.activeSessionId(agent) == null;
         if (agent == &self.main_agent) self.instances.restore_on_pick = false;
@@ -2057,8 +2057,7 @@ const App = struct {
         return completion;
     }
 
-    /// Records an "always" approval from `agent`'s turn on its instance
-    /// (D56).
+    /// Records an "always" approval from `agent`'s turn on its instance.
     pub fn allowToolForSession(self: *App, agent: *agents.Agent, tool_name: []const u8, target_path: []const u8) !void {
         try app_permission_runtime.Runtime(App).allowForSession(self, agent, tool_name, target_path);
     }
@@ -2257,12 +2256,12 @@ const App = struct {
     }
 
     /// The capabilities of `model` under the screen's provider, for main-loop
-    /// screen code (D43).
+    /// screen code.
     pub fn resolvedModelCapabilities(self: *App, model: []const u8) model_capabilities.Capabilities {
         return self.resolvedModelCapabilitiesOf(self.screenAgent(), model);
     }
 
-    /// The capabilities of `model` under `agent`'s provider (D31).
+    /// The capabilities of `model` under `agent`'s provider.
     pub fn resolvedModelCapabilitiesOf(self: *App, agent: *agents.Agent, model: []const u8) model_capabilities.Capabilities {
         const bundle = self.providerSet().select(provider_runtime.providerOf(self, agent));
         return model_capabilities.mergeCapabilities(
@@ -3225,16 +3224,16 @@ const App = struct {
     }
 
     /// Readies the subagent on screen, if any, for a turn the user starts
-    /// there, which then runs as main's does (D31).
+    /// there, which then runs as main's does.
     pub fn prepareSubagentOnScreen(self: *App, agent: *agents.Agent) !void {
         return AgentsAppRuntime.prepareOwnTurn(self, agent);
     }
 
-    /// Launches another instance on the host and shows it (D47). A failure
+    /// Launches another instance on the host and shows it. A failure
     /// leaves the host as it was and says why.
     pub fn launchInstance(self: *App, profile_name: ?[]const u8) !void {
         const child = InstancesAppRuntime.launch(self, profile_name) catch |err| {
-            debug_trace.logf("procesor", "instance launch failed profile={s} err={s}", .{ profile_name orelse "default", @errorName(err) });
+            debug_trace.logf("host", "instance launch failed profile={s} err={s}", .{ profile_name orelse "default", @errorName(err) });
             var body_buf: [200]u8 = undefined;
             const body = std.mem.print(&body_buf, "Couldn't start another fx instance: {s}.", .{@errorName(err)}) catch "Couldn't start another fx instance.";
             try self.writeDomainNotice(.{ .topic = "instances", .tone = .@"error", .body = body }, true);
@@ -3244,8 +3243,8 @@ const App = struct {
     }
 
     /// Opens the instances startup was asked for after the first one: the
-    /// resumed session's group first (D58), then fresh ones up to
-    /// `--instances` or the test hook (D47). The first stays on screen.
+    /// resumed session's group first, then fresh ones up to
+    /// `--instances` or the test hook. The first stays on screen.
     pub fn launchStartupInstances(self: *App) void {
         if (self.instances.restore_pending) {
             self.instances.restore_pending = false;
@@ -3253,7 +3252,7 @@ const App = struct {
         }
         while (self.instances.launched < self.instances.startup_count) {
             _ = InstancesAppRuntime.launch(self, null) catch |err| {
-                debug_trace.logf("procesor", "startup instance launch failed index={d} err={s}", .{ self.instances.launched, @errorName(err) });
+                debug_trace.logf("host", "startup instance launch failed index={d} err={s}", .{ self.instances.launched, @errorName(err) });
                 return;
             };
         }
@@ -3261,7 +3260,7 @@ const App = struct {
 
     /// `/close`: closes the instance on screen and every subagent in its
     /// tree. The next instance takes over and the host keeps running, the
-    /// first instance included (D52, D57). Closing the only open instance
+    /// first instance included. Closing the only open instance
     /// ends the host, as `/exit` does.
     pub fn closeInstanceOnScreen(self: *App) !void {
         if (self.agent_on_screen) |child| if (child.agent.role == .subagent) {
@@ -3280,7 +3279,7 @@ const App = struct {
         try AgentsAppRuntime.closeFirstInstance(self);
     }
 
-    /// Applies profile `name` to instance `agent` (D45).
+    /// Applies profile `name` to instance `agent`.
     pub fn applyInstanceProfile(self: *App, agent: *agents.Agent, name: []const u8) !void {
         if (comptime host_profile.tools) {
             try ProfileAppRuntime.applyProfile(self, agent, name, builtin_context.prompt_policy.system_prompt, builtin_tools.advertisement_set);
@@ -3293,7 +3292,7 @@ const App = struct {
         return ProfileAppRuntime.profileMode(agent, "instance", parent);
     }
 
-    /// The footer's name for the agent on screen (D45).
+    /// The footer's name for the agent on screen.
     pub fn footerAgentLabel(self: *App) []const u8 {
         return AgentsAppRuntime.footerLabelOnScreen(self);
     }
@@ -3319,7 +3318,7 @@ const App = struct {
     }
 
     /// Whether `agent` keeps its approval prompt this pass,
-    /// because an approval is lent between main and a subagent (D34).
+    /// because an approval is lent between main and a subagent.
     pub fn keepLentApproval(self: *App, agent: *agents.Agent, pending: ?permission_request.PermissionRequest) bool {
         return AgentsAppRuntime.keepLentApproval(self, agent, pending);
     }
@@ -3343,7 +3342,7 @@ const App = struct {
     }
 
     /// The footer note for a hidden agent waiting on an answer, such as
-    /// "reviewer needs approval · Alt+→" (D11), or empty. fx never switches
+    /// "reviewer needs approval · Alt+→", or empty. fx never switches
     /// on its own. `buf` backs the returned text.
     pub fn hiddenAgentWaitingNote(self: *App, buf: []u8) []const u8 {
         var first: ?[]const u8 = null;
@@ -5472,7 +5471,7 @@ test "switching agents walks main then the subagents in start order, keeping eac
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try app.input_runtime.edit_state.setText(alloc, "first draft");
 
-    // On to the second, then back to main, wrapping at the end (D12).
+    // On to the second, then back to main, wrapping at the end.
     try App.AgentsAppRuntime.switchAgent(&app, .next);
     try std.testing.expect(app.agent_on_screen == second);
     try std.testing.expectEqualStrings("first draft", first.screen.draft.edit.input.items);
@@ -5549,7 +5548,7 @@ test "the footer notes a hidden agent waiting on an approval, never the one on s
 
     _ = try writer.agent.approval_prompt.syncRequest(alloc, .{ .label = "write" });
     try std.testing.expectEqualStrings("writer needs approval · Alt+→", app.hiddenAgentWaitingNote(&buf));
-    // A subagent's request that main shows too is not main waiting (D18).
+    // A subagent's request that main shows too is not main waiting.
     _ = try app.main_agent.approval_prompt.syncRequest(alloc, .{ .label = "write", .origin = .{ .subagent = "writer" } });
     try std.testing.expectEqualStrings("writer needs approval · Alt+→", app.hiddenAgentWaitingNote(&buf));
 
@@ -5580,7 +5579,7 @@ test "a hidden subagent's approval is lent to main's screen, answered on its wor
     _ = try writer.agent.approval_prompt.syncRequest(alloc, request);
 
     // Main is on screen with nothing of its own: it shows the subagent's
-    // approval, and an answer there goes to the subagent's worker (D34).
+    // approval, and an answer there goes to the subagent's worker.
     App.AgentsAppRuntime.lendApproval(&app);
     try std.testing.expect(app.approval_lender == writer);
     try std.testing.expect(app.main_agent.approval_prompt.isActive());
@@ -5642,7 +5641,7 @@ test "a hidden subagent's question is lent to main's screen and goes back on a s
     try asker.agent.question_prompt.syncFrom(alloc, &entries);
 
     // Main is on screen with no question of its own: it shows the subagent's,
-    // named for it, and the subagent no longer holds it (D23).
+    // named for it, and the subagent no longer holds it.
     App.AgentsAppRuntime.lendQuestion(&app);
     try std.testing.expect(app.question_lender == asker);
     try std.testing.expect(app.main_agent.question_prompt.isActive());
@@ -5855,7 +5854,7 @@ test "a subagent's tools work under its admission, with no subagent host" {
     };
     try App.AgentsAppRuntime.visit(&app, child, &child.agent.child_run.?.admission, Check.run);
 
-    // The first instance's own tool context follows its own mode (D56).
+    // The first instance's own tool context follows its own mode.
     const main_ctx = App.AgentAppRuntime.toolContext(&app, (&app).screenAgent(), &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     try std.testing.expectEqual(types.PermissionMode.yolo, main_ctx.permission_mode);
     try std.testing.expect(main_ctx.worker == &app.main_agent.worker);
@@ -5875,7 +5874,7 @@ test "each instance keeps its own permission mode and session approvals" {
     const child = try addTestChildAgent(&app, "child-1");
     defer App.AgentsAppRuntime.shutdownChildren(&app);
 
-    // Each instance has its own mode (`tla/HostPermissions.tla` OwnChange).
+    // Each instance has its own mode.
     Permission.initMode(&app, &app.main_agent, .ask);
     Permission.initMode(&app, &second.agent, .ask);
     Permission.setMode(&app, &second.agent, .yolo);
@@ -5889,7 +5888,7 @@ test "each instance keeps its own permission mode and session approvals" {
     try std.testing.expect(second_count > 0);
     try std.testing.expectEqual(@as(usize, 0), Permission.grantsOf(&app, &app.main_agent).len);
 
-    // A subagent's still go to the first instance, as before instances (D55).
+    // A subagent's still go to the first instance, as before instances.
     try Permission.allowForSession(&app, &child.agent, "run_command", "/tmp/workspace::zig fmt");
     try std.testing.expect(Permission.grantsOf(&app, &app.main_agent).len > 0);
     try std.testing.expect(Permission.grantsOf(&app, &child.agent).ptr == Permission.grantsOf(&app, &app.main_agent).ptr);

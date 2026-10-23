@@ -581,7 +581,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         });
 
         // In-app /resume swaps one instance's session and brings back nothing
-        // else (D53).
+        // else.
         await withHost(answerByLetter, { reuse: { home, workspace } }, async ({ session }) => {
           await session.sendText("/resume");
           await session.waitForPane((pane) => /Sessions \d+/.test(pane), 15_000);

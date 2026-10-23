@@ -124,7 +124,7 @@
     {"name": "verify-tui-host-instances", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-host-instances.test.ts"], "test_file": "tui-host-instances.test.ts"},
     {"name": "verify-tui-input-line-delete", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-input-line-delete.test.ts"], "test_file": "tui-input-line-delete.test.ts"},
     {"name": "verify-tui-input-navigation", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-input-navigation.test.ts"], "test_file": "tui-input-navigation.test.ts"},
-    {"name": "verify-tui-procesor-switch", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-procesor-switch.test.ts"], "test_file": "tui-procesor-switch.test.ts"},
+    {"name": "verify-tui-host-switch", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-host-switch.test.ts"], "test_file": "tui-host-switch.test.ts"},
     {"name": "verify-tui-render-replay", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-render-replay.test.ts"], "test_file": "tui-render-replay.test.ts"},
     {"name": "verify-tui-resume", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-resume.test.ts"], "test_file": "tui-resume.test.ts"},
     {"name": "verify-tui-slash-commands", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-slash-commands.test.ts"], "test_file": "tui-slash-commands.test.ts"},

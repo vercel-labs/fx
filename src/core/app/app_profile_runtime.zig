@@ -1,5 +1,5 @@
 //! Puts each instance in its profile: the first in its launch profile, `fx
-//! --profile <name>` or fx's own `main`, and every later one in its own (D45).
+//! --profile <name>` or fx's own `main`, and every later one in its own.
 
 const std = @import("std");
 const profiles = @import("../profiles/profiles.zig");
@@ -53,7 +53,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Applies profile `name` to `agent`, any instance, as the launch
-        /// profile is applied to the first one (D45).
+        /// profile is applied to the first one.
         pub fn applyProfile(
             app: *App,
             agent: *AppAgent,
@@ -90,7 +90,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// The permission mode `agent`'s profile gives it over `parent`, the
-        /// user's: the profile's own, else `parent` (D45).
+        /// user's: the profile's own, else `parent`.
         pub fn profileMode(agent: *AppAgent, label: []const u8, parent: types.PermissionMode) types.PermissionMode {
             const profile = &agent.profile.profile;
             const mode = profiles.permissionMode(profile, parent);

@@ -179,7 +179,7 @@ pub fn sessionsDir(alloc: Allocator, home: []const u8) ![]u8 {
 }
 
 /// The host records, which list the sessions that ran together in one fx
-/// process (D58).
+/// process.
 pub fn hostsDir(alloc: Allocator, home: []const u8) ![]u8 {
     return std.Io.Dir.path.join(alloc, &.{ home, root_dir_name, hosts_dir_name });
 }

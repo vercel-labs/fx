@@ -67,7 +67,7 @@ async function withFx(
 ) {
   const gateway = startDynamicFakeGateway(respond);
   const home = createIsolatedTestHome();
-  const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-procesor-switch-")));
+  const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-switch-")));
   mkdirSync(join(home, ".fx"), { recursive: true });
   writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none" }));
   setupHome(home);

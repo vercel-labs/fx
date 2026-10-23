@@ -197,7 +197,7 @@ pub fn Runtime(comptime App: type) type {
         /// Narrows a tool context to a subagent's run: its own provider, model,
         /// and credential, web search only when its provider has it, and no
         /// subagent host, so a subagent never starts subagents. Its auto-mode
-        /// reviewer runs as main's does (D31), on the user's requests the run
+        /// reviewer runs as main's does, on the user's requests the run
         /// carries, never on main's messages to it. Hiding a tool from the model does
         /// not stop a call to it; `childLiveToolAuthority` refuses any tool
         /// outside the admission.
@@ -214,10 +214,10 @@ pub fn Runtime(comptime App: type) type {
             else
                 .disabled;
             // A child's `subagent` calls go to its own host, which the tool
-            // context already holds, as main's go to main's (D32).
+            // context already holds, as main's go to main's.
             // A child's approvals and questions go to its own worker, as
             // main's do, for main's runs and the user's alike; main's screen
-            // borrows them while the child is hidden (D23, D34).
+            // borrows them while the child is hidden.
             ctx.interactive = false;
             ctx.ask_user_questions = true;
             ctx.provider = run.admission.provider;
@@ -248,7 +248,7 @@ pub fn Runtime(comptime App: type) type {
 
         /// The permission mode a turn on the child decides its tools with when
         /// no work of main's is in flight: a turn the user typed, or steering
-        /// left over after main's run ended (D31). Null while main's run is in
+        /// left over after main's run ended. Null while main's run is in
         /// flight, whose own work decides. The admission's mode already went
         /// through the child's profile, which gives the same mode again.
         fn userPermissionMode(run: *const agents.ChildRun) ?types.PermissionMode {
@@ -559,7 +559,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Watches one agent's cancel flag while its MCP question waits. It
-        /// runs on its own thread, so it holds the agent it watches (D43).
+        /// runs on its own thread, so it holds the agent it watches.
         const DeadlineWatch = struct {
             agent: *AppAgent,
             deadline_ms: i64,
@@ -1483,7 +1483,7 @@ pub fn Runtime(comptime App: type) type {
         /// The run the turns the user starts on a subagent's own screen read:
         /// built as main's runs are, from `admission`, with the child's
         /// `instructions` as its overlay. It has no work id, since no request
-        /// of main's started it (D31). The caller owns the run.
+        /// of main's started it. The caller owns the run.
         pub fn prepareOwnTurnRun(
             app: *App,
             child_id: []const u8,

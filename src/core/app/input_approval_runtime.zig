@@ -254,8 +254,7 @@ pub fn ApprovalRuntime(comptime App: type) type {
             var response_submitted = false;
             errdefer if (!response_submitted) response.deinit();
             // A subagent's approval main's screen shows is answered here, on
-            // main's screen, and its answer goes to that subagent's worker
-            // (D34).
+            // main's screen, and its answer goes to that subagent's worker.
             const lent = if (comptime @hasDecl(App, "lentApproval")) app.lentApproval() else null;
             const worker = if (lent) |subagent| subagent.worker else &agent.worker;
             const result = worker.submitPermissionResponse(request_id, response);
@@ -264,7 +263,7 @@ pub fn ApprovalRuntime(comptime App: type) type {
                 .accepted => {
                     if (comptime @hasDecl(App, "screenAgentId")) {
                         const asker = if (lent) |subagent| subagent.id else subagentIdOf(app, agent);
-                        if (asker) |id| debug_trace.eventf("procesor", "approval_answered", .{}, "agent={s} screen={s}", .{ id, app.screenAgentId() });
+                        if (asker) |id| debug_trace.eventf("host", "approval_answered", .{}, "agent={s} screen={s}", .{ id, app.screenAgentId() });
                     }
                     clearApprovalPromptAfterSubmission(app, agent);
                     app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
@@ -356,7 +355,7 @@ pub fn ApprovalRuntime(comptime App: type) type {
 
         pub fn cancelApprovalOperation(app: *App, agent: *AppAgent) !void {
             // A subagent's approval main's screen shows is cancelled in that
-            // subagent's context, as its own screen would cancel it (D34).
+            // subagent's context, as its own screen would cancel it.
             if (comptime @hasDecl(App, "answerLentApproval")) {
                 if (try app.answerLentApproval(agent, cancelApprovalOperation)) return;
             }

@@ -233,7 +233,7 @@ pub const Context = struct {
     /// in that case.
     interactive: bool = true,
     /// Lets a turn that is not interactive still ask the user questions: a
-    /// subagent's, whose questions show on its own screen and on main's (D23).
+    /// subagent's, whose questions show on its own screen and on main's.
     ask_user_questions: bool = false,
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     lifecycle_scope: hooks.Scope = .{

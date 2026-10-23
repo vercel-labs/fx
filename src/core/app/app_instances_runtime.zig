@@ -1,8 +1,8 @@
-//! The host's instances (D45 to D50). Every top-level fx instance the host
+//! The host's instances. Every top-level fx instance the host
 //! runs is launched the same way, with its own session, worker, transcript,
 //! and profile, from the settings the host started with. The first instance
 //! is only the first one launched. Subagents are not instances: an instance
-//! or another subagent starts them (D46).
+//! or another subagent starts them.
 
 const std = @import("std");
 const agents = @import("../agents/agents.zig");
@@ -22,7 +22,7 @@ const Allocator = std.mem.Allocator;
 
 /// What every instance starts from: the per-agent settings the first one
 /// started with, including the launch profile and the process's flags, as a
-/// second fx started the same way would read them (D47, D51). Owned.
+/// second fx started the same way would read them. Owned.
 pub const Seed = struct {
     captured: bool = false,
     provider: model_provider.ProviderId = .gateway,
@@ -130,24 +130,24 @@ pub const State = struct {
     /// Backs the footer's instance label.
     label_buf: [32]u8 = undefined,
     /// Whether the first instance, kept in `App.main_agent`, still runs. It
-    /// closes like any other and stays closed (D52, D57).
+    /// closes like any other and stays closed.
     first_open: bool = true,
     /// The resume command a launched instance's teardown made at exit, for
-    /// when the user quit from its screen (D57). Owned.
+    /// when the user quit from its screen. Owned.
     exit_handoff: ?app_session_runtime.ResumeHandoff = null,
     /// This host's group id, named by its record file once two instances
-    /// are open, or the restored group's (D58).
+    /// are open, or the restored group's.
     group_id: [host_record.group_id_len]u8 = undefined,
     has_group: bool = false,
     /// The session ids the record file lists now, in launch order, or none
     /// while there is no file. Owned.
     written: std.ArrayList([]u8) = .empty,
     /// Startup resumed the first instance's session, so its group comes
-    /// back with the startup instances (D49).
+    /// back with the startup instances.
     restore_pending: bool = false,
     /// Startup opened the session picker, so the group of the session
     /// picked comes back then; a later in-app `/resume` brings back only
-    /// that session (D53).
+    /// that session.
     restore_on_pick: bool = false,
 
     pub fn deinit(self: *State, alloc: Allocator) void {
@@ -172,8 +172,7 @@ pub const State = struct {
 };
 
 /// How many instances the E2E test hook asks startup to open, or 1. The
-/// hook is `FX_TEST_INSTANCES`, like the other `FX_TEST_*` test overrides
-/// (D47).
+/// hook is `FX_TEST_INSTANCES`, like the other `FX_TEST_*` test overrides.
 pub fn testHookCount() usize {
     const raw = io_mod.getenv("FX_TEST_INSTANCES") orelse return 1;
     const count = std.fmt.parseUnsigned(usize, std.mem.trim(u8, raw, " \t\r\n"), 10) catch return 1;
@@ -187,8 +186,8 @@ pub fn Runtime(comptime App: type) type {
         const ChildAgent = app_agents_runtime.ChildAgent;
 
         /// Launches a new instance with a fresh session of its own, from the
-        /// host's seed and `profile_name`, or the launch profile when null
-        /// (D45, D47). Its worker starts now, as the first instance's does;
+        /// host's seed and `profile_name`, or the launch profile when null.
+        /// Its worker starts now, as the first instance's does;
         /// it shows its welcome when it is first on screen. Returns it,
         /// listed last among the instances.
         pub fn launch(app: *App, profile_name: ?[]const u8) !*ChildAgent {
@@ -196,7 +195,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Launches an instance that resumes saved session `session_id`, for
-        /// a resumed host's group (D58). Its conversation is drawn into its
+        /// a resumed host's group. Its conversation is drawn into its
         /// own transcript now, in its own screen context.
         pub fn launchResumed(app: *App, session_id: []const u8) !*ChildAgent {
             return launchWith(app, null, session_id);
@@ -254,7 +253,7 @@ pub fn Runtime(comptime App: type) type {
             // unfinished, as `fx --resume` does for the first one.
             if (resume_id != null) SessionRuntime.startPendingResume(app, agent);
             app.instances.launched += 1;
-            debug_trace.eventf("procesor", "instance_launched", .{}, "agent={s} profile={s} instances={d} resumed={s}", .{
+            debug_trace.eventf("host", "instance_launched", .{}, "agent={s} profile={s} instances={d} resumed={s}", .{
                 child.id,
                 name orelse "default",
                 app.instances.launched,
@@ -263,7 +262,7 @@ pub fn Runtime(comptime App: type) type {
             return child;
         }
 
-        /// Keeps the host record in step with the open instances (D58): a
+        /// Keeps the host record in step with the open instances: a
         /// file listing their sessions while two or more are open, none
         /// otherwise. Runs on the main loop and touches the disk only when
         /// the list changes, so a launch, a close, `/new`, and an in-app
@@ -319,7 +318,7 @@ pub fn Runtime(comptime App: type) type {
             const dir = profile_paths.hostsDir(app.alloc, home) catch return;
             defer app.alloc.free(dir);
             body(app, dir) catch |err| {
-                debug_trace.logf("procesor", "host_record_failed err={s}", .{@errorName(err)});
+                debug_trace.logf("host", "host_record_failed err={s}", .{@errorName(err)});
             };
         }
 
@@ -330,16 +329,16 @@ pub fn Runtime(comptime App: type) type {
                 .updated_ms = io_mod.milliTimestamp(),
                 .sessions = constNames(state.written.items),
             });
-            debug_trace.eventf("procesor", "host_record_written", .{}, "group={s} sessions={d}", .{ &state.group_id, state.written.items.len });
+            debug_trace.eventf("host", "host_record_written", .{}, "group={s} sessions={d}", .{ &state.group_id, state.written.items.len });
         }
 
         fn removeRecord(app: *App, dir: []const u8) anyerror!void {
             try host_record.remove(app.alloc, dir, &app.instances.group_id);
-            debug_trace.eventf("procesor", "host_record_removed", .{}, "group={s}", .{&app.instances.group_id});
+            debug_trace.eventf("host", "host_record_removed", .{}, "group={s}", .{&app.instances.group_id});
         }
 
         /// Brings back the group of the session the first instance resumed
-        /// at startup (D49, D54, D58). Every other session its record lists
+        /// at startup. Every other session its record lists
         /// comes back as an instance with its saved conversation, after the
         /// first and in their saved order, and the host keeps the group's
         /// id. A session that can't load is skipped with a notice. The first
@@ -350,7 +349,7 @@ pub fn Runtime(comptime App: type) type {
             const dir = profile_paths.hostsDir(app.alloc, home) catch return;
             defer app.alloc.free(dir);
             var loaded = host_record.loadAll(app.alloc, dir) catch |err| {
-                debug_trace.logf("procesor", "host_restore_failed err={s}", .{@errorName(err)});
+                debug_trace.logf("host", "host_restore_failed err={s}", .{@errorName(err)});
                 return;
             };
             defer loaded.deinit();
@@ -360,10 +359,10 @@ pub fn Runtime(comptime App: type) type {
                 @memcpy(&app.instances.group_id, restore.group_id);
                 app.instances.has_group = true;
             }
-            debug_trace.eventf("procesor", "host_restore", .{}, "group={s} sessions={d}", .{ restore.group_id, restore.others.len });
+            debug_trace.eventf("host", "host_restore", .{}, "group={s} sessions={d}", .{ restore.group_id, restore.others.len });
             for (restore.others) |id| {
                 _ = launchResumed(app, id) catch |err| {
-                    debug_trace.logf("procesor", "host_restore_skipped session={s} err={s}", .{ id, @errorName(err) });
+                    debug_trace.logf("host", "host_restore_skipped session={s} err={s}", .{ id, @errorName(err) });
                     const body = app.alloc.print("Couldn't bring back session {s} with this one: {s}.", .{ id, @errorName(err) }) catch continue;
                     defer app.alloc.free(body);
                     app.writeDomainNotice(.{ .topic = "instances", .tone = .neutral, .body = body }, true) catch {};

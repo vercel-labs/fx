@@ -803,10 +803,10 @@ pub fn SubmitRuntime(comptime App: type) type {
             const trimmed = std.mem.trim(u8, expanded.text, " \t\r\n");
 
             // On a subagent's screen the text is that subagent's own turn, as
-            // on main (D31), readied first so its profile limits it.
+            // on main, readied first so its profile limits it.
             if (comptime @hasDecl(App, "prepareSubagentOnScreen")) {
                 app.prepareSubagentOnScreen(agents.screenAgentOf(app)) catch |err| {
-                    debug_trace.logf("procesor", "own turn refused agent={s} reason={s}", .{ app.screenAgentId(), @errorName(err) });
+                    debug_trace.logf("host", "own turn refused agent={s} reason={s}", .{ app.screenAgentId(), @errorName(err) });
                     try app.writeDomainNotice(.{
                         .topic = "subagent",
                         .tone = .@"error",
@@ -978,7 +978,7 @@ pub fn SubmitRuntime(comptime App: type) type {
         }
 
         /// `/resume`, `/new`, `/fork`, `/clear`, and `/reset` replace main's
-        /// session, so they don't run on a subagent's screen (D21, D39). On a
+        /// session, so they don't run on a subagent's screen. On a
         /// subagent they would swap its saved conversation for a fresh one
         /// that is never saved. Returns true when it refused.
         fn refuseSessionCommandOnSubagentScreen(app: *App, command: *const command_specs.SlashSpec) !bool {

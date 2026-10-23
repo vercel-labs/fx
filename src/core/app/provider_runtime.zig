@@ -84,12 +84,12 @@ pub fn supported(comptime App: type) bool {
         (builtin.is_test and @hasField(App, "selected_model"));
 }
 
-/// The model of the agent on screen, for main-loop screen code (D43).
+/// The model of the agent on screen, for main-loop screen code.
 pub fn model(app: anytype) []const u8 {
     return modelOf(app, screenAgentIfTracked(app));
 }
 
-/// `agent`'s model: a subagent's own choice (D31), else the app's selection.
+/// `agent`'s model: a subagent's own choice, else the app's selection.
 pub fn modelOf(app: anytype, agent: anytype) []const u8 {
     const App = @TypeOf(app.*);
     if (subagentPreferences(app, agent)) |preferences| return preferences.model;
@@ -102,7 +102,7 @@ pub fn modelOf(app: anytype, agent: anytype) []const u8 {
     @compileError("app must own provider_selection");
 }
 
-/// Whether `App` runs subagents whose model choice is their own (D31).
+/// Whether `App` runs subagents whose model choice is their own.
 fn tracksSubagentPreferences(comptime App: type) bool {
     if (!@hasField(App, "main_agent") or !@hasField(App, "screen_owner")) return false;
     const Agent = @FieldType(App, "main_agent");
@@ -117,8 +117,8 @@ fn screenAgentIfTracked(app: anytype) if (tracksSubagentPreferences(@TypeOf(app.
     return agents.screenAgentOf(app);
 }
 
-/// A subagent's own model choice, kept in its own session's preferences
-/// (D31): set when `agent` is a subagent with its session attached. Main's
+/// A subagent's own model choice, kept in its own session's preferences:
+/// set when `agent` is a subagent with its session attached. Main's
 /// is the app's selection.
 fn subagentPreferences(app: anytype, agent: anytype) ?*const session_codec.DurableSessionPreferences {
     if (comptime !tracksSubagentPreferences(@TypeOf(app.*))) return null;
@@ -134,12 +134,12 @@ fn subagentPreferencesMut(app: anytype, agent: anytype) ?*session_codec.DurableS
     return null;
 }
 
-/// The provider of the agent on screen, for main-loop screen code (D43).
+/// The provider of the agent on screen, for main-loop screen code.
 pub fn provider(app: anytype) model_provider.ProviderId {
     return providerOf(app, screenAgentIfTracked(app));
 }
 
-/// `agent`'s provider: a subagent's own choice (D31), else the app's.
+/// `agent`'s provider: a subagent's own choice, else the app's.
 pub fn providerOf(app: anytype, agent: anytype) model_provider.ProviderId {
     const App = @TypeOf(app.*);
     if (subagentPreferences(app, agent)) |preferences| return preferences.provider;

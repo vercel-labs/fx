@@ -236,8 +236,8 @@ pub const TurnContext = struct {
     /// is not freed while a slot thread still holds its worker.
     hosted_release: ?*std.atomic.Value(u32) = null,
     managed_executions: managed_execution.Runtime,
-    /// The child session the turn writes, through the adapter (D22). Null
-    /// for a hosted run, whose child's own agent saves its turns (D31).
+    /// The child session the turn writes, through the adapter. Null
+    /// for a hosted run, whose child's own agent saves its turns.
     child: ?*session_adapter.Session,
     live_authority: ?*authority_mod.Resolver = null,
     approval_registry: ?*approval_registry_mod.Registry = null,
@@ -255,7 +255,7 @@ pub const TurnContext = struct {
         child_state.Phase,
     ) anyerror!void = null,
     live_metrics: ?*live_metrics.LiveMetrics = null,
-    /// This child's event queue, which only the main loop drains (D14).
+    /// This child's event queue, which only the main loop drains.
     /// Borrowed from the subagent host for the turn.
     failure_diagnostic: ?types.ModelFailureDiagnostic = null,
     committed: bool = false,
@@ -284,7 +284,7 @@ pub const TurnContext = struct {
         };
     }
 
-    /// A run whose child's own agent holds the session (D31): the host keeps
+    /// A run whose child's own agent holds the session: the host keeps
     /// the run's admission, approvals, phases, and result, and the agent saves
     /// its turns itself, so nothing here touches the session.
     pub fn initHosted(alloc: Allocator, max_history_turns: usize) TurnContext {
@@ -521,7 +521,7 @@ pub const TurnContext = struct {
     }
 
     pub fn commit(self: *TurnContext, work_id: []const u8, turn: types.HistoryTurn) CommitError!void {
-        // The child's own agent saves a hosted run's turns (D31).
+        // The child's own agent saves a hosted run's turns.
         if (self.child == null) return error.SessionCommitFailed;
         if (self.committed) return error.TurnAlreadyCommitted;
         try self.appendCommittedHistory(work_id, turn);
@@ -556,7 +556,7 @@ pub const TurnContext = struct {
         active_prefix: ?types.AssistantHistoryTurn,
         retained_from: ?types.ContextHistoryCut,
     ) !void {
-        // The child's own agent compacts a hosted run's session (D31).
+        // The child's own agent compacts a hosted run's session.
         const child = self.child orelse return error.SessionCommitFailed;
         var prefix: ?types.HistoryTurn = if (active_prefix) |value|
             try session.dupeHistoryTurn(self.alloc, .{ .assistant = value })
@@ -616,7 +616,7 @@ test "a subagent's tool calls are decided against its admission, whichever engin
     // Hiding a tool from the model does not stop a call to it. This shared
     // decision is what refuses any tool the host does not grant, for the
     // subagent engine and for child agents alike. `subagent` is decided like
-    // any other tool the host grants (D32).
+    // any other tool the host grants.
     const Host = struct {
         fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) authority_mod.HostResolveError!authority_mod.HostAuthority {
             return authority_mod.HostAuthority.capture(alloc, &.{ "read_file", "subagent" }, &.{}, .{}, &.{}) catch

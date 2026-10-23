@@ -2268,7 +2268,7 @@ test "input escape parser preserves double escape meta behavior" {
     try expectEscapeAction("\x1b[B", moveEscape(.paragraph_down, false));
     try expectEscapeAction("\x1bOA", moveEscape(.paragraph_up, false));
     try expectEscapeAction("\x1bOB", moveEscape(.paragraph_down, false));
-    // Meta-prefixed Left and Right are Alt+←/→, which switch agents (D9);
+    // Meta-prefixed Left and Right are Alt+←/→, which switch agents;
     // Alt+B and Alt+F keep the word jump.
     try expectEscapeAction("\x1b[D", .{ .switch_agent = .previous });
     try expectEscapeAction("\x1b[C", .{ .switch_agent = .next });
@@ -3561,7 +3561,7 @@ test "input escape parser handles ESC f as word_right" {
 }
 
 test "input escape parser maps alt+arrow to the agent switch" {
-    // ESC[1;3D — Alt+Left: the previous agent (D9)
+    // ESC[1;3D — Alt+Left: the previous agent
     var stage: u8 = 1;
     var param: u16 = 0;
     var param2: u16 = 0;
