@@ -46,8 +46,8 @@ pub const Agent = struct {
     /// authority lock, which its readers on other threads take.
     permission_mode: ?types.PermissionMode = null,
     /// An instance's session approvals: what "always" allowed in its current
-    /// session. A subagent records none; its go to the first
-    /// instance's, as before instances. Each entry owns its strings,
+    /// session. A subagent records none; its go to the instance at the
+    /// top of its tree (`root_instance`). Each entry owns its strings,
     /// allocated with the app's allocator. Guarded by the app's permission
     /// authority lock.
     session_grants: std.ArrayList(types.PermissionGrant) = .empty,
@@ -68,6 +68,14 @@ pub const Agent = struct {
     total_web_search_requests: u64 = 0,
     /// A top-level instance, every one alike, or a subagent.
     role: Role = .instance,
+    /// For a subagent, the instance at the top of its tree, whose provider,
+    /// approvals, and authority its tree starts from. Set once on the main
+    /// loop, under the app's permission authority lock, before the
+    /// subagent's first turn runs, and never changed. Null for an instance,
+    /// and for a subagent not yet bound to the host that started it, which
+    /// falls back to the first instance. Borrowed: an instance outlives
+    /// every subagent in its tree.
+    root_instance: ?*Agent = null,
     /// A subagent's current run, which sets its turns' model, effort, and
     /// authority. Null for an instance. Owned.
     child_run: ?child_run_mod.ChildRun = null,

@@ -392,18 +392,28 @@ pub fn Runtime(comptime App: type) type {
             });
         }
 
-        /// While main is on screen with no question or approval showing, a
-        /// hidden subagent's question is lent to main's prompt, named for the
-        /// subagent, so it shows on main's screen too. It goes back
-        /// before anything but the input that edits it touches it.
+        /// The instance on screen, the first or a launched one, which the
+        /// subagents of its tree lend their prompts to. Null while a subagent
+        /// is on screen.
+        fn instanceOnScreen(app: *App) ?*AppAgent {
+            const on_screen = app.agent_on_screen orelse return &app.main_agent;
+            return if (on_screen.agent.role == .instance) &on_screen.agent else null;
+        }
+
+        /// While an instance is on screen with no question or approval
+        /// showing, a hidden question from a subagent of its tree is lent to
+        /// the instance's prompt, named for the subagent, so it shows on the
+        /// instance's screen too. It goes back before anything but the input
+        /// that edits it touches it.
         pub fn lendQuestion(app: *App) void {
-            if (app.agent_on_screen != null or app.question_lender != null) return;
-            if (app.main_agent.question_prompt.isActive() or app.main_agent.approval_prompt.isActive()) return;
+            if (app.question_lender != null) return;
+            const borrower = instanceOnScreen(app) orelse return;
+            if (borrower.question_prompt.isActive() or borrower.approval_prompt.isActive()) return;
             for (app.child_agents.items) |child| {
-                if (!lendsToMain(app, child)) continue;
+                if (!lendsTo(app, child, borrower)) continue;
                 if (!child.agent.question_prompt.isActive()) continue;
-                std.mem.swap(question_prompt.QuestionPrompt, &app.main_agent.question_prompt, &child.agent.question_prompt);
-                app.main_agent.question_prompt.asker = child.displayName();
+                std.mem.swap(question_prompt.QuestionPrompt, &borrower.question_prompt, &child.agent.question_prompt);
+                borrower.question_prompt.asker = child.displayName();
                 app.question_lender = child;
                 debug_trace.eventf("host", "question_lent", .{}, "agent={s}", .{child.id});
                 app.shell.render_requests.request(.modal);
@@ -411,12 +421,13 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        /// Gives a question lent to main back to the subagent that asked it,
-        /// and returns that subagent.
+        /// Gives a lent question back to the subagent that asked it, and
+        /// returns that subagent.
         pub fn returnQuestion(app: *App) ?*ChildAgent {
             const child = app.question_lender orelse return null;
-            app.main_agent.question_prompt.asker = "";
-            std.mem.swap(question_prompt.QuestionPrompt, &app.main_agent.question_prompt, &child.agent.question_prompt);
+            const borrower = rootInstance(app, child);
+            borrower.question_prompt.asker = "";
+            std.mem.swap(question_prompt.QuestionPrompt, &borrower.question_prompt, &child.agent.question_prompt);
             app.question_lender = null;
             app.shell.render_requests.request(.modal);
             return child;
@@ -432,9 +443,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Runs `body`, an answer or a cancel, in the context of the subagent
-        /// whose question main's screen shows, so the answer reaches its
-        /// worker and joins its conversation. False when main's question is
-        /// its own.
+        /// whose question the instance's screen shows, so the answer reaches
+        /// its worker and joins its conversation. False when the question is
+        /// the instance's own.
         pub fn answerLentQuestion(app: *App, comptime body: fn (*App, *AppAgent) anyerror!void) !bool {
             const child = returnQuestion(app) orelse return false;
             const Answer = struct {
@@ -446,21 +457,23 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        /// While main is on screen with no approval or question showing, a
-        /// hidden subagent's approval is lent to main's prompt, so it shows on
-        /// main's screen too. Its request comes from its own
-        /// worker and stays labeled with its name. It goes back when the
-        /// subagent is shown, main gets its own, or the subagent stops
-        /// waiting (`keepLentApproval`). A rule a subagent's
-        /// `/permissions remember` would save is its own, so it isn't lent.
+        /// While an instance is on screen with no approval or question
+        /// showing, a hidden approval from a subagent of its tree is lent to
+        /// the instance's prompt, so it shows on the instance's screen too.
+        /// Its request comes from its own worker and stays labeled with its
+        /// name. It goes back when the subagent is shown, the instance gets
+        /// its own, or the subagent stops waiting (`keepLentApproval`). A
+        /// rule a subagent's `/permissions remember` would save is its own,
+        /// so it isn't lent.
         pub fn lendApproval(app: *App) void {
-            if (app.agent_on_screen != null or app.approval_lender != null) return;
-            if (app.main_agent.approval_prompt.isActive() or app.main_agent.question_prompt.isActive()) return;
+            if (app.approval_lender != null) return;
+            const borrower = instanceOnScreen(app) orelse return;
+            if (borrower.approval_prompt.isActive() or borrower.question_prompt.isActive()) return;
             for (app.child_agents.items) |child| {
-                if (!lendsToMain(app, child)) continue;
+                if (!lendsTo(app, child, borrower)) continue;
                 const prompt = &child.agent.approval_prompt;
                 if (!prompt.isActive() or prompt.rule_management != null) continue;
-                std.mem.swap(@TypeOf(child.agent.approval_prompt), &app.main_agent.approval_prompt, prompt);
+                std.mem.swap(@TypeOf(child.agent.approval_prompt), &borrower.approval_prompt, prompt);
                 app.approval_lender = child;
                 debug_trace.eventf("host", "approval_lent", .{}, "agent={s}", .{child.id});
                 app.shell.render_requests.request(.modal);
@@ -468,44 +481,48 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        /// Gives an approval lent to main back to the subagent it came from,
-        /// and returns that subagent.
+        /// Gives a lent approval back to the subagent it came from, and
+        /// returns that subagent.
         pub fn returnApproval(app: *App) ?*ChildAgent {
             const child = app.approval_lender orelse return null;
-            std.mem.swap(@TypeOf(child.agent.approval_prompt), &app.main_agent.approval_prompt, &child.agent.approval_prompt);
+            const borrower = rootInstance(app, child);
+            std.mem.swap(@TypeOf(child.agent.approval_prompt), &borrower.approval_prompt, &child.agent.approval_prompt);
             app.approval_lender = null;
             app.shell.render_requests.request(.modal);
             return child;
         }
 
         /// Whether the agent in context keeps its approval prompt as it is
-        /// this pass, because an approval is lent: main keeps the one it
-        /// shows until its own request comes, and the subagent that lent it
-        /// lets it be while its worker still asks the same thing. Otherwise
-        /// the approval goes back first, and the caller syncs the prompt
-        /// from the worker's `pending`.
+        /// this pass, because an approval is lent: the instance keeps the one
+        /// it shows until its own request comes, and the subagent that lent
+        /// it lets it be while its worker still asks the same thing.
+        /// Otherwise the approval goes back first, and the caller syncs the
+        /// prompt from the worker's `pending`.
         pub fn keepLentApproval(app: *App, agent: *AppAgent, pending: ?permission_request.PermissionRequest) bool {
             const lender = app.approval_lender orelse return false;
-            if (agent == &app.main_agent) {
+            const borrower = rootInstance(app, lender);
+            if (agent == borrower) {
                 if (pending == null) return true;
             } else if (agent == &lender.agent) {
-                const lent = app.main_agent.approval_prompt.request orelse return false;
+                const lent = borrower.approval_prompt.request orelse return false;
                 if (pending) |request| if (request.id == lent.id) return true;
             } else return false;
             _ = returnApproval(app);
             return false;
         }
 
-        /// The subagent whose approval main's prompt shows, while main is in
-        /// context: an answer there goes to that subagent's worker.
+        /// The subagent whose approval `agent`'s prompt shows, while that
+        /// instance is in context: an answer there goes to that subagent's
+        /// worker.
         pub fn lentApproval(app: *App, agent: *AppAgent) ?*ChildAgent {
-            if (agent != &app.main_agent) return null;
-            return app.approval_lender;
+            const lender = app.approval_lender orelse return null;
+            if (agent != rootInstance(app, lender)) return null;
+            return lender;
         }
 
         /// Runs `body`, a cancel, in the context of the subagent whose
-        /// approval main's screen shows, as its own screen would. False when
-        /// main's approval is its own.
+        /// approval the instance's screen shows, as its own screen would.
+        /// False when the approval is the instance's own.
         pub fn answerLentApproval(app: *App, agent: *AppAgent, comptime body: fn (*App, *AppAgent) anyerror!void) !bool {
             if (lentApproval(app, agent) == null) return false;
             const child = returnApproval(app).?;
@@ -666,11 +683,11 @@ pub fn Runtime(comptime App: type) type {
             return null;
         }
 
-        /// A subagent's approval or question is lent to main's screen only
-        /// when main's tree holds it: an instance's are its own, and a
-        /// subagent of another instance belongs to that instance.
-        fn lendsToMain(app: *App, child: *const ChildAgent) bool {
-            return child.agent.role == .subagent and rootInstance(app, child) == &app.main_agent;
+        /// A subagent's approval or question is lent to an instance's screen
+        /// only when that instance's tree holds it: an instance's are its
+        /// own, and a subagent of another instance belongs to that one.
+        fn lendsTo(app: *App, child: *const ChildAgent, borrower: *const AppAgent) bool {
+            return child.agent.role == .subagent and rootInstance(app, child) == borrower;
         }
 
         /// Puts `target`, or main when null, on screen, then clears the
@@ -878,13 +895,14 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
-        /// Records the host that started `child`: main's, or its parent
-        /// subagent's own. Resolvers on other threads read it under
-        /// main's authority lock.
+        /// Records the host that started `child`: an instance's, or its
+        /// parent subagent's own, and the instance at the top of its tree.
+        /// Resolvers on other threads read both under main's authority lock.
         fn setParentHost(app: *App, child: *ChildAgent, host: *subagent_tool_host.Runtime) void {
             app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
             defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
             child.parent_host = host;
+            if (child.agent.root_instance == null) child.agent.root_instance = rootInstance(app, child);
         }
 
         /// The host whose resolver is `resolver`: main's, or one of the

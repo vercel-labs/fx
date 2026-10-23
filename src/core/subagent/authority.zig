@@ -135,6 +135,16 @@ pub const HostResolver = struct {
     /// It wins over the child's profile and the work's mode, as main's
     /// choice wins over its launch profile.
     child_permission_mode_fn: ?*const fn (?*anyopaque, []const u8) ?types.PermissionMode = null,
+    /// fx's own tools, MCP integrations, and MCP view for root `root_id`,
+    /// before any profile: what a profile that sets tools or MCP servers
+    /// chooses from, even past its parent's. Without it, such a profile
+    /// narrows its parent's instead.
+    base_fn: ?*const fn (?*anyopaque, Allocator, []const u8) HostResolveError!HostAuthority = null,
+
+    fn resolveBase(self: HostResolver, alloc: Allocator, root_id: []const u8) Error!?HostAuthority {
+        const base_fn = self.base_fn orelse return null;
+        return try base_fn(self.context, alloc, root_id);
+    }
 
     fn childPermissionMode(self: HostResolver, child_id: []const u8) ?types.PermissionMode {
         const mode_fn = self.child_permission_mode_fn orelse return null;
@@ -356,13 +366,28 @@ pub const Resolver = struct {
             };
         };
 
+        // A profile that sets tools or MCP servers decides them from fx's
+        // own, even past what the parent has; what it leaves unset is the
+        // parent's.
+        const sets_tools = if (current.profile) |profile| profiles.setsTools(profile) else false;
+        const sets_mcp = if (current.profile) |profile| profiles.setsMcpServers(profile) else false;
+        var base: ?HostAuthority = if (sets_tools or sets_mcp) try self.host.resolveBase(alloc, self.root_id) else null;
+        defer if (base) |*value| value.deinit(alloc);
+        const tool_source = if (sets_tools) if (base) |*value| value.tools else host.tools else host.tools;
+        const integration_source = if (sets_mcp) if (base) |*value| value.integrations else host.integrations else host.integrations;
+        const view_source: ?*const mcp_access.View = view: {
+            if (sets_mcp) if (base) |*value| break :view if (value.mcp_view) |*view| view else null;
+            break :view if (host.mcp_view) |*view| view else null;
+        };
+        const host_generation = if (base) |value| host.generation ^ std.math.rotl(u64, value.generation, 1) else host.generation;
+
         const owned_child_id = try alloc.dupe(u8, child_id);
         errdefer alloc.free(owned_child_id);
         const owned_root_id = try alloc.dupe(u8, self.root_id);
         errdefer alloc.free(owned_root_id);
-        const tools = try cloneKeptTools(alloc, host.tools, current.profile);
+        const tools = try cloneKeptTools(alloc, tool_source, current.profile);
         errdefer freeStrings(alloc, tools);
-        const integrations = try cloneIntegrations(alloc, host.integrations, current.profile);
+        const integrations = try cloneIntegrations(alloc, integration_source, current.profile);
         errdefer freeStrings(alloc, integrations);
         var rules = try types.dupePermissionRuleSet(alloc, host.rules);
         errdefer rules.deinit(alloc);
@@ -377,7 +402,7 @@ pub const Resolver = struct {
             var value = permission_state;
             value.deinit(alloc);
         }
-        var mcp_view = if (host.mcp_view) |view| try view.clone(alloc) else null;
+        var mcp_view = if (view_source) |view| try view.clone(alloc) else null;
         errdefer if (mcp_view) |*view| view.deinit(alloc);
         if (mcp_view) |*view| {
             try rebindMcpViewOwnership(alloc, view, child_id, self.root_id);
@@ -390,7 +415,7 @@ pub const Resolver = struct {
                 child_id,
                 self.root_id,
                 current.generation,
-                host.generation,
+                host_generation,
             ),
             .tools = tools,
             .integrations = integrations,
@@ -544,6 +569,17 @@ fn cloneKeptTools(
 /// Keeps only the MCP servers `profile` allows, and their tools, so a
 /// profiled child cannot even find the others, as its integrations cannot
 /// name them.
+/// Narrows `host`'s MCP integrations and view to the servers `profile` sets,
+/// as an instance's own profile narrows what its tree starts from. A profile
+/// that sets none leaves them.
+pub fn narrowHostToMcpServers(alloc: Allocator, host: *HostAuthority, profile: *const profiles.Profile) !void {
+    if (!profiles.setsMcpServers(profile)) return;
+    const integrations = try cloneIntegrations(alloc, host.integrations, profile);
+    freeStrings(alloc, host.integrations);
+    host.integrations = integrations;
+    if (host.mcp_view) |*view| try narrowMcpView(alloc, view, profile);
+}
+
 fn narrowMcpView(alloc: Allocator, view: *mcp_access.View, profile: *const profiles.Profile) !void {
     // Both kept lists are allocated before anything in `view` moves or is
     // freed, so a failed allocation leaves `view` whole for its owner to free.
@@ -895,6 +931,104 @@ test "a subagent's profile narrows its tools, integrations, MCP view, and mode, 
     // Without a place to load it, a profiled child gets no authority at all.
     resolver.profiles = null;
     try std.testing.expectError(error.HostAuthorityUnavailable, resolver.resolve(alloc, "profiled-child"));
+}
+
+test "a profile that sets tools or MCP servers decides them from fx's own, and one that sets neither copies its parent" {
+    const Views = struct {
+        fn capture(alloc: Allocator, root_id: []const u8, tools: []const []const u8, server_names: []const []const u8) HostResolveError!HostAuthority {
+            var servers: [2]mcp_access.ServerIdentity = undefined;
+            var server_tools: [2]mcp_access.ToolIdentity = undefined;
+            for (server_names, 0..) |name, index| {
+                servers[index] = .{ .name = @constCast(name), .source = .profile, .scope = .profile, .connection_generation = 1, .catalog_generation = 1, .auth_generation = 1 };
+                server_tools[index] = .{ .name = @constCast(if (std.mem.eql(u8, name, "github")) "github_issue" else "slack_post"), .server_name = @constCast(name) };
+            }
+            const view = mcp_access.View{
+                .runtime_generation = 1,
+                .owner_id = @constCast(root_id),
+                .parent_id = @constCast(root_id),
+                .servers = servers[0..server_names.len],
+                .tools = server_tools[0..server_names.len],
+            };
+            return HostAuthority.captureWithPermissionStateAndMcpView(alloc, tools, server_names, .{}, &.{}, .{}, &view) catch
+                return error.OutOfMemory;
+        }
+        // The parent has only read_file and GitHub.
+        fn parent(_: ?*anyopaque, alloc: Allocator, root_id: []const u8) HostResolveError!HostAuthority {
+            return capture(alloc, root_id, &.{"read_file"}, &.{"github"});
+        }
+        // fx has more tools and both servers.
+        fn base(_: ?*anyopaque, alloc: Allocator, root_id: []const u8) HostResolveError!HostAuthority {
+            return capture(alloc, root_id, &.{ "read_file", "write_file", "shell", "subagent" }, &.{ "github", "slack" });
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const profiles_json = [_]struct { name: []const u8, json: []const u8 }{
+        .{ .name = "builder", .json = "{\"description\": \"Builder\", \"tools\": [\"*\", \"!subagent\"], \"mcp_servers\": [\"slack\"]}" },
+        .{ .name = "quiet", .json = "{\"description\": \"Sets nothing\"}" },
+    };
+    for (profiles_json) |entry| {
+        var path_buf: [96]u8 = undefined;
+        const dir_path = try std.mem.print(&path_buf, "fxhome/.fx/agents/{s}", .{entry.name});
+        try tmp.dir.createDirPath(io_mod.getIo(), dir_path);
+        var file_buf: [128]u8 = undefined;
+        const file_path = try std.mem.print(&file_buf, "{s}/profile.json", .{dir_path});
+        var file = try tmp.dir.createFile(io_mod.getIo(), file_path, .{});
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), entry.json);
+    }
+    const fx_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "fxhome");
+    defer alloc.free(fx_home);
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    const store = parent.stateStore();
+    var registry = try child_state.Registry.init(alloc, parent.parent.id());
+    defer registry.deinit(alloc);
+    var work = child_state.ActiveWork{ .id = try alloc.dupe(u8, "work-1"), .message = try alloc.dupe(u8, "build"), .permission_mode = .ask, .created_at_ms = 1 };
+    defer work.deinit(alloc);
+    try registry.appendOneOff(alloc, "builder-child", work);
+    try registry.setProfile(alloc, "builder-child", "builder");
+    try registry.appendOneOff(alloc, "quiet-child", work);
+    try registry.setProfile(alloc, "quiet-child", "quiet");
+    try store.save(alloc, registry);
+
+    var cache: ProfileCache = .{ .alloc = alloc, .roots = .{ .home = fx_home, .workspace_root = null } };
+    defer cache.deinit();
+    var resolver = Resolver{
+        .children = &parent.children,
+        .root_id = parent.parent.id(),
+        .host = .{ .resolve_fn = Views.parent, .base_fn = Views.base },
+        .profiles = &cache,
+    };
+
+    // The builder's tools and servers are its profile's, past the parent's.
+    var builder = try resolver.resolve(alloc, "builder-child");
+    defer builder.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), builder.tools.len);
+    for ([_][]const u8{ "read_file", "write_file", "shell" }) |name| try std.testing.expect(contains(builder.tools, name));
+    try std.testing.expect(!contains(builder.tools, "subagent"));
+    try std.testing.expectEqual(@as(usize, 1), builder.integrations.len);
+    try std.testing.expectEqualStrings("slack", builder.integrations[0]);
+    try std.testing.expectEqual(@as(usize, 1), builder.mcp_view.?.servers.len);
+    try std.testing.expectEqualStrings("slack", builder.mcp_view.?.servers[0].name);
+
+    // A profile that sets neither is a copy of its parent.
+    var quiet = try resolver.resolve(alloc, "quiet-child");
+    defer quiet.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), quiet.tools.len);
+    try std.testing.expectEqualStrings("read_file", quiet.tools[0]);
+    try std.testing.expectEqualStrings("github", quiet.integrations[0]);
+    try std.testing.expectEqualStrings("github", quiet.mcp_view.?.servers[0].name);
+
+    // Without fx's own set to choose from, a profile narrows its parent's.
+    resolver.host.base_fn = null;
+    var narrowed = try resolver.resolve(alloc, "builder-child");
+    defer narrowed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), narrowed.tools.len);
+    try std.testing.expectEqualStrings("read_file", narrowed.tools[0]);
+    try std.testing.expectEqual(@as(usize, 0), narrowed.integrations.len);
 }
 
 test "a turn no work started is limited by the child's profile and the user's mode, and only for a known child" {

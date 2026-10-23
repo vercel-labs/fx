@@ -1878,6 +1878,13 @@ const App = struct {
         return self.effectiveToolSet(agent);
     }
 
+    /// fx's tools before any agent profile narrows them: what a profile that
+    /// sets tools chooses from.
+    pub fn baseToolSet(self: *const App) tool_set_contract.ToolSet {
+        if (comptime host_profile.tools) return builtin_tools.advertisement_set;
+        return browser_workspace_tools.selectToolSet(false, self.workspaceHostInfo() != null);
+    }
+
     pub fn hasMcpTool(self: *App, name: []const u8, access: tool_mcp_runtime.Access) bool {
         return self.mcp.hasTool(name, access);
     }

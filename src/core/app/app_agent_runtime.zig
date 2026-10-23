@@ -1388,9 +1388,11 @@ pub fn Runtime(comptime App: type) type {
             turn: ?*subagent_execution.TurnContext,
         ) subagent_execution.ServiceError!ChildRunBase {
             const alloc = app.alloc;
-            // Main's tool context and prompt are read for main, as the
-            // subagent's parent.
-            const base_context = app.subagentToolContextForAdmission(&app.main_agent, admission);
+            // The tool context and prompt are those of the instance at the
+            // top of the child's tree, so a launched instance's subagents use
+            // its provider and approvals, not the first instance's.
+            const root = rootInstanceOfChild(app, child_id);
+            const base_context = app.subagentToolContextForAdmission(root, admission);
             var credential: ?credentials.Credential = null;
             errdefer if (credential) |*value| value.deinit(alloc);
             if (admission.provider == .configured or
@@ -1417,7 +1419,7 @@ pub fn Runtime(comptime App: type) type {
             const system_prompt = try alloc.dupe(u8, try subagent_agent_adapter.childSystemPrompt(
                 prompt_arena.allocator(),
                 subagent_agent_adapter.childProfile(resolver, child_id),
-                app.promptPolicy(&app.main_agent).system_prompt,
+                app.promptPolicy(root).system_prompt,
                 overlay,
             ));
             errdefer alloc.free(system_prompt);
@@ -1426,6 +1428,19 @@ pub fn Runtime(comptime App: type) type {
                 else => error.AdmissionFailed,
             };
             return .{ .admission = owned_admission, .system_prompt = system_prompt, .credential = credential };
+        }
+
+        /// The instance at the top of child `child_id`'s tree, or the first
+        /// instance while the child is not yet bound to the host that
+        /// started it. Takes the authority lock, which guards the list.
+        fn rootInstanceOfChild(app: *App, child_id: []const u8) *AppAgent {
+            if (comptime !@hasField(App, "child_agents")) return &app.main_agent;
+            app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+            defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+            for (app.child_agents.items) |child| {
+                if (std.mem.eql(u8, child.id, child_id)) return child.agent.root_instance orelse &app.main_agent;
+            }
+            return &app.main_agent;
         }
 
         fn freeChildRunBase(alloc: Allocator, base: *ChildRunBase) void {
