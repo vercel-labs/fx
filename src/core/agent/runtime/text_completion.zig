@@ -193,6 +193,7 @@ pub const CompactorCaller = struct {
     api_key: []const u8,
     credential_source: ?types.CredentialSource = null,
     account_id: ?[]const u8 = null,
+    chatgpt_direct: bool = false,
     gateway_team: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
     retry_count: usize,
@@ -253,6 +254,7 @@ pub const CompactorCaller = struct {
                 .secret_bytes = self.api_key,
                 .source = self.credential_source,
                 .account_id = self.account_id,
+                .chatgpt_direct = self.chatgpt_direct,
                 .tenant_context = self.gateway_team,
             } },
             .session_id = self.session_id,
@@ -288,7 +290,7 @@ pub const CompactorCaller = struct {
     }
 };
 
-test "a compactor request after the conversation sends it unchanged, then the request" {
+test "a direct ChatGPT compactor request preserves the conversation and credential route" {
     const testing = std.testing;
     const Fake = struct {
         instruction: []const u8 = "",
@@ -299,10 +301,12 @@ test "a compactor request after the conversation sends it unchanged, then the re
         tool_choice: types.ToolChoice = .required,
         reasoning: ?types.ReasoningEffort = null,
         ultrafast: bool = true,
+        chatgpt_direct: bool = false,
 
         fn stream(raw: ?*anyopaque, alloc: Allocator, request: agent_stream_provider.ModelRequest) !runtime_gateway_step.StreamResult {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             try request.admission.admit();
+            self.chatgpt_direct = request.credential.chatgptDirect();
             self.reasoning = request.provider_options.reasoning;
             self.ultrafast = request.provider_options.ultrafast;
             self.instructions = request.instructions.len;
@@ -329,6 +333,8 @@ test "a compactor request after the conversation sends it unchanged, then the re
         .provider = .gateway,
         .model = "m",
         .api_key = "fixture-key",
+        .credential_source = .chatgpt_subscription,
+        .chatgpt_direct = true,
         .retry_count = 1,
         .capabilities_context = &fake,
         .capabilities_fn = Fake.capabilities,
@@ -343,6 +349,7 @@ test "a compactor request after the conversation sends it unchanged, then the re
     const after = try caller.vtable.send(caller.context, testing.allocator, call);
     defer testing.allocator.free(after.text);
     try testing.expectEqualStrings("notes", after.text);
+    try testing.expect(fake.chatgpt_direct);
     try testing.expectEqualStrings("the agent's instructions", fake.instruction);
     try testing.expectEqual(@as(usize, 3), fake.messages);
     try testing.expectEqualStrings("write the notes", fake.last_message);
@@ -355,8 +362,10 @@ test "a compactor request after the conversation sends it unchanged, then the re
     // Without it, one system message and one user message, no tools, at the
     // reasoning asked for.
     call.after_conversation = false;
+    fake.chatgpt_direct = false;
     const alone = try caller.vtable.send(caller.context, testing.allocator, call);
     defer testing.allocator.free(alone.text);
+    try testing.expect(fake.chatgpt_direct);
     try testing.expectEqualStrings("the compactor's instructions", fake.instruction);
     try testing.expectEqual(@as(usize, 1), fake.messages);
     try testing.expectEqual(@as(usize, 0), fake.tools);

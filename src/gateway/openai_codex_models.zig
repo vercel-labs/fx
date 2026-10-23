@@ -69,7 +69,7 @@ fn fetchCatalogForProvider(
         return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
     var owned_account_id: ?[]u8 = null;
     defer if (owned_account_id) |account| alloc.free(account);
-    const account_id = request_auth.account_id orelse if (request_auth.credential) |credential| account: {
+    const account_id = if (request_auth.chatgpt_direct) null else request_auth.account_id orelse if (request_auth.credential) |credential| account: {
         owned_account_id = chatgpt_oauth.extractAccountId(alloc, credential) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
@@ -92,7 +92,7 @@ fn fetchCatalogForProvider(
         }
     else
         null;
-    const request_url = modelsUrl(alloc, version) catch |err| {
+    const request_url = modelsUrlForRoute(alloc, version, request_auth.chatgpt_direct) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .runtime } };
     };
@@ -103,6 +103,7 @@ fn fetchCatalogForProvider(
         .url = request_url,
         .credential = request_auth.credential,
         .account_id = account_id,
+        .chatgpt_direct = request_auth.chatgpt_direct,
     };
     var response = gateway_client.runBoundedHttpOperation(
         FetchResponse,
@@ -121,16 +122,21 @@ fn fetchCatalogForProvider(
     if (response.status != .ok) {
         return .{ .failure = model_catalog.failureForHttpStatus(response.status) };
     }
-    return catalogFromBody(alloc, response.body);
+    return catalogFromBodyForRoute(alloc, response.body, request_auth.chatgpt_direct);
 }
 
 /// Parses a successful Codex models response. A catalog without the permission
 /// reviewer's model is malformed. The result owns its catalog.
 pub fn catalogFromBody(alloc: std.mem.Allocator, body: []const u8) std.mem.Allocator.Error!model_catalog.ProviderResult {
-    var catalog = parseCatalog(alloc, body) catch |err| {
+    return catalogFromBodyForRoute(alloc, body, false);
+}
+
+pub fn catalogFromBodyForRoute(alloc: std.mem.Allocator, body: []const u8, chatgpt_direct: bool) std.mem.Allocator.Error!model_catalog.ProviderResult {
+    var catalog = parseCatalogForRoute(alloc, body, chatgpt_direct) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } };
     };
+    if (chatgpt_direct) return .{ .catalog = catalog };
     var reviewer_available = false;
     for (catalog.items) |entry| {
         if (std.mem.eql(u8, entry.id, reviewer_model)) {
@@ -145,7 +151,35 @@ pub fn catalogFromBody(alloc: std.mem.Allocator, body: []const u8) std.mem.Alloc
     return .{ .catalog = catalog };
 }
 
+test "ChatGPT direct catalog accepts public ids without legacy reviewer" {
+    const alloc = std.testing.allocator;
+    const result = try catalogFromBodyForRoute(alloc, "{\"data\":[{\"id\":\"gpt-5.4\"}]}", true);
+    var catalog = switch (result) {
+        .catalog => |value| value,
+        else => return error.TestExpectedDirectCatalog,
+    };
+    defer model_catalog.freeModelCatalog(alloc, &catalog);
+    try std.testing.expectEqual(@as(usize, 1), catalog.items.len);
+    try std.testing.expectEqualStrings("gpt-5.4", catalog.items[0].id);
+    try std.testing.expect(!catalog.items[0].has_vision);
+    try std.testing.expect(!catalog.items[0].has_reasoning);
+    try std.testing.expectEqual(@as(u32, 0), catalog.items[0].context_window);
+    const auth = catalogRequestAuth(.{ .authenticated = .{
+        .source = .chatgpt_subscription,
+        .credential = "opaque",
+        .team_context = null,
+        .chatgpt_direct = true,
+    } }).?;
+    try std.testing.expect(auth.chatgpt_direct);
+    if (io_mod.getenv(e2e_models_endpoint_env) == null) {
+        const url = try modelsUrlForRoute(alloc, versions.Version.parse("0.999.1").?, true);
+        defer alloc.free(url);
+        try std.testing.expectEqualStrings("https://api.openai.com/v1/models?client_version=0.999.1", url);
+    }
+}
+
 const CatalogRequestAuth = struct {
+    chatgpt_direct: bool = false,
     credential: ?[]const u8 = null,
     account_id: ?[]const u8 = null,
 };
@@ -158,6 +192,7 @@ fn catalogRequestAuth(access: credentials.CatalogAccess) ?CatalogRequestAuth {
             .{
                 .credential = authenticated.credential,
                 .account_id = authenticated.account_id,
+                .chatgpt_direct = authenticated.chatgpt_direct,
             }
         else
             null,
@@ -179,6 +214,7 @@ const FetchOperation = struct {
     url: []const u8,
     credential: ?[]const u8,
     account_id: ?[]const u8,
+    chatgpt_direct: bool = false,
 
     pub fn run(self: *@This()) !FetchResponse {
         var client: std.http.Client = .{ .allocator = self.alloc, .io = io_mod.getIo() };
@@ -198,12 +234,14 @@ const FetchOperation = struct {
         var response_writer = std.Io.Writer.fixed(body_buffer);
         var extra_headers: [3]std.http.Header = undefined;
         var extra_len: usize = 0;
-        if (self.account_id) |account_id| {
+        if (if (self.chatgpt_direct) null else self.account_id) |account_id| {
             extra_headers[extra_len] = .{ .name = "chatgpt-account-id", .value = account_id };
             extra_len += 1;
         }
-        extra_headers[extra_len] = .{ .name = "originator", .value = "fx" };
-        extra_len += 1;
+        if (!self.chatgpt_direct) {
+            extra_headers[extra_len] = .{ .name = "originator", .value = "fx" };
+            extra_len += 1;
+        }
         extra_headers[extra_len] = .{ .name = "accept", .value = "application/json" };
         extra_len += 1;
         const result = client.fetch(.{
@@ -228,7 +266,12 @@ const FetchOperation = struct {
 
 /// The models endpoint, with the Codex client version when known. Caller owns it.
 pub fn modelsUrl(alloc: std.mem.Allocator, version: ?versions.Version) ![]u8 {
-    const base = io_mod.getenv(e2e_models_endpoint_env) orelse default_models_endpoint;
+    return modelsUrlForRoute(alloc, version, false);
+}
+
+pub fn modelsUrlForRoute(alloc: std.mem.Allocator, version: ?versions.Version, chatgpt_direct: bool) ![]u8 {
+    const base = io_mod.getenv(e2e_models_endpoint_env) orelse
+        (if (chatgpt_direct) "https://api.openai.com/v1/models" else default_models_endpoint);
     if (io_mod.getenv(e2e_models_endpoint_env) != null and !gateway_client.isLoopbackHttpUrl(base)) {
         return error.InvalidE2ECodexModelsEndpoint;
     }
@@ -244,10 +287,19 @@ fn parseCatalog(
     alloc: std.mem.Allocator,
     json_text: []const u8,
 ) !std.ArrayList(model_catalog.ModelCatalogEntry) {
+    return parseCatalogForRoute(alloc, json_text, false);
+}
+
+fn parseCatalogForRoute(
+    alloc: std.mem.Allocator,
+    json_text: []const u8,
+    chatgpt_direct: bool,
+) !std.ArrayList(model_catalog.ModelCatalogEntry) {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json_text, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidCodexModelCatalog;
-    const models_value = parsed.value.object.get("models") orelse
+    const public_envelope = chatgpt_direct and parsed.value.object.contains("data");
+    const models_value = parsed.value.object.get(if (public_envelope) "data" else "models") orelse
         return error.InvalidCodexModelCatalog;
     if (models_value != .array or models_value.array.items.len > max_catalog_models) {
         return error.InvalidCodexModelCatalog;
@@ -258,11 +310,13 @@ fn parseCatalog(
     for (models_value.array.items) |value| {
         if (value != .object) return error.InvalidCodexModelCatalog;
         const object = value.object;
-        const visibility = try requiredString(object, "visibility");
-        const supported = try requiredBool(object, "supported_in_api");
-        if (!supported or !std.mem.eql(u8, visibility, "list")) continue;
+        if (!public_envelope) {
+            const visibility = try requiredString(object, "visibility");
+            const supported = try requiredBool(object, "supported_in_api");
+            if (!supported or !std.mem.eql(u8, visibility, "list")) continue;
+        }
 
-        const slug = try requiredString(object, "slug");
+        const slug = try requiredString(object, if (public_envelope) "id" else "slug");
         try validateModelId(slug);
         const id = try alloc.dupe(u8, slug);
         errdefer alloc.free(id);
@@ -284,7 +338,7 @@ fn parseCatalog(
             .supports_fast_mode = supports_fast,
             .has_vision = has_vision,
             .has_file_input = has_vision,
-            .has_implicit_caching = true,
+            .has_implicit_caching = !public_envelope,
             .context_window = context_window,
         });
     }

@@ -121,6 +121,8 @@ const OwnedCatalogAccess = struct {
                             .credential = credential,
                             .team_context = team_context,
                             .account_id = account_id,
+                            .authority = authenticated.authority,
+                            .chatgpt_direct = authenticated.chatgpt_direct,
                         },
                     },
                 };
@@ -1714,6 +1716,23 @@ test "model cache access copies clean up every induced allocation failure" {
         try std.testing.expect(failing.has_induced_failure);
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
+}
+
+test "model cache access preserves direct ChatGPT routing and explicit authority" {
+    const alloc = std.testing.allocator;
+    const access: credentials.CatalogAccess = .{ .authenticated = .{
+        .source = .chatgpt_subscription,
+        .credential = "chatgpt-secret",
+        .team_context = null,
+        .authority = .explicit,
+        .chatgpt_direct = true,
+    } };
+    var owned = try OwnedCatalogAccess.init(alloc, access);
+    defer owned.deinit(alloc);
+    try std.testing.expect(owned.access.authenticated.chatgpt_direct);
+    try std.testing.expect(owned.access.authenticated.authority == .explicit);
+    try std.testing.expectEqualStrings("chatgpt-secret", owned.access.authorizationCredential().?);
+    try std.testing.expect(owned.access.authorizationCredential().?.ptr != access.authorizationCredential().?.ptr);
 }
 
 test "model cache access owns Grok account identity with its credential" {

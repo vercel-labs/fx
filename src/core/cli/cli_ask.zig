@@ -564,6 +564,7 @@ const AskContext = struct {
     gateway_team: ?[]const u8 = null,
     credential_source: ?types.CredentialSource = null,
     account_id: ?[]const u8 = null,
+    chatgpt_direct: bool = false,
     refreshed_credential: ?credentials.Credential = null,
     provider: model_provider.ProviderId = .gateway,
     model_catalog_access: credentials.CatalogAccess = .{ .public_only = .no_credential },
@@ -1021,6 +1022,7 @@ const AskContext = struct {
             .gateway_team = self.gateway_team,
             .credential_source = self.credential_source,
             .account_id = self.account_id,
+            .chatgpt_direct = self.chatgpt_direct,
             .provider = self.provider,
             .provider_capabilities = provider_capabilities,
             .oauth_transport = self.cfg.gateway_provider.oauth_transport,
@@ -1112,9 +1114,10 @@ const AskContext = struct {
             .credential = self.api_key,
             .credential_source = self.credential_source,
             .account_id = self.account_id,
+            .chatgpt_direct = self.chatgpt_direct,
             .tenant = self.gateway_team,
             .endpoint = self.cfg.gateway_chat_url,
-            .reviewer_model = self.reviewer_model,
+            .reviewer_model = if (self.chatgpt_direct and self.reviewer_model.len == 0) self.model else self.reviewer_model,
             .cancel_flag = self.cancelFlag(),
         });
     }
@@ -1630,6 +1633,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         ctx.gateway_team = null;
         ctx.credential_source = .host_managed;
         ctx.account_id = null;
+        ctx.chatgpt_direct = false;
         ctx.model_catalog_access = .host_managed;
     } else {
         const startup_matches_final_model = if (startup.credential) |credential|
@@ -1658,12 +1662,14 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         ctx.gateway_team = credential.gatewayTeam();
         ctx.credential_source = credential.source;
         ctx.account_id = credential.accountId();
+        ctx.chatgpt_direct = credential.chatgpt_direct;
         ctx.model_catalog_access = credentials.catalogAccessForCredentialAndAccount(
             credential.source,
             credential.token,
             credential.gatewayTeam(),
             credential.accountId(),
         );
+        if (ctx.model_catalog_access == .authenticated) ctx.model_catalog_access.authenticated.chatgpt_direct = ctx.chatgpt_direct;
     }
 
     const restored_image_catalog = try ctx.session.snapshotImageCatalog(alloc, &.{});
@@ -1749,6 +1755,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .gateway_team = if (ctx.gateway_team) |team| @constCast(team) else null,
         .credential_source = ctx.credential_source,
         .account_id = if (ctx.account_id) |account_id| @constCast(account_id) else null,
+        .chatgpt_direct = ctx.chatgpt_direct,
         .provider = ctx.provider,
         .permission_mode = ctx.permission_mode,
         .history = context_history,
@@ -1844,7 +1851,8 @@ fn maybeStartAskTitleTask(
     if (ctx.session.agent.history.items.len != 0) return null;
     const session_id = ctx.activeSessionId() orelse return null;
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
-    const title_model = bundle.title_model orelse return null;
+    const default_title_model = bundle.title_model orelse return null;
+    const title_model = if (ctx.chatgpt_direct) ctx.model else default_title_model;
     const agent_stream = bundle.agent_stream orelse return null;
     const excerpt = session_title_generation.promptExcerpt(prompt) orelse return null;
     if (ctx.credential_source != .host_managed and ctx.api_key.len == 0) return null;
@@ -1855,6 +1863,7 @@ fn maybeStartAskTitleTask(
         .api_key = if (ctx.api_key.len > 0) ctx.api_key else null,
         .gateway_team = ctx.gateway_team,
         .account_id = ctx.account_id,
+        .chatgpt_direct = ctx.chatgpt_direct,
         .credential_source = ctx.credential_source,
         .stream_provider = agent_stream,
     }) catch return null;
@@ -2043,7 +2052,8 @@ fn adoptRefreshedAskCredential(
     worker_alloc: Allocator,
     refreshed: *credentials.Credential,
 ) ![]u8 {
-    if (ctx.credential_source != refreshed.source) return error.CredentialAuthorityChanged;
+    if (ctx.credential_source != refreshed.source or ctx.chatgpt_direct != refreshed.chatgpt_direct)
+        return error.CredentialAuthorityChanged;
     if (!optionalCredentialFieldEqual(ctx.account_id, refreshed.accountId()) or
         !optionalCredentialFieldEqual(ctx.gateway_team, refreshed.gatewayTeam()))
     {
@@ -2063,6 +2073,7 @@ fn adoptRefreshedAskCredential(
     ctx.api_key = current.token;
     ctx.credential_source = current.source;
     ctx.account_id = current.accountId();
+    ctx.chatgpt_direct = current.chatgpt_direct;
     ctx.gateway_team = current.gatewayTeam();
     ctx.model_catalog_access = credentials.catalogAccessForCredentialAndAccount(
         current.source,
@@ -2070,6 +2081,7 @@ fn adoptRefreshedAskCredential(
         current.gatewayTeam(),
         current.accountId(),
     );
+    if (ctx.model_catalog_access == .authenticated) ctx.model_catalog_access.authenticated.chatgpt_direct = ctx.chatgpt_direct;
     return worker_token;
 }
 
@@ -4859,6 +4871,52 @@ test "fx ask publishes a complete refreshed credential before later consumers" {
         "fresh-token",
         ctx.model_catalog_access.authorizationCredential().?,
     );
+}
+
+test "fx ask refresh preserves direct ChatGPT authority for catalog and tools" {
+    const alloc = std.testing.allocator;
+    var stdout_capture = TestCapture{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture = TestCapture{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+    ctx.api_key = "stale-chatgpt-token";
+    ctx.credential_source = .chatgpt_subscription;
+    ctx.account_id = "chatgpt-account";
+    ctx.chatgpt_direct = true;
+    ctx.provider = .codex;
+    ctx.model = "gpt-5.4";
+
+    var refreshed = credentials.Credential{
+        .token = try alloc.dupe(u8, "fresh-chatgpt-token"),
+        .source = .chatgpt_subscription,
+        .account_id = try alloc.dupe(u8, "chatgpt-account"),
+        .chatgpt_direct = true,
+    };
+    defer refreshed.deinit(alloc);
+    const worker_token = try adoptRefreshedAskCredential(&ctx, alloc, &refreshed);
+    defer secret.zeroAndFree(alloc, worker_token);
+    try std.testing.expectEqualStrings("fresh-chatgpt-token", worker_token);
+    try std.testing.expect(ctx.model_catalog_access.authenticated.chatgpt_direct);
+    const tool_ctx = ctx.toolContext();
+    try std.testing.expect(tool_ctx.chatgpt_direct);
+    try std.testing.expectEqualStrings("fresh-chatgpt-token", tool_ctx.api_key);
+
+    var codex = credentials.Credential{
+        .token = try alloc.dupe(u8, "codex-token"),
+        .source = .chatgpt_subscription,
+        .account_id = try alloc.dupe(u8, "chatgpt-account"),
+    };
+    defer codex.deinit(alloc);
+    try std.testing.expectError(error.CredentialAuthorityChanged, adoptRefreshedAskCredential(&ctx, alloc, &codex));
+    try std.testing.expect(ctx.chatgpt_direct);
+    try std.testing.expectEqualStrings("fresh-chatgpt-token", ctx.api_key);
 }
 
 test "fx ask ChatGPT route disables Gateway-backed auxiliary providers" {

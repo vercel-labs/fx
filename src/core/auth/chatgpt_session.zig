@@ -26,8 +26,52 @@ pub fn requireSignInStorage() error{CredentialStorageUnavailable}!void {
     _ = try session_presence.requireWritableProfileFile(auth_file_name, mutation_lock_file_name);
 }
 
+/// A stable per-profile machine identity, independent of sign-out.
+/// Creation shares the credential mutation lock and durable private-file writer.
+pub fn hostIdAlloc(alloc: Allocator) ![]u8 {
+    var mutation = try beginMutation();
+    defer mutation.deinit();
+    const name = "chatgpt-host-id";
+    const file = mutation.fx_dir.dir.openFile(io_mod.getIo(), name, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (file) |opened| {
+        var owned = opened;
+        defer owned.close(io_mod.getIo());
+        const bytes = try io_mod.readFileToEnd(alloc, &owned, 128);
+        errdefer alloc.free(bytes);
+        if (!validHostId(bytes)) return error.InvalidChatGptHostId;
+        return bytes;
+    }
+    var bytes: [16]u8 = undefined;
+    try io_mod.getIo().randomSecure(&bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = std.fmt.bytesToHex(bytes, .lower);
+    const id = try alloc.print("urn:uuid:{s}-{s}-{s}-{s}-{s}", .{ hex[0..8], hex[8..12], hex[12..16], hex[16..20], hex[20..32] });
+    errdefer alloc.free(id);
+    try io_mod.durableReplaceVerified(alloc, &mutation.fx_dir, name, id);
+    return id;
+}
+
+fn validHostId(value: []const u8) bool {
+    if (value.len != 45 or !std.mem.startsWith(u8, value, "urn:uuid:")) return false;
+    for (value[9..], 0..) |c, i| {
+        if (i == 8 or i == 13 or i == 18 or i == 23) {
+            if (c != '-') return false;
+        } else if (!std.ascii.isHex(c)) return false;
+    }
+    return value[23] == '4';
+}
+
 pub fn refreshDeadlineMs(expires_at_ms: i64) i64 {
-    return @max(expires_at_ms - expiry_skew_ms, 0);
+    return @max(expires_at_ms -| expiry_skew_ms, 0);
 }
 
 pub const Session = struct {
@@ -35,16 +79,27 @@ pub const Session = struct {
     refresh_token: []u8,
     expires_at_ms: i64,
     account_id: []u8,
+    // An issued app registration selects the public ChatGPT plan route.
+    // Absent fields preserve sessions created by the legacy Codex sign-in.
+    client_id: ?[]u8 = null,
+    host_id: ?[]u8 = null,
+    earliest_refresh_at_ms: i64 = 0,
 
     pub fn deinit(self: *Session, alloc: Allocator) void {
         secret.zeroAndFree(alloc, self.access_token);
         secret.zeroAndFree(alloc, self.refresh_token);
         alloc.free(self.account_id);
+        if (self.client_id) |value| alloc.free(value);
+        if (self.host_id) |value| alloc.free(value);
         self.* = undefined;
     }
 
     pub fn expired(self: Session, now_ms: i64) bool {
-        return refreshDeadlineMs(self.expires_at_ms) <= now_ms;
+        return self.refreshAfterMs() <= now_ms;
+    }
+
+    pub fn refreshAfterMs(self: Session) i64 {
+        return @max(refreshDeadlineMs(self.expires_at_ms), self.earliest_refresh_at_ms);
     }
 };
 
@@ -226,11 +281,26 @@ pub fn parse(alloc: Allocator, bytes: []const u8) !Session {
     errdefer alloc.free(account_id);
     if (!types.validCredentialAccountId(account_id)) return error.InvalidChatGptAuthSession;
     const expires_at_ms = try requiredInteger(object, "expires_at_ms");
+    const client_id = if (object.contains("client_id")) try dupeRequiredString(alloc, object, "client_id") else null;
+    errdefer if (client_id) |value| alloc.free(value);
+    const host_id = if (object.contains("host_id")) try dupeRequiredString(alloc, object, "host_id") else null;
+    errdefer if (host_id) |value| alloc.free(value);
+    if (client_id) |value| {
+        if (!std.mem.startsWith(u8, value, "oaiapp_") or host_id == null) return error.InvalidChatGptAuthSession;
+    }
+    const earliest_refresh_at_ms = if (object.contains("earliest_refresh_at_ms"))
+        try requiredInteger(object, "earliest_refresh_at_ms")
+    else
+        0;
+    if (client_id != null and (earliest_refresh_at_ms < 0 or earliest_refresh_at_ms > expires_at_ms)) return error.InvalidChatGptAuthSession;
     return .{
         .access_token = access_token,
         .refresh_token = refresh_token,
         .expires_at_ms = expires_at_ms,
         .account_id = account_id,
+        .client_id = client_id,
+        .host_id = host_id,
+        .earliest_refresh_at_ms = earliest_refresh_at_ms,
     };
 }
 
@@ -243,6 +313,13 @@ pub fn stringify(alloc: Allocator, session: Session) ![]u8 {
     try std.json.Stringify.value(session.refresh_token, .{}, &out.writer);
     try out.writer.print(",\"expires_at_ms\":{d},\"account_id\":", .{session.expires_at_ms});
     try std.json.Stringify.value(session.account_id, .{}, &out.writer);
+    if (session.client_id) |value| {
+        try out.writer.writeAll(",\"client_id\":");
+        try std.json.Stringify.value(value, .{}, &out.writer);
+        try out.writer.writeAll(",\"host_id\":");
+        try std.json.Stringify.value(session.host_id orelse return error.InvalidChatGptAuthSession, .{}, &out.writer);
+        try out.writer.print(",\"earliest_refresh_at_ms\":{d}", .{session.earliest_refresh_at_ms});
+    }
     try out.writer.writeAll("}\n");
     return out.toOwnedSlice();
 }
@@ -278,6 +355,24 @@ test "ChatGPT auth session round trips without exposing token fields to structur
     try std.testing.expectEqualStrings(session.refresh_token, decoded.refresh_token);
     try std.testing.expectEqualStrings(session.account_id, decoded.account_id);
     try std.testing.expectEqual(session.expires_at_ms, decoded.expires_at_ms);
+}
+
+test "ChatGPT direct registration round trips and respects earliest refresh" {
+    const alloc = std.testing.allocator;
+    var session = try parse(alloc,
+        \\{"version":1,"access_token":"opaque","refresh_token":"refresh","expires_at_ms":100000,"account_id":"user_test","client_id":"oaiapp_test","host_id":"urn:uuid:00000000-0000-4000-8000-000000000001","earliest_refresh_at_ms":80000}
+    );
+    defer session.deinit(alloc);
+    try std.testing.expect(!session.expired(79999));
+    try std.testing.expect(session.expired(80000));
+    const encoded = try stringify(alloc, session);
+    defer secret.zeroAndFree(alloc, encoded);
+    var copy = try parse(alloc, encoded);
+    defer copy.deinit(alloc);
+    try std.testing.expectEqualStrings("oaiapp_test", copy.client_id.?);
+    try std.testing.expectEqualStrings(session.host_id.?, copy.host_id.?);
+    try std.testing.expect(validHostId(copy.host_id.?));
+    try std.testing.expectEqual(@as(i64, 80000), copy.earliest_refresh_at_ms);
 }
 
 test "ChatGPT session refresh deadline keeps a one minute safety margin" {

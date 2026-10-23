@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { spawn as nodeSpawn, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -16,7 +16,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-helpers";
+import { cleanupIsolatedTestHome, createIsolatedTestHome, FX_BIN, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-helpers";
 import { fakeResponsesTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 import { readTapeFrames } from "./render-lab/tape";
 import { equivalentPngEncodings, solidPng } from "./fixtures/image-encoding";
@@ -219,7 +219,7 @@ afterEach(async () => {
   creditsGateway = null;
   catcher?.stop();
   catcher = null;
-  if (home) rmSync(home, { recursive: true, force: true });
+  if (home) cleanupIsolatedTestHome(home);
   home = null;
   stderrPath = null;
 });
@@ -524,11 +524,33 @@ function startFakeChatGptOAuth(
     responseDelayMs?: number;
     unauthorizedResponses?: number;
     rejectRefresh?: boolean;
+    badNonce?: boolean;
+    authorizationSubject?: () => string;
+    refreshSubject?: string;
+    omitRefreshIdentity?: boolean;
+    omitRefreshScope?: boolean;
+    rotateTokens?: boolean;
     beforeRefreshResponse?: () => void | Promise<void>;
     modelsResponse?: () => Promise<Response | void>;
   } = {},
 ) {
-  const accessToken = chatgptAccessToken();
+  // Seeded sessions retain legacy JWTs; browser sign-in issues opaque tokens.
+  let accessToken = chatgptAccessToken();
+  const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const jwk = { ...publicKey.export({ format: "jwk" }), kid: "fx-e2e", alg: "RS256", use: "sig" };
+  let authorization: URL | undefined;
+  const authorizationClients: string[] = [];
+  function idToken(refresh: boolean) {
+    const encode = (value: object) => Buffer.from(JSON.stringify(value)).toString("base64url");
+    const unsigned = `${encode({ alg: "RS256", kid: jwk.kid, typ: "JWT" })}.${encode({
+      iss: "https://auth.openai.com", aud: "oaiapp_fx_test",
+      sub: (refresh ? options.refreshSubject : options.authorizationSubject?.()) ?? "user_fx_test",
+      email: "fx@example.com", iat: Math.floor(Date.now() / 1000),
+      exp: Math.floor(Date.now() / 1000) + 3600,
+      nonce: options.badNonce ? "wrong-nonce" : authorization?.searchParams.get("nonce"),
+    })}`;
+    return `${unsigned}.${sign("RSA-SHA256", Buffer.from(unsigned), privateKey).toString("base64url")}`;
+  }
   let responseCount = 0;
   let models = [
     { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "max" }, { effort: "high" }], additional_speed_tiers: ["fast"], input_modalities: ["text", "image"], context_window: 272000 },
@@ -539,6 +561,7 @@ function startFakeChatGptOAuth(
     method: string;
     path: string;
     authorization: string | null;
+    headers: Headers;
     body: string | null;
   }> = [];
   const server = Bun.serve({
@@ -546,7 +569,7 @@ function startFakeChatGptOAuth(
     port: 0,
     async fetch(request) {
       const url = new URL(request.url);
-      const body = url.pathname === "/chatgpt/responses" || url.pathname === "/chatgpt/token"
+      const body = url.pathname === "/chatgpt/responses" || url.pathname === "/api/accounts/oauth/token"
         ? await request.text()
         : null;
       if (url.pathname === "/chatgpt/responses" && body?.includes(TITLE_GENERATION_MARKER)) {
@@ -556,29 +579,74 @@ function startFakeChatGptOAuth(
         method: request.method,
         path: url.pathname,
         authorization: request.headers.get("authorization"),
+        headers: new Headers(request.headers),
         body,
       });
-      if (url.pathname === "/oauth/authorize") {
+      if (url.pathname === "/.well-known/jwks.json") return Response.json({ keys: [jwk] });
+      if (url.pathname === "/api/accounts/authorize") {
+        const clientId = url.searchParams.get("client_id") ?? "";
+        expect(["dynamic_agent_client", "oaiapp_fx_test"]).toContain(clientId);
+        expect(url.searchParams.get("agent_name_hint")).toBe(clientId === "dynamic_agent_client" ? "fx" : null);
+        authorizationClients.push(clientId);
+        expect(url.searchParams.has("id_token_hint")).toBe(false);
+        expect(url.searchParams.get("resource")).toBe("https://api.openai.com/v1");
+        expect(url.searchParams.get("scope")?.split(" ")).toContain("chatgpt.tokens.use.direct");
+        expect(url.searchParams.get("nonce")).toBeTruthy();
+        expect(url.searchParams.get("ext_agent_host_id")).toBeTruthy();
+        expect(url.searchParams.get("code_challenge_method")).toBe("S256");
+        authorization = url;
+        accessToken = "opaque-chatgpt-direct-access-token";
         const redirectUri = url.searchParams.get("redirect_uri");
         const state = url.searchParams.get("state");
         if (!redirectUri || !state) return new Response("invalid authorize request", { status: 400 });
-        const callback = new URL(redirectUri.replace("localhost", "127.0.0.1"));
+        const callback = new URL(redirectUri);
+        expect(callback.hostname).toBe("127.0.0.1");
+        callback.searchParams.set("client_id", "oaiapp_fx_test");
         callback.searchParams.set("code", "chatgpt-code");
         callback.searchParams.set("state", state);
         return Response.redirect(callback.toString(), 302);
       }
-      if (url.pathname === "/chatgpt/token") {
+      if (url.pathname === "/api/accounts/oauth/token") {
         if (options.tokenDelayMs) await Bun.sleep(options.tokenDelayMs);
-        const refresh = body?.includes('"grant_type":"refresh_token"') ?? false;
+        const form = new URLSearchParams(body ?? "");
+        const refresh = form.get("grant_type") === "refresh_token" || (body?.includes('"grant_type":"refresh_token"') ?? false);
+        if (authorization) {
+          expect(request.headers.get("content-type")).toContain("application/x-www-form-urlencoded");
+          expect(form.get("client_id")).toBe("oaiapp_fx_test");
+          expect(form.get("resource")).toBe("https://api.openai.com/v1");
+          if (!refresh) {
+            expect(form.get("grant_type")).toBe("authorization_code");
+            expect(form.get("code")).toBe("chatgpt-code");
+            expect(form.get("redirect_uri")).toBe(authorization.searchParams.get("redirect_uri"));
+            expect(createHash("sha256").update(form.get("code_verifier") ?? "").digest("base64url"))
+              .toBe(authorization.searchParams.get("code_challenge"));
+          }
+        }
         if (refresh) await options.beforeRefreshResponse?.();
         if (options.rejectRefresh && refresh) {
           return Response.json({ error: { code: "refresh_token_reused" } }, { status: 401 });
         }
+        if (refresh && options.rotateTokens) accessToken = "opaque-chatgpt-rotated-access-token";
         return Response.json({
           access_token: accessToken,
-          refresh_token: "chatgpt-refresh",
+          ...(authorization ? {
+            ...(refresh && options.omitRefreshIdentity ? {} : { id_token: idToken(refresh) }),
+            token_type: "Bearer",
+            ...(refresh && options.omitRefreshScope ? {} : {
+              scope: "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct",
+            }),
+          } : {}),
+          refresh_token: refresh && options.rotateTokens ? "chatgpt-refresh-rotated" : "chatgpt-refresh",
           expires_in: 3600,
         });
+      }
+      // These loopback endpoint overrides are shared by legacy and direct
+      // credentials; the opaque bearer and header assertions pin route choice.
+      if (authorization && (url.pathname === "/chatgpt/models" || url.pathname === "/chatgpt/responses")) {
+        expect(request.headers.get("authorization")).toBe(`Bearer ${accessToken}`);
+        for (const header of ["chatgpt-account-id", "originator", "openai-beta", "openai-organization", "openai-project"]) {
+          expect(request.headers.get(header)).toBeNull();
+        }
       }
       if (url.pathname === "/chatgpt/models") {
         const overridden = await options.modelsResponse?.();
@@ -604,11 +672,15 @@ function startFakeChatGptOAuth(
   });
   const baseUrl = `http://127.0.0.1:${server.port}`;
   return {
-    accessToken,
+    get accessToken() { return accessToken; },
+    get hostId() { return authorization?.searchParams.get("ext_agent_host_id"); },
+    authorizationClients,
     requests,
     env: {
       FX_E2E_CHATGPT_ISSUER_URL: baseUrl,
-      FX_E2E_CHATGPT_TOKEN_URL: `${baseUrl}/chatgpt/token`,
+      FX_E2E_CHATGPT_ORIGIN: baseUrl,
+      FX_E2E_CHATGPT_JWKS_URL: `${baseUrl}/.well-known/jwks.json`,
+      FX_E2E_CHATGPT_TOKEN_URL: `${baseUrl}/api/accounts/oauth/token`,
       FX_E2E_OPENAI_CODEX_MODELS_URL: `${baseUrl}/chatgpt/models`,
       FX_E2E_OPENAI_CODEX_RESPONSES_URL: `${baseUrl}/chatgpt/responses`,
     },
@@ -834,7 +906,7 @@ async function completeDisplayedCodexLogin(
   await completeDisplayedSubscriptionLogin(
     activeSession,
     "Authorize with Codex",
-    `${fixture.baseUrl}/oauth/authorize?`,
+    `${fixture.baseUrl}/api/accounts/authorize?`,
   );
 }
 
@@ -859,6 +931,7 @@ async function completeDisplayedSubscriptionLogin(
 
 async function runCodexLoginWithBrowser(
   env: Record<string, string | undefined>,
+  expectedStatus = 200,
 ) {
   const childEnv: NodeJS.ProcessEnv = { ...process.env };
   for (const [key, value] of Object.entries(env)) {
@@ -874,24 +947,33 @@ async function runCodexLoginWithBrowser(
   let stderr = "";
   proc.stdout!.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
   proc.stderr!.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+  const exited = new Promise<number>((resolve, reject) => {
+    proc.once("error", reject);
+    proc.once("close", (value) => resolve(value ?? 1));
+  });
+  const killTimer = setTimeout(() => proc.kill("SIGKILL"), TIMEOUT);
   const deadline = Date.now() + TIMEOUT;
   let authorizationUrl: string | undefined;
   while (Date.now() < deadline) {
-    authorizationUrl = stdout.match(/http:\/\/127\.0\.0\.1:\d+\/oauth\/authorize\?\S+/)?.[0];
+    authorizationUrl = stdout.match(/http:\/\/127\.0\.0\.1:\d+\/api\/accounts\/authorize\?\S+/)?.[0];
     if (authorizationUrl) break;
     await Bun.sleep(20);
   }
   if (!authorizationUrl) {
     proc.kill("SIGTERM");
+    clearTimeout(killTimer);
     throw new Error(`Codex login did not print an authorization URL: ${stdout}\n${stderr}`);
   }
-  const response = await fetch(authorizationUrl, { redirect: "follow" });
-  expect(response.status).toBe(200);
-  const code = await new Promise<number>((resolve, reject) => {
-    proc.once("error", reject);
-    proc.once("close", (value) => resolve(value ?? 1));
-  });
-  return { code, stdout, stderr };
+  try {
+    const response = await fetch(authorizationUrl, { redirect: "follow", signal: AbortSignal.timeout(TIMEOUT) });
+    expect(response.status).toBe(expectedStatus);
+    const code = await exited;
+    expect(proc.signalCode, `Codex login terminated before completion: ${stderr}`).toBeNull();
+    return { code, stdout, stderr };
+  } finally {
+    clearTimeout(killTimer);
+    if (proc.exitCode === null) proc.kill("SIGKILL");
+  }
 }
 
 function startFakeCodexToolLoop(options: {
@@ -1943,7 +2025,7 @@ tmuxTest(
         await completeDisplayedSubscriptionLogin(
           session,
           `Authorize with ${label}`,
-          provider === "codex" ? `${chatgptOauth.baseUrl}/oauth/authorize?` : `${grok.baseUrl}/oauth2/authorize?`,
+          provider === "codex" ? `${chatgptOauth.baseUrl}/api/accounts/authorize?` : `${grok.baseUrl}/oauth2/authorize?`,
           400,
         );
         await session.waitForText(`${label} subscription: Credential could not be saved`, TIMEOUT);
@@ -2199,9 +2281,9 @@ tmuxTest(
     expect(signInScreen).toMatch(/^  Open\s+Authorize with Codex$/m);
     expect(signInScreen).toMatch(/^enter reopens browser · esc cancels$/m);
     expect(signInScreen).not.toContain("Code   ");
-    expect(signInScreen).not.toContain(`${chatgptOauth.baseUrl}/oauth/authorize?`);
+    expect(signInScreen).not.toContain(`${chatgptOauth.baseUrl}/api/accounts/authorize?`);
     const signInEscapes = await session.capturePaneEscapes();
-    expect(signInEscapes).toContain(`\x1b]8;id=fx-codex-auth;${chatgptOauth.baseUrl}/oauth/authorize?`);
+    expect(signInEscapes).toContain(`\x1b]8;id=fx-codex-auth;${chatgptOauth.baseUrl}/api/accounts/authorize?`);
     expect(signInEscapes).toContain("\x1b]8;;\x1b\\");
     await session.sendKeys("C-c");
     await session.waitForComposer(TIMEOUT);
@@ -2499,7 +2581,7 @@ tmuxTest(
     await session.waitForPane((pane) => !pane.includes("esc close"), TIMEOUT);
     await session.waitForComposer(TIMEOUT);
     const authorizeRequestsBeforeRoundTrip = chatgptOauth.requests.filter(
-      (request) => request.path === "/oauth/authorize",
+      (request) => request.path === "/api/accounts/authorize",
     ).length;
     const settingsPath = join(home, ".fx", "settings.json");
     const gatewayModelBefore = JSON.parse(readFileSync(settingsPath, "utf8")).models.gateway;
@@ -2539,7 +2621,7 @@ tmuxTest(
     expect(restoredCodex.provider).toBe("codex");
     expect(restoredCodex.models.gateway).toBe(gatewayModelBefore);
     expect(restoredCodex.models.codex).toBe("gpt-5.6-sol");
-    expect(chatgptOauth.requests.filter((request) => request.path === "/oauth/authorize"))
+    expect(chatgptOauth.requests.filter((request) => request.path === "/api/accounts/authorize"))
       .toHaveLength(authorizeRequestsBeforeRoundTrip);
     await session.sendText("/logout codex");
     await session.waitForText("Signed out of Codex.", TIMEOUT);
@@ -2560,8 +2642,9 @@ tmuxTest(
     const reauthenticated = JSON.parse(readFileSync(settingsPath, "utf8"));
     expect(reauthenticated.provider).toBe("codex");
     expect(reauthenticated.models.codex).toBe("gpt-5.4-mini");
-    expect(chatgptOauth.requests.filter((request) => request.path === "/oauth/authorize"))
+    expect(chatgptOauth.requests.filter((request) => request.path === "/api/accounts/authorize"))
       .toHaveLength(authorizeRequestsBeforeRoundTrip + 1);
+    expect(chatgptOauth.authorizationClients).toEqual(["dynamic_agent_client", "dynamic_agent_client"]);
     await session.sendKeys("C-c");
 
     expect(session.isAlive()).toBe(true);
@@ -2687,7 +2770,7 @@ tmuxTest(
     );
 
     const refreshRequests = chatgptOauth.requests.filter(
-      (request) => request.path === "/chatgpt/token" && request.body?.includes('"grant_type":"refresh_token"'),
+      (request) => request.path === "/api/accounts/oauth/token" && request.body?.includes('"grant_type":"refresh_token"'),
     );
     expect(refreshRequests).toHaveLength(1);
     expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
@@ -3995,9 +4078,33 @@ test("status never substitutes an environment key for a missing explicit login",
 });
 
 test(
+  "ChatGPT browser sign-in rejects a signed ID token with the wrong nonce",
+  async () => {
+    home = createIsolatedTestHome();
+    gateway = startFakeGateway([]);
+    chatgptOauth = startFakeChatGptOAuth({ badNonce: true });
+    const login = await runCodexLoginWithBrowser({
+      HOME: home, AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined,
+      FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1", FX_AUTO_UPGRADE: "0",
+      FX_NO_OPEN_BROWSER: "1", FX_SOUND: "0",
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      ...chatgptOauth.env,
+    }, 400);
+    expect(login.code).not.toBe(0);
+    expect(login.stdout).not.toContain("Signed in with Codex.");
+    expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
+    expect(chatgptOauth.requests.some((request) => request.path === "/.well-known/jwks.json")).toBe(true);
+    expect(chatgptOauth.requests.filter((request) => request.path === "/chatgpt/responses")).toHaveLength(0);
+    expect(gateway.requests).toHaveLength(0);
+  },
+  60_000,
+);
+
+test(
   "Codex CLI browser login fetches raw models and replays one 401 without Gateway leakage",
   async () => {
-    home = mkdtempSync(join(tmpdir(), "fx-codex-cli-login-"));
+    home = createIsolatedTestHome();
     gateway = startFakeGateway([]);
     chatgptOauth = startFakeChatGptOAuth({ unauthorizedResponses: 1 });
     const env = {
@@ -4008,6 +4115,7 @@ test(
       FX_SKIP_ONBOARDING: "1",
       FX_AUTO_UPGRADE: "0",
       FX_NO_OPEN_BROWSER: "1",
+      FX_SOUND: "0",
       FX_GATEWAY_BASE_URL: gateway.baseUrl,
       FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
       ...chatgptOauth.env,
@@ -4020,6 +4128,12 @@ test(
     expect(login.stderr).toBe("");
 
     const authPath = join(home, ".fx", "chatgpt-auth.json");
+    const stored = JSON.parse(readFileSync(authPath, "utf8"));
+    expect(stored.client_id).toBe("oaiapp_fx_test");
+    expect(stored.host_id).toBe(chatgptOauth.hostId);
+    expect(stored.host_id).toBeTruthy();
+    expect(stored.account_id).toBe("user_fx_test");
+    expect(stored.access_token).toBe("opaque-chatgpt-direct-access-token");
     expect(existsSync(authPath)).toBe(true);
     expect(statSync(authPath).mode & 0o077).toBe(0);
     const settingsPath = join(home, ".fx", "settings.json");
@@ -4045,9 +4159,21 @@ test(
     expect(responses).toHaveLength(2);
     expect(responses[0]!.body).toBe(responses[1]!.body);
     expect(responses[0]!.authorization).toBe(`Bearer ${chatgptOauth.accessToken}`);
+    for (const request of chatgptOauth.requests.filter((request) =>
+      request.path === "/chatgpt/models" || request.path === "/chatgpt/responses")) {
+      expect(request.authorization).toBe(`Bearer ${chatgptOauth.accessToken}`);
+      for (const header of ["chatgpt-account-id", "originator", "openai-beta", "session_id"]) {
+        expect(request.headers.get(header)).toBeNull();
+      }
+    }
     for (const request of [...gateway.requests, ...gateway.modelRequests]) {
       expect(request.headers.get("authorization")).not.toBe(`Bearer ${chatgptOauth.accessToken}`);
     }
+
+    const usage = await runFx(["usage", "--json"], { env, timeoutMs: TIMEOUT });
+    expect(usage.code).toBe(1);
+    expect(usage.stdout).toContain("unsupported_provider");
+    expect(chatgptOauth.requests.some((request) => request.path.startsWith("/backend-api/wham/"))).toBe(false);
 
     const gatewayRequestsBeforeImage = gateway.requests.length;
     const gatewayModelRequestsBeforeImage = gateway.modelRequests.length;
@@ -4077,12 +4203,19 @@ test(
     expect(gateway.modelRequests).toHaveLength(gatewayModelRequestsBeforeImage);
 
     const tokenRequestsBeforeRoundTrip = chatgptOauth.requests.filter(
-      (request) => request.path === "/chatgpt/token",
+      (request) => request.path === "/api/accounts/oauth/token",
     ).length;
     expect((await runFx(["provider", "gateway"], { env, timeoutMs: TIMEOUT })).code).toBe(0);
     expect((await runFx(["provider", "codex"], { env, timeoutMs: TIMEOUT })).code).toBe(0);
-    expect(chatgptOauth.requests.filter((request) => request.path === "/chatgpt/token"))
+    expect(chatgptOauth.requests.filter((request) => request.path === "/api/accounts/oauth/token"))
       .toHaveLength(tokenRequestsBeforeRoundTrip);
+
+    const returningLogin = await runCodexLoginWithBrowser(env);
+    expect(returningLogin.code, `stdout: ${returningLogin.stdout}\nstderr: ${returningLogin.stderr}`).toBe(0);
+    const returningStored = JSON.parse(readFileSync(authPath, "utf8"));
+    expect(chatgptOauth.authorizationClients).toEqual(["dynamic_agent_client", "oaiapp_fx_test"]);
+    expect(returningStored.client_id).toBe(stored.client_id);
+    expect(returningStored.host_id).toBe(stored.host_id);
 
     const logout = await runFx(["logout", "codex"], { env, timeoutMs: TIMEOUT });
     expect(logout.code).toBe(0);
@@ -4091,6 +4224,126 @@ test(
   },
   60_000,
 );
+
+test("ChatGPT returning sign-in preserves credentials when the signed subject changes", async () => {
+  home = createIsolatedTestHome();
+  gateway = startFakeGateway([]);
+  let subject = "user_fx_test";
+  chatgptOauth = startFakeChatGptOAuth({ authorizationSubject: () => subject });
+  const env = {
+    ...withoutSavedModelEnv(home, "codex", chatgptOauth.env),
+    AI_GATEWAY_API_KEY: ENV_TOKEN,
+    FX_SOUND: "0",
+    FX_GATEWAY_BASE_URL: gateway.baseUrl,
+    FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+  };
+  const login = await runCodexLoginWithBrowser(env);
+  expect(login.code, login.stderr).toBe(0);
+  const authPath = join(home, ".fx", "chatgpt-auth.json");
+  const original = readFileSync(authPath, "utf8");
+  subject = "different_fx_member";
+  chatgptOauth.requests.length = 0;
+
+  const returning = await runCodexLoginWithBrowser(env, 400);
+  expect(returning.code).not.toBe(0);
+  expect(returning.stdout).not.toContain("Signed in with Codex.");
+  expect(readFileSync(authPath, "utf8")).toBe(original);
+  expect(chatgptOauth.authorizationClients).toEqual(["dynamic_agent_client", "oaiapp_fx_test"]);
+  expect(chatgptOauth.requests.filter((request) => request.path === "/.well-known/jwks.json"))
+    .toHaveLength(1);
+  expect(chatgptOauth.requests.filter((request) => request.path.startsWith("/chatgpt/")))
+    .toHaveLength(0);
+  expect(gateway.requests).toHaveLength(0);
+  expect(gateway.modelRequests).toHaveLength(0);
+}, 60_000);
+
+test("ChatGPT refresh rejects a different signed subject before using rotated tokens", async () => {
+  home = createIsolatedTestHome();
+  gateway = startFakeGateway([]);
+  chatgptOauth = startFakeChatGptOAuth({
+    unauthorizedResponses: 1,
+    refreshSubject: "different_fx_member",
+    rotateTokens: true,
+  });
+  const env = {
+    ...withoutSavedModelEnv(home, "codex", chatgptOauth.env),
+    AI_GATEWAY_API_KEY: ENV_TOKEN,
+    FX_SOUND: "0",
+    FX_GATEWAY_BASE_URL: gateway.baseUrl,
+    FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+  };
+  const login = await runCodexLoginWithBrowser(env);
+  expect(login.code, login.stderr).toBe(0);
+  const authPath = join(home, ".fx", "chatgpt-auth.json");
+
+  const ask = await runFx(["ask", "--json", "--no-save", "Answer directly."], {
+    env, timeoutMs: TIMEOUT,
+  });
+  expect(ask.code).not.toBe(0);
+  expect(ask.stdout).not.toContain("CHATGPT_DIRECT_RESPONSE");
+  expect(existsSync(authPath)).toBe(false);
+  expect(chatgptOauth.requests.filter((request) => request.path === "/.well-known/jwks.json"))
+    .toHaveLength(2);
+  expect(chatgptOauth.requests.filter((request) => request.path === "/chatgpt/responses"))
+    .toHaveLength(1);
+  expect(chatgptOauth.accessToken).toBe("opaque-chatgpt-rotated-access-token");
+  for (const request of chatgptOauth.requests) {
+    expect(request.authorization).not.toBe(`Bearer ${chatgptOauth.accessToken}`);
+  }
+  expect(gateway.requests).toHaveLength(0);
+  expect(gateway.modelRequests).toHaveLength(0);
+}, 60_000);
+
+test("ChatGPT refresh rotates opaque tokens without a replacement ID token or scope", async () => {
+  home = createIsolatedTestHome();
+  gateway = startFakeGateway([]);
+  chatgptOauth = startFakeChatGptOAuth({
+    unauthorizedResponses: 1,
+    omitRefreshIdentity: true,
+    omitRefreshScope: true,
+    rotateTokens: true,
+  });
+  const env = {
+    ...withoutSavedModelEnv(home, "codex", chatgptOauth.env),
+    AI_GATEWAY_API_KEY: ENV_TOKEN,
+    FX_SOUND: "0",
+    FX_GATEWAY_BASE_URL: gateway.baseUrl,
+    FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+  };
+  const login = await runCodexLoginWithBrowser(env);
+  expect(login.code, login.stderr).toBe(0);
+  const authPath = join(home, ".fx", "chatgpt-auth.json");
+  const original = JSON.parse(readFileSync(authPath, "utf8"));
+  const ask = await runFx(["ask", "--json", "--no-save", "Answer directly."], {
+    env, timeoutMs: TIMEOUT,
+  });
+  expect(ask.code, `stdout: ${ask.stdout}\nstderr: ${ask.stderr}`).toBe(0);
+  expect(ask.stderr).toBe("");
+  expect(ask.stdout).toContain("CHATGPT_DIRECT_RESPONSE");
+  const stored = JSON.parse(readFileSync(authPath, "utf8"));
+  expect(stored.access_token).toBe("opaque-chatgpt-rotated-access-token");
+  expect(stored.refresh_token).toBe("chatgpt-refresh-rotated");
+  expect(stored.account_id).toBe(original.account_id);
+  expect(stored.client_id).toBe(original.client_id);
+  expect(stored.host_id).toBe(original.host_id);
+  expect(statSync(authPath).mode & 0o077).toBe(0);
+  const refreshRequests = chatgptOauth.requests.filter((request) =>
+    request.path === "/api/accounts/oauth/token" &&
+    new URLSearchParams(request.body ?? "").get("grant_type") === "refresh_token");
+  expect(refreshRequests).toHaveLength(1);
+  expect(new URLSearchParams(refreshRequests[0]!.body!).get("refresh_token"))
+    .toBe(original.refresh_token);
+  expect(chatgptOauth.requests.filter((request) => request.path === "/.well-known/jwks.json"))
+    .toHaveLength(1);
+  const responses = chatgptOauth.requests.filter((request) => request.path === "/chatgpt/responses");
+  expect(responses).toHaveLength(2);
+  expect(responses[0]!.authorization).toBe(`Bearer ${original.access_token}`);
+  expect(responses[1]!.authorization).toBe(`Bearer ${stored.access_token}`);
+  expect(responses[0]!.body).toBe(responses[1]!.body);
+  expect(JSON.parse(responses[1]!.body!)).toMatchObject({ store: false, stream: true });
+  expect(gateway.requests).toHaveLength(0);
+  expect(gateway.modelRequests).toHaveLength(0);
+}, 60_000);
 
 function withoutSavedModelEnv(
   testHome: string,
@@ -5845,6 +6098,7 @@ test(
       FX_SKIP_ONBOARDING: "1",
       FX_AUTO_UPGRADE: "0",
       FX_NO_OPEN_BROWSER: "1",
+      FX_SOUND: "0",
       FX_GATEWAY_BASE_URL: gateway.baseUrl,
       FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
       ...chatgptOauth.env,
@@ -5853,7 +6107,7 @@ test(
     const login = await runCodexLoginWithBrowser(env);
     expect(login.code).toBe(1);
     expect(login.stdout).not.toContain("Signed in with Codex.");
-    expect(login.stderr).toContain("fx login: could not load the target model catalog (malformed_response)");
+    expect(login.stderr).toContain("fx login: target model catalog is empty");
     expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(true);
     const settingsPath = join(home, ".fx", "settings.json");
     expect(existsSync(settingsPath)).toBe(false);

@@ -236,6 +236,7 @@ pub fn Runtime(comptime App: type) type {
                 .gateway_team = app.auth.gatewayTeam(),
                 .credential_source = app.auth.credentialSource(),
                 .account_id = app.auth.accountId(),
+                .chatgpt_direct = if (comptime @hasDecl(@TypeOf(app.auth), "chatgptDirect")) app.auth.chatgptDirect() else false,
                 .provider = selected_provider,
                 .provider_capabilities = provider_capabilities,
                 .oauth_transport = app.auth.oauthTransport(),
@@ -777,6 +778,7 @@ pub fn Runtime(comptime App: type) type {
             ctx.api_key = credential_secret;
             ctx.credential_source = credential_source;
             ctx.account_id = credential.accountId();
+            ctx.chatgpt_direct = credential.chatgptDirect();
             ctx.gateway_team = credential.tenant();
             if (comptime @hasField(App, "web_search_runtime") and @hasField(App, "session")) {
                 if (ctx.provider_capabilities.fx_search) {
@@ -1059,6 +1061,7 @@ pub fn Runtime(comptime App: type) type {
                 .api_key = job.api_key,
                 .credential_source = job.credential_source,
                 .account_id = job.account_id,
+                .chatgpt_direct = job.chatgpt_direct,
                 .gateway_team = job.gateway_team,
                 .session_id = app_session_runtime.Runtime(App).activeSessionId(app),
                 .retry_count = gateway_retry_count,

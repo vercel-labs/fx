@@ -104,6 +104,10 @@ pub const top_level_specs = [_]TopLevelSpec{
         .token = "login",
         .usage = "login [vercel|codex|grok]",
         .summary = "Sign in to Vercel or a selected provider",
+        .details = &.{
+            "fx login codex opens Sign in with ChatGPT in your browser. Allow plan usage to use your subscription through the public OpenAI Responses API.",
+            "Existing Codex sessions keep their original route until you sign in again. fx stores its own credentials without changing another app's login.",
+        },
     },
     .{
         .kind = .logout,
@@ -232,7 +236,8 @@ pub const top_level_specs = [_]TopLevelSpec{
         },
         .details = &.{
             "With AI Gateway, reads its usage reports: with fx login, your spend on the team and your budget; with an API key, that key's spend.",
-            "With Codex, reads your ChatGPT plan's limits and activity; with Grok, your plan's allowance and credits.",
+            "With existing Codex sessions, reads your ChatGPT plan's limits and activity; with Grok, your plan's allowance and credits.",
+            "New Sign in with ChatGPT sessions do not support usage reports here. View your allowance at https://chatgpt.com/settings/usage.",
             "Finished days are cached under ~/.fx and fetched at most once a day.",
         },
     },

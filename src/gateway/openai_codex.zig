@@ -199,9 +199,29 @@ pub fn acceptsCredential(lease: stream_provider.CredentialLease) bool {
 /// The Responses endpoint, or a loopback test endpoint from the environment.
 /// Borrowed; static or environment-owned.
 pub fn responsesEndpoint() error{InvalidE2EOpenAICodexEndpoint}![]const u8 {
-    const override = io_mod.getenv(e2e_endpoint_env) orelse return endpoint;
+    return responsesEndpointForRoute(false);
+}
+
+pub fn responsesEndpointForRoute(chatgpt_direct: bool) error{InvalidE2EOpenAICodexEndpoint}![]const u8 {
+    const override = io_mod.getenv(e2e_endpoint_env) orelse return if (chatgpt_direct) "https://api.openai.com/v1/responses" else endpoint;
     if (!gateway_client.isLoopbackHttpUrl(override)) return error.InvalidE2EOpenAICodexEndpoint;
     return override;
+}
+
+test "ChatGPT direct Responses uses opaque bearer without account introspection" {
+    var auth = try requestAuthHeaders(std.testing.allocator, .{ .direct = .{
+        .secret_bytes = "opaque-direct-token",
+        .source = .chatgpt_subscription,
+        .chatgpt_direct = true,
+        .account_id = "not a legacy account id",
+    } });
+    defer auth.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Bearer opaque-direct-token", auth.authorization.?);
+    try std.testing.expect(auth.account_id == null);
+    if (io_mod.getenv(e2e_endpoint_env) == null) {
+        try std.testing.expectEqualStrings("https://api.openai.com/v1/responses", try responsesEndpointForRoute(true));
+        try std.testing.expectEqualStrings(endpoint, try responsesEndpoint());
+    }
 }
 
 pub const max_extra_headers = 6;
@@ -252,6 +272,7 @@ pub fn requestAuthHeaders(alloc: Allocator, auth: stream_provider.CredentialLeas
         .direct => |direct| blk: {
             const authorization = try alloc.print("Bearer {s}", .{direct.secret_bytes});
             errdefer secret.zeroAndFree(alloc, authorization);
+            if (direct.chatgpt_direct) break :blk .{ .authorization = authorization };
             const account_id = if (direct.account_id) |account|
                 try alloc.dupe(u8, account)
             else
@@ -276,11 +297,11 @@ pub fn streamPrepared(
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
     var auth_headers = try requestAuthHeaders(alloc, request.credential);
     defer auth_headers.deinit(alloc);
-    const request_endpoint = responsesEndpoint() catch |err| return stream_provider.failResult(err);
+    const request_endpoint = responsesEndpointForRoute(request.credential.chatgptDirect()) catch |err| return stream_provider.failResult(err);
     const uri = try std.Uri.parse(request_endpoint);
 
     var extra_headers_buf: [max_extra_headers]std.http.Header = undefined;
-    const extra_headers = extraHeaders(&extra_headers_buf, auth_headers.account_id, request.session_id);
+    const extra_headers = if (request.credential.chatgptDirect()) extra_headers_buf[0..0] else extraHeaders(&extra_headers_buf, auth_headers.account_id, request.session_id);
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();

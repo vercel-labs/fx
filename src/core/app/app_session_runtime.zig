@@ -3015,7 +3015,8 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasDecl(App, "sessionTitleModel")) return;
 
             const excerpt = session_title_generation.promptExcerpt(prompt) orelse return;
-            const title_model = app.sessionTitleModel();
+            const chatgpt_direct = if (comptime @hasDecl(@TypeOf(app.auth), "chatgptDirect")) app.auth.chatgptDirect() else false;
+            const title_model = if (chatgpt_direct and app.sessionTitleModel() != null) provider_runtime.model(app) else app.sessionTitleModel();
             if (!session_title_generation.shouldGenerate(.{
                 .setting_enabled = app.session_title_generation,
                 .provider_supports_titles = title_model != null,
@@ -3034,6 +3035,7 @@ pub fn Runtime(comptime App: type) type {
                 .api_key = credential.api_key,
                 .gateway_team = credential.gateway_team,
                 .account_id = app.auth.accountId(),
+                .chatgpt_direct = chatgpt_direct,
                 .credential_source = credential.source,
                 .stream_provider = app.agentStreamProvider(),
             }) catch |err| {

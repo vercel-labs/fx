@@ -180,6 +180,7 @@ pub fn run(
         routed_config.tool_context.gateway_team = credential.gatewayTeam();
         routed_config.tool_context.credential_source = credential.source;
         routed_config.tool_context.account_id = credential.accountId();
+        routed_config.tool_context.chatgpt_direct = credential.chatgpt_direct;
     }
     const ultrafast_mode = childUltrafastMode(config.tool_context.ultrafast_mode, admission.ultrafast_mode);
     routed_config.tool_context.model = admission.model;
@@ -234,6 +235,7 @@ pub fn run(
         else
             null,
         .credential_source = routed_config.tool_context.credential_source,
+        .chatgpt_direct = routed_config.tool_context.chatgpt_direct,
         .account_id = if (routed_config.tool_context.account_id) |account_id|
             arena.dupe(u8, account_id) catch return error.OutOfMemory
         else
@@ -614,6 +616,7 @@ fn refreshGatewayCredential(
     )) orelse return null;
     defer refreshed.deinit(context.turn.alloc);
     if (context.config.tool_context.credential_source != refreshed.source or
+        context.config.tool_context.chatgpt_direct != refreshed.chatgpt_direct or
         !optionalCredentialFieldEqual(
             context.config.tool_context.account_id,
             refreshed.accountId(),
@@ -638,6 +641,7 @@ fn refreshGatewayCredential(
     context.config.tool_context.api_key = current.token;
     context.config.tool_context.credential_source = current.source;
     context.config.tool_context.account_id = current.accountId();
+    context.config.tool_context.chatgpt_direct = current.chatgpt_direct;
     context.config.tool_context.gateway_team = current.gatewayTeam();
     return worker_token;
 }
