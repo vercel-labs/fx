@@ -189,6 +189,11 @@ test "a masked prefix keeps whole UTF-8 sequences and shows control bytes as '?'
 pub const tail_max = 240;
 const tail_lines = 3;
 
+/// How long the exit watcher waits, once a process is gone, for its stderr
+/// reader to reach the end of the pipe. A child that keeps the pipe open
+/// delays the exit by this much and no more.
+const stderr_drain_ms = 250;
+
 fn exitOf(status: u32) ?Exit {
     if (std.c.W.IFEXITED(status)) return .{ .code = std.c.W.EXITSTATUS(status) };
     if (std.c.W.IFSIGNALED(status)) return .{ .signal = @truncate(@backingInt(std.c.W.TERMSIG(status))) };
@@ -287,6 +292,9 @@ pub const Process = struct {
     tail_len: [tail_lines]u8 = @splat(0),
     tail_next: u8 = 0,
     tail_count: u8 = 0,
+    /// The latest generation whose stderr reader has handled every line and
+    /// reached the end of its pipe.
+    stderr_done: std.atomic.Value(core.Generation) = .init(0),
     /// This process in `everyone.list`.
     node: std.DoublyLinkedList.Node = .{},
 
@@ -516,7 +524,7 @@ pub const Process = struct {
         errdefer p.stopSpawned(unread[0], unread[1]);
         try p.tasks.concurrent(p.io, readLines, .{ p, child.stdout.?, .{ .stdout = generation } });
         unread[0] = null;
-        try p.tasks.concurrent(p.io, readLines, .{ p, child.stderr.?, .stderr });
+        try p.tasks.concurrent(p.io, readLines, .{ p, child.stderr.?, .{ .stderr = generation } });
         unread[1] = null;
         try p.tasks.concurrent(p.io, watch, .{ p, generation, pid });
     }
@@ -621,12 +629,16 @@ pub const Process = struct {
 
     const Stream = union(enum) {
         stdout: core.Generation,
-        stderr,
+        stderr: core.Generation,
     };
 
     /// Reads lines from the server's stdout or stderr until the stream ends.
     fn readLines(p: *Process, file: std.Io.File, stream: Stream) std.Io.Cancelable!void {
         defer file.close(p.io);
+        // The exit watcher waits for this before it posts the exit.
+        defer if (stream == .stderr) {
+            _ = p.stderr_done.fetchMax(stream.stderr, .release);
+        };
         var buffer: [16 * 1024]u8 = undefined;
         var file_reader = file.reader(p.io, &buffer);
         const reader = &file_reader.interface;
@@ -685,8 +697,24 @@ pub const Process = struct {
                 p.pid = null;
             }
             p.pid_lock.unlock(p.io);
-            if (gone) return p.post(.{ .exited = generation });
+            if (gone) {
+                try p.awaitStderr(generation);
+                return p.post(.{ .exited = generation });
+            }
             try p.io.sleep(.fromMilliseconds(p.options.poll_ms), .awake);
+        }
+    }
+
+    /// Waits up to `stderr_drain_ms` for `generation`'s stderr reader to
+    /// finish. A server that exits at once can be reaped before that reader
+    /// runs, and its last lines, which explain the exit, would miss the log
+    /// sink, the tail a failure quotes, and the queue ahead of the exit.
+    fn awaitStderr(p: *Process, generation: core.Generation) std.Io.Cancelable!void {
+        const deadline = std.Io.Clock.awake.now(p.io).toMilliseconds() + stderr_drain_ms;
+        while (p.stderr_done.load(.acquire) < generation and
+            std.Io.Clock.awake.now(p.io).toMilliseconds() < deadline)
+        {
+            try p.io.sleep(.fromMilliseconds(1), .awake);
         }
     }
 
@@ -1026,6 +1054,62 @@ test "stderr lines reach the host and never change the state" {
     try p.start();
     try testing.expectEqualStrings("warming up", (try p.next(5_000)).stderr);
     try testing.expectEqual(core.State.running, p.conn.state);
+}
+
+/// A log sink that takes its time, as a reader whose thread runs only after
+/// a server that exits at once is already gone.
+const SlowSink = struct {
+    mutex: std.Io.Mutex = .init,
+    seen: [64]u8 = undefined,
+    len: usize = 0,
+
+    fn line(context: *anyopaque, bytes: []const u8) void {
+        const s: *SlowSink = @ptrCast(@alignCast(context));
+        testing.io.sleep(.fromMilliseconds(40), .awake) catch {};
+        s.mutex.lockUncancelable(testing.io);
+        defer s.mutex.unlock(testing.io);
+        s.len = @min(bytes.len, s.seen.len);
+        @memcpy(s.seen[0..s.len], bytes[0..s.len]);
+    }
+
+    fn text(s: *SlowSink) []const u8 {
+        s.mutex.lockUncancelable(testing.io);
+        defer s.mutex.unlock(testing.io);
+        return s.seen[0..s.len];
+    }
+};
+
+test "a server's last stderr lines reach the sink and the tail before its exit does" {
+    const argv = shell("echo trace-me >&2; exit 3");
+    var sink: SlowSink = .{};
+    var p: Process = undefined;
+    p.init(testing.io, testing.allocator, .{
+        .argv = &argv,
+        .config = test_config,
+        .poll_ms = 5,
+        .max_line = 64,
+        .stderr = .{ .context = &sink, .line = SlowSink.line },
+    });
+    defer p.deinit();
+    try p.start();
+    try expectState(&p, .backoff);
+    try testing.expectEqualStrings("trace-me", sink.text());
+    var tail: [tail_max]u8 = undefined;
+    try testing.expectEqualStrings("trace-me", p.stderrTail(&tail));
+}
+
+test "a child that keeps stderr open delays a server's exit by at most stderr_drain_ms" {
+    // The background sleep inherits stderr, so the pipe outlives the server.
+    const argv = shell("sleep 30 & echo $! >&2; exit 3");
+    var p: Process = undefined;
+    initTest(&p, &argv);
+    defer p.deinit();
+    try p.start();
+    const child = try std.fmt.parseInt(std.posix.pid_t, (try p.next(5_000)).stderr, 10);
+    defer std.posix.kill(child, .KILL) catch {};
+    const started = std.Io.Clock.awake.now(testing.io).toMilliseconds();
+    try expectState(&p, .backoff);
+    try testing.expect(std.Io.Clock.awake.now(testing.io).toMilliseconds() - started < 2_000);
 }
 
 test "a stop signals the server's whole process group, so its children stop too" {
