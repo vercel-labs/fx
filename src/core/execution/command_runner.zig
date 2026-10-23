@@ -2296,7 +2296,9 @@ test "bash user profile commands reuse one startup-file snapshot" {
         ".bash_profile",
         "printf 'loaded\\n' >> \"$HOME/rc-loads.log\"\n" ++
             "alias fxsnap_alias='printf alias-ok'\n" ++
-            "fxsnap_fn() { printf function-ok; }\n" ++
+            "fxsnap_fn() { _fxsnap_helper; }\n" ++
+            "_fxsnap_helper() { __fxsnap_helper; }\n" ++
+            "__fxsnap_helper() { printf function-ok; }\n" ++
             "export PATH=\"$HOME/marker-bin:$PATH\"\n" ++
             "export FXSNAP_EXPORT=exported\n",
     );
@@ -2350,7 +2352,9 @@ test "user profile commands reuse one startup-file snapshot" {
         &tmp,
         "print -r -- loaded >> \"$HOME/rc-loads.log\"\n" ++
             "alias fxsnap_alias='print -r -- alias-ok'\n" ++
-            "fxsnap_fn() { print -r -- function-ok; }\n" ++
+            "fxsnap_fn() { _fxsnap_helper; }\n" ++
+            "_fxsnap_helper() { __fxsnap_helper; }\n" ++
+            "__fxsnap_helper() { print -r -- function-ok; }\n" ++
             "export PATH=\"$HOME/marker-bin:$PATH\"\n" ++
             "export FXSNAP_EXPORT=exported\n" ++
             "for i in {1..3000}; do eval \"fxsnap_bulk_$i() { print -r -- bulk-$i; }\"; done\n",

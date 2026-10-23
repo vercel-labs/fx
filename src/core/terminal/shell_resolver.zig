@@ -334,8 +334,16 @@ const zsh_capture_script =
     \\\builtin printf 'FXSNAP:@NONCE@:REPLAY\0'
     \\\builtin print -r -- '\builtin unalias -a; \builtin unalias -as'
     \\\builtin typeset -p fpath
+    \\\builtin typeset -A __fx_snapshot_unloaded
+    \\__fx_snapshot_unloaded=()
+    \\for __fx_snapshot_name in ${(f)"$(\builtin functions -u +)"}; do
+    \\  __fx_snapshot_unloaded[$__fx_snapshot_name]=1
+    \\done
     \\for __fx_snapshot_name in ${(ko)functions}; do
-    \\  case $__fx_snapshot_name in (_*|prompt_*|__fx_snapshot_*) continue;; esac
+    \\  case $__fx_snapshot_name in
+    \\    (prompt_*|__fx_snapshot_*) continue;;
+    \\    (_*) [[ -n ${__fx_snapshot_unloaded[$__fx_snapshot_name]-} ]] && continue;;
+    \\  esac
     \\  \builtin functions -- $__fx_snapshot_name
     \\done
     \\\builtin alias -L
@@ -359,7 +367,7 @@ const bash_capture_script =
     \\\builtin printf '%s\0' $(\builtin compgen -a) $(\builtin compgen -A function)
     \\\builtin printf 'FXSNAP:@NONCE@:REPLAY\0'
     \\for __fx_snapshot_name in $(\builtin compgen -A function); do
-    \\  case $__fx_snapshot_name in _*|__fx_snapshot_*) continue;; esac
+    \\  case $__fx_snapshot_name in __fx_snapshot_*) continue;; esac
     \\  \builtin declare -f -- "$__fx_snapshot_name"
     \\done
     \\\builtin alias -p
