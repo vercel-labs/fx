@@ -792,4 +792,47 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     TIMEOUT,
   );
 
+
+  test(
+    "an instance's profile decides which MCP servers it can use",
+    async () => {
+      const fixture = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
+      // Select the fixture's tool, call it, then finish.
+      const respond = (body: string): Response => {
+        const request = JSON.parse(body) as { prompt?: Array<{ role?: string }> };
+        const results = (request.prompt ?? []).filter((message) => message.role === "tool").length;
+        if (results === 0) return call("select_mcp", "mcp_select_tool", { name: "mcp_fixture_echo" });
+        if (results === 1) return call("call_mcp", "mcp_fixture_echo", { text: "hello" });
+        return text("mcp_done", "TREE_MCP_DONE");
+      };
+      for (const [profile, servers, reaches] of [["nomcp", [], false], ["withmcp", ["fixture"], true]] as const) {
+        const home = createIsolatedTestHome();
+        const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-mcp-")));
+        try {
+          mkdirSync(join(home, ".fx"), { recursive: true });
+          writeFileSync(join(home, ".fx", "mcp.json"), JSON.stringify({
+            // The shell can ask a server for input, and the fixture checks it says so.
+            mcp: { fixture: { type: "local", command: [process.execPath, fixture], enabled: true, environment: { FX_MCP_EXPECT_ELICITATION: "both" } } },
+          }));
+          writeProfile(home, profile, { description: "Checks MCP access", mcp_servers: servers });
+          const bodies = await withHost(respond, {
+            args: `--profile ${profile}`,
+            env: { FX_PERMISSION_MODE: "full-access" },
+            reuse: { home, workspace },
+          }, async ({ session }) => {
+            await session.sendText("TREE_MCP_USER call the fixture");
+            await session.waitForText("TREE_MCP_DONE", 45_000);
+          });
+          // The fixture's answer reaches the model only when the profile
+          // names its server.
+          expect((bodies.at(-1) ?? "").includes("MODERN_MCP_TOOL_RESULT")).toBe(reaches);
+        } finally {
+          cleanupIsolatedTestHome(home);
+          rmSync(workspace, { recursive: true, force: true });
+        }
+      }
+    },
+    TIMEOUT * 2,
+  );
+
 });
