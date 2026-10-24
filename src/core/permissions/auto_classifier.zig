@@ -2158,10 +2158,7 @@ test "a caution holds only with a named harm and evidence from its source" {
         var outcome = try ProofFixture.review(case.arguments_json, true);
         defer outcome.deinit(std.testing.allocator);
         try std.testing.expect(outcome == .valid);
-        std.testing.expectEqual(case.expected, outcome.valid.decision) catch |err| {
-            std.debug.print("unexpected decision for {s}\n", .{case.arguments_json});
-            return err;
-        };
+        try std.testing.expectEqual(case.expected, outcome.valid.decision);
         if (case.expected == .clear and std.mem.find(u8, case.arguments_json, "\"caution\"") != null) {
             try std.testing.expectEqualStrings(unproven_caution_rationale, outcome.valid.rationale);
         }
