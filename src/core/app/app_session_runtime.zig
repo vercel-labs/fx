@@ -1443,6 +1443,17 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Gives an instance launched in a profile the profile's model, unless
+        /// `--model`, `--provider`, or `FX_MODEL` chose one for the process,
+        /// which still wins, as it does over the first instance's profile.
+        pub fn applyProfileModel(app: *App, agent: *AppAgent, model: []const u8) !void {
+            if (agent.session_persistence.process_model_override != null) return;
+            const preferences = if (agent.session_persistence.session_preferences) |*value| value else return;
+            const owned = try app.alloc.dupe(u8, model);
+            app.alloc.free(preferences.model);
+            preferences.model = owned;
+        }
+
         /// Gives an instance launched after the first the model the launch
         /// chose with `--model`, `--provider`, or `FX_MODEL`, which the first
         /// instance takes through the app's selection at startup. An instance's

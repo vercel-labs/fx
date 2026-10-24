@@ -55,14 +55,19 @@ async function withHost(
   options: {
     args?: string;
     instances?: number;
-    env?: Record<string, string>;
+    // A value of undefined removes the variable, such as FX_MODEL.
+    env?: Record<string, string | undefined>;
+    // The fake gateway's model catalog.
+    models?: unknown[];
+    // Filled with every request the fake gateway received, headers included.
+    requests?: Array<{ body: string; headers: Headers }>;
     remainOnExit?: boolean;
     // Reuse a profile and workspace across runs; the caller removes them.
     reuse?: { home: string; workspace: string };
   },
   run: (host: Host) => Promise<void>,
 ): Promise<string[]> {
-  const gateway = startDynamicFakeGateway(respond);
+  const gateway = startDynamicFakeGateway(respond, options.models ? { models: options.models as never } : {});
   const home = options.reuse?.home ?? createIsolatedTestHome();
   const workspace = options.reuse?.workspace ?? realpathSync(mkdtempSync(join(tmpdir(), "fx-host-instances-")));
   mkdirSync(join(home, ".fx"), { recursive: true });
@@ -91,6 +96,7 @@ async function withHost(
     });
     await session.waitForComposer(30_000);
     await run({ home, workspace, session });
+    options.requests?.push(...gateway.requests);
     return gateway.requests.map((request) => request.body);
   } finally {
     gateway.stop();
@@ -125,6 +131,39 @@ function call(id: string, tool: string, input: object): Response {
     { type: "tool-call", toolCallId: id, toolName: tool, input },
     { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
   ]);
+}
+
+// A catalog where every model takes an effort and the fast toggle.
+const PREFERENCE_MODELS = ["profile/model", "openai/gpt-5", "other/model"].map((id) => ({
+  id,
+  type: "language",
+  tags: ["reasoning", "tool-use"],
+  reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }],
+  fast_options: [{ type: "toggle" }],
+}));
+
+// Answers each prompt with DONE_ and its marker.
+function echoMarker(body: string): Response {
+  const marker = (userTexts(body).at(-1) ?? "").match(/[A-Z][A-Z0-9_]+/)?.[0] ?? "UNMARKED";
+  return text(`answer_${marker}`, `DONE_${marker}`);
+}
+
+async function promptMarker(session: TmuxSession, marker: string) {
+  await session.sendText(marker);
+  await session.waitForText(`DONE_${marker}`, 30_000);
+  await session.waitForComposer(15_000);
+}
+
+// The model, effort, and speed the request for `marker` carried.
+function preferencesOf(requests: Array<{ body: string; headers: Headers }>, marker: string) {
+  const request = requests.find((value) => (userTexts(value.body).at(-1) ?? "").includes(marker));
+  if (!request) return null;
+  const body = JSON.parse(request.body);
+  return {
+    model: request.headers.get("ai-language-model-id"),
+    reasoning: body.reasoning ?? null,
+    speed: body.providerOptions?.gateway?.speed ?? null,
+  };
 }
 
 // Saves agent profile `name` under the test home's `~/.fx/agents`.
@@ -669,35 +708,41 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
   );
 
   test(
-    "a launched instance's subagent works under that instance",
+    "a launched instance's named and one-off subagents work under that instance",
     async () => {
-      const bodies = await withHost((body) => {
-        const texts = userTexts(body).join("\n");
-        if (texts.includes("TREE_TASK")) {
-          if (answered(body)) return text("tree_child_done", "TREE_CHILD_DONE");
-          return call("tree_touch", "shell", { request: { action: "run", yield_time_ms: 30_000, timeout_ms: 600_000, command: "touch tree-marker" } });
-        }
-        if (texts.includes("TREE_USER")) {
-          if (answered(body)) return text("tree_main_final", "TREE_MAIN_FINAL");
-          return call("tree_sub", "subagent", { request: { action: "message", agent: "helper", message: "TREE_TASK make the marker" } });
-        }
-        return answerByLetter(body);
-      }, { instances: 2, env: { FX_PERMISSION_MODE: "full-access" } }, async ({ workspace, session }) => {
-        await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
-        await session.sendKeys("M-Right");
-        await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
-        await session.waitForComposer(15_000);
-        await session.sendText("TREE_USER start a helper");
-        await session.waitForText("TREE_MAIN_FINAL", 45_000);
-        // The subagent fx 2 started ran its command, so its tree has
-        // fx 2's authority rather than none.
-        expect(existsSync(join(workspace, "tree-marker"))).toBe(true);
-      });
-      const child = bodies.filter((body) => userTexts(body).join("\n").includes("TREE_TASK"));
-      expect(child.length).toBeGreaterThan(0);
-      expect(toolNames(child[0])).toContain("shell");
+      const requests = {
+        message: { action: "message", agent: "helper", message: "TREE_TASK make the marker" },
+        run: { action: "run", task: "TREE_TASK make the marker" },
+      };
+      for (const [kind, request] of Object.entries(requests)) {
+        const bodies = await withHost((body) => {
+          const texts = userTexts(body).join("\n");
+          if (texts.includes("TREE_TASK")) {
+            if (answered(body)) return text("tree_child_done", "TREE_CHILD_DONE");
+            return call("tree_touch", "shell", { request: { action: "run", yield_time_ms: 30_000, timeout_ms: 600_000, command: "touch tree-marker" } });
+          }
+          if (texts.includes("TREE_USER")) {
+            if (answered(body)) return text("tree_main_final", "TREE_MAIN_FINAL");
+            return call("tree_sub", "subagent", { request });
+          }
+          return answerByLetter(body);
+        }, { instances: 2, env: { FX_PERMISSION_MODE: "full-access" } }, async ({ workspace, session }) => {
+          await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+          await session.sendKeys("M-Right");
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("TREE_USER start a helper");
+          await session.waitForText("TREE_MAIN_FINAL", 45_000);
+          // The subagent fx 2 started ran its command, so its tree has
+          // fx 2's authority rather than none.
+          expect(existsSync(join(workspace, "tree-marker")), kind).toBe(true);
+        });
+        const child = bodies.filter((body) => userTexts(body).join("\n").includes("TREE_TASK"));
+        expect(child.length, kind).toBeGreaterThan(0);
+        expect(toolNames(child[0]), kind).toContain("shell");
+      }
     },
-    TIMEOUT,
+    TIMEOUT * 2,
   );
 
   test(
@@ -833,6 +878,101 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
       }
     },
     TIMEOUT * 2,
+  );
+
+
+  test(
+    "a launched instance's model and speed changes reach its own turns and no other's",
+    async () => {
+      for (const launch of ["instances", "launch"] as const) {
+        const requests: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, {
+          args: `${launch === "instances" ? "--instances 2 " : ""}--model openai/gpt-5 --effort high --fast`,
+          env: { FX_MODEL: undefined },
+          models: PREFERENCE_MODELS,
+          requests,
+        }, async ({ session }) => {
+          await promptMarker(session, "FIRST_BEFORE");
+          if (launch === "instances") {
+            await session.sendKeys("M-Right");
+          } else {
+            await session.sendText("/launch");
+          }
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("/model other/model low normal");
+          await session.waitForText("Switched to other/model", 15_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "SECOND_AFTER");
+          await session.sendKeys("M-Left");
+          await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "FIRST_AFTER");
+        });
+        expect(preferencesOf(requests, "SECOND_AFTER"), launch).toEqual({ model: "other/model", reasoning: "low", speed: null });
+        expect(preferencesOf(requests, "FIRST_AFTER"), launch).toEqual({ model: "openai/gpt-5", reasoning: "high", speed: "fast" });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "/launch <profile> uses the profile's model unless the process chose one",
+    async () => {
+      for (const [fxModel, expected] of [[undefined, "profile/model"], ["openai/gpt-5", "openai/gpt-5"]] as const) {
+        const requests: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, { env: { FX_MODEL: fxModel }, models: PREFERENCE_MODELS, requests }, async ({ home, session }) => {
+          writeProfile(home, "chooser", { description: "Chooses a model", model: "profile/model", effort: "high" });
+          await session.sendText("/launch chooser");
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "PROFILE_LAUNCH");
+        });
+        const launched = preferencesOf(requests, "PROFILE_LAUNCH");
+        expect(launched?.model, String(fxModel)).toBe(expected);
+        expect(launched?.reasoning, String(fxModel)).toBe("high");
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "a subagent calls the MCP tool it selected, and is offered only what its profile admits",
+    async () => {
+      const fixture = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-mcp-child-")));
+      try {
+        mkdirSync(join(home, ".fx"), { recursive: true });
+        writeFileSync(join(home, ".fx", "mcp.json"), JSON.stringify({
+          mcp: { fixture: { type: "local", command: [process.execPath, fixture], enabled: true, environment: { FX_MCP_EXPECT_ELICITATION: "both" } } },
+        }));
+        writeProfile(home, "mcp-child", { description: "Uses the fixture", tools: ["read_file", "mcp_select_tool"], mcp_servers: ["fixture"] });
+        const bodies = await withHost((body) => {
+          const request = JSON.parse(body) as { prompt?: Array<{ role?: string }> };
+          const results = (request.prompt ?? []).filter((message) => message.role === "tool").length;
+          if (userTexts(body).join("\n").includes("CHILD_MCP_TASK")) {
+            if (results === 0) return call("select_mcp", "mcp_select_tool", { name: "mcp_fixture_echo" });
+            if (results === 1) return call("call_mcp", "mcp_fixture_echo", { text: "hello" });
+            return text("child_mcp_done", "CHILD_MCP_DONE");
+          }
+          if (results === 0) return call("start_child", "subagent", { request: { action: "message", agent: "fixer", profile: "mcp-child", message: "CHILD_MCP_TASK" } });
+          return text("parent_mcp_done", "PARENT_MCP_DONE");
+        }, { env: { FX_PERMISSION_MODE: "full-access" }, reuse: { home, workspace } }, async ({ session }) => {
+          await session.sendText("PARENT_MCP start the child");
+          await session.waitForText("PARENT_MCP_DONE", 45_000);
+        });
+        const child = bodies.filter((body) => userTexts(body).join("\n").includes("CHILD_MCP_TASK"));
+        // The fixture's answer reached the child after its call.
+        expect(child.at(-1) ?? "").toContain("MODERN_MCP_TOOL_RESULT");
+        // The child is offered its profile's tools, and no vision fallback.
+        expect(toolNames(child[0])).toEqual(["read_file", "mcp_select_tool"]);
+      } finally {
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
   );
 
 });

@@ -387,7 +387,7 @@ pub const Resolver = struct {
         errdefer alloc.free(owned_root_id);
         const tools = try cloneKeptTools(alloc, tool_source, current.profile);
         errdefer freeStrings(alloc, tools);
-        const integrations = try cloneIntegrations(alloc, integration_source, current.profile);
+        const integrations = try cloneIntegrations(alloc, integration_source, current.profile, view_source);
         errdefer freeStrings(alloc, integrations);
         var rules = try types.dupePermissionRuleSet(alloc, host.rules);
         errdefer rules.deinit(alloc);
@@ -574,7 +574,7 @@ fn cloneKeptTools(
 /// that sets none leaves them.
 pub fn narrowHostToMcpServers(alloc: Allocator, host: *HostAuthority, profile: *const profiles.Profile) !void {
     if (!profiles.setsMcpServers(profile)) return;
-    const integrations = try cloneIntegrations(alloc, host.integrations, profile);
+    const integrations = try cloneIntegrations(alloc, host.integrations, profile, if (host.mcp_view) |*view| view else null);
     freeStrings(alloc, host.integrations);
     host.integrations = integrations;
     if (host.mcp_view) |*view| try narrowMcpView(alloc, view, profile);
@@ -615,25 +615,32 @@ fn narrowMcpView(alloc: Allocator, view: *mcp_access.View, profile: *const profi
     view.tools = tools;
 }
 
+/// The MCP integrations in `values` that `profile` keeps. Each is an MCP
+/// tool's name, kept when its server, as `view` names it, is one the profile
+/// allows; a name `view` doesn't know is taken as a server's own name.
 fn cloneIntegrations(
     alloc: Allocator,
     values: []const []const u8,
     profile: ?*const profiles.Profile,
+    view: ?*const mcp_access.View,
 ) ![][]u8 {
-    return cloneKept(alloc, values, profile, keepIntegration);
+    const value = profile orelse return cloneStrings(alloc, values);
+    if (!profiles.setsMcpServers(value)) return cloneStrings(alloc, values);
+    var kept: std.ArrayList([]const u8) = .empty;
+    defer kept.deinit(alloc);
+    for (values) |name| {
+        const server = if (view) |known| if (known.tool(name)) |tool| tool.server_name else name else name;
+        if (profiles.allowsMcpServer(value, server)) try kept.append(alloc, name);
+    }
+    return cloneStrings(alloc, kept.items);
 }
 
-/// A tool the child keeps: its parent's, unless its profile leaves it out.
-/// `subagent` is kept like any other, so a child starts its own; the
-/// parent's set bounds it, so nesting never widens what an agent may do.
+/// A tool the child keeps from the set it starts from, unless its profile
+/// leaves it out. `subagent` is kept like any other, so a child starts its
+/// own.
 fn keepTool(profile: ?*const profiles.Profile, name: []const u8) bool {
     const value = profile orelse return true;
     return profiles.allowsTool(value, name);
-}
-
-fn keepIntegration(profile: ?*const profiles.Profile, name: []const u8) bool {
-    const value = profile orelse return true;
-    return profiles.allowsMcpServer(value, name);
 }
 
 fn cloneKept(
@@ -864,7 +871,7 @@ test "a subagent's profile narrows its tools, integrations, MCP view, and mode, 
                 .servers = &servers,
                 .tools = &tools,
             };
-            return HostAuthority.captureWithPermissionStateAndMcpView(alloc, &.{ "read_file", "write_file", "subagent" }, &.{ "github", "slack" }, .{}, &.{}, .{}, &view) catch
+            return HostAuthority.captureWithPermissionStateAndMcpView(alloc, &.{ "read_file", "write_file", "subagent" }, &.{ "github_issue", "slack_post" }, .{}, &.{}, .{}, &view) catch
                 return error.OutOfMemory;
         }
     };
@@ -905,8 +912,9 @@ test "a subagent's profile narrows its tools, integrations, MCP view, and mode, 
     defer profiled.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), profiled.tools.len);
     try std.testing.expectEqualStrings("read_file", profiled.tools[0]);
+    // An integration is an MCP tool, kept by the server the MCP view names.
     try std.testing.expectEqual(@as(usize, 1), profiled.integrations.len);
-    try std.testing.expectEqualStrings("github", profiled.integrations[0]);
+    try std.testing.expectEqualStrings("github_issue", profiled.integrations[0]);
     // Its MCP view has only the servers its profile allows, and their tools.
     try std.testing.expectEqual(@as(usize, 1), profiled.mcp_view.?.servers.len);
     try std.testing.expectEqualStrings("github", profiled.mcp_view.?.servers[0].name);

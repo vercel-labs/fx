@@ -178,6 +178,11 @@ pub fn Runtime(comptime App: type) type {
             return app.snapshotModelToolProjection(agent, alloc, permission_mode);
         }
 
+        fn admittedTool(run: *const agents.ChildRun, name: []const u8) bool {
+            for (run.admission.tool_names) |tool| if (std.mem.eql(u8, tool, name)) return true;
+            return false;
+        }
+
         fn childRun(agent: *AppAgent) ?*agents.ChildRun {
             if (comptime !agents.hasAgentField(App, "child_run")) return null;
             return if (agent.child_run) |*run| run else null;
@@ -1223,6 +1228,9 @@ pub fn Runtime(comptime App: type) type {
                     deps.tool_registry,
                     shown,
                 );
+                // The vision fallback is offered as a tool, so a run not
+                // admitted with `vision` is not offered it.
+                if (!admittedTool(run, "vision")) config.provider_capabilities.vision_fallback = false;
             }
             const process_result = agent_runtime.processAgentPrompt(&agent.session.agent, &deps, semantic_presentation, lifecycleContext(app, agent), config, job);
             try process_result;

@@ -221,7 +221,7 @@ pub fn Runtime(comptime App: type) type {
                 seed.provider,
                 seed.configured_model,
                 seed.model_source,
-                profile_model orelse seed.selected_model,
+                seed.selected_model,
                 seed.effort,
                 seed.fast_mode,
                 seed.fast_mode_model_bound,
@@ -234,7 +234,16 @@ pub fn Runtime(comptime App: type) type {
             agent.worker.agent_turn_settings = seed.turn_settings;
             agent.worker.agent_turn_settings.provider_order = &.{};
             try agent.worker.setProviderRouting(std.heap.c_allocator, constNames(seed.provider_order), seed.provider_strict);
-            agent.effort = if (name != null) (agent.profile.profile.effort orelse seed.agent_effort) else seed.agent_effort;
+            // Its screen starts in its worker's fast mode, so a change made on
+            // it reaches the worker.
+            child.screen.fast_mode = agent.worker.agent_turn_settings.fast_mode;
+            // `--effort` wins over the profile's, as it does for the first.
+            agent.effort = if (seed.effort_process_override) |effort|
+                effort
+            else if (name != null)
+                agent.profile.profile.effort orelse seed.agent_effort
+            else
+                seed.agent_effort;
             agent.worker.agent_turn_settings.effort = agent.effort;
             agent.permission_mode = app.instanceProfileMode(agent, seed.permission_mode);
             try SessionRuntime.initializePersistence(app, agent, resume_id != null);
@@ -244,6 +253,10 @@ pub fn Runtime(comptime App: type) type {
             } else {
                 try SessionRuntime.beginFreshPersistedSession(app, agent);
                 SessionRuntime.enableSessionStores(app, agent);
+                // A fresh session starts from the configured model; the
+                // profile's replaces it unless `--model`, `--provider`, or
+                // `FX_MODEL` chose one for the process, which still wins.
+                if (profile_model) |model| try SessionRuntime.applyProfileModel(app, agent, model);
                 try SessionRuntime.applyProcessModelOverride(app, agent);
             }
             try AgentsRuntime.nameInstance(app, child, SessionRuntime.activeSessionId(agent));
