@@ -15,7 +15,7 @@ import { join } from "node:path";
 import { EVAL_MODEL, HAS_API_KEY, runFx } from "../evals/eval-helpers";
 import { pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import { sessionDir } from "./saved-sessions";
-import { fakeGatewayTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
+import { fakeGatewayHeldDecision, fakeGatewayTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 
 const TIMEOUT = 20_000;
 const MODEL = "openai/gpt-5";
@@ -187,7 +187,9 @@ function startFakeGateway(
       const body = await req.text();
       if (body.includes("\"permission_decision\"")) {
         classifierRequests.push({ body });
-        return permissionDecision(options.classifierDecision);
+        return options.classifierDecision === "caution"
+          ? fakeGatewayHeldDecision()(body)
+          : permissionDecision(options.classifierDecision);
       }
       if (body.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
       requests.push({ body });

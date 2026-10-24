@@ -20,6 +20,7 @@ import {
 } from "./tui-render-assertions";
 import {
   fakeGatewayFinalText,
+  fakeGatewayHeldDecision,
   fakeGatewayPermissionDecision,
   fakeGatewaySerializedToolCall,
   fakeGatewayTitleDefault,
@@ -423,7 +424,9 @@ function startFakeGateway(
       const body = await req.text();
       if (body.includes('"permission_decision"')) {
         classifierRequests.push({ body, headers: req.headers });
-        return fakeGatewayPermissionDecision(classifierDecision(body));
+        return classifierDecision(body) === "caution"
+          ? fakeGatewayHeldDecision()(body)
+          : fakeGatewayPermissionDecision("clear");
       }
       if (body.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
       requests.push({ body, headers: req.headers });
