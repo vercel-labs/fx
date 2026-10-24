@@ -8,6 +8,10 @@ pub const Row = struct {
     title: []const u8,
     status: []const u8 = "",
     detail: []const u8 = "",
+    /// Right-aligned compact metadata: an age for saved sessions, a state for
+    /// running children. Kept separate from `detail`, which stays next to the
+    /// title.
+    meta: []const u8 = "",
     depth: usize = 0,
     current: bool = false,
 };
@@ -47,6 +51,7 @@ pub const State = struct {
             out.title = (try text_utils.encodeTerminalSafeInline(a, row.title, 512)).bytes;
             out.status = (try text_utils.encodeTerminalSafeInline(a, row.status, 128)).bytes;
             out.detail = (try text_utils.encodeTerminalSafeInline(a, row.detail, 1024)).bytes;
+            out.meta = (try text_utils.encodeTerminalSafeInline(a, row.meta, 128)).bytes;
         }
         const selected_id = if (self.selectedRow()) |row| row.id else "";
         var selected: ?usize = null;
@@ -80,7 +85,7 @@ pub const State = struct {
     }
     fn matches(self: *const State, row: Row) bool {
         const needle = self.query();
-        return needle.len == 0 or containsIgnoreCase(row.title, needle) or containsIgnoreCase(row.id, needle) or containsIgnoreCase(row.detail, needle);
+        return needle.len == 0 or containsIgnoreCase(row.title, needle) or containsIgnoreCase(row.id, needle) or containsIgnoreCase(row.detail, needle) or containsIgnoreCase(row.meta, needle);
     }
     pub fn itemAt(self: *const State, index: usize) ?*const Row {
         var matched: usize = 0;
@@ -124,4 +129,18 @@ test "browser selection follows identity across live changes" {
     try std.testing.expectEqualStrings("two", state.selectedRow().?.id);
     state.setQuery("first");
     try std.testing.expectEqualStrings("one", state.selectedRow().?.id);
+}
+
+test "browser metadata is copied and searchable" {
+    var state: State = .{};
+    defer state.close();
+    state.open(.sessions);
+    try state.replaceRows(std.testing.allocator, &.{
+        .{ .id = "one", .title = "First", .meta = "12m" },
+        .{ .id = "two", .title = "Second", .meta = "running" },
+    });
+    try std.testing.expectEqualStrings("12m", state.itemAt(0).?.meta);
+    state.setQuery("running");
+    try std.testing.expectEqual(@as(usize, 1), state.count());
+    try std.testing.expectEqualStrings("two", state.itemAt(0).?.id);
 }

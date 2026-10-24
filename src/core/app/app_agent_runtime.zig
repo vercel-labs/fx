@@ -309,7 +309,9 @@ pub fn Runtime(comptime App: type) type {
                 .on_mcp_progress = app_callbacks.Bindings(App).onMcpProgress,
                 .tool_progress_ctx = @ptrCast(app),
                 .on_tool_progress = app_callbacks.Bindings(App).onToolProgress,
-                .subagent_status_renderer = app_callbacks.Bindings(App).subagentStatusRenderer(app),
+                // Keep a child activity row to its label and task. Model, effort,
+                // context percentage, and workspace are session state, not activity.
+                .subagent_status_renderer = null,
                 .lifecycle_view = app.lifecycle_view,
                 .lifecycle_scope = lifecycleContext(app).scope,
             };

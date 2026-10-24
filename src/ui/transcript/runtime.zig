@@ -5281,6 +5281,22 @@ pub const TranscriptRuntime = struct {
         return updated;
     }
 
+    /// True while the transcript contains only the startup welcome. The
+    /// welcome screen is the one footer surface that is not inline: it keeps
+    /// the composer at the bottom of the viewport.
+    pub fn hasOnlyWelcome(self: *const TranscriptRuntime) bool {
+        if (self.entries.items.len == 0) return false;
+        var saw_welcome = false;
+        for (self.entries.items) |entry| {
+            if (entry == .raw_bytes and entry.raw_bytes.class == .welcome) {
+                saw_welcome = true;
+                continue;
+            }
+            return false;
+        }
+        return saw_welcome;
+    }
+
     /// Clears session content but keeps the leading welcome entry. A remote
     /// attach clears the transcript before replaying the supervisor's history;
     /// the banner is client chrome and stays above that history.

@@ -321,7 +321,9 @@ pub fn Bindings(comptime App: type) type {
                 .describe_tool_action = agentDescribeToolAction,
                 .describe_tool_action_completed = agentDescribeToolActionCompleted,
                 .describe_tool_action_denied = agentDescribeToolActionDenied,
-                .subagent_status_renderer = subagentStatusRenderer(app),
+                // Keep a child activity row to its label and task. Model, effort,
+                // context percentage, and workspace are session state, not activity.
+                .subagent_status_renderer = null,
                 .permission_target_for_call = agentPermissionTargetForCall,
                 .execute_tool_call = agentExecuteToolCall,
                 .publish_committed_file_handoff = agentPublishCommittedFileHandoff,

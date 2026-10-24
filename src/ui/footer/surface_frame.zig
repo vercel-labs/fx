@@ -28,6 +28,7 @@ const surface_invalidation = @import("surface_invalidation.zig");
 const footer_paint_plan = @import("paint_plan.zig");
 const core_input_runtime = @import("../../core/input/runtime.zig");
 const visual_layout = @import("../input/visual_layout.zig");
+const ui_render = @import("../render.zig");
 const render_engine = @import("../render_engine.zig");
 const render_request = @import("../render_request.zig");
 const transcript_runtime = @import("../transcript/runtime.zig");
@@ -1158,6 +1159,14 @@ pub noinline fn measureSurfaceFooter(
     measurement.file_approval_active = projection.file_approval_active;
     measurement.picker_rows = projection.picker_rows;
     measurement.top_gap_rows = projection.top_gap_rows;
+    if (shell.hasOnlyWelcome()) {
+        // The welcome keeps the composer at the bottom. The frame solve already
+        // supports a gap between the transcript band and the footer; size that
+        // gap from the layout instead of moving the footer outside the solver.
+        const footer_rows = measurement.frameLayoutMeasurement().natural_rows;
+        const margin_rows: u16 = 1;
+        measurement.top_gap_rows = (shell.layout.rows -| ui_render.welcome_message_reserved_rows) -| footer_rows -| margin_rows;
+    }
     measurement.footer_gap_active = projection.footer_gap_active;
     measurement.banner_active = projection.banner_active;
     measurement.banner_rows = projection.banner_rows;

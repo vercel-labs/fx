@@ -976,13 +976,23 @@ pub fn composeFooterFrame(
         )
     else if (input.show_picker and input.picker_kind == .help)
         try input_presentation.composeHelpMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
-    else if (input.show_picker and input.picker_kind == .sessions and ctx.session_menu.browser != null)
-        try input_presentation.composeVariantHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending, &.{
-            "↑↓ select     enter open     ← back     esc close",
-            "↑↓ select  enter open  ← back  esc close",
-            "↑↓ enter ← esc",
-        })
-    else if (input.show_picker and input.picker_kind == .sessions)
+    else if (input.show_picker and input.picker_kind == .sessions and ctx.session_menu.browser != null) blk: {
+        const browser = ctx.session_menu.browser.?;
+        const variants: []const []const u8 = if (browser.query_len > 0) &.{
+            "up/down select   enter open   left back   esc clear filter",
+            "up/down select  enter open  left back  esc clear filter",
+            "up/down select  enter open  esc clear",
+            "enter open  esc clear",
+            "esc clear",
+        } else &.{
+            "up/down select   enter open   left back   esc close",
+            "up/down select  enter open  left back  esc close",
+            "up/down select  enter open  esc close",
+            "enter open  esc close",
+            "enter esc",
+        };
+        break :blk try input_presentation.composeVariantHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending, variants);
+    } else if (input.show_picker and input.picker_kind == .sessions)
         try input_presentation.composeResumeMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .fork)
         try input_presentation.composeForkMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)

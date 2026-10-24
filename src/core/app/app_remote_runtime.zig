@@ -9,6 +9,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const presentation = @import("../agent/assistant_presentation.zig");
 const callbacks = @import("app_callbacks.zig");
 const sessions = @import("app_session_runtime.zig");
+const session_catalog = @import("../session/session_catalog.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const diff = @import("../output/diff.zig");
 const Allocator = std.mem.Allocator;
@@ -540,16 +541,36 @@ pub fn Runtime(comptime App: type) type {
             const values = array(value, if (kind == .list) "sessions" else "children");
             var arena: std.heap.ArenaAllocator = .init(app.alloc);
             defer arena.deinit();
-            const rows = try arena.allocator().alloc(browser_mod.Row, values.len);
+            const a = arena.allocator();
+            const rows = try a.alloc(browser_mod.Row, values.len);
+            const now_ms = io_mod.milliTimestamp();
             for (values, rows) |item, *row| {
                 const id = string(item, "id") orelse "";
-                const name = string(item, "name") orelse id;
+                const name = string(item, "name") orelse "";
+                const status = string(item, "status") orelse "";
+                const detail = string(item, if (kind == .list) "cwd" else "detail") orelse "";
+                const updated_at_ms = integer(item, "updated_at_ms") orelse 0;
+                var age_buf: [32]u8 = undefined;
+                const age = session_catalog.relativeActivityAgeCompact(&age_buf, updated_at_ms, now_ms);
+                const named = name.len > 0 and !std.mem.eql(u8, name, "session");
+                const short_id = if (id.len > 8) id[0..8] else id;
+                const title = if (kind == .list and !named)
+                    try a.print("session {s}", .{short_id})
+                else if (name.len > 0)
+                    name
+                else
+                    id;
+                const meta = if (kind == .list)
+                    if (std.mem.eql(u8, status, "running") or std.mem.eql(u8, status, "awaiting_approval")) status else age
+                else
+                    status;
                 row.* = .{
                     .id = id,
                     .parent_id = string(item, "parent_id") orelse "",
-                    .title = if (name.len > 0) name else id,
-                    .status = string(item, "status") orelse "",
-                    .detail = string(item, if (kind == .list) "cwd" else "detail") orelse "",
+                    .title = title,
+                    .status = status,
+                    .detail = if (kind == .list) "" else detail,
+                    .meta = try a.dupe(u8, meta),
                     .depth = @intCast(integer(item, "depth") orelse 0),
                     .current = std.mem.eql(u8, id, app.remote.current_id),
                 };
