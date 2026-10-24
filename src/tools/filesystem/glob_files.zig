@@ -47,16 +47,19 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
         return .{ .failure = try ctx.allocator.dupe(u8, "glob_files field \"pattern\" must be a string") };
     }
 
-    const path_value = parsed.value.object.get("path");
-    const path_string: ?[]const u8 = if (path_value) |value| switch (value) {
+    // A missing field and JSON null both read as not given.
+    const path_string: ?[]const u8 = if (parsed.value.object.get("path")) |value| switch (value) {
+        .null => null,
         .string => |path| path,
-        else => null,
+        else => return .{ .failure = try ctx.allocator.dupe(u8, "glob_files field \"path\" must be a string") },
     } else null;
 
-    const mode_value = parsed.value.object.get("mode");
-    const mode: OutputMode = if (mode_value) |value| switch (value) {
-        .string => |raw| if (std.mem.eql(u8, raw, "count")) .count else .matches,
-        else => .matches,
+    const mode: OutputMode = if (parsed.value.object.get("mode")) |value| switch (value) {
+        .null => .matches,
+        .string => |raw| std.meta.stringToEnum(OutputMode, raw) orelse {
+            return .{ .failure = try ctx.allocator.dupe(u8, "glob_files field \"mode\" must be one of matches, count") };
+        },
+        else => return .{ .failure = try ctx.allocator.dupe(u8, "glob_files field \"mode\" must be a string") },
     } else .matches;
 
     const owned_pattern = try ctx.allocator.dupe(u8, pattern_value.string);
@@ -474,13 +477,16 @@ test "glob_files decodes invalid argument shapes as failures" {
     try expectDecodeFailure("[]", "glob_files arguments must be an object");
     try expectDecodeFailure("{\"path\":\".\"}", "glob_files requires string field \"pattern\"");
     try expectDecodeFailure("{\"pattern\":1}", "glob_files field \"pattern\" must be a string");
+    try expectDecodeFailure("{\"pattern\":\"*.zig\",\"path\":1}", "glob_files field \"path\" must be a string");
+    try expectDecodeFailure("{\"pattern\":\"*.zig\",\"mode\":\"files\"}", "glob_files field \"mode\" must be one of matches, count");
+    try expectDecodeFailure("{\"pattern\":\"*.zig\",\"mode\":true}", "glob_files field \"mode\" must be a string");
 }
 
 test "glob_files decodes omitted path and valid input" {
     try expectDecodeInput("{\"pattern\":\"*.zig\"}", "*.zig", ".");
     try expectDecodeInput("{\"pattern\":\"*.zig\",\"path\":\"\"}", "*.zig", ".");
     try expectDecodeInput("{\"pattern\":\"*.zig\",\"path\":\"src\"}", "*.zig", "src");
-    try expectDecodeInput("{\"pattern\":\"*.zig\",\"path\":1}", "*.zig", ".");
+    try expectDecodeInput("{\"pattern\":\"*.zig\",\"path\":null,\"mode\":null}", "*.zig", ".");
 }
 
 test "glob_files validate preserves active raw pattern and path values" {

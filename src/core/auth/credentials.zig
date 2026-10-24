@@ -815,7 +815,7 @@ pub fn refreshFxSession(
         try retire_fx_session(alloc, mutation);
         return error.NoRefreshToken;
     };
-    const expires_at_ms = oauth.expiry_timestamp_ms(
+    const expires_at_ms = oauth.expiryTimestampMs(
         io_mod.milliTimestamp(),
         refreshed.expires_in,
     ) catch |err| {

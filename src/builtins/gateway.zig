@@ -594,8 +594,8 @@ fn streamAgentCompletion(
         .content_capture_limit = request.content_capture_limit,
         .delivery = request.delivery,
         .admission = request.admission,
-        .on_reasoning_chunk = EventBridge.reasoning,
-        .on_tool_input_chunk = EventBridge.toolInput,
+        .on_reasoning_chunk = agent_stream_provider_contract.EventSink.onReasoningChunk,
+        .on_tool_input_chunk = agent_stream_provider_contract.EventSink.onToolInputChunk,
         .provider_attempt_owner = switch (request.provider_attempt_owner) {
             .transport => .transport,
             .agent => .agent,
@@ -607,8 +607,8 @@ fn streamAgentCompletion(
             alloc,
             stream_request,
             &events,
-            EventBridge.content,
-            EventBridge.toolStart,
+            agent_stream_provider_contract.EventSink.onContentChunk,
+            agent_stream_provider_contract.EventSink.onToolStart,
             deadline,
             request.cancel_flag,
         )
@@ -617,8 +617,8 @@ fn streamAgentCompletion(
             alloc,
             stream_request,
             &events,
-            EventBridge.content,
-            EventBridge.toolStart,
+            agent_stream_provider_contract.EventSink.onContentChunk,
+            agent_stream_provider_contract.EventSink.onToolStart,
             request.cancel_flag,
         )) catch |err| {
         request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(
@@ -647,32 +647,10 @@ fn streamAgentCompletion(
     } };
 }
 
-const EventBridge = struct {
-    fn sink(raw: *anyopaque) *agent_stream_provider_contract.EventSink {
-        return @ptrCast(@alignCast(raw));
-    }
-
-    fn content(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .content_delta = chunk });
-    }
-
-    fn reasoning(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .reasoning_delta = chunk });
-    }
-
-    fn toolInput(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .tool_input_delta = chunk });
-    }
-
-    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8, arguments_json: ?[]const u8) void {
-        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label, .arguments_json = arguments_json } });
-    }
-};
-
 /// Gateway reports the last provider it tried, so a provider's size rejection
 /// can arrive as a 400 from a later fallback. Classify it as too large.
 fn gatewayFailureKind(alloc: Allocator, status: std.http.Status, err_body: ?[]const u8) agent_stream_provider_contract.FailureKind {
-    const kind = failureKind(status);
+    const kind = agent_stream_provider_contract.FailureKind.fromHttpStatus(status);
     if (kind != .invalid_request) return kind;
     const body = err_body orelse return kind;
     return if (vercel_failure_diagnostics.providerRejectedRequestSize(alloc, body)) .request_too_large else kind;
@@ -686,21 +664,6 @@ test "Gateway 400 with a provider 413 attempt is a size failure" {
     try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.invalid_request, gatewayFailureKind(alloc, .bad_request, null));
     try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.request_too_large, gatewayFailureKind(alloc, .payload_too_large, null));
     try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.rate_limited, gatewayFailureKind(alloc, .too_many_requests, fallback_body));
-}
-
-fn failureKind(status: std.http.Status) agent_stream_provider_contract.FailureKind {
-    return switch (status) {
-        .bad_request => .invalid_request,
-        .unauthorized => .unauthorized,
-        .forbidden => .forbidden,
-        .payload_too_large => .request_too_large,
-        .too_many_requests => .rate_limited,
-        .internal_server_error => .server_error,
-        .bad_gateway => .bad_gateway,
-        .service_unavailable => .unavailable,
-        .gateway_timeout => .gateway_timeout,
-        else => .provider_error,
-    };
 }
 
 fn fetchCredits(

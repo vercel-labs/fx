@@ -82,7 +82,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     const opened = try host_stream.openPost(alloc, transport, request, endpoint, &headers, payload);
     defer transport.close(opened.handle);
     if (opened.status != .ok) return .{ .failed = .{
-        .kind = chat_completions.failure_kind(opened.status),
+        .kind = .fromHttpStatus(opened.status),
         .detail = try host_stream.readErrorBody(alloc, transport, opened.handle, request),
         .ownership = .owned,
     } };

@@ -749,7 +749,7 @@ fn take_login_session(
     now_ms: i64,
 ) !oauth_session.Session {
     const refresh_token = token.refresh_token orelse return LoginError.NoRefreshToken;
-    const expires_at_ms = try oauth.expiry_timestamp_ms(now_ms, token.expires_in);
+    const expires_at_ms = try oauth.expiryTimestampMs(now_ms, token.expires_in);
     const owned_issuer = try alloc.dupe(u8, issuer_url);
     errdefer alloc.free(owned_issuer);
     const owned_client_id = try alloc.dupe(u8, client_id);
@@ -948,7 +948,7 @@ const LoginPollState = struct {
     fn init(deps: LoginPollDeps, device: oauth.DeviceAuthorization) !LoginPollState {
         const now_ms = deps.now_ms(deps.ctx);
         return .{
-            .expires_at_ms = try oauth.expiry_timestamp_ms(now_ms, device.expires_in),
+            .expires_at_ms = try oauth.expiryTimestampMs(now_ms, device.expires_in),
             .interval_ms = try poll_interval_ms(device.interval),
             .next_poll_at_ms = now_ms,
         };

@@ -410,24 +410,24 @@ fn refreshSession(
         error.InvalidChatGptOAuthResponse,
         => {
             debug_trace.logf("auth", "retiring terminal Codex session reason={s}", .{@errorName(err)});
-            try retire_refresh_session(mutation);
+            try retireRefreshSession(mutation);
             return error.CredentialRefreshRejected;
         },
         else => return err,
     };
     defer token.deinit(alloc);
 
-    var replacement = refresh_replacement(alloc, &token, session.*) catch |err| {
+    var replacement = refreshReplacement(alloc, &token, session.*) catch |err| {
         if (err == error.OutOfMemory) return err;
         debug_trace.logf("auth", "retiring unusable Codex refresh reason={s}", .{@errorName(err)});
-        try retire_refresh_session(mutation);
+        try retireRefreshSession(mutation);
         if (err == error.ChatGptAccountChanged) return err;
         return error.CredentialRefreshRejected;
     };
     errdefer replacement.deinit(alloc);
     mutation.save(alloc, replacement) catch |err| {
         debug_trace.logf("auth", "retiring Codex session after refresh save failed err={s}", .{@errorName(err)});
-        retire_refresh_session(mutation) catch |cleanup_err| {
+        retireRefreshSession(mutation) catch |cleanup_err| {
             debug_trace.logf("auth", "Codex session retirement failed err={s}", .{@errorName(cleanup_err)});
         };
         return error.CredentialRefreshPersistenceUncertain;
@@ -440,7 +440,7 @@ fn refreshSession(
     replacement.account_id = &.{};
 }
 
-fn refresh_replacement(
+fn refreshReplacement(
     alloc: Allocator,
     token: *RefreshTokenResponse,
     current: chatgpt_session.Session,
@@ -472,7 +472,7 @@ fn refresh_replacement(
     return replacement;
 }
 
-fn retire_refresh_session(mutation: *chatgpt_session.Mutation) !void {
+fn retireRefreshSession(mutation: *chatgpt_session.Mutation) !void {
     const outcome = mutation.delete() catch return error.CredentialRefreshPersistenceUncertain;
     if (outcome == .deleted_not_durable) return error.CredentialRefreshPersistenceUncertain;
 }
@@ -504,7 +504,7 @@ fn requestRefreshToken(
     defer response.deinit(alloc);
     if (response.disposition != .accepted) {
         debug_trace.logf("auth", "Codex refresh request rejected", .{});
-        if (chat_gpt_refresh_requires_sign_in(response.body)) {
+        if (chatGptRefreshRequiresSignIn(response.body)) {
             return error.CredentialRefreshRejected;
         }
         return error.ChatGptOAuthRequestFailed;
@@ -533,7 +533,7 @@ fn requestRefreshToken(
     };
 }
 
-fn chat_gpt_refresh_requires_sign_in(body: []const u8) bool {
+fn chatGptRefreshRequiresSignIn(body: []const u8) bool {
     const terminal_codes = [_][]const u8{
         "\"refresh_token_expired\"",
         "\"refresh_token_reused\"",

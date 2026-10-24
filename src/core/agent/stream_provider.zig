@@ -43,6 +43,35 @@ pub const EventSink = struct {
     pub fn emit(self: EventSink, event: Event) void {
         self.emit_fn(self.context, event);
     }
+
+    // `StreamCallback` and `ToolStartCallback` adapters for transport parsers
+    // whose callback context is a `*EventSink`.
+
+    pub fn onContentChunk(context: *anyopaque, chunk: []const u8) void {
+        fromContext(context).emit(.{ .content_delta = chunk });
+    }
+
+    pub fn onReasoningChunk(context: *anyopaque, chunk: []const u8) void {
+        fromContext(context).emit(.{ .reasoning_delta = chunk });
+    }
+
+    pub fn onToolInputChunk(context: *anyopaque, chunk: []const u8) void {
+        fromContext(context).emit(.{ .tool_input_delta = chunk });
+    }
+
+    pub fn onToolStart(
+        context: *anyopaque,
+        id: []const u8,
+        name: []const u8,
+        label: ?[]const u8,
+        arguments_json: ?[]const u8,
+    ) void {
+        fromContext(context).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label, .arguments_json = arguments_json } });
+    }
+
+    fn fromContext(context: *anyopaque) *EventSink {
+        return @ptrCast(@alignCast(context));
+    }
 };
 
 pub const Admission = struct {
@@ -284,6 +313,22 @@ pub const FailureKind = enum {
     unavailable,
     gateway_timeout,
     provider_error,
+
+    /// Classifies a provider's HTTP error status.
+    pub fn fromHttpStatus(status: std.http.Status) FailureKind {
+        return switch (status) {
+            .bad_request => .invalid_request,
+            .unauthorized => .unauthorized,
+            .forbidden => .forbidden,
+            .payload_too_large => .request_too_large,
+            .too_many_requests => .rate_limited,
+            .internal_server_error => .server_error,
+            .bad_gateway => .bad_gateway,
+            .service_unavailable => .unavailable,
+            .gateway_timeout => .gateway_timeout,
+            else => .provider_error,
+        };
+    }
 };
 
 pub const FailureDiagnostics = struct {
@@ -585,6 +630,63 @@ test "stream provider accepts one typed request and emits ordered neutral events
     try std.testing.expect(!capture.failed);
     try std.testing.expectEqualStrings("firstsecond", capture.chunks.items);
     try std.testing.expectEqualStrings("done", result.completed.completion.content.?);
+}
+
+test "provider HTTP statuses classify into failure kinds" {
+    const cases = [_]struct { std.http.Status, FailureKind }{
+        .{ .bad_request, .invalid_request },
+        .{ .unauthorized, .unauthorized },
+        .{ .forbidden, .forbidden },
+        .{ .payload_too_large, .request_too_large },
+        .{ .too_many_requests, .rate_limited },
+        .{ .internal_server_error, .server_error },
+        .{ .bad_gateway, .bad_gateway },
+        .{ .service_unavailable, .unavailable },
+        .{ .gateway_timeout, .gateway_timeout },
+        .{ .not_found, .provider_error },
+        .{ .conflict, .provider_error },
+        .{ .ok, .provider_error },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case[1], FailureKind.fromHttpStatus(case[0]));
+    }
+}
+
+test "event sink callback adapters emit the matching events" {
+    const Capture = struct {
+        last: ?Event = null,
+
+        fn emit(raw: *anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.last = event;
+        }
+    };
+    var capture: Capture = .{};
+    var sink: EventSink = .{ .context = &capture, .emit_fn = Capture.emit };
+
+    const on_content: StreamCallback = EventSink.onContentChunk;
+    on_content(&sink, "text");
+    try std.testing.expectEqualStrings("text", capture.last.?.content_delta);
+
+    const on_reasoning: StreamCallback = EventSink.onReasoningChunk;
+    on_reasoning(&sink, "thought");
+    try std.testing.expectEqualStrings("thought", capture.last.?.reasoning_delta);
+
+    const on_tool_input: StreamCallback = EventSink.onToolInputChunk;
+    on_tool_input(&sink, "{\"a\"");
+    try std.testing.expectEqualStrings("{\"a\"", capture.last.?.tool_input_delta);
+
+    const on_tool_start: ToolStartCallback = EventSink.onToolStart;
+    on_tool_start(&sink, "call_1", "read_file", "Read", "{}");
+    const started = capture.last.?.tool_started;
+    try std.testing.expectEqualStrings("call_1", started.id);
+    try std.testing.expectEqualStrings("read_file", started.name);
+    try std.testing.expectEqualStrings("Read", started.label.?);
+    try std.testing.expectEqualStrings("{}", started.arguments_json.?);
+
+    on_tool_start(&sink, "call_2", "glob_files", null, null);
+    try std.testing.expect(capture.last.?.tool_started.label == null);
+    try std.testing.expect(capture.last.?.tool_started.arguments_json == null);
 }
 
 test "stream provider rejects system messages in conversation before delegation" {

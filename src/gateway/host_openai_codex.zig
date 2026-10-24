@@ -110,7 +110,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     const opened = try host_stream.openPost(alloc, transport, request, endpoint, headers_buf[0..count], payload);
     defer transport.close(opened.handle);
     if (opened.status != .ok) return .{ .failed = .{
-        .kind = openai_codex.failureKind(opened.status),
+        .kind = .fromHttpStatus(opened.status),
         .detail = try host_stream.readErrorBody(alloc, transport, opened.handle, request),
         .ownership = .owned,
     } };

@@ -202,7 +202,7 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
             detail = redacted;
         }
 
-        return .{ .failed = .{ .kind = failure_kind(response.head.status), .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
+        return .{ .failed = .{ .kind = .fromHttpStatus(response.head.status), .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
     }
     var result = consume(alloc, reader, request, watch.progress()) catch |err| return watch.failure(err);
     if (watch.finish()) |err| {
@@ -210,21 +210,6 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
         return err;
     }
     return result;
-}
-
-pub fn failure_kind(status: std.http.Status) streams.FailureKind {
-    return switch (status) {
-        .bad_request => .invalid_request,
-        .unauthorized => .unauthorized,
-        .forbidden => .forbidden,
-        .payload_too_large => .request_too_large,
-        .too_many_requests => .rate_limited,
-        .internal_server_error => .server_error,
-        .bad_gateway => .bad_gateway,
-        .service_unavailable => .unavailable,
-        .gateway_timeout => .gateway_timeout,
-        else => .provider_error,
-    };
 }
 
 /// Parses a successful streamed reply from `reader`, telling `progress` about

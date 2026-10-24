@@ -514,24 +514,24 @@ fn refreshSession(
         error.InvalidGrokOAuthResponse,
         => {
             debug_trace.logf("auth", "retiring terminal Grok session reason={s}", .{@errorName(err)});
-            try retire_refresh_session(mutation);
+            try retireRefreshSession(mutation);
             return error.CredentialRefreshRejected;
         },
         else => return err,
     };
     defer token.deinit(alloc);
 
-    var replacement = refresh_replacement(alloc, transport, &token, session.*) catch |err| {
+    var replacement = refreshReplacement(alloc, transport, &token, session.*) catch |err| {
         if (err == error.OutOfMemory) return err;
         debug_trace.logf("auth", "retiring unusable Grok refresh reason={s}", .{@errorName(err)});
-        try retire_refresh_session(mutation);
+        try retireRefreshSession(mutation);
         if (err == error.GrokAccountChanged) return err;
         return error.CredentialRefreshRejected;
     };
     errdefer replacement.deinit(alloc);
     mutation.save(alloc, replacement) catch |err| {
         debug_trace.logf("auth", "retiring Grok session after refresh save failed err={s}", .{@errorName(err)});
-        retire_refresh_session(mutation) catch |cleanup_err| {
+        retireRefreshSession(mutation) catch |cleanup_err| {
             debug_trace.logf("auth", "Grok session retirement failed err={s}", .{@errorName(cleanup_err)});
         };
         return error.CredentialRefreshPersistenceUncertain;
@@ -544,7 +544,7 @@ fn refreshSession(
     replacement.account_id = &.{};
 }
 
-fn refresh_replacement(
+fn refreshReplacement(
     alloc: Allocator,
     transport: oauth_transport.Provider,
     token: *RefreshTokenResponse,
@@ -576,7 +576,7 @@ fn refresh_replacement(
     return replacement;
 }
 
-fn retire_refresh_session(mutation: *grok_session.Mutation) !void {
+fn retireRefreshSession(mutation: *grok_session.Mutation) !void {
     const outcome = mutation.delete() catch return error.CredentialRefreshPersistenceUncertain;
     if (outcome == .deleted_not_durable) return error.CredentialRefreshPersistenceUncertain;
 }

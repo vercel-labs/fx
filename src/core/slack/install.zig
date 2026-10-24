@@ -102,7 +102,7 @@ pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, 
         var cancelled: std.atomic.Value(bool) = .init(false);
         while (accepted == null) {
             if (deadline.durationFromNow(io.getIo()).raw.nanoseconds <= 0) return error.SlackAuthorizationExpired;
-            accepted = try browser.await_form(oauth.FormCallback, oauth.parse_form_callback, alloc, &listener, &context, &cancelled, null, origin);
+            accepted = try browser.await_form(oauth.FormCallback, oauth.parseFormCallback, alloc, &listener, &context, &cancelled, null, origin);
         }
         if (deadline.durationFromNow(io.getIo()).raw.nanoseconds <= 0) return error.SlackAuthorizationExpired;
         if (accepted.?.callback.denied) return error.SlackAuthorizationDenied;
@@ -279,11 +279,11 @@ test "Slack callback consumes matching state once and rejects ambiguous fields" 
         .require_visible_ascii = true,
         .max_value_bytes = 8192,
     };
-    try std.testing.expect(oauth.parse_form_callback(&context, alloc, "state=wrong&code=code") == .unrelated);
+    try std.testing.expect(oauth.parseFormCallback(&context, alloc, "state=wrong&code=code") == .unrelated);
     try std.testing.expect(!context.consumed);
-    const accepted = oauth.parse_form_callback(&context, alloc, "state=expected&code=code%2Bvalue");
+    const accepted = oauth.parseFormCallback(&context, alloc, "state=expected&code=code%2Bvalue");
     try std.testing.expectEqualStrings("code+value", accepted.accepted.code.?);
-    try std.testing.expect(oauth.parse_form_callback(&context, alloc, "state=expected&code=code") == .unrelated);
+    try std.testing.expect(oauth.parseFormCallback(&context, alloc, "state=expected&code=code") == .unrelated);
     for ([_][]const u8{
         "state=expected&state=expected&code=code",
         "state=expected&code=code&error=denied",
@@ -295,7 +295,7 @@ test "Slack callback consumes matching state once and rejects ambiguous fields" 
             .require_visible_ascii = true,
             .max_value_bytes = 8192,
         };
-        const invalid = oauth.parse_form_callback(&invalid_context, alloc, body);
+        const invalid = oauth.parseFormCallback(&invalid_context, alloc, body);
         try std.testing.expect(invalid == .failed);
         try std.testing.expectEqual(error.InvalidSlackCallback, invalid.failed);
     }
@@ -305,7 +305,7 @@ test "Slack callback consumes matching state once and rejects ambiguous fields" 
         .require_visible_ascii = true,
         .max_value_bytes = 8192,
     };
-    try std.testing.expect(oauth.parse_form_callback(&missing_state_context, alloc, "code=code") == .unrelated);
+    try std.testing.expect(oauth.parseFormCallback(&missing_state_context, alloc, "code=code") == .unrelated);
     for ([_]struct { body: []const u8, expected: anyerror }{
         .{ .body = "state=expected&code=%zz", .expected = error.InvalidCharacter },
         .{ .body = "state=expected&code=%", .expected = error.InvalidSlackCallback },
@@ -316,7 +316,7 @@ test "Slack callback consumes matching state once and rejects ambiguous fields" 
             .require_visible_ascii = true,
             .max_value_bytes = 8192,
         };
-        const malformed = oauth.parse_form_callback(&malformed_context, alloc, scenario.body);
+        const malformed = oauth.parseFormCallback(&malformed_context, alloc, scenario.body);
         try std.testing.expectEqual(scenario.expected, malformed.failed);
     }
     var denied_context = oauth.FormCallbackContext{
@@ -325,7 +325,7 @@ test "Slack callback consumes matching state once and rejects ambiguous fields" 
         .require_visible_ascii = true,
         .max_value_bytes = 8192,
     };
-    const denied = oauth.parse_form_callback(&denied_context, alloc, "state=expected&error=access_denied");
+    const denied = oauth.parseFormCallback(&denied_context, alloc, "state=expected&error=access_denied");
     try std.testing.expect(denied.accepted.denied);
     try std.testing.expect(valid_id("UBOT", "UW"));
     try std.testing.expect(valid_id("WBOT", "UW"));

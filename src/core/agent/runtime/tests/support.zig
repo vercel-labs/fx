@@ -347,7 +347,7 @@ pub const FakeGateway = struct {
             errdefer if (failure_schema) |value| alloc.free(value);
             const failure_request_shape = if (completion.failure_request_shape) |value| try alloc.dupe(u8, value) else null;
             return .{ .failed = .{
-                .kind = failureKind(completion.status),
+                .kind = .fromHttpStatus(completion.status),
                 .detail = err_body,
                 .retry_after_seconds = completion.retry_after_seconds,
                 .diagnostics = .{
@@ -408,21 +408,6 @@ pub const FakeGateway = struct {
         request.attempt_evidence.network_failure = .{
             .cause = cause,
             .delivery = request.delivery.load(),
-        };
-    }
-
-    fn failureKind(status: std.http.Status) agent_stream_provider.FailureKind {
-        return switch (status) {
-            .bad_request => .invalid_request,
-            .unauthorized => .unauthorized,
-            .forbidden => .forbidden,
-            .payload_too_large => .request_too_large,
-            .too_many_requests => .rate_limited,
-            .internal_server_error => .server_error,
-            .bad_gateway => .bad_gateway,
-            .service_unavailable => .unavailable,
-            .gateway_timeout => .gateway_timeout,
-            else => .provider_error,
         };
     }
 };

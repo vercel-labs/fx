@@ -341,7 +341,7 @@ pub fn streamPrepared(
             break :body try alloc.dupe(u8, "xAI Grok error response exceeded the local limit");
         } else bounded_body;
         return .{ .failed = .{
-            .kind = failureKind(response.head.status),
+            .kind = .fromHttpStatus(response.head.status),
             .detail = body,
             .ownership = .owned,
         } };
@@ -369,10 +369,10 @@ pub fn completeFromStream(
         alloc,
         reader,
         &events,
-        EventBridge.content,
-        EventBridge.toolStart,
-        EventBridge.reasoning,
-        EventBridge.toolInput,
+        stream_provider.EventSink.onContentChunk,
+        stream_provider.EventSink.onToolStart,
+        stream_provider.EventSink.onReasoningChunk,
+        stream_provider.EventSink.onToolInputChunk,
         request.cancel_flag,
         request.content_capture_limit,
         progress,
@@ -388,43 +388,6 @@ pub fn completeFromStream(
         .completion = completion,
         .ownership = .owned,
     } };
-}
-
-const EventBridge = struct {
-    fn sink(raw: *anyopaque) *stream_provider.EventSink {
-        return @ptrCast(@alignCast(raw));
-    }
-
-    fn content(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .content_delta = chunk });
-    }
-
-    fn reasoning(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .reasoning_delta = chunk });
-    }
-
-    fn toolInput(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .tool_input_delta = chunk });
-    }
-
-    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8, arguments_json: ?[]const u8) void {
-        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label, .arguments_json = arguments_json } });
-    }
-};
-
-pub fn failureKind(status: std.http.Status) stream_provider.FailureKind {
-    return switch (status) {
-        .bad_request => .invalid_request,
-        .unauthorized => .unauthorized,
-        .forbidden => .forbidden,
-        .payload_too_large => .request_too_large,
-        .too_many_requests => .rate_limited,
-        .internal_server_error => .server_error,
-        .bad_gateway => .bad_gateway,
-        .service_unavailable => .unavailable,
-        .gateway_timeout => .gateway_timeout,
-        else => .provider_error,
-    };
 }
 
 fn consumeSse(

@@ -68,13 +68,28 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
         return .{ .failure = try ctx.allocator.dupe(u8, "grep_files field \"pattern\" must be a string") };
     }
 
-    const path_string = optionalStringField(parsed.value.object, "path");
-    const include_string = optionalStringField(parsed.value.object, "include");
+    const path_string = switch (try parseOptionalString(ctx.allocator, parsed.value.object, "path")) {
+        .missing => null,
+        .value => |value| value,
+        .failure => |body| return .{ .failure = body },
+    };
+    const include_string = switch (try parseOptionalString(ctx.allocator, parsed.value.object, "include")) {
+        .missing => null,
+        .value => |value| value,
+        .failure => |body| return .{ .failure = body },
+    };
     const case_insensitive = if (parsed.value.object.get("case_insensitive")) |value| switch (value) {
+        .null => false,
         .bool => |enabled| enabled,
-        else => false,
+        else => return .{ .failure = try ctx.allocator.dupe(u8, "grep_files field \"case_insensitive\" must be a boolean") },
     } else false;
-    const mode = parseOutputMode(parsed.value.object);
+    const mode: OutputMode = switch (try parseOptionalString(ctx.allocator, parsed.value.object, "mode")) {
+        .missing => .matches,
+        .value => |raw| std.meta.stringToEnum(OutputMode, raw) orelse {
+            return .{ .failure = try ctx.allocator.dupe(u8, "grep_files field \"mode\" must be one of matches, files_with_matches, count") };
+        },
+        .failure => |body| return .{ .failure = body },
+    };
 
     const head_limit = switch (try parseOptionalInteger(ctx.allocator, parsed.value.object, "head_limit", 1, "positive")) {
         .missing => output_cap,
@@ -125,19 +140,24 @@ fn inputDeinit(ptr: *anyopaque, alloc: Allocator) void {
     alloc.destroy(input);
 }
 
-fn optionalStringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const value = object.get(key) orelse return null;
-    return switch (value) {
-        .string => |text| text,
-        else => null,
-    };
-}
+const OptionalStringParse = union(enum) {
+    missing,
+    value: []const u8,
+    failure: []u8,
+};
 
-fn parseOutputMode(object: std.json.ObjectMap) OutputMode {
-    const raw = optionalStringField(object, "mode") orelse return .matches;
-    if (std.mem.eql(u8, raw, "count")) return .count;
-    if (std.mem.eql(u8, raw, "files_with_matches")) return .files_with_matches;
-    return .matches;
+/// A missing field and JSON null both read as not given.
+fn parseOptionalString(
+    alloc: Allocator,
+    object: std.json.ObjectMap,
+    key: []const u8,
+) tool_dispatch.DispatchError!OptionalStringParse {
+    const value = object.get(key) orelse return .missing;
+    return switch (value) {
+        .null => .missing,
+        .string => |text| .{ .value = text },
+        else => .{ .failure = try alloc.print("grep_files field \"{s}\" must be a string", .{key}) },
+    };
 }
 
 const OptionalIntegerParse = union(enum) {
@@ -857,6 +877,11 @@ test "grep_files decodes invalid argument shapes as failures" {
     try expectDecodeFailure("[]", "grep_files arguments must be an object");
     try expectDecodeFailure("{\"path\":\".\"}", "grep_files requires string field \"pattern\"");
     try expectDecodeFailure("{\"pattern\":1}", "grep_files field \"pattern\" must be a string");
+    try expectDecodeFailure("{\"pattern\":\"needle\",\"path\":1}", "grep_files field \"path\" must be a string");
+    try expectDecodeFailure("{\"pattern\":\"needle\",\"include\":[\"*.zig\"]}", "grep_files field \"include\" must be a string");
+    try expectDecodeFailure("{\"pattern\":\"needle\",\"case_insensitive\":\"true\"}", "grep_files field \"case_insensitive\" must be a boolean");
+    try expectDecodeFailure("{\"pattern\":\"needle\",\"mode\":\"files\"}", "grep_files field \"mode\" must be one of matches, files_with_matches, count");
+    try expectDecodeFailure("{\"pattern\":\"needle\",\"mode\":2}", "grep_files field \"mode\" must be a string");
 }
 
 test "grep_files validate preserves active raw pattern and path values" {
@@ -887,7 +912,7 @@ test "grep_files decodes defaults and all fields" {
         5,
         2,
     );
-    try expectDecodeInput("{\"pattern\":\"needle\",\"path\":1,\"include\":1,\"case_insensitive\":\"yes\"}", "needle", ".", null, false, output_cap, 0);
+    try expectDecodeInput("{\"pattern\":\"needle\",\"path\":null,\"include\":null,\"case_insensitive\":null,\"mode\":null}", "needle", ".", null, false, output_cap, 0);
 }
 
 test "grep_files decodes context_lines above cap as bounded" {
