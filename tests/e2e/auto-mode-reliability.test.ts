@@ -341,6 +341,74 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "automatic reviews in a long turn do not keep growing memory",
+    async () => {
+      const steps = Number(process.env.FX_E2E_REVIEW_MEMORY_STEPS ?? "150");
+      // Peak resident memory of one `fx ask` turn of `steps` shell calls.
+      const peakRssKb = async (reviewed: boolean) => {
+        const root = createIsolatedRoot();
+        runGit(root.workspace, ["init", "-q"]);
+        const gateway = startGateway(
+          [
+            ...Array.from({ length: steps }, (_, index) =>
+              commandCall(
+                reviewed ? `git status --short; echo step-${index}` : "git status --short",
+                `step_${index}`,
+              ),
+            ),
+            fakeGatewayFinalText("long turn complete"),
+          ],
+          Array.from({ length: steps }, (_, index) =>
+            fakeGatewayPermissionDecision("clear", `review_${index}`),
+          ),
+        );
+        const child = Bun.spawn(
+          [FX_BIN, "ask", "--quiet", "--json", "--no-save", "Run every step."],
+          {
+            cwd: root.workspace,
+            env: {
+              ...process.env,
+              ...gatewayEnv(root, gateway),
+              FX_SOUND: "0",
+              FX_MAX_AGENT_STEPS: String(steps + 10),
+            },
+            stdin: "ignore",
+            stdout: "pipe",
+            stderr: "pipe",
+          },
+        );
+        let peak = 0;
+        let running = true;
+        void child.exited.then(() => {
+          running = false;
+        });
+        while (running) {
+          const sample = Bun.spawnSync(["ps", "-o", "rss=", "-p", String(child.pid)], {
+            stdout: "pipe",
+          });
+          peak = Math.max(peak, Number(sample.stdout.toString().trim()) || 0);
+          await Bun.sleep(50);
+        }
+        const stdout = await new Response(child.stdout).text();
+        expect(await child.exited, stdout).toBe(0);
+        expect(stdout).toContain("long turn complete");
+        expect(gateway.classifierRequests).toHaveLength(reviewed ? steps : 0);
+        return peak;
+      };
+
+      const unreviewed = await peakRssKb(false);
+      const reviewed = await peakRssKb(true);
+      // Each review's request and response are temporary. Kept until the turn
+      // ends, they cost about 120 KB a review, 18 MB over 150 steps.
+      expect(
+        (reviewed - unreviewed) / 1024,
+        `peak RSS: ${unreviewed} KB without reviews, ${reviewed} KB with ${steps} reviews`,
+      ).toBeLessThan(6);
+    },
+    180_000,
+  );
+
+  test(
     "a configured safe command bypasses automatic review",
     async () => {
       const root = createIsolatedRoot();
