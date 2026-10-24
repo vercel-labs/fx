@@ -15,6 +15,8 @@ const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_agent_runtime = @import("app_agent_runtime.zig");
 const ui_render = @import("../../ui/render.zig");
+const render_input = @import("../../ui/footer/render_input.zig");
+const agents_menu_presentation = @import("../../ui/footer/agents_menu_presentation.zig");
 const session_mod = @import("../session/session.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const app_process_runtime = @import("app_process_runtime.zig");
@@ -102,6 +104,55 @@ pub const ChildAgent = struct {
             self.agent.worker.hasPendingEvents();
     }
 };
+
+/// The instance list `/agents` and Alt+↑ open. Its rows are built from the
+/// open instances each time it is drawn, so each shows what it is doing now.
+pub const AgentsMenu = struct {
+    open: bool = false,
+    /// The selected instance's place in the list, from 0.
+    selected: usize = 0,
+    window_start: usize = 0,
+    /// Backs the rows the last projection showed. Owned.
+    rows: std.ArrayList(render_input.AgentsMenuRow) = .empty,
+
+    pub fn deinit(self: *AgentsMenu, alloc: Allocator) void {
+        self.rows.deinit(alloc);
+        self.* = .{};
+    }
+};
+
+/// What an instance is doing, as the instance list shows it, most urgent
+/// first.
+pub const InstanceState = enum {
+    needs_approval,
+    has_question,
+    working,
+    finished,
+    idle,
+
+    pub fn label(self: InstanceState) []const u8 {
+        return switch (self) {
+            .needs_approval => "needs approval",
+            .has_question => "has a question",
+            .working => "working",
+            .finished => "finished",
+            .idle => "idle",
+        };
+    }
+};
+
+pub fn instanceState(agent: *agents.Agent) InstanceState {
+    if (agent.approval_prompt.isActive()) return .needs_approval;
+    if (agent.question_prompt.isActive()) return .has_question;
+    if (instanceTurnGoing(agent)) return .working;
+    if (agent.finished_unseen) return .finished;
+    return .idle;
+}
+
+/// Whether one of `agent`'s turns is going or queued.
+fn instanceTurnGoing(agent: *agents.Agent) bool {
+    return agent.worker.isProcessing() or agent.worker.queuedPromptCount() > 0;
+}
 
 /// Slot threads and the main loop both use the mailbox's list.
 const mailbox_alloc = std.heap.c_allocator;
@@ -644,6 +695,156 @@ pub fn Runtime(comptime App: type) type {
         fn positionIn(order: []const ?*ChildAgent, agent: ?*ChildAgent) ?usize {
             for (order, 0..) |value, index| if (value == agent) return index;
             return null;
+        }
+
+        /// The open instances in order, null for the first while it runs.
+        fn instanceTargets(app: *App, out: *std.ArrayList(?*ChildAgent)) !void {
+            if (firstOpen(app)) try out.append(app.alloc, null);
+            for (app.child_agents.items) |child| {
+                if (child.agent.role == .instance) try out.append(app.alloc, child);
+            }
+        }
+
+        fn targetAgent(app: *App, target: ?*ChildAgent) *AppAgent {
+            return if (target) |child| &child.agent else &app.main_agent;
+        }
+
+        /// Notes, after each tick, every instance one of whose turns ended
+        /// while it wasn't on screen, until it is shown. Redraws the footer
+        /// when one starts or ends a turn, for its note and the list.
+        pub fn noteFinishedTurns(app: *App) void {
+            var changed = false;
+            if (firstOpen(app)) changed = noteFinished(&app.main_agent, app.agent_on_screen == null) or changed;
+            for (app.child_agents.items) |child| {
+                if (child.agent.role != .instance) continue;
+                changed = noteFinished(&child.agent, child == app.agent_on_screen) or changed;
+            }
+            if (changed) app.shell.render_requests.request(.footer);
+        }
+
+        /// Updates `agent`'s marks; whether either changed.
+        fn noteFinished(agent: *AppAgent, on_screen: bool) bool {
+            const going = instanceTurnGoing(agent);
+            const finished = if (on_screen) false else agent.finished_unseen or (agent.was_working and !going);
+            const changed = going != agent.was_working or finished != agent.finished_unseen;
+            agent.was_working = going;
+            agent.finished_unseen = finished;
+            return changed;
+        }
+
+        /// The footer note for hidden instances whose turns ended since they
+        /// were last shown, such as "fx 7 finished · Alt+→", or empty. Only
+        /// while several instances are open.
+        pub fn finishedNote(app: *App, buf: []u8) []const u8 {
+            if (openInstanceCount(app) <= 1) return "";
+            var first: ?*ChildAgent = null;
+            var found = false;
+            var count: usize = 0;
+            if (firstOpen(app) and app.agent_on_screen != null and app.main_agent.finished_unseen) {
+                found = true;
+                count += 1;
+            }
+            for (app.child_agents.items) |child| {
+                if (child.agent.role != .instance or child == app.agent_on_screen or !child.agent.finished_unseen) continue;
+                if (!found) first = child;
+                found = true;
+                count += 1;
+            }
+            if (!found) return "";
+            var name_buf: [32]u8 = undefined;
+            const name = noteName(app, first, &name_buf);
+            const key = keyToward(app, first);
+            return if (count > 1)
+                std.mem.print(buf, "{s} and {d} more finished · {s}", .{ name, count - 1, key }) catch ""
+            else
+                std.mem.print(buf, "{s} finished · {s}", .{ name, key }) catch "";
+        }
+
+        pub fn menuActive(app: *App) bool {
+            if (comptime !@hasField(App, "instances")) return false;
+            return app.instances.agents_menu.open;
+        }
+
+        /// Opens the instance list with the instance on screen selected, or
+        /// the one whose subagent is.
+        pub fn openMenu(app: *App) !void {
+            if (comptime !@hasField(App, "instances")) return;
+            var targets: std.ArrayList(?*ChildAgent) = .empty;
+            defer targets.deinit(app.alloc);
+            try instanceTargets(app, &targets);
+            const on_screen: *AppAgent = if (app.agent_on_screen) |child|
+                (if (child.agent.role == .instance) &child.agent else rootInstance(app, child))
+            else
+                &app.main_agent;
+            const menu = &app.instances.agents_menu;
+            menu.selected = 0;
+            for (targets.items, 0..) |target, index| {
+                if (targetAgent(app, target) == on_screen) menu.selected = index;
+            }
+            menu.window_start = 0;
+            menu.open = true;
+            debug_trace.eventf("host", "agents_menu_opened", .{}, "instances={d} selected={d}", .{ targets.items.len, menu.selected });
+            app.shell.render_requests.request(.footer);
+        }
+
+        pub fn closeMenu(app: *App) bool {
+            if (!menuActive(app)) return false;
+            app.instances.agents_menu.open = false;
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
+        /// Moves the list's selection by `delta`, keeping it in view in
+        /// `row_budget` rows.
+        pub fn moveMenu(app: *App, delta: i32, row_budget: u16) bool {
+            if (!menuActive(app)) return false;
+            const menu = &app.instances.agents_menu;
+            const count = openInstanceCount(app);
+            if (count == 0) return true;
+            const current: i64 = @intCast(@min(menu.selected, count - 1));
+            menu.selected = @intCast(std.math.clamp(current + delta, 0, @as(i64, @intCast(count - 1))));
+            menu.window_start = agents_menu_presentation.windowStart(menuProjection(app), row_budget);
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
+        /// Shows the instance the list has selected and closes the list.
+        pub fn submitMenu(app: *App) !bool {
+            if (!menuActive(app)) return false;
+            var targets: std.ArrayList(?*ChildAgent) = .empty;
+            defer targets.deinit(app.alloc);
+            try instanceTargets(app, &targets);
+            const menu = &app.instances.agents_menu;
+            menu.open = false;
+            app.shell.render_requests.request(.footer);
+            if (targets.items.len == 0) return true;
+            const target = targets.items[@min(menu.selected, targets.items.len - 1)];
+            debug_trace.eventf("host", "agents_menu_chosen", .{}, "position={d}", .{@min(menu.selected, targets.items.len - 1) + 1});
+            if (target != app.agent_on_screen) try show(app, target);
+            return true;
+        }
+
+        /// The instance list as the footer draws it now, or an inactive one.
+        pub fn menuProjection(app: *App) render_input.AgentsMenuProjection {
+            if (!menuActive(app)) return .{};
+            const menu = &app.instances.agents_menu;
+            var targets: std.ArrayList(?*ChildAgent) = .empty;
+            defer targets.deinit(app.alloc);
+            instanceTargets(app, &targets) catch return .{};
+            menu.rows.clearRetainingCapacity();
+            menu.rows.ensureTotalCapacity(app.alloc, targets.items.len) catch return .{};
+            for (targets.items, 1..) |target, number| {
+                const agent = targetAgent(app, target);
+                menu.rows.appendAssumeCapacity(.{
+                    .number = number,
+                    .title = agent.session_title.items,
+                    .profile = agent.profile.profile.name,
+                    .state = instanceState(agent).label(),
+                    .on_screen = target == app.agent_on_screen,
+                });
+            }
+            if (menu.selected >= menu.rows.items.len) menu.selected = menu.rows.items.len -| 1;
+            return .{ .rows = menu.rows.items, .selected = menu.selected, .window_start = menu.window_start };
         }
 
         /// Whether the first instance, kept in `main_agent`, still runs.

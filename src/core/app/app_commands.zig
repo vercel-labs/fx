@@ -285,6 +285,7 @@ pub fn Handlers(comptime App: type) type {
                 .new_session = commandNewSession,
                 .launch_instance = commandLaunchInstance,
                 .close_instance = commandCloseInstance,
+                .show_agents = commandShowAgents,
                 .reset_session = commandResetSession,
                 .resume_session = commandResumeSession,
                 .fork_session = commandForkSession,
@@ -459,6 +460,14 @@ pub fn Handlers(comptime App: type) type {
             try app.closeInstanceOnScreen();
         }
 
+        /// `/agents` lists the open instances to switch to one; with one
+        /// open it says how to start another.
+        fn commandShowAgents(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime !@hasDecl(App, "openAgentsMenu")) return;
+            try app.openAgentsMenu();
+        }
+
         fn commandResumeSession(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime !runtime_profile.allows(App, .durable_sessions)) {
@@ -546,11 +555,7 @@ pub fn Handlers(comptime App: type) type {
 
         /// Shows `snapshot` in place of any other footer menu. Takes ownership.
         fn openInfoPanel(app: *App, snapshot: info_panel.Snapshot) void {
-            if (comptime @hasField(App, "skills")) app.skills.closeMenu();
-            if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
-            closeHelpMenuIfPresent(app);
-            app.input_runtime.settings_menu.close();
-            closeInlineCommandMenusIfPresent(app);
+            closeFooterMenus(app);
             app.input_runtime.info_panel.open(snapshot);
             app.shell.render_requests.request(.footer);
         }
@@ -1180,7 +1185,17 @@ pub fn Handlers(comptime App: type) type {
             }
         }
 
+        /// Closes every footer menu and panel, so another can open in its place.
+        pub fn closeFooterMenus(app: *App) void {
+            if (comptime @hasField(App, "skills")) app.skills.closeMenu();
+            if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
+            closeHelpMenuIfPresent(app);
+            app.input_runtime.settings_menu.close();
+            closeInlineCommandMenusIfPresent(app);
+        }
+
         fn closeInlineCommandMenusIfPresent(app: *App) void {
+            if (comptime @hasDecl(App, "closeAgentsMenu")) app.closeAgentsMenu();
             if (comptime !@hasField(App, "input_runtime")) return;
             const InputRuntime = @TypeOf(app.input_runtime);
             if (comptime @hasField(InputRuntime, "statusline_menu")) app.input_runtime.statusline_menu.close();
