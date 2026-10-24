@@ -420,6 +420,39 @@ fn trailingStatToken(text: []const u8) ?StatToken {
     return .{ .start = index - 1, .added = sign == '+' };
 }
 
+/// Byte index of the space that opens a trailing " +N", " -N", or " +N / -M"
+/// diff count suffix, or null when the phrase has none.
+fn trailingDiffStatsStart(text: []const u8) ?usize {
+    const last = trailingStatToken(text) orelse return null;
+    if (!last.added and last.start >= 2 and text[last.start - 2] == '/') {
+        const before_slash = std.mem.trimEnd(u8, text[0 .. last.start - 2], " ");
+        if (trailingStatToken(before_slash)) |first| {
+            if (first.added) return first.start - 1;
+        }
+    }
+    return last.start - 1;
+}
+
+/// Clips a file-mutation row so its trailing diff counts stay visible: the
+/// text before the counts takes the ellipsis instead. Falls back to
+/// clipSummary when the counts and one leading cell cannot fit. Caller owns
+/// the returned slice.
+fn clipKeepingDiffStats(
+    alloc: std.mem.Allocator,
+    text: []const u8,
+    cols: u16,
+) ![]u8 {
+    if (display_width.visibleWidthIgnoringAnsi(text) <= cols) return try alloc.dupe(u8, text);
+    const stats_start = trailingDiffStatsStart(text) orelse return clipSummary(alloc, text, cols);
+    const stats = text[stats_start..];
+    const stats_width = display_width.visibleWidthIgnoringAnsi(stats);
+    // The body needs one visible cell plus the ellipsis ahead of the counts.
+    if (stats_width + 2 > cols) return clipSummary(alloc, text, cols);
+    const body = try clipSummary(alloc, text[0..stats_start], cols - @as(u16, @intCast(stats_width)));
+    defer alloc.free(body);
+    return try alloc.print("{s}{s}", .{ body, stats });
+}
+
 /// Re-applies the diff add/remove marker accents to the trailing "+N" / "-N"
 /// counts of a normalized tool status phrase. Normalization strips SGR so
 /// grouped lines stay uniform; the counts keep their green/red so file edits
@@ -615,9 +648,13 @@ fn formatGroupBlock(
         const last_static_row = !focused_in_group and static_index == static_count;
         const connector = if (last_static_row) "└" else "├";
         const child = try scratch.print("{s} {s}", .{ connector, display_phrase });
-        const clipped = try clipSummary(scratch, child, cols);
+        const shows_diff_stats = entryShowsDiffStats(detail);
+        const clipped = if (shows_diff_stats)
+            try clipKeepingDiffStats(scratch, child, cols)
+        else
+            try clipSummary(scratch, child, cols);
         try lines.append(alloc, .{ .entry = .{ .entry_id = entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
-        const accented = if (entryShowsDiffStats(detail))
+        const accented = if (shows_diff_stats)
             try accentTrailingDiffStats(scratch, clipped, style.text_style)
         else
             clipped;
@@ -1590,6 +1627,55 @@ test "collapsed tool group keeps diff count accents" {
             "└ Edited main.zig [G]+12\x1b[0m / [R]-3\x1b[0m",
         projection.entry_actions.items[0].override.bytes,
     );
+}
+
+test "collapsed tool group clips long paths before the diff counts" {
+    const alloc = std.testing.allocator;
+    const saved_added = ui_render.diff_added_marker_style;
+    const saved_removed = ui_render.diff_removed_marker_style;
+    defer ui_render.diff_added_marker_style = saved_added;
+    defer ui_render.diff_removed_marker_style = saved_removed;
+    ui_render.diff_added_marker_style = "[G]";
+    ui_render.diff_removed_marker_style = "[R]";
+
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Edited\x1b[0m \x1b[38;5;245m/Users/example/project/site/content/docs/settings.md\x1b[0m \x1b[38;2;48;164;108m+12\x1b[0m \x1b[38;5;245m/\x1b[0m \x1b[38;2;229;72;77m-3\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Wrote\x1b[0m \x1b[38;5;245m/Users/example/project/site/content/docs/commands.md\x1b[0m \x1b[38;2;48;164;108m+143\x1b[0m\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("write_file"), .activity_kind = .write, .outcome = .completed },
+    };
+
+    var projection = try build(alloc, &entries, &details, 40);
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "● 2 tool calls · 1 write · 1 edit\n" ++
+            "├ Edited /Users/example/projec… [G]+12\x1b[0m / [R]-3\x1b[0m\n" ++
+            "└ Wrote /Users/example/project/sit… [G]+143\x1b[0m",
+        projection.entry_actions.items[0].override.bytes,
+    );
+}
+
+test "clipKeepingDiffStats falls back to a plain clip when the counts cannot fit" {
+    const alloc = std.testing.allocator;
+
+    const fits = try clipKeepingDiffStats(alloc, "├ Edited a.md +12 / -3", 40);
+    defer alloc.free(fits);
+    try std.testing.expectEqualStrings("├ Edited a.md +12 / -3", fits);
+
+    const kept = try clipKeepingDiffStats(alloc, "├ Edited a/long/path.md +12 / -3", 20);
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("├ Edited a… +12 / -3", kept);
+
+    const narrow = try clipKeepingDiffStats(alloc, "├ Edited a.md +12 / -3", 10);
+    defer alloc.free(narrow);
+    try std.testing.expectEqualStrings("├ Edited …", narrow);
+
+    const no_stats = try clipKeepingDiffStats(alloc, "├ Editing a/long/path.md", 12);
+    defer alloc.free(no_stats);
+    try std.testing.expectEqualStrings("├ Editing a…", no_stats);
 }
 
 test "grouped command lines shell-highlight verbs and numeric flags" {
