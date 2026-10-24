@@ -460,6 +460,9 @@ fn writeStatusFields(jw: *std.json.Stringify, s: Status, p: Paths) !void {
 
 /// What loading the config skipped, so a server never vanishes without a reason.
 fn writeNotes(c: Context, host: *Host) !void {
+    // A reload on the UI thread may replace them meanwhile.
+    host.notes_mutex.lockUncancelable(host.runtime.io);
+    defer host.notes_mutex.unlock(host.runtime.io);
     for (host.notes) |note| try c.err.print("note: {s}\n", .{note});
 }
 
@@ -490,7 +493,8 @@ fn show(c: Context, arena: Allocator, name: []const u8, json: bool) !u8 {
         .needs_login, .failed => &.{},
         .unknown_server => return missing(c, arena, name),
     };
-    const status = findStatus(try host.runtime.statuses(arena), name).?;
+    // A reload may have taken it out since: the host takes changes in place.
+    const status = findStatus(try host.runtime.statuses(arena), name) orelse return missing(c, arena, name);
     const p = try paths(c, arena);
     if (json) {
         var jw: std.json.Stringify = .{ .writer = c.out };
@@ -690,7 +694,7 @@ fn logout(c: Context, arena: Allocator, name: []const u8) !u8 {
         try c.err.print("{s} runs a command, so it has no login.\n", .{try safe(arena, name)});
         return 1;
     }
-    const was = findStatus(try host.runtime.statuses(arena), name).?;
+    const was = findStatus(try host.runtime.statuses(arena), name) orelse return missing(c, arena, name);
     // There's a login to sign out of when one is saved, by this fx or
     // another, or this session holds one. A running server needn't have one.
     const saved = try credentials.Store.detect(arena, c.home).get(arena, server.credentialKey());
@@ -773,7 +777,7 @@ fn login(c: Context, arena: Allocator, name: []const u8, browser: bool) !u8 {
     }
     host.runtime.login(name, open) catch |err| switch (err) {
         error.Held => {
-            const status = findStatus(try host.runtime.statuses(arena), name).?;
+            const status = findStatus(try host.runtime.statuses(arena), name) orelse return missing(c, arena, name);
             try c.err.print("{s} is {s}", .{ try safe(arena, name), try statusText(arena, status) });
             if (status.state == .waiting_for_approval) try c.err.print(": {s} approve {s}", .{ c.surface.prog(), try safe(arena, name) });
             try c.err.writeAll(".\n");

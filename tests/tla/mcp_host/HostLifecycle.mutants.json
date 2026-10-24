@@ -6,21 +6,21 @@
     "invariant": "HeldNeverSpawned"
   },
   {
-    "description": "A reload makes the new host but never starts its servers (reloadHost without startHostServers)",
-    "old": "          /\\ st' = [st EXCEPT ![n] = [x \\in Servers |-> Started(Initial(nd, x))]]",
-    "new": "          /\\ st' = [st EXCEPT ![n] = [x \\in Servers |-> Initial(nd, x)]]",
+    "description": "A reload never starts the server it approved or added back (reloadHost without startHostServers)",
+    "old": "          /\\ st' = [st EXCEPT ![cur][s] = Started(Initial(nd, s))]",
+    "new": "          /\\ st' = [st EXCEPT ![cur][s] = Initial(nd, s)]",
     "invariant": "StartedAfterFirstFrame"
   },
   {
-    "description": "The status line keeps reading the first host after a reload",
+    "description": "A status refresh keeps the line it had",
     "old": "    /\\ shown' = Line(cur)",
-    "new": "    /\\ shown' = Line(1)",
+    "new": "    /\\ shown' = shown",
     "invariant": "RefreshedLineAgrees"
   },
   {
-    "description": "Quitting signals only the current host's running servers",
+    "description": "Quitting signals only running servers, not one a reload let go of that still stops",
     "old": "    /\\ termed' = termed \\cup procs \\cup stopping",
-    "new": "    /\\ termed' = termed \\cup {p \\in procs : p[1] = cur}",
+    "new": "    /\\ termed' = termed \\cup procs",
     "invariant": "QuitSignalsEveryServer"
   },
   {
@@ -30,9 +30,9 @@
     "invariant": "RemovedNotRunning"
   },
   {
-    "description": "Only the first host's owner starts processes, so servers after a reload never settle",
-    "old": "    /\\ ~quit /\\ alive[h] /\\ st[h][s] = \"starting\" /\\ <<h, s>> \\notin procs\n",
-    "new": "    /\\ ~quit /\\ alive[h] /\\ st[h][s] = \"starting\" /\\ <<h, s>> \\notin procs /\\ h = 1\n",
+    "description": "A server added back stays down",
+    "old": "          /\\ st' = [st EXCEPT ![cur][s] = Started(Initial(nd, s))]",
+    "new": "          /\\ st' = [st EXCEPT ![cur][s] = IF d = \"ok\" THEN \"absent\" ELSE Started(Initial(nd, s))]",
     "property": "ApprovedServersSettle"
   },
   {
@@ -42,15 +42,15 @@
     "property": "EveryStopEnds"
   },
   {
-    "description": "A new host starts a server while a leased old host still runs it",
-    "old": "    /\\ \\A p \\in Live : p[1] = h\n",
-    "new": "    /\\ stopping = {}\n",
+    "description": "A server added back starts while the process its removal let go of still stops",
+    "old": "    /\\ \\A p \\in Live : p[2] # s\n",
+    "new": "    /\\ \\A p \\in procs : p[2] # s\n",
     "invariant": "OneProcessPerServer"
   },
   {
-    "description": "A new host starts a server while the old host's copy is still stopping",
-    "old": "    /\\ \\A p \\in Live : p[1] = h\n",
-    "new": "    /\\ \\A p \\in procs : p[1] = h\n",
-    "invariant": "OneProcessPerServer"
+    "description": "A reload stops every running server, as a new host did",
+    "old": "           gone == {<<cur, s>>} \\cap procs\n",
+    "new": "           gone == Of(cur)\n",
+    "property": "KeptServersKeepRunning"
   }
 ]

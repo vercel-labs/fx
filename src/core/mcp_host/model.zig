@@ -37,18 +37,31 @@ pub const Catalog = struct {
     io: std.Io,
     runtime: *Runtime,
     builtins: tool_dispatch.Registry,
-    /// Every binding carries it, so a binding from another run never matches.
-    generation: u64,
+    /// Every binding carries it, so a binding from another run, or from
+    /// before a reload dropped a server, never matches. Read through
+    /// `currentGeneration`, since `reload` changes it. 32 bits, since
+    /// wasm32 has no 64-bit atomics; bindings only compare it for equality.
+    generation: std.atomic.Value(u32),
     names: tool_names.Registry,
     mutex: std.Io.Mutex = .init,
-    /// One per `runtime.servers()`; guarded by `mutex`.
+    /// The servers the lists are of, from `runtime.servers()`, which keep
+    /// their names until the runtime goes; replaced with `lists` by
+    /// `reload`. Guarded by `mutex`.
+    servers: []const config.Server,
+    /// One per server in `servers`; guarded by `mutex`.
     lists: []List,
+    /// The last number `serial` gave out; guarded by `mutex`.
+    serials: u64 = 0,
 
     const List = struct {
+        /// Which list this is, from `serial`: a list loaded for one a reload
+        /// replaced meanwhile is dropped.
+        token: u64,
         arena: ?std.heap.ArenaAllocator = null,
         tools: []McpTool = &.{},
         digest: ?[32]u8 = null,
-        /// Bumped when the list changes; bindings carry it.
+        /// A new `serial` when the list changes, so no two lists, even of a
+        /// server removed and added back, share one; bindings carry it.
         generation: u64 = 0,
         /// The server's `toolsEpoch` when this list was asked for.
         epoch: u64 = 0,
@@ -62,28 +75,86 @@ pub const Catalog = struct {
     /// `runtime` must outlive the catalog. `builtins` are fx's own tools, so an
     /// MCP tool's name never takes one of theirs.
     pub fn init(c: *Catalog, gpa: Allocator, io: std.Io, runtime: *Runtime, builtins: tool_dispatch.Registry) Allocator.Error!void {
-        const lists = try gpa.alloc(List, runtime.servers().len);
-        for (lists) |*l| l.* = .{};
+        const servers = runtime.servers();
+        const lists = try gpa.alloc(List, servers.len);
         const now: u96 = @bitCast(std.Io.Clock.real.now(io).nanoseconds);
         c.* = .{
             .gpa = gpa,
             .io = io,
             .runtime = runtime,
             .builtins = builtins,
-            .generation = @as(u64, @truncate(now)) | 1,
+            .generation = .init(@as(u32, @truncate(now)) | 1),
             .names = .init(gpa),
+            .servers = servers,
             .lists = lists,
         };
+        for (lists) |*l| l.* = .{ .token = c.serial() };
     }
 
     pub fn deinit(c: *Catalog) void {
-        for (c.lists) |*l| {
-            if (l.arena) |*arena| arena.deinit();
-            if (l.failure) |why| c.gpa.free(why);
-        }
+        for (c.lists) |*l| freeList(c.gpa, l);
         c.gpa.free(c.lists);
         c.names.deinit();
         c.* = undefined;
+    }
+
+    /// Follows `Runtime.reload`, on the thread that called it: a server that
+    /// kept running keeps its list, and the rest start without one. When a
+    /// server the catalog knew went or was replaced, every binding and
+    /// subagent view made before stops matching, as with a new host.
+    pub fn reload(c: *Catalog, done: runtime_mod.Reloaded) Allocator.Error!void {
+        const servers = c.runtime.servers();
+        std.debug.assert(servers.len == done.kept.len);
+        const lists = try c.gpa.alloc(List, servers.len);
+        c.mutex.lockUncancelable(c.io);
+        defer c.mutex.unlock(c.io);
+        for (servers, done.kept, lists) |s, kept, *l| {
+            l.* = .{ .token = c.serial() };
+            if (!kept) continue;
+            for (c.servers, c.lists) |old, *from| if (from.token != 0 and std.mem.eql(u8, old.name, s.name)) {
+                l.* = from.*;
+                from.token = 0;
+                break;
+            };
+        }
+        for (c.lists) |*l| if (l.token != 0) freeList(c.gpa, l);
+        c.gpa.free(c.lists);
+        c.servers = servers;
+        c.lists = lists;
+        if (done.dropped) _ = c.generation.fetchAdd(2, .acq_rel);
+    }
+
+    fn currentGeneration(c: *const Catalog) u64 {
+        return c.generation.load(.acquire);
+    }
+
+    fn freeList(gpa: Allocator, l: *List) void {
+        if (l.arena) |*arena| arena.deinit();
+        if (l.failure) |why| gpa.free(why);
+    }
+
+    /// A number no list or list state had, under `mutex` once others may run.
+    fn serial(c: *Catalog) u64 {
+        c.serials += 1;
+        return c.serials;
+    }
+
+    /// The servers the catalog knows now. Their names outlive the catalog.
+    fn currentServers(c: *Catalog) []const config.Server {
+        c.mutex.lockUncancelable(c.io);
+        defer c.mutex.unlock(c.io);
+        return c.servers;
+    }
+
+    fn indexLocked(c: *const Catalog, name: []const u8) ?usize {
+        for (c.servers, 0..) |s, i| if (std.mem.eql(u8, s.name, name)) return i;
+        return null;
+    }
+
+    /// Server `name`'s list, if it is still list `token`.
+    fn listLocked(c: *Catalog, name: []const u8, token: u64) ?*List {
+        const l = &c.lists[c.indexLocked(name) orelse return null];
+        return if (l.token == token) l else null;
     }
 
     /// The has, validate, and call operations, for checks made outside a
@@ -117,7 +188,7 @@ pub const Catalog = struct {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return .{ .invalid = try arena.print("Invalid arguments for MCP tool {s}: {s}", .{ name, @errorName(err) }) };
         };
-        return .{ .valid = c.generation };
+        return .{ .valid = c.currentGeneration() };
     }
 
     /// Null when no server has the tool.
@@ -130,8 +201,8 @@ pub const Catalog = struct {
         options: tool_mcp_runtime.CallOptions,
     ) !?tool_mcp_runtime.CallResult {
         if (!c.mayAllow(options.access)) return error.McpAccessDenied;
-        if (options.expected_binding) |b| if (b.runtime_generation != c.generation) return error.McpAdvertisedToolChanged;
-        if (options.expected_runtime_generation) |g| if (g != c.generation) return error.McpAuthorityChanged;
+        if (options.expected_binding) |b| if (b.runtime_generation != c.currentGeneration()) return error.McpAdvertisedToolChanged;
+        if (options.expected_runtime_generation) |g| if (g != c.currentGeneration()) return error.McpAuthorityChanged;
         try c.ensureCurrent(name, options.cancel_flag);
         const server, const tool, const transport, const how = found: {
             c.mutex.lockUncancelable(c.io);
@@ -141,7 +212,7 @@ pub const Catalog = struct {
             if (options.expected_binding) |b| {
                 if (!b.sameDefinition(c.bindingLocked(found.server, found.tool.*))) return error.McpAdvertisedToolChanged;
             }
-            const s = c.runtime.servers()[found.server];
+            const s = c.servers[found.server];
             break :found .{ s.name, try arena.dupe(u8, found.tool.original_name), @tagName(s.transport), signIn(c.runtime.options.slash_commands, s.source) };
         };
         var asking: Asking = .{ .responder = options.input_responder orelse undefined, .tool = name, .cancel = options.cancel_flag, .io = c.io };
@@ -172,15 +243,15 @@ pub const Catalog = struct {
         access: Access,
         cancel: Cancel,
     ) !tool_mcp_runtime.SearchResult {
-        const servers = c.runtime.servers();
+        const servers = c.currentServers();
         if (request.server) |name| {
             for (servers) |s| {
                 if (std.mem.eql(u8, s.name, name)) break;
             } else return .{ .model_output = try tool_search.renderServerNotFound(alloc) };
         }
         // Every server starts at once, then each list is waited for.
-        for (servers, 0..) |s, i| if (searched(request, s)) c.runtime.prepare(i) catch {};
-        for (servers, 0..) |s, i| if (searched(request, s)) try c.refresh(i, cancel);
+        for (servers) |s| if (searched(request, s)) c.runtime.prepare(s.name) catch {};
+        for (servers) |s| if (searched(request, s)) try c.refresh(s.name, cancel);
         if (try c.renderUnavailable(alloc, request)) |output| return .{ .model_output = output };
 
         var scratch: std.heap.ArenaAllocator = .init(c.gpa);
@@ -188,12 +259,12 @@ pub const Catalog = struct {
         var candidates: std.ArrayList(tool_search.Candidate) = .empty;
         c.mutex.lockUncancelable(c.io);
         defer c.mutex.unlock(c.io);
-        for (servers, c.lists, 0..) |s, l, i| {
+        for (c.servers, c.lists, 0..) |s, l, i| {
             if (!searched(request, s) or l.state != .loaded) continue;
             for (l.tools) |*tool| {
                 if (!c.allowsLocked(access, i, tool.prefixed_name)) continue;
                 if (!try tool_search.searchable(scratch.allocator(), permission_rules, s.name, tool)) continue;
-                try candidates.append(scratch.allocator(), .{ .server_name = s.name, .instructions = try c.runtime.instructions(scratch.allocator(), i), .tool = tool, .binding = c.bindingLocked(i, tool.*) });
+                try candidates.append(scratch.allocator(), .{ .server_name = s.name, .instructions = try c.runtime.instructions(scratch.allocator(), s.name), .tool = tool, .binding = c.bindingLocked(i, tool.*) });
             }
         }
         // An open search that matches nothing says which servers it couldn't
@@ -214,7 +285,7 @@ pub const Catalog = struct {
             for (reasons.items) |reason| alloc.free(reason);
             reasons.deinit(alloc);
         }
-        for (c.runtime.servers(), c.lists) |s, l| {
+        for (c.servers, c.lists) |s, l| {
             try reasons.ensureUnusedCapacity(alloc, 1);
             reasons.appendAssumeCapacity(try c.unavailableText(alloc, s, l) orelse continue);
         }
@@ -239,7 +310,7 @@ pub const Catalog = struct {
         const found = c.findLocked(name) orelse return c.whyUnavailableLocked(alloc, name);
         if (!c.allowsLocked(access, found.server, name)) return null;
         if (permissions.rulesDenyAllTargetsForPermission(permission_rules, name)) return null;
-        const instructions = try c.runtime.instructions(alloc, found.server);
+        const instructions = try c.runtime.instructions(alloc, c.servers[found.server].name);
         defer if (instructions) |text| alloc.free(text);
         var projection = try selected_schema.project(alloc, found.tool.*, instructions, limits);
         if (projection == .selected) projection.selected.mcp_binding = c.bindingLocked(found.server, found.tool.*);
@@ -257,16 +328,16 @@ pub const Catalog = struct {
         access: Access,
         cancel: Cancel,
     ) !selected_schema.AlwaysLoadedTools {
-        const servers = c.runtime.servers();
-        for (servers, 0..) |s, i| if (s.always_loaded) c.runtime.prepare(i) catch {};
-        for (servers, 0..) |s, i| if (s.always_loaded) try c.refresh(i, cancel);
+        const servers = c.currentServers();
+        for (servers) |s| if (s.always_loaded) c.runtime.prepare(s.name) catch {};
+        for (servers) |s| if (s.always_loaded) try c.refresh(s.name, cancel);
         var loaded: selected_schema.AlwaysLoaded = .init(limits);
         errdefer loaded.deinit(alloc);
         c.mutex.lockUncancelable(c.io);
         defer c.mutex.unlock(c.io);
-        for (servers, c.lists, 0..) |s, l, i| {
+        for (c.servers, c.lists, 0..) |s, l, i| {
             if (!s.always_loaded or l.state != .loaded) continue;
-            const instructions = try c.runtime.instructions(alloc, i);
+            const instructions = try c.runtime.instructions(alloc, s.name);
             defer if (instructions) |text| alloc.free(text);
             for (l.tools) |*tool| {
                 if (permissions.rulesDenyAllTargetsForPermission(permission_rules, tool.prefixed_name)) continue;
@@ -295,7 +366,7 @@ pub const Catalog = struct {
         if (permissions.rulesDenyAllTargetsForPermission(permission_rules, name)) return .unavailable;
         const current = c.bindingLocked(found.server, found.tool.*);
         if (std.meta.eql(known_binding, current)) return .current;
-        const instructions = try c.runtime.instructions(alloc, found.server);
+        const instructions = try c.runtime.instructions(alloc, c.servers[found.server].name);
         defer if (instructions) |text| alloc.free(text);
         var projection = try selected_schema.project(alloc, found.tool.*, instructions, limits);
         if (projection == .rejected) {
@@ -352,7 +423,10 @@ pub const Catalog = struct {
         const statuses = try c.runtime.statuses(scratch.allocator());
         c.mutex.lockUncancelable(c.io);
         defer c.mutex.unlock(c.io);
-        for (c.runtime.servers(), c.lists, statuses) |s, l, status| {
+        for (c.servers, c.lists) |s, l| {
+            // The runtime may have moved on to a reload the catalog hasn't
+            // taken yet; a server it no longer has is left out.
+            const status = statusOf(statuses, s.name) orelse continue;
             switch (status.state) {
                 .waiting_for_approval, .rejected, .disabled, .unsupported, .missing_env, .invalid_env => continue,
                 else => {},
@@ -385,7 +459,7 @@ pub const Catalog = struct {
             alloc.free(server_slice);
         }
         return .{
-            .runtime_generation = c.generation,
+            .runtime_generation = c.currentGeneration(),
             .owner_id = owner,
             .parent_id = parent,
             .servers = server_slice,
@@ -406,7 +480,8 @@ pub const Catalog = struct {
         }
         c.mutex.lockUncancelable(c.io);
         defer c.mutex.unlock(c.io);
-        for (statuses, c.lists) |s, l| {
+        for (c.servers, c.lists) |server, l| {
+            const s = statusOf(statuses, server.name) orelse continue;
             const availability: model_catalog.Availability = switch (s.state) {
                 .waiting_for_approval, .rejected => continue,
                 .disabled => .disabled,
@@ -450,9 +525,9 @@ pub const Catalog = struct {
     }
 
     fn load(c: *Catalog, name: []const u8, cancel: Cancel) !void {
-        for (c.runtime.servers(), 0..) |s, i| {
+        for (c.currentServers()) |s| {
             if (s.held != null or !tool_names.matchesServer(name, s.name)) continue;
-            try c.refresh(i, cancel);
+            try c.refresh(s.name, cancel);
             if (c.known(name)) return;
         }
     }
@@ -469,7 +544,7 @@ pub const Catalog = struct {
             c.mutex.lockUncancelable(c.io);
             defer c.mutex.unlock(c.io);
             const found = c.findLocked(name) orelse return false;
-            break :found .{ found.server, c.lists[found.server].epoch };
+            break :found .{ c.servers[found.server].name, c.lists[found.server].epoch };
         };
         return epoch == c.runtime.toolsEpoch(server);
     }
@@ -480,7 +555,7 @@ pub const Catalog = struct {
         return switch (access) {
             .unrestricted => true,
             .disabled => false,
-            .scoped => |scope| scope.captured.runtime_generation == c.generation,
+            .scoped => |scope| scope.captured.runtime_generation == c.currentGeneration(),
         };
     }
 
@@ -492,7 +567,7 @@ pub const Catalog = struct {
         if (!c.mayAllow(access)) return false;
         return switch (access) {
             .scoped => |scope| scope.captured.tool(name) != null or
-                scope.captured.server(c.runtime.servers()[server].name) != null,
+                scope.captured.server(c.servers[server].name) != null,
             else => true,
         };
     }
@@ -503,7 +578,7 @@ pub const Catalog = struct {
         c.mutex.lockUncancelable(c.io);
         defer c.mutex.unlock(c.io);
         const found = c.findLocked(name) orelse return null;
-        const server = try alloc.dupe(u8, c.runtime.servers()[found.server].name);
+        const server = try alloc.dupe(u8, c.servers[found.server].name);
         errdefer alloc.free(server);
         const tool = try alloc.dupe(u8, found.tool.original_name);
         errdefer alloc.free(tool);
@@ -529,7 +604,7 @@ pub const Catalog = struct {
     fn bindingLocked(c: *const Catalog, server: usize, tool: McpTool) Binding {
         const generation = c.lists[server].generation;
         return .{
-            .runtime_generation = c.generation,
+            .runtime_generation = c.currentGeneration(),
             .connection_generation = generation,
             .catalog_generation = generation,
             .auth_generation = 0,
@@ -537,15 +612,21 @@ pub const Catalog = struct {
         };
     }
 
-    /// Gets server `i`'s list from the runtime and replaces the catalog's copy.
-    fn refresh(c: *Catalog, i: usize, cancel: Cancel) !void {
-        const server = c.runtime.servers()[i];
+    /// Gets server `name`'s list from the runtime and replaces the catalog's
+    /// copy, unless a reload replaced that list meanwhile.
+    fn refresh(c: *Catalog, name: []const u8, cancel: Cancel) !void {
+        const server, const token = found: {
+            c.mutex.lockUncancelable(c.io);
+            defer c.mutex.unlock(c.io);
+            const i = c.indexLocked(name) orelse return;
+            break :found .{ c.servers[i], c.lists[i].token };
+        };
         if (server.held != null) return;
         var scratch: std.heap.ArenaAllocator = .init(c.gpa);
         defer scratch.deinit();
         // Read first: a change that comes while the list is on its way
         // leaves this list out of date.
-        const epoch = c.runtime.toolsEpoch(i);
+        const epoch = c.runtime.toolsEpoch(server.name);
         const result = try c.runtime.tools(scratch.allocator(), server.name, cancel);
         switch (result) {
             .tools => |listed| {
@@ -555,8 +636,11 @@ pub const Catalog = struct {
                 const digest = catalog_state.digestTools(tools);
                 c.mutex.lockUncancelable(c.io);
                 defer c.mutex.unlock(c.io);
-                const l = &c.lists[i];
-                if (l.digest == null or !std.mem.eql(u8, &l.digest.?, &digest)) l.generation += 1;
+                const l = c.listLocked(server.name, token) orelse {
+                    arena.deinit();
+                    return;
+                };
+                if (l.digest == null or !std.mem.eql(u8, &l.digest.?, &digest)) l.generation = c.serial();
                 if (l.arena) |*old| old.deinit();
                 l.arena = arena;
                 l.tools = tools;
@@ -567,12 +651,12 @@ pub const Catalog = struct {
             .needs_login => {
                 c.mutex.lockUncancelable(c.io);
                 defer c.mutex.unlock(c.io);
-                c.setStateLocked(&c.lists[i], .needs_login, null);
+                c.setStateLocked(c.listLocked(server.name, token) orelse return, .needs_login, null);
             },
             .failed => |why| {
                 c.mutex.lockUncancelable(c.io);
                 defer c.mutex.unlock(c.io);
-                c.setStateLocked(&c.lists[i], .failed, why);
+                c.setStateLocked(c.listLocked(server.name, token) orelse return, .failed, why);
             },
             .unknown_server => {},
         }
@@ -637,7 +721,7 @@ pub const Catalog = struct {
     /// Why `name` can't be selected when its server's list didn't load, so
     /// the model hears more than "not found".
     fn whyUnavailableLocked(c: *Catalog, alloc: Allocator, name: []const u8) !?tool_mcp_runtime.ToolSchemaResult {
-        for (c.runtime.servers(), c.lists) |s, l| {
+        for (c.servers, c.lists) |s, l| {
             if (!tool_names.matchesServer(name, s.name)) continue;
             const text = try c.unavailableText(alloc, s, l) orelse continue;
             return .{ .rejected = .{ .model_output = text } };
@@ -651,7 +735,7 @@ pub const Catalog = struct {
         const named = request.server orelse request.query.raw;
         c.mutex.lockUncancelable(c.io);
         defer c.mutex.unlock(c.io);
-        for (c.runtime.servers(), c.lists) |s, l| {
+        for (c.servers, c.lists) |s, l| {
             if (!tool_search.queryContainsCompleteIdentity(named, s.name)) continue;
             if (l.state == .needs_login) {
                 const step = try signInStep(alloc, s.name, signIn(c.runtime.options.slash_commands, s.source));
@@ -666,7 +750,7 @@ pub const Catalog = struct {
             }
         }
         const name = request.server orelse return null;
-        for (c.runtime.servers(), c.lists) |s, l| {
+        for (c.servers, c.lists) |s, l| {
             if (!std.mem.eql(u8, s.name, name) or l.state != .failed) continue;
             return try tool_search.writeServerFailure(alloc, s.name, l.failure orelse "the server is unavailable");
         }
@@ -743,6 +827,11 @@ const Asking = struct {
 
 /// Turns the runtime's answer into the result the model sees, through fx's
 /// result projection: content, images, size limits, and errors.
+fn statusOf(statuses: []const runtime_mod.Status, name: []const u8) ?runtime_mod.Status {
+    for (statuses) |s| if (std.mem.eql(u8, s.name, name)) return s;
+    return null;
+}
+
 fn render(arena: Allocator, server: []const u8, name: []const u8, answer: runtime_mod.CallResult, max_bytes: usize, how: SignIn) !?tool_mcp_runtime.CallResult {
     const response = switch (answer) {
         .result => |r| if (r.structured) |structured|
@@ -872,7 +961,7 @@ test "a subagent made before its parent's server starts may use the server's too
     try testing.expectEqual(@as(usize, 0), view.tools.len);
     const child: Access = .{ .scoped = .{ .captured = &view, .admission_authority_generation = 0, .live = undefined } };
     try testing.expect(c.hasTool("mcp_fake_echo", child));
-    try testing.expectEqual(c.generation, (try c.validateTool(a, "mcp_fake_echo", "{}", child)).valid);
+    try testing.expectEqual(c.currentGeneration(), (try c.validateTool(a, "mcp_fake_echo", "{}", child)).valid);
     const result = (try c.callTool(a, "mcp_fake_echo", "{}", 4096, .{ .access = child })).?;
     try testing.expectEqual(tool_mcp_runtime.CallStatus.success, result.status);
 
@@ -914,14 +1003,14 @@ test "an MCP server's tools reach the model under fx's names" {
     try testing.expect(std.mem.find(u8, found.model_output, "\"name\":\"mcp_fake_echo\",\"server\":\"fake\"") != null);
     try testing.expectEqual(@as(usize, 1), found.selected_tools.len);
     const binding = found.selected_tools[0].mcp_binding.?;
-    try testing.expectEqual(c.generation, binding.runtime_generation);
+    try testing.expectEqual(c.currentGeneration(), binding.runtime_generation);
 
     const schema = (try c.toolSchema(a, "mcp_fake_echo", .{}, .{}, .unrestricted, null)).?;
     try testing.expect(std.meta.eql(binding, schema.selected.mcp_binding.?));
     try testing.expect(std.mem.find(u8, schema.selected.model_output, "mcp_fake_echo") != null);
     try testing.expect((try c.snapshotToolDefinition(a, "mcp_fake_echo", binding, .{}, .{}, .unrestricted)) == .current);
 
-    try testing.expectEqual(c.generation, (try c.validateTool(a, "mcp_fake_echo", "{}", .unrestricted)).valid);
+    try testing.expectEqual(c.currentGeneration(), (try c.validateTool(a, "mcp_fake_echo", "{}", .unrestricted)).valid);
     try testing.expect((try c.validateTool(a, "mcp_fake_echo", "[", .unrestricted)) == .invalid);
 
     var capture: @import("../agent/runtime/observation_testing.zig").Capture = .{ .expected_call = "mcp-call" };
@@ -942,11 +1031,49 @@ test "an MCP server's tools reach the model under fx's names" {
     var view = try c.snapshotAccessView(testing.allocator, "child", "parent", .{});
     defer view.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), view.tools.len);
-    try testing.expect(Access.allowsTool(.{ .scoped = .{ .captured = &view, .admission_authority_generation = 0, .live = undefined } }, c.generation, "mcp_fake_echo"));
+    try testing.expect(Access.allowsTool(.{ .scoped = .{ .captured = &view, .admission_authority_generation = 0, .live = undefined } }, c.currentGeneration(), "mcp_fake_echo"));
     var snapshot = try c.modelSnapshot(testing.allocator);
     defer snapshot.deinit(testing.allocator);
     try testing.expectEqual(model_catalog.Availability.ready, snapshot.servers[0].availability);
     try testing.expectEqual(@as(?usize, 1), snapshot.servers[0].tool_count);
+}
+
+test "a reload keeps a kept server's list and the bindings made from it, until a server is dropped" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const fake: mcp_contract.McpServerConfig = .{ .name = "fake", .command = f.server };
+    const gone: mcp_contract.McpServerConfig = .{ .name = "gone", .command = f.server };
+    const late: mcp_contract.McpServerConfig = .{ .name = "late", .command = f.server };
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &.{ fake, gone }, &f.inherited, f.options());
+    defer r.deinit();
+    var c: Catalog = undefined;
+    try c.init(testing.allocator, testing.io, &r, .{});
+    defer c.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const binding = (try c.toolSchema(a, "mcp_fake_echo", .{}, .{}, .unrestricted, null)).?.selected.mcp_binding.?;
+    try testing.expect(c.hasTool("mcp_gone_echo", .unrestricted));
+    const generation = c.currentGeneration();
+
+    // Adding a server keeps what the model was shown, and the lists loaded.
+    try c.reload(try r.reload(&.{ fake, gone, late }, &f.inherited));
+    try testing.expectEqual(generation, c.currentGeneration());
+    try testing.expectEqual(@as(usize, 2), (try c.snapshotToolNames(a, .{})).len);
+    try testing.expect((try c.snapshotToolDefinition(a, "mcp_fake_echo", binding, .{}, .{}, .unrestricted)) == .current);
+    const result = (try c.callTool(a, "mcp_fake_echo", "{}", 4096, .{ .expected_binding = binding })).?;
+    try testing.expectEqual(tool_mcp_runtime.CallStatus.success, result.status);
+
+    // Dropping one ends every binding made before, as a new host would.
+    try c.reload(try r.reload(&.{ fake, late }, &f.inherited));
+    try testing.expect(generation != c.currentGeneration());
+    try testing.expectError(error.McpAdvertisedToolChanged, c.callTool(a, "mcp_fake_echo", "{}", 4096, .{ .expected_binding = binding }));
+    try testing.expect((try c.callTool(a, "mcp_gone_echo", "{}", 4096, .{})) == null);
+    // The kept server's list stays without asking it again.
+    try testing.expectEqual(@as(usize, 1), (try c.snapshotToolNames(a, .{})).len);
+    try testing.expect(c.hasTool("mcp_late_echo", .unrestricted));
 }
 
 test "a search says why a server it names has no tools, and calls that end say how" {

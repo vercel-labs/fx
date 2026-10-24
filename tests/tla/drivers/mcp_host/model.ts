@@ -29,6 +29,7 @@ const catalog = () => JSON.parse(readFileSync(join(tlaDir, "catalog.json"), "utf
 function verdictOf(run: TlcRun, expect?: { invariant?: string; property?: string }): "PASS" | "CAUGHT" | "FAIL" {
   if (!expect) return run.exit === 0 && run.completed && run.queued === 0 ? "PASS" : "FAIL";
   if (expect.invariant) return run.exit === 12 && run.violated === expect.invariant ? "CAUGHT" : "FAIL";
+  if (run.action !== undefined) return run.exit === 13 && run.action === expect.property ? "CAUGHT" : "FAIL";
   return run.exit === 13 && run.temporal && run.violated === undefined ? "CAUGHT" : "FAIL";
 }
 

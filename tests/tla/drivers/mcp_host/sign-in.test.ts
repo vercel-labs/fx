@@ -215,10 +215,11 @@ test("contract: a login asked for again while one waits is that login: the same 
   }
 }, 150_000);
 
-// Fixed by stopping the sign-in and saying so. Before the fix this
-// case was a finding: the shell kept saying "Signing in" and the trace broke
-// IndicatorImpliesListener. It fails that way on the code before.
-test("contract: a reload during a sign-in closes its listener, and the shell stops saying \"Signing in\" and says why (trace ACCEPTED)", async () => {
+// A reload applies in place, so a change that leaves the server alone leaves
+// its sign-in going; one that removes the server ends it and says so, and the
+// shell never keeps saying "Signing in" without a listener
+// (IndicatorImpliesListener). Before the in-place reload, any change ended it.
+test("contract: a reload that leaves a server alone keeps its sign-in going, and removing the server closes its listener and says why (trace ACCEPTED)", async () => {
   const f = fixture(artifacts, "signin-reload");
   const fake = await startFake(f);
   writeProfile(f, { web: { type: "http", url: fake.url } });
@@ -237,9 +238,19 @@ test("contract: a reload during a sign-in closes its listener, and the shell sto
     const port = Number(new URL(registered).port);
     expect((await probe(port)).result).toBe("open");
     records.push({ event: "probe", data: { login: 1, result: "open" }, at: Date.now() });
-    records.push({ event: "reload", at: Date.now() });
+
+    records.push({ event: "reload", data: { server: "kept" }, at: Date.now() });
     await shell.tui.sendText(`/mcp add other -- ${BUN} ${stdioServer(f, "other").args[0]}`);
     await shell.tui.waitForText("Added other", 10_000);
+    await Bun.sleep(1_000);
+    const kept = await probe(port);
+    records.push({ event: "probe", data: { login: 1, result: kept.result }, at: Date.now() });
+    const going = await shell.status(null, 5_000);
+    records.push({ event: "status", data: { signing: going?.k === "signing" }, at: Date.now(), note: JSON.stringify(going) });
+
+    records.push({ event: "reload", data: { server: "dropped" }, at: Date.now() });
+    await shell.tui.sendText("/mcp remove web");
+    await shell.tui.waitForText("Removed web", 10_000);
     let after = await probe(port);
     // A probe the closing listener drops is no answer either way: probe again.
     for (let k = 0; k < 30 && (after.result === "open" || after.result === "reset"); k++) { await Bun.sleep(100); after = await probe(port); }
@@ -247,12 +258,14 @@ test("contract: a reload during a sign-in closes its listener, and the shell sto
     await Bun.sleep(3_000);
     const still = await shell.status(null, 5_000);
     records.push({ event: "status", data: { signing: still?.k === "signing" }, at: Date.now(), note: JSON.stringify(still) });
-    save(join(f.base, "after-reload.json"), { probe: after, status: still });
+    save(join(f.base, "after-reload.json"), { kept, going, probe: after, status: still });
     const verdict = await checkTrace({ module: "SignIn", records, dir: join(f.base, "trace"), constants: { ObsMaxLogins: 1, ObsMaxHosts: 2, ObsMaxLeases: 1, ObsBridge: false } });
     save(join(f.base, "verdict.json"), verdict);
+    expect(kept.result).toBe("open");
+    expect(going?.k).toBe("signing");
     expect(after.result).toBe("closed");
     expect(still?.k).not.toBe("signing");
-    expect(await shell.tui.captureFullScrollback()).toContain("Couldn't sign in to web: the MCP config changed before the browser came back; run /mcp login web again.");
+    expect(await shell.tui.captureFullScrollback()).toContain("Couldn't sign in to web: the MCP config changed before the browser came back.");
     expect(verdict.verdict).toBe("ACCEPTED");
     await shell.quit();
   } finally {

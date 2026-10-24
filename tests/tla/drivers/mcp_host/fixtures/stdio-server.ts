@@ -1,10 +1,12 @@
 // A 2025-11-25 stdio MCP server for the mcp-v2-model case. It logs every
 // lifecycle event to FIXTURE_LOG as JSONL ({t, name, pid, ev, ...}):
-//   start, listed (answered tools/list), eof (stdin ended), sigterm, recv, sent.
+//   start, listed (answered tools/list), eof (stdin ended, as it exits),
+//   sigterm, recv, sent; stdin_end when FIXTURE_EXIT_DELAY_MS holds the exit.
 // Env:
 //   FIXTURE_NAME          the server's name in its log lines
 //   FIXTURE_LOG           the JSONL log (appended synchronously)
 //   FIXTURE_INIT_DELAY_MS hold initialize's answer this long (a slow server)
+//   FIXTURE_EXIT_DELAY_MS once stdin ends, exit only this much later (a slow stop)
 //   FIXTURE_CONTROL       a folder; the elicit tool waits for "go" in it
 // Tools: echo (answers at once), elicit (2025 elicitations, see below).
 import { appendFileSync, existsSync } from "node:fs";
@@ -13,6 +15,7 @@ import { join } from "node:path";
 const name = process.env.FIXTURE_NAME ?? "fixture";
 const logPath = process.env.FIXTURE_LOG;
 const initDelay = Number(process.env.FIXTURE_INIT_DELAY_MS ?? "0");
+const exitDelay = Number(process.env.FIXTURE_EXIT_DELAY_MS ?? "0");
 const control = process.env.FIXTURE_CONTROL;
 const log = (ev: string, extra: object = {}) => {
   if (logPath) appendFileSync(logPath, JSON.stringify({ t: Date.now(), name, pid: process.pid, ev, ...extra }) + "\n");
@@ -75,8 +78,15 @@ process.stdin.on("data", (chunk) => {
   }
 });
 process.stdin.on("end", () => {
-  log("eof");
-  process.exit(0);
+  if (exitDelay === 0) {
+    log("eof");
+    process.exit(0);
+  }
+  log("stdin_end");
+  setTimeout(() => {
+    log("eof");
+    process.exit(0);
+  }, exitDelay);
 });
 
 async function handle(m: { id?: unknown; method?: string; params?: { name?: string }; result?: unknown; error?: unknown }) {

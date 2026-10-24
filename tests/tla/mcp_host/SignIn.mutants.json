@@ -59,5 +59,11 @@
     "old": "    /\\ IF Takes(kind) /\\ s = k\n",
     "new": "    /\\ IF Takes(kind)\n",
     "invariant": "ListenerTakesOnlyItsOwn"
+  },
+  {
+    "description": "An in-place reload that leaves the server alone ends its sign-in (the host swap before the in-place reload did)",
+    "old": "ReloadKeeps == alive[cur] /\\ UNCHANGED vars",
+    "new": "ReloadKeeps == ReloadDrops",
+    "property": "KeptSignInGoesOn"
   }
 ]

@@ -22,8 +22,12 @@
 \*   - src/core/app/app_mcp_runtime.zig HostSink: `.authorize` sets the
 \*     shell's "Signing in to NAME" (sign_in), `.signed_in` and
 \*     `.sign_in_failed` clear it; it lives in the shell's State, not in the
-\*     host, so it outlives a host a reload replaces. reloadHost replaces the
-\*     host; the old one goes with its last lease.
+\*     host, so it outlives a host a reload replaces. reloadHost reloads the
+\*     host in place (Runtime.reload): a change that leaves the server alone
+\*     leaves its login, and one that removes or changes it ends the login
+\*     (dropServer: endLogin with a `.sign_in_failed`). It replaces the host
+\*     only when the loader can't reload in place (the config went empty or
+\*     came back, or the reload failed); the old one goes with its last lease.
 \*   - src/mcp/auth/client.zig finishSignIn + core/auth.zig: a response whose
 \*     state isn't the live flow's fails the sign-in; the code is redeemed
 \*     only when it matches.
@@ -215,8 +219,25 @@ Release(h) ==
        ELSE UNCHANGED <<alive, phase, live, flow, indicator>>
     /\ UNCHANGED <<cur, retired, hostOf, got, shownUrl, saved, next, badRedeem, foreignTaken>>
 
-\* `/mcp add`, `remove`, `approve`, `reject` in the shell: reloadHost.
-Reload ==
+\* `/mcp add`, `remove`, `approve`, `reject` in the shell, applied in place,
+\* that remove or change this server: dropServer ends its login with a
+\* `.sign_in_failed` that clears the shell's "Signing in", and the engine's
+\* flow goes with the server's old slot.
+ReloadDrops ==
+    /\ alive[cur]
+    /\ IF SigningIn(cur)
+       THEN /\ phase' = Ended(live[cur])
+            /\ live' = [live EXCEPT ![cur] = 0]
+            /\ indicator' = FALSE
+       ELSE UNCHANGED <<phase, live, indicator>>
+    /\ flow' = [flow EXCEPT ![cur] = 0]
+    /\ UNCHANGED <<cur, alive, retired, leases, hostOf, got, shownUrl, saved, next, badRedeem, foreignTaken>>
+
+\* The same, leaving this server as it was.
+ReloadKeeps == alive[cur] /\ UNCHANGED vars
+
+\* A reload the loader can't apply in place: reloadHost replaces the host.
+Replace ==
     /\ cur < MaxHosts
     /\ LET n == cur + 1
            free == leases[cur] = 0
@@ -237,7 +258,9 @@ Next ==
     \/ \E k \in Logins, s \in States : Paste(k, s)
     \/ Lease
     \/ \E h \in Hosts : Release(h)
-    \/ Reload
+    \/ ReloadKeeps
+    \/ ReloadDrops
+    \/ Replace
     \* Nothing more to do is not a deadlock: Next allows stuttering.
     \/ UNCHANGED vars
 
@@ -273,6 +296,9 @@ OneSignInPerServer == Cardinality({k \in Logins : Open(k)}) <= 1
 \* The engine's live flow is the host's login, with its listener open: the
 \* browser can come back to the sign-in the engine waits on.
 FlowHasListener == \A h \in Hosts : flow[h] # 0 => live[h] = flow[h] /\ Open(flow[h])
+
+\* A reload that leaves the server as it was leaves its sign-in going.
+KeptSignInGoesOn == [][ReloadKeeps => \A k \in Logins : Open(k) => Open(k)']_vars
 
 \* ---- Liveness ----
 

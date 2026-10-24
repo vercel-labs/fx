@@ -236,8 +236,9 @@ const Request = struct {
 
     const Kind = union(enum) {
         tools: []const u8,
-        /// Starts a server's tool list without anyone waiting for it.
-        need: usize,
+        /// Starts a server's tool list without anyone waiting for it. The
+        /// name is one of `servers()`, which outlive the runtime.
+        need: []const u8,
         call: struct { server: []const u8, tool: []const u8, arguments: ?[]const u8 },
         cancel: *Request,
         login: struct { server: []const u8, open_browser: bool },
@@ -247,12 +248,26 @@ const Request = struct {
         pick_up,
         /// What the user answered, posted by the caller that asked.
         answer: struct { pending: Pending, json: ?[]u8 },
+        /// The config changed: see `reload`.
+        reload: struct { configs: []const mcp_contract.McpServerConfig, inherited: *const std.process.Environ.Map },
 
         /// Whether handling it could start a server.
         fn mayStart(k: Kind) bool {
             return switch (k) {
                 .tools, .need, .call, .login, .finish_login, .pick_up => true,
-                .cancel, .logout, .answer => false,
+                .cancel, .logout, .answer, .reload => false,
+            };
+        }
+
+        /// The server it could start, if one.
+        fn starts(k: Kind) ?[]const u8 {
+            return switch (k) {
+                .tools => |name| name,
+                .need => |name| name,
+                .call => |c| c.server,
+                .login => |l| l.server,
+                .finish_login => |f| f.server,
+                .pick_up, .cancel, .logout, .answer, .reload => null,
             };
         }
     };
@@ -263,13 +278,19 @@ const Request = struct {
         failed: Error,
         tools: ToolsResult,
         call: CallResult,
+        reloaded: Reloaded,
     };
 };
 
 /// A question the owner hands a calling thread, with what it takes to
 /// answer it. Owned by the runtime's allocator.
 const Pending = struct {
-    server: usize,
+    /// The server's name, which outlives the runtime, so the calling thread
+    /// reads it without the owner.
+    name: []const u8,
+    /// Which run of that server asked (`Runtime.ids`): an answer to a server
+    /// a reload replaced reaches no one.
+    server: u64,
     json: []u8,
     version: ?[]u8,
     reply: union(enum) {
@@ -312,7 +333,10 @@ const url_elicitation_required: i64 = -32042;
 
 const Login = struct {
     runtime: *Runtime,
+    /// Its server's index, which a reload moves; owner thread only.
     server: usize,
+    /// Its server's name, which outlives the runtime, for the login task.
+    name: []const u8,
     listener: loopback.Listener,
     group: std.Io.Group = .init,
     deadline_ms: i64,
@@ -325,20 +349,45 @@ const Login = struct {
     url: ?[]u8 = null,
 };
 
+/// What a `reload` did.
+pub const Reloaded = struct {
+    /// Per server in the new `servers()`: it kept running as it was, so what
+    /// it listed still holds.
+    kept: []const bool,
+    /// A server that ran before was removed, held back, or replaced by one
+    /// of the same name.
+    dropped: bool,
+};
+
 pub const Runtime = struct {
     gpa: Allocator,
     io: std.Io,
     options: Options,
+    /// Lives until `deinit`: every server list a reload makes stays, since
+    /// other threads may still read the one they had. Only the list and its
+    /// changed strings are kept; the rest of a config goes once the engine
+    /// copied it.
     arena: std.heap.ArenaAllocator,
+    /// Replaced by `reload` on the owner thread under `mutex`; other threads
+    /// read it under `mutex` (`servers`).
     resolved: config.Resolved,
     engine: engine.Engine,
-    /// Per server in `resolved.servers`; owner thread only.
+    /// Per server in `resolved.servers`; owner thread only. `gpa`'s, as are
+    /// `ids` and `tools_epochs`, each replaced by a reload.
     flags: []Flags,
+    /// Per server in `resolved.servers`: which run of it this is, new for
+    /// each server a reload adds or replaces. Owner thread only.
+    ids: []u64,
+    next_id: u64 = 1,
     /// Each server's count of `tools_stale` events, so the catalog can tell
     /// a list it holds from one the server may have changed since. Apart
     /// from `flags`, which a sign-in or sign-out resets, so a count never
-    /// comes back to a value the catalog already saw.
+    /// comes back to a value the catalog already saw. Replaced with
+    /// `resolved`.
     tools_epochs: []std.atomic.Value(u64),
+    /// Owner thread only: the last `drain` held a request while a server a
+    /// reload dropped stops, so the owner looks again soon.
+    holding: bool = false,
     thread: ?std.Thread = null,
     /// Set by `retire`; read by the owner thread.
     retired: std.atomic.Value(bool) = .init(false),
@@ -417,24 +466,32 @@ pub const Runtime = struct {
             .resolved = undefined,
             .engine = undefined,
             .flags = &.{},
+            .ids = &.{},
             .tools_epochs = &.{},
             .snapshot_arena = .init(gpa),
         };
         errdefer r.arena.deinit();
         errdefer r.snapshot_arena.deinit();
         const arena = r.arena.allocator();
-        r.resolved = try config.resolve(arena, configs, inherited, r.options.workspace_root);
-        r.flags = try arena.alloc(Flags, r.resolved.servers.len);
+        var scratch: std.heap.ArenaAllocator = .init(gpa);
+        defer scratch.deinit();
+        const resolved = try config.resolve(scratch.allocator(), configs, inherited, r.options.workspace_root);
+        const n = resolved.servers.len;
+        r.resolved = .{ .servers = try config.keepServers(arena, resolved.servers, &.{}), .engine = &.{}, .engine_server = try arena.dupe(usize, resolved.engine_server) };
+        r.flags = try gpa.alloc(Flags, n);
+        errdefer gpa.free(r.flags);
         for (r.flags) |*f| f.* = .{};
-        r.tools_epochs = try arena.alloc(std.atomic.Value(u64), r.resolved.servers.len);
+        r.ids = try gpa.alloc(u64, n);
+        errdefer gpa.free(r.ids);
+        for (r.ids) |*id| id.* = r.newId();
+        r.tools_epochs = try gpa.alloc(std.atomic.Value(u64), n);
+        errdefer gpa.free(r.tools_epochs);
         for (r.tools_epochs) |*e| e.* = .init(0);
+        // The engine copies what it keeps, so the rest of the config goes.
         try r.engine.init(io, gpa, .{ .context = r, .allow = allow, .log = log }, .{
             .client = .{ .info = .{ .name = "fx", .version = options.client_version }, .capabilities = declaredCapabilities(options.questions) },
-        }, r.resolved.engine);
+        }, resolved.engine);
         errdefer r.engine.deinit();
-        // The engine has its own copies now, and these may point into
-        // `configs`, which the caller may free now.
-        r.resolved.engine = &.{};
         try r.publish();
         r.thread = try std.Thread.spawn(.{}, run, .{r});
     }
@@ -472,6 +529,9 @@ pub const Runtime = struct {
         r.required.deinit(r.gpa);
         r.held.deinit(r.gpa);
         r.finished.deinit(r.gpa);
+        r.gpa.free(r.flags);
+        r.gpa.free(r.ids);
+        r.gpa.free(r.tools_epochs);
         r.snapshot_arena.deinit();
         r.arena.deinit();
         const was_retired = r.retired.load(.acquire);
@@ -509,28 +569,35 @@ pub const Runtime = struct {
         return out;
     }
 
-    /// Server `index`'s instructions (in `servers()` order), copied into
-    /// `alloc`; null when it gave none.
-    pub fn instructions(r: *Runtime, alloc: Allocator, index: usize) Allocator.Error!?[]const u8 {
+    /// Server `name`'s instructions, copied into `alloc`; null when it gave
+    /// none or there is no such server.
+    pub fn instructions(r: *Runtime, alloc: Allocator, name: []const u8) Allocator.Error!?[]const u8 {
         _ = r.active.fetchAdd(1, .acq_rel);
         defer _ = r.active.fetchSub(1, .acq_rel);
         r.mutex.lockUncancelable(r.io);
         defer r.mutex.unlock(r.io);
-        if (index >= r.snapshot.len) return null;
-        const text = r.snapshot[index].instructions orelse return null;
-        return try alloc.dupe(u8, text);
+        for (r.snapshot) |s| if (std.mem.eql(u8, s.name, name)) {
+            const text = s.instructions orelse return null;
+            return try alloc.dupe(u8, text);
+        };
+        return null;
     }
 
-    /// Server `index`'s count of the times its tools may have changed (in
-    /// `servers()` order). Read before asking for a list: a list asked for
+    /// Server `name`'s count of the times its tools may have changed; 0 for
+    /// none by that name. Read before asking for a list: a list asked for
     /// under an older count is out of date.
-    pub fn toolsEpoch(r: *const Runtime, index: usize) u64 {
-        return r.tools_epochs[index].load(.acquire);
+    pub fn toolsEpoch(r: *Runtime, name: []const u8) u64 {
+        r.mutex.lockUncancelable(r.io);
+        defer r.mutex.unlock(r.io);
+        const i = r.serverIndex(name) orelse return 0;
+        return r.tools_epochs[i].load(.acquire);
     }
 
-    /// The resolved servers, in config order; they don't change while the
-    /// runtime runs.
-    pub fn servers(r: *const Runtime) []const config.Server {
+    /// The resolved servers, in config order. A reload replaces the list,
+    /// but the one returned, and its names, stay valid until `deinit`.
+    pub fn servers(r: *Runtime) []const config.Server {
+        r.mutex.lockUncancelable(r.io);
+        defer r.mutex.unlock(r.io);
         return r.resolved.servers;
     }
 
@@ -546,14 +613,31 @@ pub const Runtime = struct {
         };
     }
 
-    /// Starts getting the tool list of `resolved.servers[index]` without
-    /// waiting, so several servers start at once; `tools` then waits less.
-    pub fn prepare(r: *Runtime, index: usize) Error!void {
+    /// Starts getting server `name`'s tool list without waiting, so several
+    /// servers start at once; `tools` then waits less. `name` is one of
+    /// `servers()`' names, which outlive the runtime.
+    pub fn prepare(r: *Runtime, name: []const u8) Error!void {
         const req = try r.gpa.create(Request);
-        req.* = .{ .kind = .{ .need = index }, .alloc = r.gpa, .owned = true };
+        req.* = .{ .kind = .{ .need = name }, .alloc = r.gpa, .owned = true };
         r.post(req) catch |err| {
             r.gpa.destroy(req);
             return err;
+        };
+    }
+
+    /// Takes the changed config in place: a server whose config is the same
+    /// keeps running, with its connection, calls, sign-in, and tools. The
+    /// rest go: a removed one stops, its calls ending cancelled, and one
+    /// added or changed starts fresh, once that name's old process is gone.
+    /// `configs` and `inherited` are read only during the call. The host's
+    /// lifecycle is modeled in `tests/tla/mcp_host/HostLifecycle.tla`.
+    pub fn reload(r: *Runtime, configs: []const mcp_contract.McpServerConfig, inherited: *const std.process.Environ.Map) Error!Reloaded {
+        var req: Request = .{ .kind = .{ .reload = .{ .configs = configs, .inherited = inherited } }, .alloc = r.gpa };
+        try r.submit(&req, null);
+        return switch (req.result) {
+            .reloaded => |done| done,
+            .failed => |err| err,
+            else => unreachable,
         };
     }
 
@@ -672,12 +756,12 @@ pub const Runtime = struct {
         var scratch: std.heap.ArenaAllocator = .init(r.gpa);
         defer scratch.deinit();
         const answer = asker.ask(asker.context, scratch.allocator(), .{
-            .server = r.resolved.servers[pending.server].name,
+            .server = pending.name,
             .input_requests_json = pending.json,
             .version = pending.version,
             .url_wait = if (pending.reply == .url_wait) &req.url_signal else null,
         }) catch |err| answer: {
-            debug_trace.logf("mcp", "MCP question not answered server={s} err={s}", .{ r.resolved.servers[pending.server].name, @errorName(err) });
+            debug_trace.logf("mcp", "MCP question not answered server={s} err={s}", .{ pending.name, @errorName(err) });
             break :answer null;
         };
         const reply = r.gpa.create(Request) catch return pending.deinit(r.gpa);
@@ -727,37 +811,63 @@ pub const Runtime = struct {
 
     /// Takes the queued requests and handles them; true once stopping.
     fn drain(r: *Runtime) bool {
-        r.mutex.lockUncancelable(r.io);
-        const stopping = r.stopping;
-        var taken = r.queue;
-        r.queue = .empty;
-        if (!stopping and r.waitsForRetired()) {
-            // A retired runtime's servers are still stopping: what could
-            // start a server waits, in order.
-            var kept: usize = 0;
+        r.holding = false;
+        while (true) {
+            r.mutex.lockUncancelable(r.io);
+            const stopping = r.stopping;
+            var taken = r.queue;
+            r.queue = .empty;
+            var after_reload = false;
+            if (!stopping) {
+                // A reload ends its batch: what came after it waits for the
+                // next one, so it is held against the servers it dropped.
+                var batch = taken.items.len;
+                for (taken.items, 0..) |req, k| if (req.kind == .reload) {
+                    batch = k + 1;
+                    break;
+                };
+                const retiring_now = r.waitsForRetired();
+                var kept: usize = 0;
+                for (taken.items[0..batch]) |req| {
+                    // What could start a server waits, in order, while a
+                    // retired runtime's servers stop, or while the process a
+                    // reload dropped under that server's name does, so a
+                    // server never runs twice.
+                    const dropped_stopping = if (req.kind.starts()) |name| r.engine.stopping(name) else false;
+                    if ((retiring_now and req.kind.mayStart()) or dropped_stopping) held: {
+                        r.queue.append(r.gpa, req) catch break :held; // out of memory: handled now
+                        if (dropped_stopping) r.holding = true;
+                        continue;
+                    }
+                    taken.items[kept] = req;
+                    kept += 1;
+                }
+                const rest = taken.items[batch..];
+                if (rest.len > 0) {
+                    if (r.queue.appendSlice(r.gpa, rest)) |_| {
+                        after_reload = true;
+                    } else |_| {
+                        // Out of memory: handled now, after the reload.
+                        @memmove(taken.items[kept..][0..rest.len], rest);
+                        kept += rest.len;
+                    }
+                }
+                taken.shrinkRetainingCapacity(kept);
+            }
+            r.mutex.unlock(r.io);
+            defer taken.deinit(r.gpa);
             for (taken.items) |req| {
-                if (req.kind.mayStart()) held: {
-                    r.queue.append(r.gpa, req) catch break :held; // out of memory: handled now
+                if (stopping) {
+                    r.finish(req, .{ .failed = error.Stopped });
                     continue;
                 }
-                taken.items[kept] = req;
-                kept += 1;
+                r.handle(req) catch |err| {
+                    debug_trace.logf("mcp", "MCP request failed kind={s} err={s}", .{ @tagName(req.kind), @errorName(err) });
+                    r.finish(req, .{ .failed = if (err == error.OutOfMemory) error.OutOfMemory else error.Failed });
+                };
             }
-            taken.shrinkRetainingCapacity(kept);
+            if (stopping or !after_reload) return stopping;
         }
-        r.mutex.unlock(r.io);
-        defer taken.deinit(r.gpa);
-        for (taken.items) |req| {
-            if (stopping) {
-                r.finish(req, .{ .failed = error.Stopped });
-                continue;
-            }
-            r.handle(req) catch |err| {
-                debug_trace.logf("mcp", "MCP request failed kind={s} err={s}", .{ @tagName(req.kind), @errorName(err) });
-                r.finish(req, .{ .failed = if (err == error.OutOfMemory) error.OutOfMemory else error.Failed });
-            };
-        }
-        return stopping;
     }
 
     /// Takes `req` out of the queue; false when it isn't there.
@@ -789,12 +899,13 @@ pub const Runtime = struct {
                 };
                 r.finish(req, .ok);
             },
-            .need => |i| {
-                if (r.resolved.servers[i].held == null) r.engine.needTools(r.resolved.servers[i].name) catch |err| {
-                    debug_trace.logf("mcp", "MCP tool list not started server={s} err={s}", .{ r.resolved.servers[i].name, @errorName(err) });
+            .need => |name| {
+                if (r.engineServer(name) != null) r.engine.needTools(name) catch |err| {
+                    debug_trace.logf("mcp", "MCP tool list not started server={s} err={s}", .{ name, @errorName(err) });
                 };
                 r.finish(req, .ok);
             },
+            .reload => |c| r.finish(req, .{ .reloaded = try r.applyReload(c.configs, c.inherited) }),
             .call => |c| {
                 const i = r.serverIndex(c.server) orelse return r.finish(req, .{ .call = .unknown_server });
                 if (r.resolved.servers[i].held != null) return r.finish(req, .{ .failed = error.Held });
@@ -846,7 +957,7 @@ pub const Runtime = struct {
             .answer => |a| {
                 // `finish` frees the pending question and the answer.
                 defer r.finish(req, .ok);
-                const name = r.resolved.servers[a.pending.server].name;
+                const name = a.pending.name;
                 var scratch: std.heap.ArenaAllocator = .init(r.gpa);
                 defer scratch.deinit();
                 switch (a.pending.reply) {
@@ -860,6 +971,13 @@ pub const Runtime = struct {
                         }
                     },
                     .elicit => |id| {
+                        // Elicitation ids are per run of a server: the one a
+                        // reload replaced never hears it, and nor does its
+                        // successor.
+                        if (r.serverById(a.pending.server) == null) {
+                            debug_trace.logf("mcp", "MCP elicitation answer dropped server={s} reason=the server was reloaded", .{name});
+                            return;
+                        }
                         const answer = elicitAnswer(scratch.allocator(), a.json) orelse mcp.elicitation.Answer{ .action = .decline };
                         r.engine.answerElicitation(name, id, answer) catch |err| {
                             debug_trace.logf("mcp", "MCP elicitation answer not sent server={s} err={s}", .{ name, @errorName(err) });
@@ -966,6 +1084,7 @@ pub const Runtime = struct {
         l.* = .{
             .runtime = r,
             .server = i,
+            .name = s.name,
             .listener = listener,
             .deadline_ms = r.nowMs() + login_timeout_ms,
             .open_browser = open_browser,
@@ -996,7 +1115,7 @@ pub const Runtime = struct {
         const url = l.listener.accept(r.io, r.gpa) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             else => {
-                debug_trace.logf("mcp", "MCP login listener failed server={s} err={s}", .{ r.resolved.servers[l.server].name, @errorName(err) });
+                debug_trace.logf("mcp", "MCP login listener failed server={s} err={s}", .{ l.name, @errorName(err) });
                 return;
             },
         };
@@ -1005,7 +1124,7 @@ pub const Runtime = struct {
             return;
         };
         req.* = .{
-            .kind = .{ .finish_login = .{ .server = r.resolved.servers[l.server].name, .url = url } },
+            .kind = .{ .finish_login = .{ .server = l.name, .url = url } },
             .alloc = r.gpa,
             .owned = true,
             .owned_url = url,
@@ -1226,7 +1345,7 @@ pub const Runtime = struct {
                         return r.engine.answerElicitation(name, x.id, cancel);
                     };
                     const json = try r.gpa.print("{{\"elicitation\":{{\"method\":\"elicitation/create\",\"params\":{s}}}}}", .{x.params});
-                    var pending: Pending = .{ .server = i, .json = json, .version = r.versionCopy(i), .reply = .{ .elicit = x.id } };
+                    var pending: Pending = .{ .name = r.resolved.servers[i].name, .server = r.ids[i], .json = json, .version = r.versionCopy(i), .reply = .{ .elicit = x.id } };
                     if (!r.offer(req, pending)) {
                         pending.deinit(r.gpa);
                         return r.engine.answerElicitation(name, x.id, cancel);
@@ -1254,7 +1373,7 @@ pub const Runtime = struct {
         defer r.mutex.unlock(r.io);
         var it = r.calls.valueIterator();
         while (it.next()) |req| if (req.*.question) |*q| {
-            if (q.server != i or q.reply != .elicit or q.reply.elicit.slot != slot) continue;
+            if (q.server != r.ids[i] or q.reply != .elicit or q.reply.elicit.slot != slot) continue;
             debug_trace.logf("mcp", "MCP question dropped server={s} reason=withdrawn before it was shown", .{r.resolved.servers[i].name});
             q.deinit(r.gpa);
             req.*.question = null;
@@ -1353,7 +1472,8 @@ pub const Runtime = struct {
         }
         out.writer.writeByte('}') catch return error.OutOfMemory;
         const pending: Pending = .{
-            .server = req.url_server,
+            .name = r.resolved.servers[req.url_server].name,
+            .server = r.ids[req.url_server],
             .json = try out.toOwnedSlice(),
             .version = r.versionCopy(req.url_server),
             .reply = if (phase == .consent) .{ .url_consent = req } else .{ .url_wait = req },
@@ -1494,6 +1614,202 @@ pub const Runtime = struct {
         }
     }
 
+    // ---- reload ----
+
+    /// The owner's side of `reload`. What can fail before a server is touched
+    /// comes first; only the engine's own reload can fail after that.
+    fn applyReload(r: *Runtime, configs: []const mcp_contract.McpServerConfig, inherited: *const std.process.Environ.Map) !Reloaded {
+        var scratch: std.heap.ArenaAllocator = .init(r.gpa);
+        defer scratch.deinit();
+        const s = scratch.allocator();
+        const next = try config.resolve(s, configs, inherited, r.options.workspace_root);
+        const n = next.servers.len;
+        // What a caller reads after the reload: the servers, and which kept running.
+        const arena = r.arena.allocator();
+        const kept_servers = try config.keepServers(arena, next.servers, r.resolved.servers);
+        const engine_server = try arena.dupe(usize, next.engine_server);
+        const kept = try arena.alloc(bool, n);
+        @memset(kept, false);
+        for (next.engine, next.engine_server) |c, j| kept[j] = r.engine.keeps(c);
+        // Each new server's old index, and each old one's new index, for the
+        // servers that keep running as they were.
+        const from = try s.alloc(?usize, n);
+        for (next.servers, kept, from) |server, k, *f| f.* = if (k) r.serverIndex(server.name) else null;
+        const to = try s.alloc(?usize, r.resolved.servers.len);
+        @memset(to, null);
+        for (from, 0..) |f, j| if (f) |i| {
+            to[i] = j;
+        };
+        const flags = try r.gpa.alloc(Flags, n);
+        errdefer r.gpa.free(flags);
+        const ids = try r.gpa.alloc(u64, n);
+        errdefer r.gpa.free(ids);
+        const epochs = try r.gpa.alloc(std.atomic.Value(u64), n);
+        errdefer r.gpa.free(epochs);
+        for (from, flags, ids, epochs) |f, *flag, *id, *epoch| {
+            flag.* = if (f) |i| r.flags[i] else .{};
+            id.* = if (f) |i| r.ids[i] else r.newId();
+            epoch.* = .init(if (f) |i| r.tools_epochs[i].load(.acquire) else 0);
+        }
+
+        var dropped = false;
+        for (r.resolved.engine_server) |i| if (to[i] == null) {
+            dropped = true;
+            r.dropServer(i, next.servers);
+        };
+        // The engine copies what it keeps; the rest goes with `scratch`.
+        try r.engine.reload(next.engine);
+        r.moveServers(to);
+        r.mutex.lockUncancelable(r.io);
+        const old_flags = r.flags;
+        const old_ids = r.ids;
+        const old_epochs = r.tools_epochs;
+        r.resolved = .{ .servers = kept_servers, .engine = &.{}, .engine_server = engine_server };
+        r.flags = flags;
+        r.ids = ids;
+        r.tools_epochs = epochs;
+        r.mutex.unlock(r.io);
+        // Other threads read the epochs only under `mutex`.
+        r.gpa.free(old_flags);
+        r.gpa.free(old_ids);
+        r.gpa.free(old_epochs);
+        var added: usize = 0;
+        for (engine_server) |j| if (from[j] == null) {
+            added += 1;
+            r.adoptSaved(j);
+        };
+        var same: usize = 0;
+        for (kept) |k| same += @intFromBool(k);
+        debug_trace.logf("mcp", "MCP config reloaded servers={d} kept={d} fresh={d} dropped={s}", .{ n, same, added, if (dropped) "yes" else "no" });
+        return .{ .kept = kept, .dropped = dropped };
+    }
+
+    /// Old server `i` doesn't run on as it was: removed, held back, or
+    /// replaced. Its calls end, as they may have run; a tool list asked of it
+    /// is asked again of whatever has its name now; its sign-in, logout,
+    /// refresh, and URL questions end. `next` is the servers after the reload.
+    fn dropServer(r: *Runtime, i: usize, next: []const config.Server) void {
+        const name = r.resolved.servers[i].name;
+        const successor: ?config.Server = for (next) |s| {
+            if (std.mem.eql(u8, s.name, name)) break s;
+        } else null;
+        const why = if (successor == null) "removed" else if (successor.?.held != null) "held back" else "changed";
+        debug_trace.logf("mcp", "MCP server stops for a reload server={s} reason={s}", .{ name, why });
+        while (r.callOn(name)) |waiting| {
+            _ = r.calls.remove(waiting.handle);
+            r.finish(waiting.request, .{ .call = .{ .ended = .{
+                .outcome = .cancelled,
+                .maybe_ran = r.engine.callSent(waiting.handle),
+                .timed_out = false,
+                .why = "the MCP config changed, and fx stopped the server",
+            } } });
+        }
+        var k: usize = 0;
+        while (k < r.tool_waiters.items.len) {
+            const w = r.tool_waiters.items[k];
+            if (w.server != i) {
+                k += 1;
+                continue;
+            }
+            _ = r.tool_waiters.swapRemove(k);
+            r.mutex.lockUncancelable(r.io);
+            const queued = if (r.queue.append(r.gpa, w.request)) |_| true else |_| false;
+            r.mutex.unlock(r.io);
+            if (queued) r.engine.wake() else r.finish(w.request, .{ .failed = error.OutOfMemory });
+        }
+        if (r.loginFor(i) != null) {
+            var buf: [320]u8 = undefined;
+            const reason = if (successor != null and successor.?.held == null)
+                std.mem.print(&buf, "the MCP config changed before the browser came back; run /mcp login {s} again", .{name}) catch "the MCP config changed before the browser came back"
+            else
+                "the MCP config changed before the browser came back";
+            r.notify(.{ .sign_in_failed = .{ .server = name, .reason = reason } });
+            r.endLogin(i);
+        }
+        k = 0;
+        while (k < r.logouts.items.len) {
+            const l = r.logouts.items[k];
+            if (l.server != i) {
+                k += 1;
+                continue;
+            }
+            _ = r.logouts.swapRemove(k);
+            r.finish(l.request, .ok);
+        }
+        r.endRefresh(i);
+        k = 0;
+        while (k < r.held.items.len) {
+            const req = r.held.items[k];
+            if (req.url_server != i) {
+                k += 1;
+                continue;
+            }
+            r.endHeld(req, .{ .call = .{ .ended = .{ .outcome = .cancelled, .maybe_ran = false, .timed_out = false, .why = "the MCP config changed, and fx stopped the server" } } });
+        }
+        k = 0;
+        while (k < r.required.items.len) {
+            if (r.required.items[k].server != i) {
+                k += 1;
+                continue;
+            }
+            r.gpa.free(r.required.orderedRemove(k).need.params);
+        }
+        k = 0;
+        while (k < r.url_questions.items.len) {
+            if (r.url_questions.items[k].server != i) {
+                k += 1;
+                continue;
+            }
+            r.gpa.free(r.url_questions.swapRemove(k).id);
+        }
+    }
+
+    /// Points what waits on a server that kept running at its new index;
+    /// `dropServer` ended the rest.
+    fn moveServers(r: *Runtime, to: []const ?usize) void {
+        for (r.tool_waiters.items) |*w| w.server = to[w.server].?;
+        for (r.logins.items) |l| l.server = to[l.server].?;
+        for (r.logouts.items) |*l| l.server = to[l.server].?;
+        for (r.refreshes.items) |*f| f.server = to[f.server].?;
+        for (r.held.items) |req| req.url_server = to[req.url_server].?;
+        for (r.required.items) |*q| q.server = to[q.server].?;
+        for (r.url_questions.items) |*q| q.server = to[q.server].?;
+    }
+
+    /// A server a reload added signs in with the login saved for it, as
+    /// `restoreCredentials` does at the start.
+    fn adoptSaved(r: *Runtime, i: usize) void {
+        const s = r.resolved.servers[i];
+        if (s.url == null) return;
+        const saved = r.options.credentials.store.get(r.gpa, s.credentialKey()) catch |err| {
+            return debug_trace.logf("mcp", "MCP saved login not read server={s} err={s}", .{ s.name, @errorName(err) });
+        } orelse return;
+        defer secret.zeroAndFree(r.gpa, saved);
+        r.engine.restoreCredential(s.name, saved) catch |err| {
+            return debug_trace.logf("mcp", "MCP credential not loaded server={s} err={s}", .{ s.name, @errorName(err) });
+        };
+        r.flags[i].signed_in = true;
+        r.flags[i].tried = credentials.digest(saved);
+    }
+
+    /// A call still waiting on server `name`.
+    fn callOn(r: *Runtime, name: []const u8) ?struct { handle: engine.Handle, request: *Request } {
+        var it = r.calls.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.value_ptr.*.kind.call.server, name)) return .{ .handle = entry.key_ptr.*, .request = entry.value_ptr.* };
+        }
+        return null;
+    }
+
+    fn serverById(r: *const Runtime, id: u64) ?usize {
+        return std.mem.findScalar(u64, r.ids, id);
+    }
+
+    fn newId(r: *Runtime) u64 {
+        defer r.next_id += 1;
+        return r.next_id;
+    }
+
     fn shutdown(r: *Runtime) void {
         while (r.logins.items.len > 0) {
             // Only a config change ends a host while it signs in: the
@@ -1580,7 +1896,7 @@ pub const Runtime = struct {
         for (r.refreshes.items) |f| if (!f.sent) {
             wait = @min(wait, refresh_retry_ms);
         };
-        if (r.waitsForRetired()) wait = @min(wait, retiring_wait_ms);
+        if (r.waitsForRetired() or r.holding) wait = @min(wait, retiring_wait_ms);
         return @intCast(wait);
     }
 
@@ -1651,7 +1967,7 @@ pub const Runtime = struct {
         }
         out.writer.writeByte('}') catch return error.OutOfMemory;
         const json = try out.toOwnedSlice();
-        return .{ .server = i, .json = json, .version = r.versionCopy(i), .reply = .{ .input = .{ .call = call_handle, .keys = keys } } };
+        return .{ .name = r.resolved.servers[i].name, .server = r.ids[i], .json = json, .version = r.versionCopy(i), .reply = .{ .input = .{ .call = call_handle, .keys = keys } } };
     }
 
     fn versionCopy(r: *Runtime, i: usize) ?[]u8 {
@@ -2294,6 +2610,154 @@ test "a replaced runtime still in use serves its calls, and holds the others unt
     old_up = false;
     lister.join();
     try testing.expect(done.load(.acquire));
+}
+
+/// Server `name`'s process id, as the fake server says it.
+fn pidOf(r: *Runtime, a: Allocator, name: []const u8) ![]const u8 {
+    const result = try r.call(a, name, "echo", "{\"text\":\"pid\"}", null, null);
+    if (result != .result) return error.TestUnexpectedResult;
+    const at = std.mem.find(u8, result.result.content, "pid=") orelse return error.TestUnexpectedResult;
+    const digits = result.result.content[at + 4 ..];
+    return digits[0 .. std.mem.findNone(u8, digits, "0123456789") orelse digits.len];
+}
+
+test "a reload keeps a server whose config is the same on its process, and restarts the changed ones" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var one = [_]mcp_contract.McpEnvVar{.{ .key = @constCast("MODE"), .value = @constCast("one") }};
+    var two = [_]mcp_contract.McpEnvVar{.{ .key = @constCast("MODE"), .value = @constCast("two") }};
+    const before = [_]mcp_contract.McpServerConfig{
+        .{ .name = "same", .command = f.server, .env = &one },
+        .{ .name = "args", .command = f.server },
+        .{ .name = "env", .command = f.server, .env = &one },
+        .{ .name = "gone", .command = f.server },
+    };
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &before, &f.inherited, f.options());
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqual(@as(usize, 1), (try r.tools(a, "same", null)).tools.len);
+    const same = try pidOf(&r, a, "same");
+    const args = try pidOf(&r, a, "args");
+    const env = try pidOf(&r, a, "env");
+    _ = try pidOf(&r, a, "gone");
+
+    // The config is read afresh, so each environment is a new map; the same
+    // variables still count as the same server.
+    const after = [_]mcp_contract.McpServerConfig{
+        .{ .name = "added", .command = f.server },
+        .{ .name = "same", .command = f.server, .env = &one },
+        .{ .name = "args", .command = f.server, .args = &.{"--new"} },
+        .{ .name = "env", .command = f.server, .env = &two },
+    };
+    const done = try r.reload(&after, &f.inherited);
+    try testing.expectEqualSlices(bool, &.{ false, true, false, false }, done.kept);
+    try testing.expect(done.dropped);
+    const statuses = try r.statuses(a);
+    try testing.expectEqualStrings("added", statuses[0].name);
+    try testing.expectEqual(State.idle, statuses[0].state);
+    // Still up and listed, before anything asks it again.
+    try testing.expectEqualStrings("same", statuses[1].name);
+    try testing.expectEqual(State.ready, statuses[1].state);
+    try testing.expectEqual(@as(usize, 1), statuses[1].tools);
+    try testing.expectEqualStrings(same, try pidOf(&r, a, "same"));
+    try testing.expect(!std.mem.eql(u8, args, try pidOf(&r, a, "args")));
+    try testing.expect(!std.mem.eql(u8, env, try pidOf(&r, a, "env")));
+    _ = try pidOf(&r, a, "added");
+    try testing.expectEqual(CallResult.unknown_server, try r.call(a, "gone", "echo", "{}", null, null));
+
+    // Taking only an added server drops nothing.
+    var more: [5]mcp_contract.McpServerConfig = undefined;
+    @memcpy(more[0..4], &after);
+    more[4] = .{ .name = "late", .command = f.server };
+    try testing.expect(!(try r.reload(&more, &f.inherited)).dropped);
+    try testing.expectEqualStrings(same, try pidOf(&r, a, "same"));
+}
+
+test "a reload ends a call on a server it drops, and a call on a server it keeps goes on" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const before = [_]mcp_contract.McpServerConfig{
+        .{ .name = "kept", .command = f.server },
+        .{ .name = "gone", .command = f.server },
+    };
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &before, &f.inherited, f.options());
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    _ = try r.tools(a, "kept", null);
+    _ = try r.tools(a, "gone", null);
+
+    const Caller = struct {
+        server: []const u8,
+        cancel: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        ended: ?@FieldType(CallResult, "ended") = null,
+        why: [128]u8 = undefined,
+        why_len: usize = 0,
+
+        fn run(c: *@This(), runtime: *Runtime) void {
+            defer c.done.store(true, .release);
+            var ca: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer ca.deinit();
+            const result = runtime.call(ca.allocator(), c.server, "echo", "{\"text\":\"slow\"}", &c.cancel, null) catch return;
+            if (result != .ended) return;
+            c.ended = result.ended;
+            if (result.ended.why) |why| {
+                c.why_len = @min(why.len, c.why.len);
+                @memcpy(c.why[0..c.why_len], why[0..c.why_len]);
+            }
+        }
+    };
+    var kept: Caller = .{ .server = "kept" };
+    var gone: Caller = .{ .server = "gone" };
+    const kept_thread = try std.Thread.spawn(.{}, Caller.run, .{ &kept, &r });
+    const gone_thread = try std.Thread.spawn(.{}, Caller.run, .{ &gone, &r });
+    std.Io.sleep(testing.io, .fromMilliseconds(300), .awake) catch {};
+
+    const after = [_]mcp_contract.McpServerConfig{.{ .name = "kept", .command = f.server }};
+    _ = try r.reload(&after, &f.inherited);
+    gone_thread.join();
+    try testing.expectEqual(engine.Outcome.cancelled, gone.ended.?.outcome);
+    // It reached the server, so it may have run there.
+    try testing.expect(gone.ended.?.maybe_ran);
+    try testing.expectEqualStrings("the MCP config changed, and fx stopped the server", gone.why[0..gone.why_len]);
+    // The kept server's call is still out; only its cancel ends it.
+    std.Io.sleep(testing.io, .fromMilliseconds(200), .awake) catch {};
+    try testing.expect(!kept.done.load(.acquire));
+    kept.cancel.store(true, .release);
+    kept_thread.join();
+    try testing.expectEqual(engine.Outcome.cancelled, kept.ended.?.outcome);
+    try testing.expectEqual(@as(usize, 0), kept.why_len);
+}
+
+test "a changed server's new process starts only once the old one is gone" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const before = [_]mcp_contract.McpServerConfig{.{ .name = "slow-exit", .command = f.server, .args = &.{"linger"} }};
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &before, &f.inherited, f.options());
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const old = try std.fmt.parseInt(std.posix.pid_t, try pidOf(&r, a, "slow-exit"), 10);
+
+    const after = [_]mcp_contract.McpServerConfig{.{ .name = "slow-exit", .command = f.server, .args = &.{ "linger", "again" } }};
+    const reloaded_ms = std.Io.Clock.awake.now(testing.io).toMilliseconds();
+    _ = try r.reload(&after, &f.inherited);
+    const new = try std.fmt.parseInt(std.posix.pid_t, try pidOf(&r, a, "slow-exit"), 10);
+    try testing.expect(new != old);
+    // The old one lingers a second after its stdin ends; the new one waited.
+    try testing.expect(std.Io.Clock.awake.now(testing.io).toMilliseconds() - reloaded_ms >= 900);
+    try testing.expectError(error.ProcessNotFound, std.posix.kill(old, @fromBackingInt(@intCast(0))));
 }
 
 test "an answer to a withdrawn 2025 question reaches no one, and the next question gets its own" {
