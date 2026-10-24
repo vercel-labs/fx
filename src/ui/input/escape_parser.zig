@@ -81,12 +81,13 @@ fn modifiedArrowAction(byte: u8, modifiers: u16, meta_prefixed: bool) ?InputEsca
         else => null,
     };
     if (meta_prefixed or (modifiers & alt_modifier) != 0) {
-        // Alt+←/→ may switch agents (see `switchesAgents` in
-        // app_input_runtime.zig); with Shift or Ctrl they keep the word
-        // jump and selection.
+        // Alt+←/→ may switch agents and Alt+↑ may list the instances (see
+        // `switchesAgents` and `listsInstances` in app_input_runtime.zig);
+        // with Shift or Ctrl they keep the word jump, paragraph move, and
+        // selection.
         const switches = (modifiers & (shift_modifier | ctrl_modifier)) == 0;
         return switch (byte) {
-            'A' => composerMove(.paragraph_up, modifiers),
+            'A' => if (switches) .open_agent_list else composerMove(.paragraph_up, modifiers),
             'B' => composerMove(.paragraph_down, modifiers),
             'C' => if (switches) .{ .switch_agent = .next } else composerMove(.word_right, modifiers),
             'D' => if (switches) .{ .switch_agent = .previous } else composerMove(.word_left, modifiers),

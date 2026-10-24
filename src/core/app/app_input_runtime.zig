@@ -931,14 +931,14 @@ pub fn Runtime(comptime App: type) type {
             max_input_len: usize,
         ) !ResolvedEscapeRoute {
             // Where Alt+←/→ don't switch, they keep the word jump their
-            // composer shortcut carries.
+            // composer shortcut carries, and where Alt+↑ doesn't list the
+            // instances, it keeps its paragraph move.
             const resolved: input_action.Action = switch (decoded) {
                 .switch_agent => |direction| if (switchesAgents(app, direction))
                     decoded
-                else if (composer_shortcut) |shortcut|
-                    .{ .composer_shortcut = shortcut }
                 else
-                    .ignore,
+                    composerMoveOf(composer_shortcut),
+                .open_agent_list => if (listsInstances(app)) decoded else composerMoveOf(composer_shortcut),
                 else => decoded,
             };
             switch (resolved) {
@@ -975,6 +975,20 @@ pub fn Runtime(comptime App: type) type {
                     if (app.shell.fullTranscriptActive()) return .done;
                     dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
                     try app_agents_runtime.Runtime(App).switchAgent(app, resolved.switch_agent);
+                }
+                return .done;
+            }
+
+            // Alt+↑ opens the instance list, and moves up in it once open.
+            if (resolved == .open_agent_list) {
+                if (comptime @hasDecl(App, "openAgentsMenu")) {
+                    if (app.shell.fullTranscriptActive()) return .done;
+                    if (app_agents_runtime.Runtime(App).menuActive(app)) {
+                        _ = try completion_rt.routeAgentsMenuMove(app, agents.screenAgentOf(app), -1);
+                        return .done;
+                    }
+                    dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
+                    try app.openAgentsMenu();
                 }
                 return .done;
             }
@@ -1086,6 +1100,7 @@ pub fn Runtime(comptime App: type) type {
                 .composer_shortcut,
                 .toggle_full_transcript,
                 .switch_agent,
+                .open_agent_list,
                 => unreachable,
                 .page_up,
                 .page_down,
@@ -1450,6 +1465,7 @@ pub fn Runtime(comptime App: type) type {
                 },
                 '\r' => {
                     if (try submitEffortMenuSelection(app, agent)) return;
+                    if (try submitAgentsMenuSelection(app)) return;
                     if (try submitSettingsMenuSelection(app, agent)) return;
                     if (try submitHelpMenuSelection(app, max_input_len, max_prompt_history)) return;
                     if (try submitMcpHostMenu(app)) return;
@@ -1734,6 +1750,40 @@ pub fn Runtime(comptime App: type) type {
                 return true;
             };
             return true;
+        }
+
+        /// Shows the instance the list has selected.
+        fn submitAgentsMenuSelection(app: *App) !bool {
+            if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
+            return app_agents_runtime.Runtime(App).submitMenu(app);
+        }
+
+        fn agentsMenuActive(app: *App) bool {
+            if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
+            return app_agents_runtime.Runtime(App).menuActive(app);
+        }
+
+        fn cancelAgentsMenu(app: *App) bool {
+            if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
+            return app_agents_runtime.Runtime(App).closeMenu(app);
+        }
+
+        /// Whether the instance list has more than one instance to show.
+        fn canListInstances(app: *App) bool {
+            if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
+            return app_agents_runtime.Runtime(App).openInstanceCount(app) > 1;
+        }
+
+        /// Alt+↑ lists the instances while more than one is open, unless the
+        /// draft has several lines, where it moves up a paragraph as on main.
+        fn listsInstances(app: *App) bool {
+            if (!canListInstances(app)) return false;
+            if (comptime !@hasField(App, "input_runtime")) return true;
+            return std.mem.findScalar(u8, app.input_runtime.edit_state.input.items, '\n') == null;
+        }
+
+        fn composerMoveOf(composer_shortcut: ?input_action.ShortcutAction) input_action.Action {
+            return if (composer_shortcut) |shortcut| .{ .composer_shortcut = shortcut } else .ignore;
         }
 
         /// Forks before the selected prompt and puts its text in the composer.
@@ -2037,7 +2087,8 @@ pub fn Runtime(comptime App: type) type {
         /// borrowing a composer they are already using.
         fn modelPickerShortcutBlocked(app: *App, agent: *AppAgent) bool {
             if (settingsMenuActive(app) or helpMenuActive(app) or
-                skillsMenuActive(app) or sessionMenuActive(agent) or forkMenuActive(agent) or mcpHostMenuActive(app)) return true;
+                skillsMenuActive(app) or sessionMenuActive(agent) or forkMenuActive(agent) or mcpHostMenuActive(app) or
+                agentsMenuActive(app)) return true;
             if (comptime @hasField(App, "auth")) {
                 if (app.auth.pickerView().active) return true;
             }
@@ -2055,11 +2106,12 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn dismissActiveMenusForComposerEdit(app: *App, agent: *AppAgent) bool {
-            // The fork and effort menus read no query from the composer, so
-            // an edit closes them.
+            // The fork and effort menus and the instance list read no query
+            // from the composer, so an edit closes them.
             const fork_menu_closed = cancelForkMenu(app, agent);
             const effort_menu_closed = cancelEffortMenu(app);
-            return dismissAuthPickerForComposerEdit(app, agent) or fork_menu_closed or effort_menu_closed;
+            const agents_menu_closed = cancelAgentsMenu(app);
+            return dismissAuthPickerForComposerEdit(app, agent) or fork_menu_closed or effort_menu_closed or agents_menu_closed;
         }
 
         fn dismissActiveMenusThenRedraw(app: *App, agent: *AppAgent) void {
@@ -2797,7 +2849,7 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeInterrupt(app, "approval_prompt");
                     return;
                 }
-                if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app, agent) or cancelForkMenu(app, agent) or cancelEffortMenu(app)) {
+                if (cancelAgentsMenu(app) or cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app, agent) or cancelForkMenu(app, agent) or cancelEffortMenu(app)) {
                     _ = disarmEscapeClear(app);
                     _ = disarmEscapeInterrupt(app, "menu");
                     app.shell.render_requests.request(.footer);
@@ -2851,7 +2903,7 @@ pub fn Runtime(comptime App: type) type {
                 _ = disarmEscapeClear(app);
                 return;
             }
-            if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app, agent) or cancelForkMenu(app, agent) or cancelEffortMenu(app)) {
+            if (cancelAgentsMenu(app) or cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app, agent) or cancelForkMenu(app, agent) or cancelEffortMenu(app)) {
                 _ = disarmEscapeClear(app);
                 app.shell.render_requests.request(.footer);
                 return;

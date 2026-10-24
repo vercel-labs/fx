@@ -2154,7 +2154,7 @@ test "input escape parser resolves unmapped single-parameter CSI u to ignore" {
 
 test "input escape parser preserves modified arrow intent" {
     try expectEscapeAction("[57352;2u", moveEscape(.visual_up, true));
-    try expectEscapeAction("[57352;3u", moveEscape(.paragraph_up, false));
+    try expectEscapeAction("[57352;3u", .open_agent_list);
     try expectEscapeAction("[57353;5u", moveEscape(.visual_down, false));
     try expectEscapeAction("[57353;9u", moveEscape(.draft_end, false));
     try expectEscapeAction("[1;4D", moveEscape(.word_left, true));
@@ -2264,9 +2264,9 @@ test "input escape parser decodes application-keypad SS3 keys" {
 }
 
 test "input escape parser preserves double escape meta behavior" {
-    try expectEscapeAction("\x1b[A", moveEscape(.paragraph_up, false));
+    try expectEscapeAction("\x1b[A", .open_agent_list);
     try expectEscapeAction("\x1b[B", moveEscape(.paragraph_down, false));
-    try expectEscapeAction("\x1bOA", moveEscape(.paragraph_up, false));
+    try expectEscapeAction("\x1bOA", .open_agent_list);
     try expectEscapeAction("\x1bOB", moveEscape(.paragraph_down, false));
     // Meta-prefixed Left and Right are Alt+←/→, and ESC b and ESC f are
     // Terminal.app's Option+←/→; all four may switch agents. Alt+B and
@@ -3602,10 +3602,12 @@ test "input escape parser handles double-ESC as meta prefix for arrows" {
     var stage: u8 = 1;
     var param: u16 = 0;
     var param2: u16 = 0;
-    // ESC ESC [ A — Option+Up on terminals that send Meta as ESC prefix
+    // ESC ESC [ A — Option+Up on terminals that send Meta as ESC prefix,
+    // which lists the instances and keeps its paragraph move with one.
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, 0x1b));
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '['));
-    try std.testing.expectEqual(@as(?InputEscapeAction, moveEscape(.paragraph_up, false)), consumeInputEscapeByte(&stage, &param, &param2, 'A'));
+    try std.testing.expectEqual(@as(?InputEscapeAction, .open_agent_list), consumeInputEscapeByte(&stage, &param, &param2, 'A'));
+    try std.testing.expectEqual(@as(?input_action.ShortcutAction, .{ .move = .{ .kind = .paragraph_up, .extend_selection = false } }), shortcuts.fromEscapeAction(.open_agent_list));
     try std.testing.expectEqual(@as(u8, 0), stage);
 }
 
