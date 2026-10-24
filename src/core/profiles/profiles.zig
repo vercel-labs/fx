@@ -273,8 +273,11 @@ pub fn systemPrompt(arena: Allocator, profile: *const Profile, base: []const u8)
 pub fn load(arena: Allocator, roots: Roots, name: []const u8, failure: *?[]const u8) LoadError!Profile {
     if (!validName(name)) return fail(arena, failure, "profile name '{s}' must use lowercase letters, digits, '-', or '_'", .{name});
     if (std.mem.eql(u8, name, main_name)) return builtin(main_name).?;
-    if (roots.home) |dir| if (try readProfile(arena, dir, name, .home, failure)) |profile| return profile;
-    if (roots.project) |dir| if (try readProfile(arena, dir, name, .project, failure)) |profile| return profile;
+    // The profile keeps its name, so it is `arena`'s like the rest of it,
+    // not the caller's.
+    const owned = try arena.dupe(u8, name);
+    if (roots.home) |dir| if (try readProfile(arena, dir, owned, .home, failure)) |profile| return profile;
+    if (roots.project) |dir| if (try readProfile(arena, dir, owned, .project, failure)) |profile| return profile;
     if (builtin(name)) |profile| return profile;
     const names = try listNames(arena, roots);
     failure.* = try arena.print("no profile named '{s}'. Profiles: {s}", .{ name, names });
@@ -596,7 +599,10 @@ test "a held profile replaces the last only when the next one loads, and keeps i
     try testing.expectEqualStrings(main_name, held.profile.name);
     try testing.expect(held.system_prompt == null);
 
-    try held.replace(testing.allocator, fx_home, null, "reviewer", "BASE", &failure);
+    // It keeps its own copy of the name it was asked for.
+    var name_buf = "reviewer".*;
+    try held.replace(testing.allocator, fx_home, null, &name_buf, "BASE", &failure);
+    @memset(&name_buf, 'x');
     try testing.expectEqualStrings("reviewer", held.profile.name);
     try testing.expectEqual(types.PermissionMode.ask, held.profile.permission_mode.?);
     try testing.expectEqualStrings("BASE\n\nReview only.", held.system_prompt.?);
