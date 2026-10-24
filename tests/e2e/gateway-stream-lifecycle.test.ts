@@ -7062,7 +7062,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           socketFailure ??= error;
         });
         connections += 1;
-        if (connections === 1) {
+        // The first connection is usually the one fx warms at launch. A
+        // pooled connection reset before use is resent silently on a fresh
+        // connection, so the second reset is the one that lands on a fresh
+        // connection, which fx reports and the turn retries.
+        if (connections <= 2) {
           socket.resetAndDestroy();
           return;
         }
@@ -7144,14 +7148,140 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(json.output).toBe(expectedOutput);
         expect(json.recovery?.state).toBe("recovered");
         expect(json.recovery?.attempt).toBe(2);
-        expect(connections).toBe(2);
+        expect(connections).toBe(3);
         expect(requests).toBe(1);
         expect(socketFailure).toBeUndefined();
-        expect(opens).toHaveLength(2);
-        expect(opens.every((line) => line.includes("attempt=1"))).toBe(true);
+        expect(opens).toHaveLength(3);
+        expect(occurrenceCount(trace, "event=stale_connection_retry")).toBe(1);
         expect(trace).toContain("provider_attempts=1/10");
         expect(trace).toContain("recovery=retry_request");
         expect(trace).toContain("event=stream_complete");
+      } finally {
+        for (const socket of sockets) socket.destroy();
+        if (server.listening) {
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }
+  }, 60_000);
+
+  test("default fx ask resends without a warning when the gateway closed a pooled connection", async () => {
+    const expectedOutput = "Answered after a closed pooled connection.";
+    const toolCallBody = await fakeGatewayToolCall("read_notes", "read_file", {
+      path: "notes.txt",
+    }).text();
+    const finalBody = await fakeGatewayFinalText(expectedOutput).text();
+
+    for (let iteration = 1; iteration <= 4; iteration += 1) {
+      const root = createFixtureRoot(`closed-pooled-connection-${iteration}`);
+      const tracePath = join(root.root, "trace.log");
+      writeFileSync(join(root.workspace, "notes.txt"), "pooled connection fixture\n");
+      const sockets = new Set<Socket>();
+      // The launch warm-up connection usually carries the first request, but
+      // it can also sit unused, so count only connections that carried one.
+      const requestSockets = new Set<Socket>();
+      let connections = 0;
+      let requests = 0;
+      let socketFailure: Error | undefined;
+      const server = createServer((socket) => {
+        sockets.add(socket);
+        socket.on("close", () => sockets.delete(socket));
+        socket.on("error", (error) => {
+          socketFailure ??= error;
+        });
+        connections += 1;
+
+        let request = Buffer.alloc(0);
+        let requestHandled = false;
+        socket.on("data", (chunk) => {
+          requestSockets.add(socket);
+          if (requestHandled) return;
+          if (request.length + chunk.length > 1024 * 1024) {
+            socketFailure ??= new Error("pooled connection fixture request exceeded 1 MiB");
+            socket.destroy();
+            return;
+          }
+          request = Buffer.concat([request, chunk]);
+          const headerEnd = request.indexOf("\r\n\r\n");
+          if (headerEnd < 0) return;
+          const headers = request.subarray(0, headerEnd).toString("utf8");
+          const lengthMatch = /\r\ncontent-length:\s*(\d+)/i.exec(`\r\n${headers}`);
+          const contentLength = lengthMatch ? Number.parseInt(lengthMatch[1]!, 10) : 0;
+          if (request.length < headerEnd + 4 + contentLength) return;
+
+          requestHandled = true;
+          requests += 1;
+          if (requests === 1) {
+            // Keep-alive response, then the connection closes the way a
+            // gateway drops an idle one. fx pools it and finds it dead when
+            // it sends the tool result.
+            socket.end(
+              "HTTP/1.1 200 OK\r\n" +
+                "Content-Type: text/event-stream\r\n" +
+                `Content-Length: ${Buffer.byteLength(toolCallBody)}\r\n\r\n` +
+                toolCallBody,
+            );
+            return;
+          }
+          socket.end(
+            "HTTP/1.1 200 OK\r\n" +
+              "Content-Type: text/event-stream\r\n" +
+              `Content-Length: ${Buffer.byteLength(finalBody)}\r\n` +
+              "Connection: close\r\n\r\n" +
+              finalBody,
+          );
+        });
+      });
+
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server.once("error", reject);
+          server.listen(0, "127.0.0.1", resolve);
+        });
+        const address = server.address();
+        if (address === null || typeof address === "string") {
+          throw new Error("missing pooled connection fixture address");
+        }
+        const result = await runFx(
+          ["ask", "--json", "--auto", "--no-save", "Read notes.txt, then answer."],
+          {
+            cwd: root.workspace,
+            env: {
+              FX_SOUND: "0",
+              HOME: root.home,
+              AI_GATEWAY_API_KEY: "fake-gateway-lifecycle-key",
+              VERCEL_OIDC_TOKEN: undefined,
+              FX_E2E_GATEWAY_CHAT_URL:
+                `http://127.0.0.1:${address.port}/v1/ai/chat/completions`,
+              FX_MODEL: MODEL,
+              FX_TRACE_LOG: tracePath,
+              FX_TRACE_SCOPES: "agent,core,gateway,stream",
+            },
+            timeoutMs: 15_000,
+          },
+        );
+        const trace = readFileSync(tracePath, "utf8");
+        if (result.code !== 0 || result.signal !== null) {
+          throw new Error(
+            `closed pooled connection iteration ${iteration} failed: code=${result.code} signal=${result.signal}\n` +
+              `stdout:\n${result.stdout}\nstderr:\n${result.stderr}\ntrace:\n${trace}`,
+          );
+        }
+        const json = parseAskJson(result.stdout);
+
+        expect(json.exit_code).toBe(0);
+        expect(json.output).toBe(expectedOutput);
+        expect(json.tool_calls.map((call) => call.name)).toEqual(["read_file"]);
+        expect(json.recovery).toBeUndefined();
+        expect(result.stderr).not.toContain("Network interrupted");
+        expect(result.stderr).not.toContain("retrying request");
+        expect(connections).toBeGreaterThanOrEqual(2);
+        expect(requestSockets.size).toBe(2);
+        expect(requests).toBe(2);
+        expect(socketFailure).toBeUndefined();
+        expect(trace).toContain("event=stale_connection_retry");
+        expect(trace).not.toContain("recovery=retry_request");
       } finally {
         for (const socket of sockets) socket.destroy();
         if (server.listening) {
