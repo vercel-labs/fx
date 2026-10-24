@@ -540,7 +540,17 @@ pub fn Runtime(comptime App: type) type {
             steering: *const SteeringProjection,
         ) render_input.RenderContext {
             const model_query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state);
-            const pending_model = if (app.input_runtime.picker.hasPendingModelPickerSelection()) app.input_runtime.picker.model_picker_pending_model.items else null;
+            // `/effort ` lists the current model's levels, whatever a `/model`
+            // flow left pending.
+            const effort_command = if (model_query) |query| query.command == .effort else false;
+            const pending_model = if (!effort_command and app.input_runtime.picker.hasPendingModelPickerSelection()) app.input_runtime.picker.model_picker_pending_model.items else null;
+            // The level the `/effort ` column highlights, which the status line
+            // shows until the column applies or closes.
+            var effort_command_preview: ?types.ReasoningEffort = null;
+            // A model with no levels, or none loaded yet, shows no `/effort `
+            // column, as `/model` skips its effort column; Enter runs the
+            // command, which says why.
+            var effort_command_without_levels = false;
             var model_picker_stage: picker_state.ModelPickerStage = .model;
             var picker_items: []const []const u8 = &.{};
             var picker_index: usize = 0;
@@ -558,9 +568,10 @@ pub fn Runtime(comptime App: type) type {
                         picker_window_start = input_completion_runtime.CompletionRuntime(App).modelPickerWindowStart(app, count, picker_index);
                     },
                     .effort => {
-                        const target = if (app.input_runtime.picker.hasPendingModelPickerSelection()) app.input_runtime.picker.model_picker_pending_model.items else provider_runtime.model(app);
+                        const target = pending_model orelse provider_runtime.model(app);
                         const capabilities = model_capabilities.resolveForApp(App, app, target);
                         const effort_count = model_capabilities.reasoningEffortOptionCount(capabilities);
+                        effort_command_without_levels = effort_command and effort_count == 0;
                         for (0..effort_count) |i| {
                             effort_picker_values_buf[i] = model_capabilities.reasoningEffortAtIndex(capabilities, i);
                             effort_picker_labels_buf[i] = effort_picker_values_buf[i].displayLabel();
@@ -569,6 +580,9 @@ pub fn Runtime(comptime App: type) type {
                         picker_items = effort_picker_labels_buf[0..count];
                         picker_index = app.input_runtime.picker.model_picker_effort_index;
                         picker_window_start = app.input_runtime.picker.model_picker_effort_window_start;
+                        if (effort_command and count > 0) {
+                            effort_command_preview = types.ReasoningEffort.parseDisplayLabel(picker_items[picker_index % count]);
+                        }
                     },
                     .fast => {
                         const count = input_completion_runtime.CompletionRuntime(App).speedPickerLabels(
@@ -649,7 +663,9 @@ pub fn Runtime(comptime App: type) type {
             const model_supports_fast = visible_capabilities.supports_fast_mode;
             const model_supports_effort = visible_capabilities.reasoning_efforts.len > 0 or
                 (active_capabilities_pending and !app.effort.isDefault());
-            const visible_effort = if (pending_model != null and model_supports_effort)
+            const visible_effort = if (effort_command_preview) |effort|
+                effort
+            else if (pending_model != null and model_supports_effort)
                 pendingPickerEffort(app, visible_model, model_query, app.input_runtime.picker.model_picker_effort_index)
             else if (active_capabilities_pending or model_capabilities.reasoningEffortSupported(visible_capabilities, app.effort))
                 app.effort
@@ -730,7 +746,7 @@ pub fn Runtime(comptime App: type) type {
                 .ctrl_c_pending = app.input_runtime.gestures.ctrlCExitArmed(),
                 .shimmer_pos = shimmer_pos,
                 .now_ms = now_ms,
-                .model_query_active = model_query != null,
+                .model_query_active = model_query != null and !effort_command_without_levels,
                 .model_picker_stage = model_picker_stage,
                 .model_completions_loading = if (model_query != null and model_picker_stage == .model) app.isModelCacheLoading() else false,
                 .model_completions_failed = if (model_query != null and model_picker_stage == .model) app.isModelCacheFailed() else false,
@@ -811,6 +827,7 @@ pub fn Runtime(comptime App: type) type {
                     app.session_persistence.fork_menu.projection()
                 else
                     .{},
+                .effort_menu = render_input.effortMenuProjection(&app.input_runtime.effort_menu),
                 .statusline_menu = render_input.statuslineMenuProjection(
                     &app.input_runtime.statusline_menu,
                     settings_snapshot,
@@ -1183,7 +1200,7 @@ pub fn Runtime(comptime App: type) type {
                     if (!question_active and approval == null and
                         (settingsMenuActive(app) or helpMenuActive(app) or
                             skillsMenuActive(app) or modelMenuActive(app) or
-                            sessionMenuActive(app) or forkMenuActive(app)))
+                            sessionMenuActive(app) or forkMenuActive(app) or effortMenuActive(app)))
                     {
                         app.shell.render_requests.request(.footer);
                     }
@@ -1193,7 +1210,7 @@ pub fn Runtime(comptime App: type) type {
                 },
             }
 
-            if (!question_active and approval == null and (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(app) or forkMenuActive(app))) {
+            if (!question_active and approval == null and (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(app) or forkMenuActive(app) or effortMenuActive(app))) {
                 if (try app_lifecycle.closeFullTranscriptIfActive(
                     app.alloc,
                     &app.terminal,
@@ -2013,6 +2030,11 @@ pub fn Runtime(comptime App: type) type {
 
         fn helpMenuActive(app: *const App) bool {
             if (comptime @hasField(App, "input_runtime")) return app.input_runtime.help_menu.active;
+            return false;
+        }
+
+        fn effortMenuActive(app: *const App) bool {
+            if (comptime @hasField(App, "input_runtime")) return app.input_runtime.effort_menu.active;
             return false;
         }
 

@@ -29,6 +29,9 @@ pub const Extras = struct {
     notify: ?runtime_mod.Notify = null,
     /// See `runtime.Options.slash_commands`.
     slash_commands: bool = false,
+    /// The host the config changed under: it takes the new config in place
+    /// (`Host.reload`) and is returned, unless no server is left.
+    reuse: ?*Host = null,
 };
 
 /// Loads the host for a workspace, or null when there is no home folder or no
@@ -44,8 +47,11 @@ pub const Host = struct {
     gpa: Allocator,
     runtime: Runtime,
     catalog: Catalog,
-    /// What loading the config skipped and why, one sentence each; owned by `gpa`.
+    /// What loading the config skipped and why, one sentence each; owned by
+    /// `gpa`. A reload replaces them under `notes_mutex`, which a thread other
+    /// than the reloading one holds while it reads them.
     notes: []const []const u8 = &.{},
+    notes_mutex: std.Io.Mutex = .init,
     /// For an owner that replaces the host while others still use it: the
     /// uses still running, and whether it was replaced. The owner guards both.
     leases: usize = 0,
@@ -65,6 +71,7 @@ pub const Host = struct {
         errdefer gpa.destroy(h);
         h.gpa = gpa;
         h.notes = &.{};
+        h.notes_mutex = .init;
         h.leases = 0;
         h.retired = false;
         try h.runtime.start(gpa, io, configs, inherited, options);
@@ -76,11 +83,33 @@ pub const Host = struct {
     /// Stops every server and frees the host.
     pub fn destroy(h: *Host) void {
         const gpa = h.gpa;
-        for (h.notes) |note| gpa.free(note);
-        gpa.free(h.notes);
+        freeNotes(gpa, h.notes);
         h.catalog.deinit();
         h.runtime.deinit();
         gpa.destroy(h);
+    }
+
+    /// Takes a changed config in place: only a server whose config changed
+    /// restarts (`Runtime.reload`), and the catalog follows. `notes` replace
+    /// the host's, which it then owns, also on failure. Called by the one
+    /// thread that reloads; others may use the host meanwhile.
+    pub fn reload(
+        h: *Host,
+        configs: []const mcp_contract.McpServerConfig,
+        inherited: *const std.process.Environ.Map,
+        notes: []const []const u8,
+    ) !void {
+        h.notes_mutex.lockUncancelable(h.runtime.io);
+        const old = h.notes;
+        h.notes = notes;
+        h.notes_mutex.unlock(h.runtime.io);
+        freeNotes(h.gpa, old);
+        try h.catalog.reload(try h.runtime.reload(configs, inherited));
+    }
+
+    fn freeNotes(gpa: Allocator, notes: []const []const u8) void {
+        for (notes) |note| gpa.free(note);
+        gpa.free(notes);
     }
 
     /// Replaced: until this host is gone, no other host starts a server, so

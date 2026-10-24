@@ -3,12 +3,7 @@
     "module": "HostLifecycle",
     "smoke": "HostLifecycle.cfg",
     "stress": "HostLifecycle.stress.cfg",
-    "findings": [
-      {
-        "config": "HostLifecycle.findings.cfg",
-        "invariant": "AtMostOneOwner"
-      }
-    ],
+    "findings": [],
     "repair": []
   },
   {

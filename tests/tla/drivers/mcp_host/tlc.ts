@@ -29,6 +29,8 @@ export interface TlcRun {
   distinct?: number;
   queued?: number;
   violated?: string;
+  /** An action property, which TLC names, unlike the rest of the temporal ones. */
+  action?: string;
   temporal: boolean;
   completed: boolean;
 }
@@ -64,6 +66,7 @@ export async function runTlc(opts: {
     label: opts.label, module: opts.module, config: cfgName, command, exit, seconds: (Date.now() - started) / 1000, log, output,
     generated: num(stats?.[1]), distinct: num(stats?.[2]), queued: num(stats?.[3]),
     violated: /Invariant (\w+) is violated/.exec(output)?.[1],
+    action: /Action property (\w+) is violated/.exec(output)?.[1],
     temporal: output.includes("Temporal properties were violated"),
     completed: output.includes("Model checking completed. No error has been found."),
   };

@@ -118,12 +118,18 @@ pub const State = struct {
         self.replaceHost(try load(alloc, workspace_root, registry, .{ .questions = questions, .notify = self.host_sink.?.notify(), .slash_commands = true }));
     }
 
-    /// Loads the config again after `/mcp` changed it; calls still using the
-    /// old host finish on it.
+    /// Loads the config again after `/mcp` changed it. The host takes it in
+    /// place, so only a server whose config changed restarts. A new host
+    /// comes only when there was none, or the last server went; calls still
+    /// using an old one finish on it.
     pub fn reloadHost(self: *State, alloc: Allocator, workspace_root: []const u8, registry: tool_dispatch.Registry) !void {
         const load = self.host_load orelse return;
         const sink = self.host_sink orelse return;
-        self.replaceHost(try load(alloc, workspace_root, registry, .{ .questions = self.host_questions, .notify = sink.notify(), .slash_commands = true }));
+        const lease = self.leaseHost();
+        defer if (lease) |l| l.deinit();
+        const current = if (lease) |l| l.host else null;
+        const next = try load(alloc, workspace_root, registry, .{ .questions = self.host_questions, .notify = sink.notify(), .slash_commands = true, .reuse = current });
+        if (next != current) self.replaceHost(next);
         self.startHostServers();
     }
 
@@ -197,8 +203,8 @@ pub const State = struct {
         const lease = self.leaseHost() orelse return;
         defer lease.deinit();
         self.host_started_ms = io_mod.milliTimestamp();
-        for (0..lease.host.runtime.servers().len) |i| lease.host.runtime.prepare(i) catch |err| {
-            debug_trace.logf("mcp", "MCP servers not started in the background at={d} err={s}", .{ i, @errorName(err) });
+        for (lease.host.runtime.servers()) |s| lease.host.runtime.prepare(s.name) catch |err| {
+            debug_trace.logf("mcp", "MCP servers not started in the background server={s} err={s}", .{ s.name, @errorName(err) });
             return;
         };
     }

@@ -37,6 +37,7 @@
   { "file": "tui-usage.test.ts", "weight": 16 },
   { "file": "tui-decision-prompts.test.ts", "weight": 174 },
   { "file": "tui-direct-write-audit.test.ts", "weight": 2 },
+  { "file": "tui-effort-menu.test.ts", "weight": 20 },
   { "file": "tui-file-picker.test.ts", "weight": 100 },
   { "file": "tui-full-transcript-brutal.test.ts", "weight": 36 },
   { "file": "tui-gateway-stream-lifecycle.test.ts", "weight": 178 },

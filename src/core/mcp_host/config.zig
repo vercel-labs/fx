@@ -82,10 +82,9 @@ fn commandLine(arena: Allocator, command: []const u8, args: []const []const u8) 
     return out.items;
 }
 
-/// Allocates everything with `arena`, which must outlive the engine: the
-/// engine copies each config but keeps pointing at a stdio server's
-/// environment. Saved sign-in credentials are not read here: the runtime
-/// hands them to the engine from its own thread.
+/// Allocates everything with `arena`; the engine copies what it keeps. Saved
+/// sign-in credentials are not read here: the runtime hands them to the
+/// engine from its own thread.
 pub fn resolve(
     arena: Allocator,
     configs: []const McpServerConfig,
@@ -155,6 +154,30 @@ pub fn resolve(
         try engine_server.append(arena, i);
     }
     return .{ .servers = servers, .engine = engine.items, .engine_server = engine_server.items };
+}
+
+/// `servers` copied into `arena`, which outlives them: a server's strings
+/// that equal the ones its namesake in `prior` has are shared, so taking a
+/// config that changed little again costs little more than the list.
+pub fn keepServers(arena: Allocator, servers: []const Server, prior: []const Server) Allocator.Error![]Server {
+    const out = try arena.alloc(Server, servers.len);
+    for (servers, out) |s, *o| {
+        const old: ?Server = for (prior) |p| {
+            if (std.mem.eql(u8, p.name, s.name)) break p;
+        } else null;
+        o.* = s;
+        o.name = if (old) |p| p.name else try arena.dupe(u8, s.name);
+        inline for (.{ "url", "command", "missing", "workspace" }) |field| {
+            @field(o, field) = try reuse(arena, @field(s, field), if (old) |p| @field(p, field) else null);
+        }
+    }
+    return out;
+}
+
+fn reuse(arena: Allocator, value: ?[]const u8, old: ?[]const u8) Allocator.Error!?[]const u8 {
+    const v = value orelse return null;
+    if (old) |o| if (std.mem.eql(u8, o, v)) return o;
+    return try arena.dupe(u8, v);
 }
 
 /// `url`'s scheme and authority, such as `https://mcp.slack.com`.

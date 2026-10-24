@@ -48,6 +48,9 @@ const InlinePickerSuppression = union(enum) {
 
 pub const model_picker_speed_options = [_][]const u8{ "normal", "fast", "ultrafast" };
 
+/// The composer text that opens the effort column for the current model.
+pub const effort_prefix = "/effort ";
+
 /// `/login` and `/setup` are aliases of `/provider`: all open the same
 /// columnar picker. Typed text keeps whichever spelling the user wrote;
 /// executing the bare command reseeds the composer with the canonical
@@ -57,10 +60,15 @@ pub const login_prefix = "/login ";
 const setup_prefix = "/setup ";
 pub const provider_picker_prefixes = [_][]const u8{ provider_prefix, login_prefix, setup_prefix };
 
+/// The command a model picker query belongs to. `/effort ` opens the effort
+/// column of `/model` on its own, for the current model.
+pub const ModelPickerCommand = enum { model, effort };
+
 pub const ModelPickerQuery = struct {
     stage: ModelPickerStage,
     query: []const u8,
     token_start: usize,
+    command: ModelPickerCommand = .model,
 };
 
 pub const ProviderPickerQuery = struct {
@@ -291,6 +299,12 @@ pub const State = struct {
         const items = editor.input.items;
         const trim_start = leadingWhitespaceLen(items);
         const trimmed = items[trim_start..];
+        if (trimmed.len >= effort_prefix.len and std.ascii.eqlIgnoreCase(trimmed[0..effort_prefix.len], effort_prefix)) return .{
+            .stage = .effort,
+            .command = .effort,
+            .query = trimmed[effort_prefix.len..],
+            .token_start = trim_start + effort_prefix.len,
+        };
         const prefix = "/model ";
         if (trimmed.len < prefix.len or !std.ascii.eqlIgnoreCase(trimmed[0..prefix.len], prefix)) return null;
 
@@ -431,6 +445,10 @@ pub const State = struct {
                 self.model_completion_index = 0;
                 self.model_completion_window_start = 0;
                 self.model_completion_anchor_current = false;
+                // The `/effort ` column reads the effort highlight with no
+                // `/model` flow open; `/model` sets it again on its effort stage.
+                self.model_picker_effort_index = 0;
+                self.model_picker_effort_window_start = 0;
             },
             .effort => {
                 self.model_picker_effort_index = 0;
@@ -517,6 +535,12 @@ pub fn isBareModelCommandAtCursor(editor: *const editor_state.State) bool {
     if (editor.cursor != editor.input.items.len) return false;
     const trimmed = std.mem.trimStart(u8, editor.input.items, " \t");
     return std.ascii.eqlIgnoreCase(trimmed, "/model");
+}
+
+pub fn isBareEffortCommandAtCursor(editor: *const editor_state.State) bool {
+    if (editor.cursor != editor.input.items.len) return false;
+    const trimmed = std.mem.trimStart(u8, editor.input.items, " \t");
+    return std.ascii.eqlIgnoreCase(trimmed, effort_prefix[0 .. effort_prefix.len - 1]);
 }
 
 pub fn filterCompletionLabels(query: []const u8, options: []const []const u8, out: [][]const u8) usize {

@@ -816,10 +816,10 @@ pub noinline fn composePickerOptionRowAnnotated(
     if (width_usize == 0 or start_col == 0 or start_col > width) return row;
 
     if (start_col > 1) try row_text.appendAbsoluteColumn(alloc, &row, start_col);
-    // Model, provider, and model-catalog pickers signal selection by
+    // Model, provider, model-catalog, and effort pickers signal selection by
     // brightness alone, like the question panel; other pickers keep the filled row.
     const selected_style = switch (kind) {
-        .model_stage, .provider_stage, .models => ui_render.selected_completion_style,
+        .model_stage, .provider_stage, .models, .effort => ui_render.selected_completion_style,
         .file, .slash, .skills, .help, .settings, .sessions, .fork, .mcp, .auth => ui_render.approval_button_inactive_style,
     };
     const base_style = if (selected) selected_style else ui_render.dim_style;
@@ -917,6 +917,7 @@ pub fn composePickerStatusRowWithProvider(
             .api_key => "",
         },
         .models => "no models available",
+        .effort => "no reasoning effort levels",
         .file => if (loading)
             "indexing files..."
         else if (failed)

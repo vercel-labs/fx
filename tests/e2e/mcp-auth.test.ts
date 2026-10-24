@@ -1348,7 +1348,7 @@ describe("MCP login", () => {
     expect(auth.requests.filter((r) => r.path === "/.well-known/oauth-authorization-server").length).toBe(1);
   }, 90_000);
 
-  test.skipIf(!tmuxAvailable())("a config change during a sign-in ends it, clears \"Signing in\", and says how to sign in again", async () => {
+  test.skipIf(!tmuxAvailable())("a config change during a sign-in keeps it going, unless it removes that server: then it ends and clears \"Signing in\"", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
     const root = createRoot(auth);
@@ -1363,9 +1363,16 @@ describe("MCP login", () => {
     await tui.waitForText("Sign in to fixture in your browser.", 10_000);
     await tui.waitForText("Signing in to fixture", 10_000);
 
+    // Another server's change leaves this sign-in waiting for its browser.
     await tui.sendText("/mcp add web https://w.example/mcp");
     await tui.waitForText("Added web to ~/.fx/mcp.json.", 10_000);
-    await tui.waitForText("Couldn't sign in to fixture: the MCP config changed before the browser came back; run /mcp login fixture again.", 10_000);
+    await Bun.sleep(1_000);
+    expect(await tui.capturePane()).toContain("Signing in to fixture");
+    expect(await tui.captureFullScrollback()).not.toContain("Couldn't sign in to fixture");
+
+    // Removing the server it signs in to ends it.
+    await tui.sendText("/mcp remove fixture");
+    await tui.waitForText("Couldn't sign in to fixture: the MCP config changed before the browser came back.", 10_000);
     // The status line catches up within its 250 ms refresh.
     const clearBy = Date.now() + 2_000;
     while ((await tui.capturePane()).includes("Signing in to fixture") && Date.now() < clearBy) await Bun.sleep(50);

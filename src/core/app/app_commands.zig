@@ -293,6 +293,7 @@ pub fn Handlers(comptime App: type) type {
                 .attach_image = commandAttachImage,
                 .manage_images = commandManageImages,
                 .handle_model = commandHandleModel,
+                .handle_effort = commandHandleEffort,
                 .handle_permissions = commandHandlePermissions,
                 .handle_allowlist = commandHandleAllowlist,
                 .show_stats = commandShowStats,
@@ -562,6 +563,24 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleModel(ctx: *anyopaque, query: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try session_commands.Commands(App).handleModel(app, query);
+        }
+
+        /// Bare `/effort` opens the menu of the current model's reasoning
+        /// effort levels; `/effort <level>` applies one.
+        fn commandHandleEffort(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            switch (try session_commands.Commands(App).handleEffort(app, rest)) {
+                .done => {},
+                .open_menu => |capabilities| {
+                    if (comptime @hasField(App, "skills")) app.skills.closeMenu();
+                    if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
+                    closeHelpMenuIfPresent(app);
+                    app.input_runtime.settings_menu.close();
+                    closeInlineCommandMenusIfPresent(app);
+                    try app.input_runtime.effort_menu.open(app.alloc, provider_runtime.model(app), capabilities, app.effort);
+                    app.shell.render_requests.request(.footer);
+                },
+            }
         }
 
         /// Bare `/permissions` opens its panel and writes nothing to the
@@ -1159,6 +1178,7 @@ pub fn Handlers(comptime App: type) type {
             if (comptime @hasField(InputRuntime, "info_panel")) app.input_runtime.info_panel.close();
             if (comptime @hasField(InputRuntime, "usage_menu")) closeUsageMenu(app);
             if (comptime @hasField(InputRuntime, "workspace_menu")) app.input_runtime.workspace_menu.close();
+            if (comptime @hasField(InputRuntime, "effort_menu")) app.input_runtime.effort_menu.close(app.alloc);
         }
 
         fn commandCopyLast(ctx: *anyopaque) !void {

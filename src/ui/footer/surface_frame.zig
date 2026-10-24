@@ -21,6 +21,7 @@ const help_menu_presentation = @import("help_menu_presentation.zig");
 const settings_menu_presentation = @import("settings_menu_presentation.zig");
 const mcp_host_menu_presentation = @import("mcp_host_menu_presentation.zig");
 const resume_menu_presentation = @import("resume_menu_presentation.zig");
+const effort_menu_presentation = @import("effort_menu_presentation.zig");
 const fork_menu_presentation = @import("fork_menu_presentation.zig");
 const question_ui = @import("question_ui.zig");
 const render_input = @import("render_input.zig");
@@ -405,7 +406,8 @@ fn buildFooterSurfaceProjection(
     const show_session_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !modal_active and ctx.session_menu.active;
     const show_fork_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !modal_active and ctx.fork_menu.active();
     const show_models_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !show_fork_menu and !modal_active and ctx.model_menu.active;
-    const show_inline_catalog = show_settings_menu or show_mcp_menu or show_help_menu or show_session_menu or show_fork_menu or show_models_menu;
+    const show_effort_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !show_fork_menu and !show_models_menu and !modal_active and ctx.effort_menu.active;
+    const show_inline_catalog = show_settings_menu or show_mcp_menu or show_help_menu or show_session_menu or show_fork_menu or show_models_menu or show_effort_menu;
     const show_skills_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !modal_active and ctx.skills_menu.active;
     const show_model_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !show_skills_query and !modal_active and
         ctx.model_query_active;
@@ -506,6 +508,8 @@ fn buildFooterSurfaceProjection(
         .fork
     else if (show_models_menu)
         .models
+    else if (show_effort_menu)
+        .effort
     else if (show_slash_query)
         .slash
     else if (show_auth_picker)
@@ -583,6 +587,12 @@ fn buildFooterSurfaceProjection(
         banner_rows,
         fork_menu_presentation.max_inline_rows,
     );
+    const effort_picker_row_budget = picker_presentation.inlinePickerRowBudgetCapped(
+        shell.layout.rows,
+        geometry.input_extra,
+        banner_rows,
+        effort_menu_presentation.max_inline_rows,
+    );
     const picker_rows: u16 = if (sizing_request) |request|
         if (request.file) |request_file|
             approval_ui.fileApprovalPickerRows(request_file)
@@ -640,6 +650,8 @@ fn buildFooterSurfaceProjection(
             shell.layout.cols,
             models_picker_row_budget,
         )
+    else if (show_effort_menu)
+        effort_menu_presentation.menuRowCount(ctx.effort_menu, effort_picker_row_budget)
     else if (show_skills_query)
         skills_menu_presentation.inlineMenuRowCount(
             ctx.skills_menu,

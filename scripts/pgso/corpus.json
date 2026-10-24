@@ -117,6 +117,7 @@
     {"name": "verify-compaction-policy", "argv": ["bun", "test", "--max-concurrency", "1", "./compaction-policy.test.ts"], "test_file": "compaction-policy.test.ts", "requires_tmux": false},
     {"name": "verify-tui-composer-edit-contracts", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-composer-edit-contracts.test.ts"], "test_file": "tui-composer-edit-contracts.test.ts"},
     {"name": "verify-tui-permissions-panel", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-permissions-panel.test.ts"], "test_file": "tui-permissions-panel.test.ts"},
+    {"name": "verify-tui-effort-menu", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-effort-menu.test.ts"], "test_file": "tui-effort-menu.test.ts"},
     {"name": "verify-tui-usage", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-usage.test.ts"], "test_file": "tui-usage.test.ts"},
     {"name": "verify-tui-decision-prompts", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-decision-prompts.test.ts"], "test_file": "tui-decision-prompts.test.ts"},
     {"name": "verify-poisoned-repository", "argv": ["bun", "test", "--max-concurrency", "1", "./poisoned-repository.test.ts"], "test_file": "poisoned-repository.test.ts"},

@@ -1,24 +1,30 @@
 ---- MODULE HostLifecycle ----
 \* fx's MCP host lifecycle, as the shell runs it.
 \*
-\* Code (vercel-labs/fx at 53a561bea):
-\*   - src/core/app/app_mcp_runtime.zig: loadHost, reloadHost (replaceHost
-\*     then startHostServers), leaseHost/releaseHost (a replaced host lives
-\*     until its last lease), destroyHost (process exit: signalServersForExit,
-\*     nothing waits), refreshHostStatus/hostStatusLine.
+\* Code (vercel-labs/fx):
+\*   - src/core/app/app_mcp_runtime.zig: loadHost, reloadHost (the host takes
+\*     the config in place, then startHostServers), leaseHost/releaseHost,
+\*     destroyHost (process exit: signalServersForExit, nothing waits),
+\*     refreshHostStatus/hostStatusLine.
 \*   - src/core/app/app_render_runtime.zig:1031: the first frame calls
 \*     startMcpHostServers, which prepares every server.
 \*   - src/core/mcp_host/runtime.zig: one owner thread per Runtime (start,
 \*     run, deinit); `.need` skips held servers (handle, `.need`); publish
-\*     turns held reasons and engine phases into statuses.
+\*     turns held reasons and engine phases into statuses; reload
+\*     (applyReload, dropServer) and drain's hold while a dropped server's
+\*     process stops (src/mcp/engine.zig reload, keeps, stopping).
 \*   - src/core/mcp_host/menu.zig statusLine: the status line text.
 \*   - src/mcp/io/process.zig signalAllForExit: SIGTERM to every process of
 \*     every engine in the program.
 \*
-\* One host is one Runtime and its owner thread. A reload makes a new host
-\* from the changed config and starts every server in it; the old host is
-\* retired and goes, with its servers, when its last lease ends. A lease is a
-\* `/mcp` verb, a status refresh, or a call still using that host.
+\* One host is one Runtime and its owner thread. A reload takes the changed
+\* config in that host: a server whose config is the same keeps its state
+\* and its process, a removed one's process stops, and one approved or added
+\* back starts once no process of it is left. A lease is a `/mcp` verb, a
+\* status refresh, or a call using the host; a reload no longer waits for
+\* one. When the config empties, or was empty, the shell swaps hosts
+\* instead, and the new one also waits for every retired host's processes;
+\* that only narrows what the model allows, so it is left out (MaxHosts 1).
 \*
 \* Server states per host (runtime.zig State, folded):
 \*   absent       not in the config (removed)
@@ -28,8 +34,8 @@
 \*   starting     connecting, or backing off (`connecting`, `retrying`)
 \*   ready, needs_login, failed
 \* Processes: `procs` are live server processes the host runs, `stopping`
-\* those whose host let go of them (stdin closed) that haven't exited yet,
-\* and `termed` those sent SIGTERM at quit.
+\* those it let go of (stdin closed) that haven't exited yet, and `termed`
+\* those sent SIGTERM at quit. A server has at most one of each.
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS
@@ -37,13 +43,14 @@ CONSTANTS
     Project,    \* those from ./.mcp.json, which start waiting for approval
     Reachable,  \* those whose command starts and answers
     NeedsAuth,  \* reachable HTTP servers that answer 401 until a sign-in
-    MaxHosts,   \* bound on reloads: hosts 1..MaxHosts
+    MaxReloads, \* bound on reloads
     MaxLeases   \* bound on leases one host holds at once
 
 ASSUME Project \subseteq Servers /\ Reachable \subseteq Servers /\ NeedsAuth \subseteq Reachable
-ASSUME MaxHosts \in Nat \ {0} /\ MaxLeases \in Nat
+ASSUME MaxReloads \in Nat /\ MaxLeases \in Nat
 
-Hosts == 1..MaxHosts
+\* One host: a reload keeps it.
+Hosts == {1}
 States == {"absent", "waiting", "rejected", "idle", "starting", "ready", "needs_login", "failed"}
 Decisions == {"ok", "pending", "approved", "rejected", "removed"}
 Changes == {"approved", "rejected", "removed", "ok"}
@@ -64,9 +71,10 @@ VARIABLES
     quit,       \* fx exited
     shown,      \* the status line's MCP text, as last refreshed
     refreshed,  \* the step just taken was a status refresh
-    heldAt      \* ghost: [Hosts -> SUBSET Servers] held when the host was made
+    heldAt,     \* ghost: [Hosts -> SUBSET Servers] held as of the last reload
+    reloads     \* reloads so far, for the bound
 
-vars == <<decision, cur, alive, retired, leases, st, procs, stopping, termed, framed, quit, shown, refreshed, heldAt>>
+vars == <<decision, cur, alive, retired, leases, st, procs, stopping, termed, framed, quit, shown, refreshed, heldAt, reloads>>
 
 D0 == [s \in Servers |-> IF s \in Project THEN "pending" ELSE "ok"]
 
@@ -107,6 +115,7 @@ TypeOK ==
     /\ framed \in BOOLEAN /\ quit \in BOOLEAN /\ refreshed \in BOOLEAN
     /\ shown \in Lines
     /\ heldAt \in [Hosts -> SUBSET Servers]
+    /\ reloads \in 0..MaxReloads
 
 Init ==
     /\ decision = D0
@@ -119,6 +128,7 @@ Init ==
     /\ framed = FALSE /\ quit = FALSE
     /\ shown = NoLine /\ refreshed = FALSE
     /\ heldAt = [h \in Hosts |-> IF h = 1 THEN Held(D0) ELSE {}]
+    /\ reloads = 0
 
 \* app_render_runtime.zig:1031 -> startHostServers: prepare(i) for every server.
 FirstFrame ==
@@ -126,32 +136,31 @@ FirstFrame ==
     /\ framed' = TRUE
     /\ st' = [st EXCEPT ![cur] = [s \in Servers |-> Started(st[cur][s])]]
     /\ refreshed' = FALSE
-    /\ UNCHANGED <<decision, cur, alive, retired, leases, procs, stopping, termed, quit, shown, heldAt>>
+    /\ UNCHANGED <<decision, cur, alive, retired, leases, procs, stopping, termed, quit, shown, heldAt, reloads>>
 
 \* Something needs a server's tools: a tool search, `/mcp show`, a call.
 Need(s) ==
     /\ ~quit /\ st[cur][s] = "idle"
     /\ st' = [st EXCEPT ![cur][s] = "starting"]
     /\ refreshed' = FALSE
-    /\ UNCHANGED <<decision, cur, alive, retired, leases, procs, stopping, termed, framed, quit, shown, heldAt>>
+    /\ UNCHANGED <<decision, cur, alive, retired, leases, procs, stopping, termed, framed, quit, shown, heldAt, reloads>>
 
-\* The owner thread starts the server's process. A retired host's servers
-\* stop on a thread of their own, so the UI never waits for them.
-\* While any other host still has a live process, in use under a lease or
-\* stopping, a host starts none, so a server never runs twice.
+\* The owner thread starts the server's process: only once no process of
+\* that server is live, even one a reload let go of that still stops, so a
+\* server never runs twice. Other servers' processes don't hold it up.
 Spawn(h, s) ==
     /\ ~quit /\ alive[h] /\ st[h][s] = "starting" /\ <<h, s>> \notin procs
-    /\ \A p \in Live : p[1] = h
+    /\ \A p \in Live : p[2] # s
     /\ procs' = procs \cup {<<h, s>>}
     /\ refreshed' = FALSE
-    /\ UNCHANGED <<decision, cur, alive, retired, leases, st, stopping, termed, framed, quit, shown, heldAt>>
+    /\ UNCHANGED <<decision, cur, alive, retired, leases, st, stopping, termed, framed, quit, shown, heldAt, reloads>>
 
 \* The server answered detection and its tool list.
 Answer(h, s) ==
     /\ ~quit /\ alive[h] /\ st[h][s] = "starting" /\ <<h, s>> \in procs /\ s \in Reachable
     /\ st' = [st EXCEPT ![h][s] = IF s \in NeedsAuth THEN "needs_login" ELSE "ready"]
     /\ refreshed' = FALSE
-    /\ UNCHANGED <<decision, cur, alive, retired, leases, procs, stopping, termed, framed, quit, shown, heldAt>>
+    /\ UNCHANGED <<decision, cur, alive, retired, leases, procs, stopping, termed, framed, quit, shown, heldAt, reloads>>
 
 \* The engine gave up on a server that never answers (its attempt limit).
 GiveUp(h, s) ==
@@ -159,18 +168,18 @@ GiveUp(h, s) ==
     /\ st' = [st EXCEPT ![h][s] = "failed"]
     /\ procs' = procs \ {<<h, s>>}
     /\ refreshed' = FALSE
-    /\ UNCHANGED <<decision, cur, alive, retired, leases, stopping, termed, framed, quit, shown, heldAt>>
+    /\ UNCHANGED <<decision, cur, alive, retired, leases, stopping, termed, framed, quit, shown, heldAt, reloads>>
 
 \* leaseHost: a `/mcp` verb, a status refresh, or a call takes the current host.
 Lease ==
     /\ ~quit /\ leases[cur] < MaxLeases
     /\ leases' = [leases EXCEPT ![cur] = @ + 1]
     /\ refreshed' = FALSE
-    /\ UNCHANGED <<decision, cur, alive, retired, st, procs, stopping, termed, framed, quit, shown, heldAt>>
+    /\ UNCHANGED <<decision, cur, alive, retired, st, procs, stopping, termed, framed, quit, shown, heldAt, reloads>>
 
 \* releaseHost: the last lease of a retired host retires it (Host.retire:
 \* Runtime.deinit on a thread of its own; the engine closes its servers'
-\* stdin).
+\* stdin). With reloads in place, no host is retired before quit.
 Release(h) ==
     /\ ~quit /\ leases[h] > 0
     /\ leases' = [leases EXCEPT ![h] = @ - 1]
@@ -180,10 +189,12 @@ Release(h) ==
             /\ stopping' = stopping \cup Of(h)
        ELSE UNCHANGED <<alive, procs, stopping>>
     /\ refreshed' = FALSE
-    /\ UNCHANGED <<decision, cur, retired, st, termed, framed, quit, shown, heldAt>>
+    /\ UNCHANGED <<decision, cur, retired, st, termed, framed, quit, shown, heldAt, reloads>>
 
 \* add, remove, approve, reject: hosts.changed -> applyMcpHostReload ->
-\* reloadHost: a new host from the config, then startHostServers.
+\* reloadHost -> Host.reload, then startHostServers. Only `s` changes: its
+\* running process, if a removal took it, stops; an approved or added-back
+\* server starts. Every other server keeps its state and process.
 Change(s, d) ==
     \/ d = "approved" /\ decision[s] = "pending"
     \/ d = "rejected" /\ decision[s] = "pending"
@@ -191,27 +202,24 @@ Change(s, d) ==
     \/ d = "ok" /\ decision[s] = "removed"
 
 Reload(s, d) ==
-    /\ ~quit /\ cur < MaxHosts /\ Change(s, d)
-    /\ LET n == cur + 1
-           nd == [decision EXCEPT ![s] = d]
-           free == leases[cur] = 0
+    /\ ~quit /\ reloads < MaxReloads /\ Change(s, d)
+    /\ reloads' = reloads + 1
+    /\ LET nd == [decision EXCEPT ![s] = d]
+           gone == {<<cur, s>>} \cap procs
        IN /\ decision' = nd
-          /\ cur' = n
-          /\ st' = [st EXCEPT ![n] = [x \in Servers |-> Started(Initial(nd, x))]]
-          /\ heldAt' = [heldAt EXCEPT ![n] = Held(nd)]
-          /\ retired' = [retired EXCEPT ![cur] = TRUE]
-          /\ alive' = [alive EXCEPT ![n] = TRUE, ![cur] = ~free]
-          /\ procs' = IF free THEN procs \ Of(cur) ELSE procs
-          /\ stopping' = IF free THEN stopping \cup Of(cur) ELSE stopping
+          /\ st' = [st EXCEPT ![cur][s] = Started(Initial(nd, s))]
+          /\ heldAt' = [heldAt EXCEPT ![cur] = Held(nd)]
+          /\ procs' = procs \ gone
+          /\ stopping' = stopping \cup gone
     /\ refreshed' = FALSE
-    /\ UNCHANGED <<leases, termed, framed, quit, shown>>
+    /\ UNCHANGED <<cur, alive, retired, leases, termed, framed, quit, shown>>
 
 \* A server whose stdin closed exits (also when fx quit meanwhile).
 Exit(h, s) ==
     /\ <<h, s>> \in stopping
     /\ stopping' = stopping \ {<<h, s>>}
     /\ refreshed' = FALSE
-    /\ UNCHANGED <<decision, cur, alive, retired, leases, st, procs, termed, framed, quit, shown, heldAt>>
+    /\ UNCHANGED <<decision, cur, alive, retired, leases, st, procs, termed, framed, quit, shown, heldAt, reloads>>
 
 \* destroyHost at process exit: every server of every host gets SIGTERM and
 \* nothing waits; fx is gone.
@@ -221,7 +229,7 @@ Quit ==
     /\ termed' = termed \cup procs \cup stopping
     /\ alive' = [h \in Hosts |-> FALSE]
     /\ refreshed' = FALSE
-    /\ UNCHANGED <<decision, cur, retired, leases, st, procs, stopping, framed, shown, heldAt>>
+    /\ UNCHANGED <<decision, cur, retired, leases, st, procs, stopping, framed, shown, heldAt, reloads>>
 
 \* A signalled server exits.
 TermExit(h, s) ==
@@ -229,14 +237,14 @@ TermExit(h, s) ==
     /\ procs' = procs \ {<<h, s>>}
     /\ stopping' = stopping \ {<<h, s>>}
     /\ refreshed' = FALSE
-    /\ UNCHANGED <<decision, cur, alive, retired, leases, st, termed, framed, quit, shown, heldAt>>
+    /\ UNCHANGED <<decision, cur, alive, retired, leases, st, termed, framed, quit, shown, heldAt, reloads>>
 
 \* refreshHostStatus: the line from the current host's statuses.
 RefreshStatus ==
     /\ ~quit
     /\ shown' = Line(cur)
     /\ refreshed' = TRUE
-    /\ UNCHANGED <<decision, cur, alive, retired, leases, st, procs, stopping, termed, framed, quit, heldAt>>
+    /\ UNCHANGED <<decision, cur, alive, retired, leases, st, procs, stopping, termed, framed, quit, heldAt, reloads>>
 
 Next ==
     \/ FirstFrame
@@ -260,9 +268,9 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 
 \* ---- Safety the code keeps ----
 
-\* A held server (waiting, rejected, or removed when its host was made) is
-\* never spawned by that host.
-HeldNeverSpawned == \A p \in procs \cup stopping \cup termed : p[2] \notin heldAt[p[1]]
+\* A held server (waiting, rejected, or removed as of the last reload) has
+\* no running process; a removed one's may still be stopping.
+HeldNeverSpawned == \A p \in procs : p[2] \notin heldAt[p[1]]
 
 \* After the first frame, and after every reload, no server the current host
 \* may run is left idle: unchanged servers come back.
@@ -275,15 +283,25 @@ RefreshedLineAgrees == refreshed => shown = Line(cur)
 QuitSignalsEveryServer == quit => Live \subseteq termed
 
 \* A removed server is never running in the current host.
-RemovedNotRunning == \A s \in Servers : decision[s] = "removed" => <<cur, s>> \notin Live
+RemovedNotRunning == \A s \in Servers : decision[s] = "removed" => <<cur, s>> \notin procs
 
-\* ---- Stated safety the code does not keep (HostLifecycle.findings.cfg) ----
-
-\* At most one owner thread drives servers at a time.
+\* At most one owner thread drives servers at a time: a reload keeps the host.
 AtMostOneOwner == Cardinality({h \in Hosts : alive[h]}) <= 1
 
-\* At most one live process per configured server.
-OneProcessPerServer == \A s \in Servers : Cardinality({h \in Hosts : <<h, s>> \in Live}) <= 1
+\* At most one live process per configured server: never one running beside
+\* the one a reload let go of.
+OneProcessPerServer ==
+    /\ procs \cap stopping = {}
+    /\ \A s \in Servers : Cardinality({h \in Hosts : <<h, s>> \in Live}) <= 1
+
+\* ---- Safety over steps ----
+
+\* Only the server a reload changed stops: a running process leaves only
+\* when its own server's config changed, when the engine gives up on it, or
+\* when fx quits.
+KeptServersKeepRunning ==
+    [][\A p \in procs : p \notin procs' =>
+         decision'[p[2]] # decision[p[2]] \/ quit \/ st[p[1]][p[2]] = "starting"]_vars
 
 \* ---- Liveness, under the fairness above ----
 

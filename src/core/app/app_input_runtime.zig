@@ -1377,6 +1377,8 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                     } else if (picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) {
                         try completion_rt.openCurrentModelPicker(app);
+                    } else if (picker_state.isBareEffortCommandAtCursor(&app.input_runtime.edit_state)) {
+                        try completion_rt.openCurrentEffortPicker(app);
                     } else if (completion_rt.hasFileQuery(app)) {
                         if ((try completion_rt.autocompleteFilePickerSelection(app, max_input_len)) == .limit_exceeded) {
                             try input_limit_feedback.report(App, app, .composer, 1);
@@ -1453,6 +1455,7 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 },
                 '\r' => {
+                    if (try submitEffortMenuSelection(app)) return;
                     if (try submitSettingsMenuSelection(app)) return;
                     if (try submitHelpMenuSelection(app, max_input_len, max_prompt_history)) return;
                     if (try submitMcpHostMenu(app)) return;
@@ -2046,9 +2049,11 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn dismissActiveMenusForComposerEdit(app: *App) bool {
-            // The fork menu reads no query from the composer, so an edit closes it.
+            // The fork and effort menus read no query from the composer, so
+            // an edit closes them.
             const fork_menu_closed = cancelForkMenu(app);
-            return dismissAuthPickerForComposerEdit(app) or fork_menu_closed;
+            const effort_menu_closed = cancelEffortMenu(app);
+            return dismissAuthPickerForComposerEdit(app) or fork_menu_closed or effort_menu_closed;
         }
 
         fn dismissActiveMenusThenRedraw(app: *App) void {
@@ -2793,7 +2798,7 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeInterrupt(app, "approval_prompt");
                     return;
                 }
-                if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app) or cancelForkMenu(app)) {
+                if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app) or cancelForkMenu(app) or cancelEffortMenu(app)) {
                     _ = disarmEscapeClear(app);
                     _ = disarmEscapeInterrupt(app, "menu");
                     app.shell.render_requests.request(.footer);
@@ -2840,7 +2845,7 @@ pub fn Runtime(comptime App: type) type {
                 _ = disarmEscapeClear(app);
                 return;
             }
-            if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app) or cancelForkMenu(app)) {
+            if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app) or cancelForkMenu(app) or cancelEffortMenu(app)) {
                 _ = disarmEscapeClear(app);
                 app.shell.render_requests.request(.footer);
                 return;
@@ -2941,6 +2946,22 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasField(App, "session_persistence")) return false;
             if (!forkMenuActive(app)) return false;
             app.session_persistence.fork_menu.close(app.alloc);
+            return true;
+        }
+
+        fn cancelEffortMenu(app: *App) bool {
+            if (!app.input_runtime.effort_menu.active) return false;
+            app.input_runtime.effort_menu.close(app.alloc);
+            return true;
+        }
+
+        /// Applies the level highlighted in the `/effort` menu and closes it.
+        fn submitEffortMenuSelection(app: *App) !bool {
+            const menu = &app.input_runtime.effort_menu;
+            const effort = menu.selectedEffort() orelse return false;
+            menu.close(app.alloc);
+            try session_commands.Commands(App).selectEffort(app, effort);
+            app.shell.render_requests.request(.footer);
             return true;
         }
     };

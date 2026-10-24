@@ -12,7 +12,9 @@ const testing = std.testing;
 /// "withdraw" asks form question Q1, withdraws it, asks Q2, and once Q2 is
 /// answered, returns what reached each: "e1 " if Q1 got an answer, then
 /// "e2=" and Q2's `name`. A call that mentions "confirm" asks question c1
-/// and returns "c1=" and the answer's action.
+/// and returns "c1=" and the answer's action. A call that mentions "pid"
+/// returns the server's process id, as "pid=" and the number. Started with
+/// `linger` as its first argument, it exits a second after its stdin ends.
 pub const script =
     \\#!/bin/sh
     \\while IFS= read -r line; do
@@ -37,9 +39,11 @@ pub const script =
     \\    *'"id":"e2"'*)
     \\      name=$(printf '%s' "$line" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
     \\      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%se2=%s"}]}}\n' "$call" "$got" "$name" ;;
+    \\    *'"method":"tools/call"'*pid*) printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"pid=%s"}]}}\n' "$id" "$$" ;;
     \\    *'"method":"tools/call"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"hi"}]}}\n' "$id" ;;
     \\  esac
     \\done
+    \\if [ "$1" = linger ]; then sleep 1; fi
     \\
 ;
 

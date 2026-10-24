@@ -25,8 +25,10 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   // SignIn's three did too, with the hold while another host is alive: its smoke and stress
   // configs now check IndicatorImpliesListener, OneSignInPerServer and
   // IndicatorClears. UrlRetry's finding is the code before the held call:
-  // it ended the call at the -32042 error.
-  expect(count("finding", "FINDING")).toBe(3);
+  // it ended the call at the -32042 error. HostLifecycle's AtMostOneOwner
+  // became the code once a reload kept its host: its smoke and stress
+  // configs check it.
+  expect(count("finding", "FINDING")).toBe(2);
   expect(count("repair", "PASS")).toBe(1);
 }, 1_800_000);
 
@@ -49,7 +51,7 @@ const controls: { name: string; module: string; constants: Record<string, never>
   },
   {
     name: "host lifecycle", module: "HostLifecycle",
-    constants: { ObsServers: ["a", "p"], ObsProject: ["p"], ObsReachable: ["a", "p"], ObsNeedsAuth: [], ObsMaxHosts: 1, ObsMaxLeases: 1 },
+    constants: { ObsServers: ["a", "p"], ObsProject: ["p"], ObsReachable: ["a", "p"], ObsNeedsAuth: [], ObsMaxReloads: 1, ObsMaxLeases: 1 },
     good: [
       { event: "spawn", data: { server: "a" } },
       { event: "ready", data: { server: "a" } },

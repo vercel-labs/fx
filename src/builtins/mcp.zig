@@ -134,15 +134,17 @@ pub fn loadHost(
     try skipUnprintableNames(alloc, &loaded);
     // A host with no servers still carries the notes saying why.
     if (loaded.configs.items.len == 0 and loaded.diagnostics.items.len == 0) return null;
-    const notes = try alloc.alloc([]const u8, loaded.diagnostics.items.len);
-    var rendered: usize = 0;
-    errdefer {
-        for (notes[0..rendered]) |note| alloc.free(note);
-        alloc.free(notes);
+    if (extras.reuse) |h| {
+        // Only the servers whose config changed restart. The host owns the
+        // notes either way.
+        if (h.reload(loaded.configs.items, &inherited, try renderNotes(alloc, loaded.diagnostics.items))) |_| return h else |err| {
+            debug_trace.logf("mcp", "MCP host not reloaded in place, starting a new one err={s}", .{@errorName(err)});
+        }
     }
-    for (loaded.diagnostics.items, notes) |diagnostic, *note| {
-        note.* = try project_config.renderWorkspaceDiagnostic(alloc, diagnostic);
-        rendered += 1;
+    const notes = try renderNotes(alloc, loaded.diagnostics.items);
+    errdefer {
+        for (notes) |note| alloc.free(note);
+        alloc.free(notes);
     }
     const h = try mcp_host.Host.create(alloc, io_mod.getIo(), loaded.configs.items, &inherited, .{
         .client_version = build_options.app_version,
@@ -154,6 +156,21 @@ pub fn loadHost(
     }, builtins);
     h.notes = notes;
     return h;
+}
+
+/// Each diagnostic in a sentence, owned by `alloc`.
+fn renderNotes(alloc: Allocator, diagnostics: []const project_config.WorkspaceDiagnostic) ![]const []const u8 {
+    const notes = try alloc.alloc([]const u8, diagnostics.len);
+    var rendered: usize = 0;
+    errdefer {
+        for (notes[0..rendered]) |note| alloc.free(note);
+        alloc.free(notes);
+    }
+    for (diagnostics, notes) |diagnostic, *note| {
+        note.* = try project_config.renderWorkspaceDiagnostic(alloc, diagnostic);
+        rendered += 1;
+    }
+    return notes;
 }
 
 fn traceWorkspaceDiagnostics(diagnostics: []const project_config.WorkspaceDiagnostic) void {
