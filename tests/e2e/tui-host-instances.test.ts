@@ -196,6 +196,15 @@ function hostRecords(home: string): string[][] {
     .map((name) => (JSON.parse(readFileSync(join(dir, name), "utf8")) as { sessions: string[] }).sessions);
 }
 
+// The host records in `home`, each as the profile of each listed session.
+function hostProfiles(home: string): Array<Array<string | null>> {
+  const dir = join(home, ".fx", "hosts");
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => (JSON.parse(readFileSync(join(dir, name), "utf8")) as { profiles?: Array<string | null> }).profiles ?? []);
+}
+
 // Runs three instances in `home`, prompts each as HOST_A, HOST_B, and
 // HOST_C, and quits; returns their session ids.
 async function saveGroup(home: string, workspace: string): Promise<string[]> {
@@ -971,6 +980,120 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         cleanupIsolatedTestHome(home);
         rmSync(workspace, { recursive: true, force: true });
       }
+    },
+    TIMEOUT,
+  );
+
+
+  test(
+    "resuming brings each instance back in the profile it ran in",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-profiles-")));
+      try {
+        writeProfile(home, "limited", { description: "Reads only", tools: ["read_file"] });
+        // fx 1 runs in main, and fx 2 is launched in `limited`.
+        await withHost(answerByLetter, { remainOnExit: true, reuse: { home, workspace } }, async ({ session }) => {
+          await session.sendText("HOST_A first run");
+          await session.waitForText("HOST_ANSWER_A", 30_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("/launch limited");
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("HOST_B first run");
+          await session.waitForText("HOST_ANSWER_B", 30_000);
+          await quitWith(session, "/exit");
+        });
+        const [a, b] = ["A", "B"].map((letter) => sessionHolding(home, `HOST_ANSWER_${letter}`)!);
+        expect(hostRecords(home)).toEqual([[a, b]]);
+        expect(hostProfiles(home)).toEqual([["main", "limited"]]);
+
+        // Resuming the limited one brings it back first and still limited,
+        // and the other in main.
+        const bodies = await withHost(answerByLetter, { args: `--resume ${b}`, reuse: { home, workspace } }, async ({ session }) => {
+          await session.waitForPane((pane) => pane.includes("fx 1/2") && pane.includes("HOST_ANSWER_B"), 30_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("HOST_C on the limited one");
+          await session.waitForText("HOST_ANSWER_C", 30_000);
+          await session.waitForComposer(15_000);
+          await session.sendKeys("M-Right");
+          await session.waitForPane((pane) => pane.includes("fx 2/2") && pane.includes("HOST_ANSWER_A"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("HOST_D on the main one");
+          await session.waitForText("HOST_ANSWER_D", 30_000);
+        });
+        const limited = bodies.find((body) => letterOf(body) === "C")!;
+        const unlimited = bodies.find((body) => letterOf(body) === "D")!;
+        expect(toolNames(limited)).toContain("read_file");
+        expect(toolNames(limited)).not.toContain("shell");
+        expect(toolNames(unlimited)).toContain("shell");
+      } finally {
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a lone instance in a profile resumes in it, unless --profile names another",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-lone-profile-")));
+      try {
+        writeProfile(home, "limited", { description: "Reads only", tools: ["read_file"] });
+        await withHost(answerByLetter, { args: "--profile limited", remainOnExit: true, reuse: { home, workspace } }, async ({ session }) => {
+          await session.sendText("HOST_A only run");
+          await session.waitForText("HOST_ANSWER_A", 30_000);
+          await quitWith(session, "/exit");
+        });
+        const a = sessionHolding(home, "HOST_ANSWER_A")!;
+        expect(hostRecords(home)).toEqual([[a]]);
+        expect(hostProfiles(home)).toEqual([["limited"]]);
+        const resumed = async (args: string, letter: string) => {
+          const bodies = await withHost(answerByLetter, { args, reuse: { home, workspace } }, async ({ session }) => {
+            await session.waitForPane((pane) => pane.includes("HOST_ANSWER_A"), 30_000);
+            await session.waitForComposer(15_000);
+            await session.sendText(`HOST_${letter} resumed`);
+            await session.waitForText(`HOST_ANSWER_${letter}`, 30_000);
+          });
+          return toolNames(bodies.find((body) => letterOf(body) === letter)!);
+        };
+        expect(await resumed(`--resume ${a}`, "B")).not.toContain("shell");
+        expect(await resumed(`--profile main --resume ${a}`, "C")).toContain("shell");
+      } finally {
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a hidden instance's waiting note names it by number and points the shorter way",
+    async () => {
+      await withHost((body) => {
+        if (answered(body)) return text("note_done", "NOTE_DONE");
+        return call("note_shell", "shell", { request: { action: "run", command: "rm -rf ./nothing-here" } });
+      }, { instances: 3, env: { FX_PERMISSION_MODE: "ask" } }, async ({ session }) => {
+        await session.waitForPane((pane) => pane.includes("fx 1/3"), 15_000);
+        await session.sendKeys("M-Left");
+        await session.waitForPane((pane) => pane.includes("fx 3/3"), 15_000);
+        await session.waitForComposer(15_000);
+        await session.sendText("NOTE_THREE go");
+        await session.waitForPane((pane) => pane.includes("rm -rf"), 15_000);
+        // fx 3 waits; from fx 1, Alt+← reaches it in one press.
+        await session.sendKeys("M-Right");
+        await session.waitForPane((pane) => pane.includes("fx 1/3") && pane.includes("fx 3 needs approval · Alt+←"), 15_000);
+        await session.waitForComposer(15_000);
+        await session.sendText("NOTE_ONE go");
+        await session.waitForPane((pane) => pane.includes("rm -rf"), 15_000);
+        // From fx 2, fx 1 comes first and is one Alt+← away.
+        await session.sendKeys("M-Right");
+        const pane = await session.waitForPane((value) => value.includes("fx 2/3") && value.includes("need you"), 15_000);
+        expect(pane).toContain("fx 1 and 1 more need you · Alt+←");
+        expect(pane).not.toContain("main");
+      });
     },
     TIMEOUT,
   );

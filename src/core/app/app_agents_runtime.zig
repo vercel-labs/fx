@@ -600,6 +600,52 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// How the waiting note names agent `child`, null for the first
+        /// instance: an instance by its place, "fx 3", while several are
+        /// open, else "main"; a subagent by its own name. May use `buf`.
+        pub fn noteName(app: *App, child: ?*ChildAgent, buf: []u8) []const u8 {
+            if (child) |value| if (value.agent.role == .subagent) return value.displayName();
+            if (openInstanceCount(app) <= 1) return "main";
+            const number = instanceNumber(app, child) orelse return "fx";
+            return std.mem.print(buf, "fx {d}", .{number}) catch "fx";
+        }
+
+        /// Instance `child`'s place among the open instances, from 1, as
+        /// the footer counts them; null `child` is the first instance.
+        pub fn instanceNumber(app: *App, child: ?*ChildAgent) ?usize {
+            var number: usize = 0;
+            if (firstOpen(app)) {
+                number += 1;
+                if (child == null) return number;
+            }
+            for (app.child_agents.items) |value| {
+                if (value.agent.role != .instance) continue;
+                number += 1;
+                if (value == child) return number;
+            }
+            return null;
+        }
+
+        /// The key that reaches agent `target`, null for the first instance,
+        /// from the one on screen in fewer presses while several instances
+        /// are open. With one, main is back and its subagents ahead, as
+        /// before instances existed.
+        pub fn keyToward(app: *App, target: ?*ChildAgent) []const u8 {
+            if (openInstanceCount(app) <= 1) return if (target == null) "Alt+←" else "Alt+→";
+            var order: std.ArrayList(?*ChildAgent) = .empty;
+            defer order.deinit(app.alloc);
+            switchList(app, &order) catch return "Alt+→";
+            const from = positionIn(order.items, app.agent_on_screen) orelse return "Alt+→";
+            const to = positionIn(order.items, target) orelse return "Alt+→";
+            const forward = (to + order.items.len - from) % order.items.len;
+            return if (forward <= order.items.len - forward) "Alt+→" else "Alt+←";
+        }
+
+        fn positionIn(order: []const ?*ChildAgent, agent: ?*ChildAgent) ?usize {
+            for (order, 0..) |value, index| if (value == agent) return index;
+            return null;
+        }
+
         /// Whether the first instance, kept in `main_agent`, still runs.
         pub fn firstOpen(app: anytype) bool {
             if (comptime !@hasField(App, "instances")) return true;

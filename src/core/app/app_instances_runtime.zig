@@ -9,7 +9,9 @@ const agents = @import("../agents/agents.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_agents_runtime = @import("app_agents_runtime.zig");
 const app_process_runtime = @import("app_process_runtime.zig");
+const app_profile_runtime = @import("app_profile_runtime.zig");
 const host_record = @import("host_record.zig");
+const profiles = @import("../profiles/profiles.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -121,6 +123,12 @@ pub const Seed = struct {
     }
 };
 
+/// A session the host record lists and the profile its instance runs in.
+const Written = struct {
+    id: []u8,
+    profile: []u8,
+};
+
 pub const State = struct {
     seed: Seed = .{},
     /// Instances launched since the host started, the first one included.
@@ -139,9 +147,9 @@ pub const State = struct {
     /// are open, or the restored group's.
     group_id: [host_record.group_id_len]u8 = undefined,
     has_group: bool = false,
-    /// The session ids the record file lists now, in launch order, or none
-    /// while there is no file. Owned.
-    written: std.ArrayList([]u8) = .empty,
+    /// The sessions the record file lists now, in launch order, each with
+    /// its instance's profile, or none while there is no file. Owned.
+    written: std.ArrayList(Written) = .empty,
     /// Startup resumed the first instance's session, so its group comes
     /// back with the startup instances.
     restore_pending: bool = false,
@@ -159,7 +167,10 @@ pub const State = struct {
     }
 
     fn clearWritten(self: *State, alloc: Allocator) void {
-        for (self.written.items) |id| alloc.free(id);
+        for (self.written.items) |entry| {
+            alloc.free(entry.id);
+            alloc.free(entry.profile);
+        }
         self.written.clearRetainingCapacity();
     }
 
@@ -195,10 +206,12 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Launches an instance that resumes saved session `session_id`, for
-        /// a resumed host's group. Its conversation is drawn into its
-        /// own transcript now, in its own screen context.
-        pub fn launchResumed(app: *App, session_id: []const u8) !*ChildAgent {
-            return launchWith(app, null, session_id);
+        /// a resumed host's group, in `profile_name`, the profile it ran in,
+        /// or the launch profile when its record names none. Its
+        /// conversation is drawn into its own transcript now, in its own
+        /// screen context.
+        pub fn launchResumed(app: *App, session_id: []const u8, profile_name: ?[]const u8) !*ChildAgent {
+            return launchWith(app, profile_name, session_id);
         }
 
         fn resumeInContext(session_id: []const u8, app: *App, agent: *agents.Agent) anyerror!void {
@@ -276,38 +289,45 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Keeps the host record in step with the open instances: a
-        /// file listing their sessions while two or more are open, none
-        /// otherwise. Runs on the main loop and touches the disk only when
-        /// the list changes, so a launch, a close, `/new`, and an in-app
-        /// `/resume` all count alike. Waits while an instance has no session
-        /// yet, such as during the startup picker.
+        /// file listing their sessions and profiles while two or more are
+        /// open, or one runs in a profile other than `main`, so resuming it
+        /// brings that profile back; none otherwise. Runs on the main loop
+        /// and touches the disk only when the list changes, so a launch, a
+        /// close, `/new`, and an in-app `/resume` all count alike. Waits
+        /// while an instance has no session yet, such as during the startup
+        /// picker.
         pub fn syncRecord(app: *App) void {
             const state = &app.instances;
             var count: usize = 0;
             var same = true;
+            var profiled = false;
             if (AgentsRuntime.firstOpen(app)) {
                 const id = SessionRuntime.activeSessionId(&app.main_agent) orelse return;
-                same = same and matchesWritten(state, count, id);
+                const profile = profileName(&app.main_agent);
+                same = same and matchesWritten(state, count, id, profile);
+                profiled = profiled or !std.mem.eql(u8, profile, profiles.main_name);
                 count += 1;
             }
             for (app.child_agents.items) |child| {
                 if (child.agent.role != .instance) continue;
                 const id = SessionRuntime.activeSessionId(&child.agent) orelse return;
-                same = same and matchesWritten(state, count, id);
+                const profile = profileName(&child.agent);
+                same = same and matchesWritten(state, count, id, profile);
+                profiled = profiled or !std.mem.eql(u8, profile, profiles.main_name);
                 count += 1;
             }
             if (same and count == state.written.items.len) return;
-            if (count < 2) {
+            if (count < 2 and !profiled) {
                 if (state.written.items.len == 0) return;
                 state.clearWritten(app.alloc);
                 if (state.has_group) withHostsDir(app, removeRecord);
                 return;
             }
             state.clearWritten(app.alloc);
-            if (AgentsRuntime.firstOpen(app)) appendWritten(app, SessionRuntime.activeSessionId(&app.main_agent).?) catch return;
+            if (AgentsRuntime.firstOpen(app)) appendWritten(app, &app.main_agent) catch return;
             for (app.child_agents.items) |child| {
                 if (child.agent.role != .instance) continue;
-                appendWritten(app, SessionRuntime.activeSessionId(&child.agent).?) catch return;
+                appendWritten(app, &child.agent) catch return;
             }
             if (!state.has_group) {
                 state.group_id = host_record.newGroupId();
@@ -316,14 +336,24 @@ pub fn Runtime(comptime App: type) type {
             withHostsDir(app, writeRecord);
         }
 
-        fn matchesWritten(state: *const State, index: usize, id: []const u8) bool {
-            return index < state.written.items.len and std.mem.eql(u8, state.written.items[index], id);
+        /// The profile instance `agent` runs in: `main` unless one was applied.
+        fn profileName(agent: *const agents.Agent) []const u8 {
+            return agent.profile.profile.name;
         }
 
-        fn appendWritten(app: *App, id: []const u8) !void {
-            const copy = try app.alloc.dupe(u8, id);
-            errdefer app.alloc.free(copy);
-            try app.instances.written.append(app.alloc, copy);
+        fn matchesWritten(state: *const State, index: usize, id: []const u8, profile: []const u8) bool {
+            if (index >= state.written.items.len) return false;
+            const entry = state.written.items[index];
+            return std.mem.eql(u8, entry.id, id) and std.mem.eql(u8, entry.profile, profile);
+        }
+
+        /// Lists `agent`, which has a session, with its profile.
+        fn appendWritten(app: *App, agent: *agents.Agent) !void {
+            const id = try app.alloc.dupe(u8, SessionRuntime.activeSessionId(agent).?);
+            errdefer app.alloc.free(id);
+            const profile = try app.alloc.dupe(u8, profileName(agent));
+            errdefer app.alloc.free(profile);
+            try app.instances.written.append(app.alloc, .{ .id = id, .profile = profile });
         }
 
         fn withHostsDir(app: *App, comptime body: fn (*App, []const u8) anyerror!void) void {
@@ -337,10 +367,19 @@ pub fn Runtime(comptime App: type) type {
 
         fn writeRecord(app: *App, dir: []const u8) anyerror!void {
             const state = &app.instances;
+            const sessions = try app.alloc.alloc([]const u8, state.written.items.len);
+            defer app.alloc.free(sessions);
+            const names = try app.alloc.alloc(?[]const u8, state.written.items.len);
+            defer app.alloc.free(names);
+            for (state.written.items, sessions, names) |entry, *id, *name| {
+                id.* = entry.id;
+                name.* = entry.profile;
+            }
             try host_record.write(app.alloc, dir, .{
                 .group_id = &state.group_id,
                 .updated_ms = io_mod.milliTimestamp(),
-                .sessions = constNames(state.written.items),
+                .sessions = sessions,
+                .profiles = names,
             });
             debug_trace.eventf("host", "host_record_written", .{}, "group={s} sessions={d}", .{ &state.group_id, state.written.items.len });
         }
@@ -351,11 +390,14 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Brings back the group of the session the first instance resumed
-        /// at startup. Every other session its record lists
-        /// comes back as an instance with its saved conversation, after the
-        /// first and in their saved order, and the host keeps the group's
-        /// id. A session that can't load is skipped with a notice. The first
-        /// instance stays on screen.
+        /// at startup. The first instance runs in the profile its session
+        /// ran in, unless `--profile` named one. Every other session its
+        /// record lists comes back as an instance in its own profile with
+        /// its saved conversation, after the first and in their saved order,
+        /// and the host keeps the group's id. A session that can't load is
+        /// skipped with a notice. The first instance stays on screen. Runs
+        /// before the first instance takes a turn: startup and the startup
+        /// picker call it before the main loop reads input.
         pub fn restoreGroup(app: *App) void {
             const resumed = SessionRuntime.activeSessionId(&app.main_agent) orelse return;
             const home = io_mod.homeDir() orelse return;
@@ -372,16 +414,44 @@ pub fn Runtime(comptime App: type) type {
                 @memcpy(&app.instances.group_id, restore.group_id);
                 app.instances.has_group = true;
             }
-            debug_trace.eventf("host", "host_restore", .{}, "group={s} sessions={d}", .{ restore.group_id, restore.others.len });
-            for (restore.others) |id| {
-                _ = launchResumed(app, id) catch |err| {
-                    debug_trace.logf("host", "host_restore_skipped session={s} err={s}", .{ id, @errorName(err) });
-                    const body = app.alloc.print("Couldn't bring back session {s} with this one: {s}.", .{ id, @errorName(err) }) catch continue;
+            debug_trace.eventf("host", "host_restore", .{}, "group={s} sessions={d} profile={s}", .{
+                restore.group_id,
+                restore.others.len,
+                restore.profile orelse "none",
+            });
+            if (restore.profile) |name| if (app.instances.seed.profile_name == null) restoreFirstProfile(app, name);
+            for (restore.others) |member| {
+                _ = launchResumed(app, member.id, member.profile) catch |err| {
+                    debug_trace.logf("host", "host_restore_skipped session={s} err={s}", .{ member.id, @errorName(err) });
+                    const reason = if (member.profile) |name| app_profile_runtime.failureReason(app.alloc, name) catch null else null;
+                    defer if (reason) |text| app.alloc.free(text);
+                    const body = if (reason) |text|
+                        app.alloc.print("Couldn't bring back session {s} with this one: {s}", .{ member.id, text }) catch continue
+                    else
+                        app.alloc.print("Couldn't bring back session {s} with this one: {s}.", .{ member.id, @errorName(err) }) catch continue;
                     defer app.alloc.free(body);
                     app.writeDomainNotice(.{ .topic = "instances", .tone = .neutral, .body = body }, true) catch {};
                     continue;
                 };
             }
+        }
+
+        /// Puts the first instance back in profile `name`, the one its
+        /// resumed session ran in. One that can't load leaves it in the
+        /// launch profile, with a notice saying why.
+        fn restoreFirstProfile(app: *App, name: []const u8) void {
+            if (std.mem.eql(u8, name, profileName(&app.main_agent))) return;
+            app.applyFirstInstanceProfile(name) catch |err| {
+                debug_trace.logf("host", "host_restore_profile_failed name={s} err={s}", .{ name, @errorName(err) });
+                const reason = app_profile_runtime.failureReason(app.alloc, name) catch null;
+                defer if (reason) |text| app.alloc.free(text);
+                const body = app.alloc.print("Couldn't use profile '{s}', which this session ran in: {s}", .{
+                    name,
+                    if (reason) |text| text else @errorName(err),
+                }) catch return;
+                defer app.alloc.free(body);
+                app.writeDomainNotice(.{ .topic = "instances", .tone = .@"error", .body = body }, true) catch {};
+            };
         }
 
         fn constNames(names: []const []u8) []const []const u8 {
