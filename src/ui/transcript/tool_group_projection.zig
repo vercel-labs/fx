@@ -563,9 +563,31 @@ fn formatGroupBlock(
 ) !GroupBlock {
     const header = try formatGroupHeader(alloc, summary, cols, style);
     defer alloc.free(header);
+    // A single tool needs no summary row. Keep its capitalized status phrase
+    // and indent any attached output under it, the same way the transcript
+    // shows a lone Read or Ran.
+    const single_entry_id = if (status_indices.len == 1)
+        toolStatusEntryId(entries[status_indices[0]])
+    else
+        null;
+    const single_detail = if (single_entry_id) |entry_id|
+        detailForEntry(details, detail_indices, entry_id, null)
+    else
+        null;
+    // Collapse only a clean, completed single tool. Failures, cancellations,
+    // timeouts, and live rows keep the summary row so their state stays explicit.
+    const collapse_single = !collapse_tool_calls and single_entry_id != null and
+        (focused_entry_id == null or focused_entry_id != single_entry_id.?) and
+        single_detail != null and single_detail.?.outcome == .completed and
+        summary.completion_unreported == 0 and summary.not_executed == 0 and
+        summary.timed_out == 0 and summary.failed == 0 and
+        summary.denied == 0 and summary.cancelled == 0;
+
     var lines: std.ArrayList(transcript_blocks.LineProvenance) = .empty;
     errdefer lines.deinit(alloc);
-    try lines.append(alloc, .{ .entry = .{ .entry_id = entries[status_indices[0]].id(), .entry_class = .tool_status, .projection_part = .group_header } });
+    if (!collapse_single) {
+        try lines.append(alloc, .{ .entry = .{ .entry_id = entries[status_indices[0]].id(), .entry_class = .tool_status, .projection_part = .group_header } });
+    }
     if (collapse_tool_calls) {
         const bytes = try alloc.dupe(u8, header);
         errdefer alloc.free(bytes);
@@ -592,9 +614,10 @@ fn formatGroupBlock(
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    try out.writer.writeAll(header);
+    if (!collapse_single) try out.writer.writeAll(header);
 
     var static_index: usize = 0;
+    var first_output_row = true;
     for (status_indices) |status_index| {
         const entry = entries[status_index];
         const entry_id = toolStatusEntryId(entry) orelse continue;
@@ -613,7 +636,7 @@ fn formatGroupBlock(
         const display_phrase = try highlightCommandPhrase(scratch, phrase, detail, style.text_style) orelse phrase;
         static_index += 1;
         const last_static_row = !focused_in_group and static_index == static_count;
-        const connector = if (last_static_row) "└" else "├";
+        const connector = if (collapse_single) "●" else if (last_static_row) "└" else "├";
         const child = try scratch.print("{s} {s}", .{ connector, display_phrase });
         const clipped = try clipSummary(scratch, child, cols);
         try lines.append(alloc, .{ .entry = .{ .entry_id = entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
@@ -621,7 +644,8 @@ fn formatGroupBlock(
             try accentTrailingDiffStats(scratch, clipped, style.text_style)
         else
             clipped;
-        try out.writer.writeByte('\n');
+        if (!collapse_single or !first_output_row) try out.writer.writeByte('\n');
+        first_output_row = false;
         if (style.text_style.len > 0) try out.writer.writeAll(style.text_style);
         try out.writer.writeAll(accented);
         if (style.text_style.len > 0) try out.writer.writeAll(style.reset_style);
@@ -1780,7 +1804,7 @@ test "completed command rows shell-highlight quoted strings without coloring the
 
     // The header, connector, and action label stay uncolored; the command
     // verb and quoted string pick up the syntax palette and close again.
-    try std.testing.expect(std.mem.startsWith(u8, row, "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mprintf\x1b[39m "));
+    try std.testing.expect(std.mem.startsWith(u8, row, "● Ran \x1b[38;5;252mprintf\x1b[39m "));
     try std.testing.expect(std.mem.find(u8, row, "\x1b[38;5;250m'hello world'\x1b[39m") != null);
 }
 
@@ -1823,7 +1847,7 @@ test "minimal completed command rows reproject stored arguments at the current w
     var wide = try build(alloc, &entries, &details, 240);
     defer wide.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mprintf\x1b[39m " ++ text_utils.repeat("alpha-beta-gamma-delta-", 8),
+        "● Ran \x1b[38;5;252mprintf\x1b[39m " ++ text_utils.repeat("alpha-beta-gamma-delta-", 8),
         wide.entry_actions.items[0].override.bytes,
     );
 
@@ -1868,7 +1892,7 @@ test "minimal completed command rows reproject stored arguments at the current w
     var relative = try build(alloc, &relative_entries, &relative_details, 240);
     defer relative.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mcd\x1b[39m ./packages/cli \x1b[38;5;252m&&\x1b[39m \x1b[38;5;252mprintf\x1b[39m" ++ text_utils.repeat(" relative-path printf", 5) ++ " relative-path ",
+        "● Ran \x1b[38;5;252mcd\x1b[39m ./packages/cli \x1b[38;5;252m&&\x1b[39m \x1b[38;5;252mprintf\x1b[39m" ++ text_utils.repeat(" relative-path printf", 5) ++ " relative-path ",
         relative.entry_actions.items[0].override.bytes,
     );
 
@@ -1893,7 +1917,7 @@ test "minimal completed command rows reproject stored arguments at the current w
     var compatibility = try build(alloc, &compatibility_entries, &compatibility_details, 240);
     defer compatibility.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Installed skill \x1b[38;5;252mprintf\x1b[39m " ++ text_utils.repeat("alpha-beta-gamma-delta-", 8),
+        "● Installed skill \x1b[38;5;252mprintf\x1b[39m " ++ text_utils.repeat("alpha-beta-gamma-delta-", 8),
         compatibility.entry_actions.items[0].override.bytes,
     );
 }
@@ -2161,7 +2185,7 @@ test "expanded group children reproject stored commands at the current width" {
     var wide = try buildExpandedStyledInterruptible(alloc, &entries, &details, 400, .{}, null);
     defer wide.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mbun\x1b[39m run " ++ text_utils.repeat("pipeline-stage-", 10),
+        "● Ran \x1b[38;5;252mbun\x1b[39m run " ++ text_utils.repeat("pipeline-stage-", 10),
         wide.entry_actions.items[0].override.bytes,
     );
 
@@ -2258,7 +2282,10 @@ test "command reprojection keeps the row's own label across lifecycle states" {
         // row keeps its own label rather than the stored prediction.
         try std.testing.expect(std.mem.find(u8, row, "...") == null);
         try std.testing.expect(std.mem.find(u8, row, "alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta") != null);
-        const expected_prefix = try alloc.print("\n└ {s} ", .{case.label});
+        const expected_prefix = if (case.outcome == .completed)
+            try alloc.print("● {s} ", .{case.label})
+        else
+            try alloc.print("\n└ {s} ", .{case.label});
         defer alloc.free(expected_prefix);
         try std.testing.expect(std.mem.find(u8, row, expected_prefix) != null);
     }
@@ -2572,11 +2599,11 @@ test "different presentation groups remain separate within one turn" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 read\n└ Read first",
+        "● Read first",
         projection.entry_actions.items[0].override.bytes,
     );
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 read\n└ Read second",
+        "● Read second",
         projection.entry_actions.items[1].override.bytes,
     );
 }
@@ -2609,7 +2636,7 @@ test "legacy lifecycle records without group identity respect transcript boundar
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 read\n└ Read first",
+        "● Read first",
         projection.entry_actions.items[0].override.bytes,
     );
     try std.testing.expect(projection.entry_actions.items[1] == .keep);
@@ -2737,7 +2764,7 @@ test "visible tool status after a display clear keeps its compact group" {
     try std.testing.expect(projection.entry_actions.items[0] == .keep);
     try std.testing.expect(projection.entry_actions.items[1] == .override);
     const block = projection.entry_actions.items[1].override.bytes;
-    try std.testing.expect(std.mem.find(u8, block, "1 tool call") != null);
+    try std.testing.expect(std.mem.find(u8, block, "read") != null);
     try std.testing.expect(std.mem.find(u8, block, "run_command") == null);
 }
 
@@ -2848,7 +2875,7 @@ test "ask activity remains outside tool groups" {
     try std.testing.expect(projection.entry_actions.items[0] == .keep);
     try std.testing.expect(projection.entry_actions.items[1] == .override);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 read\n└ read_file",
+        "● read_file",
         projection.entry_actions.items[1].override.bytes,
     );
 }
@@ -2878,7 +2905,7 @@ test "ask activity remains outside tool groups without complete detail metadata"
         projection.entry_actions.items[0].override.bytes,
     );
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 read\n└ read_file",
+        "● read_file",
         projection.entry_actions.items[2].override.bytes,
     );
 }

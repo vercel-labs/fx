@@ -2967,7 +2967,7 @@ test "assistant paragraph and next tool keep one gap after inspected tool" {
     const creating_row = try findRowContaining(&h, "Creating project");
     try expectExactlyOneBlankRowBetween(&h, inspected_after, assistant_row);
     try expectRowEmpty(&h, assistant_row + 3);
-    try expectRowTrimmedEquals(&h, assistant_row + 4, "● 1 tool call · 1 read");
+    try expectRowTrimmedEquals(&h, assistant_row + 4, "● Inspected file");
     try std.testing.expectEqual(assistant_row + 5, creating_row);
     try expectGridNotContains(&h, "Thinking");
 }

@@ -16694,20 +16694,20 @@ test "finality candidates anchor a fully grouped turn at its newest rendered gro
         .{ user_message_card.promptMarkerStyle(), ui_render.statusline_style },
     );
     defer alloc.free(group_a_header);
-    const group_b_header = try alloc.print(
-        "{s}●\x1b[0m {s}1 tool call · 1 read\x1b[0m",
-        .{ user_message_card.promptMarkerStyle(), ui_render.statusline_style },
-    );
-    defer alloc.free(group_b_header);
     const group_a_start = std.mem.find(u8, source.bytes, group_a_header) orelse
         return error.TestExpectedGroupAHeader;
-    const group_b_start = std.mem.find(u8, source.bytes, group_b_header) orelse
+    const second_intro = std.mem.find(u8, source.bytes, "SECOND_GROUP_INTRO") orelse
         return error.TestExpectedGroupBHeader;
-    try std.testing.expect(group_a_start < group_b_start);
+    try std.testing.expect(group_a_start < second_intro);
 
     const floor = source.finality.tool_turn_floors[0];
     try std.testing.expectEqual(@as(u64, 9), floor.turn_id);
-    try std.testing.expectEqual(group_b_start, floor.start_byte);
+    try std.testing.expect(floor.start_byte > second_intro);
+    try std.testing.expect(std.mem.find(
+        u8,
+        source.bytes[floor.start_byte..],
+        "Read finality fixture",
+    ) != null);
 }
 
 test "finality candidates keep a mixed legacy turn at its earliest rendered tool row" {
@@ -16730,16 +16730,16 @@ test "finality candidates keep a mixed legacy turn at its earliest rendered tool
     try std.testing.expectEqual(@as(usize, 1), source.finality.tool_turn_floors.len);
     try std.testing.expect(source.finality.mutation_pin_start == null);
 
-    const group_a_header = try alloc.print(
-        "{s}●\x1b[0m {s}1 tool call · 1 read\x1b[0m",
-        .{ user_message_card.promptMarkerStyle(), ui_render.statusline_style },
-    );
-    defer alloc.free(group_a_header);
-    const earliest_tool_start = std.mem.find(u8, source.bytes, group_a_header) orelse
+    const latest_intro = std.mem.find(u8, source.bytes, "LATEST_GROUP_INTRO") orelse
         return error.TestExpectedGroupAHeader;
     const floor = source.finality.tool_turn_floors[0];
     try std.testing.expectEqual(@as(u64, 10), floor.turn_id);
-    try std.testing.expectEqual(earliest_tool_start, floor.start_byte);
+    try std.testing.expect(floor.start_byte < latest_intro);
+    try std.testing.expect(std.mem.find(
+        u8,
+        source.bytes[floor.start_byte..],
+        "Read finality fixture",
+    ) != null);
 }
 
 test "finality candidates retain the global pin for an unidentified tool row" {
