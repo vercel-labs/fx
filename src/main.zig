@@ -3248,9 +3248,15 @@ const App = struct {
         try InstancesAppRuntime.closeOnScreen(self);
     }
 
-    /// `/agents` and Alt+↑: opens the instance list.
+    /// `/agents` and Alt+↑: opens the instance list in place of any other
+    /// footer menu or panel.
     pub fn openAgentsMenu(self: *App) !void {
+        app_commands.Handlers(App).closeFooterMenus(self);
         try AgentsAppRuntime.openMenu(self);
+    }
+
+    pub fn closeAgentsMenu(self: *App) void {
+        _ = AgentsAppRuntime.closeMenu(self);
     }
 
     /// The instance list as the footer draws it now.
