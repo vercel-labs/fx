@@ -1,13 +1,13 @@
 // Host contract:
-// - fields: shadow_vt, transcript, entries, layout, viewport_top_row,
-//   owned_top_row, pending_scroll_compact,
-//   min_visible_viewport_rows, reflow_clear_guard_rows,
-//   viewport_clear_pending,
-//   replaceable_last_line, replaceable_row, replaceable_start,
-//   last_rendered_cols, last_paint_bottom_reserved_rows,
-//   last_visible_transcript_*, last_viewport_selection,
-//   paint_trace, has_painted_transcript, resize_bottom_anchor_pending,
-//   footer_viewport, full_transcript, folded_command_blocks
+// - fields: shadow_vt, layout, viewport_top_row, owned_top_row,
+//   pending_scroll_compact, min_visible_viewport_rows,
+//   reflow_clear_guard_rows, viewport_clear_pending, replaceable_row,
+//   last_paint_bottom_reserved_rows, last_visible_transcript_*,
+//   last_viewport_selection, paint_trace, has_painted_transcript,
+//   resize_bottom_anchor_pending, footer_viewport, full_transcript
+// - notebook fields (`self.notebook.*`): transcript, entries,
+//   replaceable_last_line, replaceable_start, last_rendered_cols,
+//   folded_command_blocks
 // - methods: ensurePaintReservation, beginPaint, endPaint,
 //   resetCursorTracking, advanceCursor,
 //   compactAfterCollapsedResize, footerTopRowForExtra
@@ -284,7 +284,7 @@ fn renderTranscriptRows(
                     .folded = false,
                     .blank = blank,
                 });
-                if (self.replaceable_last_line and line.ref.ref.start <= self.replaceable_start) {
+                if (self.notebook.replaceable_last_line and line.ref.ref.start <= self.notebook.replaceable_start) {
                     rendered.replaceable_line_index = line_index;
                 }
                 rendered.last_visible_line = cursor_line;
@@ -1765,7 +1765,7 @@ fn prepareTranscriptSurfacePaintInternal(
     prepared.finality_candidates = try source.finality.clone(alloc);
     const transcript_buf = TranscriptBuffer{ .bytes = prepared.bytes };
 
-    debug_trace.logf("render", "viewport_enter layout={d}x{d} content_bottom={d} viewport_top={d} cursor={d},{d} replaceable={{last={s} row={d} start={d}}} transcript_bytes={d} entries={d}", .{ self.layout.cols, self.layout.rows, self.layout.content_bottom, self.viewport_top_row, self.cursor_row, self.cursor_col, if (effective_replaceable_last_line) "true" else "false", effective_replaceable_row, effective_replaceable_start, prepared.bytes.len, self.entries.items.len });
+    debug_trace.logf("render", "viewport_enter layout={d}x{d} content_bottom={d} viewport_top={d} cursor={d},{d} replaceable={{last={s} row={d} start={d}}} transcript_bytes={d} entries={d}", .{ self.layout.cols, self.layout.rows, self.layout.content_bottom, self.viewport_top_row, self.cursor_row, self.cursor_col, if (effective_replaceable_last_line) "true" else "false", effective_replaceable_row, effective_replaceable_start, prepared.bytes.len, self.notebook.entries.items.len });
 
     var owned_hard_lines: ?HardLineStarts = null;
     const hard_lines = if (source.hard_line_starts.len > 0)
@@ -2160,7 +2160,7 @@ fn prepareTranscriptSurfacePaintInternal(
         self.paint_trace.transcript_total_lines != render_total_lines or
         self.paint_trace.transcript_visible_rows != visible_rows or
         self.paint_trace.transcript_partial_skip_rows != partial_skip_rows or
-        self.paint_trace.transcript_entries != self.entries.items.len;
+        self.paint_trace.transcript_entries != self.notebook.entries.items.len;
     prepared.trace_transcript_frame = trace_transcript_frame;
     prepared.trace_visible_rows = visible_rows;
     if (commit_runtime_state) {
@@ -2171,7 +2171,7 @@ fn prepareTranscriptSurfacePaintInternal(
         self.paint_trace.transcript_total_lines = render_total_lines;
         self.paint_trace.transcript_visible_rows = visible_rows;
         self.paint_trace.transcript_partial_skip_rows = partial_skip_rows;
-        self.paint_trace.transcript_entries = self.entries.items.len;
+        self.paint_trace.transcript_entries = self.notebook.entries.items.len;
         self.paint_trace.transcript_log_frame = trace_transcript_frame;
     }
     if (trace_transcript_frame) {
@@ -2187,7 +2187,7 @@ fn prepareTranscriptSurfacePaintInternal(
                 partial_skip_rows,
                 rows_budget,
                 transcript_line_count,
-                self.entries.items.len,
+                self.notebook.entries.items.len,
                 transcript_buf.bytes.len,
             },
         );
@@ -2210,8 +2210,10 @@ fn prepareTranscriptSurfacePaintInternal(
     prepared.transcript_ends_with_newline = hard_lines.ends_with_newline;
     const render_context = .{
         .layout = self.layout,
-        .replaceable_last_line = effective_replaceable_last_line,
-        .replaceable_start = effective_replaceable_start,
+        .notebook = .{
+            .replaceable_last_line = effective_replaceable_last_line,
+            .replaceable_start = effective_replaceable_start,
+        },
         .replaceable_row = effective_replaceable_row,
     };
     if (commit_runtime_state) {
@@ -2274,7 +2276,7 @@ fn refreshPreparedTranscriptState(
         viewport.top_row,
         prepared.projection_ends_with_newline orelse
             prepared.transcript_ends_with_newline,
-        self.replaceable_last_line,
+        self.notebook.replaceable_last_line,
         self.replaceable_row,
     );
 
@@ -2284,7 +2286,7 @@ fn refreshPreparedTranscriptState(
         self.last_viewport_selection = prepared.selection;
         self.cursor_row = prepared.cursor.cursor_row;
         self.cursor_col = prepared.cursor.cursor_col;
-        if (self.replaceable_last_line) self.replaceable_row = prepared.cursor.replaceable_row;
+        if (self.notebook.replaceable_last_line) self.replaceable_row = prepared.cursor.replaceable_row;
     }
     debug_trace.logf(
         "render",
@@ -2372,8 +2374,10 @@ pub fn reprojectPreparedTranscriptForVisualOffset(
 
     const render_context = .{
         .layout = layout,
-        .replaceable_last_line = prepared.replaceable_last_line,
-        .replaceable_start = prepared.replaceable_start,
+        .notebook = .{
+            .replaceable_last_line = prepared.replaceable_last_line,
+            .replaceable_start = prepared.replaceable_start,
+        },
         .replaceable_row = prepared.replaceable_row,
     };
     try refreshPreparedTranscriptState(
@@ -2487,8 +2491,10 @@ pub fn stagePreparedTranscriptForVisualOffset(
 
     const render_context = .{
         .layout = layout,
-        .replaceable_last_line = prepared.replaceable_last_line,
-        .replaceable_start = prepared.replaceable_start,
+        .notebook = .{
+            .replaceable_last_line = prepared.replaceable_last_line,
+            .replaceable_start = prepared.replaceable_start,
+        },
         .replaceable_row = prepared.replaceable_row,
     };
     try refreshPreparedTranscriptState(
@@ -3295,8 +3301,10 @@ pub fn paintPreparedTranscriptIntoSurface(
 ) !paint_plan.TranscriptPaintResult {
     const render_context = .{
         .layout = self.layout,
-        .replaceable_last_line = prepared.replaceable_last_line,
-        .replaceable_start = prepared.replaceable_start,
+        .notebook = .{
+            .replaceable_last_line = prepared.replaceable_last_line,
+            .replaceable_start = prepared.replaceable_start,
+        },
         .replaceable_row = prepared.replaceable_row,
     };
     const result = try paintTranscriptIntoSurfaceWithLimit(
@@ -3411,7 +3419,7 @@ fn paintTranscriptIntoSurfaceWithLimit(
         rendered_rows.last_line_is_folded,
         viewport.top_row,
         transcript_ends_with_newline,
-        self.replaceable_last_line,
+        self.notebook.replaceable_last_line,
         self.replaceable_row,
     );
     surface.cursor_target = .{ .row = cursor.cursor_row, .col = cursor.cursor_col, .visible = true };
@@ -3457,8 +3465,10 @@ const TestTranscriptPainterHost = struct {
     cursor_row: u16 = 1,
     cursor_col: u16 = 1,
     extra_input_rows: u16 = 0,
-    replaceable_last_line: bool = false,
-    replaceable_start: usize = 0,
+    notebook: struct {
+        replaceable_last_line: bool = false,
+        replaceable_start: usize = 0,
+    } = .{},
     replaceable_row: u16 = 1,
 
     fn init(alloc: Allocator, layout: types.Layout) TestTranscriptPainterHost {

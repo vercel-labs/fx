@@ -13,6 +13,8 @@ const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const model_provider = @import("../config/model_provider.zig");
+const profiles = @import("../profiles/profiles.zig");
+const app_profile_runtime = @import("../app/app_profile_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const doctor_runtime = @import("doctor_runtime.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
@@ -137,12 +139,19 @@ pub const LaunchModifiers = struct {
     provider_order_override: ?[][]const u8 = null,
     provider_strict_override: ?bool = null,
 
+    /// `--profile <name>`: the agent profile main runs in. Owned.
+    profile_name: ?[]u8 = null,
+    /// `--instances <n>`: how many fx instances the host opens at startup,
+    /// each with its own session.
+    instances: ?usize = null,
+
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
         for (self.additional_directories) |path| alloc.free(path);
         if (self.additional_directories.len > 0) alloc.free(self.additional_directories);
         if (self.model_override) |model| alloc.free(model);
         if (self.provider_order_override) |order| freeProviderOrderOverride(alloc, order);
+        if (self.profile_name) |name| alloc.free(name);
         self.* = .{};
     }
 
@@ -153,7 +162,8 @@ pub const LaunchModifiers = struct {
     pub fn hasModelOverrides(self: LaunchModifiers) bool {
         return self.provider_override != null or self.model_override != null or
             self.effort_override != null or self.fast_override != null or
-            self.ultrafast_override != null or self.provider_order_override != null or self.provider_strict_override != null;
+            self.ultrafast_override != null or self.provider_order_override != null or self.provider_strict_override != null or
+            self.profile_name != null;
     }
 
     pub fn hasOnlyUltrafastOverride(self: LaunchModifiers) bool {
@@ -400,6 +410,9 @@ fn parseGlobalLaunchArgs(
     var model_override: ?[]u8 = null;
     errdefer if (model_override) |model| alloc.free(model);
     var effort_override: ?types.ReasoningEffort = null;
+    var profile_name: ?[]u8 = null;
+    errdefer if (profile_name) |name| alloc.free(name);
+    var instances: ?usize = null;
     var fast_override: ?bool = null;
     var ultrafast_override: ?bool = null;
     var provider_order_override: ?[][]const u8 = null;
@@ -434,6 +447,26 @@ fn parseGlobalLaunchArgs(
         } else if (std.mem.startsWith(u8, arg, "--provider=")) {
             provider_override = model_provider.parse(arg["--provider=".len..]) orelse
                 return error.InvalidProviderValue;
+        } else if (std.mem.eql(u8, arg, "--instances") or std.mem.startsWith(u8, arg, "--instances=")) {
+            const value = if (std.mem.eql(u8, arg, "--instances")) value: {
+                index += 1;
+                if (index >= args.len) return error.MissingInstancesValue;
+                break :value args[index];
+            } else arg["--instances=".len..];
+            const count = std.fmt.parseUnsigned(usize, value, 10) catch return error.InvalidInstancesValue;
+            if (count == 0) return error.InvalidInstancesValue;
+            instances = count;
+        } else if (std.mem.eql(u8, arg, "--profile") or std.mem.startsWith(u8, arg, "--profile=")) {
+            const value = if (std.mem.eql(u8, arg, "--profile")) value: {
+                index += 1;
+                if (index >= args.len) return error.MissingProfileValue;
+                break :value args[index];
+            } else arg["--profile=".len..];
+            if (value.len == 0) return error.MissingProfileValue;
+            if (!profiles.validName(value)) return error.InvalidProfileName;
+            const owned = try alloc.dupe(u8, value);
+            if (profile_name) |old| alloc.free(old);
+            profile_name = owned;
         } else if (std.mem.eql(u8, arg, "--model")) {
             index += 1;
             if (index >= args.len) return error.MissingModelValue;
@@ -501,6 +534,9 @@ fn parseGlobalLaunchArgs(
             .ultrafast_override = ultrafast_override,
             .provider_order_override = provider_order_override,
             .provider_strict_override = provider_strict_override,
+
+            .profile_name = profile_name,
+            .instances = instances,
         },
     };
 }
@@ -522,7 +558,8 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             std.mem.eql(u8, arg, "--provider") or
             std.mem.eql(u8, arg, "--provider-order") or
             std.mem.eql(u8, arg, "--model") or
-            std.mem.eql(u8, arg, "--effort"))
+            std.mem.eql(u8, arg, "--effort") or
+            std.mem.eql(u8, arg, "--profile"))
         {
             index += 1;
             if (index >= args.len) return &.{};
@@ -532,6 +569,7 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             !std.mem.startsWith(u8, arg, "--provider-order=") and
             !std.mem.startsWith(u8, arg, "--model=") and
             !std.mem.startsWith(u8, arg, "--effort=") and
+            !std.mem.startsWith(u8, arg, "--profile=") and
             !std.mem.eql(u8, arg, "--no-additional-dirs") and
             !std.mem.eql(u8, arg, "--fast") and
             !std.mem.eql(u8, arg, "--no-fast") and
@@ -1040,6 +1078,15 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
     };
     switch (parsed_launch) {
         .interactive => |launch| {
+            if (launch.modifiers.profile_name) |name| {
+                if (try app_profile_runtime.launchFailure(alloc, name)) |message| {
+                    defer alloc.free(message);
+                    try writeStderr(deps, message);
+                    var rejected = launch;
+                    rejected.deinit(alloc);
+                    return .handled_failure;
+                }
+            }
             try writeMcpProfileWarningIfPresent(alloc, cfg, deps);
             return .{ .interactive = launch };
         },
@@ -1074,6 +1121,10 @@ fn runNonInteractiveWithDeps(
     };
     if (global_args.modifiers.hasModelOverrides() and !acp_ultrafast_override) {
         try writeModelModifierUsage(deps);
+        return .handled_failure;
+    }
+    if (global_args.modifiers.instances != null) {
+        try writeStderr(deps, "fx: --instances applies to interactive sessions\n");
         return .handled_failure;
     }
 
@@ -3182,7 +3233,7 @@ fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
 fn writeModelModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
-        "fx: --provider, --model, --effort, --fast, --ultrafast, --provider-order, and --provider-strict apply to interactive sessions; for one-shot runs pass model flags after `fx ask`\n",
+        "fx: --provider, --model, --effort, --fast, --ultrafast, --provider-order, --provider-strict, and --profile apply to interactive sessions; for one-shot runs pass model flags after `fx ask`\n",
     );
 }
 
@@ -3191,6 +3242,10 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
         error.DuplicateAdditionalDirectorySuppression => "--no-additional-dirs may only be specified once",
         error.MissingModelValue => "--model requires a model id",
+        error.MissingProfileValue => "--profile requires a profile name",
+        error.MissingInstancesValue => "--instances requires a number of instances",
+        error.InvalidInstancesValue => "--instances takes a whole number of at least 1",
+        error.InvalidProfileName => "--profile names use lowercase letters, digits, '-', or '_'",
         error.MissingEffortValue => "--effort requires a value",
         error.InvalidEffortValue => "--effort value is not a valid reasoning effort",
         error.ConflictingFastFlags => "--fast and --no-fast cannot be used together",

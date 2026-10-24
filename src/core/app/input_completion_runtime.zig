@@ -1,4 +1,5 @@
 const std = @import("std");
+const agents = @import("../agents/agents.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const edit_contract = @import("../input/editor_state.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
@@ -69,6 +70,7 @@ pub const InlineCompletion = union(enum) {
 
 pub fn CompletionRuntime(comptime App: type) type {
     return struct {
+        const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
         const FilePickerSelection = struct {
             query: picker_state.FilePickerQuery,
             choice: file_index.SearchResult,
@@ -93,13 +95,13 @@ pub fn CompletionRuntime(comptime App: type) type {
             return command_specs.slashCompletionCount(app.slashRegistry(), prefix);
         }
 
-        fn slashCompletionQueryActive(app: *App) bool {
+        fn slashCompletionQueryActive(app: *App, agent: *AppAgent) bool {
             if (app.input_runtime.picker.isInlinePickerSuppressed(.slash)) return false;
             if (app.input_runtime.picker.inlinePickerTriggerKind(&app.input_runtime.edit_state) != .slash) return false;
             // Model query always owns this slot. Mid-turn bare `/model` does too;
             // idle bare `/model` still surfaces slash rows.
-            if (comptime @hasField(App, "stream")) {
-                if (app.stream.active and picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) return false;
+            if (comptime agents.hasAgentField(App, "stream")) {
+                if (agent.stream.active and picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) return false;
             }
             return command_specs.slashCompletionPrefix(
                 app.slashRegistry(),
@@ -107,30 +109,30 @@ pub fn CompletionRuntime(comptime App: type) type {
             ) != null;
         }
 
-        pub fn slashCompletionCount(app: *App) usize {
-            if (!slashCompletionQueryActive(app)) return 0;
+        pub fn slashCompletionCount(app: *App, agent: *AppAgent) usize {
+            if (!slashCompletionQueryActive(app, agent)) return 0;
             return slashCompletionCandidateCount(app);
         }
 
-        fn visibleSlashCompletionQueryActive(app: *App) bool {
-            if (comptime @hasField(App, "question_prompt")) {
-                if (app.question_prompt.isActive()) return false;
+        fn visibleSlashCompletionQueryActive(app: *App, agent: *AppAgent) bool {
+            if (comptime agents.hasAgentField(App, "question_prompt")) {
+                if (agent.question_prompt.isActive()) return false;
             }
-            if (comptime @hasField(App, "approval_prompt")) {
-                if (app.approval_prompt.isActive()) return false;
+            if (comptime agents.hasAgentField(App, "approval_prompt")) {
+                if (agent.approval_prompt.isActive()) return false;
             }
             if (hasFileQuery(app)) return false;
-            return slashCompletionQueryActive(app);
+            return slashCompletionQueryActive(app, agent);
         }
 
         /// Returns selectable completions projected by the footer.
-        pub fn visibleSlashCompletionCount(app: *App) usize {
-            if (!visibleSlashCompletionQueryActive(app)) return 0;
+        pub fn visibleSlashCompletionCount(app: *App, agent: *AppAgent) usize {
+            if (!visibleSlashCompletionQueryActive(app, agent)) return 0;
             return slashCompletionCandidateCount(app);
         }
 
-        pub fn dismissVisibleInlinePicker(app: *App) bool {
-            const kind = visibleInlinePickerKind(app) orelse return false;
+        pub fn dismissVisibleInlinePicker(app: *App, agent: *AppAgent) bool {
+            const kind = visibleInlinePickerKind(app, agent) orelse return false;
             // Escaping the picker abandons the columns it had opened, so the
             // next `/provider` starts from the provider column again.
             if (kind == .provider) provider_picker_runtime.Runtime(App).abandon(app);
@@ -138,32 +140,32 @@ pub fn CompletionRuntime(comptime App: type) type {
             return true;
         }
 
-        fn visibleInlinePickerKind(app: *App) ?picker_state.InlinePickerKind {
-            if (comptime @hasField(App, "question_prompt")) {
-                if (app.question_prompt.isActive()) return null;
+        fn visibleInlinePickerKind(app: *App, agent: *AppAgent) ?picker_state.InlinePickerKind {
+            if (comptime agents.hasAgentField(App, "question_prompt")) {
+                if (agent.question_prompt.isActive()) return null;
             }
-            if (comptime @hasField(App, "approval_prompt")) {
-                if (app.approval_prompt.isActive()) return null;
+            if (comptime agents.hasAgentField(App, "approval_prompt")) {
+                if (agent.approval_prompt.isActive()) return null;
             }
-            if (comptime @hasField(App, "stream")) {
-                if (app.stream.active) {
+            if (comptime agents.hasAgentField(App, "stream")) {
+                if (agent.stream.active) {
                     if (hasModelQuery(app)) return .model;
                     if (hasFileQuery(app)) return .file;
-                    if (visibleInlineSlashCompletion(app) != null) return .slash;
-                    if (visibleSlashCompletionCount(app) > 0) return .slash;
+                    if (visibleInlineSlashCompletion(app, agent) != null) return .slash;
+                    if (visibleSlashCompletionCount(app, agent) > 0) return .slash;
                     return null;
                 }
             }
             if (hasModelQuery(app)) return .model;
             if (provider_picker_runtime.Runtime(App).hasQuery(app)) return .provider;
             if (hasFileQuery(app)) return .file;
-            if (visibleInlineCompletion(app)) |completion| {
+            if (visibleInlineCompletion(app, agent)) |completion| {
                 return switch (completion) {
                     .skill => .skill,
                     .slash => .slash,
                 };
             }
-            if (visibleSlashCompletionCount(app) > 0) return .slash;
+            if (visibleSlashCompletionCount(app, agent) > 0) return .slash;
             return null;
         }
 
@@ -171,20 +173,20 @@ pub fn CompletionRuntime(comptime App: type) type {
             navigatePickerOptions(&app.input_runtime.picker.slash_completion_index, &app.input_runtime.picker.slash_completion_window_start, count, delta);
         }
 
-        pub fn routeSlashCompletionMove(app: *App, delta: i32) bool {
-            const count = visibleSlashCompletionCount(app);
+        pub fn routeSlashCompletionMove(app: *App, agent: *AppAgent, delta: i32) bool {
+            const count = visibleSlashCompletionCount(app, agent);
             if (count == 0) return false;
             navigateSlashCompletion(app, delta, count);
             return true;
         }
 
-        pub fn routeModifiedHistory(app: *App, direction: visual_layout.Direction, delta: i32) !void {
+        pub fn routeModifiedHistory(app: *App, agent: *AppAgent, direction: visual_layout.Direction, delta: i32) !void {
             app.input_runtime.vertical_navigation.reset();
-            if (try routeNonSlashPickerMove(app, delta)) {
+            if (try routeNonSlashPickerMove(app, agent, delta)) {
                 return;
-            } else if (!routeSlashCompletionMove(app, delta)) {
+            } else if (!routeSlashCompletionMove(app, agent, delta)) {
                 if (app.input_runtime.composer_history.activeIndex() != null) {
-                    try navigatePromptHistory(app, delta);
+                    try navigatePromptHistory(app, agent, delta);
                 } else if (direction == .up and app.input_runtime.edit_state.cursor > 0) {
                     _ = horizontal_navigation.move(
                         .draft_start,
@@ -193,7 +195,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                         &app.input_runtime.vertical_navigation,
                     );
                 } else if (direction == .up) {
-                    try navigatePromptHistory(app, -1);
+                    try navigatePromptHistory(app, agent, -1);
                 } else if (app.input_runtime.edit_state.cursor < app.input_runtime.edit_state.input.items.len) {
                     _ = horizontal_navigation.move(
                         .draft_end,
@@ -202,17 +204,18 @@ pub fn CompletionRuntime(comptime App: type) type {
                         &app.input_runtime.vertical_navigation,
                     );
                 } else {
-                    try navigatePromptHistory(app, 1);
+                    try navigatePromptHistory(app, agent, 1);
                 }
             }
         }
 
-        pub fn routePlainVertical(app: *App, direction: visual_layout.Direction, delta: i32) !void {
-            try routeComposerVertical(app, direction, delta, false, false);
+        pub fn routePlainVertical(app: *App, agent: *AppAgent, direction: visual_layout.Direction, delta: i32) !void {
+            try routeComposerVertical(app, agent, direction, delta, false, false);
         }
 
         pub fn routeComposerVertical(
             app: *App,
+            agent: *AppAgent,
             direction: visual_layout.Direction,
             delta: i32,
             extend_selection: bool,
@@ -226,7 +229,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                 delta * @as(i32, @intCast(@min(row_count, std.math.maxInt(i32))))
             else
                 delta;
-            if (try routeNonSlashPickerMove(app, picker_delta)) {
+            if (try routeNonSlashPickerMove(app, agent, picker_delta)) {
                 app.input_runtime.vertical_navigation.reset();
                 return;
             }
@@ -237,21 +240,21 @@ pub fn CompletionRuntime(comptime App: type) type {
                     direction,
                     row_count,
                     app.shell.layout.cols,
-                    app.pending_images.items,
+                    agent.pending_images.items,
                 )
             else
                 ui_input.scanInputCursorVertical(
                     &app.input_runtime,
                     direction,
                     app.shell.layout.cols,
-                    app.pending_images.items,
+                    agent.pending_images.items,
                 );
             const capped = input_presentation.cappedInputRows(
                 scan.total_rows,
                 app.shell.layout.content_bottom,
                 true,
             );
-            const visible_slash_count = if (capped.input_extra == 0) visibleSlashCompletionCount(app) else 0;
+            const visible_slash_count = if (capped.input_extra == 0) visibleSlashCompletionCount(app, agent) else 0;
             if (visible_slash_count > 0) {
                 app.input_runtime.vertical_navigation.reset();
                 navigateSlashCompletion(app, picker_delta, visible_slash_count);
@@ -276,8 +279,8 @@ pub fn CompletionRuntime(comptime App: type) type {
                     &app.input_runtime.vertical_navigation,
                 );
             } else if (direction == .up) {
-                if (try restoreQueuedSteerToComposer(app)) return;
-                try navigatePromptHistory(app, -1);
+                if (try restoreQueuedSteerToComposer(app, agent)) return;
+                try navigatePromptHistory(app, agent, -1);
             } else if (app.input_runtime.edit_state.cursor < app.input_runtime.edit_state.input.items.len) {
                 _ = horizontal_navigation.move(
                     .draft_end,
@@ -286,7 +289,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                     &app.input_runtime.vertical_navigation,
                 );
             } else {
-                try navigatePromptHistory(app, 1);
+                try navigatePromptHistory(app, agent, 1);
             }
         }
 
@@ -294,12 +297,12 @@ pub fn CompletionRuntime(comptime App: type) type {
         /// boundary back into the empty composer for editing. Returns false when
         /// no steer is retractable, leaving history navigation to run unchanged.
         /// An active history episode keeps its stashed draft untouched.
-        fn restoreQueuedSteerToComposer(app: *App) !bool {
-            if (comptime !@hasField(App, "worker")) return false;
-            if (comptime !@hasDecl(@TypeOf(app.worker), "popQueuedSteerForEdit")) return false;
+        fn restoreQueuedSteerToComposer(app: *App, agent: *AppAgent) !bool {
+            if (comptime !agents.hasAgentField(App, "worker")) return false;
+            if (comptime !@hasDecl(@TypeOf(agent.worker), "popQueuedSteerForEdit")) return false;
             if (app.input_runtime.edit_state.input.items.len > 0) return false;
             if (app.input_runtime.composer_history.activeIndex() != null) return false;
-            const text = (try app.worker.popQueuedSteerForEdit(std.heap.c_allocator)) orelse return false;
+            const text = (try agent.worker.popQueuedSteerForEdit(std.heap.c_allocator)) orelse return false;
             defer std.heap.c_allocator.free(text);
             try app.input_runtime.edit_state.setText(app.alloc, text);
             app.input_runtime.vertical_navigation.reset();
@@ -315,11 +318,11 @@ pub fn CompletionRuntime(comptime App: type) type {
             return true;
         }
 
-        pub fn navigatePromptHistory(app: *App, delta: i32) !void {
+        pub fn navigatePromptHistory(app: *App, agent: *AppAgent, delta: i32) !void {
             const has_image_id_owner =
                 @hasDecl(App, "peekNextImageId") and @hasDecl(App, "nextImageId");
             const first_image_id = if (comptime has_image_id_owner)
-                app.peekNextImageId()
+                app.peekNextImageId(agent)
             else
                 1;
             const max_input_len = if (comptime @hasDecl(App, "input_limits"))
@@ -337,7 +340,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                     .picker = &app.input_runtime.picker,
                     .vertical_navigation = &app.input_runtime.vertical_navigation,
                     .input_limit_rejection = &app.input_runtime.input_limit_rejection,
-                    .images = &app.pending_images,
+                    .images = &agent.pending_images,
                 },
                 first_image_id,
                 max_input_len,
@@ -376,7 +379,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                     app.input_runtime.historyBoundary(app.alloc);
                     if (comptime has_image_id_owner) {
                         for (0..image_count) |offset| {
-                            const committed_id = app.nextImageId();
+                            const committed_id = app.nextImageId(agent);
                             std.debug.assert(committed_id == first_image_id + offset);
                         }
                     } else {
@@ -386,24 +389,24 @@ pub fn CompletionRuntime(comptime App: type) type {
             }
         }
 
-        pub fn routeVisiblePickerMove(app: *App, delta: i32) !bool {
-            if (try routeNonSlashPickerMove(app, delta)) return true;
-            return routeSlashCompletionMove(app, delta);
+        pub fn routeVisiblePickerMove(app: *App, agent: *AppAgent, delta: i32) !bool {
+            if (try routeNonSlashPickerMove(app, agent, delta)) return true;
+            return routeSlashCompletionMove(app, agent, delta);
         }
 
-        fn routeNonSlashPickerMove(app: *App, delta: i32) !bool {
+        fn routeNonSlashPickerMove(app: *App, agent: *AppAgent, delta: i32) !bool {
             if (try routeMcpHostMenuMove(app, delta)) return true;
-            if (try routeSettingsMenuMove(app, delta)) return true;
-            if (try routeHelpMenuMove(app, delta)) return true;
-            if (try routeModelMenuMove(app, delta)) return true;
-            if (routeAuthPickerMove(app, delta)) return true;
-            if (try routeSkillsMenuMove(app, delta)) return true;
+            if (try routeSettingsMenuMove(app, agent, delta)) return true;
+            if (try routeHelpMenuMove(app, agent, delta)) return true;
+            if (try routeModelMenuMove(app, agent, delta)) return true;
+            if (routeAuthPickerMove(app, agent, delta)) return true;
+            if (try routeSkillsMenuMove(app, agent, delta)) return true;
             if (comptime runtime_profile.allows(App, .durable_sessions)) {
-                if (try routeSessionPickerMove(app, delta)) return true;
-                if (try routeForkMenuMove(app, delta)) return true;
+                if (try routeSessionPickerMove(app, agent, delta)) return true;
+                if (try routeForkMenuMove(app, agent, delta)) return true;
             }
             if (hasFileQuery(app)) {
-                navigateFilePicker(app, delta);
+                navigateFilePicker(app, agent, delta);
                 return true;
             }
             if (hasModelQuery(app)) {
@@ -411,11 +414,11 @@ pub fn CompletionRuntime(comptime App: type) type {
                 return true;
             }
             if (provider_picker_runtime.Runtime(App).hasQuery(app)) {
-                if (!app.stream.active) provider_picker_runtime.Runtime(App).navigate(app, delta);
+                if (!agent.stream.active) provider_picker_runtime.Runtime(App).navigate(app, delta);
                 return true;
             }
             // Mid-turn bare `/model`: consume arrows without slash/skill navigation.
-            if (app.stream.active and picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) return true;
+            if (agent.stream.active and picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) return true;
             return false;
         }
 
@@ -426,7 +429,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             return true;
         }
 
-        fn routeSettingsMenuMove(app: *App, delta: i32) !bool {
+        fn routeSettingsMenuMove(app: *App, agent: *AppAgent, delta: i32) !bool {
             const menu = &app.input_runtime.settings_menu;
             if (!menu.active) return false;
             const snapshot = app_commands.settingsCatalogSnapshot(app);
@@ -444,7 +447,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                             settings_menu_presentation.visibleModelItemsForBudget(
                                 projection,
                                 app.shell.layout.cols,
-                                try inlineMenuRowBudget(app, settings_menu_presentation.max_inline_rows),
+                                try inlineMenuRowBudget(app, agent, settings_menu_presentation.max_inline_rows),
                             ),
                             1,
                         ),
@@ -455,12 +458,12 @@ pub fn CompletionRuntime(comptime App: type) type {
             const visible_items = settings_menu_presentation.visibleNavigationItemsForBudget(
                 projection,
                 app.shell.layout.cols,
-                try inlineMenuRowBudget(app, settings_menu_presentation.max_inline_rows),
+                try inlineMenuRowBudget(app, agent, settings_menu_presentation.max_inline_rows),
             );
             return menu.move(&snapshot, app.input_runtime.edit_state.input.items, delta, visible_items);
         }
 
-        fn routeHelpMenuMove(app: *App, delta: i32) !bool {
+        fn routeHelpMenuMove(app: *App, agent: *AppAgent, delta: i32) !bool {
             if (!app.input_runtime.help_menu.active) return false;
             const projection = render_input.helpMenuProjection(
                 &app.input_runtime.help_menu,
@@ -470,7 +473,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             const visible_items = help_menu_presentation.visibleNavigationItemsForBudget(
                 projection,
                 app.shell.layout.cols,
-                try inlineMenuRowBudget(app, help_menu_presentation.max_inline_rows),
+                try inlineMenuRowBudget(app, agent, help_menu_presentation.max_inline_rows),
             );
             return app.input_runtime.help_menu.move(
                 app.slashRegistry(),
@@ -480,61 +483,61 @@ pub fn CompletionRuntime(comptime App: type) type {
             );
         }
 
-        fn routeModelMenuMove(app: *App, delta: i32) !bool {
+        fn routeModelMenuMove(app: *App, agent: *AppAgent, delta: i32) !bool {
             if (comptime !@hasField(App, "model_cache")) return false;
             if (!app.model_cache.menu.active) return false;
             _ = app.model_cache.menu.moveVisibleItems(
                 delta,
                 model_menu_presentation.visibleNavigationItemsForBudget(
                     render_input.modelMenuProjection(&app.model_cache),
-                    try inlineMenuRowBudget(app, model_menu_presentation.max_inline_rows),
+                    try inlineMenuRowBudget(app, agent, model_menu_presentation.max_inline_rows),
                 ),
             );
             return true;
         }
 
-        fn routeSessionPickerMove(app: *App, delta: i32) !bool {
-            if (comptime !@hasField(App, "session_persistence")) return false;
-            if (app.stream.active) return false;
-            if (!app.session_persistence.session_picker.active) return false;
-            _ = app_session_runtime.Runtime(App).moveSessionPicker(app, delta, try sessionPickerVisibleItems(app));
+        fn routeSessionPickerMove(app: *App, agent: *AppAgent, delta: i32) !bool {
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
+            if (agent.stream.active) return false;
+            if (!agent.session_persistence.session_picker.active) return false;
+            _ = app_session_runtime.Runtime(App).moveSessionPicker(app, agent, delta, try sessionPickerVisibleItems(app, agent));
             return true;
         }
 
-        fn routeForkMenuMove(app: *App, delta: i32) !bool {
-            if (comptime !@hasField(App, "session_persistence")) return false;
-            const menu = &app.session_persistence.fork_menu;
+        fn routeForkMenuMove(app: *App, agent: *AppAgent, delta: i32) !bool {
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
+            const menu = &agent.session_persistence.fork_menu;
             if (!menu.active()) return false;
             menu.move(delta);
             menu.window_start = fork_menu_presentation.windowStart(
                 menu.projection(),
                 app.shell.layout.cols,
-                try inlineMenuRowBudget(app, fork_menu_presentation.max_inline_rows),
+                try inlineMenuRowBudget(app, agent, fork_menu_presentation.max_inline_rows),
             );
             return true;
         }
 
-        fn routeAuthPickerMove(app: *App, delta: i32) bool {
+        fn routeAuthPickerMove(app: *App, agent: *AppAgent, delta: i32) bool {
             if (comptime !@hasField(App, "auth")) return false;
-            if (app.stream.active) return false;
+            if (agent.stream.active) return false;
             return app.auth.movePicker(delta);
         }
 
-        fn routeSkillsMenuMove(app: *App, delta: i32) !bool {
+        fn routeSkillsMenuMove(app: *App, agent: *AppAgent, delta: i32) !bool {
             if (comptime !@hasField(App, "skills")) return false;
-            return app.skills.moveMenuSelectionVisibleRows(delta, try skillsMenuVisibleRows(app));
+            return app.skills.moveMenuSelectionVisibleRows(delta, try skillsMenuVisibleRows(app, agent));
         }
 
-        fn skillsMenuVisibleRows(app: *App) !u16 {
+        fn skillsMenuVisibleRows(app: *App, agent: *AppAgent) !u16 {
             const projection = render_input.skillsMenuProjection(&app.skills);
             return skills_menu_presentation.inlineVisibleNavigationRowsForBudget(
                 projection,
-                try inlineMenuRowBudget(app, input_presentation.max_model_picker_rows + 2),
+                try inlineMenuRowBudget(app, agent, input_presentation.max_model_picker_rows + 2),
             );
         }
 
-        fn inlineMenuRowBudget(app: *App, max_picker_rows: u16) !u16 {
-            const budget = try footerRowBudget(app);
+        fn inlineMenuRowBudget(app: *App, agent: *AppAgent, max_picker_rows: u16) !u16 {
+            const budget = try footerRowBudget(app, agent);
             return picker_presentation.inlinePickerRowBudgetCapped(
                 app.shell.layout.rows,
                 budget.input_extra,
@@ -548,22 +551,22 @@ pub fn CompletionRuntime(comptime App: type) type {
             banner_rows: u16,
         };
 
-        fn footerRowBudget(app: *App) !FooterRowBudget {
+        fn footerRowBudget(app: *App, agent: *AppAgent) !FooterRowBudget {
             const scan = ui_input.scanInputCursorVertical(
                 &app.input_runtime,
                 .down,
                 app.shell.layout.cols,
-                app.pending_images.items,
+                agent.pending_images.items,
             );
             const capped = input_presentation.cappedInputRows(
                 scan.total_rows,
                 app.shell.layout.content_bottom,
                 true,
             );
-            if (comptime !@hasDecl(@TypeOf(app.worker), "snapshotSteeringPresentation")) {
+            if (comptime !@hasDecl(@TypeOf(agent.worker), "snapshotSteeringPresentation")) {
                 return .{ .input_extra = capped.input_extra, .banner_rows = 0 };
             }
-            var steering = try app.worker.snapshotSteeringPresentation(app.alloc);
+            var steering = try agent.worker.snapshotSteeringPresentation(app.alloc);
             defer steering.deinit(app.alloc);
             const requested_banner_rows = render_input.steeringBannerRowsForMessages(
                 steering.messages,
@@ -582,19 +585,19 @@ pub fn CompletionRuntime(comptime App: type) type {
             };
         }
 
-        pub fn syncSessionPickerWindowStart(app: *App) !void {
-            if (comptime !@hasField(App, "session_persistence")) return;
-            const picker = &app.session_persistence.session_picker;
+        pub fn syncSessionPickerWindowStart(app: *App, agent: *AppAgent) !void {
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return;
+            const picker = &agent.session_persistence.session_picker;
             const item_count = picker.navigationItemCount();
             if (!picker.active or item_count == 0) {
                 picker.window_start = 0;
                 return;
             }
-            picker.syncWindowStart(try sessionPickerVisibleItems(app));
+            picker.syncWindowStart(try sessionPickerVisibleItems(app, agent));
         }
 
-        fn sessionPickerVisibleItems(app: *App) !u16 {
-            const picker = &app.session_persistence.session_picker;
+        fn sessionPickerVisibleItems(app: *App, agent: *AppAgent) !u16 {
+            const picker = &agent.session_persistence.session_picker;
             const projection: render_input.SessionMenuProjection = .{
                 .active = picker.active,
                 .load_state = picker.load_state,
@@ -609,7 +612,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             };
             return resume_menu_presentation.visibleNavigationItemsForBudget(
                 projection,
-                try inlineMenuRowBudget(app, resume_menu_presentation.max_inline_rows),
+                try inlineMenuRowBudget(app, agent, resume_menu_presentation.max_inline_rows),
             );
         }
 
@@ -622,13 +625,13 @@ pub fn CompletionRuntime(comptime App: type) type {
             return app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) != null;
         }
 
-        pub fn visibleInlineSkillCompletion(app: *App) ?InlineSkillCompletion {
+        pub fn visibleInlineSkillCompletion(app: *App, agent: *AppAgent) ?InlineSkillCompletion {
             if (comptime !@hasField(App, "skills")) return null;
-            if (!inlineCompletionSurfaceAvailable(app)) return null;
+            if (!inlineCompletionSurfaceAvailable(app, agent)) return null;
             if (app.input_runtime.picker.inlinePickerTriggerKind(&app.input_runtime.edit_state) != .skill) return null;
             const query = app.input_runtime.picker.activeInlineSkillQuery(&app.input_runtime.edit_state) orelse return null;
             const match = skill_runtime.firstSkillNameCompletion(app.skills.items, query.query) orelse return null;
-            if (!inlineSuffixCanRender(app, match.suffix)) return null;
+            if (!inlineSuffixCanRender(app, agent, match.suffix)) return null;
             return .{
                 .skill = match.skill,
                 .suffix = match.suffix,
@@ -637,24 +640,24 @@ pub fn CompletionRuntime(comptime App: type) type {
             };
         }
 
-        pub fn visibleInlineSlashCompletion(app: *App) ?InlineSlashCompletion {
-            if (!inlineCompletionSurfaceAvailable(app)) return null;
+        pub fn visibleInlineSlashCompletion(app: *App, agent: *AppAgent) ?InlineSlashCompletion {
+            if (!inlineCompletionSurfaceAvailable(app, agent)) return null;
             if (app.input_runtime.picker.inlinePickerTriggerKind(&app.input_runtime.edit_state) != .slash) return null;
             const query = app.input_runtime.picker.activeInlineSlashQuery(&app.input_runtime.edit_state) orelse return null;
             const command = command_specs.firstSlashCompletion(app.slashRegistry(), query.prefix) orelse return null;
             const suffix = command[query.prefix.len..];
-            if (!inlineSuffixCanRender(app, suffix)) return null;
+            if (!inlineSuffixCanRender(app, agent, suffix)) return null;
             return .{ .suffix = suffix };
         }
 
-        pub fn visibleInlineCompletion(app: *App) ?InlineCompletion {
-            if (visibleInlineSkillCompletion(app)) |completion| return .{ .skill = completion };
-            if (visibleInlineSlashCompletion(app)) |completion| return .{ .slash = completion };
+        pub fn visibleInlineCompletion(app: *App, agent: *AppAgent) ?InlineCompletion {
+            if (visibleInlineSkillCompletion(app, agent)) |completion| return .{ .skill = completion };
+            if (visibleInlineSlashCompletion(app, agent)) |completion| return .{ .slash = completion };
             return null;
         }
 
-        pub fn autocompleteInlineCompletion(app: *App, max_input_len: usize) !edit_contract.InsertResult {
-            const completion = visibleInlineCompletion(app) orelse return .inactive;
+        pub fn autocompleteInlineCompletion(app: *App, agent: *AppAgent, max_input_len: usize) !edit_contract.InsertResult {
+            const completion = visibleInlineCompletion(app, agent) orelse return .inactive;
             return switch (completion) {
                 .skill => |skill| bindInlineSkillCompletion(app, skill, max_input_len),
                 .slash => |slash| app.input_runtime.insertionState().insertSliceBounded(
@@ -666,8 +669,8 @@ pub fn CompletionRuntime(comptime App: type) type {
             };
         }
 
-        pub fn autocompleteInlineSkillCompletion(app: *App, max_input_len: usize) !edit_contract.InsertResult {
-            const completion = visibleInlineSkillCompletion(app) orelse return .inactive;
+        pub fn autocompleteInlineSkillCompletion(app: *App, agent: *AppAgent, max_input_len: usize) !edit_contract.InsertResult {
+            const completion = visibleInlineSkillCompletion(app, agent) orelse return .inactive;
             return bindInlineSkillCompletion(app, completion, max_input_len);
         }
 
@@ -702,7 +705,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             return .inserted;
         }
 
-        fn inlineSuffixCanRender(app: *App, suffix: []const u8) bool {
+        fn inlineSuffixCanRender(app: *App, agent: *AppAgent, suffix: []const u8) bool {
             if (comptime !@hasField(@TypeOf(app.shell), "layout")) return false;
             const terminal_cols = app.shell.layout.cols;
             if (terminal_cols == 0) return false;
@@ -711,8 +714,8 @@ pub fn CompletionRuntime(comptime App: type) type {
                 .input = app.input_runtime.edit_state.input.items,
                 .cursor = app.input_runtime.edit_state.cursor,
                 .terminal_cols = terminal_cols,
-                .images = if (comptime @hasField(App, "pending_images"))
-                    app.pending_images.items
+                .images = if (comptime agents.hasAgentField(App, "pending_images"))
+                    agent.pending_images.items
                 else
                     &.{},
                 .pasted_blocks = app.input_runtime.entities.pasted_blocks.items,
@@ -727,18 +730,18 @@ pub fn CompletionRuntime(comptime App: type) type {
                 first_unit.cell_width <= available_cells;
         }
 
-        fn inlineCompletionSurfaceAvailable(app: *App) bool {
-            if (comptime @hasField(App, "question_prompt")) {
-                if (app.question_prompt.isActive()) return false;
+        fn inlineCompletionSurfaceAvailable(app: *App, agent: *AppAgent) bool {
+            if (comptime agents.hasAgentField(App, "question_prompt")) {
+                if (agent.question_prompt.isActive()) return false;
             }
-            if (comptime @hasField(App, "approval_prompt")) {
-                if (app.approval_prompt.isActive()) return false;
+            if (comptime agents.hasAgentField(App, "approval_prompt")) {
+                if (agent.approval_prompt.isActive()) return false;
             }
-            if (catalogMenuOwnsSurface(app)) return false;
+            if (catalogMenuOwnsSurface(app, agent)) return false;
             return true;
         }
 
-        fn catalogMenuOwnsSurface(app: *App) bool {
+        fn catalogMenuOwnsSurface(app: *App, agent: *AppAgent) bool {
             if (app.input_runtime.help_menu.active or app.input_runtime.settings_menu.active) return true;
             if (comptime @hasField(App, "skills")) {
                 if (comptime @hasField(@TypeOf(app.skills), "menu")) {
@@ -748,8 +751,8 @@ pub fn CompletionRuntime(comptime App: type) type {
             if (comptime @hasField(App, "model_cache")) {
                 if (app.model_cache.menu.active) return true;
             }
-            if (comptime @hasField(App, "session_persistence")) {
-                if (app.session_persistence.session_picker.active) return true;
+            if (comptime agents.hasAgentField(App, "session_persistence")) {
+                if (agent.session_persistence.session_picker.active) return true;
             }
             return false;
         }
@@ -759,20 +762,20 @@ pub fn CompletionRuntime(comptime App: type) type {
             return 0;
         }
 
-        fn filePickerEligible(app: *App) bool {
+        fn filePickerEligible(app: *App, agent: *AppAgent) bool {
             if (comptime !runtime_profile.allows(App, .file_index)) return false;
-            if (comptime @hasField(App, "question_prompt")) if (app.question_prompt.isActive()) return false;
-            if (comptime @hasField(App, "approval_prompt")) if (app.approval_prompt.isActive()) return false;
+            if (comptime agents.hasAgentField(App, "question_prompt")) if (agent.question_prompt.isActive()) return false;
+            if (comptime agents.hasAgentField(App, "approval_prompt")) if (agent.approval_prompt.isActive()) return false;
             if (comptime @hasField(App, "auth")) {
                 if (comptime @hasDecl(@TypeOf(app.auth), "pickerView")) if (app.auth.pickerView().active) return false;
             }
             if (comptime @hasField(App, "shell")) {
                 if (comptime @hasDecl(@TypeOf(app.shell), "fullTranscriptActive")) if (app.shell.fullTranscriptActive()) return false;
             }
-            return !catalogMenuOwnsSurface(app);
+            return !catalogMenuOwnsSurface(app, agent);
         }
 
-        pub fn reconcileFilePicker(app: *App) void {
+        pub fn reconcileFilePicker(app: *App, agent: *AppAgent) void {
             if (comptime !runtime_profile.allows(App, .file_index)) return;
             const picker = &app.input_runtime.picker;
             const query = picker.activeFilePickerQuery(&app.input_runtime.edit_state);
@@ -782,7 +785,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                 break :blk fileCompletionsDependOnIndex(app, decoded);
             } else true;
             if (picker.file_completion.reconcile(query, fileScopeEpoch(app), indexed)) picker.resetFilePickerIndex();
-            const eligible = filePickerEligible(app);
+            const eligible = filePickerEligible(app, agent);
             if (!eligible) picker.file_completion.distrust();
             if (comptime @hasDecl(App, "reconcileDirectoryCompletion")) app.reconcileDirectoryCompletion(eligible);
             if (comptime @hasField(App, "shell")) {
@@ -795,17 +798,17 @@ pub fn CompletionRuntime(comptime App: type) type {
             }
         }
 
-        pub fn collectFilePickerFacts(app: *App) void {
+        pub fn collectFilePickerFacts(app: *App, agent: *AppAgent) void {
             if (comptime !runtime_profile.allows(App, .file_index)) return;
-            reconcileFilePicker(app);
-            app.harvestDirectoryCompletion(filePickerEligible(app));
+            reconcileFilePicker(app, agent);
+            app.harvestDirectoryCompletion(filePickerEligible(app, agent));
         }
 
         /// Returns true while the frame for a keystroke that started a folder
         /// listing should wait for its rows, so they paint together.
-        pub fn holdFrameForFileListing(app: *App, now_ms: i64) bool {
+        pub fn holdFrameForFileListing(app: *App, agent: *AppAgent, now_ms: i64) bool {
             if (comptime !runtime_profile.allows(App, .file_index)) return false;
-            app.harvestDirectoryCompletion(filePickerEligible(app));
+            app.harvestDirectoryCompletion(filePickerEligible(app, agent));
             const picker = &app.input_runtime.picker;
             const state = &picker.file_completion;
             if (!state.active) {
@@ -832,12 +835,12 @@ pub fn CompletionRuntime(comptime App: type) type {
 
         /// The sole acquisition boundary. Called after input batching, never by
         /// painters, navigation or acceptance. Directory work is scheduled, not run.
-        pub fn prepareFilePicker(app: *App) void {
+        pub fn prepareFilePicker(app: *App, agent: *AppAgent) void {
             if (comptime !runtime_profile.allows(App, .file_index)) return;
-            reconcileFilePicker(app);
+            reconcileFilePicker(app, agent);
             const picker = &app.input_runtime.picker;
             const state = &picker.file_completion;
-            if (!state.active or !filePickerEligible(app)) return;
+            if (!state.active or !filePickerEligible(app, agent)) return;
             if (state.refresh_requested) {
                 state.refresh_requested = false;
                 if (state.indexed) {
@@ -912,9 +915,9 @@ pub fn CompletionRuntime(comptime App: type) type {
             return picker.file_completion.view(picker.file_completion_index, picker.file_completion_window_start);
         }
 
-        pub fn acknowledgeFilePicker(app: *App, receipt: FilePickerReceipt) void {
+        pub fn acknowledgeFilePicker(app: *App, agent: *AppAgent, receipt: FilePickerReceipt) void {
             if (comptime !runtime_profile.allows(App, .file_index)) return;
-            if (!filePickerEligible(app)) return;
+            if (!filePickerEligible(app, agent)) return;
             const picker = &app.input_runtime.picker;
             picker.file_completion.acknowledge(app.alloc, receipt, &picker.file_completion_index, &picker.file_completion_window_start);
         }
@@ -923,17 +926,17 @@ pub fn CompletionRuntime(comptime App: type) type {
             if (comptime runtime_profile.allows(App, .file_index)) app.input_runtime.picker.file_completion.distrust();
         }
 
-        fn navigateFilePicker(app: *App, delta: i32) void {
-            reconcileFilePicker(app);
-            if (!filePickerEligible(app)) return;
+        fn navigateFilePicker(app: *App, agent: *AppAgent, delta: i32) void {
+            reconcileFilePicker(app, agent);
+            if (!filePickerEligible(app, agent)) return;
             const picker = &app.input_runtime.picker;
             picker.file_completion.navigate(&picker.file_completion_index, &picker.file_completion_window_start, delta);
         }
 
-        pub fn autocompleteFilePickerSelection(app: *App, max_input_len: usize) !edit_contract.InsertResult {
+        pub fn autocompleteFilePickerSelection(app: *App, agent: *AppAgent, max_input_len: usize) !edit_contract.InsertResult {
             if (comptime !runtime_profile.allows(App, .file_index)) return .inactive;
-            reconcileFilePicker(app);
-            if (!filePickerEligible(app)) return .inactive;
+            reconcileFilePicker(app, agent);
+            if (!filePickerEligible(app, agent)) return .inactive;
             const selection = resolveFilePickerSelection(app) orelse {
                 const picker = &app.input_runtime.picker;
                 const status = filePickerView(app).status;
@@ -941,7 +944,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                 app.shell.render_requests.request(.footer);
                 return .inactive;
             };
-            return applyFilePickerSelection(app, selection, max_input_len, .open);
+            return applyFilePickerSelection(app, agent, selection, max_input_len, .open);
         }
 
         fn resolveFilePickerSelection(app: *App) ?FilePickerSelection {
@@ -953,6 +956,7 @@ pub fn CompletionRuntime(comptime App: type) type {
 
         fn applyFilePickerSelection(
             app: *App,
+            agent: *AppAgent,
             selection: FilePickerSelection,
             max_input_len: usize,
             folder_action: FolderAction,
@@ -998,7 +1002,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             if (adds_terminator) try replacement.append(app.alloc, ' ');
             const cursor_after_replacement = replace_start + replacement.items.len + @intFromBool(!opens_directory and reuses_terminator);
 
-            const result = try app.input_runtime.replacementState(&app.pending_images).replaceRangeBounded(
+            const result = try app.input_runtime.replacementState(&agent.pending_images).replaceRangeBounded(
                 app.alloc,
                 .{ .start = replace_start, .end = replace_end },
                 replacement.items,
@@ -1018,15 +1022,15 @@ pub fn CompletionRuntime(comptime App: type) type {
             return result;
         }
 
-        pub fn submitFilePickerOnEnter(app: *App, max_input_len: usize) !?edit_contract.InsertResult {
+        pub fn submitFilePickerOnEnter(app: *App, agent: *AppAgent, max_input_len: usize) !?edit_contract.InsertResult {
             if (comptime !runtime_profile.allows(App, .file_index)) return null;
-            reconcileFilePicker(app);
-            if (!filePickerOwnsSurface(app)) return null;
+            reconcileFilePicker(app, agent);
+            if (!filePickerOwnsSurface(app, agent)) return null;
             const selection = resolveFilePickerSelection(app) orelse {
                 if (app.input_runtime.picker.file_completion.acceptedEmpty()) return null;
                 return .inactive;
             };
-            const result = try applyFilePickerSelection(app, selection, max_input_len, .select);
+            const result = try applyFilePickerSelection(app, agent, selection, max_input_len, .select);
             debug_trace.logf(
                 "input",
                 "file picker Enter consumed selected={s} limit_exceeded={s}",
@@ -1038,8 +1042,8 @@ pub fn CompletionRuntime(comptime App: type) type {
             return result;
         }
 
-        pub fn filePickerOwnsSurface(app: *App) bool {
-            return filePickerEligible(app) and hasFileQuery(app);
+        pub fn filePickerOwnsSurface(app: *App, agent: *AppAgent) bool {
+            return filePickerEligible(app, agent) and hasFileQuery(app);
         }
 
         fn isCurrentFileCompletion(app: *App, query: []const u8, path: []const u8, kind: file_index.CandidateKind) bool {
@@ -1186,14 +1190,14 @@ pub fn CompletionRuntime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        pub fn advanceModelPickerOnSpace(app: *App) !bool {
+        pub fn advanceModelPickerOnSpace(app: *App, agent: *AppAgent) !bool {
             const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return false;
             if (app.input_runtime.edit_state.cursor != app.input_runtime.edit_state.input.items.len) return false;
 
             switch (query.stage) {
                 .model => {
                     const model = exactModelCompletion(app, query.query) orelse return false;
-                    try beginModelPickerOptions(app, model);
+                    try beginModelPickerOptions(app, agent, model);
                     return true;
                 },
                 .effort => {
@@ -1224,7 +1228,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             return null;
         }
 
-        pub fn submitModelPicker(app: *App) !bool {
+        pub fn submitModelPicker(app: *App, agent: *AppAgent) !bool {
             switch (app.input_runtime.picker.model_picker_stage) {
                 .model => {
                     if (app.isModelCacheLoading()) {
@@ -1234,7 +1238,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                         return true;
                     }
                     const model = selectedModelCompletion(app) orelse return false;
-                    try beginModelPickerOptions(app, model);
+                    try beginModelPickerOptions(app, agent, model);
                     return true;
                 },
                 .effort => {
@@ -1250,7 +1254,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                         try setModelComposerText(app, "/model {s} {s} ", .{ model, effort.label() });
                         try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, model_capabilities.reasoningEffortIndex(capabilities, effort), true, false, .fast);
                     } else {
-                        try session_commands.Commands(App).selectModelFromPicker(app, model, effort, app.fast_mode, false);
+                        try session_commands.Commands(App).selectModelFromPicker(app, agent, model, effort, app.fast_mode, false);
                         app.input_runtime.inputResetState().clearCurrent(app.alloc);
                     }
                     app.shell.render_requests.request(.footer);
@@ -1265,7 +1269,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                         return true;
                     };
                     const effort = model_capabilities.reasoningEffortAtIndex(model_capabilities.resolveForApp(App, app, model), app.input_runtime.picker.model_picker_effort_index);
-                    try session_commands.Commands(App).selectModelFromPicker(app, model, effort, speed.fast_mode, speed.ultrafast_mode);
+                    try session_commands.Commands(App).selectModelFromPicker(app, agent, model, effort, speed.fast_mode, speed.ultrafast_mode);
                     app.input_runtime.inputResetState().clearCurrent(app.alloc);
                     app.shell.render_requests.request(.footer);
                     return true;
@@ -1290,7 +1294,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        fn beginModelPickerOptions(app: *App, model: []const u8) !void {
+        fn beginModelPickerOptions(app: *App, agent: *AppAgent, model: []const u8) !void {
             const capabilities = model_capabilities.resolveForApp(App, app, model);
             const supports_effort = capabilities.reasoning_efforts.len > 0;
             const supports_fast = capabilities.supports_fast_mode;
@@ -1298,7 +1302,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             const supports_speed = supports_fast or supports_ultrafast;
 
             if (!supports_effort and !supports_speed) {
-                try session_commands.Commands(App).selectModelFromPicker(app, model, app.effort, app.fast_mode, false);
+                try session_commands.Commands(App).selectModelFromPicker(app, agent, model, agent.effort, app.fast_mode, false);
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
                 app.shell.render_requests.request(.footer);
                 return;
@@ -1322,11 +1326,11 @@ pub fn CompletionRuntime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        pub fn beginExactModelSelection(app: *App, model: []const u8) !void {
-            try beginModelPickerOptions(app, model);
+        pub fn beginExactModelSelection(app: *App, agent: *AppAgent, model: []const u8) !void {
+            try beginModelPickerOptions(app, agent, model);
         }
 
-        pub fn stepBackModelPicker(app: *App) !bool {
+        pub fn stepBackModelPicker(app: *App, agent: *AppAgent) !bool {
             const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return false;
             if (query.stage == .model) return false;
             if (!app.input_runtime.picker.hasPendingModelPickerSelection()) return false;
@@ -1344,7 +1348,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                     if (capabilities.reasoning_efforts.len > 0) {
                         const effort_index = model_capabilities.reasoningEffortIndex(capabilities, model_capabilities.reasoningEffortAtIndex(capabilities, app.input_runtime.picker.model_picker_effort_index));
                         try setModelComposerText(app, "/model {s} ", .{model});
-                        try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, effort_index, app.fast_mode, app.worker.agent_turn_settings.ultrafast_mode, .effort);
+                        try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, effort_index, app.fast_mode, agent.worker.agent_turn_settings.ultrafast_mode, .effort);
                     } else {
                         try restoreModelPickerModelStage(app, model);
                     }
@@ -1511,8 +1515,10 @@ pub fn CompletionRuntime(comptime App: type) type {
 const FilePickerTestApp = struct {
     alloc: std.mem.Allocator,
     input_runtime: core_input_runtime.Runtime = .{},
-    pending_images: std.ArrayList(types.ImageAttachment) = .empty,
-    stream: types.StreamState = .{},
+    main_agent: struct {
+        pending_images: std.ArrayList(types.ImageAttachment) = .empty,
+        stream: types.StreamState = .{},
+    } = .{},
     shell: struct { render_requests: render_request.RenderRequestState = .{} } = .{},
     file_completion_values: []const file_index.Candidate = &.{},
     file_completion_calls: usize = 0,
@@ -1544,7 +1550,7 @@ const FilePickerTestApp = struct {
 
     fn deinit(self: *FilePickerTestApp) void {
         self.input_runtime.deinit(self.alloc);
-        self.pending_images.deinit(self.alloc);
+        self.agent().pending_images.deinit(self.alloc);
     }
 
     pub fn fileCompletions(
@@ -1569,6 +1575,10 @@ const FilePickerTestApp = struct {
     pub fn isCurrentFileCompletion(_: *const FilePickerTestApp, _: []const u8, _: []const u8, _: file_index.CandidateKind) bool {
         return true;
     }
+
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
+    }
 };
 
 const FilesystemFilePickerTestApp = struct {
@@ -1578,7 +1588,9 @@ const FilesystemFilePickerTestApp = struct {
     workspace: app_workspace_runtime.State = .{},
     file_index: file_index.FileIndex = .{},
     input_runtime: core_input_runtime.Runtime = .{},
-    pending_images: std.ArrayList(types.ImageAttachment) = .empty,
+    main_agent: struct {
+        pending_images: std.ArrayList(types.ImageAttachment) = .empty,
+    } = .{},
 
     pub fn reconcileDirectoryCompletion(self: *FilesystemFilePickerTestApp, eligible: bool) void {
         app_workspace_runtime.Runtime(FilesystemFilePickerTestApp).reconcileDirectoryCompletion(self, eligible);
@@ -1596,7 +1608,7 @@ const FilesystemFilePickerTestApp = struct {
         app_workspace_runtime.Runtime(FilesystemFilePickerTestApp).deinit(self);
         self.file_index.deinit(self.alloc);
         self.input_runtime.deinit(self.alloc);
-        self.pending_images.deinit(self.alloc);
+        self.agent().pending_images.deinit(self.alloc);
     }
 
     pub fn fileCompletions(
@@ -1632,6 +1644,10 @@ const FilesystemFilePickerTestApp = struct {
             kind,
         );
     }
+
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
+    }
 };
 
 const inline_completion_test_slash_specs = [_]command_specs.SlashSpec{
@@ -1653,15 +1669,17 @@ const inline_completion_test_slash_registry = command_specs.SlashRegistry{
 const InlineCompletionTestApp = struct {
     alloc: std.mem.Allocator,
     input_runtime: core_input_runtime.Runtime = .{},
-    pending_images: std.ArrayList(types.ImageAttachment) = .empty,
+    main_agent: struct {
+        pending_images: std.ArrayList(types.ImageAttachment) = .empty,
+        session_persistence: struct {
+            session_picker: struct {
+                active: bool = false,
+            } = .{},
+        } = .{},
+    } = .{},
     skills: skill_runtime.Runtime = .{},
     model_cache: struct {
         menu: struct {
-            active: bool = false,
-        } = .{},
-    } = .{},
-    session_persistence: struct {
-        session_picker: struct {
             active: bool = false,
         } = .{},
     } = .{},
@@ -1678,7 +1696,11 @@ const InlineCompletionTestApp = struct {
 
     fn deinit(self: *InlineCompletionTestApp) void {
         self.input_runtime.deinit(self.alloc);
-        self.pending_images.deinit(self.alloc);
+        self.agent().pending_images.deinit(self.alloc);
+    }
+
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
     }
 };
 
@@ -1730,20 +1752,20 @@ test "inline slash completion uses the shared visible suffix and acceptance path
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "explain /he");
 
-    const completion = rt.visibleInlineCompletion(&app).?;
+    const completion = rt.visibleInlineCompletion(&app, (&app).agent()).?;
     try std.testing.expectEqualStrings("lp", completion.suffix());
     try std.testing.expectEqualStrings(
         "lp",
-        rt.visibleInlineSlashCompletion(&app).?.suffix,
+        rt.visibleInlineSlashCompletion(&app, (&app).agent()).?.suffix,
     );
     try std.testing.expectEqual(
         edit_contract.InsertResult.limit_exceeded,
-        try rt.autocompleteInlineCompletion(&app, app.input_runtime.edit_state.input.items.len),
+        try rt.autocompleteInlineCompletion(&app, (&app).agent(), app.input_runtime.edit_state.input.items.len),
     );
     try std.testing.expectEqualStrings("explain /he", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(
         edit_contract.InsertResult.inserted,
-        try rt.autocompleteInlineCompletion(&app, 4096),
+        try rt.autocompleteInlineCompletion(&app, (&app).agent(), 4096),
     );
     try std.testing.expectEqualStrings("explain /help", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(app.input_runtime.edit_state.input.items.len, app.input_runtime.edit_state.cursor);
@@ -1759,18 +1781,18 @@ test "inline slash completion stays inactive when its suffix cannot render" {
     app.shell.layout.cols = 7;
     try std.testing.expectEqual(
         @as(?InlineSlashCompletion, null),
-        rt.visibleInlineSlashCompletion(&app),
+        rt.visibleInlineSlashCompletion(&app, (&app).agent()),
     );
     try std.testing.expectEqual(
         edit_contract.InsertResult.inactive,
-        try rt.autocompleteInlineCompletion(&app, 4096),
+        try rt.autocompleteInlineCompletion(&app, (&app).agent(), 4096),
     );
     try std.testing.expectEqualStrings("x /he", app.input_runtime.edit_state.input.items);
 
     app.shell.layout.cols = 8;
     try std.testing.expectEqualStrings(
         "lp",
-        rt.visibleInlineSlashCompletion(&app).?.suffix,
+        rt.visibleInlineSlashCompletion(&app, (&app).agent()).?.suffix,
     );
 }
 
@@ -1781,13 +1803,13 @@ test "root slash query is dismissible only while candidates are visible" {
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "/hezzzzz");
 
-    try std.testing.expectEqual(@as(usize, 0), rt.visibleSlashCompletionCount(&app));
-    try std.testing.expect(!rt.dismissVisibleInlinePicker(&app));
+    try std.testing.expectEqual(@as(usize, 0), rt.visibleSlashCompletionCount(&app, (&app).agent()));
+    try std.testing.expect(!rt.dismissVisibleInlinePicker(&app, (&app).agent()));
     try std.testing.expect(!app.input_runtime.picker.isInlinePickerDismissed(.slash));
 
     try app.input_runtime.textReplacementState().replace(alloc, "/he");
-    try std.testing.expect(rt.visibleSlashCompletionCount(&app) > 0);
-    try std.testing.expect(rt.dismissVisibleInlinePicker(&app));
+    try std.testing.expect(rt.visibleSlashCompletionCount(&app, (&app).agent()) > 0);
+    try std.testing.expect(rt.dismissVisibleInlinePicker(&app, (&app).agent()));
     try std.testing.expect(app.input_runtime.picker.isInlinePickerDismissed(.slash));
 }
 
@@ -1807,11 +1829,11 @@ test "root slash completion follows multiline and command argument ownership" {
     defer app.deinit();
 
     try app.input_runtime.textReplacementState().replace(alloc, "\n   /");
-    try std.testing.expect(rt.visibleSlashCompletionCount(&app) > 0);
+    try std.testing.expect(rt.visibleSlashCompletionCount(&app, (&app).agent()) > 0);
 
     try app.input_runtime.textReplacementState().replace(alloc, "/resume ");
-    try std.testing.expectEqual(@as(usize, 0), rt.visibleSlashCompletionCount(&app));
-    try std.testing.expect(!rt.dismissVisibleInlinePicker(&app));
+    try std.testing.expectEqual(@as(usize, 0), rt.visibleSlashCompletionCount(&app, (&app).agent()));
+    try std.testing.expect(!rt.dismissVisibleInlinePicker(&app, (&app).agent()));
 }
 
 test "inline skill completion stays inactive when its suffix cannot render" {
@@ -1833,18 +1855,18 @@ test "inline skill completion stays inactive when its suffix cannot render" {
     app.shell.layout.cols = 8;
     try std.testing.expectEqual(
         @as(?InlineSkillCompletion, null),
-        rt.visibleInlineSkillCompletion(&app),
+        rt.visibleInlineSkillCompletion(&app, (&app).agent()),
     );
     try std.testing.expectEqual(
         edit_contract.InsertResult.inactive,
-        try rt.autocompleteInlineSkillCompletion(&app, 4096),
+        try rt.autocompleteInlineSkillCompletion(&app, (&app).agent(), 4096),
     );
     try std.testing.expectEqualStrings("x $man", app.input_runtime.edit_state.input.items);
 
     app.shell.layout.cols = 9;
     try std.testing.expectEqualStrings(
         "aged-menu",
-        rt.visibleInlineSkillCompletion(&app).?.suffix,
+        rt.visibleInlineSkillCompletion(&app, (&app).agent()).?.suffix,
     );
 }
 
@@ -1867,11 +1889,11 @@ test "model picker ownership suppresses inline skill completion" {
     try std.testing.expect(app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) != null);
     try std.testing.expectEqual(
         @as(?InlineSkillCompletion, null),
-        rt.visibleInlineSkillCompletion(&app),
+        rt.visibleInlineSkillCompletion(&app, (&app).agent()),
     );
     try std.testing.expectEqual(
         edit_contract.InsertResult.inactive,
-        try rt.autocompleteInlineSkillCompletion(&app, 4096),
+        try rt.autocompleteInlineSkillCompletion(&app, (&app).agent(), 4096),
     );
     try std.testing.expectEqualStrings("/model anything $man", app.input_runtime.edit_state.input.items);
 }
@@ -1892,7 +1914,7 @@ test "dedicated catalog ownership suppresses inline skill completion" {
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "x $man");
 
-    try std.testing.expect(rt.visibleInlineSkillCompletion(&app) != null);
+    try std.testing.expect(rt.visibleInlineSkillCompletion(&app, (&app).agent()) != null);
 
     app.input_runtime.help_menu.active = true;
     try expectInlineSkillCompletionInactive(&app);
@@ -1906,9 +1928,9 @@ test "dedicated catalog ownership suppresses inline skill completion" {
     try expectInlineSkillCompletionInactive(&app);
     app.model_cache.menu.active = false;
 
-    app.session_persistence.session_picker.active = true;
+    app.agent().session_persistence.session_picker.active = true;
     try expectInlineSkillCompletionInactive(&app);
-    app.session_persistence.session_picker.active = false;
+    app.agent().session_persistence.session_picker.active = false;
 
     app.skills.menu.active = true;
     try expectInlineSkillCompletionInactive(&app);
@@ -1922,35 +1944,39 @@ fn expectInlineSkillCompletionInactive(app: *InlineCompletionTestApp) !void {
     const rt = CompletionRuntime(InlineCompletionTestApp);
     try std.testing.expectEqual(
         @as(?InlineSkillCompletion, null),
-        rt.visibleInlineSkillCompletion(app),
+        rt.visibleInlineSkillCompletion(app, agents.screenAgentOf(app)),
     );
     try std.testing.expectEqual(
         edit_contract.InsertResult.inactive,
-        try rt.autocompleteInlineSkillCompletion(app, 4096),
+        try rt.autocompleteInlineSkillCompletion(app, agents.screenAgentOf(app), 4096),
     );
 }
 
 test "file picker disabled profile never claims literal input or prepares rows" {
     const DisabledApp = struct {
         pub const host_profile = runtime_profile.wasm;
+        main_agent: struct {} = .{},
         input_runtime: core_input_runtime.Runtime = .{},
+        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+            return &self.main_agent;
+        }
     };
     const rt = CompletionRuntime(DisabledApp);
     var app: DisabledApp = .{};
     defer app.input_runtime.deinit(std.testing.allocator);
     try app.input_runtime.textReplacementState().replace(std.testing.allocator, "@./file");
-    rt.prepareFilePicker(&app);
-    rt.reconcileFilePicker(&app);
-    rt.collectFilePickerFacts(&app);
+    rt.prepareFilePicker(&app, (&app).agent());
+    rt.reconcileFilePicker(&app, (&app).agent());
+    rt.collectFilePickerFacts(&app, (&app).agent());
     const workspace_rt = app_workspace_runtime.Runtime(DisabledApp);
     workspace_rt.prepareDirectoryCompletion(&app);
     workspace_rt.reconcileDirectoryCompletion(&app, true);
     workspace_rt.harvestDirectoryCompletion(&app, true);
     workspace_rt.requestStop(&app);
     try std.testing.expect(!rt.hasFileQuery(&app));
-    try std.testing.expect(!rt.filePickerOwnsSurface(&app));
-    try std.testing.expectEqual(@as(?edit_contract.InsertResult, null), try rt.submitFilePickerOnEnter(&app, 4096));
-    try std.testing.expectEqual(edit_contract.InsertResult.inactive, try rt.autocompleteFilePickerSelection(&app, 4096));
+    try std.testing.expect(!rt.filePickerOwnsSurface(&app, (&app).agent()));
+    try std.testing.expectEqual(@as(?edit_contract.InsertResult, null), try rt.submitFilePickerOnEnter(&app, (&app).agent(), 4096));
+    try std.testing.expectEqual(edit_contract.InsertResult.inactive, try rt.autocompleteFilePickerSelection(&app, (&app).agent(), 4096));
     try std.testing.expect(!app.input_runtime.picker.file_completion.active);
     try std.testing.expectEqualStrings("@./file", app.input_runtime.edit_state.input.items);
 }
@@ -1961,19 +1987,19 @@ test "file picker defers bare at refresh until the settled query mode" {
     var app = FilePickerTestApp{ .alloc = alloc };
     defer app.deinit();
     try app.input_runtime.edit_state.insertSlice(alloc, "@");
-    rt.reconcileFilePicker(&app);
+    rt.reconcileFilePicker(&app, (&app).agent());
     try std.testing.expectEqual(@as(usize, 0), app.file_index_refreshes);
     try app.input_runtime.edit_state.insertSlice(alloc, "~");
-    rt.reconcileFilePicker(&app);
-    rt.prepareFilePicker(&app);
+    rt.reconcileFilePicker(&app, (&app).agent());
+    rt.prepareFilePicker(&app, (&app).agent());
     try std.testing.expectEqual(@as(usize, 0), app.file_index_refreshes);
     try std.testing.expect(!app.input_runtime.picker.file_completion.indexed);
     // A mode change inside the same occurrence must still refresh the index.
     try app.input_runtime.edit_state.insertSlice(alloc, "notes");
-    rt.reconcileFilePicker(&app);
-    rt.prepareFilePicker(&app);
+    rt.reconcileFilePicker(&app, (&app).agent());
+    rt.prepareFilePicker(&app, (&app).agent());
     try std.testing.expectEqual(@as(usize, 1), app.file_index_refreshes);
-    rt.prepareFilePicker(&app);
+    rt.prepareFilePicker(&app, (&app).agent());
     try std.testing.expectEqual(@as(usize, 1), app.file_index_refreshes);
 }
 
@@ -1985,13 +2011,13 @@ test "file picker resize invalidation blocks acceptance without another lookup" 
     try app.input_runtime.textReplacementState().replace(alloc, "@file");
     try presentFilePickerForTest(&app);
     app.shell.render_requests.observeResizeSignal(0, 100);
-    try std.testing.expectEqual(edit_contract.InsertResult.inactive, (try rt.submitFilePickerOnEnter(&app, 4096)).?);
+    try std.testing.expectEqual(edit_contract.InsertResult.inactive, (try rt.submitFilePickerOnEnter(&app, (&app).agent(), 4096)).?);
     try std.testing.expectEqualStrings("@file", app.input_runtime.edit_state.input.items);
-    rt.prepareFilePicker(&app);
+    rt.prepareFilePicker(&app, (&app).agent());
     try std.testing.expectEqual(@as(usize, 1), app.file_completion_calls);
     app.shell.render_requests.completeResizeGeometry(false);
-    rt.acknowledgeFilePicker(&app, rt.filePickerView(&app).receipt.?);
-    try std.testing.expectEqual(edit_contract.InsertResult.inserted, (try rt.submitFilePickerOnEnter(&app, 4096)).?);
+    rt.acknowledgeFilePicker(&app, (&app).agent(), rt.filePickerView(&app).receipt.?);
+    try std.testing.expectEqual(edit_contract.InsertResult.inserted, (try rt.submitFilePickerOnEnter(&app, (&app).agent(), 4096)).?);
     try std.testing.expectEqual(@as(usize, 1), app.file_completion_calls);
 }
 
@@ -2001,32 +2027,32 @@ test "file picker preparation caches data but requires an explicit visible recei
     var app = FilePickerTestApp{ .alloc = alloc, .file_completion_values = &.{.{ .path = "file.txt", .kind = .file }} };
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "@file");
-    rt.prepareFilePicker(&app);
+    rt.prepareFilePicker(&app, (&app).agent());
     try std.testing.expectEqual(@as(usize, 1), app.file_completion_calls);
-    try std.testing.expectEqual(edit_contract.InsertResult.inactive, (try rt.submitFilePickerOnEnter(&app, 4096)).?);
+    try std.testing.expectEqual(edit_contract.InsertResult.inactive, (try rt.submitFilePickerOnEnter(&app, (&app).agent(), 4096)).?);
     try std.testing.expectEqualStrings("@file", app.input_runtime.edit_state.input.items);
-    rt.prepareFilePicker(&app);
+    rt.prepareFilePicker(&app, (&app).agent());
     try std.testing.expectEqual(@as(usize, 1), app.file_completion_calls);
-    rt.acknowledgeFilePicker(&app, rt.filePickerView(&app).receipt.?);
-    rt.navigateFilePicker(&app, 1);
+    rt.acknowledgeFilePicker(&app, (&app).agent(), rt.filePickerView(&app).receipt.?);
+    rt.navigateFilePicker(&app, (&app).agent(), 1);
     _ = rt.filePickerView(&app);
-    rt.prepareFilePicker(&app);
+    rt.prepareFilePicker(&app, (&app).agent());
     try std.testing.expectEqual(@as(usize, 1), app.file_completion_calls);
-    try std.testing.expectEqual(edit_contract.InsertResult.inserted, (try rt.submitFilePickerOnEnter(&app, 4096)).?);
+    try std.testing.expectEqual(edit_contract.InsertResult.inserted, (try rt.submitFilePickerOnEnter(&app, (&app).agent(), 4096)).?);
     try std.testing.expectEqual(@as(usize, 1), app.file_completion_calls);
     try std.testing.expectEqualStrings("@file.txt ", app.input_runtime.edit_state.input.items);
 }
 
 fn presentFilePickerForTest(app: anytype) !void {
     const rt = CompletionRuntime(@TypeOf(app.*));
-    rt.prepareFilePicker(app);
+    rt.prepareFilePicker(app, agents.screenAgentOf(app));
     if (comptime @TypeOf(app.*) == FilesystemFilePickerTestApp) {
         while (app.input_runtime.picker.file_completion.directory_request != null) {
-            rt.collectFilePickerFacts(app);
+            rt.collectFilePickerFacts(app, agents.screenAgentOf(app));
             try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
         }
     }
-    if (rt.filePickerView(app).receipt) |receipt| rt.acknowledgeFilePicker(app, receipt);
+    if (rt.filePickerView(app).receipt) |receipt| rt.acknowledgeFilePicker(app, agents.screenAgentOf(app), receipt);
 }
 
 test "streaming file selection commits the selected path" {
@@ -2038,12 +2064,12 @@ test "streaming file selection commits the selected path" {
     };
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "review @src/mai");
-    app.stream.active = true;
+    app.agent().stream.active = true;
     try presentFilePickerForTest(&app);
 
     try std.testing.expectEqual(
         edit_contract.InsertResult.inserted,
-        (try rt.submitFilePickerOnEnter(&app, 4096)).?,
+        (try rt.submitFilePickerOnEnter(&app, (&app).agent(), 4096)).?,
     );
     try std.testing.expectEqualStrings("review @src/main.zig ", app.input_runtime.edit_state.input.items);
 }
@@ -2061,7 +2087,7 @@ test "file picker encodes literal quotes without reopening quote grammar" {
 
     try std.testing.expectEqual(
         edit_contract.InsertResult.inserted,
-        try rt.autocompleteFilePickerSelection(&app, 4096),
+        try rt.autocompleteFilePickerSelection(&app, (&app).agent(), 4096),
     );
     try std.testing.expectEqualStrings("@\"\\\"weird\" ", app.input_runtime.edit_state.input.items);
     try std.testing.expect(app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) == null);
@@ -2075,7 +2101,7 @@ test "file picker quoted middle replacement preserves only the outside tail" {
     try app.input_runtime.textReplacementState().replace(alloc, "read @\"a\\\\old.txt\" suffix");
     app.input_runtime.edit_state.cursor = "read @\"a\\\\".len;
     try presentFilePickerForTest(&app);
-    try std.testing.expectEqual(edit_contract.InsertResult.inserted, try rt.autocompleteFilePickerSelection(&app, 4096));
+    try std.testing.expectEqual(edit_contract.InsertResult.inserted, try rt.autocompleteFilePickerSelection(&app, (&app).agent(), 4096));
     try std.testing.expectEqualStrings("read @\"a\\\\b.txt\" suffix", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual("read @\"a\\\\b.txt\" ".len, app.input_runtime.edit_state.cursor);
 }
@@ -2105,7 +2131,7 @@ test "filesystem file picker pipeline drills into a directory and selects a file
     try presentFilePickerForTest(&app);
     try std.testing.expectEqual(
         edit_contract.InsertResult.inserted,
-        try rt.autocompleteFilePickerSelection(&app, 4096),
+        try rt.autocompleteFilePickerSelection(&app, (&app).agent(), 4096),
     );
     try std.testing.expectEqualStrings(
         "@\"./space dir/",
@@ -2120,7 +2146,7 @@ test "filesystem file picker pipeline drills into a directory and selects a file
     try presentFilePickerForTest(&app);
     try std.testing.expectEqual(
         edit_contract.InsertResult.inserted,
-        try rt.autocompleteFilePickerSelection(&app, 4096),
+        try rt.autocompleteFilePickerSelection(&app, (&app).agent(), 4096),
     );
     try std.testing.expectEqualStrings(
         "@\"./space dir/item.txt\" ",
@@ -2152,7 +2178,7 @@ test "filesystem file picker lists an opened folder first and Enter selects it" 
 
     try app.input_runtime.textReplacementState().replace(alloc, "@./space");
     try presentFilePickerForTest(&app);
-    try std.testing.expectEqual(edit_contract.InsertResult.inserted, try rt.autocompleteFilePickerSelection(&app, 4096));
+    try std.testing.expectEqual(edit_contract.InsertResult.inserted, try rt.autocompleteFilePickerSelection(&app, (&app).agent(), 4096));
     try std.testing.expectEqualStrings("@\"./space dir/", app.input_runtime.edit_state.input.items);
 
     try presentFilePickerForTest(&app);
@@ -2161,7 +2187,7 @@ test "filesystem file picker lists an opened folder first and Enter selects it" 
     try std.testing.expectEqual(file_index.CandidateKind.directory, folder.kind);
     try std.testing.expectEqualStrings("./space dir/item.txt", app.input_runtime.picker.file_completion.selected(1).?.path);
 
-    try std.testing.expectEqual(edit_contract.InsertResult.inserted, (try rt.submitFilePickerOnEnter(&app, 4096)).?);
+    try std.testing.expectEqual(edit_contract.InsertResult.inserted, (try rt.submitFilePickerOnEnter(&app, (&app).agent(), 4096)).?);
     try std.testing.expectEqualStrings("@\"./space dir/\" ", app.input_runtime.edit_state.input.items);
     try std.testing.expect(app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) == null);
 }
@@ -2185,11 +2211,11 @@ test "filesystem file picker releases a held folder frame only with its rows" {
     defer app.deinit();
 
     try app.input_runtime.textReplacementState().replace(alloc, "@./tree/");
-    rt.prepareFilePicker(&app);
+    rt.prepareFilePicker(&app, (&app).agent());
     // The clock stands still, so the wait can end only because the rows arrived.
     const now_ms: i64 = 1_000;
     var polls: usize = 0;
-    while (rt.holdFrameForFileListing(&app, now_ms)) : (polls += 1) {
+    while (rt.holdFrameForFileListing(&app, (&app).agent(), now_ms)) : (polls += 1) {
         if (polls == 5_000) return error.TestUnexpectedResult;
         std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch unreachable;
     }
@@ -2219,15 +2245,15 @@ test "file picker loading Tab preserves pending request and Enter never queues a
     var app: FilePickerTestApp = .{ .alloc = alloc };
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "@./pending/");
-    rt.reconcileFilePicker(&app);
+    rt.reconcileFilePicker(&app, (&app).agent());
     const state = &app.input_runtime.picker.file_completion;
     state.stage(alloc, .{ .state = .ready }, .loading, null);
     state.directory_request = 71;
     state.rejectSelection(); // A retry of stale rows must also stay loading.
     for (0..4) |_| {
-        try std.testing.expectEqual(edit_contract.InsertResult.inactive, try rt.autocompleteFilePickerSelection(&app, 4096));
-        try std.testing.expectEqual(edit_contract.InsertResult.inactive, (try rt.submitFilePickerOnEnter(&app, 4096)).?);
-        rt.prepareFilePicker(&app);
+        try std.testing.expectEqual(edit_contract.InsertResult.inactive, try rt.autocompleteFilePickerSelection(&app, (&app).agent(), 4096));
+        try std.testing.expectEqual(edit_contract.InsertResult.inactive, (try rt.submitFilePickerOnEnter(&app, (&app).agent(), 4096)).?);
+        rt.prepareFilePicker(&app, (&app).agent());
         try std.testing.expectEqual(@as(?u64, 71), state.directory_request);
         try std.testing.expect(!state.lookup_dirty);
     }
@@ -2235,11 +2261,11 @@ test "file picker loading Tab preserves pending request and Enter never queues a
     try std.testing.expectEqualStrings("@./pending/", app.input_runtime.edit_state.input.items);
     state.directory_request = null;
     state.stage(alloc, .{ .state = .ready }, .ready, try file_completion_state.Rows.copy(alloc, &.{.{ .path = "./pending/a", .kind = .file, .matched_spans = &.{} }}));
-    try std.testing.expectEqual(edit_contract.InsertResult.inactive, (try rt.submitFilePickerOnEnter(&app, 4096)).?);
+    try std.testing.expectEqual(edit_contract.InsertResult.inactive, (try rt.submitFilePickerOnEnter(&app, (&app).agent(), 4096)).?);
     try std.testing.expectEqualStrings("@./pending/", app.input_runtime.edit_state.input.items);
-    rt.acknowledgeFilePicker(&app, rt.filePickerView(&app).receipt.?);
+    rt.acknowledgeFilePicker(&app, (&app).agent(), rt.filePickerView(&app).receipt.?);
     try std.testing.expectEqualStrings("@./pending/", app.input_runtime.edit_state.input.items);
-    try std.testing.expectEqual(edit_contract.InsertResult.inactive, (try rt.submitFilePickerOnEnter(&app, 4096)).?);
-    rt.navigateFilePicker(&app, 1);
-    try std.testing.expectEqual(edit_contract.InsertResult.inserted, (try rt.submitFilePickerOnEnter(&app, 4096)).?);
+    try std.testing.expectEqual(edit_contract.InsertResult.inactive, (try rt.submitFilePickerOnEnter(&app, (&app).agent(), 4096)).?);
+    rt.navigateFilePicker(&app, (&app).agent(), 1);
+    try std.testing.expectEqual(edit_contract.InsertResult.inserted, (try rt.submitFilePickerOnEnter(&app, (&app).agent(), 4096)).?);
 }

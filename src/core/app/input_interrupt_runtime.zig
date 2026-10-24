@@ -45,41 +45,42 @@ test "cancellation target distinguishes agent turns and manual compaction" {
 
 pub fn InterruptRuntime(comptime App: type) type {
     return struct {
-        pub fn hasActiveOperation(app: *App) bool {
+        const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
+        pub fn hasActiveOperation(app: *App, agent: *AppAgent) bool {
             if (comptime @hasField(App, "auth")) {
                 if (comptime @hasDecl(@TypeOf(app.auth), "providerPreparationPending")) {
                     if (app.auth.providerPreparationPending()) return true;
                 }
             }
-            return activeCancellationTarget(app) != .none;
+            return activeCancellationTarget(agent) != .none;
         }
 
-        pub fn dismissCompactionFeedback(app: *App) bool {
-            if (comptime !@hasDecl(@TypeOf(app.worker), "compactionActivitySnapshot")) return false;
-            const observed = app.worker.compactionActivitySnapshot();
+        pub fn dismissCompactionFeedback(app: *App, agent: *AppAgent) bool {
+            if (comptime !@hasDecl(@TypeOf(agent.worker), "compactionActivitySnapshot")) return false;
+            const observed = agent.worker.compactionActivitySnapshot();
             const op = observed.operation orelse return false;
             if (!op.visible(@import("../shared/io.zig").milliTimestamp())) return false;
-            if (!app.worker.dismissCompactionActivity(op.id, observed.revision)) return false;
+            if (!agent.worker.dismissCompactionActivity(op.id, observed.revision)) return false;
             app.shell.render_requests.request(.footer);
             return true;
         }
 
-        pub fn cancelActiveOperation(app: *App) !void {
+        pub fn cancelActiveOperation(app: *App, agent: *AppAgent) !void {
             if (comptime @hasField(App, "auth")) {
                 if (comptime @hasDecl(@TypeOf(app.auth), "cancelProviderPreparation")) {
                     if (app.auth.cancelProviderPreparation()) {
-                        if (comptime @hasDecl(App, "cancelPendingSubmission")) _ = App.cancelPendingSubmission(app);
+                        if (comptime @hasDecl(App, "cancelPendingSubmission")) _ = App.cancelPendingSubmission(app, agent);
                         app.shell.render_requests.request(.footer);
                         return;
                     }
                 }
             }
-            if (activeCancellationTarget(app) == .context_compaction) {
+            if (activeCancellationTarget(agent) == .context_compaction) {
                 if (comptime !@hasDecl(
-                    @TypeOf(app.worker),
+                    @TypeOf(agent.worker),
                     "cancelContextCompaction",
                 )) return;
-                const cancelled = app.worker.cancelContextCompaction(
+                const cancelled = agent.worker.cancelContextCompaction(
                     std.heap.c_allocator,
                 );
                 if (!cancelled) return;
@@ -88,21 +89,21 @@ pub fn InterruptRuntime(comptime App: type) type {
                 app.shell.render_requests.request(.footer);
                 return;
             }
-            if (!app.stream.active) return;
+            if (!agent.stream.active) return;
             // Pending approval keeps the stream active until resolution.
             // Avoid duplicate cancellation notices once the worker is cancelled.
-            if (app.worker.isCancelRequested()) return;
-            const compacting = if (comptime @hasDecl(@TypeOf(app.worker), "compactionActivitySnapshot")) blk: {
-                const observed = app.worker.compactionActivitySnapshot();
+            if (agent.worker.isCancelRequested()) return;
+            const compacting = if (comptime @hasDecl(@TypeOf(agent.worker), "compactionActivitySnapshot")) blk: {
+                const observed = agent.worker.compactionActivitySnapshot();
                 break :blk if (observed.operation) |op| op.active() else false;
             } else false;
             const tool_active = activeToolStatusCount(app) > 0;
-            debug_trace.logf("input", "cancel active operation queued={d}", .{app.worker.queuedPromptCount()});
-            traceInterruptRequested(app, "input_active_stream");
-            if (comptime @hasDecl(@TypeOf(app.worker), "requestInteractiveCancel")) {
-                app.worker.requestInteractiveCancel();
+            debug_trace.logf("input", "cancel active operation queued={d}", .{agent.worker.queuedPromptCount()});
+            traceInterruptRequested(app, agent, "input_active_stream");
+            if (comptime @hasDecl(@TypeOf(agent.worker), "requestInteractiveCancel")) {
+                agent.worker.requestInteractiveCancel();
             } else {
-                app.worker.requestCancel();
+                agent.worker.requestCancel();
             }
             app.pacer.clear(app.alloc);
             if (comptime @hasDecl(App, "playCancelSound")) app.playCancelSound();
@@ -129,27 +130,27 @@ pub fn InterruptRuntime(comptime App: type) type {
                 app.shell.render_requests.request(.footer);
                 return;
             }
-            app.stream = .{};
+            agent.stream = .{};
             app.shell.render_requests.request(.footer);
         }
 
-        pub fn pauseActiveRecovery(app: *App) bool {
-            if (!app.stream.active) return false;
-            if (comptime !@hasDecl(@TypeOf(app.worker), "isConnectivityWaitActive")) return false;
-            if (!app.worker.isConnectivityWaitActive()) return false;
-            if (comptime !@hasDecl(@TypeOf(app.worker), "requestRecoveryPause")) return false;
-            app.worker.requestRecoveryPause();
+        pub fn pauseActiveRecovery(agent: *AppAgent) bool {
+            if (!agent.stream.active) return false;
+            if (comptime !@hasDecl(@TypeOf(agent.worker), "isConnectivityWaitActive")) return false;
+            if (!agent.worker.isConnectivityWaitActive()) return false;
+            if (comptime !@hasDecl(@TypeOf(agent.worker), "requestRecoveryPause")) return false;
+            agent.worker.requestRecoveryPause();
             debug_trace.logf("input", "model recovery pause requested", .{});
             return true;
         }
 
-        pub fn traceInterruptRequested(app: *App, source: []const u8) void {
-            const approval_active = app.approval_prompt.isActive();
-            const question_active = app.question_prompt.isActive();
+        pub fn traceInterruptRequested(app: *App, agent: *AppAgent, source: []const u8) void {
+            const approval_active = agent.approval_prompt.isActive();
+            const question_active = agent.question_prompt.isActive();
             const tool_status_count = activeToolStatusCount(app);
             const pending_tool_call = approval_active or tool_status_count > 0;
             const running_tool = tool_status_count > 0 and !approval_active and !question_active;
-            const active_streamed_text_response = app.stream.active and !pending_tool_call and !question_active;
+            const active_streamed_text_response = agent.stream.active and !pending_tool_call and !question_active;
             debug_trace.eventf(
                 "interrupt",
                 "cancel_requested",
@@ -157,13 +158,13 @@ pub fn InterruptRuntime(comptime App: type) type {
                 "source={s} stream_active={s} active_streamed_text_response={s} pending_tool_call={s} approval_prompt={s} running_tool={s} stream_activity_count={d} last_activity_kind={s}",
                 .{
                     source,
-                    if (app.stream.active) "true" else "false",
+                    if (agent.stream.active) "true" else "false",
                     if (active_streamed_text_response) "true" else "false",
                     if (pending_tool_call) "true" else "false",
                     if (approval_active) "true" else "false",
                     if (running_tool) "true" else "false",
-                    app.stream.chunks,
-                    if (app.stream.last_activity_kind) |kind| @tagName(kind) else "none",
+                    agent.stream.chunks,
+                    if (agent.stream.last_activity_kind) |kind| @tagName(kind) else "none",
                 },
             );
         }
@@ -175,33 +176,39 @@ pub fn InterruptRuntime(comptime App: type) type {
             return shell_runtime.activeToolActivityCount(&app.shell);
         }
 
-        fn activeCancellationTarget(app: *App) CancellationTarget {
+        fn activeCancellationTarget(agent: *AppAgent) CancellationTarget {
             const status = if (comptime @hasDecl(
-                @TypeOf(app.worker),
+                @TypeOf(agent.worker),
                 "contextCompactionStatus",
             ))
-                app.worker.contextCompactionStatus()
+                agent.worker.contextCompactionStatus()
             else
                 worker_runtime.ContextCompactionStatus.idle;
-            return cancellationTarget(app.stream.active, status);
+            return cancellationTarget(agent.stream.active, status);
         }
     };
 }
 
 test "idle compaction feedback dismissal is scoped and never cancels active work" {
     const FakeApp = struct {
-        worker: worker_runtime.WorkerRuntime = .{},
+        main_agent: struct {
+            worker: worker_runtime.WorkerRuntime = .{},
+        } = .{},
         shell: struct { render_requests: @import("../../ui/render_request.zig").RenderRequestState = .{} } = .{},
+
+        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+            return &self.main_agent;
+        }
     };
     var app: FakeApp = .{};
-    defer app.worker.deinit(std.testing.allocator);
-    const id = app.worker.beginCompactionActivity(.manual, null);
-    try std.testing.expect(!InterruptRuntime(FakeApp).dismissCompactionFeedback(&app));
-    app.worker.settleCompactionActivity(id, .{ .outcome = .cancelled });
-    try std.testing.expect(InterruptRuntime(FakeApp).dismissCompactionFeedback(&app));
+    defer app.agent().worker.deinit(std.testing.allocator);
+    const id = app.agent().worker.beginCompactionActivity(.manual, null);
+    try std.testing.expect(!InterruptRuntime(FakeApp).dismissCompactionFeedback(&app, (&app).agent()));
+    app.agent().worker.settleCompactionActivity(id, .{ .outcome = .cancelled });
+    try std.testing.expect(InterruptRuntime(FakeApp).dismissCompactionFeedback(&app, (&app).agent()));
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
-    try std.testing.expect(!app.worker.isCancelRequested());
-    try std.testing.expect(!InterruptRuntime(FakeApp).dismissCompactionFeedback(&app));
+    try std.testing.expect(!app.agent().worker.isCancelRequested());
+    try std.testing.expect(!InterruptRuntime(FakeApp).dismissCompactionFeedback(&app, (&app).agent()));
 }
 
 test "interactive connectivity wait maps try later to recovery pause" {
@@ -218,17 +225,23 @@ test "interactive connectivity wait maps try later to recovery pause" {
         }
     };
     const FakeApp = struct {
-        stream: struct { active: bool } = .{ .active = true },
-        worker: FakeWorker = .{},
+        main_agent: struct {
+            stream: struct { active: bool } = .{ .active = true },
+            worker: FakeWorker = .{},
+        } = .{},
+
+        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+            return &self.main_agent;
+        }
     };
 
     var app = FakeApp{};
-    app.worker.connectivity_wait_active = true;
-    try std.testing.expect(InterruptRuntime(FakeApp).pauseActiveRecovery(&app));
-    try std.testing.expect(app.worker.pause_requested);
+    app.agent().worker.connectivity_wait_active = true;
+    try std.testing.expect(InterruptRuntime(FakeApp).pauseActiveRecovery((&app).agent()));
+    try std.testing.expect(app.agent().worker.pause_requested);
 
-    app.worker.pause_requested = false;
-    app.worker.connectivity_wait_active = false;
-    try std.testing.expect(!InterruptRuntime(FakeApp).pauseActiveRecovery(&app));
-    try std.testing.expect(!app.worker.pause_requested);
+    app.agent().worker.pause_requested = false;
+    app.agent().worker.connectivity_wait_active = false;
+    try std.testing.expect(!InterruptRuntime(FakeApp).pauseActiveRecovery((&app).agent()));
+    try std.testing.expect(!app.agent().worker.pause_requested);
 }

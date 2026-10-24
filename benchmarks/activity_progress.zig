@@ -9,7 +9,7 @@ const growth_batches = 5;
 const ratio_scale = 1_000;
 const max_ratio = 2 * ratio_scale;
 const Harness = struct {
-    transcript: TranscriptRuntime = .{ .max_retained_transcript_bytes = 256 },
+    transcript: TranscriptRuntime = .{ .notebook = .{ .max_retained_transcript_bytes = 256 } },
     kind: Kind,
     entry_ids: [call_ids.len]u32 = undefined,
 
@@ -172,11 +172,11 @@ const GrowthObservation = struct {
         return .{
             .initial_p95_ns = initial,
             .final_p95_ns = final,
-            .entries = transcript.entries.items.len,
             .records = transcript.toolActivityRecordCount(),
             .active = transcript.activeToolActivityCount(),
             .pins = transcript.lifecyclePinCount(),
-            .details = transcript.tool_details.items.len,
+            .entries = transcript.notebook.entries.items.len,
+            .details = transcript.notebook.tool_details.items.len,
             .retained_bytes = transcript.retainedStructuredBytesForCommandOutput(),
         };
     }

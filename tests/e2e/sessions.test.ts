@@ -1982,8 +1982,13 @@ test.skipIf(!tmuxAvailable())("ACP load after a compaction shows every earlier t
 }, TIMEOUT * 4);
 
 
-/// A child's requests never offer the subagent tool, so they tell apart.
+/// In `fx ask` and ACP a child's requests never offer the subagent tool, so
+/// they tell apart.
 const isChildRequest = (body: string) => !body.includes('"name":"subagent"');
+
+/// In the interactive app a subagent is offered the subagent tool too, so its
+/// requests tell apart by what was typed to main, which they never carry.
+const isAppChildRequest = (body: string, typed: string[]) => !typed.some((text) => body.includes(text));
 
 test("fx ask runs a one-off subagent as a v2 child with its own log, recorded in the parent's log", async () => {
   const fixture = createFixture("fx-v2-subagent-run-");
@@ -2151,7 +2156,7 @@ test("a crash while a named subagent works records it interrupted, and its next 
 test.skipIf(!tmuxAvailable())("the interactive app runs a subagent on v2 and records it in the session's log", async () => {
   const fixture = createFixture("fx-v2-app-subagent-");
   const gateway = startDynamicFakeGateway((body) => {
-    if (isChildRequest(body)) return fakeGatewayFinalText("APP_CHILD_ANSWER");
+    if (isAppChildRequest(body, ["Delegate from the app."])) return fakeGatewayFinalText("APP_CHILD_ANSWER");
     if (body.includes("APP_CHILD_ANSWER")) return fakeGatewayFinalText("APP_PARENT_DONE");
     return fakeGatewayToolCall("app-delegate", "subagent", { request: { action: "run", task: "Report from the app child." } });
   }, { classifierDecision: "clear" });
@@ -3413,7 +3418,7 @@ test.skipIf(!tmuxAvailable())("an app killed after a named child finished resume
   const fixture = createFixture("fx-v2-app-kill-after-child-");
   let phase = 1;
   const gateway = startDynamicFakeGateway((body) => {
-    if (isChildRequest(body)) {
+    if (isAppChildRequest(body, ["Start the worker.", "Ask the worker again."])) {
       if (phase === 1) return fakeGatewayFinalText("CHILD_FIRST_ANSWER");
       return fakeGatewayFinalText(body.includes("CHILD_FIRST_ANSWER") ? "CHILD_REMEMBERED" : "CHILD_FORGOT");
     }

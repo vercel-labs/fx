@@ -1,4 +1,5 @@
 const std = @import("std");
+const agents = @import("../agents/agents.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
 const builtin = @import("builtin");
@@ -333,7 +334,7 @@ pub fn captureImageAttachmentForAdmission(
     app: *App,
     attachment: *types.ImageAttachment,
 ) !CaptureAdmissionResult {
-    App.captureImageAttachment(app, attachment) catch |err| {
+    App.captureImageAttachment(app, agents.screenAgentOf(app), attachment) catch |err| {
         const notice = captureRejectionNotice(err) orelse return err;
         if (comptime !@hasDecl(App, "writeDomainNotice")) return err;
         try app.writeDomainNotice(.{

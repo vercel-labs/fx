@@ -1,4 +1,5 @@
 const std = @import("std");
+const agents = @import("../agents/agents.zig");
 const question_prompt = @import("../agent/question_prompt.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const app_commands = @import("app_commands.zig");
@@ -61,8 +62,8 @@ fn set_transcript_assistant_tail_writable(
     runtime: *transcript_runtime.TranscriptRuntime,
     writable: bool,
 ) void {
-    if (runtime.transcript_release.assistant_tail_writable == writable) return;
-    runtime.transcript_release = runtime.transcript_release.with_assistant_tail_writable(writable);
+    if (runtime.notebook.transcript_release.assistant_tail_writable == writable) return;
+    runtime.notebook.transcript_release = runtime.notebook.transcript_release.with_assistant_tail_writable(writable);
     debug_trace.logf(
         "scroll",
         "assistant tail writability changed writable={s}",
@@ -223,8 +224,8 @@ fn buildPendingCardProjection(
     presentation_shell: *const transcript_runtime.TranscriptRuntime,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) !?PendingCardProjection {
-    if (comptime !@hasField(App, "submission")) return null;
-    const pending = app.submission.pending orelse return null;
+    if (comptime !agents.hasAgentField(App, "submission")) return null;
+    const pending = agents.screenAgentOf(app).submission.pending orelse return null;
     switch (pending.phase) {
         .awaiting_frame, .awaiting_adoption => {},
         .adopted, .awaiting_auth, .queued => return null,
@@ -284,8 +285,8 @@ fn buildPendingCardProjection(
 }
 
 fn pendingPromptActivityVisible(app: anytype) bool {
-    if (comptime !@hasField(@TypeOf(app.*), "submission")) return false;
-    const pending = app.submission.pending orelse return false;
+    if (comptime !agents.hasAgentField(@TypeOf(app.*), "submission")) return false;
+    const pending = agents.screenAgentOf(app).submission.pending orelse return false;
     return pending.phase != .awaiting_auth;
 }
 
@@ -391,8 +392,8 @@ fn previewWithPendingCard(
 fn buildSteeringProjection(comptime App: type, app: *App) !SteeringProjection {
     var projection: SteeringProjection = .{};
     errdefer projection.deinit(app.alloc);
-    if (comptime @hasDecl(@TypeOf(app.worker), "snapshotSteeringPresentation")) {
-        var snapshot = try app.worker.snapshotSteeringPresentation(app.alloc);
+    if (comptime @hasDecl(@TypeOf(agents.screenAgentOf(app).worker), "snapshotSteeringPresentation")) {
+        var snapshot = try agents.screenAgentOf(app).worker.snapshotSteeringPresentation(app.alloc);
         defer snapshot.deinit(app.alloc);
         projection.waits_for_boundary = snapshot.waits_for_boundary;
         projection.messages = snapshot.messages;
@@ -418,6 +419,7 @@ noinline fn approvalScreenNeedsClear(
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
         fn appendDeferredHistoryForVisualEpoch(
             ctx: *anyopaque,
             finished: *const types.FinishedPrompt,
@@ -425,6 +427,7 @@ pub fn Runtime(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(ctx));
             return switch (try app_session_runtime.Runtime(App).appendFinishedPromptForVisualEpoch(
                 app,
+                agents.screenAgentOf(app),
                 finished.*,
             )) {
                 .uncommitted => .uncommitted,
@@ -534,7 +537,9 @@ pub fn Runtime(comptime App: type) type {
         var provider_picker_column: provider_picker_runtime.ColumnBuffer = .{};
         noinline fn footerContext(
             app: *App,
+            agent: *AppAgent,
             upgrade_status_buf: *[64]u8,
+            waiting_note_buf: *[128]u8,
             shimmer_pos: i16,
             steering: *const SteeringProjection,
         ) render_input.RenderContext {
@@ -557,7 +562,7 @@ pub fn Runtime(comptime App: type) type {
                         picker_window_start = input_completion_runtime.CompletionRuntime(App).modelPickerWindowStart(app, count, picker_index);
                     },
                     .effort => {
-                        const target = if (app.input_runtime.picker.hasPendingModelPickerSelection()) app.input_runtime.picker.model_picker_pending_model.items else provider_runtime.model(app);
+                        const target = if (app.input_runtime.picker.hasPendingModelPickerSelection()) app.input_runtime.picker.model_picker_pending_model.items else provider_runtime.modelOf(app, agent);
                         const capabilities = model_capabilities.resolveForApp(App, app, target);
                         const effort_count = model_capabilities.reasoningEffortOptionCount(capabilities);
                         for (0..effort_count) |i| {
@@ -639,22 +644,22 @@ pub fn Runtime(comptime App: type) type {
                 .loading, .ready, .empty => null,
             };
             const inline_completion =
-                input_completion_runtime.CompletionRuntime(App).visibleInlineCompletion(app);
+                input_completion_runtime.CompletionRuntime(App).visibleInlineCompletion(app, agent);
 
-            const visible_model = pending_model orelse provider_runtime.model(app);
+            const visible_model = pending_model orelse provider_runtime.modelOf(app, agent);
             const visible_capabilities = model_capabilities.resolveForApp(App, app, visible_model);
             const active_capabilities_pending = pending_model == null and app.isModelCacheLoading();
             const model_supports_fast = visible_capabilities.supports_fast_mode;
             const model_supports_effort = visible_capabilities.reasoning_efforts.len > 0 or
-                (active_capabilities_pending and !app.effort.isDefault());
+                (active_capabilities_pending and !agent.effort.isDefault());
             const visible_effort = if (pending_model != null and model_supports_effort)
                 pendingPickerEffort(app, visible_model, model_query, app.input_runtime.picker.model_picker_effort_index)
-            else if (active_capabilities_pending or model_capabilities.reasoningEffortSupported(visible_capabilities, app.effort))
-                app.effort
+            else if (active_capabilities_pending or model_capabilities.reasoningEffortSupported(visible_capabilities, agent.effort))
+                agent.effort
             else
                 .auto;
             const active_fast_mode_model_bound = if (comptime @hasDecl(App, "fastModeModelBound"))
-                app.fastModeModelBound()
+                app.fastModeModelBound(agent)
             else
                 true;
             const fast_indicator_active = if (pending_model != null)
@@ -673,21 +678,21 @@ pub fn Runtime(comptime App: type) type {
                     false;
             const settings_snapshot = app_commands.settingsCatalogSnapshot(app);
             const now_ms = io_mod.milliTimestamp();
-            var visible_stream = app.stream;
+            var visible_stream = agent.stream;
             if (visible_stream.active) {
-                const cancel_requested = if (comptime @hasField(App, "worker"))
-                    if (comptime @hasDecl(@TypeOf(app.worker), "isCancelRequested"))
-                        app.worker.isCancelRequested()
+                const cancel_requested = if (comptime agents.hasAgentField(App, "worker"))
+                    if (comptime @hasDecl(@TypeOf(agent.worker), "isCancelRequested"))
+                        agent.worker.isCancelRequested()
                     else
                         false
                 else
                     false;
                 if (cancel_requested) {
                     const stops_turn = if (comptime @hasDecl(
-                        @TypeOf(app.worker),
+                        @TypeOf(agent.worker),
                         "cancellationStopsTurn",
                     ))
-                        app.worker.cancellationStopsTurn()
+                        agent.worker.cancellationStopsTurn()
                     else
                         true;
                     if (stops_turn) visible_stream.active = false;
@@ -699,18 +704,18 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
 
-            var statusline = buildStatuslineItems(app, visible_model);
+            var statusline = buildStatuslineItems(app, agent, visible_model);
             statusline.ultrafast_indicator_active = if (pending_model != null)
                 visible_capabilities.supports_ultrafast_mode and std.mem.eql(u8, pendingPickerSpeed(model_query, app.input_runtime.picker.model_picker_fast_index), "ultrafast")
-            else if (comptime @hasField(@TypeOf(app.worker), "agent_turn_settings"))
-                app.worker.agent_turn_settings.ultrafast_mode
+            else if (comptime @hasField(@TypeOf(agent.worker), "agent_turn_settings"))
+                agent.worker.agent_turn_settings.ultrafast_mode
             else
                 false;
 
             return .{
                 .slash_registry = app.slashRegistry(),
                 .stream = visible_stream,
-                .compaction = if (comptime @hasDecl(@TypeOf(app.worker), "compactionActivitySnapshot")) app.worker.compactionActivitySnapshot() else .{},
+                .compaction = if (comptime @hasDecl(@TypeOf(agent.worker), "compactionActivitySnapshot")) agent.worker.compactionActivitySnapshot() else .{},
                 .pending_prompt_activity = pendingPromptActivityVisible(app),
                 .completed_assistant_presentation_tail = app.pacer.hasCompletedAssistantPresentationTail(),
                 .writing_response = app.pacer.hasPending(),
@@ -718,11 +723,9 @@ pub fn Runtime(comptime App: type) type {
                 .has_api_key = app.auth.credentialSource() != null or
                     (if (comptime @hasDecl(@TypeOf(app.auth), "startupCredentialPending")) app.auth.startupCredentialPending() else false),
                 .model = visible_model,
-                .pending_images = app.pending_images.items,
-                .permission_mode = if (comptime @hasField(App, "permission_engine"))
-                    app.permission_engine.mode
-                else
-                    .ask,
+                .pending_images = agent.pending_images.items,
+                // The agent on screen's own mode.
+                .permission_mode = app_permission_runtime.Runtime(App).currentMode(app),
                 .steering_messages = steering.messages,
                 .steering_waits_for_boundary = steering.waits_for_boundary,
                 .fast_indicator_active = fast_indicator_active,
@@ -792,21 +795,21 @@ pub fn Runtime(comptime App: type) type {
                     render_input.modelMenuProjection(&app.model_cache)
                 else
                     .{},
-                .session_menu = if (comptime @hasField(App, "session_persistence")) .{
-                    .active = app.session_persistence.session_picker.active,
-                    .load_state = app.session_persistence.session_picker.load_state,
-                    .summaries = app.session_persistence.session_picker.summaries.items,
-                    .has_more = app.session_persistence.session_picker.has_more,
-                    .loading_more = app.session_persistence.session_picker.loading_more,
-                    .scope = app.session_persistence.session_picker.scope,
-                    .selected_index = app.session_persistence.session_picker.selected,
-                    .window_start = app.session_persistence.session_picker.window_start,
-                    .query = app.session_persistence.session_picker.query(),
+                .session_menu = if (comptime agents.hasAgentField(App, "session_persistence")) .{
+                    .active = agent.session_persistence.session_picker.active,
+                    .load_state = agent.session_persistence.session_picker.load_state,
+                    .summaries = agent.session_persistence.session_picker.summaries.items,
+                    .has_more = agent.session_persistence.session_picker.has_more,
+                    .loading_more = agent.session_persistence.session_picker.loading_more,
+                    .scope = agent.session_persistence.session_picker.scope,
+                    .selected_index = agent.session_persistence.session_picker.selected,
+                    .window_start = agent.session_persistence.session_picker.window_start,
+                    .query = agent.session_persistence.session_picker.query(),
                     .now_ms = now_ms,
-                    .selection_failure = app.session_persistence.session_picker.selection_failure,
+                    .selection_failure = agent.session_persistence.session_picker.selection_failure,
                 } else .{},
-                .fork_menu = if (comptime @hasField(App, "session_persistence"))
-                    app.session_persistence.fork_menu.projection()
+                .fork_menu = if (comptime agents.hasAgentField(App, "session_persistence"))
+                    agent.session_persistence.fork_menu.projection()
                 else
                     .{},
                 .statusline_menu = render_input.statuslineMenuProjection(
@@ -830,6 +833,11 @@ pub fn Runtime(comptime App: type) type {
                 else
                     .{},
                 .upgrade_status = upgrade_label,
+                .agent_label = if (comptime @hasDecl(App, "footerAgentLabel")) app.footerAgentLabel() else "",
+                .waiting_note = if (comptime @hasDecl(App, "hiddenAgentWaitingNote"))
+                    app.hiddenAgentWaitingNote(waiting_note_buf)
+                else
+                    "",
                 .mcp_status = if (comptime @hasField(App, "mcp")) app.mcp.hostStatusText() else "",
                 .danger_status = if (yolo_warning_active)
                     app_permission_runtime.yolo_warning_text
@@ -841,7 +849,7 @@ pub fn Runtime(comptime App: type) type {
                     "",
                 .esc_clear_armed = app.input_runtime.gestures.escapeClearArmed(),
                 .esc_interrupt_armed = app.input_runtime.gestures.escapeInterruptArmed(),
-                .question = app.question_prompt.projection(),
+                .question = agent.question_prompt.projection(),
                 .statusline = statusline,
                 .activity = activityProjection(app),
                 .input = &app.input_runtime,
@@ -863,6 +871,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn buildStatuslineItems(
             app: *App,
+            agent: *AppAgent,
             visible_model: []const u8,
         ) ui_render.StatuslineItems {
             var items: ui_render.StatuslineItems = .{};
@@ -877,12 +886,12 @@ pub fn Runtime(comptime App: type) type {
                 items.git_branch = identity.git_branch;
             }
             if (app.statusline_context) {
-                items.context_used = app.total_input_tokens;
+                items.context_used = agents.loadTotal(&agent.total_input_tokens);
                 items.context_total = model_capabilities.resolveForApp(App, app, visible_model).context_window;
             }
             if (comptime @hasField(App, "statusline_session")) {
                 if (app.statusline_session) {
-                    items.session_title = app_session_runtime.Runtime(App).cachedSessionTitle(app);
+                    items.session_title = app_session_runtime.Runtime(App).cachedSessionTitle(agent);
                 }
             }
             return items;
@@ -904,7 +913,7 @@ pub fn Runtime(comptime App: type) type {
             return std.mem.eql(u8, pendingPickerSpeed(query, speed_index), "fast");
         }
 
-        pub fn flushRequestedFrame(app: *App) !void {
+        pub fn flushRequestedFrame(app: *App, agent: *AppAgent) !void {
             if (comptime @hasDecl(@TypeOf(app.shell), "sessionScrollbackHandoffPending")) {
                 if (app.shell.sessionScrollbackHandoffPending()) return;
             }
@@ -941,7 +950,7 @@ pub fn Runtime(comptime App: type) type {
                 )
             else
                 shell_runtime.ResizeFrameCommit.none;
-            const attempted = attemptRequestedFrame(app, snapshot) catch |err| {
+            const attempted = attemptRequestedFrame(app, agent, snapshot) catch |err| {
                 attempt.restore();
                 if (comptime @hasField(App, "terminal")) {
                     _ = app_lifecycle.closeFullTranscriptIfActive(
@@ -1003,7 +1012,7 @@ pub fn Runtime(comptime App: type) type {
             }
 
             if (result.file_picker_receipt) |receipt| {
-                input_completion_runtime.CompletionRuntime(App).acknowledgeFilePicker(app, receipt);
+                input_completion_runtime.CompletionRuntime(App).acknowledgeFilePicker(app, agent, receipt);
             } else {
                 input_completion_runtime.CompletionRuntime(App).distrustFilePicker(app);
             }
@@ -1024,7 +1033,7 @@ pub fn Runtime(comptime App: type) type {
             }
             if (comptime @hasDecl(App, "notePendingFrameCommitted")) {
                 if (result.pending_prompt_presented) {
-                    App.notePendingFrameCommitted(app);
+                    App.notePendingFrameCommitted(app, agent);
                 }
             }
             if (comptime @hasField(App, "permission_state") and
@@ -1067,12 +1076,13 @@ pub fn Runtime(comptime App: type) type {
 
         fn attemptRequestedFrame(
             app: *App,
+            agent: *AppAgent,
             snapshot: render_request.AttemptSnapshot,
         ) !?FrameAttemptResult {
             const result = (if (comptime @hasDecl(App, "renderFrameAttemptForTest"))
                 App.renderFrameAttemptForTest(app, snapshot)
             else
-                renderFrameAttempt(app, snapshot)) catch |err| {
+                renderFrameAttempt(app, agent, snapshot)) catch |err| {
                 if (err == error.InputPending) return null;
                 return err;
             };
@@ -1112,7 +1122,7 @@ pub fn Runtime(comptime App: type) type {
             return .init(app, transcriptInputPending);
         }
 
-        fn reconcileBeforeFrameRender(app: *App, queued_rows: usize) !RenderReconciliation {
+        fn reconcileBeforeFrameRender(app: *App, agent: *AppAgent, queued_rows: usize) !RenderReconciliation {
             if (comptime !@hasField(App, "terminal")) return .{ .inline_render = .{} };
 
             if (try app_lifecycle.recoverFullTranscriptDriftBeforeRender(
@@ -1124,7 +1134,7 @@ pub fn Runtime(comptime App: type) type {
                 try requestNormalViewportRecovery(app);
             }
 
-            const question_active = app.question_prompt.isActive();
+            const question_active = agent.question_prompt.isActive();
             if (question_active) {
                 if (try app_lifecycle.closeFullTranscriptIfActive(
                     app.alloc,
@@ -1140,7 +1150,7 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
 
-            const approval = app.approval_prompt.projection();
+            const approval = agent.approval_prompt.projection();
             if (approval) |projection| {
                 const approval_screen_active = try approval_screen.needsScreen(
                     app.alloc,
@@ -1176,7 +1186,7 @@ pub fn Runtime(comptime App: type) type {
                     if (!question_active and approval == null and
                         (settingsMenuActive(app) or helpMenuActive(app) or
                             skillsMenuActive(app) or modelMenuActive(app) or
-                            sessionMenuActive(app) or forkMenuActive(app)))
+                            sessionMenuActive(app, agent) or forkMenuActive(app, agent)))
                     {
                         app.shell.render_requests.request(.footer);
                     }
@@ -1186,7 +1196,7 @@ pub fn Runtime(comptime App: type) type {
                 },
             }
 
-            if (!question_active and approval == null and (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(app) or forkMenuActive(app))) {
+            if (!question_active and approval == null and (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(app, agent) or forkMenuActive(app, agent))) {
                 if (try app_lifecycle.closeFullTranscriptIfActive(
                     app.alloc,
                     &app.terminal,
@@ -1207,7 +1217,7 @@ pub fn Runtime(comptime App: type) type {
             } };
         }
 
-        fn renderFrameAttempt(app: *App, snapshot: render_request.AttemptSnapshot) !FrameAttemptResult {
+        fn renderFrameAttempt(app: *App, agent: *AppAgent, snapshot: render_request.AttemptSnapshot) !FrameAttemptResult {
             var checkpoint_storage = transcriptBuildCheckpoint(app);
             const checkpoint = if (checkpoint_storage) |*value| value else null;
             // Frame-fresh producer fact for the finality floor: the trailing
@@ -1215,11 +1225,12 @@ pub fn Runtime(comptime App: type) type {
             // the pacer still holds undelivered output.
             set_transcript_assistant_tail_writable(
                 &app.shell,
-                app.stream.active or app.pacer.hasPending(),
+                agent.stream.active or app.pacer.hasPending(),
             );
             const presentation_shell: *transcript_runtime.TranscriptRuntime = &app.shell;
             const render_requests = activeRenderRequests(app);
             var upgrade_status_buf: [64]u8 = undefined;
+            var waiting_note_buf: [128]u8 = undefined;
             var steering = try buildSteeringProjection(App, app);
             defer steering.deinit(app.alloc);
             const shimmer_pos = if (snapshot.animation_candidate) |candidate|
@@ -1228,15 +1239,17 @@ pub fn Runtime(comptime App: type) type {
                 render_requests.visibleAnimationPhase();
             const main_footer_ctx = footerContext(
                 app,
+                agent,
                 &upgrade_status_buf,
+                &waiting_note_buf,
                 shimmer_pos,
                 &steering,
             );
             const file_picker_receipt = input_completion_runtime.CompletionRuntime(App).filePickerView(app).receipt;
             var footer_ctx = main_footer_ctx;
-            const render_reconciliation = switch (try reconcileBeforeFrameRender(app, render_input.steeringBannerRows(footer_ctx, app.shell.layout.cols))) {
+            const render_reconciliation = switch (try reconcileBeforeFrameRender(app, agent, render_input.steeringBannerRows(footer_ctx, app.shell.layout.cols))) {
                 .inline_render => |inline_render| inline_render,
-                .file_approval_screen => return renderApprovalScreen(app),
+                .file_approval_screen => return renderApprovalScreen(app, agent),
                 .frame_result => |result| return result,
             };
             const presentation_commits_transcript = !render_reconciliation.alternate_screen_owns_rendering;
@@ -1270,7 +1283,7 @@ pub fn Runtime(comptime App: type) type {
                 App,
                 "fullTranscriptSidecarCapability",
             ))
-                app.fullTranscriptSidecarCapability()
+                app.fullTranscriptSidecarCapability(agent)
             else
                 null;
             var transcript_transition: ?transcript_runtime.TranscriptTransition = null;
@@ -1286,7 +1299,7 @@ pub fn Runtime(comptime App: type) type {
                     presentation_shell.footer_reserved_base_rows = footer_reserved_base_rows_before_footer_prepare;
                 }
             }
-            const visible_approval = app.approval_prompt.projection();
+            const visible_approval = agent.approval_prompt.projection();
             {
                 footer_ctx.transcript_depth = presentation_shell.transcriptPresentationDepth();
                 if (presentation_shell.fullTranscriptActive()) {
@@ -1843,8 +1856,8 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
-        fn renderApprovalScreen(app: *App) !FrameAttemptResult {
-            const approval = app.approval_prompt.projection() orelse return error.MissingApprovalRequest;
+        fn renderApprovalScreen(app: *App, agent: *AppAgent) !FrameAttemptResult {
+            const approval = agent.approval_prompt.projection() orelse return error.MissingApprovalRequest;
             const request = approval.request;
             const clear_display = approvalScreenNeedsClear(
                 app.terminal.fileApprovalScreenActive(),
@@ -1857,7 +1870,7 @@ pub fn Runtime(comptime App: type) type {
                 &app.terminal,
                 &app.shell,
                 &app.metrics,
-            ) catch |err| return failApprovalScreen(app, request.id, err);
+            ) catch |err| return failApprovalScreen(app, agent, request.id, err);
             if (app.shell.shadow_vt) |grid| {
                 if (grid.cols != app.shell.layout.cols or
                     grid.rows != app.shell.layout.rows)
@@ -1865,7 +1878,7 @@ pub fn Runtime(comptime App: type) type {
                     grid.resize(
                         app.shell.layout.cols,
                         app.shell.layout.rows,
-                    ) catch |err| return failApprovalScreen(app, request.id, err);
+                    ) catch |err| return failApprovalScreen(app, agent, request.id, err);
                 }
             }
 
@@ -1874,14 +1887,14 @@ pub fn Runtime(comptime App: type) type {
             const transcript_document: approval_screen.TranscriptDocument = switch (approval_screen.transcriptDocumentPlan(
                 approval,
                 &app.approval_screen,
-                app.shell.entries.items,
+                app.shell.notebook.entries.items,
                 app.shell.layout,
-            ) catch |err| return failApprovalScreen(app, request.id, err)) {
+            ) catch |err| return failApprovalScreen(app, agent, request.id, err)) {
                 .none => .none,
                 .progressive => |present| .{ .progressive = present },
                 .projected => blk: {
                     transcript_source = app.shell.cachedTranscriptSource(app.alloc) catch |err|
-                        return failApprovalScreen(app, request.id, err);
+                        return failApprovalScreen(app, agent, request.id, err);
                     break :blk .{ .projected = transcript_source.?.bytes };
                 },
             };
@@ -1893,7 +1906,7 @@ pub fn Runtime(comptime App: type) type {
                 transcript_document,
                 app.shell.layout,
                 clear_display,
-            ) catch |err| return failApprovalScreen(app, request.id, err);
+            ) catch |err| return failApprovalScreen(app, agent, request.id, err);
             defer screen.deinit(app.alloc);
 
             app_lifecycle.setApprovalScreenMouseTracking(
@@ -1901,13 +1914,13 @@ pub fn Runtime(comptime App: type) type {
                 &app.shell,
                 &app.metrics,
                 request.file != null or screen.document_scrollable,
-            ) catch |err| return failApprovalScreen(app, request.id, err);
+            ) catch |err| return failApprovalScreen(app, agent, request.id, err);
 
             app_lifecycle.writeLifecycleTerminalBytes(
                 &app.shell,
                 &app.metrics,
                 screen.bytes,
-            ) catch |err| return failApprovalScreen(app, request.id, err);
+            ) catch |err| return failApprovalScreen(app, agent, request.id, err);
 
             app.approval_screen.recordScreenCommit(request.id, .{
                 .request_id = request.id,
@@ -1938,6 +1951,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn failApprovalScreen(
             app: *App,
+            agent: *AppAgent,
             request_id: u64,
             err: anyerror,
         ) !FrameAttemptResult {
@@ -1957,12 +1971,12 @@ pub fn Runtime(comptime App: type) type {
                     .{@errorName(leave_err)},
                 );
             };
-            switch (app.worker.submitPermissionResponse(
+            switch (agent.worker.submitPermissionResponse(
                 request_id,
                 permission_request.OwnedPermissionResponse.init(app.alloc, .deny, null),
             )) {
                 .accepted => {
-                    app.approval_prompt.clearWithReason(app.alloc, "screen_failure");
+                    agent.approval_prompt.clearWithReason(app.alloc, "screen_failure");
                     app.approval_screen.clear();
                 },
                 .stale, .no_pending => {},
@@ -1991,13 +2005,13 @@ pub fn Runtime(comptime App: type) type {
             return false;
         }
 
-        fn sessionMenuActive(app: *const App) bool {
-            if (comptime @hasField(App, "session_persistence")) return app.session_persistence.session_picker.active;
+        fn sessionMenuActive(_: *const App, agent: *const AppAgent) bool {
+            if (comptime agents.hasAgentField(App, "session_persistence")) return agent.session_persistence.session_picker.active;
             return false;
         }
 
-        fn forkMenuActive(app: *const App) bool {
-            if (comptime @hasField(App, "session_persistence")) return app.session_persistence.fork_menu.active();
+        fn forkMenuActive(_: *const App, agent: *const AppAgent) bool {
+            if (comptime agents.hasAgentField(App, "session_persistence")) return agent.session_persistence.fork_menu.active();
             return false;
         }
 
@@ -2307,7 +2321,7 @@ fn promptTurnReservation(
         measurement.picker_rows > 0 or
         measurement.banner_active or
         measurement.footer_gap_active or
-        app.stream.active or
+        agents.screenAgentOf(app).stream.active or
         shell.fullTranscriptActive()) return .{};
     if (comptime @hasField(@TypeOf(app.*), "skills")) {
         if (comptime @hasDecl(@TypeOf(app.skills), "menuVisible")) {
@@ -2316,8 +2330,8 @@ fn promptTurnReservation(
     }
 
     const future_activity = render_engine.frame_layout.ActivityState.thinkingAfterUserTurn();
-    const pending_submission_active = if (comptime @hasField(@TypeOf(app.*), "submission"))
-        app.submission.pending != null
+    const pending_submission_active = if (comptime agents.hasAgentField(@TypeOf(app.*), "submission"))
+        agents.screenAgentOf(app).submission.pending != null
     else
         false;
     if (pending_card != null or pending_submission_active) {
@@ -2482,19 +2496,25 @@ test "pending prompt projection waits for a paintable terminal width" {
     const input_submit_runtime = @import("input_submit_runtime.zig");
     const TestApp = struct {
         alloc: std.mem.Allocator,
-        submission: input_submit_runtime.State,
+        main_agent: struct {
+            submission: input_submit_runtime.State,
+        },
+
+        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+            return &self.main_agent;
+        }
     };
     const prompt = try alloc.dupe(u8, "visible prompt");
     var app = TestApp{
         .alloc = alloc,
-        .submission = .{ .pending = .{ .draft = .{
+        .main_agent = .{ .submission = .{ .pending = .{ .draft = .{
             .turn_id = 1,
             .prompt = prompt,
             .images = &.{},
             .skill_display_spans = &.{},
-        } } },
+        } } } },
     };
-    defer app.submission.pending.?.deinit(alloc);
+    defer app.agent().submission.pending.?.deinit(alloc);
 
     for ([_]u16{ 1, 2 }) |cols| {
         var shell = transcript_runtime.TranscriptRuntime{
@@ -2520,7 +2540,7 @@ test "pending prompt projection waits for a paintable terminal width" {
         )) == null);
         try std.testing.expectEqual(
             input_submit_runtime.PendingPhase.awaiting_frame,
-            app.submission.pending.?.phase,
+            app.agent().submission.pending.?.phase,
         );
     }
 
@@ -2619,7 +2639,7 @@ test "pending prompt at an occupied band bottom preserves the summary through ad
     _ = try app.shell.appendRawTranscriptEntryClassified(alloc, summary, .turn_summary);
     app.shell.render_requests.request(.first_frame);
     app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     const first = try readCoordinatorFrameBytes(alloc, file, &offset);
     defer alloc.free(first);
     try feedRewritePublicationFrame(alloc, &physical, &history, first);
@@ -2633,7 +2653,7 @@ test "pending prompt at an occupied band bottom preserves the summary through ad
 
     const last_line = "- evidence gaps that could still change the design.";
     const prompt = text_utils.repeat("PASTE_BODY\n", 383) ++ last_line;
-    app.submission.pending = .{ .draft = .{
+    app.agent().submission.pending = .{ .draft = .{
         .turn_id = 1,
         .prompt = try alloc.dupe(u8, prompt),
         .images = &.{},
@@ -2648,8 +2668,8 @@ test "pending prompt at an occupied band bottom preserves the summary through ad
     const preview_col = app.shell.transcript_commit_state.stable.cursor_col;
     try std.testing.expectEqual(@as(usize, 1), app.pending_frame_commits);
 
-    app.submission.pending.?.phase = .adopted;
-    _ = try app.shell.writeUserPromptCard(alloc, &app.metrics, .{ .text = app.submission.pending.?.draft.prompt }, true, &.{});
+    app.agent().submission.pending.?.phase = .adopted;
+    _ = try app.shell.writeUserPromptCard(alloc, &app.metrics, .{ .text = app.agent().submission.pending.?.draft.prompt }, true, &.{});
     const scroll = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
     const adopted = try rewritePublicationText(alloc, &physical, history.items);
     defer alloc.free(adopted);
@@ -2683,9 +2703,9 @@ test "pending prompt at an occupied band bottom preserves the summary through ad
 }
 
 fn currentCompactSource(shell: *transcript_runtime.TranscriptRuntime) ?*transcript_runtime.TranscriptPreparationSource {
-    for (&shell.compact_transcript_source_cache.entries) |*entry| {
+    for (&shell.notebook.compact_transcript_source_cache.entries) |*entry| {
         if (entry.*) |*cached| {
-            if (cached.content_revision == shell.full_transcript_content_revision and
+            if (cached.content_revision == shell.notebook.full_transcript_content_revision and
                 cached.cols == shell.layout.cols and
                 cached.has_committed_frame == shell.has_committed_frame)
             {
@@ -2697,13 +2717,13 @@ fn currentCompactSource(shell: *transcript_runtime.TranscriptRuntime) ?*transcri
 }
 
 const compact_source_cache_capacity = @typeInfo(@FieldType(
-    @FieldType(transcript_runtime.TranscriptRuntime, "compact_transcript_source_cache"),
+    @FieldType(transcript_runtime.TranscriptNotebook, "compact_transcript_source_cache"),
     "entries",
 )).array.len;
 
 fn compactSourceCacheSlots(shell: *const transcript_runtime.TranscriptRuntime) [compact_source_cache_capacity]?[*]const u8 {
     var slots: [compact_source_cache_capacity]?[*]const u8 = undefined;
-    for (shell.compact_transcript_source_cache.entries, &slots) |entry, *slot| {
+    for (shell.notebook.compact_transcript_source_cache.entries, &slots) |entry, *slot| {
         slot.* = if (entry) |cached| cached.source.bytes.ptr else null;
     }
     return slots;
@@ -2745,7 +2765,7 @@ test "pending prompt on a full screen is visible before adoption and keeps its r
     _ = try app.shell.appendRawTranscriptEntryClassified(alloc, summary, .turn_summary);
     app.shell.render_requests.request(.first_frame);
     app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     const first = try readCoordinatorFrameBytes(alloc, file, &offset);
     defer alloc.free(first);
     try feedRewritePublicationFrame(alloc, &physical, &history, first);
@@ -2756,7 +2776,7 @@ test "pending prompt on a full screen is visible before adoption and keeps its r
     try std.testing.expect(app.shell.cursor_row >= app.shell.layout.content_bottom);
 
     const prompt = "FULL_SCREEN_PROMPT";
-    app.submission.pending = .{ .draft = .{
+    app.agent().submission.pending = .{ .draft = .{
         .turn_id = 1,
         .prompt = try alloc.dupe(u8, prompt),
         .images = &.{},
@@ -2773,8 +2793,8 @@ test "pending prompt on a full screen is visible before adoption and keeps its r
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, preview, summary));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, preview, prompt));
 
-    app.submission.pending.?.phase = .adopted;
-    _ = try app.shell.writeUserPromptCard(alloc, &app.metrics, .{ .text = app.submission.pending.?.draft.prompt }, true, &.{});
+    app.agent().submission.pending.?.phase = .adopted;
+    _ = try app.shell.writeUserPromptCard(alloc, &app.metrics, .{ .text = app.agent().submission.pending.?.draft.prompt }, true, &.{});
     const seeded = currentCompactSource(&app.shell) orelse return error.CommittedSourceNotCached;
     const slots_before = compactSourceCacheSlots(&app.shell);
     // A cache hit refreshes the cursor from the shell, so clearing this
@@ -2820,7 +2840,7 @@ test "pending steering on a full screen paints below the summary and leaves no f
     _ = try app.shell.appendRawTranscriptEntryClassified(alloc, summary, .turn_summary);
     app.shell.render_requests.request(.first_frame);
     app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     const first = try readCoordinatorFrameBytes(alloc, file, &offset);
     defer alloc.free(first);
     try feedRewritePublicationFrame(alloc, &physical, &history, first);
@@ -2829,7 +2849,7 @@ test "pending steering on a full screen paints below the summary and leaves no f
     try std.testing.expect(app.shell.cursor_row >= app.shell.layout.content_bottom);
 
     const steering = "FULL_SCREEN_STEERING";
-    app.worker.steering_messages = &.{steering};
+    app.agent().worker.steering_messages = &.{steering};
     _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
     const steering_row = (try findGridRow(alloc, &physical, steering)) orelse return error.SteeringPreviewNotPainted;
     const summary_row = (try findGridRow(alloc, &physical, "6m 25s")) orelse return error.SummaryMissing;
@@ -2840,7 +2860,7 @@ test "pending steering on a full screen paints below the summary and leaves no f
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, preview, summary));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, preview, steering));
 
-    app.worker.steering_messages = &.{};
+    app.agent().worker.steering_messages = &.{};
     _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
     const cleared = try rewritePublicationText(alloc, &physical, history.items);
     defer alloc.free(cleared);
@@ -2880,7 +2900,7 @@ fn expectTallPendingPromptReachesScrollback(rows: u16, preview_tail: usize) !voi
     _ = try app.shell.appendRawTranscriptEntryClassified(alloc, banner, .unknown_raw);
     app.shell.render_requests.request(.first_frame);
     app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     const first = try readCoordinatorFrameBytes(alloc, file, &offset);
     defer alloc.free(first);
     try feedRewritePublicationFrame(alloc, &physical, &history, first);
@@ -2890,7 +2910,7 @@ fn expectTallPendingPromptReachesScrollback(rows: u16, preview_tail: usize) !voi
     const first_line = "FIRST_PROMPT_LINE";
     const last_line = "LAST_PROMPT_LINE";
     const prompt = first_line ++ "\n" ++ text_utils.repeat("PASTE_BODY\n", 60) ++ last_line;
-    app.submission.pending = .{ .draft = .{
+    app.agent().submission.pending = .{ .draft = .{
         .turn_id = 1,
         .prompt = try alloc.dupe(u8, prompt),
         .images = &.{},
@@ -2904,8 +2924,8 @@ fn expectTallPendingPromptReachesScrollback(rows: u16, preview_tail: usize) !voi
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, preview, banner));
     try std.testing.expectEqual(preview_tail, std.mem.count(u8, preview, last_line));
 
-    app.submission.pending.?.phase = .adopted;
-    _ = try app.shell.writeUserPromptCard(alloc, &app.metrics, .{ .text = app.submission.pending.?.draft.prompt }, true, &.{});
+    app.agent().submission.pending.?.phase = .adopted;
+    _ = try app.shell.writeUserPromptCard(alloc, &app.metrics, .{ .text = app.agent().submission.pending.?.draft.prompt }, true, &.{});
     try std.testing.expect(try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset) > 0);
     const adopted = try rewritePublicationText(alloc, &physical, history.items);
     defer alloc.free(adopted);
@@ -2920,18 +2940,24 @@ test "pending prompt preview preserves blank bottom rows and canonical leading s
     const alloc = std.testing.allocator;
     const TestApp = struct {
         alloc: std.mem.Allocator,
-        submission: @import("input_submit_runtime.zig").State,
+        main_agent: struct {
+            submission: @import("input_submit_runtime.zig").State,
+        },
+
+        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+            return &self.main_agent;
+        }
     };
     var app = TestApp{
         .alloc = alloc,
-        .submission = .{ .pending = .{ .draft = .{
+        .main_agent = .{ .submission = .{ .pending = .{ .draft = .{
             .turn_id = 1,
             .prompt = try alloc.dupe(u8, text_utils.repeat("line\n", 30)),
             .images = &.{},
             .skill_display_spans = &.{},
-        } } },
+        } } } },
     };
-    defer app.submission.pending.?.deinit(alloc);
+    defer app.agent().submission.pending.?.deinit(alloc);
     // Rows at or near the content bottom keep the canonical separator; the
     // frame scrolls to reserve it, so only unscrolled rows check the paint row.
     const cases = [_]struct { row: u16, col: u16, advance: u16, unscrolled: bool }{
@@ -3248,6 +3274,7 @@ test "transcript checkpoint sees input retained above an empty terminal" {
 }
 
 const CoordinatorFaultTestApp = struct {
+    main_agent: struct {} = .{},
     alloc: std.mem.Allocator = std.testing.allocator,
     input_runtime: core_input_runtime.Runtime = .{},
     shell: struct {
@@ -3308,6 +3335,9 @@ const CoordinatorFaultTestApp = struct {
             },
         };
     }
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
+    }
 };
 
 test "file picker receipt aborts preserve authority and uncertain writes revoke it" {
@@ -3323,19 +3353,19 @@ test "file picker receipt aborts preserve authority and uncertain writes revoke 
         picker.file_completion.stage(alloc, .{}, .ready, try state_mod.Rows.copy(alloc, &values));
         app.file_picker_receipt = picker.file_completion.view(0, 0).receipt;
         app.shell.render_requests.request(.footer);
-        try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+        try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
         try std.testing.expect(picker.file_completion.selected(0) != null);
         picker.file_completion.stage(alloc, .{}, .ready, try state_mod.Rows.copy(alloc, &values));
         app.file_picker_receipt = picker.file_completion.view(0, 0).receipt;
         app.fault = fault;
         app.shell.render_requests.request(.footer);
         if (fault == .preparation_error) {
-            try std.testing.expectError(error.TestPreparationFailure, Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app));
-        } else try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+            try std.testing.expectError(error.TestPreparationFailure, Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent()));
+        } else try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
         try std.testing.expect(picker.file_completion.prepared != null);
         try std.testing.expectEqual(fault == .preparation_error or fault == .input_pending, picker.file_completion.selected(0) != null);
         app.fault = .committed;
-        try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+        try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
         try std.testing.expect(picker.file_completion.prepared == null);
         try std.testing.expectEqualStrings("file.txt", picker.file_completion.selected(0).?.path);
     }
@@ -3344,18 +3374,18 @@ test "file picker receipt aborts preserve authority and uncertain writes revoke 
 test "core.app_render_runtime requested-frame flush skips absent and blocked work" {
     var app = CoordinatorFaultTestApp{};
 
-    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expectEqual(@as(usize, 0), app.attempts);
 
     app.shell.render_requests.request(.footer);
     app.shell.terminal_dimensions_invalid = true;
-    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expectEqual(@as(usize, 0), app.attempts);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 
     app.shell.terminal_dimensions_invalid = false;
     app.shell.render_requests.observeResizeSignal(100, 80);
-    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expectEqual(@as(usize, 0), app.attempts);
     try std.testing.expect(app.shell.render_requests.blocksFrameCommit());
 }
@@ -3366,7 +3396,7 @@ test "core.app_render_runtime requested-frame flush commits one coalesced snapsh
     app.shell.render_requests.request(.footer);
     app.shell.render_requests.request(.modal);
 
-    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expectEqual(@as(usize, 1), app.attempts);
     try std.testing.expectEqual(@as(usize, 3), app.last_snapshot.?.reasons.count());
@@ -3378,12 +3408,12 @@ test "core.app_render_runtime flushes notifications only after a committed frame
         var app = CoordinatorFaultTestApp{ .fault = fault };
         app.shell.render_requests.request(.notification);
 
-        try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+        try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
         try std.testing.expectEqual(@as(usize, 0), app.notification_flushes);
         try std.testing.expect(app.shell.render_requests.hasReason(.notification));
 
         app.fault = .committed;
-        try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+        try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
         try std.testing.expectEqual(@as(usize, 1), app.notification_flushes);
         try std.testing.expect(!app.shell.render_requests.hasReason(.notification));
     }
@@ -3395,7 +3425,7 @@ test "core.app_render_runtime requested-frame flush preserves work injected duri
     };
     app.shell.render_requests.request(.footer);
 
-    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expectEqual(@as(usize, 1), app.attempts);
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
@@ -3416,7 +3446,7 @@ test "core.app_render_runtime requested-frame flush restores preparation errors"
 
     try std.testing.expectError(
         error.TestPreparationFailure,
-        Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app),
+        Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent()),
     );
 
     try std.testing.expectEqual(@as(usize, 1), app.attempts);
@@ -3433,13 +3463,13 @@ test "core.app_render_runtime requested-frame flush restores input-interrupted w
     var app = CoordinatorFaultTestApp{ .fault = .input_pending };
     app.shell.render_requests.request(.modal);
 
-    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expectEqual(@as(usize, 1), app.attempts);
     try std.testing.expect(app.shell.render_requests.hasReason(.modal));
 
     app.fault = .committed;
-    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expectEqual(@as(usize, 2), app.attempts);
     try std.testing.expect(!app.shell.render_requests.hasPending());
 }
@@ -3457,7 +3487,7 @@ test "core.app_render_runtime requested-frame flush restores terminal recovery o
             .bottom = 5,
         });
 
-        try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+        try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
 
         try std.testing.expectEqual(@as(usize, 1), app.attempts);
         try std.testing.expect(app.shell.render_requests.hasReason(.transcript));
@@ -3492,7 +3522,7 @@ test "core.app_render_runtime failed resize reset accepts only the superseding r
     app.shell.terminal_reset_pending = true;
     app.shell.render_requests.request(.resize);
 
-    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expect(app.shell.terminal_reset_pending);
     try std.testing.expectEqual(@as(?i32, 7), app.shell.resize_history_row_delta);
@@ -3501,7 +3531,7 @@ test "core.app_render_runtime failed resize reset accepts only the superseding r
     try std.testing.expect(app.shell.render_requests.hasReason(.resize));
 
     app.shell.render_requests.observeResizeSignal(200, 80);
-    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expectEqual(@as(usize, 1), app.attempts);
     try std.testing.expect(app.shell.terminal_reset_pending);
@@ -3525,7 +3555,7 @@ test "core.app_render_runtime failed resize reset accepts only the superseding r
     app.shell.resize_history_row_delta = 3;
     app.shell.render_requests.completeResizeGeometry(false);
     app.fault = .committed;
-    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expectEqual(@as(usize, 2), app.attempts);
     try std.testing.expect(!app.shell.terminal_reset_pending);
@@ -3556,13 +3586,13 @@ test "core.app_render_runtime awaiting resize observation blocks every flush cal
     };
     app.shell.render_requests.request(.footer);
 
-    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expectEqual(@as(usize, 0), app.attempts);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 
     app.shell.pending_resize_observation.?.result = .unavailable;
-    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expectEqual(@as(usize, 1), app.attempts);
 }
@@ -3588,7 +3618,7 @@ test "core.app_render_runtime committed resize light blocks intervening frames" 
     app.shell.resize_history_row_delta = 3;
     app.shell.render_requests.request(.resize);
 
-    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expectEqual(@as(usize, 1), app.attempts);
     try std.testing.expectEqual(
@@ -3598,7 +3628,7 @@ test "core.app_render_runtime committed resize light blocks intervening frames" 
     try std.testing.expectEqual(@as(?i32, null), app.shell.resize_history_row_delta);
 
     app.shell.render_requests.request(.footer);
-    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expectEqual(@as(usize, 1), app.attempts);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
@@ -3621,10 +3651,10 @@ test "core.app_render_runtime animation retries the captured phase after every f
         if (fault == .preparation_error) {
             try std.testing.expectError(
                 error.TestPreparationFailure,
-                Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app),
+                Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent()),
             );
         } else {
-            try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+            try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
         }
         const failed_candidate = app.last_snapshot.?.animation_candidate.?;
 
@@ -3638,7 +3668,7 @@ test "core.app_render_runtime animation retries the captured phase after every f
         );
 
         app.fault = .committed;
-        try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+        try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
         const retry_candidate = app.last_snapshot.?.animation_candidate.?;
 
         try std.testing.expectEqual(failed_candidate.generation, retry_candidate.generation);
@@ -3661,7 +3691,7 @@ test "core.app_render_runtime animation retry stays ahead of a newer fact" {
     app.shell.render_requests.animation_next_deadline_ms = 100;
     try std.testing.expect(app.shell.render_requests.requestAnimationDue(100));
 
-    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
     const failed_candidate = app.last_snapshot.?.animation_candidate.?;
     try std.testing.expectEqual(
         @as(i16, -8),
@@ -3670,12 +3700,12 @@ test "core.app_render_runtime animation retry stays ahead of a newer fact" {
 
     app.fault = .committed;
     app.inject_animation_reset = false;
-    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
     const retry_candidate = app.last_snapshot.?.animation_candidate.?;
     try std.testing.expectEqual(failed_candidate.generation, retry_candidate.generation);
     try std.testing.expect(app.shell.render_requests.hasReason(.animation));
 
-    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent());
     const newer_candidate = app.last_snapshot.?.animation_candidate.?;
     try std.testing.expect(newer_candidate.generation > retry_candidate.generation);
     try std.testing.expectEqual(
@@ -3798,25 +3828,28 @@ const CoordinatorTestApp = struct {
     metrics: types.Metrics = .{},
     input_runtime: core_input_runtime.Runtime = .{},
     terminal_input_runtime: ui_input.Runtime = .{},
-    approval_prompt: approval_prompt.ApprovalPrompt = .{},
     approval_screen: interaction_state.ApprovalScreenState = .{},
-    question_prompt: question_prompt.QuestionPrompt = .{},
-    session_persistence: app_session_runtime.Persistence = .{},
-    worker: CoordinatorTestWorker = .{},
     selected_model: std.ArrayList(u8) = .empty,
     workspace_root: []const u8 = "",
     workspace_identity: statusline_identity.Runtime = .{},
     pacer: CoordinatorTestPacer = .{},
     auth: auth_runtime.Runtime = .{},
-    pending_images: std.ArrayList(types.ImageAttachment) = .empty,
+    main_agent: struct {
+        pending_images: std.ArrayList(types.ImageAttachment) = .empty,
+        effort: types.ReasoningEffort = .auto,
+        total_input_tokens: u64 = 0,
+        approval_prompt: approval_prompt.ApprovalPrompt = .{},
+        question_prompt: question_prompt.QuestionPrompt = .{},
+        submission: @import("input_submit_runtime.zig").State = .{},
+        session_persistence: app_session_runtime.Persistence = .{},
+        worker: CoordinatorTestWorker = .{},
+        stream: types.StreamState = .{},
+    } = .{},
     skills: skill_runtime.Runtime = .{},
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.testing.allocator, "/v1/models"),
     model_cache_loading: bool = false,
-    stream: types.StreamState = .{},
     fast_mode: bool = false,
-    effort: types.ReasoningEffort = .auto,
     statusline_context: bool = false,
-    total_input_tokens: u64 = 0,
     intrinsic_fast_model: ?[]const u8 = null,
     gateway_metadata_model: ?[]const u8 = null,
     gateway_metadata: model_capabilities.GatewayMetadata = .{},
@@ -3825,10 +3858,9 @@ const CoordinatorTestApp = struct {
     terminal_client: CoordinatorTestTerminalClient = .{},
     file_completion_values: []const file_index.SearchResult = &.{},
     file_completion_calls: usize = 0,
-    submission: @import("input_submit_runtime.zig").State = .{},
     pending_frame_commits: usize = 0,
 
-    pub fn notePendingFrameCommitted(self: *CoordinatorTestApp) void {
+    pub fn notePendingFrameCommitted(self: *CoordinatorTestApp, _: anytype) void {
         self.pending_frame_commits += 1;
     }
 
@@ -3837,15 +3869,15 @@ const CoordinatorTestApp = struct {
     }
 
     fn deinit(self: *CoordinatorTestApp) void {
-        if (self.submission.pending) |*pending| pending.deinit(self.alloc);
+        if (self.agent().submission.pending) |*pending| pending.deinit(self.alloc);
         self.shell.deinit(self.alloc);
         self.input_runtime.deinit(self.alloc);
         self.terminal_input_runtime.deinit(self.alloc);
-        self.approval_prompt.deinit(self.alloc);
-        self.question_prompt.deinit(self.alloc);
+        self.agent().approval_prompt.deinit(self.alloc);
+        self.agent().question_prompt.deinit(self.alloc);
         self.selected_model.deinit(self.alloc);
         self.workspace_identity.deinit(self.alloc);
-        self.pending_images.deinit(self.alloc);
+        self.agent().pending_images.deinit(self.alloc);
         self.model_cache.deinit();
     }
 
@@ -3912,6 +3944,10 @@ const CoordinatorTestApp = struct {
     fn isFileIndexFailed(_: *CoordinatorTestApp) bool {
         return false;
     }
+
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
+    }
 };
 
 fn initCoordinatorProjectionTestApp(
@@ -3959,10 +3995,10 @@ test "file picker real frame receipt promotes only visible rows and preserves pr
     };
     app.file_completion_values = &first;
     try app.input_runtime.textReplacementState().replace(alloc, "@txt");
-    completion.prepareFilePicker(&app);
+    completion.prepareFilePicker(&app, (&app).agent());
     try std.testing.expect(app.input_runtime.picker.file_completion.selected(0) == null);
     app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expectEqualStrings("b.txt", app.input_runtime.picker.file_completion.selected(0).?.path);
     var grid: std.ArrayList(u8) = .empty;
     defer grid.deinit(alloc);
@@ -3973,21 +4009,21 @@ test "file picker real frame receipt promotes only visible rows and preserves pr
     const next = [_]file_index.SearchResult{.{ .path = "a.txt", .kind = .file, .matched_spans = &.{} }} ++ first;
     app.file_completion_values = &next;
     picker.file_completion.retry();
-    completion.prepareFilePicker(&app);
+    completion.prepareFilePicker(&app, (&app).agent());
     try std.testing.expectEqualStrings("c.txt", picker.file_completion.selected(picker.file_completion_index).?.path);
     // A catalog owns the frame while the completion stays staged.
     app.input_runtime.help_menu.active = true;
-    completion.reconcileFilePicker(&app);
+    completion.reconcileFilePicker(&app, (&app).agent());
     const prepared_revision = completion.filePickerView(&app).receipt.?.revision;
     app.shell.render_requests.request(.footer);
     app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(picker.file_completion.prepared != null);
     try std.testing.expect(picker.file_completion.selected(picker.file_completion_index) == null);
     app.input_runtime.help_menu.active = false;
     app.shell.render_requests.request(.footer);
     app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expectEqual(prepared_revision, completion.filePickerView(&app).receipt.?.revision);
     try std.testing.expectEqualStrings("c.txt", picker.file_completion.selected(picker.file_completion_index).?.path);
     try std.testing.expectEqual(@as(usize, 2), app.file_completion_calls);
@@ -4010,10 +4046,14 @@ test "core.app_render_runtime keeps final token progress during paced response t
     defer app.deinit();
 
     var upgrade_status_buf: [64]u8 = undefined;
+
+    var waiting_note_buf: [128]u8 = undefined;
     const steering: SteeringProjection = .{};
     const ctx = Runtime(CoordinatorTestApp).footerContext(
         &app,
+        (&app).agent(),
         &upgrade_status_buf,
+        &waiting_note_buf,
         0,
         &steering,
     );
@@ -4039,10 +4079,10 @@ test "core.app_render_runtime hides loading after active tool cancellation" {
     var app = CoordinatorTestApp{
         .alloc = alloc,
         .shell = .{},
-        .stream = .{ .active = true },
+        .main_agent = .{ .stream = .{ .active = true } },
     };
     defer app.deinit();
-    app.worker.cancel_requested = true;
+    app.agent().worker.cancel_requested = true;
     _ = try app.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
         .id = .{ .turn_id = 1, .call_id = "command" },
         .reconciles_provisional_call_id = null,
@@ -4051,10 +4091,14 @@ test "core.app_render_runtime hides loading after active tool cancellation" {
     } });
 
     var upgrade_status_buf: [64]u8 = undefined;
+
+    var waiting_note_buf: [128]u8 = undefined;
     const steering: SteeringProjection = .{};
     const ctx = Runtime(CoordinatorTestApp).footerContext(
         &app,
+        (&app).agent(),
         &upgrade_status_buf,
+        &waiting_note_buf,
         0,
         &steering,
     );
@@ -4076,17 +4120,21 @@ test "core.app_render_runtime keeps loading while cancellation continues the tur
     var app = CoordinatorTestApp{
         .alloc = alloc,
         .shell = .{},
-        .stream = .{ .active = true },
+        .main_agent = .{ .stream = .{ .active = true } },
     };
     defer app.deinit();
-    app.worker.cancel_requested = true;
-    app.worker.cancel_continues_turn = true;
+    app.agent().worker.cancel_requested = true;
+    app.agent().worker.cancel_continues_turn = true;
 
     var upgrade_status_buf: [64]u8 = undefined;
+
+    var waiting_note_buf: [128]u8 = undefined;
     const steering: SteeringProjection = .{};
     const ctx = Runtime(CoordinatorTestApp).footerContext(
         &app,
+        (&app).agent(),
         &upgrade_status_buf,
+        &waiting_note_buf,
         0,
         &steering,
     );
@@ -4101,16 +4149,20 @@ test "core.app_render_runtime keeps configured controls visible while model capa
         .shell = .{},
         .model_cache_loading = true,
         .fast_mode = true,
-        .effort = types.ReasoningEffort.literal("xhigh"),
+        .main_agent = .{ .effort = types.ReasoningEffort.literal("xhigh") },
     };
     defer app.deinit();
     try app.selected_model.appendSlice(alloc, "anthropic/claude-opus-4.8");
 
     var upgrade_status_buf: [64]u8 = undefined;
+
+    var waiting_note_buf: [128]u8 = undefined;
     const steering: SteeringProjection = .{};
     const ctx = Runtime(CoordinatorTestApp).footerContext(
         &app,
+        (&app).agent(),
         &upgrade_status_buf,
+        &waiting_note_buf,
         0,
         &steering,
     );
@@ -4162,10 +4214,14 @@ test "core.app_render_runtime keeps Kimi fast indicator stable across catalog hy
             try app.selected_model.appendSlice(std.testing.allocator, case.model);
 
             var upgrade_status_buf: [64]u8 = undefined;
+
+            var waiting_note_buf: [128]u8 = undefined;
             const steering: SteeringProjection = .{};
             const ctx = Runtime(CoordinatorTestApp).footerContext(
                 &app,
+                (&app).agent(),
                 &upgrade_status_buf,
+                &waiting_note_buf,
                 0,
                 &steering,
             );
@@ -4186,10 +4242,14 @@ test "core.app_render_runtime keeps a bound fast preference stable after catalog
     try app.selected_model.appendSlice(std.testing.allocator, "anthropic/claude-fable-5");
 
     var upgrade_status_buf: [64]u8 = undefined;
+
+    var waiting_note_buf: [128]u8 = undefined;
     const steering: SteeringProjection = .{};
     const ctx = Runtime(CoordinatorTestApp).footerContext(
         &app,
+        (&app).agent(),
         &upgrade_status_buf,
+        &waiting_note_buf,
         0,
         &steering,
     );
@@ -4215,10 +4275,14 @@ test "core.app_render_runtime projects only the visible inline completion suffix
     try app.input_runtime.textReplacementState().replace(alloc, "explain $man");
 
     var upgrade_status_buf: [64]u8 = undefined;
+
+    var waiting_note_buf: [128]u8 = undefined;
     const steering: SteeringProjection = .{};
     const ctx = Runtime(CoordinatorTestApp).footerContext(
         &app,
+        (&app).agent(),
         &upgrade_status_buf,
+        &waiting_note_buf,
         0,
         &steering,
     );
@@ -4239,10 +4303,14 @@ test "core.app_render_runtime projects an inline slash completion suffix after t
     try app.input_runtime.textReplacementState().replace(alloc, "explain /he");
 
     var upgrade_status_buf: [64]u8 = undefined;
+
+    var waiting_note_buf: [128]u8 = undefined;
     const steering: SteeringProjection = .{};
     const ctx = Runtime(CoordinatorTestApp).footerContext(
         &app,
+        (&app).agent(),
         &upgrade_status_buf,
+        &waiting_note_buf,
         0,
         &steering,
     );
@@ -4258,12 +4326,13 @@ test "core.app_render_runtime projects Opus 4.8 one million token context to foo
         .alloc = alloc,
         .shell = .{},
         .statusline_context = true,
-        .total_input_tokens = 43_000,
+        .main_agent = .{ .total_input_tokens = 43_000 },
     };
     defer app.deinit();
 
     const statusline = Runtime(CoordinatorTestApp).buildStatuslineItems(
         &app,
+        (&app).agent(),
         "anthropic/claude-opus-4.8",
     );
     try std.testing.expectEqual(@as(u64, 43_000), statusline.context_used);
@@ -4291,14 +4360,15 @@ test "core.app_render_runtime uses Gateway context window from resolved capabili
         .alloc = alloc,
         .shell = .{},
         .statusline_context = true,
-        .total_input_tokens = 12_000,
         .gateway_metadata_model = "provider/new-long-context",
         .gateway_metadata = .{ .context_window = 750_000 },
+        .main_agent = .{ .total_input_tokens = 12_000 },
     };
     defer app.deinit();
 
     const statusline = Runtime(CoordinatorTestApp).buildStatuslineItems(
         &app,
+        (&app).agent(),
         "provider/new-long-context",
     );
     try std.testing.expectEqual(@as(u64, 12_000), statusline.context_used);
@@ -4310,7 +4380,7 @@ test "core.app_render_runtime request owner authorizes explicit frame causes" {
     var app = CoordinatorTestApp{
         .alloc = alloc,
         .shell = .{},
-        .stream = .{ .active = true },
+        .main_agent = .{ .stream = .{ .active = true } },
     };
     defer app.deinit();
 
@@ -4367,7 +4437,7 @@ test "core.app_render_runtime requested-frame flush commits and acknowledges one
     app.shell.terminal_reset_pending = true;
 
     app.shell.render_requests.request(.first_frame);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expect(app.shell.has_committed_frame);
     try std.testing.expect(!app.shell.terminal_reset_pending);
@@ -4385,7 +4455,7 @@ test "core.app_render_runtime inline frame omits background terminal chrome and 
     defer app.deinit();
 
     app.shell.render_requests.request(.first_frame);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expectEqual(@as(usize, 0), app.terminal_client.snapshot_count);
     try std.testing.expect(app.terminal_client.source_running);
@@ -4473,7 +4543,7 @@ fn flushRebasedPublicationFrame(app: *CoordinatorTestApp, file: std.Io.File, phy
     const rows_before = std.mem.count(u8, history.items, "\n");
     app.shell.render_requests.request(.transcript);
     app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(app, agents.screenAgentOf(app));
     const bytes = try readCoordinatorFrameBytes(app.alloc, file, offset);
     defer app.alloc.free(bytes);
     try feedRewritePublicationFrame(app.alloc, physical, history, bytes);
@@ -4516,10 +4586,10 @@ test "core.app_render_runtime consolidation rebases before publishing followup r
     defer alloc.free(old_history);
     const before_mutation = try file.length(std.testing.io);
     for (ids) |id| {
-        const index = for (app.shell.entries.items, 0..) |entry, index| {
+        const index = for (app.shell.notebook.entries.items, 0..) |entry, index| {
             if (entry.id() == id) break index;
         } else return error.MissingConsolidationEntry;
-        var removed = app.shell.entries.orderedRemove(index);
+        var removed = app.shell.notebook.entries.orderedRemove(index);
         removed.deinit(alloc);
     }
     const summary = try alloc.dupe(u8, "COMPACT_COMMAND_SUMMARY\n");
@@ -4783,7 +4853,7 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
         _ = try app.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{ .id = id, .reconciles_provisional_call_id = null, .tool_name = "run_command", .activity_kind = .command } });
         break :blk app.shell.toolActivityRecord(id).?.entry_id;
     } else try store.appendPinnedToolStatusAtomic(&app.shell, alloc, "phase one\nphase two\nphase three\n");
-    const status_bytes = for (app.shell.entries.items) |entry| {
+    const status_bytes = for (app.shell.notebook.entries.items) |entry| {
         if (entry.id() == status_id) break entry.raw_bytes.bytes.len;
     } else unreachable;
     var physical = try vt_emulator.Grid.init(alloc, 80, rows);
@@ -4794,7 +4864,7 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
     var read_offset: u64 = 0;
     app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
     app.shell.render_requests.request(.first_frame);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     const first = try readCoordinatorFrameBytes(alloc, file, &read_offset);
     defer alloc.free(first);
     try feedRewritePublicationFrame(alloc, &physical, &exported, first);
@@ -4832,20 +4902,20 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
         try std.testing.expectEqual(@as(usize, 0), app.shell.committedRetentionIdentity().?.publication_entries.len);
         try app_lifecycle.openFullTranscript(alloc, &app.terminal, &app.shell, &app.metrics);
         app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
-        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
         const opened = try readCoordinatorFrameBytes(alloc, file, &read_offset);
         defer alloc.free(opened);
         try feedRewritePublicationFrame(alloc, &physical, &exported, opened);
         try std.testing.expect(app.terminal.fullTranscriptScreenActive());
         try std.testing.expect(physical.saved_normal_screen != null);
     }
-    if (case != .status_shrink) app.shell.max_retained_transcript_bytes = store.retainedStructuredBytes(&app.shell);
+    if (case != .status_shrink) app.shell.notebook.max_retained_transcript_bytes = store.retainedStructuredBytes(&app.shell);
     switch (case) {
         .command_retention => try app.shell.writeCommandOutputChunk(alloc, &app.metrics, .{}, .stdout, "NEW_COMMAND_OUTPUT\n", true),
         .status_retention => try std.testing.expect(try store.replacePinnedToolStatusAtomic(&app.shell, alloc, status_id, "phase replacement\nsecond phase\nthird phase\nfourth phase\nfifth phase\n")),
         .status_shrink => try std.testing.expect(try store.replacePinnedToolStatusAtomic(&app.shell, alloc, status_id, "ok\n")),
         .removed_conversation => {
-            app.shell.max_retained_transcript_bytes = status_bytes + "NEW_NOTICE\n".len;
+            app.shell.notebook.max_retained_transcript_bytes = status_bytes + "NEW_NOTICE\n".len;
             if (retry.viewer) {
                 try std.testing.expect(try store.replacePinnedToolStatusAtomic(&app.shell, alloc, status_id, "viewer status replacement\n"));
             } else {
@@ -4853,14 +4923,14 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
             }
         },
     }
-    const prefix_survives = for (app.shell.entries.items) |entry| {
+    const prefix_survives = for (app.shell.notebook.entries.items) |entry| {
         if (entry.id() == prefix_id) break true;
     } else false;
     try std.testing.expectEqual(case == .status_shrink, prefix_survives);
     try std.testing.expectEqual(case != .removed_conversation, app.shell.lookupAssistantSegments(assistant_id) != null);
     if (case == .status_retention) {
-        app.stream.active = true;
-        app.stream.phase = .running;
+        app.agent().stream.active = true;
+        app.agent().stream.phase = .running;
     }
     if (retry.viewer) {
         try std.testing.expect(app.terminal.fullTranscriptScreenActive());
@@ -4870,7 +4940,7 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
             app.shell.layout.cols = cols;
             app.shell.render_requests.request(.resize);
             app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
-            try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+            try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
         }
         try app_lifecycle.closeFullTranscript(alloc, &app.terminal, &app.shell, &app.metrics);
         const closed = try readCoordinatorFrameBytes(alloc, file, &read_offset);
@@ -4898,7 +4968,7 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
         }
         try std.testing.expect(app.shell.committedRetentionIdentity() == null);
         app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
-        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
         const frame = try readCoordinatorFrameBytes(alloc, file, &read_offset);
         defer alloc.free(frame);
         try feedRewritePublicationFrame(alloc, &physical, &exported, frame);
@@ -4906,7 +4976,7 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
         try std.testing.expect(!try coordinatorGridContains(physical, "RW_OLD_00"));
         return;
     }
-    const publication_bound = app.shell.transcriptCommitDiagnostic().source_bytes + app.shell.max_retained_transcript_bytes;
+    const publication_bound = app.shell.transcriptCommitDiagnostic().source_bytes + app.shell.notebook.max_retained_transcript_bytes;
     if (retry.update_status) {
         try std.testing.expect(try store.replacePinnedToolStatusAtomic(&app.shell, alloc, status_id, "phase new\nphase two\nphase end\n"));
         try std.testing.expectEqualStrings("phase new\nphase two\nphase end", store.toolStatusEntryLabel(&app.shell, status_id).?);
@@ -4920,7 +4990,7 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
             defer committed.deinit(alloc);
             try std.testing.expect(std.mem.find(u8, committed.bytes, "P2") == null);
             try std.testing.expectEqual(held_bytes, committed.bytes.len);
-            try std.testing.expect(store.retainedStructuredBytes(&app.shell) <= app.shell.max_retained_transcript_bytes);
+            try std.testing.expect(store.retainedStructuredBytes(&app.shell) <= app.shell.notebook.max_retained_transcript_bytes);
         }
     }
     if (retry.accepted_bytes) |cut| {
@@ -4929,7 +4999,7 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
         var sink = PublicationFaultSink{ .file = file, .remaining = cut };
         app.shell.test_frame_sink = .{ .ctx = &sink, .write_frame = PublicationFaultSink.write };
         app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
-        Runtime(CoordinatorTestApp).flushRequestedFrame(&app) catch |err| {
+        Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent()) catch |err| {
             if (err != error.WriteFailed and err != error.DocumentAppendInterrupted) return err;
         };
         app.shell.test_frame_sink = null;
@@ -4943,8 +5013,8 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
             try std.testing.expect(exported.items.len > exported_before_attempt);
         }
         if (retry.cancel) {
-            app.worker.cancel_requested = true;
-            app.stream.active = false;
+            app.agent().worker.cancel_requested = true;
+            app.agent().stream.active = false;
             _ = try app.shell.applyToolLifecycle(alloc, .{ .turn_finished = .{ .turn_id = 41, .outcome = .interrupted } });
             try std.testing.expectEqual(.terminal, app.shell.toolActivityRecord(.{ .turn_id = 41, .call_id = "publication-cancel" }).?.phase);
             try app.shell.finishLifecycleBatch(alloc);
@@ -4964,7 +5034,7 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
     }
     for (0..8) |_| {
         app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
-        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
         const next = try readCoordinatorFrameBytes(alloc, file, &read_offset);
         defer alloc.free(next);
         try feedRewritePublicationFrame(alloc, &physical, &exported, next);
@@ -4981,7 +5051,7 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
             const line = try std.mem.print(&buffer, "N{d}\n", .{index});
             _ = try store.writeRecordedTranscriptClassifiedAtomic(&app.shell, alloc, &app.metrics, line, .unknown_raw);
             app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
-            try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+            try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
             const next = try readCoordinatorFrameBytes(alloc, file, &read_offset);
             defer alloc.free(next);
             try feedRewritePublicationFrame(alloc, &physical, &exported, next);
@@ -4997,7 +5067,7 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
                 }
             }
             try std.testing.expect(app.shell.transcriptCommitDiagnostic().source_bytes <= publication_bound);
-            try std.testing.expect(store.retainedStructuredBytes(&app.shell) <= app.shell.max_retained_transcript_bytes);
+            try std.testing.expect(store.retainedStructuredBytes(&app.shell) <= app.shell.notebook.max_retained_transcript_bytes);
         }
         try std.testing.expect(std.mem.findScalar(bool, seen, true) != null);
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, exported.items, "RW_ARTIFACTS"));
@@ -5131,17 +5201,17 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
         // Interrupt actual preparation, not the coordinator's synthetic receipt stub.
         app.terminal_input_runtime.terminal_action_decoder.stage = 2;
         app.shell.render_requests.request(.first_frame);
-        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
         try std.testing.expectEqual(read_offset, try file.length(std.testing.io));
         try std.testing.expectEqual(case.origin, app.shell.owned_top_row);
         try std.testing.expectEqual(.invalid, app.shell.transcriptCommitDiagnostic().state);
-        try std.testing.expect(app.shell.pending_resume_source != null);
+        try std.testing.expect(app.shell.notebook.pending_resume_source != null);
         try std.testing.expect(app.shell.render_requests.hasPending());
         app.terminal_input_runtime.resetEscapeDecoder();
 
         // A unit-test stdin can be closed; suppress that unrelated poll on retries.
         app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
-        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
         const first = try readCoordinatorFrameBytes(alloc, file, &read_offset);
         defer alloc.free(first);
         const document_start = std.mem.find(u8, first, "ORIGIN_ROW_000") orelse return error.MissingResumeDocument;
@@ -5177,7 +5247,7 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
             const receipt = app.shell.transcript_commit_state.recovering;
             try std.testing.expect(receipt.materialized_flow_len != null);
             app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
-            try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+            try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
             const next = try readCoordinatorFrameBytes(alloc, file, &read_offset);
             defer alloc.free(next);
             // Recovery continues the materialized suffix instead of replaying row zero.
@@ -5196,12 +5266,12 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
         }
         for (0..3) |_| {
             app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
-            try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+            try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
         }
         try std.testing.expectEqual(.stable, app.shell.transcriptCommitDiagnostic().state);
         try std.testing.expectEqual(history_rows, app.shell.transcriptCommitDiagnostic().history_visual_offset);
         try std.testing.expectEqual(history_rows + case.origin - case.post_top, physical_scroll_rows);
-        try std.testing.expect(app.shell.pending_resume_source == null);
+        try std.testing.expect(app.shell.notebook.pending_resume_source == null);
         try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, try std.mem.print(&expected_buf, "ORIGIN_ROW_{d:0>3}", .{case.rows - 1})));
 
         const anchor = app.shell.transcript_commit_state.stable;
@@ -5209,7 +5279,7 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
         try app.shell.writeTranscript(alloc, &app.metrics, "\nAFTER_RESUME", true);
         app.shell.render_requests.request(.transcript);
         app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
-        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
         const appended = try readCoordinatorFrameBytes(alloc, file, &read_offset);
         defer alloc.free(appended);
         var cursor_buf: [32]u8 = undefined;
@@ -5254,7 +5324,7 @@ test "core.app_render_runtime first requested startup frame commits through the 
     try app.shell.writeTranscript(alloc, &app.metrics, "startup frame content\n", true);
 
     app.shell.render_requests.request(.first_frame);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expect(app.shell.has_committed_frame);
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "startup frame content"));
@@ -5262,7 +5332,7 @@ test "core.app_render_runtime first requested startup frame commits through the 
     try std.testing.expect(first_len > 0);
 
     app.shell.render_requests.request(.footer);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expectEqual(first_len, try file.length(io_mod.getIo()));
 }
@@ -5308,28 +5378,28 @@ test "core.app_render_runtime main skill menu origins share the inline footer" {
     try app.shell.writeTranscript(alloc, &app.metrics, "transcript stays visible behind the picker\n", true);
 
     app.shell.render_requests.request(.footer);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "$pure"));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "pure-core"));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "transcript stays visible"));
 
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
+    try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, .{
         .id = 42,
         .label = "web_search latest Zig release",
     }));
     app.shell.render_requests.request(.modal);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(
         app.shell.shadow_vt.?.*,
         "Would you like to allow this action?",
     ));
 
-    app.approval_prompt.clear(alloc);
+    app.agent().approval_prompt.clear(alloc);
     app.shell.render_requests.request(.modal);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Skills 1"));
 
@@ -5340,21 +5410,21 @@ test "core.app_render_runtime main skill menu origins share the inline footer" {
     const entries = [_]types.QuestionBatchEntry{
         .{ .question = "What should fx do next?", .options = &options },
     };
-    try app.question_prompt.syncFrom(alloc, &entries);
+    try app.agent().question_prompt.syncFrom(alloc, &entries);
     app.shell.render_requests.request(.modal);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Inspect repo state"));
 
-    app.question_prompt.discard(alloc, "test_cleanup");
+    app.agent().question_prompt.discard(alloc, "test_cleanup");
     app.shell.render_requests.request(.modal);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Skills 1"));
 
     try app.shell.writeTranscript(alloc, &app.metrics, "background transcript update\n", true);
     app.shell.render_requests.request(.transcript);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "background transcript update"));
 
@@ -5368,7 +5438,7 @@ test "core.app_render_runtime main skill menu origins share the inline footer" {
         .hint_row = 10,
     };
     app.shell.render_requests.request(.resize);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expectEqual(@as(u16, 48), app.shell.shadow_vt.?.cols);
@@ -5377,7 +5447,7 @@ test "core.app_render_runtime main skill menu origins share the inline footer" {
 
     app.skills.closeMenu();
     app.shell.render_requests.request(.footer);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "transcript stays visible"));
@@ -5385,14 +5455,14 @@ test "core.app_render_runtime main skill menu origins share the inline footer" {
 
     app.skills.openMenu();
     app.shell.render_requests.request(.footer);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "pure-core"));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "transcript stays visible"));
 
     app.skills.closeMenu();
     app.shell.render_requests.request(.footer);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
 
     var read_offset: u64 = 0;
@@ -5434,7 +5504,7 @@ test "core.app_render_runtime settings help and resume menus share the inline fo
 
     app.input_runtime.settings_menu.open();
     app.shell.render_requests.request(.footer);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "catalog transcript remains visible"));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Settings"));
@@ -5442,16 +5512,16 @@ test "core.app_render_runtime settings help and resume menus share the inline fo
     app.input_runtime.settings_menu.close();
     app.input_runtime.help_menu.open();
     app.shell.render_requests.request(.footer);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "catalog transcript remains visible"));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Commands 1"));
 
     app.input_runtime.help_menu.close();
-    app.session_persistence.session_picker.active = true;
-    app.session_persistence.session_picker.load_state = .loading;
+    app.agent().session_persistence.session_picker.active = true;
+    app.agent().session_persistence.session_picker.load_state = .loading;
     app.shell.render_requests.request(.footer);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "catalog transcript remains visible"));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Loading sessions"));
@@ -5501,15 +5571,15 @@ test "core.app_render_runtime roomy resume footer paints twenty VT session rows"
     };
     defer app.deinit();
     try app.selected_model.appendSlice(alloc, "test-model");
-    app.session_persistence.session_picker.active = true;
-    app.session_persistence.session_picker.load_state = .ready;
-    app.session_persistence.session_picker.summaries.items = summaries[0..];
+    app.agent().session_persistence.session_picker.active = true;
+    app.agent().session_persistence.session_picker.load_state = .ready;
+    app.agent().session_persistence.session_picker.summaries.items = summaries[0..];
     try app.shell.initBacking(alloc);
     try app.shell.enableShadowVt(alloc);
     try app.shell.writeTranscript(alloc, &app.metrics, "twenty-row transcript remains visible\n", true);
 
     app.shell.render_requests.request(.footer);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     var matching_rows: usize = 0;
     var row_text_buf: std.ArrayList(u8) = .empty;
@@ -5526,9 +5596,9 @@ test "core.app_render_runtime roomy resume footer paints twenty VT session rows"
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "twenty-row transcript remains visible"));
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
 
-    app.session_persistence.session_picker.active = false;
+    app.agent().session_persistence.session_picker.active = false;
     app.shell.render_requests.request(.footer);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Responsive session title")));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "twenty-row transcript remains visible"));
 }
@@ -5582,9 +5652,9 @@ test "core.app_render_runtime inline menus survive the VT size and resize matrix
     defer app.deinit();
     try app.selected_model.appendSlice(alloc, "test-model");
     app.skills.items = @constCast(&skills);
-    app.session_persistence.session_picker.summaries.items = summaries[0..];
-    app.session_persistence.session_picker.load_state = .ready;
-    app.session_persistence.session_picker.has_more = true;
+    app.agent().session_persistence.session_picker.summaries.items = summaries[0..];
+    app.agent().session_persistence.session_picker.load_state = .ready;
+    app.agent().session_persistence.session_picker.has_more = true;
     for (0..25) |index| {
         const id = if (index == 24) "provider/selected-model" else "provider/model";
         try app.model_cache.menu.items.append(alloc, .{
@@ -5625,7 +5695,7 @@ test "core.app_render_runtime inline menus survive the VT size and resize matrix
         app.skills.closeMenu();
         app.input_runtime.settings_menu.close();
         app.input_runtime.help_menu.close();
-        app.session_persistence.session_picker.active = false;
+        app.agent().session_persistence.session_picker.active = false;
         app.model_cache.menu.active = false;
         try app.input_runtime.textReplacementState().replace(alloc, "");
         switch (menu_case.kind) {
@@ -5633,7 +5703,7 @@ test "core.app_render_runtime inline menus survive the VT size and resize matrix
             .skills => app.skills.openMenu(),
             .settings => app.input_runtime.settings_menu.open(),
             .help => app.input_runtime.help_menu.open(),
-            .sessions => app.session_persistence.session_picker.active = true,
+            .sessions => app.agent().session_persistence.session_picker.active = true,
             .models => app.model_cache.menu.active = true,
         }
 
@@ -5648,7 +5718,7 @@ test "core.app_render_runtime inline menus survive the VT size and resize matrix
                 .hint_row = geometry.rows,
             };
             app.shell.render_requests.request(.resize);
-            try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+            try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
             try std.testing.expectEqual(geometry.cols, app.shell.shadow_vt.?.cols);
             try std.testing.expectEqual(geometry.rows, app.shell.shadow_vt.?.rows);
@@ -5665,11 +5735,11 @@ test "core.app_render_runtime inline menus survive the VT size and resize matrix
     app.skills.closeMenu();
     app.input_runtime.settings_menu.close();
     app.input_runtime.help_menu.close();
-    app.session_persistence.session_picker.active = false;
+    app.agent().session_persistence.session_picker.active = false;
     app.model_cache.menu.active = false;
     try app.input_runtime.textReplacementState().replace(alloc, "");
     app.shell.render_requests.request(.footer);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expectEqual(@as(u16, 0), app.shell.extra_input_rows);
     try std.testing.expect(!(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Responsive session title")));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "inline menu matrix transcript"));
@@ -5713,7 +5783,7 @@ test "core.app_render_runtime active setup hub stays on the inline transcript su
     try app.shell.writeTranscript(alloc, &app.metrics, "setup transcript stays behind\n", true);
 
     app.shell.render_requests.request(.footer);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Setup"));
@@ -5725,7 +5795,7 @@ test "core.app_render_runtime active setup hub stays on the inline transcript su
 
     app.auth.closePicker(alloc);
     app.shell.render_requests.request(.footer);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "setup transcript stays behind"));
@@ -5765,31 +5835,31 @@ test "core.app_render_runtime inline model catalog survives modal preemption and
     try app.shell.writeTranscript(alloc, &app.metrics, "model catalog transcript stays behind\n", true);
 
     app.shell.render_requests.request(.footer);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Models 0"));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Loading models"));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "model catalog transcript stays behind"));
 
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
+    try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, .{
         .id = 84,
         .label = "web_search latest model metadata",
     }));
     app.shell.render_requests.request(.modal);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Would you like to allow this action?"));
 
-    app.approval_prompt.clear(alloc);
+    app.agent().approval_prompt.clear(alloc);
     app.shell.render_requests.request(.modal);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Loading models"));
 
     app.model_cache.closeMenu();
     app.shell.render_requests.request(.footer);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "model catalog transcript stays behind"));
 
@@ -5862,23 +5932,23 @@ test "core.app_render_runtime file approval returns to the preserved inline skil
     try app.shell.writeTranscript(alloc, &app.metrics, "transcript behind inline skills\n", true);
 
     app.shell.render_requests.request(.footer);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
 
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, request));
-    try std.testing.expect(app.approval_prompt.syncReview(&review));
+    try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, request));
+    try std.testing.expect(app.agent().approval_prompt.syncReview(&review));
     app.shell.render_requests.request(.modal);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expectEqual(shell_runtime.AlternateScreenOwner.file_approval, app.terminal.alternate_screen_owner);
     try std.testing.expectEqualStrings("$pure", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqualStrings("pure", app.skills.menu.query());
 
-    app.approval_prompt.clear(alloc);
+    app.agent().approval_prompt.clear(alloc);
     app.shell.render_requests.request(.modal);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expectEqual(shell_runtime.AlternateScreenOwner.none, app.terminal.alternate_screen_owner);
     try std.testing.expectEqualStrings("$pure", app.input_runtime.edit_state.input.items);
@@ -5888,7 +5958,7 @@ test "core.app_render_runtime file approval returns to the preserved inline skil
 
     app.skills.closeMenu();
     app.shell.render_requests.request(.footer);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expectEqual(shell_runtime.AlternateScreenOwner.none, app.terminal.alternate_screen_owner);
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "transcript behind inline skills"));
 }
@@ -5955,14 +6025,14 @@ test "core.app_render_runtime file approvals commit the alternate screen for eac
     try app.selected_model.appendSlice(alloc, "test-model");
     try app.shell.initBacking(alloc);
     try app.shell.enableShadowVt(alloc);
-    try std.testing.expect(try app.approval_prompt.syncRequest(
+    try std.testing.expect(try app.agent().approval_prompt.syncRequest(
         alloc,
         request_a,
     ));
-    try std.testing.expect(app.approval_prompt.syncReview(&review));
+    try std.testing.expect(app.agent().approval_prompt.syncReview(&review));
 
     app.shell.render_requests.request(.first_frame);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     const first_len = try file.length(io_mod.getIo());
     try std.testing.expect(first_len > 0);
     try std.testing.expect(app.terminal.fileApprovalScreenActive());
@@ -5970,7 +6040,7 @@ test "core.app_render_runtime file approvals commit the alternate screen for eac
     try std.testing.expect(app.terminal.alternate_mouse_tracking_active);
     try std.testing.expect(approval_screen.fileApprovalAffirmativeReady(
         &app.shell,
-        app.approval_prompt.projection().?,
+        app.agent().approval_prompt.projection().?,
         &app.approval_screen,
     ));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "after"));
@@ -5978,38 +6048,38 @@ test "core.app_render_runtime file approvals commit the alternate screen for eac
     app.shell.layout.rows = 20;
     app.shell.layout.cols = 80;
     app.shell.render_requests.request(.resize);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     const resized_len = try file.length(io_mod.getIo());
     try std.testing.expect(resized_len > first_len);
     try std.testing.expectEqual(@as(u16, 80), app.shell.shadow_vt.?.cols);
     try std.testing.expectEqual(@as(u16, 20), app.shell.shadow_vt.?.rows);
     try std.testing.expect(approval_screen.fileApprovalAffirmativeReady(
         &app.shell,
-        app.approval_prompt.projection().?,
+        app.agent().approval_prompt.projection().?,
         &app.approval_screen,
     ));
 
     var request_b = request_a;
     request_b.id = 42;
-    try std.testing.expect(try app.approval_prompt.syncRequest(
+    try std.testing.expect(try app.agent().approval_prompt.syncRequest(
         alloc,
         request_b,
     ));
-    try std.testing.expect(app.approval_prompt.syncReview(&review));
+    try std.testing.expect(app.agent().approval_prompt.syncReview(&review));
     app.shell.render_requests.request(.modal);
     try std.testing.expect(!approval_screen.fileApprovalAffirmativeReady(
         &app.shell,
-        app.approval_prompt.projection().?,
+        app.agent().approval_prompt.projection().?,
         &app.approval_screen,
     ));
 
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expect((try file.length(io_mod.getIo())) > resized_len);
     try std.testing.expect(!app.shell.render_requests.hasPending());
     try std.testing.expect(approval_screen.fileApprovalAffirmativeReady(
         &app.shell,
-        app.approval_prompt.projection().?,
+        app.agent().approval_prompt.projection().?,
         &app.approval_screen,
     ));
     try std.testing.expectEqual(@as(u64, 42), app.approval_screen.screen_commit.?.request_id);
@@ -6086,17 +6156,17 @@ test "core.app_render_runtime restores file review before rendering a generic ap
     try app.selected_model.appendSlice(alloc, "test-model");
     try app.shell.initBacking(alloc);
     try app.shell.enableShadowVt(alloc);
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, file_request));
-    try std.testing.expect(app.approval_prompt.syncReview(&review));
+    try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, file_request));
+    try std.testing.expect(app.agent().approval_prompt.syncReview(&review));
 
     app.shell.render_requests.request(.first_frame);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(app.terminal.fileApprovalScreenActive());
     try std.testing.expect(app.terminal.alternate_mouse_tracking_active);
 
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, generic_request));
+    try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, generic_request));
     app.shell.render_requests.request(.modal);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expect(!app.terminal.fileApprovalScreenActive());
     try std.testing.expect(!app.terminal.alternate_mouse_tracking_active);
@@ -6154,12 +6224,12 @@ test "core.app_render_runtime generic approval exits the full transcript screen 
     try app.shell.writeTranscript(alloc, &app.metrics, "prior transcript\n", true);
     try app_lifecycle.openFullTranscript(app.alloc, &app.terminal, &app.shell, &app.metrics);
 
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
+    try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, .{
         .id = 42,
         .label = "shell.run sh -c 'printf approval'",
     }));
     app.shell.render_requests.request(.modal);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expect(!app.terminal.fullTranscriptScreenActive());
     try std.testing.expect(!app.shell.fullTranscriptActive());
@@ -6223,10 +6293,10 @@ test "core.app_render_runtime question prompt exits the full transcript screen b
     const entries = [_]types.QuestionBatchEntry{
         .{ .question = "What should fx do next?", .options = &options },
     };
-    try app.question_prompt.syncFrom(alloc, &entries);
+    try app.agent().question_prompt.syncFrom(alloc, &entries);
 
     app.shell.render_requests.request(.modal);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expect(!app.terminal.fullTranscriptScreenActive());
     try std.testing.expect(!app.shell.fullTranscriptActive());
@@ -6304,19 +6374,19 @@ test "core.app_render_runtime file approval takes over the full transcript alter
     try app.shell.enableShadowVt(alloc);
     try app.shell.writeTranscript(alloc, &app.metrics, "prior transcript\n", true);
     try app_lifecycle.openFullTranscript(app.alloc, &app.terminal, &app.shell, &app.metrics);
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, request));
-    try std.testing.expect(app.approval_prompt.syncReview(&review));
+    try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, request));
+    try std.testing.expect(app.agent().approval_prompt.syncReview(&review));
 
     app.shell.render_requests.request(.modal);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expect(!app.terminal.fullTranscriptScreenActive());
     try std.testing.expect(app.terminal.fileApprovalScreenActive());
     try std.testing.expect(!app.shell.fullTranscriptActive());
     try std.testing.expect(approval_screen.fileApprovalAffirmativeReady(
         &app.shell,
-        app.approval_prompt.projection().?,
+        app.agent().approval_prompt.projection().?,
         &app.approval_screen,
     ));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "after"));
@@ -6384,7 +6454,7 @@ test "core.app_render_runtime lifecycle rewrite recovers normal buffer after fil
         true,
     );
     app.shell.render_requests.request(.first_frame);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     const committed_before = app.shell.transcriptCommitDiagnostic();
     try std.testing.expectEqual(
         transcript_runtime.TranscriptCommitDiagnosticState.stable,
@@ -6393,9 +6463,9 @@ test "core.app_render_runtime lifecycle rewrite recovers normal buffer after fil
     try std.testing.expect((committed_before.stable_start_line orelse 0) > 0);
 
     try app_lifecycle.openFullTranscript(app.alloc, &app.terminal, &app.shell, &app.metrics);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try app.shell.writeTranscript(alloc, &app.metrics, "stream completed\n", true);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     _ = try shell_runtime.applyToolLifecyclePreservingNormalBufferAnchor(
         alloc,
         &app.shell,
@@ -6428,19 +6498,20 @@ test "core.app_render_runtime lifecycle rewrite recovers normal buffer after fil
     };
     var review = try diff_mod.FileReview.init(alloc, "", "pending\n");
     defer review.deinit(alloc);
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, request));
-    try std.testing.expect(app.approval_prompt.syncReview(&review));
+    try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, request));
+    try std.testing.expect(app.agent().approval_prompt.syncReview(&review));
     app.shell.render_requests.request(.modal);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(app.terminal.fileApprovalScreenActive());
 
     try std.testing.expect(try approval_input_runtime.ApprovalRuntime(CoordinatorTestApp).handlePermissionAction(
         &app,
+        (&app).agent(),
         .{ .number = 2 },
     ));
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
-    try std.testing.expectEqual(types.ToolPermissionDecision.deny, app.worker.submitted_permission.?);
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, app.agent().worker.submitted_permission.?);
     try std.testing.expect(!app.terminal.fileApprovalScreenActive());
     try std.testing.expectEqual(
         transcript_runtime.TranscriptCommitDiagnosticState.stable,
@@ -6488,10 +6559,10 @@ test "core.app_render_runtime full transcript defers repaint until its page is r
         true,
     );
     app.shell.render_requests.request(.first_frame);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try app_lifecycle.openFullTranscript(app.alloc, &app.terminal, &app.shell, &app.metrics);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expect(!try coordinatorGridContains(
         app.shell.shadow_vt.?.*,
@@ -6505,7 +6576,7 @@ test "core.app_render_runtime full transcript defers repaint until its page is r
     }
     try std.testing.expect(app.shell.fullTranscriptPreparedForOpen());
     app.shell.render_requests.request(.transcript);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(try coordinatorGridContains(
         app.shell.shadow_vt.?.*,
         "FULL_ASYNC_SENTINEL",
@@ -6552,10 +6623,10 @@ test "core.app_render_runtime full transcript resize defers history reset until 
         true,
     );
     app.shell.render_requests.request(.first_frame);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try app_lifecycle.openFullTranscript(app.alloc, &app.terminal, &app.shell, &app.metrics);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     app.shell.layout = .{
         .rows = 18,
         .cols = 72,
@@ -6581,7 +6652,7 @@ test "core.app_render_runtime full transcript resize defers history reset until 
     }
     try std.testing.expect(app.shell.fullTranscriptPreparedForOpen());
     app.shell.render_requests.request(.transcript);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     const resize_bytes = try readCoordinatorFrameBytes(alloc, file, &read_offset);
     defer alloc.free(resize_bytes);
     try std.testing.expect(app.terminal.fullTranscriptScreenActive());
@@ -6589,7 +6660,7 @@ test "core.app_render_runtime full transcript resize defers history reset until 
     try std.testing.expect(std.mem.find(u8, resize_bytes, "\x1b[3J") == null);
 
     try app_lifecycle.closeFullTranscript(app.alloc, &app.terminal, &app.shell, &app.metrics);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     const close_bytes = try readCoordinatorFrameBytes(alloc, file, &read_offset);
     defer alloc.free(close_bytes);
 
@@ -6645,7 +6716,7 @@ test "core.app_render_runtime exits terminal-only full transcript state before n
     try std.testing.expect(!app.shell.fullTranscriptActive());
 
     app.shell.render_requests.request(.transcript);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expect(!app.terminal.fullTranscriptScreenActive());
     try std.testing.expect(!app.shell.fullTranscriptActive());
@@ -6718,17 +6789,17 @@ test "core.app_render_runtime approval screen failure denies after leaving alter
     try app.selected_model.appendSlice(alloc, "test-model");
     try app.shell.initBacking(alloc);
     try app.shell.enableShadowVt(alloc);
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, request));
+    try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, request));
 
     app.shell.render_requests.request(.modal);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
 
     try std.testing.expect(!app.terminal.fileApprovalScreenActive());
-    try std.testing.expect(!app.approval_prompt.isActive());
+    try std.testing.expect(!app.agent().approval_prompt.isActive());
     try std.testing.expect(!app.shell.render_requests.hasReason(.external_damage));
     try std.testing.expectEqual(
         types.ToolPermissionDecision.deny,
-        app.worker.submitted_permission.?,
+        app.agent().worker.submitted_permission.?,
     );
 }
 
@@ -6815,7 +6886,7 @@ test "core.app_render_runtime coordinator physically scrolls preserved shell row
 
     var read_offset: u64 = 0;
     app.shell.render_requests.request(.first_frame);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     const initial_bytes = try readCoordinatorFrameBytes(alloc, file, &read_offset);
     defer alloc.free(initial_bytes);
     try terminal.feed(initial_bytes);
@@ -6828,7 +6899,7 @@ test "core.app_render_runtime coordinator physically scrolls preserved shell row
         true,
     );
     app.shell.render_requests.request(.footer);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     const growth_bytes = try readCoordinatorFrameBytes(alloc, file, &read_offset);
     defer alloc.free(growth_bytes);
 

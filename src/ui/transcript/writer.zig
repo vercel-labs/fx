@@ -78,20 +78,20 @@ fn writeTranscriptBytesInternal(
     // preparation sees the same pending layout as recorded writes.
     if (record) {
         try self.assertCanMutateTranscript();
-        self.transcript_cache_origin_untrimmed = false;
+        self.notebook.transcript_cache_origin_untrimmed = false;
         _ = try transcript_store.appendCappedWithinCapacity(
-            &self.transcript,
+            &self.notebook.transcript,
             alloc,
             text,
-            self.max_transcript_bytes,
-            &self.replaceable_last_line,
-            &self.replaceable_start,
+            self.notebook.max_transcript_bytes,
+            &self.notebook.replaceable_last_line,
+            &self.notebook.replaceable_start,
         );
-        if (self.replaceable_last_line) {
+        if (self.notebook.replaceable_last_line) {
             debug_trace.logf("transcript.replaceable_flip", "writeTranscriptBytes appended non-replaceable, text_bytes={d}", .{text.len});
         }
-        self.replaceable_last_line = false;
-        self.replaceable_start = 0;
+        self.notebook.replaceable_last_line = false;
+        self.notebook.replaceable_start = 0;
     }
 
     // Cursor tracking stays so the pre-paint heuristics in main.zig
@@ -179,7 +179,7 @@ pub fn writeTranscriptReturningEntryIdClassified(
 
 pub fn reconstructivePaint(self: anytype, alloc: Allocator, metrics: *Metrics) !void {
     _ = metrics;
-    debug_trace.logf("reconstructive", "enter cols={d} rows={d} content_bottom={d} entries={d} cap={d}", .{ self.layout.cols, self.layout.rows, self.layout.content_bottom, self.entries.items.len, self.max_transcript_bytes });
+    debug_trace.logf("reconstructive", "enter cols={d} rows={d} content_bottom={d} entries={d} cap={d}", .{ self.layout.cols, self.layout.rows, self.layout.content_bottom, self.notebook.entries.items.len, self.notebook.max_transcript_bytes });
     try self.ensurePaintReservation(alloc);
     try self.rebuildTranscriptCacheFromEntries(alloc, "reconstructive paint");
     self.recomputeCursorFromTranscript();
@@ -191,7 +191,7 @@ pub fn reconstructivePaint(self: anytype, alloc: Allocator, metrics: *Metrics) !
     debug_trace.logf(
         "frame_plan",
         "reconstructive_paint_frame_deferred rows={d} entries={d}",
-        .{ self.layout.rows, self.entries.items.len },
+        .{ self.layout.rows, self.notebook.entries.items.len },
     );
-    debug_trace.logf("reconstructive", "exit cursor={d},{d} viewport_top={d} transcript_bytes={d} replaceable={s}", .{ self.cursor_row, self.cursor_col, self.viewport_top_row, self.transcript.items.len, if (self.replaceable_last_line) "true" else "false" });
+    debug_trace.logf("reconstructive", "exit cursor={d},{d} viewport_top={d} transcript_bytes={d} replaceable={s}", .{ self.cursor_row, self.cursor_col, self.viewport_top_row, self.notebook.transcript.items.len, if (self.notebook.replaceable_last_line) "true" else "false" });
 }

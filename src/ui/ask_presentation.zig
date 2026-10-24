@@ -63,7 +63,7 @@ pub const Runtime = struct {
                 .sync_updates_enabled = sync_updates_enabled,
                 .history_reset_uses_ris = shell_runtime.detectHistoryResetUsesRis(alloc),
                 .layout = layout,
-                .transcript_release = .{ .policy = .append_only },
+                .notebook = .{ .transcript_release = .{ .policy = .append_only } },
             },
             .no_color = no_color,
         };
@@ -493,20 +493,20 @@ test "ask presentation paints Minimal prompt and assistant into a footerless fra
     try runtime.pushText("\x1b[1manswer\x1b[22m\n");
     try runtime.finish();
 
-    try std.testing.expect(runtime.shell.entries.items.len >= 3);
-    try std.testing.expect(runtime.shell.entries.items[0] == .raw_bytes);
+    try std.testing.expect(runtime.shell.notebook.entries.items.len >= 3);
+    try std.testing.expect(runtime.shell.notebook.entries.items[0] == .raw_bytes);
     try std.testing.expectEqual(
         transcript_runtime.RawEntryClass.welcome,
-        runtime.shell.entries.items[0].raw_bytes.class,
+        runtime.shell.notebook.entries.items[0].raw_bytes.class,
     );
-    try std.testing.expect(runtime.shell.entries.items[1] == .user_turn);
+    try std.testing.expect(runtime.shell.notebook.entries.items[1] == .user_turn);
     try std.testing.expect(runtime.shell.committed_frame_layout.footer_area.isEmpty());
     try std.testing.expectEqual(
         transcript_runtime.TranscriptCommitDiagnosticState.stable,
         runtime.shell.transcriptCommitDiagnostic().state,
     );
     const committed = runtime.shell.stableTranscriptProjectionForFlow(
-        runtime.shell.transcript.items,
+        runtime.shell.notebook.transcript.items,
     ) orelse return error.TestExpectedStableTranscript;
     try std.testing.expect(
         committed.selection.last_visible_row <=

@@ -2841,7 +2841,9 @@ describe("effect-aware command permissions", () => {
           return finalText("PARENT_OBSERVED_CHILD_DENIAL");
         }
         if (currentUserText(body).includes(childPrompt)) {
-          expect(body).not.toContain('"name":"subagent"');
+          // fx's agent profile has every tool, so the subagent may start
+          // its own.
+          expect(body).toContain('"name":"subagent"');
           return toolCall(`/usr/bin/touch ${shellQuote(markerPath)}`, {}, commandId);
         }
         if (currentUserText(body).includes(rootPrompt)) {

@@ -797,7 +797,7 @@ Settled in the 2026-09-27 pre-wiring API check:
   work item, and `State.children` lists every child with its newest work,
   outcome, data and seq. **Why:** fx needs the whole list, not only running
   work, to continue a named child, detect replaced work and report status
-  (`src/core/subagent/child_state.zig` lines 42 to 57), and this removes
+  (`src/core/subagent/child_state.zig` `Kind`, `Phase`, and `Outcome`), and this removes
   `children.json` without a second owner. **Alternative:** keep
   `children.json` next to v2 for now, which gives the same state two owners.
 - **D23 Decision:** "continue" after an interrupted turn starts a new turn

@@ -4,6 +4,7 @@ const terminal_contracts = @import("../core/terminal/contracts.zig");
 const managed_execution_contract = @import("../core/execution/managed_execution_contract.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const subagent_domain = @import("../core/subagent/domain.zig");
+const profiles = @import("../core/profiles/profiles.zig");
 const tool_projection = @import("../core/tooling/tool_projection.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const tool_mcp_dispatch = @import("../core/tooling/tool_mcp_dispatch.zig");
@@ -135,6 +136,7 @@ const subagent_properties = [_]model_tool_schema.Property{
     .{ .name = "instructions", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_instructions_bytes }, .description = "message only. Optional persistent instructions for this child. Replaces its child-specific system overlay before this message when idle; rejected while the child is working. Omit to preserve the overlay or send live feedback. Cannot replace fx's trusted base prompt or widen authority." },
     .{ .name = "model", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_model_bytes }, .description = "Optional model for the child, as a catalog model ID such as openai/gpt-5.6-terra. Unambiguous partial names resolve to catalog IDs; unknown or ambiguous names are rejected with candidate IDs. Inherits the parent's model when omitted. With message, applies only when the message creates the child and is rejected for an existing child." },
     .{ .name = "effort", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = types.ReasoningEffort.max_name_bytes }, .description = "Optional reasoning effort for the child. Inherits the parent's effort when omitted. With message, applies only when the message creates the child and is rejected for an existing child." },
+    .{ .name = "profile", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = profiles.max_name_bytes }, .description = "Optional agent profile for the child: its tools, permission mode, model, effort, and prompt, from the profiles listed in the subagent guidance. Defaults to agent. Model and effort given here override the profile's. With message, applies only when the message creates the child and is rejected for an existing child." },
 };
 const vision_description =
     "Inspect authorized images attached by the user or local image paths supplied in the conversation, and return structured factual evidence. Pass exactly one source: image_ids for attached images, or paths for local images. When to use: read visible text, UI state, objects, layout, or other visual details needed for the task. When NOT to use: inspect paths the user did not supply, infer details not visible in an image, or repeat evidence already available in the conversation.";
@@ -810,7 +812,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "bb643f827a9ffa27608b14c0e26b3b0a195f2909e7f1f7763c161f585adb6449",
+        "e46ca80477e402a569cf6f10e7098ffe2b4359e6dc74dc08b6545e00fa2ba2ec",
         &actual_hex,
     );
 }

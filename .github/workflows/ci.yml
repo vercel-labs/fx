@@ -55,6 +55,9 @@ jobs:
       - name: Check indexer boundary
         run: ./scripts/check-indexer-boundary.sh
 
+      - name: Check agents boundary
+        run: ./scripts/check-agents-boundary.sh
+
       - name: Test CI and release scripts
         run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need scripts.tests.test_fuzz_nightly -q
 
@@ -765,6 +768,7 @@ jobs:
         run: |
           scripts=(
             benchmarks/startup.sh
+            scripts/check-agents-boundary.sh
             scripts/check-compactor-boundary.sh
             scripts/check-indexer-boundary.sh
             scripts/check-public-surface.sh

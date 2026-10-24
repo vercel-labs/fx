@@ -7900,7 +7900,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(JSON.parse(toolResultOutput(body, "approval-child")).ok).toBe(true);
         return fakeGatewayFinalText("APPROVAL_RECOVERY_COMPLETE");
       }
-      if (!body.includes('"name":"subagent"')) {
+      // An interactive subagent is offered the subagent tool too, so its
+      // requests tell apart by main's prompt, which they never carry.
+      if (!body.includes("Delegate the prepared search.")) {
         childRequests++;
         if (hasCurrentToolResult(body, "after-approval")) {
           expect(toolResultOutput(body, "after-approval")).toContain("AFTER_APPROVAL");

@@ -478,7 +478,7 @@ pub const Catalog = struct {
     /// view from another host. Checked before a list is loaded.
     fn mayAllow(c: *const Catalog, access: Access) bool {
         return switch (access) {
-            .unrestricted => true,
+            .unrestricted, .servers => true,
             .disabled => false,
             .scoped => |scope| scope.captured.runtime_generation == c.generation,
         };
@@ -493,6 +493,7 @@ pub const Catalog = struct {
         return switch (access) {
             .scoped => |scope| scope.captured.tool(name) != null or
                 scope.captured.server(c.runtime.servers()[server].name) != null,
+            .servers => |filter| filter.allows(c.runtime.servers()[server].name),
             else => true,
         };
     }
@@ -883,6 +884,43 @@ test "a subagent made before its parent's server starts may use the server's too
     const stale: Access = .{ .scoped = .{ .captured = &other, .admission_authority_generation = 0, .live = undefined } };
     try testing.expect(!c.hasTool("mcp_fake_echo", stale));
     try testing.expectError(error.McpAccessDenied, c.callTool(a, "mcp_fake_echo", "{}", 4096, .{ .access = stale }));
+}
+
+test "an instance's server filter allows the tools of its servers and refuses the rest" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer r.deinit();
+    var c: Catalog = undefined;
+    try c.init(testing.allocator, testing.io, &r, .{});
+    defer c.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Named = struct {
+        fn allows(raw: *const anyopaque, server: []const u8) bool {
+            const wanted: *const []const u8 = @ptrCast(@alignCast(raw));
+            return std.mem.eql(u8, wanted.*, server);
+        }
+    };
+    const fake_name: []const u8 = "fake";
+    const other_name: []const u8 = "other";
+    const allowed: Access = .{ .servers = .{ .context = @ptrCast(&fake_name), .allows_fn = Named.allows } };
+    const refused: Access = .{ .servers = .{ .context = @ptrCast(&other_name), .allows_fn = Named.allows } };
+    try testing.expect(c.hasTool("mcp_fake_echo", allowed));
+    const result = (try c.callTool(a, "mcp_fake_echo", "{}", 4096, .{ .access = allowed })).?;
+    try testing.expectEqual(tool_mcp_runtime.CallStatus.success, result.status);
+
+    // A server the filter leaves out is neither found nor called.
+    try testing.expect(!c.hasTool("mcp_fake_echo", refused));
+    try testing.expectError(error.McpAccessDenied, c.callTool(a, "mcp_fake_echo", "{}", 4096, .{ .access = refused }));
+    const query = try lexical_relevance.prepare("echo");
+    const found = try c.searchTools(a, .{ .query = &query, .kind = .mcp }, .{}, .{}, refused, null);
+    try testing.expectEqual(@as(usize, 0), found.selected_tools.len);
 }
 
 test "an MCP server's tools reach the model under fx's names" {

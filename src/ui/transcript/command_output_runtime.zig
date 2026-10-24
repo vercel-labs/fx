@@ -58,9 +58,9 @@ fn commandBlockDirtyEntryId(block: CommandOutputBlock) ?u32 {
 }
 
 pub fn openCommandOutputDirtyEntryId(shell: anytype) ?u32 {
-    const index = shell.command_output_display.open_command_block orelse return null;
-    if (index >= shell.command_output_blocks.items.len) return null;
-    return commandBlockDirtyEntryId(shell.command_output_blocks.items[index]);
+    const index = shell.notebook.command_output_display.open_command_block orelse return null;
+    if (index >= shell.notebook.command_output_blocks.items.len) return null;
+    return commandBlockDirtyEntryId(shell.notebook.command_output_blocks.items[index]);
 }
 
 pub fn commandOutputDirtyEntryIdForLifecycle(
@@ -69,7 +69,7 @@ pub fn commandOutputDirtyEntryIdForLifecycle(
 ) ?u32 {
     const index = commandOutputBlockIndexForLifecycle(shell, lifecycle_id) orelse
         return null;
-    return commandBlockDirtyEntryId(shell.command_output_blocks.items[index]);
+    return commandBlockDirtyEntryId(shell.notebook.command_output_blocks.items[index]);
 }
 
 pub const CommandOutputLine = struct {
@@ -283,39 +283,39 @@ pub fn commandArtifactHandleFromResult(result: []const u8) ?[]const u8 {
 }
 
 pub fn removeFoldedCommandBlock(shell: anytype, alloc: Allocator, index: usize) void {
-    var block = shell.folded_command_blocks.orderedRemove(index);
+    var block = shell.notebook.folded_command_blocks.orderedRemove(index);
     block.deinit(alloc);
 
-    if (shell.command_output_display.open_block) |open| {
+    if (shell.notebook.command_output_display.open_block) |open| {
         if (open == index) {
-            shell.command_output_display.open_block = null;
+            shell.notebook.command_output_display.open_block = null;
         } else if (open > index) {
-            shell.command_output_display.open_block = open - 1;
+            shell.notebook.command_output_display.open_block = open - 1;
         }
     }
 }
 
 pub fn removeCommandOutputBlock(shell: anytype, alloc: Allocator, index: usize) void {
-    var block = shell.command_output_blocks.orderedRemove(index);
+    var block = shell.notebook.command_output_blocks.orderedRemove(index);
     block.deinit(alloc);
 
-    if (shell.command_output_display.open_command_block) |open| {
+    if (shell.notebook.command_output_display.open_command_block) |open| {
         if (open == index) {
-            shell.command_output_display.open_command_block = null;
+            shell.notebook.command_output_display.open_command_block = null;
         } else if (open > index) {
-            shell.command_output_display.open_command_block = open - 1;
+            shell.notebook.command_output_display.open_command_block = open - 1;
         }
     }
 }
 
 pub fn resetCommandOutputDisplay(shell: anytype, alloc: Allocator, reason: []const u8) void {
-    if (shell.command_output_display.open_command_block) |index| {
-        if (index < shell.command_output_blocks.items.len and shell.command_output_blocks.items[index].entry_id == null) {
-            debug_trace.logf("command_output", "dropping buffered command output lines={d} reason={s}", .{ shell.command_output_blocks.items[index].total_lines, reason });
+    if (shell.notebook.command_output_display.open_command_block) |index| {
+        if (index < shell.notebook.command_output_blocks.items.len and shell.notebook.command_output_blocks.items[index].entry_id == null) {
+            debug_trace.logf("command_output", "dropping buffered command output lines={d} reason={s}", .{ shell.notebook.command_output_blocks.items[index].total_lines, reason });
             removeCommandOutputBlock(shell, alloc, index);
         }
     }
-    shell.command_output_display = .{};
+    shell.notebook.command_output_display = .{};
 }
 
 pub fn setCommandOutputRenderPolicy(shell: anytype, styles: Styles) void {
@@ -387,7 +387,7 @@ pub fn prepareCommandOutputMutation(
         lifecycle_id,
     ) orelse
         return .decode;
-    const block = &shell.command_output_blocks.items[block_index];
+    const block = &shell.notebook.command_output_blocks.items[block_index];
 
     const stream_index = commandStreamIndex(stream);
     if (record and
@@ -529,22 +529,22 @@ fn applyPreparedCommandOutputMutationAt(
             created_at_ms,
         ),
         .overflow_fragment => |block_index| blk: {
-            std.debug.assert(block_index < shell.command_output_blocks.items.len);
-            shell.command_output_blocks.items[block_index]
+            std.debug.assert(block_index < shell.notebook.command_output_blocks.items.len);
+            shell.notebook.command_output_blocks.items[block_index]
                 .overflow_record_visible[commandStreamIndex(stream)] = true;
             requestTranscriptPaint(
                 shell,
-                commandBlockDirtyEntryId(shell.command_output_blocks.items[block_index]),
+                commandBlockDirtyEntryId(shell.notebook.command_output_blocks.items[block_index]),
             );
             break :blk null;
         },
         .count_only => |prepared| blk: {
-            std.debug.assert(prepared.block_index < shell.command_output_blocks.items.len);
-            shell.command_output_blocks.items[prepared.block_index].total_lines +|=
+            std.debug.assert(prepared.block_index < shell.notebook.command_output_blocks.items.len);
+            shell.notebook.command_output_blocks.items[prepared.block_index].total_lines +|=
                 prepared.record_count;
             requestTranscriptPaint(
                 shell,
-                commandBlockDirtyEntryId(shell.command_output_blocks.items[prepared.block_index]),
+                commandBlockDirtyEntryId(shell.notebook.command_output_blocks.items[prepared.block_index]),
             );
             break :blk null;
         },
@@ -587,7 +587,7 @@ fn applyDecodedCommandOutputMutation(
         .stderr => .stderr,
     };
     try sink.beginRecord();
-    try shell.command_output_blocks.items[command_block_index]
+    try shell.notebook.command_output_blocks.items[command_block_index]
         .decoders[streamIndex(content_stream)]
         .append(text, &sink);
     try sink.flushPending();
@@ -595,7 +595,7 @@ fn applyDecodedCommandOutputMutation(
     requestTranscriptPaint(
         shell,
         sink.first_entry_id orelse commandBlockDirtyEntryId(
-            shell.command_output_blocks.items[command_block_index],
+            shell.notebook.command_output_blocks.items[command_block_index],
         ),
     );
     return sink.first_entry_id;
@@ -609,20 +609,20 @@ fn applyCanonicalCommandOutputBatch(
     created_at_ms: ?i64,
 ) !?u32 {
     const retained_count = batch.records.items.len;
-    try shell.command_output_blocks.items[batch.block_index]
+    try shell.notebook.command_output_blocks.items[batch.block_index]
         .lines.ensureUnusedCapacity(alloc, retained_count);
-    try shell.command_output_blocks.items[batch.block_index]
+    try shell.notebook.command_output_blocks.items[batch.block_index]
         .live_entry_ids.ensureUnusedCapacity(alloc, retained_count);
-    try shell.entries.ensureUnusedCapacity(alloc, retained_count);
+    try shell.notebook.entries.ensureUnusedCapacity(alloc, retained_count);
 
     setCommandOutputRenderPolicy(shell, styles);
-    var block = &shell.command_output_blocks.items[batch.block_index];
+    var block = &shell.notebook.command_output_blocks.items[batch.block_index];
     var first_entry_id: ?u32 = null;
     const first_record_ordinal = block.total_lines;
     for (batch.records.items, 0..) |prepared_record, record_index| {
-        const entry_id = shell.next_entry_id;
-        shell.next_entry_id +%= 1;
-        shell.entries.appendAssumeCapacity(.{ .raw_bytes = .{
+        const entry_id = shell.notebook.next_entry_id;
+        shell.notebook.next_entry_id +%= 1;
+        shell.notebook.entries.appendAssumeCapacity(.{ .raw_bytes = .{
             .id = entry_id,
             .created_at_ms = created_at_ms orelse io_mod.milliTimestamp(),
             .bytes = prepared_record.placeholder,
@@ -836,9 +836,9 @@ pub fn flushCommandOutputSummaryForLifecycle(
 pub fn openCommandOutputLifecycleId(
     shell: anytype,
 ) ?types.ToolLifecycleId {
-    const index = shell.command_output_display.open_command_block orelse return null;
-    if (index >= shell.command_output_blocks.items.len) return null;
-    return shell.command_output_blocks.items[index].lifecycle_id;
+    const index = shell.notebook.command_output_display.open_command_block orelse return null;
+    if (index >= shell.notebook.command_output_blocks.items.len) return null;
+    return shell.notebook.command_output_blocks.items[index].lifecycle_id;
 }
 
 pub fn flushCommandOutputSummaryUncommitted(
@@ -856,7 +856,7 @@ pub fn flushCommandOutputSummaryUncommitted(
         shell,
         lifecycle_id,
     ) orelse return false;
-    const was_displayed = shell.command_output_display.open_command_block == block_index;
+    const was_displayed = shell.notebook.command_output_display.open_command_block == block_index;
     try finishCommandOutputBlock(
         shell,
         alloc,
@@ -869,7 +869,7 @@ pub fn flushCommandOutputSummaryUncommitted(
         // Completion makes the block pruneable; retention must not treat
         // a terminal count-only block as still active.
         if (was_displayed) {
-            shell.command_output_display.open_command_block = null;
+            shell.notebook.command_output_display.open_command_block = null;
         }
         retention_changed = try consolidateCommandOutputBlock(
             shell,
@@ -879,7 +879,7 @@ pub fn flushCommandOutputSummaryUncommitted(
     } else {
         removeCommandOutputBlock(shell, alloc, block_index);
     }
-    if (was_displayed) shell.command_output_display = .{};
+    if (was_displayed) shell.notebook.command_output_display = .{};
     return retention_changed;
 }
 
@@ -898,11 +898,11 @@ pub fn flushCommandOutputSummaryDetached(
         shell,
         lifecycle_id,
     ) orelse return;
-    const was_displayed = shell.command_output_display.open_command_block == block_index;
+    const was_displayed = shell.notebook.command_output_display.open_command_block == block_index;
     try finishCommandOutputBlock(shell, alloc, block_index, true, created_at_ms);
-    if (was_displayed) shell.command_output_display.open_command_block = null;
+    if (was_displayed) shell.notebook.command_output_display.open_command_block = null;
     try sealCommandOutputBlock(shell, alloc, block_index);
-    if (was_displayed) shell.command_output_display = .{};
+    if (was_displayed) shell.notebook.command_output_display = .{};
 }
 
 fn finishCommandOutputBlock(
@@ -927,7 +927,7 @@ fn finishCommandOutputBlock(
             .stdout => .stdout,
             .stderr => .stderr,
         };
-        try shell.command_output_blocks.items[block_index]
+        try shell.notebook.command_output_blocks.items[block_index]
             .decoders[streamIndex(content_stream)]
             .finish(&sink);
         try sink.flushPending();
@@ -938,7 +938,7 @@ fn finishCommandOutputBlock(
             block_index,
             stream_index,
         );
-        var block = &shell.command_output_blocks.items[block_index];
+        var block = &shell.notebook.command_output_blocks.items[block_index];
         block.open_line_indices[stream_index] = null;
         if (block.overflow_open_records[stream_index] and
             !block.overflow_record_visible[stream_index])
@@ -956,7 +956,7 @@ fn discardEmptyProvisionalRecord(
     block_index: usize,
     stream_index: usize,
 ) !void {
-    var block = &shell.command_output_blocks.items[block_index];
+    var block = &shell.notebook.command_output_blocks.items[block_index];
     const line_index = block.open_line_indices[stream_index] orelse return;
     const line = block.lines.items[line_index];
     if (line.visible or line.terminated or line.text.len > 0) return;
@@ -1003,7 +1003,7 @@ pub fn trimRetainedCommandOutputLine(
     block_index: usize,
     line_index: usize,
 ) !bool {
-    var block = &shell.command_output_blocks.items[block_index];
+    var block = &shell.notebook.command_output_blocks.items[block_index];
     for (block.open_line_indices) |open_index| {
         if (open_index == line_index) return false;
     }
@@ -1030,7 +1030,7 @@ pub fn trimRetainedCommandOutputLine(
         removeEntryId(&block.source_entry_ids, id);
         if (empty_anchor_bytes) |bytes| {
             const entry_index = rawEntryIndex(shell, id).?;
-            var raw = &shell.entries.items[entry_index].raw_bytes;
+            var raw = &shell.notebook.entries.items[entry_index].raw_bytes;
             alloc.free(raw.bytes);
             raw.bytes = bytes;
             raw.class = .command_output;
@@ -1057,21 +1057,21 @@ fn ensureOpenCommandOutputBlock(
     lifecycle_id: ?types.ToolLifecycleId,
 ) !usize {
     if (commandOutputBlockIndexForLifecycle(shell, lifecycle_id)) |index| {
-        if (shell.command_output_display.open_command_block != index) {
+        if (shell.notebook.command_output_display.open_command_block != index) {
             debug_trace.logf(
                 "command_output",
                 "switching command output display to matching lifecycle",
                 .{},
             );
         }
-        shell.command_output_display.open_command_block = index;
+        shell.notebook.command_output_display.open_command_block = index;
         return index;
     }
     const owned_lifecycle_id = try dupeLifecycleId(alloc, lifecycle_id);
     errdefer if (owned_lifecycle_id) |id| alloc.free(@constCast(id.call_id));
-    try shell.command_output_blocks.append(alloc, .{ .lifecycle_id = owned_lifecycle_id });
-    const index = shell.command_output_blocks.items.len - 1;
-    shell.command_output_display.open_command_block = index;
+    try shell.notebook.command_output_blocks.append(alloc, .{ .lifecycle_id = owned_lifecycle_id });
+    const index = shell.notebook.command_output_blocks.items.len - 1;
+    shell.notebook.command_output_display.open_command_block = index;
     return index;
 }
 
@@ -1079,18 +1079,18 @@ fn commandOutputBlockIndexForLifecycle(
     shell: anytype,
     lifecycle_id: ?types.ToolLifecycleId,
 ) ?usize {
-    if (shell.command_output_display.open_command_block) |index| {
-        if (index < shell.command_output_blocks.items.len and sameLifecycleId(
-            shell.command_output_blocks.items[index].lifecycle_id,
+    if (shell.notebook.command_output_display.open_command_block) |index| {
+        if (index < shell.notebook.command_output_blocks.items.len and sameLifecycleId(
+            shell.notebook.command_output_blocks.items[index].lifecycle_id,
             lifecycle_id,
         )) return index;
     }
     if (lifecycle_id == null) return null;
-    var index = shell.command_output_blocks.items.len;
+    var index = shell.notebook.command_output_blocks.items.len;
     while (index > 0) {
         index -= 1;
         if (sameLifecycleId(
-            shell.command_output_blocks.items[index].lifecycle_id,
+            shell.notebook.command_output_blocks.items[index].lifecycle_id,
             lifecycle_id,
         )) return index;
     }
@@ -1120,12 +1120,12 @@ fn CommandOutputRecordSink(comptime Shell: type) type {
             const target = try self.ensureOpenRecord();
             switch (target) {
                 .dropped => {
-                    self.shell.command_output_blocks.items[self.block_index]
+                    self.shell.notebook.command_output_blocks.items[self.block_index]
                         .overflow_record_visible[commandStreamIndex(self.stream)] = true;
                     return;
                 },
                 .retained => |line_index| {
-                    var block = &self.shell.command_output_blocks.items[self.block_index];
+                    var block = &self.shell.notebook.command_output_blocks.items[self.block_index];
                     const stream_index = commandStreamIndex(self.stream);
                     block.lines.items[line_index].visible = true;
                     if (block.overflow_open_records[stream_index]) return;
@@ -1162,17 +1162,17 @@ fn CommandOutputRecordSink(comptime Shell: type) type {
             try self.flushPending();
             switch (target) {
                 .retained => |line_index| {
-                    const line = &self.shell.command_output_blocks.items[self.block_index]
+                    const line = &self.shell.notebook.command_output_blocks.items[self.block_index]
                         .lines.items[line_index];
                     line.visible = true;
                     line.terminated = true;
                 },
                 .dropped => {
-                    self.shell.command_output_blocks.items[self.block_index]
+                    self.shell.notebook.command_output_blocks.items[self.block_index]
                         .overflow_record_visible[stream_index] = true;
                 },
             }
-            var block = &self.shell.command_output_blocks.items[self.block_index];
+            var block = &self.shell.notebook.command_output_blocks.items[self.block_index];
             block.open_line_indices[stream_index] = null;
             block.overflow_open_records[stream_index] = false;
             block.overflow_record_visible[stream_index] = false;
@@ -1180,7 +1180,7 @@ fn CommandOutputRecordSink(comptime Shell: type) type {
 
         pub fn replaceLine(self: *Self) !void {
             const stream_index = commandStreamIndex(self.stream);
-            var block = &self.shell.command_output_blocks.items[self.block_index];
+            var block = &self.shell.notebook.command_output_blocks.items[self.block_index];
             const line_index = block.open_line_indices[stream_index] orelse {
                 // A descriptor-capped record has no retained line to clear,
                 // but it is still the same logical record after a bare CR.
@@ -1213,7 +1213,7 @@ fn CommandOutputRecordSink(comptime Shell: type) type {
 
         fn ensureOpenRecord(self: *Self) !RecordTarget {
             const stream_index = commandStreamIndex(self.stream);
-            var block = &self.shell.command_output_blocks.items[self.block_index];
+            var block = &self.shell.notebook.command_output_blocks.items[self.block_index];
             if (block.open_line_indices[stream_index]) |line_index| {
                 return .{ .retained = line_index };
             }
@@ -1289,7 +1289,7 @@ fn CommandOutputRecordSink(comptime Shell: type) type {
                 self.pending_line_index = null;
             }
             if (self.pending_bytes.items.len == 0) return;
-            var block = &self.shell.command_output_blocks.items[self.block_index];
+            var block = &self.shell.notebook.command_output_blocks.items[self.block_index];
             const old_text = block.lines.items[line_index].text;
             const replacement = try self.alloc.alloc(
                 u8,
@@ -1325,10 +1325,17 @@ fn CommandOutputRecordSink(comptime Shell: type) type {
     };
 }
 
+/// True when `Shell` keeps its transcript content in a `notebook` field that
+/// has `name`.
+fn hasNotebookField(comptime Shell: type, comptime name: []const u8) bool {
+    if (!@hasField(Shell, "notebook")) return false;
+    return @hasField(@FieldType(Shell, "notebook"), name);
+}
+
 fn commandOutputRetentionCap(shell: anytype) usize {
     const Shell = @TypeOf(shell.*);
-    return if (comptime @hasField(Shell, "max_retained_transcript_bytes"))
-        shell.max_retained_transcript_bytes
+    return if (comptime hasNotebookField(Shell, "max_retained_transcript_bytes"))
+        shell.notebook.max_retained_transcript_bytes
     else
         std.math.maxInt(usize);
 }
@@ -1339,13 +1346,15 @@ fn retainedCommandOutputBytes(shell: anytype, block_index: usize) usize {
     return if (comptime @hasDecl(Shell, "retainedStructuredBytesForCommandOutput"))
         shell.retainedStructuredBytesForCommandOutput()
     else
-        commandOutputBlockRetainedBytes(shell.command_output_blocks.items[block_index]);
+        commandOutputBlockRetainedBytes(shell.notebook.command_output_blocks.items[block_index]);
 }
 
 test "unbounded command output admission does not scan retained state" {
     const CountingShell = struct {
-        max_retained_transcript_bytes: usize = std.math.maxInt(usize),
-        command_output_blocks: std.ArrayList(CommandOutputBlock) = .empty,
+        notebook: struct {
+            max_retained_transcript_bytes: usize = std.math.maxInt(usize),
+            command_output_blocks: std.ArrayList(CommandOutputBlock) = .empty,
+        } = .{},
         retained_scan_count: usize = 0,
 
         pub fn retainedStructuredBytesForCommandOutput(self: *@This()) usize {
@@ -1355,8 +1364,8 @@ test "unbounded command output admission does not scan retained state" {
     };
 
     var shell: CountingShell = .{};
-    defer shell.command_output_blocks.deinit(std.testing.allocator);
-    try shell.command_output_blocks.append(std.testing.allocator, .{});
+    defer shell.notebook.command_output_blocks.deinit(std.testing.allocator);
+    try shell.notebook.command_output_blocks.append(std.testing.allocator, .{});
 
     try std.testing.expectEqual(@as(usize, 0), retainedCommandOutputBytes(&shell, 0));
     try std.testing.expectEqual(@as(usize, 0), shell.retained_scan_count);
@@ -1420,9 +1429,9 @@ fn consolidateCommandOutputBlock(
     shell.recomputeCursorFromTranscript();
     requestTranscriptPaint(shell, null);
     if (comptime @hasDecl(@TypeOf(shell.*), "enforceStructuredRetentionAndReport")) {
-        return shell.enforceStructuredRetentionAndReport(alloc, shell.command_output_blocks.items[index].entry_id);
+        return shell.enforceStructuredRetentionAndReport(alloc, shell.notebook.command_output_blocks.items[index].entry_id);
     }
-    try shell.enforceStructuredRetention(alloc, shell.command_output_blocks.items[index].entry_id);
+    try shell.enforceStructuredRetention(alloc, shell.notebook.command_output_blocks.items[index].entry_id);
     return false;
 }
 
@@ -1431,7 +1440,7 @@ fn sealCommandOutputBlock(
     alloc: Allocator,
     index: usize,
 ) !void {
-    var block = &shell.command_output_blocks.items[index];
+    var block = &shell.notebook.command_output_blocks.items[index];
     try block.source_entry_ids.appendSlice(alloc, block.live_entry_ids.items);
     block.live_entry_ids.clearRetainingCapacity();
     var entry_id: ?u32 = null;
@@ -1462,7 +1471,7 @@ fn sealCommandOutputBlock(
 }
 
 fn rawEntryIndex(shell: anytype, id: u32) ?usize {
-    for (shell.entries.items, 0..) |entry, index| {
+    for (shell.notebook.entries.items, 0..) |entry, index| {
         if (entry == .raw_bytes and entry.raw_bytes.id == id) return index;
     }
     return null;
@@ -1472,13 +1481,13 @@ fn removeRawEntriesByIds(shell: anytype, alloc: Allocator, ids: []const u32) voi
     if (ids.len == 0) return;
 
     var i: usize = 0;
-    while (i < shell.entries.items.len) {
-        const entry = shell.entries.items[i];
+    while (i < shell.notebook.entries.items.len) {
+        const entry = shell.notebook.entries.items[i];
         if (entry == .raw_bytes and containsEntryId(ids, entry.raw_bytes.id)) {
-            var removed = shell.entries.orderedRemove(i);
+            var removed = shell.notebook.entries.orderedRemove(i);
             removed.deinit(alloc);
-            shell.replaceable_last_line = false;
-            shell.replaceable_start = 0;
+            shell.notebook.replaceable_last_line = false;
+            shell.notebook.replaceable_start = 0;
             continue;
         }
         i += 1;
@@ -1524,7 +1533,7 @@ fn commandEntriesShareRun(
     const rhs_index = rawEntryIndex(shell, rhs_entry_id) orelse return false;
     const start = @min(lhs_index, rhs_index);
     const end = @max(lhs_index, rhs_index);
-    for (shell.entries.items[start + 1 .. end]) |entry| {
+    for (shell.notebook.entries.items[start + 1 .. end]) |entry| {
         if (!commandBlockOwnsSourcePosition(block, entry.id())) return false;
     }
     return true;
@@ -1536,11 +1545,11 @@ fn retargetCommandOutputEntryIdentity(
     removed_entry_id: u32,
     retained_entry_id: u32,
 ) void {
-    var block = &shell.command_output_blocks.items[block_index];
+    var block = &shell.notebook.command_output_blocks.items[block_index];
     if (block.entry_id == removed_entry_id) block.entry_id = retained_entry_id;
     const Shell = @TypeOf(shell.*);
-    if (comptime @hasField(Shell, "tool_details")) {
-        for (shell.tool_details.items) |*detail| {
+    if (comptime hasNotebookField(Shell, "tool_details")) {
+        for (shell.notebook.tool_details.items) |*detail| {
             if (detail.command_output_entry_id == removed_entry_id) {
                 detail.command_output_entry_id = retained_entry_id;
             }
@@ -1562,10 +1571,10 @@ pub fn coalesceCommandOutputPrunedRanges(
 ) bool {
     var changed = false;
     var left_index: usize = 0;
-    while (left_index < shell.command_output_blocks.items[block_index].pruned_ranges.items.len) {
+    while (left_index < shell.notebook.command_output_blocks.items[block_index].pruned_ranges.items.len) {
         var right_index = left_index + 1;
-        while (right_index < shell.command_output_blocks.items[block_index].pruned_ranges.items.len) {
-            const block = shell.command_output_blocks.items[block_index];
+        while (right_index < shell.notebook.command_output_blocks.items[block_index].pruned_ranges.items.len) {
+            const block = shell.notebook.command_output_blocks.items[block_index];
             const left = block.pruned_ranges.items[left_index];
             const right = block.pruned_ranges.items[right_index];
             const ordinal_adjacent = left.end_record == right.start_record or
@@ -1593,7 +1602,7 @@ pub fn coalesceCommandOutputPrunedRanges(
             const merged_start = @min(left.start_record, right.start_record);
             const merged_end = @max(left.end_record, right.end_record);
 
-            var mutable_block = &shell.command_output_blocks.items[block_index];
+            var mutable_block = &shell.notebook.command_output_blocks.items[block_index];
             mutable_block.pruned_ranges.items[left_index] = .{
                 .anchor_entry_id = retained_entry_id,
                 .start_record = merged_start,
@@ -1825,8 +1834,8 @@ pub fn processPresentationForBlock(
     block: CommandOutputBlock,
 ) ?types.CommandProcessPresentation {
     const Shell = @TypeOf(shell.*);
-    if (comptime !@hasField(Shell, "tool_details")) return null;
-    for (shell.tool_details.items) |detail| {
+    if (comptime !hasNotebookField(Shell, "tool_details")) return null;
+    for (shell.notebook.tool_details.items) |detail| {
         if (!detail.isCapturedCommand()) continue;
         if (detail.lifecycle_id != null and block.lifecycle_id != null and
             sameLifecycleId(detail.lifecycle_id, block.lifecycle_id))
@@ -2295,17 +2304,17 @@ test "compact process row names timeout and output capture causes" {
 }
 
 pub fn syncCommandOutputBlockEntries(shell: anytype, alloc: Allocator) !bool {
-    if (shell.command_output_blocks.items.len == 0) return false;
+    if (shell.notebook.command_output_blocks.items.len == 0) return false;
     var changed = false;
     const cols: u16 = if (shell.layout.cols > 0) shell.layout.cols else 80;
     var entry_indices: std.AutoHashMapUnmanaged(u32, usize) = .empty;
     defer entry_indices.deinit(alloc);
-    for (shell.entries.items, 0..) |entry, index| {
+    for (shell.notebook.entries.items, 0..) |entry, index| {
         if (entry != .raw_bytes) continue;
         const result = try entry_indices.getOrPut(alloc, entry.raw_bytes.id);
         if (!result.found_existing) result.value_ptr.* = index;
     }
-    for (shell.command_output_blocks.items) |block| {
+    for (shell.notebook.command_output_blocks.items) |block| {
         var projection = try renderCompactCommandOutputWithProcessPresentation(
             alloc,
             block,
@@ -2346,7 +2355,7 @@ fn syncCommandOutputEntry(
 ) !bool {
     const desired = projection.bytesForEntry(entry_id) orelse "";
     const entry_index = entry_indices.get(entry_id) orelse return false;
-    var raw = &shell.entries.items[entry_index].raw_bytes;
+    var raw = &shell.notebook.entries.items[entry_index].raw_bytes;
     raw.class = .command_output;
     if (std.mem.eql(u8, raw.bytes, desired)) return false;
     const replacement = try alloc.dupe(u8, desired);

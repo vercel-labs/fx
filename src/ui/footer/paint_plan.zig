@@ -1867,7 +1867,7 @@ test "footer paint plan keeps compact transient activity adjacent to footer" {
     };
     defer shell.deinit(std.testing.allocator);
     const prompt = try std.testing.allocator.dupe(u8, "tell me a story in 200 words\n");
-    try shell.entries.append(std.testing.allocator, .{
+    try shell.notebook.entries.append(std.testing.allocator, .{
         .raw_bytes = .{ .id = 1, .bytes = prompt, .class = .unknown_raw },
     });
 
