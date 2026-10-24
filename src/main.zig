@@ -1619,7 +1619,8 @@ const App = struct {
     ) !worker_runtime.QueuedPrompt {
         // A subagent's turn runs under its run's admission: its model,
         // provider, permissions, and credential, never main's. It never names
-        // a session.
+        // a session. An instance's turn uses its own model and provider: the
+        // app's selection for the first, a launched one's own session choice.
         const child_run = agent.child_run;
         if (recovery_checkpoint == null and child_run == null) {
             SessionAppRuntime.maybeStartSessionTitleGeneration(self, agent, prompt);
@@ -1637,7 +1638,7 @@ const App = struct {
         const model_copy = try std.heap.c_allocator.dupe(u8, if (child_run) |active_run|
             active_run.admission.model
         else
-            self.provider_selection.selection().model);
+            provider_runtime.modelOf(self, agent));
         errdefer std.heap.c_allocator.free(model_copy);
 
         const gateway_credential: auth_runtime.GatewayCredential = if (child_run) |active_run| routed: {
@@ -1733,7 +1734,7 @@ const App = struct {
             .images = images_copy,
             .authorized_image_catalog = authorized_image_catalog,
             .model = model_copy,
-            .provider = if (child_run) |active_run| active_run.admission.provider else self.provider_selection.selection().provider,
+            .provider = if (child_run) |active_run| active_run.admission.provider else provider_runtime.providerOf(self, agent),
             .api_key = api_key_copy,
             .gateway_team = gateway_team_copy,
             .credential_source = gateway_credential.source,
