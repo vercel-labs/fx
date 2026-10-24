@@ -98,6 +98,9 @@ pub const Action = union(enum) {
     /// Alt+←/→. Its composer shortcut is the word jump the keys keep when
     /// there is no other agent to switch to.
     switch_agent: SwitchDirection,
+    /// Alt+↑, which opens the instance list. Its composer shortcut is the
+    /// paragraph move the key keeps while one instance is open.
+    open_agent_list,
     insert_newline,
     paste_start,
     paste_end,

@@ -34,6 +34,8 @@ const model_menu_presentation = @import("../../ui/footer/model_menu_presentation
 const resume_menu_presentation = @import("../../ui/footer/resume_menu_presentation.zig");
 const effort_menu_presentation = @import("../../ui/footer/effort_menu_presentation.zig");
 const fork_menu_presentation = @import("../../ui/footer/fork_menu_presentation.zig");
+const agents_menu_presentation = @import("../../ui/footer/agents_menu_presentation.zig");
+const app_agents_runtime = @import("app_agents_runtime.zig");
 const help_menu_presentation = @import("../../ui/footer/help_menu_presentation.zig");
 const settings_menu_presentation = @import("../../ui/footer/settings_menu_presentation.zig");
 const surface_frame = @import("../../ui/footer/surface_frame.zig");
@@ -397,6 +399,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         fn routeNonSlashPickerMove(app: *App, agent: *AppAgent, delta: i32) !bool {
+            if (try routeAgentsMenuMove(app, agent, delta)) return true;
             if (try routeMcpHostMenuMove(app, delta)) return true;
             if (try routeSettingsMenuMove(app, agent, delta)) return true;
             if (try routeHelpMenuMove(app, agent, delta)) return true;
@@ -505,6 +508,14 @@ pub fn CompletionRuntime(comptime App: type) type {
             if (!agent.session_persistence.session_picker.active) return false;
             _ = app_session_runtime.Runtime(App).moveSessionPicker(app, agent, delta, try sessionPickerVisibleItems(app, agent));
             return true;
+        }
+
+        /// Moves the instance list's selection, keeping it in view.
+        pub fn routeAgentsMenuMove(app: *App, agent: *AppAgent, delta: i32) !bool {
+            if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
+            const runtime = app_agents_runtime.Runtime(App);
+            if (!runtime.menuActive(app)) return false;
+            return runtime.moveMenu(app, delta, try inlineMenuRowBudget(app, agent, agents_menu_presentation.max_inline_rows));
         }
 
         fn routeForkMenuMove(app: *App, agent: *AppAgent, delta: i32) !bool {

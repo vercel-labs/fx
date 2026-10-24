@@ -40,6 +40,7 @@ const app_session_runtime = @import("core/app/app_session_runtime.zig");
 const app_upgrade_runtime = @import("core/app/app_upgrade_runtime.zig");
 const app_worker_runtime = @import("core/app/app_worker_runtime.zig");
 const app_agents_runtime = @import("core/app/app_agents_runtime.zig");
+const render_input = @import("ui/footer/render_input.zig");
 const app_profile_runtime = @import("core/app/app_profile_runtime.zig");
 const app_instances_runtime = @import("core/app/app_instances_runtime.zig");
 const profiles = @import("core/profiles/profiles.zig");
@@ -3202,6 +3203,7 @@ const App = struct {
         // its own context.
         AgentsAppRuntime.takePosts(self);
         try AgentsAppRuntime.tickChildren(self, {}, tickAgentInContext);
+        AgentsAppRuntime.noteFinishedTurns(self);
         AgentsAppRuntime.settleChildRuns(self);
         AgentsAppRuntime.settleLentQuestion(self);
         AgentsAppRuntime.lendQuestion(self);
@@ -3244,6 +3246,16 @@ const App = struct {
     /// `/close`: the instance on screen and its subagents.
     pub fn closeInstanceOnScreen(self: *App) !void {
         try InstancesAppRuntime.closeOnScreen(self);
+    }
+
+    /// `/agents` and Alt+↑: opens the instance list.
+    pub fn openAgentsMenu(self: *App) !void {
+        try AgentsAppRuntime.openMenu(self);
+    }
+
+    /// The instance list as the footer draws it now.
+    pub fn agentsMenuProjection(self: *App) render_input.AgentsMenuProjection {
+        return AgentsAppRuntime.menuProjection(self);
     }
 
     /// Applies profile `name` to instance `agent`.
@@ -3369,7 +3381,7 @@ const App = struct {
             }
             count += 1;
         }
-        const wait = first_wait orelse return "";
+        const wait = first_wait orelse return AgentsAppRuntime.finishedNote(self, buf);
         var name_buf: [32]u8 = undefined;
         const name = AgentsAppRuntime.noteName(self, first, &name_buf);
         const key = AgentsAppRuntime.keyToward(self, first);
@@ -5142,6 +5154,7 @@ test {
     _ = @import("core/config/config_runtime.zig");
     _ = @import("core/config/settings_store.zig");
     _ = @import("core/session/session_title_generation.zig");
+    _ = @import("ui/footer/agents_menu_presentation.zig");
     _ = @import("ui/footer/compact_command_menu_presentation.zig");
     _ = @import("ui/footer/settings_menu_presentation.zig");
     _ = @import("builtins/context.zig");
