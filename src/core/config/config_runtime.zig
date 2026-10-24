@@ -311,6 +311,8 @@ pub fn modelEnvOverride() ?[]const u8 {
 }
 
 pub const ModelSelectionError = error{
+    ProviderNotConfigured,
+    GatewayDisabled,
     CodexModelNotSelected,
     GrokModelNotSelected,
     ConfiguredModelNotSelected,
@@ -326,7 +328,8 @@ pub fn selectProviderModel(
     provider_override: ?model_provider.ProviderId,
     run_model: ?[]const u8,
 ) ModelSelectionError!model_provider.ProviderSelection {
-    const provider = provider_override orelse settings.provider orelse .gateway;
+    const provider = provider_override orelse settings.provider orelse return error.ProviderNotConfigured;
+    if (provider == .gateway) return error.GatewayDisabled;
     const model = settings.models.get(provider) orelse switch (provider) {
         .gateway => default_model,
         .codex => run_model orelse return error.CodexModelNotSelected,
@@ -340,6 +343,8 @@ pub fn selectProviderModel(
 pub fn modelNotSelectedMessage(err: anyerror) ?[]const u8 {
     const for_this_run = "or set a model for this run with --model or FX_MODEL";
     return switch (err) {
+        error.ProviderNotConfigured => "no endpoint is configured; run `proto-fx setup --base-url URL` to discover models, or add --model MODEL",
+        error.GatewayDisabled => "Vercel Gateway is not available in proto-fx; run `proto-fx setup --base-url URL` to configure an OpenAI-compatible endpoint",
         error.CodexModelNotSelected => "no Codex model is selected; run `fx provider codex` to choose one, " ++ for_this_run,
         error.GrokModelNotSelected => "no Grok model is selected; run `fx provider grok` to choose one, " ++ for_this_run,
         error.ConfiguredModelNotSelected => "no model is selected for this connection; save one under \"models\" in ~/.fx/settings.json, " ++ for_this_run,
@@ -350,6 +355,10 @@ pub fn modelNotSelectedMessage(err: anyerror) ?[]const u8 {
 fn resolve_provider_selection(settings: *Settings) !void {
     if (providerEnvOverride()) |raw| {
         settings.provider = model_provider.parse(raw) orelse return error.InvalidProviderValue;
+    }
+    if (settings.provider == null) {
+        const registry: configured_provider.Registry = settings.providers orelse .{};
+        if (registry.definitions.len == 1) settings.provider = model_provider.parse(registry.definitions[0].id);
     }
     if (settings.provider) |provider| settings.provider = try provider.bind(settings.providers orelse .{});
 }
@@ -4595,9 +4604,8 @@ test "selectProviderModel chooses only its provider-scoped model" {
     defer gateway_settings.deinit(std.testing.allocator);
     try gateway_settings.models.putCopy(std.testing.allocator, .gateway, "gateway/model");
     try gateway_settings.models.putCopy(std.testing.allocator, .codex, "gpt-model");
-    const gateway = try selectProviderModel("default/model", &gateway_settings, null, null);
-    try std.testing.expectEqual(model_provider.ProviderId.gateway, gateway.provider);
-    try std.testing.expectEqualStrings("gateway/model", gateway.model);
+    try std.testing.expectError(error.GatewayDisabled, selectProviderModel("default/model", &gateway_settings, null, null));
+    try std.testing.expectError(error.ProviderNotConfigured, selectProviderModel("default/model", &.{}, null, null));
 
     var codex_settings = Settings{ .provider = .codex };
     defer codex_settings.deinit(std.testing.allocator);
@@ -4629,8 +4637,7 @@ test "selectProviderModel chooses only its provider-scoped model" {
         error.CodexModelNotSelected,
         selectProviderModel("default/model", &grok_settings, .codex, null),
     );
-    const overridden_gateway = try selectProviderModel("default/model", &codex_settings, .gateway, null);
-    try std.testing.expectEqualStrings("gateway/model", overridden_gateway.model);
+    try std.testing.expectError(error.GatewayDisabled, selectProviderModel("default/model", &codex_settings, .gateway, null));
 }
 
 test "selectProviderModel accepts the run model when the provider has none saved" {
@@ -4663,9 +4670,7 @@ test "selectProviderModel accepts the run model when the provider has none saved
     const saved = try selectProviderModel("default/model", &saved_codex, null, "gpt-env");
     try std.testing.expectEqualStrings("gpt-saved", saved.model);
 
-    // Gateway keeps its compiled default as the persisted preference.
-    const gateway = try selectProviderModel("default/model", &gateway_only, null, "gpt-env");
-    try std.testing.expectEqualStrings("default/model", gateway.model);
+    try std.testing.expectError(error.GatewayDisabled, selectProviderModel("default/model", &gateway_only, null, "gpt-env"));
 }
 
 test "modelNotSelectedMessage names the provider and both ways to recover" {

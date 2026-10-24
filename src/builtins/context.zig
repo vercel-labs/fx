@@ -30,9 +30,9 @@ const shell_resolver = @import("../core/terminal/shell_resolver.zig");
 
 pub const gateway_system_prompt = @embedFile("system_prompt.md");
 
-const terminal_identity = "You are fx, a local coding CLI assistant with tool access.";
-const terminal_rendering = "Write responses in GitHub-flavored Markdown, which fx renders in the terminal.";
-const terminal_table_emphasis = "Use bold sparingly, and never inside tables, since fx already bolds table headers.";
+const terminal_identity = "You are proto-fx, a local coding CLI assistant with tool access.";
+const terminal_rendering = "Write responses in GitHub-flavored Markdown, which proto-fx renders in the terminal.";
+const terminal_table_emphasis = "Use bold sparingly, and never inside tables, since proto-fx already bolds table headers.";
 
 /// The base prompt for hosts that present fx inside another application
 /// rather than a terminal. Only the terminal identity and rendering claims
@@ -43,7 +43,7 @@ pub const embedded_system_prompt = embedded: {
     text = replaceOnce(
         text,
         terminal_identity,
-        "You are fx, a coding agent with tool access. A client application hosts this conversation and displays your replies; do not describe yourself as running in a terminal.",
+        "You are proto-fx, a coding agent with tool access. A client application hosts this conversation and displays your replies; do not describe yourself as running in a terminal.",
     );
     text = replaceOnce(text, terminal_rendering, "Write responses in GitHub-flavored Markdown, which the client application renders.");
     text = replaceOnce(text, terminal_table_emphasis, "Use bold sparingly.");
@@ -3612,7 +3612,7 @@ test "gateway_system_prompt: compact ordered sections" {
 }
 
 test "gateway_system_prompt: local workspace authority" {
-    try expectDefaultPromptContains("You are fx, a local coding CLI assistant with tool access.");
+    try expectDefaultPromptContains("You are proto-fx, a local coding CLI assistant with tool access.");
     try expectDefaultPromptContains("real local workspace");
     try expectDefaultPromptContains("source of truth for code, docs, commands, and verification");
     try expectDefaultPromptContains("Treat it as current for the turn; inspect the workspace when it is missing or stale.");
@@ -3650,7 +3650,7 @@ test "gateway_system_prompt: concise interaction and concrete blockers" {
     try expectDefaultPromptContains("Reply in the same natural language as the user's latest message unless asked to switch.");
     try expectDefaultPromptContains("Keep responses short and practical.");
     try expectDefaultPromptDoesNotContain("use markdown unless requested");
-    try expectDefaultPromptContains("Write responses in GitHub-flavored Markdown, which fx renders in the terminal.");
+    try expectDefaultPromptContains("Write responses in GitHub-flavored Markdown, which proto-fx renders in the terminal.");
     try expectDefaultPromptContains("Use a table for comparisons or data with several attributes per item");
     try expectDefaultPromptContains("fenced code blocks only for code, commands to run, or verbatim output");
     try expectDefaultPromptContains("answer simple questions in plain sentences");

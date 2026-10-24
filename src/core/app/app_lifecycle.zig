@@ -789,7 +789,9 @@ fn loadStartupStateWithKeychainRead(
     state.ultrafast_mode_source = detailed.sources.ultrafast_mode;
     state.slash_menu_categories = settings.slash_menu_categories orelse true;
     state.collapse_tool_calls = settings.collapse_tool_calls orelse false;
-    state.auto_upgrade = settings.auto_upgrade orelse true;
+    // TODO(proto-fx): restore preference-controlled updates with a proto-fx release feed
+    // and supervisor/client upgrade handoff. Do not use the upstream fx updater.
+    state.auto_upgrade = false;
     state.update_channel = settings.update_channel orelse .stable;
     state.startup_scrollback = settings.startup_scrollback orelse true;
     state.theme = if (settings.theme) |value| try alloc.dupe(u8, value) else null;
@@ -868,7 +870,9 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     );
     errdefer state.deinit(cfg.alloc);
 
-    state.credential_onboarding_skipped = cfg.auth_mode == .host_managed or credentialOnboardingDisabled();
+    // TODO(proto-fx): add provider-neutral credential onboarding, including no-key
+    // local endpoints and detached supervisor credentials, without gateway login.
+    state.credential_onboarding_skipped = true;
 
     errdefer shutdownInteractiveShell(
         cfg.terminal,

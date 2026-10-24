@@ -253,6 +253,7 @@ pub const RunCommandBackend = struct {
 /// Context shared by core tool dispatch, validation, and execution.
 pub const DispatchContext = struct {
     allocator: Allocator,
+    kernel_session: ?*@import("../session/session.zig").SessionRuntime = null,
     permission_mode: permission_gate.PermissionMode = .ask,
     permission_decider: ?PermissionDecider = null,
     execution_authority: ?command_admission.ToolExecutionAuthority = null,
@@ -401,6 +402,7 @@ pub const LabelArgKind = enum {
 pub const PermissionTargetKind = core_permissions.PermissionTargetKind;
 
 pub const ExecutorKind = enum {
+    kernel,
     glob_files,
     grep_files,
     read_file,

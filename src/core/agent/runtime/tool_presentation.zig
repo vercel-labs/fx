@@ -24,6 +24,7 @@ const test_builtin_tools = if (@import("builtin").is_test)
 else
     struct {};
 
+const execution_memory = @import("../execution_memory.zig");
 const runtime_deps = @import("deps.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
 
@@ -955,7 +956,7 @@ pub noinline fn startToolVisibleLifecycle(
 ) !bool {
     const activity_kind = activityKindForCall(arena, hooks.tool_registry, call);
     if (activity_kind == .ask) return false;
-    const redacted_arguments = try text_utils.maskSecrets(arena, call.arguments_json);
+    const redacted_arguments = try execution_memory.redactToolArgumentsJson(arena, call.name, call.arguments_json);
     const activity_line = if (call.argument_integrity == .valid) try hooks.describe_tool_action(
         hooks.ctx,
         arena,
@@ -1888,6 +1889,48 @@ test "tool lifecycle uses activity metadata from the supplied registry" {
         &.{},
     ));
     try std.testing.expectEqual(types.ToolActivityKind.open, capture.events.items[0].authoritative_started.activity_kind);
+}
+
+test "authoritative lifecycle redacts credential arguments and web fetch URLs before publication" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    const cases = [_]ToolCall{
+        .{
+            .id = "credentials",
+            .name = "mcp__fixture__echo",
+            .arguments_json =
+            \\{"token_count":128,"token":"secret-value-123456","client_secret":"hidden-value-123456"}
+            ,
+        },
+        .{
+            .id = "fetch",
+            .name = "web_fetch",
+            .arguments_json =
+            \\{"url":"https://example.com/docs?design=blue&sig=private-signature"}
+            ,
+        },
+    };
+    for (cases) |call| {
+        const event_index = capture.events.items.len;
+        try std.testing.expect(try startToolVisibleLifecycle(&hooks, arena, 1, null, call, null, &.{}));
+        const arguments = capture.events.items[event_index].authoritative_started.arguments_json.?;
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, arguments, .{});
+        defer parsed.deinit();
+        if (std.mem.eql(u8, call.name, "web_fetch")) {
+            const url = parsed.value.object.get("url").?.string;
+            try std.testing.expect(std.mem.find(u8, url, "private-signature") == null);
+            try std.testing.expect(std.mem.find(u8, url, "design=blue") != null);
+        } else {
+            try std.testing.expectEqual(@as(i64, 128), parsed.value.object.get("token_count").?.integer);
+            try std.testing.expectEqualStrings("[REDACTED]", parsed.value.object.get("token").?.string);
+            try std.testing.expectEqualStrings("[REDACTED]", parsed.value.object.get("client_secret").?.string);
+        }
+    }
 }
 
 test "presentation grouping spans silent tool steps and splits on visible prose" {

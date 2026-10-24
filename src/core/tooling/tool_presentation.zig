@@ -630,22 +630,33 @@ pub fn resolvedSkillName(call: ToolCall, presentation: tool_dispatch.CallPresent
 
 /// The caller owns the returned allocation and must free it with `alloc`.
 pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
+    return formatPlainActionState(alloc, input, false);
+}
+
+/// The caller owns the returned allocation and must free it with `alloc`.
+pub fn formatPlainCompletedAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
+    return formatPlainActionState(alloc, input, true);
+}
+
+fn formatPlainActionState(alloc: Allocator, input: ToolActionInput, completed: bool) ![]const u8 {
     const call = input.call;
     if (input.tool_registry.lookup(call.name) != null) {
-        if (try formatSubagentPlainAction(alloc, call, .active)) |line| return line;
+        if (try formatSubagentPlainAction(alloc, call, if (completed) .completed else .active)) |line| return line;
     }
     if (file_mutation_contract.isToolName(call.name)) {
         const spec = input.tool_registry.lookup(call.name) orelse
-            return alloc.print("Working: {s}", .{call.name});
+            return alloc.print("{s}: {s}", .{ if (completed) "Completed" else "Working", call.name });
         return alloc.print(
             "{s} {s}",
-            .{ spec.action_label, input.display_target orelse spec.label_arg_default },
+            .{ if (completed) spec.completed_action_label else spec.action_label, input.display_target orelse spec.label_arg_default },
         );
     }
 
     if (try formatRunCommandActivity(alloc, input.tool_registry, input.workspace_root, call)) |activity| {
         defer alloc.free(activity.detail);
-        const action_label = if (activity.compatibility_tool) |tool| tool.action_label else "Running";
+        const action_label = if (activity.compatibility_tool) |tool|
+            if (completed) tool.completed_action_label else tool.action_label
+        else if (completed) "Ran" else "Running";
         return alloc.print("{s} {s}", .{ action_label, activity.detail });
     }
 
@@ -656,27 +667,27 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
     const spec = input.tool_registry.lookup(call.name) orelse {
         if (isProviderSearchAlias(call.name)) {
             const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch {
-                return alloc.print("Searching web", .{});
+                return alloc.print("{s} web", .{if (completed) "Searched" else "Searching"});
             };
-            return alloc.print("Searching {s}", .{try formatWebSearchActionDetail(scratch, args)});
+            return alloc.print("{s} {s}", .{ if (completed) "Searched" else "Searching", try formatWebSearchActionDetail(scratch, args) });
         }
-        if (input.is_available_dynamic_mcp_tool) return alloc.print("MCP: {s}", .{call.name});
-        return alloc.print("Working: {s}", .{call.name});
+        if (input.is_available_dynamic_mcp_tool) return alloc.print("{s}: {s}", .{ if (completed) "Ran MCP" else "MCP", call.name });
+        return alloc.print("{s}: {s}", .{ if (completed) "Completed" else "Working", call.name });
     };
     const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch {
-        return alloc.print("Working: {s}", .{call.name});
+        return alloc.print("{s}: {s}", .{ if (completed) "Completed" else "Working", call.name });
     };
 
     const presentation = tool_dispatch.presentationForArgs(spec.*, args);
     if (spec.executor_kind == .web_search) {
-        return alloc.print("{s} {s}", .{ presentation.action_label, try formatWebSearchActionDetail(scratch, args) });
+        return alloc.print("{s} {s}", .{ if (completed) presentation.completed_action_label else presentation.action_label, try formatWebSearchActionDetail(scratch, args) });
     }
     const value = input.display_target orelse
         call.resolved_display_target orelse
         resolvedSkillName(call, presentation) orelse
         tool_dispatch.presentationLabelValue(presentation, args) orelse
         presentation.label_arg_default;
-    return alloc.print("{s} {s}", .{ presentation.action_label, value });
+    return alloc.print("{s} {s}", .{ if (completed) presentation.completed_action_label else presentation.action_label, value });
 }
 
 /// Names an earlier call in the row of a later call that reads its saved

@@ -446,6 +446,17 @@ pub fn resetEnvironForTest() void {
 }
 
 pub fn getenv(key: []const u8) ?[]const u8 {
+    // The fork has its own environment namespace; FX_* remains a compatibility
+    // alias for existing tooling, without overriding an explicit proto-fx value.
+    if (std.mem.startsWith(u8, key, "FX_")) {
+        var buffer: [256]u8 = undefined;
+        const named = std.mem.print(&buffer, "PROTO_{s}", .{key}) catch return getenvExact(key);
+        if (getenvExact(named)) |value| return value;
+    }
+    return getenvExact(key);
+}
+
+fn getenvExact(key: []const u8) ?[]const u8 {
     if (global_environ) |m| return m.get(key);
     if (global_environ_block) |block| return getenvFromBlock(block, key);
     if (global_raw_environ) |raw| return getenvFromLibc(key) orelse getenvFromRaw(raw, key);

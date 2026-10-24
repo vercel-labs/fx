@@ -871,6 +871,16 @@ pub fn Runtime(comptime App: type) type {
             }
             if (try full_transcript_rt.routeByte(app, byte)) return;
             if (try routeActiveModalInput(app, raw, input_limits.decision_bytes)) return;
+            if (app.input_runtime.session_browser.active) {
+                if (byte == '\r') {
+                    if (comptime @hasDecl(App, "activateBrowserSelection")) try app.activateBrowserSelection();
+                    return;
+                }
+                if (byte == 3 or byte == 4) {
+                    closeSessionBrowser(app);
+                    return;
+                }
+            }
             if (byte >= 0x80) {
                 try handleTextByte(app, .composer, byte, max_input_len);
                 return;
@@ -995,6 +1005,7 @@ pub fn Runtime(comptime App: type) type {
             if (resolved == .cursor_right and try enterMcpHostMenuItem(app)) return .done;
 
             if (try full_transcript_rt.routeComposerAction(app, resolved)) return .done;
+            if (try routeSessionBrowserAction(app, resolved)) return .done;
 
             if (composer_shortcut) |action| {
                 try routeComposerShortcutAction(app, action, max_input_len);
@@ -1053,6 +1064,14 @@ pub fn Runtime(comptime App: type) type {
                     } else if (cycleModelMenuProvider(app, -1) or cycleSkillsMenuSource(app, -1)) {
                         app.shell.render_requests.request(.footer);
                     } else {
+                        if (comptime @hasField(App, "remote")) if (app.remote.active) {
+                            try app.handleCommand(switch (app.remote.permission_mode) {
+                                .ask => "/permissions auto",
+                                .auto => "/permissions full-access",
+                                .yolo => "/permissions ask",
+                            });
+                            return .done;
+                        };
                         try app_permission_runtime.Runtime(App).toggleMode(app);
                     }
                 },
@@ -1088,6 +1107,52 @@ pub fn Runtime(comptime App: type) type {
                 .ignore => {},
             }
             return .done;
+        }
+
+        fn closeSessionBrowser(app: *App) void {
+            app.input_runtime.session_browser.close();
+            app.input_runtime.inputResetState().clearCurrent(app.alloc);
+            app.shell.render_requests.request(.footer);
+        }
+
+        fn routeSessionBrowserAction(app: *App, action: input_action.Action) !bool {
+            if (comptime !@hasDecl(App, "openSessionBrowser")) return false;
+            if (comptime @hasField(App, "remote")) if (!app.remote.active) return false;
+            const browser = &app.input_runtime.session_browser;
+            if (browser.active) {
+                const visible = @max(1, app.shell.layout.rows -| 7);
+                switch (action) {
+                    .cursor_up => browser.move(-1, visible),
+                    .cursor_down => browser.move(1, visible),
+                    .page_up => browser.move(-@as(i32, visible), visible),
+                    .page_down => browser.move(@as(i32, visible), visible),
+                    .cursor_left => {
+                        if (app.input_runtime.edit_state.input.items.len != 0) return false;
+                        try app.browserBack();
+                    },
+                    .cursor_right => {
+                        if (app.input_runtime.edit_state.input.items.len != 0) return false;
+                        try app.activateBrowserSelection();
+                    },
+                    else => return false,
+                }
+                app.shell.render_requests.request(.footer);
+                return true;
+            }
+            if (action != .cursor_left and action != .cursor_right and action != .open_all_sessions) return false;
+            if (draftHasState(app) or app.input_runtime.edit_state.selectionRange() != null or
+                settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or
+                modelMenuActive(app) or sessionMenuActive(app) or forkMenuActive(app) or mcpHostMenuActive(app)) return false;
+            if (app.auth.pickerView().active) return false;
+            if (comptime @hasField(App, "remote")) {
+                if (action == .cursor_left and app.remote.child_id.len > 0) {
+                    try app.browserBack();
+                    return true;
+                }
+            }
+            try app.openSessionBrowser(if (action == .cursor_right) .subagents else .sessions);
+            app.shell.render_requests.request(.footer);
+            return true;
         }
 
         fn routePickerControlByte(app: *App, byte: u8) !bool {
@@ -1604,6 +1669,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn activeCatalogMenuOwnsByte(app: *App, byte: u8) bool {
+            if (app.input_runtime.session_browser.active) return true;
             if (settingsMenuActive(app)) return true;
             // Typing filters its list.
             if (mcpHostMenuActive(app)) return true;
@@ -1723,6 +1789,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn sessionMenuActive(app: *App) bool {
+            if (app.input_runtime.session_browser.active) return true;
             if (comptime !@hasField(App, "session_persistence")) return false;
             return app.session_persistence.session_picker.active;
         }
@@ -2429,6 +2496,11 @@ pub fn Runtime(comptime App: type) type {
                     }, true);
                 },
                 .selection => |selection| {
+                    if (comptime @hasField(App, "remote")) if (app.remote.active) {
+                        try app.writeDomainNotice(.{ .topic = "model", .tone = .neutral, .body = "Detached sessions accept /model <id>. Effort and speed overrides are not available yet." }, true);
+                        app.shell.render_requests.request(.footer);
+                        return true;
+                    };
                     try session_commands.Commands(App).selectModelFromPicker(
                         app,
                         selection.model,
@@ -2471,6 +2543,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn syncCatalogMenus(app: *App) void {
+            if (app.input_runtime.session_browser.active) {
+                app.input_runtime.session_browser.setQuery(app.input_runtime.edit_state.input.items);
+            }
             syncSettingsMenu(app);
             syncHelpMenu(app);
             syncSkillsMenu(app);
@@ -2681,6 +2756,14 @@ pub fn Runtime(comptime App: type) type {
 
         fn resolveEscape(app: *App, was_cancel_pending: bool, now: i64) !void {
             if (try full_transcript_rt.routeAction(app, .escape)) return;
+            if (app.input_runtime.session_browser.active and !app.question_prompt.isActive() and !app.approval_prompt.isActive()) {
+                if (app.input_runtime.edit_state.input.items.len != 0) {
+                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                    app.input_runtime.session_browser.setQuery("");
+                    app.shell.render_requests.request(.footer);
+                } else closeSessionBrowser(app);
+                return;
+            }
             if (was_cancel_pending) {
                 if (app.question_prompt.isActive()) {
                     // Freeform answers mirror the composer's Esc contract:
@@ -10802,7 +10885,7 @@ test "app_input_runtime active Ctrl-C cancels stream and arms exit window" {
     var rendered = try app.shell.prepareTranscriptSource(alloc, null);
     defer rendered.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelled") != null);
-    try std.testing.expect(std.mem.find(u8, rendered.bytes, "What can fx do differently?") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "What should change?") != null);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "System:") == null);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelling") == null);
     try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
@@ -10827,7 +10910,7 @@ test "automatic compaction cancellation is silent only while compaction is activ
         try std.testing.expect(app.worker.cancel_requested);
         var rendered = try app.shell.prepareTranscriptSource(alloc, null);
         defer rendered.deinit(alloc);
-        try std.testing.expectEqual(settled, std.mem.find(u8, rendered.bytes, "What can fx do differently?") != null);
+        try std.testing.expectEqual(settled, std.mem.find(u8, rendered.bytes, "What should change?") != null);
         try std.testing.expectEqualStrings("", app.notice_body.items);
     }
 }
@@ -10859,7 +10942,7 @@ test "app_input_runtime active tool Escape presents final cancellation immediate
     var rendered = try app.shell.prepareTranscriptSource(alloc, null);
     defer rendered.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelled") != null);
-    try std.testing.expect(std.mem.find(u8, rendered.bytes, "What can fx do differently?") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "What should change?") != null);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "System:") == null);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelling") == null);
     try std.testing.expectEqual(@as(usize, 1), app.shell.activeToolActivityCount());
@@ -10882,7 +10965,7 @@ test "app_input_runtime second Ctrl-C after active cancellation exits without du
     defer rendered.deinit(alloc);
     try std.testing.expectEqual(
         @as(usize, 1),
-        std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+        std.mem.count(u8, rendered.bytes, "What should change?"),
     );
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "System:") == null);
 }

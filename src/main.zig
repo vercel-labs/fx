@@ -391,6 +391,9 @@ fn currentBuild() update_target.CurrentBuild {
     };
 }
 
+const app_remote_runtime = @import("core/app/app_remote_runtime.zig");
+const session_browser = @import("core/input/session_browser.zig");
+
 const App = struct {
     pub const app_version = version;
     pub const host_profile = selected_host_profile;
@@ -414,6 +417,7 @@ const App = struct {
     const SessionAppRuntime = app_session_runtime.Runtime(Self);
     const UpgradeAppRuntime = app_upgrade_runtime.Runtime(Self);
     const WorkerAppRuntime = app_worker_runtime.Runtime(Self);
+    const RemoteRuntime = app_remote_runtime.Runtime(Self);
     const WorkspaceAppRuntime = app_workspace_runtime.Runtime(Self);
 
     pub fn contextRegistry(self: *const Self) context_contract.Registry {
@@ -549,6 +553,7 @@ const App = struct {
     herdr: builtin_hooks.Client = .{},
     program_status: ui_program_status.Reporter = .{},
 
+    remote: app_remote_runtime.State = .{},
     session: SessionRuntime = SessionRuntime.init(max_history_turns),
     session_persistence: app_session_runtime.Persistence = .{},
     prompt_history: PromptHistoryRuntime = .{},
@@ -657,6 +662,7 @@ const App = struct {
             launch.requested_resume = null;
         }
         errdefer if (app.requested_resume) |*target| target.deinit(alloc);
+        if (comptime !host_target.is_wasm) app.remote.active = true;
         try BootstrapAppRuntime.bootstrap(
             &app,
             footer_rows,
@@ -694,7 +700,7 @@ const App = struct {
         }
         app.context_limits.applyCommandLine(launch.modifiers.context_limit_overrides);
         if (comptime host_profile.durable_sessions or host_profile.js_host_sessions) {
-            if (app.requested_resume != null) {
+            if (!app.remote.active and app.requested_resume != null) {
                 const resumed = if (launch.upgrade_relaunch != null)
                     SessionAppRuntime.resumeRequestedSessionAfterUpgrade(
                         &app,
@@ -725,6 +731,15 @@ const App = struct {
         }
         if (comptime !host_profile.auto_upgrade) app.auto_upgrade_enabled = false;
         try HostConfigAppRuntime.restore(&app, builtin_modes.registry);
+        if (comptime !host_target.is_wasm) {
+            const executable = try std.process.executablePathAlloc(io_mod.getIo(), alloc);
+            defer alloc.free(executable);
+            const resume_id = if (app.requested_resume) |target| switch (target) {
+                .id => |id| id,
+                else => null,
+            } else null;
+            try RemoteRuntime.init(&app, executable, resume_id);
+        }
         SessionAppRuntime.syncTerminalTitle(&app);
         return app;
     }
@@ -921,6 +936,7 @@ const App = struct {
     /// the cooperative host. Native interactive exit uses
     /// `shutdownForProcessExit`.
     pub fn deinit(self: *App) void {
+        self.remote.deinit(self.alloc);
         var shutdown_trace = app_lifecycle.ShutdownStageTrace.init();
         // Only real interactive sessions earn a shutdown report; failed
         // startups (no TTY, too small) reach deinit through errdefer and must
@@ -1050,6 +1066,13 @@ const App = struct {
     }
 
     pub fn ensurePromptCredential(self: *App) !bool {
+        if (self.remote.active) {
+            if (self.pending_images.items.len > 0) {
+                try self.writeDomainNotice(.{ .topic = "attachments", .tone = .warning, .body = "Image attachments are not forwarded by the detached frontend yet. Remove the image to send this prompt." }, true);
+                return false;
+            }
+            return true;
+        }
         return AuthAppRuntime.admitPromptCredential(self);
     }
 
@@ -1058,6 +1081,7 @@ const App = struct {
     }
 
     pub fn startPromptCredentialPrewarm(self: *App) void {
+        if (self.remote.active) return;
         if (comptime !host_target.is_wasm) {
             AuthAppRuntime.startPromptCredentialPrewarm(self);
         }
@@ -1066,12 +1090,14 @@ const App = struct {
     pub fn collectPendingPromptCredential(
         self: *App,
     ) !app_auth_runtime.PendingPromptCredentialReadiness {
+        if (self.remote.active) return .current;
         return AuthAppRuntime.collectPendingPromptCredential(self);
     }
 
     pub fn retryPendingPromptCredential(
         self: *App,
     ) !app_auth_runtime.PendingPromptCredentialReadiness {
+        if (self.remote.active) return .current;
         return AuthAppRuntime.retryPendingPromptCredential(self);
     }
 
@@ -1092,7 +1118,7 @@ const App = struct {
     }
 
     pub fn runLoginCommand(self: *App) !void {
-        try AuthAppRuntime.runLoginCommand(self);
+        try self.writeDomainNotice(.{ .topic = "provider", .tone = .neutral, .body = "Use proto-fx setup --base-url URL to discover models and configure a direct provider. Gateway login is not supported." }, true);
     }
 
     pub fn runLogoutCommand(self: *App, target: []const u8) !void {
@@ -1127,7 +1153,7 @@ const App = struct {
         const self: *App = @ptrCast(@alignCast(ctx));
         if (comptime !host_target.is_wasm) {
             return nativeLoopPollTimeoutMs(
-                default_timeout_ms,
+                if (self.remote.active) @min(default_timeout_ms, 100) else default_timeout_ms,
                 self.shell.render_requests.hasReason(.first_frame),
                 self.auth.sourceInventoryRefreshActive(),
                 self.skills.refreshActive(),
@@ -1158,6 +1184,7 @@ const App = struct {
     }
 
     pub fn handleCommand(self: *App, cmd: []const u8) !void {
+        if (self.remote.active and try RemoteRuntime.handleCommand(self, cmd)) return;
         try app_commands.Handlers(App).route(self, cmd);
     }
 
@@ -1186,6 +1213,11 @@ const App = struct {
     }
 
     pub fn enqueuePromptWithSkillBindings(self: *App, prompt: []const u8, skill_tokens: []const registered_entities.SkillTokenSpan) !bool {
+        if (self.remote.active) {
+            if (!try RemoteRuntime.submit(self, prompt, self.pending_images.items)) return false;
+            try self.writeUserPromptCard(.{ .text = @constCast(prompt), .images = self.pending_images.items });
+            return true;
+        }
         const context_targets = if (self.context_enabled)
             try context_contract.applicableTargetsForImages(self.alloc, self.pending_images.items)
         else
@@ -1241,6 +1273,10 @@ const App = struct {
         self: *App,
         draft: *const input_submit_runtime.PendingPromptDraft,
     ) !void {
+        if (self.remote.active) {
+            if (!try RemoteRuntime.submit(self, draft.prompt, draft.images)) return error.PendingPromptQueueRejected;
+            return;
+        }
         const context_targets = if (self.context_enabled)
             try context_contract.applicableTargetsForImages(self.alloc, draft.images)
         else
@@ -1324,6 +1360,25 @@ const App = struct {
         );
     }
 
+    pub fn openSessionBrowser(self: *App, scope: session_browser.Scope) !void {
+        try RemoteRuntime.openSessionBrowser(self, scope);
+    }
+    pub fn activateBrowserSelection(self: *App) !void {
+        try RemoteRuntime.activateBrowserSelection(self);
+    }
+    pub fn browserBack(self: *App) !void {
+        try RemoteRuntime.browserBack(self);
+    }
+    pub fn resolveRemotePermission(self: *App, decision: types.ToolPermissionDecision) !bool {
+        if (!self.remote.active) return false;
+        return RemoteRuntime.resolvePermission(self, decision);
+    }
+    pub fn cancelRemoteTurn(self: *App) !bool {
+        if (!self.remote.active) return false;
+        try RemoteRuntime.cancel(self);
+        return true;
+    }
+
     pub fn stopStream(self: *App) void {
         self.stream = .{};
         self.shell.resetCommandOutputDisplay(self.alloc, "stream stopped");
@@ -1335,10 +1390,12 @@ const App = struct {
     }
 
     pub fn newSession(self: *App) !void {
+        if (self.remote.active) return RemoteRuntime.newSession(self);
         try SessionAppRuntime.newSession(self);
     }
 
     pub fn resetSession(self: *App) !void {
+        if (self.remote.active) return RemoteRuntime.newSession(self);
         try SessionAppRuntime.resetSession(self);
     }
 
@@ -2162,7 +2219,7 @@ const App = struct {
             .text = @constCast(text),
         } });
         if (comptime host_profile.cooperative_agent) {
-            try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).workerEventHandlers(self));
+            if (!self.remote.active) try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).workerEventHandlers(self));
             try self.flushRequestedFrame();
         }
     }
@@ -2828,7 +2885,8 @@ const App = struct {
 
     pub fn loopCollectFacts(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
-        if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
+        if (comptime !host_target.is_wasm) try RemoteRuntime.poll(self);
+        if (!self.remote.active and !try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
 
         if (comptime !host_target.is_wasm) {
             if (self.file_index.joinThreadIfDone(std.heap.c_allocator)) {
@@ -2956,6 +3014,13 @@ const App = struct {
             }, true);
         }
         const input_now_ms = io_mod.milliTimestamp();
+        if (!self.shell.fullTranscriptActive() and
+            !self.approval_prompt.isActive() and
+            !self.question_prompt.isActive() and
+            !self.auth.apiKeyEntryActive())
+        {
+            _ = self.shell.tickWelcomeAnimation(self.alloc, input_now_ms);
+        }
         InputAppRuntime.expireTerminalInputGestures(self, input_now_ms);
         const terminal_input = self.terminal_input_runtime.flushTerminalAction(
             input_now_ms,
@@ -2963,7 +3028,7 @@ const App = struct {
             InputAppRuntime.terminalPasteActive(self),
         );
         try self.routeTerminalInputIngress(terminal_input);
-        try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).workerEventHandlers(self));
+        if (!self.remote.active) try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).workerEventHandlers(self));
         const now_ns = io_mod.nanoTimestamp();
         if (!self.approval_prompt.isActive() and !self.question_prompt.isActive() and !self.auth.apiKeyEntryActive()) {
             try self.pacer.tick(self.alloc, now_ns, self.pacerCallbacks());
@@ -2975,7 +3040,7 @@ const App = struct {
     pub fn loopCommitFrame(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
         defer SessionAppRuntime.finishDeferredSessionInputReplay(self);
-        if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
+        if (!self.remote.active and !try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
         if (self.terminal_input_runtime.native_clear_probe.active()) return;
         _ = self.admitPendingResizeSignal("post_input");
         InputAppRuntime.prepareFilePicker(self);
@@ -3093,7 +3158,7 @@ const App = struct {
 
     pub fn loopHandleByte(ctx: *anyopaque, byte: u8) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
-        if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
+        if (!self.remote.active and !try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
         const deferred_source = self.terminal_input_runtime.consumeDeferredTerminalInputDispatch();
 
         if (deferred_source) |source| {
@@ -3226,6 +3291,14 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
 
     var cli_arg_buf: [64][:0]const u8 = undefined;
     const cli_args = if (raw_args.len <= 1) &.{} else try cliArgsFromRaw(raw_args, &cli_arg_buf);
+    if (cli_args.len == 1 and std.mem.eql(u8, cli_args[0], "--proto-daemon")) {
+        io_mod.setRawEnviron(raw_env);
+        var threaded = std.Io.Threaded.init(processAllocator(), processIoOptions(argsFromRaw(raw_args), environBlockFromRaw(raw_env)));
+        defer threaded.deinit();
+        io_mod.setIo(threaded.io());
+        try @import("core/supervisor/server.zig").run(processAllocator(), daemonConfig());
+        return;
+    }
     if (command_runner.isForegroundSessionInvocation(cli_args)) {
         io_mod.setRawEnviron(raw_env);
         const process_args = argsFromRaw(raw_args);
@@ -3765,6 +3838,32 @@ test "native app preserves the built-in tool set without workspace metadata" {
     const advertised = app.toolAdvertisementSet();
     try std.testing.expect(advertised.order.ptr == builtin_tools.advertisement_set.order.ptr);
     try std.testing.expectEqual(builtin_tools.advertisement_set.order.len, advertised.order.len);
+}
+
+fn daemonConfig() acp_runner.Config {
+    const cfg = fullEntryConfig(.local);
+    return .{
+        .default_model = cfg.default_model,
+        .default_agent_step_limit = cfg.default_agent_step_limit,
+        .gateway_retry_count = cfg.gateway_retry_count,
+        .gateway_chat_url = cfg.gateway_chat_url,
+        .gateway_models_path = cfg.models_path,
+        .gateway_provider = cfg.gateway_provider,
+        .provider_set = cfg.provider_set,
+        .process_provider = cfg.process_provider,
+        .secret_store = cfg.secret_store,
+        .prompt_policy = cfg.prompt_policy,
+        .ignored_list_entries = cfg.ignored_list_entries,
+        .max_list_entries = cfg.max_list_entries,
+        .max_read_file_bytes = cfg.max_read_file_bytes,
+        .max_read_file_lines = cfg.max_read_file_lines,
+        .max_read_file_line_len = cfg.max_read_file_line_len,
+        .max_command_output_bytes = cfg.max_command_output_bytes,
+        .max_tool_result_bytes = cfg.max_tool_result_bytes,
+        .max_history_turns = cfg.max_history_turns,
+        .context_registry = cfg.context_registry,
+        .mode_registry = cfg.mode_registry,
+    };
 }
 
 fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {

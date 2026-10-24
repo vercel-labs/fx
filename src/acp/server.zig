@@ -351,6 +351,11 @@ pub const ServerState = struct {
     session_titles: bool = true,
     active_session: ?ActiveSessionState = null,
     active_prompt: ?*ActivePrompt = null,
+    /// Detached hosts steer streaming replies while preserving native ACP tools.
+    interruptible_steering: bool = false,
+    /// Only the detached native frontend consumes native presentation frames.
+    /// Ordinary ACP hosts keep their standard source/tool notification lane.
+    native_presentation: bool = false,
     subagent_authority_mutex: std.Io.Mutex = .init,
     skills: skill_runtime.Runtime = .{},
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
@@ -858,6 +863,190 @@ pub fn disableSubagentHost(state: *ServerState) void {
 pub fn run(alloc: Allocator, cfg: Config) !void {
     return runWithTransport(alloc, cfg, jsonrpc.Reader.init(), jsonrpc.Writer.init());
 }
+
+/// A native, persistent headless session owner. A daemon serializes calls to
+/// dispatchFrame; its writer callback may run on the prompt and child threads.
+/// Disconnecting a frontend does not destroy this owner.
+pub const PersistentHost = struct {
+    state: ServerState,
+    child_approval_revision: ?u64 = null,
+    child_approval: ?struct {
+        id: i64,
+        pending: @import("../core/subagent/approval_registry.zig").PendingRequest,
+    } = null,
+
+    pub fn init(alloc: Allocator, cfg: Config, context: ?*anyopaque, write: jsonrpc.Writer.WriteFn) !*PersistentHost {
+        const self = try alloc.create(PersistentHost);
+        errdefer alloc.destroy(self);
+        var lifecycle_runtime = hooks.Runtime.init(alloc);
+        const lifecycle_view = lifecycle_runtime.freeze();
+        self.* = .{ .state = .{
+            .alloc = alloc,
+            .cfg = cfg,
+            .interruptible_steering = true,
+            .writer = jsonrpc.Writer.initCallback(context, write),
+            .web_search_runtime = web_search_runtime.Runtime.init(.{ .provider = cfg.provider_set.gateway.fx_search }),
+            .terminal_client = terminal_client_runtime.Runtime.init(cfg.process_provider),
+            .managed_executions = managed_execution.Runtime.init(alloc),
+            .lifecycle_runtime = lifecycle_runtime,
+            .lifecycle_view = lifecycle_view,
+        } };
+        errdefer self.state.deinit();
+        self.state.sessions_v2 = if (cfg.home_override) |home|
+            try session_adapter.Store.open(alloc, home)
+        else
+            try session_adapter.Store.openFromEnv(alloc);
+        return self;
+    }
+
+    pub fn dispatchFrame(self: *PersistentHost, frame: []const u8) !void {
+        const state = &self.state;
+        reapActivePrompt(state, false);
+        var message = try jsonrpc.parseMessage(state.alloc, frame);
+        defer jsonrpc.freeMessage(state.alloc, &message);
+        if (message.isResponse()) {
+            if (self.child_approval) |forwarded| {
+                if (message.id.? == .integer and message.id.?.integer == forwarded.id) {
+                    const child_host = state.subagent_host orelse return error.SessionStopped;
+                    const decision = if (message.result_raw) |raw| value: {
+                        const parsed = try std.json.parseFromSlice(std.json.Value, state.alloc, raw, .{});
+                        defer parsed.deinit();
+                        break :value parsePermissionDecision(parsed.value) orelse return error.InvalidPermissionDecision;
+                    } else types.ToolPermissionDecision.deny;
+                    _ = try child_host.resolveApproval(.{
+                        .request_id = forwarded.pending.request_id,
+                        .child_id = forwarded.pending.child_id,
+                        .decision = decision,
+                        .timestamp_ms = io_mod.milliTimestamp(),
+                    });
+                    self.retireChildApproval();
+                    self.child_approval_revision = null;
+                    return;
+                }
+            }
+            handleClientResponse(state, state.alloc, &message);
+        } else if (message.id == null) {
+            try dispatchNotification(state, state.alloc, &message);
+        } else {
+            try dispatch(state, state.alloc, &message);
+        }
+    }
+
+    pub fn busy(self: *PersistentHost) bool {
+        reapActivePrompt(&self.state, false);
+        return self.state.active_prompt != null;
+    }
+
+    fn retireChildApproval(self: *PersistentHost) void {
+        if (self.child_approval) |*forwarded| {
+            var params: std.Io.Writer.Allocating = .init(self.state.alloc);
+            defer params.deinit();
+            std.json.Stringify.value(.{ .request_id = forwarded.id }, .{}, &params.writer) catch {};
+            self.state.writer.writeNotification(self.state.alloc, "proto/permission_retired", params.written()) catch {};
+            forwarded.pending.deinit(self.state.alloc);
+            self.child_approval = null;
+        }
+    }
+
+    pub fn refreshChildApprovals(self: *PersistentHost) void {
+        self.retireChildApproval();
+        self.child_approval_revision = null;
+    }
+
+    /// Native child approvals are registry-owned; unlike a local TUI, a detached
+    /// ACP host must project them onto its connection and route the exact reply.
+    pub fn pumpChildApprovals(self: *PersistentHost) !void {
+        const child_host = self.state.subagent_host orelse return;
+        const revision = child_host.approvals.pendingRevision();
+        if (self.child_approval_revision == revision) return;
+        var pending = try child_host.pendingApprovalRequest(self.state.alloc);
+        defer if (pending) |*request| request.deinit(self.state.alloc);
+        if (pending) |request| {
+            if (self.child_approval) |forwarded| {
+                if (std.mem.eql(u8, forwarded.pending.request_id, request.request_id)) {
+                    self.child_approval_revision = revision;
+                    return;
+                }
+            }
+        }
+        self.retireChildApproval();
+        if (pending) |request| {
+            self.state.outbound_mutex.lockUncancelable(io_mod.getIo());
+            const id = self.state.next_outbound_request_id;
+            self.state.next_outbound_request_id += 1;
+            self.state.outbound_mutex.unlock(io_mod.getIo());
+            const title = try self.state.alloc.print("Subagent {s}: {s}", .{ request.child_id, request.request.label });
+            defer self.state.alloc.free(title);
+            var params: std.Io.Writer.Allocating = .init(self.state.alloc);
+            defer params.deinit();
+            try std.json.Stringify.value(.{
+                .sessionId = self.state.active_session.?.session_id,
+                .childSessionId = request.child_id,
+                .toolCall = .{
+                    .toolCallId = request.request_id,
+                    .name = "subagent",
+                    .title = title,
+                    .kind = "execute",
+                    .status = "pending",
+                    .rawInput = .{ .child_id = request.child_id, .command = request.request.command, .arguments_preview = request.request.tool_arguments_preview, .explanation = request.request.explanation },
+                },
+                .options = .{
+                    .{ .optionId = "allow_once", .name = "Allow once", .kind = "allow_once" },
+                    .{ .optionId = "allow_always", .name = "Allow for this session", .kind = "allow_always" },
+                    .{ .optionId = "reject_once", .name = "Reject", .kind = "reject_once" },
+                },
+            }, .{}, &params.writer);
+            try self.state.writer.writeRequest(self.state.alloc, .{ .integer = @intCast(id) }, "session/request_permission", params.written());
+            self.child_approval = .{ .id = @intCast(id), .pending = request };
+            pending = null;
+        }
+        self.child_approval_revision = revision;
+    }
+
+    pub fn withdrawSteeringRequest(self: *PersistentHost, id: i64) bool {
+        const active = if (self.state.active_session) |*session| session else return false;
+        return active.steering.withdrawRequest(self.state.alloc, id);
+    }
+
+    pub const KernelInfo = struct { state: []const u8, diagnostics: []u8 };
+
+    /// Human recovery controls use the same session-owned process as the tool.
+    pub fn kernelControl(self: *PersistentHost, alloc: Allocator, action: []const u8) !KernelInfo {
+        const kernel = @import("../core/kernel/kernel.zig");
+        const paths = @import("../core/shared/profile_paths.zig");
+        const active = if (self.state.active_session) |*session| session else return error.NoActiveSession;
+        const status_only = std.mem.eql(u8, action, "status");
+        const interrupt_only = std.mem.eql(u8, action, "interrupt");
+        const stop = std.mem.eql(u8, action, "stop");
+        const restart = std.mem.eql(u8, action, "restart");
+        const prewarm = std.mem.eql(u8, action, "prewarm");
+        if (!status_only and !interrupt_only and !stop and !restart and !prewarm) return error.InvalidKernelAction;
+        if (!status_only and !interrupt_only and self.busy()) return error.SessionBusy;
+        const runtime = &active.session_rt;
+        runtime.python_lock.lockUncancelable(io_mod.getIo());
+        defer runtime.python_lock.unlock(io_mod.getIo());
+        if (runtime.python == null and (restart or prewarm)) {
+            const home = self.state.cfg.home_override orelse io_mod.homeDir() orelse return error.HomeUnavailable;
+            const artifacts = try std.Io.Dir.path.join(alloc, &.{ home, paths.root_dir_name, "kernels", active.session_id });
+            defer alloc.free(artifacts);
+            runtime.python = try kernel.Manager.create(self.state.alloc, .{ .cwd = active.workspace_root, .artifact_dir = artifacts });
+        }
+        const manager = runtime.python orelse return .{ .state = "uninitialized", .diagnostics = try alloc.dupe(u8, "") };
+        if (interrupt_only) manager.interrupt();
+        if (stop) manager.stop(true);
+        if (restart) manager.restart();
+        if (prewarm) try manager.prewarm();
+        return .{ .state = @tagName(manager.status()), .diagnostics = try manager.diagnostics(alloc) };
+    }
+
+    pub fn deinit(self: *PersistentHost) void {
+        const alloc = self.state.alloc;
+        handleCancel(&self.state, false);
+        self.retireChildApproval();
+        self.state.deinit();
+        alloc.destroy(self);
+    }
+};
 
 pub fn runWithTransport(
     alloc: Allocator,
@@ -1672,6 +1861,7 @@ fn handleSteeringPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonr
             .message = "Steering queue is full",
         }),
     };
+    if (state.interruptible_steering) _ = session.steering.claimInterrupt(&session.cancel_flag);
     debug_trace.logf("acp", "queued steering prompt bytes={d}", .{text.len});
 }
 
@@ -3277,7 +3467,7 @@ fn handleCancel(state: *ServerState, notify_client: bool) void {
         session.cancel_flag.store(true, .seq_cst);
         // A libfx turn keeps its queued steering until it ends, which hands
         // back what never reached the model.
-        if (state.cfg.minimal_kernel) session.steering.cancelForUser(&session.cancel_flag);
+        if (state.cfg.minimal_kernel or state.interruptible_steering) session.steering.cancelForUser(&session.cancel_flag);
     }
     cancelPendingOutbound(state, notify_client);
     clearPendingLegacyUrls(state);
@@ -3451,6 +3641,10 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .code = ErrorCode.invalid_params,
                 .message = "Invalid provider",
             });
+        if (parsed_provider == .gateway) return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Gateway login is unavailable in proto-fx; configure a direct provider with proto-fx setup",
+        });
         const target = parsed_provider.bind(state.configured_providers) catch
             return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Unknown or changed configured provider" });
         const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{

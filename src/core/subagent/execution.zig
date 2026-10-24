@@ -9,6 +9,7 @@ const approval_registry_mod = @import("approval_registry.zig");
 const child_state = @import("child_state.zig");
 const domain = @import("domain.zig");
 const live_metrics = @import("live_metrics.zig");
+const live_presentation = @import("live_presentation.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session = @import("../session/session.zig");
@@ -147,6 +148,7 @@ pub const TurnContext = struct {
         child_state.Phase,
     ) anyerror!void = null,
     live_metrics: ?*live_metrics.LiveMetrics = null,
+    live_presentation: ?*live_presentation.Tail = null,
     failure_diagnostic: ?types.ModelFailureDiagnostic = null,
     committed: bool = false,
 
@@ -218,12 +220,13 @@ pub const TurnContext = struct {
         return &self.managed_executions;
     }
 
-    pub fn appendLiveText(_: *TurnContext, _: []const u8) void {}
+    pub fn appendLiveText(self: *TurnContext, text: []const u8) void {
+        if (self.live_presentation) |tail| tail.appendText(self.alloc, text);
+    }
 
-    pub fn appendLiveEvent(
-        _: *TurnContext,
-        _: worker_runtime.WorkerEvent,
-    ) void {}
+    pub fn appendLiveEvent(self: *TurnContext, event: worker_runtime.WorkerEvent) void {
+        if (self.live_presentation) |tail| tail.appendEvent(self.alloc, event);
+    }
 
     pub fn resolveLiveAuthority(
         self: *TurnContext,

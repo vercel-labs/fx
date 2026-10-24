@@ -177,6 +177,9 @@ pub fn ApprovalRuntime(comptime App: type) type {
         }
 
         fn submitPermissionChoice(app: *App, decision: ToolPermissionDecision) !void {
+            if (comptime @hasDecl(App, "resolveRemotePermission")) {
+                if (try app.resolveRemotePermission(decision)) return;
+            }
             debug_trace.logf(
                 "permission",
                 "approval response submitted request_id={d} decision={s}",
@@ -399,6 +402,9 @@ pub fn ApprovalRuntime(comptime App: type) type {
         }
 
         pub fn cancelApprovalOperation(app: *App) !void {
+            if (comptime @hasDecl(App, "resolveRemotePermission")) {
+                if (try app.resolveRemotePermission(.deny)) return;
+            }
             if (app_session_runtime.Runtime(App).subagentHost(app)) |host| {
                 if (try host.pendingApprovalRequest(app.alloc)) |loaded| {
                     var pending = loaded;

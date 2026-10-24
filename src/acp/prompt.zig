@@ -1,4 +1,5 @@
 const std = @import("std");
+const native_presentation = @import("../core/subagent/live_presentation.zig");
 const observation = @import("../core/agent/runtime/observation.zig");
 const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const skill_contract = @import("../core/skills/skill_contract.zig");
@@ -272,6 +273,23 @@ const AcpContext = struct {
         try self.state.writer.writeNotification(self.alloc, "session/update", out.writer.buffered());
     }
 
+    fn sendNativeText(self: *AcpContext, text: []const u8) !void {
+        if (text.len == 0) return;
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        defer out.deinit();
+        try std.json.Stringify.value(.{ .session_id = self.session_id, .text = text }, .{}, &out.writer);
+        try self.state.writer.writeNotification(self.alloc, "proto/native_presentation", out.written());
+    }
+
+    fn sendNativeEvent(self: *AcpContext, event: worker_runtime.WorkerEvent) !void {
+        if (!self.state.native_presentation) return;
+        const projected = native_presentation.project(event) orelse return;
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        defer out.deinit();
+        try std.json.Stringify.value(.{ .session_id = self.session_id, .event = projected }, .{}, &out.writer);
+        try self.state.writer.writeNotification(self.alloc, "proto/native_presentation", out.written());
+    }
+
     fn assistantMessageId(self: *AcpContext) []const u8 {
         return self.messageId(.assistant);
     }
@@ -289,6 +307,7 @@ const AcpContext = struct {
     }
 
     fn sendAgentText(self: *AcpContext, message_id: []const u8, text: []const u8) !void {
+        if (self.state.native_presentation) return self.sendNativeText(text);
         const plain = try stripAnsiAlloc(self.alloc, text);
         defer if (plain.ptr != text.ptr) self.alloc.free(plain);
         var out: std.Io.Writer.Allocating = .init(self.alloc);
@@ -352,34 +371,36 @@ const AcpContext = struct {
         const registry = self.toolRegistry();
         const mcp_identity = if (registry.lookup(call.name) == null) self.mcpToolIdentity(arena, call.name) else null;
         if (mcp_identity) |identity| self.rememberToolIdentity(call.name, identity);
-        const presentation = tool_call_presentation.describeToolCall(registry, arena, call, mcp_identity);
-        const name = acpToolName(call.name);
-        const kind = mapToolKind(name);
-        const masked_arguments = try agent_execution_memory.redactToolArgumentsJson(
-            arena,
-            call.name,
-            call.arguments_json,
-        );
-        defer arena.free(masked_arguments);
-        var parsed_arguments: ?std.json.Parsed(std.json.Value) = std.json.parseFromSlice(
-            std.json.Value,
-            arena,
-            masked_arguments,
-            .{},
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => null,
-        };
-        defer if (parsed_arguments) |*parsed| parsed.deinit();
-        const raw_input = if (parsed_arguments) |*parsed| parsed.value else null;
-
         try self.published_tool_calls.ensureUnusedCapacity(self.alloc, 1);
         const owned_id = try self.alloc.dupe(u8, call.id);
         errdefer self.alloc.free(owned_id);
-        var out: std.Io.Writer.Allocating = .init(self.alloc);
-        defer out.deinit();
-        try acp_types.writeToolCall(&out.writer, owned_id, name, presentation.title, kind, .pending, raw_input, presentation.meta);
-        try self.sendUpdate(out.writer.buffered());
+        if (!self.state.native_presentation) {
+            const presentation = tool_call_presentation.describeToolCall(registry, arena, call, mcp_identity);
+            const name = acpToolName(call.name);
+            const kind = mapToolKind(name);
+            const masked_arguments = try agent_execution_memory.redactToolArgumentsJson(
+                arena,
+                call.name,
+                call.arguments_json,
+            );
+            defer arena.free(masked_arguments);
+            var parsed_arguments: ?std.json.Parsed(std.json.Value) = std.json.parseFromSlice(
+                std.json.Value,
+                arena,
+                masked_arguments,
+                .{},
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => null,
+            };
+            defer if (parsed_arguments) |*parsed| parsed.deinit();
+            const raw_input = if (parsed_arguments) |*parsed| parsed.value else null;
+
+            var out: std.Io.Writer.Allocating = .init(self.alloc);
+            defer out.deinit();
+            try acp_types.writeToolCall(&out.writer, owned_id, name, presentation.title, kind, .pending, raw_input, presentation.meta);
+            try self.sendUpdate(out.writer.buffered());
+        }
         self.published_tool_calls.putAssumeCapacity(
             owned_id,
             if (tool_presentation.isProviderSearchAlias(call.name)) .awaiting_provider_terminal else .open,
@@ -429,6 +450,7 @@ const AcpContext = struct {
     }
 
     fn sendToolCallProgressText(self: *AcpContext, tool_call_id: []const u8, text: ?[]const u8) !void {
+        if (self.state.native_presentation) return;
         const plain = if (text) |value| try stripAnsiAlloc(self.alloc, value) else null;
         defer if (plain) |value| if (text) |original| {
             if (value.ptr != original.ptr) self.alloc.free(value);
@@ -454,6 +476,10 @@ const AcpContext = struct {
     }
 
     fn sendToolCallCompletedWithCommandResult(self: *AcpContext, tool_call_id: []const u8, result_text: ?[]const u8, command_result_json: ?[]const u8) !void {
+        if (self.state.native_presentation) {
+            self.markCardFinished(tool_call_id);
+            return;
+        }
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
         try acp_types.writeToolCallUpdateWithCommandResult(&out.writer, tool_call_id, .completed, result_text, command_result_json);
@@ -466,6 +492,10 @@ const AcpContext = struct {
     }
 
     fn sendToolCallErrorWithCommandResult(self: *AcpContext, tool_call_id: []const u8, err_text: []const u8, command_result_json: ?[]const u8) !void {
+        if (self.state.native_presentation) {
+            self.markCardFinished(tool_call_id);
+            return;
+        }
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
         try acp_types.writeToolCallUpdateWithCommandResult(&out.writer, tool_call_id, .failed, err_text, command_result_json);
@@ -1077,6 +1107,18 @@ pub fn handlePrompt(
     );
     defer alloc.free(owned_prompt);
 
+    // A detached frontend may attach after this prompt started; include its
+    // validated user input in the live tail, not only the eventual history.
+    // Steering already publishes its input at the boundary that absorbs it.
+    if (state.interruptible_steering and recovery_checkpoint == null) {
+        var message_id_storage: acp_types.MessageIdBuffer = undefined;
+        const message_id = acp_types.generateMessageId(&message_id_storage);
+        var update: std.Io.Writer.Allocating = .init(alloc);
+        defer update.deinit();
+        try acp_types.writeUserMessageChunk(&update.writer, message_id, owned_prompt);
+        try ctx.sendUpdate(update.written());
+    }
+
     var skill_catalog = state.skills.acquireCatalog();
     defer skill_catalog.deinit();
     const host_instructions = try client_instructions.compose(
@@ -1186,7 +1228,7 @@ pub fn handlePrompt(
     try sessions.sendActiveSessionUsageUpdate(state, alloc);
 
     // A steer's interrupt the turn finished before reaching is not a cancel.
-    if (state.cfg.minimal_kernel) server.releaseSteeringInterrupt(state);
+    if (state.cfg.minimal_kernel or state.interruptible_steering) server.releaseSteeringInterrupt(state);
     if (session.cancel_flag.load(.seq_cst)) {
         ctx.stop_reason = .cancelled;
     }
@@ -1896,7 +1938,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .agent_stream_provider = server.streamProviderFor(ctx.state, ctx.state.active_session.?.provider),
         .report_usage = reportUsage,
         .flush_assistant_stream_per_content_chunk = host_target.is_wasm,
-        .render_assistant_text = false,
+        .render_assistant_text = ctx.state.native_presentation,
         .tool_registry = ctx.toolRegistry(),
         .context_registry = ctx.state.cfg.context_registry,
         .context_enabled = ctx.state.context_enabled,
@@ -2006,7 +2048,8 @@ fn takeSteeringBoundary(
         return if (kind == .cancelled) .interrupt else .none;
     }
     const kernel = ctx.state.cfg.minimal_kernel;
-    if (kind == .cancelled and !kernel) return .interrupt;
+    const interruptible = kernel or ctx.state.interruptible_steering;
+    if (kind == .cancelled and !interruptible) return .interrupt;
     if (kind == .cancelled) {
         // A user cancel ends the turn, and so does a handoff's interrupt.
         const interrupt = server.takeSteeringInterrupt(ctx.state) orelse return .interrupt;
@@ -2026,7 +2069,7 @@ fn takeSteeringBoundary(
     if (drained.texts.len == 0) return if (kind == .cancelled) .{ .continue_turn = &.{} } else .none;
     try noteJournalPlacement(ctx, drained.input_ids);
     // A steer's interrupt that a later boundary beat is spent with its steer.
-    if (kernel and kind != .cancelled) server.releaseSteeringInterrupt(ctx.state);
+    if (interruptible and kind != .cancelled) server.releaseSteeringInterrupt(ctx.state);
     // Steering shows where it joined the turn, a libfx steer by its input id.
     for (drained.texts, drained.request_ids, 0..) |text, request_id, index| {
         const input_id: ?[]const u8 = if (index < drained.input_ids.len) drained.input_ids[index] else null;
@@ -2218,6 +2261,7 @@ fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentati
     // what it left open, as the terminal transcript does at the same point.
     const cancel_requested = if (ctx.state.active_session) |*session| session.cancel_flag.load(.seq_cst) else false;
     ctx.finishOpenToolCalls(unfinishedToolCallText(outcome, cancel_requested));
+    try ctx.sendNativeEvent(.{ .tool_lifecycle = .{ .turn_finished = .{ .turn_id = turn_id, .outcome = outcome } } });
 }
 
 /// The text of the final update for a tool call a finished turn left open.
@@ -2458,12 +2502,16 @@ fn writePermissionOption(
 
 fn describeToolAction(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    return tool_presentation.formatPlainAction(arena, .{
+    const action = try tool_presentation.formatPlainAction(arena, .{
         .tool_registry = ctx.toolRegistry(),
         .call = call,
+        .workspace_root = if (ctx.state.native_presentation) ctx.state.workspace_root else "",
         .display_target = display_target,
         .is_available_dynamic_mcp_tool = lifecycleDynamicMcpToolAvailable(ctx, call.name, advertised_dynamic_tool_names),
     });
+    if (!ctx.state.native_presentation) return action;
+    defer arena.free(action);
+    return arena.print("● {s}", .{action});
 }
 
 fn resolveToolActionDisplayTarget(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !?[]const u8 {
@@ -2480,10 +2528,22 @@ fn resolveToolActionDisplayTarget(raw_ctx: *anyopaque, arena: Allocator, call: T
 
 fn describeToolActionCompleted(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    if (ctx.state.native_presentation) {
+        const action = try tool_presentation.formatPlainCompletedAction(arena, .{
+            .tool_registry = ctx.toolRegistry(),
+            .call = call,
+            .workspace_root = ctx.state.workspace_root,
+            .display_target = display_target,
+            .is_available_dynamic_mcp_tool = lifecycleDynamicMcpToolAvailable(ctx, call.name, advertised_dynamic_tool_names),
+        });
+        defer arena.free(action);
+        return arena.print("● {s}", .{action});
+    }
     if (try tool_presentation.formatSubagentPlainAction(arena, call, .completed)) |line| return line;
     return tool_presentation.formatPlainAction(arena, .{
         .tool_registry = ctx.toolRegistry(),
         .call = call,
+        .workspace_root = if (ctx.state.native_presentation) ctx.state.workspace_root else "",
         .display_target = display_target,
         .is_available_dynamic_mcp_tool = lifecycleDynamicMcpToolAvailable(ctx, call.name, advertised_dynamic_tool_names),
     });
@@ -2491,14 +2551,20 @@ fn describeToolActionCompleted(raw_ctx: *anyopaque, arena: Allocator, call: Tool
 
 fn describeToolActionDenied(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    if (try tool_presentation.formatSubagentPlainAction(arena, call, .{ .stopped = label })) |line| return line;
+    if (try tool_presentation.formatSubagentPlainAction(arena, call, .{ .stopped = label })) |line| {
+        if (!ctx.state.native_presentation) return line;
+        defer arena.free(line);
+        return arena.print("● {s}", .{line});
+    }
     const action = try tool_presentation.formatPlainAction(arena, .{
         .tool_registry = ctx.toolRegistry(),
         .call = call,
+        .workspace_root = if (ctx.state.native_presentation) ctx.state.workspace_root else "",
         .display_target = display_target,
         .is_available_dynamic_mcp_tool = lifecycleDynamicMcpToolAvailable(ctx, call.name, advertised_dynamic_tool_names),
     });
-    return arena.print("{s}: {s}", .{ label, action });
+    defer arena.free(action);
+    return arena.print("{s}{s}: {s}", .{ if (ctx.state.native_presentation) "● " else "", label, action });
 }
 
 fn lifecycleDynamicMcpToolAvailable(ctx: *AcpContext, name: []const u8, advertised_dynamic_tool_names: []const []const u8) bool {
@@ -2547,8 +2613,8 @@ fn executeToolCall(
     tool_ctx.root_user_intent_context = request.root_user_intent_context;
     tool_ctx.root_user_messages = request.root_user_messages;
     tool_ctx.root_user_evidence_complete = request.root_user_evidence_complete;
-    var progress_ctx = AcpWebSearchProgressContext{ .ctx = ctx, .tool_call_id = acp_id };
-    var fetch_progress_ctx = AcpWebFetchProgressContext{ .ctx = ctx, .tool_call_id = acp_id };
+    var progress_ctx = AcpWebSearchProgressContext{ .ctx = ctx, .tool_call_id = acp_id, .lifecycle_id = request.lifecycle_id };
+    var fetch_progress_ctx = AcpWebFetchProgressContext{ .ctx = ctx, .tool_call_id = acp_id, .lifecycle_id = request.lifecycle_id };
     tool_ctx.web_search_progress_ctx = @ptrCast(&progress_ctx);
     tool_ctx.on_web_search_progress = onWebSearchProgress;
     tool_ctx.web_fetch_progress_ctx = @ptrCast(&fetch_progress_ctx);
@@ -2684,20 +2750,40 @@ fn publishDeferredToolCompletion(
 const AcpWebSearchProgressContext = struct {
     ctx: *AcpContext,
     tool_call_id: []const u8,
+    lifecycle_id: ?types.ToolLifecycleId = null,
 };
 
 const AcpWebFetchProgressContext = struct {
     ctx: *AcpContext,
     tool_call_id: []const u8,
+    lifecycle_id: ?types.ToolLifecycleId = null,
 };
 
 fn onWebSearchProgress(raw_ctx: *anyopaque, _: []const u8, progress: types.WebSearchProgress) void {
     const progress_ctx: *AcpWebSearchProgressContext = @ptrCast(@alignCast(raw_ctx));
+    if (progress_ctx.ctx.state.native_presentation) {
+        const id = progress_ctx.lifecycle_id orelse return;
+        const plain = tool_presentation.formatWebSearchProgressPlain(progress_ctx.ctx.alloc, progress) catch return;
+        defer progress_ctx.ctx.alloc.free(plain);
+        const line = progress_ctx.ctx.alloc.print("● {s}", .{plain}) catch return;
+        defer progress_ctx.ctx.alloc.free(line);
+        progress_ctx.ctx.sendNativeEvent(.{ .tool_lifecycle = .{ .progress = .{ .id = id, .text = line } } }) catch {};
+        return;
+    }
     progress_ctx.ctx.sendWebSearchProgress(progress_ctx.tool_call_id, progress) catch {};
 }
 
 fn onWebFetchProgress(raw_ctx: *anyopaque, _: []const u8, progress: types.WebFetchProgress) void {
     const progress_ctx: *AcpWebFetchProgressContext = @ptrCast(@alignCast(raw_ctx));
+    if (progress_ctx.ctx.state.native_presentation) {
+        const id = progress_ctx.lifecycle_id orelse return;
+        const plain = tool_presentation.formatWebFetchProgressPlain(progress_ctx.ctx.alloc, progress) catch return;
+        defer progress_ctx.ctx.alloc.free(plain);
+        const line = progress_ctx.ctx.alloc.print("● {s}", .{plain}) catch return;
+        defer progress_ctx.ctx.alloc.free(line);
+        progress_ctx.ctx.sendNativeEvent(.{ .tool_lifecycle = .{ .progress = .{ .id = id, .text = line } } }) catch {};
+        return;
+    }
     progress_ctx.ctx.sendWebFetchProgress(progress_ctx.tool_call_id, progress) catch {};
 }
 
@@ -3116,11 +3202,15 @@ fn retainAcpGrant(raw_ctx: *anyopaque, tool_name: []const u8, target_path: []con
 
 fn pushEvent(raw_ctx: *anyopaque, event: worker_runtime.WorkerEvent) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
+    // Presentation delivery is best-effort. This callback consumes its owned
+    // event; returning an error would make callers release it a second time.
+    ctx.sendNativeEvent(event) catch {};
     switch (event) {
-        .clear_route_recovery_status => try ctx.clearModelRecoveryStatus(),
+        .clear_route_recovery_status => if (!ctx.state.native_presentation) ctx.clearModelRecoveryStatus() catch {},
         // A libfx steer cuts a streaming reply short, as in the fx CLI, but
         // waits once the model streams a tool call's arguments.
-        .turn_phase_update => |update| if (ctx.state.cfg.minimal_kernel) {
+        .turn_phase_update => |update| if (ctx.state.cfg.minimal_kernel or ctx.state.interruptible_steering) {
             server.noteSteeringPhase(ctx.state, update.step_id, switch (update.phase) {
                 .thinking, .generating => .reply,
                 .running, .waiting_for_subagent => .tools,
@@ -3128,7 +3218,6 @@ fn pushEvent(raw_ctx: *anyopaque, event: worker_runtime.WorkerEvent) !void {
         },
         else => {},
     }
-    worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
 }
 
 fn pushRouteRecoveryStatus(
@@ -3136,11 +3225,24 @@ fn pushRouteRecoveryStatus(
     status: types.RouteRecoveryStatus,
 ) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    if (ctx.state.native_presentation) return ctx.sendNativeEvent(.{ .route_recovery_status = status });
     try ctx.sendModelRecoveryStatus(status);
 }
 
 fn pushText(raw_ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    if (ctx.state.native_presentation) {
+        const text = switch (emission) {
+            .assistant_started => {
+                ctx.message_kind = null;
+                return;
+            },
+            .assistant_source => return,
+            .assistant_rendered, .assistant_restarted, .operational => |text| text,
+        };
+        ctx.sendNativeText(text) catch {};
+        return;
+    }
     const text, const message_id = switch (emission) {
         .assistant_started => {
             ctx.message_kind = null;
@@ -3165,10 +3267,11 @@ fn pushReasoningDelta(raw_ctx: *anyopaque, delta: []const u8) !void {
 
 fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    try ctx.sendNativeEvent(.{ .tool_lifecycle = event });
     switch (event) {
         .provisional => |provisional| {
             // A tool call the model announced is no reply a steer cuts short.
-            if (ctx.state.cfg.minimal_kernel) server.noteSteeringToolsPhase(ctx.state);
+            if (ctx.state.cfg.minimal_kernel or ctx.state.interruptible_steering) server.noteSteeringToolsPhase(ctx.state);
             const tool_name = provisional.tool_name orelse return;
             if (!tool_presentation.isProviderSearchAlias(tool_name)) return;
             var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
@@ -3181,7 +3284,7 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
             });
         },
         .authoritative_started => |started| {
-            if (ctx.state.cfg.minimal_kernel) server.noteSteeringTool(ctx.state, started.id.call_id, true);
+            if (ctx.state.cfg.minimal_kernel or ctx.state.interruptible_steering) server.noteSteeringTool(ctx.state, started.id.call_id, true);
             var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
             defer arena_state.deinit();
             _ = try ctx.sendToolCallPending(arena_state.allocator(), .{
@@ -3192,7 +3295,7 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
             });
         },
         .terminal => |terminal| {
-            if (ctx.state.cfg.minimal_kernel) server.noteSteeringTool(ctx.state, terminal.id.call_id, false);
+            if (ctx.state.cfg.minimal_kernel or ctx.state.interruptible_steering) server.noteSteeringTool(ctx.state, terminal.id.call_id, false);
             try ctx.sendProviderTerminal(terminal.id.call_id, terminal.outcome, terminal.result);
         },
         .progress, .turn_finished => {},
@@ -3216,10 +3319,15 @@ fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {
 
 fn pushDiffBlock(raw_ctx: *anyopaque, payload: agent_runtime.DiffEntryPayload) !void {
     defer diff_mod.freeDiffEntryPayload(std.heap.c_allocator, payload);
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    if (ctx.state.native_presentation) return ctx.sendNativeEvent(.{ .diff_block = payload });
     try pushText(raw_ctx, .{ .operational = payload.preview });
 }
 
-fn pushCommandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
+fn pushCommandOutputComplete(raw_ctx: *anyopaque, id: ?types.ToolLifecycleId) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    try ctx.sendNativeEvent(.{ .command_output_complete = id });
+}
 
 fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
@@ -3241,14 +3349,25 @@ fn formatToolExecutionError(_: *anyopaque, arena: Allocator, tool_name: []const 
     return tool_result_errors.formatToolExecutionErrorJson(arena, tool_name, err);
 }
 
-fn onCommandOutputChunk(raw_ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId, _: command_output_content.Stream, chunk: []const u8) !void {
+fn onCommandOutputChunk(raw_ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId, stream: command_output_content.Stream, chunk: []const u8) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    if (ctx.state.native_presentation) return ctx.sendNativeEvent(.{ .command_output = .{
+        .lifecycle_id = lifecycle_id,
+        .stream = stream,
+        .text = @constCast(chunk),
+    } });
     const id = lifecycle_id orelse return;
     try ctx.sendToolCallProgressText(id.call_id, chunk);
 }
 
 fn onMcpProgress(raw_ctx: *anyopaque, lifecycle_id: types.ToolLifecycleId, text: []const u8) void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    if (ctx.state.native_presentation) {
+        const line = ctx.alloc.print("● {s}", .{text}) catch return;
+        defer ctx.alloc.free(line);
+        ctx.sendNativeEvent(.{ .tool_lifecycle = .{ .progress = .{ .id = lifecycle_id, .text = line } } }) catch {};
+        return;
+    }
     ctx.sendToolCallProgressText(lifecycle_id.call_id, text) catch |err| {
         debug_trace.logf("mcp", "failed to publish ACP MCP progress err={s}", .{@errorName(err)});
     };
@@ -4395,6 +4514,99 @@ test "ACP stream adapter forwards raw Markdown and suppresses rendered duplicate
 
     const failed_deps = agentRuntimeDeps(&failed_ctx);
     try failed_deps.push_text(failed_deps.ctx, .{ .assistant_source = "writer failure remains suppressed" });
+}
+
+test "native root presentation selects one lane and retains typed tool progress" {
+    const alloc = std.testing.allocator;
+    const Capture = struct {
+        frames: std.ArrayList([]u8) = .empty,
+        fail: bool = false,
+
+        fn write(raw: ?*anyopaque, frame: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.fail) return error.TestPublicationFailed;
+            const owned = try std.testing.allocator.dupe(u8, frame);
+            errdefer std.testing.allocator.free(owned);
+            try self.frames.append(std.testing.allocator, owned);
+        }
+    };
+    var capture: Capture = .{};
+    defer {
+        for (capture.frames.items) |frame| alloc.free(frame);
+        capture.frames.deinit(alloc);
+    }
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = jsonrpc.Writer.initCallback(&capture, Capture.write);
+    var ctx: AcpContext = .{ .alloc = alloc, .state = &state, .session_id = "session_1" };
+    defer ctx.deinitPublishedToolCalls();
+    try std.testing.expect(!agentRuntimeDeps(&ctx).render_assistant_text);
+    state.native_presentation = true;
+    try std.testing.expect(agentRuntimeDeps(&ctx).render_assistant_text);
+    try pushText(&ctx, .{ .assistant_source = "raw source must not be emitted" });
+    try pushText(&ctx, .{ .assistant_rendered = "rendered once" });
+    try pushSystemNotice(&ctx, "system notice once");
+    const id: types.ToolLifecycleId = .{ .turn_id = 9, .call_id = "shell-1" };
+    try pushToolLifecycle(&ctx, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "shell",
+        .activity_kind = .command,
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf live\"}",
+    } });
+    try pushEvent(&ctx, .{ .turn_phase_update = .{ .turn_id = 9, .step_id = 1, .phase = .running } });
+    try pushEvent(&ctx, .{ .turn_token_update = .{ .input_tokens = 12, .output_tokens = 4 } });
+    try onCommandOutputChunk(&ctx, id, .stdout, "live stdout");
+    try pushCommandOutputComplete(&ctx, id);
+    try pushToolLifecycle(&ctx, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "● Ran printf live" },
+        .result = "tool result",
+        .result_memory = .{ .preview = "native preview", .output_bytes = 12, .output_handle = "T1" },
+    } });
+    try ctx.sendToolCallCompletedWithCommandResult(id.call_id, "ACP duplicate must not be emitted", null);
+    try pushEvent(&ctx, .{ .append_user_feedback = try std.heap.c_allocator.dupe(u8, "permission feedback") });
+    try pushHttpError(&ctx, .bad_request, "native HTTP detail", null);
+    try finalizeTurn(&ctx, 9, .completed, null);
+    try publishSteeringReplay(&ctx, "user steer once", null, null);
+    try pushEvent(&ctx, .{ .session_grant = .{
+        .tool_name = try std.heap.c_allocator.dupe(u8, "private grant"),
+        .target_path = try std.heap.c_allocator.dupe(u8, "private target"),
+    } });
+    var native_count: usize = 0;
+    var user_count: usize = 0;
+    var retained_memory = false;
+    for (capture.frames.items) |frame| {
+        try std.testing.expect(std.mem.find(u8, frame, "raw source must not") == null);
+        try std.testing.expect(std.mem.find(u8, frame, "ACP duplicate must not") == null);
+        try std.testing.expect(std.mem.find(u8, frame, "private grant") == null);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, frame, .{});
+        defer parsed.deinit();
+        const object = parsed.value.object;
+        const method = object.get("method").?.string;
+        const params = object.get("params").?.object;
+        if (std.mem.eql(u8, method, "proto/native_presentation")) {
+            native_count += 1;
+            try std.testing.expectEqualStrings("session_1", params.get("session_id").?.string);
+            if (params.get("event")) |event| if (event.object.get("tool_lifecycle")) |lifecycle| if (lifecycle.object.get("terminal")) |terminal| {
+                const memory = terminal.object.get("result_memory").?.object;
+                try std.testing.expectEqualStrings("native preview", memory.get("preview").?.string);
+                try std.testing.expectEqualStrings("T1", memory.get("output_handle").?.string);
+                retained_memory = true;
+            };
+        } else {
+            try std.testing.expectEqualStrings("session/update", method);
+            try std.testing.expectEqualStrings("user_message_chunk", params.get("update").?.object.get("sessionUpdate").?.string);
+            user_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 11), native_count);
+    try std.testing.expectEqual(@as(usize, 1), user_count);
+    try std.testing.expect(retained_memory);
+    capture.fail = true;
+    // A consumed owned event never returns a delivery error to callers whose
+    // errdefer otherwise releases it again.
+    try pushEvent(&ctx, .{ .append_user_feedback = try std.heap.c_allocator.dupe(u8, "failed publication") });
 }
 
 test "ACP auth failure emits a valid detail-free JSON-RPC notification" {

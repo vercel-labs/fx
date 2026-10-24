@@ -237,7 +237,7 @@ pub const vercel_gateway_extended_time_header = "x-vercel-gateway-extended-time"
 pub const vercel_gateway_extended_time_value = "true";
 /// Identifies fx on every AI Gateway request; the zig std.http default
 /// (`zig/<version> (std.http)`) is never sent to the gateway.
-pub const user_agent = "fx/" ++ build_options.app_version;
+pub const user_agent = "proto-fx/" ++ build_options.app_version;
 var resolved_model_trace_emitted = std.atomic.Value(bool).init(false);
 var test_cancel_watcher_spawn_error: ?anyerror = null;
 
@@ -425,7 +425,7 @@ pub fn fetchGatewayJsonCancellable(
 /// hung endpoint cannot hold a background refresh or an ACP options request.
 const gateway_json_fetch_timeout_ms: i64 = 30_000;
 
-fn fetchGatewayJsonAtUrlCancellable(
+pub fn fetchGatewayJsonAtUrlCancellable(
     alloc: std.mem.Allocator,
     api_key: ?[]const u8,
     gateway_team: ?[]const u8,

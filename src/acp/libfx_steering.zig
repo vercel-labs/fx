@@ -333,6 +333,21 @@ pub const Runtime = struct {
         return false;
     }
 
+    /// Withdraws only an unplaced managed heartbeat, never the surrounding turn.
+    pub fn withdrawRequest(self: *Runtime, alloc: Allocator, request: i64) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.messages.items, 0..) |entry, index| {
+            const id = entry.request_id orelse continue;
+            if (id != .integer or id.integer != request) continue;
+            const removed = self.messages.orderedRemove(index);
+            self.queued_bytes -= removed.text.len;
+            freeEntry(alloc, removed);
+            return true;
+        }
+        return false;
+    }
+
     /// Queues text for the running turn. A supplied request ID is copied and
     /// reported by `finishTurn`.
     pub fn enqueueRequest(

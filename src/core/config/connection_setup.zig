@@ -1,0 +1,137 @@
+//! Configure a direct Chat Completions connection, discovering its model catalog
+//! when the user did not select a model. This runs on the setup command, not paint.
+const std = @import("std");
+const io_mod = @import("../shared/io.zig");
+const configured = @import("configured_provider.zig");
+const model_provider = @import("model_provider.zig");
+const settings_store = @import("settings_store.zig");
+const http = @import("../../gateway/client.zig");
+const Allocator = std.mem.Allocator;
+
+pub const usage = "proto-fx setup --base-url URL [--model MODEL] [--api-key-env NAME] [--name NAME]";
+
+/// Returned summary is caller-owned. The settings transaction preserves all
+/// unrelated profile fields and stores only the key's environment-variable name.
+pub fn run(alloc: Allocator, args: []const [:0]const u8) ![]u8 {
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var base: ?[]const u8 = io_mod.getenv("PROTO_FX_BASE_URL");
+    var selected: ?[]const u8 = null;
+    var key_env: ?[]const u8 = null;
+    var name: []const u8 = "local";
+    var index: usize = 0;
+    while (index < args.len) : (index += 2) {
+        if (index + 1 >= args.len) return error.InvalidSetupArguments;
+        const option = args[index];
+        const value = args[index + 1];
+        if (std.mem.eql(u8, option, "--base-url")) {
+            base = value;
+        } else if (std.mem.eql(u8, option, "--model")) {
+            selected = value;
+        } else if (std.mem.eql(u8, option, "--api-key-env")) {
+            key_env = value;
+        } else if (std.mem.eql(u8, option, "--name")) {
+            name = value;
+        } else return error.InvalidSetupArguments;
+    }
+    const raw_base = base orelse return error.BaseUrlRequired;
+    try configured.validate_id(name);
+    var prefix = std.mem.trimEnd(u8, raw_base, "/");
+    var definition: std.json.Value = .{ .object = .empty };
+    try definition.object.put(a, "protocol", .{ .string = "openai-chat-completions" });
+    try definition.object.put(a, "base_url", .{ .string = prefix });
+    var auth: std.json.Value = .{ .object = .empty };
+    try auth.object.put(a, "type", .{ .string = if (key_env != null) "bearer" else "none" });
+    if (key_env) |env| try auth.object.put(a, "env", .{ .string = env });
+    try definition.object.put(a, "auth", auth);
+    var providers: std.json.Value = .{ .object = .empty };
+    try providers.object.put(a, name, definition);
+    // Validate the URL and credential slot before contacting anything.
+    var checked = try configured.Registry.parse(a, providers);
+    checked.deinit(a);
+    const bearer: ?[]const u8 = if (key_env) |env| io_mod.getenv(env) orelse return error.ApiKeyEnvironmentMissing else null;
+    var metadata: std.json.Value = .{ .object = .empty };
+    var discovered: usize = 0;
+    if (selected == null) {
+        const candidates: []const []const u8 = if (std.mem.endsWith(u8, prefix, "/v1"))
+            &.{prefix}
+        else
+            &.{ try a.print("{s}/v1", .{prefix}), prefix };
+        var found = false;
+        var last_error: anyerror = error.ModelDiscoveryFailed;
+        for (candidates) |candidate| {
+            const url = try a.print("{s}/models", .{candidate});
+            var cancel = std.atomic.Value(bool).init(false);
+            const response = http.fetchGatewayJsonAtUrlCancellable(a, bearer, null, url, &cancel, 10_000) catch |err| {
+                last_error = err;
+                continue;
+            };
+            const body = switch (response) {
+                .success => |bytes| bytes,
+                .http_status => |status| {
+                    last_error = if (status == .unauthorized or status == .forbidden) error.ModelDiscoveryUnauthorized else error.ModelDiscoveryFailed;
+                    continue;
+                },
+            };
+            const catalog = std.json.parseFromSliceLeaky(std.json.Value, a, body, .{ .allocate = .alloc_always }) catch {
+                last_error = error.InvalidModelCatalog;
+                continue;
+            };
+            if (catalog != .object) continue;
+            const data = catalog.object.get("data") orelse continue;
+            if (data != .array) continue;
+            for (data.array.items) |item| {
+                if (metadata.object.count() >= 256) break;
+                if (item != .object) continue;
+                const id = item.object.get("id") orelse continue;
+                if (id != .string or id.string.len == 0 or id.string.len > configured.max_model_bytes) continue;
+                var details: std.json.Value = .{ .object = .empty };
+                // Explicit server capabilities win. A coding endpoint is expected
+                // to support tools; unsupported responses still surface normally.
+                try details.object.put(a, "supports_tool_use", .{ .bool = true });
+                inline for (&.{ "context_window", "max_output_tokens" }) |field| {
+                    if (item.object.get(field)) |value| {
+                        if (value == .integer and value.integer > 0 and value.integer <= std.math.maxInt(u32)) try details.object.put(a, field, value);
+                    }
+                }
+                inline for (&.{ "supports_tool_use", "supports_vision" }) |field| {
+                    if (item.object.get(field)) |value| if (value == .bool) try details.object.put(a, field, value);
+                }
+                try metadata.object.put(a, id.string, details);
+                if (selected == null) selected = id.string;
+            }
+            if (metadata.object.count() == 0) {
+                last_error = error.NoModelsDiscovered;
+                continue;
+            }
+            prefix = candidate;
+            discovered = metadata.object.count();
+            found = true;
+            break;
+        }
+        if (!found) return last_error;
+    } else {
+        // An explicit model permits offline setup, without guessing capabilities.
+        try metadata.object.put(a, selected.?, .{ .object = .empty });
+    }
+    const model = selected orelse return error.NoModelsDiscovered;
+    try settings_store.validateModel(model);
+    try definition.object.put(a, "base_url", .{ .string = prefix });
+    try definition.object.put(a, "model_metadata", metadata);
+    try providers.object.put(a, name, definition);
+    var json: std.Io.Writer.Allocating = .init(a);
+    try std.json.Stringify.value(providers, .{}, &json.writer);
+    const home = io_mod.homeDir() orelse return error.HomeUnavailable;
+    var store = try settings_store.Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+    const provider = model_provider.parse(name) orelse return error.InvalidProviderId;
+    var outcome = try store.applyUserPatch(alloc, .{
+        .connections_json = json.written(),
+        .provider = provider,
+        .model_preference = .{ .provider = provider, .model = model },
+        .clear_credential_source = true,
+    });
+    defer outcome.deinit(alloc);
+    return alloc.print("Connected {s}: {s}\nModel: {s}\nDiscovered {d} models. Run proto-fx to begin.\n", .{ name, prefix, model, discovered });
+}

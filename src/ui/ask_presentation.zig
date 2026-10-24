@@ -84,7 +84,7 @@ pub const Runtime = struct {
         try self.writeTerminalBytes(prepare_terminal_sequence);
         try self.shell.initViewport(&self.metrics, start.row);
 
-        const welcome = try ui_render.welcomeMessage(alloc);
+        const welcome = try ui_render.welcomeMessage(alloc, self.shell.layout.cols);
         defer alloc.free(welcome);
         try self.shell.writeTranscriptClassified(
             alloc,

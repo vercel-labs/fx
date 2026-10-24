@@ -2137,7 +2137,7 @@ test "file approval transcript uses the current rail presentation" {
 test "file approval top-aligns a fitting welcome document and clears below" {
     const alloc = std.testing.allocator;
     var screen_state = interaction_state.ApprovalScreenState{};
-    const welcome = try ui_render.welcomeMessage(alloc);
+    const welcome = try alloc.dupe(u8, "proto-fx · Run /help for commands\n\n");
     var entries = [_]transcript_blocks.TranscriptEntry{
         .{ .raw_bytes = .{
             .id = 1,

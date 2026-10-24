@@ -11,6 +11,7 @@ const cli_replay = @import("cli_replay.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const connection_setup = @import("../config/connection_setup.zig");
 const credentials = @import("../auth/credentials.zig");
 const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -61,6 +62,7 @@ const CommandCatalog = command_specs.TopLevelRegistry;
 const TopLevelKind = command_specs.TopLevelKind;
 
 pub const Command = union(enum) {
+    daemon: []const [:0]const u8,
     interactive,
     help,
     ask: []const [:0]const u8,
@@ -204,7 +206,7 @@ pub const RunResult = union(enum) {
     handled_exit: u8,
 };
 
-const version_usage = "usage: fx --version\n";
+const version_usage = "usage: proto-fx --version\n";
 
 pub const Config = struct {
     version: []const u8 = "",
@@ -574,6 +576,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
             if (command_specs.matchesTopLevel(command_catalog, command, .credits)) return .{ .credits = args[1..] };
         },
         'd' => {
+            if (command_specs.matchesTopLevel(command_catalog, command, .daemon)) return .{ .daemon = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .doctor)) return .{ .doctor = args[1..] };
         },
         'i' => {
@@ -776,7 +779,7 @@ fn writeProviderActivationError(
 ) !void {
     const message = try alloc.print(
         "{s}: {s}\n",
-        .{ if (caller == .provider_login) "fx login" else "fx provider", detail },
+        .{ if (caller == .provider_login) "proto-fx login" else "proto-fx provider", detail },
     );
     defer alloc.free(message);
     try writeStderr(deps, message);
@@ -830,9 +833,9 @@ fn writeProviderLoginFailure(alloc: Allocator, deps: RunDeps, provider: model_pr
         return;
     }
     try writeProviderActivationError(alloc, deps, caller, switch (err) {
-        error.ClientIdMissing => "missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first",
+        error.ClientIdMissing => "missing FX_OAUTH_CLIENT_ID; configure the proto-fx Vercel App client id first",
         error.AccessDenied, error.ChatGptAuthorizationFailed, error.GrokAuthorizationFailed => "authorization denied",
-        error.ExpiredToken, error.LoginTimedOut, error.ChatGptLoginTimedOut, error.GrokLoginTimedOut => "authorization expired; run fx login again",
+        error.ExpiredToken, error.LoginTimedOut, error.ChatGptLoginTimedOut, error.GrokLoginTimedOut => "authorization expired; run proto-fx login again",
         else => "failed to sign in",
     });
 }
@@ -1030,11 +1033,11 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         var writer: std.Io.Writer.Allocating = .init(alloc);
         defer writer.deinit();
         if (globalLaunchErrorMessage(err)) |message| {
-            try writer.writer.print("fx: {s}\n", .{message});
+            try writer.writer.print("proto-fx: {s}\n", .{message});
         } else {
-            try writer.writer.print("fx: invalid global launch option: {s}\n", .{@errorName(err)});
+            try writer.writer.print("proto-fx: invalid global launch option: {s}\n", .{@errorName(err)});
         }
-        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] <command>\n");
+        try writer.writer.writeAll("usage: proto-fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] <command>\n");
         try writeStderr(deps, writer.written());
         return .handled_failure;
     };
@@ -1108,7 +1111,7 @@ fn runNonInteractiveWithDeps(
         },
         .acp => |rest| {
             const acp_opts = parseAcpArgs(rest) catch {
-                try writeStderr(deps, "usage: fx acp [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]\n");
+                try writeStderr(deps, "usage: proto-fx acp [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]\n");
                 return .handled_failure;
             };
             try cfg.acp_runner.run(alloc, .{
@@ -1146,9 +1149,13 @@ fn runNonInteractiveWithDeps(
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx login [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: proto-fx login [codex|grok]\nFor a direct endpoint, use proto-fx setup --base-url URL.\n");
                 return .handled_failure;
             };
+            if (maybe_login_provider == null or maybe_login_provider.? == .gateway) {
+                try writeStdout(deps, "No gateway login is required. Use proto-fx setup --base-url URL to discover and configure your endpoint.\n");
+                return .handled_success;
+            }
             if (cfg.auth_mode == .host_managed) {
                 try writeHostManagedAuthResult(deps);
                 return .handled_success;
@@ -1177,18 +1184,22 @@ fn runNonInteractiveWithDeps(
         },
         .logout => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx logout [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: proto-fx logout [vercel|codex|grok]\n");
                 return .handled_failure;
             };
             if (cfg.auth_mode == .host_managed) {
                 try writeHostManagedAuthResult(deps);
                 return .handled_success;
             }
+            if (maybe_login_provider == null or maybe_login_provider.? == .gateway) {
+                try writeStdout(deps, "No gateway login is used by proto-fx. Direct credentials remain in their configured environment variables.\n");
+                return .handled_success;
+            }
             // Preserve the original `fx logout` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
             if (login_provider == .codex) {
                 const outcome = chatgpt_oauth.logout() catch {
-                    try writeStderr(deps, "fx logout: failed to durably remove saved Codex login\n");
+                    try writeStderr(deps, "proto-fx logout: failed to durably remove saved Codex login\n");
                     return .handled_failure;
                 };
                 return switch (outcome) {
@@ -1201,18 +1212,18 @@ fn runNonInteractiveWithDeps(
                         break :result .handled_success;
                     },
                     .deleted_not_durable => result: {
-                        try writeStderr(deps, "fx logout: failed to durably remove saved Codex login\n");
+                        try writeStderr(deps, "proto-fx logout: failed to durably remove saved Codex login\n");
                         break :result .handled_failure;
                     },
                 };
             }
             if (login_provider == .grok) {
                 const outcome = grok_oauth.logout(alloc, cfg.gateway_provider.oauth_transport) catch {
-                    try writeStderr(deps, "fx logout: failed to durably remove saved Grok login\n");
+                    try writeStderr(deps, "proto-fx logout: failed to durably remove saved Grok login\n");
                     return .handled_failure;
                 };
                 if (outcome.revocation_failed) {
-                    try writeStderr(deps, "fx logout: local Grok session removed, but remote revocation could not be confirmed\n");
+                    try writeStderr(deps, "proto-fx logout: local Grok session removed, but remote revocation could not be confirmed\n");
                 }
                 return switch (outcome.deletion) {
                     .deleted => result: {
@@ -1224,14 +1235,14 @@ fn runNonInteractiveWithDeps(
                         break :result .handled_success;
                     },
                     .deleted_not_durable => result: {
-                        try writeStderr(deps, "fx logout: failed to durably remove saved Grok login\n");
+                        try writeStderr(deps, "proto-fx logout: failed to durably remove saved Grok login\n");
                         break :result .handled_failure;
                     },
                 };
             }
             const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
                 error.SessionDeleteFailed => {
-                    try writeStderr(deps, "fx logout: failed to durably remove saved fx login\n");
+                    try writeStderr(deps, "proto-fx logout: failed to durably remove saved proto-fx login\n");
                     return .handled_failure;
                 },
             };
@@ -1249,17 +1260,17 @@ fn runNonInteractiveWithDeps(
                             "logout credential preference clear failed err={s}",
                             .{@errorName(failure.err)},
                         );
-                        try writeStderr(deps, "fx logout: signed out, but failed to clear the saved fx login selection\n");
+                        try writeStderr(deps, "proto-fx logout: signed out, but failed to clear the saved proto-fx login selection\n");
                         return .handled_failure;
                     },
                 }
             }
             if (result.local_durability_failed) {
-                try writeStderr(deps, "fx logout: failed to durably remove saved fx login\n");
+                try writeStderr(deps, "proto-fx logout: failed to durably remove saved proto-fx login\n");
             } else {
                 try writeStdout(
                     deps,
-                    if (result.session_deleted) "Signed out of fx.\n" else "No fx login session found.\n",
+                    if (result.session_deleted) "Signed out of fx.\n" else "No proto-fx login session found.\n",
                 );
             }
             if (result.remote_revocation_failed) {
@@ -1268,70 +1279,60 @@ fn runNonInteractiveWithDeps(
             }
             return if (result.local_durability_failed) .handled_failure else .handled_success;
         },
-        .teams => |rest| {
-            if (rest.len != 0) {
-                try writeStderr(deps, "usage: fx teams\n");
-                return .handled_failure;
-            }
-            if (cfg.auth_mode == .host_managed) {
-                try writeHostManagedAuthResult(deps);
-                return .handled_success;
-            }
-            var validation_context = CliTeamValidationContext{ .alloc = alloc, .cfg = &cfg };
-            login_flow.runTeams(
-                alloc,
-                cfg.gateway_provider.oauth_transport,
-                .{
-                    .context = &validation_context,
-                    .validate_fn = validateCliTeamCredential,
-                },
-            ) catch |err| {
-                const message = switch (err) {
-                    error.NoSession => "fx teams: run fx login first\n",
-                    error.SessionChanged => "fx teams: authentication changed; try again\n",
-                    error.TeamRequestFailed => "fx teams: failed to list Vercel teams\n",
-                    error.InvalidTeamSelection => "fx teams: no team selected\n",
-                    error.AccessDenied => "fx teams: authorization denied\n",
-                    error.TeamValidationFailed => "fx teams: selected team could not access AI Gateway\n",
-                    else => "fx teams: failed to switch team\n",
-                };
-                try writeStderr(deps, message);
-                return .handled_failure;
-            };
-            if (!try activateProviderSelection(
-                alloc,
-                cfg,
-                deps,
-                .gateway,
-                .provider_login,
-                .fx_login,
-            )) return .handled_failure;
+        .teams => {
+            try writeStdout(deps, "Direct endpoints do not use gateway teams. Use proto-fx setup --base-url URL.\n");
             return .handled_success;
         },
         .provider => |rest| {
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: fx provider <name>\n");
+                try writeStderr(deps, "usage: proto-fx provider <name>\n");
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected gateway, codex, grok, or a configured name\n");
+                try writeStderr(deps, "proto-fx provider: expected gateway, codex, grok, or a configured name\n");
                 return .handled_failure;
             };
+            if (target == .gateway) {
+                try writeStderr(deps, "Gateway is disabled. Use proto-fx setup --base-url URL.\n");
+                return .handled_failure;
+            }
             return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command, null))
                 .handled_success
             else
                 .handled_failure;
         },
-        .setup => |rest| {
-            if (rest.len != 0) {
-                try writeTopLevelUsage(cfg.command_catalog, deps, .setup);
+        .daemon => |rest| {
+            if (rest.len > 1 or (rest.len == 1 and !std.mem.eql(u8, rest[0], "status") and !std.mem.eql(u8, rest[0], "stop"))) {
+                try writeStderr(deps, "usage: proto-fx daemon [status|stop]\n");
                 return .handled_failure;
             }
-            if (cfg.auth_mode == .host_managed) {
-                try writeHostManagedAuthResult(deps);
-                return .handled_success;
-            }
-            return if (try runPasteSetup(alloc, cfg.secret_store, deps)) .handled_success else .handled_failure;
+            var client = try @import("../supervisor/client.zig").Client.init(alloc);
+            defer client.deinit();
+            const stop = rest.len == 1 and std.mem.eql(u8, rest[0], "stop");
+            var response = client.request(alloc, .{ .command = if (stop) "shutdown" else "list" }) catch |err| {
+                const message = try alloc.print("proto-fx daemon: {s} (no answering supervisor)\n", .{@errorName(err)});
+                defer alloc.free(message);
+                try writeStderr(deps, message);
+                return .handled_failure;
+            };
+            defer response.deinit();
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            try std.json.Stringify.value(response.value, .{ .whitespace = .indent_2 }, &out.writer);
+            try writeStdout(deps, out.written());
+            try writeStdout(deps, "\n");
+            return .handled_success;
+        },
+        .setup => |rest| {
+            const summary = connection_setup.run(alloc, rest) catch |err| {
+                const message = try alloc.print("proto-fx setup: {s}\nUsage: {s}\n", .{ @errorName(err), connection_setup.usage });
+                defer alloc.free(message);
+                try writeStderr(deps, message);
+                return .handled_failure;
+            };
+            defer alloc.free(summary);
+            try writeStdout(deps, summary);
+            return .handled_success;
         },
         .status => |rest| {
             const opts = parseLocalSurfaceArgs(rest) catch |err| {
@@ -1458,10 +1459,10 @@ fn runNonInteractiveWithDeps(
             available_providers.definitions = startup.configured_providers.definitions;
             const catalog_provider = available_providers.select(startup.provider).cli_model_catalog orelse {
                 try writeStderr(deps, switch (startup.provider) {
-                    .gateway => "fx models: Gateway model catalog is unavailable\n",
-                    .codex => "fx models: Codex model catalog is unavailable\n",
-                    .grok => "fx models: Grok model catalog is unavailable\n",
-                    .configured => "fx models: Configured model catalog is unavailable\n",
+                    .gateway => "proto-fx models: Gateway model catalog is unavailable\n",
+                    .codex => "proto-fx models: Codex model catalog is unavailable\n",
+                    .grok => "proto-fx models: Grok model catalog is unavailable\n",
+                    .configured => "proto-fx models: Configured model catalog is unavailable\n",
                 });
                 return .handled_failure;
             };
@@ -1486,7 +1487,7 @@ fn runNonInteractiveWithDeps(
                             message,
                         );
                     } else {
-                        try writeStderr(deps, "fx models: ");
+                        try writeStderr(deps, "proto-fx models: ");
                         try writeStderr(deps, message);
                         try writeStderr(deps, "\n");
                     }
@@ -1653,172 +1654,24 @@ fn runNonInteractiveWithDeps(
                 },
             }
         },
-        .credits => |rest| {
-            const opts = parseLocalSurfaceArgs(rest) catch |err| {
-                try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .credits, "credits", err, rest);
-                return .handled_failure;
-            };
-            var startup = if (cfg.auth_mode == .host_managed)
-                try deps.load_startup_state_with_auth_mode(
-                    alloc,
-                    cfg.gateway_provider.oauth_transport,
-                    cfg.secret_store,
-                    cfg.default_model,
-                    cfg.default_agent_step_limit,
-                    cfg.auth_mode,
-                )
-            else
-                try deps.load_startup_state(
-                    alloc,
-                    cfg.gateway_provider.oauth_transport,
-                    cfg.secret_store,
-                    cfg.default_model,
-                    cfg.default_agent_step_limit,
-                );
-            defer startup.deinit(alloc);
-            try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
-
-            const credits = cfg.provider_set.select(startup.provider).credits orelse
-                gateway_provider.unavailable_credits_provider;
-            var snapshot = credits.fetch(alloc, .{
-                .credential = startup.apiKey(),
-                .credential_source = if (startup.auth_mode == .host_managed)
-                    .host_managed
-                else if (startup.credential) |credential|
-                    credential.source
-                else
-                    null,
-                .tenant = startup.gatewayTeam(),
-            });
-            defer snapshot.deinit(alloc);
-            const text = try snapshot.render(alloc, opts.format);
-            defer alloc.free(text);
-            if (snapshot.err_message != null) {
-                if (opts.format == .json) {
-                    try writeFormattedOutput(deps, text, opts.format);
-                } else {
-                    try writeStderr(deps, text);
-                }
-                return .handled_failure;
-            }
-            try writeFormattedOutput(deps, text, opts.format);
+        .credits => {
+            try writeStdout(deps, "Billing is managed by your configured endpoint.\n");
             return .handled_success;
         },
-        .usage => |rest| {
-            const opts = parseUsageArgs(rest) catch |err| {
-                try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .usage, "usage", err, rest);
-                return .handled_failure;
-            };
-            // A relative $HOME counts as unset, as everywhere else in fx.
-            const home = deps.getenv(deps.env_ctx, "HOME") orelse "";
-            if (!std.Io.Dir.path.isAbsolute(home)) {
-                try writeUsageCommandFailure(alloc, deps, error.HomeNotSet, opts.format);
-                return .handled_failure;
-            }
-            var startup = (if (cfg.auth_mode == .host_managed)
-                deps.load_startup_state_with_auth_mode(
-                    alloc,
-                    cfg.gateway_provider.oauth_transport,
-                    cfg.secret_store,
-                    cfg.default_model,
-                    cfg.default_agent_step_limit,
-                    cfg.auth_mode,
-                )
-            else
-                deps.load_startup_state(
-                    alloc,
-                    cfg.gateway_provider.oauth_transport,
-                    cfg.secret_store,
-                    cfg.default_model,
-                    cfg.default_agent_step_limit,
-                )) catch |err| {
-                try writeUsageCommandFailure(alloc, deps, err, opts.format);
-                return .handled_failure;
-            };
-            defer startup.deinit(alloc);
-
-            var dashboard = usage.Dashboard.init(alloc, usage_host.host(home));
-            defer dashboard.deinit();
-            var label_buf: usage_host.LabelBuffer = undefined;
-            if (startup.credential) |c| {
-                if (usage_host.fromCredential(c, &label_buf)) |credential| {
-                    dashboard.open(credential);
-                } else {
-                    dashboard.openUnavailable(.unsupported_provider);
-                }
-            } else {
-                dashboard.openUnavailable(.no_gateway_sign_in);
-            }
-            dashboard.waitForFetch();
-            var snapshot = try dashboard.snapshot(alloc);
-            defer snapshot.deinit();
-            const text = try (output_contracts.UsageSnapshot{ .snapshot = &snapshot, .period = opts.period }).render(alloc, opts.format);
-            defer alloc.free(text);
-            try writeFormattedOutput(deps, text, opts.format);
-            return if (snapshot.status == .ready) .handled_success else .handled_failure;
+        .usage => {
+            try writeStdout(deps, "Usage and billing are managed by your configured endpoint.\n");
+            return .handled_success;
         },
-        .upgrade => |rest| {
-            const upgrade_runtime = @import("../upgrade/upgrade_runtime.zig");
-            const opts = parseUpgradeArgs(rest) catch |err| {
-                try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .upgrade, "upgrade", err, rest);
-                return .handled_failure;
-            };
-
-            var startup = deps.load_startup_state_without_credentials(
-                alloc,
-                cfg.default_model,
-                cfg.default_agent_step_limit,
-            ) catch |err| {
-                if (opts.format == .json) {
-                    try writeJsonCommandFailure(alloc, deps, "upgrade", err, "failed to load update settings");
-                } else {
-                    try writeStderr(deps, "fx upgrade: failed to load update settings\n");
-                }
-                return .handled_failure;
-            };
-            defer startup.deinit(alloc);
-            try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
-
-            const channel = opts.channel orelse startup.update_channel;
-            if (opts.channel) |selected| {
-                var outcome = config_runtime.setUserPreferences(alloc, .{ .update_channel = selected }) catch |err| {
-                    if (opts.format == .json) {
-                        try writeJsonCommandFailure(alloc, deps, "upgrade", err, "failed to save update channel");
-                    } else {
-                        try writeStderr(deps, "fx upgrade: failed to save update channel\n");
-                    }
-                    return .handled_failure;
-                };
-                defer outcome.deinit(alloc);
-            }
-
-            var result = upgrade_runtime.run(alloc, .{
-                .channel = cfg.build_channel,
-                .version = cfg.version,
-                .revision = cfg.revision,
-            }, channel, switch (opts.format) {
-                .text => .text,
-                .json => .json,
-            });
-            defer result.deinit(alloc);
-            const text = result.snapshot.render(alloc, switch (opts.format) {
-                .text => .text,
-                .json => .json,
-            }) catch {
-                try writeStderr(deps, "fx upgrade: render failed\n");
-                return .handled_failure;
-            };
-            defer alloc.free(text);
-            try writeStdout(deps, text);
-            if (opts.format == .json) try writeStdout(deps, "\n");
-            return if (result.snapshot.status == .failed) .handled_failure else .handled_success;
+        .upgrade => {
+            try writeStdout(deps, "Upstream binary upgrades are disabled for this fork. Rebuild proto-fx from your checkout.\n");
+            return .handled_success;
         },
         .replay => |rest| {
             const exit_code = try cli_replay.run(alloc, rest);
             return if (exit_code == 0) .handled_success else .handled_failure;
         },
         .unknown => |command| {
-            try writeStderr(deps, "fx: unknown subcommand: ");
+            try writeStderr(deps, "proto-fx: unknown subcommand: ");
             try writeStderr(deps, command);
             try writeStderr(deps, "\n\n");
             try writeTopLevelHelp(alloc, cfg.command_catalog, deps, cfg.version, .stderr);
@@ -1863,7 +1716,7 @@ fn runGithubWorkflow(
     const prompt = switch (workflow) {
         .pull_request => github_workflows.buildPrompt(alloc, workflow, workflowLanguagePlaceholder(), opts.context) catch |err| switch (err) {
             error.NotGitRepository => {
-                try writeStderr(deps, "fx pr: requires running inside a git repository\n");
+                try writeStderr(deps, "proto-fx pr: requires running inside a git repository\n");
                 return .handled_failure;
             },
             else => return err,
@@ -1884,8 +1737,8 @@ fn runGithubWorkflow(
 
     const draft = draftFromRun(alloc, run_result) catch {
         try writeStderr(deps, switch (workflow) {
-            .pull_request => "fx pr: failed to parse drafted PR title/body\n",
-            .issue => "fx issue: failed to parse drafted issue title/body\n",
+            .pull_request => "proto-fx pr: failed to parse drafted PR title/body\n",
+            .issue => "proto-fx issue: failed to parse drafted issue title/body\n",
         });
         return .handled_failure;
     };
@@ -1898,8 +1751,8 @@ fn runGithubWorkflow(
     defer published.deinit(alloc);
     if (!published.ok) {
         try writeStderr(deps, switch (workflow) {
-            .pull_request => "fx pr: ",
-            .issue => "fx issue: ",
+            .pull_request => "proto-fx pr: ",
+            .issue => "proto-fx issue: ",
         });
         try writeStderr(deps, published.text);
         try writeStderr(deps, "\n");
@@ -1930,11 +1783,11 @@ fn runPasteSetup(
     deps: RunDeps,
 ) !bool {
     if (secret_store.isDisabled()) {
-        try writeStderr(deps, "fx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n");
+        try writeStderr(deps, "proto-fx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n");
         return false;
     }
     if (!deps.setup_terminal_available(deps.setup_ctx)) {
-        try writeStderr(deps, "fx setup: an interactive terminal is required to paste an API key\n");
+        try writeStderr(deps, "proto-fx setup: an interactive terminal is required to paste an API key\n");
         return false;
     }
 
@@ -1956,7 +1809,7 @@ fn runPasteSetup(
         defer secret.zeroAndFree(alloc, key);
         try writeStderr(deps, "\n");
         secret_store.store(alloc, key) catch {
-            try writeStderr(deps, "fx setup: API key was not saved\n");
+            try writeStderr(deps, "proto-fx setup: API key was not saved\n");
             return false;
         };
     }
@@ -2077,7 +1930,7 @@ fn writeConfigDiagnostics(
         var notice_writer: std.Io.Writer.Allocating = .init(alloc);
         defer notice_writer.deinit();
         try notice_writer.writer.print(
-            "fx: config {s}: {s}",
+            "proto-fx: config {s}: {s}",
             .{ @tagName(diagnostic.layer), @tagName(diagnostic.cause) },
         );
         try config_runtime.writeDiagnosticMetadata(&notice_writer.writer, diagnostic);
@@ -2228,7 +2081,7 @@ fn environMapDefault(_: ?*anyopaque) ?*const std.process.Environ.Map {
 }
 
 fn writeTopLevelUsage(command_catalog: CommandCatalog, deps: RunDeps, kind: TopLevelKind) !void {
-    try writeStderr(deps, "usage: fx ");
+    try writeStderr(deps, "usage: proto-fx ");
     try writeStderr(deps, command_specs.topLevelUsage(command_catalog, kind));
     try writeStderr(deps, "\n");
 }
@@ -2255,7 +2108,7 @@ fn runTopLevelMcp(
 /// `fx mcp`: the verbs `/mcp` shares.
 fn runMcpVerbs(alloc: Allocator, rest: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
     const home = deps.getenv(deps.env_ctx, "HOME") orelse {
-        try writeStderr(deps, "fx mcp: HOME isn't set\n");
+        try writeStderr(deps, "proto-fx mcp: HOME isn't set\n");
         return .handled_failure;
     };
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
@@ -2384,7 +2237,7 @@ fn writeMcpProfileWarning(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.print(
-        "fx: ~/.fx/mcp.json warning: {s}",
+        "proto-fx: ~/.proto-fx/mcp.json warning: {s}",
         .{@tagName(warning.cause)},
     );
     if (warning.key()) |key| {
@@ -2431,7 +2284,7 @@ fn writeUsageCommandFailure(
             message,
         );
     }
-    try writeStderr(deps, "fx usage: ");
+    try writeStderr(deps, "proto-fx usage: ");
     try writeStderr(deps, message);
     try writeStderr(deps, "\n");
 }
@@ -2441,8 +2294,8 @@ fn usageFailureMessage(err: anyerror) []const u8 {
         error.HomeNotSet => "HOME is not set",
         error.DurablePathUnsafe,
         error.PrivateStatePermissionsUnsupported,
-        => "the ~/.fx folder is unsafe",
-        else => "couldn't load the fx profile",
+        => "the ~/.proto-fx folder is unsafe",
+        else => "couldn't load the proto-fx profile",
     };
 }
 
@@ -2455,7 +2308,7 @@ fn writeWorkspaceCommandError(
 ) !void {
     if (!argsContainJson(args)) {
         if (output_contracts.workspaceErrorMessage(err)) |message| {
-            try writeStderr(deps, "fx workspace: ");
+            try writeStderr(deps, "proto-fx workspace: ");
             try writeStderr(deps, message);
             try writeStderr(deps, "\n");
             return;
@@ -2487,7 +2340,7 @@ fn writeWorkspaceIndeterminateError(
         .unconfirmed => "settings durability is uncertain; reloaded settings match neither the requested nor previous state",
     };
     if (!argsContainJson(args)) {
-        try writeStderr(deps, "fx workspace: ");
+        try writeStderr(deps, "proto-fx workspace: ");
         try writeStderr(deps, message);
         try writeStderr(deps, "\n");
         return;
@@ -2870,58 +2723,58 @@ fn writeLookupFailure(
 
     switch (err) {
         error.NoSavedSessions => {
-            try writeStderr(deps, "fx session: no saved sessions for this workspace\n");
+            try writeStderr(deps, "proto-fx session: no saved sessions for this workspace\n");
         },
         error.NoReadableSessions => {
-            try writeStderr(deps, "fx session: saved sessions are unreadable; run `fx doctor` for recovery guidance\n");
+            try writeStderr(deps, "proto-fx session: saved sessions are unreadable; run `proto-fx doctor` for recovery guidance\n");
         },
         error.SessionNotFound => {
-            try writeStderr(deps, "fx session: record not found\n");
+            try writeStderr(deps, "proto-fx session: record not found\n");
         },
         error.InvalidSessionFormat => {
             try writeStderr(
                 deps,
-                "fx session: record is corrupt; run `fx doctor` for recovery guidance\n",
+                "proto-fx session: record is corrupt; run `proto-fx doctor` for recovery guidance\n",
             );
         },
         error.UnsupportedSessionSchema => {
             try writeStderr(
                 deps,
-                "fx session: record uses an unsupported session version\n",
+                "proto-fx session: record uses an unsupported session version\n",
             );
         },
         error.InvalidSessionId => {
-            try writeStderr(deps, "fx session: invalid session id\n");
+            try writeStderr(deps, "proto-fx session: invalid session id\n");
         },
         error.SessionRecoveryNotNeeded => {
             try writeStderr(
                 deps,
-                "fx session: recovery was refused because the session has a valid commit boundary; resume it normally\n",
+                "proto-fx session: recovery was refused because the session has a valid commit boundary; resume it normally\n",
             );
         },
         error.SessionRecoveryBoundaryInvalid => {
             try writeStderr(
                 deps,
-                "fx session: no exact trustworthy recovery boundary was found; the source was left unchanged\n",
+                "proto-fx session: no exact trustworthy recovery boundary was found; the source was left unchanged\n",
             );
         },
         error.SessionBusy => {
             try writeStderr(
                 deps,
-                "fx session: session is busy or the filesystem cannot provide the required lock\n",
+                "proto-fx session: session is busy or the filesystem cannot provide the required lock\n",
             );
         },
         error.DurablePathUnsafe => {
             try writeStderr(
                 deps,
-                "fx session: durable session storage is unsafe or does not support required private permissions\n",
+                "proto-fx session: durable session storage is unsafe or does not support required private permissions\n",
             );
         },
         error.SessionStoreUnavailable => {
-            try writeStderr(deps, "fx session: durable session store is unavailable\n");
+            try writeStderr(deps, "proto-fx session: durable session store is unavailable\n");
         },
         error.HomeNotSet => {
-            try writeStderr(deps, "fx ");
+            try writeStderr(deps, "proto-fx ");
             try writeStderr(deps, kind);
             try writeStderr(deps, ": HOME is not set\n");
         },
@@ -2941,10 +2794,10 @@ fn writeSessionDetailFailure(
 ) !void {
     const message = switch (err) {
         error.InvalidSessionFormat => if (reason.len > 0) try alloc.print(
-            "session {s} can't be read: {s}; run `fx doctor`",
+            "session {s} can't be read: {s}; run `proto-fx doctor`",
             .{ session_id, reason },
         ) else try alloc.print(
-            "session {s} is corrupt; run `fx session recover {s}`",
+            "session {s} is corrupt; run `proto-fx session recover {s}`",
             .{ session_id, session_id },
         ),
         error.UnsupportedSessionSchema => try alloc.print(
@@ -2969,7 +2822,7 @@ fn writeSessionDetailFailure(
             message,
         );
     }
-    try writeStderr(deps, "fx session: ");
+    try writeStderr(deps, "proto-fx session: ");
     try writeStderr(deps, message);
     try writeStderr(deps, "\n");
 }
@@ -2991,9 +2844,9 @@ fn commandFailureMessage(err: anyerror) ?[]const u8 {
 fn lookupFailureMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.NoSavedSessions => "no saved sessions for this workspace",
-        error.NoReadableSessions => "saved sessions are unreadable; run `fx doctor` for recovery guidance",
+        error.NoReadableSessions => "saved sessions are unreadable; run `proto-fx doctor` for recovery guidance",
         error.SessionNotFound => "record not found",
-        error.InvalidSessionFormat => "record is corrupt; run `fx doctor` for recovery guidance",
+        error.InvalidSessionFormat => "record is corrupt; run `proto-fx doctor` for recovery guidance",
         error.UnsupportedSessionSchema => "record uses an unsupported session version",
         error.InvalidSessionId => "invalid session id",
         error.SessionRecoveryNotNeeded => "recovery was refused because the session has a valid commit boundary; resume it normally",
@@ -3009,19 +2862,19 @@ fn lookupFailureMessage(err: anyerror) ?[]const u8 {
     };
 }
 
-test "session detail failure names an older fx's damaged file and points at doctor (D78)" {
+test "session detail failure names an older proto-fx's damaged file and points at doctor (D78)" {
     var text = CaptureOutput.init(std.testing.allocator);
     defer text.deinit();
     try writeSessionDetailFailure(std.testing.allocator, text.deps(), "old-session", error.InvalidSessionFormat, "events.jsonl can't be read (AccessDenied)", .text);
     try std.testing.expectEqualStrings(
-        "fx session: session old-session can't be read: events.jsonl can't be read (AccessDenied); run `fx doctor`\n",
+        "proto-fx session: session old-session can't be read: events.jsonl can't be read (AccessDenied); run `proto-fx doctor`\n",
         text.stderr.written(),
     );
     var json = CaptureOutput.init(std.testing.allocator);
     defer json.deinit();
     try writeSessionDetailFailure(std.testing.allocator, json.deps(), "old-session", error.InvalidSessionFormat, "events.jsonl can't be read (AccessDenied)", .json);
     try std.testing.expect(std.mem.find(u8, json.stdout.written(), "\"code\":\"InvalidSessionFormat\"") != null);
-    try std.testing.expect(std.mem.find(u8, json.stdout.written(), "run `fx doctor`") != null);
+    try std.testing.expect(std.mem.find(u8, json.stdout.written(), "run `proto-fx doctor`") != null);
 }
 
 test "session detail failures separate corruption from unsupported schema" {
@@ -3037,7 +2890,7 @@ test "session detail failures separate corruption from unsupported schema" {
     );
     try std.testing.expectEqualStrings("", corrupt_text.stdout.written());
     try std.testing.expectEqualStrings(
-        "fx session: session broken-session is corrupt; run `fx session recover broken-session`\n",
+        "proto-fx session: session broken-session is corrupt; run `proto-fx session recover broken-session`\n",
         corrupt_text.stderr.written(),
     );
 
@@ -3056,7 +2909,7 @@ test "session detail failures separate corruption from unsupported schema" {
         std.mem.find(
             u8,
             corrupt_json.stdout.written(),
-            "\"error\":\"session broken-session is corrupt; run `fx session recover broken-session`\"",
+            "\"error\":\"session broken-session is corrupt; run `proto-fx session recover broken-session`\"",
         ) != null,
     );
     try std.testing.expect(
@@ -3079,7 +2932,7 @@ test "session detail failures separate corruption from unsupported schema" {
     );
     try std.testing.expectEqualStrings("", unsupported_text.stdout.written());
     try std.testing.expectEqualStrings(
-        "fx session: session future-session uses an unsupported session version\n",
+        "proto-fx session: session future-session uses an unsupported session version\n",
         unsupported_text.stderr.written(),
     );
 }
@@ -3096,7 +2949,7 @@ test "session recovery boundary failures keep stable text and json guidance" {
     );
     try std.testing.expectEqualStrings("", text_output.stdout.written());
     try std.testing.expectEqualStrings(
-        "fx session: no exact trustworthy recovery boundary was found; the source was left unchanged\n",
+        "proto-fx session: no exact trustworthy recovery boundary was found; the source was left unchanged\n",
         text_output.stderr.written(),
     );
 
@@ -3175,14 +3028,14 @@ fn commandSupportsWorkspaceModifiers(command: Command) bool {
 fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
-        "fx: --add-dir and --no-additional-dirs are only supported for interactive, resume, ask, ACP, PR, and issue launches\n",
+        "proto-fx: --add-dir and --no-additional-dirs are only supported for interactive, resume, ask, ACP, PR, and issue launches\n",
     );
 }
 
 fn writeModelModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
-        "fx: --provider, --model, --effort, --fast, --ultrafast, --provider-order, and --provider-strict apply to interactive sessions; for one-shot runs pass model flags after `fx ask`\n",
+        "proto-fx: --provider, --model, --effort, --fast, --ultrafast, --provider-order, and --provider-strict apply to interactive sessions; for one-shot runs pass model flags after `proto-fx ask`\n",
     );
 }
 
@@ -4425,12 +4278,12 @@ test "runIfRequested help writes top-level help" {
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("help")}, testConfig(), capture.deps());
     try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇x v0.0.0\nFast, native coding agent for the terminal."));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "proto-fx v0.0.0\nFast, native coding agent for the terminal."));
     try std.testing.expect(std.mem.find(u8, capture.stdout.written(), testConfig().version) != null);
     try std.testing.expectEqualStrings("", capture.stderr.written());
 }
 
-// `builtins/mcp.zig` "fx mcp approve saves the approval of a project server"
+// `builtins/mcp.zig` "proto-fx mcp approve saves the approval of a project server"
 // checks what approving saves.
 test "top-level MCP approve runs without interactive startup" {
     const alloc = std.testing.allocator;
@@ -4474,7 +4327,7 @@ test "workspace launch modifiers preserve supported command help" {
         deps,
     );
     try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "fx ask\n\n"));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "proto-fx ask\n\n"));
     try std.testing.expectEqualStrings("", capture.stderr.written());
 }
 
@@ -4501,11 +4354,11 @@ test "global workspace launch option errors use user-facing copy" {
     }{
         .{
             .args = &.{@constCast("--add-dir")},
-            .expected = "fx: --add-dir requires a directory path\n",
+            .expected = "proto-fx: --add-dir requires a directory path\n",
         },
         .{
             .args = &.{ @constCast("--no-additional-dirs"), @constCast("--no-additional-dirs") },
-            .expected = "fx: --no-additional-dirs may only be specified once\n",
+            .expected = "proto-fx: --no-additional-dirs may only be specified once\n",
         },
     };
 
@@ -4552,7 +4405,7 @@ test "runIfRequested version flags reject extra args" {
         const result = try runIfRequestedWithDeps(std.testing.allocator, args, testConfig(), capture.deps());
         try std.testing.expectEqual(RunResult.handled_failure, result);
         try std.testing.expectEqualStrings("", capture.stdout.written());
-        try std.testing.expectEqualStrings("usage: fx --version\n", capture.stderr.written());
+        try std.testing.expectEqualStrings("usage: proto-fx --version\n", capture.stderr.written());
     }
 }
 
@@ -4616,7 +4469,7 @@ test "setup preserves the disabled secret-store failure" {
     try std.testing.expectEqual(@as(usize, 0), capture.setup_store_calls);
     try std.testing.expectEqual(@as(usize, 0), capture.setup_read_calls);
     try std.testing.expectEqualStrings(
-        "fx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n",
+        "proto-fx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n",
         capture.stderr.written(),
     );
 }
@@ -4701,7 +4554,7 @@ test "runIfRequested rejects removed record flag as unknown input" {
         ),
     );
 
-    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "fx: unknown subcommand: --record") != null);
+    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "proto-fx: unknown subcommand: --record") != null);
 }
 
 test "global ultrafast launch modifier is ACP-only" {
@@ -4735,7 +4588,7 @@ test "runNoConfigIfRequested handles help without config" {
         testCommandCatalog(),
         capture.deps(),
     ));
-    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇x v0.0.0\nFast, native coding agent for the terminal."));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "proto-fx v0.0.0\nFast, native coding agent for the terminal."));
     try std.testing.expectEqualStrings("", capture.stderr.written());
 
     try std.testing.expect(!try runNoConfigIfRequestedWithDeps(
@@ -4804,7 +4657,7 @@ test "CLI surface uses the supplied command catalog for parsing usage and help" 
         usage_capture.deps(),
     );
     try std.testing.expectEqual(RunResult.handled_failure, result);
-    try std.testing.expectEqualStrings("usage: fx start\n", usage_capture.stderr.written());
+    try std.testing.expectEqualStrings("usage: proto-fx start\n", usage_capture.stderr.written());
 }
 
 test "workflow config does not carry placeholder gateway tools" {
@@ -4831,7 +4684,7 @@ test "runIfRequested invalid local flags write usage" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--wat") }, testConfig(), capture.deps());
     try std.testing.expectEqual(RunResult.handled_failure, result);
     try std.testing.expectEqualStrings("", capture.stdout.written());
-    try std.testing.expectEqualStrings("usage: fx status [--json]\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("usage: proto-fx status [--json]\n", capture.stderr.written());
 }
 
 test "runIfRequested invalid json local flags write json error" {
@@ -4987,7 +4840,7 @@ test "runIfRequested rejects malformed resume aliases with canonical usage" {
         );
         try std.testing.expectEqual(RunResult.handled_failure, result);
         try std.testing.expectEqualStrings(
-            "usage: fx session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>\n",
+            "usage: proto-fx session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>\n",
             capture.stderr.written(),
         );
     }
@@ -5018,7 +4871,7 @@ test "runIfRequested invalid resume writes usage" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("resume"), @constCast("a"), @constCast("b") }, testConfig(), capture.deps());
     try std.testing.expectEqual(RunResult.handled_failure, result);
     try std.testing.expectEqualStrings(
-        "usage: fx session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>\n",
+        "usage: proto-fx session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>\n",
         capture.stderr.written(),
     );
 }
@@ -5031,7 +4884,7 @@ test "runIfRequested unknown command writes header and help" {
         error.UnknownCliCommand,
         runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("wat")}, testConfig(), capture.deps()),
     );
-    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown subcommand: wat\n\n𝒇x v0.0.0\nFast, native coding agent for the terminal.\n"));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "proto-fx: unknown subcommand: wat\n\nproto-fx v0.0.0\nFast, native coding agent for the terminal.\n"));
 }
 
 test "runIfRequested bare version subcommand remains unknown" {
@@ -5042,7 +4895,7 @@ test "runIfRequested bare version subcommand remains unknown" {
         error.UnknownCliCommand,
         runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("version")}, testConfig(), capture.deps()),
     );
-    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown subcommand: version\n\n𝒇x v0.0.0\nFast, native coding agent for the terminal.\n"));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "proto-fx: unknown subcommand: version\n\nproto-fx v0.0.0\nFast, native coding agent for the terminal.\n"));
 }
 
 test "runIfRequested model fetch failure is handled" {
@@ -5058,7 +4911,7 @@ test "runIfRequested model fetch failure is handled" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("models")}, cfg, deps);
     try std.testing.expectEqual(RunResult.handled_failure, result);
     try std.testing.expectEqualStrings(
-        "fx models: could not list models: Unavailable\n",
+        "proto-fx models: could not list models: Unavailable\n",
         capture.stderr.written(),
     );
 }
@@ -5100,7 +4953,7 @@ test "runIfRequested model provider cancellation is handled" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("models")}, cfg, deps);
     try std.testing.expectEqual(RunResult.handled_failure, result);
     try std.testing.expectEqualStrings(
-        "fx models: could not list models: the request was cancelled\n",
+        "proto-fx models: could not list models: the request was cancelled\n",
         capture.stderr.written(),
     );
 }
@@ -5255,7 +5108,7 @@ test "runIfRequested local json success appends exactly one newline" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--json") }, testConfig(), deps);
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"effort\":\"auto\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"ultrafast_requested\":false,\"mcp\":{\"connection_check\":\"not_checked\",\"servers\":[],\"configuration_issues\":[],\"inspection_error\":null}}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"effort\":\"auto\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"proto-fx needs access to Vercel AI Gateway. Run proto-fx login to sign in, proto-fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/proto-fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"ultrafast_requested\":false,\"mcp\":{\"connection_check\":\"not_checked\",\"servers\":[],\"configuration_issues\":[],\"inspection_error\":null}}\n",
         capture.stdout.written(),
     );
     try std.testing.expect(!std.mem.endsWith(u8, capture.stdout.written(), "\n\n"));
@@ -5319,7 +5172,7 @@ test "status and doctor inspect MCP configuration once per command" {
     try std.testing.expect(std.mem.find(
         u8,
         doctor_capture.stdout.written(),
-        "\"detail\":\"failed to load ~/.fx/mcp.json: McpConfigInvalidJson\"",
+        "\"detail\":\"failed to load ~/.proto-fx/mcp.json: McpConfigInvalidJson\"",
     ) != null);
 }
 
@@ -5329,7 +5182,7 @@ test "writeRenderedJsonLine falls back to heap and appends exactly one newline" 
 
     var tiny_buf: [8]u8 = undefined;
     const startup = app_lifecycle.StartupStatus{
-        .workspace_root = @constCast("/tmp/fx"),
+        .workspace_root = @constCast("/tmp/proto-fx"),
         .selected_model = "test-model",
         .permission_mode = .ask,
         .agent_step_limit = 42,
@@ -5344,7 +5197,7 @@ test "writeRenderedJsonLine falls back to heap and appends exactly one newline" 
     );
 
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"effort\":\"auto\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"ultrafast_requested\":true}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"effort\":\"auto\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"proto-fx needs access to Vercel AI Gateway. Run proto-fx login to sign in, proto-fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/proto-fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"ultrafast_requested\":true}\n",
         capture.stdout.written(),
     );
 }
@@ -5358,7 +5211,7 @@ test "writeRenderedJsonLine renders doctor json through output contract" {
         .{ .name = "gh", .status = .warn, .detail = "GitHub CLI not found in PATH" },
     };
     const snapshot = doctor_runtime.Snapshot{
-        .workspace_root = @constCast("/tmp/fx"),
+        .workspace_root = @constCast("/tmp/proto-fx"),
         .model = "test-model",
         .auth = .{ .active_source = .ai_gateway_api_key },
         .permission_mode = .auto,
@@ -5375,7 +5228,7 @@ test "writeRenderedJsonLine renders doctor json through output contract" {
     );
 
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"doctor\",\"ok_count\":1,\"warn_count\":1,\"fail_count\":0,\"workspace\":\"/tmp/fx\",\"model\":\"test-model\",\"auth\":\"AI_GATEWAY_API_KEY\",\"auth_refreshable\":false,\"permission_mode\":\"auto\",\"agent_step_limit\":42,\"checks\":[{\"name\":\"auth\",\"status\":\"ok\",\"detail\":\"AI_GATEWAY_API_KEY is configured\"},{\"name\":\"gh\",\"status\":\"warn\",\"detail\":\"GitHub CLI not found in PATH\"}]}\n",
+        "{\"kind\":\"doctor\",\"ok_count\":1,\"warn_count\":1,\"fail_count\":0,\"workspace\":\"/tmp/proto-fx\",\"model\":\"test-model\",\"auth\":\"AI_GATEWAY_API_KEY\",\"auth_refreshable\":false,\"permission_mode\":\"auto\",\"agent_step_limit\":42,\"checks\":[{\"name\":\"auth\",\"status\":\"ok\",\"detail\":\"AI_GATEWAY_API_KEY is configured\"},{\"name\":\"gh\",\"status\":\"warn\",\"detail\":\"GitHub CLI not found in PATH\"}]}\n",
         capture.stdout.written(),
     );
 }
@@ -5569,7 +5422,7 @@ fn stubLoadStartupState(
 ) !app_lifecycle.StartupState {
     var state = app_lifecycle.StartupState{ .agent_step_limit = default_agent_step_limit };
     errdefer state.deinit(alloc);
-    state.workspace_root = try alloc.dupe(u8, "/tmp/fx");
+    state.workspace_root = try alloc.dupe(u8, "/tmp/proto-fx");
     state.selected_model = try alloc.dupe(u8, default_model);
     state.credential = .{
         .token = try alloc.dupe(u8, "test-key"),
@@ -5588,7 +5441,7 @@ fn stubLoadStartupStateWithoutCredentials(
         .agent_step_limit = default_agent_step_limit,
     };
     errdefer state.deinit(alloc);
-    state.workspace_root = try alloc.dupe(u8, "/tmp/fx");
+    state.workspace_root = try alloc.dupe(u8, "/tmp/proto-fx");
     return state;
 }
 
@@ -5606,7 +5459,7 @@ fn stubLoadStartupStatus(
     default_model: []const u8,
     default_agent_step_limit: usize,
 ) !app_lifecycle.StartupStatus {
-    const workspace_root = try alloc.dupe(u8, "/tmp/fx");
+    const workspace_root = try alloc.dupe(u8, "/tmp/proto-fx");
     errdefer alloc.free(workspace_root);
     const selected_model = try alloc.dupe(u8, default_model);
     errdefer alloc.free(selected_model);

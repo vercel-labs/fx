@@ -617,8 +617,16 @@ pub fn CompletionRuntime(comptime App: type) type {
             return app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) != null;
         }
 
+        fn attachedFileScopeMatches(app: *const App) bool {
+            if (comptime @hasField(App, "remote") and @hasField(App, "workspace_root")) {
+                if (app.remote.active) return std.mem.eql(u8, app.remote.cwd, app.workspace_root);
+            }
+            return true;
+        }
+
         pub fn hasFileQuery(app: *App) bool {
             if (comptime !runtime_profile.allows(App, .file_index)) return false;
+            if (!attachedFileScopeMatches(app)) return false;
             return app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) != null;
         }
 
@@ -761,6 +769,7 @@ pub fn CompletionRuntime(comptime App: type) type {
 
         fn filePickerEligible(app: *App) bool {
             if (comptime !runtime_profile.allows(App, .file_index)) return false;
+            if (!attachedFileScopeMatches(app)) return false;
             if (comptime @hasField(App, "question_prompt")) if (app.question_prompt.isActive()) return false;
             if (comptime @hasField(App, "approval_prompt")) if (app.approval_prompt.isActive()) return false;
             if (comptime @hasField(App, "auth")) {
@@ -908,6 +917,7 @@ pub fn CompletionRuntime(comptime App: type) type {
 
         pub fn filePickerView(app: *App) file_completion_state.View {
             if (comptime !runtime_profile.allows(App, .file_index)) return .{};
+            if (!attachedFileScopeMatches(app)) return .{};
             const picker = &app.input_runtime.picker;
             return picker.file_completion.view(picker.file_completion_index, picker.file_completion_window_start);
         }
@@ -1291,6 +1301,12 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         fn beginModelPickerOptions(app: *App, model: []const u8) !void {
+            if (comptime @hasField(App, "remote")) if (app.remote.active) {
+                try session_commands.Commands(App).selectModelFromPicker(app, model, app.effort, false, false);
+                app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                app.shell.render_requests.request(.footer);
+                return;
+            };
             const capabilities = model_capabilities.resolveForApp(App, app, model);
             const supports_effort = capabilities.reasoning_efforts.len > 0;
             const supports_fast = capabilities.supports_fast_mode;

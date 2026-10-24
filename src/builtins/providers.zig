@@ -1,5 +1,4 @@
 const provider_set = @import("../core/gateway/provider_set.zig");
-const gateway = @import("gateway.zig");
 const openai_codex = @import("../gateway/openai_codex.zig");
 const openai_codex_models = @import("../gateway/openai_codex_models.zig");
 const openai_codex_permission_reviewer = @import("../gateway/openai_codex_permission_reviewer.zig");
@@ -16,7 +15,7 @@ fn configuredBundle(_: ?*anyopaque, definition: *const configured_provider.Defin
 
 pub const native = provider_set.Set{
     .configured_fn = configuredBundle,
-    .gateway = gateway.provider_bundle,
+    .gateway = .{},
     .codex = .{
         .presentation = provider_catalog.find(.codex),
         .auth_strategy = .chatgpt,

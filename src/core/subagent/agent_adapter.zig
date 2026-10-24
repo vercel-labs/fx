@@ -427,7 +427,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermission,
         .resolve_tool_action_display_target = resolveToolActionDisplayTarget,
         .describe_tool_action = describeToolAction,
-        .describe_tool_action_completed = describeToolAction,
+        .describe_tool_action_completed = describeToolActionCompleted,
         .describe_tool_action_denied = describeToolActionDenied,
         .permission_target_for_call = permissionTargetForCall,
         .execute_tool_call = executeToolCall,
@@ -867,12 +867,51 @@ fn requestPreparedFileMutationPermission(
 
 fn describeToolAction(raw: *anyopaque, arena: Allocator, call: types.ToolCall, file_path: ?[]const u8, _: []const []const u8) ![]const u8 {
     const context: *Context = @ptrCast(@alignCast(raw));
-    return tool_presentation.formatPlainAction(arena, .{
+    return formatChildToolAction(arena, .{
         .tool_registry = context.config.tool_context.tool_registry,
         .call = call,
         .workspace_root = context.config.tool_context.workspace_root,
         .display_target = file_path,
-    });
+    }, false);
+}
+
+fn describeToolActionCompleted(raw: *anyopaque, arena: Allocator, call: types.ToolCall, file_path: ?[]const u8, _: []const []const u8) ![]const u8 {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    return formatChildToolAction(arena, .{
+        .tool_registry = context.config.tool_context.tool_registry,
+        .call = call,
+        .workspace_root = context.config.tool_context.workspace_root,
+        .display_target = file_path,
+    }, true);
+}
+
+fn formatChildToolAction(arena: Allocator, input: tool_presentation.ToolActionInput, completed: bool) ![]const u8 {
+    const action = if (completed)
+        try tool_presentation.formatPlainCompletedAction(arena, input)
+    else
+        try tool_presentation.formatPlainAction(arena, input);
+    defer arena.free(action);
+    // Native compact tool groups identify canonical status rows by this marker.
+    return arena.print("● {s}", .{action});
+}
+
+test "child tool labels use native canonical markers and completed tense" {
+    const alloc = std.testing.allocator;
+    const builtin_tools = @import("../../builtins/tools.zig");
+    const registry: @import("../tooling/tool_dispatch.zig").Registry = .{ .tools = &.{ builtin_tools.shell, builtin_tools.read_file } };
+    const cases = [_]struct { call: types.ToolCall, active: []const u8, completed: []const u8 }{
+        .{ .call = .{ .id = "shell", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"printf live\"}" }, .active = "● Running printf live", .completed = "● Ran printf live" },
+        .{ .call = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"example.txt\"}" }, .active = "● Reading example.txt", .completed = "● Read example.txt" },
+    };
+    for (cases) |case| {
+        const input: tool_presentation.ToolActionInput = .{ .tool_registry = registry, .call = case.call };
+        const active = try formatChildToolAction(alloc, input, false);
+        defer alloc.free(active);
+        const completed = try formatChildToolAction(alloc, input, true);
+        defer alloc.free(completed);
+        try std.testing.expectEqualStrings(case.active, active);
+        try std.testing.expectEqualStrings(case.completed, completed);
+    }
 }
 
 fn resolveToolActionDisplayTarget(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !?[]const u8 {
@@ -889,7 +928,8 @@ fn resolveToolActionDisplayTarget(raw: *anyopaque, arena: Allocator, call: types
 
 fn describeToolActionDenied(raw: *anyopaque, arena: Allocator, call: types.ToolCall, file_path: ?[]const u8, label: []const u8, dynamic_names: []const []const u8) ![]const u8 {
     const action = try describeToolAction(raw, arena, call, file_path, dynamic_names);
-    return arena.print("{s}: {s}", .{ label, action });
+    defer arena.free(action);
+    return arena.print("● {s}: {s}", .{ label, action["● ".len..] });
 }
 
 fn permissionTargetForCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall, dynamic_names: []const []const u8) ![]const u8 {

@@ -436,7 +436,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             trigger: VisualEpochResetTrigger,
         ) !bool {
-            const welcome = try ui_render.welcomeMessage(app.alloc);
+            const welcome = try ui_render.welcomeMessage(app.alloc, app.shell.layout.cols);
             defer app.alloc.free(welcome);
 
             const committed = try app.pacer.discardDeferredPresentationForVisualEpoch(
@@ -463,6 +463,7 @@ pub fn Runtime(comptime App: type) type {
             }
 
             try app.shell.resetVisualEpoch(app.alloc, welcome);
+            app.shell.startWelcomeAnimation(app.shell.layout.cols);
             try app.shell.requestTerminalReset(&app.metrics);
             switch (trigger) {
                 .native_clear_probe => debug_trace.logf(
@@ -641,7 +642,8 @@ pub fn Runtime(comptime App: type) type {
             const inline_completion =
                 input_completion_runtime.CompletionRuntime(App).visibleInlineCompletion(app);
 
-            const visible_model = pending_model orelse provider_runtime.model(app);
+            const attached_model: ?[]const u8 = if (comptime @hasField(App, "remote")) if (app.remote.active and app.remote.model.len > 0) app.remote.model else null else null;
+            const visible_model = attached_model orelse pending_model orelse provider_runtime.model(app);
             const visible_capabilities = model_capabilities.resolveForApp(App, app, visible_model);
             const active_capabilities_pending = pending_model == null and app.isModelCacheLoading();
             const model_supports_fast = visible_capabilities.supports_fast_mode;
@@ -719,10 +721,7 @@ pub fn Runtime(comptime App: type) type {
                     (if (comptime @hasDecl(@TypeOf(app.auth), "startupCredentialPending")) app.auth.startupCredentialPending() else false),
                 .model = visible_model,
                 .pending_images = app.pending_images.items,
-                .permission_mode = if (comptime @hasField(App, "permission_engine"))
-                    app.permission_engine.mode
-                else
-                    .ask,
+                .permission_mode = if (comptime @hasField(App, "remote")) (if (app.remote.active) app.remote.permission_mode else app.permission_engine.mode) else if (comptime @hasField(App, "permission_engine")) app.permission_engine.mode else .ask,
                 .steering_messages = steering.messages,
                 .steering_waits_for_boundary = steering.waits_for_boundary,
                 .fast_indicator_active = fast_indicator_active,
@@ -792,7 +791,10 @@ pub fn Runtime(comptime App: type) type {
                     render_input.modelMenuProjection(&app.model_cache)
                 else
                     .{},
-                .session_menu = if (comptime @hasField(App, "session_persistence")) .{
+                .session_menu = if (app.input_runtime.session_browser.active) .{
+                    .active = true,
+                    .browser = &app.input_runtime.session_browser,
+                } else if (comptime @hasField(App, "session_persistence")) .{
                     .active = app.session_persistence.session_picker.active,
                     .load_state = app.session_persistence.session_picker.load_state,
                     .summaries = app.session_persistence.session_picker.summaries.items,
@@ -866,7 +868,12 @@ pub fn Runtime(comptime App: type) type {
             visible_model: []const u8,
         ) ui_render.StatuslineItems {
             var items: ui_render.StatuslineItems = .{};
-            if (comptime @hasField(App, "workspace_identity") and
+            const attached_label: ?[]const u8 = if (comptime @hasField(App, "remote")) if (app.remote.active) app.remote.workspace_label else null else null;
+            if (attached_label) |label| {
+                items.workspace_label = label;
+                // The launch checkout's branch may belong to a different attached workspace.
+                items.git_branch = null;
+            } else if (comptime @hasField(App, "workspace_identity") and
                 @hasField(App, "workspace_root"))
             {
                 const identity = app.workspace_identity.refresh(
@@ -1992,6 +1999,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn sessionMenuActive(app: *const App) bool {
+            if (comptime @hasField(App, "input_runtime")) {
+                if (app.input_runtime.session_browser.active) return true;
+            }
             if (comptime @hasField(App, "session_persistence")) return app.session_persistence.session_picker.active;
             return false;
         }

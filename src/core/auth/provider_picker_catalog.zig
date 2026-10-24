@@ -110,6 +110,7 @@ pub fn parseMethod(value: []const u8) ?Method {
 }
 
 fn providerVisible(id: model_provider.ProviderId) bool {
+    if (id == .gateway) return false;
     if (comptime host_target.is_wasm) return id != .grok;
     return true;
 }

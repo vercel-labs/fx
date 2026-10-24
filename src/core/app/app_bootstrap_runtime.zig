@@ -141,7 +141,7 @@ fn BootstrapDeps(comptime App: type) type {
             []const u8,
             skill_contract.RootPolicy,
         ) app_runtime_setup.LoadSkillsError!app_runtime_setup.LoadedSkills;
-        const WelcomeMessageFn = *const fn (Allocator) anyerror![]u8;
+        const WelcomeMessageFn = *const fn (Allocator, u16) anyerror![]u8;
         const BeginFreshPersistedSessionFn = *const fn (*App) anyerror!void;
         const EnableSessionStoresFn = *const fn (*App) void;
         bootstrap_interactive_app: BootstrapInteractiveAppFn,
@@ -251,8 +251,8 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
-        fn welcomeMessageDefault(alloc: Allocator) ![]u8 {
-            return ui_render.welcomeMessage(alloc);
+        fn welcomeMessageDefault(alloc: Allocator, cols: u16) ![]u8 {
+            return ui_render.welcomeMessage(alloc, cols);
         }
 
         fn beginFreshPersistedSessionDefault(app: *App) !void {
@@ -576,7 +576,8 @@ pub fn Runtime(comptime App: type) type {
                     startup.notification_max,
                 );
             }
-            try deps.initialize_persistence(
+            const remote = if (comptime @hasField(App, "remote")) app.remote.active else false;
+            if (!remote) try deps.initialize_persistence(
                 app,
                 app.requested_resume != null,
             );
@@ -598,7 +599,7 @@ pub fn Runtime(comptime App: type) type {
             }
 
             if (app.requested_resume == null) {
-                const welcome_message = try deps.welcome_message(app.alloc);
+                const welcome_message = try deps.welcome_message(app.alloc, app.shell.layout.cols);
                 defer app.alloc.free(welcome_message);
                 var welcome_preview_buf: [96]u8 = undefined;
                 const welcome_preview = debug_trace.terminalPreview(welcome_preview_buf[0..], welcome_message);
@@ -615,6 +616,7 @@ pub fn Runtime(comptime App: type) type {
                     },
                 );
                 try app.writeTranscriptClassified(welcome_message, true, .welcome);
+                app.shell.startWelcomeAnimation(app.shell.layout.cols);
                 // Fresh sessions only: on resume the transcript must stay
                 // empty until the deferred session load replays history.
                 try writeSessionAssemblyNotice(app, startup.provider.label());
@@ -1000,7 +1002,7 @@ fn loadSkillsForTest(
     return .{ .dir = dir, .skills = &.{}, .diagnostics = diagnostics };
 }
 
-fn welcomeMessageForTest(alloc: Allocator) ![]u8 {
+fn welcomeMessageForTest(alloc: Allocator, _: u16) ![]u8 {
     return alloc.dupe(u8, "welcome\n");
 }
 

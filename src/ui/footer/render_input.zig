@@ -1,4 +1,5 @@
 const std = @import("std");
+const session_browser = @import("../../core/input/session_browser.zig");
 const question_prompt = @import("../../core/agent/question_prompt.zig");
 const approval_prompt = @import("../../core/permissions/approval_prompt.zig");
 const auth_runtime = @import("../../core/auth/auth_runtime.zig");
@@ -101,6 +102,7 @@ pub const ModelMenuProjection = struct {
 };
 
 pub const SessionMenuProjection = struct {
+    browser: ?*const session_browser.State = null,
     active: bool = false,
     load_state: session_catalog.LoadState = .loading,
     summaries: []const session_store.SessionSummary = &.{},

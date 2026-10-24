@@ -31,6 +31,7 @@ const full_transcript_screen = @import("../full_transcript_screen.zig");
 const transcript_viewport_runtime = @import("viewport_runtime.zig");
 const transcript_writer = @import("writer.zig");
 const ui_render = @import("../render.zig");
+const black_prism = @import("../black_prism.zig");
 const types = @import("../../core/shared/types.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 
@@ -642,7 +643,7 @@ fn lifecycleTerminalLine(
     const cancelled = kind == .cancelled;
     const text_style = if (cancelled) ui_render.hint_style else "";
     const text_reset = if (cancelled) ui_render.reset_style else "";
-    const follow_up = if (cancelled) " · What can fx do differently?" else "";
+    const follow_up = if (cancelled) " · What should change?" else "";
     const normalized = if (has_marker)
         try alloc.print(
             "{s}{s}{s}{s}{s}{s}{s}{s}",
@@ -4504,6 +4505,13 @@ test "render diagnostic commit skips unchanged same-row paints" {
     try std.testing.expect(std.mem.find(u8, events[0].detail(), "repaint=true") != null);
 }
 
+pub const WelcomeAnimation = struct {
+    cols: u16 = 0,
+    start_ms: i64 = 0,
+    next_frame_ms: i64 = 0,
+    animation: ?black_prism.Animation = null,
+};
+
 pub const TranscriptRuntime = struct {
     stdout_file: std.Io.File = std.Io.File.stdout(),
     test_frame_sink: if (@import("builtin").is_test) ?render_engine.terminal_diff.FrameSink else void = if (@import("builtin").is_test) null else {},
@@ -4605,6 +4613,8 @@ pub const TranscriptRuntime = struct {
     /// current width while retaining the raw byte buffer for append paths
     /// that still write pre-rendered transcript content.
     entries: std.ArrayList(TranscriptEntry) = .empty,
+    /// The startup banner animates while the welcome is the only entry.
+    welcome_animation: WelcomeAnimation = .{},
     /// Borrowed only by a detached store transaction; never installed on the live runtime.
     retention_prefix_trims: ?*std.ArrayList(transcript_store.RetentionPrefixTrim) = null,
     lifecycle_state: activity_runtime.ToolActivityState = .{},
@@ -4719,6 +4729,7 @@ pub const TranscriptRuntime = struct {
     }
 
     pub fn deinit(self: *TranscriptRuntime, alloc: Allocator) void {
+        self.stopWelcomeAnimation();
         self.disableShadowVt();
         self.full_transcript_window_load.deinit();
         self.full_transcript_page_load.deinit();
@@ -5216,6 +5227,76 @@ pub const TranscriptRuntime = struct {
         self.clearToolDetails(alloc);
         self.clearFullDetailRecords(alloc);
         return transcript_store.clearTranscript(self, alloc);
+    }
+
+    /// Starts the banner animation after a welcome write. The first frame is
+    /// already in the transcript; later frames replace it on the frame clock.
+    pub fn startWelcomeAnimation(self: *TranscriptRuntime, cols: u16) void {
+        self.stopWelcomeAnimation();
+        const now_ms = io_mod.milliTimestamp();
+        self.welcome_animation = .{
+            .cols = if (cols == 0) 80 else cols,
+            .start_ms = now_ms,
+            .next_frame_ms = now_ms + black_prism.frame_interval_ms(),
+        };
+    }
+
+    pub fn stopWelcomeAnimation(self: *TranscriptRuntime) void {
+        if (self.welcome_animation.animation) |*animation| animation.deinit();
+        self.welcome_animation = .{};
+    }
+
+    /// Replaces the welcome entry with the next animated frame when one is due.
+    /// Animation stops once session content follows the welcome.
+    pub fn tickWelcomeAnimation(self: *TranscriptRuntime, alloc: Allocator, now_ms: i64) bool {
+        if (self.welcome_animation.cols == 0) return false;
+        if (self.entries.items.len != 1) {
+            self.stopWelcomeAnimation();
+            return false;
+        }
+        const entry = &self.entries.items[0];
+        if (entry.* != .raw_bytes or entry.raw_bytes.class != .welcome) {
+            self.stopWelcomeAnimation();
+            return false;
+        }
+        const entry_id = entry.raw_bytes.id;
+        if (self.welcome_animation.animation == null) {
+            self.welcome_animation.animation = black_prism.Animation.init(alloc, self.welcome_animation.cols) catch {
+                self.stopWelcomeAnimation();
+                return false;
+            };
+            self.welcome_animation.animation.?.start(now_ms);
+            self.welcome_animation.start_ms = now_ms;
+            self.welcome_animation.next_frame_ms = now_ms + black_prism.frame_interval_ms();
+        }
+        if (now_ms < self.welcome_animation.next_frame_ms) return false;
+        const frame = (self.welcome_animation.animation.?.nextFrame(alloc, now_ms) catch return false) orelse return false;
+        defer alloc.free(frame);
+        const title = ui_render.welcomeTitle(alloc) catch return false;
+        defer alloc.free(title);
+        const banner = alloc.print("{s}\n{s}", .{ frame, title }) catch return false;
+        defer alloc.free(banner);
+        const updated = self.updateRawBytesEntry(alloc, entry_id, banner) catch false;
+        if (!updated) self.stopWelcomeAnimation();
+        return updated;
+    }
+
+    /// Clears session content but keeps the leading welcome entry. A remote
+    /// attach clears the transcript before replaying the supervisor's history;
+    /// the banner is client chrome and stays above that history.
+    pub fn clearTranscriptPreservingWelcome(self: *TranscriptRuntime, alloc: Allocator) void {
+        const welcome = if (self.entries.items.len > 0 and
+            self.entries.items[0] == .raw_bytes and
+            self.entries.items[0].raw_bytes.class == .welcome)
+            alloc.dupe(u8, self.entries.items[0].raw_bytes.bytes) catch null
+        else
+            null;
+        defer if (welcome) |bytes| alloc.free(bytes);
+
+        self.clearTranscript(alloc);
+        if (welcome) |bytes| {
+            _ = self.appendRawTranscriptEntryClassified(alloc, bytes, .welcome) catch {};
+        }
     }
 
     /// Prepends the live full-detail records (session assembly, network,

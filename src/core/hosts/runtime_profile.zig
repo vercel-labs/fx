@@ -38,11 +38,13 @@ pub const native = Profile{
     .file_index = true,
     .mcp = true,
     .subagents = true,
-    .auto_upgrade = true,
+    // TODO(proto-fx): enable with the fork's release feed and upgrade handoff.
+    .auto_upgrade = false,
     .skills = true,
     .clipboard = true,
     .url_opening = true,
-    .web_search = true,
+    // TODO(proto-fx): restore search after wiring a gateway-independent backend.
+    .web_search = false,
     .tools = true,
     .js_host_clipboard = false,
     .js_host_config = false,

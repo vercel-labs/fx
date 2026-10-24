@@ -90,10 +90,10 @@ pub const UsageSnapshot = struct {
             .ready, .fetching => {},
             .failed => |f| try writeUsageFailure(&out.writer, f, "AI Gateway"),
             .unavailable => |u| try out.writer.print("{s}\n", .{switch (u) {
-                .no_gateway_sign_in => "Usage needs an AI Gateway sign-in: run fx login or set an API key.",
-                .no_team => "Usage needs a team: run fx login and pick one.",
+                .no_gateway_sign_in => "Usage needs an AI Gateway sign-in: run proto-fx login or set an API key.",
+                .no_team => "Usage needs a team: run proto-fx login and pick one.",
                 .unsupported_provider => "Usage isn't shown for this provider yet; it reads AI Gateway.",
-                .refresh_needed => "The sign-in needs a refresh: send a message in fx, then run fx usage again.",
+                .refresh_needed => "The sign-in needs a refresh: send a message in proto-fx, then run proto-fx usage again.",
             }}),
         }
         if (v.budget) |b| {
@@ -1286,13 +1286,13 @@ pub const SessionListSnapshot = struct {
         }
         if (self.has_more) {
             try out.writer.print(
-                "[sessions] more saved sessions; continue with `fx sessions {s}--cursor {s}`\n",
+                "[sessions] more saved sessions; continue with `proto-fx sessions {s}--cursor {s}`\n",
                 .{ if (self.all_workspaces) "--all " else "", self.next_cursor orelse "" },
             );
         }
         if (self.skipped_invalid > 0) {
             try out.writer.print(
-                "[sessions] warning: skipped {d} unreadable saved session{s}; run `fx doctor` for recovery guidance\n",
+                "[sessions] warning: skipped {d} unreadable saved session{s}; run `proto-fx doctor` for recovery guidance\n",
                 .{ self.skipped_invalid, if (self.skipped_invalid == 1) "" else "s" },
             );
         }
@@ -1555,7 +1555,7 @@ pub const SessionRecoverySnapshot = struct {
         if (result.permission_rules_dropped) {
             try out.writer.writeAll("warning: saved permission rules could not be read and were not copied\n");
         }
-        try out.writer.print("resume: fx --resume {s}\n", .{result.recovered_session_id});
+        try out.writer.print("resume: proto-fx --resume {s}\n", .{result.recovered_session_id});
         return try out.toOwnedSlice();
     }
 
@@ -1652,13 +1652,13 @@ pub const SessionConvertSnapshot = struct {
             if (skipped.reason) |reason| {
                 try out.writer.print("{s}: unreadable: {s}\n", .{ skipped.id, reason });
             } else if (std.mem.eql(u8, skipped.code, "SessionBusy")) {
-                try out.writer.print("{s}: busy, open in another fx\n", .{skipped.id});
+                try out.writer.print("{s}: busy, open in another proto-fx\n", .{skipped.id});
             } else try out.writer.print("{s}: unreadable\n", .{skipped.id});
         }
         for (self.left_out) |left| {
             try out.writer.print("{s}: converted without {s}", .{ left.id, left.file });
             if (!std.mem.eql(u8, left.member, left.id)) try out.writer.print(" of its subagent {s}", .{left.member});
-            try out.writer.print(" because {s}; ~/.fx/sessions/{s} keeps it\n", .{ left.reason, left.member });
+            try out.writer.print(" because {s}; ~/.proto-fx/sessions/{s} keeps it\n", .{ left.reason, left.member });
         }
         for (self.kept) |kept| try out.writer.print("{s}: kept as it is: {s}\n", .{ kept.id, kept.reason });
         return out.toOwnedSlice();
@@ -1698,7 +1698,7 @@ pub const SessionConvertSnapshot = struct {
     }
 };
 
-test "fx sessions convert names each file it left out, in text and JSON" {
+test "proto-fx sessions convert names each file it left out, in text and JSON" {
     const alloc = std.testing.allocator;
     const snapshot: SessionConvertSnapshot = .{ .converted = 1, .busy = 0, .unreadable = 0, .skipped = &.{}, .left_out = &.{
         .{ .id = "root", .member = "root", .file = "logs/commands/replay.bin", .cause = "too_large", .reason = "it is 600 bytes, more than the 512 the new store keeps in one file", .bytes = 600, .limit = 512 },
@@ -1709,9 +1709,9 @@ test "fx sessions convert names each file it left out, in text and JSON" {
     defer alloc.free(text);
     try std.testing.expectEqualStrings(
         "converted 1, busy 0, unreadable 0\n" ++
-            "root: converted without logs/commands/replay.bin because it is 600 bytes, more than the 512 the new store keeps in one file; ~/.fx/sessions/root keeps it\n" ++
-            "root: converted without tool-results/big.txt of its subagent kid because it is 700 bytes, more than the 512 the new store keeps in one file; ~/.fx/sessions/kid keeps it\n" ++
-            "root: converted without terminal/state/link because it is not a file or folder; ~/.fx/sessions/root keeps it\n",
+            "root: converted without logs/commands/replay.bin because it is 600 bytes, more than the 512 the new store keeps in one file; ~/.proto-fx/sessions/root keeps it\n" ++
+            "root: converted without tool-results/big.txt of its subagent kid because it is 700 bytes, more than the 512 the new store keeps in one file; ~/.proto-fx/sessions/kid keeps it\n" ++
+            "root: converted without terminal/state/link because it is not a file or folder; ~/.proto-fx/sessions/root keeps it\n",
         text,
     );
     const json = try snapshot.render(alloc, .json);
@@ -1725,7 +1725,7 @@ test "fx sessions convert names each file it left out, in text and JSON" {
     );
 }
 
-test "fx sessions convert renders its counts and each skip as text and JSON from one snapshot" {
+test "proto-fx sessions convert renders its counts and each skip as text and JSON from one snapshot" {
     const alloc = std.testing.allocator;
     const snapshot: SessionConvertSnapshot = .{ .converted = 2, .busy = 1, .unreadable = 1, .skipped = &.{
         .{ .id = "held", .code = "SessionBusy", .reason = null },
@@ -1734,7 +1734,7 @@ test "fx sessions convert renders its counts and each skip as text and JSON from
     const text = try snapshot.render(alloc, .text);
     defer alloc.free(text);
     try std.testing.expectEqualStrings(
-        "converted 2, busy 1, unreadable 1\nheld: busy, open in another fx\ntorn: unreadable: events.jsonl line 3 is not valid JSON\n",
+        "converted 2, busy 1, unreadable 1\nheld: busy, open in another proto-fx\ntorn: unreadable: events.jsonl line 3 is not valid JSON\n",
         text,
     );
     const json = try snapshot.render(alloc, .json);
@@ -1745,23 +1745,23 @@ test "fx sessions convert renders its counts and each skip as text and JSON from
     );
 }
 
-test "fx sessions convert names each subagent it keeps as it is, in text and JSON (D88)" {
+test "proto-fx sessions convert names each subagent it keeps as it is, in text and JSON (D88)" {
     const alloc = std.testing.allocator;
     const snapshot: SessionConvertSnapshot = .{ .converted = 1, .busy = 0, .unreadable = 0, .skipped = &.{}, .kept = &.{
-        .{ .id = "grandchild", .reason = "it is a subagent of the earlier subagent child, which no fx opens" },
+        .{ .id = "grandchild", .reason = "it is a subagent of the earlier subagent child, which no proto-fx opens" },
     } };
     const text = try snapshot.render(alloc, .text);
     defer alloc.free(text);
     try std.testing.expectEqualStrings(
         "converted 1, busy 0, unreadable 0\n" ++
-            "grandchild: kept as it is: it is a subagent of the earlier subagent child, which no fx opens\n",
+            "grandchild: kept as it is: it is a subagent of the earlier subagent child, which no proto-fx opens\n",
         text,
     );
     const json = try snapshot.render(alloc, .json);
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
         "{\"kind\":\"sessions_convert\",\"converted\":1,\"busy\":0,\"unreadable\":0,\"skipped\":[],\"left_out\":[]," ++
-            "\"kept\":[{\"id\":\"grandchild\",\"reason\":\"it is a subagent of the earlier subagent child, which no fx opens\"}]}",
+            "\"kept\":[{\"id\":\"grandchild\",\"reason\":\"it is a subagent of the earlier subagent child, which no proto-fx opens\"}]}",
         json,
     );
 }
@@ -2051,9 +2051,9 @@ pub const UpgradeSnapshot = struct {
             },
             .up_to_date => {
                 if (std.mem.eql(u8, self.channel, "dev") and self.latest_revision.len > 0) {
-                    try out.writer.print("fx dev {s} is already up to date (", .{shortRevision(self.latest_revision)});
+                    try out.writer.print("proto-fx dev {s} is already up to date (", .{shortRevision(self.latest_revision)});
                 } else {
-                    try out.writer.writeAll("fx is already up to date (");
+                    try out.writer.writeAll("proto-fx is already up to date (");
                 }
                 try writeVersionWithPrefix(&out.writer, self.latest);
                 try out.writer.writeAll(")\n");
@@ -2357,9 +2357,9 @@ test "command failure snapshot renders stable escaped json" {
 test "core status snapshot text and json stay stable" {
     const snapshot = StatusSnapshot{
         .model = "alpha",
-        .auth_help = "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.",
+        .auth_help = "proto-fx needs access to Vercel AI Gateway. Run proto-fx login to sign in, proto-fx setup to use an API key, or set AI_GATEWAY_API_KEY.",
         .permission_mode = .ask,
-        .workspace_root = "/tmp/fx",
+        .workspace_root = "/tmp/proto-fx",
         .history_turns = 3,
         .session_permission_grants = 1,
         .agent_step_limit = 24,
@@ -2368,14 +2368,14 @@ test "core status snapshot text and json stay stable" {
     const text = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
-        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=missing\n[status] auth_refreshable=false\n[status] auth_help=fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\n[status] permission_mode=ask\n[status] workspace=/tmp/fx\n[status] history_turns=3\n[status] session_permission_grants=1\n[status] agent_step_limit=24\n[status] ultrafast_requested=false\n",
+        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=missing\n[status] auth_refreshable=false\n[status] auth_help=proto-fx needs access to Vercel AI Gateway. Run proto-fx login to sign in, proto-fx setup to use an API key, or set AI_GATEWAY_API_KEY.\n[status] permission_mode=ask\n[status] workspace=/tmp/proto-fx\n[status] history_turns=3\n[status] session_permission_grants=1\n[status] agent_step_limit=24\n[status] ultrafast_requested=false\n",
         text,
     );
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":3,\"session_permission_grants\":1,\"agent_step_limit\":24,\"ultrafast_requested\":false}",
+        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"proto-fx needs access to Vercel AI Gateway. Run proto-fx login to sign in, proto-fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/proto-fx\",\"history_turns\":3,\"session_permission_grants\":1,\"agent_step_limit\":24,\"ultrafast_requested\":false}",
         json,
     );
 }
@@ -2385,7 +2385,7 @@ test "core status snapshot includes selected team when present" {
         .model = "alpha",
         .auth = .{ .active_source = .fx_login, .team = "example-team" },
         .permission_mode = .ask,
-        .workspace_root = "/tmp/fx",
+        .workspace_root = "/tmp/proto-fx",
         .history_turns = 0,
         .session_permission_grants = 0,
         .agent_step_limit = 24,
@@ -2394,14 +2394,14 @@ test "core status snapshot includes selected team when present" {
     const text = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
-        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=fx login\n[status] auth_refreshable=true\n[status] team=example-team\n[status] permission_mode=ask\n[status] workspace=/tmp/fx\n[status] history_turns=0\n[status] session_permission_grants=0\n[status] agent_step_limit=24\n[status] ultrafast_requested=false\n",
+        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=proto-fx login\n[status] auth_refreshable=true\n[status] team=example-team\n[status] permission_mode=ask\n[status] workspace=/tmp/proto-fx\n[status] history_turns=0\n[status] session_permission_grants=0\n[status] agent_step_limit=24\n[status] ultrafast_requested=false\n",
         text,
     );
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"fx login\",\"auth_refreshable\":true,\"team\":\"example-team\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":24,\"ultrafast_requested\":false}",
+        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"proto-fx login\",\"auth_refreshable\":true,\"team\":\"example-team\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/proto-fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":24,\"ultrafast_requested\":false}",
         json,
     );
 }
@@ -2416,7 +2416,7 @@ test "status distinguishes the selected model route from connected providers" {
             .chatgpt_connected = true,
         },
         .permission_mode = .auto,
-        .workspace_root = "/tmp/fx",
+        .workspace_root = "/tmp/proto-fx",
         .history_turns = 0,
         .session_permission_grants = 0,
         .agent_step_limit = 24,
@@ -2439,7 +2439,7 @@ test "status reports where the model came from alongside the model" {
         .model_origin = "FX_MODEL",
         .provider = .codex,
         .permission_mode = .auto,
-        .workspace_root = "/tmp/fx",
+        .workspace_root = "/tmp/proto-fx",
         .history_turns = 0,
         .session_permission_grants = 0,
         .agent_step_limit = 24,
@@ -2459,7 +2459,7 @@ test "status reports the effort a new session starts with after the model" {
         .model_origin = "settings",
         .effort = types.ReasoningEffort.literal("xhigh"),
         .permission_mode = .auto,
-        .workspace_root = "/tmp/fx",
+        .workspace_root = "/tmp/proto-fx",
         .history_turns = 0,
         .session_permission_grants = 0,
         .agent_step_limit = 24,
@@ -2488,7 +2488,7 @@ test "status JSON lists the session modes after the permission mode" {
         .model = "provider/model",
         .permission_mode = .yolo,
         .modes = .{ .current = "open", .all = modes[0..] },
-        .workspace_root = "/tmp/fx",
+        .workspace_root = "/tmp/proto-fx",
         .history_turns = 0,
         .session_permission_grants = 0,
         .agent_step_limit = 24,
@@ -2515,7 +2515,7 @@ test "MCP config diagnostic renders in status text and JSON but not interactive 
     const snapshot = StatusSnapshot{
         .model = "alpha",
         .permission_mode = .ask,
-        .workspace_root = "/tmp/fx",
+        .workspace_root = "/tmp/proto-fx",
         .history_turns = 0,
         .session_permission_grants = 0,
         .agent_step_limit = 24,
@@ -2592,7 +2592,7 @@ test "status and doctor share a side-effect-free MCP inspection contract" {
     const status = StatusSnapshot{
         .model = "alpha",
         .permission_mode = .auto,
-        .workspace_root = "/tmp/fx",
+        .workspace_root = "/tmp/proto-fx",
         .history_turns = 0,
         .session_permission_grants = 0,
         .agent_step_limit = 24,
@@ -2616,7 +2616,7 @@ test "status and doctor share a side-effect-free MCP inspection contract" {
     try std.testing.expect(std.mem.find(u8, status_json, "broken entry was ignored") != null);
 
     const doctor = DoctorSnapshot{
-        .workspace_root = "/tmp/fx",
+        .workspace_root = "/tmp/proto-fx",
         .model = "alpha",
         .permission_mode = .auto,
         .agent_step_limit = 24,
@@ -2823,7 +2823,7 @@ test "core session list snapshot text and json stay stable" {
     defer std.testing.allocator.free(paged_text);
     try std.testing.expectEqualStrings(
         "[sessions] 1 saved\n - Session title\n   id=abc | 3 turns | Spanish | updated 1970-01-01 00:00:00.002 UTC\n" ++
-            "[sessions] more saved sessions; continue with `fx sessions --cursor v1:2:abc`\n",
+            "[sessions] more saved sessions; continue with `proto-fx sessions --cursor v1:2:abc`\n",
         paged_text,
     );
 
@@ -3008,7 +3008,7 @@ test "core empty session detail snapshot text and json stay stable" {
     const detail = session_store.ReadOnlyDetail{
         .summary = .{
             .id = @constCast("sess-empty"),
-            .workspace_root = @constCast("/tmp/fx"),
+            .workspace_root = @constCast("/tmp/proto-fx"),
             .created_at_ms = 1,
             .updated_at_ms = 2,
             .conversation_language = types.ConversationLanguage.literal("en"),
@@ -3016,8 +3016,8 @@ test "core empty session detail snapshot text and json stay stable" {
         },
         .state = .{
             .id = @constCast("sess-empty"),
-            .origin_workspace_root = @constCast("/tmp/fx"),
-            .workspace_root = @constCast("/tmp/fx"),
+            .origin_workspace_root = @constCast("/tmp/proto-fx"),
+            .workspace_root = @constCast("/tmp/proto-fx"),
             .created_at_ms = 1,
             .updated_at_ms = 2,
             .conversation_language = types.ConversationLanguage.literal("en"),
@@ -3083,7 +3083,7 @@ test "core session detail snapshot preserves history variant shapes" {
     const detail = session_store.ReadOnlyDetail{
         .summary = .{
             .id = @constCast("sess-history"),
-            .workspace_root = @constCast("/tmp/fx"),
+            .workspace_root = @constCast("/tmp/proto-fx"),
             .created_at_ms = 1,
             .updated_at_ms = 2,
             .conversation_language = types.ConversationLanguage.literal("es"),
@@ -3091,8 +3091,8 @@ test "core session detail snapshot preserves history variant shapes" {
         },
         .state = .{
             .id = @constCast("sess-history"),
-            .origin_workspace_root = @constCast("/tmp/fx"),
-            .workspace_root = @constCast("/tmp/fx"),
+            .origin_workspace_root = @constCast("/tmp/proto-fx"),
+            .workspace_root = @constCast("/tmp/proto-fx"),
             .created_at_ms = 1,
             .updated_at_ms = 2,
             .conversation_language = types.ConversationLanguage.literal("es"),
@@ -3168,7 +3168,7 @@ test "core session detail JSON includes assistant execution memory" {
     const detail = session_store.ReadOnlyDetail{
         .summary = .{
             .id = @constCast("sess-exec"),
-            .workspace_root = @constCast("/tmp/fx"),
+            .workspace_root = @constCast("/tmp/proto-fx"),
             .created_at_ms = 1,
             .updated_at_ms = 2,
             .conversation_language = types.ConversationLanguage.literal("en"),
@@ -3176,8 +3176,8 @@ test "core session detail JSON includes assistant execution memory" {
         },
         .state = .{
             .id = @constCast("sess-exec"),
-            .origin_workspace_root = @constCast("/tmp/fx"),
-            .workspace_root = @constCast("/tmp/fx"),
+            .origin_workspace_root = @constCast("/tmp/proto-fx"),
+            .workspace_root = @constCast("/tmp/proto-fx"),
             .created_at_ms = 1,
             .updated_at_ms = 2,
             .conversation_language = types.ConversationLanguage.literal("en"),
@@ -3221,7 +3221,7 @@ test "core session recovery snapshot text and json stay stable" {
     );
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
-        "[session recovery] copied source-session to recovered-session\nhistory_turns: 4\nresume: fx --resume recovered-session\n",
+        "[session recovery] copied source-session to recovered-session\nhistory_turns: 4\nresume: proto-fx --resume recovered-session\n",
         text,
     );
 
@@ -3245,7 +3245,7 @@ test "core session recovery snapshot text and json stay stable" {
     }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(partial_text);
     try std.testing.expectEqualStrings(
-        "[session recovery] copied source-session to partial-session\nhistory_turns: 4\nwarning: legacy command artifacts could not be authenticated\nresume: fx --resume partial-session\n",
+        "[session recovery] copied source-session to partial-session\nhistory_turns: 4\nwarning: legacy command artifacts could not be authenticated\nresume: proto-fx --resume partial-session\n",
         partial_text,
     );
     const partial_json = try (SessionRecoverySnapshot{
@@ -3268,7 +3268,7 @@ test "core session recovery snapshot text and json stay stable" {
     }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(without_rules_text);
     try std.testing.expectEqualStrings(
-        "[session recovery] copied source-session to ruleless-session\nhistory_turns: 4\nwarning: saved permission rules could not be read and were not copied\nresume: fx --resume ruleless-session\n",
+        "[session recovery] copied source-session to ruleless-session\nhistory_turns: 4\nwarning: saved permission rules could not be read and were not copied\nresume: proto-fx --resume ruleless-session\n",
         without_rules_text,
     );
     const without_rules_json = try (SessionRecoverySnapshot{
@@ -3287,7 +3287,7 @@ test "core doctor snapshot text and json stay stable" {
         .{ .name = @constCast("gh"), .status = .warn, .detail = @constCast("GitHub CLI not found in PATH") },
     };
     const snapshot = DoctorSnapshot{
-        .workspace_root = "/tmp/fx",
+        .workspace_root = "/tmp/proto-fx",
         .model = "alpha",
         .auth = .{ .active_source = .ai_gateway_api_key },
         .permission_mode = .ask,
@@ -3298,14 +3298,14 @@ test "core doctor snapshot text and json stay stable" {
     const text = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
-        "[doctor] ok=1 warn=1 fail=0\n[doctor] workspace=/tmp/fx\n[doctor] model=alpha\n[doctor] auth=AI_GATEWAY_API_KEY\n[doctor] auth_refreshable=false\n[doctor] permission_mode=ask\n[doctor] agent_step_limit=24\n[ok] auth: AI_GATEWAY_API_KEY is configured\n[warn] gh: GitHub CLI not found in PATH\n",
+        "[doctor] ok=1 warn=1 fail=0\n[doctor] workspace=/tmp/proto-fx\n[doctor] model=alpha\n[doctor] auth=AI_GATEWAY_API_KEY\n[doctor] auth_refreshable=false\n[doctor] permission_mode=ask\n[doctor] agent_step_limit=24\n[ok] auth: AI_GATEWAY_API_KEY is configured\n[warn] gh: GitHub CLI not found in PATH\n",
         text,
     );
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"doctor\",\"ok_count\":1,\"warn_count\":1,\"fail_count\":0,\"workspace\":\"/tmp/fx\",\"model\":\"alpha\",\"auth\":\"AI_GATEWAY_API_KEY\",\"auth_refreshable\":false,\"permission_mode\":\"ask\",\"agent_step_limit\":24,\"checks\":[{\"name\":\"auth\",\"status\":\"ok\",\"detail\":\"AI_GATEWAY_API_KEY is configured\"},{\"name\":\"gh\",\"status\":\"warn\",\"detail\":\"GitHub CLI not found in PATH\"}]}",
+        "{\"kind\":\"doctor\",\"ok_count\":1,\"warn_count\":1,\"fail_count\":0,\"workspace\":\"/tmp/proto-fx\",\"model\":\"alpha\",\"auth\":\"AI_GATEWAY_API_KEY\",\"auth_refreshable\":false,\"permission_mode\":\"ask\",\"agent_step_limit\":24,\"checks\":[{\"name\":\"auth\",\"status\":\"ok\",\"detail\":\"AI_GATEWAY_API_KEY is configured\"},{\"name\":\"gh\",\"status\":\"warn\",\"detail\":\"GitHub CLI not found in PATH\"}]}",
         json,
     );
 }
@@ -3317,7 +3317,7 @@ test "doctor text escapes hostile check details while json preserves data" {
         .detail = "warning key=bad\n\x1b]0;pwn\x07",
     }};
     const snapshot = DoctorSnapshot{
-        .workspace_root = "/tmp/fx",
+        .workspace_root = "/tmp/proto-fx",
         .model = "alpha",
         .permission_mode = .ask,
         .agent_step_limit = 24,
@@ -3455,7 +3455,7 @@ test "core upgrade snapshot renders errors and statuses" {
 
     const up_to_date_text = try up_to_date.renderText(std.testing.allocator);
     defer std.testing.allocator.free(up_to_date_text);
-    try std.testing.expectEqualStrings("fx is already up to date (v0.2.10)\n", up_to_date_text);
+    try std.testing.expectEqualStrings("proto-fx is already up to date (v0.2.10)\n", up_to_date_text);
 
     const failed_text = try (UpgradeSnapshot{
         .current = "0.2.9",
@@ -3488,7 +3488,7 @@ test "core upgrade snapshot identifies dev revisions" {
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
         "upgraded to dev abcdef012345 (v0.3.66)\n" ++
-            "changes: https://github.com/vercel-labs/fx/compare/111111111111...abcdef0123456789abcdef0123456789abcdef01\n",
+            "changes: https://github.com/vercel-labs/proto-fx/compare/111111111111...abcdef0123456789abcdef0123456789abcdef01\n",
         text,
     );
 
@@ -3839,12 +3839,12 @@ pub const SlackSnapshot = struct {
         if (format == .json) {
             try std.json.Stringify.value(self, .{}, &out.writer);
         } else if (!self.installed) {
-            try out.writer.writeAll("No local Slack bot installation. Run fx slack install.\n");
+            try out.writer.writeAll("No local Slack bot installation. Run proto-fx slack install.\n");
         } else {
             try out.writer.writeAll(if (std.mem.eql(u8, self.action, "install"))
-                "fx is now installed in your Slack workspace.\n"
+                "proto-fx is now installed in your Slack workspace.\n"
             else
-                "Your fx Slack bot credentials are saved on this computer.\n");
+                "Your proto-fx Slack bot credentials are saved on this computer.\n");
             if (self.expires_at_ms) |expiry| {
                 if (local_time.local(expiry)) |reading| {
                     var date_buf: [24]u8 = undefined;
@@ -3854,7 +3854,7 @@ pub const SlackSnapshot = struct {
                 } else {
                     try out.writer.writeAll("Access expiration time is unavailable.\n");
                 }
-                try out.writer.writeAll("Run fx slack refresh to renew locally.\n");
+                try out.writer.writeAll("Run proto-fx slack refresh to renew locally.\n");
             }
         }
         return out.toOwnedSlice();

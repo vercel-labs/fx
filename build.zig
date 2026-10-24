@@ -68,7 +68,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const exe = b.addExecutable(.{
-        .name = "fx",
+        .name = "proto-fx",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -108,7 +108,7 @@ pub fn build(b: *std.Build) void {
     // Tests launch the installed fx binary, and the session boundary test
     // walks the source tree.
     const test_paths = b.addOptions();
-    test_paths.addOptionPathUntracked("product_exe", b.graph.path(.install_bin, "fx"));
+    test_paths.addOptionPathUntracked("product_exe", b.graph.path(.install_bin, "proto-fx"));
     test_paths.addOptionPathUntracked("source_root", b.path("src"));
     const test_paths_module = test_paths.createModule();
     exe.root_module.addImport("test_paths", test_paths_module);

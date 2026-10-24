@@ -19,8 +19,9 @@ pub const bold_style = "\x1b[1m";
 pub const ask_activity_label = "⏺ Asking";
 
 const user_message_card = @import("assistant/user_message_card.zig");
+const black_prism = @import("black_prism.zig");
 
-pub const welcome_message_reserved_rows: u16 = 11;
+pub const welcome_message_reserved_rows: u16 = 25;
 
 pub var is_light: bool = false;
 pub var divider_style: []const u8 = shared_theme.fx_dark.divider_style;
@@ -177,7 +178,7 @@ fn writeBuildLabel(
     });
 }
 
-pub fn welcomeMessage(alloc: std.mem.Allocator) ![]u8 {
+pub fn welcomeTitle(alloc: std.mem.Allocator) ![]u8 {
     var label_buf: [welcome_build_label_bytes]u8 = undefined;
     const build_label = try writeBuildLabel(
         &label_buf,
@@ -186,9 +187,17 @@ pub fn welcomeMessage(alloc: std.mem.Allocator) ![]u8 {
         build_options.git_commit,
     );
     return alloc.print(
-        "{s}𝒇x{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
+        "{s}proto-fx{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
         .{ subtitle_style, reset_style, dim_style, build_label },
     );
+}
+
+pub fn welcomeMessage(alloc: std.mem.Allocator, cols: u16) ![]u8 {
+    const banner = try black_prism.renderStill(alloc, cols, 0);
+    defer alloc.free(banner);
+    const title = try welcomeTitle(alloc);
+    defer alloc.free(title);
+    return alloc.print("{s}\n{s}", .{ banner, title });
 }
 
 pub const StatuslineItems = struct {
@@ -744,13 +753,13 @@ test "terminal title writes the label to the caller's output file" {
 
     // A host that redirects its output keeps the escape sequence off the
     // real stdout, which the Zig test runner owns as its protocol channel.
-    terminalTitleFor(&sink).set("fx v" ++ build_options.app_version ++ " | fx");
+    terminalTitleFor(&sink).set("proto-fx v" ++ build_options.app_version ++ " | proto-fx");
 
     var written_file = try tmp.dir.openFile(io_mod.getIo(), "terminal-title.log", .{});
     defer written_file.close(io_mod.getIo());
     const written = try io_mod.readFileToEnd(alloc, &written_file, 128);
     defer alloc.free(written);
-    try std.testing.expectEqualStrings("\x1b]2;fx v" ++ build_options.app_version ++ " | fx\x07", written);
+    try std.testing.expectEqualStrings("\x1b]2;proto-fx v" ++ build_options.app_version ++ " | proto-fx\x07", written);
 }
 
 test "terminal title sanitizes and bounds untrusted labels" {
@@ -796,7 +805,7 @@ pub fn formatResumeHandoff(
     terminal_cols: u16,
 ) ![]const u8 {
     const label = "Continue session with:";
-    const command = "fx --resume ";
+    const command = "proto-fx --resume ";
     const single_row_width = label.len + 1 + command.len + session_id.len;
     const separator = if (single_row_width <= terminal_cols) " " else "\n  ";
     return std.mem.print(
@@ -863,18 +872,18 @@ test "resume handoff uses one row only when the full instruction fits" {
     initTheme(false, null);
     defer initTheme(false, null);
 
-    const single_row = "Continue session with: fx --resume session-123";
+    const single_row = "Continue session with: proto-fx --resume session-123";
     var exact_buffer: [128]u8 = undefined;
     const exact = try formatResumeHandoff(&exact_buffer, "session-123", single_row.len);
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;245mContinue session with: fx --resume session-123\x1b[0m\n",
+        "\x1b[38;5;245mContinue session with: proto-fx --resume session-123\x1b[0m\n",
         exact,
     );
 
     var narrow_buffer: [128]u8 = undefined;
     const narrow = try formatResumeHandoff(&narrow_buffer, "session-123", single_row.len - 1);
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;245mContinue session with:\n  fx --resume session-123\x1b[0m\n",
+        "\x1b[38;5;245mContinue session with:\n  proto-fx --resume session-123\x1b[0m\n",
         narrow,
     );
 }
@@ -886,7 +895,7 @@ test "resume handoff follows the active muted theme shade" {
     var buffer: [128]u8 = undefined;
     const message = try formatResumeHandoff(&buffer, "session-123", 80);
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;247mContinue session with: fx --resume session-123\x1b[0m\n",
+        "\x1b[38;5;247mContinue session with: proto-fx --resume session-123\x1b[0m\n",
         message,
     );
 }
@@ -918,17 +927,17 @@ test "initTheme selects the light inline code foreground" {
 }
 
 test "welcomeMessage shows version and help hint" {
-    const message = try welcomeMessage(std.testing.allocator);
+    const message = try welcomeMessage(std.testing.allocator, 80);
     defer std.testing.allocator.free(message);
 
-    try std.testing.expect(std.mem.find(u8, message, "𝒇x") != null);
+    try std.testing.expect(std.mem.find(u8, message, "proto-fx") != null);
     try std.testing.expect(std.mem.find(u8, message, build_options.app_version) != null);
     try std.testing.expect(std.mem.find(u8, message, "/help") != null);
 }
 
 test "welcomeMessage keeps only the app name bright" {
     initTheme(false, null);
-    const message = try welcomeMessage(std.testing.allocator);
+    const message = try welcomeMessage(std.testing.allocator, 80);
     defer std.testing.allocator.free(message);
 
     var label_buf: [welcome_build_label_bytes]u8 = undefined;
@@ -939,12 +948,12 @@ test "welcomeMessage keeps only the app name bright" {
         build_options.git_commit,
     );
     const expected = try std.testing.allocator.print(
-        "{s}𝒇x{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
+        "{s}proto-fx{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
         .{ subtitle_style, reset_style, dim_style, build_label },
     );
     defer std.testing.allocator.free(expected);
 
-    try std.testing.expectEqualStrings(expected, message);
+    try std.testing.expect(std.mem.endsWith(u8, message, expected));
 }
 
 test "build label stays bare on the stable channel" {
@@ -1105,11 +1114,11 @@ test "buildHintLine omits the session segment when no title is cached" {
 test "buildHintLine shows the workspace and Git branch" {
     var buf: [256]u8 = undefined;
     const line = buildHintLine(false, true, "openai/gpt-5", .ask, false, .auto, false, .{
-        .workspace_label = "/workspace/code/fx",
+        .workspace_label = "/workspace/code/proto-fx",
         .git_branch = "feature/statusline",
     }, 100, &buf);
     try std.testing.expectEqualStrings(
-        "ask · gpt-5 · /workspace/code/fx (feature/statusline)",
+        "ask · gpt-5 · /workspace/code/proto-fx (feature/statusline)",
         line,
     );
 }
@@ -1154,11 +1163,11 @@ test "buildHintLine shows a non-Git workspace without branch punctuation" {
 test "buildHintLine labels detached HEAD" {
     var buf: [128]u8 = undefined;
     const line = buildHintLine(false, true, "openai/gpt-5", .ask, false, .auto, false, .{
-        .workspace_label = "/tmp/fx",
+        .workspace_label = "/tmp/proto-fx",
         .git_branch = "detached:0123456789ab",
     }, 80, &buf);
     try std.testing.expectEqualStrings(
-        "ask · gpt-5 · /tmp/fx (detached:0123456789ab)",
+        "ask · gpt-5 · /tmp/proto-fx (detached:0123456789ab)",
         line,
     );
 }

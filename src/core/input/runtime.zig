@@ -1,4 +1,5 @@
 const std = @import("std");
+const session_browser = @import("session_browser.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const settings_catalog = @import("../config/settings_catalog.zig");
 const info_panel = @import("info_panel.zig");
@@ -34,6 +35,7 @@ const ImageBlocks = kill_ring.ImageBlocks;
 
 pub const Runtime = struct {
     edit_state: editor_state.State = .{},
+    session_browser: session_browser.State = .{},
     slash_menu_categories: bool = true,
     picker: picker_state.State = .{},
     help_menu: command_specs.HelpMenu = .{},
@@ -69,6 +71,7 @@ pub const Runtime = struct {
         input_reset.resetPendingTextScalarWithTrace(&self.text_scalar, "shutdown");
         self.paste.deinit(alloc);
         self.info_panel.close();
+        self.session_browser.close();
         self.usage_menu.close();
         self.edit_state.deinit(alloc);
         self.picker.deinit(alloc);

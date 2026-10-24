@@ -6,6 +6,7 @@ const child_state = @import("child_state.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
 const live_metrics = @import("live_metrics.zig");
+const live_presentation = @import("live_presentation.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const permission_request = @import("../permissions/permission_request.zig");
@@ -15,6 +16,7 @@ const session_store = @import("../session/session_store.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const types = @import("../shared/types.zig");
 
+const python_kernel = @import("../kernel/kernel.zig");
 const Allocator = std.mem.Allocator;
 
 pub const StartResult = enum { started, already_running };
@@ -33,6 +35,8 @@ const Slot = struct {
     owner: *Owner,
     child_id: []u8,
     metrics: live_metrics.LiveMetrics = .{},
+    presentation: live_presentation.Tail = .{},
+    presentation_work_id: ?[]u8 = null,
     cancel: std.atomic.Value(bool) = .init(false),
     shutdown: std.atomic.Value(bool) = .init(false),
     worker: ?*worker_runtime.WorkerRuntime = null,
@@ -98,6 +102,29 @@ pub const Owner = struct {
     slots: std.ArrayList(*Slot) = .empty,
     feedback: std.ArrayList(*Feedback) = .empty,
     closed: bool = false,
+    /// Kernel processes belong to child sessions, not their short-lived work slots.
+    /// A running child temporarily owns its entry's pointer in TurnContext.runtime.
+    kernels: std.array_hash_map.String(?*python_kernel.Manager) = .empty,
+
+    fn lendKernel(self: *Owner, child_id: []const u8, turn: *execution.TurnContext) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.kernels.getPtr(child_id)) |manager| {
+            turn.runtime.python = manager.*;
+            manager.* = null;
+            return;
+        }
+        const key = try self.alloc.dupe(u8, child_id);
+        errdefer self.alloc.free(key);
+        try self.kernels.put(self.alloc, key, null);
+    }
+
+    fn retainKernel(self: *Owner, child_id: []const u8, turn: *execution.TurnContext) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.kernels.getPtr(child_id).?.* = turn.runtime.python;
+        turn.runtime.python = null;
+    }
 
     fn feedbackReplayLocked(self: *Owner, operation_id: []const u8, fingerprint: [32]u8) ?FeedbackResult {
         for (self.feedback.items) |item| {
@@ -288,6 +315,27 @@ pub const Owner = struct {
         return observation;
     }
 
+    /// Snapshot only this work's native display tail. The owner lock pins the
+    /// slot while its separate presentation lock copies callback-owned bytes.
+    pub fn snapshotPresentation(
+        self: *Owner,
+        alloc: Allocator,
+        child_id: []const u8,
+        work_id: []const u8,
+        after: u64,
+        reset: bool,
+    ) !?live_presentation.Snapshot {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.slots.items) |slot| {
+            if (slot.completion != .running or !std.mem.eql(u8, slot.child_id, child_id)) continue;
+            const active_work = slot.presentation_work_id orelse continue;
+            if (!std.mem.eql(u8, active_work, work_id)) continue;
+            return try slot.presentation.snapshot(alloc, after, reset);
+        }
+        return null;
+    }
+
     pub fn cancel(self: *Owner, child_id: []const u8) CancelError!void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -362,6 +410,11 @@ pub const Owner = struct {
             destroySlot(self, slot);
         }
         self.slots.deinit(self.alloc);
+        for (self.kernels.keys(), self.kernels.values()) |key, value| {
+            if (value) |manager| manager.destroy();
+            self.alloc.free(key);
+        }
+        self.kernels.deinit(self.alloc);
         for (self.feedback.items) |item| item.deinit(self.alloc);
         self.feedback.deinit(self.alloc);
         self.* = undefined;
@@ -441,6 +494,8 @@ fn destroySlot(owner: *Owner, slot: *Slot) void {
     while (slot.waiters != 0) owner.waiters_changed.waitUncancelable(io_mod.getIo(), &owner.mutex);
     owner.mutex.unlock(io_mod.getIo());
     std.debug.assert(slot.route_refs == 0);
+    slot.presentation.deinit(owner.alloc);
+    if (slot.presentation_work_id) |id| owner.alloc.free(id);
     owner.alloc.free(slot.child_id);
     owner.alloc.destroy(slot);
 }
@@ -515,6 +570,7 @@ fn slotMain(slot: *Slot) void {
     // Take owner before registry, matching cancellation and approval lock ordering.
     owner.mutex.lockUncancelable(io_mod.getIo());
     const completed = owner.finish(slot.child_id, outcome.work_id, outcome.outcome, outcome.failure);
+    slot.presentation.deinit(owner.alloc);
     slot.completion = if (completed) |value| .{ .published = value } else .unpublished;
     slot.done.set(io_mod.getIo());
     owner.mutex.unlock(io_mod.getIo());
@@ -547,6 +603,9 @@ fn runOne(slot: *Slot) OneOutcome {
     var turn = child.turn(owner.alloc, owner.max_history_turns) catch |err|
         return failedOutcome(work_id, "turn_initialization", err);
     defer turn.deinit();
+    owner.lendKernel(slot.child_id, &turn) catch |err|
+        return failedOutcome(work_id, "kernel_ownership", err);
+    defer owner.retainKernel(slot.child_id, &turn);
     turn.live_authority = owner.authority_resolver;
     turn.approval_registry = owner.approvals;
     turn.child_id = slot.child_id;
@@ -554,7 +613,11 @@ fn runOne(slot: *Slot) OneOutcome {
     turn.phase_context = owner;
     turn.phase_fn = Owner.phaseTransition;
     turn.live_metrics = &slot.metrics;
+    turn.live_presentation = &slot.presentation;
+    const presentation_work_id = owner.alloc.dupe(u8, snapshot.active.id) catch
+        return failedOutcome(work_id, "presentation_ownership", error.OutOfMemory);
     owner.mutex.lockUncancelable(io_mod.getIo());
+    slot.presentation_work_id = presentation_work_id;
     slot.worker = turn.workerRuntime();
     slot.work_id = turn.active_work_id;
     if (slot.cancel.load(.seq_cst)) slot.worker.?.requestShutdown();

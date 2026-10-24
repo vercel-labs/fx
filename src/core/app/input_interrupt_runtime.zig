@@ -65,6 +65,9 @@ pub fn InterruptRuntime(comptime App: type) type {
         }
 
         pub fn cancelActiveOperation(app: *App) !void {
+            if (comptime @hasDecl(App, "cancelRemoteTurn")) {
+                if (try app.cancelRemoteTurn()) return;
+            }
             if (comptime @hasField(App, "auth")) {
                 if (comptime @hasDecl(@TypeOf(app.auth), "cancelProviderPreparation")) {
                     if (app.auth.cancelProviderPreparation()) {

@@ -1507,6 +1507,18 @@ pub const Session = struct {
         return self.handle.onDisk();
     }
 
+    /// A detached session owner must retain even an empty root (for example a
+    /// scheduled first prompt). The manager publishes on a lifecycle frame;
+    /// this closed empty frame stores the seed but adds no conversation item,
+    /// so restoring it yields empty history and never replays execution.
+    pub fn retainForBackground(self: *Session) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.saved()) return;
+        _ = try self.write(&.{ .turn_started, .turn_committed });
+        self.last_turn += 1;
+    }
+
     /// The session's folder under `~/.fx/sessions/v2`, for display. Caller owns it.
     pub fn folderPath(self: *const Session, alloc: Allocator) ![]u8 {
         return std.Io.Dir.path.join(alloc, &.{

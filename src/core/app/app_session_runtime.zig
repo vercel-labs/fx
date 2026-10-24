@@ -305,7 +305,7 @@ const ResumeNotice = union(enum) {
 };
 
 fn writeUpgradeNoticeBody(writer: *std.Io.Writer, upgrade: UpgradeNotice) !void {
-    try writer.writeAll("fx has been updated to ");
+    try writer.writeAll("proto-fx has been updated to ");
     if (upgrade.channel == .dev and update_target.isValidRevision(upgrade.revision)) {
         try writer.print("dev {s} (v{s})", .{
             upgrade.revision[0..@min(upgrade.revision.len, 12)],
@@ -1833,9 +1833,10 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn finishLiveSessionTransition(app: *App) !void {
-            const welcome = try ui_render.welcomeMessage(app.alloc);
+            const welcome = try ui_render.welcomeMessage(app.alloc, app.shell.layout.cols);
             defer app.alloc.free(welcome);
             try app.writeTranscriptClassified(welcome, true, .welcome);
+            app.shell.startWelcomeAnimation(app.shell.layout.cols);
             app.shell.render_requests.request(.footer);
             try shell_runtime.requestRedraw(&app.shell, &app.metrics, .replay_viewport);
         }
@@ -2820,7 +2821,7 @@ pub fn Runtime(comptime App: type) type {
                     recordShutdownFailure(app, failure);
                     if (comptime @hasDecl(App, "writeDomainNotice")) {
                         const body = try app.alloc.print(
-                            "Turn completed, but fx could not save it ({s}). The session keeps running; this turn may be missing after a resume.",
+                            "Turn completed, but proto-fx could not save it ({s}). The session keeps running; this turn may be missing after a resume.",
                             .{@errorName(failure)},
                         );
                         defer app.alloc.free(body);
@@ -2967,11 +2968,11 @@ pub fn Runtime(comptime App: type) type {
             else
                 "";
             const folder = if (basename.len == 0) "workspace" else basename;
-            const prefix = "fx v" ++ build_options.app_version ++ " | ";
+            const prefix = "proto-fx v" ++ build_options.app_version ++ " | ";
             var label_buffer: [prefix.len + std.Io.Dir.max_path_bytes]u8 = undefined;
             const label = std.mem.print(&label_buffer, "{s}{s}", .{ prefix, folder }) catch |err| {
                 debug_trace.logf("session", "terminal title workspace omitted err={s}", .{@errorName(err)});
-                provider.set("fx v" ++ build_options.app_version);
+                provider.set("proto-fx v" ++ build_options.app_version);
                 return;
             };
             provider.set(label);
@@ -3943,7 +3944,7 @@ pub fn Runtime(comptime App: type) type {
                         .body = display.title,
                     });
                     // A plain line, so the command copies as it is.
-                    const line = try app.alloc.print("original session fx --resume {s}\n", .{source_id});
+                    const line = try app.alloc.print("original session proto-fx --resume {s}\n", .{source_id});
                     defer app.alloc.free(line);
                     try sink.appendRaw(line);
                 },
@@ -3955,6 +3956,14 @@ pub fn Runtime(comptime App: type) type {
             var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
             defer labels.deinit(app.alloc);
             return replayHistoryToSink(app, &sink, history, &labels);
+        }
+
+        /// Reuses the normal transcript projection without taking persistence ownership.
+        pub fn replayRemoteHistory(app: *App, history: []const types.HistoryTurn) !void {
+            var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
+            defer labels.deinit(app.alloc);
+            var sink = LiveHistorySink(App){ .app = app };
+            try replayHistoryToSink(app, &sink, history, &labels);
         }
 
         fn replayHistoryToSink(
@@ -4234,6 +4243,12 @@ pub fn Runtime(comptime App: type) type {
             else
                 null;
             const outcome_decision = command_decision orelse terminal_action_decision;
+            // A shell request rejected before execution is a failed tool row,
+            // not command stdout. Keep its structured explanation in detail.
+            const shell_correction = if (result.status == .failure and std.mem.eql(u8, call.name, "shell"))
+                try tool_result_errors.inspectTerminalActionFieldCorrection(action_arena.allocator(), result.output)
+            else
+                null;
             const formatted_action_base = if (deferred)
                 try app.describeToolActionDeniedWithAdvertised(
                     action_arena.allocator(),
@@ -4263,7 +4278,18 @@ pub fn Runtime(comptime App: type) type {
                 )
             else if (try tooling_presentation.subagentStatusLine(action_arena.allocator(), call, result.output)) |line|
                 line
-            else if (result.status == .success) success: {
+            else if (shell_correction) |correction| correction: {
+                const action = try tooling_presentation.formatPlainAction(action_arena.allocator(), .{
+                    .tool_registry = app.toolAdvertisementSet().registry,
+                    .call = call,
+                    .workspace_root = labels.workspace_root,
+                    .display_target = action_target,
+                });
+                break :correction try action_arena.allocator().print(
+                    "● Failed: {s} · {d} invalid field{s}",
+                    .{ action, correction.invalid_field_count, if (correction.invalid_field_count == 1) "" else "s" },
+                );
+            } else if (result.status == .success) success: {
                 var skill_name_buffer: [skill_contract.max_name_bytes]u8 = undefined;
                 const registry = app.toolAdvertisementSet().registry;
                 const display_target = target: {
@@ -4324,7 +4350,7 @@ pub fn Runtime(comptime App: type) type {
                 outcome,
                 action,
             );
-            if (!is_command or deferred or permission_denial_reason != null) {
+            if (!is_command or deferred or permission_denial_reason != null or shell_correction != null) {
                 try sink.attachHistoricalToolDetail(entry_id, call, result);
                 return;
             }
@@ -4332,15 +4358,14 @@ pub fn Runtime(comptime App: type) type {
                 try sink.attachHistoricalToolDetail(entry_id, call, result);
                 return;
             }
-            const wrote_command_output =
-                try writeCommandReplay(
-                    app,
-                    sink,
-                    result.command_output_replay,
-                    result.tool_call_id,
-                ) or
-                try writeStoredCommandOutput(app, sink, result) or
-                try writeSavedCommandOutput(sink, result.output);
+            const command_output = if (try writeCommandReplay(
+                app,
+                sink,
+                result.command_output_replay,
+                result.tool_call_id,
+            )) @as(?bool, true) else try writeStoredCommandOutput(app, sink, result) orelse
+                try writeSavedCommandOutput(app.alloc, sink, call.name, result.output);
+            const wrote_command_output = command_output orelse false;
             // Attach terminal detail after historical command chunks so typed
             // process presentation joins the existing block instead of
             // synthesizing a second, empty command-output block.
@@ -4357,6 +4382,8 @@ pub fn Runtime(comptime App: type) type {
                 sink.attachHistoricalCommandOutput(entry_id);
                 return;
             }
+            // A recognized empty shell result has no output block to attach.
+            if (command_output != null) return;
 
             debug_trace.logf(
                 "session",
@@ -4603,16 +4630,16 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             sink: anytype,
             result: types.PersistedToolResult,
-        ) !bool {
-            const handle = result.output_handle orelse return false;
-            if (app.session_persistence.v2 == null) return false;
+        ) !?bool {
+            const handle = result.output_handle orelse return null;
+            if (app.session_persistence.v2 == null) return null;
             const capability = activeChildCapability(app) catch |err| {
                 debug_trace.logf(
                     "session",
                     "resume command replay could not open result handle={s} err={s}",
                     .{ handle, @errorName(err) },
                 );
-                return false;
+                return null;
             };
             const output = result_store.readForReplayManaged(
                 app.alloc,
@@ -4625,10 +4652,10 @@ pub fn Runtime(comptime App: type) type {
                     "resume command replay could not read result handle={s} err={s}",
                     .{ handle, @errorName(err) },
                 );
-                return false;
+                return null;
             };
             defer app.alloc.free(output);
-            return writeSavedCommandOutput(sink, output);
+            return writeSavedCommandOutput(app.alloc, sink, result.tool_name, output);
         }
 
         fn writeUnreportedToolStatus(
@@ -4670,12 +4697,29 @@ pub fn Runtime(comptime App: type) type {
             return sink.appendToolStatus(kind, status);
         }
 
-        fn writeSavedCommandOutput(sink: anytype, output: []const u8) !bool {
+        // Null means unrecognized; false means a recognized result with no output.
+        fn writeSavedCommandOutput(alloc: Allocator, sink: anytype, tool_name: []const u8, output: []const u8) !?bool {
+            if (std.mem.eql(u8, tool_name, "shell")) {
+                var parsed = std.json.parseFromSlice(struct {
+                    state: []const u8,
+                    output_delta: []const u8,
+                }, alloc, output, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => null,
+                };
+                if (parsed) |*snapshot| {
+                    defer snapshot.deinit();
+                    if (snapshot.value.output_delta.len == 0) return false;
+                    try sink.appendCommandOutput(.stdout, snapshot.value.output_delta);
+                    try sink.finishCommandOutput();
+                    return true;
+                }
+            }
             var wrote = false;
             wrote = try writeCommandEnvelope(sink, output, "<stdout>\n", "\n</stdout>", .stdout) or wrote;
             wrote = try writeCommandEnvelope(sink, output, "<stderr>\n", "\n</stderr>", .stderr) or wrote;
             if (wrote) try sink.finishCommandOutput();
-            return wrote;
+            return if (wrote) true else null;
         }
 
         fn writeCommandEnvelope(
@@ -7526,6 +7570,101 @@ test "execution replay writes completed status before saved command output" {
     );
 }
 
+test "historical shell replay decodes snapshot output without exposing its envelope" {
+    const cases = [_]struct {
+        tool_name: []const u8 = "shell",
+        output: []const u8,
+        stdout: []const u8 = "",
+        stderr: []const u8 = "",
+        raw: bool = false,
+        status: @FieldType(types.PersistedToolResult, "status") = .success,
+        label: ?[]const u8 = null,
+    }{
+        .{
+            .output = "{\"session_id\":null,\"state\":\"completed\",\"backend\":\"command\",\"output_delta\":\"first\\n\\n\\\"quoted\\\"\\tlast\\n\"}",
+            .stdout = "first\n\n\"quoted\"\tlast\n",
+        },
+        .{ .output = "{\"state\":\"completed\",\"output_delta\":\"\"}" },
+        .{
+            .output = "exit_code=0\n<stdout>\nlegacy\n</stdout>\n<stderr>\nwarning\n</stderr>\n",
+            .stdout = "legacy",
+            .stderr = "warning",
+        },
+        .{
+            .tool_name = "run_command",
+            .output = "{\"state\":\"completed\",\"output_delta\":\"not a shell result\"}",
+            .raw = true,
+        },
+        .{ .output = "{\"output_delta\":\"unrecognized result\"}", .raw = true },
+        .{
+            .status = .failure,
+            .output =
+            \\{"error":{"code":"invalid_shell_request","executed":false,"problems":["invalid_field is not accepted for run."]}}
+            ,
+            .label = "● Failed: Running printf · 1 invalid field\n",
+        },
+        .{
+            .status = .failure,
+            .output =
+            \\{"error":{"code":"invalid_shell_request","executed":true,"problems":["command-produced JSON"]}}
+            ,
+            .raw = true,
+        },
+        .{
+            .output =
+            \\{"error":{"code":"invalid_shell_request","executed":false,"problems":["successful raw output is not a rejection"]}}
+            ,
+            .raw = true,
+        },
+        .{
+            .status = .failure,
+            .output =
+            \\{"state":"completed","output_delta":"{\"error\":{\"code\":\"invalid_shell_request\",\"executed\":false,\"problems\":[\"command-produced JSON\"]}}"}
+            ,
+            .stdout =
+            \\{"error":{"code":"invalid_shell_request","executed":false,"problems":["command-produced JSON"]}}
+            ,
+        },
+    };
+    for (cases) |case| {
+        var app = try TestApp.init(std.testing.allocator, "/workspace");
+        defer app.deinit();
+        var calls = [_]types.ToolCall{.{
+            .id = "shell_replay",
+            .name = case.tool_name,
+            .arguments_json = "{\"action\":\"run\",\"command\":\"printf\"}",
+        }};
+        var results = [_]types.PersistedToolResult{.{
+            .tool_call_id = @constCast("shell_replay"),
+            .tool_name = @constCast(case.tool_name),
+            .status = case.status,
+            .output = @constCast(case.output),
+            .output_bytes = case.output.len,
+            .stored_output_bytes = case.output.len,
+        }};
+        var steps = [_]types.ToolExecutionStep{.{
+            .tool_calls = &calls,
+            .tool_results = &results,
+        }};
+        try Runtime(TestApp).writeExecutionHistory(&app, .{ .tool_steps = &steps });
+        try std.testing.expectEqualStrings(case.stdout, app.command_stdout.items);
+        try std.testing.expectEqualStrings(case.stderr, app.command_stderr.items);
+        try std.testing.expectEqual(@as(usize, @intFromBool(case.stdout.len > 0 or case.stderr.len > 0)), app.command_output_flush_count);
+        try std.testing.expectEqual(@as(usize, 1), app.historical_tool_detail_entry_ids.items.len);
+        if (case.label) |label| {
+            try std.testing.expectEqualStrings(label, app.completed_tool_statuses.items[0]);
+            try std.testing.expectEqual(types.ToolOutcomeKind.failed, app.completed_tool_outcomes.items[0]);
+            // No command/raw entry may split the neighboring compact tool group.
+            try std.testing.expectEqualSlices(ReplayEvent, &.{.completed_tool_status}, app.replay_events.items);
+        }
+        if (case.raw) {
+            try std.testing.expect(std.mem.startsWith(u8, app.transcript.items, case.output));
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
+        }
+    }
+}
+
 test "resume restores complete command output stored behind a result handle" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -7914,7 +8053,7 @@ test "upgrade notice body identifies stable notes and dev changes" {
                 .previous_revision = "",
                 .revision = "",
             },
-            .expected = "fx has been updated to v9.9.9 (\x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4mnotes\x1b[24m\x1b]8;;\x1b\\)",
+            .expected = "proto-fx has been updated to v9.9.9 (\x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4mnotes\x1b[24m\x1b]8;;\x1b\\)",
         },
         .{
             .upgrade = .{
@@ -7923,7 +8062,7 @@ test "upgrade notice body identifies stable notes and dev changes" {
                 .previous_revision = "1111111111111111111111111111111111111111",
                 .revision = "abcdef0123456789abcdef0123456789abcdef01",
             },
-            .expected = "fx has been updated to dev abcdef012345 (v9.9.9) (\x1b]8;;https://github.com/vercel-labs/fx/compare/1111111111111111111111111111111111111111...abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
+            .expected = "proto-fx has been updated to dev abcdef012345 (v9.9.9) (\x1b]8;;https://github.com/vercel-labs/fx/compare/1111111111111111111111111111111111111111...abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
         },
         .{
             .upgrade = .{
@@ -7932,7 +8071,7 @@ test "upgrade notice body identifies stable notes and dev changes" {
                 .previous_revision = "",
                 .revision = "abcdef0123456789abcdef0123456789abcdef01",
             },
-            .expected = "fx has been updated to dev abcdef012345 (v9.9.9) (\x1b]8;;https://github.com/vercel-labs/fx/commit/abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
+            .expected = "proto-fx has been updated to dev abcdef012345 (v9.9.9) (\x1b]8;;https://github.com/vercel-labs/fx/commit/abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
         },
     };
 
@@ -8282,7 +8421,7 @@ test "upgrade resume restores active session with the installed version notice" 
     try std.testing.expectEqualStrings("run server", context[2].assistant.user.text);
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
     try std.testing.expectEqualStrings(
-        "✓ fx has been updated to v9.9.9 (\x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4mnotes\x1b[24m\x1b]8;;\x1b\\)",
+        "✓ proto-fx has been updated to v9.9.9 (\x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4mnotes\x1b[24m\x1b]8;;\x1b\\)",
         app.notices.items[0],
     );
     try std.testing.expectEqual(@as(usize, 2), app.completed_tool_statuses.items.len);
@@ -8695,7 +8834,7 @@ test "resumeRequestedSession replays persisted model Markdown without parsing ge
     );
     try std.testing.expectEqual(@as(usize, 1), app.assistant_thematic_rule_count);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Cancelled") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "What can fx do differently?") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "What should change?") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "System:") == null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Cancelling") == null);
     try std.testing.expectEqual(
@@ -8814,7 +8953,7 @@ test "resumeRequestedSession replays active-tool interruption with live cancella
     try std.testing.expectEqual(@as(usize, 1), app.cards.items.len);
     try std.testing.expectEqualStrings("inspect the browser", app.cards.items[0].text);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Cancelled") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "What can fx do differently?") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "What should change?") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "System:") == null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Cancelling") == null);
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
@@ -10880,11 +11019,11 @@ test "terminal title shows the session title once cached and falls back to build
 
     try std.testing.expectEqualStrings("", app.terminalTitleLabelText());
     Runtime(TestApp).syncTerminalTitle(&app);
-    try std.testing.expectEqualStrings("fx v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("proto-fx v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
 
     try app.selected_model.appendSlice(alloc, "zai/glm-5.2");
     Runtime(TestApp).syncTerminalTitle(&app);
-    try std.testing.expectEqualStrings("fx v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("proto-fx v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
 
     try app.session.appendHistoryEntry(alloc, .{ .assistant = .{
         .user = .{ .text = @constCast("wire the release notes generator") },
@@ -10905,7 +11044,7 @@ test "terminal title shows the session title once cached and falls back to build
 
     Runtime(TestApp).clearCachedSessionTitle(&app);
     try std.testing.expect(Runtime(TestApp).cachedSessionTitle(&app) == null);
-    try std.testing.expectEqualStrings("fx v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("proto-fx v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
 }
 
 test "cached session title drops control bytes before they reach the terminal" {
@@ -10943,7 +11082,7 @@ test "terminal title uses the workspace basename and handles unnamed roots" {
         defer app.deinit();
         Runtime(TestApp).syncTerminalTitle(&app);
         var expected_buffer: [128]u8 = undefined;
-        const expected = try std.mem.print(&expected_buffer, "fx v{s} | {s}", .{ build_options.app_version, case.folder });
+        const expected = try std.mem.print(&expected_buffer, "proto-fx v{s} | {s}", .{ build_options.app_version, case.folder });
         try std.testing.expectEqualStrings(expected, app.terminalTitleLabelText());
     }
 }

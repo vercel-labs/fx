@@ -1161,6 +1161,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         ctx.web_search_runtime_ready and ctx.web_search_backend != null;
     return .{
         .allocator = arena,
+        .kernel_session = ctx.session,
         .observer = ctx.observer,
         .permission_mode = ctx.permission_mode,
         .workspace_root = ctx.workspace_root,

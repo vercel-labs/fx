@@ -19,6 +19,7 @@ pub const SlashRegistry = command_specs.SlashRegistry;
 const json_option = command_specs.OptionDoc{ .flag = "--json", .description = "Emit machine-readable JSON instead of text" };
 
 pub const top_level_specs = [_]TopLevelSpec{
+    .{ .kind = .daemon, .token = "daemon", .usage = "daemon [status|stop]", .summary = "Inspect or gracefully stop the detached supervisor", .details = &.{"Stopping the supervisor cancels active work, saves supported kernel globals, and releases its processes. Closing the terminal only detaches."} },
     .{
         .kind = .help,
         .token = "help",
@@ -33,7 +34,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .summary = "Run one noninteractive request",
         .options = &.{
             .{ .flag = "--auto", .description = "Automatically review unresolved permission requests" },
-            .{ .flag = "--full-access", .description = "Disable fx permission checks" },
+            .{ .flag = "--full-access", .description = "Disable proto-fx permission checks" },
             .{ .flag = "--yolo", .description = "Alias for --full-access" },
             .{ .flag = "--model <id>", .description = "Override the model for this request" },
             .{ .flag = "--effort <level>", .description = "Override the reasoning effort for this request" },
@@ -102,20 +103,20 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .login,
         .token = "login",
-        .usage = "login [vercel|codex|grok]",
-        .summary = "Sign in to Vercel or a selected provider",
+        .usage = "login [codex|grok]",
+        .summary = "Sign in to an optional subscription provider",
     },
     .{
         .kind = .logout,
         .token = "logout",
-        .usage = "logout [vercel|codex|grok]",
-        .summary = "Sign out of Vercel or a selected provider session",
+        .usage = "logout [codex|grok]",
+        .summary = "Sign out of a selected provider session",
     },
     .{
         .kind = .setup,
         .token = "setup",
-        .usage = "setup",
-        .summary = "Configure an AI Gateway API key",
+        .usage = "setup --base-url URL [--model MODEL] [--api-key-env NAME] [--name NAME]",
+        .summary = "Discover models and configure an OpenAI-compatible endpoint",
     },
     .{
         .kind = .status,
@@ -134,7 +135,7 @@ pub const top_level_specs = [_]TopLevelSpec{
             "Modes:",
             "  ask          Prompt before sensitive tool calls",
             "  auto         Apply rules, then review unresolved sensitive tool calls (default)",
-            "  full-access  Disable fx permission checks",
+            "  full-access  Disable proto-fx permission checks",
             "",
             "Change the mode from the interactive shell with `/permissions [ask|auto|full-access|reset]`,",
             "and manage persistent allow rules with `/allowlist`.",
@@ -158,7 +159,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .kind = .provider,
         .token = "provider",
         .usage = "provider <name>",
-        .summary = "Choose the model provider used by fx",
+        .summary = "Choose the model provider used by proto-fx",
     },
     .{
         .kind = .doctor,
@@ -171,7 +172,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .kind = .teams,
         .token = "teams",
         .usage = "teams",
-        .summary = "Choose the Vercel team used by AI Gateway",
+        .summary = "Show direct endpoint setup guidance",
     },
     .{
         .kind = .session,
@@ -231,16 +232,16 @@ pub const top_level_specs = [_]TopLevelSpec{
             json_option,
         },
         .details = &.{
-            "With AI Gateway, reads its usage reports: with fx login, your spend on the team and your budget; with an API key, that key's spend.",
+            "With AI Gateway, reads its usage reports: with proto-fx login, your spend on the team and your budget; with an API key, that key's spend.",
             "With Codex, reads your ChatGPT plan's limits and activity; with Grok, your plan's allowance and credits.",
-            "Finished days are cached under ~/.fx and fetched at most once a day.",
+            "Finished days are cached under ~/.proto-fx and fetched at most once a day.",
         },
     },
     .{
         .kind = .upgrade,
         .token = "upgrade",
         .usage = "upgrade [--channel <stable|dev>] [--json]",
-        .summary = "Upgrade 𝒇x on the selected release channel",
+        .summary = "Show local rebuild guidance (upstream upgrades disabled)",
         .options = &.{
             .{ .flag = "--channel <stable|dev>", .description = "Select and remember the release channel" },
             json_option,
@@ -291,23 +292,19 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     } },
     .{ .entries = &.{
         .{ .kind = .sessions, .usage = "sessions" },
+        .{ .kind = .daemon, .usage = "daemon [status|stop]" },
         .{ .kind = .session, .usage = "session <last|id>" },
         .{ .usage = "session resume [last|id]", .summary = "Resume the latest workspace session or a session by id" },
         .{ .usage = "session recover <id>", .summary = "Copy a recoverable corrupt session" },
     } },
     .{ .entries = &.{
-        .{ .kind = .login, .usage = "login [vercel|codex|grok]", .summary = "Sign in to a model provider" },
-        .{ .kind = .logout, .usage = "logout [vercel|codex|grok]", .summary = "Sign out of a model provider" },
+        .{ .kind = .login, .usage = "login [codex|grok]", .summary = "Sign in to a model provider" },
+        .{ .kind = .logout, .usage = "logout [codex|grok]", .summary = "Sign out of a model provider" },
         .{ .kind = .provider, .usage = "provider <name>", .summary = "Choose the active model provider" },
         .{ .kind = .models, .usage = "models" },
     } },
     .{ .entries = &.{
-        .{ .kind = .setup, .usage = "setup", .summary = "Configure a Vercel AI Gateway API key" },
-        .{ .kind = .teams, .usage = "teams", .summary = "Choose a Vercel AI Gateway team" },
-        .{ .kind = .credits, .usage = "credits|balance", .summary = "Show Vercel AI Gateway credits" },
-    } },
-    .{ .entries = &.{
-        .{ .kind = .usage, .usage = "usage [--period <today|7d|month>]", .summary = "Show your provider's usage and spend" },
+        .{ .kind = .setup, .usage = "setup --base-url URL", .summary = "Discover models and connect directly" },
     } },
     .{ .entries = &.{
         .{ .kind = .status, .usage = "status" },
@@ -316,7 +313,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .slack, .usage = "slack <install|status|refresh>" },
         .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },
-        .{ .kind = .upgrade, .usage = "upgrade", .summary = "Upgrade fx on the selected release channel" },
+        .{ .kind = .upgrade, .usage = "upgrade", .summary = "Show local rebuild guidance (upstream upgrades disabled)" },
         .{ .kind = .acp, .usage = "acp" },
         .{ .kind = .help, .usage = "help" },
     } },
@@ -381,31 +378,28 @@ pub const top_level_flags = [_]TopLevelFlag{
     },
     .{
         .usage = "-v, --version",
-        .description = "Print the fx version and exit",
+        .description = "Print the proto-fx version and exit",
     },
 };
 
 pub const top_level_examples = [_]TopLevelExample{
-    .{ .command = "fx", .description = "Start a fresh interactive session" },
-    .{ .command = "fx ask \"Explain the changes in this repository\"", .description = "Run one request and exit" },
-    .{ .command = "fx session resume last", .description = "Continue the latest session for this workspace" },
-    .{ .command = "fx status --json", .description = "Inspect the current configuration as JSON" },
+    .{ .command = "proto-fx", .description = "Start a fresh interactive session" },
+    .{ .command = "proto-fx ask \"Explain the changes in this repository\"", .description = "Run one request and exit" },
+    .{ .command = "proto-fx session resume last", .description = "Continue the latest session for this workspace" },
+    .{ .command = "proto-fx status --json", .description = "Inspect the current configuration as JSON" },
 };
 
 pub const top_level_notes = [_][]const u8{
-    "Run `fx <command> --help` for command-specific usage and options.",
+    "Run `proto-fx <command> --help` for command-specific usage and options.",
     "Run `/help` inside an interactive session for slash commands.",
 };
 
-pub const top_level_resources = [_]TopLevelResource{
-    .{ .label = "Learn more about fx:", .value = "https://fx.sh/docs", .link = true },
-    .{ .label = "Report a problem:", .value = "run `/feedback` inside fx" },
-};
+pub const top_level_resources = [_]TopLevelResource{};
 
 pub const top_level_registry = TopLevelRegistry{
     .specs = top_level_specs[0..],
     .description = "Fast, native coding agent for the terminal.",
-    .interactive_hint = "fx starts an interactive session by default. Use `fx ask` to run one noninteractive request.",
+    .interactive_hint = "proto-fx starts an interactive session by default. Use `proto-fx ask` to run one noninteractive request.",
     .help_groups = top_level_help_groups[0..],
     .flags = top_level_flags[0..],
     .examples = top_level_examples[0..],
@@ -447,7 +441,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .accepts_payload = true },
     .{ .kind = .fork_session, .command = "/fork", .help_entry = "/fork", .completion_description = "fork the session before a prompt", .presentation_category = .session },
     .{ .kind = .login, .command = "/login", .help_entry = "/login", .completion_description = "choose the model provider and how it signs in", .presentation_category = .account, .has_args = true },
-    .{ .kind = .logout, .command = "/logout", .help_entry = "/logout [vercel|codex|grok]", .completion_description = "sign out of a provider session", .presentation_category = .account, .has_args = true, .accepts_payload = true },
+    .{ .kind = .logout, .command = "/logout", .help_entry = "/logout [codex|grok]", .completion_description = "sign out of a provider session", .presentation_category = .account, .has_args = true, .accepts_payload = true },
     .{ .kind = .provider, .command = "/provider", .aliases = &.{"/setup"}, .help_entry = "/provider (/setup)", .completion_description = "choose the model provider and how it signs in", .presentation_category = .account, .has_args = true },
     .{ .kind = .stats, .command = "/stats", .help_entry = "/stats", .completion_description = "show token and turn statistics", .presentation_category = .account },
     .{ .kind = .usage, .command = "/usage", .aliases = &.{}, .help_entry = "/usage", .completion_description = "show your provider's usage and spend", .presentation_category = .account },
@@ -455,13 +449,13 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .image, .command = "/image", .aliases = &.{"/img"}, .help_entry = "/image <path> (/img)", .completion_description = "attach an image by path", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .images, .command = "/images", .help_entry = "/images [clear]", .completion_description = "manage pending image attachments", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true, .accepts_payload = true },
-    .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|full-access|reset]", .completion_description = "choose what fx is allowed to do", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
+    .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|full-access|reset]", .completion_description = "choose what proto-fx is allowed to do", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .allowlist, .command = "/allowlist", .help_entry = "/allowlist [view [effective|local|user]|[local|user] add|remove|reset ...]", .completion_description = "manage trusted commands, tools, and URLs", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .undo, .command = "/undo", .help_entry = "/undo", .completion_description = "undo the latest tracked file operation", .presentation_category = .session },
     .{ .kind = .mcp, .command = "/mcp", .help_entry = "/mcp [list|show|add|remove|login|logout|approve|reject]", .completion_description = "manage MCP servers and their logins", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .skills, .command = "/skills", .help_entry = "/skills [list|add|install|show|create|remove|path] [name|url|path] ($ opens skill search)", .completion_description = "browse and manage skills", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .copy, .command = "/copy", .help_entry = "/copy", .completion_description = "copy the last assistant response", .presentation_category = .session },
-    .{ .kind = .feedback, .command = "/feedback", .help_entry = "/feedback", .completion_description = "open the fx feedback form", .presentation_category = .product, .show_in_welcome = true },
+    .{ .kind = .feedback, .command = "/feedback", .help_entry = "/feedback", .completion_description = "open the proto-fx feedback form", .presentation_category = .product, .show_in_welcome = true },
     .{ .kind = .trace, .command = "/trace", .help_entry = "/trace", .completion_description = "copy a private diagnostic trace", .presentation_category = .product },
     .{ .kind = .compact, .command = "/compact", .help_entry = "/compact", .completion_description = "summarize context into a fresh window", .presentation_category = .session },
     .{ .kind = .settings, .command = "/settings", .help_entry = "/settings [startup-scrollback [on|off]]", .completion_description = "browse and update settings", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
@@ -474,7 +468,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .notifications, .command = "/sound", .help_entry = "/sound [on|off|max]", .completion_description = "toggle sounds and terminal bells", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .workspace, .command = "/workspace", .help_entry = "/workspace [list|add PATH|remove PATH|clear]", .completion_description = "manage additional workspace directories", .presentation_category = .workspace, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .shell, .command = "/shell", .help_entry = "/shell reload", .completion_description = "reload shell startup files for commands", .presentation_category = .workspace, .has_args = true, .accepts_payload = true },
-    .{ .kind = .version, .command = "/version", .help_entry = "/version", .completion_description = "show the fx version", .presentation_category = .general },
+    .{ .kind = .version, .command = "/version", .help_entry = "/version", .completion_description = "show the proto-fx version", .presentation_category = .general },
     .{ .kind = .quit, .command = "/quit", .aliases = &.{"/exit"}, .help_entry = "/quit", .completion_description = "exit the interactive shell", .presentation_category = .general, .show_in_welcome = true },
 };
 

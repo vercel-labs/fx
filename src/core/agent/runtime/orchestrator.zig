@@ -2912,6 +2912,70 @@ fn hasToolResult(messages: []const ChatMessage, call_id: []const u8) bool {
     return false;
 }
 
+/// The issuing tool step owns its commentary once interrupted execution keeps
+/// one of its results. Until then the partial remains the only saved copy.
+/// Use the exact message boundary, never text equality: later responses may
+/// legitimately repeat the same prose.
+fn interruptedToolStepAssistant(
+    partial_assistant: []const u8,
+    current_turn_messages: []const ChatMessage,
+    issuing_message_index: usize,
+    active_tool_call: ?ToolCall,
+) ?[]const u8 {
+    const issuing = current_turn_messages[issuing_message_index];
+    const content = issuing.content orelse return partial_assistant;
+    if (content.len == 0) return partial_assistant;
+
+    // Match buildInterruptedExecutionMemory's completed-call projection.
+    var result_end = issuing_message_index + 1;
+    while (result_end < current_turn_messages.len and
+        current_turn_messages[result_end].role == .tool) : (result_end += 1)
+    {}
+    const results = current_turn_messages[issuing_message_index + 1 .. result_end];
+    for (issuing.tool_calls) |call| {
+        if (active_tool_call) |active| {
+            if (std.mem.eql(u8, call.id, active.id)) continue;
+        }
+        if (hasToolResult(results, call.id)) return null;
+    }
+    return partial_assistant;
+}
+
+test "interrupted assistant prose stays with its owning tool step" {
+    const alloc = std.testing.allocator;
+    const prose = "Checking both tasks.";
+    const earlier = [_]ToolCall{.{ .id = "earlier", .name = "shell", .arguments_json = "{}" }};
+    const calls = [_]ToolCall{
+        .{ .id = "completed", .name = "shell", .arguments_json = "{}" },
+        .{ .id = "cancelled", .name = "shell", .arguments_json = "{}" },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .content = prose, .tool_calls = &earlier },
+        .{ .role = .tool, .tool_call_id = earlier[0].id, .tool_name = "shell", .tool_result_status = .success, .content = "done" },
+        .{ .role = .assistant, .content = prose, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = calls[0].id, .tool_name = "shell", .tool_result_status = .success, .content = "done" },
+        .{ .role = .assistant, .content = "Now reviewing their results." },
+        .{ .role = .assistant, .content = prose },
+    };
+
+    // The earlier identical paragraph cannot claim this step's partial before
+    // it has a completed result of its own.
+    try std.testing.expectEqualStrings(prose, interruptedToolStepAssistant(prose, messages[0..3], 2, calls[1]).?);
+    const execution = try runtime_execution_memory.buildInterruptedExecutionMemory(alloc, messages[0..4], calls[1]);
+    defer types.freeExecutionMemory(alloc, execution);
+    try std.testing.expectEqual(@as(usize, 2), execution.tool_steps.len);
+    try std.testing.expectEqualStrings(prose, execution.tool_steps[1].assistant.?);
+    try std.testing.expect(interruptedToolStepAssistant(prose, messages[0..4], 2, calls[1]) == null);
+    try std.testing.expect(interruptedToolStepAssistant(prose, messages[0..4], 2, null) == null);
+
+    // A result excluded as the active cancelled call cannot own the partial.
+    try std.testing.expectEqualStrings(prose, interruptedToolStepAssistant(prose, messages[0..4], 2, calls[0]).?);
+    // A new response owns its own partial, even when its text repeats an older
+    // response. Streaming cancellation does not use the prior tool boundary.
+    try std.testing.expectEqualStrings("Now reviewing their results.", interruptedToolStepAssistant("Now reviewing their results.", &messages, 4, null).?);
+    try std.testing.expectEqualStrings(prose, interruptedToolStepAssistant(prose, &messages, 5, null).?);
+}
+
 fn appendProviderExecutedToolResult(
     deps: *const AgentRuntimeDeps,
     stream_ctx: *runtime_assistant_stream.StreamChunkContext,
@@ -5090,6 +5154,11 @@ const ProviderAdmission = struct {
     fn admit(raw: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         runtime_assistant_stream.publishTurnPhase(self.stream, .thinking);
+        // Establish the turn before publishing its first absolute token snapshot.
+        // Native observers reset per-turn counters on the source phase event.
+        runtime_assistant_stream.pushTokenProgressUpdate(self.stream, .changed) catch |progress_err| {
+            debug_trace.logf("agent", "token progress publication failed source=provider_admission err={s}", .{@errorName(progress_err)});
+        };
         if (self.pending_status.*) |status| {
             try pushRouteRecoveryStatus(self.deps, status);
             self.pending_status.* = null;
@@ -7672,9 +7741,6 @@ fn processQueuedPromptLoop(
                 return error.ContextCapacityExceeded;
             }
             summary_accumulator.prepareTokenRequest();
-            runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, .changed) catch |progress_err| {
-                debug_trace.logf("agent", "token progress publication failed source=gateway_prepare err={s}", .{@errorName(progress_err)});
-            };
             if (job.provider == .gateway) {
                 try persistRecoveryCheckpoint(
                     deps,
@@ -10023,6 +10089,7 @@ fn processQueuedPromptLoop(
                 );
             };
         }
+        const issuing_tool_message_index = within_turn_suffix.items.len;
         try runtime_tool_batch.appendAssistantToolCallStep(
             arena,
             &within_turn_suffix,
@@ -10159,7 +10226,7 @@ fn processQueuedPromptLoop(
                             advertised_dynamic_tool_names,
                         );
                         try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                        try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, parallel_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                        try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruptedToolStepAssistant(partial_assistant, within_turn_suffix.items, issuing_tool_message_index, parallel_call), parallel_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                         finish_trace.finish("interrupted");
                         return;
                     }
@@ -10220,7 +10287,7 @@ fn processQueuedPromptLoop(
                             advertised_dynamic_tool_names,
                         );
                         try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                        try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, parallel_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                        try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruptedToolStepAssistant(partial_assistant, within_turn_suffix.items, issuing_tool_message_index, parallel_call), parallel_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                         finish_trace.finish("interrupted");
                         return;
                     }
@@ -10241,7 +10308,7 @@ fn processQueuedPromptLoop(
                             advertised_dynamic_tool_names,
                         );
                         try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                        try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, parallel_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                        try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruptedToolStepAssistant(partial_assistant, within_turn_suffix.items, issuing_tool_message_index, parallel_call), parallel_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                         finish_trace.finish("interrupted");
                         return;
                     };
@@ -10307,7 +10374,7 @@ fn processQueuedPromptLoop(
                             advertised_dynamic_tool_names,
                         );
                         try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                        try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, parallel_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                        try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruptedToolStepAssistant(partial_assistant, within_turn_suffix.items, issuing_tool_message_index, parallel_call), parallel_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                         finish_trace.finish("interrupted");
                         return;
                     }
@@ -10403,7 +10470,7 @@ fn processQueuedPromptLoop(
                             advertised_dynamic_tool_names,
                         );
                         try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                        try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, executable_calls.items[0], completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                        try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruptedToolStepAssistant(partial_assistant, within_turn_suffix.items, issuing_tool_message_index, executable_calls.items[0]), executable_calls.items[0], completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                         finish_trace.finish("interrupted");
                         return;
                     }
@@ -10558,7 +10625,7 @@ fn processQueuedPromptLoop(
                 if (config.cancel_flag.load(.seq_cst)) {
                     runtime_telemetry.traceCancelObserved(step_ctx, true);
                     try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                    try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, cancelled_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                    try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruptedToolStepAssistant(partial_assistant, within_turn_suffix.items, issuing_tool_message_index, cancelled_call), cancelled_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                     finish_trace.finish("interrupted");
                     return;
                 }
@@ -10682,7 +10749,7 @@ fn processQueuedPromptLoop(
                     advertised_dynamic_tool_names,
                 );
                 try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, tool_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruptedToolStepAssistant(partial_assistant, within_turn_suffix.items, issuing_tool_message_index, tool_call), tool_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                 finish_trace.finish("interrupted");
                 return;
             }
@@ -11039,7 +11106,7 @@ fn processQueuedPromptLoop(
                     advertised_dynamic_tool_names,
                 );
                 try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, tool_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruptedToolStepAssistant(partial_assistant, within_turn_suffix.items, issuing_tool_message_index, tool_call), tool_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                 finish_trace.finish("interrupted");
                 return;
             };
@@ -11381,7 +11448,7 @@ fn processQueuedPromptLoop(
                     advertised_dynamic_tool_names,
                 );
                 try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, tool_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruptedToolStepAssistant(partial_assistant, within_turn_suffix.items, issuing_tool_message_index, tool_call), tool_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                 finish_trace.finish("interrupted");
                 return;
             }
@@ -11468,7 +11535,7 @@ fn processQueuedPromptLoop(
                         advertised_dynamic_tool_names,
                     );
                     try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                    try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, tool_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                    try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruptedToolStepAssistant(partial_assistant, within_turn_suffix.items, issuing_tool_message_index, tool_call), tool_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                     finish_trace.finish("interrupted");
                     return;
                 }
@@ -11763,7 +11830,7 @@ fn processQueuedPromptLoop(
                     advertised_dynamic_tool_names,
                 );
                 try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, tool_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruptedToolStepAssistant(partial_assistant, within_turn_suffix.items, issuing_tool_message_index, tool_call), tool_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                 finish_trace.finish("interrupted");
                 return;
             }
@@ -11894,7 +11961,7 @@ fn processQueuedPromptLoop(
                         deps,
                         finalization,
                         job,
-                        partial_assistant,
+                        interruptedToolStepAssistant(partial_assistant, within_turn_suffix.items, issuing_tool_message_index, tool_call),
                         tool_call,
                         completed_tool_names.items,
                         &interrupted_persisted,
@@ -11909,7 +11976,7 @@ fn processQueuedPromptLoop(
                         deps,
                         finalization,
                         job,
-                        partial_assistant,
+                        interruptedToolStepAssistant(partial_assistant, within_turn_suffix.items, issuing_tool_message_index, tool_call),
                         tool_call,
                         completed_tool_names.items,
                         &interrupted_persisted,

@@ -410,6 +410,13 @@ pub fn SubmitRuntime(comptime App: type) type {
                 "",
                 .{},
             );
+            if (comptime @hasField(App, "remote")) {
+                if (app.remote.active) {
+                    // The detached queue owns the prompt now. It never emits the
+                    // local worker's begin_presented_prompt acknowledgment.
+                    clearPendingSubmissionWithSnapshots(app, "remote_queue_owned", .preserve);
+                }
+            }
         }
 
         pub fn acceptPresentedPrompt(app: *App, turn_id: u64) !void {
@@ -707,6 +714,16 @@ pub fn SubmitRuntime(comptime App: type) type {
 
             const left_trimmed = std.mem.trimStart(u8, expanded.text, " \t\r\n");
             const resolved_slash_submission = resolvedSlashSubmission(app, left_trimmed);
+            // These detached-runtime commands are not part of the upstream slash registry.
+            // Route them before unknown slash text can become a model prompt.
+            if (comptime @hasField(App, "remote")) if (app.remote.active) {
+                const end = std.mem.findAny(u8, resolved_slash_submission, " \t\r\n") orelse resolved_slash_submission.len;
+                for ([_][]const u8{ "/heartbeat", "/kernel", "/setup", "/teams", "/upgrade", "/subagents", "/effort", "/context" }) |command| {
+                    if (!std.mem.eql(u8, resolved_slash_submission[0..end], command)) continue;
+                    try submitSlashCommand(app, left_trimmed, null, max_prompt_history);
+                    return;
+                }
+            };
             if (knownSlashCommand(app, resolved_slash_submission)) |command| {
                 if (requiresPromptCredential(command, resolved_slash_submission) and !try preflightPrompt(app)) return;
                 try submitSlashCommand(app, left_trimmed, null, max_prompt_history);
@@ -2203,6 +2220,7 @@ const PendingLifecycleFake = struct {
 
     alloc: std.mem.Allocator,
     submission: State = .{},
+    remote: struct { active: bool = false } = .{},
     worker: struct {
         held: bool = true,
         release_count: usize = 0,
@@ -2351,6 +2369,32 @@ fn expectPendingSnapshotMissing(path: []const u8) !void {
         error.FileNotFound,
         std.Io.Dir.openFileAbsolute(std.testing.io, path, .{}),
     );
+}
+
+test "detached submission releases pending ownership for consecutive prompts" {
+    const Runtime = SubmitRuntime(PendingLifecycleFake);
+    var app = try pendingLifecycleFake(std.testing.allocator, 501);
+    defer app.deinit();
+    app.remote.active = true;
+
+    for (0..2) |index| {
+        if (index != 0) {
+            app.submission.pending = PendingSubmission.init(try buildPendingPromptDraft(
+                app.alloc,
+                502,
+                "next prompt",
+                &.{},
+                &.{},
+            ));
+            app.worker.held = true;
+        }
+        Runtime.noteCommittedFrame(&app);
+        Runtime.collectPendingSubmissionFacts(&app);
+        try std.testing.expect(app.submission.pending == null);
+        try std.testing.expect(!app.worker.held);
+        try std.testing.expectEqual(index + 1, app.finalization_count);
+        try std.testing.expectEqual(index + 1, app.worker.release_count);
+    }
 }
 
 test "post-commit adoption failure keeps one retryable owner and hold" {

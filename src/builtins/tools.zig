@@ -1,4 +1,5 @@
 const std = @import("std");
+const kernel_impl = @import("../tools/kernel.zig");
 const builtin_gateway = @import("gateway.zig");
 const terminal_contracts = @import("../core/terminal/contracts.zig");
 const managed_execution_contract = @import("../core/execution/managed_execution_contract.zig");
@@ -704,7 +705,40 @@ pub const read_tool_result = ToolSpec{
     .irreversible_fn = read_tool_result_impl.isIrreversible,
 };
 
+const kernel_description = "Execute Python in this session's persistent CPython kernel. Variables survive cells, top-level await is supported, and async tasks can continue between cells. Output and last-expression results are returned. action defaults to execute; status inspects, interrupt cancels the active cell, stop snapshots and releases Python, restart discards the live process and restores the last valid snapshot lazily, and prewarm starts it in the background. timeout_ms is an advisory time budget, not a hard deadline. Runtime helper APIs such as rlm are not installed; use the native tools for those operations. Python can access the filesystem and network under the same tool permission policy as shell execution.";
+pub const kernel = ToolSpec{
+    .name = "kernel",
+    .description = kernel_description,
+    .model_schema = .{
+        .name = "kernel",
+        .description = kernel_description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "execute", "status", "interrupt", "stop", "restart", "prewarm" } } },
+                .{ .name = "code", .json_type = .string },
+                .{ .name = "timeout_ms", .json_type = .integer, .bounds = &.{ .minimum = 0 } },
+                .{ .name = "max_output_chars", .json_type = .integer, .bounds = &.{ .minimum = 0, .maximum = 65_536 } },
+            },
+            .required = &.{},
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .kernel,
+    .activity_kind = .command,
+    .requires_approval = true,
+    .action_label = "Executing",
+    .completed_action_label = "Executed",
+    .label_arg_kind = .none,
+    .label_arg_default = "Python",
+    .permission_target_kind = .none,
+    .decode = kernel_impl.decode,
+    .call = kernel_impl.call,
+    .reads_only_fn = kernel_impl.readsOnly,
+    .irreversible_fn = kernel_impl.isIrreversible,
+};
+
 pub const all = [_]tool_dispatch.Tool{
+    kernel,
     glob_files,
     grep_files,
     read_file,
@@ -726,6 +760,7 @@ pub const all = [_]tool_dispatch.Tool{
 pub const registry = tool_dispatch.Registry{ .tools = all[0..] };
 
 pub const advertisement_order = [_][]const u8{
+    "kernel",
     "read_file",
     "glob_files",
     "grep_files",

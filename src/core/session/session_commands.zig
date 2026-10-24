@@ -451,6 +451,12 @@ pub fn Commands(comptime App: type) type {
         }
 
         pub fn handleModel(app: *App, query: []const u8) !void {
+            if (comptime @hasField(App, "remote")) if (app.remote.active) {
+                const command = try app.alloc.print("/model {s}", .{query});
+                defer app.alloc.free(command);
+                try app.handleCommand(command);
+                return;
+            };
             if (query.len == 0) {
                 try app.writeDomainNotice(.{ .topic = "model", .tone = .neutral, .body = provider_runtime.model(app) }, true);
                 return;
@@ -465,6 +471,12 @@ pub fn Commands(comptime App: type) type {
         /// panel instead (`openPermissionsSnapshot`), and anything else gets
         /// the usage.
         pub fn handlePermissions(app: *App, rest: []const u8) !void {
+            if (comptime @hasField(App, "remote")) if (app.remote.active) {
+                const command = try app.alloc.print("/permissions {s}", .{rest});
+                defer app.alloc.free(command);
+                try app.handleCommand(command);
+                return;
+            };
             if (config_runtime.parsePermissionMode(rest)) |mode| {
                 try app_permission_runtime.Runtime(App).selectMode(app, mode);
                 try app.writeDomainNotice(.{
@@ -979,6 +991,12 @@ pub fn Commands(comptime App: type) type {
             fast_mode: bool,
             ultrafast_mode: bool,
         ) !void {
+            if (comptime @hasField(App, "remote")) if (app.remote.active) {
+                const command = try app.alloc.print("/model {s}", .{model});
+                defer app.alloc.free(command);
+                try app.handleCommand(command);
+                return;
+            };
             try setResolvedModelRuntime(app, model);
             var patch = app_session_runtime.SessionPreferencePatch{
                 .provider = provider_runtime.provider(app),

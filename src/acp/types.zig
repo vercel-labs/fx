@@ -324,7 +324,7 @@ pub fn writeInitializeResponse(w: *std.Io.Writer, capabilities: AgentCapabilitie
     if (capabilities.system_prompt) try w.writeAll(",\"systemPrompt\":{}");
     try w.writeByte('}');
     try w.print(",\"_meta\":{{\"fx\":{{\"steering\":{s}}}}}", .{if (capabilities.steering) "true" else "false"});
-    try w.writeAll("},\"agentInfo\":{\"name\":\"fx\",\"title\":\"fx\",\"version\":");
+    try w.writeAll("},\"agentInfo\":{\"name\":\"proto-fx\",\"title\":\"proto-fx\",\"version\":");
     try writeJsonStr(build_options.app_version, w);
     try w.writeAll("},");
     try w.writeAll("\"authMethods\":[]}");
@@ -564,7 +564,7 @@ test "writeInitializeResponse contains required fields" {
     const mcp_capabilities = agent_capabilities.get("mcpCapabilities").?.object;
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"protocolVersion\":1") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"loadSession\":true") != null);
-    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"name\":\"fx\"") != null);
+    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"name\":\"proto-fx\"") != null);
     try std.testing.expectEqualStrings(
         build_options.app_version,
         parsed.value.object.get("agentInfo").?.object.get("version").?.string,

@@ -14962,7 +14962,7 @@ test "transcript lifecycle terminal and finalization transitions stay batch safe
         const expected_line = if (case.kind == .cancelled)
             try std.mem.print(
                 &expected,
-                "{s}{s}{s} {s}{s}{s} · What can fx do differently?\n",
+                "{s}{s}{s} {s}{s}{s} · What should change?\n",
                 .{
                     case.marker_style,
                     case.marker,
@@ -15085,7 +15085,7 @@ test "transcript lifecycle terminal markers preserve ANSI summaries and normaliz
     try expectRawEntryBytes(&runtime, styled_cancelled_entry_id, try std.mem.print(
         &styled_cancelled_expected,
         "{s}■{s}{s} Cancelled\x1b[0m \x1b[38;5;245msleep 30\x1b[0m{s}" ++
-            " · What can fx do differently?\n",
+            " · What should change?\n",
         .{
             ui_render.warning_style,
             ui_render.reset_style,
@@ -15117,7 +15117,7 @@ test "transcript lifecycle terminal markers preserve ANSI summaries and normaliz
     var cancelled_expected: [128]u8 = undefined;
     try expectRawEntryBytes(&runtime, cancelled_entry_id, try std.mem.print(
         &cancelled_expected,
-        "{s}■{s} {s}Tool cancelled{s} · What can fx do differently?\n",
+        "{s}■{s} {s}Tool cancelled{s} · What should change?\n",
         .{
             ui_render.warning_style,
             ui_render.reset_style,
@@ -15164,7 +15164,7 @@ test "active tool cancellation is presented immediately without closing lifecycl
     defer rendered.deinit(alloc);
     try std.testing.expectEqual(
         @as(usize, 2),
-        std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+        std.mem.count(u8, rendered.bytes, "What should change?"),
     );
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "System:") == null);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelling") == null);
@@ -15213,7 +15213,7 @@ test "late successful settlement preserves its result and one turn cancellation"
         defer rendered.deinit(alloc);
         try std.testing.expectEqual(
             @as(usize, 1),
-            std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+            std.mem.count(u8, rendered.bytes, "What should change?"),
         );
         try std.testing.expectEqual(
             @as(usize, 1),
@@ -15270,7 +15270,7 @@ test "post-cancel sibling settlement preserves one turn cancellation" {
         defer rendered.deinit(alloc);
         try std.testing.expectEqual(
             @as(usize, 1),
-            std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+            std.mem.count(u8, rendered.bytes, "What should change?"),
         );
         try std.testing.expectEqual(
             @as(usize, 1),
@@ -15319,7 +15319,7 @@ test "late zero-output command settlement reserves distinct presentation entries
         defer rendered.deinit(alloc);
         try std.testing.expectEqual(
             @as(usize, 1),
-            std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+            std.mem.count(u8, rendered.bytes, "What should change?"),
         );
         try std.testing.expectEqual(
             @as(usize, 1),
@@ -15379,7 +15379,7 @@ fn checkLateZeroOutputCommandCancellationAllocationFailuresImpl(alloc: Allocator
     defer rendered.deinit(alloc);
     try std.testing.expectEqual(
         @as(usize, 1),
-        std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+        std.mem.count(u8, rendered.bytes, "What should change?"),
     );
 }
 

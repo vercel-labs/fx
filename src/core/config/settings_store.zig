@@ -9,6 +9,7 @@ const compactor = @import("../compactor/compactor.zig");
 const context_limits = @import("context_limits.zig");
 const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
+const configured_provider = @import("configured_provider.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -93,6 +94,9 @@ pub const ProjectMcpMutation = struct {
 };
 
 pub const UserSettingsPatch = struct {
+    /// Settings-style provider definitions. Contains credential environment
+    /// names, never credential values; merged under the existing writer lock.
+    connections_json: ?[]const u8 = null,
     model_preference: ?ModelPreferencePatch = null,
     provider: ?model_provider.ProviderId = null,
     permission_mode: ?types.PermissionMode = null,
@@ -116,7 +120,7 @@ pub const UserSettingsPatch = struct {
     notification_max: ?bool = null,
 
     fn isEmpty(self: UserSettingsPatch) bool {
-        return self.model_preference == null and
+        return self.connections_json == null and self.model_preference == null and
             self.provider == null and
             self.permission_mode == null and
             self.credential_source == null and
@@ -1046,6 +1050,17 @@ fn applyUserPatchToRoot(
     patch: UserSettingsPatch,
 ) !PatchApplication {
     var application = PatchApplication{};
+    if (patch.connections_json) |json| {
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{ .duplicate_field_behavior = .@"error", .allocate = .alloc_always });
+        var checked = try configured_provider.Registry.parse(arena, parsed);
+        defer checked.deinit(arena);
+        if (!root.object.contains("providers")) try root.object.put(arena, "providers", .{ .object = .empty });
+        const providers = root.object.getPtr("providers").?;
+        if (providers.* != .object) return error.InvalidSettingsFormat;
+        var entries = parsed.object.iterator();
+        while (entries.next()) |entry| try providers.object.put(arena, entry.key_ptr.*, entry.value_ptr.*);
+        application.changed = true;
+    }
     if (patch.model_preference) |preference| {
         application.changed = try putModelPreference(arena, &root.object, preference) or application.changed;
     }

@@ -2444,7 +2444,7 @@ fn interactivePermissionRequest(
             .amendment_allowed = true,
         };
     }
-    const tool_arguments_preview = if (isAvailableDynamicTool(input, call.name)) blk: {
+    const tool_arguments_preview = if (isAvailableDynamicTool(input, call.name) or std.mem.eql(u8, call.name, "kernel")) blk: {
         const encoded = try text_utils.encodeTerminalSafe(
             arena,
             call.arguments_json,

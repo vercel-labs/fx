@@ -45,7 +45,7 @@ pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, 
     const home = io.homeDir() orelse return error.HomeNotSet;
     var home_dir = io.VerifiedDir{ .dir = try std.Io.Dir.openDirAbsolute(io.getIo(), home, .{ .iterate = true }) };
     defer home_dir.close();
-    var root = try io.openOrCreateVerifiedPrivateDir(&home_dir, ".fx");
+    var root = try io.openOrCreateVerifiedPrivateDir(&home_dir, ".proto-fx");
     defer root.close();
     var dir = try io.openOrCreateVerifiedPrivateDir(&root, "slack");
     defer dir.close();

@@ -971,6 +971,10 @@ fn handleRestoreSession(
     model_owned = false;
     session_rt_owned = false;
     session_host_owned = false;
+    if (state.active_session) |*active| {
+        @import("../tools/kernel.zig").prewarmSaved(&active.session_rt, state.alloc, active.workspace_root, active.session_id) catch |err|
+            debug_trace.logf("kernel", "restore prewarm unavailable: {s}", .{@errorName(err)});
+    }
     // One map, so a recovered read can name a call from an earlier turn.
     var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
     defer sources.deinit(alloc);
@@ -2048,7 +2052,7 @@ pub fn writeProviderConfigOption(
 ) !void {
     try w.writeAll("{\"id\":\"provider\",\"name\":\"Provider\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":");
     try writeJsonStr(current.label(), w);
-    try w.writeAll(",\"options\":[{\"value\":\"gateway\",\"name\":\"Vercel AI Gateway\"},{\"value\":\"codex\",\"name\":\"Codex subscription\"}");
+    try w.writeAll(",\"options\":[{\"value\":\"codex\",\"name\":\"Codex subscription\"}");
     if (comptime !host_target.is_wasm) {
         try w.writeAll(",{\"value\":\"grok\",\"name\":\"Grok subscription\"}");
         for (definitions) |definition| {
