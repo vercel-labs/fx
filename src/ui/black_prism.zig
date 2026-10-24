@@ -13,7 +13,7 @@ const Allocator = std.mem.Allocator;
 pub const scene_cols: usize = 200;
 pub const scene_rows: usize = 100;
 pub const fps: u32 = 15;
-pub const banner_rows: u16 = 18;
+pub const banner_rows: u16 = 22;
 
 const n = scene_cols * scene_rows;
 const W: f32 = @floatFromInt(scene_cols);
@@ -469,13 +469,12 @@ pub const Animation = struct {
     }
 
     fn renderBraille(self: *Animation, alloc: Allocator) ![]u8 {
-        const target_cols: usize = 140;
-        const target_rows: usize = 70;
-        const braille_cols = target_cols / 2;
-        const braille_rows = (target_rows + 3) / 4;
+        const braille_cols = scene_cols / 2;
         const out_cols: usize = @min(@as(usize, if (self.cols == 0) 80 else self.cols), braille_cols);
         const start_col = (braille_cols - out_cols) / 2;
-        const out_rows: usize = @min(@as(usize, banner_rows), braille_rows);
+        const start_scene_row: usize = 12;
+        const end_scene_row = scene_rows;
+        const out_rows: usize = @min(@as(usize, banner_rows), (end_scene_row - start_scene_row + 3) / 4);
         const braille_bits = [4][2]u8{
             .{ 0x01, 0x04 },
             .{ 0x02, 0x10 },
@@ -489,35 +488,23 @@ pub const Animation = struct {
             var current_fg: i16 = -1;
             for (0..out_cols) |col| {
                 const braille_x = start_col + col;
-                const braille_y = row;
+                const scene_x = braille_x * 2;
+                const scene_y = start_scene_row + row * 4;
                 var bits: u8 = 0;
                 var best_dot: u8 = 0;
                 var color: u8 = 0;
                 for (0..4) |dy| {
                     for (0..2) |dx| {
-                        const target_x = braille_x * 2 + dx;
-                        const target_y = braille_y * 4 + dy;
-                        if (target_x >= target_cols or target_y >= target_rows) continue;
-                        const sx0 = target_x * scene_cols / target_cols;
-                        const sx1 = @max(sx0 + 1, (target_x + 1) * scene_cols / target_cols);
-                        const sy0 = target_y * scene_rows / target_rows;
-                        const sy1 = @max(sy0 + 1, (target_y + 1) * scene_rows / target_rows);
-                        var dot: u8 = 0;
-                        var cell_color: u8 = 0;
-                        for (sy0..@min(sy1, scene_rows)) |y| {
-                            for (sx0..@min(sx1, scene_cols)) |x| {
-                                const candidate = self.dot_ids[y * scene_cols + x];
-                                if (candidate > dot) {
-                                    dot = candidate;
-                                    cell_color = self.color_ids[y * scene_cols + x];
-                                }
-                            }
-                        }
+                        const y = scene_y + dy;
+                        const x = scene_x + dx;
+                        if (y >= end_scene_row or x >= scene_cols) continue;
+                        const k = y * scene_cols + x;
+                        const dot = self.dot_ids[k];
                         if (dot == 0) continue;
                         bits |= braille_bits[dy][dx];
                         if (dot > best_dot) {
                             best_dot = dot;
-                            color = cell_color;
+                            color = self.color_ids[k];
                         }
                     }
                 }

@@ -21,7 +21,7 @@ pub const ask_activity_label = "⏺ Asking";
 const user_message_card = @import("assistant/user_message_card.zig");
 const black_prism = @import("black_prism.zig");
 
-pub const welcome_message_reserved_rows: u16 = 21;
+pub const welcome_message_reserved_rows: u16 = 25;
 
 pub var is_light: bool = false;
 pub var divider_style: []const u8 = shared_theme.fx_dark.divider_style;
