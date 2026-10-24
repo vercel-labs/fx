@@ -153,6 +153,8 @@ pub const State = struct {
     /// Startup resumed the first instance's session, so its group comes
     /// back with the startup instances.
     restore_pending: bool = false,
+    /// The instance list `/agents` and Alt+↑ open.
+    agents_menu: app_agents_runtime.AgentsMenu = .{},
     /// Startup opened the session picker, so the group of the session
     /// picked comes back then; a later in-app `/resume` brings back only
     /// that session.
@@ -164,6 +166,7 @@ pub const State = struct {
         self.exit_handoff = null;
         self.clearWritten(alloc);
         self.written.deinit(alloc);
+        self.agents_menu.deinit(alloc);
     }
 
     fn clearWritten(self: *State, alloc: Allocator) void {

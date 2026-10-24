@@ -27,7 +27,7 @@ pub const composeDividerRow = row_text.composeDividerRow;
 pub const appendClipped = row_text.appendClipped;
 pub const appendAbsoluteColumn = row_text.appendAbsoluteColumn;
 
-pub const PickerKind = enum { model_stage, provider_stage, models, effort, file, slash, skills, help, settings, sessions, fork, mcp, auth };
+pub const PickerKind = enum { model_stage, provider_stage, models, effort, file, slash, skills, help, settings, sessions, fork, agents, mcp, auth };
 pub const CappedInputRows = struct {
     row_limit: usize,
     total_lines: u16,

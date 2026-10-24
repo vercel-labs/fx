@@ -60,6 +60,7 @@ pub fn fromEscapeAction(action: InputEscapeAction) ?ShortcutAction {
         .insert_newline => .insert_newline,
         .composer_shortcut => |shortcut| shortcut,
         .switch_agent => |direction| move(if (direction == .next) .word_right else .word_left),
+        .open_agent_list => move(.paragraph_up),
         .remapped_byte => |byte| fromControlByte(byte),
         else => null,
     };

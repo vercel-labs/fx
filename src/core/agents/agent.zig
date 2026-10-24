@@ -68,6 +68,12 @@ pub const Agent = struct {
     total_web_search_requests: u64 = 0,
     /// A top-level instance, every one alike, or a subagent.
     role: Role = .instance,
+    /// Whether one of its turns was going when the host last looked, so the
+    /// host can tell when one ends. Main loop only.
+    was_working: bool = false,
+    /// One of its turns ended while it wasn't on screen, and it hasn't been
+    /// shown since. Main loop only.
+    finished_unseen: bool = false,
     /// For a subagent, the instance at the top of its tree, whose provider,
     /// approvals, and authority its tree starts from. Set once on the main
     /// loop, under the app's permission authority lock, before the

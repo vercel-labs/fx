@@ -1176,4 +1176,83 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     TIMEOUT,
   );
 
+
+  test(
+    "/agents lists the open instances, and Enter shows the chosen one",
+    async () => {
+      await withHost(answerByLetter, { instances: 3 }, async ({ session }) => {
+        await session.waitForPane((pane) => pane.includes("fx 1/3"), 15_000);
+        await session.sendText("/agents");
+        const list = await session.waitForPane((pane) => pane.includes("fx 3 ·"), 15_000);
+        expect(list).toContain("fx 1 (on screen) ·");
+        expect(list).toContain("fx 2 · new session · main · idle");
+        expect(list).toContain("fx 3 · new session · main · idle");
+        expect(list).toContain("enter show");
+        // Esc closes it.
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes("fx 3 ·"), 15_000);
+        // ↓↓ and Enter show fx 3.
+        await session.sendText("/agents");
+        await session.waitForPane((pane) => pane.includes("fx 3 ·"), 15_000);
+        await session.sendKeys("Down");
+        await session.sendKeys("Down");
+        await session.sendKeys("Enter");
+        await session.waitForPane((pane) => pane.includes("fx 3/3") && !pane.includes("fx 3 ·"), 15_000);
+        await session.waitForComposer(15_000);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "Alt+Up opens the instance list while several instances are open, and not with one",
+    async () => {
+      await withHost(answerByLetter, {}, async ({ session }) => {
+        await session.sendKeys("M-Up");
+        await Bun.sleep(500);
+        expect(await session.capturePane()).not.toContain("fx 1 (on screen)");
+        await session.sendText("/launch");
+        await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+        await session.waitForComposer(15_000);
+        await session.sendKeys("M-Up");
+        const list = await session.waitForPane((pane) => pane.includes("fx 2 (on screen) ·"), 15_000);
+        expect(list).toContain("fx 1 ·");
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes("fx 2 (on screen) ·"), 15_000);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a hidden instance that finishes is named in the footer until it is shown",
+    async () => {
+      await withHost(async (body) => {
+        if (userTexts(body).join("\n").includes("HOST_S")) await Bun.sleep(1500);
+        return answerByLetter(body);
+      }, { instances: 2 }, async ({ session }) => {
+        await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+        await session.sendKeys("M-Right");
+        await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+        await session.waitForComposer(15_000);
+        await session.sendText("HOST_S slow work");
+        await session.sendKeys("M-Left");
+        await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+        await session.waitForPane((pane) => pane.includes("fx 2 finished · Alt+→"), 15_000);
+        await session.sendText("/agents");
+        const list = await session.waitForPane((pane) => pane.includes("fx 2 ·"), 15_000);
+        expect(list).toMatch(/fx 2 · .* · main · finished/);
+        await session.sendKeys("Escape");
+        // Showing it clears the note.
+        await session.sendKeys("M-Right");
+        await session.waitForPane((pane) => pane.includes("fx 2/2") && pane.includes("HOST_ANSWER_S"), 15_000);
+        await session.sendKeys("M-Left");
+        await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+        await Bun.sleep(300);
+        expect(await session.capturePane()).not.toContain("finished ·");
+      });
+    },
+    TIMEOUT,
+  );
+
 });
