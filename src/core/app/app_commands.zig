@@ -285,6 +285,7 @@ pub fn Handlers(comptime App: type) type {
                 .new_session = commandNewSession,
                 .launch_instance = commandLaunchInstance,
                 .close_instance = commandCloseInstance,
+                .show_agents = commandShowAgents,
                 .reset_session = commandResetSession,
                 .resume_session = commandResumeSession,
                 .fork_session = commandForkSession,
@@ -457,6 +458,14 @@ pub fn Handlers(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime !@hasDecl(App, "closeInstanceOnScreen")) return;
             try app.closeInstanceOnScreen();
+        }
+
+        /// `/agents` lists the open instances to switch to one; with one
+        /// open it says how to start another.
+        fn commandShowAgents(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime !@hasDecl(App, "openAgentsMenu")) return;
+            try app.openAgentsMenu();
         }
 
         fn commandResumeSession(ctx: *anyopaque) !void {

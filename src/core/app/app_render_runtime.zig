@@ -812,6 +812,7 @@ pub fn Runtime(comptime App: type) type {
                     agent.session_persistence.fork_menu.projection()
                 else
                     .{},
+                .agents_menu = if (comptime @hasDecl(App, "agentsMenuProjection")) app.agentsMenuProjection() else .{},
                 .statusline_menu = render_input.statuslineMenuProjection(
                     &app.input_runtime.statusline_menu,
                     settings_snapshot,
@@ -1186,7 +1187,7 @@ pub fn Runtime(comptime App: type) type {
                     if (!question_active and approval == null and
                         (settingsMenuActive(app) or helpMenuActive(app) or
                             skillsMenuActive(app) or modelMenuActive(app) or
-                            sessionMenuActive(app, agent) or forkMenuActive(app, agent)))
+                            sessionMenuActive(app, agent) or forkMenuActive(app, agent) or agentsMenuActive(app)))
                     {
                         app.shell.render_requests.request(.footer);
                     }
@@ -1196,7 +1197,7 @@ pub fn Runtime(comptime App: type) type {
                 },
             }
 
-            if (!question_active and approval == null and (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(app, agent) or forkMenuActive(app, agent))) {
+            if (!question_active and approval == null and (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(app, agent) or forkMenuActive(app, agent) or agentsMenuActive(app))) {
                 if (try app_lifecycle.closeFullTranscriptIfActive(
                     app.alloc,
                     &app.terminal,
@@ -2008,6 +2009,11 @@ pub fn Runtime(comptime App: type) type {
         fn sessionMenuActive(_: *const App, agent: *const AppAgent) bool {
             if (comptime agents.hasAgentField(App, "session_persistence")) return agent.session_persistence.session_picker.active;
             return false;
+        }
+
+        fn agentsMenuActive(app: *const App) bool {
+            if (comptime !@hasField(App, "instances")) return false;
+            return app.instances.agents_menu.open;
         }
 
         fn forkMenuActive(_: *const App, agent: *const AppAgent) bool {

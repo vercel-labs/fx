@@ -141,6 +141,30 @@ pub const ForkMenuProjection = struct {
     }
 };
 
+/// One row of the instance list: an open instance and how it is doing.
+pub const AgentsMenuRow = struct {
+    /// Its place among the open instances, from 1, as in "fx 3".
+    number: usize,
+    /// Its session's title, or empty before it has one.
+    title: []const u8,
+    /// The agent profile it runs in.
+    profile: []const u8,
+    /// What it is doing, such as "needs approval".
+    state: []const u8,
+    on_screen: bool,
+};
+
+/// The instance list `/agents` and Alt+↑ open: every open instance in order.
+pub const AgentsMenuProjection = struct {
+    rows: []const AgentsMenuRow = &.{},
+    selected: usize = 0,
+    window_start: usize = 0,
+
+    pub fn active(self: AgentsMenuProjection) bool {
+        return self.rows.len > 0;
+    }
+};
+
 pub const HelpMenuProjection = struct {
     active: bool = false,
     category: ?command_specs.SlashPresentationCategory = null,
@@ -380,6 +404,7 @@ pub const RenderContext = struct {
     model_menu: ModelMenuProjection = .{},
     session_menu: SessionMenuProjection = .{},
     fork_menu: ForkMenuProjection = .{},
+    agents_menu: AgentsMenuProjection = .{},
     statusline_menu: StatuslineMenuProjection = .{},
     info_panel: InfoPanelProjection = .{},
     usage_menu: UsageMenuProjection = .{},
