@@ -1182,8 +1182,13 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     async () => {
       await withHost(answerByLetter, { instances: 3 }, async ({ session }) => {
         await session.waitForPane((pane) => pane.includes("fx 1/3"), 15_000);
-        await session.sendText("/agents");
+        // Alt+Up opens the list in place of an open panel, which holds
+        // typed keys.
+        await session.sendText("/status");
+        await session.waitForPane((pane) => pane.includes("Step limit"), 15_000);
+        await session.sendKeys("M-Up");
         const list = await session.waitForPane((pane) => pane.includes("fx 3 ·"), 15_000);
+        expect(list).not.toContain("Step limit");
         expect(list).toContain("fx 1 (on screen) ·");
         expect(list).toContain("fx 2 · new session · main · idle");
         expect(list).toContain("fx 3 · new session · main · idle");
