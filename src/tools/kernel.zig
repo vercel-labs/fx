@@ -72,7 +72,7 @@ pub fn call(ctx: dispatch.DispatchContext, erased: dispatch.ToolInput) dispatch.
         .timeout_ms = input.timeout_ms,
         .max_output_chars = input.max_output_chars,
     }) catch |err| {
-        if (err == error.KernelCapacityExhausted) return .{ .failure = try ctx.allocator.dupe(u8, "Every live Python kernel in this process is running a cell, so this kernel could not start within a minute. Retry after a cell finishes, or raise PROTO_FX_MAX_LIVE_KERNELS.") };
+        if (err == error.KernelCapacityExhausted) return .{ .failure = try ctx.allocator.dupe(u8, "This process already runs its maximum number of Python kernels and every one is running a cell, so this kernel could not start within a minute. Retry after a cell finishes, or raise PROTO_FX_MAX_LIVE_KERNELS.") };
         if (err == error.KernelStillBusyAfterInterrupt) return .{ .failure = try ctx.allocator.dupe(u8, "The Python kernel is still running the interrupted cell. Wait and retry, or call kernel with action restart to discard it and recover the last saved globals.") };
         const diagnostic = manager.diagnostics(ctx.allocator) catch return error.OutOfMemory;
         defer ctx.allocator.free(diagnostic);

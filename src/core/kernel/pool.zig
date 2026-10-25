@@ -1,11 +1,14 @@
 //! The one owner of every kernel in this process. It keys saved kernels by
 //! their snapshot directory, so each session node has one kernel however many
 //! session runtimes or nested hosts reach it, and it bounds the Python
-//! processes: at most `Limits.max_live` run at once, the least recently used
-//! idle one is parked (snapshot, then stop) to admit another, and one left
-//! idle past its TTL is parked by the sweeper. A parked kernel restores
-//! lazily on its next cell. A kernel running a cell is never parked. The
-//! decision is D95 in `tests/tla/session_manager/system-design.md`.
+//! processes by their private memory: the sweeper samples every live kernel
+//! and zygote (`memory.zig`), and while the total, or the total plus an
+//! estimate for a kernel about to start, exceeds `Limits.budget_bytes`, the
+//! least recently used idle kernel is parked (snapshot, then stop). At most
+//! `Limits.max_live` processes run at once whatever the budget. One left idle
+//! past its TTL is parked too. A parked kernel restores lazily on its next
+//! cell. A kernel running a cell is never parked. The decision is D95 in
+//! `tests/tla/session_manager/system-design.md`.
 //!
 //! Lock order: the pool mutex may be taken before a manager's mutex, never
 //! after. Parking happens with the pool unlocked, under a pin that keeps the
@@ -14,6 +17,8 @@ const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const kernel = @import("kernel.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const memory = @import("memory.zig");
+const zygote = @import("zygote.zig");
 const Allocator = std.mem.Allocator;
 const Manager = kernel.Manager;
 const Cancel = ?*const std.atomic.Value(bool);
@@ -27,9 +32,21 @@ pub const held_idle_env = "PROTO_FX_KERNEL_HELD_IDLE_MS";
 /// tree a subagent belongs to. Only `releaseRetained` compares it.
 pub const Retainer = *const anyopaque;
 
+/// What a kernel that has not been sampled yet is assumed to cost, until any
+/// live kernel has been: then the smallest sampled one stands in for it.
+const default_estimate: u64 = 24 << 20;
+
 pub const Limits = struct {
-    /// Python processes alive at once.
-    max_live: usize = 4,
+    /// Hard ceiling on Python kernel processes alive at once, matching the
+    /// process-wide slot pool. `PROTO_FX_MAX_LIVE_KERNELS` overrides it.
+    max_live: usize = 32,
+    /// Private memory every live kernel and zygote may hold together; the
+    /// environment default is `memory.configuredBudget`.
+    budget_bytes: u64 = std.math.maxInt(u64),
+    /// How often the sweeper samples memory while any kernel is live.
+    sample_ms: i64 = 2000,
+    /// How long zygotes outlive the last live kernel.
+    zygote_linger_ms: i64 = 60_000,
     /// Idle TTL for a kernel no session runtime holds: a subagent's between
     /// its turns. Zero never parks.
     idle_ms: i64 = 5 * 60 * 1000,
@@ -44,7 +61,8 @@ pub const Limits = struct {
     fn fromEnv() Limits {
         var value: Limits = .{};
         const max_live = parse(io_mod.getenv(max_live_env), @intCast(value.max_live));
-        if (max_live > 0) value.max_live = @intCast(@min(max_live, 64));
+        if (max_live > 0) value.max_live = @intCast(@min(max_live, 256));
+        value.budget_bytes = memory.configuredBudget();
         value.idle_ms = parse(io_mod.getenv(idle_env), value.idle_ms);
         value.held_idle_ms = parse(io_mod.getenv(held_idle_env), value.held_idle_ms);
         return value;
@@ -70,6 +88,10 @@ pub const Membership = struct {
     /// Counted against `max_live` from admission until its process stops.
     live: bool = false,
     last_used: i64 = 0,
+    /// The live process, once spawned; zero before.
+    pid: std.posix.pid_t = 0,
+    /// Its last sampled private memory; zero until the first sample.
+    private_bytes: u64 = 0,
 };
 
 var mutex: std.Io.Mutex = .init;
@@ -79,6 +101,8 @@ var limits: Limits = .{};
 var keyed: std.ArrayList(*Manager) = .empty;
 var live: std.ArrayList(*Manager) = .empty;
 var sweeper_running = false;
+/// The zygotes' private memory at the last sample.
+var zygote_bytes: u64 = 0;
 /// Counters for tests and diagnostics.
 var parked_total: u64 = 0;
 
@@ -103,6 +127,44 @@ pub fn parkedTotal() u64 {
     defer mutex.unlock(io_mod.getIo());
     return parked_total;
 }
+
+/// The sampled private memory of live kernels and zygotes, counting each
+/// kernel not sampled yet at the estimate.
+pub fn memoryTotal() u64 {
+    mutex.lockUncancelable(io_mod.getIo());
+    defer mutex.unlock(io_mod.getIo());
+    return totalLocked();
+}
+
+fn totalLocked() u64 {
+    const estimate = estimateLocked();
+    var total = zygote_bytes;
+    for (live.items) |manager| total +|= if (manager.pool.private_bytes > 0) manager.pool.private_bytes else estimate;
+    return total;
+}
+
+fn estimateLocked() u64 {
+    var smallest: u64 = 0;
+    for (live.items) |manager| {
+        const bytes = manager.pool.private_bytes;
+        if (bytes > 0 and (smallest == 0 or bytes < smallest)) smallest = bytes;
+    }
+    return if (smallest > 0) smallest else default_estimate;
+}
+
+fn fitsLocked(config: Limits) Fit {
+    return fits(config, live.items.len, totalLocked(), estimateLocked());
+}
+
+/// Whether admitting one more kernel keeps the pool within its limits.
+fn fits(config: Limits, live_count: usize, total: u64, estimate: u64) Fit {
+    if (live_count >= config.max_live) return .over_ceiling;
+    // The first kernel always fits: a budget below one kernel would refuse all work.
+    if (live_count > 0 and total +| estimate > config.budget_bytes) return .over_budget;
+    return .fits;
+}
+
+const Fit = enum { fits, over_budget, over_ceiling };
 
 pub fn liveCount() usize {
     mutex.lockUncancelable(io_mod.getIo());
@@ -219,12 +281,15 @@ pub fn touch(manager: *Manager) void {
     changed.broadcast(io_mod.getIo());
 }
 
-/// Counts `manager` as live before its process starts, parking the least
-/// recently used idle kernel if the pool is full. When every live kernel is
-/// running a cell it waits for one to finish, up to `admit_wait_ms`, then
-/// refuses with `error.KernelCapacityExhausted`. Waiting rather than refusing
-/// at once lets a fan-out of children share a small cap; the deadline keeps a
-/// stuck cell from hanging every other start.
+/// Counts `manager` as live before its process starts, parking least recently
+/// used idle kernels while the memory budget or the ceiling would be exceeded.
+/// Over budget with nothing parkable, it admits anyway: the budget is a soft
+/// target on a lagging sample, every kernel in the way is running a cell, and
+/// the sweeper parks idle kernels as soon as cells end. At the ceiling with
+/// every live kernel running a cell it waits for one to finish, up to
+/// `admit_wait_ms`, then refuses with `error.KernelCapacityExhausted`. Waiting
+/// rather than refusing at once lets a fan-out of children share the ceiling;
+/// the deadline keeps a stuck cell from hanging every other start.
 pub fn admit(manager: *Manager, cancel: Cancel, owner: *const std.atomic.Value(bool)) !void {
     const io = io_mod.getIo();
     const deadline = now() + limitsSnapshot().admit_wait_ms;
@@ -233,9 +298,15 @@ pub fn admit(manager: *Manager, cancel: Cancel, owner: *const std.atomic.Value(b
     mutex.lockUncancelable(io);
     defer mutex.unlock(io);
     if (manager.pool.live) return;
-    while (live.items.len >= limitsLocked().max_live) {
+    while (true) {
+        const fit = fitsLocked(limitsLocked());
+        if (fit == .fits) break;
         if (isSet(cancel) or owner.load(.acquire)) return error.Cancelled;
         const victim = pickVictimLocked(skipped.items) orelse {
+            if (fit == .over_budget) {
+                debug_trace.logf("kernel", "admit over budget total={d} budget={d} live={d}: every live kernel is busy", .{ totalLocked(), limitsLocked().budget_bytes, live.items.len });
+                break;
+            }
             const left = deadline - now();
             if (left <= 0) return error.KernelCapacityExhausted;
             // A cell finishing, a park, or a stop broadcasts; the slice rechecks cancel.
@@ -249,8 +320,18 @@ pub fn admit(manager: *Manager, cancel: Cancel, owner: *const std.atomic.Value(b
     live.appendAssumeCapacity(manager);
     manager.pool.live = true;
     manager.pool.last_used = now();
-    debug_trace.logf("kernel", "admit dir={s} live={d}", .{ manager.artifact_dir, live.items.len });
+    manager.pool.pid = 0;
+    manager.pool.private_bytes = 0;
+    debug_trace.logf("kernel", "admit dir={s} live={d} total={d}", .{ manager.artifact_dir, live.items.len, totalLocked() });
     startSweeperLocked();
+}
+
+/// Its process started as `pid`, which the sweeper samples from now on.
+pub fn started(manager: *Manager, pid: std.posix.pid_t) void {
+    mutex.lockUncancelable(io_mod.getIo());
+    defer mutex.unlock(io_mod.getIo());
+    manager.pool.pid = pid;
+    manager.pool.private_bytes = 0;
 }
 
 /// Its process stopped: it no longer counts against the cap.
@@ -264,6 +345,8 @@ pub fn retire(manager: *Manager) void {
 fn removeLive(manager: *Manager) void {
     if (!manager.pool.live) return;
     manager.pool.live = false;
+    manager.pool.pid = 0;
+    manager.pool.private_bytes = 0;
     for (live.items, 0..) |candidate, index| if (candidate == manager) {
         _ = live.swapRemove(index);
         return;
@@ -290,7 +373,7 @@ fn pickOldest(candidates: []const Candidate) ?usize {
 }
 
 fn pickVictimLocked(skipped: []const *Manager) ?*Manager {
-    var candidates: [64]Candidate = undefined;
+    var candidates: [256]Candidate = undefined;
     const count = @min(live.items.len, candidates.len);
     for (live.items[0..count], candidates[0..count]) |manager, *candidate| {
         const excluded = std.mem.findScalar(*Manager, skipped, manager) != null;
@@ -328,16 +411,34 @@ fn startSweeperLocked() void {
     sweeper_running = true;
 }
 
-/// Parks kernels idle past their TTL. It exits once no kernel is live and a
-/// later admission starts it again.
+/// Samples memory, parks kernels while the pool is over budget or idle past
+/// their TTL, and stops the zygotes once no kernel has been live for
+/// `zygote_linger_ms`. A later admission starts it again.
 fn sweep() void {
     const io = io_mod.getIo();
     mutex.lockUncancelable(io);
-    defer mutex.unlock(io);
-    while (live.items.len > 0) {
+    var empty_since: ?i64 = null;
+    var next_sample: i64 = 0;
+    while (true) {
         const config = limitsLocked();
         const at = now();
-        var next_due: i64 = at + 60_000;
+        if (live.items.len == 0) {
+            const since = empty_since orelse at;
+            empty_since = since;
+            const left = since + config.zygote_linger_ms - at;
+            if (left <= 0) break;
+            changed.waitTimeout(io, &mutex, .{ .duration = .{ .raw = .fromMilliseconds(std.math.clamp(left, 10, 60_000)), .clock = .awake } }) catch {};
+            continue;
+        }
+        empty_since = null;
+        if (at >= next_sample) {
+            mutex.unlock(io);
+            sample();
+            mutex.lockUncancelable(io);
+            next_sample = now() + config.sample_ms;
+            if (overBudgetParkLocked(config)) continue;
+        }
+        var next_due: i64 = @min(at + 60_000, next_sample);
         var due: ?*Manager = null;
         for (live.items) |manager| {
             const ttl = if (manager.pool.refs > 0 or !manager.pool.keyed) config.held_idle_ms else config.idle_ms;
@@ -362,6 +463,55 @@ fn sweep() void {
         changed.waitTimeout(io, &mutex, .{ .duration = .{ .raw = .fromMilliseconds(std.math.clamp(next_due - at, 10, 60_000)), .clock = .awake } }) catch {};
     }
     sweeper_running = false;
+    zygote_bytes = 0;
+    mutex.unlock(io);
+    zygote.stopAll();
+}
+
+/// Caller holds the mutex. Parks least recently used idle kernels until the
+/// sampled total fits the budget, and reports whether it parked any. Kernels
+/// that will not park are skipped until the next sample. As in admission, one
+/// kernel always stays, however small the budget.
+fn overBudgetParkLocked(config: Limits) bool {
+    var skipped: std.ArrayList(*Manager) = .empty;
+    defer skipped.deinit(std.heap.c_allocator);
+    var parked_any = false;
+    while (live.items.len > 1 and totalLocked() > config.budget_bytes) {
+        const victim = pickVictimLocked(skipped.items) orelse break;
+        debug_trace.logf("kernel", "over budget total={d} budget={d}: parking dir={s}", .{ totalLocked(), config.budget_bytes, victim.artifact_dir });
+        if (parkPinnedLocked(victim)) {
+            parked_any = true;
+        } else skipped.append(std.heap.c_allocator, victim) catch break;
+    }
+    return parked_any;
+}
+
+/// Reads every live kernel's and zygote's private memory, with the pool
+/// unlocked for the syscalls. A kernel that stopped meanwhile keeps no sample.
+fn sample() void {
+    const io = io_mod.getIo();
+    const Reading = struct { manager: *Manager, pid: std.posix.pid_t, bytes: u64 = 0 };
+    var readings: [256]Reading = undefined;
+    var count: usize = 0;
+    mutex.lockUncancelable(io);
+    for (live.items) |manager| {
+        if (manager.pool.pid <= 0 or count == readings.len) continue;
+        readings[count] = .{ .manager = manager, .pid = manager.pool.pid };
+        count += 1;
+    }
+    mutex.unlock(io);
+    for (readings[0..count]) |*reading| reading.bytes = memory.privateBytes(reading.pid) orelse 0;
+    var zygote_pids: [8]std.posix.pid_t = undefined;
+    var zygote_total: u64 = 0;
+    for (zygote_pids[0..zygote.pids(&zygote_pids)]) |pid| zygote_total +|= memory.privateBytes(pid) orelse 0;
+    mutex.lockUncancelable(io);
+    defer mutex.unlock(io);
+    zygote_bytes = zygote_total;
+    for (readings[0..count]) |reading| {
+        // Only a manager still live under the same pid takes the reading.
+        if (std.mem.findScalar(*Manager, live.items, reading.manager) == null) continue;
+        if (reading.manager.pool.pid == reading.pid) reading.manager.pool.private_bytes = reading.bytes;
+    }
 }
 
 fn isSet(flag: Cancel) bool {
@@ -379,6 +529,18 @@ test "the pool parks the least recently used parkable kernel" {
     const busy = [_]Candidate{ .{ .last_used = 1, .parkable = false }, .{ .last_used = 2, .parkable = false } };
     try std.testing.expectEqual(@as(?usize, null), pickOldest(&busy));
     try std.testing.expectEqual(@as(?usize, null), pickOldest(&.{}));
+}
+
+test "admission checks the ceiling first, then the memory budget, and always admits the first kernel" {
+    const config: Limits = .{ .max_live = 3, .budget_bytes = 100 };
+    try std.testing.expectEqual(Fit.fits, fits(config, 0, 500, 500));
+    try std.testing.expectEqual(Fit.fits, fits(config, 1, 40, 60));
+    try std.testing.expectEqual(Fit.over_budget, fits(config, 1, 41, 60));
+    try std.testing.expectEqual(Fit.over_ceiling, fits(config, 3, 0, 0));
+    try std.testing.expectEqual(Fit.over_budget, fits(.{ .budget_bytes = 10 }, 1, std.math.maxInt(u64), 1));
+    // The default limits have no budget until the environment sets one.
+    try std.testing.expectEqual(Fit.fits, fits(.{}, 31, 1 << 40, 1 << 40));
+    try std.testing.expectEqual(Fit.over_ceiling, fits(.{}, 32, 0, 0));
 }
 
 test "pool limits read overrides and ignore bad values" {
@@ -552,4 +714,37 @@ test "an idle kernel parks after its TTL and restores lazily" {
     try std.testing.expectEqual(kernel.State.idle, a.status());
     try std.testing.expectEqual(@as(usize, 0), liveCount());
     try fixture.expectResult(a, "sum(z)", "6");
+}
+
+test "a start over the memory budget parks an idle kernel, and so does the sweeper" {
+    var fixture: LiveFixture = undefined;
+    // One byte: any second kernel is over budget.
+    try fixture.init(.{ .max_live = 8, .budget_bytes = 1, .idle_ms = 0, .held_idle_ms = 0, .sample_ms = 100 });
+    defer fixture.deinit();
+    const a = try fixture.manager("a");
+    defer a.destroy();
+    const b = try fixture.manager("b");
+    defer b.destroy();
+    try fixture.expectResult(a, "v = 'a'\nv", "'a'");
+    const parked = parkedTotal();
+    try fixture.expectResult(b, "v = 'b'\nv", "'b'");
+    try std.testing.expectEqual(kernel.State.idle, a.status());
+    try std.testing.expectEqual(parked + 1, parkedTotal());
+    try std.testing.expectEqual(@as(usize, 1), liveCount());
+
+    // Admitted under a loose budget, both run until the budget tightens; then
+    // the sweeper parks the least recently used one from its samples.
+    setLimits(.{ .max_live = 8, .idle_ms = 0, .held_idle_ms = 0, .sample_ms = 100 });
+    try fixture.expectResult(a, "v", "'a'");
+    try std.testing.expectEqual(@as(usize, 2), liveCount());
+    mutex.lockUncancelable(io_mod.getIo());
+    limits.budget_bytes = 1;
+    mutex.unlock(io_mod.getIo());
+    changed.broadcast(io_mod.getIo());
+    var waited: usize = 0;
+    while (liveCount() > 1 and waited < 100) : (waited += 1) io_mod.sleep(50 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(usize, 1), liveCount());
+    try std.testing.expectEqual(kernel.State.idle, b.status());
+    try std.testing.expect(memoryTotal() > 0);
+    try fixture.expectResult(b, "v", "'b'");
 }

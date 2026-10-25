@@ -73,10 +73,39 @@ pub fn ensure(alloc: Allocator, explicit_python: ?[]const u8, progress: ?Progres
     return .{ .python = python, .runtime = runtime };
 }
 
+/// Interpreters that passed the probe in this process. A probe costs a whole
+/// Python start, so each kernel start would otherwise pay for two.
+var probed_lock: std.Io.Mutex = .init;
+var probed: std.ArrayList([]u8) = .empty;
+
 fn probe(alloc: Allocator, python: []const u8, cancel: Cancellation) !bool {
-    return command(alloc, &.{ python, "-c", "import sys, dill; assert sys.version_info >= (3, 11)" }, cancel, 15_000) catch |err| switch (err) {
+    const io = io_mod.getIo();
+    probed_lock.lockUncancelable(io);
+    for (probed.items) |known| if (std.mem.eql(u8, known, python)) {
+        probed_lock.unlock(io);
+        return true;
+    };
+    probed_lock.unlock(io);
+    const ok = command(alloc, &.{ python, "-c", "import sys, dill; assert sys.version_info >= (3, 11)" }, cancel, 15_000) catch |err| switch (err) {
         error.OutOfMemory, error.Cancelled => return err,
         else => false,
+    };
+    if (!ok) return false;
+    probed_lock.lockUncancelable(io);
+    defer probed_lock.unlock(io);
+    const owned = std.heap.c_allocator.dupe(u8, python) catch return true;
+    probed.append(std.heap.c_allocator, owned) catch std.heap.c_allocator.free(owned);
+    return true;
+}
+
+/// Drops a cached probe, after the interpreter failed to start a kernel.
+pub fn forget(python: []const u8) void {
+    const io = io_mod.getIo();
+    probed_lock.lockUncancelable(io);
+    defer probed_lock.unlock(io);
+    for (probed.items, 0..) |known, index| if (std.mem.eql(u8, known, python)) {
+        std.heap.c_allocator.free(probed.swapRemove(index));
+        return;
     };
 }
 

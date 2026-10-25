@@ -30,8 +30,10 @@
 
 """Minimal CPython REPL runtime speaking newline-delimited JSON over stdio.
 
-Entry point: ``python -u runtime.py``. A dedicated JSONL channel carries
-execute, interrupt, snapshot, restore and shutdown requests. Cells execute
+Entry point: ``python -u runtime.py``, or ``runtime.py --zygote`` for the fork
+server that starts kernels with these imports already done (``_zygote_main``).
+A dedicated JSONL channel carries execute, interrupt, snapshot, restore and
+shutdown requests. Cells execute
 with top-level await in one persistent ``__main__`` namespace on a single
 asyncio event loop. Only macOS and Linux are supported.
 """
@@ -1308,5 +1310,127 @@ def main() -> None:
     _loop.close()
 
 
+def _reap_children(signum: int, frame: types.FrameType | None) -> None:
+    """Zygote only: reap every exited kernel at once, so none lingers as a zombie."""
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            return
+
+
+def _recv_exact(sock: Any, size: int) -> bytes:
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise EOFError
+        data += chunk
+    return data
+
+
+def _zygote_child(sock: Any, fds: list[int], req: dict[str, Any]) -> None:
+    """Become a kernel exactly as a direct spawn would; never returns."""
+    code = 1
+    try:
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+        os.setpgid(0, 0)
+        for target, fd in enumerate(fds):
+            os.dup2(fd, target)
+        # Detach first: the socket object must never close a reused fd number later.
+        sock.detach()
+        fd_dir = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
+        for name in os.listdir(fd_dir):
+            if int(name) > 2:
+                try:
+                    os.close(int(name))
+                except OSError:
+                    pass
+        os.chdir(req["cwd"])
+        os.environ.clear()
+        os.environ.update(req["env"])
+        sys.argv = sys.argv[:1]
+        main()
+        code = 0
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 1
+    except BaseException:  # noqa: BLE001 - a kernel must never return into the zygote loop
+        traceback.print_exc()
+    finally:
+        try:
+            import atexit
+
+            atexit._run_exitfuncs()
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            os._exit(code)
+
+
+def _zygote_main() -> None:
+    """Pre-imported, single-threaded fork server; one per interpreter per host process.
+
+    The host's socket is fd 0. Each request is an 8-byte little-endian length that
+    carries the kernel's stdin, stdout and stderr by SCM_RIGHTS, then a JSON body
+    naming the kernel's cwd and environment. The reply line names the forked pid.
+    Nothing here may start a thread or load a library that is unsafe to fork.
+    """
+    import socket
+
+    sock = socket.socket(fileno=os.dup(0))
+    devnull = os.open(os.devnull, os.O_RDWR)
+    os.dup2(devnull, 0)
+    os.close(devnull)
+    signal.signal(signal.SIGCHLD, _reap_children)
+    # A kernel imports dill only to snapshot or restore, but every saved kernel
+    # snapshots soon after its first cell. Imported here, its pages are shared:
+    # measured on 3.11, a forked kernel then holds about 10.6 MiB privately
+    # after its first snapshot instead of 14.1 MiB.
+    try:
+        import dill  # noqa: F401
+    except Exception:  # noqa: BLE001 - the probe guarantees dill; a kernel reports its absence
+        pass
+    # Frozen objects are never scanned by the collector, so a kernel's GC
+    # passes leave the pages it shares with the zygote untouched.
+    import gc
+
+    gc.freeze()
+    sock.sendall(json.dumps({"ready": PROTOCOL_VERSION}).encode() + b"\n")
+    while True:
+        try:
+            header, fds, _, _ = socket.recv_fds(sock, 8, 3)
+            if not header:
+                os._exit(0)
+            header += _recv_exact(sock, 8 - len(header))
+            req = json.loads(_recv_exact(sock, int.from_bytes(header, "little")))
+        except (EOFError, OSError):
+            os._exit(0)
+        if len(fds) != 3:
+            for fd in fds:
+                os.close(fd)
+            sock.sendall(b'{"error":"expected three descriptors"}\n')
+            continue
+        try:
+            pid = os.fork()
+        except OSError as err:
+            pid = -1
+            reply = {"error": f"fork failed: {err}"}
+        if pid == 0:
+            _zygote_child(sock, fds, req)
+        for fd in fds:
+            os.close(fd)
+        if pid > 0:
+            reply = {"pid": pid}
+        try:
+            sock.sendall(json.dumps(reply).encode() + b"\n")
+        except OSError:
+            os._exit(0)
+
+
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--zygote"]:
+        _zygote_main()
+    else:
+        main()

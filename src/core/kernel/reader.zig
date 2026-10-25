@@ -22,7 +22,7 @@ pub fn run(self: *Manager, stdout: std.Io.File, stderr: std.Io.File) void {
         // Reap on EOF or corruption, not only on the next tool call. The writer lock
         // makes closing pipes and signaling the unreaped PID safe against interrupts.
         self.writer.lockUncancelable(io_mod.getIo());
-        if (self.child) |*child| child.kill(io_mod.getIo());
+        if (self.child) |*child| child.kill();
         self.writer.unlock(io_mod.getIo());
     }
     var pending: std.ArrayList(u8) = .empty;

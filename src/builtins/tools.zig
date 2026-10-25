@@ -634,7 +634,7 @@ pub const read_tool_result = ToolSpec{
     .irreversible_fn = read_tool_result_impl.isIrreversible,
 };
 
-const kernel_description = "Execute Python in this session's persistent CPython kernel. Variables survive cells, top-level await is supported, and async tasks can continue between cells. Output and last-expression results are returned. action defaults to execute; status inspects, interrupt cancels the active cell, stop snapshots and releases Python, restart discards the live process and restores the last valid snapshot lazily, and prewarm starts it in the background. timeout_ms is an advisory time budget, not a hard deadline. Runtime helper APIs such as rlm are not installed; use the native tools for those operations. Python has the filesystem and network access of the proto-fx process. Unless a permission rule or full access already allows it, every kernel call needs approval: ask mode prompts with the raw arguments and auto mode sends the call to security review. Code is not parsed like shell commands, so the routine-command shortcut never applies.";
+const kernel_description = "Execute Python in this session's persistent CPython kernel. Variables survive cells, top-level await is supported, and async tasks can continue between cells. Output and last-expression results are returned. action defaults to execute; status inspects, interrupt cancels the active cell, stop snapshots and releases Python, restart discards the live process and restores the last valid snapshot lazily, and prewarm starts it in the background. timeout_ms is an advisory time budget, not a hard deadline. An idle kernel can be parked automatically, after an idle period or when live kernels exceed the memory budget set by PROTO_FX_KERNEL_MEMORY_BUDGET: its globals are snapshotted, its process stops, and the next cell restores them. Anything a snapshot cannot hold is lost when that happens, such as open sockets and file handles, running asyncio tasks, and threads, so recreate those in the cell that needs them. A running cell is never parked. Runtime helper APIs such as rlm are not installed; use the native tools for those operations. Python has the filesystem and network access of the proto-fx process. Unless a permission rule or full access already allows it, every kernel call needs approval: ask mode prompts with the raw arguments and auto mode sends the call to security review. Code is not parsed like shell commands, so the routine-command shortcut never applies.";
 pub const kernel = ToolSpec{
     .name = "kernel",
     .description = kernel_description,
@@ -769,7 +769,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "0428b962a6a8fa38818abba17084d709730cdcd1a25b2c835beaa3c9acd67e1d",
+        "2af3bc879867e180ed301d19e2607b786862f7a56b22b7de3ca77e0c37f8e224",
         &actual_hex,
     );
 }

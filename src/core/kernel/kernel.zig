@@ -8,6 +8,7 @@ const protocol = @import("protocol.zig");
 const bootstrap = @import("bootstrap.zig");
 const reader = @import("reader.zig");
 const pool = @import("pool.zig");
+const process = @import("process.zig");
 const Allocator = std.mem.Allocator;
 const Buffer = protocol.Buffer;
 const Cancel = ?*const std.atomic.Value(bool);
@@ -101,7 +102,7 @@ pub const Manager = struct {
     reader_stop: std.atomic.Value(bool) = .init(false),
     disposed: std.atomic.Value(bool) = .init(false),
     state: State = .idle,
-    child: ?std.process.Child = null,
+    child: ?process.Process = null,
     reader_thread: ?std.Thread = null,
     prewarm_thread: ?std.Thread = null,
     repair_thread: ?std.Thread = null,
@@ -335,9 +336,7 @@ pub const Manager = struct {
         // An explicit restart must also break a cell that catches KeyboardInterrupt.
         // Signal the unreaped PID; only the reader/cleanup owns waiting and closing pipes.
         self.writer.lockUncancelable(io_mod.getIo());
-        if (self.child) |child| if (child.id) |pid| {
-            std.posix.kill(pid, .KILL) catch {};
-        };
+        if (self.child) |child| child.signal(.KILL);
         self.writer.unlock(io_mod.getIo());
         self.lockGateUncancelable();
         defer self.unlockGate();
@@ -444,27 +443,24 @@ pub const Manager = struct {
         var owner: [32]u8 = undefined;
         try env.put("PROTO_FX_KERNEL_OWNER_PID", try std.mem.print(&owner, "{d}", .{std.c.getpid()}));
         try env.put("PYTHONUTF8", "1");
-        const spawned = try std.process.spawn(io, .{
-            .argv = &.{ paths.python, "-u", paths.runtime },
-            .cwd = .{ .path = self.cwd },
-            .environ_map = &env,
-            .stdin = .pipe,
-            .stdout = .pipe,
-            .stderr = .pipe,
-            .pgid = 0,
-        });
+        const spawned = process.spawn(self.alloc, .{ .python = paths.python, .runtime = paths.runtime, .cwd = self.cwd, .env = &env }) catch |err| {
+            // A vanished interpreter must be probed again before the next start.
+            bootstrap.forget(paths.python);
+            return err;
+        };
         self.writer.lockUncancelable(io);
         self.child = spawned;
         self.writer.unlock(io);
+        pool.started(self, spawned.pid);
         errdefer self.stopLocked(false);
         if (cancelled(cancel) or self.disposed.load(.acquire) or self.stopping.load(.acquire)) return error.Cancelled;
-        for ([_]std.Io.File{ self.child.?.stdin.?, self.child.?.stdout.?, self.child.?.stderr.? }) |file| {
+        for ([_]std.Io.File{ spawned.stdin, spawned.stdout, spawned.stderr }) |file| {
             const flags = std.posix.system.fcntl(file.handle, std.posix.F.GETFL);
             if (flags < 0 or std.posix.system.fcntl(file.handle, std.posix.F.SETFL, @as(usize, @intCast(flags)) | (@as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK"))) < 0) return error.KernelPipeSetupFailed;
         }
         if (self.persist) reader.openLog(self);
         self.reader_stop.store(false, .release);
-        self.reader_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, reader.run, .{ self, self.child.?.stdout.?, self.child.?.stderr.? });
+        self.reader_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, reader.run, .{ self, spawned.stdout, spawned.stderr });
         const deadline = now() + 30_000;
         self.mutex.lockUncancelable(io);
         while (self.state == .starting) {
@@ -617,7 +613,8 @@ pub const Manager = struct {
         }
         defer self.writer.unlock(io_mod.getIo());
         const child = self.child orelse return error.KernelNotRunning;
-        const stdin = child.stdin orelse return error.KernelNotRunning;
+        if (child.gone) return error.KernelNotRunning;
+        const stdin = child.stdin;
         var written: usize = 0;
         while (written < bytes.len) {
             if (cancelled(cancel) or now() >= deadline) {
@@ -667,14 +664,12 @@ pub const Manager = struct {
         self.reader_stop.store(true, .release);
         // Signal before join so an EOF wakes the reader even while the child was blocked.
         self.writer.lockUncancelable(io_mod.getIo());
-        if (self.child) |child| if (child.id) |pid| {
-            std.posix.kill(pid, .TERM) catch {};
-        };
+        if (self.child) |child| child.signal(.TERM);
         self.writer.unlock(io_mod.getIo());
         if (self.reader_thread) |thread| thread.join();
         self.reader_thread = null;
         self.writer.lockUncancelable(io_mod.getIo());
-        if (self.child) |*child| child.kill(io_mod.getIo());
+        if (self.child) |*child| child.kill();
         self.child = null;
         self.writer.unlock(io_mod.getIo());
         if (self.stderr_log) |file| file.close(io_mod.getIo());
@@ -859,4 +854,7 @@ test {
     _ = protocol;
     _ = reader;
     _ = pool;
+    _ = process;
+    _ = @import("memory.zig");
+    _ = @import("zygote.zig");
 }
