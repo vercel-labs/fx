@@ -874,13 +874,25 @@ pub fn Runtime(comptime App: type) type {
             if (try routeActiveModalInput(app, raw, input_limits.decision_bytes)) return;
             if (app.input_runtime.session_browser.active) {
                 if (byte == '\r') {
+                    if (app.input_runtime.session_browser.pendingDeleteId() != null) {
+                        if (comptime @hasDecl(App, "deleteBrowserSelection")) try app.deleteBrowserSelection();
+                        return;
+                    }
                     if (comptime @hasDecl(App, "activateBrowserSelection")) try app.activateBrowserSelection();
                     return;
                 }
-                if (byte == 3 or byte == 4) {
+                if (byte == 4) {
+                    if (app.input_runtime.session_browser.pendingDeleteId() == null) {
+                        try beginSessionBrowserDelete(app);
+                    }
+                    return;
+                }
+                if (byte == 3) {
                     closeSessionBrowser(app);
                     return;
                 }
+                // A delete confirmation owns the browser until Enter or Esc.
+                if (app.input_runtime.session_browser.pendingDeleteId() != null) return;
             }
             if (byte >= 0x80) {
                 try handleTextByte(app, .composer, byte, max_input_len);
@@ -1108,12 +1120,40 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
+        /// Ctrl+D in the session browser asks to delete the selected saved
+        /// session. The session in view cannot delete itself, and subagents
+        /// belong to their parent, so neither starts a confirmation.
+        fn beginSessionBrowserDelete(app: *App) !void {
+            if (comptime !@hasDecl(App, "deleteBrowserSelection")) return;
+            const browser = &app.input_runtime.session_browser;
+            if (browser.scope != .sessions) return;
+            if (browser.pendingDeleteId() != null) return;
+            if (browser.selectedRow() == null) return;
+            if (!browser.beginDelete()) {
+                try app.writeDomainNotice(.{
+                    .topic = "session",
+                    .tone = .warning,
+                    .body = "The session in view cannot be deleted. Open another session first.",
+                }, true);
+                app.shell.render_requests.request(.footer);
+                return;
+            }
+            app.shell.render_requests.request(.footer);
+        }
+
+        fn cancelSessionBrowserDelete(app: *App) void {
+            if (app.input_runtime.session_browser.pendingDeleteId() == null) return;
+            app.input_runtime.session_browser.cancelDelete();
+            app.shell.render_requests.request(.footer);
+        }
+
         fn routeSessionBrowserAction(app: *App, action: input_action.Action) !bool {
             if (comptime !@hasDecl(App, "openSessionBrowser")) return false;
             const session = session_backend.Ops(App).view(app);
             if (!session.session_browser) return false;
             const browser = &app.input_runtime.session_browser;
             if (browser.active) {
+                if (browser.pendingDeleteId() != null) return true;
                 const visible = @max(1, app.shell.layout.rows -| 7);
                 switch (action) {
                     .cursor_up => browser.move(-1, visible),
@@ -2742,6 +2782,10 @@ pub fn Runtime(comptime App: type) type {
         fn resolveEscape(app: *App, was_cancel_pending: bool, now: i64) !void {
             if (try full_transcript_rt.routeAction(app, .escape)) return;
             if (app.input_runtime.session_browser.active and !app.question_prompt.isActive() and !app.approval_prompt.isActive()) {
+                if (app.input_runtime.session_browser.pendingDeleteId() != null) {
+                    cancelSessionBrowserDelete(app);
+                    return;
+                }
                 if (app.input_runtime.edit_state.input.items.len != 0) {
                     app.input_runtime.inputResetState().clearCurrent(app.alloc);
                     app.input_runtime.session_browser.setQuery("");
@@ -3494,6 +3538,7 @@ const RoutingFakeApp = struct {
     resume_selected_count: usize = 0,
     resume_selected_error: anyerror = error.SessionStoreUnavailable,
     resume_selected_closes_picker: bool = false,
+    browser_delete_count: usize = 0,
     load_more_session_count: usize = 0,
     selected_credential_source: ?types.CredentialSource = null,
     selected_auth_action: ?auth_runtime.AcquisitionAction = null,
@@ -3736,6 +3781,11 @@ const RoutingFakeApp = struct {
     pub fn prepareLiveSessionResume(_: *RoutingFakeApp) !void {}
 
     pub fn finishLiveSessionResume(_: *RoutingFakeApp) !void {}
+
+    pub fn deleteBrowserSelection(self: *RoutingFakeApp) !void {
+        self.browser_delete_count += 1;
+        self.input_runtime.session_browser.cancelDelete();
+    }
 
     pub fn resumeSelectedSession(self: *RoutingFakeApp) !bool {
         self.resume_selected_count += 1;
@@ -8508,6 +8558,46 @@ test "app_input_runtime composer control aliases move, delete, and preserve proc
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expect(app.should_exit);
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
+}
+
+test "app_input_runtime ctrl+d confirms a browser delete before it asks" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.input_runtime.session_browser.open(.sessions);
+    try app.input_runtime.session_browser.replaceRows(alloc, &.{
+        .{ .id = "current", .title = "Current", .current = true },
+        .{ .id = "other", .title = "Other" },
+    });
+    app.input_runtime.session_browser.selected = 1;
+
+    try feedRoutingBytes(&app, "\x04");
+    try std.testing.expectEqualStrings("other", app.input_runtime.session_browser.pendingDeleteId().?);
+    try std.testing.expectEqual(@as(usize, 0), app.browser_delete_count);
+
+    // Movement is suspended while the confirmation owns the browser.
+    try feedRoutingBytes(&app, "\x1b[B");
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.session_browser.selected);
+    try Runtime(RoutingFakeApp).resolveEscape(&app, false, 100);
+    try std.testing.expect(app.input_runtime.session_browser.pendingDeleteId() == null);
+
+    // The session in view cannot delete itself.
+    app.input_runtime.session_browser.selected = 0;
+    try feedRoutingBytes(&app, "\x04");
+    try std.testing.expect(app.input_runtime.session_browser.pendingDeleteId() == null);
+    try std.testing.expect(std.mem.find(u8, app.notice_body.items, "cannot be deleted") != null);
+
+    // Enter confirms the row chosen, even after the list moved under it.
+    app.input_runtime.session_browser.selected = 1;
+    try feedRoutingBytes(&app, "\x04");
+    try app.input_runtime.session_browser.replaceRows(alloc, &.{
+        .{ .id = "newer", .title = "Newer" },
+        .{ .id = "current", .title = "Current", .current = true },
+        .{ .id = "other", .title = "Other" },
+    });
+    try feedRoutingBytes(&app, "\r");
+    try std.testing.expectEqual(@as(usize, 1), app.browser_delete_count);
+    try std.testing.expect(app.input_runtime.session_browser.pendingDeleteId() == null);
 }
 
 test "app_input_runtime ctrl+n navigates prompt history directly" {

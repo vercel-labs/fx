@@ -4806,6 +4806,41 @@ pub fn listSummaries(
     return list;
 }
 
+/// Deletes the session `id` wherever the listing found it: sessions v2 when
+/// it holds the folder, else a legacy v1 root with the children it owns.
+/// Also removes the terminal and side folders fx keeps beside it. A session
+/// another process holds is Busy, and one that is no longer there is
+/// SessionNotFound.
+pub fn deleteSession(store: *Store, alloc: Allocator, id: []const u8) !void {
+    session_layout.validateSessionId(id) catch return error.SessionNotFound;
+    var deleted_v2 = true;
+    store.manager.delete(id) catch |err| switch (err) {
+        error.NotFound => deleted_v2 = false,
+        error.Busy => return error.SessionBusy,
+        error.InvalidArgument => return error.SessionNotFound,
+        else => return err,
+    };
+    if (!deleted_v2) {
+        var v1 = session_store.Store.initReadOnlyFromHome(alloc, store.home, "/") catch |err| switch (err) {
+            error.FileNotFound => return error.SessionNotFound,
+            else => return err,
+        };
+        defer v1.deinit(alloc);
+        var problem: v1_conversion.Problem = .{};
+        var family = v1_conversion.lockFamily(alloc, &v1, id, 0, &problem) catch |err| switch (err) {
+            error.SessionNotFound => return error.SessionNotFound,
+            error.SessionBusy => return error.SessionBusy,
+            error.InvalidSessionFormat => return error.SessionUnreadable,
+            else => return err,
+        };
+        defer family.release();
+        for (family.members.items) |member| {
+            if (!v1_conversion.removeFolder(&v1, member.id, "deleted")) return error.SessionDeleteFailed;
+        }
+    }
+    store.removeFiles(id, "deleted");
+}
+
 fn summaryOf(alloc: Allocator, scratch: Allocator, item: sm.Summary) !session_store.SessionSummary {
     const id = try alloc.dupe(u8, item.id);
     errdefer alloc.free(id);
@@ -6751,6 +6786,59 @@ test "a session that never reached the disk takes its terminal folder, and a sav
     _ = try landed.handle.append(&.{ .turn_started, .turn_committed });
     landed.close();
     try testing.expect(pathExists(&t, &.{ ".fx", terminal_dir_name, landed_id }));
+}
+
+test "deleting a saved session removes its history and the folders beside it" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    try s.commitTurn(assistantTurn("q", "a"), types.ConversationLanguage.default());
+    s.close();
+
+    var fx = try io_mod.openOrCreateVerifiedPrivateDirFromDir(t.tmp.dir, profile_paths.root_dir_name);
+    defer fx.close();
+    for ([_][]const u8{ terminal_dir_name, files_dir_name }) |name| {
+        var root = try io_mod.openOrCreateVerifiedPrivateDir(&fx, name);
+        defer root.close();
+        var owner = try io_mod.openOrCreateVerifiedPrivateDir(&root, id);
+        owner.close();
+    }
+
+    try deleteSession(&t.store, testing.allocator, id);
+    try testing.expectError(error.NotFound, t.store.manager.peek(testing.allocator, id));
+    try testing.expect(!pathExists(&t, &.{ profile_paths.root_dir_name, profile_paths.sessions_dir_name, session_layout.sessions_v2_dir, id }));
+    try testing.expect(!pathExists(&t, &.{ profile_paths.root_dir_name, terminal_dir_name, id }));
+    try testing.expect(!pathExists(&t, &.{ profile_paths.root_dir_name, files_dir_name, id }));
+
+    // A second delete finds nothing, and a forged id never reaches the disk.
+    try testing.expectError(error.SessionNotFound, deleteSession(&t.store, testing.allocator, id));
+    try testing.expectError(error.SessionNotFound, deleteSession(&t.store, testing.allocator, "../escape"));
+}
+
+test "deleting a legacy session removes its family and the folders beside it" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const root_id = (try v1.fixture("family", 3))[0];
+
+    const family = [_][]const u8{ "7hLXblLzOjbv", "dvAUvp8xcGs3", "CnPJVDFTOape" };
+    for (family) |member| try testing.expect(pathExists(&t, &.{ profile_paths.root_dir_name, profile_paths.sessions_dir_name, member }));
+    var fx = try io_mod.openOrCreateVerifiedPrivateDirFromDir(t.tmp.dir, profile_paths.root_dir_name);
+    defer fx.close();
+    var terminal_root = try io_mod.openOrCreateVerifiedPrivateDir(&fx, terminal_dir_name);
+    defer terminal_root.close();
+    var terminal_owner = try io_mod.openOrCreateVerifiedPrivateDir(&terminal_root, root_id);
+    terminal_owner.close();
+
+    try deleteSession(&t.store, testing.allocator, root_id);
+    for (family) |member| try testing.expect(!pathExists(&t, &.{ profile_paths.root_dir_name, profile_paths.sessions_dir_name, member }));
+    try testing.expect(!pathExists(&t, &.{ profile_paths.root_dir_name, terminal_dir_name, root_id }));
 }
 
 test "recover copies the folders outside the manager, never a link, and says when it left one out" {

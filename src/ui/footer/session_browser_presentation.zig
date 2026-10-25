@@ -82,6 +82,7 @@ pub fn composeRow(alloc: std.mem.Allocator, state: *const browser.State, index: 
 }
 
 const filtered_hints = [_][]const u8{
+    "up/down select   enter open   ctrl+d delete   left back   esc clear filter",
     "up/down select   enter open   left back   esc clear filter",
     "up/down select  enter open  left back  esc clear filter",
     "up/down select  enter open  esc clear",
@@ -90,11 +91,19 @@ const filtered_hints = [_][]const u8{
 };
 
 const unfiltered_hints = [_][]const u8{
+    "up/down select   enter open   ctrl+d delete   left back   esc close",
     "up/down select   enter open   left back   esc close",
     "up/down select  enter open  left back  esc close",
     "up/down select  enter open  esc close",
     "enter open  esc close",
     "enter esc",
+};
+
+const delete_hints = [_][]const u8{
+    "enter delete   esc cancel",
+    "enter delete  esc cancel",
+    "enter delete",
+    "enter delete",
 };
 
 /// The key hint under the browser: Esc clears a filter before it closes.
@@ -104,8 +113,32 @@ pub fn composeHintRow(
     width: u16,
     ctrl_c_pending: bool,
 ) !std.ArrayList(u8) {
-    const variants: []const []const u8 = if (state.query_len > 0) &filtered_hints else &unfiltered_hints;
+    const variants: []const []const u8 = if (state.pendingDeleteId() != null)
+        &delete_hints
+    else if (state.query_len > 0)
+        &filtered_hints
+    else
+        &unfiltered_hints;
     return input_presentation.composeVariantHintRow(alloc, width, ctrl_c_pending, variants);
+}
+
+test "delete confirmation replaces the browser hint" {
+    const alloc = std.testing.allocator;
+    var state: browser.State = .{};
+    defer state.close();
+    state.open(.sessions);
+    try state.replaceRows(alloc, &.{
+        .{ .id = "current", .title = "Current", .current = true },
+        .{ .id = "other", .title = "Other" },
+    });
+    state.selected = 1;
+    try std.testing.expect(state.beginDelete());
+
+    var hint = try composeHintRow(alloc, &state, 80, false);
+    defer hint.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, hint.items, "enter delete") != null);
+    try std.testing.expect(std.mem.find(u8, hint.items, "esc cancel") != null);
+    try std.testing.expect(std.mem.find(u8, hint.items, "ctrl+d") == null);
 }
 
 test "browser rows keep title and right-aligned meta only" {

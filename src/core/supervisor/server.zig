@@ -489,6 +489,60 @@ pub const Daemon = struct {
         return protocol.encode(arena, protocol.SessionList{ .sessions = rows.items, .last_attached_id = attached });
     }
 
+    /// Deletes `session` and its saved history. The session in view and one
+    /// another client watches are refused: deleting the former would leave
+    /// the composer without a session, and deleting the latter would drop a
+    /// live view. The registry and state file drop it before its files do,
+    /// so a restart cannot reopen what the user deleted.
+    fn deleteSession(self: *Daemon, session: *Session, id: []const u8, arena: Allocator) ![]const u8 {
+        {
+            self.registry_mutex.lockUncancelable(io_mod.getIo());
+            defer self.registry_mutex.unlock(io_mod.getIo());
+            if (self.last_attached_id) |attached| if (std.mem.eql(u8, attached, id)) return error.SessionInUse;
+        }
+        if (session.hasViewers()) return error.SessionInUse;
+        if (session.isActive()) return error.SessionBusy;
+        const owned_id = try self.alloc.dupe(u8, id);
+        defer self.alloc.free(owned_id);
+        {
+            self.registry_mutex.lockUncancelable(io_mod.getIo());
+            defer self.registry_mutex.unlock(io_mod.getIo());
+            for (self.sessions.items, 0..) |entry, index| if (entry == session) {
+                _ = self.sessions.orderedRemove(index);
+                break;
+            };
+        }
+        self.persist() catch |err| {
+            // Put it back: the registry and state file still agree, and its
+            // executor is untouched.
+            self.registry_mutex.lockUncancelable(io_mod.getIo());
+            self.sessions.append(self.alloc, session) catch {};
+            self.registry_mutex.unlock(io_mod.getIo());
+            return err;
+        };
+        session.stopExecutor();
+        session.destroy();
+        var store = session_adapter.Store.open(self.alloc, self.home) catch |err| {
+            self.saved_index_stale.store(true, .release);
+            self.noteListChange();
+            return err;
+        };
+        defer store.deinit(self.alloc);
+        session_adapter.deleteSession(&store, self.alloc, owned_id) catch |err| switch (err) {
+            // A session that never reached the disk has no history left to
+            // remove; the live row is already gone.
+            error.SessionNotFound => {},
+            else => {
+                self.saved_index_stale.store(true, .release);
+                self.noteListChange();
+                return err;
+            },
+        };
+        self.saved_index_stale.store(true, .release);
+        self.noteListChange();
+        return protocol.encode(arena, protocol.Ack{});
+    }
+
     /// Restores the registry from the state file. Sessions this supervisor
     /// owned reopen on their executors; a failure is recorded on the session.
     fn restore(self: *Daemon) !void {
@@ -555,6 +609,11 @@ pub const Daemon = struct {
             .unwatch => |request| if (request.topic == .list) {
                 if (job.watcher()) |conn| self.unwatchList(conn);
                 return try protocol.encode(arena, protocol.Ack{});
+            },
+            .delete => |request| {
+                const session = self.find(request.session_id) orelse return error.SessionNotFound;
+                const reply = try self.deleteSession(session, request.session_id, arena);
+                return reply;
             },
             .create => |request| {
                 const existing = if (request.@"resume") |id| self.find(id) else null;
@@ -708,6 +767,48 @@ test "the idle limit defaults to ten minutes and zero disables it" {
     try std.testing.expectEqual(default_idle_ms, idleLimitMs("soon"));
     try std.testing.expectEqual(@as(i64, 1500), idleLimitMs("1500"));
     try std.testing.expectEqual(@as(i64, 0), idleLimitMs("0"));
+}
+
+test "deleting a session refuses the attached and busy ones, then drops the rest" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const state_path = try std.Io.Dir.path.join(alloc, &.{ home, "sessions.json" });
+    defer alloc.free(state_path);
+    var daemon = Daemon{ .alloc = alloc, .cfg = undefined, .home = home, .state_path = state_path, .incarnation = "test" };
+    defer daemon.deinit();
+
+    const session = try daemon.register("S1", "/w", "one");
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The session the user last attached stays.
+    daemon.last_attached_id = try alloc.dupe(u8, "S1");
+    try std.testing.expectError(error.SessionInUse, daemon.deleteSession(session, "S1", a));
+    try std.testing.expect(daemon.find("S1") != null);
+    alloc.free(daemon.last_attached_id.?);
+    daemon.last_attached_id = null;
+
+    // A turn or host request keeps it too.
+    session.record_mutex.lockUncancelable(io_mod.getIo());
+    session.record.running = true;
+    session.record_mutex.unlock(io_mod.getIo());
+    try std.testing.expectError(error.SessionBusy, daemon.deleteSession(session, "S1", a));
+    try std.testing.expect(daemon.find("S1") != null);
+    session.record_mutex.lockUncancelable(io_mod.getIo());
+    session.record.running = false;
+    session.record_mutex.unlock(io_mod.getIo());
+
+    _ = try daemon.deleteSession(session, "S1", a);
+    try std.testing.expect(daemon.find("S1") == null);
+    try std.testing.expectEqual(@as(usize, 0), daemon.sessions.items.len);
+    const saved = try tmp.dir.readFileAlloc(io, "sessions.json", alloc, .limited(1 << 16));
+    defer alloc.free(saved);
+    try std.testing.expect(std.mem.find(u8, saved, "S1") == null);
 }
 
 test "an anchor tells a removed socket from a removed state directory" {

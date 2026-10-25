@@ -1395,6 +1395,9 @@ const App = struct {
     pub fn browserBack(self: *App) !void {
         if (self.backend == .detached) try DetachedBackend.browserBack(self);
     }
+    pub fn deleteBrowserSelection(self: *App) !void {
+        if (self.backend == .detached) try DetachedBackend.deleteBrowserSelection(self);
+    }
     /// True when the backend answered the prompt; the in-process approval
     /// flow handles it otherwise.
     pub fn resolveRemotePermission(self: *App, decision: types.ToolPermissionDecision) !bool {

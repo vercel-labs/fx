@@ -27,6 +27,11 @@ pub const State = struct {
     error_buf: [160]u8 = undefined,
     error_len: usize = 0,
     loading: bool = false,
+    /// The selected session awaiting delete confirmation. It is copied so a
+    /// live list update cannot move the action to another row. A valid id is
+    /// at most 255 bytes (`session_layout.validateSessionId`).
+    pending_delete_buf: [256]u8 = undefined,
+    pending_delete_len: usize = 0,
 
     pub fn close(self: *State) void {
         if (self.arena) |*arena| arena.deinit();
@@ -106,6 +111,21 @@ pub const State = struct {
     pub fn selectedRow(self: *const State) ?*const Row {
         return self.itemAt(self.selected);
     }
+    /// Starts delete confirmation for the selected session. False for no
+    /// selection or the session in view, which cannot delete itself.
+    pub fn beginDelete(self: *State) bool {
+        const row = self.selectedRow() orelse return false;
+        if (row.current) return false;
+        self.pending_delete_len = @min(row.id.len, self.pending_delete_buf.len);
+        @memmove(self.pending_delete_buf[0..self.pending_delete_len], row.id[0..self.pending_delete_len]);
+        return true;
+    }
+    pub fn pendingDeleteId(self: *const State) ?[]const u8 {
+        return if (self.pending_delete_len == 0) null else self.pending_delete_buf[0..self.pending_delete_len];
+    }
+    pub fn cancelDelete(self: *State) void {
+        self.pending_delete_len = 0;
+    }
     pub fn move(self: *State, delta: i32, visible: usize) void {
         self.selected = if (delta < 0) self.selected -| @as(usize, @intCast(-delta)) else @min(self.selected +| @as(usize, @intCast(delta)), self.count() -| 1);
         if (self.selected < self.window_start) self.window_start = self.selected;
@@ -129,6 +149,29 @@ test "browser selection follows identity across live changes" {
     try std.testing.expectEqualStrings("two", state.selectedRow().?.id);
     state.setQuery("first");
     try std.testing.expectEqualStrings("one", state.selectedRow().?.id);
+}
+
+test "delete confirmation keeps the chosen session across list updates" {
+    var state: State = .{};
+    defer state.close();
+    state.open(.sessions);
+    try state.replaceRows(std.testing.allocator, &.{
+        .{ .id = "current", .title = "Current", .current = true },
+        .{ .id = "other", .title = "Other" },
+    });
+    state.selected = 0;
+    try std.testing.expect(!state.beginDelete());
+    state.selected = 1;
+    try std.testing.expect(state.beginDelete());
+    try std.testing.expectEqualStrings("other", state.pendingDeleteId().?);
+    try state.replaceRows(std.testing.allocator, &.{
+        .{ .id = "current", .title = "Current", .current = true },
+        .{ .id = "newer", .title = "Newer" },
+        .{ .id = "other", .title = "Other" },
+    });
+    try std.testing.expectEqualStrings("other", state.pendingDeleteId().?);
+    state.cancelDelete();
+    try std.testing.expect(state.pendingDeleteId() == null);
 }
 
 test "browser metadata is copied and searchable" {

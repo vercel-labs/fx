@@ -15,7 +15,7 @@ const Allocator = std.mem.Allocator;
 const SnapshotView = remote_view.SnapshotView;
 /// What a reply answers. `poll` is a pushed session update, and `resync` the
 /// resubscribe after a reconnect.
-pub const Kind = enum { startup, startup_last, startup_remembered, attach, poll, resync, list, children, history, submit, cancel, rpc, heartbeat, kernel, rename, config, command, unwatch };
+pub const Kind = enum { startup, startup_last, startup_remembered, attach, poll, resync, list, children, history, submit, cancel, rpc, heartbeat, kernel, rename, config, command, delete, unwatch };
 /// A request waiting to be sent, or sent and waiting for its reply.
 const Request = struct {
     kind: Kind,
@@ -412,6 +412,20 @@ pub fn Runtime(comptime App: type) type {
             if (!outcome.value.ok) {
                 const message = outcome.value.@"error" orelse "The local session request failed";
                 if (kind == .list or kind == .children) app.input_runtime.session_browser.fail(message);
+                if (kind == .delete) {
+                    app.input_runtime.session_browser.cancelDelete();
+                    const friendly = if (std.mem.eql(u8, message, "SessionInUse"))
+                        "The session is open in another view or another fx process and was not deleted."
+                    else if (std.mem.eql(u8, message, "SessionBusy"))
+                        "The session is still busy and was not deleted."
+                    else if (std.mem.eql(u8, message, "SessionNotFound"))
+                        "The session was already deleted."
+                    else
+                        message;
+                    try app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = friendly }, true);
+                    app.shell.render_requests.request(.footer);
+                    return;
+                }
                 try app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = message }, true);
                 return;
             }
@@ -465,6 +479,10 @@ pub fn Runtime(comptime App: type) type {
                 },
                 .config => try View.notice(app, "session", "Session configuration updated."),
                 .rename => try View.notice(app, "session", "Session renamed."),
+                .delete => {
+                    app.input_runtime.session_browser.cancelDelete();
+                    try View.notice(app, "session", "Session deleted.");
+                },
                 .rpc => app.remote.permission_response_queued = false,
                 // A session command's result, like a turn's output, arrives
                 // as a pushed session update.

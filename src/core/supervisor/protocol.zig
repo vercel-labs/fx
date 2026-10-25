@@ -22,7 +22,7 @@ const Allocator = std.mem.Allocator;
 
 /// Bumped whenever a request or response changes shape. A client refuses a
 /// supervisor that answers `ping` with another version.
-pub const version: u32 = 6;
+pub const version: u32 = 7;
 
 pub const Heartbeat = struct {
     prompt: []const u8 = "",
@@ -127,6 +127,7 @@ pub const Request = union(enum) {
     cancel: Cancel,
     permission: Permission,
     stop: SessionRef,
+    delete: SessionRef,
     heartbeat: HeartbeatRequest,
     children: ChildrenRequest,
     history: History,
@@ -413,6 +414,7 @@ test "requests round trip with their command beside the fields" {
     try std.testing.expectEqualStrings("s", (try Request.parse(arena, "{\"command\":\"stop\",\"session_id\":\"s\"}")).sessionId().?);
     // A request without a node addresses the root.
     try std.testing.expect((try Request.parse(arena, "{\"command\":\"prompt\",\"session_id\":\"s\",\"text\":\"x\"}")).prompt.node_id == null);
+    try std.testing.expectEqualStrings("s", (try Request.parse(arena, "{\"command\":\"delete\",\"session_id\":\"s\"}")).sessionId().?);
 }
 
 test "framed and bare requests parse to the same request" {

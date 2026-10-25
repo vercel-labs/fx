@@ -280,6 +280,19 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
+        /// Confirms the browser's pending delete. The supervisor closes the
+        /// session and removes its saved history; its list watch pushes the
+        /// new rows.
+        pub fn deleteBrowserSelection(app: *App) !void {
+            const browser = &app.input_runtime.session_browser;
+            const id = browser.pendingDeleteId() orelse return;
+            const owned = try app.alloc.dupe(u8, id);
+            defer app.alloc.free(owned);
+            browser.cancelDelete();
+            try app.remote.enqueue(.delete, .{ .delete = .{ .session_id = owned } });
+            app.shell.render_requests.request(.footer);
+        }
+
         pub fn activateBrowserSelection(app: *App) !void {
             const browser = &app.input_runtime.session_browser;
             const row = browser.selectedRow() orelse return;
