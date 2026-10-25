@@ -53,6 +53,13 @@ pub fn Runtime(comptime App: type) type {
                 .permissions_reload => try notice(app, "permissions", "Session permissions reloaded."),
                 .shell_reload => try notice(app, "shell", "The next command reloads your shell startup files. Remembered command approvals were reset."),
                 .model, .effort => try noticeSafe(app, "model", result.text orelse ""),
+                .fork => {
+                    try noticeSafe(app, "session", result.text orelse "");
+                    // As root /fork does: the fork becomes the open session.
+                    if (comptime @hasDecl(App, "clearPendingSubmissionForSessionTransition")) {
+                        if (result.session_id) |id| try Backend.openSavedSession(app, id);
+                    }
+                },
             }
         }
 
@@ -451,11 +458,14 @@ pub fn Runtime(comptime App: type) type {
             // The inactive local engine mirrors the attached projection for settings panels.
             app.permission_engine.mode = remote.permission_mode;
             const running = summary.status == .running or summary.status == .awaiting_approval;
+            const generation = remote.generation;
             for (value.events) |event| {
                 if (event.sequence <= remote.sequence) continue;
                 // A command's result answers the node the person focuses,
                 // which may be a subagent; the rest is the root's transcript.
                 if (remote.child_id.len == 0 or isCommandResult(event.frame)) try applyFrame(app, event.frame);
+                // A fork's result switched sessions: the rest belongs to the old one.
+                if (remote.generation != generation) return;
                 remote.sequence = event.sequence;
             }
             if (remote.child_id.len == 0) {

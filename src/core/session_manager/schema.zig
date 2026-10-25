@@ -112,6 +112,10 @@ pub const Outcome = enum { ok, failed, cancelled, interrupted, lost };
 pub const SetKey = enum { prefs, title, permissions, usage, workspace, language, client_prompt, tool_identities, moved_files, compaction_records, v1_source };
 
 pub const ForkOrigin = struct { id: []const u8, seq: u64 };
+/// Where a fork of a tree's node came from (D98): the source tree's root
+/// and the source's newest turn the fork holds. `forked_from` names the
+/// node itself. A separate field, so readers before D98 skip it.
+pub const NodeOrigin = struct { root: []const u8, turn: u64 };
 
 /// The fields of one line, by kind. Slices are borrowed. `data`, `value`
 /// and `state` are raw JSON, stored and returned byte for byte.
@@ -142,6 +146,7 @@ pub const Body = union(Kind) {
         /// depth 1 under its parent.
         root: ?[]const u8 = null,
         depth: ?u64 = null,
+        forked_node: ?NodeOrigin = null,
     };
     pub const Turn = struct { turn: u64 };
     pub const Piece = struct {
@@ -199,6 +204,12 @@ pub fn appendBody(gpa: std.mem.Allocator, out: *std.ArrayList(u8), body: Body) e
                 try out.appendSlice(gpa, "{\"id\":");
                 try appendJsonString(gpa, out, origin.id);
                 try out.print(gpa, ",\"seq\":{d}}}", .{origin.seq});
+            }
+            if (c.forked_node) |origin| {
+                try w.key("forked_node");
+                try out.appendSlice(gpa, "{\"root\":");
+                try appendJsonString(gpa, out, origin.root);
+                try out.print(gpa, ",\"turn\":{d}}}", .{origin.turn});
             }
         },
         .turn_started, .turn_committed => |t| try w.number("turn", t.turn),
@@ -273,6 +284,7 @@ fn bodyOf(kind: Kind, f: Fields) BodyError!Body {
             .forked_from = try f.opt(ForkOrigin, "forked_from"),
             .root = try f.opt([]const u8, "root"),
             .depth = try f.opt(u64, "depth"),
+            .forked_node = try f.opt(NodeOrigin, "forked_node"),
         } },
         .turn_started => .{ .turn_started = .{ .turn = try f.req(u64, "turn") } },
         .turn_committed => .{ .turn_committed = .{ .turn = try f.req(u64, "turn") } },
@@ -741,7 +753,10 @@ test "every kind's fields round trip, raw values byte for byte" {
         .forked_from = .{ .id = "src", .seq = 9 },
         .root = "r0",
         .depth = 2,
+        .forked_node = .{ .root = "tree", .turn = 4 },
     } })).session_created;
+    try testing.expectEqualStrings("tree", created.forked_node.?.root);
+    try testing.expectEqual(@as(u64, 4), created.forked_node.?.turn);
     try testing.expectEqualStrings("/Users/me/my \"project\"\n", created.workspace);
     try testing.expectEqual(Role.child, created.role);
     try testing.expectEqualStrings("p1", created.parent.?);

@@ -1708,8 +1708,9 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   node below it, stays browsable but read-only: messages and changing
   commands are refused with a typed reason, the browser shows it as
   abandoned, and its parent's registry drops it, so the agent name is free
-  for a new child. A child node is not forked: its parent addresses it by
-  name, and a fork would be a child the parent never started.
+  for a new child. A fork of a node is D98's, never a sibling: its parent
+  addresses its children by name, and a sibling would be a child the
+  parent never started.
   `Rewind.tla` checks that a dropped turn comes only with the subtree
   idle, that exactly the children of dropped turns are abandoned, that no
   abandoned node or node below it runs again, and that the parent's
@@ -1718,6 +1719,29 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   the same line keeps the tree and the history consistent after a crash.
   **Alternative:** fork the node to a new id, which breaks its parent's
   record of it; or truncate the log, which the manager never does.
+
+- **D98 Decision:** `/fork` of a node at any depth makes a new root
+  session, through the same fork as the root's (D58, D5): the manager
+  copies the node's log through its newest kept turn, every line kind
+  as it is (unknown and future kinds included, a `rewound` line with the
+  turns it drops), and hard-links every blob. The copy owns none of the
+  node's children, so their results stay in the transcript as text and
+  their names are free. Line 1 keeps `forked_from` naming the node and
+  adds `forked_node {root, turn}`, the source tree and turn, as a field of
+  its own that readers before D98 skip; the title says the same, such as
+  "forked from root › reviewer · turn 4". The fork drops the child's
+  instructions from its preferences but keeps the node's first prompt, its
+  mission, as the first turn. It is a normal root: it has the subagent
+  tool at depth 0, its own tree budget and run slots, a fresh kernel and an
+  empty store, and the session's permission mode rather than the ceiling
+  the node had under its parent. The person's `/fork` authorizes that
+  wider authority, as opening any root session would. The source tree is
+  not changed, and the frontend switches to the fork as root `/fork`
+  does. Refused while a turn of the node runs. `Wiring.tla` checks that
+  a fork of the root or of any node is a new root (`ForkIsNewRoot`).
+  **Why:** a person forks a subagent to give it their own attention, so
+  it gets its own session. **Alternative:** a sibling node under the same
+  parent, which the parent never asked for; or refusing the fork.
 
 ## Design Risks And Failure Behavior
 

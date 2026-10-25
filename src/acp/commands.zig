@@ -49,6 +49,9 @@ pub const Command = union(Name) {
     model: ?[]const u8,
     /// A subagent's reasoning effort for its next turns; null reads it.
     effort: ?[]const u8,
+    /// Fork a subagent into a new root session (D98). The root forks
+    /// through its own picker.
+    fork,
 };
 
 /// The `command` field of an `fx/command` request and its result.
@@ -64,6 +67,7 @@ pub const Name = enum {
     mcp_verb,
     model,
     effort,
+    fork,
 };
 
 pub const WorkspaceAction = union(enum) {
@@ -126,8 +130,8 @@ pub const NodeRefusal = enum {
     /// A compaction summarized the turn a rewind would drop.
     rewind_past_compaction,
     invalid_effort,
-    /// A subagent is not forked: its parent names it (D97).
-    fork,
+    /// The node has no turn to fork yet.
+    nothing_to_fork,
     /// `/compact` on a subagent: its own turns compact it.
     compact,
 
@@ -142,7 +146,7 @@ pub const NodeRefusal = enum {
             .abandoned => "This subagent was abandoned when its parent was rewound. You can read it, but it takes no messages or changes.",
             .rewind_past_compaction => "This subagent's latest turn is covered by a compaction, so it cannot be rewound.",
             .invalid_effort => "usage: /effort auto|minimal|low|medium|high",
-            .fork => "A subagent cannot be forked: its parent addresses it by name, and a fork would be a child the parent never started. Use /undo to rewind it, or fork the root session.",
+            .nothing_to_fork => "This subagent has no turn to fork yet.",
             .compact => "A subagent compacts its own context during its turns. Compact the root session from the root.",
         };
     }
@@ -224,6 +228,8 @@ pub const Result = union(enum) {
     compaction: Compaction,
     undo: Undo,
     context: ContextUsage,
+    /// A fork's new root session (D98) and what it says about it.
+    fork: struct { session_id: []const u8, text: []const u8 },
     /// The command needs no payload beyond its name.
     ack,
 };
@@ -239,6 +245,8 @@ pub const Response = struct {
     used: ?u64 = null,
     total: ?u32 = null,
     auto_compact_percent: ?u8 = null,
+    /// `fork`: the new root session to switch to.
+    session_id: ?[]const u8 = null,
 };
 
 /// Writes one `fx/command` result object. The daemon wraps it in its own
@@ -257,6 +265,10 @@ pub fn writeResult(writer: *std.Io.Writer, command: Command, result: Result) !vo
             response.used = usage.used;
             response.total = usage.total;
             response.auto_compact_percent = usage.auto_compact_percent;
+        },
+        .fork => |fork| {
+            response.session_id = fork.session_id;
+            response.text = nonEmpty(fork.text);
         },
         .ack => {},
     }
@@ -300,6 +312,7 @@ test "requestFields names every command the way parse reads it back" {
         .last_reply,             .compact,                        .undo,                                      .context,                                      .shell_reload,
         .{ .workspace = .list }, .{ .workspace = .clear },        .{ .workspace = .{ .add = "/tmp/extra" } }, .{ .workspace = .{ .remove = "/tmp/extra" } }, .permissions_reload,
         .mcp_status,             .{ .mcp_verb = "login linear" }, .{ .model = "small" },                      .{ .model = null },                            .{ .effort = "high" },
+        .fork,
     };
     for (commands) |command| {
         const encoded = try std.json.Stringify.valueAlloc(alloc, requestFields(command), .{ .emit_null_optional_fields = false });

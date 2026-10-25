@@ -117,8 +117,11 @@ pub const Identity = struct {
     /// A child's tree root and depth (D91); null as line 1 leaves them out.
     root: ?[]u8 = null,
     depth: ?u64 = null,
+    /// A fork of a tree's node: the source tree and turn (D98).
+    forked_node: ?NodeOrigin = null,
 
     pub const Origin = struct { id: []u8, seq: u64 };
+    pub const NodeOrigin = struct { root: []u8, turn: u64 };
 
     fn fromCreated(gpa: std.mem.Allocator, c: schema.Body.Created) error{OutOfMemory}!Identity {
         var identity: Identity = .{
@@ -133,6 +136,7 @@ pub const Identity = struct {
         if (c.forked_from) |origin| identity.forked_from = .{ .id = try gpa.dupe(u8, origin.id), .seq = origin.seq };
         if (c.root) |root| identity.root = try gpa.dupe(u8, root);
         identity.depth = c.depth;
+        if (c.forked_node) |origin| identity.forked_node = .{ .root = try gpa.dupe(u8, origin.root), .turn = origin.turn };
         return identity;
     }
 
@@ -146,6 +150,7 @@ pub const Identity = struct {
             .forked_from = if (identity.forked_from) |o| .{ .id = o.id, .seq = o.seq } else null,
             .root = identity.root,
             .depth = identity.depth,
+            .forked_node = if (identity.forked_node) |o| .{ .root = o.root, .turn = o.turn } else null,
         };
     }
 
@@ -168,6 +173,7 @@ pub const Identity = struct {
         if (identity.parent) |parent| gpa.free(parent);
         if (identity.forked_from) |origin| gpa.free(origin.id);
         if (identity.root) |root| gpa.free(root);
+        if (identity.forked_node) |origin| gpa.free(origin.root);
     }
 };
 
@@ -1139,6 +1145,7 @@ pub const NewOptions = struct {
     host: schema.Host,
     parent: ?[]const u8 = null,
     forked_from: ?schema.ForkOrigin = null,
+    forked_node: ?schema.NodeOrigin = null,
     /// A child's tree root and depth (D91), written on its line 1.
     root: ?[]const u8 = null,
     depth: ?u64 = null,
@@ -1165,6 +1172,7 @@ pub fn openNew(env: *const Env, options: NewOptions) error{OutOfMemory}!*Session
         .host = options.host,
         .parent = options.parent,
         .forked_from = options.forked_from,
+        .forked_node = options.forked_node,
         .root = options.root,
         .depth = options.depth,
     });
@@ -1727,6 +1735,8 @@ pub const ForkOptions = struct {
     at: ForkPoint,
     workspace: []const u8,
     host: schema.Host,
+    /// Set when the source is a node of a tree (D98).
+    node: ?schema.NodeOrigin = null,
 };
 
 pub const ForkError = OpenError || error{InvalidForkPoint};
@@ -1754,6 +1764,7 @@ pub fn openFork(env: *const Env, options: ForkOptions) ForkError!*Session {
         .workspace = options.workspace,
         .host = options.host,
         .forked_from = .{ .id = options.source, .seq = point.seq },
+        .forked_node = options.node,
     });
     errdefer {
         session.phase = .closed;

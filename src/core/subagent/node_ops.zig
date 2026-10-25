@@ -1,6 +1,6 @@
 //! What a frontend does to a node anywhere in a tree, outside that node's
-//! own turns: reach its host through its ancestors' (D96), and rewind it
-//! (D97). Every path here names node ids from just below the root down to
+//! own turns: reach its host through its ancestors' (D96), rewind it (D97),
+//! and fork it into a new root session (D98). Every path here names node ids from just below the root down to
 //! the target.
 const std = @import("std");
 const child_state = @import("child_state.zig");
@@ -110,4 +110,48 @@ pub fn rewindLatest(alloc: Allocator, root: *tool_host.Runtime, path: []const []
     entry.children.forget();
     debug_trace.logf("subagent", "node rewound node_id={s} turn={d} abandoned={d}", .{ id, newest.turn, rewound.abandoned.len });
     return .{ .rewound = .{ .prompt = try alloc.dupe(u8, newest.prompt), .abandoned = rewound.abandoned.len } };
+}
+
+pub const Forked = struct {
+    /// The new root session's id, owned.
+    session_id: []u8,
+    /// How many of the node's turns it holds.
+    turns: usize,
+};
+
+pub const ForkOutcome = union(enum) {
+    forked: Forked,
+    refused: enum { busy, nothing_to_fork },
+};
+
+/// Forks the node `path` ends at into a new root session holding its whole
+/// history, as `/fork` forks a root (D58, D98): the session manager copies
+/// the node's log through its newest kept turn and hard-links its blobs,
+/// and the copy owns none of the node's children. The fork's line 1 names
+/// the source tree and turn, and its title names `trail`, the node's path
+/// as a person reads it. The source tree is not changed. Refused while a
+/// turn of the node runs. Caller owns the id.
+pub fn forkLatest(alloc: Allocator, root: *tool_host.Runtime, path: []const []const u8, workspace: []const u8, trail: []const u8) !ForkOutcome {
+    const entry = lease(root, path) catch |err| return switch (err) {
+        error.NodeBusy => .{ .refused = .busy },
+        else => err,
+    };
+    defer release(root, entry);
+    if (entry.turn) return .{ .refused = .busy };
+    const points = try entry.session.forkPoints(alloc);
+    defer session_adapter.Session.freeForkPoints(alloc, points);
+    if (points.len == 0) return .{ .refused = .nothing_to_fork };
+    const newest = points[points.len - 1].turn;
+    const copy = try entry.session.fork(alloc, .{
+        .before_turn = newest + 1,
+        .workspace = workspace,
+        .host = .acp,
+        .node = .{ .root = root.tree.root_id, .turn = newest },
+    });
+    defer copy.close();
+    const title = try alloc.print("forked from {s} · turn {d}", .{ trail, points.len });
+    defer alloc.free(title);
+    try copy.rename(title);
+    debug_trace.logf("subagent", "node forked node_id={s} turn={d} fork={s}", .{ path[path.len - 1], newest, copy.id() });
+    return .{ .forked = .{ .session_id = try alloc.dupe(u8, copy.id()), .turns = points.len } };
 }

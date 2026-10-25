@@ -4296,10 +4296,11 @@ fn handleHostCommand(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messag
             shell_snapshot.reloadForUser();
             try host_commands.writeResult(&out.writer, command, .ack);
         },
-        // The root's model and effort are session config options.
-        .model, .effort => return state.writer.writeError(alloc, msg.id, .{
+        // The root's model and effort are session config options, and the
+        // root forks through its own picker.
+        .model, .effort, .fork => return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
-            .message = "Set the root session's model and effort with session/set_config_option.",
+            .message = if (command == .fork) "This forks a subagent; the root session forks with its own /fork." else "Set the root session's model and effort with session/set_config_option.",
         }),
         .context => {
             const capabilities = activeSessionCapabilities(state, session);

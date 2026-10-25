@@ -530,3 +530,62 @@ test "a node is not rewound while a node below it runs" {
     defer if (allowed == .rewound) alloc.free(allowed.rewound.prompt);
     try std.testing.expect(allowed == .rewound);
 }
+
+test "a fork of a depth-2 node is a new root with the node's history, its origin, and no children" {
+    const alloc = std.testing.allocator;
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var named = Named{};
+    const runtime = try namedHost(alloc, &parent, &named);
+    defer runtime.deinit();
+    // n2 spawns a child of its own, which the fork must not carry.
+    named.leaf_spawns = true;
+    const first = try messageFrom(alloc, runtime, "n1", "start", "root-1");
+    defer alloc.free(first.body);
+    const n1 = try childNamed(alloc, runtime, "n1");
+    defer alloc.free(n1);
+    const n1_host = try node_ops.lease(runtime, &.{n1});
+    const n2 = childNamed(alloc, n1_host.runtime, "n2");
+    node_ops.release(runtime, n1_host);
+    const n2_id = try n2;
+    defer alloc.free(n2_id);
+    const source_lines = blk: {
+        var page = try parent.store.manager.read(alloc, n2_id, .start, .forward, 1000);
+        defer page.deinit();
+        break :blk page.entries.len;
+    };
+
+    const outcome = try node_ops.forkLatest(alloc, runtime, &.{ n1, n2_id }, parent.home, "root › n1 › n2");
+    const fork_id = outcome.forked.session_id;
+    defer alloc.free(fork_id);
+    var peeked = try parent.store.manager.peek(alloc, fork_id);
+    defer peeked.deinit(alloc);
+    // A root of its own: no parent, depth 0, its own tree, no children.
+    try std.testing.expect(peeked.parent == null);
+    try std.testing.expectEqual(@as(u64, 0), peeked.depth);
+    try std.testing.expectEqualStrings(fork_id, peeked.root);
+    try std.testing.expectEqual(@as(usize, 0), peeked.state.children.items.len);
+    // Line 1 names where it came from.
+    var page = try parent.store.manager.read(alloc, fork_id, .start, .forward, 1);
+    defer page.deinit();
+    const created = page.entries[0].body.?.session_created;
+    try std.testing.expectEqualStrings(n2_id, created.forked_from.?.id);
+    try std.testing.expectEqualStrings(parent.parent.id(), created.forked_node.?.root);
+    const title = try std.json.parseFromSlice([]const u8, alloc, peeked.state.title.?, .{});
+    defer title.deinit();
+    try std.testing.expectEqualStrings("forked from root › n1 › n2 · turn 1", title.value);
+    // Its transcript is the node's, mission first.
+    const forked = try parent.store.childHistory(alloc, fork_id);
+    defer types.freeHistoryTurnSlice(alloc, forked);
+    try std.testing.expectEqual(@as(usize, 1), forked.len);
+    try std.testing.expectEqualStrings("start", forked[0].assistant.user.text);
+    // The source tree is as it was.
+    var after = try parent.store.manager.read(alloc, n2_id, .start, .forward, 1000);
+    defer after.deinit();
+    try std.testing.expectEqual(source_lines, after.entries.len);
+    var source = try parent.store.manager.peek(alloc, n2_id);
+    defer source.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), source.state.children.items.len);
+    try std.testing.expectEqualStrings(n1, source.parent.?);
+}

@@ -38,6 +38,8 @@ pub const State = fold.State;
 /// Turns a rewind dropped from a session's history (D97).
 pub const Dropped = fold.Dropped;
 pub const Rewind = fold.Rewind;
+/// Where a fork of a tree's node came from (D98).
+pub const NodeOrigin = schema.NodeOrigin;
 pub const Child = fold.Child;
 pub const Diagnostic = diag.Event;
 pub const DiagnosticKind = diag.Kind;
@@ -138,6 +140,8 @@ pub const ForkOptions = struct {
     at: ForkPoint,
     workspace: []const u8,
     host: Host,
+    /// The source tree's root and turn when the source is a node (D98).
+    node: ?schema.NodeOrigin = null,
 };
 
 pub const ImportOptions = struct {
@@ -355,6 +359,7 @@ pub const Manager = struct {
             .at = options.at,
             .workspace = options.workspace,
             .host = options.host,
+            .node = options.node,
         }) catch |err| return switch (err) {
             error.NotFound, error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion, error.InvalidForkPoint, error.OutOfMemory => |e| e,
             else => |io_err| storage.ioFault(io_err),

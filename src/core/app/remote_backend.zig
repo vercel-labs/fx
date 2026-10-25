@@ -176,6 +176,18 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn switchSession(app: *App, id: []const u8) !void {
+            try focusSession(app, id);
+            try app.remote.enqueue(.attach, .{ .attach = .{ .session_id = app.remote.current_id, .after_sequence = 0 } });
+        }
+
+        /// Opens saved session `id`, which the supervisor may not hold yet,
+        /// such as a fork (D98), and focuses it.
+        pub fn openSavedSession(app: *App, id: []const u8) !void {
+            try focusSession(app, id);
+            try app.remote.enqueue(.startup, .{ .create = .{ .cwd = app.workspace_root, .@"resume" = app.remote.current_id } });
+        }
+
+        fn focusSession(app: *App, id: []const u8) !void {
             const owned = try app.alloc.dupe(u8, id);
             app.clearPendingSubmissionForSessionTransition();
             if (app.remote.current_id.len > 0) app.alloc.free(app.remote.current_id);
@@ -184,7 +196,6 @@ pub fn Runtime(comptime App: type) type {
             app.remote.generation +%= 1;
             app.remote.sequence = 0;
             View.resetTranscript(app);
-            try app.remote.enqueue(.attach, .{ .attach = .{ .session_id = app.remote.current_id, .after_sequence = 0 } });
         }
 
         fn leaveChild(app: *App) void {
@@ -371,7 +382,9 @@ pub fn Runtime(comptime App: type) type {
 
         fn commandFork(ctx: *anyopaque) !void {
             const app = appFrom(ctx);
-            if (!focus(app).isRoot()) return notice(app, "subagent", host_commands.NodeRefusal.fork.text());
+            // A subagent forks into a new root session, which the result
+            // then focuses (D98).
+            if (!focus(app).isRoot()) return runHostCommand(app, focus(app), "forking it", .fork);
             try notice(app, "session", "Detached session fork is not available yet. Use /new to create a session, or /resume to switch.");
         }
 

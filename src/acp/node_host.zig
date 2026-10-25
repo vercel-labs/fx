@@ -455,6 +455,31 @@ pub fn runCommand(arena: Allocator, state: *server.ServerState, node_id: []const
             return null;
         },
         .compact => return .compact,
+        // A fork of a node is a new root session of its own (D98).
+        .fork => {
+            const active = if (state.active_session) |*session| session else return .unknown_node;
+            var trail: std.Io.Writer.Allocating = .init(arena);
+            try trail.writer.writeAll("root");
+            for (node.path, 0..) |hop, index| {
+                const parent = if (index == 0) active.session_id else node.path[index - 1];
+                try trail.writer.print(" › {s}", .{try nodeLabel(arena, state, parent, hop)});
+            }
+            const outcome = node_ops.forkLatest(arena, root, node.path, active.workspace_root, trail.written()) catch |err| return switch (err) {
+                error.NodeUnavailable => .unknown_node,
+                else => err,
+            };
+            switch (outcome) {
+                .refused => |refusal| return switch (refusal) {
+                    .busy => .node_running,
+                    .nothing_to_fork => .nothing_to_fork,
+                },
+                .forked => |forked| {
+                    const text = try arena.print("Forked into a new session: forked from {s} · turn {d}.", .{ trail.written(), forked.turns });
+                    try host_commands.writeResult(out, command, .{ .fork = .{ .session_id = forked.session_id, .text = text } });
+                    return null;
+                },
+            }
+        },
         else => return .unsupported,
     }
 }

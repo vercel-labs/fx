@@ -2551,6 +2551,9 @@ pub const Session = struct {
         host: Host,
         /// The title the source shows; the fork gets it marked as a fork.
         title: ?[]const u8 = null,
+        /// Set when this session is a node of a tree: the fork is a new
+        /// root that records the tree and turn it came from (D98).
+        node: ?sm.NodeOrigin = null,
     };
 
     /// A new session holding this one's log up to the end of the turn before
@@ -2575,6 +2578,7 @@ pub const Session = struct {
             .at = .{ .turn = cut },
             .workspace = options.workspace,
             .host = options.host,
+            .node = options.node,
         });
         errdefer handle.release();
         const copy = try init(alloc, self.store, handle, false);
@@ -2585,6 +2589,13 @@ pub const Session = struct {
         const state = try handle.state(arena.allocator());
         copy.last_turn = state.last_turn;
         if (options.title) |title| try copy.rename(try forkTitle(arena.allocator(), title));
+        // A fork of a node is a root: its preferences lose the child's
+        // instructions, which its first prompt still carries (D98).
+        if (options.node != null) {
+            var preferences = try copy.currentPreferences(alloc);
+            defer preferences.deinit(alloc);
+            try copy.setPreferences(preferences);
+        }
         traceWiring("Fork", copy.id(), "", copy.store.pid);
         return copy;
     }

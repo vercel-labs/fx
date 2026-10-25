@@ -11,6 +11,9 @@
 (* "Continue" starts a new turn linked to an interrupted one (D23).       *)
 (* `/fork` (D58) makes a new session from the current one's log before a  *)
 (* prompt and switches to it. The process can crash anywhere.             *)
+(* A turn may also leave a node of the session's tree on disk, a child    *)
+(* session the host never opens. `/fork` of such a node makes a new root, *)
+(* as `/fork` of the root does, never a session inside the tree (D98).    *)
 (*                                                                         *)
 (* The manager's own rules are modeled elsewhere (TurnLifecycle.tla,       *)
 (* Subagents.tla, WriterLock.tla); here a reopen simply ends a turn a      *)
@@ -32,9 +35,10 @@ VARIABLES
     childOf,     \* the session whose turn spawned the child, or "none"
     next,        \* the session opened to switch to, or "none" (D41)
     made,        \* [Sessions -> BOOLEAN]: the session exists on disk
-    forkOf       \* [Sessions -> Sessions \cup {"none"}]: the session a fork came from
+    forkOf,      \* [Sessions -> Sessions \cup {"none"}]: the session a fork came from
+    parentOf     \* [Sessions -> Sessions \cup {"none"}]: a node's parent; "none" for a root
 
-vars == <<up, cur, turnOpen, lastEnd, linked, child, childOf, next, made, forkOf>>
+vars == <<up, cur, turnOpen, lastEnd, linked, child, childOf, next, made, forkOf, parentOf>>
 
 TypeOK ==
     /\ up \in BOOLEAN
@@ -47,6 +51,7 @@ TypeOK ==
     /\ next \in Sessions \cup {"none"}
     /\ made \in [Sessions -> BOOLEAN]
     /\ forkOf \in [Sessions -> Sessions \cup {"none"}]
+    /\ parentOf \in [Sessions -> Sessions \cup {"none"}]
 
 Init ==
     /\ up = FALSE
@@ -59,6 +64,7 @@ Init ==
     /\ next = "none"
     /\ made = [s \in Sessions |-> FALSE]
     /\ forkOf = [s \in Sessions |-> "none"]
+    /\ parentOf = [s \in Sessions |-> "none"]
 
 Active == up /\ cur # "none"
 
@@ -66,7 +72,7 @@ Active == up /\ cur # "none"
 Start ==
     /\ ~up
     /\ up' = TRUE
-    /\ UNCHANGED <<cur, turnOpen, lastEnd, linked, child, childOf, next, made, forkOf>>
+    /\ UNCHANGED <<cur, turnOpen, lastEnd, linked, child, childOf, next, made, forkOf, parentOf>>
 
 \* The adapter opens a session: into the slot, or, while one is open, as the
 \* session to switch to (D41). A turn a crash left open ends as interrupted.
@@ -74,11 +80,12 @@ Open(s) ==
     /\ up
     /\ next = "none"
     /\ s # cur
+    /\ parentOf[s] = "none"
     /\ IF cur = "none" THEN cur' = s /\ next' = "none" ELSE cur' = cur /\ next' = s
     /\ turnOpen' = [turnOpen EXCEPT ![s] = FALSE]
     /\ lastEnd' = IF turnOpen[s] THEN [lastEnd EXCEPT ![s] = "interrupt"] ELSE lastEnd
     /\ made' = [made EXCEPT ![s] = TRUE]
-    /\ UNCHANGED <<up, linked, child, childOf, forkOf>>
+    /\ UNCHANGED <<up, linked, child, childOf, forkOf, parentOf>>
 
 \* New work needs a session and no switch pending.
 Idle == Active /\ next = "none"
@@ -88,7 +95,7 @@ BeginTurn ==
     /\ ~turnOpen[cur]
     /\ turnOpen' = [turnOpen EXCEPT ![cur] = TRUE]
     /\ linked' = [linked EXCEPT ![cur] = "none"]
-    /\ UNCHANGED <<up, cur, lastEnd, child, childOf, next, made, forkOf>>
+    /\ UNCHANGED <<up, cur, lastEnd, child, childOf, next, made, forkOf, parentOf>>
 
 \* "Continue" (D23): a new turn whose first item links to the newest ended
 \* turn, which must have been interrupted.
@@ -98,7 +105,7 @@ Continue ==
     /\ lastEnd[cur] = "interrupt"
     /\ turnOpen' = [turnOpen EXCEPT ![cur] = TRUE]
     /\ linked' = [linked EXCEPT ![cur] = lastEnd[cur]]
-    /\ UNCHANGED <<up, cur, lastEnd, child, childOf, next, made, forkOf>>
+    /\ UNCHANGED <<up, cur, lastEnd, child, childOf, next, made, forkOf, parentOf>>
 
 \* The turn ends, also while a switch is pending (a cancelled turn).
 EndTurn(e) ==
@@ -106,7 +113,7 @@ EndTurn(e) ==
     /\ turnOpen[cur]
     /\ turnOpen' = [turnOpen EXCEPT ![cur] = FALSE]
     /\ lastEnd' = [lastEnd EXCEPT ![cur] = e]
-    /\ UNCHANGED <<up, cur, linked, child, childOf, next, made, forkOf>>
+    /\ UNCHANGED <<up, cur, linked, child, childOf, next, made, forkOf, parentOf>>
 
 \* A turn spawns a child thread (child_spawned through the parent).
 Spawn ==
@@ -115,7 +122,7 @@ Spawn ==
     /\ child = "none"
     /\ child' = "running"
     /\ childOf' = cur
-    /\ UNCHANGED <<up, cur, turnOpen, lastEnd, linked, next, made, forkOf>>
+    /\ UNCHANGED <<up, cur, turnOpen, lastEnd, linked, next, made, forkOf, parentOf>>
 
 \* The child's thread appends child_finished through the parent's Session,
 \* or the parent cancels it; either way through an open parent.
@@ -125,7 +132,7 @@ ChildDone ==
     /\ cur = childOf
     /\ child' = "none"
     /\ childOf' = "none"
-    /\ UNCHANGED <<up, cur, turnOpen, lastEnd, linked, next, made, forkOf>>
+    /\ UNCHANGED <<up, cur, turnOpen, lastEnd, linked, next, made, forkOf, parentOf>>
 
 \* The host closes a session, to switch or to exit: children are finished
 \* and joined first, then close interrupts an open turn. Closing the
@@ -139,24 +146,36 @@ Close(s) ==
     /\ next' = "none"
     /\ turnOpen' = [turnOpen EXCEPT ![s] = FALSE]
     /\ lastEnd' = IF turnOpen[s] THEN [lastEnd EXCEPT ![s] = "interrupt"] ELSE lastEnd
-    /\ UNCHANGED <<up, linked, child, childOf, made, forkOf>>
+    /\ UNCHANGED <<up, linked, child, childOf, made, forkOf, parentOf>>
 
 \* /fork (D58): a new session holding the current one's log before a chosen
 \* prompt becomes the session to switch to, and Close then hands it the
 \* slot. Only between turns and with no child running; the source is never
 \* written. The fork's newest ended turn is whichever the source had before
 \* that prompt.
-Fork(f) ==
+Fork(f, src) ==
     /\ Idle
     /\ child = "none"
+    /\ src = cur \/ (made[src] /\ parentOf[src] = cur)
     /\ f \notin {cur, next}
     /\ ~made[f]
     /\ ~turnOpen[cur]
     /\ next' = f
     /\ made' = [made EXCEPT ![f] = TRUE]
-    /\ forkOf' = [forkOf EXCEPT ![f] = cur]
+    /\ forkOf' = [forkOf EXCEPT ![f] = src]
+    /\ parentOf' = parentOf
     /\ \E e \in Ends : lastEnd' = [lastEnd EXCEPT ![f] = e]
     /\ UNCHANGED <<up, cur, turnOpen, linked, child, childOf>>
+
+\* A turn of the open session leaves a node of its tree on disk.
+NewNode(n) ==
+    /\ Idle
+    /\ turnOpen[cur]
+    /\ ~made[n]
+    /\ n \notin {cur, next}
+    /\ made' = [made EXCEPT ![n] = TRUE]
+    /\ parentOf' = [parentOf EXCEPT ![n] = cur]
+    /\ UNCHANGED <<up, cur, turnOpen, lastEnd, linked, child, childOf, next, forkOf>>
 
 Exit ==
     /\ up
@@ -164,7 +183,7 @@ Exit ==
     /\ next = "none"
     /\ child = "none"
     /\ up' = FALSE
-    /\ UNCHANGED <<cur, turnOpen, lastEnd, linked, child, childOf, next, made, forkOf>>
+    /\ UNCHANGED <<cur, turnOpen, lastEnd, linked, child, childOf, next, made, forkOf, parentOf>>
 
 \* The process dies anywhere: memory and threads are gone; the logs stay.
 Crash ==
@@ -174,7 +193,7 @@ Crash ==
     /\ next' = "none"
     /\ child' = "none"
     /\ childOf' = "none"
-    /\ UNCHANGED <<turnOpen, lastEnd, linked, made, forkOf>>
+    /\ UNCHANGED <<turnOpen, lastEnd, linked, made, forkOf, parentOf>>
 
 Next ==
     \/ Start
@@ -182,7 +201,8 @@ Next ==
     \/ BeginTurn \/ Continue
     \/ \E e \in {"commit", "interrupt"} : EndTurn(e)
     \/ Spawn \/ ChildDone
-    \/ \E f \in Sessions : Fork(f)
+    \/ \E f, src \in Sessions : Fork(f, src)
+    \/ \E n \in Sessions : NewNode(n)
     \/ Exit \/ Crash
 
 Spec == Init /\ [][Next]_vars
@@ -195,6 +215,9 @@ ParentOutlivesChildren == child = "running" => (up /\ cur = childOf)
 
 \* A pending switch names a second session, never the current one (D41).
 SwitchIsTwoSessions == next # "none" => (cur # "none" /\ cur # next)
+
+\* A fork, of the root or of any node of its tree, is a root (D98).
+ForkIsNewRoot == \A f \in Sessions : forkOf[f] # "none" => parentOf[f] = "none"
 
 \* A continuation always continues an interrupted turn.
 ContinueLinksInterrupted == \A s \in Sessions : linked[s] \in {"none", "interrupt"}
