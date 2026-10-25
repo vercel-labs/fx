@@ -225,6 +225,62 @@ pub const CommitError = error{
     SessionCommitFailed,
 };
 
+/// Counts the slot-thread turns that hold a child agent's worker, so the
+/// main loop frees the agent only once none is left, and wakes the main loop
+/// when the last one lets go.
+pub const HostedRelease = struct {
+    count: std.atomic.Value(u32) = .init(0),
+    released: std.Io.Event = .unset,
+
+    pub fn hold(self: *HostedRelease) void {
+        _ = self.count.fetchAdd(1, .acq_rel);
+    }
+
+    /// Lets go of one hold. Wakes the waiter before the count drops: once it
+    /// reads zero it may free this, so nothing touches it afterwards.
+    pub fn release(self: *HostedRelease) void {
+        self.released.set(io_mod.getIo());
+        _ = self.count.fetchSub(1, .release);
+    }
+
+    pub fn held(self: *const HostedRelease) bool {
+        return self.count.load(.acquire) > 0;
+    }
+
+    /// Blocks until no hold is left, or `timeout_ms` passes. False on the
+    /// timeout, when a slot thread still holds the agent.
+    pub fn waitReleased(self: *HostedRelease, timeout_ms: i64) bool {
+        const deadline = io_mod.milliTimestamp() + timeout_ms;
+        while (true) {
+            if (!self.held()) return true;
+            if (io_mod.milliTimestamp() >= deadline) return false;
+            self.released.reset();
+            // A release between the check and the reset is not lost.
+            if (!self.held()) return true;
+            self.released.waitTimeout(io_mod.getIo(), .{ .duration = .{
+                .raw = .fromMilliseconds(50),
+                .clock = .awake,
+            } }) catch {};
+        }
+    }
+};
+
+test "a hosted agent's waiter wakes when the last hold lets go, or times out" {
+    var hosted: HostedRelease = .{};
+    try std.testing.expect(hosted.waitReleased(0));
+    hosted.hold();
+    try std.testing.expect(!hosted.waitReleased(20));
+    const Releaser = struct {
+        fn run(target: *HostedRelease) void {
+            io_mod.sleep(10 * std.time.ns_per_ms);
+            target.release();
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Releaser.run, .{&hosted});
+    defer thread.join();
+    try std.testing.expect(hosted.waitReleased(5_000));
+}
+
 pub const TurnContext = struct {
     alloc: Allocator,
     runtime: session.SessionRuntime,
@@ -234,7 +290,7 @@ pub const TurnContext = struct {
     hosted_worker: ?*worker_runtime.WorkerRuntime = null,
     /// Counts this turn as using its child agent until `deinit`, so the agent
     /// is not freed while a slot thread still holds its worker.
-    hosted_release: ?*std.atomic.Value(u32) = null,
+    hosted_release: ?*HostedRelease = null,
     managed_executions: managed_execution.Runtime,
     /// The child session the turn writes, through the adapter. Null
     /// for a hosted run, whose child's own agent saves its turns.
@@ -302,7 +358,7 @@ pub const TurnContext = struct {
     }
 
     pub fn deinit(self: *TurnContext) void {
-        if (self.hosted_release) |count| _ = count.fetchSub(1, .release);
+        if (self.hosted_release) |hosted| hosted.release();
         self.managed_executions.deinit();
         self.worker.deinit(self.alloc);
         self.runtime.deinit(self.alloc);

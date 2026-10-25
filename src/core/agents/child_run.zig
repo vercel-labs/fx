@@ -91,13 +91,18 @@ pub const ChildRun = struct {
 pub const Completion = struct {
     mutex: std.Io.Mutex = .init,
     outcome: ?Outcome = null,
+    /// Set with the outcome, so the slot thread waits without polling.
+    done: std.Io.Event = .unset,
 
     pub const Outcome = enum { completed, failed, cancelled };
 
+    /// Sets the outcome under the lock: the slot thread reads it under the
+    /// same lock and may free this once it has, so nothing here outlives it.
     pub fn finish(self: *Completion, outcome: Outcome) void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         if (self.outcome == null) self.outcome = outcome;
+        self.done.set(io_mod.getIo());
     }
 
     pub fn result(self: *Completion) ?Outcome {

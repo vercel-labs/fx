@@ -9,9 +9,9 @@ const context_contract = @import("../workspace/context_contract.zig");
 const diff = @import("../output/diff.zig");
 const approval_prompt = @import("../permissions/approval_prompt.zig");
 const question_prompt = @import("../agent/question_prompt.zig");
-const input_submit_runtime = @import("../app/input_submit_runtime.zig");
+const submission_state = @import("../app/submission_state.zig");
 const session_runtime = @import("../session/session.zig");
-const app_session_runtime = @import("../app/app_session_runtime.zig");
+const session_persistence = @import("../app/session_persistence.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const child_run_mod = @import("child_run.zig");
 const profiles = @import("../profiles/profiles.zig");
@@ -30,7 +30,7 @@ pub const Agent = struct {
     /// first instance, which the app finds as its `main_agent` field.
     app: ?*anyopaque = null,
     session: session_runtime.SessionRuntime = session_runtime.SessionRuntime.init(max_history_turns),
-    session_persistence: app_session_runtime.Persistence = .{},
+    session_persistence: session_persistence.Persistence = .{},
     worker_thread: ?std.Thread = null,
     worker: worker_runtime.WorkerRuntime = .{},
     stream: types.StreamState = .{},
@@ -51,7 +51,7 @@ pub const Agent = struct {
     /// allocated with the app's allocator. Guarded by the app's permission
     /// authority lock.
     session_grants: std.ArrayList(types.PermissionGrant) = .empty,
-    submission: input_submit_runtime.State = .{},
+    submission: submission_state.State = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     next_image_id: usize = 1,
     managed_executions: managed_execution.Runtime = managed_execution.Runtime.init(std.heap.c_allocator),

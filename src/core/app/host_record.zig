@@ -16,6 +16,11 @@ const Allocator = std.mem.Allocator;
 pub const format_version: u32 = 1;
 pub const group_id_len = 16;
 const max_record_bytes = 64 * 1024;
+
+/// How many records `pruneOldest` keeps: the newest by when they were last
+/// written. Every resume reads them all, so this bounds that work. An older
+/// group's sessions still resume, one at a time.
+pub const max_records = 100;
 const max_id_len = 128;
 
 /// One host's record. Its slices are borrowed from whoever holds it.
@@ -228,6 +233,52 @@ pub fn write(alloc: Allocator, dir_path: []const u8, record: Record) !void {
     try io_mod.writeFileAtomic(alloc, path, bytes);
 }
 
+/// The groups of `records` past the newest `keep`, oldest last written
+/// first, leaving out `keep_group`, which the caller is about to use.
+/// Caller owns the slice; its strings are borrowed from `records`.
+pub fn staleGroups(alloc: Allocator, records: []const Record, keep: usize, keep_group: ?[]const u8) ![]const []const u8 {
+    const order = try alloc.alloc(usize, records.len);
+    defer alloc.free(order);
+    for (order, 0..) |*slot, index| slot.* = index;
+    std.mem.sort(usize, order, records, struct {
+        fn lessThan(list: []const Record, a: usize, b: usize) bool {
+            return newer(list[a], list[b]);
+        }
+    }.lessThan);
+    var stale: std.ArrayList([]const u8) = .empty;
+    errdefer stale.deinit(alloc);
+    var kept: usize = 0;
+    for (order) |index| {
+        const record = records[index];
+        if (keep_group) |group| if (std.mem.eql(u8, record.group_id, group)) continue;
+        if (kept < keep) {
+            kept += 1;
+            continue;
+        }
+        try stale.append(alloc, record.group_id);
+    }
+    std.mem.reverse([]const u8, stale.items);
+    return stale.toOwnedSlice(alloc);
+}
+
+/// Removes from `dir_path` the records `staleGroups` picks out of `records`
+/// with `max_records`. Returns how many it removed; one that can't be
+/// removed is logged and left.
+pub fn pruneOldest(alloc: Allocator, dir_path: []const u8, records: []const Record, keep_group: ?[]const u8) !usize {
+    const stale = try staleGroups(alloc, records, max_records, keep_group);
+    defer alloc.free(stale);
+    var removed: usize = 0;
+    for (stale) |group| {
+        remove(alloc, dir_path, group) catch |err| {
+            debug_trace.logf("host", "host_record_prune_failed group={s} err={s}", .{ group, @errorName(err) });
+            continue;
+        };
+        removed += 1;
+    }
+    if (removed > 0) debug_trace.eventf("host", "host_records_pruned", .{}, "removed={d} kept={d}", .{ removed, records.len - removed });
+    return removed;
+}
+
 /// Removes record `group_id` from `dir_path`, if it is there.
 pub fn remove(alloc: Allocator, dir_path: []const u8, group_id: []const u8) !void {
     if (!isValidId(group_id)) return error.InvalidHostRecord;
@@ -380,7 +431,38 @@ test "restoring holds for random sets of records" {
 }
 
 test "restoring holds for fuzzed sets of records" {
-    try std.testing.fuzz({}, fuzzRestore, .{});
+    try std.testing.fuzz({}, fuzzRestore, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").host_restore.*),
+    });
+}
+
+test "a host record file decodes or is refused on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzDecode, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "{\"version\":1,\"updated_ms\":5,\"sessions\":[\"abc\",\"def\"]}",
+            "{\"version\":1,\"updated_ms\":5,\"sessions\":[\"abc\"],\"profiles\":[\"main\"]}",
+            "{\"version\":2}",
+            "[]",
+            "\xff\x00{",
+        }) ++ @import("fuzz_corpus").host_record_decode.*),
+    });
+}
+
+fn fuzzDecode(_: void, smith: *std.testing.Smith) anyerror!void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var buffer: [4096]u8 = undefined;
+    const bytes = buffer[0..@intCast(smith.slice(&buffer))];
+    const record = decode(arena, "0123456789abcdef", bytes) catch return;
+    // What decodes is a record fx would write, and it writes back the same.
+    for (record.sessions) |id| try std.testing.expect(isValidId(id));
+    try std.testing.expect(record.profiles.len == 0 or record.profiles.len == record.sessions.len);
+    const encoded = try encode(arena, record);
+    const again = try decode(arena, record.group_id, encoded);
+    try std.testing.expectEqual(record.updated_ms, again.updated_ms);
+    try std.testing.expectEqual(record.sessions.len, again.sessions.len);
+    for (record.sessions, again.sessions) |a, b| try std.testing.expectEqualStrings(a, b);
 }
 
 fn fuzzRestore(_: void, smith: *std.testing.Smith) !void {
@@ -393,6 +475,36 @@ fn fuzzRestore(_: void, smith: *std.testing.Smith) !void {
         records[count] = .{ .group_id = groups_pool[count], .updated_ms = smith.valueRangeAtMost(u8, 0, 4), .sessions = session_buf[count][0..len] };
     }
     try expectRestore(std.testing.allocator, records[0..count], ids_pool[smith.index(ids_pool.len)]);
+}
+
+test "pruning keeps the newest records and the group in use" {
+    const alloc = std.testing.allocator;
+    const none: []const []const u8 = &.{};
+    const records = [_]Record{
+        .{ .group_id = "aaaaaaaaaaaaaaaa", .updated_ms = 10, .sessions = none },
+        .{ .group_id = "bbbbbbbbbbbbbbbb", .updated_ms = 50, .sessions = none },
+        .{ .group_id = "cccccccccccccccc", .updated_ms = 30, .sessions = none },
+        .{ .group_id = "dddddddddddddddd", .updated_ms = 40, .sessions = none },
+        .{ .group_id = "eeeeeeeeeeeeeeee", .updated_ms = 20, .sessions = none },
+    };
+    const stale = try staleGroups(alloc, &records, 2, null);
+    defer alloc.free(stale);
+    try std.testing.expectEqual(@as(usize, 3), stale.len);
+    try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaa", stale[0]);
+    try std.testing.expectEqualStrings("eeeeeeeeeeeeeeee", stale[1]);
+    try std.testing.expectEqualStrings("cccccccccccccccc", stale[2]);
+
+    // The group being restored stays even when it is the oldest, and it
+    // takes none of the newest places.
+    const kept = try staleGroups(alloc, &records, 2, "aaaaaaaaaaaaaaaa");
+    defer alloc.free(kept);
+    try std.testing.expectEqual(@as(usize, 2), kept.len);
+    try std.testing.expectEqualStrings("eeeeeeeeeeeeeeee", kept[0]);
+    try std.testing.expectEqualStrings("cccccccccccccccc", kept[1]);
+
+    const few = try staleGroups(alloc, &records, max_records, null);
+    defer alloc.free(few);
+    try std.testing.expectEqual(@as(usize, 0), few.len);
 }
 
 test "host records are written whole, listed, and removed" {

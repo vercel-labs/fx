@@ -910,6 +910,17 @@ pub fn Runtime(comptime App: type) type {
             return app_agents_runtime.Runtime(App).canSwitch(app);
         }
 
+        /// Alt+←/→ switch agents only where their word jump would not move
+        /// the cursor: with another agent to switch to, nothing selected,
+        /// and the cursor at the draft's start for ← or its end for →. An
+        /// empty draft is both. Everywhere else they jump by word, as on
+        /// main, so switching never costs a word move.
+        fn switchesAgents(app: *App, direction: input_action.SwitchDirection) bool {
+            if (!canSwitchAgents(app)) return false;
+            if (comptime !@hasField(App, "input_runtime")) return true;
+            return app.input_runtime.edit_state.staysForWordJump(direction == .previous);
+        }
+
         fn routeResolvedEscapeAction(
             app: *App,
             decoded: input_action.Action,
@@ -919,12 +930,17 @@ pub fn Runtime(comptime App: type) type {
             was_cancel_pending: bool,
             max_input_len: usize,
         ) !ResolvedEscapeRoute {
-            // With no other agent to switch to, Alt+←/→ keep the word jump
-            // their composer shortcut carries.
-            const resolved: input_action.Action = if (decoded == .switch_agent and !canSwitchAgents(app))
-                if (composer_shortcut) |shortcut| .{ .composer_shortcut = shortcut } else .ignore
-            else
-                decoded;
+            // Where Alt+←/→ don't switch, they keep the word jump their
+            // composer shortcut carries.
+            const resolved: input_action.Action = switch (decoded) {
+                .switch_agent => |direction| if (switchesAgents(app, direction))
+                    decoded
+                else if (composer_shortcut) |shortcut|
+                    .{ .composer_shortcut = shortcut }
+                else
+                    .ignore,
+                else => decoded,
+            };
             switch (resolved) {
                 .remapped_byte, .paste_start, .paste_end, .ignore => {},
                 else => disarmCtrlCExit(app, "semantic_action"),

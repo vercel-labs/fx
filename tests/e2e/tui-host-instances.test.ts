@@ -539,6 +539,42 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
   );
 
   test(
+    "an instance with no turn stays out of the host record, and quitting from it names a saved one",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-unsaved-")));
+      try {
+        let printed = "";
+        await withHost(answerByLetter, { instances: 3, remainOnExit: true, reuse: { home, workspace } }, async ({ session }) => {
+          await session.sendText("HOST_A only");
+          await session.waitForText("HOST_ANSWER_A", 30_000);
+          await session.waitForComposer(15_000);
+          await Bun.sleep(500);
+          // Only fx 1 saved a session, so there is no group to record.
+          expect(hostRecords(home)).toEqual([]);
+          await session.sendKeys("M-Right");
+          await session.waitForPane((pane) => pane.includes("fx 2/3"), 15_000);
+          await session.waitForComposer(15_000);
+          printed = await quitWith(session, "/exit");
+        });
+        const saved = sessionHolding(home, "HOST_ANSWER_A");
+        expect(saved).not.toBeNull();
+        expect(printed).toContain(`Continue session with: fx --resume ${saved}`);
+        // Resuming it brings back fx 1 alone, with no notice about the others.
+        await withHost(answerByLetter, { args: `--resume ${saved}`, reuse: { home, workspace } }, async ({ session }) => {
+          const pane = await session.waitForPane((value) => value.includes("HOST_ANSWER_A"), 30_000);
+          expect(pane).not.toMatch(/fx \d+\/\d+/);
+          expect(pane).not.toContain("Couldn't bring back");
+        });
+      } finally {
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "/close on the only open instance ends fx with its resume command",
     async () => {
       await withHost(answerByLetter, { instances: 2, remainOnExit: true }, async ({ home, session }) => {
@@ -620,6 +656,12 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
           expect(hostRecords(home)).toEqual([]);
           await session.sendText("/launch");
           await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          // fx 2 joins the record once its first turn saves its session.
+          await Bun.sleep(500);
+          expect(hostRecords(home)).toEqual([]);
+          await session.sendText("HOST_B second");
+          await session.waitForText("HOST_ANSWER_B", 30_000);
           await session.waitForPane(() => hostRecords(home).length === 1 && hostRecords(home)[0]!.length === 2, 15_000);
           await session.waitForComposer(15_000);
           await session.sendText("/close");
@@ -676,13 +718,15 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
           expect(await session.capturePane()).not.toMatch(/fx \d+\/\d+/);
         });
 
-        // A member that can't load is skipped with a notice; the rest come back.
+        // A member whose session is gone is left out without a notice, the
+        // rest come back, and the record follows.
         rmSync(join(home, ".fx", "sessions", "v2", a), { recursive: true, force: true });
         await withHost(answerByLetter, { args: `--resume ${b}`, reuse: { home, workspace } }, async ({ session }) => {
           const pane = await session.waitForPane((value) => value.includes("fx 1/2") && value.includes("HOST_ANSWER_B"), 30_000);
-          expect(pane).toContain(`Couldn't bring back session ${a}`);
+          expect(pane).not.toContain("Couldn't bring back");
           await session.sendKeys("M-Right");
           await session.waitForPane((value) => value.includes("fx 2/2") && value.includes("HOST_ANSWER_C"), 15_000);
+          await session.waitForPane(() => hostRecords(home).some((ids) => ids.length === 2 && !ids.includes(a!)), 15_000);
         });
         expect(c).not.toBeNull();
       } finally {

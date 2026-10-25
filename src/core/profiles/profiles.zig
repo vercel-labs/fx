@@ -6,11 +6,13 @@
 //! `<name>/prompt.md`. A name resolves from the user's `~/.fx/agents/` first,
 //! then the repository's `.fx/agents/`, then fx's own `main` and `agent`.
 //! A repository's profile never sets the permission mode, so a cloned
-//! repository cannot grant itself access.
+//! repository cannot grant itself access, and its files never resolve
+//! outside the repository, so it cannot read the user's other files.
 
 const std = @import("std");
 const types = @import("../shared/types.zig");
 const io_mod = @import("../shared/io.zig");
+const pathing = @import("../workspace/pathing.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 
 const Allocator = std.mem.Allocator;
@@ -81,6 +83,9 @@ pub const Roots = struct {
     home: ?[]const u8 = null,
     /// `<workspace>/.fx/agents`.
     project: ?[]const u8 = null,
+    /// The workspace itself, which a repository's profile files must stay
+    /// inside. Without it they must stay inside `project`.
+    repository: ?[]const u8 = null,
 
     /// Builds both roots from the fx home and the workspace. Caller owns the
     /// result through `arena`.
@@ -91,6 +96,17 @@ pub const Roots = struct {
                 try std.Io.Dir.path.join(arena, &.{ root, profile_paths.root_dir_name, profile_paths.agents_dir_name })
             else
                 null,
+            .repository = workspace_root,
+        };
+    }
+
+    /// The folder a profile saved in `dir` must keep its files in: the
+    /// repository for a repository's profile. The user's own profiles may
+    /// link anywhere, so theirs is null.
+    fn fileRoot(self: Roots, source: Source, dir: []const u8) ?[]const u8 {
+        return switch (source) {
+            .project => self.repository orelse dir,
+            .home, .builtin => null,
         };
     }
 };
@@ -276,8 +292,8 @@ pub fn load(arena: Allocator, roots: Roots, name: []const u8, failure: *?[]const
     // The profile keeps its name, so it is `arena`'s like the rest of it,
     // not the caller's.
     const owned = try arena.dupe(u8, name);
-    if (roots.home) |dir| if (try readProfile(arena, dir, owned, .home, failure)) |profile| return profile;
-    if (roots.project) |dir| if (try readProfile(arena, dir, owned, .project, failure)) |profile| return profile;
+    if (roots.home) |dir| if (try readProfile(arena, dir, owned, .home, roots.fileRoot(.home, dir), failure)) |profile| return profile;
+    if (roots.project) |dir| if (try readProfile(arena, dir, owned, .project, roots.fileRoot(.project, dir), failure)) |profile| return profile;
     if (builtin(name)) |profile| return profile;
     const names = try listNames(arena, roots);
     failure.* = try arena.print("no profile named '{s}'. Profiles: {s}", .{ name, names });
@@ -304,7 +320,7 @@ pub fn list(arena: Allocator, roots: Roots) ![]Entry {
             if (hasEntry(entries.items, item.name)) continue;
             const name = try arena.dupe(u8, item.name);
             var failure: ?[]const u8 = null;
-            const profile = (readProfile(arena, dir_path, name, root.source, &failure) catch |err| switch (err) {
+            const profile = (readProfile(arena, dir_path, name, root.source, roots.fileRoot(root.source, dir_path), &failure) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => continue,
             }) orelse continue;
@@ -340,19 +356,27 @@ fn entryLessThan(_: void, a: Entry, b: Entry) bool {
 }
 
 /// Reads `<dir>/<name>/profile.json` and its optional `prompt.md`. Returns null
-/// when the profile is not saved there.
-fn readProfile(arena: Allocator, dir: []const u8, name: []const u8, source: Source, failure: *?[]const u8) LoadError!?Profile {
+/// when the profile is not saved there. With `within`, both files must
+/// resolve inside that folder (`Roots.fileRoot`).
+fn readProfile(
+    arena: Allocator,
+    dir: []const u8,
+    name: []const u8,
+    source: Source,
+    within: ?[]const u8,
+    failure: *?[]const u8,
+) LoadError!?Profile {
     const settings_path = try std.Io.Dir.path.join(arena, &.{ dir, name, settings_file_name });
-    const settings = readFile(arena, settings_path, max_settings_bytes) catch |err| switch (err) {
+    const settings = readFile(arena, settings_path, max_settings_bytes, within) catch |err| switch (err) {
         error.FileNotFound => return null,
         error.OutOfMemory => return error.OutOfMemory,
-        else => return fail(arena, failure, "profile '{s}': cannot read {s}: {s}", .{ name, settings_path, @errorName(err) }),
+        else => return fail(arena, failure, "profile '{s}': cannot read {s}: {s}", .{ name, settings_path, try readFailure(arena, err, max_settings_bytes) }),
     };
     const prompt_path = try std.Io.Dir.path.join(arena, &.{ dir, name, prompt_file_name });
-    const prompt = readFile(arena, prompt_path, max_prompt_bytes) catch |err| switch (err) {
+    const prompt = readFile(arena, prompt_path, max_prompt_bytes, within) catch |err| switch (err) {
         error.FileNotFound => "",
         error.OutOfMemory => return error.OutOfMemory,
-        else => return fail(arena, failure, "profile '{s}': cannot read {s}: {s}", .{ name, prompt_path, @errorName(err) }),
+        else => return fail(arena, failure, "profile '{s}': cannot read {s}: {s}", .{ name, prompt_path, try readFailure(arena, err, max_prompt_bytes) }),
     };
     return parse(arena, name, source, settings, prompt, failure) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -360,10 +384,152 @@ fn readProfile(arena: Allocator, dir: []const u8, name: []const u8, source: Sour
     };
 }
 
-fn readFile(arena: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
-    defer file.close(io_mod.getIo());
+/// Why a profile file couldn't be read, in words, with the error's name when
+/// there are none for it. The result belongs to `arena`.
+fn readFailure(arena: Allocator, err: anyerror, max_bytes: usize) Allocator.Error![]const u8 {
+    return switch (err) {
+        error.StreamTooLong => if (max_bytes == max_prompt_bytes)
+            "it is larger than the 256 KiB a profile file may hold"
+        else
+            "it is larger than the 64 KiB a profile file may hold",
+        error.AccessDenied, error.PermissionDenied => "fx isn't allowed to read it",
+        error.IsDir => "it is a folder, not a file",
+        error.NotRegularFile => "it isn't a regular file",
+        error.OutsideRepository => "it links outside the repository, and a repository's profile may read only its own files",
+        else => try arena.print("the file couldn't be read ({s})", .{@errorName(err)}),
+    };
+}
+
+test "profile read failures name the limit or the cause instead of an error" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expect(std.mem.find(u8, try readFailure(arena, error.StreamTooLong, max_prompt_bytes), "256 KiB") != null);
+    try std.testing.expect(std.mem.find(u8, try readFailure(arena, error.StreamTooLong, max_settings_bytes), "64 KiB") != null);
+    try std.testing.expectEqualStrings("it is a folder, not a file", try readFailure(arena, error.IsDir, max_prompt_bytes));
+    try std.testing.expectEqualStrings("the file couldn't be read (SymLinkLoop)", try readFailure(arena, error.SymLinkLoop, max_prompt_bytes));
+}
+
+test "profile parsing stays bounded on fuzzed settings and prompts" {
+    try std.testing.fuzz({}, fuzzProfileParse, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "{}",
+            "{\"tools\": [\"read_file\"], \"prompt\": \"replace\"}",
+            "{\"mcp_servers\": [\"*\"], \"model\": \"openai/gpt-5\", \"effort\": \"low\"}",
+            "{\"tools\": 3, \"unknown\": null}",
+            "\xff\x00{",
+        }) ++ @import("fuzz_corpus").profile_parse.*),
+    });
+}
+
+fn fuzzProfileParse(_: void, smith: *std.testing.Smith) anyerror!void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var settings_buffer: [4096]u8 = undefined;
+    const settings = settings_buffer[0..@intCast(smith.slice(&settings_buffer))];
+    var prompt_buffer: [512]u8 = undefined;
+    const prompt = prompt_buffer[0..@intCast(smith.slice(&prompt_buffer))];
+    var failure: ?[]const u8 = null;
+    const profile = parse(arena.allocator(), "fuzz", .project, settings, prompt, &failure) catch |err| switch (err) {
+        // A refused profile always says why.
+        error.InvalidProfile => return std.testing.expect(failure != null),
+        error.OutOfMemory => return err,
+    };
+    try std.testing.expectEqualStrings("fuzz", profile.name);
+}
+
+/// Reads the profile file at `path`, up to `max_bytes`, into `arena`. It
+/// reads only a regular file, so a link to a terminal, a pipe, or a device
+/// can neither hang fx nor feed it. With `within`, the file's real path must
+/// lie inside that folder, so a link can't hand a repository's profile a
+/// file from elsewhere on the machine.
+fn readFile(arena: Allocator, path: []const u8, max_bytes: usize, within: ?[]const u8) ![]u8 {
+    const io = io_mod.getIo();
+    const target = try io_mod.realpathAlloc(arena, path);
+    if (within) |root_path| {
+        const root = try io_mod.realpathAlloc(arena, root_path);
+        if (!pathing.pathInside(root, target)) return error.OutsideRepository;
+    }
+    // Checked before opening: opening a pipe waits for a writer.
+    const stat = try std.Io.Dir.cwd().statFile(io, target, .{ .follow_symlinks = false });
+    switch (stat.kind) {
+        .file => {},
+        .directory => return error.IsDir,
+        else => return error.NotRegularFile,
+    }
+    var file = try std.Io.Dir.openFileAbsolute(io, target, .{ .allow_directory = false, .follow_symlinks = false });
+    defer file.close(io);
+    // The path may have changed since the check.
+    if ((try file.stat(io)).kind != .file) return error.NotRegularFile;
     return io_mod.readFileToEnd(arena, &file, max_bytes);
+}
+
+/// Saves `target` at `sub_path` as a link, creating its folders.
+fn linkTestFile(dir: std.Io.Dir, target: []const u8, sub_path: []const u8) !void {
+    if (std.Io.Dir.path.dirname(sub_path)) |parent| try dir.createDirPath(io_mod.getIo(), parent);
+    try dir.symLink(io_mod.getIo(), target, sub_path, .{ .is_directory = false });
+}
+
+fn writeTestFile(dir: std.Io.Dir, sub_path: []const u8, bytes: []const u8) !void {
+    if (std.Io.Dir.path.dirname(sub_path)) |parent| try dir.createDirPath(io_mod.getIo(), parent);
+    var file = try dir.createFile(io_mod.getIo(), sub_path, .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(), bytes);
+}
+
+test "a repository's profile reads only files inside the repository" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "outside/secret.txt", "SECRET");
+    try writeTestFile(tmp.dir, "repo/prompts/review.md", "Review only.");
+    const outside_secret = try io_mod.dirRealpathAlloc(arena, tmp.dir, "outside/secret.txt");
+    const inside_prompt = try io_mod.dirRealpathAlloc(arena, tmp.dir, "repo/prompts/review.md");
+    try writeTestProfile(tmp.dir, "repo/.fx/agents/evil", "{\"description\": \"Evil\"}");
+    try linkTestFile(tmp.dir, outside_secret, "repo/.fx/agents/evil/prompt.md");
+    try writeTestProfile(tmp.dir, "repo/.fx/agents/shared", "{\"description\": \"Shared prompt\"}");
+    try linkTestFile(tmp.dir, inside_prompt, "repo/.fx/agents/shared/prompt.md");
+    try writeTestFile(tmp.dir, "outside/settings/profile.json", "{\"description\": \"Elsewhere\"}");
+    try linkTestFile(tmp.dir, try io_mod.dirRealpathAlloc(arena, tmp.dir, "outside/settings/profile.json"), "repo/.fx/agents/far/profile.json");
+    const roots = try Roots.init(arena, null, try io_mod.dirRealpathAlloc(arena, tmp.dir, "repo"));
+
+    var failure: ?[]const u8 = null;
+    try testing.expectError(error.InvalidProfile, load(arena, roots, "evil", &failure));
+    try testing.expect(std.mem.find(u8, failure.?, "links outside the repository") != null);
+    try testing.expectError(error.InvalidProfile, load(arena, roots, "far", &failure));
+    try testing.expect(std.mem.find(u8, failure.?, "links outside the repository") != null);
+    // A link that stays inside the repository is read.
+    const shared = try load(arena, roots, "shared", &failure);
+    try testing.expectEqualStrings("Review only.", shared.prompt);
+    // Neither refused profile is offered.
+    const entries = try list(arena, roots);
+    for (entries) |entry| try testing.expect(!std.mem.eql(u8, entry.name, "evil") and !std.mem.eql(u8, entry.name, "far"));
+}
+
+test "a profile reads only regular files, and the user's own may link anywhere" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "dotfiles/review.md", "Review only.");
+    try writeTestProfile(tmp.dir, "home/linked", "{\"description\": \"Linked\"}");
+    try linkTestFile(tmp.dir, try io_mod.dirRealpathAlloc(arena, tmp.dir, "dotfiles/review.md"), "home/linked/prompt.md");
+    try writeTestProfile(tmp.dir, "home/device", "{\"description\": \"Device\"}");
+    try linkTestFile(tmp.dir, "/dev/null", "home/device/prompt.md");
+    try writeTestProfile(tmp.dir, "home/folder", "{\"description\": \"Folder\"}");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/folder/prompt.md");
+    const roots: Roots = .{ .home = try io_mod.dirRealpathAlloc(arena, tmp.dir, "home") };
+
+    var failure: ?[]const u8 = null;
+    const linked = try load(arena, roots, "linked", &failure);
+    try testing.expectEqualStrings("Review only.", linked.prompt);
+    try testing.expectError(error.InvalidProfile, load(arena, roots, "device", &failure));
+    try testing.expect(std.mem.find(u8, failure.?, "isn't a regular file") != null);
+    try testing.expectError(error.InvalidProfile, load(arena, roots, "folder", &failure));
+    try testing.expect(std.mem.find(u8, failure.?, "it is a folder, not a file") != null);
 }
 
 fn listAllows(entries: []const []const u8, name: []const u8, wildcard_skips: bool) bool {

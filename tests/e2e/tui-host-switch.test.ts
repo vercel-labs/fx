@@ -403,4 +403,48 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "with a subagent, Alt+Left jumps by word inside a draft and switches only where no word is left",
+    async () => {
+      let mainCalls = 0;
+      await withFx((body) => {
+        if (!isMainRequest(body)) return text("child_answer", "EDGE_CHILD_ANSWER");
+        mainCalls += 1;
+        if (mainCalls === 1) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "reviewer", message: "EDGE_TASK look for nothing" },
+          });
+        }
+        return text("main_final", "EDGE_MAIN_FINAL");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER_EDGE");
+        await session.waitForText("EDGE_MAIN_FINAL", 30_000);
+        await session.waitForComposer(15_000);
+
+        // Inside a draft, Alt+Left moves by word as it does with no subagent.
+        await session.sendLiteral("hello world");
+        await session.waitForText("hello world", 10_000);
+        await session.sendKeys("M-Left");
+        await session.sendLiteral("Z");
+        const moved = await session.waitForPane((pane) => pane.includes("hello Zworld"), 10_000);
+        expect(moved).not.toContain("reviewer \u00b7 ");
+
+        // At the draft's start no word is left to jump over, so it switches,
+        // and the draft stays on main.
+        await session.sendKeys("C-a");
+        await session.sendKeys("M-Left");
+        const child = await session.waitForPane((pane) => pane.includes("reviewer \u00b7 "), 15_000);
+        expect(child).not.toContain("hello Zworld");
+
+        // Terminal.app sends ESC b for Option+Left. In the subagent's empty
+        // composer it switches too, back to main and its draft.
+        await session.sendKeys("M-b");
+        const main = await session.waitForPane(
+          (pane) => pane.includes("hello Zworld") && !pane.includes("reviewer \u00b7 "), 15_000);
+        expect(main).toContain("EDGE_MAIN_FINAL");
+      });
+    },
+    TIMEOUT,
+  );
 });
