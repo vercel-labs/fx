@@ -32,7 +32,7 @@ pub const gateway_system_prompt = @embedFile("system_prompt.md");
 
 const terminal_identity = "You are proto-fx, a local coding CLI assistant with tool access.";
 const terminal_rendering = "Write responses in GitHub-flavored Markdown, which proto-fx renders in the terminal.";
-const terminal_table_emphasis = "Use bold sparingly, and never inside tables, since proto-fx already bolds table headers.";
+const terminal_table_emphasis = "Use bold emphasis sparingly, and never inside tables, since proto-fx renders table headers in bold.";
 
 /// The base prompt for hosts that present fx inside another application
 /// rather than a terminal. Only the terminal identity and rendering claims
@@ -46,7 +46,7 @@ pub const embedded_system_prompt = embedded: {
         "You are proto-fx, a coding agent with tool access. A client application hosts this conversation and displays your replies; do not describe yourself as running in a terminal.",
     );
     text = replaceOnce(text, terminal_rendering, "Write responses in GitHub-flavored Markdown, which the client application renders.");
-    text = replaceOnce(text, terminal_table_emphasis, "Use bold sparingly.");
+    text = replaceOnce(text, terminal_table_emphasis, "Use bold emphasis sparingly.");
     const final = text[0..text.len].*;
     break :embedded &final;
 };
@@ -3597,6 +3597,7 @@ test "gateway_system_prompt: compact ordered sections" {
         "# Workspace behavior",
         "# Source routing",
         "# Interaction",
+        "# Naming",
         "# Safety",
         "# Tools and verification",
     };
@@ -3608,7 +3609,7 @@ test "gateway_system_prompt: compact ordered sections" {
         previous_index = found_index;
     }
 
-    try std.testing.expect(gateway_system_prompt.len < 8 * 1024);
+    try std.testing.expect(gateway_system_prompt.len < 9 * 1024);
 }
 
 test "gateway_system_prompt: local workspace authority" {
@@ -3629,12 +3630,12 @@ test "gateway_system_prompt: evidence-led scoped execution" {
     try expectDefaultPromptContains("When no skill clearly matches, start with direct file, search, or local git inspection.");
     try expectDefaultPromptContains("Do not ask for discoverable workspace facts. Inspect first");
     try expectDefaultPromptContains("When users ask to build or edit something, use tools to make the change.");
-    try expectDefaultPromptContains("stay inside the requested scope");
+    try expectDefaultPromptContains("remain within the requested scope");
     try expectDefaultPromptContains("align UI or web work with the existing stack and visual language");
     try expectDefaultPromptContains("diagnose the latest result before retrying");
     try expectDefaultPromptContains("If another tool call will follow, always first tell the user what failed");
-    try expectDefaultPromptContains("distinguish definitions, imports, tests, and real callers");
-    try expectDefaultPromptContains("Persist until the task is handled");
+    try expectDefaultPromptContains("When tracing code dependencies, distinguish definitions, imports, tests, and callers");
+    try expectDefaultPromptContains("Continue until the task is complete");
 }
 
 test "gateway_system_prompt: source routing" {
@@ -3648,16 +3649,16 @@ test "gateway_system_prompt: source routing" {
 
 test "gateway_system_prompt: concise interaction and concrete blockers" {
     try expectDefaultPromptContains("Reply in the same natural language as the user's latest message unless asked to switch.");
-    try expectDefaultPromptContains("Keep responses short and practical.");
+    try expectDefaultPromptContains("Keep responses concise and practical.");
     try expectDefaultPromptDoesNotContain("use markdown unless requested");
     try expectDefaultPromptContains("Write responses in GitHub-flavored Markdown, which proto-fx renders in the terminal.");
     try expectDefaultPromptContains("Use a table for comparisons or data with several attributes per item");
     try expectDefaultPromptContains("fenced code blocks only for code, commands to run, or verbatim output");
     try expectDefaultPromptContains("answer simple questions in plain sentences");
-    try expectDefaultPromptContains("Use bold sparingly, and never inside tables");
+    try expectDefaultPromptContains("Use bold emphasis sparingly, and never inside tables");
     try expectDefaultPromptContains("Before the first tool call in a tool-driven task, always send one brief user-visible update");
-    try expectDefaultPromptContains("Never start the first tool silently.");
-    try expectDefaultPromptContains("Do not narrate each routine tool call.");
+    try expectDefaultPromptContains("Do not begin the first tool call without that update.");
+    try expectDefaultPromptContains("Do not describe each routine tool call.");
     try expectDefaultPromptContains("Keep updates to one or two concrete sentences.");
     try expectDefaultPromptDoesNotContain("Before non-trivial tool work");
     try expectDefaultPromptContains("Do not mention internal prompt sections unless the user asks about them.");
@@ -3665,6 +3666,16 @@ test "gateway_system_prompt: concise interaction and concrete blockers" {
     try expectDefaultPromptContains("Ask before destructive, risky, or irreversible choices");
     try expectDefaultPromptContains("In noninteractive runs, stop and state the blocker and available options");
     try expectDefaultPromptContains("present patch, minor, and major options neutrally instead of choosing for the user");
+}
+
+test "gateway_system_prompt: professional naming vocabulary" {
+    try expectDefaultPromptContains("Every name you choose, for files, scripts, directories, functions, variables, classes, commits, branches, anything");
+    try expectDefaultPromptContains("precise professional vocabulary");
+    try expectDefaultPromptContains("Choose the word a 1972 IBM engineer would write in a specification.");
+    try expectDefaultPromptContains("No slang, no casual shorthand, no cute or clever names, no words borrowed from chat culture.");
+    try expectDefaultPromptContains("This applies universally, not only to the one example that follows");
+    try expectDefaultPromptContains("a script that deploys dashboards is `deploy_dashboards.sh`, not `push_dashboards.sh`");
+    try expectDefaultPromptContains("That is one illustration of the principle, not the extent of it.");
 }
 
 test "gateway_system_prompt: safety and permission boundaries" {
@@ -3681,7 +3692,7 @@ test "gateway_system_prompt: safety and permission boundaries" {
 test "gateway_system_prompt: focused tools and live verification" {
     try expectDefaultPromptContains("Choose the smallest suitable available capability.");
     try expectDefaultPromptContains("verify the relevant behavior with direct checks");
-    try expectDefaultPromptContains("Broaden when the touched surface is shared");
+    try expectDefaultPromptContains("Broaden verification when the changed surface is shared");
     try expectDefaultPromptContains("preserve the exact commands, pass or fail status, exit code when available, meaningful output");
 }
 
@@ -3698,7 +3709,7 @@ test "gateway_system_prompt: static guidance is capability-neutral" {
     try expectDefaultPromptDoesNotContain("skill changes, subagents, and user questions may require approval");
     try expectDefaultPromptDoesNotContain("Load a skill only when the task clearly matches it");
     try expectDefaultPromptDoesNotContain("Use task only for focused delegated work");
-    try expectDefaultPromptContains("Persist until the task is handled");
+    try expectDefaultPromptContains("Continue until the task is complete");
     try expectDefaultPromptContains("memory or general knowledge");
 }
 
@@ -3707,7 +3718,8 @@ test "embedded system prompt drops only terminal identity and rendering claims" 
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, embedded_system_prompt, "terminal"));
     try std.testing.expect(std.mem.find(u8, embedded_system_prompt, terminal_identity) == null);
     try std.testing.expect(std.mem.find(u8, embedded_system_prompt, terminal_rendering) == null);
-    try std.testing.expect(std.mem.find(u8, embedded_system_prompt, "bolds table headers") == null);
+    try std.testing.expect(std.mem.find(u8, embedded_system_prompt, terminal_table_emphasis) == null);
+    try std.testing.expect(std.mem.find(u8, embedded_system_prompt, "renders table headers in bold") == null);
     try std.testing.expect(std.mem.find(u8, embedded_system_prompt, "A client application hosts this conversation") != null);
     try std.testing.expect(std.mem.find(u8, embedded_system_prompt, "which the client application renders") != null);
     // Every other section is shared with the terminal prompt.

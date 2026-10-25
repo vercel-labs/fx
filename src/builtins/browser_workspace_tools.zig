@@ -5,7 +5,7 @@ const tool_set = @import("../core/tooling/tool_set.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 
 const shell_description =
-    "Run one completion-only command inside the browser workspace with action=run. This clean root-fixed shell is the workspace interface. Native host paths, git, Node, npm, Python, managed running handles, TTY input, and operating-system access are unavailable.";
+    "Run one completion-only command inside the browser workspace with action=run. This clean, root-fixed shell is the workspace interface. Native host paths, git, Node, npm, Python, managed running handles, TTY input, and operating-system access are unavailable.";
 
 const shell = buildShellSpec();
 
@@ -71,7 +71,7 @@ test "browser workspace projects exactly one completion-only shell" {
     try std.testing.expectEqual(@as(?usize, 64 * 1024), schema.input_schema.properties[1].bounds.?.max_length);
     try std.testing.expectEqual(false, schema.input_schema.additional_properties.?);
     try std.testing.expect(std.mem.find(u8, schema.description, "shell is the workspace interface") != null);
-    try std.testing.expect(std.mem.find(u8, schema.description, "clean root-fixed") != null);
+    try std.testing.expect(std.mem.find(u8, schema.description, "clean, root-fixed") != null);
 }
 
 test "browser workspace model-facing tool contract stays byte exact" {
@@ -86,7 +86,7 @@ test "browser workspace model-facing tool contract stays byte exact" {
     std.crypto.hash.sha2.Sha256.hash(schema_json, &digest, .{});
     const actual_hex = std.fmt.bytesToHex(digest, .lower);
     try std.testing.expectEqualStrings(
-        "7646b1773d02e366cec366f77a2760b218865831ff828c18d9ce61748aaab4c8",
+        "61f5b3787ab47ab925d2c0dbabc4483b54424f923ada814fcf62dd3c63c86ba3",
         &actual_hex,
     );
 }
