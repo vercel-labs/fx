@@ -634,7 +634,7 @@ pub const read_tool_result = ToolSpec{
     .irreversible_fn = read_tool_result_impl.isIrreversible,
 };
 
-const kernel_description = "Execute Python in this session's persistent CPython kernel. Variables survive cells, top-level await is supported, and async tasks can continue between cells. Output and last-expression results are returned. action defaults to execute; status inspects, interrupt cancels the active cell, stop snapshots and releases Python, restart discards the live process and restores the last valid snapshot lazily, and prewarm starts it in the background. timeout_ms is an advisory time budget, not a hard deadline. Runtime helper APIs such as rlm are not installed; use the native tools for those operations. Python can access the filesystem and network under the same tool permission policy as shell execution.";
+const kernel_description = "Execute Python in this session's persistent CPython kernel. Variables survive cells, top-level await is supported, and async tasks can continue between cells. Output and last-expression results are returned. action defaults to execute; status inspects, interrupt cancels the active cell, stop snapshots and releases Python, restart discards the live process and restores the last valid snapshot lazily, and prewarm starts it in the background. timeout_ms is an advisory time budget, not a hard deadline. Runtime helper APIs such as rlm are not installed; use the native tools for those operations. Python has the filesystem and network access of the proto-fx process. Unless a permission rule or full access already allows it, every kernel call needs approval: ask mode prompts with the raw arguments and auto mode sends the call to security review. Code is not parsed like shell commands, so the routine-command shortcut never applies.";
 pub const kernel = ToolSpec{
     .name = "kernel",
     .description = kernel_description,
@@ -655,6 +655,7 @@ pub const kernel = ToolSpec{
     .executor_kind = .kernel,
     .activity_kind = .command,
     .requires_approval = true,
+    .approval_shows_arguments = true,
     .action_label = "Executing",
     .completed_action_label = "Executed",
     .label_arg_kind = .none,
@@ -768,7 +769,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "5e9bcac47bf4a450c37c7dda065e67e882e84a9d96ad89521026b9739f29a28e",
+        "99bb5f66df809997d8aa4e65323f55d8aa2662b8da4851bcaa8274450745fff4",
         &actual_hex,
     );
 }

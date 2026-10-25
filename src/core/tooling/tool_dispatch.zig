@@ -253,7 +253,8 @@ pub const RunCommandBackend = struct {
 /// Context shared by core tool dispatch, validation, and execution.
 pub const DispatchContext = struct {
     allocator: Allocator,
-    kernel_session: ?*@import("../session/session.zig").SessionRuntime = null,
+    /// The session's Python kernel slot; null in hosts without a session runtime.
+    kernel: ?*@import("../kernel/slot.zig").Slot = null,
     permission_mode: permission_gate.PermissionMode = .ask,
     permission_decider: ?PermissionDecider = null,
     execution_authority: ?command_admission.ToolExecutionAuthority = null,
@@ -479,6 +480,9 @@ pub const Tool = struct {
     executor_kind: ExecutorKind = .read_file,
     activity_kind: core_types.ToolActivityKind = .read,
     requires_approval: bool = false,
+    /// The approval prompt shows the call's raw arguments, bounded and terminal-safe,
+    /// because no structured target or command summarizes what the call does.
+    approval_shows_arguments: bool = false,
     approval_policy: ApprovalPolicy = .standard,
     action_label: []const u8 = "Working",
     completed_action_label: []const u8 = "Completed",

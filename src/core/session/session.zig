@@ -1,7 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const kernel_agent = @import("../agent/runtime/agent.zig");
-const python_kernel = @import("../kernel/kernel.zig");
+const kernel_slot = @import("../kernel/slot.zig");
 const core_types = @import("../shared/types.zig");
 const history_range = @import("../shared/history_range.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -1365,8 +1365,8 @@ fn collectShellIdsWithKey(alloc: Allocator, text: []const u8, key: []const u8, o
 }
 
 pub const SessionRuntime = struct {
-    python: ?*python_kernel.Manager = null,
-    python_lock: std.Io.Mutex = .init,
+    /// The session's Python kernel. Attach and detach never change its lifetime.
+    kernel: kernel_slot.Slot = .{},
     agent: kernel_agent.Agent = .{},
     context_notice_hashes: std.AutoHashMapUnmanaged(u64, void) = .empty,
     context_notice_lock: std.Io.Mutex = .init,
@@ -1401,8 +1401,7 @@ pub const SessionRuntime = struct {
     }
 
     pub fn deinit(self: *SessionRuntime, alloc: Allocator) void {
-        if (self.python) |manager| manager.destroy();
-        self.python = null;
+        self.kernel.deinit();
         self.clearWebFetchArtifacts();
         self.permission_state.deinit(alloc);
         self.agent.deinit(alloc);
@@ -1410,8 +1409,7 @@ pub const SessionRuntime = struct {
     }
 
     pub fn reset(self: *SessionRuntime, alloc: Allocator) void {
-        if (self.python) |manager| manager.destroy();
-        self.python = null;
+        self.kernel.deinit();
         self.clearWebFetchArtifacts();
         self.clearPermissionState(alloc);
         self.clearHistory(alloc);

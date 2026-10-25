@@ -663,7 +663,7 @@ const AskContext = struct {
             .mode_id = cfg.mode_registry.default_mode_id,
             .session = session_runtime.SessionRuntime.init(cfg.max_history_turns),
             .web_search_runtime = web_search_runtime.Runtime.init(.{
-                .provider = cfg.provider_set.gateway.fx_search.?,
+                .provider = cfg.provider_set.gateway.fx_search,
             }),
             .terminal_client = terminal_client_runtime.Runtime.init(
                 cfg.process_provider,

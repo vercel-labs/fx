@@ -588,6 +588,12 @@ pub fn milliTimestamp() i64 {
     return @intCast(@divFloor(ts.nanoseconds, 1_000_000));
 }
 
+/// Milliseconds on the monotonic awake clock, for deadlines that wall-clock changes must not move.
+pub fn monotonicMilliTimestamp() i64 {
+    const ts = std.Io.Timestamp.now(getIo(), .awake);
+    return @intCast(@divFloor(ts.nanoseconds, 1_000_000));
+}
+
 pub fn nanoTimestamp() i128 {
     const ts = std.Io.Timestamp.now(getIo(), .real);
     return @intCast(ts.nanoseconds);

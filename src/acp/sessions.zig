@@ -142,7 +142,7 @@ pub fn handleNewLibfxSession(
     const model = try alloc.dupe(u8, state.selected_model);
     var model_owned = true;
     defer if (model_owned) alloc.free(model);
-    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns);
+    var session_rt = newSessionRuntime(state);
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
 
@@ -191,7 +191,7 @@ pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *
     const model = try alloc.dupe(u8, durable.preferences.model);
     var model_owned = true;
     defer if (model_owned) alloc.free(model);
-    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns);
+    var session_rt = newSessionRuntime(state);
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
     const revision = js_host_session_store.commit(alloc, durable, null) catch
@@ -518,7 +518,7 @@ fn startV2Session(
     const model_copy = try alloc.dupe(u8, state.selected_model);
     var model_owned = true;
     defer if (model_owned) alloc.free(model_copy);
-    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns);
+    var session_rt = newSessionRuntime(state);
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
     session_rt.configureWebFetchArtifactBlobs(alloc, try v2.childCapability(), v2.id());
@@ -651,7 +651,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     const model_copy = try alloc.dupe(u8, loaded.state.preferences.model);
     var model_owned = true;
     defer if (model_owned) alloc.free(model_copy);
-    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns);
+    var session_rt = newSessionRuntime(state);
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
     try session_rt.restoreWithPermissionState(
@@ -932,7 +932,7 @@ fn handleRestoreSession(
     var model_owned = true;
     defer if (model_owned) alloc.free(model_copy);
 
-    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns);
+    var session_rt = newSessionRuntime(state);
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
     try session_rt.restoreWithPermissionState(
@@ -980,7 +980,7 @@ fn handleRestoreSession(
     session_rt_owned = false;
     session_host_owned = false;
     if (state.active_session) |*active| {
-        @import("../tools/kernel.zig").prewarmSaved(&active.session_rt, state.alloc, active.workspace_root, active.session_id) catch |err|
+        active.session_rt.kernel.prewarmIfSaved(state.alloc, .{ .cwd = active.workspace_root, .session_id = active.session_id }) catch |err|
             debug_trace.logf("kernel", "restore prewarm unavailable: {s}", .{@errorName(err)});
     }
     // One map, so a recovered read can name a call from an earlier turn.
@@ -1256,6 +1256,13 @@ fn restoredToolIdentities(
             return .{};
         },
     };
+}
+
+/// A session runtime whose kernel keeps snapshots under this host's profile home.
+fn newSessionRuntime(state: *const server.ServerState) session_runtime.SessionRuntime {
+    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns);
+    session_rt.kernel.home_override = state.cfg.home_override;
+    return session_rt;
 }
 
 fn activateSession(state: *server.ServerState, activation: SessionActivation) !void {

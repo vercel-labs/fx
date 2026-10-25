@@ -107,6 +107,10 @@ fn toolRequiresApproval(input: Input, name: []const u8) bool {
     return if (registeredTool(input, name)) |spec| spec.requires_approval else false;
 }
 
+fn approvalShowsArguments(input: Input, name: []const u8) bool {
+    return if (registeredTool(input, name)) |spec| spec.approval_shows_arguments else false;
+}
+
 fn registeredTerminalCallReadsOnly(
     input: Input,
     arena: Allocator,
@@ -2444,7 +2448,7 @@ fn interactivePermissionRequest(
             .amendment_allowed = true,
         };
     }
-    const tool_arguments_preview = if (isAvailableDynamicTool(input, call.name) or std.mem.eql(u8, call.name, "kernel")) blk: {
+    const tool_arguments_preview = if (isAvailableDynamicTool(input, call.name) or approvalShowsArguments(input, call.name)) blk: {
         const encoded = try text_utils.encodeTerminalSafe(
             arena,
             call.arguments_json,

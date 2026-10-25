@@ -1,12 +1,9 @@
 //! Permissions are settled by normal tool admission before kernel execution.
 const std = @import("std");
 const dispatch = @import("../core/tooling/tool_dispatch.zig");
-const kernel = @import("../core/kernel/kernel.zig");
-const session_runtime = @import("../core/session/session.zig");
-const io_mod = @import("../core/shared/io.zig");
-const profile_paths = @import("../core/shared/profile_paths.zig");
-const session_paths = @import("../core/session/session_store_paths.zig");
+const kernel = @import("../core/kernel/slot.zig");
 const Allocator = std.mem.Allocator;
+/// `execute` runs code; every other action is a `kernel.Action` recovery control.
 const Action = enum { execute, status, interrupt, stop, restart, prewarm };
 const Input = struct { action: Action, code: ?[]u8, timeout_ms: u64, max_output_chars: usize };
 
@@ -61,65 +58,13 @@ const Output = struct {
     }
 };
 
-fn ensureManager(session: *session_runtime.SessionRuntime, alloc: Allocator, cwd: []const u8, id: ?[]const u8) !*kernel.Manager {
-    session.python_lock.lockUncancelable(io_mod.getIo());
-    defer session.python_lock.unlock(io_mod.getIo());
-    if (session.python) |manager| return manager;
-    const artifacts = if (id) |session_id| blk: {
-        try session_paths.validateSessionId(session_id);
-        const home = io_mod.homeDir() orelse return error.HomeNotSet;
-        break :blk try std.Io.Dir.path.join(alloc, &.{ home, profile_paths.root_dir_name, "kernels", session_id });
-    } else try alloc.dupe(u8, "");
-    defer alloc.free(artifacts);
-    const manager = try kernel.Manager.create(alloc, .{ .cwd = cwd, .artifact_dir = artifacts, .persist = id != null });
-    session.python = manager;
-    return manager;
-}
-
-/// Call on saved-session resume, after the session runtime has its stable owner.
-/// The helper only allocates state; the worker checks for a snapshot and does any Python setup.
-pub fn prewarmSaved(session: *session_runtime.SessionRuntime, alloc: Allocator, cwd: []const u8, id: []const u8) !void {
-    const manager = try ensureManager(session, alloc, cwd, id);
-    try manager.prewarmIfSaved();
-}
-
 pub fn call(ctx: dispatch.DispatchContext, erased: dispatch.ToolInput) dispatch.DispatchError!dispatch.ToolResult {
-    const session = ctx.kernel_session orelse return .{ .failure = try ctx.allocator.dupe(u8, "kernel is unavailable in this host") };
+    const slot = ctx.kernel orelse return .{ .failure = try ctx.allocator.dupe(u8, "kernel is unavailable in this host") };
     const input = erased.as(Input);
-    session.python_lock.lockUncancelable(io_mod.getIo());
-    const existing = session.python;
-    session.python_lock.unlock(io_mod.getIo());
-    if (existing == null and input.action != .execute and input.action != .prewarm) {
-        return .{ .success = try ctx.allocator.dupe(u8, "Python kernel: idle (starts on first execution)") };
-    }
-    const manager = existing orelse ensureManager(session, ctx.lifecycle_allocator, ctx.workspace_root, ctx.terminal_owner_session_id) catch |err|
+    const owner: kernel.Owner = .{ .cwd = ctx.workspace_root, .session_id = ctx.terminal_owner_session_id };
+    if (input.action != .execute) return control(ctx, slot, owner, std.meta.stringToEnum(kernel.Action, @tagName(input.action)).?);
+    const manager = slot.ensure(ctx.lifecycle_allocator, owner) catch |err|
         return .{ .failure = try ctx.allocator.print("Kernel initialization failed: {s}", .{@errorName(err)}) };
-    switch (input.action) {
-        .status => return .{ .success = try ctx.allocator.print("Python kernel: {t}", .{manager.status()}) },
-        .interrupt => {
-            manager.interrupt();
-            return .{ .success = try ctx.allocator.dupe(u8, "Interrupt requested; the current cell remains busy until Python finishes handling it.") };
-        },
-        .stop => {
-            manager.stop(true);
-            return .{ .success = try ctx.allocator.dupe(u8, if (manager.persist)
-                "Python kernel stopped. Saved globals will be restored on the next execution; live tasks and open resources are closed."
-            else
-                "Python kernel stopped. This unsaved session does not keep snapshots; the next execution has an empty namespace.") };
-        },
-        .restart => {
-            manager.restart();
-            return .{ .success = try ctx.allocator.dupe(u8, if (manager.persist)
-                "Python kernel discarded without a final snapshot. The next execution starts fresh and restores the last saved globals; unsaved changes, tasks and open resources are lost."
-            else
-                "Python kernel discarded. The next execution has an empty namespace; this unsaved session does not keep snapshots.") };
-        },
-        .prewarm => {
-            manager.prewarm() catch |err| return .{ .failure = try ctx.allocator.print("Kernel prewarm failed: {s}", .{@errorName(err)}) };
-            return .{ .success = try ctx.allocator.dupe(u8, "Python kernel startup requested in the background. Execute joins the same startup; status reports its state.") };
-        },
-        .execute => {},
-    }
     var output = Output{ .ctx = ctx };
     const result = manager.execute(ctx.allocator, input.code.?, .{
         .cancel = ctx.cancel_flag,
@@ -135,6 +80,27 @@ pub fn call(ctx: dispatch.DispatchContext, erased: dispatch.ToolInput) dispatch.
     defer result.deinit(ctx.allocator);
     const text = result.text(ctx.allocator) catch return error.OutOfMemory;
     return if (result.status == .ok) .{ .success = text } else .{ .failure = text };
+}
+
+fn control(ctx: dispatch.DispatchContext, slot: *kernel.Slot, owner: kernel.Owner, action: kernel.Action) dispatch.DispatchError!dispatch.ToolResult {
+    const state = slot.control(ctx.lifecycle_allocator, owner, action) catch |err|
+        return .{ .failure = try ctx.allocator.print("Kernel {t} failed: {s}", .{ action, @errorName(err) }) };
+    if (state == null) return .{ .success = try ctx.allocator.dupe(u8, "Python kernel: idle (starts on first execution)") };
+    // The first owner decided persistence when it created the kernel.
+    const persist = slot.current().?.persist;
+    return .{ .success = try switch (action) {
+        .status => ctx.allocator.print("Python kernel: {t}", .{state.?}),
+        .interrupt => ctx.allocator.dupe(u8, "Interrupt requested; the current cell remains busy until Python finishes handling it."),
+        .stop => ctx.allocator.dupe(u8, if (persist)
+            "Python kernel stopped. Saved globals will be restored on the next execution; live tasks and open resources are closed."
+        else
+            "Python kernel stopped. This unsaved session does not keep snapshots; the next execution has an empty namespace."),
+        .restart => ctx.allocator.dupe(u8, if (persist)
+            "Python kernel discarded without a final snapshot. The next execution starts fresh and restores the last saved globals; unsaved changes, tasks and open resources are lost."
+        else
+            "Python kernel discarded. The next execution has an empty namespace; this unsaved session does not keep snapshots."),
+        .prewarm => ctx.allocator.dupe(u8, "Python kernel startup requested in the background. Execute joins the same startup; status reports its state."),
+    } };
 }
 
 test "kernel action decoding distinguishes inspection from execution" {

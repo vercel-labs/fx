@@ -105,10 +105,10 @@ fn command(alloc: Allocator, argv: []const []const u8, cancel: Cancellation, tim
     var reader: std.Io.File.MultiReader = undefined;
     reader.init(alloc, io, storage.toStreams(), &.{ child.stdout.?, child.stderr.? });
     defer reader.deinit();
-    const deadline = now() + timeout_ms;
+    const deadline = io_mod.monotonicMilliTimestamp() + timeout_ms;
     while (true) {
         try cancel.check();
-        if (now() >= deadline) return error.KernelSetupTimedOut;
+        if (io_mod.monotonicMilliTimestamp() >= deadline) return error.KernelSetupTimedOut;
         reader.fill(4096, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch |err| switch (err) {
             error.Timeout => continue,
             error.EndOfStream => break,
@@ -120,8 +120,4 @@ fn command(alloc: Allocator, argv: []const []const u8, cancel: Cancellation, tim
     }
     try reader.checkAnyError();
     return (try child.wait(io)).success();
-}
-
-fn now() i64 {
-    return @intCast(@divFloor(std.Io.Timestamp.now(io_mod.getIo(), .awake).nanoseconds, std.time.ns_per_ms));
 }

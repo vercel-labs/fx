@@ -16,7 +16,7 @@ const session_store = @import("../session/session_store.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const types = @import("../shared/types.zig");
 
-const python_kernel = @import("../kernel/kernel.zig");
+const python_kernel = @import("../kernel/slot.zig");
 const Allocator = std.mem.Allocator;
 
 pub const StartResult = enum { started, already_running };
@@ -110,7 +110,7 @@ pub const Owner = struct {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         if (self.kernels.getPtr(child_id)) |manager| {
-            turn.runtime.python = manager.*;
+            turn.runtime.kernel.manager = manager.*;
             manager.* = null;
             return;
         }
@@ -122,8 +122,8 @@ pub const Owner = struct {
     fn retainKernel(self: *Owner, child_id: []const u8, turn: *execution.TurnContext) void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        self.kernels.getPtr(child_id).?.* = turn.runtime.python;
-        turn.runtime.python = null;
+        self.kernels.getPtr(child_id).?.* = turn.runtime.kernel.manager;
+        turn.runtime.kernel.manager = null;
     }
 
     fn feedbackReplayLocked(self: *Owner, operation_id: []const u8, fingerprint: [32]u8) ?FeedbackResult {

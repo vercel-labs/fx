@@ -24,13 +24,16 @@
 # This software is a port of the Prime Agent TypeScript product, originally
 # Copyright (c) 2025 Mario Zechner, used under the MIT License.
 #
-# Adapted for proto-fx: kernel mechanics only; runtime tools are intentionally absent.
+# Adapted for proto-fx: kernel mechanics only. Runtime tools, display and
+# host-request hooks, name listing, the snapshot manifest, pruning, legacy
+# snapshot restore, and Windows support are removed.
 
 """Minimal CPython REPL runtime speaking newline-delimited JSON over stdio.
 
 Entry point: ``python -u runtime.py``. A dedicated JSONL channel carries
-execute, interrupt, snapshot, restore, list_names and shutdown requests. Cells execute with top-level await in one persistent
-``__main__`` namespace on a single asyncio event loop.
+execute, interrupt, snapshot, restore and shutdown requests. Cells execute
+with top-level await in one persistent ``__main__`` namespace on a single
+asyncio event loop. Only macOS and Linux are supported.
 """
 
 from __future__ import annotations
@@ -39,7 +42,6 @@ import ast
 import asyncio
 import codecs
 import contextvars
-import ctypes
 import functools
 import inspect
 import io
@@ -61,13 +63,12 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 
-DEFAULT_SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024
-DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES = 16 * 1024 * 1024
+_SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024
+_SNAPSHOT_MAX_VARIABLE_BYTES = 16 * 1024 * 1024
 
-# Plain ASCII, never a pickle start: _restore_state sniffs it to tell v2 framed
-# payloads from legacy (single dill-pickled dict) ones.
+# Every snapshot starts with this header; a file without it is not restored.
 _SNAPSHOT_MAGIC = b"PROTO-FX-KERNEL-SNAPSHOT-V2\n"
 
 # Stream writes must fit one protocol frame: the host buffers whole lines
@@ -78,19 +79,15 @@ _STREAM_FRAME_TEXT_CAP = 64 * 1024
 # bounds a pathological repr or exception text in transit.
 _RESULT_TEXT_CAP = 1_048_576
 _RESULT_TRUNCATION_MARKER = f"\n[... result truncated at {_RESULT_TEXT_CAP} characters ...]"
-# Oversized display and host_request payloads fail the cell instead of wedging host memory.
-_PAYLOAD_CAP = 16 * 1024 * 1024
 
 # Names the session bootstrap re-creates on every start; never snapshotted.
-_ALWAYS_SKIP = {"asyncio", "In", "Out", "get_ipython", "exit", "quit", "open"}
-# IPython-injected names that may appear in a snapshot payload; never restored.
-_RESTORE_SKIP = {"In", "Out", "get_ipython"}
-# The target of the last successful snapshot, remembered so an EOF shutdown
+_ALWAYS_SKIP = {"asyncio", "exit", "quit", "open"}
+# The path of the last successful snapshot, remembered so an EOF shutdown
 # (the host process died without a graceful dispose) can flush the final
 # namespace before exit. `None` until this process has committed a snapshot:
 # an EOF before that must not overwrite the on-disk payload with a namespace
 # the host never considered durable.
-_last_snapshot_target: dict[str, Any] | None = None
+_last_snapshot_path: str | None = None
 
 _protocol_fd: int = -1
 # The host's stderr before _setup_fds captures fd 2: the only channel that can
@@ -101,18 +98,9 @@ _loop: asyncio.AbstractEventLoop | None = None
 _serve_task: asyncio.Task[Any] | None = None
 
 
-class _CellExecution:
-    def __init__(self) -> None:
-        self.finished = asyncio.Event()
-        self.owner: asyncio.Task[Any] | None = None
-
-
 # Asyncio tasks copy cell context at creation, so detached tasks retain their
-# output attribution and completion barrier. Threads start with a fresh context.
+# output attribution. Threads start with a fresh context.
 _current_cell: contextvars.ContextVar[str | None] = contextvars.ContextVar("_current_cell", default=None)
-_current_cell_execution: contextvars.ContextVar[_CellExecution | None] = contextvars.ContextVar(
-    "_current_cell_execution", default=None
-)
 _active: dict[str, Any] = {"task": None, "rid": None, "interrupted": False}
 _cell_counter = 0
 # Interrupt bookkeeping shared between the reader thread and the loop thread.
@@ -137,57 +125,6 @@ def _send(event: dict[str, Any]) -> None:
                 os.write(_host_stderr_fd, f"proto_fx_kernel: dropped protocol frame: {err}\n".encode())
             except OSError:
                 pass
-
-
-def _check_payload(event: str, data: dict[str, Any]) -> None:
-    """Fail the calling cell when a `data` payload would not fit one protocol frame.
-
-    Strict-dumps validation: default allow_nan=True would let NaN/Infinity
-    serialize as non-JSON text and tear the host's protocol framing (a
-    non-serializable value raises TypeError here before any bytes are
-    written, so NaN is the only corruption vector). The encoded length
-    enforces the frame cap; _send re-serializes.
-    """
-    if len(json.dumps(data, allow_nan=False)) > _PAYLOAD_CAP:
-        raise ValueError(f"{event} payload exceeds the {_PAYLOAD_CAP}-character frame cap")
-
-
-def emit(data: dict[str, Any]) -> None:
-    """Ship one display event carrying a dict of MIME type -> JSON payload.
-
-    Thread-safe; the event is tagged with the cell running at call time.
-    """
-    if not isinstance(data, dict) or not data or not all(isinstance(k, str) for k in data):
-        raise TypeError("emit() requires a non-empty dict keyed by MIME type strings")
-    _check_payload("display", data)
-    _send({"event": "display", "id": _current_cell.get(), "data": data})
-
-
-def is_active() -> bool:
-    """True when this process serves the repl protocol (not merely imported)."""
-    return _protocol_fd >= 0
-
-
-def current_cell_completion_context() -> tuple[asyncio.Event, asyncio.Task[Any] | None] | None:
-    """Return the calling cell's completion barrier and owning execution task."""
-    execution = _current_cell_execution.get()
-    if execution is None:
-        return None
-    return execution.finished, execution.owner
-
-
-def active_cell_task() -> asyncio.Task[Any] | None:
-    """The cell body task executing right now, or None between cells (global
-    state, not the cell contextvar — detached tasks keep stale context copies)."""
-    with _interrupt_lock:
-        task = _active["task"]
-    return task if isinstance(task, asyncio.Task) and not task.done() else None
-
-
-
-
-
-
 
 
 class _Pump:
@@ -412,7 +349,6 @@ def _request_interrupt(target: str | None) -> None:
     """
     global _sigint_target
     with _interrupt_lock:
-        task = _active["task"]
         rid = _active["rid"]
         if rid is not None and (target is None or target == rid):
             # Active, or in the done-task handoff before _run_guarded's finally:
@@ -430,25 +366,11 @@ def _request_interrupt(target: str | None) -> None:
             return
         else:
             return
-    # SIGINT must land on the main thread, where cells execute. Windows has no
-    # signal.pthread_kill: fall back to cancelling the active task on the loop
-    # (sync-blocked cells and the finishing repr/drain cannot be broken there;
-    # best-effort parity).
-    if hasattr(signal, "pthread_kill"):
-        signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
-        if _loop is not None:
-            # Wake the selector so a cancel scheduled by the handler runs promptly.
-            _loop.call_soon_threadsafe(lambda: None)
-        return
+    # SIGINT must land on the main thread, where cells execute.
+    signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
     if _loop is not None:
-
-        def cancel_active() -> None:
-            current = _active["task"]
-            if current is task and current is not None and not current.done():
-                _active["interrupted"] = True
-                current.cancel()
-
-        _loop.call_soon_threadsafe(cancel_active)
+        # Wake the selector so a cancel scheduled by the handler runs promptly.
+        _loop.call_soon_threadsafe(lambda: None)
 
 
 def _consume_pending_interrupt(rid: str) -> bool:
@@ -636,14 +558,11 @@ async def _handle_execute(req: dict[str, Any], ns: dict[str, Any]) -> None:
     cell_id = req["id"]
     _cell_counter += 1
     filename = f"<cell-{_cell_counter}>"
-    execution = _CellExecution()
     cell_token = _current_cell.set(cell_id)
-    execution_token = _current_cell_execution.set(execution)
     try:
         codes, has_trailing = _compile_cell(req["code"], filename)
         assert _loop is not None
         task = _loop.create_task(_run_codes(codes, ns))
-        execution.owner = task
         status, value, error = await _run_guarded(task, cell_id)
         result_text: str | None = None
         try:
@@ -670,9 +589,6 @@ async def _handle_execute(req: dict[str, Any], ns: dict[str, Any]) -> None:
             _send(error)
         _send({"event": "done", "id": cell_id, "status": status})
     finally:
-        execution.owner = None
-        execution.finished.set()
-        _current_cell_execution.reset(execution_token)
         _current_cell.reset(cell_token)
 
 
@@ -709,7 +625,7 @@ class _CappedWriter:
         return size
 
 
-def _read_snapshot_records(fh: Any, max_bytes: int, max_variable_bytes: int) -> dict[str, bytes]:
+def _read_snapshot_records(fh: Any) -> dict[str, bytes]:
     """Framing damage is a corrupt snapshot: a restore error, never a partial namespace.
     Length fields are bounds-checked before their reads, so a corrupt header cannot force a huge
     allocation; the writer's own per-record and aggregate caps bound every blob read, so a
@@ -730,17 +646,17 @@ def _read_snapshot_records(fh: Any, max_bytes: int, max_variable_bytes: int) -> 
         # corrupt or sparse snapshot declaring a multi-gigabyte name must
         # fail the cap BEFORE the read allocates it (the same OOM class
         # the blob caps close).
-        if name_len > max_bytes:
+        if name_len > _SNAPSHOT_MAX_BYTES:
             raise ValueError("snapshot record name exceeds the aggregate byte cap")
         name = fh.read(name_len)
         raw_len = fh.read(8)
         blob_len = int.from_bytes(raw_len, "little")
         if len(raw_len) < 8 or fh.tell() + blob_len > size:
             raise ValueError("truncated snapshot record")
-        if blob_len > max_variable_bytes:
+        if blob_len > _SNAPSHOT_MAX_VARIABLE_BYTES:
             raise ValueError("snapshot record exceeds the per-variable byte cap")
         total += blob_len
-        if total > max_bytes:
+        if total > _SNAPSHOT_MAX_BYTES:
             raise ValueError("snapshot payload exceeds the aggregate byte cap")
         blob = fh.read(blob_len)
         if len(blob) < blob_len:
@@ -752,14 +668,8 @@ def _read_snapshot_records(fh: Any, max_bytes: int, max_variable_bytes: int) -> 
 def _snapshot_state(
     ns: dict[str, Any],
     path: str,
-    manifest_path: str,
-    max_bytes: int,
-    max_variable_bytes: int,
-    prune_oversized: bool,
     committed: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    import datetime
-
     try:
         import dill
     except Exception as err:  # noqa: BLE001 - dill is provisioned by the host, not a hard dep
@@ -768,48 +678,26 @@ def _snapshot_state(
 
     saved: list[str] = []
     skipped: list[dict[str, str]] = []
-    oversized: list[str] = []
     missing = object()
 
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    temps: list[str] = []
-
-    def stage_temp(target: str, mode: str):
-        # Unique same-directory temps: a fixed '.tmp' name could alias the other
-        # final path (clobbering it) or collide with a concurrent snapshot.
-        fd, name = tempfile.mkstemp(
-            dir=os.path.dirname(target) or ".", prefix=os.path.basename(target) + ".", suffix=".tmp"
-        )
-        temps.append(name)
-        try:
-            return os.fdopen(fd, mode), name
-        except BaseException:
-            os.close(fd)  # fdopen never took ownership: the raw fd would leak
-            raise
-
-    def discard_temps() -> None:
-        for stale in temps:
-            try:
-                os.remove(stale)
-            except OSError:
-                pass
-
-    # Stage both temps before replacing anything: any failure up to the first
-    # replace leaves the previous payload+manifest pair fully intact.
-    stage = "write"
-    parked: list[int] = []
+    # A unique same-directory temp: a fixed '.tmp' name could collide with a
+    # concurrent snapshot, and the same directory keeps the final rename atomic.
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=os.path.basename(path) + ".", suffix=".tmp")
+    result: dict[str, Any] | None = None
     handler_installed = False
     previous = None
     try:
         try:
-            if max_bytes < len(_SNAPSHOT_MAGIC):
-                # Even the header alone busts the cap: keep the committed-payload <= cap invariant.
-                return {"error": "write failed: snapshot exceeds aggregate snapshot size cap"}
-            fh, tmp = stage_temp(path, "wb")
+            try:
+                fh = os.fdopen(fd, "wb")
+            except BaseException:
+                os.close(fd)  # fdopen never took ownership: the raw fd would leak
+                raise
             with fh:
                 # Single pass: each variable is dill-serialized exactly once, streamed
                 # into the staged temp. The record header is charged against the aggregate
-                # cap up front, so a completed record can never overflow it (no prefix re-dump).
+                # cap up front, so a completed record can never overflow it.
                 total = fh.write(_SNAPSHOT_MAGIC)
                 for name in list(ns.keys()):
                     if name.startswith("_") or name in _ALWAYS_SKIP:
@@ -823,33 +711,22 @@ def _snapshot_state(
                         encoded = name.encode("utf-8")
                     except UnicodeEncodeError as err:
                         # A lone-surrogate name (e.g. "\ud800") cannot ride the
-                        # v2 record header; skip it like any other unserializable
+                        # record header; skip it like any other unserializable
                         # name instead of failing the whole snapshot.
                         skipped.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
                         continue
                     # Record header: 4-byte name length + 8-byte blob length, plus the name itself.
-                    budget = max_bytes - total - 12 - len(encoded)
-                    # Prune mode measures at the full per-variable cap: only that cap decides
-                    # pruned-ness, and the write always re-measures — in-place mutation
-                    # defeats any name-based size tracking from an earlier dump.
-                    limit = max_variable_bytes if prune_oversized else min(max_variable_bytes, budget)
+                    budget = _SNAPSHOT_MAX_BYTES - total - 12 - len(encoded)
                     buffer = io.BytesIO()
                     try:
-                        dill.dump(value, _CappedWriter(buffer, limit))
+                        dill.dump(value, _CappedWriter(buffer, min(_SNAPSHOT_MAX_VARIABLE_BYTES, budget)))
                         blob = buffer.getvalue()
                     except _SnapshotSizeLimitExceeded:
-                        if not prune_oversized and budget < max_variable_bytes:
-                            skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
-                        else:
-                            skipped.append({"name": name, "reason": "exceeds per-variable snapshot size cap"})
-                            oversized.append(name)
+                        cap = "aggregate" if budget < _SNAPSHOT_MAX_VARIABLE_BYTES else "per-variable"
+                        skipped.append({"name": name, "reason": f"exceeds {cap} snapshot size cap"})
                         continue
                     except Exception as err:  # noqa: BLE001 - one unpicklable name must not abort the snapshot
                         skipped.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
-                        continue
-                    if total + 12 + len(encoded) + len(blob) > max_bytes:
-                        # Only reachable in prune mode, where the measurement cap ignores the budget.
-                        skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
                         continue
                     fh.write(len(encoded).to_bytes(4, "little"))
                     fh.write(encoded)
@@ -858,59 +735,37 @@ def _snapshot_state(
                     total += 12 + len(encoded) + len(blob)
                     saved.append(name)
                 saved.sort()
-                pruned = sorted(name for name in oversized if name in ns) if prune_oversized else []
-                manifest = {
-                    "version": 1,
-                    "savedNames": saved,
-                    "skipped": skipped,
-                    "pruned": pruned,
-                    "bytes": total,
-                    "pythonVersion": sys.version.split()[0],
-                    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                }
-                stage = "manifest write"
-                fh, manifest_tmp = stage_temp(manifest_path, "w")
-                with fh:
-                    json.dump(manifest, fh)
         except BaseException as err:  # noqa: BLE001 - Exception -> error dict, rest propagates
             if not isinstance(err, Exception):
                 raise  # e.g. KeyboardInterrupt: clean up (outer finally), then propagate
-            return {"error": f"{stage} failed: {err}"}
+            return {"error": f"write failed: {err}"}
 
-        # A SIGINT-raised KeyboardInterrupt anywhere from the first commit through the
-        # last cleanup removal would desync payload/manifest/namespace or misreport a
-        # committed snapshot: park SIGINT until the end; it is consumed, see below.
-        previous = signal.signal(signal.SIGINT, lambda signum, frame: parked.append(signum))
+        # A SIGINT-raised KeyboardInterrupt between the commit and publishing the
+        # result would misreport a committed snapshot as failed: park SIGINT until
+        # the end. The parked interrupt is consumed, not re-raised: it targeted this
+        # now-complete request.
+        previous = signal.signal(signal.SIGINT, lambda signum, frame: None)
         handler_installed = True
         try:
             os.replace(tmp, path)
         except OSError as err:
             return {"error": f"write failed: {err}"}
-        try:
-            os.replace(manifest_tmp, manifest_path)
-        except OSError as err:
-            # Fail before the prune deletions so a bad manifest path never destroys state.
-            return {"error": f"manifest write failed: {err}"}
-        for name in pruned:
-            ns.pop(name, None)
-        result = {"saved": saved, "skipped": skipped, "pruned": pruned, "bytes": total}
+        result = {"saved": saved, "skipped": skipped, "bytes": total}
         # Publish while still parked: a later KeyboardInterrupt into this task finds the committed result (see _handle_state).
         if committed is not None:
             committed.append(result)
     finally:
-        # The one guaranteed cleanup point (unique owned names: after a successful
-        # commit the renamed temps no longer exist, so this is a no-op). It runs with
-        # SIGINT still parked; the nested finally makes the restore the guaranteed
-        # last action even when cleanup itself fails.
+        # The nested finally makes the handler restore the guaranteed last action
+        # even when removing the uncommitted temp fails.
         try:
-            discard_temps()
+            if result is None:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
         finally:
             if handler_installed:
                 signal.signal(signal.SIGINT, previous)
-                # The parked SIGINT is consumed, not re-raised: with the manifest committed and
-                # the namespace pruned, the destructive snapshot has succeeded, and re-raising
-                # would misreport it as failed and risk the host discarding the only copy of
-                # the pruned variables. The interrupt targeted this now-complete request.
     return result
 
 
@@ -1019,7 +874,7 @@ def _revive_with_live_globals(
     if backfill is not None:
         for name, dep in value.__globals__.items():
             # Snapshots never save _-prefixed or skip-listed names; backfill must not smuggle them past that policy.
-            if name in ns or name.startswith("_") or name in _ALWAYS_SKIP or name in _RESTORE_SKIP:
+            if name in ns or name.startswith("_") or name in _ALWAYS_SKIP:
                 continue
             backfill.append((name, revive(dep)))
     if value.__defaults__:
@@ -1077,8 +932,6 @@ def _restore_state(
     ns: dict[str, Any],
     path: str,
     committed: list[dict[str, Any]] | None = None,
-    max_bytes: int | None = None,
-    max_variable_bytes: int | None = None,
 ) -> dict[str, Any]:
     if not os.path.exists(path):
         return {"restored": [], "failed": [], "reason": "snapshot not found"}
@@ -1089,30 +942,15 @@ def _restore_state(
     unpickler = _snapshot_unpickler(dill)
     try:
         with open(path, "rb") as fh:
-            if fh.read(len(_SNAPSHOT_MAGIC)) == _SNAPSHOT_MAGIC:
-                payload = _read_snapshot_records(
-                    fh,
-                    max_bytes if max_bytes is not None else DEFAULT_SNAPSHOT_MAX_BYTES,
-                    (
-                        max_variable_bytes
-                        if max_variable_bytes is not None
-                        else DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES
-                    ),
-                )
-            else:
-                # Legacy: one dill-pickled dict; old snapshot files must keep restoring.
-                fh.seek(0)
-                payload = unpickler(fh).load()
+            if fh.read(len(_SNAPSHOT_MAGIC)) != _SNAPSHOT_MAGIC:
+                return {"error": "load failed: unsupported snapshot format"}
+            payload = _read_snapshot_records(fh)
     except Exception as err:  # noqa: BLE001 - a corrupt snapshot yields an empty restore
         return {"error": f"load failed: {_safe_str(err)}"}
-    if not isinstance(payload, dict):
-        return {"error": "corrupt snapshot: not a dict"}
 
     staged: dict[str, Any] = {}
     failed: list[dict[str, str]] = []
     for name, blob in payload.items():
-        if name in _RESTORE_SKIP:
-            continue
         try:
             staged[name] = unpickler(io.BytesIO(blob)).load()
         except Exception as err:  # noqa: BLE001 - revive every other name regardless
@@ -1158,35 +996,8 @@ async def _handle_state(req: dict[str, Any], ns: dict[str, Any]) -> None:
 
     async def run() -> dict[str, Any]:
         if req["type"] == "snapshot":
-            prune = req.get("prune_oversized", False)
-            if not isinstance(prune, bool):
-                return {"error": "prune_oversized must be a boolean"}
-            for field in ("max_bytes", "max_variable_bytes"):
-                # Any present value must be a non-negative int; a JSON null is not a valid way to ask
-                # for the default, and a negative cap would prune every user variable from ns.
-                if field in req and (
-                    isinstance(req[field], bool) or not isinstance(req[field], int) or req[field] < 0
-                ):
-                    return {"error": f"{field} must be a non-negative integer"}
-            # realpath resolves symlinks, so aliased paths cannot silently clobber the payload.
-            if os.path.realpath(req["path"]) == os.path.realpath(req["manifest_path"]):
-                return {"error": "path and manifest_path must differ"}
-            return _snapshot_state(
-                ns,
-                req["path"],
-                req["manifest_path"],
-                req.get("max_bytes", DEFAULT_SNAPSHOT_MAX_BYTES),
-                req.get("max_variable_bytes", DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES),
-                prune,
-                committed,
-            )
-        return _restore_state(
-            ns,
-            req["path"],
-            committed,
-            req.get("max_bytes", DEFAULT_SNAPSHOT_MAX_BYTES),
-            req.get("max_variable_bytes", DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES),
-        )
+            return _snapshot_state(ns, req["path"], committed)
+        return _restore_state(ns, req["path"], committed)
 
     assert _loop is not None
     task = _loop.create_task(run())
@@ -1231,13 +1042,8 @@ async def _handle_state(req: dict[str, Any], ns: dict[str, Any]) -> None:
         _send({"event": "done", "id": rid, "status": "error", "reason": result["error"]})
         return
     if req["type"] == "snapshot":
-        global _last_snapshot_target
-        _last_snapshot_target = {
-            "path": req["path"],
-            "manifest_path": req["manifest_path"],
-            "max_bytes": req.get("max_bytes", DEFAULT_SNAPSHOT_MAX_BYTES),
-            "max_variable_bytes": req.get("max_variable_bytes", DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES),
-        }
+        global _last_snapshot_path
+        _last_snapshot_path = req["path"]
     _send({"event": "done", "id": rid, "status": "ok", **result})
 
 
@@ -1251,35 +1057,12 @@ def _flush_final_snapshot(ns: dict[str, Any]) -> None:
     Atomic staging (temp + rename) means an interrupted flush leaves the
     previous payload intact, never a torn one.
     """
-    target = _last_snapshot_target
-    if target is None:
+    if _last_snapshot_path is None:
         return
     try:
-        _snapshot_state(
-            ns,
-            target["path"],
-            target["manifest_path"],
-            target["max_bytes"],
-            target["max_variable_bytes"],
-            False,
-            None,
-        )
+        _snapshot_state(ns, _last_snapshot_path)
     except BaseException:  # noqa: BLE001 - never block or crash the shutdown path
         pass
-
-
-def _list_names(ns: dict[str, Any]) -> list[str]:
-    """User-defined top-level names, filtered like the snapshot."""
-    # Non-string keys (globals()[1] = 1) are not user-listable names.
-    return sorted(
-        name for name in ns if isinstance(name, str) and not name.startswith("_") and name not in _ALWAYS_SKIP
-    )
-
-
-async def _handle_list_names(req: dict[str, Any], ns: dict[str, Any]) -> None:
-    _send({"event": "done", "id": req["id"], "status": "ok", "names": _list_names(ns)})
-
-
 
 
 async def _handle_request(
@@ -1303,10 +1086,6 @@ async def _handle_request(
         _send({"event": "done", "id": rid, "status": "error"})
 
 
-
-
-
-
 async def _serve(queue: asyncio.Queue[dict[str, Any]], ns: dict[str, Any]) -> None:
     while True:
         req = await queue.get()
@@ -1323,16 +1102,14 @@ async def _serve(queue: asyncio.Queue[dict[str, Any]], ns: dict[str, Any]) -> No
             if isinstance(req.get("id"), str):
                 _send({"event": "done", "id": req["id"], "status": "ok"})
             return
-        handlers = {"execute": _handle_execute, "snapshot": _handle_state,
-                    "restore": _handle_state, "list_names": _handle_list_names}
+        handlers = {"execute": _handle_execute, "snapshot": _handle_state, "restore": _handle_state}
         await _handle_request(handlers[kind], req, ns)
 
 
 _REQUIRED_FIELDS = {
     "execute": ("id", "code"),
-    "snapshot": ("id", "path", "manifest_path"),
+    "snapshot": ("id", "path"),
     "restore": ("id", "path"),
-    "list_names": ("id",),
     "shutdown": (),
 }
 
@@ -1458,34 +1235,8 @@ def _wait_owner_posix(owner: int, initial_ppid: int) -> None:
         wait_for_exit()
 
 
-def _wait_owner_windows(owner: int) -> None:
-    # Blocks until the owner exits. os.kill(pid, 0) on Windows TERMINATES the
-    # target, so a SYNCHRONIZE handle wait is the only sound probe.
-    from ctypes import wintypes
-
-    SYNCHRONIZE = 0x00100000
-    INFINITE = 0xFFFFFFFF
-    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    k32.OpenProcess.restype = wintypes.HANDLE
-    k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-    k32.WaitForSingleObject.restype = wintypes.DWORD
-    k32.CloseHandle.argtypes = [wintypes.HANDLE]
-    k32.CloseHandle.restype = wintypes.BOOL
-    handle = k32.OpenProcess(SYNCHRONIZE, False, owner)
-    if not handle:
-        return  # already gone (or unprobeable): exit rather than run ownerless
-    try:
-        k32.WaitForSingleObject(handle, INFINITE)
-    finally:
-        k32.CloseHandle(handle)
-
-
 def _owner_watchdog(owner: int, initial_ppid: int) -> None:
-    if os.name == "nt":
-        _wait_owner_windows(owner)
-    else:
-        _wait_owner_posix(owner, initial_ppid)
+    _wait_owner_posix(owner, initial_ppid)
     # Event-loop-independent by design: a synchronous cell monopolizes the
     # loop, so the queued EOF shutdown can never run; hard-exit from here.
     os._exit(1)
@@ -1531,9 +1282,6 @@ def main() -> None:
     stdin_fd = _setup_fds()
     _start_owner_watchdog()
 
-    # Alias the executing module so an in-cell `from proto_fx_kernel import emit`
-    # binds the live module, not a second copy.
-    sys.modules.setdefault("proto_fx_kernel", sys.modules[__name__])
     # A real __main__ module makes dill pickle user functions/classes by value.
     user_module = types.ModuleType("__main__")
     user_module.__dict__["__builtins__"] = __builtins__

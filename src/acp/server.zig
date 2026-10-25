@@ -1035,32 +1035,14 @@ pub const PersistentHost = struct {
     pub const KernelInfo = struct { state: []const u8, diagnostics: []u8 };
 
     /// Human recovery controls use the same session-owned process as the tool.
-    pub fn kernelControl(self: *PersistentHost, alloc: Allocator, action: []const u8) !KernelInfo {
-        const kernel = @import("../core/kernel/kernel.zig");
-        const paths = @import("../core/shared/profile_paths.zig");
+    pub fn kernelControl(self: *PersistentHost, alloc: Allocator, action_name: []const u8) !KernelInfo {
+        const kernel = @import("../core/kernel/slot.zig");
         const active = if (self.state.active_session) |*session| session else return error.NoActiveSession;
-        const status_only = std.mem.eql(u8, action, "status");
-        const interrupt_only = std.mem.eql(u8, action, "interrupt");
-        const stop = std.mem.eql(u8, action, "stop");
-        const restart = std.mem.eql(u8, action, "restart");
-        const prewarm = std.mem.eql(u8, action, "prewarm");
-        if (!status_only and !interrupt_only and !stop and !restart and !prewarm) return error.InvalidKernelAction;
-        if (!status_only and !interrupt_only and self.busy()) return error.SessionBusy;
-        const runtime = &active.session_rt;
-        runtime.python_lock.lockUncancelable(io_mod.getIo());
-        defer runtime.python_lock.unlock(io_mod.getIo());
-        if (runtime.python == null and (restart or prewarm)) {
-            const home = self.state.cfg.home_override orelse io_mod.homeDir() orelse return error.HomeUnavailable;
-            const artifacts = try std.Io.Dir.path.join(alloc, &.{ home, paths.root_dir_name, "kernels", active.session_id });
-            defer alloc.free(artifacts);
-            runtime.python = try kernel.Manager.create(self.state.alloc, .{ .cwd = active.workspace_root, .artifact_dir = artifacts });
-        }
-        const manager = runtime.python orelse return .{ .state = "uninitialized", .diagnostics = try alloc.dupe(u8, "") };
-        if (interrupt_only) manager.interrupt();
-        if (stop) manager.stop(true);
-        if (restart) manager.restart();
-        if (prewarm) try manager.prewarm();
-        return .{ .state = @tagName(manager.status()), .diagnostics = try manager.diagnostics(alloc) };
+        const action = std.meta.stringToEnum(kernel.Action, action_name) orelse return error.InvalidKernelAction;
+        if (action != .status and action != .interrupt and self.busy()) return error.SessionBusy;
+        const slot = &active.session_rt.kernel;
+        const state = try slot.control(self.state.alloc, .{ .cwd = active.workspace_root, .session_id = active.session_id }, action);
+        return .{ .state = if (state) |value| @tagName(value) else "uninitialized", .diagnostics = try slot.diagnostics(alloc) };
     }
 
     pub fn deinit(self: *PersistentHost) void {

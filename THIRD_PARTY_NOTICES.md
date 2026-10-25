@@ -130,4 +130,4 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 This software is a port of the Prime Agent TypeScript product, originally
 Copyright (c) 2025 Mario Zechner, used under the MIT License.
 
-Adapted for proto-fx: kernel mechanics only; runtime tools are intentionally absent.
+Adapted for proto-fx: kernel mechanics only. Runtime tools, display and host-request hooks, name listing, the snapshot manifest, pruning, legacy snapshot restore, and Windows support are removed.
