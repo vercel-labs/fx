@@ -528,7 +528,7 @@ pub const Daemon = struct {
             return err;
         };
         defer store.deinit(self.alloc);
-        session_adapter.deleteSession(&store, self.alloc, owned_id) catch |err| switch (err) {
+        session_adapter.deleteSession(&store, owned_id) catch |err| switch (err) {
             // A session that never reached the disk has no history left to
             // remove; the live row is already gone.
             error.SessionNotFound => {},
