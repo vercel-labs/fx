@@ -3088,6 +3088,8 @@ pub fn compactNow(state: *server.ServerState, alloc: Allocator) !ManualCompactio
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
 
+    // The commit effect allocates the history the session adopts with the
+    // context's allocator, so it must outlive this call: never the arena.
     var ctx = AcpContext{
         .alloc = alloc,
         .state = state,
