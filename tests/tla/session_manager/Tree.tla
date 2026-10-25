@@ -15,8 +15,17 @@
 (* descendant alive.                                                       *)
 (*                                                                         *)
 (* The node universe is fixed: r is the root; a, b, c form a chain below  *)
-(* it to depth 3; s is a second child of r, which may run beside a; d     *)
-(* would sit under c at depth 4, which the policy refuses.                 *)
+(* it to depth 3; s is a second child of r, which may run beside a, and  *)
+(* t is s's child; d would sit under c at depth 4, which the policy       *)
+(* refuses. With MaxNodes = 4 the budget, not the depth limit, is what    *)
+(* stops a, b, c, s, t, and the depth limit, not the budget, is what      *)
+(* stops a, b, c, d, so each rule is the one that binds somewhere.        *)
+(*                                                                         *)
+(* Tree.cfg runs two slots, so the siblings a and s contend and a waiting *)
+(* parent's lent slot goes to a sibling's subtree. Tree.mutants.cfg runs  *)
+(* one slot, where two runners at once break SlotsBounded. One tree's     *)
+(* `Slots` stands for the smaller of its tree pool (8) and the process    *)
+(* pool (32); trees sharing the process pool are not modeled.             *)
 (*                                                                         *)
 (* Design: system-design.md D91 and D92. Code: src/core/subagent/tree.zig *)
 (* (SpawnPolicy), slot_pool.zig (Permit), tool_host.zig (runChild,        *)
@@ -27,14 +36,15 @@ EXTENDS Naturals, FiniteSets
 CONSTANTS MaxDepth, MaxNodes, Slots
 
 Root == "r"
-Nodes == {"r", "a", "b", "c", "d", "s"}
+Nodes == {"r", "a", "b", "c", "d", "s", "t"}
 Children == Nodes \ {Root}
 Parent == [n \in Children |->
              CASE n = "a" -> "r"
                [] n = "b" -> "a"
                [] n = "c" -> "b"
                [] n = "d" -> "c"
-               [] n = "s" -> "r"]
+               [] n = "s" -> "r"
+               [] n = "t" -> "s"]
 
 RECURSIVE Depth(_)
 Depth(n) == IF n = Root THEN 0 ELSE 1 + Depth(Parent[n])
