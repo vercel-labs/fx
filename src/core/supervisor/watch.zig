@@ -130,7 +130,7 @@ pub const Watchers = struct {
         defer self.mutex.unlock(io_mod.getIo());
         const watcher = self.find(conn) orelse return;
         switch (topic) {
-            .session, .list => {},
+            .session, .list, .stopped => {},
             .children => watcher.children = null,
             .child => if (watcher.child) |*cursor| {
                 cursor.deinit(alloc);

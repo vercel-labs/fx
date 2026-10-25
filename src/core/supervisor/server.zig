@@ -429,6 +429,22 @@ pub const Daemon = struct {
         self.connections.appendAssumeCapacity(conn);
     }
 
+    /// Tells every client the stop is intentional, then closes the
+    /// connections. A client that does not read within a second is cut off.
+    fn closeConnections(self: *Daemon) void {
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        for (self.connections.items) |conn| {
+            conn.push(arena_state.allocator(), .stopped, "{\"ok\":true}") catch {};
+            conn.channel.finish();
+        }
+        const deadline = io_mod.milliTimestamp() + 1_000;
+        for (self.connections.items) |conn| {
+            while (!conn.done.load(.acquire) and io_mod.milliTimestamp() < deadline) io_mod.sleep(10 * std.time.ns_per_ms);
+        }
+        self.reapConnections(true);
+    }
+
     /// Joins the threads of connections that ended, or of every connection
     /// once `all` closes them.
     fn reapConnections(self: *Daemon, all: bool) void {
@@ -593,6 +609,6 @@ pub fn run(alloc: Allocator, cfg: acp_config.Config) !void {
     }
     // No request routes after this; then save while the hosts are still
     // open: each live, saved session is owned and reopens on the next start.
-    daemon.reapConnections(true);
+    daemon.closeConnections();
     try daemon.persist();
 }

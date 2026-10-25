@@ -83,6 +83,9 @@ pub const Incoming = union(enum) {
     /// The connection could not open, or closed. Every request sent before
     /// it has no reply coming.
     disconnected: anyerror,
+    /// The supervisor stopped on purpose. The connection does not reopen
+    /// and nothing more arrives.
+    stopped,
     /// A reply (`id` set) or a pushed update (`update` set).
     frame: std.json.Parsed(protocol.ServerFrame),
 
@@ -105,6 +108,8 @@ pub const Connection = struct {
     channel: Channel,
     thread: ?std.Thread = null,
     connected: std.atomic.Value(bool) = .init(false),
+    /// Set by the pump thread when the supervisor announced its stop.
+    stopped: bool = false,
     next_id: u64 = 1,
     inbox_mutex: std.Io.Mutex = .init,
     inbox: std.ArrayList(Incoming) = .empty,
@@ -173,6 +178,11 @@ pub const Connection = struct {
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
         }) catch return;
+        if (parsed.value.update == .stopped) {
+            parsed.deinit();
+            self.stopped = true;
+            return;
+        }
         self.deliver(.{ .frame = parsed });
     }
 
@@ -196,6 +206,9 @@ pub const Connection = struct {
             backoff_ms = 0;
             const ended: anyerror = if (self.channel.pump(stream, self)) |_| error.SupervisorDisconnected else |err| err;
             self.connected.store(false, .release);
+            // An intentional stop stays stopped; only a drop or crash
+            // starts the supervisor again.
+            if (self.stopped) return self.deliver(.stopped);
             if (self.channel.isClosed() and !self.channel.reset()) return;
             self.deliver(.{ .disconnected = ended });
             reported = true;

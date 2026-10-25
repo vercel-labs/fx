@@ -39,6 +39,8 @@ const Link = enum {
     /// wait in case the supervisor restarted.
     resyncing,
     ready,
+    /// The supervisor stopped on purpose; nothing reconnects.
+    stopped,
 };
 pub const State = struct {
     allocator: ?Allocator = null,
@@ -639,6 +641,10 @@ pub fn Runtime(comptime App: type) type {
                 try notice(app, "images", "Image forwarding is not supported by the detached frontend yet. Remove the image attachments before sending; no prompt was submitted.");
                 return false;
             }
+            if (app.remote.link == .stopped) {
+                try app.writeDomainNotice(.{ .topic = "session", .tone = .warning, .body = "Supervisor stopped. Relaunch proto-fx to reconnect." }, true);
+                return false;
+            }
             if (!app.remote.active or app.remote.current_id.len == 0) {
                 try app.writeDomainNotice(.{ .topic = "session", .tone = .warning, .body = "The session is still connecting. Please send again when it is ready." }, true);
                 return false;
@@ -766,6 +772,12 @@ pub fn Runtime(comptime App: type) type {
             for (incoming.items) |item| switch (item) {
                 .connected => try connected(app),
                 .disconnected => |failure| try disconnected(app, failure),
+                .stopped => {
+                    remote.link = .stopped;
+                    dropRequests(app.alloc, &remote.sent);
+                    remote.permission_response_queued = false;
+                    try app.writeDomainNotice(.{ .topic = "session", .tone = .warning, .body = "Supervisor stopped. Relaunch proto-fx to reconnect." }, true);
+                },
                 .frame => |parsed| {
                     const frame = parsed.value;
                     if (frame.id) |id| {
@@ -838,6 +850,7 @@ pub fn Runtime(comptime App: type) type {
                 .list => try applyResponse(app, .list, body),
                 .children => try applyResponse(app, .children, body),
                 .child => try applyResponse(app, .history, body),
+                .stopped => {},
             }
         }
 

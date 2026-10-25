@@ -22,7 +22,7 @@ const Allocator = std.mem.Allocator;
 
 /// Bumped whenever a request or response changes shape. A client refuses a
 /// supervisor that answers `ping` with another version.
-pub const version: u32 = 3;
+pub const version: u32 = 4;
 
 pub const Heartbeat = struct {
     prompt: []const u8 = "",
@@ -69,7 +69,9 @@ pub const Prompt = struct { session_id: []const u8, text: []const u8 };
 pub const SessionRef = struct { session_id: []const u8 };
 
 /// What a connection can watch besides its attached session.
-pub const Topic = enum { session, list, children, child };
+/// `stopped` is not watched: the supervisor sends it to every connection
+/// before an intentional stop, so clients stay down instead of restarting it.
+pub const Topic = enum { session, list, children, child, stopped };
 
 pub const List = struct { watch: bool = false };
 pub const ChildrenRequest = struct { session_id: []const u8, watch: bool = false };
