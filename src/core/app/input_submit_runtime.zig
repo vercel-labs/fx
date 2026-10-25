@@ -8,6 +8,7 @@ const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
 const types = @import("../shared/types.zig");
+const session_backend = @import("session_backend.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
@@ -410,12 +411,10 @@ pub fn SubmitRuntime(comptime App: type) type {
                 "",
                 .{},
             );
-            if (comptime @hasField(App, "remote")) {
-                if (app.remote.active) {
-                    // The detached queue owns the prompt now. It never emits the
-                    // local worker's begin_presented_prompt acknowledgment.
-                    clearPendingSubmissionWithSnapshots(app, "remote_queue_owned", .preserve);
-                }
+            if (!session_backend.Ops(App).agentInProcess(app)) {
+                // The detached queue owns the prompt now. Only an in-process
+                // worker sends the begin_presented_prompt acknowledgment.
+                clearPendingSubmissionWithSnapshots(app, "remote_queue_owned", .preserve);
             }
         }
 
@@ -714,16 +713,6 @@ pub fn SubmitRuntime(comptime App: type) type {
 
             const left_trimmed = std.mem.trimStart(u8, expanded.text, " \t\r\n");
             const resolved_slash_submission = resolvedSlashSubmission(app, left_trimmed);
-            // These detached-runtime commands are not part of the upstream slash registry.
-            // Route them before unknown slash text can become a model prompt.
-            if (comptime @hasField(App, "remote")) if (app.remote.active) {
-                const end = std.mem.findAny(u8, resolved_slash_submission, " \t\r\n") orelse resolved_slash_submission.len;
-                for ([_][]const u8{ "/heartbeat", "/kernel", "/setup", "/teams", "/upgrade", "/subagents", "/effort", "/context" }) |command| {
-                    if (!std.mem.eql(u8, resolved_slash_submission[0..end], command)) continue;
-                    try submitSlashCommand(app, left_trimmed, null, max_prompt_history);
-                    return;
-                }
-            };
             if (knownSlashCommand(app, resolved_slash_submission)) |command| {
                 if (requiresPromptCredential(command, resolved_slash_submission) and !try preflightPrompt(app)) return;
                 try submitSlashCommand(app, left_trimmed, null, max_prompt_history);
@@ -2220,7 +2209,7 @@ const PendingLifecycleFake = struct {
 
     alloc: std.mem.Allocator,
     submission: State = .{},
-    remote: struct { active: bool = false } = .{},
+    backend: session_backend.Kind = .in_process,
     worker: struct {
         held: bool = true,
         release_count: usize = 0,
@@ -2375,7 +2364,7 @@ test "detached submission releases pending ownership for consecutive prompts" {
     const Runtime = SubmitRuntime(PendingLifecycleFake);
     var app = try pendingLifecycleFake(std.testing.allocator, 501);
     defer app.deinit();
-    app.remote.active = true;
+    app.backend = .detached;
 
     for (0..2) |index| {
         if (index != 0) {

@@ -22,6 +22,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const types = @import("../shared/types.zig");
+const session_backend = @import("session_backend.zig");
 const file_index = @import("../workspace/file_index.zig");
 const statusline_identity = @import("../workspace/statusline_identity.zig");
 const activity_runtime = @import("../output/activity_runtime.zig");
@@ -655,8 +656,7 @@ pub fn Runtime(comptime App: type) type {
             const inline_completion =
                 input_completion_runtime.CompletionRuntime(App).visibleInlineCompletion(app);
 
-            const attached_model: ?[]const u8 = if (comptime @hasField(App, "remote")) if (app.remote.active and app.remote.model.len > 0) app.remote.model else null else null;
-            const visible_model = attached_model orelse pending_model orelse provider_runtime.model(app);
+            const visible_model = session_backend.Ops(App).view(app).model orelse pending_model orelse provider_runtime.model(app);
             const visible_capabilities = model_capabilities.resolveForApp(App, app, visible_model);
             const active_capabilities_pending = pending_model == null and app.isModelCacheLoading();
             const model_supports_fast = visible_capabilities.supports_fast_mode;
@@ -736,7 +736,8 @@ pub fn Runtime(comptime App: type) type {
                     (if (comptime @hasDecl(@TypeOf(app.auth), "startupCredentialPending")) app.auth.startupCredentialPending() else false),
                 .model = visible_model,
                 .pending_images = app.pending_images.items,
-                .permission_mode = if (comptime @hasField(App, "remote")) (if (app.remote.active) app.remote.permission_mode else app.permission_engine.mode) else if (comptime @hasField(App, "permission_engine")) app.permission_engine.mode else .ask,
+                // A detached backend mirrors its session's mode into the engine.
+                .permission_mode = if (comptime @hasField(App, "permission_engine")) app.permission_engine.mode else .ask,
                 .steering_messages = steering.messages,
                 .steering_waits_for_boundary = steering.waits_for_boundary,
                 .fast_indicator_active = fast_indicator_active,
@@ -882,8 +883,7 @@ pub fn Runtime(comptime App: type) type {
             visible_model: []const u8,
         ) ui_render.StatuslineItems {
             var items: ui_render.StatuslineItems = .{};
-            const attached_label: ?[]const u8 = if (comptime @hasField(App, "remote")) if (app.remote.active) app.remote.workspace_label else null else null;
-            if (attached_label) |label| {
+            if (session_backend.Ops(App).view(app).workspace_label) |label| {
                 items.workspace_label = label;
                 // The launch checkout's branch may belong to a different attached workspace.
                 items.git_branch = null;

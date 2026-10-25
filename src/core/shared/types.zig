@@ -2292,6 +2292,25 @@ pub const PermissionMode = enum {
             std.ascii.eqlIgnoreCase(raw, "yolo")) return .yolo;
         return null;
     }
+
+    /// The mode's product ID, which `parse` reads back: what settings,
+    /// host config, and the supervisor store.
+    pub fn configId(self: PermissionMode) []const u8 {
+        return switch (self) {
+            .ask => "ask",
+            .auto => "auto",
+            .yolo => "full-access",
+        };
+    }
+
+    /// The mode a toggle moves to: ask, auto, full access, then ask again.
+    pub fn next(self: PermissionMode) PermissionMode {
+        return switch (self) {
+            .ask => .auto,
+            .auto => .yolo,
+            .yolo => .ask,
+        };
+    }
 };
 
 pub const RuleDecision = enum {

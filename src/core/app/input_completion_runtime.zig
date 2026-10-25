@@ -12,6 +12,7 @@ const list_window = @import("../shared/list_window.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const session_commands = @import("../session/session_commands.zig");
+const session_backend = @import("session_backend.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const file_index = @import("../workspace/file_index.zig");
@@ -630,11 +631,11 @@ pub fn CompletionRuntime(comptime App: type) type {
             return app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) != null;
         }
 
+        /// The file index covers this process's workspace, so it completes
+        /// paths only for a session working there.
         fn attachedFileScopeMatches(app: *const App) bool {
-            if (comptime @hasField(App, "remote") and @hasField(App, "workspace_root")) {
-                if (app.remote.active) return std.mem.eql(u8, app.remote.cwd, app.workspace_root);
-            }
-            return true;
+            if (comptime !@hasField(App, "workspace_root")) return true;
+            return std.mem.eql(u8, session_backend.Ops(App).view(app).workspace_root, app.workspace_root);
         }
 
         pub fn hasFileQuery(app: *App) bool {
@@ -1285,7 +1286,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                         try setModelComposerText(app, "/model {s} {s} ", .{ model, effort.label() });
                         try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, model_capabilities.reasoningEffortIndex(capabilities, effort), true, false, .fast);
                     } else {
-                        try session_commands.Commands(App).selectModelFromPicker(app, model, effort, app.fast_mode, false);
+                        try session_backend.Ops(App).selectModel(app, .{ .model = model, .effort = effort, .fast_mode = app.fast_mode, .ultrafast_mode = false });
                         app.input_runtime.inputResetState().clearCurrent(app.alloc);
                     }
                     app.shell.render_requests.request(.footer);
@@ -1300,7 +1301,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                         return true;
                     };
                     const effort = model_capabilities.reasoningEffortAtIndex(model_capabilities.resolveForApp(App, app, model), app.input_runtime.picker.model_picker_effort_index);
-                    try session_commands.Commands(App).selectModelFromPicker(app, model, effort, speed.fast_mode, speed.ultrafast_mode);
+                    try session_backend.Ops(App).selectModel(app, .{ .model = model, .effort = effort, .fast_mode = speed.fast_mode, .ultrafast_mode = speed.ultrafast_mode });
                     app.input_runtime.inputResetState().clearCurrent(app.alloc);
                     app.shell.render_requests.request(.footer);
                     return true;
@@ -1355,20 +1356,16 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         fn beginModelPickerOptions(app: *App, model: []const u8) !void {
-            if (comptime @hasField(App, "remote")) if (app.remote.active) {
-                try session_commands.Commands(App).selectModelFromPicker(app, model, app.effort, false, false);
-                app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                app.shell.render_requests.request(.footer);
-                return;
-            };
+            // Only offer the stages this process knows the model supports.
+            const offers_options = session_backend.Ops(App).view(app).model_options;
             const capabilities = model_capabilities.resolveForApp(App, app, model);
-            const supports_effort = capabilities.reasoning_efforts.len > 0;
-            const supports_fast = capabilities.supports_fast_mode;
-            const supports_ultrafast = capabilities.supports_ultrafast_mode;
+            const supports_effort = offers_options and capabilities.reasoning_efforts.len > 0;
+            const supports_fast = offers_options and capabilities.supports_fast_mode;
+            const supports_ultrafast = offers_options and capabilities.supports_ultrafast_mode;
             const supports_speed = supports_fast or supports_ultrafast;
 
             if (!supports_effort and !supports_speed) {
-                try session_commands.Commands(App).selectModelFromPicker(app, model, app.effort, app.fast_mode, false);
+                try session_backend.Ops(App).selectModel(app, .{ .model = model, .effort = app.effort, .fast_mode = app.fast_mode, .ultrafast_mode = false });
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
                 app.shell.render_requests.request(.footer);
                 return;

@@ -36,6 +36,7 @@ const display_width = @import("../shared/display_width.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 const session_commands = @import("../session/session_commands.zig");
+const session_backend = @import("session_backend.zig");
 const info_panel = @import("../input/info_panel.zig");
 const usage = @import("../../usage/usage.zig");
 const usage_host = @import("usage_host.zig");
@@ -272,6 +273,10 @@ pub fn Handlers(comptime App: type) type {
                 .handle_workspace = commandHandleWorkspace,
                 .handle_shell = commandHandleShell,
                 .show_version = commandShowVersion,
+                .show_context = commandNeedsDetachedSession,
+                .browse_subagents = commandNeedsDetachedSession,
+                .handle_heartbeat = commandNeedsDetachedSessionWithArgs,
+                .handle_kernel = commandNeedsDetachedSessionWithArgs,
                 .unknown = commandUnknown,
             };
         }
@@ -394,7 +399,9 @@ pub fn Handlers(comptime App: type) type {
             try app.newSession();
         }
 
-        fn commandResumeSession(ctx: *anyopaque) !void {
+        /// An in-process session has no saved-session index to pick by id,
+        /// so `/resume` opens the picker either way.
+        fn commandResumeSession(ctx: *anyopaque, _: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime !runtime_profile.allows(App, .durable_sessions)) {
                 try app.writeDomainNotice(.{
@@ -1242,8 +1249,15 @@ pub fn Handlers(comptime App: type) type {
             try image_commands.Commands(App).attachClipboard(app);
         }
 
-        fn commandToggleFast(ctx: *anyopaque) !void {
+        fn commandToggleFast(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
+            if (rest.len > 0) {
+                const enabled = parseToggle(rest) orelse {
+                    try app.writeDomainNotice(.{ .topic = "", .tone = .@"error", .body = "usage: /fast [on|off]" }, true);
+                    return;
+                };
+                if (enabled == app.fast_mode) return;
+            }
             try session_commands.Commands(App).toggleFast(app);
         }
 
@@ -1318,6 +1332,21 @@ pub fn Handlers(comptime App: type) type {
                 .tone = .neutral,
                 .body = App.app_version,
             }, true);
+        }
+
+        /// Heartbeats, the kernel, subagent transcripts, and the context
+        /// report belong to a session the supervisor runs.
+        fn commandNeedsDetachedSession(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try app.writeDomainNotice(.{
+                .topic = "session",
+                .tone = .neutral,
+                .body = "This command needs a detached session, which this host does not run.",
+            }, true);
+        }
+
+        fn commandNeedsDetachedSessionWithArgs(ctx: *anyopaque, _: []const u8) !void {
+            try commandNeedsDetachedSession(ctx);
         }
 
         fn commandUnknown(ctx: *anyopaque, _: []const u8) !void {
@@ -3180,9 +3209,7 @@ fn handleNotificationsCommand(app: anytype, rest: []const u8) !void {
 pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     const App = @TypeOf(app.*);
     var snapshot: settings_catalog.Snapshot = .{};
-    if (comptime @hasField(App, "remote")) {
-        if (app.remote.active) snapshot.session_controls = false;
-    }
+    snapshot.session_controls = session_backend.Ops(App).view(app).session_controls;
     if (comptime provider_runtime.supported(App)) snapshot.model = provider_runtime.model(app);
     if (comptime @hasField(App, "effort")) snapshot.effort = app.effort.displayLabel();
     if (comptime @hasField(App, "fast_mode")) snapshot.fast_mode = app.fast_mode;
@@ -3358,6 +3385,26 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
         },
         .prompt_history => try session_commands.Commands(@TypeOf(app.*)).handleHistory(app, change.value),
     }
+}
+
+/// The words a person types for a boolean option: on and off, or true and
+/// false, in any case, or 1 and 0.
+pub fn parseToggle(raw: []const u8) ?bool {
+    if (std.ascii.eqlIgnoreCase(raw, "on") or std.ascii.eqlIgnoreCase(raw, "true") or std.mem.eql(u8, raw, "1")) return true;
+    if (std.ascii.eqlIgnoreCase(raw, "off") or std.ascii.eqlIgnoreCase(raw, "false") or std.mem.eql(u8, raw, "0")) return false;
+    return null;
+}
+
+test "parseToggle accepts the words a person types for a boolean option" {
+    try std.testing.expect(parseToggle("on").?);
+    try std.testing.expect(parseToggle("ON").?);
+    try std.testing.expect(parseToggle("true").?);
+    try std.testing.expect(parseToggle("1").?);
+    try std.testing.expect(!parseToggle("off").?);
+    try std.testing.expect(!parseToggle("False").?);
+    try std.testing.expect(!parseToggle("0").?);
+    try std.testing.expect(parseToggle("maybe") == null);
+    try std.testing.expect(parseToggle("") == null);
 }
 
 fn parseOnOff(value: []const u8) ?bool {

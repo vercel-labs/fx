@@ -65,7 +65,7 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn persistPermissionMode(_: *App, mode: PermissionMode) void {
             if (comptime !runtime_profile.allows(App, .js_host_config)) return;
-            persist("mode", configIdForPermissionMode(mode));
+            persist("mode", mode.configId());
         }
     };
 }
@@ -80,17 +80,8 @@ fn persist(id: []const u8, value: []const u8) void {
     };
 }
 
-/// The host persists product mode IDs, which are the CLI's permission modes.
-fn configIdForPermissionMode(mode: PermissionMode) []const u8 {
-    return switch (mode) {
-        .auto => "auto",
-        .ask => "ask",
-        .yolo => "full-access",
-    };
-}
-
 test "host config maps permission modes to restorable product modes" {
-    try std.testing.expectEqualStrings("auto", configIdForPermissionMode(.auto));
-    try std.testing.expectEqualStrings("ask", configIdForPermissionMode(.ask));
-    try std.testing.expectEqualStrings("full-access", configIdForPermissionMode(.yolo));
+    try std.testing.expectEqualStrings("auto", PermissionMode.auto.configId());
+    try std.testing.expectEqualStrings("ask", PermissionMode.ask.configId());
+    try std.testing.expectEqualStrings("full-access", PermissionMode.yolo.configId());
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const session_backend = @import("session_backend.zig");
 const builtin = @import("builtin");
 const app_process_runtime = @import("app_process_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
@@ -506,7 +507,7 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
 }
 
 fn startWorkerThread(comptime App: type, app: *App, deps: RunDeps) !void {
-    if (comptime @hasField(App, "remote")) if (app.remote.active) return;
+    if (!session_backend.Ops(App).agentInProcess(app)) return;
     if (!@hasField(App, "worker_thread")) {
         const start = deps.start_worker_thread orelse return error.MissingWorkerThreadDependency;
         return start(deps.worker_ctx, @ptrCast(app));

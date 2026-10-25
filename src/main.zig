@@ -393,6 +393,8 @@ fn currentBuild() update_target.CurrentBuild {
 }
 
 const app_remote_runtime = @import("core/app/app_remote_runtime.zig");
+const session_backend = @import("core/app/session_backend.zig");
+const remote_backend = @import("core/app/remote_backend.zig");
 const session_browser = @import("core/input/session_browser.zig");
 
 const App = struct {
@@ -419,6 +421,7 @@ const App = struct {
     const UpgradeAppRuntime = app_upgrade_runtime.Runtime(Self);
     const WorkerAppRuntime = app_worker_runtime.Runtime(Self);
     const RemoteRuntime = app_remote_runtime.Runtime(Self);
+    const DetachedBackend = remote_backend.Runtime(Self);
     const WorkspaceAppRuntime = app_workspace_runtime.Runtime(Self);
 
     pub fn contextRegistry(self: *const Self) context_contract.Registry {
@@ -554,6 +557,9 @@ const App = struct {
     herdr: builtin_hooks.Client = .{},
     program_status: ui_program_status.Reporter = .{},
 
+    /// Who runs this frontend's session, chosen once in `init`. The
+    /// detached backend keeps its connection and view state in `remote`.
+    backend: session_backend.Kind = .in_process,
     remote: app_remote_runtime.State = .{},
     session: SessionRuntime = SessionRuntime.init(max_history_turns),
     session_persistence: app_session_runtime.Persistence = .{},
@@ -663,7 +669,9 @@ const App = struct {
             launch.requested_resume = null;
         }
         errdefer if (app.requested_resume) |*target| target.deinit(alloc);
-        if (comptime !host_target.is_wasm) app.remote.active = true;
+        // The native binary always drives a supervisor session; the libfx
+        // terminal runs its agent in process.
+        if (comptime !host_target.is_wasm) app.backend = .detached;
         try BootstrapAppRuntime.bootstrap(
             &app,
             footer_rows,
@@ -701,7 +709,7 @@ const App = struct {
         }
         app.context_limits.applyCommandLine(launch.modifiers.context_limit_overrides);
         if (comptime host_profile.durable_sessions or host_profile.js_host_sessions) {
-            if (!app.remote.active and app.requested_resume != null) {
+            if (app.backend == .in_process and app.requested_resume != null) {
                 const resumed = if (launch.upgrade_relaunch != null)
                     SessionAppRuntime.resumeRequestedSessionAfterUpgrade(
                         &app,
@@ -732,7 +740,7 @@ const App = struct {
         }
         if (comptime !host_profile.auto_upgrade) app.auto_upgrade_enabled = false;
         try HostConfigAppRuntime.restore(&app, builtin_modes.registry);
-        if (comptime !host_target.is_wasm) {
+        if (comptime !host_target.is_wasm) if (app.backend == .detached) {
             const executable = try std.process.executablePathAlloc(io_mod.getIo(), alloc);
             defer alloc.free(executable);
             const resume_id = if (app.requested_resume) |target| switch (target) {
@@ -740,7 +748,7 @@ const App = struct {
                 else => null,
             } else null;
             try RemoteRuntime.init(&app, executable, resume_id);
-        }
+        };
         SessionAppRuntime.syncTerminalTitle(&app);
         return app;
     }
@@ -1066,15 +1074,17 @@ const App = struct {
         try SessionAppRuntime.suspendToJobControl(self, footer_rows);
     }
 
+    /// The detached daemon holds the model credentials; this process only
+    /// checks what it cannot forward yet.
     pub fn ensurePromptCredential(self: *App) !bool {
-        if (self.remote.active) {
-            if (self.pending_images.items.len > 0) {
+        switch (self.backend) {
+            .in_process => return AuthAppRuntime.admitPromptCredential(self),
+            .detached => {
+                if (self.pending_images.items.len == 0) return true;
                 try self.writeDomainNotice(.{ .topic = "attachments", .tone = .warning, .body = "Image attachments are not forwarded by the detached frontend yet. Remove the image to send this prompt." }, true);
                 return false;
-            }
-            return true;
+            },
         }
-        return AuthAppRuntime.admitPromptCredential(self);
     }
 
     pub fn restoreSessionCredential(self: *App, previous_provider: model_provider.ProviderId) !void {
@@ -1082,7 +1092,7 @@ const App = struct {
     }
 
     pub fn startPromptCredentialPrewarm(self: *App) void {
-        if (self.remote.active) return;
+        if (self.backend == .detached) return;
         if (comptime !host_target.is_wasm) {
             AuthAppRuntime.startPromptCredentialPrewarm(self);
         }
@@ -1091,15 +1101,19 @@ const App = struct {
     pub fn collectPendingPromptCredential(
         self: *App,
     ) !app_auth_runtime.PendingPromptCredentialReadiness {
-        if (self.remote.active) return .current;
-        return AuthAppRuntime.collectPendingPromptCredential(self);
+        return switch (self.backend) {
+            .in_process => AuthAppRuntime.collectPendingPromptCredential(self),
+            .detached => .current,
+        };
     }
 
     pub fn retryPendingPromptCredential(
         self: *App,
     ) !app_auth_runtime.PendingPromptCredentialReadiness {
-        if (self.remote.active) return .current;
-        return AuthAppRuntime.retryPendingPromptCredential(self);
+        return switch (self.backend) {
+            .in_process => AuthAppRuntime.retryPendingPromptCredential(self),
+            .detached => .current,
+        };
     }
 
     pub fn runProviderCommand(self: *App) !void {
@@ -1154,7 +1168,7 @@ const App = struct {
         const self: *App = @ptrCast(@alignCast(ctx));
         if (comptime !host_target.is_wasm) {
             return nativeLoopPollTimeoutMs(
-                if (self.remote.active) @min(default_timeout_ms, 100) else default_timeout_ms,
+                if (self.backend == .detached) @min(default_timeout_ms, 100) else default_timeout_ms,
                 self.shell.render_requests.hasReason(.first_frame),
                 self.auth.sourceInventoryRefreshActive(),
                 self.skills.refreshActive(),
@@ -1185,8 +1199,10 @@ const App = struct {
     }
 
     pub fn handleCommand(self: *App, cmd: []const u8) !void {
-        if (self.remote.active and try RemoteRuntime.handleCommand(self, cmd)) return;
-        try app_commands.Handlers(App).route(self, cmd);
+        switch (self.backend) {
+            .in_process => try app_commands.Handlers(App).route(self, cmd),
+            .detached => try DetachedBackend.route(self, cmd),
+        }
     }
 
     pub fn clearPendingImages(self: *App) void {
@@ -1214,11 +1230,17 @@ const App = struct {
     }
 
     pub fn enqueuePromptWithSkillBindings(self: *App, prompt: []const u8, skill_tokens: []const registered_entities.SkillTokenSpan) !bool {
-        if (self.remote.active) {
-            if (!try RemoteRuntime.submit(self, prompt, self.pending_images.items)) return false;
-            try self.writeUserPromptCard(.{ .text = @constCast(prompt), .images = self.pending_images.items });
-            return true;
+        switch (self.backend) {
+            .in_process => return self.enqueueInProcessPrompt(prompt, skill_tokens),
+            .detached => {
+                if (!try DetachedBackend.submit(self, prompt, self.pending_images.items)) return false;
+                try self.writeUserPromptCard(.{ .text = @constCast(prompt), .images = self.pending_images.items });
+                return true;
+            },
         }
+    }
+
+    fn enqueueInProcessPrompt(self: *App, prompt: []const u8, skill_tokens: []const registered_entities.SkillTokenSpan) !bool {
         const context_targets = if (self.context_enabled)
             try context_contract.applicableTargetsForImages(self.alloc, self.pending_images.items)
         else
@@ -1274,8 +1296,8 @@ const App = struct {
         self: *App,
         draft: *const input_submit_runtime.PendingPromptDraft,
     ) !void {
-        if (self.remote.active) {
-            if (!try RemoteRuntime.submit(self, draft.prompt, draft.images)) return error.PendingPromptQueueRejected;
+        if (self.backend == .detached) {
+            if (!try DetachedBackend.submit(self, draft.prompt, draft.images)) return error.PendingPromptQueueRejected;
             return;
         }
         const context_targets = if (self.context_enabled)
@@ -1361,23 +1383,35 @@ const App = struct {
         );
     }
 
+    /// The session browser exists only for detached sessions; the input
+    /// runtime offers it when `session_backend.View.session_browser` says so.
     pub fn openSessionBrowser(self: *App, scope: session_browser.Scope) !void {
-        try RemoteRuntime.openSessionBrowser(self, scope);
+        if (self.backend == .detached) try DetachedBackend.openSessionBrowser(self, scope);
     }
     pub fn activateBrowserSelection(self: *App) !void {
-        try RemoteRuntime.activateBrowserSelection(self);
+        if (self.backend == .detached) try DetachedBackend.activateBrowserSelection(self);
     }
     pub fn browserBack(self: *App) !void {
-        try RemoteRuntime.browserBack(self);
+        if (self.backend == .detached) try DetachedBackend.browserBack(self);
     }
+    /// True when the backend answered the prompt; the in-process approval
+    /// flow handles it otherwise.
     pub fn resolveRemotePermission(self: *App, decision: types.ToolPermissionDecision) !bool {
-        if (!self.remote.active) return false;
-        return RemoteRuntime.resolvePermission(self, decision);
+        return switch (self.backend) {
+            .in_process => false,
+            .detached => DetachedBackend.resolvePermission(self, decision),
+        };
     }
+    /// True when the backend cancelled the turn; the in-process interrupt
+    /// flow handles it otherwise.
     pub fn cancelRemoteTurn(self: *App) !bool {
-        if (!self.remote.active) return false;
-        try RemoteRuntime.cancel(self);
-        return true;
+        switch (self.backend) {
+            .in_process => return false,
+            .detached => {
+                try DetachedBackend.cancel(self);
+                return true;
+            },
+        }
     }
 
     pub fn stopStream(self: *App) void {
@@ -1393,17 +1427,22 @@ const App = struct {
     /// The frontend writes settings files; a detached host enforces its own
     /// copy of the permission rules and must reload them.
     pub fn reloadSessionPermissions(self: *App) !void {
-        if (self.remote.active) try RemoteRuntime.reloadPermissions(self);
+        if (self.backend == .detached) try DetachedBackend.reloadPermissions(self);
     }
 
     pub fn newSession(self: *App) !void {
-        if (self.remote.active) return RemoteRuntime.newSession(self);
-        try SessionAppRuntime.newSession(self);
+        switch (self.backend) {
+            .in_process => try SessionAppRuntime.newSession(self),
+            .detached => try DetachedBackend.newSession(self),
+        }
     }
 
+    /// A detached session cannot be reset in place, so reset starts a new one.
     pub fn resetSession(self: *App) !void {
-        if (self.remote.active) return RemoteRuntime.newSession(self);
-        try SessionAppRuntime.resetSession(self);
+        switch (self.backend) {
+            .in_process => try SessionAppRuntime.resetSession(self),
+            .detached => try DetachedBackend.newSession(self),
+        }
     }
 
     pub fn prepareLiveSessionResume(self: *App) !void {
@@ -2226,7 +2265,7 @@ const App = struct {
             .text = @constCast(text),
         } });
         if (comptime host_profile.cooperative_agent) {
-            if (!self.remote.active) try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).workerEventHandlers(self));
+            try self.deliverSessionEvents();
             try self.flushRequestedFrame();
         }
     }
@@ -2902,10 +2941,27 @@ const App = struct {
         }
     }
 
+    /// Applies what the backend reported since the last loop pass: worker
+    /// events in process, supervisor replies when detached.
+    fn deliverSessionEvents(self: *App) !void {
+        switch (self.backend) {
+            .in_process => try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).workerEventHandlers(self)),
+            .detached => if (comptime !host_target.is_wasm) try RemoteRuntime.poll(self),
+        }
+    }
+
+    /// An in-process worker can hold input while it admits a resumed
+    /// session's prompts; a detached session admits on the supervisor.
+    fn admitsInteractiveInput(self: *App) !bool {
+        return switch (self.backend) {
+            .in_process => WorkerAppRuntime.authorizeInteractiveAdmission(self),
+            .detached => true,
+        };
+    }
+
     pub fn loopCollectFacts(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
-        if (comptime !host_target.is_wasm) try RemoteRuntime.poll(self);
-        if (!self.remote.active and !try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
+        if (!try self.admitsInteractiveInput()) return;
 
         if (comptime !host_target.is_wasm) {
             if (self.file_index.joinThreadIfDone(std.heap.c_allocator)) {
@@ -3041,7 +3097,7 @@ const App = struct {
             InputAppRuntime.terminalPasteActive(self),
         );
         try self.routeTerminalInputIngress(terminal_input);
-        if (!self.remote.active) try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).workerEventHandlers(self));
+        try self.deliverSessionEvents();
         const now_ns = io_mod.nanoTimestamp();
         if (!self.footerPromptActive()) {
             try self.pacer.tick(self.alloc, now_ns, self.pacerCallbacks());
@@ -3053,7 +3109,7 @@ const App = struct {
     pub fn loopCommitFrame(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
         defer SessionAppRuntime.finishDeferredSessionInputReplay(self);
-        if (!self.remote.active and !try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
+        if (!try self.admitsInteractiveInput()) return;
         if (self.terminal_input_runtime.native_clear_probe.active()) return;
         _ = self.admitPendingResizeSignal("post_input");
         InputAppRuntime.prepareFilePicker(self);
@@ -3171,7 +3227,7 @@ const App = struct {
 
     pub fn loopHandleByte(ctx: *anyopaque, byte: u8) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
-        if (!self.remote.active and !try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
+        if (!try self.admitsInteractiveInput()) return;
         const deferred_source = self.terminal_input_runtime.consumeDeferredTerminalInputDispatch();
 
         if (deferred_source) |source| {
@@ -4765,6 +4821,9 @@ test {
     _ = @import("core/app/app_runtime_setup.zig");
     _ = @import("core/app/app_session_runtime.zig");
     _ = @import("core/app/app_remote_runtime.zig");
+    _ = @import("core/app/remote_backend.zig");
+    _ = @import("core/app/remote_view.zig");
+    _ = @import("core/app/session_backend.zig");
     _ = @import("core/supervisor/protocol.zig");
     _ = @import("core/supervisor/record.zig");
     _ = @import("core/supervisor/session.zig");

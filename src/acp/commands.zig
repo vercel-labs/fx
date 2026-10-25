@@ -94,7 +94,7 @@ pub const ParseError = error{ MissingCommand, UnknownCommand, MissingPath };
 
 /// An `fx/command` request's fields. The request also names its session,
 /// which the server checks before this.
-const Request = struct {
+pub const Request = struct {
     command: []const u8,
     /// `workspace` only. Absent means `list`.
     action: ?[]const u8 = null,
@@ -119,6 +119,21 @@ pub fn parse(arena: std.mem.Allocator, params: std.json.Value) (ParseError || er
         .workspace => .{ .workspace = try parseWorkspaceAction(request) },
         .mcp_verb => .{ .mcp_verb = nonEmpty(request.line) orelse return error.MissingCommand },
         inline else => |tag| tag,
+    };
+}
+
+/// The request fields that name `command`; `parse` reads them back. The
+/// strings borrow `command`.
+pub fn requestFields(command: Command) Request {
+    return switch (command) {
+        .workspace => |action| switch (action) {
+            .list => .{ .command = "workspace" },
+            .clear => .{ .command = "workspace", .action = "clear" },
+            .add => |path| .{ .command = "workspace", .action = "add", .path = path },
+            .remove => |path| .{ .command = "workspace", .action = "remove", .path = path },
+        },
+        .mcp_verb => |line| .{ .command = "mcp_verb", .line = line },
+        inline else => |_, tag| .{ .command = @tagName(tag) },
     };
 }
 
@@ -153,7 +168,7 @@ pub const Result = union(enum) {
 
 /// The flat object the frontend reads: the command's name and only the
 /// fields its result has.
-const Response = struct {
+pub const Response = struct {
     command: Name,
     text: ?[]const u8 = null,
     compaction: ?Compaction = null,
@@ -214,6 +229,34 @@ test "parse reads known commands and rejects anything else" {
     const not_an_object = try std.json.parseFromSlice(std.json.Value, alloc, "[]", .{});
     defer not_an_object.deinit();
     try std.testing.expectError(error.MissingCommand, parse(not_an_object.arena.allocator(), not_an_object.value));
+}
+
+test "requestFields names every command the way parse reads it back" {
+    const alloc = std.testing.allocator;
+    const commands = [_]Command{
+        .last_reply,             .compact,                        .undo,                                      .context,                                      .shell_reload,
+        .{ .workspace = .list }, .{ .workspace = .clear },        .{ .workspace = .{ .add = "/tmp/extra" } }, .{ .workspace = .{ .remove = "/tmp/extra" } }, .permissions_reload,
+        .mcp_status,             .{ .mcp_verb = "login linear" },
+    };
+    for (commands) |command| {
+        const encoded = try std.json.Stringify.valueAlloc(alloc, requestFields(command), .{ .emit_null_optional_fields = false });
+        defer alloc.free(encoded);
+        const value = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+        defer value.deinit();
+        const decoded = try parse(value.arena.allocator(), value.value);
+        try std.testing.expectEqual(std.meta.activeTag(command), std.meta.activeTag(decoded));
+        switch (command) {
+            .workspace => |action| switch (action) {
+                .add, .remove => |path| try std.testing.expectEqualStrings(path, switch (decoded.workspace) {
+                    .add, .remove => |decoded_path| decoded_path,
+                    else => return error.TestExpectedWorkspacePath,
+                }),
+                else => try std.testing.expectEqual(std.meta.activeTag(action), std.meta.activeTag(decoded.workspace)),
+            },
+            .mcp_verb => |line| try std.testing.expectEqualStrings(line, decoded.mcp_verb),
+            else => {},
+        }
+    }
 }
 
 test "writeResult renders the command and escapes its text" {

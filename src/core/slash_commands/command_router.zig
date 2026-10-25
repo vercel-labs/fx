@@ -9,7 +9,7 @@ pub const ParsedCommand = union(enum) {
     clear_screen,
     new_session,
     reset_session,
-    resume_session,
+    resume_session: []const u8,
     rename_session: []const u8,
     fork_session,
     help,
@@ -36,13 +36,17 @@ pub const ParsedCommand = union(enum) {
     alias: []const u8,
     credits,
     paste,
-    fast,
+    fast: []const u8,
     ultrafast: []const u8,
     statusline: []const u8,
     notifications: []const u8,
     workspace: []const u8,
     shell: []const u8,
     version,
+    context,
+    subagents,
+    heartbeat: []const u8,
+    kernel: []const u8,
     unknown,
 };
 
@@ -52,7 +56,7 @@ pub const CommandHandlers = struct {
     clear_screen: *const fn (ctx: *anyopaque) anyerror!void,
     new_session: *const fn (ctx: *anyopaque) anyerror!void,
     reset_session: *const fn (ctx: *anyopaque) anyerror!void,
-    resume_session: *const fn (ctx: *anyopaque) anyerror!void,
+    resume_session: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     fork_session: *const fn (ctx: *anyopaque) anyerror!void,
     show_help: *const fn (ctx: *anyopaque) anyerror!void,
     login: *const fn (ctx: *anyopaque) anyerror!void,
@@ -78,7 +82,7 @@ pub const CommandHandlers = struct {
     handle_alias: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_credits: *const fn (ctx: *anyopaque) anyerror!void,
     paste_clipboard: *const fn (ctx: *anyopaque) anyerror!void,
-    toggle_fast: *const fn (ctx: *anyopaque) anyerror!void,
+    toggle_fast: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_ultrafast: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_statusline: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     rename_session: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
@@ -86,6 +90,10 @@ pub const CommandHandlers = struct {
     handle_workspace: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_shell: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_version: *const fn (ctx: *anyopaque) anyerror!void,
+    show_context: *const fn (ctx: *anyopaque) anyerror!void,
+    browse_subagents: *const fn (ctx: *anyopaque) anyerror!void,
+    handle_heartbeat: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
+    handle_kernel: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     unknown: *const fn (ctx: *anyopaque, cmd: []const u8) anyerror!void,
 };
 
@@ -99,7 +107,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .clear_screen => .clear_screen,
         .new_session => .new_session,
         .reset_session => .reset_session,
-        .resume_session => .resume_session,
+        .resume_session => .{ .resume_session = payload },
         .rename_session => .{ .rename_session = payload },
         .fork_session => .fork_session,
         .help => .help,
@@ -126,27 +134,42 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .alias => .{ .alias = payload },
         .credits => .credits,
         .paste => .paste,
-        .fast => .fast,
+        .fast => .{ .fast = payload },
         .ultrafast => .{ .ultrafast = payload },
         .statusline => .{ .statusline = payload },
         .notifications => .{ .notifications = payload },
         .workspace => .{ .workspace = payload },
         .shell => .{ .shell = payload },
         .version => .version,
+        .context => .context,
+        .subagents => .subagents,
+        .heartbeat => .{ .heartbeat = payload },
+        .kernel => .{ .kernel = payload },
     };
 }
 
-pub fn parse(registry: SlashRegistry, cmd: []const u8) ParsedCommand {
-    for (registry.commands) |spec| {
+/// A registered command and the text after its name.
+pub const Match = struct {
+    spec: *const command_specs.SlashSpec,
+    payload: []const u8,
+};
+
+pub fn match(registry: SlashRegistry, cmd: []const u8) ?Match {
+    for (registry.commands) |*spec| {
         if (spec.accepts_payload) {
             if (command_specs.matchedSlashPrefix(registry, cmd, spec.kind)) |prefix| {
-                return parsedCommand(spec.kind, command_payload(cmd, prefix));
+                return .{ .spec = spec, .payload = command_payload(cmd, prefix) };
             }
         } else if (command_specs.matchesSlashExact(registry, cmd, spec.kind)) {
-            return parsedCommand(spec.kind, "");
+            return .{ .spec = spec, .payload = "" };
         }
     }
-    return .unknown;
+    return null;
+}
+
+pub fn parse(registry: SlashRegistry, cmd: []const u8) ParsedCommand {
+    const matched = match(registry, cmd) orelse return .unknown;
+    return parsedCommand(matched.spec.kind, matched.payload);
 }
 
 pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []const u8) !void {
@@ -155,7 +178,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .clear_screen => try handlers.clear_screen(handlers.ctx),
         .new_session => try handlers.new_session(handlers.ctx),
         .reset_session => try handlers.reset_session(handlers.ctx),
-        .resume_session => try handlers.resume_session(handlers.ctx),
+        .resume_session => |rest| try handlers.resume_session(handlers.ctx, rest),
         .rename_session => |rest| try handlers.rename_session(handlers.ctx, rest),
         .fork_session => try handlers.fork_session(handlers.ctx),
         .help => try handlers.show_help(handlers.ctx),
@@ -182,13 +205,17 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .alias => |rest| try handlers.handle_alias(handlers.ctx, rest),
         .credits => try handlers.show_credits(handlers.ctx),
         .paste => try handlers.paste_clipboard(handlers.ctx),
-        .fast => try handlers.toggle_fast(handlers.ctx),
+        .fast => |rest| try handlers.toggle_fast(handlers.ctx, rest),
         .ultrafast => |rest| try handlers.handle_ultrafast(handlers.ctx, rest),
         .statusline => |rest| try handlers.handle_statusline(handlers.ctx, rest),
         .notifications => |rest| try handlers.handle_notifications(handlers.ctx, rest),
         .workspace => |rest| try handlers.handle_workspace(handlers.ctx, rest),
         .shell => |rest| try handlers.handle_shell(handlers.ctx, rest),
         .version => try handlers.show_version(handlers.ctx),
+        .context => try handlers.show_context(handlers.ctx),
+        .subagents => try handlers.browse_subagents(handlers.ctx),
+        .heartbeat => |rest| try handlers.handle_heartbeat(handlers.ctx, rest),
+        .kernel => |rest| try handlers.handle_kernel(handlers.ctx, rest),
         .unknown => try handlers.unknown(handlers.ctx, cmd),
     }
 }
@@ -245,7 +272,14 @@ test "parse distinguishes new and reset lifecycle commands" {
 }
 
 test "parse recognizes interactive resume" {
-    try std.testing.expectEqual(ParsedCommand.resume_session, parse(testSlashRegistry(), "/resume"));
+    switch (parse(testSlashRegistry(), "/resume")) {
+        .resume_session => |rest| try std.testing.expectEqualStrings("", rest),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/resume last")) {
+        .resume_session => |rest| try std.testing.expectEqualStrings("last", rest),
+        else => return error.TestExpectedEqual,
+    }
 }
 
 test "parse recognizes fork without a payload" {
@@ -300,8 +334,28 @@ test "parse recognizes exact no-payload commands" {
     try std.testing.expectEqual(ParsedCommand.credits, parse(testSlashRegistry(), "/credits"));
     try std.testing.expectEqual(ParsedCommand.credits, parse(testSlashRegistry(), "/balance"));
     try std.testing.expectEqual(ParsedCommand.paste, parse(testSlashRegistry(), "/paste"));
-    try std.testing.expectEqual(ParsedCommand.fast, parse(testSlashRegistry(), "/fast"));
     try std.testing.expectEqual(ParsedCommand.version, parse(testSlashRegistry(), "/version"));
+}
+
+test "parse extracts fast and detached session command payloads" {
+    switch (parse(testSlashRegistry(), "/fast on")) {
+        .fast => |rest| try std.testing.expectEqualStrings("on", rest),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/heartbeat start 60 check the build")) {
+        .heartbeat => |rest| try std.testing.expectEqualStrings("start 60 check the build", rest),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/kernel status")) {
+        .kernel => |rest| try std.testing.expectEqualStrings("status", rest),
+        else => return error.TestExpectedEqual,
+    }
+    try std.testing.expectEqual(ParsedCommand.context, parse(testSlashRegistry(), "/context"));
+    try std.testing.expectEqual(ParsedCommand.subagents, parse(testSlashRegistry(), "/subagents"));
+    const matched = match(testSlashRegistry(), "/kernel restart").?;
+    try std.testing.expectEqual(command_specs.SlashKind.kernel, matched.spec.kind);
+    try std.testing.expectEqualStrings("restart", matched.payload);
+    try std.testing.expect(match(testSlashRegistry(), "/nonsense") == null);
 }
 
 test "parse extracts ultrafast command payload" {

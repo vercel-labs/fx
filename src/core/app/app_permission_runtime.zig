@@ -134,11 +134,7 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn toggleMode(app: *App) !void {
             if (comptime !@hasField(App, "permission_engine")) return;
-            try selectMode(app, switch (app.permission_engine.mode) {
-                .ask => .auto,
-                .auto => .yolo,
-                .yolo => .ask,
-            });
+            try selectMode(app, app.permission_engine.mode.next());
         }
 
         pub fn reset(app: *App) !void {

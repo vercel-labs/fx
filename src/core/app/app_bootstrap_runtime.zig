@@ -25,6 +25,7 @@ const permissions = @import("../permissions/permissions.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const types = @import("../shared/types.zig");
+const session_backend = @import("session_backend.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -576,8 +577,7 @@ pub fn Runtime(comptime App: type) type {
                     startup.notification_max,
                 );
             }
-            const remote = if (comptime @hasField(App, "remote")) app.remote.active else false;
-            if (!remote) try deps.initialize_persistence(
+            if (session_backend.Ops(App).agentInProcess(app)) try deps.initialize_persistence(
                 app,
                 app.requested_resume != null,
             );

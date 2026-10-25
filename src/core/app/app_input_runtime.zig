@@ -36,6 +36,7 @@ const permission_request = @import("../permissions/permission_request.zig");
 const approval_decision = @import("../permissions/approval_decision.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_commands = @import("../session/session_commands.zig");
+const session_backend = @import("session_backend.zig");
 const session_catalog = @import("../session/session_catalog.zig");
 const session_runtime = @import("../session/session.zig");
 const session_adapter = @import("../session/session_adapter.zig");
@@ -1064,15 +1065,7 @@ pub fn Runtime(comptime App: type) type {
                     } else if (cycleModelMenuProvider(app, -1) or cycleSkillsMenuSource(app, -1)) {
                         app.shell.render_requests.request(.footer);
                     } else {
-                        if (comptime @hasField(App, "remote")) if (app.remote.active) {
-                            try app.handleCommand(switch (app.remote.permission_mode) {
-                                .ask => "/permissions auto",
-                                .auto => "/permissions full-access",
-                                .yolo => "/permissions ask",
-                            });
-                            return .done;
-                        };
-                        try app_permission_runtime.Runtime(App).toggleMode(app);
+                        try session_backend.Ops(App).cyclePermissionMode(app);
                     }
                 },
                 .open_all_sessions => {
@@ -1117,7 +1110,8 @@ pub fn Runtime(comptime App: type) type {
 
         fn routeSessionBrowserAction(app: *App, action: input_action.Action) !bool {
             if (comptime !@hasDecl(App, "openSessionBrowser")) return false;
-            if (comptime @hasField(App, "remote")) if (!app.remote.active) return false;
+            const session = session_backend.Ops(App).view(app);
+            if (!session.session_browser) return false;
             const browser = &app.input_runtime.session_browser;
             if (browser.active) {
                 const visible = @max(1, app.shell.layout.rows -| 7);
@@ -1144,11 +1138,9 @@ pub fn Runtime(comptime App: type) type {
                 settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or
                 modelMenuActive(app) or sessionMenuActive(app) or forkMenuActive(app) or mcpHostMenuActive(app)) return false;
             if (app.auth.pickerView().active) return false;
-            if (comptime @hasField(App, "remote")) {
-                if (action == .cursor_left and app.remote.child_id.len > 0) {
-                    try app.browserBack();
-                    return true;
-                }
+            if (action == .cursor_left and session.child_transcript) {
+                try app.browserBack();
+                return true;
             }
             try app.openSessionBrowser(if (action == .cursor_right) .subagents else .sessions);
             app.shell.render_requests.request(.footer);
@@ -2144,13 +2136,7 @@ pub fn Runtime(comptime App: type) type {
         fn applyInlineSettingsModelSelection(app: *App) !void {
             const selected = (try app.model_cache.menu.selectedModelAlloc(app.alloc)) orelse return;
             defer app.alloc.free(selected);
-            try session_commands.Commands(App).selectModelFromPicker(
-                app,
-                selected,
-                app.effort,
-                app.fast_mode,
-                false,
-            );
+            try session_backend.Ops(App).selectModel(app, .{ .model = selected, .effort = app.effort, .fast_mode = app.fast_mode, .ultrafast_mode = false });
             app.model_cache.closeMenu();
             app.shell.render_requests.request(.footer);
         }
@@ -2501,18 +2487,12 @@ pub fn Runtime(comptime App: type) type {
                     }, true);
                 },
                 .selection => |selection| {
-                    if (comptime @hasField(App, "remote")) if (app.remote.active) {
+                    if (!session_backend.Ops(App).view(app).model_options) {
                         try app.writeDomainNotice(.{ .topic = "model", .tone = .neutral, .body = "Detached sessions accept /model <id>. Effort and speed overrides are not available yet." }, true);
                         app.shell.render_requests.request(.footer);
                         return true;
-                    };
-                    try session_commands.Commands(App).selectModelFromPicker(
-                        app,
-                        selection.model,
-                        selection.effort,
-                        selection.fast_mode,
-                        selection.ultrafast_mode,
-                    );
+                    }
+                    try session_backend.Ops(App).selectModel(app, .{ .model = selection.model, .effort = selection.effort, .fast_mode = selection.fast_mode, .ultrafast_mode = selection.ultrafast_mode });
                     app.input_runtime.inputResetState().clearCurrent(app.alloc);
                 },
             }
