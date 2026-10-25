@@ -1,7 +1,8 @@
 //! The kernel's output reader: the one thread that drains the Python process's
 //! stdout and stderr between and during calls. It turns protocol frames into
-//! request progress on the `Manager`, takes debounced background snapshots,
-//! and keeps the bounded stderr log. Lifecycle (start, stop, repair) and the
+//! request progress on the `Manager` and keeps the bounded stderr log.
+//! Snapshots happen only at a turn's end, at a park and at a stop (D99), so
+//! the reader takes none of its own. Lifecycle (start, stop, repair) and the
 //! callers' side of each request stay in `kernel.zig`.
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
@@ -30,16 +31,7 @@ pub fn run(self: *Manager, stdout: std.Io.File, stderr: std.Io.File) void {
     var buffer: [64 * 1024]u8 = undefined;
     var stderr_open = true;
     while (!self.reader_stop.load(.acquire)) {
-        self.mutex.lockUncancelable(io_mod.getIo());
-        const idle_unclaimed = self.active == .none and !self.caller_waiting and self.save_guard == .open;
-        const wake_at = if (self.active == .snapshot and !self.caller_waiting)
-            self.request_started + 5000
-        else if (idle_unclaimed)
-            self.save_due orelse std.math.maxInt(i64)
-        else
-            std.math.maxInt(i64);
-        self.mutex.unlock(io_mod.getIo());
-        const poll_timeout: i32 = @intCast(@min(1000, @max(0, wake_at - now())));
+        const poll_timeout: i32 = 1000;
         var fds = [_]std.posix.pollfd{
             .{ .fd = stdout.handle, .events = std.posix.POLL.IN, .revents = 0 },
             .{ .fd = if (stderr_open) stderr.handle else -1, .events = std.posix.POLL.IN, .revents = 0 },
@@ -100,28 +92,6 @@ pub fn run(self: *Manager, stdout: std.Io.File, stderr: std.Io.File) void {
                 pending = .empty;
             }
         }
-        self.mutex.lockUncancelable(io_mod.getIo());
-        const save_reached = if (self.save_due) |due| now() >= due else false;
-        const should_save = self.persist and self.state == .running and self.active == .none and !self.caller_waiting and self.save_guard == .open and save_reached and !self.stopping.load(.acquire);
-        const snapshot_hung = self.active == .snapshot and !self.caller_waiting and now() - self.request_started > 5000;
-        // Reserve the slot while holding the state lock, so a foreground execute cannot race it.
-        var save_id: u64 = 0;
-        if (should_save) {
-            self.sequence += 1;
-            save_id = self.sequence;
-            self.active_id = save_id;
-            self.active = .snapshot;
-            self.request_started = now();
-        }
-        self.mutex.unlock(io_mod.getIo());
-        if (snapshot_hung) {
-            self.fail("Kernel snapshot timed out; preserving the previous save.");
-            return;
-        }
-        if (save_id != 0) self.sendSnapshot(save_id) catch {
-            self.fail("Could not save the Python namespace.");
-            return;
-        };
     }
 }
 
@@ -169,15 +139,24 @@ fn handleEvent(self: *Manager, line: []const u8) !void {
             if ((event.status orelse .@"error") != .ok) self.request_status = .failed;
             const ok = self.request_status == .ok;
             switch (self.active) {
-                .restore => self.save_guard = if (ok and event.failed.len == 0) .open else .protected_unreported,
-                .execute => if (ok) {
-                    self.save_due = now() + 1500;
+                .restore => {
+                    if (!ok) try self.restore_report.append(self.alloc, event.reason orelse "the restore failed", diagnostic_cap);
+                    for (event.failed, 0..) |entry, index| {
+                        if (index > 0 or !ok) try self.restore_report.append(self.alloc, ", ", diagnostic_cap);
+                        try self.restore_report.append(self.alloc, entry.name, diagnostic_cap);
+                        try self.restore_report.append(self.alloc, " (", diagnostic_cap);
+                        try self.restore_report.append(self.alloc, entry.reason, diagnostic_cap);
+                        try self.restore_report.append(self.alloc, ")", diagnostic_cap);
+                    }
                 },
-                // Failed snapshots are not tight-loop retried; a later cell schedules one.
-                .snapshot => {
-                    self.save_due = null;
-                    if (!ok) try self.diagnostic.append(self.alloc, event.reason orelse "Snapshot failed", diagnostic_cap);
-                },
+                .execute => {},
+                .snapshot => if (ok) {
+                    const manifest = try protocol.Manifest.create(self.alloc, event.records, event.failed);
+                    manifest.written = event.written;
+                    manifest.bytes = event.bytes;
+                    if (self.snapshot_result) |old| old.destroy();
+                    self.snapshot_result = manifest;
+                } else try self.diagnostic.append(self.alloc, event.reason orelse "Snapshot failed", diagnostic_cap),
                 .shutdown, .none => {},
             }
             self.completed_id = id;

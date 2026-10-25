@@ -210,6 +210,50 @@ pub fn stateOf(artifact_dir: []const u8) ?kernel.State {
     return null;
 }
 
+/// The kernels of session node `node_id`, each pinned so it outlives the
+/// caller's use, which ends with `unpinAll`. Caller owns the list.
+pub fn nodeKernels(alloc: Allocator, node_id: []const u8) ![]*Manager {
+    const io = io_mod.getIo();
+    mutex.lockUncancelable(io);
+    defer mutex.unlock(io);
+    var found: std.ArrayList(*Manager) = .empty;
+    errdefer found.deinit(alloc);
+    if (node_id.len == 0) return found.toOwnedSlice(alloc);
+    for (keyed.items) |manager| {
+        if (!manager.persist or !std.mem.eql(u8, manager.node_id, node_id)) continue;
+        try found.append(alloc, manager);
+    }
+    for (found.items) |manager| manager.pool.pins += 1;
+    return found.toOwnedSlice(alloc);
+}
+
+/// Ends `nodeKernels`' pins and frees its list.
+pub fn unpinAll(alloc: Allocator, managers: []*Manager) void {
+    var doomed: std.ArrayList(*Manager) = .empty;
+    defer doomed.deinit(std.heap.c_allocator);
+    mutex.lockUncancelable(io_mod.getIo());
+    for (managers) |manager| {
+        manager.pool.pins -= 1;
+        if (takeIfUnownedLocked(manager)) doomed.append(std.heap.c_allocator, manager) catch {};
+    }
+    mutex.unlock(io_mod.getIo());
+    changed.broadcast(io_mod.getIo());
+    for (doomed.items) |manager| manager.destroy();
+    alloc.free(managers);
+}
+
+/// After a rewind of node `node_id` (D97, D99): each of its kernels drops
+/// its process and its save, and starts again in the background from the
+/// node's log, so the first cell finds it restored.
+pub fn resetNode(alloc: Allocator, node_id: []const u8) void {
+    const managers = nodeKernels(alloc, node_id) catch return;
+    defer unpinAll(alloc, managers);
+    for (managers) |manager| {
+        manager.resetToLog();
+        manager.prewarmIfSaved() catch {};
+    }
+}
+
 /// Drops one hold. The kernel is destroyed, with a final snapshot, unless a
 /// retainer keeps its live process for a later turn.
 pub fn release(manager: *Manager) void {
@@ -636,7 +680,10 @@ const LiveFixture = struct {
     fn manager(self: *LiveFixture, name: []const u8) !*Manager {
         const dir = try std.Io.Dir.path.join(self.alloc, &.{ self.root, name });
         defer self.alloc.free(dir);
-        return Manager.create(self.alloc, .{ .cwd = self.root, .artifact_dir = dir, .python = self.python });
+        const blobs = try std.Io.Dir.path.join(self.alloc, &.{ dir, "blobs" });
+        defer self.alloc.free(blobs);
+        try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), blobs);
+        return Manager.create(self.alloc, .{ .cwd = self.root, .artifact_dir = dir, .python = self.python, .blob_dir = blobs });
     }
 
     fn expectResult(self: *LiveFixture, target: *Manager, code: []const u8, expected: []const u8) !void {

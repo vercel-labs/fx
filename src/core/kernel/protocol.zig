@@ -3,17 +3,18 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 pub const max_frame_bytes = 32 * 1024 * 1024;
 /// Must equal `PROTOCOL_VERSION` in runtime.py; bump both when the wire shape changes.
-pub const version = 4;
+pub const version = 5;
 
 /// One host-to-runtime frame. Request ids travel as decimal strings.
 pub const Request = union(enum) {
     execute: struct { id: u64, code: []const u8 },
     interrupt: u64,
-    snapshot: Target,
-    restore: Target,
+    /// Writes each changed global as a record into `dir`, the node's blob
+    /// folder, and answers with the manifest (D99).
+    snapshot: struct { id: u64, dir: []const u8 },
+    /// Loads `records` from `dir`, or a legacy snapshot file at `path`.
+    restore: struct { id: u64, dir: []const u8 = "", records: []const Record = &.{}, path: ?[]const u8 = null },
     shutdown: u64,
-
-    pub const Target = struct { id: u64, path: []const u8 };
 
     pub fn jsonStringify(self: Request, jw: anytype) !void {
         try jw.beginObject();
@@ -25,10 +26,31 @@ pub const Request = union(enum) {
                 try jw.objectField("code");
                 try jw.write(request.code);
             },
-            .snapshot, .restore => |target| {
+            .snapshot => |target| {
                 try writeId(jw, target.id);
-                try jw.objectField("path");
-                try jw.write(target.path);
+                try jw.objectField("dir");
+                try jw.write(target.dir);
+            },
+            .restore => |target| {
+                try writeId(jw, target.id);
+                if (target.path) |path| {
+                    try jw.objectField("path");
+                    try jw.write(path);
+                } else {
+                    try jw.objectField("dir");
+                    try jw.write(target.dir);
+                    try jw.objectField("records");
+                    try jw.beginArray();
+                    for (target.records) |record| {
+                        try jw.beginObject();
+                        try jw.objectField("name");
+                        try jw.write(record.name);
+                        try jw.objectField("hash");
+                        try jw.write(record.hash);
+                        try jw.endObject();
+                    }
+                    try jw.endArray();
+                }
             },
             .interrupt, .shutdown => |id| try writeId(jw, id),
         }
@@ -39,6 +61,48 @@ pub const Request = union(enum) {
         var buf: [24]u8 = undefined;
         try jw.objectField("id");
         try jw.write(std.mem.print(&buf, "{d}", .{id}) catch unreachable);
+    }
+};
+
+/// One global of a snapshot: its name, and the blob holding its record.
+pub const Record = struct { name: []const u8 = "", hash: []const u8 = "", bytes: u64 = 0 };
+
+/// A kernel's globals at one moment: the records that hold them, and the
+/// globals a snapshot could not hold. Owns its slices.
+pub const Manifest = struct {
+    arena: std.heap.ArenaAllocator,
+    records: []const Record = &.{},
+    failed: []const Event.Failure = &.{},
+    /// Record bytes the snapshot that made it wrote, and their total.
+    written: u64 = 0,
+    bytes: u64 = 0,
+
+    pub fn create(gpa: Allocator, records: []const Record, failed: []const Event.Failure) !*Manifest {
+        const self = try gpa.create(Manifest);
+        errdefer gpa.destroy(self);
+        self.* = .{ .arena = std.heap.ArenaAllocator.init(gpa) };
+        errdefer self.arena.deinit();
+        const a = self.arena.allocator();
+        const owned_records = try a.alloc(Record, records.len);
+        for (records, owned_records) |record, *slot| slot.* = .{ .name = try a.dupe(u8, record.name), .hash = try a.dupe(u8, record.hash), .bytes = record.bytes };
+        const owned_failed = try a.alloc(Event.Failure, failed.len);
+        for (failed, owned_failed) |entry, *slot| slot.* = .{ .name = try a.dupe(u8, entry.name), .reason = try a.dupe(u8, entry.reason) };
+        self.records = owned_records;
+        self.failed = owned_failed;
+        return self;
+    }
+
+    pub fn clone(self: *const Manifest, gpa: Allocator) !*Manifest {
+        const copy = try create(gpa, self.records, self.failed);
+        copy.written = self.written;
+        copy.bytes = self.bytes;
+        return copy;
+    }
+
+    pub fn destroy(self: *Manifest) void {
+        const gpa = self.arena.child_allocator;
+        self.arena.deinit();
+        gpa.destroy(self);
     }
 };
 
@@ -53,8 +117,12 @@ pub const Event = struct {
     evalue: []const u8 = "",
     traceback: []const []const u8 = &.{},
     reason: ?[]const u8 = null,
-    /// Names a restore could not revive.
+    /// Names a restore could not revive, or a snapshot could not hold.
     failed: []const Failure = &.{},
+    /// A snapshot's manifest (D99).
+    records: []const Record = &.{},
+    written: u64 = 0,
+    bytes: u64 = 0,
 
     pub const Kind = enum { ready, stdout, stderr, result, @"error", done };
     pub const DoneStatus = enum { ok, @"error" };
@@ -162,8 +230,11 @@ test "kernel requests serialize with string ids and a type tag" {
     try std.json.Stringify.value(Request{ .execute = .{ .id = 7, .code = "x = 1" } }, .{}, &out.writer);
     try std.testing.expectEqualStrings("{\"type\":\"execute\",\"id\":\"7\",\"code\":\"x = 1\"}", out.written());
     out.clearRetainingCapacity();
-    try std.json.Stringify.value(Request{ .snapshot = .{ .id = 8, .path = "/s" } }, .{}, &out.writer);
-    try std.testing.expectEqualStrings("{\"type\":\"snapshot\",\"id\":\"8\",\"path\":\"/s\"}", out.written());
+    try std.json.Stringify.value(Request{ .snapshot = .{ .id = 8, .dir = "/s" } }, .{}, &out.writer);
+    try std.testing.expectEqualStrings("{\"type\":\"snapshot\",\"id\":\"8\",\"dir\":\"/s\"}", out.written());
+    out.clearRetainingCapacity();
+    try std.json.Stringify.value(Request{ .restore = .{ .id = 9, .dir = "/b", .records = &.{.{ .name = "x", .hash = "h" }} } }, .{}, &out.writer);
+    try std.testing.expectEqualStrings("{\"type\":\"restore\",\"id\":\"9\",\"dir\":\"/b\",\"records\":[{\"name\":\"x\",\"hash\":\"h\"}]}", out.written());
     out.clearRetainingCapacity();
     try std.json.Stringify.value(Request{ .interrupt = 9 }, .{}, &out.writer);
     try std.testing.expectEqualStrings("{\"type\":\"interrupt\",\"id\":\"9\"}", out.written());

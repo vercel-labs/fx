@@ -153,9 +153,12 @@ test "a forked kernel interrupts, restarts and outlives a killed zygote, which i
     defer alloc.free(dir_a);
     const dir_b = try std.Io.Dir.path.join(alloc, &.{ root, "b" });
     defer alloc.free(dir_b);
-    const a = try kernel.Manager.create(alloc, .{ .cwd = root, .artifact_dir = dir_a, .python = python });
+    const blobs = try std.Io.Dir.path.join(alloc, &.{ root, "blobs" });
+    defer alloc.free(blobs);
+    try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), blobs);
+    const a = try kernel.Manager.create(alloc, .{ .cwd = root, .artifact_dir = dir_a, .python = python, .blob_dir = blobs });
     defer a.destroy();
-    const b = try kernel.Manager.create(alloc, .{ .cwd = root, .artifact_dir = dir_b, .python = python });
+    const b = try kernel.Manager.create(alloc, .{ .cwd = root, .artifact_dir = dir_b, .python = python, .blob_dir = blobs });
     defer b.destroy();
 
     const Cell = struct {

@@ -1732,8 +1732,9 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   "forked from root › reviewer · turn 4". The fork drops the child's
   instructions from its preferences but keeps the node's first prompt, its
   mission, as the first turn. It is a normal root: it has the subagent
-  tool at depth 0, its own tree budget and run slots, a fresh kernel and an
-  empty store, and the session's permission mode rather than the ceiling
+  tool at depth 0, its own tree budget and run slots, the node's
+  kernels and store as they were at the fork point (D99), and the
+  session's permission mode rather than the ceiling
   the node had under its parent. The person's `/fork` authorizes that
   wider authority, as opening any root session would. The source tree is
   not changed, and the frontend switches to the fork as root `/fork`
@@ -1742,6 +1743,29 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   **Why:** a person forks a subagent to give it their own attention, so
   it gets its own session. **Alternative:** a sibling node under the same
   parent, which the parent never asked for; or refusing the fork.
+
+- **D99 Decision (amends D95 and D98):** a node's Python state lives in
+  its own session log. Three manager line kinds, allowed only inside a
+  turn and stamped with it: `store_set {turn, key, blob}` and
+  `store_del {turn, key}` for the `proto_fx` store, and
+  `kernel_snapshot {turn, kernel, names, blobs, failed}` for a kernel's
+  globals at the end of a turn in which it ran a cell. Each global is one
+  record, its dill bytes a content-addressed blob of the node's session,
+  so unchanged globals reuse their blobs and every turn's state is kept
+  for the life of the session. The kernel process writes its records into
+  the node's blob folder with the manager's blob steps; only the manager
+  writes lines, and every read checks a blob against its name. A turn's
+  end snapshots each due kernel under its command gate before the end
+  line, so no later cell comes first. Both states fold on demand and skip
+  lines of turns a rewind dropped, so a rewind returns the node's kernels
+  to the newest snapshot it kept (they restart and restore in the
+  background) and a fork at turn N restores the newest snapshot at or
+  before N, with no fork or rewind code of their own. A park writes the
+  same records and is remembered by the process, which restores it before
+  the log. Background saves are gone: a crash mid-turn restores the last
+  ended turn. `PythonState.tla` checks `RestoreExact`. **Why:** a fork or
+  undo at any turn must give that turn's exact Python state. **Alternative:**
+  one snapshot file per kernel, which kept only the newest state.
 
 ## Design Risks And Failure Behavior
 

@@ -36,7 +36,22 @@ pub const Options = struct {
     persist: bool = true,
     python: ?[]const u8 = null,
     progress: ?bootstrap.Progress = null,
+    /// The node's session blob folder, where the kernel writes its records
+    /// (D99). Empty keeps none.
+    blob_dir: []const u8 = "",
+    /// The node's session id and this kernel's name among its kernels.
+    node_id: []const u8 = "",
+    name: []const u8 = "default",
+    /// Finds the kernel's newest snapshot in the node's log.
+    resolver: ?Resolver = null,
 };
+
+/// The globals the node's log holds for kernel `name` of `node_id`, whose
+/// records live in `blob_dir`, or null when it holds none. Caller owns it.
+pub const Resolver = *const fn (alloc: Allocator, blob_dir: []const u8, node_id: []const u8, name: []const u8) anyerror!?*protocol.Manifest;
+pub const Manifest = protocol.Manifest;
+/// The longest a snapshot or a restore of a large namespace may take.
+const state_timeout_ms = 300_000;
 pub const ExecuteOptions = struct {
     cancel: ?*const std.atomic.Value(bool) = null,
     on_stream: ?StreamSink = null,
@@ -76,9 +91,6 @@ pub const Result = struct {
 
 /// The request occupying the kernel's single request slot.
 const Request = enum { none, execute, snapshot, restore, shutdown };
-/// Whether saved globals may be overwritten. A failed or partial restore protects the
-/// original snapshot until a later restore succeeds; the next cell reports it once.
-const SaveGuard = enum { open, protected_unreported, protected };
 /// What the next start does with the saved snapshot. A restore that hung is skipped
 /// once, so the replacement starts with an empty namespace instead of hanging again.
 const NextRestore = enum { restore, skip };
@@ -89,7 +101,13 @@ pub const Manager = struct {
     artifact_dir: []u8,
     persist: bool,
     python: ?[]u8,
+    /// A snapshot file from before per-variable records, restored only when
+    /// the log holds none (D99).
     snapshot_path: []u8,
+    blob_dir: []u8,
+    node_id: []u8,
+    name: []u8,
+    resolver: ?Resolver,
     progress: ?bootstrap.Progress,
     /// Guards the request and lifecycle fields below; the atomics need no lock.
     mutex: std.Io.Mutex = .init,
@@ -124,10 +142,22 @@ pub const Manager = struct {
     value: Buffer = .{},
     background: Buffer = .{},
     diagnostic: Buffer = .{},
-    /// When the reader takes a debounced background snapshot; null when nothing is pending.
-    save_due: ?i64 = null,
-    save_guard: SaveGuard = .open,
     next_restore: NextRestore = .restore,
+    /// A cell was sent since the node's log last recorded this kernel's
+    /// globals: the turn's end must snapshot it (D99). Under `mutex`.
+    log_dirty: bool = false,
+    /// The globals as this process last saved or restored them; the next
+    /// start restores these before anything in the log. Under `mutex`.
+    saved: ?*Manifest = null,
+    /// The manifest the last snapshot answered with, for its caller.
+    snapshot_result: ?*Manifest = null,
+    /// What the running restore could not revive.
+    restore_report: Buffer = .{},
+    /// The line the next cell prints first, naming globals a restore lost.
+    notice: ?[]u8 = null,
+    /// The last snapshot's duration and the record bytes it wrote.
+    last_snapshot_ms: u64 = 0,
+    last_snapshot_written: u64 = 0,
     stderr_log: ?std.Io.File = null,
     stderr_log_bytes: usize = 0,
     /// Owned by `pool.zig` and guarded by its mutex.
@@ -145,7 +175,25 @@ pub const Manager = struct {
         const python = if (options.python) |p| try alloc.dupe(u8, p) else null;
         errdefer if (python) |p| alloc.free(p);
         const snapshot = try std.Io.Dir.path.join(alloc, &.{ dir, "kernel-state.dill" });
-        self.* = .{ .alloc = alloc, .cwd = cwd, .artifact_dir = dir, .persist = options.persist, .python = python, .snapshot_path = snapshot, .progress = options.progress };
+        errdefer alloc.free(snapshot);
+        const blob_dir = try alloc.dupe(u8, options.blob_dir);
+        errdefer alloc.free(blob_dir);
+        const node_id = try alloc.dupe(u8, options.node_id);
+        errdefer alloc.free(node_id);
+        const name = try alloc.dupe(u8, options.name);
+        self.* = .{
+            .alloc = alloc,
+            .cwd = cwd,
+            .artifact_dir = dir,
+            .persist = options.persist,
+            .python = python,
+            .snapshot_path = snapshot,
+            .progress = options.progress,
+            .blob_dir = blob_dir,
+            .node_id = node_id,
+            .name = name,
+            .resolver = options.resolver,
+        };
         return self;
     }
 
@@ -171,6 +219,13 @@ pub const Manager = struct {
         self.value.deinit(self.alloc);
         self.background.deinit(self.alloc);
         self.diagnostic.deinit(self.alloc);
+        self.restore_report.deinit(self.alloc);
+        if (self.saved) |manifest| manifest.destroy();
+        if (self.snapshot_result) |manifest| manifest.destroy();
+        if (self.notice) |text| self.alloc.free(text);
+        self.alloc.free(self.blob_dir);
+        self.alloc.free(self.node_id);
+        self.alloc.free(self.name);
         self.alloc.free(self.cwd);
         self.alloc.free(self.artifact_dir);
         if (self.python) |p| self.alloc.free(p);
@@ -202,7 +257,7 @@ pub const Manager = struct {
 
     fn warm(self: *Manager, snapshot_only: bool) void {
         defer self.warming.store(false, .release);
-        if (snapshot_only) std.Io.Dir.cwd().access(io_mod.getIo(), self.snapshot_path, .{}) catch return;
+        if (snapshot_only and !self.hasSavedState()) return;
         self.lockGateUncancelable();
         defer self.unlockGate();
         self.ensureLocked(null) catch {};
@@ -257,10 +312,12 @@ pub const Manager = struct {
         self.cap = @min(options.max_output_chars, 1024 * 1024);
         self.sink = options.on_stream;
         self.request_status = .ok;
-        if (self.save_guard == .protected_unreported) {
-            self.err.append(self.alloc, "[kernel] Some saved state could not be restored; the original snapshot is preserved.\n", self.cap) catch {};
-            self.save_guard = .protected;
+        if (self.notice) |text| {
+            self.err.append(self.alloc, text, self.cap) catch {};
+            self.alloc.free(text);
+            self.notice = null;
         }
+        self.log_dirty = true;
         self.mutex.unlock(io);
         const id = try self.begin(.execute);
         const cell_began = now();
@@ -356,7 +413,7 @@ pub const Manager = struct {
     fn parkableLocked(self: *Manager) bool {
         if (self.gate_held or self.disposed.load(.acquire) or self.stopping.load(.acquire)) return false;
         if (self.state == .failed) return true;
-        return self.state == .running and self.active == .none and self.persist and self.save_guard == .open;
+        return self.state == .running and self.active == .none and self.persist and self.blob_dir.len > 0;
     }
 
     /// Snapshots and stops an idle kernel so its process memory is released; the
@@ -387,12 +444,154 @@ pub const Manager = struct {
     }
 
     fn saveNow(self: *Manager) bool {
-        const id = self.begin(.snapshot) catch return false;
-        self.sendSnapshot(id) catch return false;
-        self.waitDone(id, 5000) catch return false;
+        const manifest = self.snapshotLocked() catch return false;
+        self.keepSaved(manifest);
+        return true;
+    }
+
+    /// Takes a snapshot with the gate held: each changed global becomes a
+    /// record in the node's blob folder (D99). Caller owns the manifest.
+    fn snapshotLocked(self: *Manager) !*Manifest {
+        if (self.blob_dir.len == 0) return error.KernelHasNoRecordFolder;
+        const began = now();
+        const id = try self.begin(.snapshot);
+        try self.send(.{ .snapshot = .{ .id = id, .dir = self.blob_dir } }, null, 1000);
+        try self.waitDone(id, state_timeout_ms);
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const manifest = self.snapshot_result orelse return error.KernelSnapshotFailed;
+        self.snapshot_result = null;
+        if (self.request_status != .ok) {
+            manifest.destroy();
+            return error.KernelSnapshotFailed;
+        }
+        self.last_snapshot_ms = @intCast(@max(0, now() - began));
+        self.last_snapshot_written = manifest.written;
+        return manifest;
+    }
+
+    /// Makes `manifest` what the next start restores; takes ownership.
+    fn keepSaved(self: *Manager, manifest: *Manifest) void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        return self.request_status == .ok;
+        if (self.saved) |old| old.destroy();
+        self.saved = manifest;
+    }
+
+    /// Whether a start would restore anything: this process's last save,
+    /// the node's log, or a legacy snapshot file.
+    fn hasSavedState(self: *Manager) bool {
+        if (!self.persist) return false;
+        {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            defer self.mutex.unlock(io_mod.getIo());
+            if (self.saved != null) return true;
+        }
+        if (self.resolveLog()) |manifest| {
+            manifest.destroy();
+            return true;
+        }
+        std.Io.Dir.cwd().access(io_mod.getIo(), self.snapshot_path, .{}) catch return false;
+        return true;
+    }
+
+    fn resolveLog(self: *Manager) ?*Manifest {
+        const resolver = self.resolver orelse return null;
+        if (self.blob_dir.len == 0 or self.node_id.len == 0) return null;
+        return resolver(self.alloc, self.blob_dir, self.node_id, self.name) catch |err| {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            defer self.mutex.unlock(io_mod.getIo());
+            self.diagnostic.append(self.alloc, "Could not read the kernel's snapshots from the session log: ", diagnostic_cap) catch {};
+            self.diagnostic.append(self.alloc, @errorName(err), diagnostic_cap) catch {};
+            return null;
+        };
+    }
+
+    /// What the node's log must record for this kernel at the end of the
+    /// turn, or null when no cell ran since it last did (D99). A live kernel
+    /// snapshots now, under its gate, so no later cell can come first; a
+    /// parked one reports what it parked with. The caller writes the line
+    /// and then calls `recorded`. Caller owns the manifest.
+    pub fn turnSnapshot(self: *Manager, alloc: Allocator) !?*Manifest {
+        if (!self.persist) return null;
+        {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            defer self.mutex.unlock(io_mod.getIo());
+            if (!self.log_dirty) return null;
+        }
+        try self.lockGate(&self.disposed);
+        defer self.unlockGate();
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        const live = self.state == .running and self.active == .none;
+        if (live) self.caller_waiting = true;
+        self.mutex.unlock(io);
+        if (live) {
+            defer {
+                self.mutex.lockUncancelable(io);
+                self.caller_waiting = false;
+                self.mutex.unlock(io);
+            }
+            const manifest = try self.snapshotLocked();
+            errdefer manifest.destroy();
+            const copy = try manifest.clone(alloc);
+            self.keepSaved(manifest);
+            return copy;
+        }
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        // A dead kernel with no save restores from the log, which already
+        // holds what its next start sees.
+        const saved = self.saved orelse {
+            self.log_dirty = false;
+            return null;
+        };
+        return try saved.clone(alloc);
+    }
+
+    /// Whether a cell ran since the node's log last recorded this kernel.
+    pub fn dueForLog(self: *Manager) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return self.persist and self.log_dirty;
+    }
+
+    /// The node's log now holds this kernel's globals.
+    pub fn recorded(self: *Manager) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.log_dirty = false;
+    }
+
+    /// The node's log no longer matches this kernel, after a rewind (D99):
+    /// the process goes without a snapshot, this process's save is
+    /// forgotten, and the next start restores from the log.
+    pub fn resetToLog(self: *Manager) void {
+        self.stopping.store(true, .release);
+        self.writer.lockUncancelable(io_mod.getIo());
+        if (self.child) |child| child.signal(.KILL);
+        self.writer.unlock(io_mod.getIo());
+        self.lockGateUncancelable();
+        defer self.unlockGate();
+        self.stopLocked(false);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        if (self.saved) |manifest| manifest.destroy();
+        self.saved = null;
+        self.log_dirty = false;
+        if (self.notice) |text| self.alloc.free(text);
+        self.notice = null;
+        self.next_restore = .restore;
+        self.mutex.unlock(io_mod.getIo());
+        self.stopping.store(false, .release);
+    }
+
+    /// Snapshot statistics for `/kernel`: the last snapshot's duration and
+    /// the record bytes it wrote.
+    pub fn snapshotStats(self: *Manager) struct { ms: u64, written: u64 } {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return .{ .ms = self.last_snapshot_ms, .written = self.last_snapshot_written };
     }
 
     fn ensureLocked(self: *Manager, cancel: Cancel) !void {
@@ -492,14 +691,64 @@ pub const Manager = struct {
             self.caller_waiting = false;
             self.mutex.unlock(io);
         }
-        const id = try self.begin(.restore);
-        try self.send(.{ .restore = .{ .id = id, .path = self.snapshot_path } }, null, 1000);
-        self.waitDone(id, 30_000) catch {
+        try self.restoreLocked();
+    }
+
+    /// Restores the newest saved globals: this process's last save, else
+    /// the node's log, else a legacy snapshot file (D99). A restore that
+    /// loses globals leaves one line naming them for the next cell.
+    fn restoreLocked(self: *Manager) !void {
+        const io = io_mod.getIo();
+        var source: ?*Manifest = blk: {
             self.mutex.lockUncancelable(io);
-            self.save_guard = .protected_unreported;
+            defer self.mutex.unlock(io);
+            break :blk if (self.saved) |saved| try saved.clone(self.alloc) else null;
+        };
+        if (source == null) source = self.resolveLog();
+        defer if (source) |manifest| manifest.destroy();
+        const legacy = source == null and if (std.Io.Dir.cwd().access(io, self.snapshot_path, .{})) |_| true else |_| false;
+        if (source == null and !legacy) return;
+        self.mutex.lockUncancelable(io);
+        self.restore_report.clear();
+        self.mutex.unlock(io);
+        const id = try self.begin(.restore);
+        try self.send(if (source) |manifest|
+            .{ .restore = .{ .id = id, .dir = self.blob_dir, .records = manifest.records } }
+        else
+            .{ .restore = .{ .id = id, .path = self.snapshot_path } }, null, 5000);
+        const timed_out = if (self.waitDone(id, state_timeout_ms)) |_| false else |_| true;
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        var line: std.Io.Writer.Allocating = .init(self.alloc);
+        defer line.deinit();
+        var count: usize = 0;
+        if (source) |manifest| for (manifest.failed) |entry| {
+            try line.writer.print("{s}{s} ({s})", .{ if (count == 0) "" else ", ", entry.name, entry.reason });
+            count += 1;
+        };
+        const report = try self.restore_report.finish(self.alloc, diagnostic_cap);
+        defer self.alloc.free(report);
+        if (report.len > 0) {
+            try line.writer.print("{s}{s}", .{ if (count == 0) "" else ", ", report });
+            count += 1;
+        }
+        if (timed_out) {
+            try line.writer.print("{s}every global: the restore did not finish in time", .{if (count == 0) "" else ", "});
+            count += 1;
+        }
+        if (count > 0) {
+            if (self.notice) |old| self.alloc.free(old);
+            self.notice = try self.alloc.print("[kernel] Not restored: {s}\n", .{line.written()});
+        }
+        if (timed_out) {
             self.next_restore = .skip;
-            self.mutex.unlock(io);
             return error.KernelRestoreFailed;
+        }
+        // The namespace now holds what the source names; later starts in this
+        // process restore it rather than read the log again.
+        if (source) |manifest| if (self.saved == null) {
+            self.saved = manifest;
+            source = null;
         };
     }
 
@@ -649,13 +898,10 @@ pub const Manager = struct {
             self.interrupt();
             self.waitIdle(null) catch {};
             self.mutex.lockUncancelable(io_mod.getIo());
-            const can_save = self.persist and self.active == .none and self.save_guard == .open;
+            const can_save = self.persist and self.active == .none and self.blob_dir.len > 0;
             self.mutex.unlock(io_mod.getIo());
             if (can_save) {
-                if (self.begin(.snapshot)) |id| {
-                    self.sendSnapshot(id) catch {};
-                    self.waitDone(id, 5000) catch {};
-                } else |_| {}
+                if (self.snapshotLocked()) |manifest| self.keepSaved(manifest) else |_| {}
             }
             if (self.begin(.shutdown)) |id| {
                 self.send(.{ .shutdown = id }, null, 1000) catch {};
@@ -682,14 +928,8 @@ pub const Manager = struct {
         self.caller_waiting = false;
         self.sink = null;
         self.background.clear();
-        self.save_due = null;
         self.mutex.unlock(io_mod.getIo());
         self.notify();
-    }
-
-    /// The reader's debounced save uses this too.
-    pub fn sendSnapshot(self: *Manager, id: u64) !void {
-        try self.send(.{ .snapshot = .{ .id = id, .path = self.snapshot_path } }, null, 1000);
     }
 
     /// Only the reader schedules a repair, after it has reaped the damaged child. A replacement
@@ -807,7 +1047,10 @@ test "kernel live cells persist globals across stop, restart and interrupt" {
     defer io_mod.resetEnvironForTest();
     const artifacts = try std.Io.Dir.path.join(alloc, &.{ root, "artifacts" });
     defer alloc.free(artifacts);
-    const manager = try Manager.create(alloc, .{ .cwd = root, .artifact_dir = artifacts, .python = python });
+    const blobs = try std.Io.Dir.path.join(alloc, &.{ artifacts, "blobs" });
+    defer alloc.free(blobs);
+    try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), blobs);
+    const manager = try Manager.create(alloc, .{ .cwd = root, .artifact_dir = artifacts, .python = python, .blob_dir = blobs });
     defer manager.destroy();
 
     const first = try manager.execute(alloc, "x = 41\nprint('hi')", .{});
@@ -849,6 +1092,83 @@ test "kernel live cells persist globals across stop, restart and interrupt" {
     const still_alive = try manager.execute(alloc, "x * 2", .{});
     defer still_alive.deinit(alloc);
     try std.testing.expectEqualStrings("82", still_alive.result);
+}
+
+/// The log the next test's resolver reads: one manifest, or none.
+var test_log: ?*Manifest = null;
+
+fn testResolver(alloc: Allocator, _: []const u8, _: []const u8, _: []const u8) anyerror!?*Manifest {
+    const manifest = test_log orelse return null;
+    return try manifest.clone(alloc);
+}
+
+// Runs only when PROTO_FX_KERNEL_TEST_PYTHON names a Python 3.11+ with dill.
+test "a turn snapshot writes only changed records, and a reset restores the log's turn (D99)" {
+    const alloc = std.testing.allocator;
+    var runner_env = try std.process.Environ.createMap(std.testing.environ, alloc);
+    defer runner_env.deinit();
+    const python = runner_env.get("PROTO_FX_KERNEL_TEST_PYTHON") orelse return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const kernel_home = try std.Io.Dir.path.join(alloc, &.{ root, "kernel-home" });
+    defer alloc.free(kernel_home);
+    var env = std.process.Environ.Map.init(alloc);
+    defer env.deinit();
+    try env.put("HOME", root);
+    try env.put("PROTO_FX_KERNEL_HOME", kernel_home);
+    io_mod.setEnvironMap(&env);
+    defer io_mod.resetEnvironForTest();
+    const artifacts = try std.Io.Dir.path.join(alloc, &.{ root, "artifacts" });
+    defer alloc.free(artifacts);
+    const blobs = try std.Io.Dir.path.join(alloc, &.{ root, "blobs" });
+    defer alloc.free(blobs);
+    try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), blobs);
+    test_log = null;
+    const manager = try Manager.create(alloc, .{ .cwd = root, .artifact_dir = artifacts, .python = python, .blob_dir = blobs, .node_id = "n", .resolver = testResolver });
+    defer manager.destroy();
+
+    const first = try manager.execute(alloc, "x = 1\nbig = bytes(1 << 20)", .{});
+    first.deinit(alloc);
+    const one = (try manager.turnSnapshot(alloc)).?;
+    defer one.destroy();
+    manager.recorded();
+    try std.testing.expectEqual(@as(usize, 2), one.records.len);
+    try std.testing.expect(one.written > 1 << 20);
+    // Nothing ran since: nothing to record.
+    try std.testing.expect((try manager.turnSnapshot(alloc)) == null);
+    const second = try manager.execute(alloc, "x = 2", .{});
+    second.deinit(alloc);
+    const two = (try manager.turnSnapshot(alloc)).?;
+    defer two.destroy();
+    manager.recorded();
+    // The unchanged megabyte is not written again.
+    try std.testing.expect(two.written < 1024);
+
+    // A rewind back to the first turn: the kernel restores what its log holds.
+    test_log = one;
+    defer test_log = null;
+    manager.resetToLog();
+    const back = try manager.execute(alloc, "x", .{});
+    defer back.deinit(alloc);
+    try std.testing.expectEqualStrings("1", back.result);
+    try std.testing.expectEqual(@as(usize, 0), back.stderr.len);
+
+    // A global the snapshot could not hold is named once after the restore.
+    const sock = try manager.execute(alloc, "import socket\ns = socket.socket()", .{});
+    sock.deinit(alloc);
+    const three = (try manager.turnSnapshot(alloc)).?;
+    defer three.destroy();
+    try std.testing.expectEqual(@as(usize, 1), three.failed.len);
+    test_log = three;
+    manager.resetToLog();
+    const after = try manager.execute(alloc, "x", .{});
+    defer after.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, after.stderr, "[kernel] Not restored: s (") != null);
+    const quiet = try manager.execute(alloc, "x", .{});
+    defer quiet.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), quiet.stderr.len);
 }
 
 test {

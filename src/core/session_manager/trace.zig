@@ -363,7 +363,7 @@ pub const TurnTraces = struct {
             .turn_interrupted => "interrupt",
             .set => "set",
             .closed => "closed",
-            .snapshot, .child_spawned, .child_finished, .rewound => null,
+            .snapshot, .child_spawned, .child_finished, .rewound, .store_set, .store_del, .kernel_snapshot => null,
         };
     }
 

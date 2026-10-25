@@ -27,6 +27,9 @@ pub const Kind = enum {
     snapshot,
     closed,
     rewound,
+    store_set,
+    store_del,
+    kernel_snapshot,
 };
 
 pub const Header = struct {
@@ -132,6 +135,9 @@ pub const Body = union(Kind) {
     snapshot: Snapshot,
     closed: void,
     rewound: Rewound,
+    store_set: StoreSet,
+    store_del: StoreDel,
+    kernel_snapshot: KernelSnapshot,
 
     pub const Created = struct {
         id: []const u8,
@@ -168,11 +174,14 @@ pub const Body = union(Kind) {
         blobs: []const []const u8 = &.{},
     };
 
-    /// The blobs a line refers to: an item's or a setting's, else none.
+    /// The blobs a line refers to: an item's, a setting's, a stored
+    /// value's or a kernel snapshot's, else none.
     pub fn blobRefs(body: Body) []const []const u8 {
         return switch (body) {
             .item => |piece| piece.blobs,
             .set => |s| s.blobs,
+            .store_set => |s| s.blob[0..1],
+            .kernel_snapshot => |k| k.blobs,
             else => &.{},
         };
     }
@@ -184,6 +193,21 @@ pub const Body = union(Kind) {
     /// newest turn when it was written, and every child first spawned
     /// after `turn` started is abandoned (D97). Written between turns.
     pub const Rewound = struct { turn: u64, through: u64, abandoned: []const []const u8 = &.{} };
+    /// One value of the node's `proto_fx` store, kept as blob `blob[0]`
+    /// (D99). Written inside a turn; a rewind of that turn drops it.
+    pub const StoreSet = struct { turn: u64, key: []const u8, blob: *const [1][]const u8 };
+    pub const StoreDel = struct { turn: u64, key: []const u8 };
+    /// The globals of the node's kernel `kernel` at the end of turn `turn`
+    /// (D99): global `names[i]` is the record kept as blob `blobs[i]`.
+    /// `failed` is fx's raw JSON list of the globals the snapshot could not
+    /// hold, each `{"name","reason"}`.
+    pub const KernelSnapshot = struct {
+        turn: u64,
+        kernel: []const u8,
+        names: []const []const u8,
+        blobs: []const []const u8,
+        failed: []const u8 = "[]",
+    };
 };
 
 /// Appends the fields of `body`. Strings must be valid UTF-8 and raw values
@@ -253,6 +277,22 @@ pub fn appendBody(gpa: std.mem.Allocator, out: *std.ArrayList(u8), body: Body) e
             try w.number("turn", r.turn);
             try w.number("through", r.through);
             try w.stringList("abandoned", r.abandoned);
+        },
+        .store_set => |v| {
+            try w.number("turn", v.turn);
+            try w.string("key", v.key);
+            try w.string("blob", v.blob[0]);
+        },
+        .store_del => |v| {
+            try w.number("turn", v.turn);
+            try w.string("key", v.key);
+        },
+        .kernel_snapshot => |k| {
+            try w.number("turn", k.turn);
+            try w.string("kernel", k.kernel);
+            try w.stringList("names", k.names);
+            try w.stringList("blobs", k.blobs);
+            try w.raw("failed", k.failed);
         },
     }
 }
@@ -326,6 +366,24 @@ fn bodyOf(kind: Kind, f: Fields) BodyError!Body {
             .through = try f.req(u64, "through"),
             .abandoned = try f.opt([]const []const u8, "abandoned") orelse &.{},
         } },
+        .store_set => blk: {
+            const blob = try f.arena.create([1][]const u8);
+            blob[0] = try f.req([]const u8, "blob");
+            break :blk .{ .store_set = .{ .turn = try f.req(u64, "turn"), .key = try f.req([]const u8, "key"), .blob = blob } };
+        },
+        .store_del => .{ .store_del = .{ .turn = try f.req(u64, "turn"), .key = try f.req([]const u8, "key") } },
+        .kernel_snapshot => blk: {
+            const names = try f.req([]const []const u8, "names");
+            const blobs = try f.req([]const []const u8, "blobs");
+            if (names.len != blobs.len) return error.BadBody;
+            break :blk .{ .kernel_snapshot = .{
+                .turn = try f.req(u64, "turn"),
+                .kernel = try f.req([]const u8, "kernel"),
+                .names = names,
+                .blobs = blobs,
+                .failed = f.raw("failed") orelse "[]",
+            } };
+        },
     };
 }
 

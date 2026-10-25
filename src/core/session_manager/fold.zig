@@ -255,7 +255,9 @@ pub const Line = struct {
 /// before `fork_seq` belong to the source and are skipped.
 pub fn apply(gpa: std.mem.Allocator, state: *State, fork_seq: u64, line: Line) error{OutOfMemory}!void {
     switch (line.body) {
-        .session_created, .item, .snapshot, .closed => {},
+        // The store and kernel lines fold on demand, never into the state
+        // (`python_fold.zig`, D99).
+        .session_created, .item, .snapshot, .closed, .store_set, .store_del, .kernel_snapshot => {},
         .turn_started => |t| {
             state.open_turn = t.turn;
             state.last_turn = @max(state.last_turn, t.turn);
@@ -310,6 +312,20 @@ pub const Event = union(enum) {
     /// Drops turns `turn` through the newest from the history and abandons
     /// the named children (D97). The manager fills in `through`.
     rewound: Rewind,
+    /// A value of the node's store, or its removal (D99). Inside a turn;
+    /// the manager fills in the turn.
+    store_set: StoreSet,
+    store_del: []const u8,
+    /// The kernel's globals at this turn's end (D99). Inside a turn.
+    kernel_snapshot: KernelSnapshot,
+};
+
+pub const StoreSet = struct { key: []const u8, blob: *const [1][]const u8 };
+pub const KernelSnapshot = struct {
+    kernel: []const u8,
+    names: []const []const u8,
+    blobs: []const []const u8,
+    failed: []const u8 = "[]",
 };
 
 pub const Rewind = struct { turn: u64, abandoned: []const []const u8 = &.{} };
@@ -382,6 +398,20 @@ pub fn plan(state: *const State, events: []const Event, out: []schema.Body) Tran
                     if (openWorkAt(state, events[0..i], id) != null) return error.InvalidTransition;
                 }
                 break :blk .{ .rewound = .{ .turn = r.turn, .through = last_turn, .abandoned = r.abandoned } };
+            },
+            // Python state belongs to the turn that made it, so a rewind
+            // drops it with the turn (`tests/tla/session_manager/PythonState.tla`).
+            .store_set => |v| .{ .store_set = .{ .turn = open_turn orelse return error.InvalidTransition, .key = v.key, .blob = v.blob } },
+            .store_del => |key| .{ .store_del = .{ .turn = open_turn orelse return error.InvalidTransition, .key = key } },
+            .kernel_snapshot => |k| blk: {
+                if (k.names.len != k.blobs.len) return error.InvalidTransition;
+                break :blk .{ .kernel_snapshot = .{
+                    .turn = open_turn orelse return error.InvalidTransition,
+                    .kernel = k.kernel,
+                    .names = k.names,
+                    .blobs = k.blobs,
+                    .failed = k.failed,
+                } };
             },
         };
     }
@@ -612,7 +642,7 @@ fn randomEvent(random: std.Random) Event {
 fn specValid(open: bool, event: Event) ?bool {
     return switch (event) {
         .turn_started => !open,
-        .item, .turn_committed, .turn_interrupted => open,
+        .item, .turn_committed, .turn_interrupted, .store_set, .store_del, .kernel_snapshot => open,
         .compacted, .set => true,
         .child_spawned, .child_finished, .rewound => null, // not in TurnLifecycle
     };

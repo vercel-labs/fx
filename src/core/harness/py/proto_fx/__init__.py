@@ -35,8 +35,12 @@ Edits through harness.fs ask for permission, show a diff and can be undone
 like the agent's own. A plain open(path, "w") of a file the agent read raises
 StaleWriteError if the file changed on disk since.
 
+    harness.store["plan"] = {"step": 3}  # kept in the session; follows forks and undo
+    harness.store.get("plan", {}); "plan" in harness.store; harness.store.keys()
+    del harness.store["plan"]
+
 Errors are HarnessError subclasses: Unavailable, Refused, PermissionDenied,
-ToolFailed (with .output), KernelError (with .output), StaleWriteError,
+ToolFailed (with .output), KernelError (with .output), StaleWriteError, Unstorable,
 AnchorError and Cancelled.
 """
 
@@ -52,12 +56,13 @@ from ._client import (  # noqa: F401
     KernelError,
     PermissionDenied,
     Refused,
-    StaleWriteError,
+    StaleWriteError, Unstorable,
     ToolFailed,
     Unavailable,
     available,
     request,
 )
+from .store import Unstorable, store  # noqa: F401
 
 __all__ = [
     "tool",
@@ -69,6 +74,8 @@ __all__ = [
     "kernel",
     "Kernel",
     "fs",
+    "store",
+    "Unstorable",
     "available",
     "HarnessError",
     "Unavailable",

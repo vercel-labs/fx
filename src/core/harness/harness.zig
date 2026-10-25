@@ -54,6 +54,7 @@ const payload = [_]struct { path: []const u8, data: []const u8 }{
     .{ .path = "proto_fx/_client.py", .data = @embedFile("py/proto_fx/_client.py") },
     .{ .path = "proto_fx/fs.py", .data = @embedFile("py/proto_fx/fs.py") },
     .{ .path = "_proto_fx_guard.py", .data = @embedFile("py/_proto_fx_guard.py") },
+    .{ .path = "proto_fx/store.py", .data = @embedFile("py/proto_fx/store.py") },
 };
 
 /// Opens a lease for one command of node `options.node_id`. The caller
@@ -197,6 +198,7 @@ test {
     _ = @import("ops.zig");
     _ = @import("op_agent.zig");
     _ = @import("op_kernel.zig");
+    _ = @import("op_store.zig");
     _ = @import("tests.zig");
     _ = @import("seen.zig");
     _ = @import("ops/fs.zig");

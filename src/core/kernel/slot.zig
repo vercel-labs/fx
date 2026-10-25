@@ -7,6 +7,7 @@ const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const session_paths = @import("../session/session_store_paths.zig");
 const kernel = @import("kernel.zig");
+const session_layout = @import("../session/session_layout.zig");
 pub const pool = @import("pool.zig");
 const Allocator = std.mem.Allocator;
 
@@ -71,7 +72,9 @@ pub const Slot = struct {
         if (self.manager) |manager| return manager;
         const artifacts = try self.artifactDir(alloc, owner.session_id);
         defer alloc.free(artifacts);
-        const manager = try pool.acquire(alloc, .{ .cwd = owner.cwd, .artifact_dir = artifacts, .persist = owner.session_id != null }, self.retainer);
+        const blobs = try self.blobDir(alloc, owner.session_id);
+        defer alloc.free(blobs);
+        const manager = try pool.acquire(alloc, self.options(owner, artifacts, blobs, default_name), self.retainer);
         self.manager = manager;
         return manager;
     }
@@ -114,10 +117,12 @@ pub const Slot = struct {
         if (self.named.items.len >= max_named) return error.TooManyKernels;
         const artifacts = try self.namedArtifactDir(alloc, owner.session_id, name);
         defer alloc.free(artifacts);
+        const blobs = try self.blobDir(alloc, owner.session_id);
+        defer alloc.free(blobs);
         try self.named.ensureUnusedCapacity(std.heap.c_allocator, 1);
         const owned = try std.heap.c_allocator.dupe(u8, name);
         errdefer std.heap.c_allocator.free(owned);
-        const manager = try pool.acquire(alloc, .{ .cwd = owner.cwd, .artifact_dir = artifacts, .persist = owner.session_id != null }, self.retainer);
+        const manager = try pool.acquire(alloc, self.options(owner, artifacts, blobs, name), self.retainer);
         self.named.appendAssumeCapacity(.{ .name = owned, .manager = manager });
         return manager;
     }
@@ -184,14 +189,38 @@ pub const Slot = struct {
                 try states.append(arena, if (pool.stateOf(path)) |state| @tagName(state) else "saved");
             }
         }
-        if (names.items.len == 0) return alloc.dupe(u8, base);
         var out: std.Io.Writer.Allocating = .init(alloc);
         errdefer out.deinit();
         try out.writer.writeAll(base);
-        if (base.len > 0 and base[base.len - 1] != '\n') try out.writer.writeByte('\n');
-        try out.writer.writeAll("named kernels:");
-        for (names.items, states.items) |name, state| try out.writer.print(" {s} ({s})", .{ name, state });
+        if (names.items.len > 0) {
+            if (base.len > 0 and base[base.len - 1] != '\n') try out.writer.writeByte('\n');
+            try out.writer.writeAll("named kernels:");
+            for (names.items, states.items) |name, state| try out.writer.print(" {s} ({s})", .{ name, state });
+        }
+        if (owner.session_id != null) try self.writeUsage(arena, &out.writer, owner, names.items);
         return out.toOwnedSlice();
+    }
+
+    /// A saved node's kernel keeps its globals as records of its own session
+    /// and restores from the session's log (D99).
+    fn options(_: *const Slot, owner: Owner, artifacts: []const u8, blobs: []const u8, name: []const u8) kernel.Options {
+        return .{
+            .cwd = owner.cwd,
+            .artifact_dir = artifacts,
+            .persist = owner.session_id != null,
+            .blob_dir = blobs,
+            .node_id = owner.session_id orelse "",
+            .name = name,
+            .resolver = state_resolver,
+        };
+    }
+
+    /// The node's session blob folder, or empty for an unsaved session.
+    fn blobDir(self: *const Slot, alloc: Allocator, session_id: ?[]const u8) ![]u8 {
+        const id = session_id orelse return alloc.dupe(u8, "");
+        try session_paths.validateSessionId(id);
+        const home = self.home_override orelse io_mod.homeDir() orelse return error.HomeNotSet;
+        return nodeBlobDir(alloc, home, id);
     }
 
     /// `<home>/<profile root>/kernels/<session id>`, or empty for an unsaved session.
@@ -202,6 +231,29 @@ pub const Slot = struct {
         return std.Io.Dir.path.join(alloc, &.{ home, profile_paths.root_dir_name, "kernels", id });
     }
 
+    /// One line per kernel of the node naming the snapshots its log keeps
+    /// and the disk their records take, shared records counted once (D99).
+    fn writeUsage(self: *Slot, arena: Allocator, w: *std.Io.Writer, owner: Owner, named: []const []const u8) !void {
+        const id = owner.session_id orelse return;
+        const blobs = self.blobDir(arena, id) catch return;
+        const all = try arena.alloc([]const u8, named.len + 1);
+        all[0] = default_name;
+        @memcpy(all[1..], named);
+        for (all) |name| {
+            const usage_fn = state_usage orelse return;
+            const use = usage_fn(arena, blobs, id, name) catch continue;
+            if (use.snapshots == 0) continue;
+            var size: [32]u8 = undefined;
+            try w.print("\nsnapshots {s}: {d} turns, {d} records, {s} on disk", .{ name, use.snapshots, use.records, formatBytes(&size, use.bytes) });
+            const manager = self.currentNamed(name) orelse continue;
+            const stats = manager.snapshotStats();
+            if (stats.ms > 0 or stats.written > 0) {
+                var wrote: [32]u8 = undefined;
+                try w.print(" (last took {d} ms, wrote {s})", .{ stats.ms, formatBytes(&wrote, stats.written) });
+            }
+        }
+    }
+
     /// The default kernel's directory with `@<name>` appended.
     fn namedArtifactDir(self: *const Slot, alloc: Allocator, session_id: ?[]const u8, name: []const u8) ![]u8 {
         const base = try self.artifactDir(alloc, session_id);
@@ -210,6 +262,28 @@ pub const Slot = struct {
         return std.mem.concat(alloc, u8, &.{ base, "@", name });
     }
 };
+
+fn formatBytes(buffer: []u8, bytes: u64) []const u8 {
+    const value: f64 = @floatFromInt(bytes);
+    if (bytes < 1024) return std.mem.print(buffer, "{d} B", .{bytes}) catch "";
+    if (bytes < 1 << 20) return std.mem.print(buffer, "{d:.1} KiB", .{value / 1024}) catch "";
+    if (bytes < 1 << 30) return std.mem.print(buffer, "{d:.1} MiB", .{value / (1 << 20)}) catch "";
+    return std.mem.print(buffer, "{d:.2} GiB", .{value / (1 << 30)}) catch "";
+}
+
+/// Finds a kernel's snapshot in its node's log (D99). The session layer
+/// installs it (`session/python_state.zig`) when it opens a session, so the
+/// kernel never depends on the session manager.
+pub var state_resolver: ?kernel.Resolver = null;
+/// What a kernel's snapshots keep on disk, for `/kernel`; installed with it.
+pub var state_usage: ?*const fn (alloc: Allocator, blob_dir: []const u8, node_id: []const u8, name: []const u8) anyerror!Usage = null;
+pub const Usage = struct { snapshots: usize = 0, records: usize = 0, bytes: u64 = 0 };
+
+/// `<home>/.proto-fx/sessions/v2/<id>/blobs`: where a node's kernels write
+/// their records. Caller owns it.
+pub fn nodeBlobDir(alloc: Allocator, home: []const u8, id: []const u8) ![]u8 {
+    return std.Io.Dir.path.join(alloc, &.{ home, profile_paths.root_dir_name, profile_paths.sessions_dir_name, session_layout.sessions_v2_dir, id, "blobs" });
+}
 
 /// The kernel a node gets without naming one.
 pub const default_name = "default";

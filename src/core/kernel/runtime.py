@@ -55,7 +55,6 @@ import platform
 import select
 import signal
 import sys
-import tempfile
 import threading
 import time
 import traceback
@@ -65,12 +64,13 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 
+# The single-file snapshot from before per-variable records, read only to
+# restore a session saved by an older build.
 _SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024
 _SNAPSHOT_MAX_VARIABLE_BYTES = 16 * 1024 * 1024
-
-# Every snapshot starts with this header; a file without it is not restored.
+# Every legacy snapshot starts with this header; a file without it is not restored.
 _SNAPSHOT_MAGIC = b"PROTO-FX-KERNEL-SNAPSHOT-V2\n"
 
 # Stream writes must fit one protocol frame: the host buffers whole lines
@@ -84,12 +84,6 @@ _RESULT_TRUNCATION_MARKER = f"\n[... result truncated at {_RESULT_TEXT_CAP} char
 
 # Names the session bootstrap re-creates on every start; never snapshotted.
 _ALWAYS_SKIP = {"asyncio", "exit", "quit", "open"}
-# The path of the last successful snapshot, remembered so an EOF shutdown
-# (the host process died without a graceful dispose) can flush the final
-# namespace before exit. `None` until this process has committed a snapshot:
-# an EOF before that must not overwrite the on-disk payload with a namespace
-# the host never considered durable.
-_last_snapshot_path: str | None = None
 
 _protocol_fd: int = -1
 # The host's stderr before _setup_fds captures fd 2: the only channel that can
@@ -612,21 +606,6 @@ class _SnapshotSizeLimitExceeded(Exception):
     pass
 
 
-class _CappedWriter:
-    def __init__(self, sink: Any, limit: int) -> None:
-        self._sink = sink
-        self._limit = limit
-        self.written = 0
-
-    def write(self, chunk: Any) -> int:
-        size = len(chunk)
-        if self.written + size > self._limit:
-            raise _SnapshotSizeLimitExceeded()
-        self._sink.write(chunk)
-        self.written += size
-        return size
-
-
 def _read_snapshot_records(fh: Any) -> dict[str, bytes]:
     """Framing damage is a corrupt snapshot: a restore error, never a partial namespace.
     Length fields are bounds-checked before their reads, so a corrupt header cannot force a huge
@@ -682,107 +661,189 @@ def _import_dill() -> Any:
     return dill
 
 
-def _snapshot_state(
+# Per-variable records (D99): each global is one record, its dill bytes stored
+# as a content-addressed blob of the node's session (named by its SHA-256, the
+# manager's blob name), and a snapshot is the manifest of names to blobs that
+# the host writes into the session log at the turn's end.
+_RECORD_MAX_BYTES = 512 * 1024 * 1024
+_SNAPSHOT_MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
+_RECORD_MAX_COUNT = 4096
+_RECORD_NAME_MAX_BYTES = 256
+# A record bigger than this spills to its staging file while it is serialized.
+_SPOOL_MEMORY_BYTES = 32 * 1024 * 1024
+# Values of these exact types cannot change in place: the same object as at
+# the last snapshot reuses its record without serializing it again.
+_IMMUTABLE_ATOMS = (int, float, complex, str, bytes, bool, type(None), range)
+# name -> (value, hash, size) as of this process's last snapshot or restore.
+_record_cache: dict[str, tuple[Any, str, int]] = {}
+# Records that failed to restore, kept by hash while the name stays unbound,
+# so a later environment that can load them still finds them.
+_unrestored: dict[str, tuple[str, int]] = {}
+# Hashes known to exist in `_known_dir`.
+_known_hashes: set[str] = set()
+_known_dir: str | None = None
+
+
+class _Spool:
+    """Hashes a record as it is written: in memory up to _SPOOL_MEMORY_BYTES,
+    then in a staging file in the blob folder, which the commit renames."""
+
+    def __init__(self, folder: str, limit: int) -> None:
+        import hashlib
+
+        self._folder = folder
+        self._limit = limit
+        self._hash = hashlib.sha256()
+        self._memory: io.BytesIO | None = io.BytesIO()
+        self._fd = -1
+        self._tmp: str | None = None
+        self.size = 0
+
+    def _staging(self) -> int:
+        self._tmp = os.path.join(self._folder, ".pending." + uuid.uuid4().hex[:16] + ".tmp")
+        # Read-only like the manager's blobs; the descriptor stays writable.
+        self._fd = os.open(self._tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+        return self._fd
+
+    def _write_fd(self, data: Any) -> None:
+        view = memoryview(data)
+        while view:
+            done = os.write(self._fd, view)
+            view = view[done:]
+
+    def write(self, chunk: Any) -> int:
+        size = len(chunk)
+        if self.size + size > self._limit:
+            raise _SnapshotSizeLimitExceeded()
+        self._hash.update(chunk)
+        self.size += size
+        if self._memory is not None:
+            self._memory.write(chunk)
+            if self._memory.tell() > _SPOOL_MEMORY_BYTES:
+                self._staging()
+                self._write_fd(self._memory.getbuffer())
+                self._memory = None
+        else:
+            self._write_fd(chunk)
+        return size
+
+    def digest(self) -> str:
+        return self._hash.hexdigest()
+
+    def commit(self, path: str) -> None:
+        if self._fd < 0:
+            self._staging()
+            assert self._memory is not None
+            self._write_fd(self._memory.getbuffer())
+        os.fsync(self._fd)
+        os.close(self._fd)
+        self._fd = -1
+        assert self._tmp is not None
+        os.replace(self._tmp, path)
+        self._tmp = None
+
+    def discard(self) -> None:
+        if self._fd >= 0:
+            os.close(self._fd)
+            self._fd = -1
+        if self._tmp is not None:
+            try:
+                os.remove(self._tmp)
+            except OSError:
+                pass
+            self._tmp = None
+        self._memory = None
+
+
+def _snapshot_records(
     ns: dict[str, Any],
-    path: str,
+    folder: str,
     committed: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    """Writes every global that changed as its own record and returns the
+    manifest: records [{name, hash, bytes}] and failed [{name, reason}]."""
+    global _record_cache, _known_dir
     try:
         dill = _import_dill()
     except Exception as err:  # noqa: BLE001 - dill is provisioned by the host, not a hard dep
         return {"error": f"dill unavailable: {err}"}
     dill.settings["recurse"] = True
-
-    saved: list[str] = []
-    skipped: list[dict[str, str]] = []
+    if not os.path.isdir(folder):
+        return {"error": "the session folder is not on disk yet"}
+    if _known_dir != folder:
+        _known_hashes.clear()
+        _known_dir = folder
+    records: list[dict[str, Any]] = []
+    failed: list[dict[str, str]] = []
+    cache: dict[str, tuple[Any, str, int]] = {}
     missing = object()
-
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    # A unique same-directory temp: a fixed '.tmp' name could collide with a
-    # concurrent snapshot, and the same directory keeps the final rename atomic.
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=os.path.basename(path) + ".", suffix=".tmp")
-    result: dict[str, Any] | None = None
-    handler_installed = False
-    previous = None
-    try:
+    total = 0
+    written = 0
+    for name in list(ns.keys()):
+        if name.startswith("_") or name in _ALWAYS_SKIP:
+            continue
+        value = ns.get(name, missing)
+        if value is missing:
+            failed.append({"name": name, "reason": "deleted during snapshot"})
+            continue
         try:
+            encoded = name.encode("utf-8")
+        except UnicodeEncodeError as err:
+            failed.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
+            continue
+        if len(encoded) > _RECORD_NAME_MAX_BYTES:
+            failed.append({"name": name[:64], "reason": f"name longer than {_RECORD_NAME_MAX_BYTES} bytes"})
+            continue
+        if len(records) >= _RECORD_MAX_COUNT:
+            failed.append({"name": name, "reason": f"more than {_RECORD_MAX_COUNT} globals"})
+            continue
+        known = _record_cache.get(name)
+        if known is not None and known[0] is value and type(value) in _IMMUTABLE_ATOMS and known[1] in _known_hashes:
+            digest, size = known[1], known[2]
+        else:
+            budget = _SNAPSHOT_MAX_TOTAL_BYTES - total
+            spool = _Spool(folder, min(_RECORD_MAX_BYTES, budget))
             try:
-                fh = os.fdopen(fd, "wb")
-            except BaseException:
-                os.close(fd)  # fdopen never took ownership: the raw fd would leak
-                raise
-            with fh:
-                # Single pass: each variable is dill-serialized exactly once, streamed
-                # into the staged temp. The record header is charged against the aggregate
-                # cap up front, so a completed record can never overflow it.
-                total = fh.write(_SNAPSHOT_MAGIC)
-                for name in list(ns.keys()):
-                    if name.startswith("_") or name in _ALWAYS_SKIP:
-                        continue
-                    value = ns.get(name, missing)
-                    if value is missing:
-                        # A background thread deleted the name after the key listing.
-                        skipped.append({"name": name, "reason": "deleted during snapshot"})
-                        continue
-                    try:
-                        encoded = name.encode("utf-8")
-                    except UnicodeEncodeError as err:
-                        # A lone-surrogate name (e.g. "\ud800") cannot ride the
-                        # record header; skip it like any other unserializable
-                        # name instead of failing the whole snapshot.
-                        skipped.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
-                        continue
-                    # Record header: 4-byte name length + 8-byte blob length, plus the name itself.
-                    budget = _SNAPSHOT_MAX_BYTES - total - 12 - len(encoded)
-                    buffer = io.BytesIO()
-                    try:
-                        dill.dump(value, _CappedWriter(buffer, min(_SNAPSHOT_MAX_VARIABLE_BYTES, budget)))
-                        blob = buffer.getvalue()
-                    except _SnapshotSizeLimitExceeded:
-                        cap = "aggregate" if budget < _SNAPSHOT_MAX_VARIABLE_BYTES else "per-variable"
-                        skipped.append({"name": name, "reason": f"exceeds {cap} snapshot size cap"})
-                        continue
-                    except Exception as err:  # noqa: BLE001 - one unpicklable name must not abort the snapshot
-                        skipped.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
-                        continue
-                    fh.write(len(encoded).to_bytes(4, "little"))
-                    fh.write(encoded)
-                    fh.write(len(blob).to_bytes(8, "little"))
-                    fh.write(blob)
-                    total += 12 + len(encoded) + len(blob)
-                    saved.append(name)
-                saved.sort()
-        except BaseException as err:  # noqa: BLE001 - Exception -> error dict, rest propagates
-            if not isinstance(err, Exception):
-                raise  # e.g. KeyboardInterrupt: clean up (outer finally), then propagate
-            return {"error": f"write failed: {err}"}
-
-        # A SIGINT-raised KeyboardInterrupt between the commit and publishing the
-        # result would misreport a committed snapshot as failed: park SIGINT until
-        # the end. The parked interrupt is consumed, not re-raised: it targeted this
-        # now-complete request.
-        previous = signal.signal(signal.SIGINT, lambda signum, frame: None)
-        handler_installed = True
+                try:
+                    dill.dump(value, spool)
+                except _SnapshotSizeLimitExceeded:
+                    cap = "total" if budget < _RECORD_MAX_BYTES else "per-variable"
+                    failed.append({"name": name, "reason": f"exceeds the {cap} snapshot size cap"})
+                    continue
+                except Exception as err:  # noqa: BLE001 - one unpicklable name must not abort the snapshot
+                    failed.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
+                    continue
+                digest, size = spool.digest(), spool.size
+                path = os.path.join(folder, digest)
+                if digest not in _known_hashes and not os.path.exists(path):
+                    spool.commit(path)
+                    written += size
+            except OSError as err:
+                return {"error": f"write failed: {err}"}
+            finally:
+                spool.discard()
+        _known_hashes.add(digest)
+        cache[name] = (value, digest, size)
+        records.append({"name": name, "hash": digest, "bytes": size})
+        total += size
+    for name, (digest, size) in list(_unrestored.items()):
+        if name in ns:
+            del _unrestored[name]
+        elif os.path.exists(os.path.join(folder, digest)) and len(records) < _RECORD_MAX_COUNT:
+            records.append({"name": name, "hash": digest, "bytes": size})
+    if written:
         try:
-            os.replace(tmp, path)
+            dir_fd = os.open(folder, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
         except OSError as err:
             return {"error": f"write failed: {err}"}
-        result = {"saved": saved, "skipped": skipped, "bytes": total}
-        # Publish while still parked: a later KeyboardInterrupt into this task finds the committed result (see _handle_state).
-        if committed is not None:
-            committed.append(result)
-    finally:
-        # The nested finally makes the handler restore the guaranteed last action
-        # even when removing the uncommitted temp fails.
-        try:
-            if result is None:
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
-        finally:
-            if handler_installed:
-                signal.signal(signal.SIGINT, previous)
+    _record_cache = cache
+    result = {"records": records, "failed": failed, "written": written, "bytes": total}
+    if committed is not None:
+        committed.append(result)
     return result
 
 
@@ -950,13 +1011,13 @@ def _restore_state(
     path: str,
     committed: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    """Restores a snapshot file from before per-variable records (legacy)."""
     if not os.path.exists(path):
         return {"restored": [], "failed": [], "reason": "snapshot not found"}
     try:
         dill = _import_dill()
     except Exception as err:  # noqa: BLE001
         return {"error": f"dill unavailable: {err}"}
-    unpickler = _snapshot_unpickler(dill)
     try:
         with open(path, "rb") as fh:
             if fh.read(len(_SNAPSHOT_MAGIC)) != _SNAPSHOT_MAGIC:
@@ -964,14 +1025,67 @@ def _restore_state(
             payload = _read_snapshot_records(fh)
     except Exception as err:  # noqa: BLE001 - a corrupt snapshot yields an empty restore
         return {"error": f"load failed: {_safe_str(err)}"}
+    return _apply_records(ns, dill, {name: (blob, None) for name, blob in payload.items()}, [], committed)
 
-    staged: dict[str, Any] = {}
+
+def _restore_records(
+    ns: dict[str, Any],
+    folder: str,
+    records: list[Any],
+    committed: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Restores the records a turn's manifest names from the node's blobs,
+    each checked against its hash."""
+    import hashlib
+
+    try:
+        dill = _import_dill()
+    except Exception as err:  # noqa: BLE001
+        return {"error": f"dill unavailable: {err}"}
+    global _known_dir
+    if _known_dir != folder:
+        _known_hashes.clear()
+        _known_dir = folder
+    payload: dict[str, tuple[bytes, str | None]] = {}
     failed: list[dict[str, str]] = []
-    for name, blob in payload.items():
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(record.get("name"), str) or not isinstance(record.get("hash"), str):
+            continue
+        name, digest = record["name"], record["hash"]
+        try:
+            with open(os.path.join(folder, digest), "rb") as fh:
+                blob = fh.read(_RECORD_MAX_BYTES + 1)
+        except FileNotFoundError:
+            failed.append({"name": name, "reason": "its saved record is missing"})
+            continue
+        except OSError as err:
+            failed.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
+            continue
+        if len(blob) > _RECORD_MAX_BYTES or hashlib.sha256(blob).hexdigest() != digest:
+            failed.append({"name": name, "reason": "its saved record is damaged"})
+            continue
+        _known_hashes.add(digest)
+        payload[name] = (blob, digest)
+    return _apply_records(ns, dill, payload, failed, committed)
+
+
+def _apply_records(
+    ns: dict[str, Any],
+    dill: Any,
+    payload: dict[str, tuple[bytes, str | None]],
+    failed: list[dict[str, str]],
+    committed: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    unpickler = _snapshot_unpickler(dill)
+    staged: dict[str, Any] = {}
+    not_loaded: dict[str, tuple[str, int]] = {}
+    for name, (blob, digest) in payload.items():
         try:
             staged[name] = unpickler(io.BytesIO(blob)).load()
         except Exception as err:  # noqa: BLE001 - revive every other name regardless
             failed.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
+            if digest is not None:
+                not_loaded[name] = (digest, len(blob))
     # Revive every staged name before parking: a failure must never abort the
     # apply halfway and leave the namespace half old, half new.
     prepared: dict[str, Any] = {}
@@ -986,6 +1100,9 @@ def _restore_state(
             prepared[name] = _revive_with_live_globals(value, ns, name_backfill)
         except Exception as err:  # noqa: BLE001 - one broken revival must not abort the restore
             revive_failed.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
+            digest = payload[name][1]
+            if digest is not None:
+                not_loaded[name] = (digest, len(payload[name][0]))
             continue
         backfill.extend(name_backfill)
     result = {"restored": sorted(prepared), "failed": failed + revive_failed}
@@ -998,6 +1115,14 @@ def _restore_state(
             # prepared names already sit in ns here: a restored value always beats backfill.
             if name not in ns:
                 ns[name] = value
+        global _record_cache
+        _record_cache = {
+            name: (value, payload[name][1], len(payload[name][0]))
+            for name, value in prepared.items()
+            if payload[name][1] is not None
+        }
+        _unrestored.clear()
+        _unrestored.update(not_loaded)
         # Publish while still parked: a later KeyboardInterrupt into this task finds the committed result (see _handle_state).
         if committed is not None:
             committed.append(result)
@@ -1013,7 +1138,9 @@ async def _handle_state(req: dict[str, Any], ns: dict[str, Any]) -> None:
 
     async def run() -> dict[str, Any]:
         if req["type"] == "snapshot":
-            return _snapshot_state(ns, req["path"], committed)
+            return _snapshot_records(ns, req["dir"], committed)
+        if isinstance(req.get("records"), list):
+            return _restore_records(ns, req["dir"], req["records"], committed)
         return _restore_state(ns, req["path"], committed)
 
     assert _loop is not None
@@ -1058,28 +1185,7 @@ async def _handle_state(req: dict[str, Any], ns: dict[str, Any]) -> None:
     if "error" in result:
         _send({"event": "done", "id": rid, "status": "error", "reason": result["error"]})
         return
-    if req["type"] == "snapshot":
-        global _last_snapshot_path
-        _last_snapshot_path = req["path"]
     _send({"event": "done", "id": rid, "status": "ok", **result})
-
-
-def _flush_final_snapshot(ns: dict[str, Any]) -> None:
-    """EOF-only best-effort final snapshot before exit.
-
-    The host died without a graceful dispose (crash, SIGKILL, worker exit
-    path that skipped `shutdown`), so its debounced snapshots stop at the
-    last one. Flush the current namespace to the last-known target so a
-    resume revives state up to the EOF instead of up to the debounce.
-    Atomic staging (temp + rename) means an interrupted flush leaves the
-    previous payload intact, never a torn one.
-    """
-    if _last_snapshot_path is None:
-        return
-    try:
-        _snapshot_state(ns, _last_snapshot_path)
-    except BaseException:  # noqa: BLE001 - never block or crash the shutdown path
-        pass
 
 
 async def _handle_request(
@@ -1109,8 +1215,6 @@ async def _serve(queue: asyncio.Queue[dict[str, Any]], ns: dict[str, Any]) -> No
         signal.signal(signal.SIGINT, _sigint_handler)
         kind = req["type"]
         if kind == "shutdown":
-            if req.get("eof"):
-                _flush_final_snapshot(ns)
             tasks = {task for task in asyncio.all_tasks() if task is not asyncio.current_task()}
             for task in tasks:
                 task.cancel()
@@ -1125,8 +1229,8 @@ async def _serve(queue: asyncio.Queue[dict[str, Any]], ns: dict[str, Any]) -> No
 
 _REQUIRED_FIELDS = {
     "execute": ("id", "code"),
-    "snapshot": ("id", "path"),
-    "restore": ("id", "path"),
+    "snapshot": ("id", "dir"),
+    "restore": ("id",),
     "shutdown": (),
 }
 

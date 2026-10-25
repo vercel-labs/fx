@@ -23,6 +23,10 @@ pub const all = .{
     @import("ops/fs.zig").write,
     @import("ops/fs.zig").check,
     @import("ops/fs.zig").note,
+    @import("op_store.zig").set,
+    @import("op_store.zig").get,
+    @import("op_store.zig").del,
+    @import("op_store.zig").keys,
 };
 
 /// The names every op answers to, for `hello`.

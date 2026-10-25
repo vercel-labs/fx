@@ -38,6 +38,9 @@ pub const State = fold.State;
 /// Turns a rewind dropped from a session's history (D97).
 pub const Dropped = fold.Dropped;
 pub const Rewind = fold.Rewind;
+/// The on-demand folds of a node's store and kernel snapshot lines (D99).
+pub const python_fold = @import("python_fold.zig");
+pub const KernelSnapshot = fold.KernelSnapshot;
 /// Where a fork of a tree's node came from (D98).
 pub const NodeOrigin = schema.NodeOrigin;
 pub const Child = fold.Child;
@@ -752,7 +755,29 @@ fn checkEvents(gpa: std.mem.Allocator, events: []const Event, import: bool) Appe
             if (c.data) |data| try checkChildData(gpa, data);
         },
         .rewound => |r| for (r.abandoned) |id| try checkId(id),
+        .store_set => |v| {
+            try checkName(v.key, max_store_key_bytes);
+            if (!schema.validBlobHash(v.blob[0])) return error.InvalidArgument;
+        },
+        .store_del => |key| try checkName(key, max_store_key_bytes),
+        .kernel_snapshot => |k| {
+            try checkName(k.kernel, max_store_key_bytes);
+            if (k.names.len != k.blobs.len or k.names.len > max_kernel_records) return error.InvalidArgument;
+            for (k.names) |name| try checkName(name, max_store_key_bytes);
+            for (k.blobs) |hash| if (!schema.validBlobHash(hash)) return error.InvalidArgument;
+            try checkJson(gpa, k.failed);
+            if (k.failed.len == 0 or k.failed[0] != '[') return error.InvalidArgument;
+        },
     };
+}
+
+/// Longest store key, kernel name or global name a line carries (D99).
+pub const max_store_key_bytes = 256;
+/// Most globals one `kernel_snapshot` line names (D99).
+pub const max_kernel_records = 4096;
+
+fn checkName(name: []const u8, max: usize) AppendError!void {
+    if (name.len == 0 or name.len > max or !std.unicode.utf8ValidateSlice(name)) return error.InvalidArgument;
 }
 
 /// Folded into every snapshot for each child, so kept small (D22).
@@ -775,6 +800,7 @@ test {
     _ = @import("fold.zig");
     _ = @import("session.zig");
     _ = @import("catalog.zig");
+    _ = @import("python_fold.zig");
     // Fault injection and traces exist only with -Dhooks=true.
     if (storage.hooks) {
         _ = @import("storage_fault.zig");
@@ -865,6 +891,7 @@ const api_tests = struct {
     //! The API as fx will use it: this file imports only `api.zig`.
 
     const api = @import("api.zig");
+    const python_fold_api = api.python_fold;
 
     const testing = std.testing;
     const gpa = testing.allocator;
@@ -2046,6 +2073,59 @@ const api_tests = struct {
         const body = try m.getBlob(gpa, fork_id, &record);
         defer gpa.free(body);
         try testing.expectEqualStrings("T1 shell: ls\nResult:\nfirst\n", body);
+    }
+
+    test "store and kernel lines live inside turns, and a rewind and a fork carry them with no code of their own (D99)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        _ = try s.append(&.{ .turn_started, piece });
+        const one = try s.putBlob("one");
+        const two = try s.putBlob("two");
+        const one_ref: [1][]const u8 = .{&one};
+        const two_ref: [1][]const u8 = .{&two};
+        // Outside a turn they are refused, as items are.
+        _ = try s.append(&.{ .{ .store_set = .{ .key = "k", .blob = &one_ref } }, .{ .kernel_snapshot = .{ .kernel = "default", .names = &.{"x"}, .blobs = &.{&one} } }, .turn_committed });
+        try testing.expectError(error.InvalidTransition, s.append(&.{.{ .store_del = "k" }}));
+        try testing.expectError(error.InvalidArgument, s.append(&.{.{ .kernel_snapshot = .{ .kernel = "default", .names = &.{ "x", "y" }, .blobs = &.{&one} } }}));
+        _ = try s.append(&.{ .turn_started, .{ .store_set = .{ .key = "k", .blob = &two_ref } }, .{ .kernel_snapshot = .{ .kernel = "default", .names = &.{"x"}, .blobs = &.{&two} } }, .turn_committed });
+        // A blob the line names must exist first.
+        const missing: [64]u8 = @splat('e');
+        const missing_ref: [1][]const u8 = .{&missing};
+        try testing.expectError(error.InvalidTransition, s.append(&.{ .turn_started, .{ .store_set = .{ .key = "k", .blob = &missing_ref } } }));
+        try testing.expectEqual(@as(?u64, null), (try s.state(gpa)).open_turn);
+        var st = try s.state(gpa);
+        defer st.deinit(gpa);
+        var newest = (try python_fold_api.latestKernel(gpa, s, st.dropped.items, "default")).?;
+        defer newest.deinit();
+        try testing.expectEqualStrings(&two, newest.blobs[0]);
+        // Rewinding turn 2 brings both back to turn 1.
+        _ = try s.append(&.{.{ .rewound = .{ .turn = 2 } }});
+        var after = try s.state(gpa);
+        defer after.deinit(gpa);
+        var kernel = (try python_fold_api.latestKernel(gpa, s, after.dropped.items, "default")).?;
+        defer kernel.deinit();
+        try testing.expectEqualStrings(&one, kernel.blobs[0]);
+        var kept = try python_fold_api.store(gpa, s, after.dropped.items);
+        defer kept.deinit();
+        try testing.expectEqualStrings(&one, kept.get("k").?);
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        s.release();
+        // A fork at turn 1 holds turn 1's lines and links their blobs.
+        const fork = try m.openFork(.{ .source = id, .at = .{ .turn = 1 }, .workspace = "/w", .host = .app });
+        defer fork.release();
+        var fst = try fork.state(gpa);
+        defer fst.deinit(gpa);
+        var forked = (try python_fold_api.latestKernel(gpa, fork, fst.dropped.items, "default")).?;
+        defer forked.deinit();
+        try testing.expectEqualStrings(&one, forked.blobs[0]);
+        const body = try m.getBlob(gpa, fork.id(), &one);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("one", body);
+        try testing.expectEqual(@as(u64, 0), (try m.verify(id)).bad_blobs);
     }
 
     test "a blob is read-only and its path opens to its bytes, in the session and in a fork (D49)" {

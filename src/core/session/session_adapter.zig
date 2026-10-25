@@ -54,6 +54,22 @@ const session_display_metadata = @import("session_display_metadata.zig");
 const session_store = @import("session_store.zig");
 const session_summary_codec = @import("session_summary_codec.zig");
 const v1_conversion = @import("v1_conversion.zig");
+const python_state = @import("python_state.zig");
+
+/// The part of the manager's API that `python_state.zig`, this adapter's
+/// helper for a node's Python state (D99), reads: the store and kernel
+/// folds and a lock-free reader. Everything else stays behind this file.
+pub const python_api = struct {
+    pub const Manager = sm.Manager;
+    pub const From = sm.From;
+    pub const Direction = sm.Direction;
+    pub const Page = sm.Page;
+    pub const Event = sm.Event;
+    pub const Dropped = sm.Dropped;
+    pub const KernelSnapshot = sm.KernelSnapshot;
+    pub const python_fold = sm.python_fold;
+    pub const max_store_key_bytes = sm.max_store_key_bytes;
+};
 const child_state = @import("../subagent/child_state.zig");
 const artifact_digest = @import("artifact_digest.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
@@ -1508,6 +1524,8 @@ pub const Session = struct {
         errdefer BlobHost.release(host);
         const self = try alloc.create(Session);
         self.* = .{ .alloc = alloc, .store = store, .handle = handle, .files_path = files_path, .host = host, .fresh = fresh };
+        // The node's `proto_fx` store reaches it by id while it is open (D99).
+        python_state.register(self);
         return self;
     }
 
@@ -1590,6 +1608,7 @@ pub const Session = struct {
     /// A copy of its capability that a background reader still holds keeps
     /// reading, and stores nothing more (D44).
     pub fn close(self: *Session) void {
+        python_state.unregister(self);
         // Before the close, which forgets whether the log is on disk.
         const was_saved = self.saved();
         self.host.detach();
@@ -1621,6 +1640,7 @@ pub const Session = struct {
     }
 
     fn destroyInner(self: *Session) void {
+        python_state.unregister(self);
         const alloc = self.alloc;
         if (self.capability) |*capability| capability.deinit();
         BlobHost.release(self.host);
@@ -1682,6 +1702,14 @@ pub const Session = struct {
         if (self.turn_open) return;
         _ = try self.write(&.{.turn_started});
         self.startedTurn();
+    }
+
+    /// Appends store lines (D99) to the running turn, opening it first.
+    pub fn appendPythonState(self: *Session, events: []const sm.Event) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        try self.openTurnLocked();
+        _ = try self.write(events);
     }
 
     /// Ends a turn its work left open, as closing the session would: the
@@ -1749,6 +1777,11 @@ pub const Session = struct {
     /// Appends a finished turn: the pieces not streamed yet, then its end,
     /// in one durable batch. `turn` must already be prepared.
     pub fn commitTurn(self: *Session, turn: types.HistoryTurn, language: types.ConversationLanguage) !void {
+        // Each kernel that ran a cell this turn snapshots before the turn
+        // ends, and the end batch records it (D99). Outside the mutex: a
+        // large namespace takes a while, and it opens the turn first.
+        var kernels = python_state.TurnKernels.take(self.alloc, self);
+        defer kernels.deinit();
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -1768,6 +1801,7 @@ pub const Session = struct {
         const start = try self.streamedPrefix(encoded[0..pieces.len]);
 
         var tail: std.ArrayList(sm.Event) = .empty;
+        try tail.appendSlice(a, kernels.events.items);
         switch (end) {
             .turn_completed => try tail.append(a, .turn_committed),
             .interrupted => |interruption| try tail.append(a, .{ .turn_interrupted = switch (interruption.reason) {
@@ -1792,6 +1826,7 @@ pub const Session = struct {
         if (derived_title) |title| try tail.append(a, .{ .set = .{ .key = .title, .value = try jsonString(a, title) } });
 
         try self.writePieces(a, all[start..], encoded[start..], tail.items);
+        kernels.recorded();
         try self.turn_numbers.append(self.alloc, self.last_turn);
         self.turn_open = false;
         self.clearStreamed();
@@ -2096,6 +2131,7 @@ pub const Session = struct {
     /// Lets go of an import, published or not. A published one is opened
     /// again as any session is.
     fn dropImport(self: *Session) void {
+        python_state.unregister(self);
         self.host.detach();
         self.handle.release();
         self.destroyInner();
@@ -2305,6 +2341,8 @@ pub const Session = struct {
             self.trim = .{};
         };
         debug_trace.logf("session", "event=sessions_v2_rewound session={s} turn={d} through={d} abandoned={d}", .{ self.id(), turn, state.last_turn, abandoned.items.len });
+        // The node's kernels go back to the newest snapshot the rewind kept.
+        python_state.afterRewind(self.id());
         return .{ .abandoned = try abandoned.toOwnedSlice(alloc) };
     }
 
@@ -4531,7 +4569,7 @@ noinline fn replay(
                     if (keptTurn(alloc, dropped, turn, ended.turn)) try sink.turn(try presentStoredResults(src, alloc, turn), ended.turn);
                 },
                 .compacted => |line| try sink.summary(line.data),
-                .session_created, .turn_committed, .set, .child_spawned, .child_finished, .snapshot, .closed, .rewound => {},
+                .session_created, .turn_committed, .set, .child_spawned, .child_finished, .snapshot, .closed, .rewound, .store_set, .store_del, .kernel_snapshot => {},
             }
         }
         from = .{ .at = page.next orelse break };
