@@ -48,8 +48,14 @@ pub const State = struct {
     sent: std.ArrayList(Request) = .empty,
     /// What this connection asked the supervisor to push.
     watching: struct { list: bool = false, children: bool = false, child: bool = false } = .{},
+    /// The attached root session.
     current_id: []u8 = &.{},
+    /// The node below the root that the composer shows, empty at the root.
+    /// Any node other than the root is a read-only transcript.
     child_id: []u8 = &.{},
+    /// The nodes between the root and `child_id`, nearest the root first;
+    /// Left walks back up through them.
+    child_ancestors: std.ArrayList([]u8) = .empty,
     generation: u64 = 1,
     sequence: u64 = 0,
     child_history_count: ?usize = null,
@@ -79,6 +85,8 @@ pub const State = struct {
         self.sent.deinit(alloc);
         if (self.current_id.len > 0) alloc.free(self.current_id);
         if (self.child_id.len > 0) alloc.free(self.child_id);
+        for (self.child_ancestors.items) |id| alloc.free(id);
+        self.child_ancestors.deinit(alloc);
         if (self.child_prompt.len > 0) alloc.free(self.child_prompt);
         if (self.child_work_id.len > 0) alloc.free(self.child_work_id);
         if (self.model.len > 0) alloc.free(self.model);
@@ -88,6 +96,11 @@ pub const State = struct {
         for (self.submitted_text.items) |text| alloc.free(text);
         self.submitted_text.deinit(alloc);
         self.* = .{};
+    }
+
+    /// The node the composer shows: the viewed child, or the root.
+    pub fn viewedNodeId(self: *const State) []const u8 {
+        return if (self.child_id.len > 0) self.child_id else self.current_id;
     }
 
     pub fn clearChildTracking(self: *State, alloc: Allocator) void {

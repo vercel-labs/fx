@@ -104,7 +104,29 @@ pub fn Runtime(comptime App: type) type {
         fn leaveChild(app: *App) void {
             if (app.remote.child_id.len > 0) app.alloc.free(app.remote.child_id);
             app.remote.child_id = &.{};
+            for (app.remote.child_ancestors.items) |ancestor| app.alloc.free(ancestor);
+            app.remote.child_ancestors.clearRetainingCapacity();
             app.remote.clearChildTracking(app.alloc);
+        }
+
+        /// Shows the read-only transcript of node `id` under the attached
+        /// root. `parent_id` is its parent: the node shown now when the
+        /// person descends, or an ancestor when Left walks back up.
+        pub fn viewChild(app: *App, id: []const u8, parent_id: []const u8) !void {
+            const remote = &app.remote;
+            const owned = try app.alloc.dupe(u8, id);
+            errdefer app.alloc.free(owned);
+            if (remote.child_id.len > 0 and std.mem.eql(u8, parent_id, remote.child_id)) {
+                // Descending: the node shown now becomes an ancestor.
+                try remote.child_ancestors.append(app.alloc, remote.child_id);
+            } else if (remote.child_id.len > 0) {
+                app.alloc.free(remote.child_id);
+            }
+            remote.child_id = owned;
+            remote.generation +%= 1;
+            remote.clearChildTracking(app.alloc);
+            View.resetTranscriptContents(app);
+            try Transport.refreshChild(app);
         }
 
         /// Replaces the host's live permission rules with what this process
@@ -160,30 +182,32 @@ pub fn Runtime(comptime App: type) type {
             const row = browser.selectedRow() orelse return;
             const id = try app.alloc.dupe(u8, row.id);
             defer app.alloc.free(id);
+            const parent_id = try app.alloc.dupe(u8, row.parent_id);
+            defer app.alloc.free(parent_id);
             const scope = browser.scope;
             browser.close();
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
-            if (scope == .subagents) {
-                if (app.remote.child_id.len > 0) app.alloc.free(app.remote.child_id);
-                app.remote.child_id = try app.alloc.dupe(u8, id);
-                app.remote.generation +%= 1;
-                app.remote.clearChildTracking(app.alloc);
-                View.resetTranscriptContents(app);
-                try Transport.refreshChild(app);
-            } else {
-                try switchSession(app, id);
+            switch (scope) {
+                .subagents => try viewChild(app, id, parent_id),
+                .sessions => try switchSession(app, id),
             }
             app.shell.render_requests.request(.footer);
         }
 
-        /// Closes the browser; from a child transcript, returns to its parent.
+        /// Closes the browser; from a child transcript, shows its parent,
+        /// which is the root once no ancestor is left.
         pub fn browserBack(app: *App) !void {
             app.input_runtime.session_browser.close();
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
-            if (app.remote.child_id.len > 0) {
-                app.alloc.free(app.remote.child_id);
-                app.remote.child_id = &.{};
-                try switchSession(app, app.remote.current_id);
+            const remote = &app.remote;
+            if (remote.child_id.len > 0) {
+                if (remote.child_ancestors.pop()) |parent| {
+                    defer app.alloc.free(parent);
+                    const grandparent = remote.child_ancestors.last() orelse remote.current_id;
+                    try viewChild(app, parent, grandparent);
+                } else {
+                    try switchSession(app, remote.current_id);
+                }
             }
             app.shell.render_requests.request(.footer);
         }

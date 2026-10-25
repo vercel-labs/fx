@@ -571,6 +571,7 @@ test "built-in slash commands register exact active order" {
         "/feedback",
         "/trace",
         "/compact",
+        "/context",
         "/settings",
         "/alias",
         "/credits",
@@ -581,6 +582,9 @@ test "built-in slash commands register exact active order" {
         "/sound",
         "/workspace",
         "/shell",
+        "/kernel",
+        "/heartbeat",
+        "/subagents",
         "/version",
         "/quit",
     };

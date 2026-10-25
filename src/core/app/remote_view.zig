@@ -166,8 +166,16 @@ pub fn Runtime(comptime App: type) type {
             if (!browser.active or browser.scope != .subagents) return;
             var arena: std.heap.ArenaAllocator = .init(app.alloc);
             defer arena.deinit();
-            const rows = try arena.allocator().alloc(browser_mod.Row, children.len);
-            for (children, rows) |item, *row| {
+            // Right lists the children of whichever node the composer shows.
+            const node = app.remote.viewedNodeId();
+            var count: usize = 0;
+            for (children) |item| count += @intFromBool(std.mem.eql(u8, item.parent_id, node));
+            const rows = try arena.allocator().alloc(browser_mod.Row, count);
+            var index: usize = 0;
+            for (children) |item| {
+                if (!std.mem.eql(u8, item.parent_id, node)) continue;
+                const row = &rows[index];
+                index += 1;
                 row.* = .{
                     .id = item.id,
                     .parent_id = item.parent_id,
@@ -176,7 +184,7 @@ pub fn Runtime(comptime App: type) type {
                     .detail = item.detail,
                     .meta = item.status,
                     .depth = item.depth,
-                    .current = std.mem.eql(u8, item.id, app.remote.current_id),
+                    .current = std.mem.eql(u8, item.id, node),
                 };
             }
             try browser.replaceRows(app.alloc, rows);

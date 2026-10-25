@@ -397,7 +397,7 @@ test "parse treats unknown and malformed command inputs as unknown" {
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/output quiet"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/task"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/tasks"));
-    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/subagents"));
+    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/subagents now"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "hello"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/copy extra"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), " /model claude-opus"));
@@ -496,8 +496,9 @@ fn recordCopy(ctx: *anyopaque) anyerror!void {
     testContext(ctx).called = "copy";
 }
 
-fn recordResumeSession(ctx: *anyopaque) anyerror!void {
+fn recordResumeSession(ctx: *anyopaque, payload: []const u8) anyerror!void {
     testContext(ctx).called = "resume";
+    testContext(ctx).payload = payload;
 }
 
 fn recordForkSession(ctx: *anyopaque) anyerror!void {
@@ -546,7 +547,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .clear_screen = unexpectedNoPayload,
         .new_session = unexpectedNoPayload,
         .reset_session = unexpectedNoPayload,
-        .resume_session = unexpectedNoPayload,
+        .resume_session = unexpectedPayload,
         .fork_session = unexpectedNoPayload,
         .show_help = unexpectedNoPayload,
         .login = unexpectedNoPayload,
@@ -572,7 +573,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .handle_alias = unexpectedPayload,
         .show_credits = unexpectedNoPayload,
         .paste_clipboard = unexpectedNoPayload,
-        .toggle_fast = unexpectedNoPayload,
+        .toggle_fast = unexpectedPayload,
         .handle_ultrafast = unexpectedPayload,
         .handle_statusline = unexpectedPayload,
         .rename_session = unexpectedPayload,
@@ -580,6 +581,10 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .handle_workspace = unexpectedPayload,
         .handle_shell = unexpectedPayload,
         .show_version = unexpectedNoPayload,
+        .show_context = unexpectedNoPayload,
+        .browse_subagents = unexpectedNoPayload,
+        .handle_heartbeat = unexpectedPayload,
+        .handle_kernel = unexpectedPayload,
         .unknown = unexpectedPayload,
     };
 }
