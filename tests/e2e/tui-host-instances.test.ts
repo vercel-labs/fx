@@ -1224,6 +1224,46 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         expect(list).toContain("fx 1 ·");
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !pane.includes("fx 2 (on screen) ·"), 15_000);
+
+        // In a draft of several lines, Alt+Up moves up a paragraph instead.
+        await session.sendLiteral("first");
+        await session.sendKeys("M-Enter");
+        await session.sendLiteral("second");
+        await session.waitForText("second", 10_000);
+        await session.sendKeys("M-Up");
+        await session.sendLiteral("Z");
+        const moved = await session.waitForPane((pane) => pane.includes("Z"), 10_000);
+        expect(moved).not.toContain("(on screen) ·");
+        expect(moved).not.toContain("secondZ");
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "the instance list marks the instance whose subagent is on screen",
+    async () => {
+      await withHost((body) => {
+        const texts = userTexts(body).join("\n");
+        if (texts.includes("LIST_TASK")) return text("list_child", "LIST_CHILD_DONE");
+        if (texts.includes("LIST_USER")) {
+          if (answered(body)) return text("list_main_final", "LIST_MAIN_FINAL");
+          return call("list_sub", "subagent", { request: { action: "message", agent: "helper", message: "LIST_TASK look" } });
+        }
+        return answerByLetter(body);
+      }, { instances: 2, env: { FX_PERMISSION_MODE: "full-access" } }, async ({ session }) => {
+        await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+        await session.waitForComposer(15_000);
+        await session.sendText("LIST_USER start a helper");
+        await session.waitForText("LIST_MAIN_FINAL", 30_000);
+        await session.waitForComposer(15_000);
+        // fx 1's subagent comes right after it when switching.
+        await session.sendKeys("M-Right");
+        await session.waitForPane((pane) => pane.includes("helper \u00b7 "), 15_000);
+        await session.sendKeys("M-Up");
+        const list = await session.waitForPane((pane) => pane.includes("fx 1 (on screen) ·"), 15_000);
+        expect(list).toContain("fx 2 ·");
+        await session.sendKeys("Escape");
       });
     },
     TIMEOUT,
