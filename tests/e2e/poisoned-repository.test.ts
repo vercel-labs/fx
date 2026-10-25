@@ -310,7 +310,7 @@ describe("poisoned repository", () => {
 });
 
 // Dotfile managers often make `~/.gitconfig` a symlink. Files the user's own
-// excludes file ignores must stay out of glob and grep through it, as in git.
+// excludes file ignores must stay out of @ completion through it, as in git.
 describe("user git config through a symlink", () => {
   tmuxTest(
     "@ completion honors an excludes file named by a symlinked ~/.gitconfig",

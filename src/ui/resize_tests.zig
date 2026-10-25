@@ -2967,8 +2967,9 @@ test "assistant paragraph and next tool keep one gap after inspected tool" {
     const creating_row = try findRowContaining(&h, "Creating project");
     try expectExactlyOneBlankRowBetween(&h, inspected_after, assistant_row);
     try expectRowEmpty(&h, assistant_row + 3);
-    try expectRowTrimmedEquals(&h, assistant_row + 4, "● Inspected file");
-    try std.testing.expectEqual(assistant_row + 5, creating_row);
+    // The completed lone tool collapses to its own row, without a header.
+    try expectRowTrimmedEquals(&h, assistant_row + 4, "● Creating project");
+    try std.testing.expectEqual(assistant_row + 4, creating_row);
     try expectGridNotContains(&h, "Thinking");
 }
 
@@ -4403,9 +4404,7 @@ test "welcome logo stays pinned while middle transcript rows overflow" {
     defer approval.deinit(h.alloc);
 
     try h.shell.initViewportWithReservedRows(&h.metrics, 6, ui_render.welcome_message_reserved_rows);
-    const welcome = try ui_render.welcomeMessage(h.alloc, h.shell.layout.cols);
-    defer h.alloc.free(welcome);
-    try h.shell.writeTranscriptClassified(h.alloc, &h.metrics, welcome, true, .welcome);
+    try h.shell.writeWelcome(h.alloc, &h.metrics);
 
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(h.alloc);
@@ -4431,9 +4430,7 @@ test "welcome logo stays pinned during footer-reserved overflow" {
     defer h.deinit();
 
     try h.shell.initViewportWithReservedRows(&h.metrics, 6, ui_render.welcome_message_reserved_rows);
-    const welcome = try ui_render.welcomeMessage(h.alloc, h.shell.layout.cols);
-    defer h.alloc.free(welcome);
-    try h.shell.writeTranscriptClassified(h.alloc, &h.metrics, welcome, true, .welcome);
+    try h.shell.writeWelcome(h.alloc, &h.metrics);
 
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(h.alloc);
@@ -4466,9 +4463,7 @@ test "welcome pinning does not hide submitted user prompt" {
     defer approval.deinit(h.alloc);
 
     try h.shell.initViewportWithReservedRows(&h.metrics, 10, ui_render.welcome_message_reserved_rows);
-    const welcome = try ui_render.welcomeMessage(h.alloc, h.shell.layout.cols);
-    defer h.alloc.free(welcome);
-    try h.shell.writeTranscriptClassified(h.alloc, &h.metrics, welcome, true, .welcome);
+    try h.shell.writeWelcome(h.alloc, &h.metrics);
 
     const prompt = try h.alloc.dupe(u8, "PLEASE KEEP THIS PROMPT VISIBLE");
     _ = try h.shell.appendUserTurnOwned(h.alloc, .{ .text = prompt, .images = &.{} });
@@ -4502,9 +4497,7 @@ test "render engine preserves transcript footer activity behavior" {
     defer approval.deinit(h.alloc);
 
     try h.shell.initViewportWithReservedRows(&h.metrics, 6, ui_render.welcome_message_reserved_rows);
-    const welcome = try ui_render.welcomeMessage(alloc, 80);
-    defer alloc.free(welcome);
-    try h.shell.writeTranscriptClassified(alloc, &h.metrics, welcome, true, .welcome);
+    try h.shell.writeWelcome(alloc, &h.metrics);
 
     _ = try appendCompletedToolStatus(&h, "Listed src/ui");
     _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, "The renderer should preserve exactly one paragraph gap after tools.");
@@ -5056,9 +5049,7 @@ test "conversation tail takes priority over pinned welcome" {
     defer h.deinit();
 
     try h.shell.initViewportWithReservedRows(&h.metrics, 6, ui_render.welcome_message_reserved_rows);
-    const welcome = try ui_render.welcomeMessage(h.alloc, h.shell.layout.cols);
-    defer h.alloc.free(welcome);
-    try h.shell.writeTranscriptClassified(h.alloc, &h.metrics, welcome, true, .welcome);
+    try h.shell.writeWelcome(h.alloc, &h.metrics);
 
     const prompt = try h.alloc.dupe(u8, "user message must stay visible");
     _ = try h.shell.appendUserTurnOwned(h.alloc, .{ .text = prompt, .images = &.{} });
@@ -5084,9 +5075,7 @@ test "entry-bound shimmer resolves inside pinned welcome tail selection" {
     defer approval.deinit(h.alloc);
 
     try h.shell.initViewportWithReservedRows(&h.metrics, 6, ui_render.welcome_message_reserved_rows);
-    const welcome = try ui_render.welcomeMessage(h.alloc, h.shell.layout.cols);
-    defer h.alloc.free(welcome);
-    try h.shell.writeTranscriptClassified(h.alloc, &h.metrics, welcome, true, .welcome);
+    try h.shell.writeWelcome(h.alloc, &h.metrics);
 
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(h.alloc);

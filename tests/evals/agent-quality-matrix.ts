@@ -256,7 +256,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     currentBaselineResult: {
       status: "passing",
       notes:
-        "Live ./zig-out/bin/fx ask --auto --json --no-save used shell grep first and repeated the search five times. Forbidden tools: none; behavior reported concrete local matches in command_policy.zig, tool_permission.zig, and terminal.zig.",
+        "Measured before grep_files and glob_files were removed: live ./zig-out/bin/fx ask --auto --json --no-save used grep_files first and made five grep_files calls total. Forbidden tools: none; behavior reported concrete local matches in command_policy.zig, tool_permission.zig, and terminal.zig. The baseline has not been re-measured with shell search since the removal.",
     },
     targetResult: "Uses local search tools only and reports concrete local matches.",
     coveredEntrypoints: [

@@ -888,21 +888,21 @@ test "full tool detail keeps wrapped rails primary while output stays secondary"
 test "full projection retains consecutive in-memory tool details" {
     const alloc = std.testing.allocator;
     const entries = [_]transcript_blocks.TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .created_at_ms = 0, .bytes = @constCast("● Listed .\n"), .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .created_at_ms = 0, .bytes = @constCast("● Read notes.txt\n"), .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 2, .created_at_ms = 0, .bytes = @constCast("● Read README.md\n"), .class = .tool_status } },
     };
     var details = [_]ToolDetailRecord{
         .{
             .entry_id = 1,
             .tool_name = try alloc.dupe(u8, "read_file"),
-            .arguments_json = try alloc.dupe(u8, "{\"path\":\"README.md\"}"),
-            .result = try alloc.dupe(u8, "LIST_FULL_DETAIL_MARKER"),
+            .arguments_json = try alloc.dupe(u8, "{\"path\":\"notes.txt\"}"),
+            .result = try alloc.dupe(u8, "FIRST_FULL_DETAIL_MARKER"),
         },
         .{
             .entry_id = 2,
             .tool_name = try alloc.dupe(u8, "read_file"),
             .arguments_json = try alloc.dupe(u8, "{\"path\":\"README.md\"}"),
-            .result = try alloc.dupe(u8, "READ_FULL_DETAIL_MARKER"),
+            .result = try alloc.dupe(u8, "SECOND_FULL_DETAIL_MARKER"),
         },
     };
     defer for (&details) |*detail| detail.deinit(alloc);
@@ -920,8 +920,8 @@ test "full projection retains consecutive in-memory tool details" {
     const source = try renderProjectionViewportSource(alloc, &projection, null, 80, 24, 0);
     defer alloc.free(source);
 
-    try std.testing.expect(std.mem.find(u8, source, "LIST_FULL_DETAIL_MARKER") != null);
-    try std.testing.expect(std.mem.find(u8, source, "READ_FULL_DETAIL_MARKER") != null);
+    try std.testing.expect(std.mem.find(u8, source, "FIRST_FULL_DETAIL_MARKER") != null);
+    try std.testing.expect(std.mem.find(u8, source, "SECOND_FULL_DETAIL_MARKER") != null);
 }
 
 /// Paints the whole measured projection through the terminal engine, as the

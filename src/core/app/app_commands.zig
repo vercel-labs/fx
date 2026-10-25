@@ -1624,11 +1624,10 @@ fn writeCurrentStateSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem
     }
     try writeDebugEnvSummary(writer, alloc);
     if (comptime @hasField(App, "stream")) {
-        try writer.print("stream: active={s} chunks={d} reads={d} lists={d} writes={d} edits={d} commands={d} subagents={d}", .{
+        try writer.print("stream: active={s} chunks={d} reads={d} writes={d} edits={d} commands={d} subagents={d}", .{
             boolLabel(app.stream.active),
             app.stream.chunks,
             app.stream.read_count,
-            app.stream.list_count,
             app.stream.write_count,
             app.stream.edit_count,
             app.stream.command_count,

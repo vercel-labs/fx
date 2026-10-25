@@ -25,6 +25,7 @@ const help_menu_presentation = @import("help_menu_presentation.zig");
 const settings_menu_presentation = @import("settings_menu_presentation.zig");
 const mcp_host_menu_presentation = @import("mcp_host_menu_presentation.zig");
 const resume_menu_presentation = @import("resume_menu_presentation.zig");
+const session_browser_presentation = @import("session_browser_presentation.zig");
 const effort_menu_presentation = @import("effort_menu_presentation.zig");
 const fork_menu_presentation = @import("fork_menu_presentation.zig");
 const question_ui = @import("question_ui.zig");
@@ -761,6 +762,18 @@ pub fn composeFooterFrame(
                 );
                 try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
             }
+        } else if (input.picker_kind == .session_browser and ctx.session_browser != null) {
+            var menu_row_index: u16 = 0;
+            while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
+                var menu_row = try session_browser_presentation.composeRow(
+                    alloc,
+                    ctx.session_browser.?,
+                    menu_row_index,
+                    shell.layout.cols,
+                    input.picker_rows,
+                );
+                try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
+            }
         } else if (input.picker_kind == .sessions and ctx.session_menu.active) {
             var menu_row_index: u16 = 0;
             while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
@@ -989,23 +1002,9 @@ pub fn composeFooterFrame(
         )
     else if (input.show_picker and input.picker_kind == .help)
         try input_presentation.composeHelpMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
-    else if (input.show_picker and input.picker_kind == .sessions and ctx.session_menu.browser != null) blk: {
-        const browser = ctx.session_menu.browser.?;
-        const variants: []const []const u8 = if (browser.query_len > 0) &.{
-            "up/down select   enter open   left back   esc clear filter",
-            "up/down select  enter open  left back  esc clear filter",
-            "up/down select  enter open  esc clear",
-            "enter open  esc clear",
-            "esc clear",
-        } else &.{
-            "up/down select   enter open   left back   esc close",
-            "up/down select  enter open  left back  esc close",
-            "up/down select  enter open  esc close",
-            "enter open  esc close",
-            "enter esc",
-        };
-        break :blk try input_presentation.composeVariantHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending, variants);
-    } else if (input.show_picker and input.picker_kind == .sessions)
+    else if (input.show_picker and input.picker_kind == .session_browser and ctx.session_browser != null)
+        try session_browser_presentation.composeHintRow(alloc, ctx.session_browser.?, shell.layout.cols, ctx.ctrl_c_pending)
+    else if (input.show_picker and input.picker_kind == .sessions)
         try input_presentation.composeResumeMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .fork)
         try input_presentation.composeForkMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)

@@ -15,7 +15,9 @@ const vt_emulator = @import("../../core/terminal/engine.zig");
 
 const TranscriptEntry = transcript_blocks.TranscriptEntry;
 const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
-const cancellation_follow_up = " · What should change?";
+/// Appended to a cancelled tool's terminal row. Shared with the transcript runtime
+/// so the group projection can strip exactly what the runtime wrote.
+pub const cancellation_follow_up = " · What should change?";
 
 pub const Projection = struct {
     entry_actions: std.ArrayList(transcript_blocks.EntryRenderAction) = .empty,
@@ -142,15 +144,13 @@ const ProjectionMode = enum { compact, expanded };
 
 const category_labels = [_][]const u8{
     "read",
-    "list",
     "write",
     "edit",
     "open",
     "command",
     "subagent",
-    "browser",
 };
-const command_category_index = 5;
+const command_category_index = 4;
 
 const Summary = struct {
     total: usize = 0,
@@ -161,6 +161,28 @@ const Summary = struct {
     cancelled: usize = 0,
     completion_unreported: usize = 0,
     not_executed: usize = 0,
+
+    const Anomaly = struct { count: usize, label: []const u8 };
+
+    /// Outcomes other than a clean completion, in the order the group
+    /// header names them.
+    fn anomalies(self: Summary) [6]Anomaly {
+        return .{
+            .{ .count = self.completion_unreported, .label = "unreported" },
+            .{ .count = self.not_executed, .label = "not executed" },
+            .{ .count = self.timed_out, .label = "timed out" },
+            .{ .count = self.failed, .label = "failed" },
+            .{ .count = self.denied, .label = "denied" },
+            .{ .count = self.cancelled, .label = "cancelled" },
+        };
+    }
+
+    fn isClean(self: Summary) bool {
+        for (self.anomalies()) |anomaly| {
+            if (anomaly.count != 0) return false;
+        }
+        return true;
+    }
 };
 
 const PresentationGroup = struct {
@@ -177,12 +199,11 @@ const PresentationGroup = struct {
 fn categoryIndex(kind: types.ToolActivityKind) ?usize {
     return switch (kind) {
         .read => 0,
-        .list => 1,
-        .write => 2,
-        .edit => 3,
-        .open => 4,
+        .write => 1,
+        .edit => 2,
+        .open => 3,
         .command => command_category_index,
-        .subagent => 6,
+        .subagent => 5,
         .ask => null,
     };
 }
@@ -537,16 +558,114 @@ fn formatGroupSummary(alloc: std.mem.Allocator, summary: Summary) ![]u8 {
             category_labels[index];
         try appendSegment(&out.writer, count, label);
     }
-    try appendSegment(&out.writer, summary.completion_unreported, "unreported");
-    try appendSegment(&out.writer, summary.not_executed, "not executed");
-    try appendSegment(&out.writer, summary.timed_out, "timed out");
-    try appendSegment(&out.writer, summary.failed, "failed");
-    try appendSegment(&out.writer, summary.denied, "denied");
-    try appendSegment(&out.writer, summary.cancelled, "cancelled");
+    for (summary.anomalies()) |anomaly| {
+        try appendSegment(&out.writer, anomaly.count, anomaly.label);
+    }
     return out.toOwnedSlice();
 }
 
 const GroupBlock = struct { bytes: []u8, lines: []const transcript_blocks.LineProvenance };
+
+const SingleEntry = struct {
+    entry: TranscriptEntry,
+    entry_id: u32,
+    detail: *const ToolDetailRecord,
+};
+
+/// The group's only entry when it is a clean, completed, unfocused tool row.
+/// Failures, cancellations, timeouts, and live or focused rows keep the summary
+/// header so their state stays explicit.
+fn cleanSingleEntry(
+    entries: []const TranscriptEntry,
+    status_indices: []const usize,
+    details: []const ToolDetailRecord,
+    detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
+    summary: Summary,
+    focused_entry_id: ?u32,
+) ?SingleEntry {
+    if (status_indices.len != 1 or !summary.isClean()) return null;
+    const entry = entries[status_indices[0]];
+    const entry_id = toolStatusEntryId(entry) orelse return null;
+    if (focused_entry_id == entry_id) return null;
+    const detail = detailForEntry(details, detail_indices, entry_id, null) orelse return null;
+    if (detail.outcome != .completed or statusNamesAsk(entry, detail)) return null;
+    return .{ .entry = entry, .entry_id = entry_id, .detail = detail };
+}
+
+/// The row text for one tool entry: its canonical status phrase, with a
+/// truncated command reprojected and highlighted. Allocated in `scratch`.
+fn statusRowPhrase(
+    scratch: std.mem.Allocator,
+    entry: TranscriptEntry,
+    detail: ?*const ToolDetailRecord,
+    style: SummaryStyle,
+) ![]const u8 {
+    const raw_phrase = switch (entry) {
+        .raw_bytes => |raw| try normalizeCanonicalStatus(scratch, raw.bytes),
+        else => null,
+    } orelse if (detail) |record| record.tool_name else "tool activity";
+    const phrase = try reprojectTruncatedCommandPhrase(
+        scratch,
+        raw_phrase,
+        detail,
+    ) orelse raw_phrase;
+    return try highlightCommandPhrase(scratch, phrase, detail, style.text_style) orelse phrase;
+}
+
+/// Writes one clipped, styled row, preceded by a newline unless it is the
+/// block's first row, and records its provenance.
+fn appendStatusRow(
+    alloc: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    out: *std.Io.Writer,
+    lines: *std.ArrayList(transcript_blocks.LineProvenance),
+    entry_id: u32,
+    detail: ?*const ToolDetailRecord,
+    row: []const u8,
+    first_row: bool,
+    cols: u16,
+    style: SummaryStyle,
+) !void {
+    const clipped = try clipSummary(scratch, row, cols);
+    const accented = if (entryShowsDiffStats(detail))
+        try accentTrailingDiffStats(scratch, clipped, style.text_style)
+    else
+        clipped;
+    try lines.append(alloc, .{ .entry = .{ .entry_id = entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
+    if (!first_row) try out.writeByte('\n');
+    if (style.text_style.len > 0) try out.writeAll(style.text_style);
+    try out.writeAll(accented);
+    if (style.text_style.len > 0) try out.writeAll(style.reset_style);
+}
+
+/// A lone completed tool renders as its own "● Read README.md" row, without
+/// a one-item summary header or tree connector.
+fn formatSingleToolRow(
+    alloc: std.mem.Allocator,
+    single: SingleEntry,
+    cols: u16,
+    style: SummaryStyle,
+) !GroupBlock {
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer mem_utils.deinit_arena(scratch_state);
+    const scratch = scratch_state.allocator();
+
+    var lines: std.ArrayList(transcript_blocks.LineProvenance) = .empty;
+    errdefer lines.deinit(alloc);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+
+    const phrase = try statusRowPhrase(scratch, single.entry, single.detail, style);
+    const row = try scratch.print("● {s}", .{phrase});
+    try appendStatusRow(alloc, scratch, &out.writer, &lines, single.entry_id, single.detail, row, true, cols, style);
+    if (subagentStatusContinuation(single.entry, single.detail)) |continuation| {
+        const continuation_row = try scratch.print("  {s}", .{continuation});
+        try appendStatusRow(alloc, scratch, &out.writer, &lines, single.entry_id, null, continuation_row, false, cols, style);
+    }
+    const bytes = try out.toOwnedSlice();
+    errdefer alloc.free(bytes);
+    return .{ .bytes = bytes, .lines = try lines.toOwnedSlice(alloc) };
+}
 
 fn formatGroupBlock(
     alloc: std.mem.Allocator,
@@ -561,33 +680,18 @@ fn formatGroupBlock(
     style: SummaryStyle,
     styles: transcript_blocks.Styles,
 ) !GroupBlock {
+    if (!collapse_tool_calls) {
+        if (cleanSingleEntry(entries, status_indices, details, detail_indices, summary, focused_entry_id)) |single| {
+            return formatSingleToolRow(alloc, single, cols, style);
+        }
+    }
+
     const header = try formatGroupHeader(alloc, summary, cols, style);
     defer alloc.free(header);
-    // A single tool needs no summary row. Keep its capitalized status phrase
-    // and indent any attached output under it, the same way the transcript
-    // shows a lone Read or Ran.
-    const single_entry_id = if (status_indices.len == 1)
-        toolStatusEntryId(entries[status_indices[0]])
-    else
-        null;
-    const single_detail = if (single_entry_id) |entry_id|
-        detailForEntry(details, detail_indices, entry_id, null)
-    else
-        null;
-    // Collapse only a clean, completed single tool. Failures, cancellations,
-    // timeouts, and live rows keep the summary row so their state stays explicit.
-    const collapse_single = !collapse_tool_calls and single_entry_id != null and
-        (focused_entry_id == null or focused_entry_id != single_entry_id.?) and
-        single_detail != null and single_detail.?.outcome == .completed and
-        summary.completion_unreported == 0 and summary.not_executed == 0 and
-        summary.timed_out == 0 and summary.failed == 0 and
-        summary.denied == 0 and summary.cancelled == 0;
 
     var lines: std.ArrayList(transcript_blocks.LineProvenance) = .empty;
     errdefer lines.deinit(alloc);
-    if (!collapse_single) {
-        try lines.append(alloc, .{ .entry = .{ .entry_id = entries[status_indices[0]].id(), .entry_class = .tool_status, .projection_part = .group_header } });
-    }
+    try lines.append(alloc, .{ .entry = .{ .entry_id = entries[status_indices[0]].id(), .entry_class = .tool_status, .projection_part = .group_header } });
     if (collapse_tool_calls) {
         const bytes = try alloc.dupe(u8, header);
         errdefer alloc.free(bytes);
@@ -614,52 +718,27 @@ fn formatGroupBlock(
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    if (!collapse_single) try out.writer.writeAll(header);
+    try out.writer.writeAll(header);
 
     var static_index: usize = 0;
-    var first_output_row = true;
     for (status_indices) |status_index| {
         const entry = entries[status_index];
         const entry_id = toolStatusEntryId(entry) orelse continue;
         const detail = detailForEntry(details, detail_indices, entry_id, null);
         if (statusNamesAsk(entry, detail) or focused_entry_id == entry_id) continue;
 
-        const raw_phrase = switch (entry) {
-            .raw_bytes => |raw| try normalizeCanonicalStatus(scratch, raw.bytes),
-            else => null,
-        } orelse if (detail) |record| record.tool_name else "tool activity";
-        const phrase = try reprojectTruncatedCommandPhrase(
-            scratch,
-            raw_phrase,
-            detail,
-        ) orelse raw_phrase;
-        const display_phrase = try highlightCommandPhrase(scratch, phrase, detail, style.text_style) orelse phrase;
+        const display_phrase = try statusRowPhrase(scratch, entry, detail, style);
         static_index += 1;
         const last_static_row = !focused_in_group and static_index == static_count;
-        const connector = if (collapse_single) "●" else if (last_static_row) "└" else "├";
+        const connector = if (last_static_row) "└" else "├";
         const child = try scratch.print("{s} {s}", .{ connector, display_phrase });
-        const clipped = try clipSummary(scratch, child, cols);
-        try lines.append(alloc, .{ .entry = .{ .entry_id = entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
-        const accented = if (entryShowsDiffStats(detail))
-            try accentTrailingDiffStats(scratch, clipped, style.text_style)
-        else
-            clipped;
-        if (!collapse_single or !first_output_row) try out.writer.writeByte('\n');
-        first_output_row = false;
-        if (style.text_style.len > 0) try out.writer.writeAll(style.text_style);
-        try out.writer.writeAll(accented);
-        if (style.text_style.len > 0) try out.writer.writeAll(style.reset_style);
+        try appendStatusRow(alloc, scratch, &out.writer, &lines, entry_id, detail, child, false, cols, style);
         if (subagentStatusContinuation(entry, detail)) |continuation| {
             const continuation_row = try scratch.print(
                 "{s}{s}",
                 .{ if (last_static_row) "  " else "│ ", continuation },
             );
-            const clipped_continuation = try clipSummary(scratch, continuation_row, cols);
-            try lines.append(alloc, .{ .entry = .{ .entry_id = entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
-            try out.writer.writeByte('\n');
-            if (style.text_style.len > 0) try out.writer.writeAll(style.text_style);
-            try out.writer.writeAll(clipped_continuation);
-            if (style.text_style.len > 0) try out.writer.writeAll(style.reset_style);
+            try appendStatusRow(alloc, scratch, &out.writer, &lines, entry_id, null, continuation_row, false, cols, style);
         }
     }
 
@@ -1422,11 +1501,11 @@ test "collapsed tool groups render only the summary header" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{ .id = 1, .bytes = @constCast("● Read file\n"), .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = @constCast("● List files\n"), .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = @constCast("● Edited file\n"), .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read },
-        .{ .entry_id = 2, .tool_name = @constCast("list_files"), .activity_kind = .list },
+        .{ .entry_id = 2, .tool_name = @constCast("edit_file"), .activity_kind = .edit },
     };
 
     var projection = try buildStyledFocused(alloc, &entries, &details, 120, null, true, .{}, .{});
@@ -2184,8 +2263,9 @@ test "expanded group children reproject stored commands at the current width" {
 
     var wide = try buildExpandedStyledInterruptible(alloc, &entries, &details, 400, .{}, null);
     defer wide.deinit(alloc);
+    // The full transcript keeps the group header even for a single tool.
     try std.testing.expectEqualStrings(
-        "● Ran \x1b[38;5;252mbun\x1b[39m run " ++ text_utils.repeat("pipeline-stage-", 10),
+        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mbun\x1b[39m run " ++ text_utils.repeat("pipeline-stage-", 10),
         wide.entry_actions.items[0].override.bytes,
     );
 
@@ -2585,6 +2665,7 @@ test "different presentation groups remain separate within one turn" {
             .activity_kind = .read,
             .lifecycle_id = .{ .turn_id = 7, .call_id = @constCast("first") },
             .presentation_group_id = .{ .turn_id = 7, .anchor_step_id = 11 },
+            .outcome = .completed,
         },
         .{
             .entry_id = 2,
@@ -2592,6 +2673,7 @@ test "different presentation groups remain separate within one turn" {
             .activity_kind = .read,
             .lifecycle_id = .{ .turn_id = 7, .call_id = @constCast("second") },
             .presentation_group_id = .{ .turn_id = 7, .anchor_step_id = 12 },
+            .outcome = .completed,
         },
     };
 
@@ -2623,6 +2705,7 @@ test "legacy lifecycle records without group identity respect transcript boundar
             .tool_name = @constCast("read_file"),
             .activity_kind = .read,
             .lifecycle_id = .{ .turn_id = 7, .call_id = @constCast("first") },
+            .outcome = .completed,
         },
         .{
             .entry_id = 3,
@@ -2660,6 +2743,7 @@ fn checkPresentationGroupingAllocationFailures(alloc: std.mem.Allocator) !void {
             .tool_name = @constCast("run_command"),
             .activity_kind = .command,
             .lifecycle_id = .{ .turn_id = 7, .call_id = @constCast("first") },
+            .outcome = .completed,
             .presentation_group_id = .{ .turn_id = 7, .anchor_step_id = 11 },
         },
         .{
@@ -2866,7 +2950,7 @@ test "ask activity remains outside tool groups" {
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("ask_user_question"), .activity_kind = .ask, .outcome = .completed },
-        .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = null },
+        .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
     };
 
     var projection = try build(alloc, &entries, &details, 120);
@@ -2996,7 +3080,7 @@ test "styled minimal summary preserves the clipped width" {
 test "expanded tool title stays primary while the group summary stays secondary" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "Listed .", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "Read README.md", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read },
@@ -3011,15 +3095,15 @@ test "expanded tool title stays primary while the group summary stays secondary"
     const expanded = projection.entry_actions.items[0].override.bytes;
 
     try std.testing.expect(std.mem.find(u8, expanded, "<secondary>1 tool call · 1 read<reset>") != null);
-    try std.testing.expect(std.mem.find(u8, expanded, "\n└ Listed .") != null);
+    try std.testing.expect(std.mem.find(u8, expanded, "\n└ Read README.md") != null);
     try std.testing.expect(std.mem.find(u8, expanded, "\n│\n") == null);
-    try std.testing.expect(std.mem.find(u8, expanded, "<secondary>└ Listed .") == null);
+    try std.testing.expect(std.mem.find(u8, expanded, "<secondary>└ Read README.md") == null);
 }
 
 test "expanded tool relationships materialize at multiple widths" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "Listed .", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "Read README.md", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read },
@@ -3061,7 +3145,7 @@ test "expanded tool relationships materialize at multiple widths" {
         try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 2);
     }
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;81m●\x1b[0m \x1b[1;3m1 tool call · 1 read\x1b[0m\n└ Listed .",
+        "\x1b[38;5;81m●\x1b[0m \x1b[1;3m1 tool call · 1 read\x1b[0m\n└ Read README.md",
         wide.entry_actions.items[0].override.bytes,
     );
 }

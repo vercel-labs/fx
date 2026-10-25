@@ -103,7 +103,6 @@ pub const ModelMenuProjection = struct {
 };
 
 pub const SessionMenuProjection = struct {
-    browser: ?*const session_browser.State = null,
     active: bool = false,
     load_state: session_catalog.LoadState = .loading,
     summaries: []const session_store.SessionSummary = &.{},
@@ -406,6 +405,9 @@ pub const RenderContext = struct {
     settings_menu: SettingsMenuProjection = .{},
     model_menu: ModelMenuProjection = .{},
     session_menu: SessionMenuProjection = .{},
+    /// The remote session browser, while it is open. It replaces the saved
+    /// session picker in the composer.
+    session_browser: ?*const session_browser.State = null,
     fork_menu: ForkMenuProjection = .{},
     effort_menu: EffortMenuProjection = .{},
     statusline_menu: StatuslineMenuProjection = .{},

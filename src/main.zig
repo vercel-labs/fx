@@ -2311,6 +2311,18 @@ const App = struct {
         try self.shell.writeTranscriptClassified(self.alloc, &self.metrics, text, record, class);
     }
 
+    pub fn writeWelcome(self: *App) !void {
+        try self.shell.writeWelcome(self.alloc, &self.metrics);
+    }
+
+    /// An approval, question, or API key prompt owns the footer. The welcome
+    /// banner and the output pacer hold still under it.
+    fn footerPromptActive(self: *const App) bool {
+        return self.approval_prompt.isActive() or
+            self.question_prompt.isActive() or
+            self.auth.apiKeyEntryActive();
+    }
+
     pub fn writeCompletedToolStatus(
         self: *App,
         kind: types.ToolOutcomeKind,
@@ -3021,13 +3033,7 @@ const App = struct {
             }, true);
         }
         const input_now_ms = io_mod.milliTimestamp();
-        if (!self.shell.fullTranscriptActive() and
-            !self.approval_prompt.isActive() and
-            !self.question_prompt.isActive() and
-            !self.auth.apiKeyEntryActive())
-        {
-            _ = self.shell.tickWelcomeAnimation(self.alloc, input_now_ms);
-        }
+        if (!self.footerPromptActive()) _ = self.shell.tickWelcome(self.alloc, input_now_ms);
         InputAppRuntime.expireTerminalInputGestures(self, input_now_ms);
         const terminal_input = self.terminal_input_runtime.flushTerminalAction(
             input_now_ms,
@@ -3037,7 +3043,7 @@ const App = struct {
         try self.routeTerminalInputIngress(terminal_input);
         if (!self.remote.active) try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).workerEventHandlers(self));
         const now_ns = io_mod.nanoTimestamp();
-        if (!self.approval_prompt.isActive() and !self.question_prompt.isActive() and !self.auth.apiKeyEntryActive()) {
+        if (!self.footerPromptActive()) {
             try self.pacer.tick(self.alloc, now_ns, self.pacerCallbacks());
         } else {
             self.pacer.pause(now_ns);

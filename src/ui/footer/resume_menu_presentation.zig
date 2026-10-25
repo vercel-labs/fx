@@ -1,5 +1,4 @@
 const std = @import("std");
-const session_browser_presentation = @import("session_browser_presentation.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const list_window = @import("../../core/shared/list_window.zig");
 const picker_presentation = @import("picker_presentation.zig");
@@ -194,7 +193,6 @@ const SessionMenuLayout = struct {
 };
 
 pub fn menuRowCount(projection: SessionMenuProjection, _: u16, max_rows: u16) u16 {
-    if (projection.browser) |browser| return session_browser_presentation.rowCount(browser, max_rows);
     return SessionMenuLayout.build(projection, max_rows).row_count;
 }
 
@@ -209,7 +207,6 @@ pub fn composeSessionMenuRow(
     width: u16,
     row_budget: u16,
 ) !std.ArrayList(u8) {
-    if (projection.browser) |browser| return session_browser_presentation.composeRow(alloc, browser, row_index, width, row_budget);
     const row: std.ArrayList(u8) = .empty;
     if (width == 0 or row_index >= row_budget) return row;
 

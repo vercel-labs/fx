@@ -21,6 +21,7 @@ const help_menu_presentation = @import("help_menu_presentation.zig");
 const settings_menu_presentation = @import("settings_menu_presentation.zig");
 const mcp_host_menu_presentation = @import("mcp_host_menu_presentation.zig");
 const resume_menu_presentation = @import("resume_menu_presentation.zig");
+const session_browser_presentation = @import("session_browser_presentation.zig");
 const effort_menu_presentation = @import("effort_menu_presentation.zig");
 const fork_menu_presentation = @import("fork_menu_presentation.zig");
 const question_ui = @import("question_ui.zig");
@@ -403,11 +404,14 @@ fn buildFooterSurfaceProjection(
     const show_settings_menu = !viewer_active and !show_auth_picker and !modal_active and ctx.settings_menu.active;
     const show_mcp_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !modal_active and ctx.mcp_host_menu.active();
     const show_help_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !modal_active and ctx.help_menu.active;
-    const show_session_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !modal_active and ctx.session_menu.active;
-    const show_fork_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !modal_active and ctx.fork_menu.active();
-    const show_models_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !show_fork_menu and !modal_active and ctx.model_menu.active;
-    const show_effort_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !show_fork_menu and !show_models_menu and !modal_active and ctx.effort_menu.active;
-    const show_inline_catalog = show_settings_menu or show_mcp_menu or show_help_menu or show_session_menu or show_fork_menu or show_models_menu or show_effort_menu;
+    const show_session_surface = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !modal_active and
+        (ctx.session_browser != null or ctx.session_menu.active);
+    const show_session_browser = show_session_surface and ctx.session_browser != null;
+    const show_session_menu = show_session_surface and !show_session_browser;
+    const show_fork_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_surface and !modal_active and ctx.fork_menu.active();
+    const show_models_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_surface and !show_fork_menu and !modal_active and ctx.model_menu.active;
+    const show_effort_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_surface and !show_fork_menu and !show_models_menu and !modal_active and ctx.effort_menu.active;
+    const show_inline_catalog = show_settings_menu or show_mcp_menu or show_help_menu or show_session_surface or show_fork_menu or show_models_menu or show_effort_menu;
     const show_skills_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !modal_active and ctx.skills_menu.active;
     const show_model_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !show_skills_query and !modal_active and
         ctx.model_query_active;
@@ -502,6 +506,8 @@ fn buildFooterSurfaceProjection(
         .mcp
     else if (show_help_menu)
         .help
+    else if (show_session_browser)
+        .session_browser
     else if (show_session_menu)
         .sessions
     else if (show_fork_menu)
@@ -632,6 +638,8 @@ fn buildFooterSurfaceProjection(
             shell.layout.cols,
             expanded_picker_row_budget,
         )
+    else if (show_session_browser)
+        session_browser_presentation.rowCount(ctx.session_browser.?, expanded_picker_row_budget)
     else if (show_session_menu)
         resume_menu_presentation.menuRowCount(
             ctx.session_menu,
@@ -1177,7 +1185,7 @@ pub noinline fn measureSurfaceFooter(
         // gap from the layout instead of moving the footer outside the solver.
         const footer_rows = measurement.frameLayoutMeasurement().natural_rows;
         const margin_rows: u16 = 1;
-        measurement.top_gap_rows = (shell.layout.rows -| ui_render.welcome_message_reserved_rows) -| footer_rows -| margin_rows;
+        measurement.top_gap_rows = (shell.layout.rows -| shell.welcomeRows()) -| footer_rows -| margin_rows;
     }
     measurement.footer_gap_active = projection.footer_gap_active;
     measurement.banner_active = projection.banner_active;

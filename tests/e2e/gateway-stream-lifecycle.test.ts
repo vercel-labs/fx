@@ -2950,7 +2950,7 @@ describe("gateway stream lifecycle", () => {
           writeFileSync(resourcePath, `${resourceSentinel}\n`);
           if (scenario.cancel) {
             await tui.sendKeys("C-c");
-            await tui.waitForText("What can fx do differently?", 10_000);
+            await tui.waitForText("What should change?", 10_000);
             await tui.waitForStableComposer(10_000);
             expect(gateway.requestCount()).toBe(heldRequestCount);
             releaseFinish();

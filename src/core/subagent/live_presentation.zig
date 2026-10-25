@@ -9,7 +9,16 @@ const Allocator = std.mem.Allocator;
 pub const byte_limit = 512 * 1024;
 pub const event_limit = 1024;
 const frame_limit = 64 * 1024;
+/// One encoded frame, kept as the exact JSON object a snapshot lists.
 const Frame = struct { sequence: u64, json: []u8 };
+
+/// The wire shape of one frame: a cursor sequence and either streamed text or
+/// a projected presentation event.
+const WireFrame = struct {
+    sequence: u64,
+    text: ?[]const u8 = null,
+    event: ?PresentationEvent = null,
+};
 
 pub const Snapshot = struct {
     sequence: u64 = 0,
@@ -20,7 +29,8 @@ pub const Snapshot = struct {
 
 pub const Tail = struct {
     mutex: std.Io.Mutex = .init,
-    frames: std.ArrayList(Frame) = .empty,
+    /// Oldest first; the oldest frames drop when a limit is reached.
+    frames: std.Deque(Frame) = .empty,
     bytes: usize = 0,
     sequence: u64 = 0,
     scratch: []u8 = &.{},
@@ -33,8 +43,7 @@ pub const Tail = struct {
     }
 
     fn clear(self: *Tail, alloc: Allocator) void {
-        for (self.frames.items) |frame| alloc.free(frame.json);
-        self.frames.clearRetainingCapacity();
+        while (self.frames.popFront()) |frame| alloc.free(frame.json);
         self.bytes = 0;
     }
 
@@ -42,7 +51,7 @@ pub const Tail = struct {
         if (text.len == 0) return;
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        self.appendLocked(alloc, .{ .text = text });
+        self.appendLocked(alloc, .{ .sequence = self.sequence + 1, .text = text });
     }
 
     pub fn appendEvent(self: *Tail, alloc: Allocator, event: worker_runtime.WorkerEvent) void {
@@ -51,18 +60,18 @@ pub const Tail = struct {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         const projected = project(event) orelse return;
-        self.appendLocked(alloc, .{ .event = projected });
+        self.appendLocked(alloc, .{ .sequence = self.sequence + 1, .event = projected });
     }
 
-    fn appendLocked(self: *Tail, alloc: Allocator, value: anytype) void {
-        self.sequence += 1;
+    fn appendLocked(self: *Tail, alloc: Allocator, frame: WireFrame) void {
+        self.sequence = frame.sequence;
         while (true) {
             if (self.scratch.len == 0) self.scratch = alloc.alloc(u8, 4096) catch {
                 self.clear(alloc);
                 return;
             };
             var writer: std.Io.Writer = .fixed(self.scratch);
-            std.json.Stringify.value(value, .{}, &writer) catch {
+            std.json.Stringify.value(frame, .{ .emit_null_optional_fields = false }, &writer) catch {
                 if (self.scratch.len == frame_limit) {
                     // An oversized event creates an explicit cursor gap, not
                     // unbounded allocations or a partially encoded payload.
@@ -81,12 +90,12 @@ pub const Tail = struct {
                 self.clear(alloc);
                 return;
             };
-            while (self.frames.items.len >= event_limit or self.bytes + json.len > byte_limit) {
-                const old = self.frames.orderedRemove(0);
+            while (self.frames.len >= event_limit or self.bytes + json.len > byte_limit) {
+                const old = self.frames.popFront().?;
                 self.bytes -= old.json.len;
                 alloc.free(old.json);
             }
-            self.frames.append(alloc, .{ .sequence = self.sequence, .json = json }) catch {
+            self.frames.pushBack(alloc, .{ .sequence = frame.sequence, .json = json }) catch {
                 alloc.free(json);
                 self.clear(alloc);
                 return;
@@ -101,18 +110,18 @@ pub const Tail = struct {
     pub fn snapshot(self: *Tail, alloc: Allocator, after: u64, force_reset: bool) !Snapshot {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        const oldest = if (self.frames.items.len > 0) self.frames.items[0].sequence else self.sequence + 1;
+        const oldest = if (self.frames.front()) |frame| frame.sequence else self.sequence + 1;
         const reset = force_reset or after > self.sequence or after < oldest - 1;
         var writer: std.Io.Writer.Allocating = .init(alloc);
         defer writer.deinit();
         try writer.writer.writeByte('[');
         var comma = false;
-        for (self.frames.items) |frame| {
+        var frames = self.frames.iterator();
+        while (frames.next()) |frame| {
             if (!reset and frame.sequence <= after) continue;
             if (comma) try writer.writer.writeByte(',');
             comma = true;
-            try writer.writer.print("{{\"sequence\":{d},", .{frame.sequence});
-            try writer.writer.writeAll(frame.json[1..]);
+            try writer.writer.writeAll(frame.json);
         }
         try writer.writer.writeByte(']');
         return .{ .sequence = self.sequence, .oldest_sequence = oldest, .reset = reset, .events_json = try writer.toOwnedSlice() };
@@ -178,14 +187,14 @@ test "child live presentation owns in-flight events and bounds cursor replay" {
     defer arena.deinit();
     const first = try tail.snapshot(arena.allocator(), 0, true);
     try std.testing.expectEqual(@as(u64, 3), first.sequence);
-    try std.testing.expect(std.mem.find(u8, first.events_json, "live") != null);
+    try std.testing.expect(std.mem.startsWith(u8, first.events_json, "[{\"sequence\":1,\"text\":\"live\"},{\"sequence\":2,\"event\":{"));
     try std.testing.expect(std.mem.find(u8, first.events_json, "authoritative_started") != null);
     try std.testing.expect(std.mem.find(u8, first.events_json, "running now") != null);
     const unchanged = try tail.snapshot(arena.allocator(), first.sequence, false);
     try std.testing.expectEqualStrings("[]", unchanged.events_json);
     try std.testing.expect(!unchanged.reset);
     for (0..event_limit + 1) |_| tail.appendText(alloc, "next");
-    try std.testing.expectEqual(event_limit, tail.frames.items.len);
+    try std.testing.expectEqual(event_limit, tail.frames.len);
     try std.testing.expect(tail.bytes <= byte_limit);
     const gap = try tail.snapshot(arena.allocator(), 1, false);
     try std.testing.expect(gap.reset);
@@ -193,10 +202,10 @@ test "child live presentation owns in-flight events and bounds cursor replay" {
     const large: [16 * 1024]u8 = @splat('a');
     for (0..40) |_| tail.appendText(alloc, &large);
     try std.testing.expect(tail.bytes <= byte_limit);
-    try std.testing.expect(tail.frames.items.len < 40);
+    try std.testing.expect(tail.frames.len < 40);
     const oversized: [frame_limit + 1]u8 = @splat('b');
     tail.appendText(alloc, &oversized);
-    try std.testing.expectEqual(@as(usize, 0), tail.frames.items.len);
+    try std.testing.expectEqual(@as(usize, 0), tail.frames.len);
     try std.testing.expect(tail.scratch.len <= frame_limit);
     const skipped = try tail.snapshot(arena.allocator(), first.sequence, false);
     try std.testing.expect(skipped.reset);

@@ -284,7 +284,6 @@ pub const StreamState = struct {
     phase_step_id: u64 = 0,
     chunks: usize = 0,
     read_count: usize = 0,
-    list_count: usize = 0,
     write_count: usize = 0,
     edit_count: usize = 0,
     open_count: usize = 0,
@@ -2469,7 +2468,6 @@ pub const PermissionRuleSet = struct {
 
 pub const ToolActivityKind = enum {
     read,
-    list,
     write,
     edit,
     open,

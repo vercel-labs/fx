@@ -1842,8 +1842,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       expect(scrollback.match(/Run \/help for commands/g)).toHaveLength(1);
       expect(scrollback).toContain("stream the resize marker command");
       expect(scrollback).not.toContain(preFxMarker);
-      expect(scrollback).toContain("● 1 tool call · 1 command");
-      expect(scrollback).toContain("Ran for i in $(seq 1 96)");
+      expect(scrollback).toContain("● Ran for i in $(seq 1 96)");
       expect(scrollback).not.toContain("resize-stream-marker 001");
       expect(scrollback).not.toContain("resize-stream-marker 096");
       expect(scrollback).toContain(finalResponse);

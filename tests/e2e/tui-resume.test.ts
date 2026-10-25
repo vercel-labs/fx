@@ -1221,8 +1221,7 @@ printf '${trailingMarker}   '
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared command.");
       const compact = await waitForScrollback(active, doneMarker);
-      expect(compact).toContain("● 1 tool call · 1 command");
-      expect(compact).toContain("└ Ran ./command-output-controls.sh");
+      expect(compact).toContain("● Ran ./command-output-controls.sh");
       expect(compact).not.toContain(`│ ${ansiMarker}`);
       expect(compact).not.toContain(`│ ${crMarker}`);
       expect(compact).not.toContain("│ TAB");
@@ -1621,7 +1620,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared command.");
       const compact = await waitForScrollback(active, "FULL_CTRL_O_DONE");
-      expect(compact).toContain("● 1 tool call · 1 command");
+      expect(compact).toContain("● Ran ");
       expect(compact).not.toContain("lines more (ctrl+o to view)");
       expect(compact).not.toContain(tailMarker);
       await active.waitForPane(
@@ -1700,7 +1699,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText(tailMarker, TIMEOUT);
 
       await active.sendKeys("C-o");
-      await active.waitForText("● 1 tool call · 1 command", TIMEOUT);
+      await active.waitForText("● Ran ", TIMEOUT);
       const restored = await active.capturePane();
       const restoredScrollback = await active.captureFullScrollback();
       expect(restored).not.toContain("lines more (ctrl+o to view)");
@@ -1778,7 +1777,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared cap-crossing command.");
       const compact = await waitForScrollback(active, finalMarker, timeout);
-      expect(compact).toContain("● 1 tool call · 1 command");
+      expect(compact).toContain("● Ran ");
       expect(compact).not.toContain("lines more (ctrl+o to view)");
       expect(compact).not.toContain(stdoutTail);
       expect(compact).not.toContain(stderrTail);
@@ -6316,8 +6315,7 @@ printf '${stdoutTail2}\\n'
     let active: TmuxSession | null = null;
 
     function expectCompactCommandOutput(pane: string): void {
-      expect(pane).toContain("● 1 tool call · 1 command");
-      expect(pane).toContain("Ran ./resume-command-output.sh");
+      expect(pane).toContain("● Ran ./resume-command-output.sh");
       expect(pane).not.toContain("lines more (ctrl+o to view)");
       expect(pane).not.toContain(firstMarker);
       expect(pane).not.toContain("RESUME_COMMAND_TAIL");
@@ -7096,7 +7094,7 @@ test.skipIf(!tmuxAvailable())(
         height: 40,
       });
       await active.waitForComposer(TIMEOUT);
-      await active.waitForText("What can fx do differently?", TIMEOUT);
+      await active.waitForText("What should change?", TIMEOUT);
       const resumedGrid = await active.capturePaneGrid();
       const footer = findFooterBlocks(resumedGrid).at(-1);
       const cancelledRow = resumedGrid.findIndex((row) => row.includes("■ Cancelled"));
@@ -7373,13 +7371,13 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       const resumed = stripAnsi(await waitForScrollback(
         active,
-        "What can fx do differently?",
+        "What should change?",
         timeout,
       ));
       const cancelledIndex = resumed.indexOf("Cancelled");
       expect(cancelledIndex).toBeGreaterThanOrEqual(0);
       expect(resumed).toContain("■ Cancelled");
-      expect(countOccurrences(resumed, "What can fx do differently?")).toBe(1);
+      expect(countOccurrences(resumed, "What should change?")).toBe(1);
       expect(resumed).not.toContain("system: cancelled");
       expect(resumed).not.toContain("Cancelling");
       expect(resumed).not.toContain("Interrupted by user after completing");

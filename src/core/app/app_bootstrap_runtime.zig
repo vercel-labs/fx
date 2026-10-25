@@ -141,7 +141,7 @@ fn BootstrapDeps(comptime App: type) type {
             []const u8,
             skill_contract.RootPolicy,
         ) app_runtime_setup.LoadSkillsError!app_runtime_setup.LoadedSkills;
-        const WelcomeMessageFn = *const fn (Allocator, u16) anyerror![]u8;
+        const WriteWelcomeFn = *const fn (*App) anyerror!void;
         const BeginFreshPersistedSessionFn = *const fn (*App) anyerror!void;
         const EnableSessionStoresFn = *const fn (*App) void;
         bootstrap_interactive_app: BootstrapInteractiveAppFn,
@@ -150,7 +150,7 @@ fn BootstrapDeps(comptime App: type) type {
         load_mcp_host: ?mcp_host.LoadFn = null,
         load_skills: LoadSkillsFn,
         skill_root_policy: skill_contract.RootPolicy,
-        welcome_message: WelcomeMessageFn,
+        write_welcome: WriteWelcomeFn,
         begin_fresh_persisted_session: BeginFreshPersistedSessionFn,
         enable_session_stores: EnableSessionStoresFn,
         terminal_title: host.TerminalTitle,
@@ -198,7 +198,7 @@ pub fn Runtime(comptime App: type) type {
                 .load_mcp_host = capability_providers.load_mcp_host,
                 .load_skills = app_runtime_setup.loadSkills,
                 .skill_root_policy = capability_providers.skill_root_policy,
-                .welcome_message = welcomeMessageDefault,
+                .write_welcome = writeWelcomeDefault,
                 .begin_fresh_persisted_session = beginFreshPersistedSessionDefault,
                 .enable_session_stores = enableSessionStoresDefault,
                 .terminal_title = capability_providers.terminal_title,
@@ -251,8 +251,8 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
-        fn welcomeMessageDefault(alloc: Allocator, cols: u16) ![]u8 {
-            return ui_render.welcomeMessage(alloc, cols);
+        fn writeWelcomeDefault(app: *App) !void {
+            return app.writeWelcome();
         }
 
         fn beginFreshPersistedSessionDefault(app: *App) !void {
@@ -599,24 +599,7 @@ pub fn Runtime(comptime App: type) type {
             }
 
             if (app.requested_resume == null) {
-                const welcome_message = try deps.welcome_message(app.alloc, app.shell.layout.cols);
-                defer app.alloc.free(welcome_message);
-                var welcome_preview_buf: [96]u8 = undefined;
-                const welcome_preview = debug_trace.terminalPreview(welcome_preview_buf[0..], welcome_message);
-                debug_trace.logf(
-                    "paint",
-                    "welcome_write bytes={d} reserved_rows={d} has_version={s} has_help={s} has_feedback={s} preview=\"{s}\"",
-                    .{
-                        welcome_message.len,
-                        ui_render.welcome_message_reserved_rows,
-                        if (std.mem.find(u8, welcome_message, " v") != null) "true" else "false",
-                        if (std.mem.find(u8, welcome_message, "Run /help") != null) "true" else "false",
-                        if (std.mem.find(u8, welcome_message, "Feedback?") != null) "true" else "false",
-                        welcome_preview,
-                    },
-                );
-                try app.writeTranscriptClassified(welcome_message, true, .welcome);
-                app.shell.startWelcomeAnimation(app.shell.layout.cols);
+                try deps.write_welcome(app);
                 // Fresh sessions only: on resume the transcript must stay
                 // empty until the deferred session load replays history.
                 try writeSessionAssemblyNotice(app, startup.provider.label());
@@ -883,7 +866,7 @@ fn testDeps() BootstrapDeps(TestApp) {
             .managed_root_source = .global_fx,
             .global_roots = &test_global_skill_roots,
         },
-        .welcome_message = welcomeMessageForTest,
+        .write_welcome = writeWelcomeForTest,
         .begin_fresh_persisted_session = beginFreshPersistedSessionForTest,
         .enable_session_stores = enableSessionStoresForTest,
         .terminal_title = .{
@@ -1002,8 +985,8 @@ fn loadSkillsForTest(
     return .{ .dir = dir, .skills = &.{}, .diagnostics = diagnostics };
 }
 
-fn welcomeMessageForTest(alloc: Allocator, _: u16) ![]u8 {
-    return alloc.dupe(u8, "welcome\n");
+fn writeWelcomeForTest(app: *TestApp) !void {
+    try app.writeTranscriptClassified("welcome\n", true, .welcome);
 }
 
 fn configureSessionPreferencesForTest(

@@ -78,7 +78,6 @@ pub const RuleDecision = types.RuleDecision;
 pub const PermissionTargetKind = enum {
     none,
     path_existing,
-    path_optional_existing,
     path_create_parent,
     path_existing_parent,
     command_cwd,
@@ -192,13 +191,6 @@ pub fn permissionTargetForCall(
             break :blk arena.print("{s}::{s}", .{ cwd, command });
         },
         .url => arena.dupe(u8, try tool_args.requiredStringArg(args, "url")),
-        .path_optional_existing => blk: {
-            const path_arg = tool_args.optionalStringArg(args, "path") orelse ".";
-            break :blk if (path_arg.len == 0 or std.mem.eql(u8, path_arg, "."))
-                arena.dupe(u8, workspace_root)
-            else
-                try resolveFileToolPath(arena, workspace_root, call.name, path_arg, .existing);
-        },
         .path_create_parent => blk: {
             const path_arg = try tool_args.requiredStringArg(args, "path");
             const target_path = try resolveFileToolPath(arena, workspace_root, call.name, path_arg, .create);
@@ -1100,7 +1092,7 @@ pub fn isFilesystemMutationTool(tool_name: []const u8) bool {
 pub fn displayTargetForPolicy(alloc: std.mem.Allocator, workspace_root: []const u8, target_path: []const u8, target_kind: PermissionTargetKind) ![]u8 {
     return switch (target_kind) {
         .command_cwd => displayCommandTarget(alloc, workspace_root, target_path),
-        .path_existing, .path_optional_existing, .path_create_parent, .path_existing_parent => displayPathTarget(alloc, workspace_root, target_path),
+        .path_existing, .path_create_parent, .path_existing_parent => displayPathTarget(alloc, workspace_root, target_path),
         else => alloc.dupe(u8, target_path),
     };
 }
@@ -1510,7 +1502,7 @@ pub fn patternForSessionGrantMatch(tool_name: []const u8, target_path: []const u
 
 fn isPathBasedTool(target_kind: PermissionTargetKind) bool {
     return switch (target_kind) {
-        .path_existing, .path_optional_existing, .path_create_parent, .path_existing_parent => true,
+        .path_existing, .path_create_parent, .path_existing_parent => true,
         else => false,
     };
 }
@@ -2318,15 +2310,15 @@ test "command cwd and read accept explicit external paths" {
     defer alloc.free(external_cwd);
     try std.testing.expectEqualStrings(shared, external_cwd);
 
-    const search_call = types.ToolCall{
-        .id = "search",
+    const read_call = types.ToolCall{
+        .id = "read",
         .name = "read_file",
         .arguments_json = try arena_state.allocator().print("{{\"path\":\"{s}\"}}", .{shared}),
     };
-    const search_target = try permissionTargetForCallInScope(arena_state.allocator(), active_scope, search_call, .path_optional_existing);
-    try std.testing.expectEqualStrings(shared, search_target);
-    const external_search_target = try permissionTargetForCallInScope(arena_state.allocator(), removed_scope, search_call, .path_optional_existing);
-    try std.testing.expectEqualStrings(shared, external_search_target);
+    const read_target = try permissionTargetForCallInScope(arena_state.allocator(), active_scope, read_call, .path_existing);
+    try std.testing.expectEqualStrings(shared, read_target);
+    const external_read_target = try permissionTargetForCallInScope(arena_state.allocator(), removed_scope, read_call, .path_existing);
+    try std.testing.expectEqualStrings(shared, external_read_target);
 }
 
 test "displayTargetForPolicy renders workspace-relative paths and command cwd" {
@@ -2678,14 +2670,14 @@ test "suggestedSessionGrants returns exact broad workspace path suggestions" {
     }
 }
 
-test "suggestedSessionGrants uses registered path metadata for provider tools" {
+test "suggestedSessionGrants uses registered path metadata for workspace reads" {
     const alloc = std.testing.allocator;
     const grants = try suggestedSessionGrants(
         alloc,
         "/tmp/workspace",
-        "provider_list",
+        "read_file",
         "/tmp/workspace/src",
-        .path_optional_existing,
+        .path_existing,
     );
     defer freeGrants(alloc, grants);
 

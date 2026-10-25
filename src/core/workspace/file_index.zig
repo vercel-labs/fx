@@ -866,7 +866,7 @@ fn loadGeneration(
 /// `<home>/.fx/file-index/<sha256>.idx`, or null without an absolute home
 /// directory. The digest covers the roots and every variable that locates git
 /// config, so a listing built under one config is never reused under another.
-pub fn snapshotPath(alloc: Allocator, roots: []const []const u8) Allocator.Error!?[]const u8 {
+fn snapshotPath(alloc: Allocator, roots: []const []const u8) Allocator.Error!?[]const u8 {
     const home = io_mod.homeDir() orelse return null;
     if (!std.Io.Dir.path.isAbsolute(home)) return null;
     var config_environment: [indexer.config_environment_names.len]?[]const u8 = undefined;

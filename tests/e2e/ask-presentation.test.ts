@@ -513,7 +513,8 @@ describe("fx ask presentation", () => {
       const scrollback = await session.captureFullScrollback();
       const escaped = await session.captureFullScrollbackEscapes();
       expect(scrollback).toContain("Inspect fixture.txt and render the response.");
-      expect(pane.match(/1 tool call · 1 read/g)).toHaveLength(2);
+      // The completed read collapses to its own row; the failed read keeps its header.
+      expect(pane.match(/1 tool call · 1 read/g)).toHaveLength(1);
       expect(pane).toContain("Reading fixture.txt");
       expect(pane).toContain("Between groups.");
       expect(pane).toContain("Reading missing.txt");
@@ -947,7 +948,7 @@ describe("fx ask presentation", () => {
       const scrollback = await session.captureFullScrollback();
       expect(scrollback).toContain("Run the notice filtering fixture.");
       expect(scrollback).toContain("Notice filtering complete.");
-      expect(scrollback).toContain("1 tool call · 1 command");
+      expect(scrollback).toContain("● Ran printf notice-test > ask-notice.txt");
       expect(scrollback).not.toContain("project instructions");
       expect(scrollback).not.toContain("Auto agent approved this request");
       expect(scrollback).not.toMatch(/[*✓!✗⊘i] system:/);

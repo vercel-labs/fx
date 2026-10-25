@@ -2,11 +2,14 @@
 const std = @import("std");
 const browser = @import("../../core/input/session_browser.zig");
 const display_width = @import("../../core/shared/display_width.zig");
+const input_presentation = @import("input_presentation.zig");
 const render = @import("../render.zig");
 const row_text = @import("row_text.zig");
+
 pub fn rowCount(state: *const browser.State, budget: u16) u16 {
     return @intCast(@min(budget, @max(1, @min(state.count(), 20)) + 1));
 }
+
 pub fn composeRow(alloc: std.mem.Allocator, state: *const browser.State, index: u16, width: u16, budget: u16) !std.ArrayList(u8) {
     var row: std.ArrayList(u8) = .empty;
     errdefer row.deinit(alloc);
@@ -76,6 +79,33 @@ pub fn composeRow(alloc: std.mem.Allocator, state: *const browser.State, index: 
     try row_text.appendSingleLineEllipsized(alloc, &row, left.items, width);
     try row.appendSlice(alloc, render.reset_style);
     return row;
+}
+
+const filtered_hints = [_][]const u8{
+    "up/down select   enter open   left back   esc clear filter",
+    "up/down select  enter open  left back  esc clear filter",
+    "up/down select  enter open  esc clear",
+    "enter open  esc clear",
+    "esc clear",
+};
+
+const unfiltered_hints = [_][]const u8{
+    "up/down select   enter open   left back   esc close",
+    "up/down select  enter open  left back  esc close",
+    "up/down select  enter open  esc close",
+    "enter open  esc close",
+    "enter esc",
+};
+
+/// The key hint under the browser: Esc clears a filter before it closes.
+pub fn composeHintRow(
+    alloc: std.mem.Allocator,
+    state: *const browser.State,
+    width: u16,
+    ctrl_c_pending: bool,
+) !std.ArrayList(u8) {
+    const variants: []const []const u8 = if (state.query_len > 0) &filtered_hints else &unfiltered_hints;
+    return input_presentation.composeVariantHintRow(alloc, width, ctrl_c_pending, variants);
 }
 
 test "browser rows keep title and right-aligned meta only" {

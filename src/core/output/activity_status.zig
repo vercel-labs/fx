@@ -91,7 +91,6 @@ const ActivityPart = struct {
 
 fn streamStatusVerb(stream: StreamState) []const u8 {
     return switch (stream.last_activity_kind orelse return "thinking") {
-        .list => "listing",
         .read => "reading",
         .write => "writing",
         .edit => "editing",
@@ -231,10 +230,9 @@ fn buildThinkingLabelFull(buf: []u8, stream: StreamState) []const u8 {
     return out.buffered();
 }
 
-fn activityParts(stream: StreamState) [7]ActivityPart {
+fn activityParts(stream: StreamState) [6]ActivityPart {
     return .{
         .{ .count = stream.read_count, .singular = "file", .plural = "files", .verb = "read" },
-        .{ .count = stream.list_count, .singular = "directory", .plural = "directories", .verb = "listed" },
         .{ .count = stream.write_count, .singular = "file", .plural = "files", .verb = "wrote" },
         .{ .count = stream.edit_count, .singular = "file", .plural = "files", .verb = "edited" },
         .{ .count = stream.command_count, .singular = "command", .plural = "commands", .verb = "started" },
@@ -506,9 +504,8 @@ test "buildThinkingLabelFull renders ordered activity counts" {
     var buf: [256]u8 = undefined;
     const label = buildThinkingLabelFull(&buf, .{
         .active = true,
-        .last_activity_kind = .list,
+        .last_activity_kind = .read,
         .read_count = 2,
-        .list_count = 3,
         .write_count = 4,
         .edit_count = 5,
         .command_count = 6,
@@ -517,7 +514,7 @@ test "buildThinkingLabelFull renders ordered activity counts" {
     });
 
     try std.testing.expectEqualStrings(
-        "listing | 2 files read, 3 directories listed, 4 files wrote, 5 files edited, 6 commands started, 7 subagents created, 8 files opened",
+        "reading | 2 files read, 4 files wrote, 5 files edited, 6 commands started, 7 subagents created, 8 files opened",
         label,
     );
 }
@@ -547,13 +544,12 @@ test "buildProgressLabel appends turn token suffix after activity list" {
     var buf: [256]u8 = undefined;
     const label = buildProgressLabel(&buf, .{
         .active = true,
-        .last_activity_kind = .list,
+        .last_activity_kind = .read,
         .read_count = 2,
-        .list_count = 3,
         .token_progress = .{ .input_tokens = 10, .output_tokens = 20 },
     });
 
-    try std.testing.expectEqualStrings("listing | 2 files read, 3 directories listed (↑10 ↓20)", label.?);
+    try std.testing.expectEqualStrings("reading | 2 files read (↑10 ↓20)", label.?);
 }
 
 test "buildProgressLabel keeps worst case activity and token suffix within buffer" {
@@ -562,7 +558,6 @@ test "buildProgressLabel keeps worst case activity and token suffix within buffe
         .active = true,
         .last_activity_kind = .command,
         .read_count = 9,
-        .list_count = 9,
         .write_count = 9,
         .edit_count = 9,
         .command_count = 9,

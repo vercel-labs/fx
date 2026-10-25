@@ -1833,10 +1833,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn finishLiveSessionTransition(app: *App) !void {
-            const welcome = try ui_render.welcomeMessage(app.alloc, app.shell.layout.cols);
-            defer app.alloc.free(welcome);
-            try app.writeTranscriptClassified(welcome, true, .welcome);
-            app.shell.startWelcomeAnimation(app.shell.layout.cols);
+            try app.writeWelcome();
             app.shell.render_requests.request(.footer);
             try shell_runtime.requestRedraw(&app.shell, &app.metrics, .replay_viewport);
         }
@@ -5760,6 +5757,12 @@ const TestApp = struct {
         try self.raw_transcript_classes.append(self.alloc, class);
         try self.replay_events.append(self.alloc, .raw_transcript);
         try self.assistant_presentation_events.append(self.alloc, .raw_transcript);
+    }
+
+    fn writeWelcome(self: *TestApp) !void {
+        const title = try ui_render.welcomeTitle(self.alloc);
+        defer self.alloc.free(title);
+        try self.writeTranscriptClassified(title, true, .welcome);
     }
 
     fn writeCompletedToolStatus(

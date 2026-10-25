@@ -17,12 +17,10 @@ pub const banner_rows: u16 = 22;
 
 const n = scene_cols * scene_rows;
 const W: f32 = @floatFromInt(scene_cols);
-const H: f32 = @floatFromInt(scene_rows);
-const Wf: f32 = W;
-const Hf: f32 = H;
 const scale: f32 = 1.36;
 const top: f32 = 12;
-const dots = [_][]const u8{ " ", "·", "•", "●" };
+/// Scene rows above the banner's first Braille row. The apex sits at `top`.
+const first_scene_row: usize = 12;
 const cover = [_]f32{ 0, 0.3, 0.6, 1 };
 const bayer = blk: {
     const raw = [_]u8{
@@ -84,68 +82,65 @@ const bands = [_][3]f32{
     .{ 0.6, 0.28, 1 },
 };
 
+/// Per-pixel scene state. The geometry fields depend only on the scene and
+/// are computed once in `init`; the color fields are rewritten every frame.
+const Pixel = struct {
+    // Geometry.
+    cov: f32 = 0,
+    rim: f32 = 0,
+    beam_d: f32 = 0,
+    beam_s: f32 = 0,
+    inner: f32 = 0,
+    ghost: f32 = 0,
+    fan_u: f32 = -1,
+    fan_r: f32 = 0,
+    sheen: f32 = 0,
+    // Frame.
+    red: f32 = 0,
+    green: f32 = 0,
+    blue: f32 = 0,
+    spark: f32 = 0,
+    dot: u8 = 0,
+    color: u8 = 0,
+};
+
+/// Scene landmarks shared by the geometry pass and every frame.
+const Landmarks = struct {
+    /// Apex.
+    ax: f32,
+    ay: f32,
+    /// Left and right base corners, and the base line.
+    lx: f32,
+    rx: f32,
+    by: f32,
+    /// Where the beam enters and leaves the prism.
+    ex: f32,
+    ey: f32,
+    xx: f32,
+    xy: f32,
+    /// Scene row of the floor line; rows from here down mirror the scene.
+    floor: usize,
+};
+
 pub const Animation = struct {
     alloc: Allocator,
-    cols: u16,
     start_ms: i64 = 0,
-    frame_index: u32 = 0,
     next_frame_ms: i64 = 0,
-    cov: []f32,
-    rim: []f32,
-    beam_d: []f32,
-    beam_s: []f32,
-    inner: []f32,
-    ghost: []f32,
-    fan_u: []f32,
-    fan_r: []f32,
-    sheen: []f32,
-    red: []f32,
-    green: []f32,
-    blue: []f32,
-    spark: []f32,
-    dot_ids: []u8,
-    color_ids: []u8,
+    pixels: []Pixel,
+    marks: Landmarks,
     palette_256: [palette.len]u8,
-    static_fields: StaticFields = undefined,
 
-    pub fn init(alloc: Allocator, cols: u16) !Animation {
+    /// Allocates the scene and computes its geometry. Call `deinit` to free it.
+    pub fn init(alloc: Allocator) !Animation {
+        const pixels = try alloc.alloc(Pixel, n);
+        @memset(pixels, .{});
         var self = Animation{
             .alloc = alloc,
-            .cols = cols,
-            .cov = &.{},
-            .rim = &.{},
-            .beam_d = &.{},
-            .beam_s = &.{},
-            .inner = &.{},
-            .ghost = &.{},
-            .fan_u = &.{},
-            .fan_r = &.{},
-            .sheen = &.{},
-            .red = &.{},
-            .green = &.{},
-            .blue = &.{},
-            .spark = &.{},
-            .dot_ids = &.{},
-            .color_ids = &.{},
+            .pixels = pixels,
+            .marks = undefined,
             .palette_256 = undefined,
         };
-        errdefer self.deinit();
-        self.cov = try alloc.alloc(f32, n);
-        self.rim = try alloc.alloc(f32, n);
-        self.beam_d = try alloc.alloc(f32, n);
-        self.beam_s = try alloc.alloc(f32, n);
-        self.inner = try alloc.alloc(f32, n);
-        self.ghost = try alloc.alloc(f32, n);
-        self.fan_u = try alloc.alloc(f32, n);
-        self.fan_r = try alloc.alloc(f32, n);
-        self.sheen = try alloc.alloc(f32, n);
-        self.red = try alloc.alloc(f32, n);
-        self.green = try alloc.alloc(f32, n);
-        self.blue = try alloc.alloc(f32, n);
-        self.spark = try alloc.alloc(f32, n);
-        self.dot_ids = try alloc.alloc(u8, n);
-        self.color_ids = try alloc.alloc(u8, n);
-        self.computeStatic();
+        self.computeGeometry();
         for (palette, 0..) |p, i| {
             self.palette_256[i] = nearest256(
                 @floatFromInt(p[0]),
@@ -157,54 +152,41 @@ pub const Animation = struct {
     }
 
     pub fn deinit(self: *Animation) void {
-        const alloc = self.alloc;
-        alloc.free(self.cov);
-        alloc.free(self.rim);
-        alloc.free(self.beam_d);
-        alloc.free(self.beam_s);
-        alloc.free(self.inner);
-        alloc.free(self.ghost);
-        alloc.free(self.fan_u);
-        alloc.free(self.fan_r);
-        alloc.free(self.sheen);
-        alloc.free(self.red);
-        alloc.free(self.green);
-        alloc.free(self.blue);
-        alloc.free(self.spark);
-        alloc.free(self.dot_ids);
-        alloc.free(self.color_ids);
+        self.alloc.free(self.pixels);
+        self.* = undefined;
     }
 
+    /// Restarts the frame clock at `now_ms`; frame 0 is the one shown now.
     pub fn start(self: *Animation, now_ms: i64) void {
         self.start_ms = now_ms;
-        self.frame_index = 0;
-        self.next_frame_ms = now_ms + frame_interval_ms();
+        self.next_frame_ms = now_ms + frameIntervalMs();
     }
 
-    pub fn nextFrame(self: *Animation, alloc: Allocator, now_ms: i64) !?[]u8 {
-        if (self.start_ms == 0) self.start(now_ms);
+    /// Renders the frame due at `now_ms` for `cols` terminal columns, or
+    /// returns null before it is due. Caller owns the result.
+    pub fn nextFrame(self: *Animation, alloc: Allocator, cols: u16, now_ms: i64) !?[]u8 {
         if (now_ms < self.next_frame_ms) return null;
         const elapsed = now_ms - self.start_ms;
-        const next_index: u32 = @intCast(@max(0, @divFloor(elapsed * @as(i64, fps), 1000)));
-        self.frame_index = next_index;
-        const next_ms = self.start_ms + @divFloor(@as(i64, next_index + 1) * 1000, fps);
+        const index: u32 = @intCast(@max(0, @divFloor(elapsed * @as(i64, fps), 1000)));
+        const next_ms = self.start_ms + @divFloor(@as(i64, index + 1) * 1000, fps);
         self.next_frame_ms = @max(next_ms, now_ms + 1);
-        return try self.renderFrame(alloc, @as(f32, @floatFromInt(next_index)) / @as(f32, fps));
+        return try self.renderFrame(alloc, cols, @as(f32, @floatFromInt(index)) / @as(f32, fps));
     }
 
-    pub fn renderFrame(self: *Animation, alloc: Allocator, t: f32) ![]u8 {
+    /// Renders the scene at `t` seconds as `banner_rows` Braille rows, centered
+    /// and cropped to `cols`. Caller owns the result.
+    pub fn renderFrame(self: *Animation, alloc: Allocator, cols: u16, t: f32) ![]u8 {
         self.computeFrame(t);
-        return try self.renderBraille(alloc);
+        return try self.renderBraille(alloc, cols);
     }
 
-    fn computeStatic(self: *Animation) void {
+    fn computeGeometry(self: *Animation) void {
         const gh = ink.len;
         var gw: usize = 0;
         for (ink) |line| gw = @max(gw, line.len);
         var c0: usize = gw;
         var c1: usize = 0;
-        for (ink, 0..) |line, r| {
-            _ = r;
+        for (ink) |line| {
             for (line, 0..) |ch, c| {
                 if (ch != ' ') {
                     c0 = @min(c0, c);
@@ -224,10 +206,13 @@ pub const Animation = struct {
         const ey = mix(ay, by, enter);
         const xx = mix(ax, rx, leave);
         const xy = mix(ay, by, leave);
+        // The beam source sits off the left edge; the ghost reflection bends
+        // at (gx, gy) on its way to the exit face.
         const sx: f32 = -4;
         const sy = ey + 21;
-        const bx = mix(ex, xx, 0.62);
-        const bby = by - 1;
+        const gx = mix(ex, xx, 0.62);
+        const gy = by - 1;
+        const pixels = self.pixels;
 
         for (0..scene_rows) |r| {
             for (0..scene_cols) |x| {
@@ -242,58 +227,57 @@ pub const Animation = struct {
                         const off_y = @as(f32, @floatFromInt(j)) * 1.1;
                         const ggx = @as(f32, @floatFromInt(c0)) + ((px + off_x) - left) / scale;
                         const ggy = ((py + off_y) - top) / (2 * scale);
-                        s += bilinear_fn(gw, gh, ggx, ggy);
+                        s += bilinearInk(gw, gh, ggx, ggy);
                     }
                 }
-                self.cov[r * scene_cols + x] = smooth(0.38, 0.62, s / 9);
+                pixels[r * scene_cols + x].cov = smooth(0.38, 0.62, s / 9);
             }
         }
 
         for (1..scene_rows - 1) |r| {
             for (1..scene_cols - 1) |x| {
                 const k = r * scene_cols + x;
-                const gx = self.cov[k + 1] - self.cov[k - 1];
-                const gy = self.cov[k + scene_cols] - self.cov[k - scene_cols];
-                self.rim[k] = clamp01(@sqrt(gx * gx + gy * gy) * 1.25);
+                const dx = pixels[k + 1].cov - pixels[k - 1].cov;
+                const dy = pixels[k + scene_cols].cov - pixels[k - scene_cols].cov;
+                pixels[k].rim = clamp01(@sqrt(dx * dx + dy * dy) * 1.25);
             }
         }
 
         const beam_len = @sqrt((ex - sx) * (ex - sx) + (ey - sy) * (ey - sy));
         for (0..scene_rows) |r| {
             for (0..scene_cols) |x| {
-                const k = r * scene_cols + x;
+                const pixel = &pixels[r * scene_cols + x];
                 const px = @as(f32, @floatFromInt(x)) + 0.5;
                 const py = @as(f32, @floatFromInt(r)) + 0.5;
                 const b = seg(px, py, sx, sy, ex, ey);
-                self.beam_d[k] = b.d;
-                self.beam_s[k] = b.s * beam_len;
+                pixel.beam_d = b.d;
+                pixel.beam_s = b.s * beam_len;
                 const di = seg(px, py, ex, ey, xx, xy);
-                self.inner[k] = @exp(-pow2(di.d / (1 + di.s * 0.8)));
-                const d1 = seg(px, py, ex, ey, bx, bby);
-                const d2 = seg(px, py, bx, bby, xx + 2, xy + 9);
-                self.ghost[k] = @exp(-pow2(@min(d1.d, d2.d) / 0.8));
+                pixel.inner = @exp(-pow2(di.d / (1 + di.s * 0.8)));
+                const d1 = seg(px, py, ex, ey, gx, gy);
+                const d2 = seg(px, py, gx, gy, xx + 2, xy + 9);
+                pixel.ghost = @exp(-pow2(@min(d1.d, d2.d) / 0.8));
                 const dl = ((px - ax) * (by - ay) + (py - ay) * (ax - lx)) / @sqrt(pow2(by - ay) + pow2(ax - lx));
                 const dr = ((rx - ax) * (py - ay) - (px - ax) * (by - ay)) / @sqrt(pow2(by - ay) + pow2(rx - ax));
                 const db = by - py;
                 const edge = @min(@min(dl, dr), db);
                 const up = smooth(by, ay + 10, py);
                 const echo = @exp(-pow2((dl - 6) / 0.8)) + 0.6 * @exp(-pow2((dr - 6) / 0.8));
-                self.sheen[k] = @exp(-edge / 1.4) * 0.07 + echo * up * 0.16 + @exp(-pow2((db - 5) / 0.8)) * 0.06;
+                pixel.sheen = @exp(-edge / 1.4) * 0.07 + echo * up * 0.16 + @exp(-pow2((db - 5) / 0.8)) * 0.06;
                 const fx = px - xx;
                 const fy = py - xy;
                 if (fx > -2 and py < @as(f32, @floatFromInt(floor))) {
                     const a = std.math.atan2(fy, fx);
-                    self.fan_u[k] = (a - red) / (violet - red);
-                    self.fan_r[k] = @sqrt(fx * fx + fy * fy);
+                    pixel.fan_u = (a - red) / (violet - red);
+                    pixel.fan_r = @sqrt(fx * fx + fy * fy);
                 } else {
-                    self.fan_u[k] = -1;
-                    self.fan_r[k] = 0;
+                    pixel.fan_u = -1;
+                    pixel.fan_r = 0;
                 }
             }
         }
 
-        // Constants the frame loop reuses.
-        self.static_fields = .{
+        self.marks = .{
             .ax = ax,
             .ay = ay,
             .lx = lx,
@@ -303,91 +287,88 @@ pub const Animation = struct {
             .ey = ey,
             .xx = xx,
             .xy = xy,
-            .sx = sx,
-            .sy = sy,
-            .bx = bx,
-            .bby = bby,
             .floor = floor,
         };
     }
 
     fn computeFrame(self: *Animation, t: f32) void {
-        const ax = self.static_fields.ax;
-        const ax_ = self.static_fields;
+        const m = self.marks;
+        const pixels = self.pixels;
+        const floor_rows: f32 = @floatFromInt(m.floor);
         const pulse = 0.84 + 0.16 * @sin(t * 1.6);
-        @memset(self.spark, 0);
+        for (pixels) |*pixel| pixel.spark = 0;
 
-        var mote: usize = 0;
+        var mote: i32 = 0;
         while (mote < dust) : (mote += 1) {
-            const i: u32 = @intCast(mote);
-            const mx = hash(@intCast(i), 1) * W;
-            const my = hash(@intCast(i), 2) * @as(f32, @floatFromInt(ax_.floor));
-            const vx = 0.6 + hash(@intCast(i), 3) * 2.4;
-            const vy = (hash(@intCast(i), 4) - 0.5) * 1.2;
-            const ph = hash(@intCast(i), 5) * 6.28;
-            const tw = 1 + hash(@intCast(i), 6) * 3;
+            const mx = hash(mote, 1) * W;
+            const my = hash(mote, 2) * floor_rows;
+            const vx = 0.6 + hash(mote, 3) * 2.4;
+            const vy = (hash(mote, 4) - 0.5) * 1.2;
+            const ph = hash(mote, 5) * 6.28;
+            const tw = 1 + hash(mote, 6) * 3;
             const x = wrap(mx + vx * t + 2 * @sin(t * 0.4 + ph), W);
-            const y = wrap(my + vy * t + 1.5 * @sin(t * 0.3 + ph * 2), @as(f32, @floatFromInt(ax_.floor)));
-            const kk = @as(usize, @intFromFloat(@floor(y))) * scene_cols + @as(usize, @intFromFloat(@floor(x)));
-            self.spark[kk] = @max(self.spark[kk], std.math.pow(f32, 0.5 + 0.5 * @sin(t * tw + ph), 3));
+            const y = wrap(my + vy * t + 1.5 * @sin(t * 0.3 + ph * 2), floor_rows);
+            const k = @as(usize, @intFromFloat(@floor(y))) * scene_cols + @as(usize, @intFromFloat(@floor(x)));
+            pixels[k].spark = @max(pixels[k].spark, std.math.pow(f32, 0.5 + 0.5 * @sin(t * tw + ph), 3));
         }
 
         for (0..scene_rows) |r| {
             for (0..scene_cols) |x| {
                 const k = r * scene_cols + x;
+                const pixel = &pixels[k];
                 const px = @as(f32, @floatFromInt(x)) + 0.5;
                 const py = @as(f32, @floatFromInt(r)) + 0.5;
                 var cr: f32 = 0;
                 var cg: f32 = 0;
                 var cb: f32 = 0;
-                var floor_value: f32 = 0;
 
-                if (r >= ax_.floor) {
-                    const below = r - ax_.floor;
-                    const m = (ax_.floor - 1 - below) * scene_cols;
+                if (r >= m.floor) {
+                    // The floor mirrors the rows above it, already computed
+                    // this frame, with a slight horizontal wobble.
+                    const below = r - m.floor;
+                    const mirror = (m.floor - 1 - below) * scene_cols;
                     const wob = @as(i32, @intFromFloat(@round(0.7 * @sin(@as(f32, @floatFromInt(r)) * 1.7 + t * 2))));
-                    const x0 = clampInt(@as(i32, @intCast(x)) - 1 + wob, 0, scene_cols - 1);
-                    const x1 = clampInt(@as(i32, @intCast(x)) + 1 + wob, 0, scene_cols - 1);
-                    const xc = clampInt(@as(i32, @intCast(x)) + wob, 0, scene_cols - 1);
+                    const x0 = mirror + clampInt(@as(i32, @intCast(x)) - 1 + wob, 0, scene_cols - 1);
+                    const x1 = mirror + clampInt(@as(i32, @intCast(x)) + 1 + wob, 0, scene_cols - 1);
+                    const xc = mirror + clampInt(@as(i32, @intCast(x)) + wob, 0, scene_cols - 1);
                     const fall = 0.6 * @exp(-@as(f32, @floatFromInt(below)) / 10);
-                    cr = (self.red[m + x0] + 2 * self.red[m + xc] + self.red[m + x1]) * 0.25 * fall;
-                    cg = (self.green[m + x0] + 2 * self.green[m + xc] + self.green[m + x1]) * 0.25 * fall;
-                    cb = (self.blue[m + x0] + 2 * self.blue[m + xc] + self.blue[m + x1]) * 0.25 * fall;
+                    cr = (pixels[x0].red + 2 * pixels[xc].red + pixels[x1].red) * 0.25 * fall;
+                    cg = (pixels[x0].green + 2 * pixels[xc].green + pixels[x1].green) * 0.25 * fall;
+                    cb = (pixels[x0].blue + 2 * pixels[xc].blue + pixels[x1].blue) * 0.25 * fall;
                     if (below == 0) {
-                        const h = 0.1 + 0.25 * @exp(-pow2((px - ax) / 60));
+                        const h = 0.1 + 0.25 * @exp(-pow2((px - m.ax) / 60));
                         cr += h;
                         cg += h;
                         cb += h;
                     }
-                    if (px > ax_.xx) {
-                        const u = clamp01((px - ax_.xx) / (W - ax_.xx));
+                    if (px > m.xx) {
+                        const u = clamp01((px - m.xx) / (W - m.xx));
                         const s = spectrum(0.55 + 0.45 * u);
                         const spill = 0.13 * smooth(0, 0.25, u) * @exp(-@as(f32, @floatFromInt(below)) / 4) * pulse;
                         cr += s[0] * spill;
                         cg += s[1] * spill;
                         cb += s[2] * spill;
                     }
-                    floor_value = 0;
                 } else {
-                    const c = self.cov[k];
+                    const c = pixel.cov;
                     var lr: f32 = 0;
                     var lg: f32 = 0;
                     var lb: f32 = 0;
 
-                    const bd = self.beam_d[k];
+                    const bd = pixel.beam_d;
                     if (bd < 30) {
-                        const wave = 0.85 + 0.15 * @sin(self.beam_s[k] * 0.16 - t * 7);
+                        const wave = 0.85 + 0.15 * @sin(pixel.beam_s * 0.16 - t * 7);
                         const core = @exp(-pow2(bd / 1.45)) * 1.3 * pulse * wave;
                         const halo = @exp(-bd / 2.2) * 0.3 * pulse;
-                        const v = (core + halo) * smooth(0, 6, self.beam_s[k]) * (1 - c * 0.9);
+                        const v = (core + halo) * smooth(0, 6, pixel.beam_s) * (1 - c * 0.9);
                         lr += v;
                         lg += v;
                         lb += v * 1.02;
                     }
 
-                    const u = self.fan_u[k];
+                    const u = pixel.fan_u;
                     if (u > -0.3 and u < 1.3 and c < 0.9) {
-                        const d = self.fan_r[k];
+                        const d = pixel.fan_r;
                         const band = smooth(-0.05, 0.04, u) * smooth(1.05, 0.96, u);
                         if (band > 0) {
                             const s = spectrum(u);
@@ -397,15 +378,15 @@ pub const Animation = struct {
                             lg += s[1] * v;
                             lb += s[2] * v;
                         }
-                        const edge = @exp(-@max(0, @max(-u, u - 1)) * 12) * (1 - band) * 0.12 * smooth(0, 10, self.fan_r[k]) * (1 - c);
+                        const edge = @exp(-@max(0, @max(-u, u - 1)) * 12) * (1 - band) * 0.12 * smooth(0, 10, d) * (1 - c);
                         const s2 = spectrum(u);
                         lr += s2[0] * edge;
                         lg += s2[1] * edge;
                         lb += s2[2] * edge;
                     }
 
-                    const de = @sqrt(pow2(px - ax_.ex) + pow2(py - ax_.ey));
-                    const dx = @sqrt(pow2(px - ax_.xx) + pow2(py - ax_.xy));
+                    const de = @sqrt(pow2(px - m.ex) + pow2(py - m.ey));
+                    const dx = @sqrt(pow2(px - m.xx) + pow2(py - m.xy));
                     const spot = (@exp(-de / 2.2) * 1.1 + @exp(-de / 7) * 0.08) * pulse;
                     lr += spot;
                     lg += spot;
@@ -416,8 +397,8 @@ pub const Animation = struct {
                     lb += exit * 0.95;
 
                     const lp = @max(@max(lr, lg), lb);
-                    if (self.spark[k] > 0 and lp > 0.02) {
-                        const s = self.spark[k] * @min(1, lp * 4) * 1.4;
+                    if (pixel.spark > 0 and lp > 0.02) {
+                        const s = pixel.spark * @min(1, lp * 4) * 1.4;
                         const inv = 1 / @max(lp, 1e-3);
                         cr += s * (0.5 + 0.5 * lr * inv);
                         cg += s * (0.5 + 0.5 * lg * inv);
@@ -428,20 +409,20 @@ pub const Animation = struct {
                     cb += lb;
 
                     if (c > 0.01) {
-                        const py_frac = (py - ax_.ay) / (ax_.by - ax_.ay);
+                        const py_frac = (py - m.ay) / (m.by - m.ay);
                         const drift = 0.5 + 0.5 * @sin(t * 0.5 + (@as(f32, @floatFromInt(x)) - @as(f32, @floatFromInt(r))) * 0.04);
-                        var g = 0.012 * py_frac + self.sheen[k] * (0.5 + 0.5 * drift);
-                        g += self.inner[k] * 0.55 * pulse + self.ghost[k] * 0.08;
-                        const tint = smooth(0.4, 1, (px - ax_.ex) / (ax_.xx - ax_.ex)) * self.inner[k] * 0.25;
+                        var g = 0.012 * py_frac + pixel.sheen * (0.5 + 0.5 * drift);
+                        g += pixel.inner * 0.55 * pulse + pixel.ghost * 0.08;
+                        const tint = smooth(0.4, 1, (px - m.ex) / (m.xx - m.ex)) * pixel.inner * 0.25;
                         cr += c * (g + tint * 0.3);
                         cg += c * (g + tint * 0.15);
                         cb += c * (g + tint * 0.45);
                     }
 
-                    const e = self.rim[k];
+                    const e = pixel.rim;
                     if (e > 0.02) {
                         const near = @exp(-de / 16) * 0.5 + @exp(-dx / 16) * 0.35;
-                        const top_spot = @exp(-@sqrt(pow2(px - ax_.ax) + pow2(py - ax_.ay)) / 10) * 0.25;
+                        const top_spot = @exp(-@sqrt(pow2(px - m.ax) + pow2(py - m.ay)) / 10) * 0.25;
                         const v = e * (0.62 + near * pulse + top_spot);
                         cr += v;
                         cg += v;
@@ -449,34 +430,32 @@ pub const Animation = struct {
                     }
                 }
 
-                self.red[k] = cr;
-                self.green[k] = cg;
-                self.blue[k] = cb;
+                pixel.red = cr;
+                pixel.green = cg;
+                pixel.blue = cb;
 
                 const peak = @max(@max(cr, cg), @max(cb, 1e-4));
-                const level = clamp01(floor_value + (1 - floor_value) * std.math.pow(f32, peak, 0.85) * 0.95);
+                const level = clamp01(std.math.pow(f32, peak, 0.85) * 0.95);
                 const step = clampInt(@as(i32, @intFromFloat(@round(level * 3 + bayer[(r & 3) * 4 + (x & 3)]))), 0, 3);
-                self.dot_ids[k] = @intCast(step);
+                pixel.dot = @intCast(step);
                 if (step != 0) {
-                    const want = @min(1, (level + 0.06) / cover[@intCast(step)]);
+                    const want = @min(1, (level + 0.06) / cover[step]);
                     const s = (0.3 + 0.7 * want) / peak;
-                    self.color_ids[k] = nearest(clamp01(cr * s), clamp01(cg * s), clamp01(cb * s));
+                    pixel.color = nearest(clamp01(cr * s), clamp01(cg * s), clamp01(cb * s));
                 } else {
-                    self.color_ids[k] = 0;
+                    pixel.color = 0;
                 }
             }
         }
     }
 
-    fn renderBraille(self: *Animation, alloc: Allocator) ![]u8 {
+    fn renderBraille(self: *const Animation, alloc: Allocator, cols: u16) ![]u8 {
         const braille_cols = scene_cols / 2;
-        const out_cols: usize = @min(@as(usize, if (self.cols == 0) 80 else self.cols), braille_cols);
+        const out_cols: usize = @min(@as(usize, if (cols == 0) 80 else cols), braille_cols);
         const start_col = (braille_cols - out_cols) / 2;
-        const start_scene_row: usize = 12;
-        const end_scene_row = scene_rows;
-        const out_rows: usize = @min(@as(usize, banner_rows), (end_scene_row - start_scene_row + 3) / 4);
+        const out_rows: usize = @min(@as(usize, banner_rows), (scene_rows - first_scene_row + 3) / 4);
         const braille_bits = [4][2]u8{
-            .{ 0x01, 0x04 },
+            .{ 0x01, 0x08 },
             .{ 0x02, 0x10 },
             .{ 0x04, 0x20 },
             .{ 0x40, 0x80 },
@@ -485,11 +464,10 @@ pub const Animation = struct {
         var out: std.Io.Writer.Allocating = .init(alloc);
         errdefer out.deinit();
         for (0..out_rows) |row| {
-            var current_fg: i16 = -1;
+            var current_fg: ?u8 = null;
             for (0..out_cols) |col| {
-                const braille_x = start_col + col;
-                const scene_x = braille_x * 2;
-                const scene_y = start_scene_row + row * 4;
+                const scene_x = (start_col + col) * 2;
+                const scene_y = first_scene_row + row * 4;
                 var bits: u8 = 0;
                 var best_dot: u8 = 0;
                 var color: u8 = 0;
@@ -497,14 +475,13 @@ pub const Animation = struct {
                     for (0..2) |dx| {
                         const y = scene_y + dy;
                         const x = scene_x + dx;
-                        if (y >= end_scene_row or x >= scene_cols) continue;
-                        const k = y * scene_cols + x;
-                        const dot = self.dot_ids[k];
-                        if (dot == 0) continue;
+                        if (y >= scene_rows or x >= scene_cols) continue;
+                        const pixel = self.pixels[y * scene_cols + x];
+                        if (pixel.dot == 0) continue;
                         bits |= braille_bits[dy][dx];
-                        if (dot > best_dot) {
-                            best_dot = dot;
-                            color = self.color_ids[k];
+                        if (pixel.dot > best_dot) {
+                            best_dot = pixel.dot;
+                            color = pixel.color;
                         }
                     }
                 }
@@ -513,35 +490,18 @@ pub const Animation = struct {
                     continue;
                 }
                 const fg = self.palette_256[color];
-                if (current_fg != @as(i16, @intCast(fg))) {
+                if (current_fg != fg) {
                     try out.writer.print("\x1b[38;5;{d}m", .{fg});
-                    current_fg = @intCast(fg);
+                    current_fg = fg;
                 }
                 var encoded: [4]u8 = undefined;
-                const len = std.unicode.utf8Encode(@as(u21, 0x2800) + @as(u21, bits), &encoded) catch 0;
+                const len = std.unicode.utf8Encode(@as(u21, 0x2800) + @as(u21, bits), &encoded) catch unreachable;
                 try out.writer.writeAll(encoded[0..len]);
             }
             try out.writer.writeAll("\x1b[0m\n");
         }
         return try out.toOwnedSlice();
     }
-
-    const StaticFields = struct {
-        ax: f32,
-        ay: f32,
-        lx: f32,
-        rx: f32,
-        by: f32,
-        ex: f32,
-        ey: f32,
-        xx: f32,
-        xy: f32,
-        sx: f32,
-        sy: f32,
-        bx: f32,
-        bby: f32,
-        floor: usize,
-    };
 };
 
 fn clamp01(v: f32) f32 {
@@ -672,7 +632,7 @@ fn nearest256(r: f32, g: f32, b: f32) u8 {
     return best;
 }
 
-fn at_ink_fn(gw: usize, gh: usize, c: i32, r: i32) f32 {
+fn inkAt(gw: usize, gh: usize, c: i32, r: i32) f32 {
     if (r < 0 or r >= @as(i32, @intCast(gh)) or c < 0 or c >= @as(i32, @intCast(gw))) return 0;
     const line = ink[@intCast(r)];
     const cc: usize = @intCast(c);
@@ -680,7 +640,7 @@ fn at_ink_fn(gw: usize, gh: usize, c: i32, r: i32) f32 {
     return if (line[cc] != ' ') 1 else 0;
 }
 
-fn bilinear_fn(gw: usize, gh: usize, gx: f32, gy: f32) f32 {
+fn bilinearInk(gw: usize, gh: usize, gx: f32, gy: f32) f32 {
     const x = gx - 0.5;
     const y = gy - 0.5;
     const xi = @floor(x);
@@ -689,19 +649,73 @@ fn bilinear_fn(gw: usize, gh: usize, gx: f32, gy: f32) f32 {
     const fy = y - yi;
     const x0: i32 = @intFromFloat(xi);
     const y0: i32 = @intFromFloat(yi);
-    const a = at_ink_fn(gw, gh, x0, y0);
-    const b = at_ink_fn(gw, gh, x0 + 1, y0);
-    const c = at_ink_fn(gw, gh, x0, y0 + 1);
-    const d = at_ink_fn(gw, gh, x0 + 1, y0 + 1);
+    const a = inkAt(gw, gh, x0, y0);
+    const b = inkAt(gw, gh, x0 + 1, y0);
+    const c = inkAt(gw, gh, x0, y0 + 1);
+    const d = inkAt(gw, gh, x0 + 1, y0 + 1);
     return a + (b - a) * fx + (c - a) * fy + (a - b - c + d) * fx * fy;
 }
 
-pub fn renderStill(alloc: Allocator, cols: u16, t: f32) ![]u8 {
-    var anim = try Animation.init(alloc, cols);
-    defer anim.deinit();
-    return anim.renderFrame(alloc, t);
+pub fn frameIntervalMs() i64 {
+    return @divFloor(1000, @as(i64, fps));
 }
 
-pub fn frame_interval_ms() i64 {
-    return @divFloor(1000, @as(i64, fps));
+const display_width = @import("../core/shared/display_width.zig");
+
+test "frames stay within the banner rows and the requested width" {
+    const alloc = std.testing.allocator;
+    var animation = try Animation.init(alloc);
+    defer animation.deinit();
+    for ([_]u16{ 0, 1, 40, 80, 100, 240 }) |cols| {
+        const frame = try animation.renderFrame(alloc, cols, 1.5);
+        defer alloc.free(frame);
+        try std.testing.expect(std.mem.endsWith(u8, frame, "\n"));
+        try std.testing.expectEqual(@as(usize, banner_rows), std.mem.count(u8, frame, "\n"));
+        const expected_width: usize = @min(@as(usize, if (cols == 0) 80 else cols), scene_cols / 2);
+        var rows = std.mem.splitScalar(u8, frame[0 .. frame.len - 1], '\n');
+        while (rows.next()) |row| {
+            try std.testing.expectEqual(expected_width, display_width.visibleWidthIgnoringAnsi(row));
+        }
+    }
+}
+
+test "frames are deterministic for a scene time and change over time" {
+    const alloc = std.testing.allocator;
+    var first = try Animation.init(alloc);
+    defer first.deinit();
+    var second = try Animation.init(alloc);
+    defer second.deinit();
+
+    const a = try first.renderFrame(alloc, 80, 2.0);
+    defer alloc.free(a);
+    const later = try first.renderFrame(alloc, 80, 3.0);
+    defer alloc.free(later);
+    const again = try first.renderFrame(alloc, 80, 2.0);
+    defer alloc.free(again);
+    const b = try second.renderFrame(alloc, 80, 2.0);
+    defer alloc.free(b);
+
+    try std.testing.expectEqualStrings(a, again);
+    try std.testing.expectEqualStrings(a, b);
+    try std.testing.expect(!std.mem.eql(u8, a, later));
+}
+
+test "the frame clock waits for each frame and skips missed ones" {
+    const alloc = std.testing.allocator;
+    var animation = try Animation.init(alloc);
+    defer animation.deinit();
+    animation.start(1_000);
+
+    try std.testing.expect((try animation.nextFrame(alloc, 80, 1_000)) == null);
+    const due = (try animation.nextFrame(alloc, 80, 1_000 + frameIntervalMs())).?;
+    alloc.free(due);
+    try std.testing.expect((try animation.nextFrame(alloc, 80, 1_000 + frameIntervalMs())) == null);
+
+    // After a stall the clock jumps to the frame for the current time.
+    const late = (try animation.nextFrame(alloc, 80, 3_000)).?;
+    defer alloc.free(late);
+    const expected = try animation.renderFrame(alloc, 80, 2.0);
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, late);
+    try std.testing.expect(animation.next_frame_ms > 3_000);
 }

@@ -215,13 +215,7 @@ pub fn appendFileEvidenceForTool(
     if (parsed.value != .object) return;
     const object = parsed.value.object;
 
-    const path = switch (action) {
-        .search => non_empty_string_field(object, "path") orelse
-            non_empty_string_field(object, "directory") orelse
-            non_empty_string_field(object, "query") orelse
-            ".",
-        else => non_empty_string_field(object, "path") orelse return,
-    };
+    const path = non_empty_string_field(object, "path") orelse return;
 
     const evidence = try makeFileEvidence(
         alloc,
@@ -1252,7 +1246,7 @@ test "normal execution-memory builders produce identical durable projection" {
         .{
             .id = "call_read_second",
             .name = "read_file",
-            .arguments_json = "{\"path\":\"src\"}",
+            .arguments_json = "{\"path\":\"src/main.zig\"}",
         },
     };
     var second_calls = [_]ToolCall{.{
@@ -1283,13 +1277,13 @@ test "normal execution-memory builders produce identical durable projection" {
         },
         .{
             .role = .tool,
-            .content = "search failed",
+            .content = "read failed",
             .tool_call_id = first_calls[1].id,
             .tool_name = "read_file",
             .tool_result_status = .failure,
             .tool_result_memory = .{
                 .output_handle = "result-call_read_second-read_file.txt",
-                .preview = "search preview",
+                .preview = "read preview",
                 .output_bytes = 128,
                 .stored_output_bytes = 64,
                 .truncated = true,
@@ -1335,13 +1329,13 @@ test "normal execution-memory builders produce identical durable projection" {
         },
         .{
             .role = .tool,
-            .content = .{ .text = "search failed" },
+            .content = .{ .text = "read failed" },
             .tool_call_id = first_calls[1].id,
             .tool_name = "read_file",
             .tool_result_status = .failure,
             .tool_result_memory = .{
                 .output_handle = "result-call_read_second-read_file.txt",
-                .preview = "search preview",
+                .preview = "read preview",
                 .output_bytes = 128,
                 .stored_output_bytes = 64,
                 .truncated = true,
@@ -1391,7 +1385,7 @@ test "normal execution-memory builders produce identical durable projection" {
         chat_memory.tool_steps[0].tool_results[1].tool_name,
     );
     try std.testing.expectEqualStrings("notes.txt", chat_memory.files[0].path);
-    try std.testing.expectEqualStrings("src", chat_memory.files[1].path);
+    try std.testing.expectEqualStrings("src/main.zig", chat_memory.files[1].path);
     try std.testing.expectEqualStrings("notes.txt", chat_memory.files[2].path);
     try std.testing.expect(chat_memory.files[0].stale);
     try std.testing.expect(chat_memory.files[0].model_view_covers_full_file);

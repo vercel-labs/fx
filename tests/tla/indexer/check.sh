@@ -8,10 +8,10 @@
 # refresh-witness-*.cfg claims that one reuse path cannot happen and must be
 # violated, which shows that the path is reachable.
 #
-# GrepCut (merging parallel grep results), ListingWait (when the file picker
-# shows a loading row), and SnapshotSources (when a listing snapshot may be
-# reused): the contract and implementation configs must pass, and each
-# *-mutation-* config plants one bug that its named invariant must catch.
+# ListingWait (when the file picker shows a loading row) and SnapshotSources
+# (when a listing snapshot may be reused): the contract and implementation
+# configs must pass, and each *-mutation-* config plants one bug that its named
+# invariant must catch.
 #
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 #
@@ -33,9 +33,6 @@ RefreshWitness refresh-witness-NoReuseAfterEdit NoReuseAfterEdit -deadlock
 RefreshWitness refresh-witness-NoReuseAfterIgnore NoReuseAfterIgnore -deadlock
 RefreshWitness refresh-witness-NoEditAfterReuse NoEditAfterReuse -deadlock
 RefreshWitness refresh-witness-NoIgnoreChangeAfterReuse NoIgnoreChangeAfterReuse -deadlock
-GrepCut grep-cut - -deadlock
-GrepCut grep-cut-mutation-order MergeCorrect -deadlock
-GrepCut grep-cut-mutation-oom MergeCorrect -deadlock
 ListingWait listing-wait - -deadlock
 ListingWait listing-wait-mutation NoFlashUnlessSlow -deadlock
 SnapshotSources snapshot-contract - -deadlock

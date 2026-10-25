@@ -630,33 +630,67 @@ pub fn resolvedSkillName(call: ToolCall, presentation: tool_dispatch.CallPresent
 
 /// The caller owns the returned allocation and must free it with `alloc`.
 pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
-    return formatPlainActionState(alloc, input, false);
+    return formatPlainActionPhase(alloc, input, .active);
 }
 
 /// The caller owns the returned allocation and must free it with `alloc`.
 pub fn formatPlainCompletedAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
-    return formatPlainActionState(alloc, input, true);
+    return formatPlainActionPhase(alloc, input, .completed);
 }
 
-fn formatPlainActionState(alloc: Allocator, input: ToolActionInput, completed: bool) ![]const u8 {
+/// Whether a plain action row describes a running or a finished call.
+const ActionPhase = enum {
+    active,
+    completed,
+
+    /// Verbs for calls whose spec does not name its own labels.
+    const Verb = enum { generic, run, mcp, search };
+
+    const verbs = std.enums.EnumArray(Verb, [2][]const u8).init(.{
+        .generic = .{ "Working", "Completed" },
+        .run = .{ "Running", "Ran" },
+        .mcp = .{ "MCP", "Ran MCP" },
+        .search = .{ "Searching", "Searched" },
+    });
+
+    fn verb(self: ActionPhase, kind: Verb) []const u8 {
+        return verbs.get(kind)[@backingInt(self)];
+    }
+
+    /// The spec's own label for this phase. `labels` is a tool spec or a call
+    /// presentation.
+    fn label(self: ActionPhase, labels: anytype) []const u8 {
+        return switch (self) {
+            .active => labels.action_label,
+            .completed => labels.completed_action_label,
+        };
+    }
+
+    fn subagentState(self: ActionPhase) SubagentActionState {
+        return switch (self) {
+            .active => .active,
+            .completed => .completed,
+        };
+    }
+};
+
+fn formatPlainActionPhase(alloc: Allocator, input: ToolActionInput, phase: ActionPhase) ![]const u8 {
     const call = input.call;
     if (input.tool_registry.lookup(call.name) != null) {
-        if (try formatSubagentPlainAction(alloc, call, if (completed) .completed else .active)) |line| return line;
+        if (try formatSubagentPlainAction(alloc, call, phase.subagentState())) |line| return line;
     }
     if (file_mutation_contract.isToolName(call.name)) {
         const spec = input.tool_registry.lookup(call.name) orelse
-            return alloc.print("{s}: {s}", .{ if (completed) "Completed" else "Working", call.name });
+            return alloc.print("{s}: {s}", .{ phase.verb(.generic), call.name });
         return alloc.print(
             "{s} {s}",
-            .{ if (completed) spec.completed_action_label else spec.action_label, input.display_target orelse spec.label_arg_default },
+            .{ phase.label(spec), input.display_target orelse spec.label_arg_default },
         );
     }
 
     if (try formatRunCommandActivity(alloc, input.tool_registry, input.workspace_root, call)) |activity| {
         defer alloc.free(activity.detail);
-        const action_label = if (activity.compatibility_tool) |tool|
-            if (completed) tool.completed_action_label else tool.action_label
-        else if (completed) "Ran" else "Running";
+        const action_label = if (activity.compatibility_tool) |tool| phase.label(tool) else phase.verb(.run);
         return alloc.print("{s} {s}", .{ action_label, activity.detail });
     }
 
@@ -667,27 +701,27 @@ fn formatPlainActionState(alloc: Allocator, input: ToolActionInput, completed: b
     const spec = input.tool_registry.lookup(call.name) orelse {
         if (isProviderSearchAlias(call.name)) {
             const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch {
-                return alloc.print("{s} web", .{if (completed) "Searched" else "Searching"});
+                return alloc.print("{s} web", .{phase.verb(.search)});
             };
-            return alloc.print("{s} {s}", .{ if (completed) "Searched" else "Searching", try formatWebSearchActionDetail(scratch, args) });
+            return alloc.print("{s} {s}", .{ phase.verb(.search), try formatWebSearchActionDetail(scratch, args) });
         }
-        if (input.is_available_dynamic_mcp_tool) return alloc.print("{s}: {s}", .{ if (completed) "Ran MCP" else "MCP", call.name });
-        return alloc.print("{s}: {s}", .{ if (completed) "Completed" else "Working", call.name });
+        if (input.is_available_dynamic_mcp_tool) return alloc.print("{s}: {s}", .{ phase.verb(.mcp), call.name });
+        return alloc.print("{s}: {s}", .{ phase.verb(.generic), call.name });
     };
     const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch {
-        return alloc.print("{s}: {s}", .{ if (completed) "Completed" else "Working", call.name });
+        return alloc.print("{s}: {s}", .{ phase.verb(.generic), call.name });
     };
 
     const presentation = tool_dispatch.presentationForArgs(spec.*, args);
     if (spec.executor_kind == .web_search) {
-        return alloc.print("{s} {s}", .{ if (completed) presentation.completed_action_label else presentation.action_label, try formatWebSearchActionDetail(scratch, args) });
+        return alloc.print("{s} {s}", .{ phase.label(presentation), try formatWebSearchActionDetail(scratch, args) });
     }
     const value = input.display_target orelse
         call.resolved_display_target orelse
         resolvedSkillName(call, presentation) orelse
         tool_dispatch.presentationLabelValue(presentation, args) orelse
         presentation.label_arg_default;
-    return alloc.print("{s} {s}", .{ if (completed) presentation.completed_action_label else presentation.action_label, value });
+    return alloc.print("{s} {s}", .{ phase.label(presentation), value });
 }
 
 /// Names an earlier call in the row of a later call that reads its saved

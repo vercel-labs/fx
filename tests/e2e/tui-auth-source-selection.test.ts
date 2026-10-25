@@ -1342,7 +1342,7 @@ for (const provider of ["codex", "grok"] as const) {
         await Bun.sleep(20);
       }
       await session.sendKeys("C-c");
-      await session.waitForText("What can fx do differently?", TIMEOUT);
+      await session.waitForText("What should change?", TIMEOUT);
       release();
       await openProviderPicker(session);
       await session.sendKeys("Down");
@@ -1543,7 +1543,7 @@ tmuxTest("provider recovery refuses active logout before deleting a busy subscri
   expect(outcome).toContain("Sign out is unavailable until active and queued work finishes.");
   expect(existsSync(authPath)).toBe(true);
   await session.sendKeys("C-c");
-  await session.waitForText("What can fx do differently?", TIMEOUT);
+  await session.waitForText("What should change?", TIMEOUT);
   expect(readFileSync(stderrPath, "utf8")).toBe("");
 }, 60_000);
 
@@ -1571,7 +1571,7 @@ tmuxTest("provider recovery validates a Gateway team after a cancelled turn", as
       await Bun.sleep(20);
     }
     await session.sendKeys("C-c");
-    await session.waitForText("What can fx do differently?", TIMEOUT);
+    await session.waitForText("What should change?", TIMEOUT);
     release();
     await selectFxLoginCredential(session);
     expect(gateway.modelRequests.some((request) =>
@@ -1819,7 +1819,7 @@ for (const scenario of [
 
       await session.sendKeys("C-u");
       await session.sendInterruptEscapePair(TIMEOUT);
-      await session.waitForText("What can fx do differently?", TIMEOUT);
+      await session.waitForText("What should change?", TIMEOUT);
       await session.sendText(scenario.command.trim());
       await session.waitForPane(
         (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
@@ -2626,7 +2626,7 @@ tmuxTest(
     const cancelStarted = Date.now();
     await session.sendKeys("C-c");
     const cancelledPane = await session.waitForText(
-      "What can fx do differently?",
+      "What should change?",
       TIMEOUT,
     );
     await session.waitForComposer(TIMEOUT);

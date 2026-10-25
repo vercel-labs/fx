@@ -4926,11 +4926,7 @@ test "initial session grants follow active registry metadata" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var provider_read = builtin_tools.read_file;
-    provider_read.name = "provider_read";
-    provider_read.model_schema.name = "provider_read";
-    provider_read.permission_target_kind = .path_optional_existing;
-    const tools = [_]tool_dispatch.Tool{provider_read};
+    const tools = [_]tool_dispatch.Tool{builtin_tools.read_file};
 
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.tool_registry = .{ .tools = tools[0..] };
@@ -4944,11 +4940,12 @@ test "initial session grants follow active registry metadata" {
         arena,
         &local_grants,
         "/tmp/workspace",
-        .{ .id = "provider-read", .name = "provider_read", .arguments_json = "{\"path\":\".\"}" },
+        .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"src\"}" },
         "/tmp/workspace/src",
     );
 
-    try std.testing.expectEqual(@as(usize, 4), local_grants.items.len);
+    // A workspace read suggests the read and edit tree grants.
+    try std.testing.expectEqual(@as(usize, 2), local_grants.items.len);
     try expectGrantListsEqual(local_grants.items, hooks.propagated_grants.items);
 }
 

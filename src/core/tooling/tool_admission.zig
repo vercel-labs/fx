@@ -4832,13 +4832,13 @@ test "permission target kind follows supplied registry metadata" {
         permission_auto_classifier.Classifier.disabled(),
     );
 
-    var provider_read = test_builtin_tools.read_file;
-    provider_read.permission_target_kind = .none;
-    const tools = [_]tool_dispatch.Tool{provider_read};
+    var untargeted_read = test_builtin_tools.read_file;
+    untargeted_read.permission_target_kind = .none;
+    const tools = [_]tool_dispatch.Tool{untargeted_read};
     input.tool_registry = .{ .tools = tools[0..] };
 
     const target = try permissionTargetForCall(input, arena_state.allocator(), .{
-        .id = "provider-read",
+        .id = "read",
         .name = "read_file",
         .arguments_json = "{\"path\":\"src/main.zig\"}",
     });
@@ -4951,32 +4951,36 @@ test "live authority preserves a non-directory read failure for tool execution" 
 }
 
 test "permission rule display follows supplied registry metadata" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = "notes.txt", .data = "notes" });
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
-    defer worker.deinit(std.testing.allocator);
+    defer worker.deinit(alloc);
     var input = testInputWithClassifier(
         &worker,
         permission_auto_classifier.Classifier.disabled(),
     );
+    input.workspace_root = workspace;
 
-    var provider_read = test_builtin_tools.read_file;
-    provider_read.name = "provider_read";
-    provider_read.model_schema.name = "provider_read";
-    provider_read.permission_target_kind = .path_optional_existing;
-    const tools = [_]tool_dispatch.Tool{provider_read};
+    const tools = [_]tool_dispatch.Tool{test_builtin_tools.read_file};
     input.tool_registry = .{ .tools = tools[0..] };
     var rules = [_]types.PermissionRule{.{
-        .permission = @constCast("provider_read"),
-        .pattern = @constCast("."),
+        .permission = @constCast("read"),
+        .pattern = @constCast("notes.txt"),
         .action = .deny,
     }};
     input.permission_rules = .{ .rules = rules[0..] };
 
     const outcome = try requestPermissionOutcome(input, arena_state.allocator(), .{
-        .id = "provider-read",
-        .name = "provider_read",
-        .arguments_json = "{\"path\":\".\"}",
+        .id = "read",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"notes.txt\"}",
     }, .ask, &.{});
     try std.testing.expectEqual(ToolPermissionDecision.policy_denied, outcome.decision);
 }

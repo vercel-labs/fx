@@ -820,7 +820,7 @@ pub noinline fn composePickerOptionRowAnnotated(
     // brightness alone, like the question panel; other pickers keep the filled row.
     const selected_style = switch (kind) {
         .model_stage, .provider_stage, .models, .effort => ui_render.selected_completion_style,
-        .file, .slash, .skills, .help, .settings, .sessions, .fork, .mcp, .auth => ui_render.approval_button_inactive_style,
+        .file, .slash, .skills, .help, .settings, .sessions, .session_browser, .fork, .mcp, .auth => ui_render.approval_button_inactive_style,
     };
     const base_style = if (selected) selected_style else ui_render.dim_style;
     const available = width_usize - @as(usize, start_col - 1);
@@ -928,7 +928,7 @@ pub fn composePickerStatusRowWithProvider(
         .skills => "no matching skills",
         .help => "no matching commands",
         .settings => "no matching settings",
-        .sessions => "no matching sessions",
+        .sessions, .session_browser => "no matching sessions",
         .fork => "nothing to fork yet",
         .mcp => "no MCP items available",
         .auth => "authentication actions unavailable",

@@ -1332,7 +1332,6 @@ pub fn Runtime(comptime App: type) type {
             stream.last_activity_kind = kind;
             switch (kind) {
                 .read => stream.read_count += 1,
-                .list => stream.list_count += 1,
                 .write => stream.write_count += 1,
                 .edit => stream.edit_count += 1,
                 .open => stream.open_count += 1,

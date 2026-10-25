@@ -2711,7 +2711,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           await session.waitForText(finalText, TIMEOUT);
         } else {
           await session.sendInterruptEscapePair(TIMEOUT);
-          await session.waitForText("What can fx do differently?", TIMEOUT);
+          await session.waitForText("What should change?", TIMEOUT);
         }
         await session.waitForPane((pane) => !pane.includes("Thinking") && hasEmptyComposer(pane), TIMEOUT);
         const scrollback = await session.captureFullScrollback();
@@ -2926,12 +2926,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         TIMEOUT,
       );
       await session!.sendInterruptEscapePair(TIMEOUT);
-      await session!.waitForText("What can fx do differently?", TIMEOUT);
+      await session!.waitForText("What should change?", TIMEOUT);
       await session!.waitForComposer(TIMEOUT);
       const scrollback = await session!.captureFullScrollback();
 
       expect(queuedGateway.requests).toHaveLength(3);
-      expect(scrollback).toContain("What can fx do differently?");
+      expect(scrollback).toContain("What should change?");
       expect(scrollback).not.toContain("system: cancelled");
       expect(scrollback).not.toContain("Cancelling");
       expect(scrollback).not.toContain("request failed: ModelError");
@@ -3392,7 +3392,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(hold.cancelled).toBe(false);
       await session.sendKeys("C-c");
       const cancelledPane = await session.waitForText(
-        "What can fx do differently?",
+        "What should change?",
         TIMEOUT,
       );
 
@@ -3482,7 +3482,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText("Thinking", TIMEOUT);
       await Bun.sleep(250);
       await session.sendKeys("C-c");
-      await session.waitForText("What can fx do differently?", TIMEOUT);
+      await session.waitForText("What should change?", TIMEOUT);
 
       execFileSync(FX_BIN, ["replay", tapePath, "--frames-dir", framesRoot], {
         encoding: "utf8",
@@ -3568,7 +3568,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       }
 
       await session.sendKeys("C-c");
-      await session.waitForText("What can fx do differently?", TIMEOUT);
+      await session.waitForText("What should change?", TIMEOUT);
       expect(hold.cancelled).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isAlive()).toBe(true);
@@ -3654,7 +3654,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       }
 
       await session.sendKeys("C-c");
-      await session.waitForText("What can fx do differently?", TIMEOUT);
+      await session.waitForText("What should change?", TIMEOUT);
       expect(continued.cancelled).toBe(true);
       expect(heldGateway.requests).toHaveLength(2);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -4740,8 +4740,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const workspacePath = join(artifacts, "workspace");
       const stderrPath = join(artifacts, "stderr.log");
       const readFilename = "ACTIVE_PERMISSION_READ_SENTINEL.txt";
-      const toolHeader = "● 1 tool call · 1 read";
-      const toolMarker = `└ Read ${readFilename}`;
+      // A lone completed read collapses to one row without a group header.
+      const toolHeader = `● Read ${readFilename}`;
+      const toolMarker = toolHeader;
       const activeBefore = "ACTIVE_PERMISSION_BEFORE_SENTINEL\n";
       const activeAfter = "ACTIVE_PERMISSION_AFTER_SENTINEL\n";
       const followupPrompt = "ACTIVE_PERMISSION_FOLLOWUP_PROMPT_SENTINEL";
@@ -4895,7 +4896,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.sendKeys("C-c");
       const afterFirst = await session.waitForText(
-        "What can fx do differently?",
+        "What should change?",
         TIMEOUT,
       );
       await waitForCondition(() => hold.cancelled, "stream cancellation");
@@ -4906,7 +4907,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       const scrollbackAfterFirst = await session.captureFullScrollbackEscapes();
       expect(
-        countOccurrences(scrollbackAfterFirst, "What can fx do differently?"),
+        countOccurrences(scrollbackAfterFirst, "What should change?"),
       ).toBe(1);
 
       await session.sendKeys("C-c");
@@ -4918,9 +4919,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       const scrollback = await session.captureFullScrollback();
       const trace = readFileSync(tracePath, "utf8");
-      expect(scrollback).toContain("What can fx do differently?");
+      expect(scrollback).toContain("What should change?");
       expect(
-        countOccurrences(scrollback, "What can fx do differently?"),
+        countOccurrences(scrollback, "What should change?"),
       ).toBe(1);
       expect(scrollback).not.toContain("system: cancelled");
       expect(scrollback).not.toContain("Cancelling");

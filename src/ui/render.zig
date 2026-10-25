@@ -21,7 +21,9 @@ pub const ask_activity_label = "⏺ Asking";
 const user_message_card = @import("assistant/user_message_card.zig");
 const black_prism = @import("black_prism.zig");
 
-pub const welcome_message_reserved_rows: u16 = 25;
+/// Rows the welcome fills at a width that fits its title: the banner, a
+/// blank row, the title row, and the blank row after it. See `welcome.zig`.
+pub const welcome_message_reserved_rows: u16 = black_prism.banner_rows + 3;
 
 pub var is_light: bool = false;
 pub var divider_style: []const u8 = shared_theme.fx_dark.divider_style;
@@ -190,14 +192,6 @@ pub fn welcomeTitle(alloc: std.mem.Allocator) ![]u8 {
         "{s}proto-𝒇x{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
         .{ subtitle_style, reset_style, dim_style, build_label },
     );
-}
-
-pub fn welcomeMessage(alloc: std.mem.Allocator, cols: u16) ![]u8 {
-    const banner = try black_prism.renderStill(alloc, cols, 0);
-    defer alloc.free(banner);
-    const title = try welcomeTitle(alloc);
-    defer alloc.free(title);
-    return alloc.print("{s}\n{s}", .{ banner, title });
 }
 
 pub const StatuslineItems = struct {
@@ -926,8 +920,8 @@ test "initTheme selects the light inline code foreground" {
     try std.testing.expectEqualStrings("run \x1b[38;5;235mzig build\x1b[39m now\n", out.items);
 }
 
-test "welcomeMessage shows version and help hint" {
-    const message = try welcomeMessage(std.testing.allocator, 80);
+test "welcomeTitle shows version and help hint" {
+    const message = try welcomeTitle(std.testing.allocator);
     defer std.testing.allocator.free(message);
 
     try std.testing.expect(std.mem.find(u8, message, "proto-𝒇x") != null);
@@ -935,9 +929,9 @@ test "welcomeMessage shows version and help hint" {
     try std.testing.expect(std.mem.find(u8, message, "/help") != null);
 }
 
-test "welcomeMessage keeps only the app name bright" {
+test "welcomeTitle keeps only the app name bright" {
     initTheme(false, null);
-    const message = try welcomeMessage(std.testing.allocator, 80);
+    const message = try welcomeTitle(std.testing.allocator);
     defer std.testing.allocator.free(message);
 
     var label_buf: [welcome_build_label_bytes]u8 = undefined;

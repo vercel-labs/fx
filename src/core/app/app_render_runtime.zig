@@ -436,7 +436,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             trigger: VisualEpochResetTrigger,
         ) !bool {
-            const welcome = try ui_render.welcomeMessage(app.alloc, app.shell.layout.cols);
+            const welcome = try app.shell.renderWelcome(app.alloc);
             defer app.alloc.free(welcome);
 
             const committed = try app.pacer.discardDeferredPresentationForVisualEpoch(
@@ -463,7 +463,6 @@ pub fn Runtime(comptime App: type) type {
             }
 
             try app.shell.resetVisualEpoch(app.alloc, welcome);
-            app.shell.startWelcomeAnimation(app.shell.layout.cols);
             try app.shell.requestTerminalReset(&app.metrics);
             switch (trigger) {
                 .native_clear_probe => debug_trace.logf(
@@ -807,10 +806,8 @@ pub fn Runtime(comptime App: type) type {
                     render_input.modelMenuProjection(&app.model_cache)
                 else
                     .{},
-                .session_menu = if (app.input_runtime.session_browser.active) .{
-                    .active = true,
-                    .browser = &app.input_runtime.session_browser,
-                } else if (comptime @hasField(App, "session_persistence")) .{
+                .session_browser = if (app.input_runtime.session_browser.active) &app.input_runtime.session_browser else null,
+                .session_menu = if (comptime @hasField(App, "session_persistence")) .{
                     .active = app.session_persistence.session_picker.active,
                     .load_state = app.session_persistence.session_picker.load_state,
                     .summaries = app.session_persistence.session_picker.summaries.items,

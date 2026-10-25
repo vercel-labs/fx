@@ -169,7 +169,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       await session.sendKeys("C-c");
       const cleared = (await session.capturePaneGrid()).join("\n");
       expect(cleared).not.toContain("DISCARD_THIS_DRAFT");
-      expect(cleared).not.toContain("What can fx do differently?");
+      expect(cleared).not.toContain("What should change?");
       expect(held.cancelCount).toBe(0);
       expect(readTrace(tracePath)).toContain("draft cleared reason=ctrl_c");
       expect(readTrace(tracePath)).not.toContain("event=cancel_requested");
@@ -177,14 +177,14 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
 
       await session.sendKeys("C-c");
       await waitForCondition(() => held.cancelled, "second Control-C cancellation");
-      await session.waitForText("What can fx do differently?", TIMEOUT);
+      await session.waitForText("What should change?", TIMEOUT);
       expect(held.cancelCount).toBe(1);
       expect(session.isPaneAlive()).toBe(true);
 
       await session.sendText("Continue after cancellation.");
       await session.waitForText("COMPOSER_INTERRUPT_RECOVERED", TIMEOUT);
       const scrollback = await session.captureFullScrollback();
-      expect(countOccurrences(scrollback, "What can fx do differently?")).toBe(1);
+      expect(countOccurrences(scrollback, "What should change?")).toBe(1);
       expect(scrollback).not.toContain("DISCARD_THIS_DRAFT");
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.requests[1]!.body).not.toContain("DISCARD_THIS_DRAFT");
@@ -272,7 +272,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       );
       const scrollback = await session.captureFullScrollback();
       expect(scrollback).toContain("Read probe.txt");
-      expect(countOccurrences(scrollback, "What can fx do differently?")).toBe(2);
+      expect(countOccurrences(scrollback, "What should change?")).toBe(2);
       expect((await session.capturePaneGrid()).join("\n")).not.toContain("Thinking");
       expect(gateway.requests).toHaveLength(4);
       expect(held.cancelCount).toBe(1);
@@ -529,7 +529,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       await session.sendKeys("Escape");
       await waitForCondition(() => held.cancelled, "gateway stream cancellation");
       await waitForTrace(tracePath, "event=interrupt_persisted", TIMEOUT);
-      await session.waitForText("What can fx do differently?", TIMEOUT);
+      await session.waitForText("What should change?", TIMEOUT);
       const cancelledGrid = await session.capturePaneGrid();
       const footer = findFooterBlocks(cancelledGrid).at(-1);
       const cancelledRow = cancelledGrid.findIndex((row) => row.includes("■ Cancelled"));
@@ -552,7 +552,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
         expect(interruptedScrollback).toContain(chunk.trim());
       }
       expect(
-        countOccurrences(interruptedScrollback, "What can fx do differently?"),
+        countOccurrences(interruptedScrollback, "What should change?"),
       ).toBe(1);
       expect(interruptedScrollback).not.toContain("system: cancelled");
       expect(interruptedScrollback).not.toContain("Cancelling");
@@ -569,7 +569,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       }
       expect(finalScrollback).toContain(FOLLOW_UP_RESPONSE);
       expect(
-        countOccurrences(finalScrollback, "What can fx do differently?"),
+        countOccurrences(finalScrollback, "What should change?"),
       ).toBe(1);
       expect(finalScrollback).not.toContain("system: cancelled");
       expect(finalScrollback).not.toContain("Cancelling");
@@ -721,7 +721,7 @@ while :; do sleep 1; done
       const cancelStartedAt = Date.now();
       await session.sendKeys("Escape");
       const immediateCancellation = await session.waitForText(
-        "What can fx do differently?",
+        "What should change?",
         TIMEOUT,
       );
       expect(Date.now() - cancelStartedAt).toBeLessThan(500);
@@ -749,7 +749,7 @@ while :; do sleep 1; done
 
       await waitForTrace(tracePath, "finish processing queued=0", TIMEOUT);
       await session.waitForText(
-        "Cancelled ./hold-workspace-cancel.sh · What can fx do differently?",
+        "Cancelled ./hold-workspace-cancel.sh · What should change?",
         TIMEOUT,
       );
       await session.sendText("/workspace list");
@@ -895,7 +895,7 @@ while :; do sleep 1; done
       await Bun.sleep(150);
       const cancelStartedAt = Date.now();
       await session.sendKeys("Escape");
-      await session.waitForText("What can fx do differently?", TIMEOUT);
+      await session.waitForText("What should change?", TIMEOUT);
       expect(Date.now() - cancelStartedAt).toBeLessThan(500);
       expect(readTrace(tracePath)).not.toContain(
         `event=after_tool_execution call_id=${callId}`,
@@ -919,7 +919,7 @@ while :; do sleep 1; done
       await session.waitForText("Ran while", TIMEOUT);
       const scrollback = await session.captureFullScrollback();
       expect(scrollback).toContain("Ran while");
-      expect(countOccurrences(scrollback, "What can fx do differently?")).toBe(1);
+      expect(countOccurrences(scrollback, "What should change?")).toBe(1);
       expect(scrollback).not.toContain("system: cancelled");
       expect(scrollback).not.toContain("Cancelling");
       expect(gateway.requests).toHaveLength(1);

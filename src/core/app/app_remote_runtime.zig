@@ -1024,7 +1024,6 @@ pub fn Runtime(comptime App: type) type {
                     app.stream.chunks += 1;
                     switch (kind) {
                         .read => app.stream.read_count += 1,
-                        .list => app.stream.list_count += 1,
                         .write => app.stream.write_count += 1,
                         .edit => app.stream.edit_count += 1,
                         .open => app.stream.open_count += 1,
@@ -1409,7 +1408,7 @@ fn itemsOf(value: std.json.Value) []const std.json.Value {
 fn toolKind(kind: []const u8) types.ToolActivityKind {
     if (std.mem.eql(u8, kind, "read")) return .read;
     if (std.mem.eql(u8, kind, "edit")) return .edit;
-    if (std.mem.eql(u8, kind, "search")) return .list;
+    if (std.mem.eql(u8, kind, "search")) return .read;
     if (std.mem.eql(u8, kind, "think")) return .ask;
     return .command;
 }
