@@ -5,14 +5,23 @@ const io_mod = @import("../shared/io.zig");
 const configured = @import("configured_provider.zig");
 const model_provider = @import("model_provider.zig");
 const settings_store = @import("settings_store.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 const http = @import("../../gateway/client.zig");
 const Allocator = std.mem.Allocator;
 
 pub const usage = "proto-fx setup --base-url URL [--model MODEL] [--api-key-env NAME] [--name NAME]";
 
+/// Whether `err` means the arguments were malformed, so the usage helps.
+pub fn isUsageError(err: anyerror) bool {
+    return err == error.InvalidSetupArguments or err == error.BaseUrlRequired;
+}
+
 /// Returned summary is caller-owned. The settings transaction preserves all
 /// unrelated profile fields and stores only the key's environment-variable name.
-pub fn run(alloc: Allocator, args: []const [:0]const u8) ![]u8 {
+/// When an environment, network, or file operation fails, `failure` receives
+/// a caller-owned sentence naming what failed. Setup creates the profile
+/// directory under HOME but never HOME itself.
+pub fn run(alloc: Allocator, args: []const [:0]const u8, failure: *?[]u8) ![]u8 {
     var arena: std.heap.ArenaAllocator = .init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -50,7 +59,10 @@ pub fn run(alloc: Allocator, args: []const [:0]const u8) ![]u8 {
     // Validate the URL and credential slot before contacting anything.
     var checked = try configured.Registry.parse(a, providers);
     checked.deinit(a);
-    const bearer: ?[]const u8 = if (key_env) |env| io_mod.getenv(env) orelse return error.ApiKeyEnvironmentMissing else null;
+    const bearer: ?[]const u8 = if (key_env) |env| io_mod.getenv(env) orelse {
+        failure.* = try alloc.print("the environment variable {s} named by --api-key-env is not set", .{env});
+        return error.ApiKeyEnvironmentMissing;
+    } else null;
     var metadata: std.json.Value = .{ .object = .empty };
     var discovered: usize = 0;
     if (selected == null) {
@@ -60,8 +72,10 @@ pub fn run(alloc: Allocator, args: []const [:0]const u8) ![]u8 {
             &.{ try a.print("{s}/v1", .{prefix}), prefix };
         var found = false;
         var last_error: anyerror = error.ModelDiscoveryFailed;
+        var last_url: []const u8 = "";
         for (candidates) |candidate| {
             const url = try a.print("{s}/models", .{candidate});
+            last_url = url;
             var cancel = std.atomic.Value(bool).init(false);
             const response = http.fetchGatewayJsonAtUrlCancellable(a, bearer, null, url, &cancel, 10_000) catch |err| {
                 last_error = err;
@@ -110,7 +124,10 @@ pub fn run(alloc: Allocator, args: []const [:0]const u8) ![]u8 {
             found = true;
             break;
         }
-        if (!found) return last_error;
+        if (!found) {
+            failure.* = try alloc.print("could not list models at {s} ({s}); pass --model to set up offline", .{ last_url, @errorName(last_error) });
+            return last_error;
+        }
     } else {
         // An explicit model permits offline setup, without guessing capabilities.
         try metadata.object.put(a, selected.?, .{ .object = .empty });
@@ -122,16 +139,46 @@ pub fn run(alloc: Allocator, args: []const [:0]const u8) ![]u8 {
     try providers.object.put(a, name, definition);
     var json: std.Io.Writer.Allocating = .init(a);
     try std.json.Stringify.value(providers, .{}, &json.writer);
-    const home = io_mod.homeDir() orelse return error.HomeUnavailable;
+    const provider = model_provider.parse(name) orelse return error.InvalidProviderId;
+    const home = io_mod.homeDir() orelse {
+        failure.* = try alloc.dupe(u8, "HOME is not set, so there is no profile to save the connection in");
+        return error.HomeUnavailable;
+    };
+    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{}) catch |err| {
+        failure.* = if (err == error.FileNotFound)
+            try alloc.print("the home directory {s} does not exist", .{home})
+        else
+            try alloc.print("cannot open the home directory {s} ({s})", .{ home, @errorName(err) });
+        return err;
+    };
+    home_dir.close(io_mod.getIo());
+    saveConnection(alloc, home, json.written(), provider, model) catch |err| {
+        const root = profile_paths.rootDir(a, home) catch home;
+        failure.* = try alloc.print("cannot save the connection in {s} ({s})", .{ root, @errorName(err) });
+        return err;
+    };
+    return alloc.print("Connected {s}: {s}\nModel: {s}\nDiscovered {d} models. Run proto-fx to begin.\n", .{ name, prefix, model, discovered });
+}
+
+fn saveConnection(alloc: Allocator, home: []const u8, connections_json: []const u8, provider: model_provider.ProviderId, model: []const u8) !void {
     var store = try settings_store.Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
-    const provider = model_provider.parse(name) orelse return error.InvalidProviderId;
     var outcome = try store.applyUserPatch(alloc, .{
-        .connections_json = json.written(),
+        .connections_json = connections_json,
         .provider = provider,
         .model_preference = .{ .provider = provider, .model = model },
         .clear_credential_source = true,
     });
-    defer outcome.deinit(alloc);
-    return alloc.print("Connected {s}: {s}\nModel: {s}\nDiscovered {d} models. Run proto-fx to begin.\n", .{ name, prefix, model, discovered });
+    outcome.deinit(alloc);
+}
+
+test "setup names a missing home instead of printing usage" {
+    const alloc = std.testing.allocator;
+    var failure: ?[]u8 = null;
+    defer if (failure) |message| alloc.free(message);
+    const args = [_][:0]const u8{ "--model", "m" };
+    try std.testing.expectError(error.BaseUrlRequired, run(alloc, &args, &failure));
+    try std.testing.expect(isUsageError(error.BaseUrlRequired));
+    try std.testing.expect(failure == null);
+    try std.testing.expect(!isUsageError(error.FileNotFound));
 }

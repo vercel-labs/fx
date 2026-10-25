@@ -1284,8 +1284,15 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .setup => |rest| {
-            const summary = connection_setup.run(alloc, rest) catch |err| {
-                const message = try alloc.print("proto-fx setup: {s}\nUsage: {s}\n", .{ @errorName(err), connection_setup.usage });
+            var failure: ?[]u8 = null;
+            defer if (failure) |text| alloc.free(text);
+            const summary = connection_setup.run(alloc, rest, &failure) catch |err| {
+                const message = if (failure) |text|
+                    try alloc.print("proto-fx setup: {s}\n", .{text})
+                else if (connection_setup.isUsageError(err))
+                    try alloc.print("proto-fx setup: {s}\nUsage: {s}\n", .{ @errorName(err), connection_setup.usage })
+                else
+                    try alloc.print("proto-fx setup: {s}\n", .{@errorName(err)});
                 defer alloc.free(message);
                 try writeStderr(deps, message);
                 return .handled_failure;
