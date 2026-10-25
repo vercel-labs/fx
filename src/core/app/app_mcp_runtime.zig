@@ -11,6 +11,7 @@ const mcp_model_catalog = @import("../mcp/model_catalog.zig");
 const mcp_host = @import("../mcp_host/host.zig");
 const mcp_verbs = @import("../mcp_host/verbs.zig");
 const mcp_menu = @import("../mcp_host/menu.zig");
+const mcp_notice_text = @import("../mcp_host/notice_text.zig");
 const editor_state = @import("../input/editor_state.zig");
 const command_lex = @import("../shell_command/command_lex.zig");
 const mod_registry = @import("../mods/registry.zig");
@@ -18,7 +19,6 @@ const context_limits = @import("../config/context_limits.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const types = @import("../shared/types.zig");
-const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -338,10 +338,6 @@ pub const State = struct {
         /// On the host's owner thread: what a login or a call needs the user to hear.
         fn onNotice(context: *anyopaque, notice: mcp_host.Notice) void {
             const sink: *HostSink = @ptrCast(@alignCast(context));
-            const a = std.heap.c_allocator;
-            var arena: std.heap.ArenaAllocator = .init(a);
-            defer arena.deinit();
-            const aa = arena.allocator();
             sink.mutex.lockUncancelable(io_mod.getIo());
             defer sink.mutex.unlock(io_mod.getIo());
             switch (notice) {
@@ -349,24 +345,17 @@ pub const State = struct {
                     sink.waitForSignIn(n.server, n.url);
                     // The menu shows the address; a typed login prints it.
                     if (!sink.isTyped(n.server)) return;
-                    const text = a.print("Sign in to {s} in your browser. If it didn't open, go to:\n  {s}", .{ safeText(aa, n.server, 160), safeText(aa, n.url, 16 * 1024) }) catch return;
-                    sink.pushLocked(text, false);
                 },
-                .signed_in => |server| {
-                    sink.endSignIn(server);
-                    sink.report(server, a.print("Signed in to {s}.", .{safeText(aa, server, 160)}) catch return, false);
-                },
-                .sign_in_failed => |n| {
-                    sink.endSignIn(n.server);
-                    sink.report(n.server, a.print("Couldn't sign in to {s}: {s}.", .{ safeText(aa, n.server, 160), safeText(aa, n.reason, 240) }) catch return, true);
-                },
-                // The status line says so for as long as it's true.
-                .needs_login => {},
-                .not_saved => |n| {
-                    const server = safeText(aa, n.server, 160);
-                    const text = a.print("Couldn't save {s}'s new login: {s}. It keeps working here, but after a restart {s} needs a login again.", .{ server, safeText(aa, n.reason, 240), server }) catch return;
-                    sink.pushLocked(text, true);
-                },
+                .signed_in => |server| sink.endSignIn(server),
+                .sign_in_failed => |n| sink.endSignIn(n.server),
+                .needs_login, .not_saved => {},
+            }
+            // The status line says a login is needed for as long as it's true.
+            const shown = (mcp_notice_text.format(std.heap.c_allocator, notice) catch return) orelse return;
+            switch (notice) {
+                .signed_in => |server| sink.report(server, shown.text, shown.warning),
+                .sign_in_failed => |n| sink.report(n.server, shown.text, shown.warning),
+                else => sink.pushLocked(shown.text, shown.warning),
             }
         }
 
@@ -432,10 +421,6 @@ pub const State = struct {
                 debug_trace.logf("mcp", "MCP notice dropped: out of memory", .{});
                 std.heap.c_allocator.free(text);
             };
-        }
-
-        fn safeText(arena: Allocator, raw: []const u8, max: usize) []const u8 {
-            return (text_utils.encodeTerminalSafeInline(arena, raw, max) catch return "?").bytes;
         }
     };
 

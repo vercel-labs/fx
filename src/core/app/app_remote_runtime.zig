@@ -993,6 +993,15 @@ pub fn Runtime(comptime App: type) type {
         /// Native root and child frames share fx's owned presentation reducer.
         /// The offset is fixed for the displayed history baseline: user echoes
         /// (including steering) must not change an in-flight tool's identity.
+        /// A host sends a tool's status as plain text; the transcript marks
+        /// its status rows, as the local terminal's own tool labels are.
+        /// Text that already carries the marker came from an older host.
+        fn withStatusMarker(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+            const marker = "● ";
+            if (text.len == 0 or std.mem.startsWith(u8, text, marker)) return text;
+            return std.mem.concat(arena, u8, &.{ marker, text });
+        }
+
         fn applyNativeEvent(app: *App, event: std.json.Value) !void {
             if (field(event, "tool_lifecycle")) |value| {
                 var parsed = try std.json.parseFromValue(types.ToolLifecycleEvent, app.alloc, value, .{ .ignore_unknown_fields = true });
@@ -1012,10 +1021,12 @@ pub fn Runtime(comptime App: type) type {
                     .progress => |*progress| {
                         progress.id = try nativeLifecycleId(app, progress.id);
                         if (app.shell.toolActivityRecord(progress.id) == null) return;
+                        progress.text = try withStatusMarker(parsed.arena.allocator(), progress.text);
                     },
                     .terminal => |*terminal| {
                         terminal.id = try nativeLifecycleId(app, terminal.id);
                         if (app.shell.toolActivityRecord(terminal.id) == null) return;
+                        terminal.outcome.summary = try withStatusMarker(parsed.arena.allocator(), terminal.outcome.summary);
                     },
                     .turn_finished => |*finished| finished.turn_id = (try nativeLifecycleId(app, .{ .turn_id = finished.turn_id, .call_id = "" })).turn_id,
                 }
@@ -1523,9 +1534,11 @@ test "root native presentation preserves tool detail through steering and resets
     try std.testing.expectEqual(@as(usize, 1), app.stream.command_count);
     try std.testing.expectEqual(@as(u64, 13), app.stream.token_progress.output_tokens);
     try app.frame(
-        \\{"method":"proto/native_presentation","params":{"session_id":"root","event":{"tool_lifecycle":{"progress":{"id":{"turn_id":7,"call_id":"shell-1"},"text":"● Running printf root"}}}}}
+        \\{"method":"proto/native_presentation","params":{"session_id":"root","event":{"tool_lifecycle":{"progress":{"id":{"turn_id":7,"call_id":"shell-1"},"text":"Running printf root"}}}}}
     );
     try std.testing.expect(std.mem.find(u8, try app.statusText(id), "Running printf root") != null);
+    // The host sent plain text; the frontend marks the status row.
+    try std.testing.expect(std.mem.startsWith(u8, try app.statusText(id), "●"));
     // The ACP compatibility copy must not create another tool or replace labels.
     try app.frame(
         \\{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"duplicate","name":"shell","title":"generic shell","kind":"execute"}}}

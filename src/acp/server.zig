@@ -28,6 +28,7 @@ const hooks = @import("../core/hooks/hooks.zig");
 const mcp_host = @import("../core/mcp_host/host.zig");
 const mcp_verbs = @import("../core/mcp_host/verbs.zig");
 const mcp_runtime = @import("../core/mcp_host/runtime.zig");
+const mcp_notice_text = @import("../core/mcp_host/notice_text.zig");
 const builtin_mcp = @import("../builtins/mcp.zig");
 const command_lex = @import("../core/shell_command/command_lex.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
@@ -40,7 +41,7 @@ const session_runtime = @import("../core/session/session.zig");
 const change_tracker_mod = @import("../core/workspace/change_tracker.zig");
 const shell_snapshot = @import("../core/terminal/shell_snapshot.zig");
 const workspace_commands = @import("../core/workspace/workspace_commands.zig");
-const output_contracts = @import("../core/output/output_contracts.zig");
+const workspace_update = @import("../core/workspace/workspace_update.zig");
 const session_title_generation = @import("../core/session/session_title_generation.zig");
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
 const terminal_client_runtime = @import("../core/terminal/client.zig");
@@ -322,6 +323,23 @@ const ActivePrompt = struct {
     reapable: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
+/// Who reads a host's turns. A host has exactly one reader for its life.
+pub const Presentation = enum {
+    /// A standard ACP client: `session/update` notifications with plain
+    /// text and tool cards.
+    acp,
+    /// The detached native fx frontend: `proto/native_presentation` frames
+    /// carrying the worker events the local terminal renders, and no ACP tool
+    /// cards. A steer interrupts a streaming reply, as in libfx.
+    native,
+};
+
+/// Whether a steer cuts the running reply short instead of waiting for the
+/// next boundary: libfx turns and the native frontend's turns.
+pub fn steersInterruptibly(state: *const ServerState) bool {
+    return state.cfg.minimal_kernel or state.presentation == .native;
+}
+
 pub const ServerState = struct {
     configured_providers: @import("../core/config/configured_provider.zig").Registry = .{},
     alloc: Allocator,
@@ -370,11 +388,8 @@ pub const ServerState = struct {
     active_prompt: ?*ActivePrompt = null,
     /// A long `fx/command`, such as compaction, running on its own thread.
     host_job: ?*HostJob = null,
-    /// Detached hosts steer streaming replies while preserving native ACP tools.
-    interruptible_steering: bool = false,
-    /// Only the detached native frontend consumes native presentation frames.
-    /// Ordinary ACP hosts keep their standard source/tool notification lane.
-    native_presentation: bool = false,
+    /// Who reads this host's turns. Chosen once, when the host starts.
+    presentation: Presentation = .acp,
     subagent_authority_mutex: std.Io.Mutex = .init,
     skills: skill_runtime.Runtime = .{},
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
@@ -906,7 +921,7 @@ pub const PersistentHost = struct {
         self.* = .{ .state = .{
             .alloc = alloc,
             .cfg = cfg,
-            .interruptible_steering = true,
+            .presentation = .native,
             .writer = jsonrpc.Writer.initCallback(context, write),
             .web_search_runtime = web_search_runtime.Runtime.init(.{ .provider = cfg.provider_set.gateway.fx_search }),
             .terminal_client = terminal_client_runtime.Runtime.init(cfg.process_provider),
@@ -1876,7 +1891,7 @@ fn handleSteeringPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonr
             .message = "Steering queue is full",
         }),
     };
-    if (state.interruptible_steering) _ = session.steering.claimInterrupt(&session.cancel_flag);
+    if (state.presentation == .native) _ = session.steering.claimInterrupt(&session.cancel_flag);
     debug_trace.logf("acp", "queued steering prompt bytes={d}", .{text.len});
 }
 
@@ -3482,7 +3497,7 @@ fn handleCancel(state: *ServerState, notify_client: bool) void {
         session.cancel_flag.store(true, .seq_cst);
         // A libfx turn keeps its queued steering until it ends, which hands
         // back what never reached the model.
-        if (state.cfg.minimal_kernel or state.interruptible_steering) session.steering.cancelForUser(&session.cancel_flag);
+        if (steersInterruptibly(state)) session.steering.cancelForUser(&session.cancel_flag);
     }
     if (state.host_job) |job| job.cancel.store(true, .seq_cst);
     cancelPendingOutbound(state, notify_client);
@@ -4241,9 +4256,10 @@ fn handleHostCommand(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messag
     });
     if (!try requireParsedActiveSessionTarget(state, alloc, msg.id, parsed.value)) return;
 
-    const command = host_commands.parse(parsed.value) catch |err| return state.writer.writeError(alloc, msg.id, .{
+    const command = host_commands.parse(parsed.arena.allocator(), parsed.value) catch |err| return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
         .message = switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
             error.MissingCommand => "Missing command",
             error.UnknownCommand => "Unknown command",
             error.MissingPath => "Missing path",
@@ -4625,34 +4641,16 @@ pub fn mcpNotify(state: *ServerState) mcp_runtime.Notify {
 
 fn pushMcpNotice(raw: *anyopaque, notice: mcp_runtime.Notice) void {
     const state: *ServerState = @ptrCast(@alignCast(raw));
-    var text: std.Io.Writer.Allocating = .init(state.alloc);
-    defer text.deinit();
-    var warning = false;
-    switch (notice) {
-        .authorize => |n| text.writer.print(
-            "Sign in to {s} in your browser. If it didn't open, go to:\n  {s}",
-            .{ n.server, n.url },
-        ) catch return,
-        .signed_in => |server| text.writer.print("Signed in to {s}.", .{server}) catch return,
-        .sign_in_failed => |n| {
-            warning = true;
-            text.writer.print("Couldn't sign in to {s}: {s}.", .{ n.server, n.reason }) catch return;
-        },
-        .needs_login => return,
-        .not_saved => |n| {
-            warning = true;
-            text.writer.print("Couldn't save {s}'s login: {s}.", .{ n.server, n.reason }) catch return;
-        },
-    }
+    const shown = (mcp_notice_text.format(state.alloc, notice) catch return) orelse return;
+    defer state.alloc.free(shown.text);
     const session_id = if (state.active_session) |active| active.session_id else "";
     var params: std.Io.Writer.Allocating = .init(state.alloc);
     defer params.deinit();
-    params.writer.writeAll("{\"session_id\":") catch return;
-    std.json.Stringify.value(session_id, .{}, &params.writer) catch return;
-    params.writer.writeAll(",\"text\":") catch return;
-    std.json.Stringify.value(text.written(), .{}, &params.writer) catch return;
-    params.writer.print(",\"warning\":{}", .{warning}) catch return;
-    params.writer.writeByte('}') catch return;
+    std.json.Stringify.value(.{
+        .session_id = session_id,
+        .text = shown.text,
+        .warning = shown.warning,
+    }, .{}, &params.writer) catch return;
     state.writer.writeNotification(state.alloc, "fx/mcp_notice", params.written()) catch {};
 }
 
@@ -4697,63 +4695,39 @@ const WorkspaceOutcome = struct {
 };
 
 /// Runs one workspace action against the host's live access set. The text is
-/// the same snapshot `/workspace` prints locally; a rejection comes back with
+/// the same one `/workspace` prints locally; a rejection comes back with
 /// `ok = false` so the frontend can render it as an error.
 fn runWorkspaceCommand(state: *ServerState, alloc: Allocator, action: host_commands.WorkspaceAction) !WorkspaceOutcome {
     const command_action: workspace_commands.Action = switch (action) {
-        .list => return .{ .ok = true, .text = try workspaceSnapshotText(state, alloc, null) },
+        .list => return .{
+            .ok = true,
+            .text = try workspace_update.snapshotText(alloc, state.workspace_root, &state.workspace_access, null),
+        },
         .add => |path| .{ .add = path },
         .remove => |path| .{ .remove = path },
         .clear => .clear,
     };
+    var host: WorkspaceHost = .{ .state = state, .alloc = alloc };
+    const report = try workspace_update.apply(alloc, state.workspace_root, &host, command_action);
+    return .{ .ok = report.tone != .@"error", .text = report.text };
+}
 
-    var phase: workspace_commands.FailurePhase = .stage;
-    var result = workspace_commands.execute(alloc, state.workspace_root, &state.workspace_access, command_action, &phase) catch |err| {
-        const reason = output_contracts.workspaceErrorMessage(err) orelse "workspace update failed";
-        const prefix: []const u8 = switch (phase) {
-            .stage => "Workspace update rejected",
-            .commit => "Workspace settings were not changed",
-            .reconcile => "Workspace settings are uncertain and could not be reloaded",
-        };
-        return .{ .ok = false, .text = try alloc.print("{s}: {s}", .{ prefix, reason }) };
-    };
-    defer result.deinit(alloc);
+/// The ACP host's live workspace access, as `workspace_update.apply` reads
+/// and replaces it.
+const WorkspaceHost = struct {
+    state: *ServerState,
+    alloc: Allocator,
 
-    switch (result) {
-        .updated => |*updated| {
-            installWorkspaceAccess(state, alloc, &updated.access);
-            return .{ .ok = true, .text = try workspaceSnapshotText(state, alloc, updated.mutation) };
-        },
-        .indeterminate => |*reconciliation| {
-            const text: []const u8 = switch (reconciliation.*) {
-                .intended => |*access| blk: {
-                    installWorkspaceAccess(state, alloc, access);
-                    reconciliation.* = .unconfirmed;
-                    break :blk "Workspace settings durability is uncertain; reloaded settings match the requested update.";
-                },
-                .previous => |*access| blk: {
-                    installWorkspaceAccess(state, alloc, access);
-                    reconciliation.* = .unconfirmed;
-                    break :blk "Workspace settings durability is uncertain; reloaded settings match the previous state, so the update is not active.";
-                },
-                .unconfirmed => "Workspace settings durability is uncertain; reloaded settings match neither the requested nor previous state, so runtime access is unchanged.",
-            };
-            return .{ .ok = true, .text = try alloc.dupe(u8, text) };
-        },
+    pub fn workspaceAccess(self: *WorkspaceHost) *const workspace_access.WorkspaceAccess {
+        return &self.state.workspace_access;
     }
-}
 
-fn installWorkspaceAccess(state: *ServerState, alloc: Allocator, access: *workspace_access.WorkspaceAccess) void {
-    state.workspace_access.deinit(alloc);
-    state.workspace_access = access.*;
-    access.* = .{};
-}
-
-fn workspaceSnapshotText(state: *ServerState, alloc: Allocator, mutation: ?workspace_commands.Mutation) ![]u8 {
-    var snapshot = output_contracts.WorkspaceSnapshot.fromAccess(state.workspace_root, &state.workspace_access);
-    snapshot.mutation = mutation;
-    return snapshot.renderInteractiveBody(alloc);
-}
+    pub fn installWorkspaceAccess(self: *WorkspaceHost, access: *workspace_access.WorkspaceAccess) void {
+        self.state.workspace_access.deinit(self.alloc);
+        self.state.workspace_access = access.*;
+        access.* = .{};
+    }
+};
 
 /// Handles the older `session/set_mode`, modeled with the `mode` option in
 /// `tests/tla/acp/AcpPermissionModes.tla`.

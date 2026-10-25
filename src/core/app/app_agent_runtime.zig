@@ -29,6 +29,7 @@ const model_provider = @import("../config/model_provider.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const session_runtime = @import("../session/session.zig");
 const result_store = @import("../session/result_store.zig");
+const manual_compaction = @import("../agent/manual_compaction.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const subagent_agent_adapter = @import("../subagent/agent_adapter.zig");
@@ -1045,42 +1046,30 @@ pub fn Runtime(comptime App: type) type {
                 deps.agent_stream_provider = bundle.agent_stream_or_unavailable();
                 break :blk bundle.capabilities;
             } else .{};
-            const capabilities = deps.available_model_capabilities(deps.ctx, job.model);
             const settings = app.worker.effectiveAgentTurnSettings();
-            var provider_options = model_capabilities.resolveProviderOptionsForCapabilities(capabilities, settings.effort, settings.fast_mode);
-            provider_options.prompt_caching = provider_capabilities.gateway_prompt_caching;
-            if (job.provider == .gateway) {
-                provider_options.provider_order = settings.provider_order;
-                provider_options.provider_strict = settings.provider_strict;
-            }
-            var summary_model: agent_runtime.CompactorCaller = .{
-                .stream_provider = deps.agent_stream_provider,
-                .cooperative_transport_pulse = deps.cooperative_transport_pulse,
-                .provider = job.provider,
-                .model = job.model,
-                .api_key = job.api_key,
-                .credential_source = job.credential_source,
-                .account_id = job.account_id,
-                .gateway_team = job.gateway_team,
-                .session_id = app_session_runtime.Runtime(App).activeSessionId(app),
-                .retry_count = gateway_retry_count,
-                .provider_options = provider_options,
-                .max_output_tokens = model_capabilities.requestOutputTokens(capabilities),
-                .capabilities_context = deps.ctx,
-                .capabilities_fn = deps.available_model_capabilities,
-            };
-            const result = agent_runtime.compactContext(arena, &deps, .{
-                .operation_id = operation_id,
-                .activity_origin = .manual,
-                .compactor = .{
-                    .history = job.history,
-                    .append_messages = session_runtime.appendHistoryChatMessages,
-                    .size = agent_runtime.compactionSize(&app.session.agent, capabilities, settings.auto_compact_percent, job.model),
-                    .caller = summary_model.caller(),
-                    .records = if (app_session_runtime.Runtime(App).childCapability(app)) |capability| result_store.compactorStore(capability) else null,
-                    .cancel_flag = &app.worker.worker_cancel_requested,
-                    .trace_ctx = .{ .turn_id = job.turn_id },
+            const result = manual_compaction.run(arena, &deps, .{
+                .model = .{
+                    .provider = job.provider,
+                    .model = job.model,
+                    .api_key = job.api_key,
+                    .credential_source = job.credential_source,
+                    .account_id = job.account_id,
+                    .gateway_team = job.gateway_team,
+                    .session_id = app_session_runtime.Runtime(App).activeSessionId(app),
+                    .retry_count = gateway_retry_count,
+                    .effort = settings.effort,
+                    .fast_mode = settings.fast_mode,
+                    .prompt_caching = provider_capabilities.gateway_prompt_caching,
+                    .provider_order = settings.provider_order,
+                    .provider_strict = settings.provider_strict,
                 },
+                .history = job.history,
+                .agent = &app.session.agent,
+                .auto_compact_percent = settings.auto_compact_percent,
+                .records = if (app_session_runtime.Runtime(App).childCapability(app)) |capability| result_store.compactorStore(capability) else null,
+                .cancel_flag = &app.worker.worker_cancel_requested,
+                .turn_id = job.turn_id,
+                .operation_id = operation_id,
             }) catch |err| {
                 if (err == error.Cancelled and app.worker.worker_cancel_requested.load(.seq_cst)) return;
                 return @as(anyerror!void, err);

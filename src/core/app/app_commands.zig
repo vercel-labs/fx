@@ -23,6 +23,7 @@ const feedback_runtime = @import("../feedback/runtime.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
+const workspace_update = @import("../workspace/workspace_update.zig");
 const image_commands = @import("../images/image_commands.zig");
 const app_mcp_runtime = @import("app_mcp_runtime.zig");
 const model_cache_runtime = @import("model_cache_runtime.zig");
@@ -184,7 +185,7 @@ fn handleWorkspaceCommand(app: anytype, rest: []const u8) !void {
             }, true);
             return;
         };
-        return writeWorkspaceSnapshot(app, null);
+        return writeWorkspaceSnapshot(app);
     };
 
     if (!tryBeginWorkspaceMutation(app)) {
@@ -197,64 +198,17 @@ fn handleWorkspaceCommand(app: anytype, rest: []const u8) !void {
     }
     defer app.worker.releaseTurnStartHold();
 
-    var failure_phase: workspace_commands.FailurePhase = .stage;
-    var result = workspace_commands.execute(
-        app.alloc,
-        app.workspace_root,
-        app.workspaceAccess(),
-        action,
-        &failure_phase,
-    ) catch |err| {
-        const reason = output_contracts.workspaceErrorMessage(err) orelse "workspace update failed";
-        const prefix: []const u8 = switch (failure_phase) {
-            .stage => "Workspace update rejected",
-            .commit => "Workspace settings were not changed",
-            .reconcile => "Workspace settings are uncertain and could not be reloaded",
-        };
-        const message = try app.alloc.print("{s}: {s}", .{ prefix, reason });
-        defer app.alloc.free(message);
-        try app.writeDomainNotice(.{
-            .topic = "workspace",
-            .tone = .@"error",
-            .body = message,
-        }, true);
-        return;
-    };
-    defer result.deinit(app.alloc);
-
-    switch (result) {
-        .updated => |*updated| {
-            _ = app.installWorkspaceAccess(&updated.access);
-            try writeWorkspaceSnapshot(app, updated.mutation);
-        },
-        .indeterminate => |*reconciliation| {
-            const message: []const u8 = switch (reconciliation.*) {
-                .intended => |*reconciled| blk: {
-                    _ = app.installWorkspaceAccess(reconciled);
-                    break :blk "Workspace settings durability is uncertain; reloaded settings match the requested update.";
-                },
-                .previous => |*reconciled| blk: {
-                    _ = app.installWorkspaceAccess(reconciled);
-                    break :blk "Workspace settings durability is uncertain; reloaded settings match the previous state, so the update is not active.";
-                },
-                .unconfirmed => "Workspace settings durability is uncertain; reloaded settings match neither the requested nor previous state, so runtime access is unchanged.",
-            };
-            try app.writeDomainNotice(.{
-                .topic = "workspace",
-                .tone = .warning,
-                .body = message,
-            }, true);
-        },
-    }
+    const report = try workspace_update.apply(app.alloc, app.workspace_root, app, action);
+    defer app.alloc.free(report.text);
+    try app.writeDomainNotice(.{
+        .topic = "workspace",
+        .tone = report.tone,
+        .body = report.text,
+    }, true);
 }
 
-fn writeWorkspaceSnapshot(
-    app: anytype,
-    mutation: ?workspace_commands.Mutation,
-) !void {
-    var snapshot = output_contracts.WorkspaceSnapshot.fromAccess(app.workspace_root, app.workspaceAccess());
-    snapshot.mutation = mutation;
-    const body = try snapshot.renderInteractiveBody(app.alloc);
+fn writeWorkspaceSnapshot(app: anytype) !void {
+    const body = try workspace_update.snapshotText(app.alloc, app.workspace_root, app.workspaceAccess(), null);
     defer app.alloc.free(body);
     try app.writeDomainNotice(.{
         .topic = "workspace",
@@ -2893,7 +2847,7 @@ test "workspace list reports refresh rejection without replacing access" {
             return &self.access;
         }
 
-        fn installWorkspaceAccess(_: *@This(), _: *Access) bool {
+        pub fn installWorkspaceAccess(_: *@This(), _: *Access) bool {
             return false;
         }
 

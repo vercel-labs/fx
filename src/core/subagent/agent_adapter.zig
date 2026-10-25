@@ -885,23 +885,22 @@ fn describeToolActionCompleted(raw: *anyopaque, arena: Allocator, call: types.To
     }, true);
 }
 
+/// Plain text: the frontend that shows a child's live transcript adds the
+/// status marker, as it does for a root session's tools.
 fn formatChildToolAction(arena: Allocator, input: tool_presentation.ToolActionInput, completed: bool) ![]const u8 {
-    const action = if (completed)
-        try tool_presentation.formatPlainCompletedAction(arena, input)
+    return if (completed)
+        tool_presentation.formatPlainCompletedAction(arena, input)
     else
-        try tool_presentation.formatPlainAction(arena, input);
-    defer arena.free(action);
-    // Native compact tool groups identify canonical status rows by this marker.
-    return arena.print("● {s}", .{action});
+        tool_presentation.formatPlainAction(arena, input);
 }
 
-test "child tool labels use native canonical markers and completed tense" {
+test "child tool labels are plain and use the completed tense" {
     const alloc = std.testing.allocator;
     const builtin_tools = @import("../../builtins/tools.zig");
     const registry: @import("../tooling/tool_dispatch.zig").Registry = .{ .tools = &.{ builtin_tools.shell, builtin_tools.read_file } };
     const cases = [_]struct { call: types.ToolCall, active: []const u8, completed: []const u8 }{
-        .{ .call = .{ .id = "shell", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"printf live\"}" }, .active = "● Running printf live", .completed = "● Ran printf live" },
-        .{ .call = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"example.txt\"}" }, .active = "● Reading example.txt", .completed = "● Read example.txt" },
+        .{ .call = .{ .id = "shell", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"printf live\"}" }, .active = "Running printf live", .completed = "Ran printf live" },
+        .{ .call = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"example.txt\"}" }, .active = "Reading example.txt", .completed = "Read example.txt" },
     };
     for (cases) |case| {
         const input: tool_presentation.ToolActionInput = .{ .tool_registry = registry, .call = case.call };
@@ -929,7 +928,7 @@ fn resolveToolActionDisplayTarget(raw: *anyopaque, arena: Allocator, call: types
 fn describeToolActionDenied(raw: *anyopaque, arena: Allocator, call: types.ToolCall, file_path: ?[]const u8, label: []const u8, dynamic_names: []const []const u8) ![]const u8 {
     const action = try describeToolAction(raw, arena, call, file_path, dynamic_names);
     defer arena.free(action);
-    return arena.print("● {s}: {s}", .{ label, action["● ".len..] });
+    return arena.print("{s}: {s}", .{ label, action });
 }
 
 fn permissionTargetForCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall, dynamic_names: []const []const u8) ![]const u8 {

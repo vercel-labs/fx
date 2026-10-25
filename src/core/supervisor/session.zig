@@ -292,7 +292,6 @@ pub const Session = struct {
         cfg.workspace_root_override = self.cwd;
         const host = try acp.PersistentHost.init(alloc, cfg, self, publish);
         errdefer host.deinit();
-        host.state.native_presentation = true;
         self.host = host;
         errdefer self.host = null;
         var arena_state = std.heap.ArenaAllocator.init(alloc);
