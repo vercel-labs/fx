@@ -348,6 +348,9 @@ const max_static_status_activity_rows: u16 = 3;
 pub const RenderContext = struct {
     slash_registry: command_specs.SlashRegistry = .{},
     stream: StreamState,
+    /// Tail of the reasoning streamed for the active step. Borrowed; empty
+    /// hides the preview.
+    reasoning_preview: []const u8 = "",
     compaction: @import("../../core/output/compaction_activity.zig").Snapshot = .{},
     pending_prompt_activity: bool = false,
     completed_assistant_presentation_tail: bool = false,
@@ -644,7 +647,7 @@ pub fn activityOverlayInput(
 pub fn activityProjectionRows(projection: ActivityProjection, cols: u16) u16 {
     return switch (projection) {
         .turn_thinking => |thinking| if (thinking.tone == .thinking)
-            1
+            1 +| activity_runtime.reasoningPreviewRowCount(thinking.detail, cols)
         else
             wrappedStatusRowCount(thinking.label, cols, max_static_status_activity_rows),
         .none, .tool_slot => 1,
@@ -698,11 +701,15 @@ fn turnActivityProjection(
 
     var visible_stream = ctx.stream;
     visible_stream.last_activity_kind = null;
+    // The preview belongs to the thinking phase: once text or a tool call
+    // starts, the status row describes what is happening instead.
+    const detail: []const u8 = if (visible_stream.phase == .thinking) ctx.reasoning_preview else "";
     if (activity_status.buildTurnLabel(buf, visible_stream, ctx.now_ms)) |label| {
-        return .{ .turn_thinking = .{ .label = label } };
+        return .{ .turn_thinking = .{ .label = label, .detail = detail } };
     }
     return .{ .turn_thinking = .{
         .label = "• Thinking",
+        .detail = detail,
     } };
 }
 
@@ -777,6 +784,14 @@ pub fn activityProjectionLabel(projection: ActivityProjection) ?[]const u8 {
         .none => null,
         .turn_thinking => |thinking| thinking.label,
         .tool_slot => |slot| slot.thinking_label orelse slot.fallback_label,
+    };
+}
+
+/// The reasoning tail painted under the status row, if any.
+pub fn activityProjectionDetail(projection: ActivityProjection) ?[]const u8 {
+    return switch (projection) {
+        .turn_thinking => |thinking| if (thinking.detail.len > 0) thinking.detail else null,
+        .none, .tool_slot => null,
     };
 }
 
@@ -1219,6 +1234,53 @@ test "static turn status reserves wrapped activity rows" {
     try std.testing.expectEqual(@as(u16, 1), activityProjectionRows(normal_thinking, 42));
     try std.testing.expect(activityProjectionRows(projection, 42) > 1);
     try std.testing.expectEqual(@as(u16, 1), activityProjectionRows(projection, 160));
+}
+
+test "thinking activity reserves rows for the reasoning preview" {
+    const quiet: ActivityProjection = .{ .turn_thinking = .{ .label = "• Thinking" } };
+    try std.testing.expectEqual(@as(u16, 1), activityProjectionRows(quiet, 80));
+    try std.testing.expect(activityProjectionDetail(quiet) == null);
+
+    const preview: ActivityProjection = .{ .turn_thinking = .{
+        .label = "• Thinking",
+        .detail = "one two three four five six seven eight",
+    } };
+    try std.testing.expectEqual(@as(u16, 2), activityProjectionRows(preview, 80));
+    try std.testing.expectEqual(@as(u16, 4), activityProjectionRows(preview, 12));
+    try std.testing.expectEqualStrings(
+        "one two three four five six seven eight",
+        activityProjectionDetail(preview).?,
+    );
+}
+
+test "frame-owned thinking activity carries only the thinking phase preview" {
+    var input = InputRuntime{};
+    defer input.deinit(std.testing.allocator);
+    var shell = TranscriptRuntime{};
+    defer shell.deinit(std.testing.allocator);
+    var ctx: RenderContext = .{
+        .stream = .{ .active = true },
+        .reasoning_preview = "first line\nsecond line",
+        .has_api_key = true,
+        .model = "gpt-5.1",
+        .shimmer_pos = 0,
+        .input = &input,
+    };
+
+    var buf: [256]u8 = undefined;
+    switch (frameOwnedActivityProjection(&buf, &shell, ctx, null)) {
+        .turn_thinking => |thinking| try std.testing.expectEqualStrings(
+            "first line\nsecond line",
+            thinking.detail,
+        ),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+
+    ctx.stream.phase = .generating;
+    switch (frameOwnedActivityProjection(&buf, &shell, ctx, null)) {
+        .turn_thinking => |thinking| try std.testing.expectEqualStrings("", thinking.detail),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
 }
 
 test "static turn status wraps at word boundaries" {

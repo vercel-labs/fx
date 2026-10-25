@@ -66,6 +66,7 @@ pub const SurfaceFooterFrame = struct {
     paint: PaintPlan,
     composed: footer_viewport.ComposedFooterFrame,
     activity_label: std.ArrayList(u8) = .empty,
+    activity_detail: std.ArrayList(u8) = .empty,
     tool_activity_label: std.ArrayList(u8) = .empty,
     shimmer_pos: i16 = -render_request.animation_padding,
     thinking_blink: ?bool = null,
@@ -74,11 +75,16 @@ pub const SurfaceFooterFrame = struct {
     pub fn deinit(self: *SurfaceFooterFrame, alloc: Allocator) void {
         self.composed.deinit(alloc);
         self.activity_label.deinit(alloc);
+        self.activity_detail.deinit(alloc);
         self.tool_activity_label.deinit(alloc);
     }
 
     pub fn label(self: *const SurfaceFooterFrame) []const u8 {
         return self.activity_label.items;
+    }
+
+    pub fn detail(self: *const SurfaceFooterFrame) []const u8 {
+        return self.activity_detail.items;
     }
 
     pub fn toolLabel(self: *const SurfaceFooterFrame) ?[]const u8 {
@@ -719,6 +725,7 @@ fn buildFooterSurfaceProjection(
 fn appendActivityLabels(
     alloc: Allocator,
     primary: *std.ArrayList(u8),
+    detail: *std.ArrayList(u8),
     tool: *std.ArrayList(u8),
     projection: ActivityProjection,
     ctx: RenderContext,
@@ -726,6 +733,9 @@ fn appendActivityLabels(
 ) !void {
     var primary_buf: [256]u8 = undefined;
     try primary.appendSlice(alloc, render_input.activityFallbackLabel(&primary_buf, projection, ctx));
+    if (render_input.activityProjectionDetail(projection)) |reasoning| {
+        try detail.appendSlice(alloc, reasoning);
+    }
     try render_input.appendActivityToolLabel(alloc, tool, projection, cols);
 }
 
@@ -829,11 +839,14 @@ fn assembleSurfaceFooterFrame(
 
     var activity_label: std.ArrayList(u8) = .empty;
     errdefer activity_label.deinit(alloc);
+    var activity_detail: std.ArrayList(u8) = .empty;
+    errdefer activity_detail.deinit(alloc);
     var tool_activity_label: std.ArrayList(u8) = .empty;
     errdefer tool_activity_label.deinit(alloc);
     try appendActivityLabels(
         alloc,
         &activity_label,
+        &activity_detail,
         &tool_activity_label,
         assembly.activity_projection,
         assembly.planner_input.ctx,
@@ -844,6 +857,7 @@ fn assembleSurfaceFooterFrame(
         .paint = paint,
         .composed = composed,
         .activity_label = activity_label,
+        .activity_detail = activity_detail,
         .tool_activity_label = tool_activity_label,
         .shimmer_pos = assembly.planner_input.ctx.shimmer_pos,
         .thinking_blink = render_input.frameActivityBlink(assembly.planner_input.ctx),
@@ -1148,10 +1162,15 @@ pub noinline fn measureSurfaceFooter(
         .turn_thinking => |thinking| {
             try measurement.active_label.appendSlice(alloc, thinking.label);
             measurement.active_label_present = true;
-            measurement.activity_projection = .{ .turn_thinking = .{
-                .label = measurement.active_label.items,
-                .tone = thinking.tone,
-            } };
+            measurement.activity_projection = .{
+                .turn_thinking = .{
+                    .label = measurement.active_label.items,
+                    .tone = thinking.tone,
+                    // Borrowed from the frame's RenderContext, which outlives the
+                    // measurement; the layout reserves its rows.
+                    .detail = thinking.detail,
+                },
+            };
         },
     }
 
@@ -1691,6 +1710,41 @@ test "surface footer measurement preserves route recovery status tone" {
         .turn_thinking => |thinking| {
             try std.testing.expectEqual(ActivityProjection.Tone.danger, thinking.tone);
             try std.testing.expectEqualStrings("⚠ blocked · content filter", thinking.label);
+        },
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+}
+
+test "surface footer measurement preserves the reasoning preview detail" {
+    const alloc = std.testing.allocator;
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var shell = surfaceTestShell(24, 80);
+    defer shell.deinit(alloc);
+
+    const approval = ApprovalPrompt{};
+    const preview = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu " ++
+        "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu " ++
+        "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu " ++
+        "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu";
+    const ctx = RenderContext{
+        .stream = .{ .active = true, .phase = .thinking },
+        .reasoning_preview = preview,
+        .has_api_key = true,
+        .model = "gpt-5.1",
+        .input = &input,
+    };
+
+    var measurement = try measureSurfaceFooter(alloc, &shell, approval.projection(), ctx);
+    defer measurement.deinit(alloc);
+
+    switch (measurement.activity_projection) {
+        .turn_thinking => |thinking| {
+            try std.testing.expectEqualStrings(preview, thinking.detail);
+            try std.testing.expectEqual(@as(u16, 4), render_input.activityProjectionRows(
+                measurement.activity_projection,
+                shell.layout.cols,
+            ));
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
     }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const display_width = @import("../shared/display_width.zig");
 const types = @import("../shared/types.zig");
 
 pub const ToolLifecyclePhase = enum {
@@ -43,6 +44,10 @@ pub const ActivityProjection = union(enum) {
     pub const TurnThinking = struct {
         label: []const u8,
         tone: Tone = .thinking,
+        /// Tail of the reasoning streamed for this step, shown under the
+        /// status row while the turn is still thinking. Borrowed, and empty
+        /// when the provider sent no visible reasoning.
+        detail: []const u8 = "",
     };
 
     pub const ToolSlot = struct {
@@ -571,4 +576,148 @@ test "lifecycle transition reports focus changes from immutable snapshots" {
     var changed = unchanged;
     changed.snapshot.focused_entry_id = 7;
     try std.testing.expect(changed.focus_changed());
+}
+
+/// Visual rows of live reasoning the activity band shows at most.
+pub const reasoning_preview_row_limit: usize = 3;
+/// Newest reasoning bytes kept for the inline preview.
+pub const reasoning_preview_max_bytes: usize = 4096;
+/// Preview rows align under the status label's marker.
+pub const reasoning_preview_indent_width: usize = 2;
+
+/// Keeps the newest reasoning bytes after `chunk` joins `list`. The buffer is
+/// display-only, so a dropped prefix lands on a line boundary when the text
+/// has one; an unbroken line keeps its newest bytes without splitting a
+/// codepoint.
+pub fn appendReasoningPreviewTail(
+    list: *std.ArrayList(u8),
+    alloc: std.mem.Allocator,
+    chunk: []const u8,
+) !void {
+    if (chunk.len == 0) return;
+    var start: usize = 0;
+    if (chunk.len >= reasoning_preview_max_bytes) {
+        start = chunk.len - reasoning_preview_max_bytes;
+        while (start < chunk.len and (chunk[start] & 0xc0) == 0x80) start += 1;
+        list.clearRetainingCapacity();
+    }
+    try list.appendSlice(alloc, chunk[start..]);
+    if (list.items.len <= reasoning_preview_max_bytes) return;
+
+    const excess = list.items.len - reasoning_preview_max_bytes;
+    var cut = excess;
+    while (cut < list.items.len and list.items[cut] != '\n') cut += 1;
+    if (cut == list.items.len) {
+        cut = excess;
+        while (cut < list.items.len and (list.items[cut] & 0xc0) == 0x80) cut += 1;
+    } else {
+        cut += 1;
+    }
+    if (cut >= list.items.len) {
+        list.clearRetainingCapacity();
+        return;
+    }
+    @memmove(list.items[0 .. list.items.len - cut], list.items[cut..]);
+    list.shrinkRetainingCapacity(list.items.len - cut);
+}
+
+const PreviewSpan = struct { start: usize, len: usize };
+
+/// Wraps `text` into at most the newest `reasoning_preview_row_limit` visual
+/// rows. Each row already fits `cols`; the indent width is reserved here so
+/// paint-time rows never need rewrapping.
+fn previewSpans(
+    text: []const u8,
+    cols: u16,
+    spans: *[reasoning_preview_row_limit]PreviewSpan,
+) usize {
+    const safe_cols: usize = @max(cols, 1);
+    const indent: usize = @min(@as(usize, reasoning_preview_indent_width), safe_cols - 1);
+    const available: usize = safe_cols - indent;
+    var remaining = std.mem.trimStart(u8, text, " \t\r\n");
+    var stored: usize = 0;
+    while (remaining.len > 0) {
+        const newline = std.mem.findScalar(u8, remaining, '\n') orelse remaining.len;
+        var line = std.mem.trimEnd(u8, remaining[0..newline], " \t\r");
+        remaining = if (newline < remaining.len)
+            std.mem.trimStart(u8, remaining[newline + 1 ..], " \t\r\n")
+        else
+            "";
+        while (line.len > 0) {
+            var chunk = display_width.wrapCutIgnoringAnsi(line, available);
+            if (chunk.len == 0) {
+                const unit = display_width.displayUnitAt(line, 0);
+                chunk = line[0..unit.byte_len];
+            }
+            const span: PreviewSpan = .{
+                .start = @intFromPtr(chunk.ptr) - @intFromPtr(text.ptr),
+                .len = chunk.len,
+            };
+            if (stored < reasoning_preview_row_limit) {
+                spans[stored] = span;
+                stored += 1;
+            } else {
+                @memmove(spans[0 .. reasoning_preview_row_limit - 1], spans[1..reasoning_preview_row_limit]);
+                spans[reasoning_preview_row_limit - 1] = span;
+            }
+            line = std.mem.trimStart(u8, line[chunk.len..], " \t");
+        }
+    }
+    return stored;
+}
+
+pub fn reasoningPreviewRowCount(text: []const u8, cols: u16) u16 {
+    if (text.len == 0) return 0;
+    var spans: [reasoning_preview_row_limit]PreviewSpan = undefined;
+    return @intCast(previewSpans(text, cols, &spans));
+}
+
+/// Fills `out` with the newest preview rows, oldest first.
+pub fn reasoningPreviewRows(
+    text: []const u8,
+    cols: u16,
+    out: *[reasoning_preview_row_limit][]const u8,
+) []const []const u8 {
+    var spans: [reasoning_preview_row_limit]PreviewSpan = undefined;
+    const stored = previewSpans(text, cols, &spans);
+    for (0..stored) |i| {
+        const span = spans[i];
+        out[i] = text[span.start .. span.start + span.len];
+    }
+    return out[0..stored];
+}
+
+test "reasoning preview keeps the newest bounded tail on a line boundary" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try appendReasoningPreviewTail(&list, std.testing.allocator, "first line\nsecond line\n");
+    try std.testing.expectEqualStrings("first line\nsecond line\n", list.items);
+
+    const filler = try std.testing.allocator.alloc(u8, reasoning_preview_max_bytes);
+    defer std.testing.allocator.free(filler);
+    @memset(filler, 'x');
+    try appendReasoningPreviewTail(&list, std.testing.allocator, filler);
+    try std.testing.expect(list.items.len <= reasoning_preview_max_bytes);
+    try std.testing.expect(list.items.len > 0);
+}
+
+test "reasoning preview rows keep only the newest three visual rows" {
+    const text = "alpha beta gamma delta epsilon zeta eta theta";
+    var rows: [reasoning_preview_row_limit][]const u8 = undefined;
+    const shown = reasoningPreviewRows(text, 10, &rows);
+    try std.testing.expectEqual(@as(usize, reasoning_preview_row_limit), shown.len);
+    try std.testing.expectEqual(@as(u16, reasoning_preview_row_limit), reasoningPreviewRowCount(text, 10));
+    try std.testing.expect(std.mem.find(u8, shown[shown.len - 1], "theta") != null);
+
+    try std.testing.expectEqual(@as(u16, 0), reasoningPreviewRowCount("", 10));
+    try std.testing.expectEqual(@as(u16, reasoning_preview_row_limit), reasoningPreviewRowCount(text, 1));
+}
+
+test "reasoning preview rows never split a wide codepoint" {
+    var rows: [reasoning_preview_row_limit][]const u8 = undefined;
+    const shown = reasoningPreviewRows("界海語 reasoning tail", 3, &rows);
+    try std.testing.expect(shown.len > 0);
+    for (shown) |row| {
+        try std.testing.expect(std.unicode.utf8ValidateSlice(row));
+    }
 }

@@ -14,6 +14,7 @@ const callbacks = @import("app_callbacks.zig");
 const sessions = @import("app_session_runtime.zig");
 const session_catalog = @import("../session/session_catalog.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
+const activity_runtime = @import("../output/activity_runtime.zig");
 const diff = @import("../output/diff.zig");
 const remote_runtime = @import("app_remote_runtime.zig");
 const remote_backend = @import("remote_backend.zig");
@@ -141,6 +142,9 @@ pub fn Runtime(comptime App: type) type {
             app.remote.submitted_text.clearRetainingCapacity();
             app.shell.clearTranscriptPreservingWelcome(app.alloc);
             app.stream = .{};
+            if (comptime @hasField(App, "reasoning_preview")) {
+                app.reasoning_preview.clearRetainingCapacity();
+            }
             _ = app.shell.worker_status_state().clear();
             app.shell.render_requests.request(.transcript);
         }
@@ -377,6 +381,15 @@ pub fn Runtime(comptime App: type) type {
                 var parsed = try std.json.parseFromValue(types.TurnTokenProgress, app.alloc, value, .{});
                 defer parsed.deinit();
                 app.stream.token_progress = parsed.value;
+            } else if (field(event, "reasoning_preview")) |value| {
+                if (value == .string and comptime @hasField(App, "reasoning_preview")) {
+                    try activity_runtime.appendReasoningPreviewTail(
+                        &app.reasoning_preview,
+                        app.alloc,
+                        value.string,
+                    );
+                    app.shell.render_requests.request(.footer);
+                }
             } else if (field(event, "assistant_presentation")) |value| {
                 var parsed = try std.json.parseFromValue(presentation.Event, app.alloc, value, .{});
                 defer parsed.deinit();

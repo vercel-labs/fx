@@ -5,6 +5,7 @@ const debug_trace = @import("../../core/shared/debug_trace.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const render_request = @import("../render_request.zig");
 const ui_render = @import("../render.zig");
+const activity_runtime = @import("../../core/output/activity_runtime.zig");
 const render_engine = @import("../render_engine.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
@@ -15,6 +16,9 @@ const surface_shimmer_paint_trace_fmt = "shimmer_surface_paint row={d} visible={
 
 pub const ActivityPaintInput = struct {
     label: []const u8,
+    /// Reasoning tail painted under the status row while the turn is still
+    /// thinking. Empty paints nothing.
+    detail: []const u8 = "",
     tool_label: ?[]const u8 = null,
     shimmer_pos: i16,
     style: ActivityPaintStyle = .thinking,
@@ -245,11 +249,41 @@ fn paintPlannedActivityRow(
         );
     std.debug.assert(result.rows_touched <= max_rows);
 
+    if (!overlay and max_rows > 1 and input.detail.len > 0) {
+        try paintActivityDetailRows(surface, input.detail, row + 1, max_rows - 1);
+    }
+
     return .{
         .painted = true,
         .row = row,
         .overlay = overlay,
     };
+}
+
+/// Paints the wrapped reasoning tail below the status row. Each row already
+/// fits `cols`; the indent is added here so the text aligns under the marker.
+fn paintActivityDetailRows(
+    surface: *frame_surface.FrameSurface,
+    detail: []const u8,
+    first_row: u16,
+    max_rows: u16,
+) !void {
+    if (detail.len == 0 or max_rows == 0) return;
+    var rows: [activity_runtime.reasoning_preview_row_limit][]const u8 = undefined;
+    const shown = activity_runtime.reasoningPreviewRows(detail, surface.cols, &rows);
+    const indent: [activity_runtime.reasoning_preview_indent_width]u8 = @splat(' ');
+    var buf: [4096]u8 = undefined;
+    for (shown, 0..) |line, index| {
+        if (index >= max_rows) break;
+        const target = first_row + @as(u16, @intCast(index));
+        if (!surface.plan.activity_band.containsRow(target)) break;
+        const styled = std.mem.print(
+            &buf,
+            "{s}{s}{s}{s}",
+            .{ ui_render.dim_style, &indent, line, ui_render.reset_style },
+        ) catch break;
+        _ = try surface.writeAnsiBandNoWrap(target, 1, styled, .activity, .same_owner);
+    }
 }
 
 // A steady on/off blink with no fade. Folding in the padding keeps the phase
@@ -513,6 +547,43 @@ test "activity surface painter clamps long transient label to one row" {
     try std.testing.expectEqual(@as(u21, '.'), fixtures.surface.cellAt(4, 8).?.codepoint);
     try std.testing.expectEqual(@as(u21, ' '), fixtures.surface.cellAt(5, 1).?.codepoint);
     try std.testing.expectEqual(paint_plan.CellOwner.footer, fixtures.surface.cellAt(5, 1).?.owner);
+}
+
+test "activity surface painter paints the reasoning preview below the status row" {
+    var plan = testPlan(
+        .{ .transient_row = .{ .row = 3, .row_count = 4, .gap_above_rows = 0 } },
+        .{ .top = 3, .bottom = 6, .owner = .activity },
+    );
+    plan.layout.rows = 8;
+    plan.layout.cols = 24;
+    plan.footer_band = .{ .top = 7, .bottom = 8, .owner = .footer };
+    plan.footer.top = 7;
+    plan.footer.top_divider = 7;
+    plan.footer.input_base = 7;
+    plan.footer.bottom_divider = 7;
+    plan.footer.hint = 8;
+    plan.footer.total_rows = 2;
+    var fixtures = try testSurface(plan);
+    defer fixtures.surface.deinit();
+    defer fixtures.shadow.deinit();
+
+    const result = try paintActivityIntoSurface(&fixtures.surface, .{
+        .label = "• Thinking",
+        .detail = "one\ntwo\nthree",
+        .shimmer_pos = 0,
+        .thinking_blink = true,
+    });
+
+    try std.testing.expect(result.painted);
+    try std.testing.expectEqual(@as(u16, 3), result.row);
+    try std.testing.expectEqual(@as(u21, ' '), fixtures.surface.cellAt(4, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, 'o'), fixtures.surface.cellAt(4, 3).?.codepoint);
+    try std.testing.expectEqual(@as(u21, 't'), fixtures.surface.cellAt(5, 3).?.codepoint);
+    try std.testing.expectEqual(@as(u21, 't'), fixtures.surface.cellAt(6, 3).?.codepoint);
+    try std.testing.expectEqual(@as(u21, 'r'), fixtures.surface.cellAt(6, 5).?.codepoint);
+    try std.testing.expectEqual(paint_plan.CellOwner.activity, fixtures.surface.cellAt(6, 3).?.owner);
+    try std.testing.expectEqual(paint_plan.CellOwner.activity, fixtures.surface.cellAt(4, 3).?.owner);
+    try std.testing.expectEqual(paint_plan.CellOwner.footer, fixtures.surface.cellAt(7, 1).?.owner);
 }
 
 test "activity surface painter wraps static status labels under marker" {

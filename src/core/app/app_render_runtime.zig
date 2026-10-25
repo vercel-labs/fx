@@ -727,6 +727,7 @@ pub fn Runtime(comptime App: type) type {
             return .{
                 .slash_registry = app.slashRegistry(),
                 .stream = visible_stream,
+                .reasoning_preview = if (comptime @hasField(App, "reasoning_preview")) app.reasoning_preview.items else "",
                 .compaction = if (comptime @hasDecl(@TypeOf(app.worker), "compactionActivitySnapshot")) app.worker.compactionActivitySnapshot() else .{},
                 .pending_prompt_activity = pendingPromptActivityVisible(app),
                 .completed_assistant_presentation_tail = app.pacer.hasCompletedAssistantPresentationTail(),
@@ -2284,6 +2285,7 @@ fn FramePaintContext(comptime App: type) type {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.activity_result = try shimmer_runtime.paintActivityIntoSurface(surface, .{
                 .label = self.footer_frame.label(),
+                .detail = self.footer_frame.detail(),
                 .tool_label = self.footer_frame.toolLabel(),
                 .shimmer_pos = self.footer_frame.shimmer_pos,
                 .style = self.activity_style,

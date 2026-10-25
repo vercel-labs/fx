@@ -349,6 +349,7 @@ pub fn Runtime(comptime App: type) type {
                 .command_output,
                 .turn_token_update,
                 .turn_phase_update,
+                .reasoning_preview,
                 .diff_block,
                 .restore_failed_prompt,
                 => .drop,
@@ -749,6 +750,9 @@ pub fn Runtime(comptime App: type) type {
                 // this thread. Keep any open command block until the queued
                 // turn boundary finalizes it instead of discarding output.
                 app.stream = .{};
+                if (comptime @hasField(App, "reasoning_preview")) {
+                    app.reasoning_preview.clearRetainingCapacity();
+                }
                 app.shell.render_requests.request(.footer);
             } else if (modal_active and !app.stream.active) {
                 app.stream.active = true;
@@ -1149,6 +1153,16 @@ pub fn Runtime(comptime App: type) type {
                     .turn_phase_update => |update| {
                         applyTurnPhase(app, update);
                     },
+                    .reasoning_preview => |text| {
+                        if (comptime @hasField(App, "reasoning_preview")) {
+                            try activity_runtime.appendReasoningPreviewTail(
+                                &app.reasoning_preview,
+                                app.alloc,
+                                text,
+                            );
+                            app.shell.render_requests.request(.footer);
+                        }
+                    },
                     .diff_block => |payload| {
                         drain_owns_current = false;
                         try handlers.diff_block(handlers.ctx, payload);
@@ -1321,6 +1335,9 @@ pub fn Runtime(comptime App: type) type {
 
         fn resetStream(app: *App, clear_route_recovery: bool) void {
             app.stream = .{};
+            if (comptime @hasField(App, "reasoning_preview")) {
+                app.reasoning_preview.clearRetainingCapacity();
+            }
             if (clear_route_recovery and app.shell.worker_status_state().clear()) {
                 app.shell.render_requests.request(.footer);
             }
@@ -1891,6 +1908,7 @@ const FakeApp = struct {
     question_prompt: FakeQuestionPrompt = .{},
     input_runtime: InputRuntime = .{},
     stream: types.StreamState = .{},
+    reasoning_preview: std.ArrayList(u8) = .empty,
     shell: FakeShell = .{},
     pacer: FakePacer = .{},
     subagents: FakeSubagents = .{},
@@ -1926,6 +1944,7 @@ const FakeApp = struct {
         self.shell.deinit(self.alloc);
         self.subagents.deinit(self.alloc);
         self.transcript.deinit(self.alloc);
+        self.reasoning_preview.deinit(self.alloc);
     }
 
     fn pacerCallbacks(self: *FakeApp) void {
@@ -2534,6 +2553,25 @@ test "core.app_worker_runtime applies turn token output as an absolute snapshot"
     try tickNoop(&app);
 
     try std.testing.expectEqual(@as(u64, 4), app.stream.token_progress.output_tokens);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+}
+
+test "core.app_worker_runtime keeps the newest reasoning preview for the footer" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    app.worker.processing = true;
+    app.stream.active = true;
+    const first = try std.heap.c_allocator.dupe(u8, "first ");
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .reasoning_preview = first });
+    std.heap.c_allocator.free(first);
+    const second = try std.heap.c_allocator.dupe(u8, "second");
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .reasoning_preview = second });
+    std.heap.c_allocator.free(second);
+
+    try tickNoop(&app);
+
+    try std.testing.expectEqualStrings("first second", app.reasoning_preview.items);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 

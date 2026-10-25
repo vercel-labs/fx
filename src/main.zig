@@ -613,6 +613,9 @@ const App = struct {
     total_web_search_requests: u64 = 0,
 
     stream: StreamState = .{},
+    /// Newest reasoning bytes streamed for the active step, shown under the
+    /// footer's thinking row. Ownership stays here; renderers borrow it.
+    reasoning_preview: std.ArrayList(u8) = .empty,
     metrics: Metrics = .{},
     pub fn init(
         alloc: Allocator,
@@ -990,6 +993,7 @@ const App = struct {
         self.shell.deinit(self.alloc);
         self.pacer.deinit(self.alloc);
         self.session_title.deinit(self.alloc);
+        self.reasoning_preview.deinit(self.alloc);
         SessionAppRuntime.deinitPersistence(self);
         self.provider_selection.deinit();
         if (self.requested_resume) |*target| {
@@ -1420,6 +1424,7 @@ const App = struct {
 
     pub fn stopStream(self: *App) void {
         self.stream = .{};
+        self.reasoning_preview.clearRetainingCapacity();
         self.shell.resetCommandOutputDisplay(self.alloc, "stream stopped");
         self.shell.render_requests.request(.footer);
     }

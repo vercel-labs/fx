@@ -503,6 +503,10 @@ pub const WorkerEvent = union(enum) {
     tool_lifecycle: types.ToolLifecycleEvent,
     turn_token_update: types.TurnTokenProgress,
     turn_phase_update: types.TurnPhaseUpdate,
+    /// Reasoning bytes the model just streamed for the active step. Owned by
+    /// the event; the consumer frees it. Display-only: durable reasoning
+    /// reaches ctrl+o through a full-only transcript notice.
+    reasoning_preview: []u8,
     diff_block: diff_mod.DiffEntryPayload,
     context_compaction: ContextCompaction,
     finish_prompt: types.FinishedPrompt,
@@ -3994,6 +3998,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
         },
         .turn_token_update => |update| .{ .turn_token_update = update },
         .turn_phase_update => |update| .{ .turn_phase_update = update },
+        .reasoning_preview => |text| .{ .reasoning_preview = try alloc.dupe(u8, text) },
         .diff_block => |payload| blk: {
             const preview = try alloc.dupe(u8, payload.preview);
             errdefer alloc.free(preview);
@@ -4069,6 +4074,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
         .clear_route_recovery_status => {},
         .provider_resolved => |slug| alloc.free(slug),
         .api_status_text => |text| alloc.free(text),
+        .reasoning_preview => |text| alloc.free(text),
         .credential_refreshed => |credential| {
             var owned = credential;
             owned.deinit(alloc);
