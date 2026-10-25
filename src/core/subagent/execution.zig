@@ -10,6 +10,8 @@ const child_state = @import("child_state.zig");
 const domain = @import("domain.zig");
 const live_metrics = @import("live_metrics.zig");
 const live_presentation = @import("live_presentation.zig");
+const slot_pool = @import("slot_pool.zig");
+const tool_host = @import("tool_host.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session = @import("../session/session.zig");
@@ -149,6 +151,15 @@ pub const TurnContext = struct {
     ) anyerror!void = null,
     live_metrics: ?*live_metrics.LiveMetrics = null,
     live_presentation: ?*live_presentation.Tail = null,
+    /// Ids from the tree's root down to this child (D93), owned by the
+    /// work's runner.
+    node_path: []const []const u8 = &.{},
+    /// The run slots this turn holds, lent back while it waits on its own
+    /// children (D92).
+    permit: ?*slot_pool.Permit = null,
+    /// This child's own host for its children, while its turn runs; null
+    /// when it may not spawn (D91).
+    node_host: ?*tool_host.Runtime = null,
     failure_diagnostic: ?types.ModelFailureDiagnostic = null,
     committed: bool = false,
 
@@ -373,15 +384,14 @@ pub const TurnContext = struct {
             return error.RegistryClosed;
         const worker_route = self.approval_worker_route orelse
             return error.RegistryClosed;
-        const child_id = self.child_id orelse return error.ChildNotAttached;
+        if (self.node_path.len == 0) return error.ChildNotAttached;
         const work_id = self.active_work_id orelse return error.StaleRequest;
         var authority = try self.resolveLiveAuthority(alloc);
         defer authority.deinit(alloc);
         try self.transitionPhase(work_id, .awaiting_approval);
         registry.registerTool(
             stable_request_id,
-            child_id,
-            authority.root_id,
+            self.node_path,
             work_id,
             request,
             grants,

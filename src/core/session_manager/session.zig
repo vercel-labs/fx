@@ -114,6 +114,9 @@ pub const Identity = struct {
     host: schema.Host,
     parent: ?[]u8 = null,
     forked_from: ?Origin = null,
+    /// A child's tree root and depth (D91); null as line 1 leaves them out.
+    root: ?[]u8 = null,
+    depth: ?u64 = null,
 
     pub const Origin = struct { id: []u8, seq: u64 };
 
@@ -128,6 +131,8 @@ pub const Identity = struct {
         identity.workspace = try gpa.dupe(u8, c.workspace);
         if (c.parent) |parent| identity.parent = try gpa.dupe(u8, parent);
         if (c.forked_from) |origin| identity.forked_from = .{ .id = try gpa.dupe(u8, origin.id), .seq = origin.seq };
+        if (c.root) |root| identity.root = try gpa.dupe(u8, root);
+        identity.depth = c.depth;
         return identity;
     }
 
@@ -139,7 +144,17 @@ pub const Identity = struct {
             .host = identity.host,
             .parent = identity.parent,
             .forked_from = if (identity.forked_from) |o| .{ .id = o.id, .seq = o.seq } else null,
+            .root = identity.root,
+            .depth = identity.depth,
         };
+    }
+
+    /// The session's place in its tree (D91). A root is its own root at
+    /// depth 0; a child whose line 1 predates D91 sits at depth 1 under its
+    /// parent, since no build before then nested children.
+    pub fn node(identity: *const Identity) Node {
+        const parent = identity.parent orelse return .{ .root = identity.id, .depth = 0 };
+        return .{ .root = identity.root orelse parent, .depth = identity.depth orelse 1 };
     }
 
     /// Child lines at or before this seq belong to a fork's source.
@@ -152,8 +167,12 @@ pub const Identity = struct {
         gpa.free(identity.workspace);
         if (identity.parent) |parent| gpa.free(parent);
         if (identity.forked_from) |origin| gpa.free(origin.id);
+        if (identity.root) |root| gpa.free(root);
     }
 };
+
+/// Where a session sits in its tree (D91). Borrowed from its identity.
+pub const Node = struct { root: []const u8, depth: u64 };
 
 const Live = struct {
     dir: storage.Dir,
@@ -1120,6 +1139,9 @@ pub const NewOptions = struct {
     host: schema.Host,
     parent: ?[]const u8 = null,
     forked_from: ?schema.ForkOrigin = null,
+    /// A child's tree root and depth (D91), written on its line 1.
+    root: ?[]const u8 = null,
+    depth: ?u64 = null,
     /// Import (D8) keeps a v1 id; otherwise a fresh id is drawn.
     id: ?[]const u8 = null,
     /// Import only: the original creation time, stamped on line 1.
@@ -1143,6 +1165,8 @@ pub fn openNew(env: *const Env, options: NewOptions) error{OutOfMemory}!*Session
         .host = options.host,
         .parent = options.parent,
         .forked_from = options.forked_from,
+        .root = options.root,
+        .depth = options.depth,
     });
     errdefer identity.deinit(gpa);
     const session = try gpa.create(Session);

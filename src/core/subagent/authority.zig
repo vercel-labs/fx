@@ -5,6 +5,7 @@ const mcp_access = @import("../mcp/access_policy.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const session_store = @import("../session/session_store.zig");
+const tree = @import("tree.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -189,9 +190,16 @@ pub const Snapshot = struct {
     }
 };
 
+/// Resolves the authority of one node's children: the root host's live
+/// authority, narrowed to what the children's abilities allow (D91).
 pub const Resolver = struct {
     children: *child_state.V2Children,
+    /// The node whose children this resolves.
+    node_id: []const u8 = "",
+    /// The tree's root, whose host answers for every depth.
     root_id: []const u8 = "",
+    /// What every child of this node may do, fixed when its host started.
+    child_abilities: tree.Abilities,
     host: HostResolver,
 
     pub fn resolve(
@@ -200,8 +208,9 @@ pub const Resolver = struct {
         child_id: []const u8,
     ) Error!Snapshot {
         domain.validateId(child_id) catch return error.ChildNotAttached;
+        domain.validateId(self.node_id) catch return error.ChildNotAttached;
         domain.validateId(self.root_id) catch return error.ChildNotAttached;
-        const store = child_state.Store{ .children = self.children, .parent_id = self.root_id };
+        const store = child_state.Store{ .children = self.children, .parent_id = self.node_id };
         const work_generation = blk: {
             var lock = store.acquireLock();
             defer lock.release();
@@ -240,7 +249,7 @@ pub const Resolver = struct {
         errdefer alloc.free(owned_child_id);
         const owned_root_id = try alloc.dupe(u8, self.root_id);
         errdefer alloc.free(owned_root_id);
-        const tools = try cloneToolsWithoutSubagent(alloc, host.tools);
+        const tools = try cloneToolsFor(alloc, host.tools, self.child_abilities);
         errdefer freeStrings(alloc, tools);
         const integrations = try cloneStrings(alloc, host.integrations);
         errdefer freeStrings(alloc, integrations);
@@ -260,14 +269,14 @@ pub const Resolver = struct {
         var mcp_view = if (host.mcp_view) |view| try view.clone(alloc) else null;
         errdefer if (mcp_view) |*view| view.deinit(alloc);
         if (mcp_view) |*view| {
-            try rebindMcpViewOwnership(alloc, view, child_id, self.root_id);
+            try rebindMcpViewOwnership(alloc, view, child_id, self.node_id);
         }
         return .{
             .child_id = owned_child_id,
             .root_id = owned_root_id,
             .generation = authorityGeneration(
                 child_id,
-                self.root_id,
+                self.node_id,
                 current.generation,
                 host.generation,
             ),
@@ -408,13 +417,15 @@ fn cloneStrings(alloc: Allocator, values: []const []const u8) ![][]u8 {
     return out;
 }
 
-fn cloneToolsWithoutSubagent(
+/// The parent's tools a child with `abilities` keeps: always a subset.
+fn cloneToolsFor(
     alloc: Allocator,
     values: []const []const u8,
+    abilities: tree.Abilities,
 ) ![][]u8 {
     var count: usize = 0;
     for (values) |value| {
-        if (!std.mem.eql(u8, value, "subagent")) count += 1;
+        if (abilities.keepsTool(value)) count += 1;
     }
     const out = try alloc.alloc([]u8, count);
     var copied: usize = 0;
@@ -423,7 +434,7 @@ fn cloneToolsWithoutSubagent(
         alloc.free(out);
     }
     for (values) |value| {
-        if (std.mem.eql(u8, value, "subagent")) continue;
+        if (!abilities.keepsTool(value)) continue;
         out[copied] = try alloc.dupe(u8, value);
         copied += 1;
     }
@@ -457,7 +468,7 @@ test "child permission admission inherits without elevation" {
     );
 }
 
-test "tool authority excludes nested subagents and preserves rules" {
+test "tool authority refuses a tool the node's set lacks and preserves rules" {
     const alloc = std.testing.allocator;
     const decision = try decideToolAuthority(alloc, .{
         .generation = 1,
@@ -469,6 +480,21 @@ test "tool authority excludes nested subagents and preserves rules" {
         .permission_mode = .yolo,
     }, "/tmp", "subagent", "subagent", .none);
     try std.testing.expectEqual(ToolAuthorityDecision.unavailable, decision);
+}
+
+test "a child keeps its parent's tools and the spawn tool only while it may spawn" {
+    const alloc = std.testing.allocator;
+    const policy = tree.SpawnPolicy{};
+    const parent_tools = [_][]const u8{ "read_file", tree.spawn_tool_name, "shell" };
+    for ([_]u8{ 1, 2, 3 }) |depth| {
+        const tools = try cloneToolsFor(alloc, &parent_tools, tree.Abilities.at(policy, depth));
+        defer freeStrings(alloc, tools);
+        const spawns = for (tools) |tool| {
+            if (std.mem.eql(u8, tool, tree.spawn_tool_name)) break true;
+        } else false;
+        try std.testing.expectEqual(depth < 3, spawns);
+        try std.testing.expectEqual(@as(usize, if (depth < 3) 3 else 2), tools.len);
+    }
 }
 
 test "authority capture permits registry access and rejects changed work" {
@@ -544,7 +570,9 @@ test "authority capture permits registry access and rejects changed work" {
         var fixture = Fixture{ .store = store, .change = change };
         var resolver = Resolver{
             .children = &parent.children,
+            .node_id = parent.parent.id(),
             .root_id = parent.parent.id(),
+            .child_abilities = tree.Abilities.at(.{ .max_depth = 1 }, 1),
             .host = .{ .context = &fixture, .resolve_fn = Fixture.resolve },
         };
         try std.testing.expectError(error.ChildNotAttached, resolver.resolve(alloc, "missing-child"));

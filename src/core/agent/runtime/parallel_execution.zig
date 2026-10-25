@@ -43,9 +43,15 @@ fn isSubagentCall(registry: tool_dispatch.Registry, call: ToolCall) bool {
     return tool.executor_kind == .subagent and tool.activity_kind == .subagent;
 }
 
+/// Each subagent call waits on its own thread, and its child runs only
+/// with one of the tree's run slots, so a group asks for no more children
+/// at once than a tree runs by default (D92). Later calls form the next
+/// group.
+const max_parallel_subagent_calls = @import("../../subagent/slot_pool.zig").default_tree_slots;
+
 fn parallelSubagentPrefixLen(registry: tool_dispatch.Registry, calls: []const ToolCall) usize {
     var len: usize = 0;
-    while (len < calls.len and isSubagentCall(registry, calls[len])) : (len += 1) {}
+    while (len < calls.len and len < max_parallel_subagent_calls and isSubagentCall(registry, calls[len])) : (len += 1) {}
     return len;
 }
 
@@ -681,6 +687,15 @@ test "host calls run together until a writer, which runs alone" {
     try std.testing.expectEqual(LeadingGroup{}, leadingParallelGroup(registry, calls[2..]));
     const expected_last: LeadingGroup = if (builtin.single_threaded) .{} else .{ .kind = .host, .len = 1 };
     try std.testing.expectEqual(expected_last, leadingParallelGroup(registry, calls[3..]));
+}
+
+test "a subagent group holds at most max_parallel_subagent_calls calls" {
+    const builtin_tools = @import("../../../builtins/tools.zig");
+    const registry = tool_dispatch.Registry{ .tools = &.{builtin_tools.subagent} };
+    var calls: [max_parallel_subagent_calls + 3]ToolCall = undefined;
+    for (&calls) |*call| call.* = toolCall("child", "subagent", "{\"action\":\"run\",\"task\":\"t\"}");
+    try std.testing.expectEqual(LeadingGroup{ .kind = .subagent, .len = max_parallel_subagent_calls }, leadingParallelGroup(registry, &calls));
+    try std.testing.expectEqual(LeadingGroup{ .kind = .subagent, .len = 3 }, leadingParallelGroup(registry, calls[max_parallel_subagent_calls..]));
 }
 
 test "a host group holds at most max_parallel_host_calls calls" {

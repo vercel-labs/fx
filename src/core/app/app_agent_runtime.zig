@@ -261,10 +261,6 @@ pub fn Runtime(comptime App: type) type {
                     app_session_runtime.Runtime(App).subagentHost(app)
                 else
                     null,
-                .subagent_caller_id = if (comptime @hasField(App, "session_persistence"))
-                    app_session_runtime.Runtime(App).activeSessionId(app)
-                else
-                    null,
                 .permission_mode = permission_snapshot.mode,
                 .permission_grants = permission_grants,
                 .permission_rules = permission_rules,
@@ -1135,8 +1131,6 @@ pub fn Runtime(comptime App: type) type {
                     },
                 };
             return subagent_agent_adapter.run(.{
-                .host = app_session_runtime.Runtime(App).subagentHost(app) orelse
-                    return error.ProviderFailed,
                 .tool_context = tool_context,
                 .provider_set = providers,
                 .system_prompt = prompt_policy.system_prompt,
@@ -1894,7 +1888,6 @@ test "app agent runtime builds tool context from app state and MCP callbacks" {
     try std.testing.expectEqual(&app.worker, ctx.worker);
     try std.testing.expect(!@hasField(tool_runtime.Context, "background"));
     try std.testing.expect(ctx.subagent_host == null);
-    try std.testing.expect(ctx.subagent_caller_id == null);
     try std.testing.expectEqual(&app.session, ctx.session);
     try std.testing.expectEqual(&app.change_tracker, ctx.tracker.?);
     const child_ctx = Runtime(FakeApp).childToolContext(ctx);

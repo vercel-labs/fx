@@ -64,17 +64,21 @@ pub const WorkerRoute = struct {
 
 const Binding = struct {
     request_id: []u8,
-    child_id: []u8,
-    root_id: []u8,
+    /// The asking node's ids from the root down to it; the last one is the
+    /// node (D93).
+    path: [][]u8,
     work_id: []u8,
     request: permission_request.OwnedPermissionRequest,
     worker: WorkerRoute,
     worker_request_id: u64,
 
+    fn childId(self: Binding) []const u8 {
+        return self.path[self.path.len - 1];
+    }
+
     fn deinit(self: *Binding, alloc: Allocator) void {
         alloc.free(self.request_id);
-        alloc.free(self.child_id);
-        alloc.free(self.root_id);
+        freePath(alloc, self.path);
         alloc.free(self.work_id);
         self.request.deinit(alloc);
         self.* = undefined;
@@ -83,17 +87,40 @@ const Binding = struct {
 
 pub const PendingRequest = struct {
     request_id: []u8,
+    /// The asking node: the last id of `path`.
     child_id: []u8,
+    /// Ids from the tree's root down to the asking node (D93).
+    path: [][]u8,
     request: permission_request.OwnedPermissionRequest,
 
     pub fn deinit(self: *PendingRequest, alloc: Allocator) void {
         alloc.free(self.request_id);
         alloc.free(self.child_id);
+        freePath(alloc, self.path);
         self.request.deinit(alloc);
         self.* = undefined;
     }
+
+    fn of(alloc: Allocator, binding: *const Binding) Error!PendingRequest {
+        const request_id = try alloc.dupe(u8, binding.request_id);
+        errdefer alloc.free(request_id);
+        const child_id = try alloc.dupe(u8, binding.childId());
+        errdefer alloc.free(child_id);
+        const path = try clonePath(alloc, binding.path);
+        errdefer freePath(alloc, path);
+        const request = permission_request.OwnedPermissionRequest.dupe(
+            alloc,
+            binding.request.view(),
+        ) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.CommitFailed,
+        };
+        return .{ .request_id = request_id, .child_id = child_id, .path = path, .request = request };
+    }
 };
 
+/// One registry per tree (D93): approvals from every depth wait here, in
+/// the order they were asked.
 pub const Registry = struct {
     alloc: Allocator,
     mutex: std.Io.Mutex = .init,
@@ -107,53 +134,51 @@ pub const Registry = struct {
         return self.pending_revision;
     }
 
-    pub fn firstPendingRequest(
-        self: *Registry,
-        alloc: Allocator,
-        root_id: []const u8,
-    ) Error!?PendingRequest {
+    pub fn firstPendingRequest(self: *Registry, alloc: Allocator) Error!?PendingRequest {
+        const pending = try self.pendingRequests(alloc, 1);
+        defer alloc.free(pending);
+        return if (pending.len == 0) null else pending[0];
+    }
+
+    /// Up to `limit` waiting approvals, oldest first. Caller owns each and
+    /// the slice.
+    pub fn pendingRequests(self: *Registry, alloc: Allocator, limit: usize) Error![]PendingRequest {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         if (self.closed) return error.RegistryClosed;
-        for (self.bindings.items) |*binding| {
-            if (!std.mem.eql(u8, binding.root_id, root_id)) continue;
-            const request_id = try alloc.dupe(u8, binding.request_id);
-            errdefer alloc.free(request_id);
-            const child_id = try alloc.dupe(u8, binding.child_id);
-            errdefer alloc.free(child_id);
-            const request = permission_request.OwnedPermissionRequest.dupe(
-                alloc,
-                binding.request.view(),
-            ) catch |err| return switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                else => error.CommitFailed,
-            };
-            return .{
-                .request_id = request_id,
-                .child_id = child_id,
-                .request = request,
-            };
+        const count = @min(limit, self.bindings.items.len);
+        const out = try alloc.alloc(PendingRequest, count);
+        var built: usize = 0;
+        errdefer {
+            for (out[0..built]) |*value| value.deinit(alloc);
+            alloc.free(out);
         }
-        return null;
+        for (self.bindings.items[0..count]) |*binding| {
+            out[built] = try PendingRequest.of(alloc, binding);
+            built += 1;
+        }
+        return out;
     }
 
+    /// `path` runs from the tree's root to the asking node.
     pub fn registerTool(
         self: *Registry,
         stable_request_id: []const u8,
-        child_id: []const u8,
-        root_id: []const u8,
+        path: []const []const u8,
         work_id: []const u8,
         request: permission_request.PermissionRequest,
         _: []const types.PermissionGrant,
         worker: WorkerRoute,
         _: i64,
     ) Error!void {
+        if (path.len == 0) return error.WrongChild;
+        const child_id = path[path.len - 1];
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         if (self.closed) return error.RegistryClosed;
         if (self.find(stable_request_id)) |index| {
             const existing = self.bindings.items[index];
-            if (!std.mem.eql(u8, existing.child_id, child_id) or
+            if (!std.mem.eql(u8, existing.childId(), child_id) or
                 !std.mem.eql(u8, existing.work_id, work_id) or
                 !existing.worker.eql(worker) or
                 existing.worker_request_id != request.id)
@@ -178,16 +203,13 @@ pub const Registry = struct {
         }
         const owned_request_id = try self.alloc.dupe(u8, stable_request_id);
         errdefer self.alloc.free(owned_request_id);
-        const owned_child_id = try self.alloc.dupe(u8, child_id);
-        errdefer self.alloc.free(owned_child_id);
-        const owned_root_id = try self.alloc.dupe(u8, root_id);
-        errdefer self.alloc.free(owned_root_id);
+        const owned_path = try clonePath(self.alloc, path);
+        errdefer freePath(self.alloc, owned_path);
         const owned_work_id = try self.alloc.dupe(u8, work_id);
         errdefer self.alloc.free(owned_work_id);
         try self.bindings.append(self.alloc, .{
             .request_id = owned_request_id,
-            .child_id = owned_child_id,
-            .root_id = owned_root_id,
+            .path = owned_path,
             .work_id = owned_work_id,
             .request = owned_request,
             .worker = worker,
@@ -221,7 +243,7 @@ pub const Registry = struct {
             return error.RequestNotFound;
         };
         const binding = &self.bindings.items[index];
-        if (!std.mem.eql(u8, binding.child_id, child_id)) {
+        if (!std.mem.eql(u8, binding.childId(), child_id)) {
             self.mutex.unlock(io_mod.getIo());
             return error.WrongChild;
         }
@@ -274,7 +296,7 @@ pub const Registry = struct {
         var index = self.bindings.items.len;
         while (index > 0) {
             index -= 1;
-            if (!std.mem.eql(u8, self.bindings.items[index].child_id, child_id)) continue;
+            if (!std.mem.eql(u8, self.bindings.items[index].childId(), child_id)) continue;
             var removed = self.bindings.orderedRemove(index);
             removed.worker.cancel();
             removed.deinit(self.alloc);
@@ -309,6 +331,25 @@ pub const Registry = struct {
         PermissionCommitFailed,
     }!void {}
 };
+
+fn clonePath(alloc: Allocator, path: []const []const u8) Allocator.Error![][]u8 {
+    const out = try alloc.alloc([]u8, path.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |id| alloc.free(id);
+        alloc.free(out);
+    }
+    for (path) |id| {
+        out[built] = try alloc.dupe(u8, id);
+        built += 1;
+    }
+    return out;
+}
+
+fn freePath(alloc: Allocator, path: [][]u8) void {
+    for (path) |id| alloc.free(id);
+    alloc.free(path);
+}
 
 pub fn preparedRequestFingerprint(
     request: permission_request.PermissionRequest,
@@ -355,4 +396,56 @@ test "approval identity is deterministic" {
         stableApprovalId("child", "work", prepared),
         stableApprovalId("child", "work", prepared),
     );
+}
+
+test "one tree registry forwards every pending approval with the path to the node that asked" {
+    const Route = struct {
+        cancels: usize = 0,
+        fn submit(_: *anyopaque, _: u64, response: permission_request.OwnedPermissionResponse, _: ?worker_runtime.WorkerRuntime.PermissionCommit) worker_runtime.WorkerRuntime.PermissionCommitError!worker_runtime.PermissionSubmissionResult {
+            var owned = response;
+            owned.deinit();
+            return .accepted;
+        }
+        fn cancel(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.cancels += 1;
+        }
+        fn pin(_: *anyopaque) bool {
+            return true;
+        }
+        fn release(_: *anyopaque) void {}
+    };
+    const alloc = std.testing.allocator;
+    var route_state = Route{};
+    const route = WorkerRoute{ .context = &route_state, .submit_fn = Route.submit, .cancel_fn = Route.cancel, .pin_fn = Route.pin, .release_fn = Route.release };
+    var registry = Registry{ .alloc = alloc };
+    defer registry.deinit();
+    try registry.registerTool("near", &.{ "root", "child" }, "w1", .{ .id = 1, .label = "shell.run" }, &.{}, route, 1);
+    try registry.registerTool("deep", &.{ "root", "child", "grandchild", "leaf" }, "w2", .{ .id = 2, .label = "edit" }, &.{}, route, 2);
+    try std.testing.expectError(error.WrongChild, registry.registerTool("none", &.{}, "w3", .{ .id = 3, .label = "x" }, &.{}, route, 3));
+
+    const pending = try registry.pendingRequests(alloc, 8);
+    defer {
+        for (pending) |*value| value.deinit(alloc);
+        alloc.free(pending);
+    }
+    try std.testing.expectEqual(@as(usize, 2), pending.len);
+    try std.testing.expectEqualStrings("child", pending[0].child_id);
+    try std.testing.expectEqualStrings("leaf", pending[1].child_id);
+    try std.testing.expectEqual(@as(usize, 4), pending[1].path.len);
+    try std.testing.expectEqualStrings("root", pending[1].path[0]);
+    try std.testing.expectEqualStrings("grandchild", pending[1].path[2]);
+    // The bound holds, and the oldest comes first.
+    const first = try registry.pendingRequests(alloc, 1);
+    defer {
+        for (first) |*value| value.deinit(alloc);
+        alloc.free(first);
+    }
+    try std.testing.expectEqualStrings("near", first[0].request_id);
+    // The deep node's own id resolves its request.
+    try std.testing.expectError(error.WrongChild, registry.resolve("deep", "child", .once, null, 0));
+    try std.testing.expectEqual(ResolveResult.accepted, try registry.resolve("deep", "leaf", .once, null, 0));
+    var remaining = (try registry.firstPendingRequest(alloc)).?;
+    defer remaining.deinit(alloc);
+    try std.testing.expectEqualStrings("near", remaining.request_id);
 }

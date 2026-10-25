@@ -134,6 +134,12 @@ pub const Body = union(Kind) {
         host: Host,
         parent: ?[]const u8 = null,
         forked_from: ?ForkOrigin = null,
+        /// A child's place in its tree (D91): the tree's root session and
+        /// the child's depth below it. Only children write them; a line 1
+        /// without them is a root at depth 0, or a child from before D91 at
+        /// depth 1 under its parent.
+        root: ?[]const u8 = null,
+        depth: ?u64 = null,
     };
     pub const Turn = struct { turn: u64 };
     pub const Piece = struct {
@@ -180,6 +186,8 @@ pub fn appendBody(gpa: std.mem.Allocator, out: *std.ArrayList(u8), body: Body) e
             try w.string("role", @tagName(c.role));
             try w.string("host", @tagName(c.host));
             if (c.parent) |parent| try w.string("parent", parent);
+            if (c.root) |root| try w.string("root", root);
+            if (c.depth) |depth| try w.number("depth", depth);
             if (c.forked_from) |origin| {
                 try w.key("forked_from");
                 try out.appendSlice(gpa, "{\"id\":");
@@ -252,6 +260,8 @@ fn bodyOf(kind: Kind, f: Fields) BodyError!Body {
             .host = try f.req(Host, "host"),
             .parent = try f.opt([]const u8, "parent"),
             .forked_from = try f.opt(ForkOrigin, "forked_from"),
+            .root = try f.opt([]const u8, "root"),
+            .depth = try f.opt(u64, "depth"),
         } },
         .turn_started => .{ .turn_started = .{ .turn = try f.req(u64, "turn") } },
         .turn_committed => .{ .turn_committed = .{ .turn = try f.req(u64, "turn") } },
@@ -708,11 +718,15 @@ test "every kind's fields round trip, raw values byte for byte" {
         .host = .acp,
         .parent = "p1",
         .forked_from = .{ .id = "src", .seq = 9 },
+        .root = "r0",
+        .depth = 2,
     } })).session_created;
     try testing.expectEqualStrings("/Users/me/my \"project\"\n", created.workspace);
     try testing.expectEqual(Role.child, created.role);
     try testing.expectEqualStrings("p1", created.parent.?);
     try testing.expectEqual(@as(u64, 9), created.forked_from.?.seq);
+    try testing.expectEqualStrings("r0", created.root.?);
+    try testing.expectEqual(@as(?u64, 2), created.depth);
 
     // Whitespace, key order and number spelling inside opaque JSON survive.
     const data = "{ \"b\": 1.50, \"a\": [1e3, \"\\u00e9\"] }";

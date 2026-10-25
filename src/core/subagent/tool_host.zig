@@ -21,6 +21,10 @@ const session = @import("../session/session.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const session_store = @import("../session/session_store.zig");
+const result_store = @import("../session/result_store.zig");
+const slot_pool = @import("slot_pool.zig");
+const text_utils = @import("../shared/text_utils.zig");
+const tree_mod = @import("tree.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
@@ -60,6 +64,12 @@ fn unavailableChildRun(
     _: *std.atomic.Value(bool),
 ) execution.ServiceError!execution.RunOutcome {
     return error.ProviderFailed;
+}
+
+test {
+    _ = @import("nested_tests.zig");
+    _ = @import("slot_pool.zig");
+    _ = @import("tree.zig");
 }
 
 test "managed execution receipts retain the pending contract" {
@@ -102,7 +112,6 @@ pub const ModelOverrideResolver = struct {
 
 pub const ExecuteOptions = struct {
     observer: ?*execution_observation.Observer = null,
-    caller_id: []const u8,
     invocation_id: []const u8,
     parent_permission_mode: types.PermissionMode = .yolo,
     root_user_intent_context: []const u8 = "",
@@ -135,14 +144,35 @@ pub const ApprovalResolveOptions = struct {
     timestamp_ms: i64,
 };
 
+/// A result longer than this reaches the parent as its start and a handle
+/// to the whole text, which `read_tool_result` reads (D94).
+pub const max_inline_result_bytes: usize = 6000;
+
+/// One node's host for its children (D91). The root's host is created by
+/// the frontend and owns the tree; each child gets its own host while its
+/// turn runs and it may spawn, borrowing the tree.
 pub const Runtime = struct {
     alloc: Allocator,
-    /// The parent's children, borrowed until deinit (D22).
+    /// This node's children, borrowed until deinit (D22); a node host
+    /// below the root owns them.
     children: *child_state.V2Children,
-    root_id: []u8,
+    /// The node this host serves.
+    node_id: []u8,
+    /// Ids from the tree's root down to this node.
+    node_path: []const []const u8 = &.{},
+    depth: u8 = 0,
+    tree: *tree_mod.Tree,
+    owns_tree: bool = false,
+    owns_children: bool = false,
+    /// The widest permission mode this node's children may get: its own.
+    permission_ceiling: types.PermissionMode = .yolo,
+    /// The run slots of this node's own turn, lent back while it waits on
+    /// a child (D92); null for the root, whose turn holds none.
+    caller_permit: ?*slot_pool.Permit = null,
     host_authority: authority.HostResolver,
     child_runner: ChildRunner,
-    approvals: approval_registry.Registry,
+    /// The tree's registry (D93).
+    approvals: *approval_registry.Registry,
     authority_resolver: authority.Resolver,
     managed: managed_owner.Owner,
     admission_mutex: std.Io.Mutex = .init,
@@ -152,57 +182,132 @@ pub const Runtime = struct {
     const YieldedWork = struct { child_id: []u8, work_id: []u8, max_result_bytes: usize, result: ?ManagedExecutionResult = null, delivered: bool = false };
     pub const YieldedResult = struct { child_id: []const u8, work_id: []const u8, body: []const u8, max_result_bytes: usize, delivered: bool, receipt_sequence: u64 = 0 };
 
-    /// A host over a parent whose children live in its log (D22), returned
-    /// only after abandoned child work has been recovered. Borrows
-    /// `children` and the callback contexts until deinit; the parent stays
-    /// open until then (`tests/tla/session_manager/Wiring.tla`
-    /// ParentOutlivesChildren).
+    /// The root's host over a session whose children live in its log
+    /// (D22), returned only after abandoned child work has been recovered.
+    /// It owns the tree. Borrows `children` and the callback contexts until
+    /// deinit; the root stays open until then
+    /// (`tests/tla/session_manager/Wiring.tla` ParentOutlivesChildren).
     pub fn create(
         alloc: Allocator,
         children: *child_state.V2Children,
         host_authority: authority.HostResolver,
         child_runner: ChildRunner,
     ) !*Runtime {
+        return createWithPolicy(alloc, children, host_authority, child_runner, .{});
+    }
+
+    pub fn createWithPolicy(
+        alloc: Allocator,
+        children: *child_state.V2Children,
+        host_authority: authority.HostResolver,
+        child_runner: ChildRunner,
+        policy: tree_mod.SpawnPolicy,
+    ) !*Runtime {
         const root_id = children.parent.id();
         try domain.validateId(root_id);
-        const runtime = try alloc.create(Runtime);
-        errdefer alloc.destroy(runtime);
-        const owned_root = try alloc.dupe(u8, root_id);
-        errdefer alloc.free(owned_root);
-        runtime.* = .{
-            .alloc = alloc,
+        const tree = try tree_mod.Tree.create(alloc, root_id, children.parent.store, policy);
+        errdefer tree.destroy();
+        const runtime = try open(alloc, .{
             .children = children,
-            .root_id = owned_root,
+            .tree = tree,
+            .depth = 0,
             .host_authority = host_authority,
             .child_runner = child_runner,
-            .approvals = undefined,
+        });
+        runtime.owns_tree = true;
+        return runtime;
+    }
+
+    const OpenOptions = struct {
+        children: *child_state.V2Children,
+        tree: *tree_mod.Tree,
+        depth: u8,
+        node_path: ?[]const []const u8 = null,
+        permission_ceiling: types.PermissionMode = .yolo,
+        caller_permit: ?*slot_pool.Permit = null,
+        host_authority: authority.HostResolver,
+        child_runner: ChildRunner,
+    };
+
+    fn open(alloc: Allocator, options: OpenOptions) !*Runtime {
+        const node_id = options.children.parent.id();
+        const runtime = try alloc.create(Runtime);
+        errdefer alloc.destroy(runtime);
+        const owned_node = try alloc.dupe(u8, node_id);
+        errdefer alloc.free(owned_node);
+        runtime.* = .{
+            .alloc = alloc,
+            .children = options.children,
+            .node_id = owned_node,
+            .depth = options.depth,
+            .tree = options.tree,
+            .permission_ceiling = options.permission_ceiling,
+            .caller_permit = options.caller_permit,
+            .host_authority = options.host_authority,
+            .child_runner = options.child_runner,
+            .approvals = &options.tree.approvals,
             .authority_resolver = undefined,
             .managed = undefined,
         };
-        runtime.approvals = .{
-            .alloc = alloc,
-        };
+        runtime.node_path = options.node_path orelse (&runtime.tree.root_id)[0..1];
         runtime.authority_resolver = .{
-            .children = children,
-            .root_id = runtime.root_id,
-            .host = host_authority,
+            .children = options.children,
+            .node_id = runtime.node_id,
+            .root_id = options.tree.root_id,
+            .child_abilities = tree_mod.Abilities.at(options.tree.policy, options.depth + 1),
+            .host = options.host_authority,
         };
         runtime.managed = runtime.managedOwnerValue();
-        errdefer runtime.approvals.deinit();
         errdefer runtime.managed.deinit();
         try runtime.managed.recoverInterrupted();
         return runtime;
     }
 
+    /// A host for `turn`'s child, which runs under this node, while that
+    /// turn runs: its children live in the child's own log (D22, D91).
+    /// Returns null when the child may not spawn.
+    fn openNode(self: *Runtime, turn: *execution.TurnContext, permission_mode: types.PermissionMode) !?*Runtime {
+        const depth = self.depth + 1;
+        if (!self.tree.policy.canSpawn(depth)) return null;
+        const children = try self.alloc.create(child_state.V2Children);
+        errdefer self.alloc.destroy(children);
+        children.* = child_state.V2Children.init(self.alloc, turn.child, self.children.workspace);
+        errdefer children.deinit();
+        const node = try open(self.alloc, .{
+            .children = children,
+            .tree = self.tree,
+            .depth = depth,
+            .node_path = turn.node_path,
+            .permission_ceiling = permission_mode,
+            .caller_permit = turn.permit,
+            .host_authority = self.host_authority,
+            .child_runner = self.child_runner,
+        });
+        node.owns_children = true;
+        return node;
+    }
+
+    /// Joins every child first, so no node closes while a descendant runs
+    /// (`tests/tla/session_manager/Tree.tla` AncestorsOutliveDescendants).
     pub fn deinit(self: *Runtime) void {
         self.cancelYielded();
         self.yielded.deinit(self.alloc);
         self.managed.deinit();
-        self.approvals.deinit();
-        self.alloc.free(self.root_id);
+        if (self.owns_children) {
+            self.children.deinit();
+            self.alloc.destroy(self.children);
+        }
+        if (self.owns_tree) self.tree.destroy();
+        self.alloc.free(self.node_id);
         const alloc = self.alloc;
         self.* = undefined;
         alloc.destroy(self);
+    }
+
+    /// Whether this node's children or any of their descendants are running,
+    /// the check a rewind of this node must pass (D91).
+    pub fn subtreeBusy(self: *Runtime) bool {
+        return self.managed.anyRunning();
     }
 
     /// Points the host's callbacks at a host context that moved; the
@@ -215,20 +320,31 @@ pub const Runtime = struct {
         self.host_authority = host_authority;
         self.child_runner.context = child_runner_context;
         self.authority_resolver.children = self.children;
-        self.authority_resolver.root_id = self.root_id;
+        self.authority_resolver.node_id = self.node_id;
         self.authority_resolver.host = host_authority;
         self.managed.children = self.children;
         self.managed.state_store.children = self.children;
         self.managed.services.context = self;
         self.managed.authority_resolver = &self.authority_resolver;
-        self.managed.approvals = &self.approvals;
+        self.managed.approvals = self.approvals;
     }
 
+    /// The oldest approval waiting anywhere in the tree.
     pub fn pendingApprovalRequest(
         self: *Runtime,
         alloc: Allocator,
     ) !?approval_registry.PendingRequest {
-        return self.approvals.firstPendingRequest(alloc, self.root_id);
+        return self.approvals.firstPendingRequest(alloc);
+    }
+
+    /// Up to `limit` approvals waiting anywhere in the tree, oldest first,
+    /// each naming the path to the node that asked (D93).
+    pub fn pendingApprovalRequests(
+        self: *Runtime,
+        alloc: Allocator,
+        limit: usize,
+    ) ![]approval_registry.PendingRequest {
+        return self.approvals.pendingRequests(alloc, limit);
     }
 
     pub fn resolveApproval(
@@ -280,12 +396,9 @@ pub const Runtime = struct {
 
         return switch (request.*) {
             .run, .message => blk: {
-                if (!std.mem.eql(u8, options.caller_id, self.root_id)) {
-                    break :blk self.encodeManaged(alloc, .{
-                        .ok = false,
-                        .error_code = "caller_unavailable",
-                    });
-                }
+                // A child is never wider than the node that asks for it.
+                const child_mode = authority.admitChildPermission(self.permission_ceiling, options.parent_permission_mode) catch
+                    break :blk self.encodeManaged(alloc, .{ .ok = false, .error_code = @tagName(tree_mod.SpawnRefusal.permission_escalation) });
                 const resolved_model: ?[]const u8 = switch (try resolveOverrideModel(alloc, request.override(), options)) {
                     .rejected => |failure| break :blk try self.encodeManaged(alloc, failure),
                     .accepted => |model| model,
@@ -309,6 +422,7 @@ pub const Runtime = struct {
                         request.*,
                         operation_id,
                         options,
+                        child_mode,
                         resolved_model,
                     );
                     defer admitted.deinit(admission_alloc);
@@ -366,15 +480,12 @@ pub const Runtime = struct {
                         },
                         .ready => |ready| {
                             if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = ready.child_id, .work_id = operation_id, .phase = .dispatched } });
-                            const result = self.observeManagedState(
+                            const result = self.observeLendingSlot(
                                 alloc,
                                 ready.child_id,
                                 operation_id,
                                 effectiveDefaults(options.defaults, request.override(), resolved_model),
-                                options.progress,
-                                options.cancel_flag,
-                                options.steering_worker,
-                                options.model_capability_resolver,
+                                options,
                             ) catch |err| {
                                 if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = ready.child_id, .work_id = operation_id, .phase = if (err == error.Cancelled) .cancelled else .failed } });
                                 return err;
@@ -478,12 +589,49 @@ pub const Runtime = struct {
                 .run_fn = runChild,
             },
             .authority_resolver = &self.authority_resolver,
-            .approvals = &self.approvals,
+            .approvals = self.approvals,
+            .tree = self.tree,
+            .node_path = self.node_path,
         };
     }
 
     fn childStateStore(self: *Runtime) child_state.Store {
-        return .{ .children = self.children, .parent_id = self.root_id };
+        return .{ .children = self.children, .parent_id = self.node_id };
+    }
+
+    /// Waits on a child with this node's own run slots lent back, so the
+    /// child can run however full the pool is (D92). The slots come back
+    /// before this node's turn goes on.
+    fn observeLendingSlot(
+        self: *Runtime,
+        alloc: Allocator,
+        child_id: []const u8,
+        work_id: []const u8,
+        fallback_defaults: Defaults,
+        options: ExecuteOptions,
+    ) !ManagedExecutionResult {
+        const permit = self.caller_permit;
+        if (permit) |held| held.lend();
+        var result = self.observeManagedState(
+            alloc,
+            child_id,
+            work_id,
+            fallback_defaults,
+            options.progress,
+            options.cancel_flag,
+            options.steering_worker,
+            options.model_capability_resolver,
+        ) catch |err| {
+            if (permit) |held| held.reclaim(.{}) catch {};
+            return err;
+        };
+        if (permit) |held| held.reclaim(.{ .first = options.cancel_flag }) catch {
+            alloc.free(result.body);
+            if (result.final_status) |status| alloc.free(status.model);
+            result = undefined;
+            return error.Cancelled;
+        };
+        return result;
     }
 
     const ManagedAdmission = union(enum) {
@@ -520,6 +668,7 @@ pub const Runtime = struct {
         request: model_contract.Request,
         operation_id: []const u8,
         options: ExecuteOptions,
+        child_mode: types.PermissionMode,
         resolved_model: ?[]const u8,
     ) !ManagedAdmission {
         // A running registry entry must not be exposed before its Slot exists.
@@ -527,7 +676,7 @@ pub const Runtime = struct {
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
         if (options.cancel_flag) |cancel| if (cancel.load(.seq_cst)) return error.Cancelled;
-        var admitted = try self.admitManagedWork(alloc, request, operation_id, options, resolved_model);
+        var admitted = try self.admitManagedWork(alloc, request, operation_id, options, child_mode, resolved_model);
         errdefer admitted.deinit(alloc);
         if (admitted == .ready) {
             const child_id = admitted.ready.child_id;
@@ -547,6 +696,7 @@ pub const Runtime = struct {
         request: model_contract.Request,
         operation_id: []const u8,
         options: ExecuteOptions,
+        child_mode: types.PermissionMode,
         resolved_model: ?[]const u8,
     ) !ManagedAdmission {
         const fingerprint = model_contract.requestFingerprint(request);
@@ -610,10 +760,12 @@ pub const Runtime = struct {
             fingerprint,
             request,
             options,
+            child_mode,
         );
         defer active.deinit(alloc);
         switch (request) {
             .run => {
+                if (try self.refuseNewChild(alloc, registry)) |refused| return refused;
                 const child_id = try session_store.generateSessionId(alloc);
                 defer alloc.free(child_id);
                 try registry.appendOneOff(alloc, child_id, active);
@@ -662,6 +814,7 @@ pub const Runtime = struct {
                     try self.ensureManagedChildSession(started.id, active.id, defaults);
                     return managedAdmissionReady(alloc, started.id);
                 }
+                if (try self.refuseNewChild(alloc, registry)) |refused| return refused;
                 const child_id = try session_store.generateSessionId(alloc);
                 defer alloc.free(child_id);
                 try registry.appendPersistent(
@@ -679,6 +832,13 @@ pub const Runtime = struct {
                 );
             },
         }
+    }
+
+    /// The spawn policy's one check for a new child (D91).
+    fn refuseNewChild(self: *Runtime, alloc: Allocator, registry: child_state.Registry) !?ManagedAdmission {
+        const refusal = (try self.tree.admitNode(self.depth, registry.children.len)) orelse return null;
+        debug_trace.logf("subagent", "admission rejected node_id={s} depth={d} code={s}", .{ self.node_id, self.depth, @tagName(refusal) });
+        return try managedAdmissionRejected(alloc, null, @tagName(refusal));
     }
 
     fn ensureManagedChildSession(
@@ -727,9 +887,9 @@ pub const Runtime = struct {
             if (cancel_flag) |flag| {
                 if (flag.load(.seq_cst)) {
                     debug_trace.eventf("subagent", "parent_cancel_propagated", .{}, "child_id={s} work_id={s}", .{ child_id, work_id });
-                    self.managed.cancel(child_id) catch |err| switch (err) {
-                        error.ChildUnavailable => {},
-                    };
+                    // The child cancels its own children the same way and
+                    // joins them, so the subtree stops deepest first.
+                    self.managed.cancelAndJoin(child_id);
                     return error.Cancelled;
                 }
             }
@@ -951,7 +1111,31 @@ pub const Runtime = struct {
         else
             null;
         defer if (failure_text) |text| alloc.free(text);
-        return self.encodeManaged(alloc, terminalResult(observation, failure_text orelse result));
+        const capped = try self.capResult(alloc, work_id, failure_text orelse result);
+        defer if (capped) |text| alloc.free(text);
+        return self.encodeManaged(alloc, terminalResult(observation, capped orelse failure_text orelse result));
+    }
+
+    /// A long result keeps its start and a handle to the whole text, saved
+    /// with this node's session (D94). Null keeps `text` as it is.
+    fn capResult(self: *Runtime, alloc: Allocator, work_id: []const u8, text: ?[]const u8) !?[]u8 {
+        const full = text orelse return null;
+        if (full.len <= max_inline_result_bytes) return null;
+        const head = text_utils.utf8PrefixByBytes(full, max_inline_result_bytes);
+        const handle = self.storeFullResult(alloc, work_id, full) catch |err| {
+            debug_trace.logf("subagent", "full result not stored node_id={s} work_id={s} err={s}", .{ self.node_id, work_id, @errorName(err) });
+            return try alloc.print("{s}\n\n[Subagent result truncated: {d} of {d} bytes shown. The full text could not be stored.]", .{ head, head.len, full.len });
+        };
+        defer alloc.free(handle);
+        return try alloc.print(
+            "{s}\n\n[Subagent result truncated: {d} of {d} bytes shown. Read the rest with read_tool_result, handle \"{s}\".]",
+            .{ head, head.len, full.len, handle },
+        );
+    }
+
+    fn storeFullResult(self: *Runtime, alloc: Allocator, work_id: []const u8, full: []const u8) ![]u8 {
+        const capability = try self.children.parent.childCapability();
+        return result_store.storeLargeResultManaged(alloc, capability, work_id, tree_mod.spawn_tool_name, full);
     }
 
     fn managedResultText(
@@ -1088,7 +1272,7 @@ fn operationIdAlloc(
 }
 
 fn checkYieldedOwnership(alloc: Allocator) !void {
-    var runtime = Runtime{ .alloc = alloc, .children = undefined, .root_id = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
+    var runtime = Runtime{ .alloc = alloc, .children = undefined, .node_id = undefined, .tree = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
     runtime.managed = .{ .alloc = alloc, .children = undefined, .state_store = undefined, .services = undefined, .authority_resolver = undefined, .approvals = undefined };
     defer runtime.yielded.deinit(alloc);
     defer while (runtime.yielded.items.len > 0) {
@@ -1127,7 +1311,7 @@ test "subagent admission preserves an undelivered result before advancing its ch
         .assistant = @constCast("ORIGINAL_RESULT"),
     } }};
     (try parent.openChild("frozen-child", &history)).close();
-    var runtime = Runtime{ .alloc = alloc, .children = &parent.children, .root_id = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
+    var runtime = Runtime{ .alloc = alloc, .children = &parent.children, .node_id = undefined, .tree = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
     defer runtime.yielded.deinit(alloc);
     try runtime.retainYielded("frozen-child", "old-work", 4096, 64);
     defer runtime.removeYielded("frozen-child", "old-work");
@@ -1150,7 +1334,7 @@ test "subagent admission preserves an undelivered result before advancing its ch
 
 test "parallel subagent wait bookkeeping stays serialized" {
     const alloc = std.testing.allocator;
-    var runtime = Runtime{ .alloc = alloc, .children = undefined, .root_id = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
+    var runtime = Runtime{ .alloc = alloc, .children = undefined, .node_id = undefined, .tree = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
     defer runtime.yielded.deinit(alloc);
     const Writer = struct {
         runtime: *Runtime,
@@ -1227,7 +1411,6 @@ test "subagent feedback waits for admitted work to install its worker" {
             var request = try model_contract.validateRequest(self.runtime.alloc, .{ .message = .{ .agent = "reviewer", .message = self.text } });
             defer request.deinit(self.runtime.alloc);
             return self.runtime.executeManaged(self.runtime.alloc, &request, .{
-                .caller_id = self.runtime.root_id,
                 .invocation_id = self.text,
                 .defaults = .{ .provider = .gateway, .model = "test", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
                 .max_result_bytes = 4096,
@@ -1322,7 +1505,6 @@ fn checkFailedStartBookkeeping(action: model_contract.Action) !void {
     });
     defer request.deinit(alloc);
     const options = ExecuteOptions{
-        .caller_id = parent.parent.id(),
         .invocation_id = "failed-start",
         .identity_epoch = 1,
         .defaults = .{ .provider = .gateway, .model = "test", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
@@ -1502,7 +1684,6 @@ test "model override resolves against the catalog before child creation" {
     var request = try model_contract.validateRequest(alloc, .{ .run = .{ .task = "probe", .model = "terra-fast" } });
     defer request.deinit(alloc);
     const result = try runtime.executeManaged(arena, &request, .{
-        .caller_id = parent.parent.id(),
         .invocation_id = "override-resolve",
         .defaults = .{ .provider = .gateway, .model = "parent-model", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
         .max_result_bytes = 4096,
@@ -1530,7 +1711,6 @@ test "unknown and ambiguous model overrides reject before any child session" {
     defer runtime.deinit();
 
     const options = ExecuteOptions{
-        .caller_id = parent.parent.id(),
         .invocation_id = "override-reject",
         .defaults = .{ .provider = .gateway, .model = "parent-model", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
         .max_result_bytes = 4096,
@@ -1579,7 +1759,6 @@ test "model override passes through for non-gateway providers" {
     var request = try model_contract.validateRequest(alloc, .{ .run = .{ .task = "probe", .model = "unknown-model" } });
     defer request.deinit(alloc);
     const result = try runtime.executeManaged(arena, &request, .{
-        .caller_id = parent.parent.id(),
         .invocation_id = "override-non-gateway",
         .defaults = .{ .provider = .codex, .model = "parent-model", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
         .max_result_bytes = 4096,
@@ -1724,6 +1903,7 @@ fn makeManagedWork(
     request_fingerprint: [32]u8,
     request: model_contract.Request,
     options: ExecuteOptions,
+    permission_mode: types.PermissionMode,
 ) !child_state.ActiveWork {
     const message = switch (request) {
         .run => |value| value.task,
@@ -1745,7 +1925,7 @@ fn makeManagedWork(
         .root_user_intent_context = @constCast(root_context),
         .root_user_messages = try cloneStrings(alloc, options.root_user_messages),
         .root_user_evidence_complete = options.root_user_evidence_complete,
-        .permission_mode = options.parent_permission_mode,
+        .permission_mode = permission_mode,
         .created_at_ms = options.timestamp_ms,
     };
 }
@@ -1855,6 +2035,10 @@ fn captureAdmission(
     };
 }
 
+/// Runs one child turn with its own host when it may spawn. The host and
+/// every descendant it started are gone before the turn returns, so the
+/// child outlives them (`tests/tla/session_manager/Tree.tla`
+/// AncestorsOutliveDescendants).
 fn runChild(
     raw: ?*anyopaque,
     turn: *execution.TurnContext,
@@ -1863,6 +2047,14 @@ fn runChild(
     cancel: *std.atomic.Value(bool),
 ) execution.ServiceError!execution.RunOutcome {
     const self: *Runtime = @ptrCast(@alignCast(raw.?));
+    const node = self.openNode(turn, admission.permission_mode) catch |err| blk: {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        debug_trace.logf("subagent", "node host unavailable child_id={s} err={s}", .{ turn.child_id orelse "unknown", @errorName(err) });
+        break :blk null;
+    };
+    defer if (node) |host| host.deinit();
+    turn.node_host = node;
+    defer turn.node_host = null;
     return self.child_runner.run_fn(
         self.child_runner.context,
         turn,

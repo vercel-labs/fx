@@ -102,7 +102,13 @@ pub const NewOptions = struct {
     /// root always gets a fresh one. A taken id fails the first turn's
     /// append and leaves the existing session as it was.
     id: ?[]const u8 = null,
+    /// A child's tree root and depth (D91), recorded on its line 1.
+    root: ?[]const u8 = null,
+    depth: ?u64 = null,
 };
+
+/// Where a session sits in its tree (D91).
+pub const Node = session_mod.Node;
 
 pub const ResumeTarget = union(enum) {
     id: []const u8,
@@ -146,12 +152,16 @@ pub const Peeked = struct {
     role: Role,
     /// A child's parent; null for a root.
     parent: ?[]u8 = null,
+    /// The tree's root session, owned (D91).
+    root: []u8,
+    depth: u64,
     workspace: []u8,
     /// With `created_ms` and `updated_ms` set, as `Session.state` sets them.
     state: State,
 
     pub fn deinit(p: *Peeked, gpa: std.mem.Allocator) void {
         if (p.parent) |value| gpa.free(value);
+        gpa.free(p.root);
         gpa.free(p.workspace);
         p.state.deinit(gpa);
         p.* = undefined;
@@ -262,6 +272,8 @@ pub const Manager = struct {
     pub fn openNew(m: *Manager, options: NewOptions) OpenError!Session {
         try checkText(options.workspace);
         try checkRoleParent(options.role, options.parent);
+        if (options.role != .child and (options.root != null or options.depth != null)) return error.InvalidArgument;
+        if (options.root) |root| try checkId(root);
         if (options.id) |id| {
             if (options.role != .child) return error.InvalidArgument;
             try checkId(id);
@@ -272,6 +284,8 @@ pub const Manager = struct {
             .role = options.role,
             .parent = options.parent,
             .id = options.id,
+            .root = options.root,
+            .depth = options.depth,
         });
         return .{ .manager = m, .inner = inner };
     }
@@ -415,9 +429,14 @@ pub const Manager = struct {
         state.updated_ms = summary.updated_ms;
         const workspace = try gpa.dupe(u8, summary.identity.workspace);
         errdefer gpa.free(workspace);
+        const node_ = summary.identity.node();
+        const root = try gpa.dupe(u8, node_.root);
+        errdefer gpa.free(root);
         return .{
             .role = summary.identity.role,
             .parent = if (summary.identity.parent) |parent| try gpa.dupe(u8, parent) else null,
+            .root = root,
+            .depth = node_.depth,
             .workspace = workspace,
             .state = state,
         };
@@ -553,6 +572,11 @@ pub const Session = struct {
     pub fn read(s: Session, gpa: std.mem.Allocator, from: From, direction: Direction, limit: usize) SessionReadError!Page {
         if (limit == 0) return error.InvalidArgument;
         return s.inner.readPage(gpa, from, direction, limit);
+    }
+
+    /// The session's tree root and depth (D91), borrowed until `close`.
+    pub fn node(s: Session) Node {
+        return s.inner.identity.node();
     }
 
     /// Whether the session's log is on disk now, so a resume finds it.

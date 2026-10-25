@@ -16,6 +16,8 @@ const session_store = @import("../session/session_store.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const types = @import("../shared/types.zig");
 
+const slot_pool = @import("slot_pool.zig");
+const tree_mod = @import("tree.zig");
 const python_kernel = @import("../kernel/slot.zig");
 const Allocator = std.mem.Allocator;
 
@@ -96,6 +98,11 @@ pub const Owner = struct {
     services: execution.Services,
     authority_resolver: *authority.Resolver,
     approvals: *approval_registry.Registry,
+    /// The tree this node belongs to, for run slots and lineage (D91, D92);
+    /// null runs children without either, as unit fixtures do.
+    tree: ?*tree_mod.Tree = null,
+    /// Ids from the tree's root down to this node.
+    node_path: []const []const u8 = &.{},
     max_history_turns: usize = 8,
     mutex: std.Io.Mutex = .init,
     waiters_changed: std.Io.Condition = .init,
@@ -231,6 +238,17 @@ pub const Owner = struct {
         defer self.mutex.unlock(io_mod.getIo());
         for (self.slots.items) |slot| {
             if (std.mem.eql(u8, slot.child_id, child_id)) return slot.completion == .running;
+        }
+        return false;
+    }
+
+    /// Whether any child's work is still running. A child's descendants
+    /// run only inside its own running turn, so this covers the subtree.
+    pub fn anyRunning(self: *Owner) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.slots.items) |slot| {
+            if (slot.completion == .running) return true;
         }
         return false;
     }
@@ -597,6 +615,15 @@ fn runOne(slot: *Slot) OneOutcome {
     const work_id = owner.alloc.dupe(u8, snapshot.active.id) catch
         return fallbackOutcome(owner.alloc, "unknown", .failed);
 
+    // The expensive runtime starts only once the turn holds a run slot (D92).
+    var permit: ?slot_pool.Permit = if (owner.tree) |tree| tree.permit() else null;
+    if (permit) |*held| held.acquire(.{ .first = &slot.cancel, .second = &slot.shutdown }) catch
+        return .{ .work_id = work_id, .outcome = if (slot.shutdown.load(.seq_cst)) .interrupted else .cancelled };
+    defer if (permit) |*held| held.release();
+    const node_path = childPath(owner.alloc, owner.node_path, slot.child_id) catch |err|
+        return failedOutcome(work_id, "node_path", err);
+    defer owner.alloc.free(node_path);
+
     var child = OpenChild.open(owner, slot.child_id, snapshot.instructions) catch |err|
         return failedOutcome(work_id, "session_resume", err);
     defer child.close(owner.alloc);
@@ -614,6 +641,8 @@ fn runOne(slot: *Slot) OneOutcome {
     turn.phase_fn = Owner.phaseTransition;
     turn.live_metrics = &slot.metrics;
     turn.live_presentation = &slot.presentation;
+    turn.node_path = node_path;
+    turn.permit = if (permit) |*held| held else null;
     const presentation_work_id = owner.alloc.dupe(u8, snapshot.active.id) catch
         return failedOutcome(work_id, "presentation_ownership", error.OutOfMemory);
     owner.mutex.lockUncancelable(io_mod.getIo());
@@ -719,6 +748,8 @@ const OpenChild = struct {
                 .language = seed.language,
                 .permission_state = .{},
                 .instructions = instructions,
+                // Line 1 records the child's place in its tree (D91).
+                .node = if (owner.tree) |tree| .{ .root = tree.root_id, .depth = owner.node_path.len } else null,
             },
         );
         errdefer session.close();
@@ -734,6 +765,15 @@ const OpenChild = struct {
         return execution.TurnContext.init(alloc, self.session, max_history_turns);
     }
 };
+
+/// `parent` with `child_id` appended; the ids stay borrowed. Caller frees
+/// the slice.
+fn childPath(alloc: Allocator, parent: []const []const u8, child_id: []const u8) ![]const []const u8 {
+    const path = try alloc.alloc([]const u8, parent.len + 1);
+    @memcpy(path[0..parent.len], parent);
+    path[parent.len] = child_id;
+    return path;
+}
 
 fn workerRoute(slot: *Slot) approval_registry.WorkerRoute {
     return .{
@@ -969,7 +1009,7 @@ const CancellationJoinTest = struct {
         const turn = self.turn.?;
         Owner.phaseTransition(self.owner, "child", "work", .awaiting_approval) catch
             return error.PermissionRegistrationFailed;
-        self.owner.approvals.registerTool("approval", "child", "parent", "work", request, &.{}, turn.approval_worker_route.?, 1) catch
+        self.owner.approvals.registerTool("approval", &.{ "parent", "child" }, "work", request, &.{}, turn.approval_worker_route.?, 1) catch
             return error.PermissionRegistrationFailed;
         self.request_id = request.id;
         self.registered.set(io_mod.getIo());
@@ -1104,7 +1144,7 @@ fn testCancellationJoin(timing: enum { pending, before_permission, before_attach
     const observation = try owner.observe("child");
     try std.testing.expectEqual(child_state.Outcome.cancelled, observation.outcome.?);
     try std.testing.expect(observation.failure == null);
-    var pending = try approvals.firstPendingRequest(alloc, "parent");
+    var pending = try approvals.firstPendingRequest(alloc);
     defer if (pending) |*request| request.deinit(alloc);
     try std.testing.expect(pending == null);
     try std.testing.expectEqual(false, rescued);
@@ -1220,8 +1260,7 @@ test "worker detach invalidates approval routes before worker deinit" {
     const route = workerRoute(&slot);
     try approvals.registerTool(
         "approval",
-        "child",
-        "root",
+        &.{ "root", "child" },
         "work",
         .{ .id = 9, .label = "review" },
         &.{},
@@ -1231,7 +1270,7 @@ test "worker detach invalidates approval routes before worker deinit" {
 
     detachWorker(&slot);
     try std.testing.expect(slot.worker == null);
-    var pending = try approvals.firstPendingRequest(alloc, "root");
+    var pending = try approvals.firstPendingRequest(alloc);
     defer if (pending) |*request| request.deinit(alloc);
     try std.testing.expect(pending == null);
     try std.testing.expectEqual(

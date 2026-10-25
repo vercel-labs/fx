@@ -802,7 +802,7 @@ pub fn Bindings(comptime App: type) type {
                 try out.writer.writeByte('\n');
                 if (!result.delivered) try acknowledgements.append(arena, .{
                     .child_id = result.child_id,
-                    .target_session_id = host.root_id,
+                    .target_session_id = host.node_id,
                     .delivery_id = result.work_id,
                     .through_sequence = result.receipt_sequence,
                     .start_offset = 0,
@@ -816,7 +816,7 @@ pub fn Bindings(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(ctx));
             const host = app.session_persistence.subagent_host orelse return;
             for (acknowledgements) |ack| {
-                if (std.mem.eql(u8, ack.target_session_id, host.root_id)) {
+                if (std.mem.eql(u8, ack.target_session_id, host.node_id)) {
                     if (ack.through_sequence != 0) host.acknowledgeFeedback(ack.child_id, ack.delivery_id, ack.through_sequence) else host.acknowledgeYielded(ack.child_id, ack.delivery_id);
                 }
             }

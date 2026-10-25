@@ -31,7 +31,7 @@ const types = @import("../shared/types.zig");
 const diff_mod = @import("../output/diff.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
-const tool_host = @import("tool_host.zig");
+const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const child_state = @import("child_state.zig");
 
 const Allocator = std.mem.Allocator;
@@ -55,7 +55,6 @@ fn childModelCapabilityResolver(
 }
 
 pub const Config = struct {
-    host: *tool_host.Runtime,
     tool_context: tool_runtime.Context,
     provider_set: provider_set.Set,
     system_prompt: []const u8,
@@ -100,8 +99,8 @@ const Context = struct {
             } }
         else
             .disabled;
-        result.subagent_host = self.config.host;
-        result.subagent_caller_id = self.turn.child_id;
+        // The child's own host for its children; none when it may not spawn.
+        result.subagent_host = self.turn.node_host;
         result.session_child_capability = self.turn.childCapability() catch null;
         result.interactive = false;
         result.output_chunk_ctx = self;
@@ -152,6 +151,9 @@ pub fn run(
     const arena = arena_state.allocator();
     var routed_credential: ?credentials.Credential = null;
     defer if (routed_credential) |*credential| credential.deinit(turn.alloc);
+    // The child's kernel keeps its snapshots under the same profile home as
+    // the root's, before anything can create it.
+    turn.sessionRuntime().kernel.home_override = config.tool_context.session.kernel.home_override;
     var routed_config = config;
     const provider = config.provider_set.select(admission.provider);
     routed_config.tool_context.agent_stream_provider = provider.agent_stream_or_unavailable();
@@ -257,14 +259,11 @@ pub fn run(
             .provider_strict = admission.provider == .gateway and config.tool_context.provider_strict,
         },
     };
-    const child_tool_names = try withoutSubagentNames(
-        arena,
-        config.advertised_tool_names,
-    );
-    const child_functions = try withoutSubagentFunctions(
-        arena,
-        config.advertised_functions,
-    );
+    // A child advertises only the built-in tools its admission holds, a
+    // subset of its parent's (D91).
+    const registry = config.tool_context.tool_registry;
+    const child_tool_names = try admittedNames(arena, registry, admission.tool_names, config.advertised_tool_names);
+    const child_functions = try admittedFunctions(arena, registry, admission.tool_names, config.advertised_functions);
     const child_system_prompt = if (message.system_prompt_overlay.len == 0)
         config.system_prompt
     else
@@ -366,40 +365,56 @@ test "subagent finalization preserves every outcome and fails closed on absence"
     }
 }
 
-fn withoutSubagentNames(
-    alloc: Allocator,
-    names: []const []const u8,
-) ![]const []const u8 {
-    var count: usize = 0;
-    for (names) |name| {
-        if (!std.mem.eql(u8, name, "subagent")) count += 1;
+/// A built-in tool stays advertised only when the child's admission holds
+/// it; names the registry does not know (MCP and other dynamic tools) pass,
+/// since their own authority decides them.
+fn admitted(registry: tool_dispatch.Registry, tools: []const []const u8, name: []const u8) bool {
+    if (registry.lookup(name) == null) return true;
+    for (tools) |tool| {
+        if (std.mem.eql(u8, tool, name)) return true;
     }
-    const filtered = try alloc.alloc([]const u8, count);
-    var index: usize = 0;
-    for (names) |name| {
-        if (std.mem.eql(u8, name, "subagent")) continue;
-        filtered[index] = name;
-        index += 1;
-    }
-    return filtered;
+    return false;
 }
 
-fn withoutSubagentFunctions(
+fn admittedNames(
     alloc: Allocator,
+    registry: tool_dispatch.Registry,
+    tools: []const []const u8,
+    names: []const []const u8,
+) ![]const []const u8 {
+    var filtered: std.ArrayList([]const u8) = .empty;
+    for (names) |name| {
+        if (admitted(registry, tools, name)) try filtered.append(alloc, name);
+    }
+    return filtered.toOwnedSlice(alloc);
+}
+
+fn admittedFunctions(
+    alloc: Allocator,
+    registry: tool_dispatch.Registry,
+    tools: []const []const u8,
     functions: []const model_tool_schema.FunctionSchema,
 ) ![]const model_tool_schema.FunctionSchema {
-    var count: usize = 0;
+    var filtered: std.ArrayList(model_tool_schema.FunctionSchema) = .empty;
     for (functions) |function| {
-        if (!std.mem.eql(u8, function.name, "subagent")) count += 1;
+        if (admitted(registry, tools, function.name)) try filtered.append(alloc, function);
     }
-    const filtered = try alloc.alloc(model_tool_schema.FunctionSchema, count);
-    var index: usize = 0;
-    for (functions) |function| {
-        if (std.mem.eql(u8, function.name, "subagent")) continue;
-        filtered[index] = function;
-        index += 1;
-    }
-    return filtered;
+    return filtered.toOwnedSlice(alloc);
+}
+
+test "a child advertises its admitted built-ins and every dynamic tool" {
+    const alloc = std.testing.allocator;
+    const builtin_tools = @import("../../builtins/tools.zig");
+    const registry: tool_dispatch.Registry = .{ .tools = &.{ builtin_tools.read_file, builtin_tools.subagent } };
+    const advertised = [_][]const u8{ "read_file", "subagent", "mcp_lookup" };
+    const leaf = try admittedNames(alloc, registry, &.{"read_file"}, &advertised);
+    defer alloc.free(leaf);
+    try std.testing.expectEqual(@as(usize, 2), leaf.len);
+    try std.testing.expectEqualStrings("read_file", leaf[0]);
+    try std.testing.expectEqualStrings("mcp_lookup", leaf[1]);
+    const spawner = try admittedNames(alloc, registry, &.{ "read_file", "subagent" }, &advertised);
+    defer alloc.free(spawner);
+    try std.testing.expectEqual(@as(usize, 3), spawner.len);
 }
 
 fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
@@ -505,8 +520,6 @@ test "child runtime capability callbacks preserve fallback and child cancellatio
     try parent.init(alloc);
     defer parent.deinit();
     const root = parent.home;
-    const host = try tool_host.Runtime.create(alloc, &parent.children, .{ .resolve_fn = Fixture.resolve }, .{});
-    defer host.deinit();
     const child = try parent.openChild("capability-child", &.{});
     defer child.close();
     var turn = try execution.TurnContext.init(alloc, child, 0);
@@ -519,7 +532,6 @@ test "child runtime capability callbacks preserve fallback and child cancellatio
     const registry = context_contract.Registry{ .default_provider = context_contract.empty_provider };
     var context = Context{
         .config = .{
-            .host = host,
             .tool_context = .{
                 .workspace_root = root,
                 .ignored_list_entries = &.{},

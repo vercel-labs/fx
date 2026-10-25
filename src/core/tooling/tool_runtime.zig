@@ -159,8 +159,8 @@ pub const Context = struct {
     first_call_tool_choice: types.ToolChoice = .auto,
     tool_registry: tool_dispatch.Registry = .{},
     host_tool_provider: ?tool_dispatch.HostToolProvider = null,
+    /// The calling node's own host for its children (D91).
     subagent_host: ?*subagent_tool_host.Runtime = null,
-    subagent_caller_id: ?[]const u8 = null,
     permission_mode: PermissionMode,
     permission_grants: []const PermissionGrant,
     session_grants: []const PermissionGrant = &.{},
@@ -2177,13 +2177,10 @@ fn executeSubagentProvider(
     const ctx = state.runtime;
     const host = ctx.subagent_host orelse
         return subagentProviderFailure(arena, "host_unavailable");
-    const caller_id = ctx.subagent_caller_id orelse
-        return subagentProviderFailure(arena, "caller_unavailable");
     const identity_epoch = host.issueOperationIdentity(invocation_id);
     var progress_bridge = SubagentProgressBridge.init(arena, ctx, state.call);
     const output = host.executeManaged(arena, request, .{
         .observer = ctx.observer,
-        .caller_id = caller_id,
         .invocation_id = invocation_id,
         .parent_permission_mode = ctx.permission_mode,
         .root_user_intent_context = ctx.root_user_intent_context,
@@ -2456,7 +2453,6 @@ const TestRuntime = struct {
     worker: WorkerRuntime = .{},
     session: SessionRuntime = .{ .max_history_turns = 8 },
     subagent_host: ?*subagent_tool_host.Runtime = null,
-    subagent_caller_id: ?[]const u8 = null,
     model: []const u8 = "",
     reviewer_model: []const u8 = "",
     session_allocator: Allocator = std.testing.allocator,
@@ -2540,7 +2536,6 @@ const TestRuntime = struct {
             .permission_rules = self.permission_rules,
             .tool_registry = self.tool_registry,
             .subagent_host = self.subagent_host,
-            .subagent_caller_id = self.subagent_caller_id,
             .worker = &self.worker,
             .permission_prompter = if (self.interactive)
                 tool_admission.workerPrompter(&self.worker)

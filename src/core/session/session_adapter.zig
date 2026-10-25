@@ -362,6 +362,29 @@ pub const Store = struct {
         return history.toOwnedSlice(alloc);
     }
 
+    /// The ids of the children `id` spawned, read without its lock from its
+    /// folded state, in first-spawn order. Free with `freeIds`.
+    pub fn childIds(store: *Store, alloc: Allocator, id: []const u8) ![][]u8 {
+        var peeked = try store.manager.peek(alloc, id);
+        defer peeked.deinit(alloc);
+        const out = try alloc.alloc([]u8, peeked.state.children.items.len);
+        var built: usize = 0;
+        errdefer {
+            for (out[0..built]) |value| alloc.free(value);
+            alloc.free(out);
+        }
+        for (peeked.state.children.items) |child| {
+            out[built] = try alloc.dupe(u8, child.id);
+            built += 1;
+        }
+        return out;
+    }
+
+    pub fn freeIds(alloc: Allocator, ids: [][]u8) void {
+        for (ids) |value| alloc.free(value);
+        alloc.free(ids);
+    }
+
     /// A child's newest preferences, read without its lock. Caller owns.
     pub fn childPreferences(store: *Store, alloc: Allocator, child_id: []const u8) !session_codec.DurableSessionPreferences {
         var from: sm.From = .end;
@@ -860,7 +883,13 @@ pub const Seed = struct {
     /// A child's instructions, kept in its own `prefs` (D34); roots leave
     /// it empty.
     instructions: []const u8 = "",
+    /// A new child's tree root and depth, written on its line 1 (D91).
+    /// Null leaves them out, which reads back as depth 1 under its parent.
+    node: ?Node = null,
 };
+
+/// Where a session sits in its tree (D91): its root session and depth.
+pub const Node = sm.Node;
 
 pub const Target = union(enum) {
     id: []const u8,
@@ -1325,7 +1354,15 @@ pub const Session = struct {
             error.NotFound => {},
             else => return err,
         }
-        const handle = try store.manager.openNew(.{ .workspace = workspace, .host = .child, .role = .child, .parent = parent_id, .id = child_id });
+        const handle = try store.manager.openNew(.{
+            .workspace = workspace,
+            .host = .child,
+            .role = .child,
+            .parent = parent_id,
+            .id = child_id,
+            .root = if (seed.node) |node_| node_.root else null,
+            .depth = if (seed.node) |node_| node_.depth else null,
+        });
         errdefer handle.release();
         const self = try init(alloc, store, handle, false);
         errdefer self.destroyInner();
@@ -1452,6 +1489,11 @@ pub const Session = struct {
 
     pub fn id(self: *const Session) []const u8 {
         return self.handle.id();
+    }
+
+    /// The session's tree root and depth as its line 1 records them (D91).
+    pub fn node(self: *const Session) Node {
+        return self.handle.node();
     }
 
     /// Appends through the manager; a host session also traces the turn and
@@ -5261,6 +5303,51 @@ test "the manager guards child lines, and a child without a log reopens under it
     defer child.close();
     try testing.expectEqualStrings(child_id, child.id());
     try testing.expectEqualStrings("", child.childInstructions());
+}
+
+test "a grandchild records its root and depth on line 1 and lists under its parent (D91)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    const alloc = testing.allocator;
+    var model = "test-model".*;
+    const root = try Session.create(alloc, &t.store, "/w", .ask, testSeed(&model));
+    defer root.close();
+    try root.commitTurn(assistantTurn("delegate", "ok"), types.ConversationLanguage.default());
+    try testing.expectEqual(@as(u64, 0), root.node().depth);
+    try testing.expectEqualStrings(root.id(), root.node().root);
+
+    const child_id = "1786460757753-mid";
+    const grandchild_id = "1786460757753-low";
+    try root.appendChildLines(&.{.{ .spawned = .{ .child = child_id, .work_id = "w1" } }});
+    // A child opened without a node reads back as depth 1 under its parent.
+    const child = try Session.openChild(alloc, &t.store, root.id(), child_id, "/w", testSeed(&model));
+    defer child.close();
+    try testing.expectEqual(@as(u64, 1), child.node().depth);
+    try testing.expectEqualStrings(root.id(), child.node().root);
+    try child.commitTurn(assistantTurn("go deeper", "ok"), types.ConversationLanguage.default());
+    try child.appendChildLines(&.{.{ .spawned = .{ .child = grandchild_id, .work_id = "w2" } }});
+
+    var seed = testSeed(&model);
+    seed.node = .{ .root = root.id(), .depth = 2 };
+    {
+        const grandchild = try Session.openChild(alloc, &t.store, child_id, grandchild_id, "/w", seed);
+        defer grandchild.close();
+        try grandchild.commitTurn(assistantTurn("leaf", "done"), types.ConversationLanguage.default());
+    }
+    const reopened = try Session.openChild(alloc, &t.store, child_id, grandchild_id, "/w", testSeed(&model));
+    defer reopened.close();
+    try testing.expectEqual(@as(u64, 2), reopened.node().depth);
+    try testing.expectEqualStrings(root.id(), reopened.node().root);
+    var peeked = try t.store.manager.peek(alloc, grandchild_id);
+    defer peeked.deinit(alloc);
+    try testing.expectEqualStrings(child_id, peeked.parent.?);
+    try testing.expectEqual(@as(u64, 2), peeked.depth);
+
+    const ids = try t.store.childIds(alloc, child_id);
+    defer Store.freeIds(alloc, ids);
+    try testing.expectEqual(@as(usize, 1), ids.len);
+    try testing.expectEqualStrings(grandchild_id, ids[0]);
 }
 
 test "v2 child ultrafast preferences survive instruction changes and resume" {

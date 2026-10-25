@@ -1475,9 +1475,9 @@ Settled while removing v1 (2026-10-17):
   reached the model a second time, up to 170 messages in real sessions,
   enough to fill the window on resume. **Alternative:** keep whole turns.
 - **D88 Decision:** a v1 subagent whose parent is not a v1 root, such as
-  a subagent's own subagent from before v0.0.8 (since then a subagent has
-  no subagent tool, so no fx opens one), or one whose parent is gone or
-  does not list it, is kept as it is. `fx sessions convert` names each
+  a subagent's own subagent from before v0.0.8 (from then until D91 a
+  subagent had no subagent tool, so no v1 build opens one), or one whose
+  parent is gone or does not list it, is kept as it is. `fx sessions convert` names each
   under `kept` and `fx doctor` names each too, with the reason, and its
   family converts without it. **Why:** no v1 session is left unexplained.
   **Alternative:** convert descendants at every depth, for sessions no
@@ -1561,6 +1561,75 @@ only by quitting):
   can be resumed yet. **Alternative:** show the id only once saved; print
   the full `fx --resume` command; or keep counting turns and show a fork
   before its first prompt as unsaved, though resume opens it.
+
+Settled for nested subagents (2026-10-25, replacing D88's rule that a
+subagent has no subagent tool):
+- **D91 Decision:** every agent is the same kind of session node, and
+  subagents nest to depth 3. The root is the node at depth 0.
+  - A child's line 1 records `parent`, `root` and `depth` (`root` and
+    `depth` are new optional fields of `session_created`). A line 1
+    without them is a root at depth 0, or a child written before D91, at
+    depth 1 under its parent. The layout stays flat: one folder per
+    session, and each node's `child_spawned` and `child_finished` lines in
+    its own parent's log. Nothing infers the tree from paths.
+  - One spawn policy (`src/core/subagent/tree.zig` `SpawnPolicy`) decides
+    every spawn, checked by the node's host: nodes sit at depths 0 to
+    `max_depth` (3), a node has at most 64 children, and a tree holds at
+    most 256 nodes below its root, counted across every depth from the
+    saved logs on first need.
+  - A node's abilities come from its depth once, when its host starts. A
+    child's tools are a subset of its parent's, and a node at the depth
+    limit is not offered the subagent tool. A child's permission mode is
+    never wider than the node that spawns it
+    (`authority.admitChildPermission`). No code asks whether a session is
+    a child.
+  - The root's host is created by the frontend and owns the tree. A child
+    gets its own host for its children while its turn runs, if it may
+    spawn; the host's children live in the child's own log. The host and
+    every descendant it started are joined before that turn returns, so no
+    node closes while a descendant runs, and a cancel stops the subtree
+    deepest first. A child may outlive its parent's turn only as yielded
+    work of the root, never the root's host.
+  - A node's host answers whether any of its descendants runs
+    (`Runtime.subtreeBusy`), the check a rewind of that node must pass.
+    Rewinding a child node, and marking the children it spawned after the
+    rewind point as abandoned, are not built yet; the abandoned mark needs
+    a session line the manager does not have.
+
+  `Tree.tla` checks the depth limit, the tree budget, that every ancestor
+  waits while a descendant lives, and that no node is an orphan.
+  **Why:** a tree of identical nodes keeps one code path for every depth,
+  and recording the place in the tree on line 1 lets any reader place a
+  session without opening its ancestors. **Alternative:** keep subagents
+  flat; or give each depth its own host kind.
+- **D92 Decision:** a child's turn runs only while it holds a run slot:
+  one of its tree's pool (8) and one of the process's pool (32), taken in
+  that order and given back in reverse (`slot_pool.zig` `Permit`). The
+  session, turn state and kernel of a child's turn start after it holds
+  its slot. A parent blocked on its children lends its slot back while it
+  waits, and takes one again before its turn goes on. A parallel tool
+  group delegates to at most 8 children at once. `Tree.tla` checks that
+  never more turns run than there are slots, and, with fairness, that a
+  queued child always runs, so a chain from the root to depth 3 cannot
+  deadlock even with one slot. **Why:** threads and turn state were
+  unbounded in the number of delegations. **Alternative:** one thread per
+  child, as before; or a slot held across the wait, which deadlocks a
+  chain deeper than the pool.
+- **D93 Decision:** one approval registry per tree. Each pending approval
+  carries the path of node ids from the root to the node that asked, and
+  the host forwards every pending approval up to a bound, oldest first
+  (`Runtime.pendingApprovalRequests`). An approval resolves against the
+  asking node's id at any depth. **Why:** a frontend that watches the root
+  sees every approval in its tree and can name the node that asked.
+  **Alternative:** a registry per node, which the frontend would have to
+  find and poll one by one.
+- **D94 Decision:** a child's result reaches its parent with at most 6000
+  bytes inline. A longer one keeps its start and names a handle to the
+  whole text, saved as a blob of the parent's session, which
+  `read_tool_result` reads. **Why:** a deep tree would otherwise carry
+  every descendant's full answer in each ancestor's context.
+  **Alternative:** the general 64 KiB tool result cap, which is too large
+  to repeat at every level.
 
 ## Design Risks And Failure Behavior
 

@@ -568,7 +568,6 @@ const AcpContext = struct {
             .permission_reviewer_provider = self.state.cfg.provider_set.select(session.provider).permission_reviewer,
             .auto_classifier = self.auto_classifier,
             .subagent_host = self.state.subagent_host,
-            .subagent_caller_id = session.session_id,
             .worker = &self.state.worker,
             .permission_prompter = if (self.state.initialized) .{
                 .observer = self.observer,
@@ -1326,7 +1325,6 @@ pub fn runSubagentChild(
     cancel: *std.atomic.Value(bool),
 ) subagent_execution.ServiceError!subagent_execution.RunOutcome {
     const state: *server.ServerState = @ptrCast(@alignCast(raw.?));
-    const subagent_host = state.subagent_host orelse return error.ProviderFailed;
     const alloc = state.alloc;
     state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
     const active = if (state.active_session) |*session| session else {
@@ -1367,7 +1365,6 @@ pub fn runSubagentChild(
     var skill_catalog = state.skills.acquireCatalog();
     defer skill_catalog.deinit();
     return subagent_agent_adapter.run(.{
-        .host = subagent_host,
         .tool_context = ctx.toolContext(),
         .provider_set = state.cfg.provider_set,
         .system_prompt = state.cfg.prompt_policy.systemPromptFor(state.terminal_ui),
