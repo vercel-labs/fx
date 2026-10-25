@@ -52,7 +52,7 @@ These rules apply to every change:
 - Don't commit home-directory paths, real team IDs, or personal project slugs. `scripts/check-public-surface.sh` rejects them in CI, so use `/Users/example/` in fixtures.
 - Don't document behavior that doesn't exist yet.
 
-If a coding agent helps with your change, point it at AGENTS.md. Any prose the agent writes for your contribution, including pull request titles and descriptions, commit messages, documentation, and issues, must follow the `technical-writer` skill in `.fx/skills/technical-writer/`.
+If a coding agent helps with your change, point it at AGENTS.md.
 
 ## Test your change
 
