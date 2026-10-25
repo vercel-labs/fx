@@ -4,20 +4,37 @@
 //! carries both over the supervisor connection. See `session_backend.zig`
 //! for the contract this implements.
 //!
+//! Every operation that acts on a session names its target `Node`; nothing
+//! here defaults to the root. The composer's focus (the root, or the
+//! subagent it shows) picks the target for prompts and `.node` commands,
+//! and a command's `scope` sends `.tree` and `.root` commands to the root.
+//! `wireSession` is the one place that refuses what the supervisor cannot
+//! do on a node yet.
+//!
 //! Slash commands go through the shared router with this backend's handler
 //! table: commands the session owns become requests, and frontend commands
-//! (help, settings, images, sound) keep their in-process handlers. Whether a
-//! command may run in a read-only child transcript comes from its spec's
-//! `child_transcript` field.
+//! (help, settings, images, sound) keep their in-process handlers.
 const std = @import("std");
 const types = @import("../shared/types.zig");
 const client_protocol = @import("../supervisor/protocol.zig");
 const host_commands = @import("../../acp/commands.zig");
 const command_router = @import("../slash_commands/command_router.zig");
+const command_specs = @import("../slash_commands/command_specs.zig");
 const browser_mod = @import("../input/session_browser.zig");
 const app_commands = @import("app_commands.zig");
 const remote_runtime = @import("app_remote_runtime.zig");
 const remote_view = @import("remote_view.zig");
+
+/// A session the supervisor runs: the attached root, or a node below it.
+pub const Node = struct {
+    id: []const u8,
+    /// The root session the node belongs to; `id` itself for the root.
+    root_id: []const u8,
+
+    pub fn isRoot(self: Node) bool {
+        return std.mem.eql(u8, self.id, self.root_id);
+    }
+};
 
 pub fn Runtime(comptime App: type) type {
     return struct {
@@ -25,9 +42,53 @@ pub fn Runtime(comptime App: type) type {
         const Transport = remote_runtime.Runtime(App);
         const notice = View.notice;
 
+        /// The session the composer shows.
+        pub fn focus(app: *const App) Node {
+            return .{ .id = app.remote.viewedNodeId(), .root_id = app.remote.current_id };
+        }
+
+        /// The root of the focused tree.
+        pub fn root(app: *const App) Node {
+            return .{ .id = app.remote.current_id, .root_id = app.remote.current_id };
+        }
+
+        /// The session to address on the wire for `target`, or null after
+        /// telling the person why not. The supervisor runs operations on its
+        /// root sessions only for now, so a subagent target is refused here
+        /// and nowhere else.
+        fn wireSession(app: *App, target: Node, purpose: []const u8) !?[]const u8 {
+            if (target.root_id.len == 0) {
+                const body = try app.alloc.print("Open a session before {s}.", .{purpose});
+                defer app.alloc.free(body);
+                try notice(app, "session", body);
+                return null;
+            }
+            if (!target.isRoot()) {
+                const body = try app.alloc.print("This is not yet supported in a subagent session: {s}. Press Left to return to the parent.", .{purpose});
+                defer app.alloc.free(body);
+                try notice(app, "subagent", body);
+                return null;
+            }
+            return target.id;
+        }
+
+        /// The target a command of `kind` acts on: its spec's scope, applied
+        /// to the composer's focus.
+        fn commandTarget(app: *App, kind: command_specs.SlashKind) Node {
+            return switch (scopeOf(app, kind)) {
+                .node => focus(app),
+                .tree, .root => root(app),
+            };
+        }
+
+        fn scopeOf(app: *App, kind: command_specs.SlashKind) command_specs.CommandScope {
+            for (app.slashRegistry().commands) |spec| if (spec.kind == kind) return spec.scope;
+            return .node;
+        }
+
         // Session lifecycle and turns.
 
-        pub fn submit(app: *App, prompt: []const u8, images: []const types.ImageAttachment) !bool {
+        pub fn submit(app: *App, target: Node, prompt: []const u8, images: []const types.ImageAttachment) !bool {
             if (images.len > 0) {
                 try notice(app, "images", "Image forwarding is not supported by the detached frontend yet. Remove the image attachments before sending; no prompt was submitted.");
                 return false;
@@ -36,40 +97,41 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{ .topic = "session", .tone = .warning, .body = "Supervisor stopped. Relaunch proto-fx to reconnect." }, true);
                 return false;
             }
-            if (app.remote.current_id.len == 0) {
+            if (target.root_id.len == 0) {
                 try app.writeDomainNotice(.{ .topic = "session", .tone = .warning, .body = "The session is still connecting. Please send again when it is ready." }, true);
                 return false;
             }
-            if (app.remote.child_id.len > 0) {
-                try notice(app, "subagent", "This is a child transcript. Return to its parent to send a message.");
-                return false;
-            }
+            const session_id = try wireSession(app, target, "sending a message") orelse return false;
             // `remote_view` skips the host's echo of a prompt shown here.
             const text = try app.alloc.dupe(u8, prompt);
             errdefer app.alloc.free(text);
             if (app.remote.submitted_text.items.len >= 32) app.alloc.free(app.remote.submitted_text.orderedRemove(0));
             try app.remote.submitted_text.append(app.alloc, text);
             errdefer _ = app.remote.submitted_text.pop();
-            try app.remote.enqueue(.submit, .{ .prompt = .{ .session_id = app.remote.current_id, .text = prompt } });
+            try app.remote.enqueue(.submit, .{ .prompt = .{ .session_id = session_id, .text = prompt } });
             app.stream.active = true;
             app.shell.render_requests.request(.footer);
             return true;
         }
 
-        pub fn cancel(app: *App) !void {
-            if (app.remote.current_id.len == 0) return;
-            try app.remote.enqueue(.cancel, .{ .cancel = .{ .session_id = app.remote.current_id } });
+        pub fn cancel(app: *App, target: Node) !void {
+            if (target.root_id.len == 0) return;
+            const session_id = try wireSession(app, target, "cancelling its turn") orelse return;
+            try app.remote.enqueue(.cancel, .{ .cancel = .{ .session_id = session_id } });
         }
 
-        /// Answers the pending permission prompt. False when none is pending.
+        /// Answers the pending permission prompt, in the session that asked.
+        /// False when none is pending.
         pub fn resolvePermission(app: *App, decision: types.ToolPermissionDecision) !bool {
             const id = app.remote.pending_permission_id orelse return false;
+            const session_id = app.remote.pending_permission_session;
+            if (session_id.len == 0) return false;
             const option: client_protocol.PermissionOption = switch (decision) {
                 .once => .allow_once,
                 .always => .allow_always,
                 .deny, .policy_denied, .permission_required => .reject_once,
             };
-            try app.remote.enqueue(.rpc, .{ .permission = .{ .session_id = app.remote.current_id, .request_id = id, .option = option } });
+            try app.remote.enqueue(.rpc, .{ .permission = .{ .session_id = session_id, .request_id = id, .option = option } });
             app.remote.permission_response_queued = true;
             app.approval_prompt.clear(app.alloc);
             app.shell.render_requests.request(.modal);
@@ -131,33 +193,25 @@ pub fn Runtime(comptime App: type) type {
 
         /// Replaces the host's live permission rules with what this process
         /// just wrote to the profile or project settings.
+        /// Permission rules are the tree's shared config, so they reload on
+        /// the root host.
         pub fn reloadPermissions(app: *App) !void {
             if (app.remote.current_id.len == 0) return;
-            try runHostCommand(app, "reloading its permissions", .permissions_reload);
+            try runHostCommand(app, root(app), "reloading its permissions", .permissions_reload);
         }
 
-        pub fn setModel(app: *App, model: []const u8) !void {
-            const id = try sessionFor(app, "changing its configuration") orelse return;
+        pub fn setModel(app: *App, target: Node, model: []const u8) !void {
+            const id = try wireSession(app, target, "changing the model") orelse return;
             try app.remote.enqueue(.config, .{ .model = .{ .session_id = id, .model = model } });
         }
 
-        pub fn setPermissionMode(app: *App, mode: types.PermissionMode) !void {
-            const id = try sessionFor(app, "changing its configuration") orelse return;
+        pub fn setPermissionMode(app: *App, target: Node, mode: types.PermissionMode) !void {
+            const id = try wireSession(app, target, "changing the permission mode") orelse return;
             try app.remote.enqueue(.config, .{ .mode = .{ .session_id = id, .mode = mode.configId() } });
         }
 
-        /// The attached session's id, or null after telling the person to
-        /// open one before `purpose`.
-        fn sessionFor(app: *App, purpose: []const u8) !?[]const u8 {
-            if (app.remote.current_id.len > 0) return app.remote.current_id;
-            const body = try app.alloc.print("Open a session before {s}.", .{purpose});
-            defer app.alloc.free(body);
-            try notice(app, "session", body);
-            return null;
-        }
-
-        fn runHostCommand(app: *App, purpose: []const u8, command: host_commands.Command) !void {
-            const id = try sessionFor(app, purpose) orelse return;
+        fn runHostCommand(app: *App, target: Node, purpose: []const u8, command: host_commands.Command) !void {
+            const id = try wireSession(app, target, purpose) orelse return;
             const fields = host_commands.requestFields(command);
             try app.remote.enqueue(.command, .{ .command = .{
                 .session_id = id,
@@ -216,15 +270,10 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn route(app: *App, cmd: []const u8) !void {
             const registry = app.slashRegistry();
-            if (app.remote.child_id.len > 0) if (command_router.match(registry, cmd)) |matched| {
-                const access = matched.spec.child_transcript;
-                if (!access.admits(matched.payload)) {
-                    const body = try app.alloc.print("This child transcript is read-only. Press Left to return to the parent before running {s}.", .{matched.spec.command});
-                    defer app.alloc.free(body);
-                    try notice(app, "subagent", body);
-                    return;
-                }
-                if (access != .allowed) try notice(app, "subagent", "Showing parent session status; this child transcript is read-only.");
+            if (app.remote.child_id.len > 0) if (command_router.match(registry, cmd)) |matched| switch (matched.spec.scope) {
+                .node => {},
+                .tree => try notice(app, "subagent", "This applies to the whole session tree."),
+                .root => try notice(app, "subagent", "This runs on the root session."),
             };
             var handlers = app_commands.Handlers(App).commandHandlers(app);
             // `/clear` keeps the old conversation's processes, which the
@@ -276,7 +325,7 @@ pub fn Runtime(comptime App: type) type {
         fn commandRename(ctx: *anyopaque, rest: []const u8) !void {
             const app = appFrom(ctx);
             if (rest.len == 0) return notice(app, "", "usage: /rename <title>");
-            const id = try sessionFor(app, "renaming it") orelse return;
+            const id = try wireSession(app, commandTarget(app, .rename_session), "renaming it") orelse return;
             try app.remote.enqueue(.rename, .{ .rename = .{ .session_id = id, .name = rest } });
         }
 
@@ -308,15 +357,24 @@ pub fn Runtime(comptime App: type) type {
 
         fn commandModel(ctx: *anyopaque, query: []const u8) !void {
             const app = appFrom(ctx);
-            if (query.len == 0) return notice(app, "model", app.remote.model);
-            try setModel(app, query);
+            const target = commandTarget(app, .model);
+            if (query.len == 0) {
+                // Only the root's model is in the attached snapshot.
+                _ = try wireSession(app, target, "reading its model") orelse return;
+                return notice(app, "model", app.remote.model);
+            }
+            try setModel(app, target, query);
         }
 
         fn commandPermissions(ctx: *anyopaque, rest: []const u8) !void {
             const app = appFrom(ctx);
-            if (rest.len == 0) return notice(app, "permissions", app.remote.permission_mode.configId());
+            const target = commandTarget(app, .permissions);
+            if (rest.len == 0) {
+                _ = try wireSession(app, target, "reading its permission mode") orelse return;
+                return notice(app, "permissions", app.remote.permission_mode.configId());
+            }
             const mode = types.PermissionMode.parse(rest) orelse return notice(app, "", "usage: /permissions ask|auto|full-access");
-            try setPermissionMode(app, mode);
+            try setPermissionMode(app, target, mode);
         }
 
         /// The host owns each option's accepted values and its rejection
@@ -324,70 +382,77 @@ pub fn Runtime(comptime App: type) type {
         fn commandEffort(ctx: *anyopaque, rest: []const u8) !void {
             const app = appFrom(ctx);
             if (rest.len == 0) return notice(app, "", "usage: /effort auto|minimal|low|medium|high");
-            try setOption(app, "effort", rest);
+            try setOption(app, commandTarget(app, .effort), "effort", rest);
         }
 
         fn commandFast(ctx: *anyopaque, rest: []const u8) !void {
-            try setToggleOption(appFrom(ctx), "fast", rest, "usage: /fast on|off");
+            const app = appFrom(ctx);
+            try setToggleOption(app, commandTarget(app, .fast), "fast", rest, "usage: /fast on|off");
         }
 
         fn commandUltrafast(ctx: *anyopaque, rest: []const u8) !void {
-            try setToggleOption(appFrom(ctx), "ultrafast", rest, "usage: /ultrafast on|off");
+            const app = appFrom(ctx);
+            try setToggleOption(app, commandTarget(app, .ultrafast), "ultrafast", rest, "usage: /ultrafast on|off");
         }
 
-        fn setToggleOption(app: *App, option: []const u8, rest: []const u8, usage: []const u8) !void {
+        fn setToggleOption(app: *App, target: Node, option: []const u8, rest: []const u8, usage: []const u8) !void {
             const enabled = app_commands.parseToggle(rest) orelse return notice(app, "", usage);
-            try setOption(app, option, if (enabled) "true" else "false");
+            try setOption(app, target, option, if (enabled) "true" else "false");
         }
 
-        fn setOption(app: *App, option: []const u8, value: []const u8) !void {
-            const id = try sessionFor(app, "changing its configuration") orelse return;
+        fn setOption(app: *App, target: Node, option: []const u8, value: []const u8) !void {
+            const id = try wireSession(app, target, "changing its configuration") orelse return;
             try app.remote.enqueue(.config, .{ .option = .{ .session_id = id, .config_id = option, .value = value } });
         }
 
         fn commandCopy(ctx: *anyopaque) !void {
-            try runHostCommand(appFrom(ctx), "copying a reply", .last_reply);
+            const app = appFrom(ctx);
+            try runHostCommand(app, commandTarget(app, .copy), "copying a reply", .last_reply);
         }
 
         fn commandUndo(ctx: *anyopaque) !void {
-            try runHostCommand(appFrom(ctx), "undoing a file operation", .undo);
+            const app = appFrom(ctx);
+            try runHostCommand(app, commandTarget(app, .undo), "undoing a file operation", .undo);
         }
 
         fn commandCompact(ctx: *anyopaque) !void {
             const app = appFrom(ctx);
-            const attached = app.remote.current_id.len > 0;
-            try runHostCommand(app, "compacting it", .compact);
-            if (attached) try notice(app, "session", "Compacting context...");
+            const target = commandTarget(app, .compact);
+            _ = try wireSession(app, target, "compacting it") orelse return;
+            try runHostCommand(app, target, "compacting it", .compact);
+            try notice(app, "session", "Compacting context...");
         }
 
         fn commandContext(ctx: *anyopaque) !void {
-            try runHostCommand(appFrom(ctx), "checking its context", .context);
+            const app = appFrom(ctx);
+            try runHostCommand(app, commandTarget(app, .context), "checking its context", .context);
         }
 
         fn commandWorkspace(ctx: *anyopaque, rest: []const u8) !void {
             const app = appFrom(ctx);
+            const target = commandTarget(app, .workspace);
             const usage = "usage: /workspace [list|add PATH|remove PATH|clear]";
             const purpose = "changing its workspace";
-            if (rest.len == 0 or std.mem.eql(u8, rest, "list")) return runHostCommand(app, purpose, .{ .workspace = .list });
-            if (std.mem.eql(u8, rest, "clear")) return runHostCommand(app, purpose, .{ .workspace = .clear });
+            if (rest.len == 0 or std.mem.eql(u8, rest, "list")) return runHostCommand(app, target, purpose, .{ .workspace = .list });
+            if (std.mem.eql(u8, rest, "clear")) return runHostCommand(app, target, purpose, .{ .workspace = .clear });
             const verb_end = std.mem.findAny(u8, rest, " \t") orelse return notice(app, "", usage);
             const path = std.mem.trim(u8, rest[verb_end..], " \t");
             if (path.len == 0) return notice(app, "", usage);
             const verb = rest[0..verb_end];
-            if (std.mem.eql(u8, verb, "add")) return runHostCommand(app, purpose, .{ .workspace = .{ .add = path } });
-            if (std.mem.eql(u8, verb, "remove")) return runHostCommand(app, purpose, .{ .workspace = .{ .remove = path } });
+            if (std.mem.eql(u8, verb, "add")) return runHostCommand(app, target, purpose, .{ .workspace = .{ .add = path } });
+            if (std.mem.eql(u8, verb, "remove")) return runHostCommand(app, target, purpose, .{ .workspace = .{ .remove = path } });
             try notice(app, "", usage);
         }
 
         fn commandShell(ctx: *anyopaque, rest: []const u8) !void {
             const app = appFrom(ctx);
             if (!std.mem.eql(u8, rest, "reload")) return notice(app, "", "usage: /shell reload");
-            try runHostCommand(app, "reloading its shell", .shell_reload);
+            try runHostCommand(app, commandTarget(app, .shell), "reloading its shell", .shell_reload);
         }
 
         fn commandMcp(ctx: *anyopaque, rest: []const u8) !void {
             const app = appFrom(ctx);
-            try runHostCommand(app, "managing MCP servers", if (rest.len == 0) .mcp_status else .{ .mcp_verb = rest });
+            try runHostCommand(app, commandTarget(app, .mcp), "managing MCP servers", if (rest.len == 0) .mcp_status else .{ .mcp_verb = rest });
         }
 
         fn commandSubagents(ctx: *anyopaque) !void {
@@ -401,7 +466,7 @@ pub fn Runtime(comptime App: type) type {
             const app = appFrom(ctx);
             const request = parseHeartbeat(rest) orelse
                 return notice(app, "", "usage: /heartbeat status|start <seconds> <prompt>|pause|resume|stop");
-            const id = try sessionFor(app, "managing its background runtime") orelse return;
+            const id = try wireSession(app, commandTarget(app, .heartbeat), "managing its heartbeat") orelse return;
             try app.remote.enqueue(.heartbeat, .{ .heartbeat = .{
                 .session_id = id,
                 .action = request.action,
@@ -414,7 +479,7 @@ pub fn Runtime(comptime App: type) type {
             const app = appFrom(ctx);
             const action = parseKernelAction(rest) orelse
                 return notice(app, "", "usage: /kernel status|restart|stop|prewarm|interrupt");
-            const id = try sessionFor(app, "managing its background runtime") orelse return;
+            const id = try wireSession(app, commandTarget(app, .kernel), "managing its kernel") orelse return;
             try app.remote.enqueue(.kernel, .{ .kernel = .{ .session_id = id, .action = action } });
         }
     };
@@ -483,24 +548,32 @@ test "kernel arguments accept only the supervisor's actions" {
     try std.testing.expect(parseKernelAction("reboot") == null);
 }
 
-test "child transcript access comes from the slash specs" {
+test "command scopes send tree and root commands past the focused subagent" {
     const registry = @import("../../builtins/commands.zig").slash_registry;
-    const Case = struct { cmd: []const u8, admitted: bool };
+    const Case = struct { cmd: []const u8, scope: command_specs.CommandScope };
     const cases = [_]Case{
-        .{ .cmd = "/kernel", .admitted = true },
-        .{ .cmd = "/kernel status", .admitted = true },
-        .{ .cmd = "/kernel restart", .admitted = false },
-        .{ .cmd = "/heartbeat stop", .admitted = false },
-        .{ .cmd = "/model", .admitted = true },
-        .{ .cmd = "/model status", .admitted = false },
-        .{ .cmd = "/permissions auto", .admitted = false },
-        .{ .cmd = "/compact", .admitted = false },
-        .{ .cmd = "/workspace", .admitted = false },
-        .{ .cmd = "/status", .admitted = true },
-        .{ .cmd = "/new", .admitted = true },
+        .{ .cmd = "/model", .scope = .node },
+        .{ .cmd = "/undo", .scope = .node },
+        .{ .cmd = "/kernel status", .scope = .node },
+        .{ .cmd = "/compact", .scope = .node },
+        .{ .cmd = "/workspace add /tmp", .scope = .tree },
+        .{ .cmd = "/mcp", .scope = .tree },
+        .{ .cmd = "/shell reload", .scope = .tree },
+        .{ .cmd = "/allowlist", .scope = .tree },
+        .{ .cmd = "/heartbeat stop", .scope = .root },
+        .{ .cmd = "/new", .scope = .root },
+        .{ .cmd = "/resume last", .scope = .root },
+        .{ .cmd = "/clear", .scope = .root },
     };
     for (cases) |case| {
         const matched = command_router.match(registry, case.cmd) orelse return error.TestExpectedCommand;
-        try std.testing.expectEqual(case.admitted, matched.spec.child_transcript.admits(matched.payload));
+        try std.testing.expectEqual(case.scope, matched.spec.scope);
     }
+}
+
+test "a node names its root explicitly" {
+    const root_node: Node = .{ .id = "root", .root_id = "root" };
+    const child: Node = .{ .id = "child", .root_id = "root" };
+    try std.testing.expect(root_node.isRoot());
+    try std.testing.expect(!child.isRoot());
 }

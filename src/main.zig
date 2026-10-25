@@ -1233,7 +1233,7 @@ const App = struct {
         switch (self.backend) {
             .in_process => return self.enqueueInProcessPrompt(prompt, skill_tokens),
             .detached => {
-                if (!try DetachedBackend.submit(self, prompt, self.pending_images.items)) return false;
+                if (!try DetachedBackend.submit(self, DetachedBackend.focus(self), prompt, self.pending_images.items)) return false;
                 try self.writeUserPromptCard(.{ .text = @constCast(prompt), .images = self.pending_images.items });
                 return true;
             },
@@ -1297,7 +1297,8 @@ const App = struct {
         draft: *const input_submit_runtime.PendingPromptDraft,
     ) !void {
         if (self.backend == .detached) {
-            if (!try DetachedBackend.submit(self, draft.prompt, draft.images)) return error.PendingPromptQueueRejected;
+            // The backend already said why it refused the prompt.
+            if (!try DetachedBackend.submit(self, DetachedBackend.focus(self), draft.prompt, draft.images)) return error.PromptRefusedByBackend;
             return;
         }
         const context_targets = if (self.context_enabled)
@@ -1408,7 +1409,7 @@ const App = struct {
         switch (self.backend) {
             .in_process => return false,
             .detached => {
-                try DetachedBackend.cancel(self);
+                try DetachedBackend.cancel(self, DetachedBackend.focus(self));
                 return true;
             },
         }

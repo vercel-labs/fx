@@ -24,6 +24,11 @@
 //!   deliver events                    worker event tick           supervisor poll
 //!   browse sessions and subagents     (not offered)               session browser
 //!
+//! The detached backend addresses every operation to an explicit session
+//! node (`remote_backend.Node`): the composer's focus for prompts, cancels,
+//! and `.node` commands, and the root for `.tree` and `.root` commands (see
+//! `command_specs.CommandScope`). It has no implicit "main" session.
+//!
 //! What the frontend shows of its session (model, mode, workspace) comes
 //! from `Ops.view`, so renderers and pickers never read either backend's
 //! state directly.
@@ -97,7 +102,8 @@ pub fn Ops(comptime App: type) type {
 
         pub fn selectModel(app: *App, selection: ModelSelection) !void {
             if (comptime has_backend) if (app.backend == .detached) {
-                return remote_backend.Runtime(App).setModel(app, selection.model);
+                const Detached = remote_backend.Runtime(App);
+                return Detached.setModel(app, Detached.focus(app), selection.model);
             };
             try session_commands.Commands(App).selectModelFromPicker(
                 app,
@@ -111,7 +117,8 @@ pub fn Ops(comptime App: type) type {
         /// Moves to the next permission mode: ask, auto, full access.
         pub fn cyclePermissionMode(app: *App) !void {
             if (comptime has_backend) if (app.backend == .detached) {
-                return remote_backend.Runtime(App).setPermissionMode(app, app.remote.permission_mode.next());
+                const Detached = remote_backend.Runtime(App);
+                return Detached.setPermissionMode(app, Detached.focus(app), app.remote.permission_mode.next());
             };
             try app_permission_runtime.Runtime(App).toggleMode(app);
         }

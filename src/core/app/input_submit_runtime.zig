@@ -581,6 +581,11 @@ pub fn SubmitRuntime(comptime App: type) type {
         }
 
         fn finishPendingSubmissionFailure(app: *App, err: anyerror) void {
+            // A backend that refuses a prompt tells the person why itself.
+            if (err == error.PromptRefusedByBackend) {
+                clearPendingSubmission(app, "backend_refused");
+                return;
+            }
             const turn_id = app.submission.pending.?.draft.turn_id;
             const body = app.alloc.print(
                 "failed to submit prompt after presentation ({s})",

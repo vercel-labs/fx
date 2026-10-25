@@ -81,28 +81,16 @@ pub const SlashKind = enum {
     kernel,
 };
 
-/// What a command may do while the composer shows a subagent's read-only
-/// transcript. Only the detached frontend has child transcripts.
-pub const ChildTranscriptAccess = enum {
-    /// Runs the same as in the parent.
-    allowed,
-    /// Changes the session, so a read-only child transcript refuses it.
-    refused,
-    /// The bare form reports the parent session; arguments are refused.
-    reads_parent,
-    /// The bare form and `status` report the parent session; any other
-    /// argument is refused.
-    reads_parent_status,
-
-    /// Whether `payload` only reads, so a child transcript may run it.
-    pub fn admits(self: ChildTranscriptAccess, payload: []const u8) bool {
-        return switch (self) {
-            .allowed => true,
-            .refused => false,
-            .reads_parent => payload.len == 0,
-            .reads_parent_status => payload.len == 0 or std.mem.eql(u8, payload, "status"),
-        };
-    }
+/// Which session a slash command acts on when the composer can show a
+/// node below the root session (a subagent). Commands that only touch this
+/// frontend (help, settings, sound, images) ignore it.
+pub const CommandScope = enum {
+    /// The focused session: the root, or the subagent the composer shows.
+    node,
+    /// The whole session tree, through the root host's shared config.
+    tree,
+    /// The root session, whatever the composer shows.
+    root,
 };
 
 pub const OptionDoc = struct {
@@ -200,7 +188,7 @@ pub const SlashSpec = struct {
     has_args: bool = false,
     accepts_payload: bool = false,
     requires_prompt_credential: bool = false,
-    child_transcript: ChildTranscriptAccess = .allowed,
+    scope: CommandScope = .node,
 };
 
 pub const SlashRegistry = mod_registry.CommandRegistry(SlashSpec);

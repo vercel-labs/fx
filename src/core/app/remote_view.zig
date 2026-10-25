@@ -129,6 +129,8 @@ pub fn Runtime(comptime App: type) type {
             resetTranscriptContents(app);
             app.approval_prompt.clear(app.alloc);
             app.remote.pending_permission_id = null;
+            if (app.remote.pending_permission_session.len > 0) app.alloc.free(app.remote.pending_permission_session);
+            app.remote.pending_permission_session = &.{};
             app.remote.permission_response_queued = false;
             app.shell.render_requests.request(.transcript);
         }
@@ -458,7 +460,7 @@ pub fn Runtime(comptime App: type) type {
                     app.approval_prompt.clear(app.alloc);
                 } else for (value.pending) |frame| {
                     if (std.mem.eql(u8, string(frame, "method") orelse "", "session/request_permission")) {
-                        try showPermission(app, frame);
+                        try showPermission(app, value.session_id, frame);
                         break;
                     }
                 }
@@ -534,9 +536,13 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        pub fn showPermission(app: *App, frame: std.json.Value) !void {
+        /// Shows the permission request `session_id`'s host is waiting on.
+        pub fn showPermission(app: *App, session_id: []const u8, frame: std.json.Value) !void {
             const id: u64 = @intCast(integer(frame, "id") orelse return);
             if (app.approval_prompt.request) |request| if (request.id == id) return;
+            const owned = try app.alloc.dupe(u8, session_id);
+            if (app.remote.pending_permission_session.len > 0) app.alloc.free(app.remote.pending_permission_session);
+            app.remote.pending_permission_session = owned;
             app.remote.pending_permission_id = @intCast(id);
             const params = field(frame, "params") orelse return;
             const tool = field(params, "toolCall") orelse return;

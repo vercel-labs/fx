@@ -74,6 +74,8 @@ pub const State = struct {
     reconnect_notice: bool = false,
     permission_mode: types.PermissionMode = .ask,
     pending_permission_id: ?i64 = null,
+    /// The session whose host asked `pending_permission_id`.
+    pending_permission_session: []u8 = &.{},
     permission_response_queued: bool = false,
     submitted_text: std.ArrayList([]u8) = .empty,
 
@@ -85,6 +87,7 @@ pub const State = struct {
         self.sent.deinit(alloc);
         if (self.current_id.len > 0) alloc.free(self.current_id);
         if (self.child_id.len > 0) alloc.free(self.child_id);
+        if (self.pending_permission_session.len > 0) alloc.free(self.pending_permission_session);
         for (self.child_ancestors.items) |id| alloc.free(id);
         self.child_ancestors.deinit(alloc);
         if (self.child_prompt.len > 0) alloc.free(self.child_prompt);

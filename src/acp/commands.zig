@@ -18,6 +18,10 @@
 //!   (after /permissions edits) permissions_reload
 //!   /mcp                       mcp_status
 //!   /mcp VERB ...              mcp_verb
+//!
+//! `/kernel` and `/heartbeat` are supervisor requests instead: the
+//! supervisor schedules heartbeats across clients and answers kernel status
+//! while the host runs a turn.
 const std = @import("std");
 
 pub const Command = union(Name) {
