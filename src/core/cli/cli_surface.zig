@@ -3072,7 +3072,7 @@ fn runDaemonCommand(alloc: Allocator, cfg: Config, rest: []const [:0]const u8, d
     const supervisor_protocol = @import("../supervisor/protocol.zig");
     var client = try supervisor_client.Client.init(alloc);
     defer client.deinit();
-    var response = client.request(alloc, if (action == .stop) .shutdown else .list) catch |err| {
+    var response = client.request(alloc, if (action == .stop) .shutdown else .{ .list = .{} }) catch |err| {
         const message = try alloc.print("proto-fx daemon: {s} (no answering supervisor)\n", .{@errorName(err)});
         defer alloc.free(message);
         try writeStderr(deps, message);

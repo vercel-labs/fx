@@ -5,6 +5,14 @@
 //! `ok`; a failed one has `error` and nothing else. Both ends parse these
 //! types with std.json, so a field changes in one place.
 //!
+//! A client keeps one connection open (`channel.zig`). Each request travels
+//! in a `RequestFrame` with an id its `ReplyFrame` repeats, and the
+//! supervisor pushes `UpdateFrame`s for what the connection watches: the
+//! session it attached to, and the session list, a session's children, or
+//! one child's transcript when it asked with `watch`. A bare request with no
+//! id is a one-shot exchange: the supervisor answers it bare and hangs up,
+//! which is how `proto-fx daemon` talks to a supervisor of any version.
+//!
 //! Shapes that carry host-produced JSON (saved history, ACP frames) take the
 //! JSON type as a parameter: the supervisor writes cached bytes through
 //! `RawJson`, and a client reads them as `std.json.Value` or a typed slice.
@@ -14,7 +22,7 @@ const Allocator = std.mem.Allocator;
 
 /// Bumped whenever a request or response changes shape. A client refuses a
 /// supervisor that answers `ping` with another version.
-pub const version: u32 = 2;
+pub const version: u32 = 3;
 
 pub const Heartbeat = struct {
     prompt: []const u8 = "",
@@ -60,6 +68,13 @@ pub const Kernel = struct { session_id: []const u8, action: []const u8 = "status
 pub const Prompt = struct { session_id: []const u8, text: []const u8 };
 pub const SessionRef = struct { session_id: []const u8 };
 
+/// What a connection can watch besides its attached session.
+pub const Topic = enum { session, list, children, child };
+
+pub const List = struct { watch: bool = false };
+pub const ChildrenRequest = struct { session_id: []const u8, watch: bool = false };
+pub const Unwatch = struct { topic: Topic, session_id: ?[]const u8 = null };
+
 pub const Permission = struct {
     session_id: []const u8,
     request_id: i64,
@@ -80,12 +95,14 @@ pub const History = struct {
     after_live_sequence: u64 = 0,
     live_active: bool = false,
     include_history: bool = true,
+    /// Push this child's transcript as it changes, from the returned cursor.
+    watch: bool = false,
 };
 
 pub const Request = union(enum) {
     ping,
     shutdown,
-    list,
+    list: List,
     create: Create,
     attach: Attach,
     mode: SetMode,
@@ -99,8 +116,9 @@ pub const Request = union(enum) {
     permission: Permission,
     stop: SessionRef,
     heartbeat: HeartbeatRequest,
-    children: SessionRef,
+    children: ChildrenRequest,
     history: History,
+    unwatch: Unwatch,
 
     pub const Tag = std.meta.Tag(Request);
 
@@ -108,6 +126,7 @@ pub const Request = union(enum) {
     pub fn sessionId(self: Request) ?[]const u8 {
         return switch (self) {
             .ping, .shutdown, .list, .create => null,
+            .unwatch => |payload| payload.session_id,
             inline else => |payload| payload.session_id,
         };
     }
@@ -157,6 +176,39 @@ pub const Request = union(enum) {
         return std.json.parseFromValueLeaky(Request, arena, value, .{});
     }
 };
+
+/// A request on a kept-open connection.
+pub const RequestFrame = struct { id: u64, request: Request };
+
+/// The supervisor's answer to the request with the same id.
+pub const ReplyFrame = struct { id: u64, response: RawJson };
+
+/// A change the supervisor pushes to a watching connection. `body` has the
+/// shape of the response to the request that started the watch: a
+/// `Snapshot` delta for `session`, a `SessionList`, `Children`, or a
+/// `ChildHistory`.
+pub const UpdateFrame = struct { update: Topic, body: RawJson };
+
+/// What a client reads: a reply or an update.
+pub const ServerFrame = struct {
+    id: ?u64 = null,
+    response: ?std.json.Value = null,
+    update: ?Topic = null,
+    body: ?std.json.Value = null,
+};
+
+/// Parses a request frame or a bare one-shot request. Everything returned
+/// borrows `arena`. The id survives a bad request so the reply can name it.
+pub fn parseInbound(arena: Allocator, bytes: []const u8, id: *?u64) !Request {
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{});
+    if (value == .object) if (value.object.get("request")) |request| {
+        const raw_id = value.object.get("id") orelse return error.MissingField;
+        if (raw_id != .integer or raw_id.integer < 0) return error.UnexpectedToken;
+        id.* = @intCast(raw_id.integer);
+        return std.json.parseFromValueLeaky(Request, arena, request, .{});
+    };
+    return std.json.parseFromValueLeaky(Request, arena, value, .{});
+}
 
 /// Writes already-encoded JSON in place. The supervisor keeps saved history
 /// and host frames encoded, so a snapshot copies bytes instead of re-parsing.
@@ -339,6 +391,38 @@ test "requests round trip with their command beside the fields" {
     try std.testing.expectEqualStrings("session", create.create.name);
     try std.testing.expect(create.create.@"resume" == null);
     try std.testing.expectEqualStrings("s", (try Request.parse(arena, "{\"command\":\"stop\",\"session_id\":\"s\"}")).sessionId().?);
+}
+
+test "framed and bare requests parse to the same request" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const request: Request = .{ .history = .{ .session_id = "s", .child_id = "c", .watch = true } };
+    var id: ?u64 = null;
+    const framed = try parseInbound(arena, try encode(arena, RequestFrame{ .id = 9, .request = request }), &id);
+    try std.testing.expectEqual(@as(?u64, 9), id);
+    try std.testing.expect(framed.history.watch);
+    var bare_id: ?u64 = null;
+    const bare = try parseInbound(arena, try encode(arena, request), &bare_id);
+    try std.testing.expect(bare_id == null);
+    try std.testing.expectEqualStrings("c", bare.history.child_id.?);
+    // A bad request inside a frame still reports its id.
+    var bad_id: ?u64 = null;
+    try std.testing.expectError(error.InvalidEnumTag, parseInbound(arena, "{\"id\":4,\"request\":{\"command\":\"explode\"}}", &bad_id));
+    try std.testing.expectEqual(@as(?u64, 4), bad_id);
+    const unwatch = try Request.parse(arena, "{\"command\":\"unwatch\",\"topic\":\"list\"}");
+    try std.testing.expect(unwatch.sessionId() == null);
+}
+
+test "replies and updates carry their bodies as json" {
+    const alloc = std.testing.allocator;
+    const bytes = try encode(alloc, UpdateFrame{ .update = .list, .body = .{ .bytes = "{\"ok\":true,\"sessions\":[]}" } });
+    defer alloc.free(bytes);
+    const parsed = try std.json.parseFromSlice(ServerFrame, alloc, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.id == null);
+    try std.testing.expectEqual(Topic.list, parsed.value.update.?);
+    try std.testing.expect(parsed.value.body.?.object.get("ok").?.bool);
 }
 
 test "unknown and malformed requests are rejected" {

@@ -1,5 +1,7 @@
-//! Attached terminal client. Socket requests run off the paint thread; closing this
-//! state releases only client resources, never the supervisor's sessions.
+//! Attached terminal client. One kept-open supervisor connection carries every
+//! request and the updates the supervisor pushes; its I/O thread keeps socket
+//! work off the paint thread. Closing this state releases only client
+//! resources, never the supervisor's sessions.
 const std = @import("std");
 const client_mod = @import("../supervisor/client.zig");
 const client_protocol = @import("../supervisor/protocol.zig");
@@ -16,57 +18,44 @@ const diff = @import("../output/diff.zig");
 const metrics_line = @import("../output/metrics_line.zig");
 const Allocator = std.mem.Allocator;
 const SnapshotView = client_protocol.Snapshot([]const types.HistoryTurn, std.json.Value);
-const Kind = enum { startup, startup_last, startup_remembered, attach, poll, list, children, history, submit, cancel, rpc, heartbeat, kernel, rename, config, command };
+/// What a reply answers. `poll` is a pushed session update, and `resync` the
+/// resubscribe after a reconnect.
+const Kind = enum { startup, startup_last, startup_remembered, attach, poll, resync, list, children, history, submit, cancel, rpc, heartbeat, kernel, rename, config, command, unwatch };
+/// A request waiting to be sent, or sent and waiting for its reply.
 const Request = struct {
-    alloc: Allocator,
     kind: Kind,
     json: []u8,
     generation: u64,
-    executable: ?[]u8 = null,
-    fn deinit(self: *Request) void {
-        self.alloc.free(self.json);
-        if (self.executable) |value| self.alloc.free(value);
-    }
+    id: u64 = 0,
 };
-const Task = struct {
-    thread: ?std.Thread = null,
-    done: std.atomic.Value(bool) = .init(false),
-    alloc: Allocator,
-    client: *const client_mod.Client,
-    request: Request,
-    response: ?client_mod.Response = null,
-    failure: ?anyerror = null,
-    fn run(self: *Task) void {
-        defer self.done.store(true, .release);
-        if (self.request.executable) |executable| self.client.ensureRunning(executable) catch |err| {
-            self.failure = err;
-            return;
-        };
-        self.response = self.client.requestJson(self.alloc, self.request.json) catch |err| {
-            self.failure = err;
-            return;
-        };
-    }
-    fn deinit(self: *Task) void {
-        if (self.thread) |thread| thread.join();
-        if (self.response) |*response| response.deinit();
-        self.request.deinit();
-        self.alloc.destroy(self);
-    }
+fn dropRequests(alloc: Allocator, list: *std.ArrayList(Request)) void {
+    for (list.items) |request| alloc.free(request.json);
+    list.clearRetainingCapacity();
+}
+const Link = enum {
+    /// No connection yet, or the last one dropped.
+    connecting,
+    /// Reconnected; the resubscribe has not answered, so queued requests
+    /// wait in case the supervisor restarted.
+    resyncing,
+    ready,
 };
 pub const State = struct {
     allocator: ?Allocator = null,
     active: bool = false,
-    client: ?*client_mod.Client = null,
-    task: ?*Task = null,
+    connection: ?*client_mod.Connection = null,
+    link: Link = .connecting,
+    connected_once: bool = false,
+    /// Requests not sent yet. They go out when the link is ready.
     queue: std.ArrayList(Request) = .empty,
+    /// Sent requests awaiting their replies.
+    sent: std.ArrayList(Request) = .empty,
+    /// What this connection asked the supervisor to push.
+    watching: struct { list: bool = false, children: bool = false, child: bool = false } = .{},
     current_id: []u8 = &.{},
     child_id: []u8 = &.{},
     generation: u64 = 1,
     sequence: u64 = 0,
-    next_poll_ms: i64 = 0,
-    next_list_ms: i64 = 0,
-    next_child_poll_ms: i64 = 0,
     child_history_count: ?usize = null,
     child_work_id: []u8 = &.{},
     child_sequence: u64 = 0,
@@ -92,13 +81,11 @@ pub const State = struct {
     submitted_text: std.ArrayList([]u8) = .empty,
 
     pub fn deinit(self: *State, alloc: Allocator) void {
-        if (self.task) |task| task.deinit();
-        for (self.queue.items) |*request| request.deinit();
+        if (self.connection) |connection| connection.stop();
+        dropRequests(alloc, &self.queue);
         self.queue.deinit(alloc);
-        if (self.client) |client| {
-            client.deinit();
-            alloc.destroy(client);
-        }
+        dropRequests(alloc, &self.sent);
+        self.sent.deinit(alloc);
         if (self.current_id.len > 0) alloc.free(self.current_id);
         if (self.child_id.len > 0) alloc.free(self.child_id);
         if (self.child_prompt.len > 0) alloc.free(self.child_prompt);
@@ -129,17 +116,55 @@ pub const State = struct {
         if (self.queue.items.len >= 32) return error.RemoteQueueFull;
         const json = try client_protocol.encode(alloc, request);
         errdefer alloc.free(json);
-        try self.queue.append(alloc, .{ .alloc = alloc, .kind = kind, .json = json, .generation = self.generation });
+        try self.queue.append(alloc, .{ .kind = kind, .json = json, .generation = self.generation });
     }
-    fn startNext(self: *State) !void {
-        if (self.task != null or self.queue.items.len == 0) return;
+
+    /// Sends one request now, ahead of the queue. A connection that just
+    /// dropped drops it too; its `disconnected` follows.
+    fn sendNow(self: *State, kind: Kind, request: client_protocol.Request) !void {
         const alloc = self.allocator orelse return error.RemoteNotInitialized;
-        const task = try alloc.create(Task);
-        errdefer alloc.destroy(task);
-        task.* = .{ .alloc = alloc, .client = self.client.?, .request = self.queue.orderedRemove(0) };
-        errdefer task.request.deinit();
-        task.thread = try std.Thread.spawn(.{}, Task.run, .{task});
-        self.task = task;
+        const json = try client_protocol.encode(alloc, request);
+        self.transmit(.{ .kind = kind, .json = json, .generation = self.generation }) catch |err| {
+            alloc.free(json);
+            if (err == error.SupervisorDisconnected) return;
+            return err;
+        };
+    }
+
+    /// Sends `request` and tracks it until its reply. Takes ownership of
+    /// `request.json` only on success.
+    fn transmit(self: *State, request: Request) !void {
+        const alloc = self.allocator orelse return error.RemoteNotInitialized;
+        try self.sent.ensureUnusedCapacity(alloc, 1);
+        var sent = request;
+        sent.id = try self.connection.?.send(request.json);
+        self.sent.appendAssumeCapacity(sent);
+    }
+
+    /// Sends the queue in order while the link is ready. What a dropped
+    /// connection could not take stays queued.
+    fn flush(self: *State) !void {
+        while (self.link == .ready and self.queue.items.len > 0) {
+            self.transmit(self.queue.items[0]) catch |err| {
+                if (err == error.SupervisorDisconnected) return;
+                return err;
+            };
+            _ = self.queue.orderedRemove(0);
+        }
+    }
+
+    /// Removes and returns the sent request `id` answers. Caller frees its json.
+    fn answered(self: *State, id: u64) ?Request {
+        for (self.sent.items, 0..) |request, index| if (request.id == id) return self.sent.orderedRemove(index);
+        return null;
+    }
+
+    /// Whether a request of `kind` for the current view is queued or sent.
+    fn inFlight(self: *const State, kind: Kind) bool {
+        for ([_][]const Request{ self.queue.items, self.sent.items }) |list| {
+            for (list) |request| if (request.kind == kind and request.generation == self.generation) return true;
+        }
+        return false;
     }
 };
 
@@ -147,14 +172,9 @@ pub fn Runtime(comptime App: type) type {
     return struct {
         pub fn init(app: *App, executable: []const u8, resume_id: ?[]const u8) !void {
             const remote = &app.remote;
-            if (remote.client != null) return;
-            const client = try app.alloc.create(client_mod.Client);
-            client.* = client_mod.Client.init(app.alloc) catch |err| {
-                app.alloc.destroy(client);
-                return err;
-            };
+            if (remote.connection != null) return;
+            remote.connection = try client_mod.Connection.start(app.alloc, executable);
             remote.allocator = app.alloc;
-            remote.client = client;
             remote.active = true;
             errdefer remote.deinit(app.alloc);
             if (app.requested_resume) |requested| {
@@ -164,17 +184,15 @@ pub fn Runtime(comptime App: type) type {
                 switch (target) {
                     .pick => {
                         app.input_runtime.session_browser.open(.sessions);
-                        try remote.enqueue(.list, .list);
+                        try refreshBrowser(app);
                     },
-                    .last => try remote.enqueue(.startup_last, .list),
-                    .remembered => try remote.enqueue(.startup_remembered, .list),
+                    .last => try remote.enqueue(.startup_last, .{ .list = .{} }),
+                    .remembered => try remote.enqueue(.startup_remembered, .{ .list = .{} }),
                     .id => |id| try remote.enqueue(.startup, .{ .create = .{ .cwd = app.workspace_root, .@"resume" = id } }),
                 }
             } else {
                 try remote.enqueue(.startup, .{ .create = .{ .cwd = app.workspace_root, .@"resume" = resume_id } });
             }
-            remote.queue.items[0].executable = try app.alloc.dupe(u8, executable);
-            try remote.startNext();
         }
 
         /// Returns true only for commands owned by the detached session frontend.
@@ -203,7 +221,7 @@ pub fn Runtime(comptime App: type) type {
             }
             if (std.mem.eql(u8, name, "/resume")) {
                 if (rest.len == 0) try openSessionBrowser(app, .sessions) else if (std.mem.eql(u8, rest, "last")) {
-                    try app.remote.enqueue(.startup_last, .list);
+                    try app.remote.enqueue(.startup_last, .{ .list = .{} });
                 } else try switchSession(app, rest);
                 return true;
             }
@@ -652,15 +670,18 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
+        /// Loads the browser's rows and watches them: the supervisor pushes
+        /// each change until the browser closes or changes scope.
         fn refreshBrowser(app: *App) !void {
             if (app.input_runtime.session_browser.scope == .sessions) {
-                try app.remote.enqueue(.list, .list);
+                try app.remote.enqueue(.list, .{ .list = .{ .watch = true } });
+                app.remote.watching.list = true;
             } else if (app.remote.current_id.len > 0) {
-                try app.remote.enqueue(.children, .{ .children = .{ .session_id = app.remote.current_id } });
+                try app.remote.enqueue(.children, .{ .children = .{ .session_id = app.remote.current_id, .watch = true } });
+                app.remote.watching.children = true;
             } else {
                 try app.input_runtime.session_browser.replaceRows(app.alloc, &.{});
             }
-            app.remote.next_list_ms = io_mod.milliTimestamp() + 750;
         }
 
         pub fn activateBrowserSelection(app: *App) !void {
@@ -731,41 +752,118 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.transcript);
         }
 
+        /// Applies what the connection received, then sends what is queued.
+        /// Nothing here waits on the socket.
         pub fn poll(app: *App) !void {
             const remote = &app.remote;
             if (!remote.active) return;
-            if (remote.task) |task| {
-                if (task.done.load(.acquire)) {
-                    remote.task = null;
-                    defer task.deinit();
-                    if (task.request.generation == remote.generation) {
-                        if (task.request.kind == .rpc) remote.permission_response_queued = false;
-                        if (task.failure) |failure| {
-                            remote.next_poll_ms = io_mod.milliTimestamp() + 2_000;
-                            if (task.request.kind == .list or task.request.kind == .children) app.input_runtime.session_browser.fail(@errorName(failure));
-                            try app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = @errorName(failure) }, true);
-                        } else if (task.response) |*response| {
-                            try applyResponse(app, task.request.kind, response.value);
-                        }
+            const connection = remote.connection orelse return;
+            var incoming = connection.take();
+            defer {
+                for (incoming.items) |*item| item.deinit();
+                incoming.deinit(app.alloc);
+            }
+            for (incoming.items) |item| switch (item) {
+                .connected => try connected(app),
+                .disconnected => |failure| try disconnected(app, failure),
+                .frame => |parsed| {
+                    const frame = parsed.value;
+                    if (frame.id) |id| {
+                        const request = remote.answered(id) orelse continue;
+                        defer app.alloc.free(request.json);
+                        if (request.kind == .resync) remote.link = .ready;
+                        if (request.generation != remote.generation) continue;
+                        if (request.kind == .rpc) remote.permission_response_queued = false;
+                        try applyResponse(app, request.kind, frame.response orelse continue);
+                    } else if (frame.update) |topic| {
+                        try applyUpdate(app, topic, frame.body orelse continue);
                     }
-                }
-            }
-            const now = io_mod.milliTimestamp();
-            if (remote.task == null and remote.queue.items.len == 0 and remote.current_id.len > 0 and now >= remote.next_poll_ms) {
-                try remote.enqueue(.poll, .{ .attach = .{ .session_id = remote.current_id, .after_sequence = remote.sequence, .include_history = false } });
-                remote.next_poll_ms = now + 100;
-            }
-            if (app.input_runtime.session_browser.active and now >= remote.next_list_ms and remote.queue.items.len < 2) try refreshBrowser(app);
-            if (remote.child_id.len > 0 and now >= remote.next_child_poll_ms and remote.queue.items.len < 2) {
-                try refreshChild(app);
-            }
-            try remote.startNext();
+                },
+            };
+            try unwatchClosedViews(app);
+            try remote.flush();
         }
 
+        /// A connection opened. After an outage, resubscribe from the last
+        /// event seen before sending anything queued: if the supervisor
+        /// restarted, the snapshot says so and queued requests are dropped.
+        fn connected(app: *App) !void {
+            const remote = &app.remote;
+            if (!remote.connected_once) {
+                remote.connected_once = true;
+                remote.link = .ready;
+                return;
+            }
+            // The supervisor forgot this connection's watches.
+            remote.watching = .{};
+            if (remote.current_id.len == 0) {
+                remote.link = .ready;
+                return;
+            }
+            remote.link = .resyncing;
+            try remote.sendNow(.resync, .{ .attach = .{ .session_id = remote.current_id, .after_sequence = remote.sequence, .include_history = false } });
+            if (app.input_runtime.session_browser.active) try refreshBrowser(app);
+            if (remote.child_id.len > 0) {
+                remote.child_history_count = null;
+                try refreshChild(app);
+            }
+        }
+
+        fn disconnected(app: *App, failure: anyerror) !void {
+            const remote = &app.remote;
+            remote.link = .connecting;
+            // Nothing sent before the outage will be answered.
+            dropRequests(app.alloc, &remote.sent);
+            remote.permission_response_queued = false;
+            if (app.input_runtime.session_browser.active) app.input_runtime.session_browser.fail(@errorName(failure));
+            if (!remote.connected_once) {
+                try app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = @errorName(failure) }, true);
+                return;
+            }
+            const body = try app.alloc.print("Lost the connection to the supervisor ({s}). Reconnecting.", .{@errorName(failure)});
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{ .topic = "session", .tone = .warning, .body = body }, true);
+        }
+
+        /// Applies one pushed update. A session update waits for the reply
+        /// that starts its watch, which carries the baseline.
+        fn applyUpdate(app: *App, topic: client_protocol.Topic, body: std.json.Value) !void {
+            const remote = &app.remote;
+            switch (topic) {
+                .session => {
+                    if (remote.link != .ready or remote.inFlight(.startup) or remote.inFlight(.attach)) return;
+                    if (!std.mem.eql(u8, string(body, "session_id") orelse "", remote.current_id)) return;
+                    try applyResponse(app, .poll, body);
+                },
+                .list => try applyResponse(app, .list, body),
+                .children => try applyResponse(app, .children, body),
+                .child => try applyResponse(app, .history, body),
+            }
+        }
+
+        /// Stops the pushes for views the user closed.
+        fn unwatchClosedViews(app: *App) !void {
+            const remote = &app.remote;
+            if (remote.link != .ready) return;
+            const browser = &app.input_runtime.session_browser;
+            if (remote.watching.list and !(browser.active and browser.scope == .sessions)) {
+                try remote.enqueue(.unwatch, .{ .unwatch = .{ .topic = .list } });
+                remote.watching.list = false;
+            }
+            if (remote.watching.children and !(browser.active and browser.scope == .subagents)) {
+                try remote.enqueue(.unwatch, .{ .unwatch = .{ .topic = .children, .session_id = remote.current_id } });
+                remote.watching.children = false;
+            }
+            if (remote.watching.child and remote.child_id.len == 0) {
+                try remote.enqueue(.unwatch, .{ .unwatch = .{ .topic = .child, .session_id = remote.current_id } });
+                remote.watching.child = false;
+            }
+        }
+
+        /// Loads the child transcript from the cursor and watches it.
         fn refreshChild(app: *App) !void {
             const remote = &app.remote;
-            if (remote.task) |task| if (task.request.kind == .history and task.request.generation == remote.generation) return;
-            for (remote.queue.items) |request| if (request.kind == .history and request.generation == remote.generation) return;
+            if (remote.inFlight(.history)) return;
             try remote.enqueue(.history, .{ .history = .{
                 .session_id = remote.current_id,
                 .child_id = remote.child_id,
@@ -773,8 +871,9 @@ pub fn Runtime(comptime App: type) type {
                 .after_live_sequence = remote.child_sequence,
                 .live_active = remote.child_live_active,
                 .include_history = remote.child_history_count == null,
+                .watch = true,
             } });
-            remote.next_child_poll_ms = io_mod.milliTimestamp() + 150;
+            remote.watching.child = true;
         }
 
         fn decode(comptime T: type, app: *App, value: std.json.Value) !std.json.Parsed(T) {
@@ -791,7 +890,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             switch (kind) {
-                .startup, .attach, .poll => {
+                .startup, .attach, .poll, .resync => {
                     var snapshot = try decode(SnapshotView, app, value);
                     defer snapshot.deinit();
                     try applySnapshot(app, snapshot.value);
@@ -843,19 +942,12 @@ pub fn Runtime(comptime App: type) type {
                     defer child.deinit();
                     try applyChildSnapshot(app, child.value);
                 },
-                .config => {
-                    try notice(app, "session", "Session configuration updated.");
-                    app.remote.next_poll_ms = 0;
-                },
-                .rename => {
-                    try notice(app, "session", "Session renamed.");
-                    app.remote.next_poll_ms = 0;
-                },
+                .config => try notice(app, "session", "Session configuration updated."),
+                .rename => try notice(app, "session", "Session renamed."),
                 .rpc => app.remote.permission_response_queued = false,
-                // The daemon accepts a session command and reports its result
-                // through the event stream, so poll for it right away.
-                .command => app.remote.next_poll_ms = 0,
-                .submit, .cancel => app.remote.next_poll_ms = 0,
+                // A session command's result, like a turn's output, arrives
+                // as a pushed session update.
+                .command, .submit, .cancel, .unwatch => {},
             }
             app.shell.render_requests.request(.footer);
         }
@@ -920,8 +1012,7 @@ pub fn Runtime(comptime App: type) type {
                 const history = value.history orelse {
                     // Ask for a complete baseline rather than joining unrelated tails.
                     remote.child_history_count = null;
-                    remote.next_child_poll_ms = 0;
-                    return;
+                    return refreshChild(app);
                 };
                 const owned_work = try app.alloc.dupe(u8, value.work_id);
                 errdefer app.alloc.free(owned_work);
@@ -1121,8 +1212,7 @@ pub fn Runtime(comptime App: type) type {
             }
             if (changed) {
                 // Never replay a command after a connection's execution owner changes.
-                for (remote.queue.items) |*request| request.deinit();
-                remote.queue.clearRetainingCapacity();
+                dropRequests(app.alloc, &remote.queue);
                 try switchSession(app, value.session_id);
                 remote.reconnect_notice = true;
                 return;
@@ -1175,11 +1265,7 @@ pub fn Runtime(comptime App: type) type {
                     app.stream.waiting_since_ms = 0;
                 }
             }
-            var submission_queued = false;
-            for (remote.queue.items) |request| if (request.kind == .submit and request.generation == remote.generation) {
-                submission_queued = true;
-                break;
-            };
+            const submission_queued = remote.inFlight(.submit);
             app.stream.active = if (remote.child_id.len > 0) childIsRunning(app) else running or submission_queued;
             if (remote.reconnect_notice) {
                 remote.reconnect_notice = false;

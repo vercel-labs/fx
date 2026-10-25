@@ -4769,6 +4769,10 @@ test {
     _ = @import("core/supervisor/record.zig");
     _ = @import("core/supervisor/session.zig");
     _ = @import("core/supervisor/server.zig");
+    _ = @import("core/supervisor/channel.zig");
+    _ = @import("core/supervisor/watch.zig");
+    _ = @import("core/supervisor/child_views.zig");
+    _ = @import("core/supervisor/client.zig");
     _ = @import("acp/server.zig");
     _ = @import("core/app/app_upgrade_runtime.zig");
     _ = @import("core/app/app_worker_runtime.zig");

@@ -61,6 +61,19 @@ pub const Record = struct {
         self.heartbeat = heartbeat;
     }
 
+    /// Whether a viewer would see the same session in both records.
+    pub fn sameView(self: *const Record, other: *const Record) bool {
+        const eql = std.mem.eql;
+        const same_failure = if (self.failure) |failure| other.failure != null and eql(u8, failure, other.failure.?) else other.failure == null;
+        const a = self.heartbeat;
+        const b = other.heartbeat;
+        return same_failure and eql(u8, self.name, other.name) and eql(u8, self.model, other.model) and
+            eql(u8, self.mode, other.mode) and self.stopped == other.stopped and self.live == other.live and
+            self.saved == other.saved and self.running == other.running and self.updated_at_ms == other.updated_at_ms and
+            eql(u8, a.prompt, b.prompt) and a.interval_ms == b.interval_ms and a.next_run_ms == b.next_run_ms and
+            a.paused == b.paused and a.run_count == b.run_count;
+    }
+
     /// A restart reopens this session: it has a conversation, or a stop or
     /// failure the user should see.
     pub fn reopens(self: *const Record) bool {
@@ -97,7 +110,9 @@ test "record clones own their strings" {
     record.setHeartbeat(alloc, .{ .prompt = try alloc.dupe(u8, "check"), .interval_ms = 1000, .paused = false });
     var copy = try record.clone(alloc);
     defer copy.deinit(alloc);
+    try std.testing.expect(record.sameView(&copy));
     try copy.setName(alloc, "second");
+    try std.testing.expect(!record.sameView(&copy));
     try std.testing.expectEqualStrings("first", record.name);
     try std.testing.expectEqualStrings("check", copy.heartbeat.prompt);
     try std.testing.expect(copy.heartbeat.prompt.ptr != record.heartbeat.prompt.ptr);

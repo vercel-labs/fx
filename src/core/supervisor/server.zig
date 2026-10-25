@@ -1,12 +1,14 @@
 //! Same-executable detached session owner. Existing ACP hosts run the native
 //! fx engine, each on its session's executor thread (`session.zig`).
 //!
-//! The accept loop answers supervisor-wide requests itself and hands every
-//! session request, with its connection, to that session's executor, so a
-//! slow open or command in one session never stalls another. The registry
-//! (`sessions`, `last_attached_id`) and the state file change only under
-//! `registry_mutex`; a session's own record changes only through `commit`,
-//! which saves it first.
+//! The accept loop only accepts: each client connection gets its own pump
+//! thread (`Conn`), which answers supervisor-wide requests itself and hands
+//! every session request, with its connection, to that session's executor.
+//! A slow client, open, or command therefore never stalls another. Routing
+//! (registry membership, the saved-session index, list watchers) happens
+//! under `route_mutex`. The registry (`sessions`, `last_attached_id`) and
+//! the state file change only under `registry_mutex`; a session's own record
+//! changes only through `commit`, which saves it first.
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const acp_config = @import("../cli/acp_runner.zig");
@@ -14,6 +16,7 @@ const session_adapter = @import("../session/session_adapter.zig");
 const session_store = @import("../session/session_store.zig");
 const protocol = @import("protocol.zig");
 const client = @import("client.zig");
+const Channel = @import("channel.zig").Channel;
 const session_mod = @import("session.zig");
 const Session = session_mod.Session;
 const Record = session_mod.Record;
@@ -21,8 +24,9 @@ const Allocator = std.mem.Allocator;
 extern "c" fn setsid() c_int;
 
 const max_sessions = 128;
-/// How long `list` reuses the store's saved-session index. The browser
-/// polls every 750 ms; a commit invalidates the index at once.
+/// How long `list` reuses the store's saved-session index, which is also how
+/// often a watched list looks for sessions saved elsewhere. A commit
+/// invalidates the index at once.
 const saved_index_ttl_ms = 2_000;
 
 /// The state file, `sessions.json`.
@@ -72,6 +76,119 @@ const SavedIndex = struct {
     }
 };
 
+/// One client connection and the thread that pumps it. The thread, the
+/// daemon's connection list, jobs that answer on it, and the session and list
+/// watches it holds each keep a reference; the last release frees it.
+pub const Conn = struct {
+    daemon: *Daemon,
+    stream: std.Io.net.Stream,
+    channel: Channel,
+    refs: std.atomic.Value(u32) = .init(2),
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+    watched_mutex: std.Io.Mutex = .init,
+    /// The session this connection last attached to, which pushes to it.
+    watched: ?[]u8 = null,
+
+    pub fn retain(self: *Conn) *Conn {
+        _ = self.refs.fetchAdd(1, .monotonic);
+        return self;
+    }
+
+    pub fn release(self: *Conn) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        const alloc = self.daemon.alloc;
+        self.channel.deinit();
+        if (self.watched) |id| alloc.free(id);
+        alloc.destroy(self);
+    }
+
+    pub fn isOpen(self: *Conn) bool {
+        return !self.channel.isClosed();
+    }
+
+    /// Answers request `id`, or a one-shot request (null `id`) and then
+    /// hangs up.
+    pub fn reply(self: *Conn, arena: Allocator, id: ?u64, bytes: []const u8) void {
+        const request_id = id orelse {
+            self.channel.send(bytes) catch {};
+            return self.channel.finish();
+        };
+        const framed = protocol.encode(arena, protocol.ReplyFrame{ .id = request_id, .response = .{ .bytes = bytes } }) catch return;
+        self.channel.send(framed) catch {};
+    }
+
+    pub fn push(self: *Conn, arena: Allocator, topic: protocol.Topic, body: []const u8) !void {
+        try self.channel.send(try protocol.encode(arena, protocol.UpdateFrame{ .update = topic, .body = .{ .bytes = body } }));
+    }
+
+    /// Records `id` as the watched session. Returns the session watched
+    /// before, if another; the caller owns it.
+    pub fn watchSession(self: *Conn, alloc: Allocator, id: []const u8) !?[]u8 {
+        const owned = try alloc.dupe(u8, id);
+        self.watched_mutex.lockUncancelable(io_mod.getIo());
+        defer self.watched_mutex.unlock(io_mod.getIo());
+        const previous = self.watched;
+        self.watched = owned;
+        const old = previous orelse return null;
+        if (!std.mem.eql(u8, old, id)) return old;
+        alloc.free(old);
+        return null;
+    }
+
+    fn main(self: *Conn) void {
+        self.channel.pump(self.stream, self) catch {};
+        self.channel.shutDown();
+        self.daemon.forget(self);
+        self.stream.close(io_mod.getIo());
+        self.done.store(true, .release);
+        self.release();
+    }
+
+    /// The pump's frame handler.
+    pub fn frame(self: *Conn, bytes: []const u8) void {
+        self.daemon.route(self, bytes);
+    }
+};
+
+/// Where a request's answer goes: the request `id` on a kept-open
+/// connection, or a one-shot exchange when `id` is null.
+const Reply = struct { conn: *Conn, id: ?u64 = null };
+
+/// One request with the connection that waits for its answer. The request
+/// borrows `arena`. A null `reply` is the supervisor's own request.
+pub const Job = struct {
+    arena: std.heap.ArenaAllocator,
+    request: protocol.Request,
+    /// Holds a reference on its connection.
+    reply: ?Reply = null,
+    /// A failed open records the failure on the session instead of only
+    /// answering, as a restore at startup does.
+    record_failure: bool = false,
+
+    pub fn destroy(self: *Job, alloc: Allocator) void {
+        if (self.reply) |reply| reply.conn.release();
+        self.arena.deinit();
+        alloc.destroy(self);
+    }
+
+    pub fn answer(self: *Job, bytes: []const u8) void {
+        const reply = self.reply orelse return;
+        reply.conn.reply(self.arena.allocator(), reply.id, bytes);
+    }
+
+    /// The connection that may watch what this request reads: only a
+    /// kept-open one.
+    pub fn watcher(self: *const Job) ?*Conn {
+        const reply = self.reply orelse return null;
+        return if (reply.id != null) reply.conn else null;
+    }
+};
+
+pub fn answerFailure(job: *Job, message: []const u8) void {
+    job.answer(protocol.encode(job.arena.allocator(), protocol.Failure{ .@"error" = message }) catch return);
+}
+
 pub const Daemon = struct {
     alloc: Allocator,
     cfg: acp_config.Config,
@@ -81,9 +198,18 @@ pub const Daemon = struct {
     registry_mutex: std.Io.Mutex = .init,
     sessions: std.ArrayList(*Session) = .empty,
     last_attached_id: ?[]u8 = null,
-    stopping: bool = false,
+    stopping: std.atomic.Value(bool) = .init(false),
     saved_index: SavedIndex = .{},
     saved_index_stale: std.atomic.Value(bool) = .init(true),
+
+    route_mutex: std.Io.Mutex = .init,
+    /// Accept-loop owned; each entry holds a reference.
+    connections: std.ArrayList(*Conn) = .empty,
+    /// Guarded by `route_mutex`; each entry holds a reference.
+    list_watchers: std.ArrayList(*Conn) = .empty,
+    /// Bumped whenever a listed session may look different.
+    list_version: std.atomic.Value(u64) = .init(0),
+    list_pushed: struct { version: u64 = 0, at_ms: i64 = 0, digest: u64 = 0 } = .{},
 
     fn deinit(self: *Daemon) void {
         // Stop every executor before freeing any session: a running one may
@@ -91,11 +217,18 @@ pub const Daemon = struct {
         for (self.sessions.items) |session| session.stopExecutor();
         for (self.sessions.items) |session| session.destroy();
         self.sessions.deinit(self.alloc);
+        for (self.list_watchers.items) |conn| conn.release();
+        self.list_watchers.deinit(self.alloc);
+        self.connections.deinit(self.alloc);
         if (self.last_attached_id) |id| self.alloc.free(id);
         self.saved_index.deinit(self.alloc);
     }
 
-    fn find(self: *Daemon, id: []const u8) ?*Session {
+    pub fn noteListChange(self: *Daemon) void {
+        _ = self.list_version.fetchAdd(1, .release);
+    }
+
+    pub fn find(self: *Daemon, id: []const u8) ?*Session {
         self.registry_mutex.lockUncancelable(io_mod.getIo());
         defer self.registry_mutex.unlock(io_mod.getIo());
         for (self.sessions.items) |session| if (session.idEquals(id)) return session;
@@ -120,6 +253,7 @@ pub const Daemon = struct {
         std.mem.swap(Record, &session.record, next);
         session.record_mutex.unlock(io_mod.getIo());
         self.saved_index_stale.store(true, .release);
+        session.noteRecordChange();
     }
 
     fn persist(self: *Daemon) !void {
@@ -240,6 +374,77 @@ pub const Daemon = struct {
         }
     }
 
+    /// Sends the session list to its watchers when it changed. Holds
+    /// `route_mutex`.
+    fn pushList(self: *Daemon) void {
+        if (self.list_watchers.items.len == 0) return;
+        const version = self.list_version.load(.acquire);
+        const now = io_mod.milliTimestamp();
+        if (version == self.list_pushed.version and now - self.list_pushed.at_ms < saved_index_ttl_ms) return;
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const bytes = self.list(arena) catch return;
+        const digest = std.hash.Wyhash.hash(0, bytes);
+        const changed = digest != self.list_pushed.digest;
+        self.list_pushed = .{ .version = version, .at_ms = now, .digest = digest };
+        if (!changed) return;
+        for (self.list_watchers.items) |conn| conn.push(arena, .list, bytes) catch {};
+    }
+
+    /// Holds `route_mutex`.
+    fn watchList(self: *Daemon, conn: *Conn) !void {
+        for (self.list_watchers.items) |watcher| if (watcher == conn) return;
+        try self.list_watchers.append(self.alloc, conn.retain());
+    }
+
+    /// Holds `route_mutex`.
+    fn unwatchList(self: *Daemon, conn: *Conn) void {
+        for (self.list_watchers.items, 0..) |watcher, index| if (watcher == conn) {
+            _ = self.list_watchers.swapRemove(index);
+            return conn.release();
+        };
+    }
+
+    /// Drops everything `conn` watches once it closed.
+    fn forget(self: *Daemon, conn: *Conn) void {
+        self.route_mutex.lockUncancelable(io_mod.getIo());
+        defer self.route_mutex.unlock(io_mod.getIo());
+        self.unwatchList(conn);
+        conn.watched_mutex.lockUncancelable(io_mod.getIo());
+        const watched = conn.watched;
+        conn.watched_mutex.unlock(io_mod.getIo());
+        const id = watched orelse return;
+        if (self.find(id)) |session| session.watchers.forget(self.alloc, conn);
+    }
+
+    /// Starts a pump thread for a new connection.
+    fn serve(self: *Daemon, stream: std.Io.net.Stream) !void {
+        const conn = try self.alloc.create(Conn);
+        errdefer self.alloc.destroy(conn);
+        conn.* = .{ .daemon = self, .stream = stream, .channel = try Channel.init(self.alloc) };
+        errdefer conn.channel.deinit();
+        try self.connections.ensureUnusedCapacity(self.alloc, 1);
+        conn.thread = try std.Thread.spawn(.{}, Conn.main, .{conn});
+        self.connections.appendAssumeCapacity(conn);
+    }
+
+    /// Joins the threads of connections that ended, or of every connection
+    /// once `all` closes them.
+    fn reapConnections(self: *Daemon, all: bool) void {
+        var index: usize = 0;
+        while (index < self.connections.items.len) {
+            const conn = self.connections.items[index];
+            if (all) conn.channel.shutDown() else if (!conn.done.load(.acquire)) {
+                index += 1;
+                continue;
+            }
+            conn.thread.?.join();
+            _ = self.connections.swapRemove(index);
+            conn.release();
+        }
+    }
+
     fn list(self: *Daemon, arena: Allocator) ![]const u8 {
         try self.discoverSaved();
         var rows: std.ArrayList(protocol.SessionSummary) = .empty;
@@ -284,35 +489,42 @@ pub const Daemon = struct {
         };
     }
 
-    /// Answers one connection. Session requests move, with the connection,
-    /// to that session's executor; the rest are answered here.
-    fn route(self: *Daemon, stream: std.Io.net.Stream) void {
-        const job = newJob(self.alloc) catch {
-            stream.close(io_mod.getIo());
-            return;
-        };
-        job.reply = stream;
+    /// Answers one request frame from `conn`. Session requests move, with
+    /// the connection, to that session's executor; the rest are answered
+    /// here, on the connection's thread.
+    fn route(self: *Daemon, conn: *Conn, bytes: []const u8) void {
+        const job = newJob(self.alloc) catch return;
+        job.reply = .{ .conn = conn.retain() };
         const arena = job.arena.allocator();
-        const answer: ?[]const u8 = self.routeJob(job) catch |err| (protocol.encode(arena, protocol.Failure{ .@"error" = @errorName(err) }) catch null);
-        if (answer) |bytes| {
-            client.writeFrame(stream, bytes) catch {};
+        const answer: ?[]const u8 = self.routeJob(job, bytes) catch |err| (protocol.encode(arena, protocol.Failure{ .@"error" = @errorName(err) }) catch null);
+        if (answer) |reply| {
+            job.answer(reply);
             job.destroy(self.alloc);
         }
     }
 
     /// Returns the answer for a request handled here, or null when `job`
     /// moved to an executor.
-    fn routeJob(self: *Daemon, job: *session_mod.Job) !?[]const u8 {
+    fn routeJob(self: *Daemon, job: *Job, bytes: []const u8) !?[]const u8 {
         const arena = job.arena.allocator();
-        const bytes = try client.readFrame(arena, job.reply.?, 2000);
-        job.request = protocol.Request.parse(arena, bytes) catch return error.InvalidRequest;
+        job.request = protocol.parseInbound(arena, bytes, &job.reply.?.id) catch return error.InvalidRequest;
+        self.route_mutex.lockUncancelable(io_mod.getIo());
+        defer self.route_mutex.unlock(io_mod.getIo());
         switch (job.request) {
             .ping => return try protocol.encode(arena, protocol.Pong{}),
             .shutdown => {
-                self.stopping = true;
+                self.stopping.store(true, .release);
                 return try protocol.encode(arena, protocol.Ack{});
             },
-            .list => return try self.list(arena),
+            .list => |request| {
+                const listed = try self.list(arena);
+                if (request.watch) if (job.watcher()) |conn| try self.watchList(conn);
+                return listed;
+            },
+            .unwatch => |request| if (request.topic == .list) {
+                if (job.watcher()) |conn| self.unwatchList(conn);
+                return try protocol.encode(arena, protocol.Ack{});
+            },
             .create => |request| {
                 const existing = if (request.@"resume") |id| self.find(id) else null;
                 const session = existing orelse new: {
@@ -322,17 +534,16 @@ pub const Daemon = struct {
                 session.submit(job);
                 return null;
             },
-            else => {
-                const session = self.find(job.request.sessionId().?) orelse return error.SessionNotFound;
-                session.submit(job);
-                return null;
-            },
+            else => {},
         }
+        const session = self.find(job.request.sessionId() orelse return error.SessionNotFound) orelse return error.SessionNotFound;
+        session.submit(job);
+        return null;
     }
 };
 
-fn newJob(alloc: Allocator) !*session_mod.Job {
-    const job = try alloc.create(session_mod.Job);
+fn newJob(alloc: Allocator) !*Job {
+    const job = try alloc.create(Job);
     job.* = .{ .arena = std.heap.ArenaAllocator.init(alloc), .request = .ping };
     return job;
 }
@@ -367,19 +578,21 @@ pub fn run(alloc: Allocator, cfg: acp_config.Config) !void {
     defer daemon.deinit();
     try daemon.restore();
     try daemon.discoverSaved();
-    while (!daemon.stopping) {
-        daemon.reapRetired();
+    while (!daemon.stopping.load(.acquire)) {
+        daemon.reapConnections(false);
+        {
+            daemon.route_mutex.lockUncancelable(io);
+            defer daemon.route_mutex.unlock(io);
+            daemon.reapRetired();
+            daemon.pushList();
+        }
         var fds = [_]std.posix.pollfd{.{ .fd = listener.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
         if (try std.posix.poll(&fds, 200) == 0) continue;
         const stream = try listener.accept(io);
-        const send_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
-        std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&send_timeout)) catch {
-            stream.close(io);
-            continue;
-        };
-        daemon.route(stream);
+        daemon.serve(stream) catch stream.close(io);
     }
-    // Save while the hosts are still open: each live, saved session is owned
-    // and reopens on the next start.
+    // No request routes after this; then save while the hosts are still
+    // open: each live, saved session is owned and reopens on the next start.
+    daemon.reapConnections(true);
     try daemon.persist();
 }

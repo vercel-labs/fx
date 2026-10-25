@@ -2,20 +2,22 @@
 //!
 //! The executor is the host's only owner (`acp.PersistentHost`): it runs
 //! every request for this session in order, the heartbeat, and the child
-//! approval pump, and it is the thread that opens and closes the host. The
-//! accept loop only reads the session's `Record`, under `record_mutex`, and
-//! hands requests over with their connection. The host's writer callback,
-//! `publish`, may run on any host thread, so the event log has its own lock.
+//! approval pump, and it is the thread that opens and closes the host. It
+//! also pushes what changed to every connection watching the session
+//! (`watch.zig`). Connection threads only read the session's `Record`, under
+//! `record_mutex`, and hand requests over with their connection. The host's
+//! writer callback, `publish`, may run on any host thread, so the event log
+//! has its own lock, and it wakes the executor to push new events.
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const acp = @import("../../acp/server.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
-const child_state = @import("../subagent/child_state.zig");
-const live_presentation = @import("../subagent/live_presentation.zig");
-const types = @import("../shared/types.zig");
 const protocol = @import("protocol.zig");
-const client = @import("client.zig");
-const Daemon = @import("server.zig").Daemon;
+const server = @import("server.zig");
+const watch_mod = @import("watch.zig");
+const child_views = @import("child_views.zig");
+const Daemon = server.Daemon;
+const Conn = server.Conn;
 const Allocator = std.mem.Allocator;
 
 const event_bytes_limit = 2 * 1024 * 1024;
@@ -30,22 +32,7 @@ pub const Record = @import("record.zig").Record;
 const Pending = struct { id: i64, frame: []u8 };
 const PendingCommand = struct { id: i64, name: []u8 };
 
-/// One request with the connection that waits for its answer. The request
-/// borrows `arena`. A null `reply` is the supervisor's own request.
-pub const Job = struct {
-    arena: std.heap.ArenaAllocator,
-    request: protocol.Request,
-    reply: ?std.Io.net.Stream = null,
-    /// A failed open records the failure on the session instead of only
-    /// answering, as a restore at startup does.
-    record_failure: bool = false,
-
-    pub fn destroy(self: *Job, alloc: Allocator) void {
-        if (self.reply) |stream| stream.close(io_mod.getIo());
-        self.arena.deinit();
-        alloc.destroy(self);
-    }
-};
+const Job = server.Job;
 
 pub const Session = struct {
     daemon: *Daemon,
@@ -60,6 +47,8 @@ pub const Session = struct {
     jobs_cond: std.Io.Condition = .init,
     jobs: std.ArrayList(*Job) = .empty,
     quit: bool = false,
+    /// `publish` added something watchers have not seen.
+    push_due: bool = false,
     thread: ?std.Thread = null,
     /// A new session whose open failed. The accept loop reaps it.
     retired: std.atomic.Value(bool) = .init(false),
@@ -81,6 +70,11 @@ pub const Session = struct {
     commands: std.ArrayList(PendingCommand) = .empty,
     heartbeat_request: ?i64 = null,
     capture: ?Capture = null,
+    /// Counts every change a watcher sees: events, pending requests, and
+    /// the record.
+    version: u64 = 0,
+
+    watchers: watch_mod.Watchers = .{},
 
     const Event = struct { sequence: u64, frame: []u8 };
     const Capture = struct { id: i64, frame: ?[]u8 = null };
@@ -108,6 +102,7 @@ pub const Session = struct {
         self.pending.deinit(alloc);
         for (self.commands.items) |command| alloc.free(command.name);
         self.commands.deinit(alloc);
+        self.watchers.deinit(alloc);
         self.jobs.deinit(alloc);
         if (self.history_json) |history| alloc.free(history);
         alloc.free(self.id);
@@ -132,7 +127,7 @@ pub const Session = struct {
         const alloc = self.daemon.alloc;
         if (self.thread == null) {
             self.thread = std.Thread.spawn(.{}, executorMain, .{self}) catch |err| {
-                answerFailure(job, @errorName(err));
+                server.answerFailure(job, @errorName(err));
                 job.destroy(alloc);
                 return;
             };
@@ -140,7 +135,7 @@ pub const Session = struct {
         self.jobs_mutex.lockUncancelable(io_mod.getIo());
         defer self.jobs_mutex.unlock(io_mod.getIo());
         self.jobs.append(alloc, job) catch {
-            answerFailure(job, "OutOfMemory");
+            server.answerFailure(job, "OutOfMemory");
             job.destroy(alloc);
             return;
         };
@@ -157,7 +152,7 @@ pub const Session = struct {
         self.thread = null;
     }
 
-    const Next = union(enum) { job: *Job, tick, quit };
+    const Next = union(enum) { job: *Job, tick, push, quit };
 
     fn next(self: *Session) Next {
         const io = io_mod.getIo();
@@ -166,6 +161,10 @@ pub const Session = struct {
         while (true) {
             if (self.quit) return .quit;
             if (self.jobs.items.len > 0) return .{ .job = self.jobs.orderedRemove(0) };
+            if (self.push_due) {
+                self.push_due = false;
+                return .push;
+            }
             const wait_ms = self.next_tick_ms - io_mod.milliTimestamp();
             if (wait_ms <= 0) return .tick;
             self.jobs_cond.waitTimeout(io, &self.jobs_mutex, .{ .duration = .{
@@ -180,13 +179,14 @@ pub const Session = struct {
             switch (self.next()) {
                 .quit => break,
                 .job => |job| self.run(job),
-                .tick => {},
+                .tick, .push => {},
             }
             const now = io_mod.milliTimestamp();
             if (now >= self.next_tick_ms) {
                 self.tick(now);
                 self.next_tick_ms = now + tick_ms;
             }
+            self.pushUpdates();
             if (self.retired.load(.acquire)) break;
         }
         // Requests that arrived after shutdown began get an answer.
@@ -195,7 +195,7 @@ pub const Session = struct {
         self.jobs_mutex.unlock(io_mod.getIo());
         defer self.daemon.alloc.free(left);
         for (left) |job| {
-            answerFailure(job, "SupervisorStopping");
+            server.answerFailure(job, "SupervisorStopping");
             job.destroy(self.daemon.alloc);
         }
         self.closeHost();
@@ -204,20 +204,20 @@ pub const Session = struct {
     fn run(self: *Session, job: *Job) void {
         const arena = job.arena.allocator();
         const bytes = self.handle(arena, job) catch |err| protocol.encode(arena, protocol.Failure{ .@"error" = @errorName(err) }) catch "";
-        if (job.reply) |stream| client.writeFrame(stream, bytes) catch {};
+        job.answer(bytes);
         job.destroy(self.daemon.alloc);
         self.refreshRecord() catch |err| std.debug.print("proto-fx: session record refresh failed: {s}\n", .{@errorName(err)});
     }
 
     fn handle(self: *Session, arena: Allocator, job: *Job) ![]const u8 {
         switch (job.request) {
-            .create => |request| return self.open(arena, request.@"resume", job.record_failure),
+            .create => |request| return self.watchFrom(job, try self.open(arena, request.@"resume", job.record_failure)),
             .attach => |request| {
                 const include_history = request.include_history orelse (request.after_sequence == 0);
-                // Background polls observe a stop; only a deliberate attach
+                // A resubscribe observes a stop; only a deliberate attach
                 // reopens a stopped or saved session.
-                if (include_history) return self.open(arena, self.id, false);
-                return self.snapshot(arena, request.after_sequence, false);
+                if (include_history) return self.watchFrom(job, try self.open(arena, self.id, false));
+                return self.watchFrom(job, try self.snapshot(arena, request.after_sequence, false));
             },
             .mode => |request| return self.nativeCall(arena, "session/set_mode", .{ .sessionId = self.id, .modeId = request.mode }),
             .model => |request| {
@@ -254,8 +254,21 @@ pub const Session = struct {
             },
             .stop => return self.stop(arena),
             .heartbeat => |request| return self.heartbeat(arena, request),
-            .children => return self.children(arena),
-            .history => |request| return self.historyView(arena, request),
+            .children => |request| {
+                const bytes = try self.children(arena);
+                if (request.watch) if (job.watcher()) |conn| self.watchers.watchChildren(conn, bytes);
+                return bytes;
+            },
+            .history => |request| {
+                if (request.child_id == null) return self.rootHistory(arena);
+                const view = try self.childView(arena, request);
+                if (request.watch) if (job.watcher()) |conn| try self.watchers.watchChild(self.daemon.alloc, conn, view);
+                return protocol.encode(arena, view);
+            },
+            .unwatch => |request| {
+                if (job.watcher()) |conn| self.watchers.unwatch(self.daemon.alloc, conn, request.topic);
+                return protocol.encode(arena, protocol.Ack{});
+            },
             .ping, .shutdown, .list => return error.UnknownCommand,
         }
     }
@@ -264,7 +277,7 @@ pub const Session = struct {
 
     /// Opens the host if it is closed, marks this session the one the user
     /// last attached, and answers with a full snapshot.
-    fn open(self: *Session, arena: Allocator, resume_id: ?[]const u8, record_failure: bool) ![]const u8 {
+    fn open(self: *Session, arena: Allocator, resume_id: ?[]const u8, record_failure: bool) !Snap {
         if (self.host == null) self.openHost(if (resume_id) |id| if (id.len > 0) id else null else null) catch |err| {
             if (self.id.len == 0) {
                 self.retired.store(true, .release);
@@ -427,7 +440,8 @@ pub const Session = struct {
         };
         const response = try std.json.parseFromSliceLeaky(Response, arena, bytes, .{ .ignore_unknown_fields = true });
         if (response.@"error") |failure| return protocol.encode(arena, protocol.Failure{ .@"error" = failure.message });
-        return protocol.encode(arena, protocol.NativeResult(std.json.Value){ .result = response.result orelse return error.NativeCommandIncomplete });
+        // `session/set_mode` answers with a null result.
+        return protocol.encode(arena, protocol.NativeResult(std.json.Value){ .result = response.result orelse .null });
     }
 
     /// Hands one frontend command to the host. The host owns its effect and
@@ -460,6 +474,7 @@ pub const Session = struct {
             defer self.record_mutex.unlock(io_mod.getIo());
             self.record.updated_at_ms = io_mod.milliTimestamp();
         }
+        self.noteRecordChange();
         const blocks = [_]struct { type: []const u8, text: []const u8 }{.{ .type = "text", .text = text }};
         return self.dispatch("session/prompt", .{
             .sessionId = self.id,
@@ -484,9 +499,14 @@ pub const Session = struct {
         try host.dispatchFrame(frame);
         // A rejected reply must not consume the visible request before its
         // owner accepted it. Child retirement may have removed it already.
-        self.events_mutex.lockUncancelable(io_mod.getIo());
-        defer self.events_mutex.unlock(io_mod.getIo());
-        if (self.pendingIndex(request_id)) |index| self.daemon.alloc.free(self.pending.orderedRemove(index).frame);
+        {
+            self.events_mutex.lockUncancelable(io_mod.getIo());
+            defer self.events_mutex.unlock(io_mod.getIo());
+            const index = self.pendingIndex(request_id) orelse return;
+            self.daemon.alloc.free(self.pending.orderedRemove(index).frame);
+            self.version += 1;
+        }
+        self.daemon.noteListChange();
     }
 
     fn pendingIndex(self: *const Session, id: i64) ?usize {
@@ -495,11 +515,15 @@ pub const Session = struct {
     }
 
     fn clearPending(self: *Session) void {
-        self.events_mutex.lockUncancelable(io_mod.getIo());
-        defer self.events_mutex.unlock(io_mod.getIo());
-        for (self.pending.items) |entry| self.daemon.alloc.free(entry.frame);
-        self.pending.clearRetainingCapacity();
-        self.heartbeat_request = null;
+        {
+            self.events_mutex.lockUncancelable(io_mod.getIo());
+            defer self.events_mutex.unlock(io_mod.getIo());
+            for (self.pending.items) |entry| self.daemon.alloc.free(entry.frame);
+            self.pending.clearRetainingCapacity();
+            self.heartbeat_request = null;
+            self.version += 1;
+        }
+        self.daemon.noteListChange();
     }
 
     pub fn pendingCount(self: *Session) usize {
@@ -605,6 +629,7 @@ pub const Session = struct {
             if (!waiting) self.fireHeartbeat(now);
         }
         self.refreshRecord() catch |err| std.debug.print("proto-fx: session record refresh failed: {s}\n", .{@errorName(err)});
+        self.pushViews();
     }
 
     fn fireHeartbeat(self: *Session, now: i64) void {
@@ -660,10 +685,24 @@ pub const Session = struct {
         var next_record = try self.liveRecord();
         const persisted_change = next_record.reopens() != self.record.reopens() or !std.mem.eql(u8, next_record.name, self.record.name);
         if (persisted_change) return self.daemon.commit(self, &next_record, false);
-        self.record_mutex.lockUncancelable(io_mod.getIo());
-        defer self.record_mutex.unlock(io_mod.getIo());
-        std.mem.swap(Record, &self.record, &next_record);
+        const changed = !next_record.sameView(&self.record);
+        {
+            self.record_mutex.lockUncancelable(io_mod.getIo());
+            defer self.record_mutex.unlock(io_mod.getIo());
+            std.mem.swap(Record, &self.record, &next_record);
+        }
         next_record.deinit(alloc);
+        if (changed) self.noteRecordChange();
+    }
+
+    /// Tells watchers and the session list that the record changed.
+    pub fn noteRecordChange(self: *Session) void {
+        {
+            self.events_mutex.lockUncancelable(io_mod.getIo());
+            defer self.events_mutex.unlock(io_mod.getIo());
+            self.version += 1;
+        }
+        self.daemon.noteListChange();
     }
 
     // -- views ---------------------------------------------------------------
@@ -720,7 +759,10 @@ pub const Session = struct {
         self.history_dirty = false;
     }
 
-    fn snapshot(self: *Session, arena: Allocator, after: u64, include_history: bool) ![]const u8 {
+    /// A snapshot response and the event sequence and version it covers.
+    const Snap = struct { bytes: []const u8, sequence: u64, version: u64 };
+
+    fn snapshot(self: *Session, arena: Allocator, after: u64, include_history: bool) !Snap {
         try self.refreshHistory();
         const pending_count = self.pendingCount();
         const session_summary = try summaryOf(arena, self.id, self.cwd, &self.record, pending_count);
@@ -735,7 +777,7 @@ pub const Session = struct {
         }
         const pending = try arena.alloc(Frame, self.pending.items.len);
         for (self.pending.items, pending) |entry, *out| out.* = .{ .bytes = entry.frame };
-        return protocol.encode(arena, protocol.Snapshot(Frame, Frame){
+        const bytes = try protocol.encode(arena, protocol.Snapshot(Frame, Frame){
             .incarnation = self.daemon.incarnation,
             .session_id = self.id,
             .session = session_summary,
@@ -746,86 +788,98 @@ pub const Session = struct {
             .events = events.items,
             .pending = pending,
         });
+        return .{ .bytes = bytes, .sequence = self.sequence, .version = self.version };
+    }
+
+    // -- watchers ------------------------------------------------------------
+
+    /// Starts `job`'s connection watching this session from `snap`, the
+    /// answer it returns. A connection watches one session at a time.
+    fn watchFrom(self: *Session, job: *const Job, snap: Snap) ![]const u8 {
+        const conn = job.watcher() orelse return snap.bytes;
+        const alloc = self.daemon.alloc;
+        if (try conn.watchSession(alloc, self.id)) |previous| {
+            defer alloc.free(previous);
+            // A watched session keeps its executor, so it is never freed.
+            if (self.daemon.find(previous)) |other| other.watchers.forget(alloc, conn);
+        }
+        try self.watchers.watch(alloc, conn, snap.sequence, snap.version);
+        return snap.bytes;
+    }
+
+    fn wakeForPush(self: *Session) void {
+        self.jobs_mutex.lockUncancelable(io_mod.getIo());
+        defer self.jobs_mutex.unlock(io_mod.getIo());
+        self.push_due = true;
+        self.jobs_cond.signal(io_mod.getIo());
+    }
+
+    fn currentVersion(self: *Session) u64 {
+        self.events_mutex.lockUncancelable(io_mod.getIo());
+        defer self.events_mutex.unlock(io_mod.getIo());
+        return self.version;
+    }
+
+    /// Sends each watcher a snapshot delta of what it has not seen.
+    fn pushUpdates(self: *Session) void {
+        const alloc = self.daemon.alloc;
+        self.watchers.mutex.lockUncancelable(io_mod.getIo());
+        defer self.watchers.mutex.unlock(io_mod.getIo());
+        self.watchers.pruneLocked(alloc);
+        if (self.watchers.items.items.len == 0) return;
+        const version = self.currentVersion();
+        for (self.watchers.items.items) |*watcher| {
+            if (watcher.version == version) continue;
+            var arena_state = std.heap.ArenaAllocator.init(alloc);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            const snap = self.snapshot(arena, watcher.sequence, false) catch continue;
+            watcher.conn.push(arena, .session, snap.bytes) catch {};
+            watcher.sequence = snap.sequence;
+            watcher.version = snap.version;
+        }
+    }
+
+    /// Sends the children list and child transcripts that changed to the
+    /// watchers that asked for them.
+    fn pushViews(self: *Session) void {
+        if (self.host == null) return;
+        const alloc = self.daemon.alloc;
+        self.watchers.mutex.lockUncancelable(io_mod.getIo());
+        defer self.watchers.mutex.unlock(io_mod.getIo());
+        for (self.watchers.items.items) |*watcher| {
+            var arena_state = std.heap.ArenaAllocator.init(alloc);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            if (watcher.children) |last| if (self.children(arena)) |bytes| {
+                const digest = watch_mod.digest(bytes);
+                if (digest != last) {
+                    watcher.conn.push(arena, .children, bytes) catch {};
+                    watcher.children = digest;
+                }
+            } else |_| {};
+            if (watcher.child) |*cursor| {
+                const view = self.childView(arena, cursor.request(self.id)) catch continue;
+                if (!cursor.changedBy(view)) continue;
+                const bytes = protocol.encode(arena, view) catch continue;
+                watcher.conn.push(arena, .child, bytes) catch {};
+                cursor.advance(alloc, view) catch {};
+            }
+        }
+    }
+
+    fn rootHistory(self: *Session, arena: Allocator) ![]const u8 {
+        if (self.host == null) return error.SessionStopped;
+        try self.refreshHistory();
+        return protocol.encode(arena, protocol.RootHistory(protocol.RawJson){ .history = .{ .bytes = self.history_json orelse "[]" } });
     }
 
     fn children(self: *Session, arena: Allocator) ![]const u8 {
-        const host = self.host orelse return error.SessionStopped;
-        var rows: std.ArrayList(protocol.Child) = .empty;
-        if (host.state.subagent_v2_children) |registry_children| {
-            const store = child_state.Store{ .children = registry_children, .parent_id = self.id };
-            const registry = try store.load(arena);
-            for (registry.children) |*child| {
-                try rows.append(arena, .{
-                    .id = child.id,
-                    .parent_id = self.id,
-                    .name = child.agentName() orelse "subagent",
-                    .status = childStatus(child, false),
-                    .detail = if (child.active) |active| active.message else child.instructions(),
-                });
-            }
-        }
-        return protocol.encode(arena, protocol.Children{ .children = rows.items });
+        return child_views.children(arena, self.host orelse return error.SessionStopped, self.id);
     }
 
-    fn childStatus(child: *const child_state.Child, live_active: bool) []const u8 {
-        if (live_active and child.phase == .idle) return "running";
-        if (child.phase == .finished) if (child.last_outcome) |outcome| return @tagName(outcome);
-        return @tagName(child.phase);
-    }
-
-    fn historyView(self: *Session, arena: Allocator, request: protocol.History) ![]const u8 {
-        const host = self.host orelse return error.SessionStopped;
-        const child_id = request.child_id orelse {
-            try self.refreshHistory();
-            return protocol.encode(arena, protocol.RootHistory(protocol.RawJson){ .history = .{ .bytes = self.history_json orelse "[]" } });
-        };
-        const registry_children = host.state.subagent_v2_children orelse return error.ChildNotFound;
-        const store = child_state.Store{ .children = registry_children, .parent_id = self.id };
-        const registry = try store.load(arena);
-        for (registry.children) |*row| {
-            if (!std.mem.eql(u8, row.id, child_id)) continue;
-            const work_id = if (row.active) |active| active.id else row.last_work_id orelse "";
-            const changed_work = !std.mem.eql(u8, request.work_id orelse "", work_id);
-            const live = if (host.state.subagent_host) |child_host|
-                try child_host.managed.snapshotPresentation(arena, child_id, work_id, request.after_live_sequence, request.include_history or changed_work)
-            else
-                null;
-            const live_active = live != null or row.phase == .running or row.phase == .awaiting_approval;
-            const tail: live_presentation.Snapshot = live orelse .{};
-            const live_reset = request.include_history or changed_work or tail.reset or request.live_active != live_active;
-            var turns: ?[]const types.HistoryTurn = null;
-            if (live_reset) {
-                // Current-work commits and compaction can race this read.
-                // Work identity keeps them out of the immutable prior history
-                // until settlement replaces the live tail.
-                const saved: []types.HistoryTurn = host.state.sessions_v2.?.childHistory(arena, child_id) catch |err| switch (err) {
-                    error.NotFound, error.FileNotFound => if (live_active) &.{} else return err,
-                    else => return err,
-                };
-                var kept: std.ArrayList(types.HistoryTurn) = .empty;
-                for (saved) |turn| {
-                    if (live_active and historyBelongsToWork(turn, work_id)) continue;
-                    try kept.append(arena, turn);
-                }
-                turns = kept.items;
-            }
-            return protocol.encode(arena, protocol.ChildHistory(protocol.RawJson){
-                .child_id = child_id,
-                .work_id = work_id,
-                .live_active = live_active,
-                .live_sequence = tail.sequence,
-                .oldest_live_sequence = tail.oldest_sequence,
-                .live_reset = live_reset,
-                .name = row.agentName() orelse "subagent",
-                .status = childStatus(row, live_active),
-                .last_outcome = if (row.last_outcome) |outcome| @tagName(outcome) else null,
-                .last_failure = if (row.last_failure) |*failure| failure.view() else null,
-                .active_prompt = if (live_active) if (row.active) |active| active.message else null else null,
-                .history = turns,
-                .live_events = .{ .bytes = tail.events_json },
-            });
-        }
-        return error.ChildNotFound;
+    fn childView(self: *Session, arena: Allocator, request: protocol.History) !protocol.ChildHistory(protocol.RawJson) {
+        return child_views.childView(arena, self.host orelse return error.SessionStopped, self.id, request);
     }
 
     // -- the host's writer ---------------------------------------------------
@@ -835,30 +889,45 @@ pub const Session = struct {
     /// join the replay log, and requests stay pending until answered.
     fn publish(raw: ?*anyopaque, frame: []const u8) !void {
         const self: *Session = @ptrCast(@alignCast(raw.?));
-        const alloc = self.daemon.alloc;
         const trimmed = std.mem.trim(u8, frame, "\r\n");
-        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        var arena_state = std.heap.ArenaAllocator.init(self.daemon.alloc);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        const Head = struct {
-            id: ?std.json.Value = null,
-            method: ?[]const u8 = null,
-            params: ?struct { request_id: ?i64 = null } = null,
-            result: ?std.json.Value = null,
-            @"error": ?struct { message: []const u8 = "The session command failed" } = null,
-        };
         const parsed: ?Head = std.json.parseFromSliceLeaky(Head, arena, trimmed, .{ .ignore_unknown_fields = true }) catch null;
+        const outcome = outcome: {
+            self.events_mutex.lockUncancelable(io_mod.getIo());
+            defer self.events_mutex.unlock(io_mod.getIo());
+            break :outcome try self.recordFrame(arena, trimmed, parsed);
+        };
+        if (outcome == .silent) return;
+        if (outcome == .pending_changed) self.daemon.noteListChange();
+        self.wakeForPush();
+    }
 
-        self.events_mutex.lockUncancelable(io_mod.getIo());
-        defer self.events_mutex.unlock(io_mod.getIo());
+    const Head = struct {
+        id: ?std.json.Value = null,
+        method: ?[]const u8 = null,
+        params: ?struct { request_id: ?i64 = null } = null,
+        result: ?std.json.Value = null,
+        @"error": ?struct { message: []const u8 = "The session command failed" } = null,
+    };
+
+    const Recorded = enum { silent, event, pending_changed };
+
+    /// Routes one host frame. Holds `events_mutex`.
+    fn recordFrame(self: *Session, arena: Allocator, trimmed: []const u8, parsed: ?Head) !Recorded {
+        const alloc = self.daemon.alloc;
         // A frame this cannot read is still a frame the viewer may.
-        const head = parsed orelse return self.appendEvent(boundedFrame(trimmed));
+        const head = parsed orelse {
+            try self.appendEvent(boundedFrame(trimmed));
+            return .event;
+        };
         const id: ?i64 = if (head.id) |value| if (value == .integer) value.integer else null else null;
         if (head.method == null) {
-            const response_id = id orelse return;
+            const response_id = id orelse return .silent;
             if (self.capture) |*capture| if (capture.id == response_id) {
                 if (capture.frame == null) capture.frame = try alloc.dupe(u8, trimmed);
-                return;
+                return .silent;
             };
             if (self.heartbeat_request == response_id) self.heartbeat_request = null;
             for (self.commands.items, 0..) |command, index| {
@@ -874,13 +943,16 @@ pub const Session = struct {
                         .@"error" = if (head.@"error") |failure| failure.message else null,
                     },
                 });
-                return self.appendEvent(result);
+                try self.appendEvent(result);
+                return .event;
             }
-            return;
+            return .silent;
         }
+        var outcome: Recorded = .event;
         if (std.mem.eql(u8, head.method.?, protocol.permission_retired_method)) {
             if (head.params) |params| if (params.request_id) |retired| if (self.pendingIndex(retired)) |index| {
                 alloc.free(self.pending.orderedRemove(index).frame);
+                outcome = .pending_changed;
             };
         }
         // Requests survive the replay window: a detached approval waits.
@@ -888,8 +960,10 @@ pub const Session = struct {
             const copy = try alloc.dupe(u8, trimmed);
             errdefer alloc.free(copy);
             try self.pending.append(alloc, .{ .id = request_id, .frame = copy });
+            outcome = .pending_changed;
         };
         try self.appendEvent(boundedFrame(trimmed));
+        return outcome;
     }
 
     fn boundedFrame(frame: []const u8) []const u8 {
@@ -911,20 +985,6 @@ pub const Session = struct {
         self.sequence += 1;
         self.events.appendAssumeCapacity(.{ .sequence = self.sequence, .frame = copy });
         self.event_bytes += copy.len;
+        self.version += 1;
     }
 };
-
-pub fn answerFailure(job: *Job, message: []const u8) void {
-    const stream = job.reply orelse return;
-    const bytes = protocol.encode(job.arena.allocator(), protocol.Failure{ .@"error" = message }) catch return;
-    client.writeFrame(stream, bytes) catch {};
-}
-
-fn historyBelongsToWork(turn: types.HistoryTurn, work_id: []const u8) bool {
-    const saved_work = switch (turn) {
-        .assistant => |entry| entry.user.work_id,
-        .interrupted => |entry| entry.user.work_id,
-        .compacted_summary => null,
-    } orelse return false;
-    return std.mem.eql(u8, saved_work, work_id);
-}

@@ -1,12 +1,14 @@
-//! Local daemon client. The caller owns responses and must keep blocking requests off paint paths.
+//! Local daemon client: `Client` for one-shot requests and `Connection`, the
+//! kept-open connection an attached terminal uses. The caller owns responses.
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const protocol = @import("protocol.zig");
+const Channel = @import("channel.zig").Channel;
 const Allocator = std.mem.Allocator;
 
 pub const Response = std.json.Parsed(std.json.Value);
-pub const max_frame_bytes = 8 * 1024 * 1024;
+const max_frame_bytes = @import("channel.zig").max_frame_bytes;
 /// The hidden command that runs the supervisor (`cli_surface.zig`).
 pub const daemon_argument = "--proto-daemon";
 
@@ -24,16 +26,16 @@ pub const Client = struct {
         self.* = undefined;
     }
 
-    /// Executes one local request (`protocol.Request`). Run this on a
-    /// frontend I/O worker, never while painting. The response owns all
-    /// strings until deinit().
+    /// Executes one bare, one-shot request (`protocol.Request`), which a
+    /// supervisor of any version answers. It blocks, so never call it while
+    /// painting. The response owns all strings until deinit().
     pub fn request(self: *const Client, alloc: Allocator, command: protocol.Request) !Response {
         const json = try protocol.encode(alloc, command);
         defer alloc.free(json);
         return self.requestJson(alloc, json);
     }
 
-    pub fn requestJson(self: *const Client, alloc: Allocator, json: []const u8) !Response {
+    fn requestJson(self: *const Client, alloc: Allocator, json: []const u8) !Response {
         const address = try std.Io.net.UnixAddress.init(self.socket_path);
         const stream = try address.connect(io_mod.getIo());
         defer stream.close(io_mod.getIo());
@@ -73,6 +75,141 @@ pub const Client = struct {
     }
 };
 
+/// What the connection's I/O thread hands the frontend, in arrival order.
+pub const Incoming = union(enum) {
+    /// A connection is open. After a `disconnected`, the frontend
+    /// resubscribes: the supervisor forgot this connection's watches.
+    connected,
+    /// The connection could not open, or closed. Every request sent before
+    /// it has no reply coming.
+    disconnected: anyerror,
+    /// A reply (`id` set) or a pushed update (`update` set).
+    frame: std.json.Parsed(protocol.ServerFrame),
+
+    pub fn deinit(self: *Incoming) void {
+        switch (self.*) {
+            .frame => |*parsed| parsed.deinit(),
+            else => {},
+        }
+    }
+};
+
+/// One kept-open connection to the supervisor, run by one I/O thread. The
+/// thread starts the supervisor if none answers, reconnects with backoff
+/// when the connection drops, and queues what it reads for `take`. Only the
+/// owning thread calls `send`, `take`, and `stop`.
+pub const Connection = struct {
+    alloc: Allocator,
+    client: Client,
+    executable: []u8,
+    channel: Channel,
+    thread: ?std.Thread = null,
+    connected: std.atomic.Value(bool) = .init(false),
+    next_id: u64 = 1,
+    inbox_mutex: std.Io.Mutex = .init,
+    inbox: std.ArrayList(Incoming) = .empty,
+
+    const max_backoff_ms = 2_000;
+
+    pub fn start(alloc: Allocator, executable: []const u8) !*Connection {
+        const self = try alloc.create(Connection);
+        errdefer alloc.destroy(self);
+        var client = try Client.init(alloc);
+        errdefer client.deinit();
+        const owned = try alloc.dupe(u8, executable);
+        errdefer alloc.free(owned);
+        var channel = try Channel.init(alloc);
+        errdefer channel.deinit();
+        self.* = .{ .alloc = alloc, .client = client, .executable = owned, .channel = channel };
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        return self;
+    }
+
+    /// Closes the connection, joins its thread, and frees everything.
+    pub fn stop(self: *Connection) void {
+        const alloc = self.alloc;
+        self.channel.shutDown();
+        if (self.thread) |thread| thread.join();
+        for (self.inbox.items) |*item| item.deinit();
+        self.inbox.deinit(alloc);
+        self.channel.deinit();
+        alloc.free(self.executable);
+        self.client.deinit();
+        alloc.destroy(self);
+    }
+
+    /// Queues an encoded `protocol.Request` and returns the id its reply
+    /// will carry. Fails while no connection is open.
+    pub fn send(self: *Connection, request_json: []const u8) !u64 {
+        if (!self.connected.load(.acquire)) return error.SupervisorDisconnected;
+        const id = self.next_id;
+        const bytes = try protocol.encode(self.alloc, .{ .id = id, .request = protocol.RawJson{ .bytes = request_json } });
+        defer self.alloc.free(bytes);
+        self.channel.send(bytes) catch |err| return if (err == error.OutOfMemory) err else error.SupervisorDisconnected;
+        self.next_id += 1;
+        return id;
+    }
+
+    /// Everything received since the last call. Caller owns the list and
+    /// deinits each item.
+    pub fn take(self: *Connection) std.ArrayList(Incoming) {
+        self.inbox_mutex.lockUncancelable(io_mod.getIo());
+        defer self.inbox_mutex.unlock(io_mod.getIo());
+        const items = self.inbox;
+        self.inbox = .empty;
+        return items;
+    }
+
+    fn deliver(self: *Connection, item: Incoming) void {
+        var owned = item;
+        self.inbox_mutex.lockUncancelable(io_mod.getIo());
+        defer self.inbox_mutex.unlock(io_mod.getIo());
+        self.inbox.append(self.alloc, owned) catch owned.deinit();
+    }
+
+    /// The pump's frame handler.
+    pub fn frame(self: *Connection, bytes: []const u8) void {
+        const parsed = std.json.parseFromSlice(protocol.ServerFrame, self.alloc, bytes, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        }) catch return;
+        self.deliver(.{ .frame = parsed });
+    }
+
+    fn run(self: *Connection) void {
+        var backoff_ms: i32 = 0;
+        // One notice per outage, not one per failed attempt.
+        var reported = false;
+        while (true) {
+            if (backoff_ms > 0) self.channel.waitWake(backoff_ms);
+            if (!self.channel.reset()) return;
+            backoff_ms = if (backoff_ms == 0) 250 else @min(backoff_ms * 2, max_backoff_ms);
+            const stream = self.open() catch |err| {
+                if (!reported) self.deliver(.{ .disconnected = err });
+                reported = true;
+                continue;
+            };
+            defer stream.close(io_mod.getIo());
+            self.connected.store(true, .release);
+            self.deliver(.connected);
+            reported = false;
+            backoff_ms = 0;
+            const ended: anyerror = if (self.channel.pump(stream, self)) |_| error.SupervisorDisconnected else |err| err;
+            self.connected.store(false, .release);
+            if (self.channel.isClosed() and !self.channel.reset()) return;
+            self.deliver(.{ .disconnected = ended });
+            reported = true;
+            backoff_ms = 250;
+        }
+    }
+
+    fn open(self: *Connection) !std.Io.net.Stream {
+        try self.client.ensureRunning(self.executable);
+        const address = try std.Io.net.UnixAddress.init(self.client.socket_path);
+        return address.connect(io_mod.getIo());
+    }
+};
+
 pub fn stateDir(alloc: Allocator) ![]u8 {
     if (io_mod.getenv("PROTO_FX_STATE_DIR")) |override| return alloc.dupe(u8, override);
     const home = io_mod.homeDir() orelse return error.HomeUnavailable;
@@ -87,7 +224,7 @@ pub fn socketPath(alloc: Allocator) ![]u8 {
     return std.Io.Dir.path.join(alloc, &.{ root, "control.sock" });
 }
 
-pub fn writeFrame(stream: std.Io.net.Stream, json: []const u8) !void {
+fn writeFrame(stream: std.Io.net.Stream, json: []const u8) !void {
     var buffer: [4096]u8 = undefined;
     var writer = stream.writer(io_mod.getIo(), &buffer);
     try writer.interface.writeAll(json);
@@ -95,7 +232,7 @@ pub fn writeFrame(stream: std.Io.net.Stream, json: []const u8) !void {
     try writer.interface.flush();
 }
 
-pub fn readFrame(alloc: Allocator, stream: std.Io.net.Stream, timeout_ms: i32) ![]u8 {
+fn readFrame(alloc: Allocator, stream: std.Io.net.Stream, timeout_ms: i32) ![]u8 {
     var bytes: std.ArrayList(u8) = .empty;
     errdefer bytes.deinit(alloc);
     const deadline = io_mod.milliTimestamp() + timeout_ms;
