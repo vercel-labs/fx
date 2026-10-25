@@ -201,6 +201,15 @@ pub fn acquire(alloc: Allocator, options: kernel.Options, retainer: ?Retainer) !
     return manager;
 }
 
+/// The state of the saved kernel kept under `artifact_dir`, if the pool
+/// holds one; it takes no hold.
+pub fn stateOf(artifact_dir: []const u8) ?kernel.State {
+    mutex.lockUncancelable(io_mod.getIo());
+    defer mutex.unlock(io_mod.getIo());
+    for (keyed.items) |manager| if (std.mem.eql(u8, manager.artifact_dir, artifact_dir)) return manager.status();
+    return null;
+}
+
 /// Drops one hold. The kernel is destroyed, with a final snapshot, unless a
 /// retainer keeps its live process for a later turn.
 pub fn release(manager: *Manager) void {

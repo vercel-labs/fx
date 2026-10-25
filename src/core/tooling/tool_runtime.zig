@@ -31,6 +31,7 @@ const execution_router = @import("../execution/router.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const subagent_model_contract = @import("../subagent/model_contract.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
+const harness_mod = @import("../harness/harness.zig");
 const subagent_tool_provider = @import("../subagent/tool_provider.zig");
 const session_runtime = @import("../session/session.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
@@ -161,6 +162,9 @@ pub const Context = struct {
     host_tool_provider: ?tool_dispatch.HostToolProvider = null,
     /// The calling node's own host for its children (D91).
     subagent_host: ?*subagent_tool_host.Runtime = null,
+    /// The running turn's services for `proto_fx` in the agent's shell
+    /// commands; null runs commands without the harness.
+    harness: ?harness_mod.Services = null,
     permission_mode: PermissionMode,
     permission_grants: []const PermissionGrant,
     session_grants: []const PermissionGrant = &.{},
@@ -429,6 +433,7 @@ pub fn executeToolCallAuthorized(
     execution_ctx.command_timeout_started_ms = request.command_timeout_started_ms;
     execution_ctx.command_replay_capture = request.command_replay_capture;
     execution_ctx.command_replay_unavailable = request.command_replay_unavailable;
+    execution_ctx.harness = request.harness;
 
     const started_at_ms = io_mod.milliTimestamp();
     const uses_file_mutation_contract = if (registeredToolSpec(
@@ -1161,6 +1166,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
     return .{
         .allocator = arena,
         .kernel = &ctx.session.kernel,
+        .harness = ctx.harness,
         .observer = ctx.observer,
         .permission_mode = ctx.permission_mode,
         .workspace_root = ctx.workspace_root,
@@ -1550,6 +1556,19 @@ fn commandReplayPolicy(
     };
 }
 
+/// What the harness needs from this tool context for an agent shell command.
+fn harnessCommand(ctx: Context) harness_mod.Command {
+    return .{
+        .services = ctx.harness,
+        .kernel = &ctx.session.kernel,
+        .session_id = ctx.lifecycle_scope.session_id,
+        .workspace_root = ctx.workspace_root,
+        .kernel_allocator = ctx.session_allocator,
+        .cancel = runtimeCancelFlag(ctx),
+        .parent_call_id = if (ctx.output_chunk_lifecycle_id) |id| id.call_id else "",
+    };
+}
+
 fn toolRunCommand(
     ctx: Context,
     arena: Allocator,
@@ -1698,7 +1717,10 @@ fn toolRunCommand(
         .capture = replay_capture,
     };
 
+    const harness_lease = if (route == .approved_shell) harness_mod.openForCommand(harnessCommand(ctx)) else null;
+    defer if (harness_lease) |lease| harness_mod.close(lease);
     const routed = execution_router.executePreparedRoute(.{
+        .environment_extension = if (harness_lease) |lease| lease.environment() else null,
         .max_command_output_bytes = ctx.max_command_output_bytes,
         .cancel_flag = runtimeCancelFlag(ctx),
         .output_chunk_lifecycle_id = ctx.output_chunk_lifecycle_id,

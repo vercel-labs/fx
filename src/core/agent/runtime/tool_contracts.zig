@@ -186,6 +186,9 @@ pub const ToolExecutionRequest = struct {
     /// Present for interactive tool calls so streamed command output can stay
     /// attached to the status row that owns this exact call.
     lifecycle_id: ?types.ToolLifecycleId = null,
+    /// The turn's services for `proto_fx`, offered to a shell command this
+    /// call runs. Borrowed for the call.
+    harness: ?@import("../../harness/services.zig").Services = null,
 };
 
 pub const DiffEntryPayload = diff.DiffEntryPayload;

@@ -35,6 +35,8 @@ pub const StartCapturedInput = struct {
     on_output_chunk: ?command_runner.CommandOutputCallback = null,
     yield_time_ms: u32 = contract.default_yield_time_ms,
     cancel_flag: ?*std.atomic.Value(bool) = null,
+    /// Extra variables for the command, copied into the execution.
+    environment_extension: ?command_runner.EnvironmentExtension = null,
 };
 
 pub const TtyCursor = struct {
@@ -172,6 +174,7 @@ const Entry = struct {
     max_output_bytes: usize,
     timeout_ms: ?usize,
     command_artifact_dir: ?[]const u8,
+    environment_extension: ?command_runner.EnvironmentExtension = null,
     backend_kind: contract.Backend,
     persistence_kind: contract.Persistence,
     mutex: std.Io.Mutex = .init,
@@ -267,6 +270,7 @@ const Entry = struct {
             .max_output_bytes = input.max_output_bytes,
             .timeout_ms = input.timeout_ms,
             .command_artifact_dir = command_artifact_dir,
+            .environment_extension = if (input.environment_extension) |extension| try extension.dupe(owned) else null,
             .backend_kind = .captured,
             .persistence_kind = .process,
             .backend_state = .{ .captured = .{ .route = route } },
@@ -443,6 +447,7 @@ const Entry = struct {
             .timeout_ms = self.timeout_ms,
             .timeout_started_ms = started_ms,
             .command_artifact_dir = self.command_artifact_dir,
+            .environment_extension = self.environment_extension,
         }, self.arena.allocator(), captured.route) catch |err| {
             const zio = io_mod.getIo();
             self.mutex.lockUncancelable(zio);

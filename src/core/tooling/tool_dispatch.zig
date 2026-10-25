@@ -255,6 +255,8 @@ pub const DispatchContext = struct {
     allocator: Allocator,
     /// The session's Python kernel slot; null in hosts without a session runtime.
     kernel: ?*@import("../kernel/slot.zig").Slot = null,
+    /// The running turn's services for `proto_fx` in agent shell commands.
+    harness: ?@import("../harness/services.zig").Services = null,
     permission_mode: permission_gate.PermissionMode = .ask,
     permission_decider: ?PermissionDecider = null,
     execution_authority: ?command_admission.ToolExecutionAuthority = null,

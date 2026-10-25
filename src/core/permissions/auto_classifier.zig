@@ -216,6 +216,10 @@ pub const ProvenBindings = struct {
 pub const ReviewOrigin = enum {
     root,
     subagent,
+    /// A `proto_fx` call from Python that one of the node's own shell
+    /// commands started: the code is the agent's, so it is reviewed
+    /// contextually, like a subagent's call.
+    harness,
 };
 
 const ReviewView = enum {
@@ -943,7 +947,7 @@ test "prepared mutations serialize exact action without operational packet field
 }
 
 fn selectReviewView(request: ReviewRequest) ReviewView {
-    if (request.review_turn.origin == .subagent) return .contextual;
+    if (request.review_turn.origin != .root) return .contextual;
     return switch (request.action) {
         .command, .shell_input => .contextual,
         .file_mutation => .normal,

@@ -36,12 +36,25 @@ pub const Slot = struct {
     /// so a subagent finds it warm on its next turn. Idle TTLs and the live cap still
     /// park it. Null stops the kernel when the slot lets go.
     retainer: ?pool.Retainer = null,
+    /// The node's other kernels, which `proto_fx` names, keyed by name and
+    /// guarded by `lock`. Each is a pool kernel of its own, saved beside the
+    /// default one under `<session id>@<name>`.
+    named: std.ArrayList(Named) = .empty,
+
+    pub const Named = struct { name: []u8, manager: *Manager };
 
     /// Only the owning session calls this, after tool callers have joined. The
     /// pool stops the kernel unless the retainer or another slot still keeps it.
     pub fn deinit(self: *Slot) void {
         if (self.manager) |manager| pool.release(manager);
         self.manager = null;
+        for (self.named.items) |entry| {
+            pool.release(entry.manager);
+            std.heap.c_allocator.free(entry.name);
+        }
+        self.named.deinit(std.heap.c_allocator);
+        // A session resets its slot and may deinit it again later.
+        self.named = .empty;
     }
 
     /// The kernel if one was acquired. It stays valid until `deinit`.
@@ -90,6 +103,97 @@ pub const Slot = struct {
         return manager.diagnostics(alloc);
     }
 
+    /// The kernel called `name`, created on first use: `default` is the
+    /// one `ensure` gives. `alloc` must be thread-safe and outlive the slot.
+    pub fn ensureNamed(self: *Slot, alloc: Allocator, owner: Owner, name: []const u8) !*Manager {
+        if (std.mem.eql(u8, name, default_name)) return self.ensure(alloc, owner);
+        if (!validName(name)) return error.InvalidKernelName;
+        self.lock.lockUncancelable(io_mod.getIo());
+        defer self.lock.unlock(io_mod.getIo());
+        for (self.named.items) |entry| if (std.mem.eql(u8, entry.name, name)) return entry.manager;
+        if (self.named.items.len >= max_named) return error.TooManyKernels;
+        const artifacts = try self.namedArtifactDir(alloc, owner.session_id, name);
+        defer alloc.free(artifacts);
+        try self.named.ensureUnusedCapacity(std.heap.c_allocator, 1);
+        const owned = try std.heap.c_allocator.dupe(u8, name);
+        errdefer std.heap.c_allocator.free(owned);
+        const manager = try pool.acquire(alloc, .{ .cwd = owner.cwd, .artifact_dir = artifacts, .persist = owner.session_id != null }, self.retainer);
+        self.named.appendAssumeCapacity(.{ .name = owned, .manager = manager });
+        return manager;
+    }
+
+    /// The kernel called `name` if this slot holds it.
+    pub fn currentNamed(self: *Slot, name: []const u8) ?*Manager {
+        if (std.mem.eql(u8, name, default_name)) return self.current();
+        self.lock.lockUncancelable(io_mod.getIo());
+        defer self.lock.unlock(io_mod.getIo());
+        for (self.named.items) |entry| if (std.mem.eql(u8, entry.name, name)) return entry.manager;
+        return null;
+    }
+
+    /// `control` for the kernel called `name`; null when it never started here.
+    pub fn controlNamed(self: *Slot, alloc: Allocator, owner: Owner, name: []const u8, action: Action) !?State {
+        if (std.mem.eql(u8, name, default_name)) return self.control(alloc, owner, action);
+        const manager = if (action == .prewarm) try self.ensureNamed(alloc, owner, name) else self.currentNamed(name) orelse return null;
+        switch (action) {
+            .status => {},
+            .interrupt => manager.interrupt(),
+            .stop => manager.stop(true),
+            .restart => manager.restart(),
+            .prewarm => try manager.prewarm(),
+        }
+        return manager.status();
+    }
+
+    /// What `/kernel` shows: the default kernel's diagnostics, then one line
+    /// naming every other kernel of the node, live in this slot or the pool,
+    /// or saved on disk. Caller owns the text.
+    pub fn report(self: *Slot, alloc: Allocator, owner: Owner) ![]u8 {
+        const base = try self.diagnostics(alloc);
+        defer alloc.free(base);
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var names: std.ArrayList([]const u8) = .empty;
+        var states: std.ArrayList([]const u8) = .empty;
+        {
+            self.lock.lockUncancelable(io_mod.getIo());
+            defer self.lock.unlock(io_mod.getIo());
+            for (self.named.items) |entry| {
+                try names.append(arena, try arena.dupe(u8, entry.name));
+                try states.append(arena, @tagName(entry.manager.status()));
+            }
+        }
+        if (owner.session_id) |id| saved: {
+            const root = self.artifactDir(arena, id) catch break :saved;
+            const parent = std.Io.Dir.path.dirname(root) orelse break :saved;
+            var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), parent, .{ .iterate = true }) catch break :saved;
+            defer dir.close(io_mod.getIo());
+            const prefix = try arena.print("{s}@", .{id});
+            var it = dir.iterate();
+            while (it.next(io_mod.getIo()) catch null) |entry| {
+                if (entry.kind != .directory or !std.mem.startsWith(u8, entry.name, prefix)) continue;
+                const name = entry.name[prefix.len..];
+                if (!validName(name)) continue;
+                const known = for (names.items) |existing| {
+                    if (std.mem.eql(u8, existing, name)) break true;
+                } else false;
+                if (known) continue;
+                const path = try std.Io.Dir.path.join(arena, &.{ parent, entry.name });
+                try names.append(arena, try arena.dupe(u8, name));
+                try states.append(arena, if (pool.stateOf(path)) |state| @tagName(state) else "saved");
+            }
+        }
+        if (names.items.len == 0) return alloc.dupe(u8, base);
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        try out.writer.writeAll(base);
+        if (base.len > 0 and base[base.len - 1] != '\n') try out.writer.writeByte('\n');
+        try out.writer.writeAll("named kernels:");
+        for (names.items, states.items) |name, state| try out.writer.print(" {s} ({s})", .{ name, state });
+        return out.toOwnedSlice();
+    }
+
     /// `<home>/<profile root>/kernels/<session id>`, or empty for an unsaved session.
     fn artifactDir(self: *const Slot, alloc: Allocator, session_id: ?[]const u8) ![]u8 {
         const id = session_id orelse return alloc.dupe(u8, "");
@@ -97,7 +201,32 @@ pub const Slot = struct {
         const home = self.home_override orelse io_mod.homeDir() orelse return error.HomeNotSet;
         return std.Io.Dir.path.join(alloc, &.{ home, profile_paths.root_dir_name, "kernels", id });
     }
+
+    /// The default kernel's directory with `@<name>` appended.
+    fn namedArtifactDir(self: *const Slot, alloc: Allocator, session_id: ?[]const u8, name: []const u8) ![]u8 {
+        const base = try self.artifactDir(alloc, session_id);
+        if (base.len == 0) return base;
+        defer alloc.free(base);
+        return std.mem.concat(alloc, u8, &.{ base, "@", name });
+    }
 };
+
+/// The kernel a node gets without naming one.
+pub const default_name = "default";
+/// Named kernels one node may hold besides its default one.
+pub const max_named: usize = 16;
+
+/// A kernel name: 1 to 32 of lowercase letters, digits, `_` and `-`,
+/// starting with a letter or digit.
+pub fn validName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 32) return false;
+    for (name, 0..) |c, i| switch (c) {
+        'a'...'z', '0'...'9' => {},
+        '_', '-' => if (i == 0) return false,
+        else => return false,
+    };
+    return true;
+}
 
 test "kernel slot derives snapshots from the bound home and rejects unsafe ids" {
     const alloc = std.testing.allocator;
@@ -111,6 +240,28 @@ test "kernel slot derives snapshots from the bound home and rejects unsafe ids" 
     defer alloc.free(unsaved);
     try std.testing.expectEqualStrings("", unsaved);
     try std.testing.expectError(error.InvalidSessionId, slot.artifactDir(alloc, "../escape"));
+}
+
+test "named kernels are validated and saved beside the default one" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(validName("a"));
+    try std.testing.expect(validName("data-2"));
+    try std.testing.expect(!validName(""));
+    try std.testing.expect(!validName("-x"));
+    try std.testing.expect(!validName("A"));
+    try std.testing.expect(!validName("../x"));
+    try std.testing.expect(!validName("abcdefghijklmnopqrstuvwxyz0123456"));
+    var slot: Slot = .{ .home_override = "/Users/example" };
+    const dir = try slot.namedArtifactDir(alloc, "abc-123", "a");
+    defer alloc.free(dir);
+    const expected = try std.Io.Dir.path.join(alloc, &.{ "/Users/example", profile_paths.root_dir_name, "kernels", "abc-123@a" });
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, dir);
+    const unsaved = try slot.namedArtifactDir(alloc, null, "a");
+    defer alloc.free(unsaved);
+    try std.testing.expectEqualStrings("", unsaved);
+    try std.testing.expectError(error.InvalidKernelName, slot.ensureNamed(alloc, .{ .cwd = "/", .session_id = null }, "Bad"));
+    try std.testing.expectEqual(@as(?State, null), try slot.controlNamed(alloc, .{ .cwd = "/", .session_id = null }, "a", .status));
 }
 
 test "kernel slot controls report no kernel until one is created" {

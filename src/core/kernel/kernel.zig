@@ -423,7 +423,7 @@ pub const Manager = struct {
         try acquireBootPermit(cancel, &self.stopping);
         var boot_permit = true;
         defer if (boot_permit) releaseBootPermit();
-        const paths = bootstrap.ensure(self.alloc, self.python, self.progress, .{ .caller = cancel, .owner = &self.stopping }) catch |err| {
+        const paths = bootstrap.ensure(self.alloc, self.python, self.cwd, self.progress, .{ .caller = cancel, .owner = &self.stopping }) catch |err| {
             self.fail(@errorName(err));
             return err;
         };
@@ -443,6 +443,7 @@ pub const Manager = struct {
         var owner: [32]u8 = undefined;
         try env.put("PROTO_FX_KERNEL_OWNER_PID", try std.mem.print(&owner, "{d}", .{std.c.getpid()}));
         try env.put("PYTHONUTF8", "1");
+        if (paths.dill_path) |path| try env.put("PROTO_FX_KERNEL_DILL_PATH", path);
         const spawned = process.spawn(self.alloc, .{ .python = paths.python, .runtime = paths.runtime, .cwd = self.cwd, .env = &env }) catch |err| {
             // A vanished interpreter must be probed again before the next start.
             bootstrap.forget(paths.python);

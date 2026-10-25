@@ -1,4 +1,5 @@
 const std = @import("std");
+const harness = @import("../../core/harness/harness.zig");
 const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const command_admission = @import("../../core/permissions/command_admission.zig");
@@ -639,7 +640,19 @@ fn callRun(
     var execution_id_buffer: [64]u8 = undefined;
     const execution_id = runtime.generatedId(&execution_id_buffer) catch |err|
         return runtimeFailure(ctx, err);
+    // Python this command starts can reach this node until the call returns.
+    const harness_lease = harness.openForCommand(.{
+        .services = ctx.harness,
+        .kernel = ctx.kernel,
+        .session_id = ctx.terminal_owner_session_id,
+        .workspace_root = ctx.workspace_root,
+        .kernel_allocator = ctx.lifecycle_allocator,
+        .cancel = ctx.cancel_flag,
+        .parent_call_id = if (ctx.output_chunk_lifecycle_id) |id| id.call_id else "",
+    });
+    defer if (harness_lease) |lease| harness.close(lease);
     var prepared = runtime.startCaptured(ctx.allocator, .{
+        .environment_extension = if (harness_lease) |lease| lease.environment() else null,
         .execution_id = execution_id,
         .command = command,
         .cwd = cwd,

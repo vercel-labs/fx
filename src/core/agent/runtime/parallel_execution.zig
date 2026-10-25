@@ -128,6 +128,8 @@ pub const ParallelHookExecContext = struct {
     advertised_dynamic_tool_names: []const []const u8,
     max_tool_result_bytes: usize,
     classification_complete: []const bool = &.{},
+    /// The turn's services for `proto_fx` in shell commands these calls run.
+    harness: ?@import("../../harness/services.zig").Services = null,
 };
 
 const ParallelExecuteFn = *const fn (*anyopaque, Allocator, ToolCall, usize) anyerror!ToolExecutionResult;
@@ -374,6 +376,7 @@ pub fn parallelHookExecute(ctx: *anyopaque, alloc: Allocator, call: ToolCall, in
         .classification_complete = index < exec_ctx.classification_complete.len and
             exec_ctx.classification_complete[index],
         .lifecycle_id = .{ .turn_id = exec_ctx.turn_id, .call_id = call.id },
+        .harness = exec_ctx.harness,
     });
 }
 

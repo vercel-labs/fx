@@ -498,7 +498,7 @@ pub fn kernelControl(alloc: Allocator, state: *server.ServerState, node_id: []co
     defer slot.deinit();
     _ = try slot.ensure(state.alloc, .{ .cwd = active.workspace_root, .session_id = node_id });
     const value = try slot.control(state.alloc, .{ .cwd = active.workspace_root, .session_id = node_id }, action);
-    return .{ .state = if (value) |current| @tagName(current) else "uninitialized", .diagnostics = try slot.diagnostics(alloc) };
+    return .{ .state = if (value) |current| @tagName(current) else "uninitialized", .diagnostics = try slot.report(alloc, .{ .cwd = active.workspace_root, .session_id = node_id }) };
 }
 
 fn lastReply(history: []const types.HistoryTurn) ?[]const u8 {

@@ -40,7 +40,47 @@ pub const Config = struct {
     /// Shell snapshot epoch of the remembered grant that admitted a `user`
     /// profile command, or null when it was not admitted by a grant.
     shell_grant_epoch: ?u64 = null,
+    /// Changes the command's environment after fx's own variables, such as
+    /// the harness lease of an agent shell command. Null changes nothing.
+    environment_extension: ?EnvironmentExtension = null,
 };
+
+/// Variables a command gets on top of fx's own, as plain data so a command
+/// that outlives its caller keeps a copy (`dupe`).
+pub const EnvironmentExtension = struct {
+    /// Put first on PYTHONPATH, keeping any value after it.
+    python_path_prefix: []const u8 = "",
+    set: []const [2][]const u8 = &.{},
+    unset: []const []const u8 = &.{},
+
+    pub fn dupe(self: EnvironmentExtension, alloc: Allocator) !EnvironmentExtension {
+        const set = try alloc.alloc([2][]const u8, self.set.len);
+        for (self.set, set) |pair, *out| out.* = .{ try alloc.dupe(u8, pair[0]), try alloc.dupe(u8, pair[1]) };
+        const unset = try alloc.alloc([]const u8, self.unset.len);
+        for (self.unset, unset) |name, *out| out.* = try alloc.dupe(u8, name);
+        return .{ .python_path_prefix = try alloc.dupe(u8, self.python_path_prefix), .set = set, .unset = unset };
+    }
+
+    pub fn apply(self: EnvironmentExtension, environment: *std.process.Environ.Map) !void {
+        if (self.python_path_prefix.len > 0) {
+            const existing = environment.get("PYTHONPATH") orelse "";
+            if (existing.len == 0) {
+                try environment.put("PYTHONPATH", self.python_path_prefix);
+            } else {
+                const joined = try std.mem.concat(std.heap.c_allocator, u8, &.{ self.python_path_prefix, ":", existing });
+                defer std.heap.c_allocator.free(joined);
+                try environment.put("PYTHONPATH", joined);
+            }
+        }
+        for (self.set) |pair| try environment.put(pair[0], pair[1]);
+        for (self.unset) |name| _ = environment.swapRemove(name);
+    }
+};
+
+fn applyCommandEnvironment(cfg: Config, environment: *std.process.Environ.Map) !void {
+    try applyAgentEnvironment(environment);
+    if (cfg.environment_extension) |extension| try extension.apply(environment);
+}
 
 const ai_agent_env = "AI_AGENT";
 const ai_agent_name = "fx";
@@ -1420,7 +1460,7 @@ fn executeProcessWithInput(
     const started_ms = io_mod.milliTimestamp();
     var environment = try io_mod.cloneEnvironMap(scratch);
     defer environment.deinit();
-    try applyAgentEnvironment(&environment);
+    try applyCommandEnvironment(cfg, &environment);
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = argv,
         .stdin = if (closed_input) .pipe else .ignore,
@@ -1482,7 +1522,7 @@ fn executeProcessWithScript(
     else
         try io_mod.cloneEnvironMap(scratch);
     defer environment.deinit();
-    try applyAgentEnvironment(&environment);
+    try applyCommandEnvironment(cfg, &environment);
     if (comptime supports_foreground_session) {
         return executeProcessWithDetachedSession(
             scratch,

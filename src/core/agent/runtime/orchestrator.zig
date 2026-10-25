@@ -48,6 +48,7 @@ const runtime_lifecycle = @import("lifecycle.zig");
 const runtime_prompt_context = @import("prompt_context.zig");
 const compactor = @import("../../compactor/compactor.zig");
 const runtime_text_completion = @import("text_completion.zig");
+const runtime_harness_services = @import("harness_services.zig");
 const compaction_activity = @import("../../output/compaction_activity.zig");
 const runtime_telemetry = @import("telemetry.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
@@ -2314,12 +2315,12 @@ test "terminal request normalization cleans every partial allocation failure" {
     );
 }
 
-const LiveToolAuthorityResolution = union(enum) {
+pub const LiveToolAuthorityResolution = union(enum) {
     resolved: runtime_deps.ResolvedLiveToolAuthority,
     tool_failure: []const u8,
 };
 
-fn resolveLiveToolAuthority(
+pub fn resolveLiveToolAuthority(
     deps: *const AgentRuntimeDeps,
     arena: Allocator,
     call: ToolCall,
@@ -2359,7 +2360,7 @@ fn resolveLiveToolAuthority(
     ) };
 }
 
-fn liveAuthorityRejectsExecution(
+pub fn liveAuthorityRejectsExecution(
     resolved: runtime_deps.ResolvedLiveToolAuthority,
 ) bool {
     return resolved.decision == .deny or
@@ -6035,7 +6036,7 @@ fn buildReviewTurnContext(
     };
 }
 
-fn permissionDeniedModelOutput(
+pub fn permissionDeniedModelOutput(
     alloc: Allocator,
     tool_name: []const u8,
     reason: types.ToolPermissionDenialReason,
@@ -10522,7 +10523,24 @@ fn processQueuedPromptLoop(
                         within_turn_suffix.items,
                         step_batch.pending_user_suffix.items,
                     );
+                    var parallel_harness_turn: runtime_harness_services.Turn = .{
+                        .deps = deps,
+                        .config = &config,
+                        .mode = root_action_permission_mode,
+                        .grants = local_grants.items,
+                        .root_user_intent_context = parallel_execution_root_user_context,
+                        .current_turn_messages = within_turn_suffix.items,
+                        .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
+                        .advertised_dynamic_tools = advertised_dynamic_tools,
+                        .skill_locations = if (skills.catalog) |catalog| &catalog.locations else null,
+                        .credential = activeCredentialLease(active_api_key, job),
+                        .model = successful_gateway_model,
+                        .session_id = lifecycle.scope.session_id,
+                        .trace = step_ctx,
+                    };
+                    defer parallel_harness_turn.deinit();
                     var parallel_exec_ctx = runtime_parallel_execution.ParallelHookExecContext{
+                        .harness = parallel_harness_turn.services(),
                         .skill_locations = if (skills.catalog) |catalog| &catalog.locations else null,
                         .hooks = deps,
                         .turn_id = turn_id,
@@ -11865,7 +11883,24 @@ fn processQueuedPromptLoop(
             const execution_lifecycle_id = types.ToolLifecycleId{ .turn_id = turn_id, .call_id = execution_call.id };
             const execution_is_command = runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, tool_call) == .command;
             var execution_error: ?anyerror = null;
+            var harness_turn: runtime_harness_services.Turn = .{
+                .deps = deps,
+                .config = &config,
+                .mode = action_permission_mode,
+                .grants = execution_grants,
+                .root_user_intent_context = tool_execution_root_user_context,
+                .current_turn_messages = within_turn_suffix.items,
+                .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
+                .advertised_dynamic_tools = advertised_dynamic_tools,
+                .skill_locations = if (skills.catalog) |catalog| &catalog.locations else null,
+                .credential = activeCredentialLease(active_api_key, job),
+                .model = successful_gateway_model,
+                .session_id = lifecycle.scope.session_id,
+                .trace = step_ctx,
+            };
+            defer harness_turn.deinit();
             var execution = deps.executeToolCall(.{
+                .harness = harness_turn.services(),
                 .skill_locations = if (skills.catalog) |catalog| &catalog.locations else null,
                 .call_allocator = call_allocator,
                 .result_allocator = arena,

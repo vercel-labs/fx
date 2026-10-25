@@ -667,13 +667,28 @@ def _read_snapshot_records(fh: Any) -> dict[str, bytes]:
     return records
 
 
+def _import_dill() -> Any:
+    """dill, from the interpreter or, for a project environment without it,
+    from the folder the host names in PROTO_FX_KERNEL_DILL_PATH."""
+    try:
+        import dill
+    except ImportError:
+        extra = os.environ.get("PROTO_FX_KERNEL_DILL_PATH")
+        if not extra:
+            raise
+        if extra not in sys.path:
+            sys.path.append(extra)
+        import dill
+    return dill
+
+
 def _snapshot_state(
     ns: dict[str, Any],
     path: str,
     committed: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     try:
-        import dill
+        dill = _import_dill()
     except Exception as err:  # noqa: BLE001 - dill is provisioned by the host, not a hard dep
         return {"error": f"dill unavailable: {err}"}
     dill.settings["recurse"] = True
@@ -938,7 +953,7 @@ def _restore_state(
     if not os.path.exists(path):
         return {"restored": [], "failed": [], "reason": "snapshot not found"}
     try:
-        import dill
+        dill = _import_dill()
     except Exception as err:  # noqa: BLE001
         return {"error": f"dill unavailable: {err}"}
     unpickler = _snapshot_unpickler(dill)
@@ -1389,7 +1404,7 @@ def _zygote_main() -> None:
     # measured on 3.11, a forked kernel then holds about 10.6 MiB privately
     # after its first snapshot instead of 14.1 MiB.
     try:
-        import dill  # noqa: F401
+        _import_dill()
     except Exception:  # noqa: BLE001 - the probe guarantees dill; a kernel reports its absence
         pass
     # Frozen objects are never scanned by the collector, so a kernel's GC

@@ -1007,8 +1007,9 @@ pub const PersistentHost = struct {
         if (node_id) |id| if (!std.mem.eql(u8, id, active.session_id)) return node_host.kernelControl(alloc, &self.state, id, action);
         if (action != .status and action != .interrupt and self.busy()) return error.SessionBusy;
         const slot = &active.session_rt.kernel;
-        const state = try slot.control(self.state.alloc, .{ .cwd = active.workspace_root, .session_id = active.session_id }, action);
-        return .{ .state = if (state) |value| @tagName(value) else "uninitialized", .diagnostics = try slot.diagnostics(alloc) };
+        const owner: kernel.Owner = .{ .cwd = active.workspace_root, .session_id = active.session_id };
+        const state = try slot.control(self.state.alloc, owner, action);
+        return .{ .state = if (state) |value| @tagName(value) else "uninitialized", .diagnostics = try slot.report(alloc, owner) };
     }
 
     pub fn deinit(self: *PersistentHost) void {
