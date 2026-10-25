@@ -26,6 +26,7 @@ pub const Kind = enum {
     child_finished,
     snapshot,
     closed,
+    rewound,
 };
 
 pub const Header = struct {
@@ -126,6 +127,7 @@ pub const Body = union(Kind) {
     child_finished: Finished,
     snapshot: Snapshot,
     closed: void,
+    rewound: Rewound,
 
     pub const Created = struct {
         id: []const u8,
@@ -173,6 +175,10 @@ pub const Body = union(Kind) {
     pub const WorkItem = struct { child: []const u8, work_id: []const u8, data: ?[]const u8 = null };
     pub const Finished = struct { child: []const u8, work_id: []const u8, outcome: Outcome, data: ?[]const u8 = null };
     pub const Snapshot = struct { covers_seq: u64, state: []const u8, compaction_offset: ?u64 };
+    /// The session's history drops turns `turn` through `through`, the
+    /// newest turn when it was written, and every child first spawned
+    /// after `turn` started is abandoned (D97). Written between turns.
+    pub const Rewound = struct { turn: u64, through: u64, abandoned: []const []const u8 = &.{} };
 };
 
 /// Appends the fields of `body`. Strings must be valid UTF-8 and raw values
@@ -232,6 +238,11 @@ pub fn appendBody(gpa: std.mem.Allocator, out: *std.ArrayList(u8), body: Body) e
             if (s.compaction_offset) |offset| try w.number("compaction_offset", offset);
         },
         .closed => {},
+        .rewound => |r| {
+            try w.number("turn", r.turn);
+            try w.number("through", r.through);
+            try w.stringList("abandoned", r.abandoned);
+        },
     }
 }
 
@@ -298,6 +309,11 @@ fn bodyOf(kind: Kind, f: Fields) BodyError!Body {
             .compaction_offset = try f.opt(u64, "compaction_offset"),
         } },
         .closed => .closed,
+        .rewound => .{ .rewound = .{
+            .turn = try f.req(u64, "turn"),
+            .through = try f.req(u64, "through"),
+            .abandoned = try f.opt([]const []const u8, "abandoned") orelse &.{},
+        } },
     };
 }
 
@@ -531,12 +547,17 @@ const FieldWriter = struct {
 
     /// `"blobs":[...]`, written only when there is at least one.
     fn blobList(w: FieldWriter, hashes: []const []const u8) error{OutOfMemory}!void {
-        if (hashes.len == 0) return;
-        try w.key("blobs");
+        try w.stringList("blobs", hashes);
+    }
+
+    /// `"name":[...]`, written only when there is at least one string.
+    fn stringList(w: FieldWriter, name: []const u8, values: []const []const u8) error{OutOfMemory}!void {
+        if (values.len == 0) return;
+        try w.key(name);
         try w.out.append(w.gpa, '[');
-        for (hashes, 0..) |hash, i| {
+        for (values, 0..) |value, i| {
             if (i > 0) try w.out.append(w.gpa, ',');
-            try appendJsonString(w.gpa, w.out, hash);
+            try appendJsonString(w.gpa, w.out, value);
         }
         try w.out.append(w.gpa, ']');
     }
@@ -790,6 +811,13 @@ test "every kind's fields round trip, raw values byte for byte" {
     try testing.expectEqual(@as(?u64, 400), snap.compaction_offset);
 
     try testing.expectEqual(Body.closed, try roundTrip(arena, .closed));
+
+    const rewound = (try roundTrip(arena, .{ .rewound = .{ .turn = 3, .through = 5, .abandoned = &.{ "c1", "c2" } } })).rewound;
+    try testing.expectEqual(@as(u64, 3), rewound.turn);
+    try testing.expectEqual(@as(u64, 5), rewound.through);
+    try testing.expectEqualStrings("c2", rewound.abandoned[1]);
+    const bare = (try roundTrip(arena, .{ .rewound = .{ .turn = 1, .through = 1 } })).rewound;
+    try testing.expectEqual(@as(usize, 0), bare.abandoned.len);
 }
 
 test "a body missing a required field is rejected" {

@@ -43,13 +43,24 @@ pub fn Runtime(comptime App: type) type {
                     .compacted => "Context compacted.",
                     .nothing_to_compact => "No context to compact.",
                 }),
-                .undo => if (result.outcome) |outcome| try applyUndo(app, outcome, result.path orelse ""),
+                .undo => if (result.outcome) |outcome| {
+                    if (outcome == .rewound) return noticeSafe(app, "undo", result.text orelse "");
+                    try applyUndo(app, outcome, result.path orelse "");
+                },
                 .context => try applyContext(app, result),
                 .mcp_verb, .mcp_status => try notice(app, "mcp", result.text orelse ""),
                 .workspace => try notice(app, "workspace", result.text orelse ""),
                 .permissions_reload => try notice(app, "permissions", "Session permissions reloaded."),
                 .shell_reload => try notice(app, "shell", "The next command reloads your shell startup files. Remembered command approvals were reset."),
+                .model, .effort => try noticeSafe(app, "model", result.text orelse ""),
             }
+        }
+
+        /// Host text that names the person's own prompts, shown safely.
+        fn noticeSafe(app: *App, topic: []const u8, text: []const u8) !void {
+            var safe = try text_utils.encodeTerminalSafe(app.alloc, text, 4096);
+            defer safe.deinit(app.alloc);
+            try notice(app, topic, safe.bytes);
         }
 
         fn applyLastReply(app: *App, text: []const u8) !void {
@@ -92,7 +103,7 @@ pub fn Runtime(comptime App: type) type {
             const body = switch (outcome) {
                 .restored => try app.alloc.print("Restored {s}", .{safe.bytes}),
                 .deleted => try app.alloc.print("Deleted {s} (was newly created)", .{safe.bytes}),
-                .unavailable, .nothing_to_undo => try app.alloc.print("Could not undo {s}", .{safe.bytes}),
+                .unavailable, .nothing_to_undo, .rewound => try app.alloc.print("Could not undo {s}", .{safe.bytes}),
             };
             defer app.alloc.free(body);
             try notice(app, "undo", body);
@@ -442,7 +453,9 @@ pub fn Runtime(comptime App: type) type {
             const running = summary.status == .running or summary.status == .awaiting_approval;
             for (value.events) |event| {
                 if (event.sequence <= remote.sequence) continue;
-                if (remote.child_id.len == 0) try applyFrame(app, event.frame);
+                // A command's result answers the node the person focuses,
+                // which may be a subagent; the rest is the root's transcript.
+                if (remote.child_id.len == 0 or isCommandResult(event.frame)) try applyFrame(app, event.frame);
                 remote.sequence = event.sequence;
             }
             if (remote.child_id.len == 0) {
@@ -471,6 +484,10 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
             }
+        }
+
+        fn isCommandResult(frame: std.json.Value) bool {
+            return std.mem.eql(u8, string(frame, "method") orelse "", client_protocol.command_result_method);
         }
 
         fn applyFrame(app: *App, frame: std.json.Value) !void {

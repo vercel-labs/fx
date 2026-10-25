@@ -999,10 +999,12 @@ pub const PersistentHost = struct {
     pub const KernelInfo = struct { state: []const u8, diagnostics: []u8 };
 
     /// Human recovery controls use the same session-owned process as the tool.
-    pub fn kernelControl(self: *PersistentHost, alloc: Allocator, action_name: []const u8) !KernelInfo {
+    /// `/kernel` on the root, or on node `node_id` below it at any depth.
+    pub fn kernelControl(self: *PersistentHost, alloc: Allocator, action_name: []const u8, node_id: ?[]const u8) !KernelInfo {
         const kernel = @import("../core/kernel/slot.zig");
         const active = if (self.state.active_session) |*session| session else return error.NoActiveSession;
         const action = std.meta.stringToEnum(kernel.Action, action_name) orelse return error.InvalidKernelAction;
+        if (node_id) |id| if (!std.mem.eql(u8, id, active.session_id)) return node_host.kernelControl(alloc, &self.state, id, action);
         if (action != .status and action != .interrupt and self.busy()) return error.SessionBusy;
         const slot = &active.session_rt.kernel;
         const state = try slot.control(self.state.alloc, .{ .cwd = active.workspace_root, .session_id = active.session_id }, action);
@@ -4294,6 +4296,11 @@ fn handleHostCommand(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messag
             shell_snapshot.reloadForUser();
             try host_commands.writeResult(&out.writer, command, .ack);
         },
+        // The root's model and effort are session config options.
+        .model, .effort => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "Set the root session's model and effort with session/set_config_option.",
+        }),
         .context => {
             const capabilities = activeSessionCapabilities(state, session);
             try host_commands.writeResult(&out.writer, command, .{ .context = .{

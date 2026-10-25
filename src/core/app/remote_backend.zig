@@ -234,6 +234,8 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn setModel(app: *App, target: Node, model: []const u8) !void {
+            // A subagent keeps its model on its own node, for its next turns.
+            if (!target.isRoot()) return runHostCommand(app, target, "changing its model", .{ .model = model });
             const id = try wireSession(app, target, "changing the model") orelse return;
             try app.remote.enqueue(.config, .{ .model = .{ .session_id = id, .model = model } });
         }
@@ -368,7 +370,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn commandFork(ctx: *anyopaque) !void {
-            try notice(appFrom(ctx), "session", "Detached session fork is not available yet. Use /new to create a session, or /resume to switch.");
+            const app = appFrom(ctx);
+            if (!focus(app).isRoot()) return notice(app, "subagent", host_commands.NodeRefusal.fork.text());
+            try notice(app, "session", "Detached session fork is not available yet. Use /new to create a session, or /resume to switch.");
         }
 
         fn commandGatewayAccount(ctx: *anyopaque) !void {
@@ -396,6 +400,7 @@ pub fn Runtime(comptime App: type) type {
         fn commandModel(ctx: *anyopaque, query: []const u8) !void {
             const app = appFrom(ctx);
             const target = commandTarget(app, .model);
+            if (!target.isRoot() and query.len == 0) return runHostCommand(app, target, "reading its model", .{ .model = null });
             if (query.len == 0) {
                 // Only the root's model is in the attached snapshot.
                 _ = try wireSession(app, target, "reading its model") orelse return;
@@ -419,8 +424,10 @@ pub fn Runtime(comptime App: type) type {
         /// text, so effort passes through and speed only normalizes on/off.
         fn commandEffort(ctx: *anyopaque, rest: []const u8) !void {
             const app = appFrom(ctx);
+            const target = commandTarget(app, .effort);
+            if (!target.isRoot()) return runHostCommand(app, target, "changing its effort", .{ .effort = if (rest.len > 0) rest else null });
             if (rest.len == 0) return notice(app, "", "usage: /effort auto|minimal|low|medium|high");
-            try setOption(app, commandTarget(app, .effort), "effort", rest);
+            try setOption(app, target, "effort", rest);
         }
 
         fn commandFast(ctx: *anyopaque, rest: []const u8) !void {

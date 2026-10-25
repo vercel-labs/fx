@@ -11,6 +11,13 @@ const schema = @import("schema.zig");
 
 pub const Interruption = struct { turn: u64, reason: schema.Reason };
 
+/// Turns `turn` through `through` that a rewind dropped from the history
+/// (D97). Turn numbers only grow, so ranges never reuse a number.
+pub const Dropped = struct { turn: u64, through: u64 };
+
+/// The most rewinds one session keeps; a later one is refused.
+pub const max_rewinds = 64;
+
 /// One child spawned in this session (D22). Owns its slices.
 pub const Child = struct {
     id: []u8,
@@ -25,6 +32,9 @@ pub const Child = struct {
     finish_data: ?[]u8 = null,
     /// Seq of the newest line about this child; fx uses it as a generation.
     seq: u64,
+    /// A rewind of this session dropped the turn that first spawned it
+    /// (D97): it stays listed, read-only, and takes no more work.
+    abandoned: bool = false,
 
     fn deinit(child: Child, gpa: std.mem.Allocator) void {
         gpa.free(child.id);
@@ -49,6 +59,7 @@ pub const Child = struct {
         return std.mem.eql(u8, a.id, b.id) and
             std.mem.eql(u8, a.work_id, b.work_id) and
             a.open == b.open and a.outcome == b.outcome and a.seq == b.seq and
+            a.abandoned == b.abandoned and
             optionalEql(a.spawn_data, b.spawn_data) and
             optionalEql(a.finish_data, b.finish_data);
     }
@@ -78,6 +89,8 @@ pub const State = struct {
     v1_source: ?[]u8 = null,
     /// Every child spawned in this session, in first-spawn order (D22).
     children: std.ArrayList(Child) = .empty,
+    /// The turns rewinds dropped, oldest rewind first (D97).
+    dropped: std.ArrayList(Dropped) = .empty,
     last_compaction_seq: ?u64 = null,
     /// Byte offset of the newest `compacted` line. fx's `data` there may
     /// keep a tail of earlier lines, which the adapter reads back to.
@@ -97,7 +110,13 @@ pub const State = struct {
         }
         for (state.children.items) |child| child.deinit(gpa);
         state.children.deinit(gpa);
+        state.dropped.deinit(gpa);
         state.* = undefined;
+    }
+
+    /// Whether a rewind dropped turn `turn` from the history (D97).
+    pub fn droppedTurn(state: *const State, turn: u64) bool {
+        return isDropped(state.dropped.items, turn);
     }
 
     /// Forgets every child: a fork owns none of its source's (D5).
@@ -110,6 +129,7 @@ pub const State = struct {
     pub fn clone(state: *const State, gpa: std.mem.Allocator) error{OutOfMemory}!State {
         var copy: State = state.*;
         copy.children = .empty;
+        copy.dropped = .empty;
         inline for (setting_fields) |name| @field(copy, name) = null;
         errdefer copy.deinit(gpa);
         inline for (setting_fields) |name| {
@@ -117,6 +137,7 @@ pub const State = struct {
         }
         try copy.children.ensureTotalCapacity(gpa, state.children.items.len);
         for (state.children.items) |child| copy.children.appendAssumeCapacity(try child.clone(gpa));
+        try copy.dropped.appendSlice(gpa, state.dropped.items);
         return copy;
     }
 
@@ -191,12 +212,22 @@ pub const State = struct {
         for (a.children.items, b.children.items) |x, y| {
             if (!x.eql(y)) return false;
         }
+        if (a.dropped.items.len != b.dropped.items.len) return false;
+        for (a.dropped.items, b.dropped.items) |x, y| {
+            if (!std.meta.eql(x, y)) return false;
+        }
         return a.last_compaction_seq == b.last_compaction_seq and
             a.compaction_offset == b.compaction_offset and
             a.clean_exit == b.clean_exit and
             a.last_seq == b.last_seq;
     }
 };
+
+/// Whether any of `ranges` holds `turn`.
+pub fn isDropped(ranges: []const Dropped, turn: u64) bool {
+    for (ranges) |range| if (turn >= range.turn and turn <= range.through) return true;
+    return false;
+}
 
 const setting_fields = .{ "prefs", "title", "permissions", "usage", "workspace", "language", "client_prompt", "tool_identities", "moved_files", "compaction_records", "v1_source" };
 
@@ -250,6 +281,13 @@ pub fn apply(gpa: std.mem.Allocator, state: *State, fork_seq: u64, line: Line) e
         },
         .child_spawned => |c| if (line.seq > fork_seq) try state.spawnChild(gpa, line.seq, c),
         .child_finished => |c| if (line.seq > fork_seq) try state.finishChild(gpa, line.seq, c),
+        .rewound => |r| {
+            try state.dropped.append(gpa, .{ .turn = r.turn, .through = r.through });
+            for (r.abandoned) |id| {
+                const index = state.findChild(id) orelse continue;
+                state.children.items[index].abandoned = true;
+            }
+        },
     }
     state.last_seq = line.seq;
     state.clean_exit = line.body == .closed;
@@ -269,7 +307,12 @@ pub const Event = union(enum) {
     set: schema.Body.Setting,
     child_spawned: schema.Body.WorkItem,
     child_finished: schema.Body.Finished,
+    /// Drops turns `turn` through the newest from the history and abandons
+    /// the named children (D97). The manager fills in `through`.
+    rewound: Rewind,
 };
+
+pub const Rewind = struct { turn: u64, abandoned: []const []const u8 = &.{} };
 
 /// One completed piece of a turn: fx's data, and the blobs it refers to.
 pub const Piece = struct {
@@ -318,6 +361,8 @@ pub fn plan(state: *const State, events: []const Event, out: []schema.Body) Tran
             // OneOpenWork); a finish names exactly that one.
             .child_spawned => |c| blk: {
                 if (openWorkAt(state, events[0..i], c.child) != null) return error.InvalidTransition;
+                // An abandoned child takes no more work (D97).
+                if (abandonedAt(state, events[0..i], c.child)) return error.InvalidTransition;
                 break :blk .{ .child_spawned = c };
             },
             .child_finished => |c| blk: {
@@ -325,8 +370,39 @@ pub fn plan(state: *const State, events: []const Event, out: []schema.Body) Tran
                 if (!std.mem.eql(u8, open, c.work_id)) return error.InvalidTransition;
                 break :blk .{ .child_finished = c };
             },
+            // Between turns, over turns that exist, and never over a child
+            // whose work runs (`tests/tla/session_manager/Rewind.tla`
+            // NoRewindWhileBusy).
+            .rewound => |r| blk: {
+                if (open_turn != null) return error.InvalidTransition;
+                if (r.turn == 0 or r.turn > last_turn) return error.InvalidTransition;
+                if (rewindsAt(state, events[0..i]) >= max_rewinds) return error.InvalidTransition;
+                for (r.abandoned) |id| {
+                    if (state.findChild(id) == null) return error.InvalidTransition;
+                    if (openWorkAt(state, events[0..i], id) != null) return error.InvalidTransition;
+                }
+                break :blk .{ .rewound = .{ .turn = r.turn, .through = last_turn, .abandoned = r.abandoned } };
+            },
         };
     }
+}
+
+/// Whether `child` is abandoned after `earlier` events of the batch.
+fn abandonedAt(state: *const State, earlier: []const Event, child: []const u8) bool {
+    if (state.findChild(child)) |index| if (state.children.items[index].abandoned) return true;
+    for (earlier) |event| switch (event) {
+        .rewound => |r| for (r.abandoned) |id| if (std.mem.eql(u8, id, child)) return true,
+        else => {},
+    };
+    return false;
+}
+
+fn rewindsAt(state: *const State, earlier: []const Event) usize {
+    var count = state.dropped.items.len;
+    for (earlier) |event| {
+        if (event == .rewound) count += 1;
+    }
+    return count;
 }
 
 /// The child's unfinished work item after `earlier` events of the batch,
@@ -375,9 +451,20 @@ pub fn encodeState(gpa: std.mem.Allocator, out: *std.ArrayList(u8), state: *cons
         if (child.outcome) |outcome| try out.print(gpa, ",\"outcome\":\"{s}\"", .{@tagName(outcome)});
         if (child.spawn_data) |data| try appendRawField(gpa, out, "spawn_data", data);
         if (child.finish_data) |data| try appendRawField(gpa, out, "finish_data", data);
+        if (child.abandoned) try out.appendSlice(gpa, ",\"abandoned\":true");
         try out.append(gpa, '}');
     }
-    try out.appendSlice(gpa, "],\"last_compaction_seq\":");
+    try out.append(gpa, ']');
+    // Written only after a rewind, so older snapshots read the same.
+    if (state.dropped.items.len > 0) {
+        try out.appendSlice(gpa, ",\"dropped\":[");
+        for (state.dropped.items, 0..) |range, i| {
+            if (i > 0) try out.append(gpa, ',');
+            try out.print(gpa, "{{\"turn\":{d},\"through\":{d}}}", .{ range.turn, range.through });
+        }
+        try out.append(gpa, ']');
+    }
+    try out.appendSlice(gpa, ",\"last_compaction_seq\":");
     try printOptional(gpa, out, state.last_compaction_seq);
     try out.appendSlice(gpa, ",\"compaction_offset\":");
     try printOptional(gpa, out, state.compaction_offset);
@@ -428,7 +515,14 @@ pub fn decodeState(gpa: std.mem.Allocator, arena: std.mem.Allocator, raw: []cons
             .spawn_data = spawn_data,
             .finish_data = finish_data,
             .seq = try c.req(u64, "seq"),
+            .abandoned = try c.opt(bool, "abandoned") orelse false,
         });
+    }
+    if (f.raw("dropped")) |raw_dropped| {
+        for (try schema.rawElements(arena, raw_dropped)) |raw_range| {
+            const r = try schema.Fields.parseObject(arena, raw_range);
+            try state.dropped.append(gpa, .{ .turn = try r.req(u64, "turn"), .through = try r.req(u64, "through") });
+        }
     }
     return state;
 }
@@ -488,7 +582,7 @@ fn randomEvent(random: std.Random) Event {
     const values = [_][]const u8{ "\"v1\"", "{\"m\":\"v2\"}", "[1, 2]", "null" };
     const data = [_]?[]const u8{ null, "{\"name\":\"n\"}", "null" };
     const outcomes = [_]schema.Outcome{ .ok, .failed, .cancelled, .interrupted };
-    return switch (random.uintLessThan(u8, 9)) {
+    return switch (random.uintLessThan(u8, 10)) {
         0 => .turn_started,
         1 => .{ .item = .{ .type = "assistant", .data = "{\"text\":\"piece\"}" } },
         2 => .{ .compacted = "{\"summary\":\"s\"}" },
@@ -506,6 +600,10 @@ fn randomEvent(random: std.Random) Event {
             .outcome = outcomes[random.uintLessThan(usize, outcomes.len)],
             .data = data[random.uintLessThan(usize, data.len)],
         } },
+        8 => .{ .rewound = .{
+            .turn = 1 + random.uintLessThan(u64, 3),
+            .abandoned = if (random.boolean()) &.{} else children[random.uintLessThan(usize, 2)..][0..1],
+        } },
         else => .turn_started,
     };
 }
@@ -516,7 +614,7 @@ fn specValid(open: bool, event: Event) ?bool {
         .turn_started => !open,
         .item, .turn_committed, .turn_interrupted => open,
         .compacted, .set => true,
-        .child_spawned, .child_finished => null, // not in TurnLifecycle
+        .child_spawned, .child_finished, .rewound => null, // not in TurnLifecycle
     };
 }
 
@@ -690,7 +788,9 @@ test "snapshot state round trips" {
         .id = try testing.allocator.dupe(u8, "c2"),
         .work_id = try testing.allocator.dupe(u8, "w"),
         .seq = 10,
+        .abandoned = true,
     });
+    try state.dropped.append(testing.allocator, .{ .turn = 2, .through = 3 });
     var out: std.ArrayList(u8) = .empty;
     try encodeState(arena.allocator(), &out, &state);
     var decoded = try decodeState(testing.allocator, arena.allocator(), out.items);
@@ -698,4 +798,49 @@ test "snapshot state round trips" {
     try testing.expect(decoded.eql(&state));
     try testing.expectEqualStrings("null", decoded.usage.?);
     try testing.expectEqual(@as(?[]u8, null), decoded.prefs);
+}
+
+test "a rewind drops turns between turns and abandons only idle children" {
+    var state: State = .{};
+    defer state.deinit(testing.allocator);
+    var one: [1]schema.Body = undefined;
+    var seq: u64 = 0;
+    const steps = [_]Event{
+        .turn_started,
+        .{ .child_spawned = .{ .child = "early", .work_id = "w1" } },
+        .{ .child_finished = .{ .child = "early", .work_id = "w1", .outcome = .ok } },
+        .turn_committed,
+        .turn_started,
+        .{ .child_spawned = .{ .child = "late", .work_id = "w2" } },
+    };
+    for (steps) |event| {
+        try plan(&state, &.{event}, &one);
+        seq += 1;
+        try apply(testing.allocator, &state, 0, .{ .seq = seq, .offset = 0, .body = one[0] });
+    }
+    // Not inside a turn, not past the newest turn, not over running work.
+    try testing.expectError(error.InvalidTransition, plan(&state, &.{.{ .rewound = .{ .turn = 2 } }}, &one));
+    try plan(&state, &.{.turn_committed}, &one);
+    seq += 1;
+    try apply(testing.allocator, &state, 0, .{ .seq = seq, .offset = 0, .body = one[0] });
+    try testing.expectError(error.InvalidTransition, plan(&state, &.{.{ .rewound = .{ .turn = 3 } }}, &one));
+    try testing.expectError(error.InvalidTransition, plan(&state, &.{.{ .rewound = .{ .turn = 2, .abandoned = &.{"late"} } }}, &one));
+    try testing.expectError(error.InvalidTransition, plan(&state, &.{.{ .rewound = .{ .turn = 2, .abandoned = &.{"ghost"} } }}, &one));
+    try plan(&state, &.{.{ .child_finished = .{ .child = "late", .work_id = "w2", .outcome = .ok } }}, &one);
+    seq += 1;
+    try apply(testing.allocator, &state, 0, .{ .seq = seq, .offset = 0, .body = one[0] });
+    try plan(&state, &.{.{ .rewound = .{ .turn = 2, .abandoned = &.{"late"} } }}, &one);
+    try testing.expectEqual(@as(u64, 2), one[0].rewound.through);
+    seq += 1;
+    try apply(testing.allocator, &state, 0, .{ .seq = seq, .offset = 0, .body = one[0] });
+    try testing.expect(state.droppedTurn(2));
+    try testing.expect(!state.droppedTurn(1));
+    try testing.expect(!state.children.items[0].abandoned);
+    try testing.expect(state.children.items[1].abandoned);
+    // The next turn is numbered past the dropped ones, and an abandoned
+    // child takes no more work.
+    try plan(&state, &.{.turn_started}, &one);
+    try testing.expectEqual(@as(u64, 3), one[0].turn_started.turn);
+    try testing.expectError(error.InvalidTransition, plan(&state, &.{.{ .child_spawned = .{ .child = "late", .work_id = "w3" } }}, &one));
+    try plan(&state, &.{.{ .child_spawned = .{ .child = "early", .work_id = "w3" } }}, &one);
 }

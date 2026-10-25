@@ -479,6 +479,15 @@ pub const V2Children = struct {
         self.* = undefined;
     }
 
+    /// Reads the children from the parent's log again at the next load, as
+    /// after a rewind abandoned some of them (D97).
+    pub fn forget(self: *V2Children) void {
+        self.state.lockUncancelable(io_mod.getIo());
+        defer self.state.unlock(io_mod.getIo());
+        if (self.registry) |*registry| registry.deinit(self.alloc);
+        self.registry = null;
+    }
+
     /// Remembers the settings a new child starts with, replacing older ones.
     pub fn rememberSeed(self: *V2Children, child_id: []const u8, seed: ChildSeed) !void {
         self.state.lockUncancelable(io_mod.getIo());
@@ -614,21 +623,28 @@ fn registryFromChildren(alloc: Allocator, parent_id: []const u8, folded: []const
     var registry = try Registry.init(alloc, parent_id);
     errdefer registry.deinit(alloc);
     if (folded.len > max_children) return error.StateTooLarge;
-    if (folded.len == 0) return registry;
-    const children = try alloc.alloc(Child, folded.len);
+    var generation: u64 = 0;
+    var live: usize = 0;
+    for (folded) |entry| {
+        generation = @max(generation, entry.seq);
+        // An abandoned child is no longer one of the node's live children:
+        // its name is free again, and it takes no work (D97).
+        if (!entry.abandoned) live += 1;
+    }
+    registry.generation = generation;
+    if (live == 0) return registry;
+    const children = try alloc.alloc(Child, live);
     var built: usize = 0;
     errdefer {
         for (children[0..built]) |*child| child.deinit(alloc);
         alloc.free(children);
     }
-    var generation: u64 = 0;
     for (folded) |entry| {
+        if (entry.abandoned) continue;
         children[built] = try childFromFolded(alloc, entry);
         built += 1;
-        generation = @max(generation, entry.seq);
     }
     registry.children = children;
-    registry.generation = generation;
     return registry;
 }
 

@@ -20,6 +20,11 @@ fn permissionRank(mode: types.PermissionMode) u2 {
     };
 }
 
+/// The narrower of two permission modes.
+pub fn narrowerPermission(a: types.PermissionMode, b: types.PermissionMode) types.PermissionMode {
+    return if (permissionRank(a) <= permissionRank(b)) a else b;
+}
+
 pub fn admitChildPermission(
     parent: types.PermissionMode,
     requested: ?types.PermissionMode,

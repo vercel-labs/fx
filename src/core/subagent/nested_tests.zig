@@ -8,6 +8,7 @@ const domain = @import("domain.zig");
 const execution = @import("execution.zig");
 const io_mod = @import("../shared/io.zig");
 const model_contract = @import("model_contract.zig");
+const node_ops = @import("node_ops.zig");
 const session = @import("../session/session.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const slot_pool = @import("slot_pool.zig");
@@ -326,4 +327,206 @@ test "a long child result reaches its parent capped, with a handle to the rest" 
     try std.testing.expect(result.body.len < tool_host.max_inline_result_bytes + 512);
     try std.testing.expect(std.mem.find(u8, result.body, "read_tool_result") != null);
     try std.testing.expect(std.mem.find(u8, result.body, "result-") != null);
+}
+
+/// A chain of named subagents: the node at depth d messages `n{d+1}` until
+/// `deepest`, and each reply names the node's turn count so far.
+const Named = struct {
+    process: slot_pool.Pool = .{ .capacity = 32 },
+    deepest: usize = 2,
+    /// Whether the deepest node's next turn spawns a one-off child.
+    leaf_spawns: bool = false,
+
+    fn run(raw: ?*anyopaque, turn: *execution.TurnContext, message: domain.QueuedMessage, admission: domain.AdmissionSnapshot, cancel: *std.atomic.Value(bool)) execution.ServiceError!execution.RunOutcome {
+        const self: *Named = @ptrCast(@alignCast(raw.?));
+        const depth = turn.node_path.len - 1;
+        if (!turn.worker.beginDirectProcessing(1)) return error.ProviderFailed;
+        turn.beginTurn() catch return error.ProviderFailed;
+        var inner: ?[]u8 = null;
+        defer if (inner) |text| turn.alloc.free(text);
+        const spawn_below = depth < self.deepest or (self.leaf_spawns and depth == self.deepest);
+        if (spawn_below) if (turn.node_host) |node| {
+            const agent = turn.alloc.print("n{d}", .{depth + 1}) catch return error.OutOfMemory;
+            defer turn.alloc.free(agent);
+            var request = (if (depth < self.deepest)
+                model_contract.validateRequest(turn.alloc, .{ .message = .{ .agent = agent, .message = message.content } })
+            else
+                model_contract.validateRequest(turn.alloc, .{ .run = .{ .task = "late work" } })) catch return error.ProviderFailed;
+            defer request.deinit(turn.alloc);
+            const invocation = turn.alloc.print("{s}-{d}", .{ turn.active_work_id.?, depth }) catch return error.OutOfMemory;
+            defer turn.alloc.free(invocation);
+            const result = node.executeManaged(turn.alloc, &request, .{
+                .invocation_id = invocation,
+                .parent_permission_mode = admission.permission_mode,
+                .defaults = testDefaults(),
+                .max_result_bytes = 4096,
+                .timestamp_ms = 1,
+                .cancel_flag = cancel,
+            }) catch return error.ProviderFailed;
+            inner = result.body;
+        };
+        const text = turn.alloc.print("depth {d} turn {d}: {s}", .{ depth, turn.runtime.agent.history.items.len + 1, inner orelse "leaf" }) catch return error.OutOfMemory;
+        defer turn.alloc.free(text);
+        turn.commit(turn.active_work_id.?, .{ .assistant = .{ .user = .{ .text = message.content }, .assistant = text } }) catch return error.ProviderFailed;
+        return .completed;
+    }
+};
+
+fn namedHost(alloc: Allocator, parent: *child_state.TestParent, named: *Named) !*tool_host.Runtime {
+    const runtime = try tool_host.Runtime.create(alloc, &parent.children, .{ .resolve_fn = Chain.resolve }, .{ .context = named, .run_fn = Named.run });
+    runtime.tree.process_slots = &named.process;
+    return runtime;
+}
+
+/// The root's message to `n1`, as the root's subagent tool sends it.
+fn messageFrom(alloc: Allocator, host: *tool_host.Runtime, agent: []const u8, text: []const u8, invocation_id: []const u8) !tool_host.ManagedExecutionResult {
+    var request = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = agent, .message = text } });
+    defer request.deinit(alloc);
+    return host.executeManaged(alloc, &request, .{
+        .invocation_id = invocation_id,
+        .parent_permission_mode = .yolo,
+        .defaults = testDefaults(),
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+        // As a person's message from the frontend: no turn's slots to lend.
+        .lend_turn_slots = host.depth == 0,
+    });
+}
+
+/// The id of `host`'s named child `agent`.
+fn childNamed(alloc: Allocator, host: *tool_host.Runtime, agent: []const u8) ![]u8 {
+    var lock = host.managed.state_store.acquireLock();
+    defer lock.release();
+    var registry = try host.managed.state_store.load(alloc);
+    defer registry.deinit(alloc);
+    return alloc.dupe(u8, (registry.findPersistent(agent) orelse return error.TestExpectedChild).id);
+}
+
+test "a node's host outlives its parent's turn, and a depth-2 node takes a message after it" {
+    const alloc = std.testing.allocator;
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var named = Named{};
+    const runtime = try namedHost(alloc, &parent, &named);
+    defer runtime.deinit();
+    const first = try messageFrom(alloc, runtime, "n1", "start", "root-1");
+    defer alloc.free(first.body);
+    try std.testing.expect(first.success);
+    try std.testing.expect(std.mem.find(u8, first.body, "depth 2 turn 1") != null);
+    // Every node that ran keeps its host after its turn: depth 1 and 2.
+    try std.testing.expectEqual(@as(usize, 2), runtime.tree.nodes.openCount());
+    try std.testing.expect(!runtime.subtreeBusy());
+
+    // A person messages n2 through n1's host while n1 runs no turn.
+    const n1 = try childNamed(alloc, runtime, "n1");
+    defer alloc.free(n1);
+    const n1_host = try node_ops.lease(runtime, &.{n1});
+    const second = messageFrom(alloc, n1_host.runtime, "n2", "follow up", "frontend-1");
+    node_ops.release(runtime, n1_host);
+    const reply = try second;
+    defer alloc.free(reply.body);
+    try std.testing.expect(reply.success);
+    try std.testing.expect(std.mem.find(u8, reply.body, "depth 2 turn 2") != null);
+    try std.testing.expectEqual(@as(usize, 0), runtime.tree.slots.inUse());
+}
+
+test "idle node hosts close leaves first under the TTL and the cap, and reopen on demand" {
+    const alloc = std.testing.allocator;
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var named = Named{};
+    const runtime = try namedHost(alloc, &parent, &named);
+    defer runtime.deinit();
+    runtime.tree.nodes.limits = .{ .idle_ms = 60 * 60 * 1000, .max_open = 8 };
+    const first = try messageFrom(alloc, runtime, "n1", "start", "root-1");
+    defer alloc.free(first.body);
+    try std.testing.expectEqual(@as(usize, 2), runtime.tree.nodes.openCount());
+    // Not idle long enough: nothing closes.
+    runtime.tree.nodes.sweep(io_mod.monotonicMilliTimestamp());
+    try std.testing.expectEqual(@as(usize, 2), runtime.tree.nodes.openCount());
+    // Past the TTL only the leaf closes: n1's host is held open by n2's.
+    const later = io_mod.monotonicMilliTimestamp() + 2 * 60 * 60 * 1000;
+    runtime.tree.nodes.sweep(later);
+    try std.testing.expectEqual(@as(usize, 1), runtime.tree.nodes.openCount());
+    runtime.tree.nodes.sweep(later);
+    try std.testing.expectEqual(@as(usize, 0), runtime.tree.nodes.openCount());
+    // The next message reopens both from their logs, which kept every turn.
+    const second = try messageFrom(alloc, runtime, "n1", "again", "root-2");
+    defer alloc.free(second.body);
+    try std.testing.expect(std.mem.find(u8, second.body, "depth 1 turn 2") != null);
+    try std.testing.expect(std.mem.find(u8, second.body, "depth 2 turn 2") != null);
+    // Over the cap, the least recently used idle host closes at once.
+    runtime.tree.nodes.limits.max_open = 1;
+    runtime.tree.nodes.sweep(io_mod.monotonicMilliTimestamp());
+    try std.testing.expectEqual(@as(usize, 1), runtime.tree.nodes.openCount());
+    try std.testing.expect(runtime.tree.nodes.closed_total >= 3);
+}
+
+test "a rewind of a child drops its newest turn and abandons the children that turn spawned" {
+    const alloc = std.testing.allocator;
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var named = Named{ .deepest = 1 };
+    const runtime = try namedHost(alloc, &parent, &named);
+    defer runtime.deinit();
+    const first = try messageFrom(alloc, runtime, "n1", "start", "root-1");
+    defer alloc.free(first.body);
+    // Its second turn spawns a one-off child.
+    named.leaf_spawns = true;
+    const second = try messageFrom(alloc, runtime, "n1", "spawn one", "root-2");
+    defer alloc.free(second.body);
+    try std.testing.expect(second.success);
+    const n1 = try childNamed(alloc, runtime, "n1");
+    defer alloc.free(n1);
+    const outcome = try node_ops.rewindLatest(alloc, runtime, &.{n1});
+    defer if (outcome == .rewound) alloc.free(outcome.rewound.prompt);
+    try std.testing.expectEqualStrings("spawn one", outcome.rewound.prompt);
+    try std.testing.expectEqual(@as(usize, 1), outcome.rewound.abandoned);
+    var peeked = try parent.store.manager.peek(alloc, n1);
+    defer peeked.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), peeked.state.children.items.len);
+    try std.testing.expect(peeked.state.children.items[0].abandoned);
+    const history = try parent.store.childHistory(alloc, n1);
+    defer types.freeHistoryTurnSlice(alloc, history);
+    try std.testing.expectEqual(@as(usize, 1), history.len);
+    // The root's record of n1's work stays as it was.
+    var lock = runtime.managed.state_store.acquireLock();
+    var registry = try runtime.managed.state_store.load(alloc);
+    lock.release();
+    defer registry.deinit(alloc);
+    try std.testing.expectEqual(child_state.Outcome.completed, registry.findById(n1).?.last_outcome.?);
+    // The node goes on from what the rewind kept.
+    named.leaf_spawns = false;
+    const third = try messageFrom(alloc, runtime, "n1", "after", "root-3");
+    defer alloc.free(third.body);
+    try std.testing.expect(std.mem.find(u8, third.body, "depth 1 turn 2") != null);
+}
+
+test "a node is not rewound while a node below it runs" {
+    const alloc = std.testing.allocator;
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var named = Named{};
+    const runtime = try namedHost(alloc, &parent, &named);
+    defer runtime.deinit();
+    const first = try messageFrom(alloc, runtime, "n1", "start", "root-1");
+    defer alloc.free(first.body);
+    const n1 = try childNamed(alloc, runtime, "n1");
+    defer alloc.free(n1);
+    const n1_host = try node_ops.lease(runtime, &.{n1});
+    defer node_ops.release(runtime, n1_host);
+    // n2's turn holds its host as a running turn would.
+    const n2 = try childNamed(alloc, n1_host.runtime, "n2");
+    defer alloc.free(n2);
+    const n2_host = try runtime.tree.nodes.lease(n1_host.runtime, n2, .turn, "");
+    const refused = try node_ops.rewindLatest(alloc, runtime, &.{n1});
+    try std.testing.expectEqual(node_ops.RewindOutcome{ .refused = .busy }, refused);
+    runtime.tree.nodes.release(n2_host, .turn);
+    const allowed = try node_ops.rewindLatest(alloc, runtime, &.{n1});
+    defer if (allowed == .rewound) alloc.free(allowed.rewound.prompt);
+    try std.testing.expect(allowed == .rewound);
 }

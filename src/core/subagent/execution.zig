@@ -89,6 +89,15 @@ pub const ServiceError = error{
     Cancelled,
 };
 
+/// A child's host, leased for one turn of it (D96): the child's open log,
+/// and its host for its own children when it may spawn.
+pub const NodeLease = struct {
+    session: *session_adapter.Session,
+    host: ?*tool_host.Runtime,
+    /// The registry's entry, which `Services.release` gives back.
+    handle: *anyopaque,
+};
+
 pub const Services = struct {
     context: ?*anyopaque = null,
     capture_fn: *const fn (
@@ -103,6 +112,10 @@ pub const Services = struct {
         domain.AdmissionSnapshot,
         *std.atomic.Value(bool),
     ) ServiceError!RunOutcome,
+    /// The child's host for one of its turns. Without one, as in unit
+    /// fixtures, the turn opens the child's log itself and has no host.
+    lease_fn: ?*const fn (?*anyopaque, []const u8, []const u8) ServiceError!NodeLease = null,
+    release_fn: ?*const fn (?*anyopaque, NodeLease) void = null,
 
     pub fn capture(
         self: Services,
@@ -157,8 +170,8 @@ pub const TurnContext = struct {
     /// The run slots this turn holds, lent back while it waits on its own
     /// children (D92).
     permit: ?*slot_pool.Permit = null,
-    /// This child's own host for its children, while its turn runs; null
-    /// when it may not spawn (D91).
+    /// This child's own host for its children, leased for the turn from
+    /// the tree's registry; null when it may not spawn (D91, D96).
     node_host: ?*tool_host.Runtime = null,
     failure_diagnostic: ?types.ModelFailureDiagnostic = null,
     committed: bool = false,

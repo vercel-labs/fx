@@ -1,8 +1,8 @@
 //! A tree of agent sessions (D91). Every agent is a session node: the root
 //! at depth 0, each child one deeper. One `Tree` per root host holds what
 //! the whole tree shares: the spawn policy, the node budget, the run slots
-//! (D92) and the approval registry (D93). Node hosts below the root borrow
-//! it; the root host owns it.
+//! (D92), the approval registry (D93) and the hosts of every node below the
+//! root (D96). Node hosts borrow it; the root host owns it.
 const std = @import("std");
 const approval_registry = @import("approval_registry.zig");
 const child_state = @import("child_state.zig");
@@ -10,6 +10,8 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const slot_pool = @import("slot_pool.zig");
+const node_hosts = @import("node_hosts.zig");
+const tool_host = @import("tool_host.zig");
 const kernel_pool = @import("../kernel/slot.zig").pool;
 
 const Allocator = std.mem.Allocator;
@@ -80,14 +82,12 @@ pub const Tree = struct {
     process_slots: *slot_pool.Pool = &slot_pool.process_pool,
     mutex: std.Io.Mutex = .init,
     /// Nodes below the root, saved or admitted; counted on first need.
-    nodes: ?usize = null,
-    /// The hosts of nodes that can spawn now: the root's for the tree's
-    /// life, and each child's while its turn runs. Viewers read a node's
-    /// children and live output through them (`withHost`).
-    hosts_mutex: std.Io.Mutex = .init,
-    hosts: std.ArrayList(NodeHost) = .empty,
-
-    pub const NodeHost = struct { id: []const u8, host: *anyopaque };
+    node_count: ?usize = null,
+    /// The root's host, for the tree's life.
+    root_host: ?*tool_host.Runtime = null,
+    /// The open hosts of the nodes below the root (D96). Viewers read a
+    /// node's children and live output through them (`withHost`).
+    nodes: node_hosts.Registry,
 
     /// Caller owns; free with `destroy`.
     pub fn create(alloc: Allocator, root_id: []const u8, store: *session_adapter.Store, policy: SpawnPolicy) !*Tree {
@@ -100,49 +100,29 @@ pub const Tree = struct {
             .store = store,
             .approvals = .{ .alloc = alloc },
             .slots = .{ .capacity = policy.tree_slots },
+            .nodes = node_hosts.Registry.init(alloc, node_hosts.Limits.fromEnv()),
         };
         return tree;
     }
 
-    /// The root host calls this after joining every node, so no node still
-    /// uses the kernels the tree kept for its subagents.
+    /// The root host calls this after joining its own children. Every node
+    /// host closes, deepest first, and then no node still uses the kernels
+    /// the tree kept for its subagents.
     pub fn destroy(self: *Tree) void {
+        self.nodes.closeAll();
         kernel_pool.releaseRetained(self);
-        std.debug.assert(self.hosts.items.len == 0);
-        self.hosts.deinit(self.alloc);
         self.approvals.deinit();
         const alloc = self.alloc;
         alloc.free(self.root_id);
         alloc.destroy(self);
     }
 
-    /// Lists `host` as the live host of node `id`, which it borrows until
-    /// `unregisterHost`.
-    pub fn registerHost(self: *Tree, id: []const u8, host: *anyopaque) !void {
-        self.hosts_mutex.lockUncancelable(io_mod.getIo());
-        defer self.hosts_mutex.unlock(io_mod.getIo());
-        try self.hosts.append(self.alloc, .{ .id = id, .host = host });
-    }
-
-    /// Waits for any `withHost` reading `host`, so the host may close after.
-    pub fn unregisterHost(self: *Tree, host: *anyopaque) void {
-        self.hosts_mutex.lockUncancelable(io_mod.getIo());
-        defer self.hosts_mutex.unlock(io_mod.getIo());
-        for (self.hosts.items, 0..) |entry, index| if (entry.host == host) {
-            _ = self.hosts.swapRemove(index);
-            return;
-        };
-    }
-
-    /// Runs `visit(context, host)` on node `id`'s live host, which cannot
-    /// close until `visit` returns. Null when the node has no live host.
-    pub fn withHost(self: *Tree, id: []const u8, comptime R: type, context: anytype, comptime visit: fn (@TypeOf(context), *anyopaque) R) ?R {
-        self.hosts_mutex.lockUncancelable(io_mod.getIo());
-        defer self.hosts_mutex.unlock(io_mod.getIo());
-        for (self.hosts.items) |entry| {
-            if (std.mem.eql(u8, entry.id, id)) return visit(context, entry.host);
-        }
-        return null;
+    /// Runs `visit(context, host)` on node `id`'s open host, which cannot
+    /// close until `visit` returns. Null when the node has no open host.
+    /// The root's host stays open for the tree's life.
+    pub fn withHost(self: *Tree, id: []const u8, comptime R: type, context: anytype, comptime visit: fn (@TypeOf(context), *tool_host.Runtime) R) ?R {
+        if (std.mem.eql(u8, id, self.root_id)) return visit(context, self.root_host orelse return null);
+        return self.nodes.visit(id, R, context, visit);
     }
 
     pub fn permit(self: *Tree) slot_pool.Permit {
@@ -155,10 +135,10 @@ pub const Tree = struct {
     pub fn admitNode(self: *Tree, parent_depth: u8, children: usize) !?SpawnRefusal {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        const nodes = self.nodes orelse try self.countSaved();
-        self.nodes = nodes;
+        const nodes = self.node_count orelse try self.countSaved();
+        self.node_count = nodes;
         if (self.policy.admit(parent_depth, children, nodes)) |refusal| return refusal;
-        self.nodes = nodes + 1;
+        self.node_count = nodes + 1;
         return null;
     }
 
@@ -212,23 +192,6 @@ test "one spawn policy bounds depth, children per node and the tree" {
     try std.testing.expect(!leaf.can_spawn);
     try std.testing.expect(!leaf.keepsTool(spawn_tool_name));
     try std.testing.expect(leaf.keepsTool("read_file"));
-}
-
-test "a node's live host is found by id until it unregisters" {
-    var tree = Tree{ .alloc = std.testing.allocator, .policy = .{}, .root_id = @constCast("root"), .store = undefined, .approvals = .{ .alloc = std.testing.allocator }, .slots = .{ .capacity = 1 } };
-    defer tree.hosts.deinit(std.testing.allocator);
-    var host: u8 = 7;
-    try tree.registerHost("child", &host);
-    const Read = struct {
-        fn value(expected: u8, raw: *anyopaque) bool {
-            const byte: *u8 = @ptrCast(raw);
-            return byte.* == expected;
-        }
-    };
-    try std.testing.expectEqual(@as(?bool, true), tree.withHost("child", bool, @as(u8, 7), Read.value));
-    try std.testing.expectEqual(@as(?bool, null), tree.withHost("other", bool, @as(u8, 7), Read.value));
-    tree.unregisterHost(&host);
-    try std.testing.expectEqual(@as(?bool, null), tree.withHost("child", bool, @as(u8, 7), Read.value));
 }
 
 test "the spawn tool is the built-in subagent tool" {

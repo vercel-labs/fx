@@ -35,6 +35,9 @@ pub const Body = schema.Body;
 pub const Event = fold.Event;
 pub const Piece = fold.Piece;
 pub const State = fold.State;
+/// Turns a rewind dropped from a session's history (D97).
+pub const Dropped = fold.Dropped;
+pub const Rewind = fold.Rewind;
 pub const Child = fold.Child;
 pub const Diagnostic = diag.Event;
 pub const DiagnosticKind = diag.Kind;
@@ -743,6 +746,7 @@ fn checkEvents(gpa: std.mem.Allocator, events: []const Event, import: bool) Appe
             if (c.outcome == .lost and !import) return error.InvalidArgument;
             if (c.data) |data| try checkChildData(gpa, data);
         },
+        .rewound => |r| for (r.abandoned) |id| try checkId(id),
     };
 }
 

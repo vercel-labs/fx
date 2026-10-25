@@ -11,8 +11,9 @@
 //!
 //!   /copy                      last_reply
 //!   /compact                   compact
-//!   /undo                      undo
+//!   /undo                      undo (on a subagent: rewind its newest turn)
 //!   /context                   context
+//!   /model, /effort (subagent) model, effort
 //!   /shell reload              shell_reload
 //!   /workspace [add|remove|clear]  workspace
 //!   (after /permissions edits) permissions_reload
@@ -43,6 +44,11 @@ pub const Command = union(Name) {
     mcp_status,
     /// Run one `/mcp` verb line against this session's MCP host.
     mcp_verb: []const u8,
+    /// A subagent's model for its next turns; null reads it. The root's
+    /// model is a session config option instead.
+    model: ?[]const u8,
+    /// A subagent's reasoning effort for its next turns; null reads it.
+    effort: ?[]const u8,
 };
 
 /// The `command` field of an `fx/command` request and its result.
@@ -56,6 +62,8 @@ pub const Name = enum {
     permissions_reload,
     mcp_status,
     mcp_verb,
+    model,
+    effort,
 };
 
 pub const WorkspaceAction = union(enum) {
@@ -77,12 +85,17 @@ pub const UndoOutcome = enum {
     deleted,
     unavailable,
     nothing_to_undo,
+    /// A subagent's newest turn was rewound (D97); `text` says what.
+    rewound,
 };
 
 pub const Undo = struct {
     outcome: UndoOutcome,
-    /// The file the operation touched; empty only for `nothing_to_undo`.
+    /// The file the operation touched; empty for `nothing_to_undo` and
+    /// `rewound`.
     path: []const u8 = "",
+    /// What a rewind dropped, as the host words it.
+    text: []const u8 = "",
 };
 
 pub const ContextUsage = struct {
@@ -97,29 +110,40 @@ pub const ContextUsage = struct {
 /// Why the host will not run something on a node below the root. The host
 /// answers with `text()`, which the frontend shows as it is.
 pub const NodeRefusal = enum {
-    /// The host does not run this on a subagent yet.
+    /// The host does not run this on a subagent.
     unsupported,
     unknown_node,
-    /// The node's work is running or waiting for an approval.
+    /// The node, or a node below it, is running or waiting for an approval.
     node_running,
     /// A one-off subagent ran its task and takes no more messages.
     one_off,
-    /// Only the root's own subagents take messages from the frontend.
-    not_root_child,
     /// Another message from the frontend is still running.
     message_running,
     /// Every run slot of the session's tree is taken.
     capacity,
+    /// A rewind of its parent dropped the turn that started it (D97).
+    abandoned,
+    /// A compaction summarized the turn a rewind would drop.
+    rewind_past_compaction,
+    invalid_effort,
+    /// A subagent is not forked: its parent names it (D97).
+    fork,
+    /// `/compact` on a subagent: its own turns compact it.
+    compact,
 
     pub fn text(self: NodeRefusal) []const u8 {
         return switch (self) {
-            .unsupported => "This is not yet supported in a subagent session. Press Left to return to the parent.",
+            .unsupported => "This is not supported in a subagent session. Press Left to return to the parent.",
             .unknown_node => "This subagent is not part of the attached session.",
-            .node_running => "This subagent is still working. Send your message when it finishes, or press Left to return to the parent.",
+            .node_running => "This subagent, or one below it, is still working. Try again when it finishes, or press Left to return to the parent.",
             .one_off => "This subagent ran a one-off task and takes no follow-up messages. Ask its parent to start a named subagent instead.",
-            .not_root_child => "Only a subagent of the root session takes your messages for now. Message its parent instead.",
             .message_running => "Another message to a subagent is still running. Send this one when it finishes.",
             .capacity => "Every subagent run slot of this session is in use. Send your message when one finishes.",
+            .abandoned => "This subagent was abandoned when its parent was rewound. You can read it, but it takes no messages or changes.",
+            .rewind_past_compaction => "This subagent's latest turn is covered by a compaction, so it cannot be rewound.",
+            .invalid_effort => "usage: /effort auto|minimal|low|medium|high",
+            .fork => "A subagent cannot be forked: its parent addresses it by name, and a fork would be a child the parent never started. Use /undo to rewind it, or fork the root session.",
+            .compact => "A subagent compacts its own context during its turns. Compact the root session from the root.",
         };
     }
 };
@@ -152,6 +176,8 @@ pub fn parse(arena: std.mem.Allocator, params: std.json.Value) (ParseError || er
     return switch (name) {
         .workspace => .{ .workspace = try parseWorkspaceAction(request) },
         .mcp_verb => .{ .mcp_verb = nonEmpty(request.line) orelse return error.MissingCommand },
+        .model => .{ .model = nonEmpty(request.line) },
+        .effort => .{ .effort = nonEmpty(request.line) },
         inline else => |tag| tag,
     };
 }
@@ -167,6 +193,8 @@ pub fn requestFields(command: Command) Request {
             .remove => |path| .{ .command = "workspace", .action = "remove", .path = path },
         },
         .mcp_verb => |line| .{ .command = "mcp_verb", .line = line },
+        .model => |value| .{ .command = "model", .line = value },
+        .effort => |value| .{ .command = "effort", .line = value },
         inline else => |_, tag| .{ .command = @tagName(tag) },
     };
 }
@@ -223,6 +251,7 @@ pub fn writeResult(writer: *std.Io.Writer, command: Command, result: Result) !vo
         .undo => |undo| {
             response.outcome = undo.outcome;
             response.path = nonEmpty(undo.path);
+            response.text = nonEmpty(undo.text);
         },
         .context => |usage| {
             response.used = usage.used;
@@ -270,7 +299,7 @@ test "requestFields names every command the way parse reads it back" {
     const commands = [_]Command{
         .last_reply,             .compact,                        .undo,                                      .context,                                      .shell_reload,
         .{ .workspace = .list }, .{ .workspace = .clear },        .{ .workspace = .{ .add = "/tmp/extra" } }, .{ .workspace = .{ .remove = "/tmp/extra" } }, .permissions_reload,
-        .mcp_status,             .{ .mcp_verb = "login linear" },
+        .mcp_status,             .{ .mcp_verb = "login linear" }, .{ .model = "small" },                      .{ .model = null },                            .{ .effort = "high" },
     };
     for (commands) |command| {
         const encoded = try std.json.Stringify.valueAlloc(alloc, requestFields(command), .{ .emit_null_optional_fields = false });

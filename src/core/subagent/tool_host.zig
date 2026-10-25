@@ -25,6 +25,7 @@ const result_store = @import("../session/result_store.zig");
 const slot_pool = @import("slot_pool.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tree_mod = @import("tree.zig");
+const node_hosts = @import("node_hosts.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
@@ -68,6 +69,8 @@ fn unavailableChildRun(
 
 test {
     _ = @import("nested_tests.zig");
+    _ = @import("node_hosts.zig");
+    _ = @import("node_ops.zig");
     _ = @import("slot_pool.zig");
     _ = @import("tree.zig");
 }
@@ -126,6 +129,10 @@ pub const ExecuteOptions = struct {
     progress: ?ProgressSink = null,
     model_capability_resolver: ?model_capabilities.Resolver = null,
     model_override_resolver: ?ModelOverrideResolver = null,
+    /// The caller is this node's own turn, whose run slots its wait lends
+    /// back (D92). A person's message from the frontend runs outside any
+    /// turn and holds none, so it lends nothing.
+    lend_turn_slots: bool = true,
 };
 
 pub const ManagedExecutionResult = struct {
@@ -148,13 +155,14 @@ pub const ApprovalResolveOptions = struct {
 /// to the whole text, which `read_tool_result` reads (D94).
 pub const max_inline_result_bytes: usize = 6000;
 
-/// One node's host for its children (D91). The root's host is created by
-/// the frontend and owns the tree; each child gets its own host while its
-/// turn runs and it may spawn, borrowing the tree.
+/// One node's host for its children (D91, D96). The root's host is created
+/// by the frontend and owns the tree. Every node below it has its host in
+/// the tree's registry (`node_hosts.zig`), opened when the node has work
+/// and closed once it is idle, so it outlives its parent's turn.
 pub const Runtime = struct {
     alloc: Allocator,
-    /// This node's children, borrowed until deinit (D22); a node host
-    /// below the root owns them.
+    /// This node's children, borrowed until deinit (D22): from the frontend
+    /// for the root, from the node's registry entry below it.
     children: *child_state.V2Children,
     /// The node this host serves.
     node_id: []u8,
@@ -163,12 +171,15 @@ pub const Runtime = struct {
     depth: u8 = 0,
     tree: *tree_mod.Tree,
     owns_tree: bool = false,
-    owns_children: bool = false,
-    /// The widest permission mode this node's children may get: its own.
+    /// The registry entry that owns this host; null for the root.
+    node_entry: ?*node_hosts.Entry = null,
+    /// The widest permission mode this node's children may get: its own,
+    /// as its latest turn was admitted.
     permission_ceiling: types.PermissionMode = .yolo,
-    /// The run slots of this node's own turn, lent back while it waits on
-    /// a child (D92); null for the root, whose turn holds none.
-    caller_permit: ?*slot_pool.Permit = null,
+    /// The run slots of this node's running turn, lent back while it waits
+    /// on a child (D92); null between turns and for the root, whose turn
+    /// holds none.
+    turn_permit: ?*slot_pool.Permit = null,
     host_authority: authority.HostResolver,
     child_runner: ChildRunner,
     /// The tree's registry (D93).
@@ -215,6 +226,7 @@ pub const Runtime = struct {
             .child_runner = child_runner,
         });
         runtime.owns_tree = true;
+        tree.root_host = runtime;
         return runtime;
     }
 
@@ -223,8 +235,8 @@ pub const Runtime = struct {
         tree: *tree_mod.Tree,
         depth: u8,
         node_path: ?[]const []const u8 = null,
+        node_entry: ?*node_hosts.Entry = null,
         permission_ceiling: types.PermissionMode = .yolo,
-        caller_permit: ?*slot_pool.Permit = null,
         host_authority: authority.HostResolver,
         child_runner: ChildRunner,
     };
@@ -241,8 +253,8 @@ pub const Runtime = struct {
             .node_id = owned_node,
             .depth = options.depth,
             .tree = options.tree,
+            .node_entry = options.node_entry,
             .permission_ceiling = options.permission_ceiling,
-            .caller_permit = options.caller_permit,
             .host_authority = options.host_authority,
             .child_runner = options.child_runner,
             .approvals = &options.tree.approvals,
@@ -260,57 +272,43 @@ pub const Runtime = struct {
         runtime.managed = runtime.managedOwnerValue();
         errdefer runtime.managed.deinit();
         try runtime.managed.recoverInterrupted();
-        try options.tree.registerHost(runtime.node_id, runtime);
         return runtime;
     }
 
-    /// Runs `visit(context, host)` on the live host of node `id` anywhere in
+    /// Runs `visit(context, host)` on the open host of node `id` anywhere in
     /// this tree; that host cannot close until `visit` returns. Null when
-    /// the node has no live host: it is not the root and no turn of it runs.
+    /// the node has no open host: it is not the root and has had no work
+    /// lately (D96).
     pub fn withNodeHost(self: *Runtime, id: []const u8, comptime R: type, context: anytype, comptime visit: fn (@TypeOf(context), *Runtime) R) ?R {
-        const Adapter = struct {
-            fn call(ctx: @TypeOf(context), raw: *anyopaque) R {
-                return visit(ctx, @ptrCast(@alignCast(raw)));
-            }
-        };
-        return self.tree.withHost(id, R, context, Adapter.call);
+        return self.tree.withHost(id, R, context, visit);
     }
 
-    /// A host for `turn`'s child, which runs under this node, while that
-    /// turn runs: its children live in the child's own log (D22, D91).
-    /// Returns null when the child may not spawn.
-    fn openNode(self: *Runtime, turn: *execution.TurnContext, permission_mode: types.PermissionMode) !?*Runtime {
-        const depth = self.depth + 1;
-        if (!self.tree.policy.canSpawn(depth)) return null;
-        const children = try self.alloc.create(child_state.V2Children);
-        errdefer self.alloc.destroy(children);
-        children.* = child_state.V2Children.init(self.alloc, turn.child, self.children.workspace);
-        errdefer children.deinit();
-        const node = try open(self.alloc, .{
-            .children = children,
+    /// The host of `entry`'s node, a child of this node, over the children
+    /// in its own log (D22, D96). It may spawn only below the depth limit.
+    pub fn openChildHost(self: *Runtime, entry: *node_hosts.Entry) !*Runtime {
+        return open(self.alloc, .{
+            .children = &entry.children,
             .tree = self.tree,
-            .depth = depth,
-            .node_path = turn.node_path,
-            .permission_ceiling = permission_mode,
-            .caller_permit = turn.permit,
+            .depth = entry.depth,
+            .node_path = @ptrCast(entry.path),
+            .node_entry = entry,
+            // Until the node's own turn is admitted, its children get no
+            // wider a mode than this node's.
+            .permission_ceiling = self.permission_ceiling,
             .host_authority = self.host_authority,
             .child_runner = self.child_runner,
         });
-        node.owns_children = true;
-        return node;
     }
 
     /// Joins every child first, so no node closes while a descendant runs
     /// (`tests/tla/session_manager/Tree.tla` AncestorsOutliveDescendants).
+    /// The root host then closes every node host of the tree, deepest
+    /// first.
     pub fn deinit(self: *Runtime) void {
-        self.tree.unregisterHost(self);
+        if (self.owns_tree) self.tree.root_host = null;
         self.cancelYielded();
         self.yielded.deinit(self.alloc);
         self.managed.deinit();
-        if (self.owns_children) {
-            self.children.deinit();
-            self.alloc.destroy(self.children);
-        }
         if (self.owns_tree) self.tree.destroy();
         self.alloc.free(self.node_id);
         const alloc = self.alloc;
@@ -319,9 +317,19 @@ pub const Runtime = struct {
     }
 
     /// Whether this node's children or any of their descendants are running,
-    /// the check a rewind of this node must pass (D91).
+    /// the check a rewind of this node must pass (D91, D97).
     pub fn subtreeBusy(self: *Runtime) bool {
-        return self.managed.anyRunning();
+        return self.managed.anyRunning() or self.tree.nodes.subtreeBusy(self.node_id);
+    }
+
+    /// Whether the host may close: no child's work runs and no yielded
+    /// result waits for delivery.
+    pub fn idle(self: *Runtime) bool {
+        if (self.managed.anyRunning()) return false;
+        self.yielded_mutex.lockUncancelable(io_mod.getIo());
+        defer self.yielded_mutex.unlock(io_mod.getIo());
+        for (self.yielded.items) |item| if (!item.delivered) return false;
+        return true;
     }
 
     /// Points the host's callbacks at a host context that moved; the
@@ -341,6 +349,7 @@ pub const Runtime = struct {
         self.managed.services.context = self;
         self.managed.authority_resolver = &self.authority_resolver;
         self.managed.approvals = self.approvals;
+        if (self.owns_tree) self.tree.nodes.rebind(child_runner_context, host_authority);
     }
 
     /// The oldest approval waiting anywhere in the tree.
@@ -601,6 +610,8 @@ pub const Runtime = struct {
                 .context = self,
                 .capture_fn = captureAdmission,
                 .run_fn = runChild,
+                .lease_fn = leaseChildNode,
+                .release_fn = releaseChildNode,
             },
             .authority_resolver = &self.authority_resolver,
             .approvals = self.approvals,
@@ -624,7 +635,7 @@ pub const Runtime = struct {
         fallback_defaults: Defaults,
         options: ExecuteOptions,
     ) !ManagedExecutionResult {
-        const permit = self.caller_permit;
+        const permit = if (options.lend_turn_slots) self.turn_permit else null;
         if (permit) |held| held.lend();
         var result = self.observeManagedState(
             alloc,
@@ -896,6 +907,10 @@ pub const Runtime = struct {
             .effort = fallback_defaults.effort,
         };
         defer status.deinit(alloc);
+        // A caller with no steering worker never takes a yielded result
+        // later, so a wait that ends without one leaves nothing to deliver
+        // and the host can go idle (D96).
+        errdefer if (steering_worker == null) self.removeYielded(child_id, work_id);
         status.tick(.{}, io_mod.milliTimestamp());
         while (true) {
             if (cancel_flag) |flag| {
@@ -918,7 +933,7 @@ pub const Runtime = struct {
                     self.managed.cancelAndJoin(child_id);
                     debug_trace.eventf("subagent", "steering_wait_registration_dropped", .{}, "child_id={s} work_id={s} reason=observation_failed_no_runner error={s}", .{ child_id, work_id, @errorName(err) });
                     self.removeYielded(child_id, work_id);
-                }
+                } else if (steering_worker == null) self.removeYielded(child_id, work_id);
                 return self.encodeManaged(alloc, .{
                     .ok = false,
                     .error_code = switch (err) {
@@ -2049,10 +2064,8 @@ fn captureAdmission(
     };
 }
 
-/// Runs one child turn with its own host when it may spawn. The host and
-/// every descendant it started are gone before the turn returns, so the
-/// child outlives them (`tests/tla/session_manager/Tree.tla`
-/// AncestorsOutliveDescendants).
+/// Runs one child turn. Its host, leased for the turn, carries the turn's
+/// run slots and permission mode to the children it spawns (D92, D96).
 fn runChild(
     raw: ?*anyopaque,
     turn: *execution.TurnContext,
@@ -2061,14 +2074,13 @@ fn runChild(
     cancel: *std.atomic.Value(bool),
 ) execution.ServiceError!execution.RunOutcome {
     const self: *Runtime = @ptrCast(@alignCast(raw.?));
-    const node = self.openNode(turn, admission.permission_mode) catch |err| blk: {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        debug_trace.logf("subagent", "node host unavailable child_id={s} err={s}", .{ turn.child_id orelse "unknown", @errorName(err) });
-        break :blk null;
+    if (turn.node_host) |node| {
+        node.permission_ceiling = admission.permission_mode;
+        node.turn_permit = turn.permit;
+    }
+    defer if (turn.node_host) |node| {
+        node.turn_permit = null;
     };
-    defer if (node) |host| host.deinit();
-    turn.node_host = node;
-    defer turn.node_host = null;
     return self.child_runner.run_fn(
         self.child_runner.context,
         turn,
@@ -2076,6 +2088,27 @@ fn runChild(
         admission,
         cancel,
     );
+}
+
+/// Leases the host of this node's child `child_id` for its turn (D96). The
+/// turn writes the child's log through it, and a child below the depth
+/// limit gets it as its host for its own children.
+fn leaseChildNode(raw: ?*anyopaque, child_id: []const u8, instructions: []const u8) execution.ServiceError!execution.NodeLease {
+    const self: *Runtime = @ptrCast(@alignCast(raw.?));
+    const entry = self.tree.nodes.lease(self, child_id, .turn, instructions) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.AdmissionFailed,
+    };
+    return .{
+        .session = entry.session,
+        .host = if (self.tree.policy.canSpawn(entry.depth)) entry.runtime else null,
+        .handle = entry,
+    };
+}
+
+fn releaseChildNode(raw: ?*anyopaque, lease: execution.NodeLease) void {
+    const self: *Runtime = @ptrCast(@alignCast(raw.?));
+    self.tree.nodes.release(@ptrCast(@alignCast(lease.handle)), .turn);
 }
 
 fn cloneStrings(

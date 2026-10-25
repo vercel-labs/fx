@@ -1583,18 +1583,15 @@ subagent has no subagent tool):
     never wider than the node that spawns it
     (`authority.admitChildPermission`). No code asks whether a session is
     a child.
-  - The root's host is created by the frontend and owns the tree. A child
-    gets its own host for its children while its turn runs, if it may
-    spawn; the host's children live in the child's own log. The host and
-    every descendant it started are joined before that turn returns, so no
-    node closes while a descendant runs, and a cancel stops the subtree
-    deepest first. A child may outlive its parent's turn only as yielded
-    work of the root, never the root's host.
-  - A node's host answers whether any of its descendants runs
-    (`Runtime.subtreeBusy`), the check a rewind of that node must pass.
-    Rewinding a child node, and marking the children it spawned after the
-    rewind point as abandoned, are not built yet; the abandoned mark needs
-    a session line the manager does not have.
+  - The root's host is created by the frontend and owns the tree. Every
+    child has its own host for its children, whose children live in the
+    child's own log; D96 says how long it lives (it first lived for one
+    turn of the child). A cancel stops the subtree deepest first. A child
+    may outlive its parent's turn, as yielded work of the root or as a
+    person's message to it (D96), but never the root's host.
+  - A node's host answers whether it or any of its descendants runs
+    (`Runtime.subtreeBusy`), the check a rewind of that node must pass
+    (D97).
 
   `Tree.tla` checks the depth limit, the tree budget, that every ancestor
   waits while a descendant lives, and that no node is an orphan.
@@ -1664,6 +1661,63 @@ subagent has no subagent tool):
   each node host, which stopped a grandchild's kernel at the end of every
   turn of its parent; or refusing at once when the pool is full, which
   fails a fan-out of children that only needed to queue.
+
+Settled for persistent node hosts and rewinding nodes (2026-10-25):
+- **D96 Decision:** every node below the root keeps its host between its
+  turns. One registry per tree (`src/core/subagent/node_hosts.zig`) owns
+  each node host: the node's only writable log handle in the process, its
+  children, and the host that runs them. A host opens on demand, for the
+  node's own turn (which its parent runs and leases the host for), for a
+  person's message to one of its children, or for a command on it, and
+  each lease of a deep node leases the hosts on its way down. Every open
+  host holds its parent's open, so hosts nest as the tree does. A host
+  closes only with no lease, no open child host and no running work, once
+  idle past a TTL (5 minutes, `PROTO_FX_NODE_HOST_IDLE_MS`) or while the
+  tree has more open hosts than its cap (16, `PROTO_FX_MAX_NODE_HOSTS`),
+  least recently used first; the next use opens it again from its log.
+  The root host closes the tree: every node's work is told to stop, every
+  turn ends, and the hosts close deepest first. A node's model, effort and
+  latest context use live on its own log (`prefs` and `usage`), so they
+  survive its host closing; its kernel lives in the process pool (D95).
+  A person may message an idle named node at any depth: its parent's host
+  runs the message as that parent's own `message` call would, lending no
+  run slot, since no turn of the parent holds one, and with a mode no
+  wider than the parent's. `NodeHosts.tla` checks that an open host's
+  ancestors are open, that a running turn or a use keeps its host open,
+  and, with fairness, that idle hosts close and the tree's closing closes
+  every host. **Why:** a host that lived for one turn of its node left a
+  node below depth 1 with nobody to take a message or a command between
+  turns. **Alternative:** a host per turn, as D91 first had; or hosts that
+  never close, which grow with every node a tree ever ran.
+- **D97 Decision:** a node is rewound in place, never forked. A
+  `rewound` line (a new manager line kind, written between turns) names
+  the turns it drops, from a turn through the newest, and the children
+  first spawned once that turn started, which become abandoned. The fold
+  keeps the dropped turn ranges and the abandoned mark per child; replay
+  leaves the dropped turns out of every history, fork points included,
+  and turn numbers keep growing past them. The manager refuses a rewind
+  inside a turn, past the newest turn, or over a child whose work is
+  open, and fx refuses one over a compaction newer than the turn, whose
+  summary covers what would stay. `/undo` on a child node rewinds its
+  newest turn (a node keeps no file journal of its own). A rewind runs
+  only while the node and every node below it are idle: the node's parent
+  admits no turn of it, the node admits no child, and the registry leases
+  no host at or below it until the line is written. The parent's recorded
+  tool result of the node's earlier work never changes; the rewind only
+  changes what the node's later turns see. An abandoned node, and every
+  node below it, stays browsable but read-only: messages and changing
+  commands are refused with a typed reason, the browser shows it as
+  abandoned, and its parent's registry drops it, so the agent name is free
+  for a new child. A child node is not forked: its parent addresses it by
+  name, and a fork would be a child the parent never started.
+  `Rewind.tla` checks that a dropped turn comes only with the subtree
+  idle, that exactly the children of dropped turns are abandoned, that no
+  abandoned node or node below it runs again, and that the parent's
+  record only grows. **Why:** an append-only log keeps every line, so a
+  rewind has to be a line that later readers apply; abandoning children in
+  the same line keeps the tree and the history consistent after a crash.
+  **Alternative:** fork the node to a new id, which breaks its parent's
+  record of it; or truncate the log, which the manager never does.
 
 ## Design Risks And Failure Behavior
 

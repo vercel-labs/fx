@@ -390,15 +390,21 @@ pub const Owner = struct {
         if (registry.generation != generation) try self.state_store.save(self.alloc, registry);
     }
 
-    pub fn deinit(self: *Owner) void {
+    /// Refuses new work and stops every running child, without joining: the
+    /// tree's closing waits for their turns to end before any host closes.
+    pub fn requestShutdown(self: *Owner) void {
         self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
         self.closed = true;
         for (self.slots.items) |slot| {
             slot.shutdown.store(true, .seq_cst);
             slot.cancel.store(true, .seq_cst);
             if (slot.worker) |worker| worker.requestShutdown();
         }
-        self.mutex.unlock(io_mod.getIo());
+    }
+
+    pub fn deinit(self: *Owner) void {
+        self.requestShutdown();
 
         for (self.slots.items) |slot| {
             destroySlot(self, slot);
@@ -595,12 +601,14 @@ fn runOne(slot: *Slot) OneOutcome {
         return failedOutcome(work_id, "node_path", err);
     defer owner.alloc.free(node_path);
 
+    // The child's host outlives this turn: the tree's registry owns it (D96).
     var child = OpenChild.open(owner, slot.child_id, snapshot.instructions) catch |err|
         return failedOutcome(work_id, "session_resume", err);
-    defer child.close(owner.alloc);
+    defer child.close(owner);
     var turn = child.turn(owner.alloc, owner.max_history_turns) catch |err|
         return failedOutcome(work_id, "turn_initialization", err);
     defer turn.deinit();
+    turn.node_host = child.host;
     // The kernel belongs to the child's session node in the process kernel pool,
     // keyed by the child's id, not to this turn or this host. The tree keeps its
     // live process between turns until the root host closes.
@@ -654,6 +662,11 @@ fn runOne(slot: *Slot) OneOutcome {
     );
     var owned_admission = admission;
     defer owned_admission.deinit(owner.alloc);
+    // Its latest context use outlives the turn and the host (D96).
+    defer {
+        const used = slot.metrics.snapshot().input_tokens;
+        if (used > 0) child.session.setContextUsage(used) catch |err| debugFailure(slot.child_id, "context_usage", err);
+    }
     const result = owner.services.run(
         &turn,
         message,
@@ -692,14 +705,29 @@ fn runOne(slot: *Slot) OneOutcome {
     };
 }
 
-/// The child session one work item runs in (D22).
+/// The child session one work item runs in (D22): its host's, leased from
+/// the tree's registry (D96), or one the turn opens for itself.
 const OpenChild = struct {
     session: *session_adapter.Session,
     preferences: session_codec.DurableSessionPreferences,
+    lease: ?execution.NodeLease = null,
+    host: ?*@import("tool_host.zig").Runtime = null,
+
+    fn open(owner: *Owner, child_id: []const u8, instructions: []const u8) !OpenChild {
+        const lease_fn = owner.services.lease_fn orelse return openOwn(owner, child_id, instructions);
+        const lease = try lease_fn(owner.services.context, child_id, instructions);
+        errdefer owner.services.release_fn.?(owner.services.context, lease);
+        return .{
+            .session = lease.session,
+            .preferences = try lease.session.currentPreferences(owner.alloc),
+            .lease = lease,
+            .host = lease.host,
+        };
+    }
 
     /// Opens the child's log, or starts it under the id its spawn line
     /// names with the seed its admission left (D34).
-    fn open(owner: *Owner, child_id: []const u8, instructions: []const u8) !OpenChild {
+    fn openOwn(owner: *Owner, child_id: []const u8, instructions: []const u8) !OpenChild {
         const children = owner.children;
         var seed = (try children.seedFor(owner.alloc, child_id)) orelse blk: {
             debug_trace.logf("subagent", "child seed unavailable child_id={s} using=parent_preferences", .{child_id});
@@ -728,9 +756,12 @@ const OpenChild = struct {
         return .{ .session = session, .preferences = try session.currentPreferences(owner.alloc) };
     }
 
-    fn close(self: *OpenChild, alloc: Allocator) void {
-        self.preferences.deinit(alloc);
-        self.session.close();
+    fn close(self: *OpenChild, owner: *Owner) void {
+        self.preferences.deinit(owner.alloc);
+        const lease = self.lease orelse return self.session.close();
+        // A turn its work left open ends here, as a close would end it.
+        self.session.endOpenTurn() catch |err| debugFailure(self.session.id(), "turn_end", err);
+        owner.services.release_fn.?(owner.services.context, lease);
     }
 
     fn turn(self: *OpenChild, alloc: Allocator, max_history_turns: usize) !execution.TurnContext {

@@ -98,6 +98,8 @@ pub const Child = struct {
     finish_data: ?[]u8,
     /// Seq of the newest line about this child.
     seq: u64,
+    /// A rewind of the parent dropped the turn that first spawned it (D97).
+    abandoned: bool = false,
 };
 
 pub fn freeChildren(alloc: Allocator, children: []Child) void {
@@ -383,6 +385,19 @@ pub const Store = struct {
     pub fn freeIds(alloc: Allocator, ids: [][]u8) void {
         for (ids) |value| alloc.free(value);
         alloc.free(ids);
+    }
+
+    /// The context tokens a session's latest model call used, as
+    /// `Session.setContextUsage` saved them; null before any. Read without
+    /// its lock.
+    pub fn contextUsage(store: *Store, alloc: Allocator, id: []const u8) !?u64 {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const peeked = try store.manager.peek(arena.allocator(), id);
+        const raw = peeked.state.usage orelse return null;
+        const Usage = struct { context_tokens: ?u64 = null };
+        const usage = std.json.parseFromSliceLeaky(Usage, arena.allocator(), raw, .{ .ignore_unknown_fields = true }) catch return null;
+        return usage.context_tokens;
     }
 
     /// A child's newest preferences, read without its lock. Caller owns.
@@ -1385,6 +1400,15 @@ pub const Session = struct {
         return self.instructions orelse "";
     }
 
+    /// Makes `text` the child's instructions when it is not empty and differs
+    /// from the stored ones, as `openChild` does for each work item (D34).
+    pub fn useInstructions(self: *Session, text: []const u8) !void {
+        if (text.len == 0 or std.mem.eql(u8, text, self.childInstructions())) return;
+        var preferences = try self.currentPreferences(self.alloc);
+        defer preferences.deinit(self.alloc);
+        try self.replaceInstructions(preferences, text);
+    }
+
     fn replaceInstructions(self: *Session, preferences: session_codec.DurableSessionPreferences, text: []const u8) !void {
         const owned = try self.alloc.dupe(u8, text);
         errdefer self.alloc.free(owned);
@@ -1658,6 +1682,17 @@ pub const Session = struct {
         if (self.turn_open) return;
         _ = try self.write(&.{.turn_started});
         self.startedTurn();
+    }
+
+    /// Ends a turn its work left open, as closing the session would: the
+    /// session stays open for its next turn (D96).
+    pub fn endOpenTurn(self: *Session) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (!self.turn_open) return;
+        _ = try self.write(&.{.{ .turn_interrupted = .cancel }});
+        self.turn_open = false;
+        self.clearStreamed();
     }
 
     /// Opens the turn as its work starts. A subagent child streams nothing,
@@ -2184,6 +2219,95 @@ pub const Session = struct {
         _ = try self.write(&.{.{ .set = .{ .key = .prefs, .value = try encodePreferences(arena.allocator(), preferences, self.instructions) } }});
     }
 
+    /// Records how many tokens of context the session's latest model call
+    /// used, so a reader learns it without the session open.
+    pub fn setContextUsage(self: *Session, tokens: u64) !void {
+        var buf: [64]u8 = undefined;
+        const value = try std.mem.print(&buf, "{{\"context_tokens\":{d}}}", .{tokens});
+        _ = try self.write(&.{.{ .set = .{ .key = .usage, .value = value } }});
+    }
+
+    // -- rewind (D97) --------------------------------------------------------
+
+    pub const Rewound = struct {
+        /// The children first spawned in a dropped turn, now abandoned;
+        /// owned.
+        abandoned: [][]u8,
+
+        pub fn deinit(self: *Rewound, alloc: Allocator) void {
+            for (self.abandoned) |child| alloc.free(child);
+            alloc.free(self.abandoned);
+            self.* = undefined;
+        }
+    };
+
+    /// Drops turn `turn` and every later turn from the history, and abandons
+    /// each child first spawned once `turn` had started (D97). Lines are
+    /// only appended: one `rewound` line names the dropped turns and the
+    /// abandoned children. Refused while a turn is open, for a turn the
+    /// history does not hold, and before a compaction, whose summary covers
+    /// the turns it would drop. The caller makes sure no child of this
+    /// session runs; the manager refuses to abandon one whose work is open.
+    pub fn rewind(self: *Session, alloc: Allocator, turn: u64) !Rewound {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.turn_open) return error.TurnOpen;
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const state = try self.handle.state(sa);
+        if (turn == 0 or turn > state.last_turn or state.droppedTurn(turn)) return error.InvalidRewindPoint;
+        var start_seq: ?u64 = null;
+        var first_spawn: std.array_hash_map.String(u64) = .empty;
+        var from: sm.From = .start;
+        while (true) {
+            var page = try self.handle.read(sa, from, .forward, replay_page_lines);
+            defer page.deinit();
+            for (page.entries) |entry| {
+                const body = entry.body orelse continue;
+                switch (body) {
+                    .turn_started => |t| if (t.turn == turn) {
+                        start_seq = entry.seq;
+                    },
+                    .compacted => if (start_seq != null) return error.RewindPastCompaction,
+                    .child_spawned => |c| {
+                        const slot = try first_spawn.getOrPut(sa, c.child);
+                        if (!slot.found_existing) {
+                            slot.key_ptr.* = try sa.dupe(u8, c.child);
+                            slot.value_ptr.* = entry.seq;
+                        }
+                    },
+                    else => {},
+                }
+            }
+            from = .{ .at = page.next orelse break };
+        }
+        const after = start_seq orelse return error.InvalidRewindPoint;
+        var abandoned: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (abandoned.items) |child| alloc.free(child);
+            abandoned.deinit(alloc);
+        }
+        for (state.children.items) |child| {
+            const spawned = first_spawn.get(child.id) orelse continue;
+            if (spawned <= after or child.abandoned) continue;
+            try abandoned.append(alloc, try alloc.dupe(u8, child.id));
+        }
+        _ = try self.write(&.{.{ .rewound = .{ .turn = turn, .abandoned = @ptrCast(abandoned.items) } }});
+        var kept: usize = 0;
+        for (self.turn_numbers.items) |number| {
+            if (number) |value| if (value >= turn) continue;
+            self.turn_numbers.items[kept] = number;
+            kept += 1;
+        }
+        self.turn_numbers.shrinkRetainingCapacity(kept);
+        if (self.trim.turn) |value| if (value >= turn) {
+            self.trim = .{};
+        };
+        debug_trace.logf("session", "event=sessions_v2_rewound session={s} turn={d} through={d} abandoned={d}", .{ self.id(), turn, state.last_turn, abandoned.items.len });
+        return .{ .abandoned = try abandoned.toOwnedSlice(alloc) };
+    }
+
     // -- children (D22) ------------------------------------------------------
 
     /// Every child of this session as its log folds them, in first-spawn
@@ -2213,6 +2337,7 @@ pub const Session = struct {
                 .spawn_data = spawn_copy,
                 .finish_data = if (child.finish_data) |data| try alloc.dupe(u8, data) else null,
                 .seq = child.seq,
+                .abandoned = child.abandoned,
             };
             built += 1;
         }
@@ -2435,9 +2560,19 @@ pub const Session = struct {
     pub fn fork(self: *Session, alloc: Allocator, options: Fork) !*Session {
         if (options.before_turn == 0) return error.InvalidForkPoint;
         io_mod.e2eFailIfDurableMutationAttempted();
+        // The fork ends with the newest turn before `before_turn` that a
+        // rewind kept: a dropped turn's end comes before its `rewound` line,
+        // which the fork must not lose (D97).
+        var cut = options.before_turn - 1;
+        {
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const state = try self.handle.state(scratch.allocator());
+            while (cut > 0 and state.droppedTurn(cut)) cut -= 1;
+        }
         const handle = try self.store.manager.openFork(.{
             .source = self.id(),
-            .at = .{ .turn = options.before_turn - 1 },
+            .at = .{ .turn = cut },
             .workspace = options.workspace,
             .host = options.host,
         });
@@ -2813,6 +2948,17 @@ const Source = struct {
 
     fn read(src: Source, sa: Allocator, from: sm.From, limit: usize) !sm.Page {
         return src.readTo(sa, from, .forward, limit);
+    }
+
+    /// The turns rewinds dropped from the history (D97), in `a`. A log the
+    /// fold cannot read drops none here; its replay reports the damage.
+    fn dropped(src: Source, a: Allocator) ![]const sm.Dropped {
+        if (src.handle) |handle| return (try handle.state(a)).dropped.items;
+        const peeked = src.store.manager.peek(a, src.id) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return &.{},
+        };
+        return peeked.state.dropped.items;
     }
 
     fn readTo(src: Source, sa: Allocator, from: sm.From, direction: sm.Direction, limit: usize) !sm.Page {
@@ -4274,6 +4420,10 @@ noinline fn replay(
     // The text of the message whose calls are running, until a finished
     // step's own assistant piece supersedes it (D51).
     var running_text: ?[]const u8 = null;
+    var dropped_arena = std.heap.ArenaAllocator.init(alloc);
+    defer dropped_arena.deinit();
+    // Turns a rewind dropped are left out of every history (D97).
+    const dropped = try src.dropped(dropped_arena.allocator());
     var from = start;
     while (true) {
         var page = try src.read(sa, from, replay_page_lines);
@@ -4337,10 +4487,14 @@ noinline fn replay(
                             try represented.append(ta, try ta.dupe(u8, value.call_id));
                         },
                         .steering => |value| try builder.appendSteering(value.text),
-                        .turn_completed => |value| try sink.turn(try presentStoredResults(src, alloc, try builder.finishAssistant(value)), lastStarted(entry)),
+                        .turn_completed => |value| {
+                            const turn = try builder.finishAssistant(value);
+                            if (keptTurn(alloc, dropped, turn, lastStarted(entry))) try sink.turn(try presentStoredResults(src, alloc, turn), lastStarted(entry));
+                        },
                         .interrupted => |value| {
                             interrupted_item = true;
-                            try sink.turn(try presentStoredResults(src, alloc, try builder.finishInterrupted(value)), lastStarted(entry));
+                            const turn = try builder.finishInterrupted(value);
+                            if (keptTurn(alloc, dropped, turn, lastStarted(entry))) try sink.turn(try presentStoredResults(src, alloc, turn), lastStarted(entry));
                         },
                         .context_checkpoint => return error.InvalidConversationFrame,
                     }
@@ -4363,15 +4517,26 @@ noinline fn replay(
                         return err;
                     };
                     if (answered > 0) debug_trace.logf("session", "event=sessions_v2_replay_unfinished_tools session={s} turn={d} calls={d}", .{ src.id, ended.turn, answered });
-                    try sink.turn(try presentStoredResults(src, alloc, turn), ended.turn);
+                    if (keptTurn(alloc, dropped, turn, ended.turn)) try sink.turn(try presentStoredResults(src, alloc, turn), ended.turn);
                 },
                 .compacted => |line| try sink.summary(line.data),
-                .session_created, .turn_committed, .set, .child_spawned, .child_finished, .snapshot, .closed => {},
+                .session_created, .turn_committed, .set, .child_spawned, .child_finished, .snapshot, .closed, .rewound => {},
             }
         }
         from = .{ .at = page.next orelse break };
     }
     if (!builder.isIdle()) debug_trace.logf("session", "event=sessions_v2_replay_open_turn session={s} dropped=unfinished_pieces", .{src.id});
+}
+
+/// Whether a replayed turn stays in the history: false, after freeing it,
+/// when a rewind dropped its number (D97).
+fn keptTurn(alloc: Allocator, dropped: []const sm.Dropped, turn: types.HistoryTurn, number: ?u64) bool {
+    const value = number orelse return true;
+    for (dropped) |range| if (value >= range.turn and value <= range.through) {
+        types.freeHistoryTurn(alloc, turn);
+        return false;
+    };
+    return true;
 }
 
 /// `turn` with each stored result shown as v1 showed it: one the model saw
@@ -5681,6 +5846,58 @@ test "a fork holds the turns before its prompt under a new id and leaves the sou
     // The fork goes on as any session does; the source is still untouched.
     try commitPrompt(copy, "a different third");
     try testing.expectEqual(source_lines, try lineCount(t.store.manager, s.id()));
+}
+
+test "a rewind drops later turns, abandons children spawned after its point, and survives a resume and a fork (D97)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try commitPrompt(s, "first");
+    try s.appendChildLines(&.{ .{ .spawned = .{ .child = "01J00000000000000000000001", .work_id = "w1", .data = "{}" } }, .{ .finished = .{ .child = "01J00000000000000000000001", .work_id = "w1", .outcome = .ok } } });
+    try commitPrompt(s, "second");
+    try s.appendChildLines(&.{ .{ .spawned = .{ .child = "01J00000000000000000000002", .work_id = "w2", .data = "{}" } }, .{ .finished = .{ .child = "01J00000000000000000000002", .work_id = "w2", .outcome = .ok } } });
+    try commitPrompt(s, "third");
+    const points = try s.forkPoints(testing.allocator);
+    defer Session.freeForkPoints(testing.allocator, points);
+    try testing.expectError(error.InvalidRewindPoint, s.rewind(testing.allocator, 0));
+    try testing.expectError(error.InvalidRewindPoint, s.rewind(testing.allocator, points[2].turn + 1));
+    var rewound = try s.rewind(testing.allocator, points[1].turn);
+    defer rewound.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), rewound.abandoned.len);
+    try testing.expectEqualStrings("01J00000000000000000000002", rewound.abandoned[0]);
+    // A dropped turn cannot be the point of another rewind.
+    try testing.expectError(error.InvalidRewindPoint, s.rewind(testing.allocator, points[2].turn));
+    const children = try s.children(testing.allocator);
+    defer freeChildren(testing.allocator, children);
+    try testing.expect(!children[0].abandoned);
+    try testing.expect(children[1].abandoned);
+    try commitPrompt(s, "again");
+    const after = try s.forkPoints(testing.allocator);
+    defer Session.freeForkPoints(testing.allocator, after);
+    try testing.expectEqual(@as(usize, 2), after.len);
+    try testing.expectEqualStrings("again", after[1].prompt);
+    try testing.expect(after[1].turn > points[2].turn);
+    // A fork before the new prompt holds only what the rewind kept.
+    const copy = try s.fork(testing.allocator, .{ .before_turn = after[1].turn, .workspace = "/w", .host = .app });
+    var forked = try copy.restore(testing.allocator);
+    defer forked.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), forked.history.len);
+    copy.close();
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    try testing.expectEqualStrings("first", restored.history[0].assistant.user.text);
+    try testing.expectEqualStrings("again", restored.history[1].assistant.user.text);
+    const read_back = try t.store.childHistory(testing.allocator, id);
+    defer types.freeHistoryTurnSlice(testing.allocator, read_back);
+    try testing.expectEqual(@as(usize, 2), read_back.len);
 }
 
 test "a fork of a fork keeps one fork mark, and a fork before the first prompt is empty (D58)" {

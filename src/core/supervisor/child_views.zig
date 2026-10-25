@@ -63,7 +63,15 @@ fn childRows(host: *acp.PersistentHost, read: Read) !Found {
 fn liveRows(read: *const Read, node: *tool_host.Runtime) anyerror!Found {
     const store = child_state.Store{ .children = node.children, .parent_id = node.node_id };
     const registry = try store.load(read.arena);
-    const rows = try read.arena.alloc(Row, registry.children.len);
+    // The registry holds a node's live children; those a rewind abandoned
+    // stay listed from its log, read-only (D97).
+    const folded = try node.children.parent.children(read.arena);
+    var abandoned: usize = 0;
+    for (folded) |child| {
+        if (child.abandoned) abandoned += 1;
+    }
+    const all = try read.arena.alloc(Row, registry.children.len + abandoned);
+    const rows = all[0..registry.children.len];
     var live: ?live_presentation.Snapshot = null;
     for (registry.children, rows) |*child, *row| {
         const busy = child.phase == .running or child.phase == .awaiting_approval;
@@ -86,9 +94,22 @@ fn liveRows(read: *const Read, node: *tool_host.Runtime) anyerror!Found {
         const changed_work = !std.mem.eql(u8, read.viewer_work_id, work_id);
         live = try node.managed.snapshotPresentation(read.arena, child.id, work_id, read.after, read.reset or changed_work);
     }
+    var next = rows.len;
+    for (folded) |child| {
+        if (!child.abandoned) continue;
+        all[next] = .{
+            .id = child.id,
+            .parent_id = node.node_id,
+            .name = spawnAgent(read.arena, child.spawn_data) orelse "subagent",
+            .status = "abandoned",
+            .depth = node.depth + 1,
+            .work_id = child.work_id,
+        };
+        next += 1;
+    }
     // The registry strings borrow the arena; the node id outlives the read.
-    for (rows) |*row| row.parent_id = try read.arena.dupe(u8, row.parent_id);
-    return .{ .rows = rows, .live = live };
+    for (all) |*row| row.parent_id = try read.arena.dupe(u8, row.parent_id);
+    return .{ .rows = all, .live = live };
 }
 
 fn liveStatus(child: *const child_state.Child) []const u8 {
@@ -99,6 +120,12 @@ fn liveStatus(child: *const child_state.Child) []const u8 {
 
 /// fx's data on the saved `child_spawned` and `child_finished` lines.
 const SpawnData = struct { agent: ?[]const u8 = null };
+
+fn spawnAgent(arena: Allocator, raw: ?[]const u8) ?[]const u8 {
+    const data = raw orelse return null;
+    const spawn = std.json.parseFromSliceLeaky(SpawnData, arena, data, .{ .ignore_unknown_fields = true }) catch return null;
+    return spawn.agent;
+}
 const FinishData = struct { failure: ?[]const u8 = null };
 
 fn savedRows(arena: Allocator, store: *session_adapter.Store, node_id: []const u8) ![]const Row {
@@ -117,7 +144,9 @@ fn savedRows(arena: Allocator, store: *session_adapter.Store, node_id: []const u
             else => @tagName(value),
         } else null;
         // Saved work with no live host stopped: its parent's turn ended.
-        const status = if (child.open)
+        const status = if (child.abandoned)
+            "abandoned"
+        else if (child.open)
             "interrupted"
         else if (outcome) |value|
             if (spawn.agent != null and !std.mem.eql(u8, value, "interrupted") and !std.mem.eql(u8, value, "lost")) "idle" else value

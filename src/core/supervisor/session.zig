@@ -265,10 +265,9 @@ pub const Session = struct {
             .command => |request| return self.hostCommand(arena, request),
             .rename => |request| return self.rename(arena, request.name),
             .kernel => |request| {
-                // Child kernels belong to their nodes' runtimes, which the
-                // root's kernel control does not reach yet.
-                if (self.belowRoot(request.node_id)) return protocol.encode(arena, protocol.Failure{ .@"error" = host_commands.NodeRefusal.unsupported.text() });
-                const info = try (self.host orelse return error.SessionStopped).kernelControl(arena, request.action);
+                // Every node's kernel lives in the process pool under its id.
+                const node_id = if (self.belowRoot(request.node_id)) request.node_id else null;
+                const info = try (self.host orelse return error.SessionStopped).kernelControl(arena, request.action, node_id);
                 return protocol.encode(arena, protocol.KernelState{ .kernel = .{ .state = info.state, .diagnostics = info.diagnostics } });
             },
             .prompt => |request| {

@@ -35,6 +35,7 @@ pub const top_level_specs = [_]TopLevelSpec{
             "Python kernels share a memory budget: when their private memory together, or with a kernel about to start, exceeds it, the least recently used idle kernel saves its globals and stops. The budget defaults to a quarter of physical memory, at most 4 GiB; set PROTO_FX_KERNEL_MEMORY_BUDGET in bytes or with a K, M, or G suffix, such as 2G. At most 32 kernels run at once whatever the budget; PROTO_FX_MAX_LIVE_KERNELS changes that ceiling. A running cell is never stopped.",
             "An idle kernel also saves its globals and stops after 5 minutes when no session holds it, such as a subagent's between turns, or after 30 minutes when one does. Its next cell restores it. Set PROTO_FX_KERNEL_IDLE_MS or PROTO_FX_KERNEL_HELD_IDLE_MS in milliseconds to change these times; 0 never stops a kernel.",
             "Kernels start by forking a preloaded Python fork server, one per interpreter, which stops a minute after the last kernel does. Set PROTO_FX_KERNEL_ZYGOTE=0 to start each kernel as a new Python process instead.",
+            "Each subagent keeps its session open between its turns, so you can message or rewind it at any depth. One left idle closes after 5 minutes, and a session tree keeps at most 16 open, closing the least recently used idle one first. Set PROTO_FX_NODE_HOST_IDLE_MS or PROTO_FX_MAX_NODE_HOSTS to change these limits.",
         },
     },
     .{

@@ -1,16 +1,22 @@
-//! What a persistent host does for the nodes below its root session (D91):
-//! it forwards their approvals to its connection, delivers a person's
-//! message to an idle child, and runs the `fx/command`s a child supports.
+//! What a persistent host does for the nodes below its root session (D91,
+//! D96): it forwards their approvals to its connection, delivers a person's
+//! message to an idle node at any depth, and runs the `fx/command`s a node
+//! supports, rewind included (D97).
 //! Everything here runs on the host's owner thread except a message's own
 //! work, which runs on its thread until the host joins it.
 const std = @import("std");
 const io_mod = @import("../core/shared/io.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const types = @import("../core/shared/types.zig");
+const text_utils = @import("../core/shared/text_utils.zig");
 const approval_registry = @import("../core/subagent/approval_registry.zig");
 const child_state = @import("../core/subagent/child_state.zig");
 const model_contract = @import("../core/subagent/model_contract.zig");
 const tool_host = @import("../core/subagent/tool_host.zig");
+const node_hosts = @import("../core/subagent/node_hosts.zig");
+const node_ops = @import("../core/subagent/node_ops.zig");
+const authority = @import("../core/subagent/authority.zig");
+const kernel = @import("../core/kernel/slot.zig");
 const session_adapter = @import("../core/session/session_adapter.zig");
 const host_commands = @import("commands.zig");
 const server = @import("server.zig");
@@ -172,8 +178,9 @@ fn nodeLabel(arena: Allocator, state: *server.ServerState, parent_id: []const u8
     return fallback;
 }
 
-/// A person's message to a child of the root, running as that child's own
-/// work on its own thread, as the root's `message` call would run it.
+/// A person's message to a node at any depth, running as that node's own
+/// work on its own thread, as its parent's `message` call would run it. It
+/// holds its parent's host open until it ends (D96).
 pub const Message = struct {
     state: *server.ServerState,
     alloc: Allocator,
@@ -184,6 +191,10 @@ pub const Message = struct {
     defaults: tool_host.Defaults,
     permission_mode: types.PermissionMode,
     max_result_bytes: usize,
+    /// The host the message runs on: the node's parent's.
+    host: *tool_host.Runtime,
+    /// The lease on that host; null when it is the root's.
+    lease: ?*node_hosts.Entry,
     cancel: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
     thread: std.Thread = undefined,
@@ -200,7 +211,7 @@ pub const Message = struct {
 
     fn run(self: *Message) void {
         defer self.done.store(true, .release);
-        const root = self.state.subagent_host orelse return;
+        defer if (self.lease) |entry| self.host.tree.nodes.release(entry, .use);
         var arena_state = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -209,13 +220,14 @@ pub const Message = struct {
             return;
         };
         defer request.deinit(arena);
-        const result = root.executeManaged(arena, &request, .{
+        const result = self.host.executeManaged(arena, &request, .{
             .invocation_id = self.invocation_id,
             .parent_permission_mode = self.permission_mode,
             .defaults = self.defaults,
             .max_result_bytes = self.max_result_bytes,
             .timestamp_ms = io_mod.milliTimestamp(),
             .cancel_flag = &self.cancel,
+            .lend_turn_slots = false,
         }) catch |err| {
             debug_trace.logf("acp", "node message failed node_id={s} err={s}", .{ self.node_id, @errorName(err) });
             return;
@@ -254,8 +266,8 @@ pub const Messages = struct {
         self.reap(true);
     }
 
-    /// Starts `text` as node `node_id`'s next work, or names why it cannot
-    /// take it now.
+    /// Starts `text` as node `node_id`'s next work, at any depth, or names
+    /// why it cannot take it now.
     pub fn start(self: *Messages, state: *server.ServerState, node_id: []const u8, text: []const u8) !?host_commands.NodeRefusal {
         if (self.busy()) return .message_running;
         const root = state.subagent_host orelse return .unsupported;
@@ -263,10 +275,22 @@ pub const Messages = struct {
         var arena_state = std.heap.ArenaAllocator.init(state.alloc);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        const registry = try (child_state.Store{ .children = root.children, .parent_id = root.node_id }).load(arena);
+        const node = (try resolve(arena, state, node_id)) orelse return .unknown_node;
+        if (node.abandoned) return .abandoned;
+        // The node's parent runs the message, as its own `message` call.
+        const above = node.path[0 .. node.path.len - 1];
+        const lease: ?*node_hosts.Entry = if (above.len == 0) null else node_ops.lease(root, above) catch |err| return switch (err) {
+            error.NodeBusy => .node_running,
+            error.NodeUnavailable => .unknown_node,
+            else => err,
+        };
+        var handed = false;
+        defer if (!handed) if (lease) |entry| node_ops.release(root, entry);
+        const host = if (lease) |entry| entry.runtime else root;
+        const registry = try (child_state.Store{ .children = host.children, .parent_id = host.node_id }).load(arena);
         const child = for (registry.children) |*row| {
             if (std.mem.eql(u8, row.id, node_id)) break row;
-        } else return if (deeperNode(arena, state, node_id)) .not_root_child else .unknown_node;
+        } else return .unknown_node;
         switch (child.phase) {
             .running, .awaiting_approval => return .node_running,
             else => {},
@@ -302,39 +326,154 @@ pub const Messages = struct {
                 .ultrafast_mode = active.ultrafast_mode,
                 .conversation_language = active.session_rt.languageSnapshot(),
             },
-            .permission_mode = active.permission_mode,
+            // No wider than the session, nor than the parent's own mode.
+            .permission_mode = authority.narrowerPermission(active.permission_mode, host.permission_ceiling),
             .max_result_bytes = active.max_tool_result_bytes,
+            .host = host,
+            .lease = lease,
         };
         message.thread = try std.Thread.spawn(.{}, Message.run, .{message});
+        handed = true;
         self.running = message;
-        debug_trace.logf("acp", "node message started node_id={s} agent={s}", .{ node_id, agent });
+        debug_trace.logf("acp", "node message started node_id={s} agent={s} depth={d}", .{ node_id, agent, node.path.len });
         return null;
     }
 };
 
-/// Whether `node_id` is a saved node of this tree below a child of the root.
-fn deeperNode(arena: Allocator, state: *server.ServerState, node_id: []const u8) bool {
-    const store = if (state.sessions_v2) |*value| value else return false;
-    const peeked = store.manager.peek(arena, node_id) catch return false;
-    const active = if (state.active_session) |*session| session else return false;
-    return std.mem.eql(u8, peeked.root, active.session_id) and peeked.depth > 1;
+/// A node of the attached session's tree, as its saved logs place it.
+const Resolved = struct {
+    /// Ids from just below the root down to the node, in `arena`.
+    path: []const []const u8,
+    /// The node, or one of its ancestors, was abandoned by a rewind of its
+    /// parent (D97): it is read-only.
+    abandoned: bool,
+};
+
+/// More hops than any tree has levels, so a damaged parent chain ends.
+const max_resolve_hops = 16;
+
+/// Places `node_id` in the attached session's tree by walking its saved
+/// parents up to the root; null when it is not a node below that root.
+fn resolve(arena: Allocator, state: *server.ServerState, node_id: []const u8) !?Resolved {
+    const store = if (state.sessions_v2) |*value| value else return null;
+    const active = if (state.active_session) |*session| session else return null;
+    var path: std.ArrayList([]const u8) = .empty;
+    var abandoned = false;
+    var current = node_id;
+    for (0..max_resolve_hops) |_| {
+        const peeked = store.manager.peek(arena, current) catch return null;
+        const parent = peeked.parent orelse return null;
+        if (!std.mem.eql(u8, peeked.root, active.session_id)) return null;
+        const above = store.manager.peek(arena, parent) catch return null;
+        for (above.state.children.items) |child| {
+            if (std.mem.eql(u8, child.id, current) and child.abandoned) abandoned = true;
+        }
+        try path.insert(arena, 0, current);
+        if (std.mem.eql(u8, parent, active.session_id)) return .{ .path = path.items, .abandoned = abandoned };
+        current = parent;
+    }
+    return null;
 }
 
-/// Runs `command` for node `node_id` below the root, writing its result to
-/// `out`, or names why the host cannot run it on a node yet.
+/// Runs `command` for node `node_id` below the root, at any depth, writing
+/// its result to `out`, or names why the host cannot run it there.
 pub fn runCommand(arena: Allocator, state: *server.ServerState, node_id: []const u8, command: host_commands.Command, out: *std.Io.Writer) !?host_commands.NodeRefusal {
     const store = if (state.sessions_v2) |*value| value else return .unknown_node;
-    const active = if (state.active_session) |*session| session else return .unknown_node;
-    const peeked = store.manager.peek(arena, node_id) catch return .unknown_node;
-    if (!std.mem.eql(u8, peeked.root, active.session_id)) return .unknown_node;
+    const root = state.subagent_host orelse return .unknown_node;
+    const node = (try resolve(arena, state, node_id)) orelse return .unknown_node;
     switch (command) {
         .last_reply => {
             const history = try store.childHistory(arena, node_id);
             try host_commands.writeResult(out, command, .{ .text = lastReply(history) orelse "" });
             return null;
         },
+        .context => {
+            var preferences = try store.childPreferences(arena, node_id);
+            defer preferences.deinit(arena);
+            const capabilities = state.capability_resolver.available(preferences.model, state.cfg.provider_set.select(preferences.provider).fallbackModelCapabilities(preferences.model));
+            try host_commands.writeResult(out, command, .{ .context = .{
+                .used = (try store.contextUsage(arena, node_id)) orelse 0,
+                .total = capabilities.context_window,
+                .auto_compact_percent = state.auto_compact_percent,
+            } });
+            return null;
+        },
+        // A node has no file journal of its own: undo on it rewinds its
+        // newest turn (D97).
+        .undo => {
+            if (node.abandoned) return .abandoned;
+            const outcome = node_ops.rewindLatest(arena, root, node.path) catch |err| return switch (err) {
+                error.NodeUnavailable => .unknown_node,
+                else => err,
+            };
+            switch (outcome) {
+                .refused => |refusal| return switch (refusal) {
+                    .busy => .node_running,
+                    .past_compaction => .rewind_past_compaction,
+                    .nothing_to_rewind => {
+                        try host_commands.writeResult(out, command, .{ .undo = .{ .outcome = .nothing_to_undo } });
+                        return null;
+                    },
+                },
+                .rewound => |rewound| {
+                    std.mem.replaceScalar(u8, rewound.prompt, '\n', ' ');
+                    const prompt = text_utils.utf8PrefixByBytes(rewound.prompt, 160);
+                    const more = if (prompt.len < rewound.prompt.len) "…" else "";
+                    const text = switch (rewound.abandoned) {
+                        0 => try arena.print("Rewound this subagent's latest turn: \"{s}{s}\"", .{ prompt, more }),
+                        1 => try arena.print("Rewound this subagent's latest turn: \"{s}{s}\". The subagent it started there is abandoned: you can read it, not message it.", .{ prompt, more }),
+                        else => try arena.print("Rewound this subagent's latest turn: \"{s}{s}\". The {d} subagents it started there are abandoned: you can read them, not message them.", .{ prompt, more, rewound.abandoned }),
+                    };
+                    try host_commands.writeResult(out, command, .{ .undo = .{ .outcome = .rewound, .text = text } });
+                    return null;
+                },
+            }
+        },
+        .model, .effort => |value| {
+            const wanted = value orelse {
+                var preferences = try store.childPreferences(arena, node_id);
+                defer preferences.deinit(arena);
+                const text = try arena.print("model: {s} · effort: {s}", .{ preferences.model, preferences.effort.label() });
+                try host_commands.writeResult(out, command, .{ .text = text });
+                return null;
+            };
+            if (node.abandoned) return .abandoned;
+            const effort: ?types.ReasoningEffort = if (command == .effort) types.ReasoningEffort.parse(wanted) orelse return .invalid_effort else null;
+            const entry = node_ops.lease(root, node.path) catch |err| return switch (err) {
+                error.NodeBusy => .node_running,
+                error.NodeUnavailable => .unknown_node,
+                else => err,
+            };
+            defer node_ops.release(root, entry);
+            // Saved on the node, so its next turns use it however often its
+            // host closes and opens again.
+            var preferences = try entry.session.currentPreferences(arena);
+            if (effort) |level| preferences.effort = level else preferences.model = try arena.dupe(u8, wanted);
+            try entry.session.setPreferences(preferences);
+            const text = try arena.print("This subagent's next turns use model {s} · effort {s}.", .{ preferences.model, preferences.effort.label() });
+            try host_commands.writeResult(out, command, .{ .text = text });
+            return null;
+        },
+        .compact => return .compact,
         else => return .unsupported,
     }
+}
+
+/// `/kernel` for node `node_id`: its kernel lives in the process pool under
+/// the node's id, whether or not a turn of it holds it (D95).
+pub fn kernelControl(alloc: Allocator, state: *server.ServerState, node_id: []const u8, action: kernel.Action) !server.PersistentHost.KernelInfo {
+    var arena_state = std.heap.ArenaAllocator.init(state.alloc);
+    defer arena_state.deinit();
+    const root = state.subagent_host orelse return error.NoActiveSession;
+    const active = if (state.active_session) |*session| session else return error.NoActiveSession;
+    const node = (try resolve(arena_state.allocator(), state, node_id)) orelse return error.ChildNotFound;
+    if (node.abandoned and action != .status) return error.NodeAbandoned;
+    if (action != .status and action != .interrupt and root.tree.nodes.subtreeBusy(node_id)) return error.SessionBusy;
+    var slot: kernel.Slot = .{ .home_override = state.cfg.home_override, .retainer = root.tree };
+    defer slot.deinit();
+    _ = try slot.ensure(state.alloc, .{ .cwd = active.workspace_root, .session_id = node_id });
+    const value = try slot.control(state.alloc, .{ .cwd = active.workspace_root, .session_id = node_id }, action);
+    return .{ .state = if (value) |current| @tagName(current) else "uninitialized", .diagnostics = try slot.diagnostics(alloc) };
 }
 
 fn lastReply(history: []const types.HistoryTurn) ?[]const u8 {
