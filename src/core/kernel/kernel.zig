@@ -7,6 +7,7 @@ const io_mod = @import("../shared/io.zig");
 const protocol = @import("protocol.zig");
 const bootstrap = @import("bootstrap.zig");
 const reader = @import("reader.zig");
+const pool = @import("pool.zig");
 const Allocator = std.mem.Allocator;
 const Buffer = protocol.Buffer;
 const Cancel = ?*const std.atomic.Value(bool);
@@ -128,6 +129,8 @@ pub const Manager = struct {
     next_restore: NextRestore = .restore,
     stderr_log: ?std.Io.File = null,
     stderr_log_bytes: usize = 0,
+    /// Owned by `pool.zig` and guarded by its mutex.
+    pool: pool.Membership = .{},
 
     /// `alloc` must be thread-safe. All options are copied; the session owns the returned manager.
     pub fn create(alloc: Allocator, options: Options) !*Manager {
@@ -147,6 +150,7 @@ pub const Manager = struct {
 
     /// Only the owning session calls this, after tool callers have joined. Never call on TUI detach.
     pub fn destroy(self: *Manager) void {
+        pool.forget(self);
         self.disposed.store(true, .release);
         self.stopping.store(true, .release);
         self.interrupt();
@@ -234,6 +238,9 @@ pub const Manager = struct {
         self.mutex.lockUncancelable(io);
         self.caller_waiting = true;
         self.mutex.unlock(io);
+        pool.touch(self);
+        // Marks the end of the cell; a start waiting on the pool rechecks once the gate opens.
+        defer pool.touch(self);
         defer {
             self.mutex.lockUncancelable(io);
             self.sink = null;
@@ -338,6 +345,57 @@ pub const Manager = struct {
         self.stopping.store(false, .release);
     }
 
+    /// Whether the pool may park this kernel now: no command holds it, no request
+    /// is in flight, and either a stop loses nothing a snapshot cannot restore or
+    /// the process is already dead. The pool calls this under its own mutex.
+    pub fn parkable(self: *Manager) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return self.parkableLocked();
+    }
+
+    fn parkableLocked(self: *Manager) bool {
+        if (self.gate_held or self.disposed.load(.acquire) or self.stopping.load(.acquire)) return false;
+        if (self.state == .failed) return true;
+        return self.state == .running and self.active == .none and self.persist and self.save_guard == .open;
+    }
+
+    /// Snapshots and stops an idle kernel so its process memory is released; the
+    /// next cell restores it. It never waits for a running cell: when another
+    /// command holds the kernel, or the snapshot fails, it leaves the kernel
+    /// running and reports false.
+    pub fn park(self: *Manager) bool {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        if (!self.parkableLocked()) {
+            self.mutex.unlock(io);
+            return false;
+        }
+        self.gate_held = true;
+        // Claims the snapshot, so the reader does not time it out as a background save.
+        self.caller_waiting = true;
+        const dead = self.state == .failed;
+        self.mutex.unlock(io);
+        defer self.unlockGate();
+        if (!dead and !self.saveNow()) {
+            self.mutex.lockUncancelable(io);
+            self.caller_waiting = false;
+            self.mutex.unlock(io);
+            return false;
+        }
+        self.stopLocked(false);
+        return true;
+    }
+
+    fn saveNow(self: *Manager) bool {
+        const id = self.begin(.snapshot) catch return false;
+        self.sendSnapshot(id) catch return false;
+        self.waitDone(id, 5000) catch return false;
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return self.request_status == .ok;
+    }
+
     fn ensureLocked(self: *Manager, cancel: Cancel) !void {
         if (self.disposed.load(.acquire)) return error.KernelDisposed;
         if (self.stopping.load(.acquire)) return error.Cancelled;
@@ -362,6 +420,7 @@ pub const Manager = struct {
         self.generation += 1;
         self.diagnostic.clear();
         self.mutex.unlock(io_mod.getIo());
+        try pool.admit(self, cancel, &self.stopping);
         try acquireBootPermit(cancel, &self.stopping);
         var boot_permit = true;
         defer if (boot_permit) releaseBootPermit();
@@ -620,6 +679,7 @@ pub const Manager = struct {
         self.writer.unlock(io_mod.getIo());
         if (self.stderr_log) |file| file.close(io_mod.getIo());
         self.stderr_log = null;
+        pool.retire(self);
         self.mutex.lockUncancelable(io_mod.getIo());
         self.state = .idle;
         self.active = .none;
@@ -704,6 +764,7 @@ fn isPermanent(err: anyerror) bool {
         error.KernelPythonProvisioningFailed,
         error.KernelHomeMustBeAbsolute,
         error.HomeNotSet,
+        error.KernelCapacityExhausted,
         => true,
         else => false,
     };
@@ -797,4 +858,5 @@ test "kernel live cells persist globals across stop, restart and interrupt" {
 test {
     _ = protocol;
     _ = reader;
+    _ = pool;
 }

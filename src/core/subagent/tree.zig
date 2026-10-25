@@ -10,6 +10,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const slot_pool = @import("slot_pool.zig");
+const kernel_pool = @import("../kernel/slot.zig").pool;
 
 const Allocator = std.mem.Allocator;
 
@@ -96,7 +97,10 @@ pub const Tree = struct {
         return tree;
     }
 
+    /// The root host calls this after joining every node, so no node still
+    /// uses the kernels the tree kept for its subagents.
     pub fn destroy(self: *Tree) void {
+        kernel_pool.releaseRetained(self);
         self.approvals.deinit();
         const alloc = self.alloc;
         alloc.free(self.root_id);

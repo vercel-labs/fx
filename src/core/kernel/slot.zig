@@ -1,11 +1,13 @@
-//! The kernel front door for sessions: one `Slot` per session runtime owns the lazily
-//! created Python kernel, where its snapshots live, and the recovery controls that the
-//! tool, the `/kernel` command, and ACP resume share.
+//! The kernel front door for sessions: one `Slot` per session runtime holds the session
+//! node's lazily created Python kernel from the process-wide pool (`pool.zig`), decides
+//! where its snapshots live, and runs the recovery controls that the tool, the `/kernel`
+//! command, and ACP resume share.
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const session_paths = @import("../session/session_store_paths.zig");
 const kernel = @import("kernel.zig");
+pub const pool = @import("pool.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Manager = kernel.Manager;
@@ -30,14 +32,19 @@ pub const Slot = struct {
     /// Profile home for snapshots; null uses `$HOME`. Borrowed from the host
     /// configuration, which outlives the session.
     home_override: ?[]const u8 = null,
+    /// Keeps the kernel's live process past this slot, until `pool.releaseRetained`,
+    /// so a subagent finds it warm on its next turn. Idle TTLs and the live cap still
+    /// park it. Null stops the kernel when the slot lets go.
+    retainer: ?pool.Retainer = null,
 
-    /// Only the owning session calls this, after tool callers have joined.
+    /// Only the owning session calls this, after tool callers have joined. The
+    /// pool stops the kernel unless the retainer or another slot still keeps it.
     pub fn deinit(self: *Slot) void {
-        if (self.manager) |manager| manager.destroy();
+        if (self.manager) |manager| pool.release(manager);
         self.manager = null;
     }
 
-    /// The kernel if one was created. It stays valid until `deinit`.
+    /// The kernel if one was acquired. It stays valid until `deinit`.
     pub fn current(self: *Slot) ?*Manager {
         self.lock.lockUncancelable(io_mod.getIo());
         defer self.lock.unlock(io_mod.getIo());
@@ -51,7 +58,7 @@ pub const Slot = struct {
         if (self.manager) |manager| return manager;
         const artifacts = try self.artifactDir(alloc, owner.session_id);
         defer alloc.free(artifacts);
-        const manager = try Manager.create(alloc, .{ .cwd = owner.cwd, .artifact_dir = artifacts, .persist = owner.session_id != null });
+        const manager = try pool.acquire(alloc, .{ .cwd = owner.cwd, .artifact_dir = artifacts, .persist = owner.session_id != null }, self.retainer);
         self.manager = manager;
         return manager;
     }
@@ -117,4 +124,5 @@ test "kernel slot controls report no kernel until one is created" {
 
 test {
     _ = kernel;
+    _ = pool;
 }

@@ -1630,6 +1630,24 @@ subagent has no subagent tool):
   every descendant's full answer in each ancestor's context.
   **Alternative:** the general 64 KiB tool result cap, which is too large
   to repeat at every level.
+- **D95 Decision:** one process-wide kernel pool owns every Python kernel
+  (`src/core/kernel/pool.zig`), keyed by the node's snapshot directory, so
+  each session node has one kernel however many runtimes or nested hosts
+  reach it. A session runtime holds it through its `kernel.Slot`. A
+  child's turn names its tree as the kernel's retainer, so the kernel's
+  live process outlives that turn and the nested host that ran it, until
+  the root host closes the tree. At most 4 processes live at once: a start
+  parks the least recently used idle kernel (snapshot, then stop), and the
+  next cell restores it. A kernel running a cell is never parked; when
+  every live kernel is busy, a start waits up to a minute and then
+  refuses. An idle kernel also parks after a TTL: 5 minutes when no
+  runtime holds it, 30 minutes when one does, such as an open root
+  session. A park whose snapshot fails leaves the kernel running.
+  **Why:** each kernel is a Python process of tens of megabytes, and a
+  tree of 256 nodes could otherwise keep one alive per node. **Alternative:**
+  kernels owned by each node host, which stopped a grandchild's kernel at
+  the end of every turn of its parent; or refusing at once when the pool
+  is full, which fails a fan-out of children that only needed to queue.
 
 ## Design Risks And Failure Behavior
 

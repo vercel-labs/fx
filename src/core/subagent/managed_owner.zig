@@ -18,7 +18,6 @@ const types = @import("../shared/types.zig");
 
 const slot_pool = @import("slot_pool.zig");
 const tree_mod = @import("tree.zig");
-const python_kernel = @import("../kernel/slot.zig");
 const Allocator = std.mem.Allocator;
 
 pub const StartResult = enum { started, already_running };
@@ -109,29 +108,6 @@ pub const Owner = struct {
     slots: std.ArrayList(*Slot) = .empty,
     feedback: std.ArrayList(*Feedback) = .empty,
     closed: bool = false,
-    /// Kernel processes belong to child sessions, not their short-lived work slots.
-    /// A running child temporarily owns its entry's pointer in TurnContext.runtime.
-    kernels: std.array_hash_map.String(?*python_kernel.Manager) = .empty,
-
-    fn lendKernel(self: *Owner, child_id: []const u8, turn: *execution.TurnContext) !void {
-        self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
-        if (self.kernels.getPtr(child_id)) |manager| {
-            turn.runtime.kernel.manager = manager.*;
-            manager.* = null;
-            return;
-        }
-        const key = try self.alloc.dupe(u8, child_id);
-        errdefer self.alloc.free(key);
-        try self.kernels.put(self.alloc, key, null);
-    }
-
-    fn retainKernel(self: *Owner, child_id: []const u8, turn: *execution.TurnContext) void {
-        self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
-        self.kernels.getPtr(child_id).?.* = turn.runtime.kernel.manager;
-        turn.runtime.kernel.manager = null;
-    }
 
     fn feedbackReplayLocked(self: *Owner, operation_id: []const u8, fingerprint: [32]u8) ?FeedbackResult {
         for (self.feedback.items) |item| {
@@ -428,11 +404,6 @@ pub const Owner = struct {
             destroySlot(self, slot);
         }
         self.slots.deinit(self.alloc);
-        for (self.kernels.keys(), self.kernels.values()) |key, value| {
-            if (value) |manager| manager.destroy();
-            self.alloc.free(key);
-        }
-        self.kernels.deinit(self.alloc);
         for (self.feedback.items) |item| item.deinit(self.alloc);
         self.feedback.deinit(self.alloc);
         self.* = undefined;
@@ -630,9 +601,10 @@ fn runOne(slot: *Slot) OneOutcome {
     var turn = child.turn(owner.alloc, owner.max_history_turns) catch |err|
         return failedOutcome(work_id, "turn_initialization", err);
     defer turn.deinit();
-    owner.lendKernel(slot.child_id, &turn) catch |err|
-        return failedOutcome(work_id, "kernel_ownership", err);
-    defer owner.retainKernel(slot.child_id, &turn);
+    // The kernel belongs to the child's session node in the process kernel pool,
+    // keyed by the child's id, not to this turn or this host. The tree keeps its
+    // live process between turns until the root host closes.
+    if (owner.tree) |tree| turn.runtime.kernel.retainer = tree;
     turn.live_authority = owner.authority_resolver;
     turn.approval_registry = owner.approvals;
     turn.child_id = slot.child_id;

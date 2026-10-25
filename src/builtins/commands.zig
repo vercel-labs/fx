@@ -32,6 +32,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .details = &.{
             "Stopping the supervisor cancels active work, saves supported kernel globals, and releases its processes. Closing the terminal only detaches.",
             "With no terminal attached, no running turn, subagent, or kernel cell, and no active heartbeat, the supervisor stops the same way after 10 minutes. Set PROTO_FX_DAEMON_IDLE_MS to change that delay in milliseconds, or to 0 to keep it running. The next proto-fx launch starts it again and reopens your sessions.",
+            "At most 4 Python kernels run at once; starting another saves and stops the least recently used idle one. An idle kernel also saves its globals and stops after 5 minutes when no session holds it, such as a subagent's between turns, or after 30 minutes when one does. Its next cell restores it. Set PROTO_FX_MAX_LIVE_KERNELS, PROTO_FX_KERNEL_IDLE_MS, or PROTO_FX_KERNEL_HELD_IDLE_MS to change these limits; an idle time of 0 never stops a kernel.",
         },
     },
     .{
