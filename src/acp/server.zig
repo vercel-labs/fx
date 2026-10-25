@@ -65,6 +65,7 @@ const libfx_steering = @import("libfx_steering.zig");
 const journal_events = @import("../core/agent/runtime/journal.zig");
 const libfx_journal = @import("libfx_journal.zig");
 const tool_call_identities = @import("tool_call_identities.zig");
+const node_host = @import("node_host.zig");
 
 const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
@@ -907,11 +908,10 @@ pub fn run(alloc: Allocator, cfg: Config) !void {
 /// Disconnecting a frontend does not destroy this owner.
 pub const PersistentHost = struct {
     state: ServerState,
-    child_approval_revision: ?u64 = null,
-    child_approval: ?struct {
-        id: i64,
-        pending: @import("../core/subagent/approval_registry.zig").PendingRequest,
-    } = null,
+    /// Approvals from every node below the root, forwarded to the connection.
+    child_approvals: node_host.Approvals = .{},
+    /// A person's message running on a child of the root.
+    node_messages: node_host.Messages = .{},
 
     pub fn init(alloc: Allocator, cfg: Config, context: ?*anyopaque, write: jsonrpc.Writer.WriteFn) !*PersistentHost {
         const self = try alloc.create(PersistentHost);
@@ -943,24 +943,13 @@ pub const PersistentHost = struct {
         var message = try jsonrpc.parseMessage(state.alloc, frame);
         defer jsonrpc.freeMessage(state.alloc, &message);
         if (message.isResponse()) {
-            if (self.child_approval) |forwarded| {
-                if (message.id.? == .integer and message.id.?.integer == forwarded.id) {
-                    const child_host = state.subagent_host orelse return error.SessionStopped;
-                    const decision = if (message.result_raw) |raw| value: {
-                        const parsed = try std.json.parseFromSlice(std.json.Value, state.alloc, raw, .{});
-                        defer parsed.deinit();
-                        break :value parsePermissionDecision(parsed.value) orelse return error.InvalidPermissionDecision;
-                    } else types.ToolPermissionDecision.deny;
-                    _ = try child_host.resolveApproval(.{
-                        .request_id = forwarded.pending.request_id,
-                        .child_id = forwarded.pending.child_id,
-                        .decision = decision,
-                        .timestamp_ms = io_mod.milliTimestamp(),
-                    });
-                    self.retireChildApproval();
-                    self.child_approval_revision = null;
-                    return;
-                }
+            if (message.id.? == .integer and self.child_approvals.owns(message.id.?.integer)) {
+                const decision = if (message.result_raw) |raw| value: {
+                    const parsed = try std.json.parseFromSlice(std.json.Value, state.alloc, raw, .{});
+                    defer parsed.deinit();
+                    break :value parsePermissionDecision(parsed.value) orelse return error.InvalidPermissionDecision;
+                } else types.ToolPermissionDecision.deny;
+                return self.child_approvals.answer(state, message.id.?.integer, decision);
             }
             handleClientResponse(state, state.alloc, &message);
         } else if (message.id == null) {
@@ -976,70 +965,30 @@ pub const PersistentHost = struct {
         return self.state.active_prompt != null or hostJobRunning(&self.state);
     }
 
-    fn retireChildApproval(self: *PersistentHost) void {
-        if (self.child_approval) |*forwarded| {
-            var params: std.Io.Writer.Allocating = .init(self.state.alloc);
-            defer params.deinit();
-            std.json.Stringify.value(.{ .request_id = forwarded.id }, .{}, &params.writer) catch {};
-            self.state.writer.writeNotification(self.state.alloc, "proto/permission_retired", params.written()) catch {};
-            forwarded.pending.deinit(self.state.alloc);
-            self.child_approval = null;
-        }
-    }
-
     pub fn refreshChildApprovals(self: *PersistentHost) void {
-        self.retireChildApproval();
-        self.child_approval_revision = null;
+        self.child_approvals.retireAll(&self.state);
     }
 
-    /// Native child approvals are registry-owned; unlike a local TUI, a detached
-    /// ACP host must project them onto its connection and route the exact reply.
+    /// Native child approvals are registry-owned; unlike a local TUI, a
+    /// detached ACP host projects those of every depth onto its connection,
+    /// up to a bound, and routes each exact reply.
     pub fn pumpChildApprovals(self: *PersistentHost) !void {
-        const child_host = self.state.subagent_host orelse return;
-        const revision = child_host.approvals.pendingRevision();
-        if (self.child_approval_revision == revision) return;
-        var pending = try child_host.pendingApprovalRequest(self.state.alloc);
-        defer if (pending) |*request| request.deinit(self.state.alloc);
-        if (pending) |request| {
-            if (self.child_approval) |forwarded| {
-                if (std.mem.eql(u8, forwarded.pending.request_id, request.request_id)) {
-                    self.child_approval_revision = revision;
-                    return;
-                }
-            }
-        }
-        self.retireChildApproval();
-        if (pending) |request| {
-            self.state.outbound_mutex.lockUncancelable(io_mod.getIo());
-            const id = self.state.next_outbound_request_id;
-            self.state.next_outbound_request_id += 1;
-            self.state.outbound_mutex.unlock(io_mod.getIo());
-            const title = try self.state.alloc.print("Subagent {s}: {s}", .{ request.child_id, request.request.label });
-            defer self.state.alloc.free(title);
-            var params: std.Io.Writer.Allocating = .init(self.state.alloc);
-            defer params.deinit();
-            try std.json.Stringify.value(.{
-                .sessionId = self.state.active_session.?.session_id,
-                .childSessionId = request.child_id,
-                .toolCall = .{
-                    .toolCallId = request.request_id,
-                    .name = "subagent",
-                    .title = title,
-                    .kind = "execute",
-                    .status = "pending",
-                    .rawInput = .{ .child_id = request.child_id, .command = request.request.command, .arguments_preview = request.request.tool_arguments_preview, .explanation = request.request.explanation },
-                },
-                .options = .{
-                    .{ .optionId = "allow_once", .name = "Allow once", .kind = "allow_once" },
-                    .{ .optionId = "allow_always", .name = "Allow for this session", .kind = "allow_always" },
-                    .{ .optionId = "reject_once", .name = "Reject", .kind = "reject_once" },
-                },
-            }, .{}, &params.writer);
-            try self.state.writer.writeRequest(self.state.alloc, .{ .integer = @intCast(id) }, "session/request_permission", params.written());
-            self.child_approval = .{ .id = @intCast(id), .pending = request };
-            pending = null;
-        }
-        self.child_approval_revision = revision;
+        try self.child_approvals.pump(&self.state);
+    }
+
+    /// Starts a person's message as node `node_id`'s next work, or names why
+    /// the node cannot take it now.
+    pub fn messageNode(self: *PersistentHost, node_id: []const u8, text: []const u8) !?host_commands.NodeRefusal {
+        return self.node_messages.start(&self.state, node_id, text);
+    }
+
+    pub fn cancelNode(self: *PersistentHost, node_id: []const u8) void {
+        self.node_messages.cancel(node_id);
+    }
+
+    /// A person's message runs on a node, beside whatever the root does.
+    pub fn nodeWorkRunning(self: *PersistentHost) bool {
+        return self.node_messages.busy();
     }
 
     pub fn withdrawSteeringRequest(self: *PersistentHost, id: i64) bool {
@@ -1063,7 +1012,8 @@ pub const PersistentHost = struct {
     pub fn deinit(self: *PersistentHost) void {
         const alloc = self.state.alloc;
         handleCancel(&self.state, false);
-        self.retireChildApproval();
+        self.node_messages.deinit();
+        self.child_approvals.deinit(&self.state);
         self.state.deinit();
         alloc.destroy(self);
     }
@@ -4272,6 +4222,13 @@ fn handleHostCommand(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messag
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
+    // A command for a node below the root runs on that node, or is refused.
+    if (parsed.value.object.get("nodeId")) |node| if (node == .string and !std.mem.eql(u8, node.string, session.session_id)) {
+        if (try node_host.runCommand(parsed.arena.allocator(), state, node.string, command, &out.writer)) |refusal| {
+            return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_request, .message = refusal.text() });
+        }
+        return state.writer.writeResponse(alloc, msg.id, out.written());
+    };
     switch (command) {
         .last_reply => try host_commands.writeResult(&out.writer, command, .{
             .text = session.session_rt.lastAssistantReply() orelse "",

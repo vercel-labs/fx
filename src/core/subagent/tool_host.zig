@@ -260,7 +260,20 @@ pub const Runtime = struct {
         runtime.managed = runtime.managedOwnerValue();
         errdefer runtime.managed.deinit();
         try runtime.managed.recoverInterrupted();
+        try options.tree.registerHost(runtime.node_id, runtime);
         return runtime;
+    }
+
+    /// Runs `visit(context, host)` on the live host of node `id` anywhere in
+    /// this tree; that host cannot close until `visit` returns. Null when
+    /// the node has no live host: it is not the root and no turn of it runs.
+    pub fn withNodeHost(self: *Runtime, id: []const u8, comptime R: type, context: anytype, comptime visit: fn (@TypeOf(context), *Runtime) R) ?R {
+        const Adapter = struct {
+            fn call(ctx: @TypeOf(context), raw: *anyopaque) R {
+                return visit(ctx, @ptrCast(@alignCast(raw)));
+            }
+        };
+        return self.tree.withHost(id, R, context, Adapter.call);
     }
 
     /// A host for `turn`'s child, which runs under this node, while that
@@ -290,6 +303,7 @@ pub const Runtime = struct {
     /// Joins every child first, so no node closes while a descendant runs
     /// (`tests/tla/session_manager/Tree.tla` AncestorsOutliveDescendants).
     pub fn deinit(self: *Runtime) void {
+        self.tree.unregisterHost(self);
         self.cancelYielded();
         self.yielded.deinit(self.alloc);
         self.managed.deinit();

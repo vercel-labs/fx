@@ -1,9 +1,10 @@
 //! The connections watching one session, and what each was last sent.
 //!
 //! A watcher sees the session's events and record from the snapshot that
-//! started its watch (`Session.pushUpdates`), and, when it asked, the
-//! session's children list and one child's transcript (`Session.pushViews`).
-//! Each watcher holds a reference on its connection.
+//! started its watch (`Session.pushUpdates`), and, when it asked, one node's
+//! children list and one node's transcript, at any depth of the session's
+//! tree (`Session.pushViews`). A node no one watches costs no reads or
+//! pushes. Each watcher holds a reference on its connection.
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const protocol = @import("protocol.zig");
@@ -18,6 +19,7 @@ pub fn digest(bytes: []const u8) u64 {
 /// send in its next `history` request.
 const ChildCursor = struct {
     child_id: []u8,
+    parent_id: []u8,
     work_id: []u8,
     live_sequence: u64,
     live_active: bool,
@@ -26,8 +28,11 @@ const ChildCursor = struct {
     fn init(alloc: Allocator, view: anytype) !ChildCursor {
         const child_id = try alloc.dupe(u8, view.child_id);
         errdefer alloc.free(child_id);
+        const parent_id = try alloc.dupe(u8, view.parent_id);
+        errdefer alloc.free(parent_id);
         return .{
             .child_id = child_id,
+            .parent_id = parent_id,
             .work_id = try alloc.dupe(u8, view.work_id),
             .live_sequence = view.live_sequence,
             .live_active = view.live_active,
@@ -37,6 +42,7 @@ const ChildCursor = struct {
 
     fn deinit(self: *ChildCursor, alloc: Allocator) void {
         alloc.free(self.child_id);
+        alloc.free(self.parent_id);
         alloc.free(self.work_id);
         self.* = undefined;
     }
@@ -45,6 +51,7 @@ const ChildCursor = struct {
         return .{
             .session_id = session_id,
             .child_id = self.child_id,
+            .parent_id = if (self.parent_id.len > 0) self.parent_id else null,
             .work_id = self.work_id,
             .after_live_sequence = self.live_sequence,
             .live_active = self.live_active,
@@ -69,16 +76,23 @@ const ChildCursor = struct {
     }
 };
 
+pub const ChildrenWatch = struct {
+    node_id: []u8,
+    /// The digest of the list last sent.
+    digest: u64,
+};
+
 const Watcher = struct {
     conn: *Conn,
     /// The last event sequence and session version this watcher was sent.
     sequence: u64,
     version: u64,
-    /// The digest of the children list last sent, while watched.
-    children: ?u64 = null,
+    /// The node whose children list is watched, and what was last sent.
+    children: ?ChildrenWatch = null,
     child: ?ChildCursor = null,
 
     fn deinit(self: *Watcher, alloc: Allocator) void {
+        if (self.children) |list| alloc.free(list.node_id);
         if (self.child) |*cursor| cursor.deinit(alloc);
         self.conn.release();
         self.* = undefined;
@@ -107,6 +121,7 @@ pub const Watchers = struct {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         if (self.find(conn)) |watcher| {
+            if (watcher.children) |list| alloc.free(list.node_id);
             if (watcher.child) |*cursor| cursor.deinit(alloc);
             watcher.* = .{ .conn = conn, .sequence = sequence, .version = version };
             return;
@@ -131,7 +146,10 @@ pub const Watchers = struct {
         const watcher = self.find(conn) orelse return;
         switch (topic) {
             .session, .list, .stopped => {},
-            .children => watcher.children = null,
+            .children => if (watcher.children) |list| {
+                alloc.free(list.node_id);
+                watcher.children = null;
+            },
             .child => if (watcher.child) |*cursor| {
                 cursor.deinit(alloc);
                 watcher.child = null;
@@ -139,12 +157,15 @@ pub const Watchers = struct {
         }
     }
 
-    /// Watches the children list `conn` was just sent, if it watches this
-    /// session.
-    pub fn watchChildren(self: *Watchers, conn: *Conn, bytes: []const u8) void {
+    /// Watches node `node_id`'s children list, which `conn` was just sent,
+    /// if it watches this session. It replaces any list watched before.
+    pub fn watchChildren(self: *Watchers, alloc: Allocator, conn: *Conn, node_id: []const u8, bytes: []const u8) !void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        if (self.find(conn)) |watcher| watcher.children = digest(bytes);
+        const watcher = self.find(conn) orelse return;
+        const owned = try alloc.dupe(u8, node_id);
+        if (watcher.children) |list| alloc.free(list.node_id);
+        watcher.children = .{ .node_id = owned, .digest = digest(bytes) };
     }
 
     /// Watches the child transcript `conn` was just sent, from where `view`
@@ -156,6 +177,33 @@ pub const Watchers = struct {
         const cursor = try ChildCursor.init(alloc, view);
         if (watcher.child) |*old| old.deinit(alloc);
         watcher.child = cursor;
+    }
+
+    /// Pushes each watched children list and node transcript that changed.
+    /// `views` reads them: `children(arena, node_id)` and
+    /// `childView(arena, request)`, the bodies their requests return.
+    pub fn pushViews(self: *Watchers, alloc: Allocator, views: anytype) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.items.items) |*watcher| {
+            var arena_state = std.heap.ArenaAllocator.init(alloc);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            if (watcher.children) |*list| if (views.children(arena, list.node_id)) |bytes| {
+                const value = digest(bytes);
+                if (value != list.digest) {
+                    watcher.conn.push(arena, .children, bytes) catch {};
+                    list.digest = value;
+                }
+            } else |_| {};
+            if (watcher.child) |*cursor| {
+                const view = views.childView(arena, cursor.request(views.id)) catch continue;
+                if (!cursor.changedBy(view)) continue;
+                const bytes = protocol.encode(arena, view) catch continue;
+                watcher.conn.push(arena, .child, bytes) catch {};
+                cursor.advance(alloc, view) catch {};
+            }
+        }
     }
 
     /// Drops watchers whose connection ended. Holds `mutex`.
@@ -175,7 +223,7 @@ pub const Watchers = struct {
 
 test "a child cursor reports only new output or a changed status" {
     const alloc = std.testing.allocator;
-    const View = struct { child_id: []const u8, work_id: []const u8, live_sequence: u64, live_active: bool, live_reset: bool = false, status: []const u8 };
+    const View = struct { child_id: []const u8, parent_id: []const u8 = "mid", work_id: []const u8, live_sequence: u64, live_active: bool, live_reset: bool = false, status: []const u8 };
     var cursor = try ChildCursor.init(alloc, View{ .child_id = "c", .work_id = "w1", .live_sequence = 3, .live_active = true, .status = "running" });
     defer cursor.deinit(alloc);
     try std.testing.expect(!cursor.changedBy(View{ .child_id = "c", .work_id = "w1", .live_sequence = 3, .live_active = true, .status = "running" }));
@@ -185,4 +233,6 @@ test "a child cursor reports only new output or a changed status" {
     const next = cursor.request("s");
     try std.testing.expectEqualStrings("w2", next.work_id.?);
     try std.testing.expect(!next.include_history and !next.live_active);
+    // A node below a child is read under its real parent.
+    try std.testing.expectEqualStrings("mid", next.parent_id.?);
 }

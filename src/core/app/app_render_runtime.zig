@@ -860,6 +860,7 @@ pub fn Runtime(comptime App: type) type {
                 .esc_interrupt_armed = app.input_runtime.gestures.escapeInterruptArmed(),
                 .question = app.question_prompt.projection(),
                 .statusline = statusline,
+                .breadcrumb = session_backend.Ops(App).view(app).breadcrumb,
                 .activity = activityProjection(app),
                 .input = &app.input_runtime,
             };

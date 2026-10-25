@@ -27,6 +27,17 @@ fn dropRequests(alloc: Allocator, list: *std.ArrayList(Request)) void {
     for (list.items) |request| alloc.free(request.json);
     list.clearRetainingCapacity();
 }
+/// One node on the path from the root to the viewed child.
+pub const Hop = struct {
+    id: []u8,
+    name: []u8,
+
+    pub fn deinit(self: Hop, alloc: Allocator) void {
+        alloc.free(self.id);
+        alloc.free(self.name);
+    }
+};
+
 const Link = enum {
     /// No connection yet, or the last one dropped.
     connecting,
@@ -51,11 +62,16 @@ pub const State = struct {
     /// The attached root session.
     current_id: []u8 = &.{},
     /// The node below the root that the composer shows, empty at the root.
-    /// Any node other than the root is a read-only transcript.
+    /// A prompt typed there is a message to that node.
     child_id: []u8 = &.{},
+    /// Its label: its agent name, or the end of its id.
+    child_name: []u8 = &.{},
     /// The nodes between the root and `child_id`, nearest the root first;
     /// Left walks back up through them.
-    child_ancestors: std.ArrayList([]u8) = .empty,
+    child_ancestors: std.ArrayList(Hop) = .empty,
+    /// The footer's path to the focused node, `root › a › b`; empty at the
+    /// root.
+    breadcrumb: []u8 = &.{},
     generation: u64 = 1,
     sequence: u64 = 0,
     child_history_count: ?usize = null,
@@ -87,8 +103,10 @@ pub const State = struct {
         self.sent.deinit(alloc);
         if (self.current_id.len > 0) alloc.free(self.current_id);
         if (self.child_id.len > 0) alloc.free(self.child_id);
+        if (self.child_name.len > 0) alloc.free(self.child_name);
+        if (self.breadcrumb.len > 0) alloc.free(self.breadcrumb);
         if (self.pending_permission_session.len > 0) alloc.free(self.pending_permission_session);
-        for (self.child_ancestors.items) |id| alloc.free(id);
+        for (self.child_ancestors.items) |hop| hop.deinit(alloc);
         self.child_ancestors.deinit(alloc);
         if (self.child_prompt.len > 0) alloc.free(self.child_prompt);
         if (self.child_work_id.len > 0) alloc.free(self.child_work_id);
@@ -104,6 +122,32 @@ pub const State = struct {
     /// The node the composer shows: the viewed child, or the root.
     pub fn viewedNodeId(self: *const State) []const u8 {
         return if (self.child_id.len > 0) self.child_id else self.current_id;
+    }
+
+    /// The parent of the viewed child: its nearest ancestor, or the root.
+    pub fn viewedParentId(self: *const State) []const u8 {
+        return if (self.child_ancestors.last()) |hop| hop.id else self.current_id;
+    }
+
+    /// Whether the viewed child's work is running or waiting for an approval.
+    pub fn viewedChildRunning(self: *const State) bool {
+        const status = self.child_status[0..self.child_status_len];
+        return self.child_live_active or std.mem.eql(u8, status, "running") or std.mem.eql(u8, status, "awaiting_approval");
+    }
+
+    /// Rebuilds `breadcrumb` from the root through the ancestors to the
+    /// viewed child.
+    pub fn rebuildBreadcrumb(self: *State, alloc: Allocator) !void {
+        var path: std.Io.Writer.Allocating = .init(alloc);
+        defer path.deinit();
+        if (self.child_id.len > 0) {
+            try path.writer.writeAll("root");
+            for (self.child_ancestors.items) |hop| try path.writer.print(" › {s}", .{hop.name});
+            try path.writer.print(" › {s}", .{self.child_name});
+        }
+        const owned = try path.toOwnedSlice();
+        if (self.breadcrumb.len > 0) alloc.free(self.breadcrumb);
+        self.breadcrumb = owned;
     }
 
     pub fn clearChildTracking(self: *State, alloc: Allocator) void {
@@ -221,7 +265,8 @@ pub fn Runtime(comptime App: type) type {
                 try app.remote.enqueue(.list, .{ .list = .{ .watch = true } });
                 app.remote.watching.list = true;
             } else if (app.remote.current_id.len > 0) {
-                try app.remote.enqueue(.children, .{ .children = .{ .session_id = app.remote.current_id, .watch = true } });
+                // Right lists the children of whichever node the composer shows.
+                try app.remote.enqueue(.children, .{ .children = .{ .session_id = app.remote.current_id, .node_id = app.remote.viewedNodeId(), .watch = true } });
                 app.remote.watching.children = true;
             } else {
                 try app.input_runtime.session_browser.replaceRows(app.alloc, &.{});
@@ -347,6 +392,7 @@ pub fn Runtime(comptime App: type) type {
             try remote.enqueue(.history, .{ .history = .{
                 .session_id = remote.current_id,
                 .child_id = remote.child_id,
+                .parent_id = remote.viewedParentId(),
                 .work_id = if (remote.child_work_id.len > 0) remote.child_work_id else null,
                 .after_live_sequence = remote.child_sequence,
                 .live_active = remote.child_live_active,
@@ -383,7 +429,7 @@ pub fn Runtime(comptime App: type) type {
                 .children => {
                     var listed = try decode(client_protocol.Children, app, value);
                     defer listed.deinit();
-                    try View.applyChildRows(app, listed.value.children);
+                    try View.applyChildRows(app, listed.value.node_id, listed.value.children);
                 },
                 .startup_last, .startup_remembered => {
                     var listed = try decode(client_protocol.SessionList, app, value);
@@ -413,7 +459,7 @@ pub fn Runtime(comptime App: type) type {
                     try View.showKernel(app, state.value.kernel);
                 },
                 .history => {
-                    var child = try decode(client_protocol.ChildHistory(std.json.Value), app, value);
+                    var child = try decode(client_protocol.ChildHistory([]const types.HistoryTurn, std.json.Value), app, value);
                     defer child.deinit();
                     try View.applyChildSnapshot(app, child.value);
                 },

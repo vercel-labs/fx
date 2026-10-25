@@ -355,6 +355,9 @@ pub const RenderContext = struct {
     writing_response: bool = false,
     has_api_key: bool,
     model: []const u8,
+    /// The path to the focused node of a session tree, as labels joined by
+    /// ` › `; empty at the root.
+    breadcrumb: []const u8 = "",
     pending_images: []const types.ImageAttachment = &.{},
     composer_visible: bool = true,
     permission_mode: types.PermissionMode = .ask,

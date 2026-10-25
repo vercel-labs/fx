@@ -94,6 +94,36 @@ pub const ContextUsage = struct {
     auto_compact_percent: u8,
 };
 
+/// Why the host will not run something on a node below the root. The host
+/// answers with `text()`, which the frontend shows as it is.
+pub const NodeRefusal = enum {
+    /// The host does not run this on a subagent yet.
+    unsupported,
+    unknown_node,
+    /// The node's work is running or waiting for an approval.
+    node_running,
+    /// A one-off subagent ran its task and takes no more messages.
+    one_off,
+    /// Only the root's own subagents take messages from the frontend.
+    not_root_child,
+    /// Another message from the frontend is still running.
+    message_running,
+    /// Every run slot of the session's tree is taken.
+    capacity,
+
+    pub fn text(self: NodeRefusal) []const u8 {
+        return switch (self) {
+            .unsupported => "This is not yet supported in a subagent session. Press Left to return to the parent.",
+            .unknown_node => "This subagent is not part of the attached session.",
+            .node_running => "This subagent is still working. Send your message when it finishes, or press Left to return to the parent.",
+            .one_off => "This subagent ran a one-off task and takes no follow-up messages. Ask its parent to start a named subagent instead.",
+            .not_root_child => "Only a subagent of the root session takes your messages for now. Message its parent instead.",
+            .message_running => "Another message to a subagent is still running. Send this one when it finishes.",
+            .capacity => "Every subagent run slot of this session is in use. Send your message when one finishes.",
+        };
+    }
+};
+
 pub const ParseError = error{ MissingCommand, UnknownCommand, MissingPath };
 
 /// An `fx/command` request's fields. The request also names its session,

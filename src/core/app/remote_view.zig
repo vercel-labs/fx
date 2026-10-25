@@ -166,13 +166,16 @@ pub fn Runtime(comptime App: type) type {
             try browser.replaceRows(app.alloc, rows);
         }
 
-        pub fn applyChildRows(app: *App, children: []const client_protocol.Child) !void {
+        /// `node_id` names the node these are the children of; a list for a
+        /// node the composer left is stale.
+        pub fn applyChildRows(app: *App, node_id: []const u8, children: []const client_protocol.Child) !void {
             const browser = &app.input_runtime.session_browser;
             if (!browser.active or browser.scope != .subagents) return;
             var arena: std.heap.ArenaAllocator = .init(app.alloc);
             defer arena.deinit();
             // Right lists the children of whichever node the composer shows.
             const node = app.remote.viewedNodeId();
+            if (node_id.len > 0 and !std.mem.eql(u8, node_id, node)) return;
             var count: usize = 0;
             for (children) |item| count += @intFromBool(std.mem.eql(u8, item.parent_id, node));
             const rows = try arena.allocator().alloc(browser_mod.Row, count);
@@ -195,7 +198,7 @@ pub fn Runtime(comptime App: type) type {
             try browser.replaceRows(app.alloc, rows);
         }
 
-        pub fn applyChildSnapshot(app: *App, value: client_protocol.ChildHistory(std.json.Value)) !void {
+        pub fn applyChildSnapshot(app: *App, value: client_protocol.ChildHistory([]const types.HistoryTurn, std.json.Value)) !void {
             const remote = &app.remote;
             if (remote.child_id.len == 0 or !std.mem.eql(u8, remote.child_id, value.child_id)) return;
             const live_active = value.live_active;
@@ -217,7 +220,7 @@ pub fn Runtime(comptime App: type) type {
                 try sessions.Runtime(App).replayRemoteHistory(app, history);
                 remote.native_turn_offset = app.shell.finalizedToolTurnWatermark() + 1;
                 const outcome = if (live_active) value.status else value.last_outcome orelse value.status;
-                const body = try app.alloc.print("{s} · {s} · read-only child transcript · left returns to parent", .{ value.name, outcome });
+                const body = try app.alloc.print("{s} · {s} · subagent transcript · left returns to parent, right lists its subagents", .{ value.name, outcome });
                 defer app.alloc.free(body);
                 try notice(app, "subagent", body);
                 if (!live_active) if (value.last_failure) |failure| try notice(app, "subagent", failure);
@@ -237,7 +240,7 @@ pub fn Runtime(comptime App: type) type {
             remote.child_status_len = @min(status.len, remote.child_status.len);
             @memcpy(remote.child_status[0..remote.child_status_len], status[0..remote.child_status_len]);
             remote.child_live_active = live_active;
-            app.stream.active = childIsRunning(app);
+            app.stream.active = remote.viewedChildRunning() or remote.submissionQueued();
             if (std.mem.eql(u8, status, "awaiting_approval")) {
                 if (app.stream.waiting_since_ms == 0) app.stream.waiting_since_ms = io_mod.milliTimestamp();
             } else if (app.stream.waiting_since_ms != 0) {
@@ -452,7 +455,7 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
             const submission_queued = remote.submissionQueued();
-            app.stream.active = if (remote.child_id.len > 0) childIsRunning(app) else running or submission_queued;
+            app.stream.active = if (remote.child_id.len > 0) remote.viewedChildRunning() or submission_queued else running or submission_queued;
             if (remote.reconnect_notice) {
                 remote.reconnect_notice = false;
                 try notice(app, "session", "Supervisor restarted; restored this session. Unsent requests were not replayed.");
@@ -468,11 +471,6 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
             }
-        }
-
-        fn childIsRunning(app: *App) bool {
-            const status = app.remote.child_status[0..app.remote.child_status_len];
-            return app.remote.child_live_active or std.mem.eql(u8, status, "running") or std.mem.eql(u8, status, "awaiting_approval");
         }
 
         fn applyFrame(app: *App, frame: std.json.Value) !void {

@@ -15,6 +15,7 @@
 //!   operation                         in_process                  detached
 //!   submit a prompt                   worker queue                supervisor `prompt`
 //!   admit a prompt before its card    always                      focused node takes it
+//!   message an idle subagent          (not offered)               supervisor `prompt` with its node
 //!   admit a prompt / credentials      local credential checks     daemon owns credentials
 //!   cancel the turn                   worker interrupt            supervisor `cancel`
 //!   answer a permission request       local approval flow         supervisor `permission`
@@ -58,8 +59,11 @@ pub const View = struct {
     workspace_root: []const u8 = "",
     /// A terminal-safe label for an attached workspace, when it has one.
     workspace_label: ?[]const u8 = null,
-    /// The composer shows a read-only child transcript.
+    /// The composer shows a subagent below the root; Left returns to its
+    /// parent.
     child_transcript: bool = false,
+    /// The path to the focused node, `root › a › b`; empty at the root.
+    breadcrumb: []const u8 = "",
     /// Left and Right open the session and subagent browser.
     session_browser: bool = false,
     /// Model pickers can offer effort and speed stages, because this
@@ -93,6 +97,7 @@ pub fn Ops(comptime App: type) type {
                     .workspace_root = remote.cwd,
                     .workspace_label = remote.workspace_label,
                     .child_transcript = remote.child_id.len > 0,
+                    .breadcrumb = remote.breadcrumb,
                     .session_browser = true,
                     .model_options = false,
                     .session_controls = false,

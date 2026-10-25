@@ -16,6 +16,8 @@ const protocol = @import("protocol.zig");
 const server = @import("server.zig");
 const watch_mod = @import("watch.zig");
 const child_views = @import("child_views.zig");
+const host_commands = @import("../../acp/commands.zig");
+const kernel_slot = @import("../kernel/slot.zig");
 const Daemon = server.Daemon;
 const Conn = server.Conn;
 const Allocator = std.mem.Allocator;
@@ -78,6 +80,8 @@ pub const Session = struct {
     version: u64 = 0,
 
     watchers: watch_mod.Watchers = .{},
+    /// Recently viewed node transcripts. Executor-owned.
+    views: child_views.Cache,
 
     const Event = struct { sequence: u64, frame: []u8 };
     const Capture = struct { id: i64, frame: ?[]u8 = null };
@@ -91,7 +95,7 @@ pub const Session = struct {
         const owned_cwd = try alloc.dupe(u8, cwd);
         errdefer alloc.free(owned_cwd);
         const owned_id = try alloc.dupe(u8, id);
-        self.* = .{ .daemon = daemon, .id = owned_id, .cwd = owned_cwd, .record = record, .next_tick_ms = io_mod.milliTimestamp() };
+        self.* = .{ .daemon = daemon, .id = owned_id, .cwd = owned_cwd, .record = record, .next_tick_ms = io_mod.milliTimestamp(), .views = .{ .alloc = alloc } };
         return self;
     }
 
@@ -106,6 +110,7 @@ pub const Session = struct {
         for (self.commands.items) |command| alloc.free(command.name);
         self.commands.deinit(alloc);
         self.watchers.deinit(alloc);
+        self.views.deinit();
         self.jobs.deinit(alloc);
         if (self.history_json) |history| alloc.free(history);
         alloc.free(self.id);
@@ -168,10 +173,8 @@ pub const Session = struct {
         const host = self.host orelse return false;
         if (host.busy() or self.record.heartbeatArmed()) return true;
         // A cell runs inside a turn, so this only catches one that outlives
-        // its turn's cancellation.
-        if (host.state.active_session) |*active| if (active.session_rt.kernel.current()) |manager| {
-            if (manager.executing()) return true;
-        };
+        // its turn's cancellation, at any depth: the pool owns every kernel.
+        if (kernel_slot.pool.anyExecuting()) return true;
         var arena_state = std.heap.ArenaAllocator.init(self.daemon.alloc);
         defer arena_state.deinit();
         // An unreadable registry keeps the supervisor up rather than risk
@@ -262,15 +265,23 @@ pub const Session = struct {
             .command => |request| return self.hostCommand(arena, request),
             .rename => |request| return self.rename(arena, request.name),
             .kernel => |request| {
+                // Child kernels belong to their nodes' runtimes, which the
+                // root's kernel control does not reach yet.
+                if (self.belowRoot(request.node_id)) return protocol.encode(arena, protocol.Failure{ .@"error" = host_commands.NodeRefusal.unsupported.text() });
                 const info = try (self.host orelse return error.SessionStopped).kernelControl(arena, request.action);
                 return protocol.encode(arena, protocol.KernelState{ .kernel = .{ .state = info.state, .diagnostics = info.diagnostics } });
             },
             .prompt => |request| {
+                if (self.belowRoot(request.node_id)) return self.messageNode(arena, request.node_id.?, request.text);
                 const request_id = try self.prompt(request.text, .user);
                 return protocol.encode(arena, protocol.PromptAdmitted{ .request_id = request_id });
             },
-            .cancel => {
+            .cancel => |request| {
                 const host = self.host orelse return error.SessionStopped;
+                if (self.belowRoot(request.node_id)) {
+                    host.cancelNode(request.node_id.?);
+                    return protocol.encode(arena, protocol.Ack{});
+                }
                 _ = try self.dispatch("session/cancel", .{ .sessionId = self.id }, .none);
                 self.clearPending();
                 host.refreshChildApprovals();
@@ -283,8 +294,9 @@ pub const Session = struct {
             .stop => return self.stop(arena),
             .heartbeat => |request| return self.heartbeat(arena, request),
             .children => |request| {
-                const bytes = try self.children(arena);
-                if (request.watch) if (job.watcher()) |conn| self.watchers.watchChildren(conn, bytes);
+                const node_id = request.node_id orelse self.id;
+                const bytes = try self.children(arena, node_id);
+                if (request.watch) if (job.watcher()) |conn| try self.watchers.watchChildren(self.daemon.alloc, conn, node_id, bytes);
                 return bytes;
             },
             .history => |request| {
@@ -480,12 +492,29 @@ pub const Session = struct {
         }
         _ = try self.dispatch("fx/command", .{
             .sessionId = self.id,
+            .nodeId = if (self.belowRoot(request.node_id)) request.node_id else null,
             .command = request.name,
             .action = request.action,
             .path = request.path,
             .line = request.line,
         }, .{ .command = request.name });
         return protocol.encode(arena, protocol.CommandAccepted{});
+    }
+
+    /// Whether `node_id` names a node below this session's root.
+    fn belowRoot(self: *const Session, node_id: ?[]const u8) bool {
+        const id = node_id orelse return false;
+        return id.len > 0 and !std.mem.eql(u8, id, self.id);
+    }
+
+    /// Hands a user message to node `node_id`, which runs it as its own
+    /// work. A refusal names why, so the frontend can show it.
+    fn messageNode(self: *Session, arena: Allocator, node_id: []const u8, text: []const u8) ![]const u8 {
+        if (text.len == 0 or text.len > max_prompt_bytes) return error.InvalidPrompt;
+        const host = self.host orelse return error.SessionStopped;
+        if (try host.messageNode(node_id, text)) |refusal| return protocol.encode(arena, protocol.Failure{ .@"error" = refusal.text() });
+        self.noteWork();
+        return protocol.encode(arena, protocol.PromptAdmitted{ .request_id = 0 });
     }
 
     const PromptOrigin = enum { user, heartbeat };
@@ -718,23 +747,7 @@ pub const Session = struct {
         const pending = self.pendingCount();
         self.record_mutex.lockUncancelable(io_mod.getIo());
         defer self.record_mutex.unlock(io_mod.getIo());
-        return summaryOf(arena, self.id, self.cwd, &self.record, pending);
-    }
-
-    fn summaryOf(arena: Allocator, id: []const u8, cwd: []const u8, record: *const Record, pending: usize) !protocol.SessionSummary {
-        var heartbeat_copy = record.heartbeat;
-        heartbeat_copy.prompt = try arena.dupe(u8, record.heartbeat.prompt);
-        return .{
-            .id = try arena.dupe(u8, id),
-            .name = try arena.dupe(u8, record.name),
-            .cwd = try arena.dupe(u8, cwd),
-            .model = try arena.dupe(u8, record.model),
-            .mode = if (record.mode.len > 0) try arena.dupe(u8, record.mode) else "auto",
-            .status = record.status(pending),
-            .heartbeat = heartbeat_copy,
-            .error_message = if (record.failure) |failure| try arena.dupe(u8, failure) else null,
-            .updated_at_ms = record.updated_at_ms,
-        };
+        return self.record.summary(arena, self.id, self.cwd, pending);
     }
 
     /// Whether the browser lists this session: a live one once its first
@@ -770,7 +783,7 @@ pub const Session = struct {
     fn snapshot(self: *Session, arena: Allocator, after: u64, include_history: bool) !Snap {
         try self.refreshHistory();
         const pending_count = self.pendingCount();
-        const session_summary = try summaryOf(arena, self.id, self.cwd, &self.record, pending_count);
+        const session_summary = try self.record.summary(arena, self.id, self.cwd, pending_count);
         const checkpoint = if (include_history) self.history_sequence else after;
         const Frame = protocol.RawJson;
         self.events_mutex.lockUncancelable(io_mod.getIo());
@@ -845,32 +858,11 @@ pub const Session = struct {
         }
     }
 
-    /// Sends the children list and child transcripts that changed to the
+    /// Sends the children lists and node transcripts that changed to the
     /// watchers that asked for them.
     fn pushViews(self: *Session) void {
         if (self.host == null) return;
-        const alloc = self.daemon.alloc;
-        self.watchers.mutex.lockUncancelable(io_mod.getIo());
-        defer self.watchers.mutex.unlock(io_mod.getIo());
-        for (self.watchers.items.items) |*watcher| {
-            var arena_state = std.heap.ArenaAllocator.init(alloc);
-            defer arena_state.deinit();
-            const arena = arena_state.allocator();
-            if (watcher.children) |last| if (self.children(arena)) |bytes| {
-                const digest = watch_mod.digest(bytes);
-                if (digest != last) {
-                    watcher.conn.push(arena, .children, bytes) catch {};
-                    watcher.children = digest;
-                }
-            } else |_| {};
-            if (watcher.child) |*cursor| {
-                const view = self.childView(arena, cursor.request(self.id)) catch continue;
-                if (!cursor.changedBy(view)) continue;
-                const bytes = protocol.encode(arena, view) catch continue;
-                watcher.conn.push(arena, .child, bytes) catch {};
-                cursor.advance(alloc, view) catch {};
-            }
-        }
+        self.watchers.pushViews(self.daemon.alloc, self);
     }
 
     fn rootHistory(self: *Session, arena: Allocator) ![]const u8 {
@@ -879,12 +871,12 @@ pub const Session = struct {
         return protocol.encode(arena, protocol.RootHistory(protocol.RawJson){ .history = .{ .bytes = self.history_json orelse "[]" } });
     }
 
-    fn children(self: *Session, arena: Allocator) ![]const u8 {
-        return child_views.children(arena, self.host orelse return error.SessionStopped, self.id);
+    pub fn children(self: *Session, arena: Allocator, node_id: []const u8) ![]const u8 {
+        return child_views.children(arena, self.host orelse return error.SessionStopped, node_id);
     }
 
-    fn childView(self: *Session, arena: Allocator, request: protocol.History) !protocol.ChildHistory(protocol.RawJson) {
-        return child_views.childView(arena, self.host orelse return error.SessionStopped, self.id, request);
+    pub fn childView(self: *Session, arena: Allocator, request: protocol.History) !child_views.View {
+        return child_views.childView(arena, self.host orelse return error.SessionStopped, &self.views, request);
     }
 
     // -- the host's writer ---------------------------------------------------

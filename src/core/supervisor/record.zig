@@ -52,6 +52,24 @@ pub const Record = struct {
         self.* = undefined;
     }
 
+    /// The listed summary of session `id`, with `pending` requests waiting.
+    /// Everything borrows `arena`.
+    pub fn summary(record: *const Record, arena: Allocator, id: []const u8, cwd: []const u8, pending: usize) !protocol.SessionSummary {
+        var heartbeat_copy = record.heartbeat;
+        heartbeat_copy.prompt = try arena.dupe(u8, record.heartbeat.prompt);
+        return .{
+            .id = try arena.dupe(u8, id),
+            .name = try arena.dupe(u8, record.name),
+            .cwd = try arena.dupe(u8, cwd),
+            .model = try arena.dupe(u8, record.model),
+            .mode = if (record.mode.len > 0) try arena.dupe(u8, record.mode) else "auto",
+            .status = record.status(pending),
+            .heartbeat = heartbeat_copy,
+            .error_message = if (record.failure) |failure| try arena.dupe(u8, failure) else null,
+            .updated_at_ms = record.updated_at_ms,
+        };
+    }
+
     pub fn setName(self: *Record, alloc: Allocator, name: []const u8) !void {
         const owned = try alloc.dupe(u8, name);
         alloc.free(self.name);

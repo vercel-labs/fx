@@ -8,8 +8,10 @@
 //! here defaults to the root. The composer's focus (the root, or the
 //! subagent it shows) picks the target for prompts and `.node` commands,
 //! and a command's `scope` sends `.tree` and `.root` commands to the root.
-//! `wireSession` is the one place that refuses what the supervisor cannot
-//! do on a node yet.
+//! A prompt, a cancel, a host command, or `/kernel` on a node travels with
+//! the node's id, and the host decides what it can do there (D91).
+//! `wireSession` refuses the session settings the supervisor changes only
+//! on the root.
 //!
 //! Slash commands go through the shared router with this backend's handler
 //! table: commands the session owns become requests, and frontend commands
@@ -52,17 +54,26 @@ pub fn Runtime(comptime App: type) type {
             return .{ .id = app.remote.current_id, .root_id = app.remote.current_id };
         }
 
+        /// The root session to address on the wire for `target`, or null
+        /// after telling the person why not.
+        fn wireRoot(app: *App, target: Node, purpose: []const u8) !?[]const u8 {
+            if (target.root_id.len > 0) return target.root_id;
+            const body = try app.alloc.print("Open a session before {s}.", .{purpose});
+            defer app.alloc.free(body);
+            try notice(app, "session", body);
+            return null;
+        }
+
+        /// The node id to send beside the root's, null for the root itself.
+        fn wireNode(target: Node) ?[]const u8 {
+            return if (target.isRoot()) null else target.id;
+        }
+
         /// The session to address on the wire for `target`, or null after
-        /// telling the person why not. The supervisor runs operations on its
-        /// root sessions only for now, so a subagent target is refused here
-        /// and nowhere else.
+        /// telling the person why not. The supervisor changes a session's
+        /// settings on its root only, so a subagent target is refused here.
         fn wireSession(app: *App, target: Node, purpose: []const u8) !?[]const u8 {
-            if (target.root_id.len == 0) {
-                const body = try app.alloc.print("Open a session before {s}.", .{purpose});
-                defer app.alloc.free(body);
-                try notice(app, "session", body);
-                return null;
-            }
+            _ = try wireRoot(app, target, purpose) orelse return null;
             if (!target.isRoot()) {
                 const body = try app.alloc.print("This is not yet supported in a subagent session: {s}. Press Left to return to the parent.", .{purpose});
                 defer app.alloc.free(body);
@@ -104,7 +115,13 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{ .topic = "session", .tone = .warning, .body = "The session is still connecting. Please send again when it is ready." }, true);
                 return null;
             }
-            return wireSession(app, target, "sending a message");
+            // A subagent takes a message only between its own turns; the
+            // host checks the rest and names any refusal.
+            if (!target.isRoot() and app.remote.viewedChildRunning()) {
+                try notice(app, "subagent", host_commands.NodeRefusal.node_running.text());
+                return null;
+            }
+            return target.root_id;
         }
 
         pub fn submit(app: *App, target: Node, prompt: []const u8, images: []const types.ImageAttachment) !bool {
@@ -115,7 +132,7 @@ pub fn Runtime(comptime App: type) type {
             if (app.remote.submitted_text.items.len >= 32) app.alloc.free(app.remote.submitted_text.orderedRemove(0));
             try app.remote.submitted_text.append(app.alloc, text);
             errdefer _ = app.remote.submitted_text.pop();
-            try app.remote.enqueue(.submit, .{ .prompt = .{ .session_id = session_id, .text = prompt } });
+            try app.remote.enqueue(.submit, .{ .prompt = .{ .session_id = session_id, .node_id = wireNode(target), .text = prompt } });
             app.stream.active = true;
             app.shell.render_requests.request(.footer);
             return true;
@@ -123,8 +140,8 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn cancel(app: *App, target: Node) !void {
             if (target.root_id.len == 0) return;
-            const session_id = try wireSession(app, target, "cancelling its turn") orelse return;
-            try app.remote.enqueue(.cancel, .{ .cancel = .{ .session_id = session_id } });
+            const session_id = try wireRoot(app, target, "cancelling its turn") orelse return;
+            try app.remote.enqueue(.cancel, .{ .cancel = .{ .session_id = session_id, .node_id = wireNode(target) } });
         }
 
         /// Answers the pending permission prompt, in the session that asked.
@@ -171,27 +188,36 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn leaveChild(app: *App) void {
-            if (app.remote.child_id.len > 0) app.alloc.free(app.remote.child_id);
-            app.remote.child_id = &.{};
-            for (app.remote.child_ancestors.items) |ancestor| app.alloc.free(ancestor);
-            app.remote.child_ancestors.clearRetainingCapacity();
-            app.remote.clearChildTracking(app.alloc);
+            const remote = &app.remote;
+            if (remote.child_id.len > 0) app.alloc.free(remote.child_id);
+            remote.child_id = &.{};
+            if (remote.child_name.len > 0) app.alloc.free(remote.child_name);
+            remote.child_name = &.{};
+            for (remote.child_ancestors.items) |hop| hop.deinit(app.alloc);
+            remote.child_ancestors.clearRetainingCapacity();
+            remote.clearChildTracking(app.alloc);
+            remote.rebuildBreadcrumb(app.alloc) catch {};
         }
 
-        /// Shows the read-only transcript of node `id` under the attached
-        /// root. `parent_id` is its parent: the node shown now when the
-        /// person descends, or an ancestor when Left walks back up.
-        pub fn viewChild(app: *App, id: []const u8, parent_id: []const u8) !void {
+        /// Focuses node `id`, labelled `name`, under the attached root.
+        /// `parent_id` is its parent: the node shown now when the person
+        /// descends, or an ancestor when Left walks back up.
+        pub fn viewChild(app: *App, id: []const u8, parent_id: []const u8, name: []const u8) !void {
             const remote = &app.remote;
             const owned = try app.alloc.dupe(u8, id);
             errdefer app.alloc.free(owned);
+            const owned_name = try app.alloc.dupe(u8, if (name.len > 0) name else id[id.len -| 8..]);
+            errdefer app.alloc.free(owned_name);
             if (remote.child_id.len > 0 and std.mem.eql(u8, parent_id, remote.child_id)) {
                 // Descending: the node shown now becomes an ancestor.
-                try remote.child_ancestors.append(app.alloc, remote.child_id);
+                try remote.child_ancestors.append(app.alloc, .{ .id = remote.child_id, .name = remote.child_name });
             } else if (remote.child_id.len > 0) {
                 app.alloc.free(remote.child_id);
+                app.alloc.free(remote.child_name);
             }
             remote.child_id = owned;
+            remote.child_name = owned_name;
+            try remote.rebuildBreadcrumb(app.alloc);
             remote.generation +%= 1;
             remote.clearChildTracking(app.alloc);
             View.resetTranscriptContents(app);
@@ -217,11 +243,14 @@ pub fn Runtime(comptime App: type) type {
             try app.remote.enqueue(.config, .{ .mode = .{ .session_id = id, .mode = mode.configId() } });
         }
 
+        /// The host runs the command on `target`, or answers with the reason
+        /// it cannot run it on a subagent.
         fn runHostCommand(app: *App, target: Node, purpose: []const u8, command: host_commands.Command) !void {
-            const id = try wireSession(app, target, purpose) orelse return;
+            const id = try wireRoot(app, target, purpose) orelse return;
             const fields = host_commands.requestFields(command);
             try app.remote.enqueue(.command, .{ .command = .{
                 .session_id = id,
+                .node_id = wireNode(target),
                 .name = fields.command,
                 .action = fields.action,
                 .path = fields.path,
@@ -245,11 +274,13 @@ pub fn Runtime(comptime App: type) type {
             defer app.alloc.free(id);
             const parent_id = try app.alloc.dupe(u8, row.parent_id);
             defer app.alloc.free(parent_id);
+            const name = try app.alloc.dupe(u8, row.title);
+            defer app.alloc.free(name);
             const scope = browser.scope;
             browser.close();
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             switch (scope) {
-                .subagents => try viewChild(app, id, parent_id),
+                .subagents => try viewChild(app, id, parent_id, name),
                 .sessions => try switchSession(app, id),
             }
             app.shell.render_requests.request(.footer);
@@ -263,9 +294,9 @@ pub fn Runtime(comptime App: type) type {
             const remote = &app.remote;
             if (remote.child_id.len > 0) {
                 if (remote.child_ancestors.pop()) |parent| {
-                    defer app.alloc.free(parent);
-                    const grandparent = remote.child_ancestors.last() orelse remote.current_id;
-                    try viewChild(app, parent, grandparent);
+                    defer parent.deinit(app.alloc);
+                    const grandparent = if (remote.child_ancestors.last()) |hop| hop.id else remote.current_id;
+                    try viewChild(app, parent.id, grandparent, parent.name);
                 } else {
                     try switchSession(app, remote.current_id);
                 }
@@ -425,9 +456,9 @@ pub fn Runtime(comptime App: type) type {
         fn commandCompact(ctx: *anyopaque) !void {
             const app = appFrom(ctx);
             const target = commandTarget(app, .compact);
-            _ = try wireSession(app, target, "compacting it") orelse return;
+            _ = try wireRoot(app, target, "compacting it") orelse return;
             try runHostCommand(app, target, "compacting it", .compact);
-            try notice(app, "session", "Compacting context...");
+            if (target.isRoot()) try notice(app, "session", "Compacting context...");
         }
 
         fn commandContext(ctx: *anyopaque) !void {
@@ -486,8 +517,9 @@ pub fn Runtime(comptime App: type) type {
             const app = appFrom(ctx);
             const action = parseKernelAction(rest) orelse
                 return notice(app, "", "usage: /kernel status|restart|stop|prewarm|interrupt");
-            const id = try wireSession(app, commandTarget(app, .kernel), "managing its kernel") orelse return;
-            try app.remote.enqueue(.kernel, .{ .kernel = .{ .session_id = id, .action = action } });
+            const target = commandTarget(app, .kernel);
+            const id = try wireRoot(app, target, "managing its kernel") orelse return;
+            try app.remote.enqueue(.kernel, .{ .kernel = .{ .session_id = id, .node_id = wireNode(target), .action = action } });
         }
     };
 }

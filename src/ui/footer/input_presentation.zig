@@ -21,6 +21,7 @@ const InputRuntime = core_input_runtime.Runtime;
 const RenderContext = render_input.RenderContext;
 
 const max_status_line_len: usize = 512;
+const breadcrumb = @import("breadcrumb.zig");
 pub const max_top_row_len = row_text.max_top_row_len;
 pub const max_model_picker_rows: u16 = list_window.default_max_picker_rows;
 pub const composeDividerRow = row_text.composeDividerRow;
@@ -502,12 +503,15 @@ pub fn composeHintRow(
         width,
         &hint_buf,
     );
+    var crumb_buf: [max_status_line_len]u8 = undefined;
     var hint_line = if (question_hint) |hint|
         hint
     else if (ctx.ctrl_c_pending)
         "press ctrl+c again to exit"
     else if (auth_hint) |hint|
         hint
+    else if (ctx.breadcrumb.len > 0)
+        withBreadcrumb(ctx.breadcrumb, base_hint_line, width, &crumb_buf)
     else
         base_hint_line;
 
@@ -577,6 +581,24 @@ pub fn composeHintRow(
 
     return row;
 }
+
+/// The focused node's path ahead of the hint line. It takes up to half the
+/// row, or all of it on a narrow terminal, and gives up its root end first.
+fn withBreadcrumb(path: []const u8, hint: []const u8, width: u16, out: []u8) []const u8 {
+    const room: usize = if (width < 48) width else @max(@as(usize, width) / 2, 24);
+    var fitted_buf: [max_status_line_len]u8 = undefined;
+    const fitted = breadcrumb.fit(path, room, &fitted_buf);
+    const parts = [_][]const u8{ fitted, statusline_gap, hint };
+    var end: usize = 0;
+    for (parts) |part| {
+        const take = @min(part.len, out.len - end);
+        @memcpy(out[end..][0..take], part[0..take]);
+        end += take;
+    }
+    return out[0..end];
+}
+
+const statusline_gap = " · ";
 
 pub fn dangerStatusText(
     approval_active: bool,

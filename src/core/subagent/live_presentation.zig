@@ -18,6 +18,24 @@ const WireFrame = struct {
     sequence: u64,
     text: ?[]const u8 = null,
     event: ?PresentationEvent = null,
+
+    /// A frame names only the part it carries, but its event keeps every
+    /// field, null ones too: the viewer parses it as the root lane's
+    /// events, whose optional fields have no defaults.
+    pub fn jsonStringify(self: WireFrame, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("sequence");
+        try jw.write(self.sequence);
+        if (self.text) |text| {
+            try jw.objectField("text");
+            try jw.write(text);
+        }
+        if (self.event) |event| {
+            try jw.objectField("event");
+            try jw.write(event);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const Snapshot = struct {
@@ -71,7 +89,7 @@ pub const Tail = struct {
                 return;
             };
             var writer: std.Io.Writer = .fixed(self.scratch);
-            std.json.Stringify.value(frame, .{ .emit_null_optional_fields = false }, &writer) catch {
+            std.json.Stringify.value(frame, .{}, &writer) catch {
                 if (self.scratch.len == frame_limit) {
                     // An oversized event creates an explicit cursor gap, not
                     // unbounded allocations or a partially encoded payload.
@@ -189,6 +207,8 @@ test "child live presentation owns in-flight events and bounds cursor replay" {
     try std.testing.expectEqual(@as(u64, 3), first.sequence);
     try std.testing.expect(std.mem.startsWith(u8, first.events_json, "[{\"sequence\":1,\"text\":\"live\"},{\"sequence\":2,\"event\":{"));
     try std.testing.expect(std.mem.find(u8, first.events_json, "authoritative_started") != null);
+    // The viewer's parser needs the event's null fields.
+    try std.testing.expect(std.mem.find(u8, first.events_json, "\"reconciles_provisional_call_id\":null") != null);
     try std.testing.expect(std.mem.find(u8, first.events_json, "running now") != null);
     const unchanged = try tail.snapshot(arena.allocator(), first.sequence, false);
     try std.testing.expectEqualStrings("[]", unchanged.events_json);

@@ -22,7 +22,7 @@ const Allocator = std.mem.Allocator;
 
 /// Bumped whenever a request or response changes shape. A client refuses a
 /// supervisor that answers `ping` with another version.
-pub const version: u32 = 5;
+pub const version: u32 = 6;
 
 pub const Heartbeat = struct {
     prompt: []const u8 = "",
@@ -57,6 +57,8 @@ pub const SetOption = struct { session_id: []const u8, config_id: []const u8, va
 /// One `fx/command` the host runs; see `acp/commands.zig` for the names.
 pub const HostCommand = struct {
     session_id: []const u8,
+    /// The node of the session's tree the command acts on; null is the root.
+    node_id: ?[]const u8 = null,
     name: []const u8,
     action: ?[]const u8 = null,
     path: ?[]const u8 = null,
@@ -64,9 +66,12 @@ pub const HostCommand = struct {
 };
 
 pub const Rename = struct { session_id: []const u8, name: []const u8 };
-pub const Kernel = struct { session_id: []const u8, action: []const u8 = "status" };
-pub const Prompt = struct { session_id: []const u8, text: []const u8 };
+pub const Kernel = struct { session_id: []const u8, node_id: ?[]const u8 = null, action: []const u8 = "status" };
+/// A prompt for the root, or a user message for the node `node_id` names.
+pub const Prompt = struct { session_id: []const u8, node_id: ?[]const u8 = null, text: []const u8 };
 pub const SessionRef = struct { session_id: []const u8 };
+/// Cancels the root's turn, or the work a user message started on a node.
+pub const Cancel = struct { session_id: []const u8, node_id: ?[]const u8 = null };
 
 /// What a connection can watch besides its attached session.
 /// `stopped` is not watched: the supervisor sends it to every connection
@@ -74,7 +79,9 @@ pub const SessionRef = struct { session_id: []const u8 };
 pub const Topic = enum { session, list, children, child, stopped };
 
 pub const List = struct { watch: bool = false };
-pub const ChildrenRequest = struct { session_id: []const u8, watch: bool = false };
+/// The direct children of `node_id`, any node of the session's tree; null
+/// is the root.
+pub const ChildrenRequest = struct { session_id: []const u8, node_id: ?[]const u8 = null, watch: bool = false };
 pub const Unwatch = struct { topic: Topic, session_id: ?[]const u8 = null };
 
 pub const Permission = struct {
@@ -93,6 +100,9 @@ pub const HeartbeatRequest = struct {
 pub const History = struct {
     session_id: []const u8,
     child_id: ?[]const u8 = null,
+    /// The node's parent when the viewer knows it; the supervisor reads it
+    /// from the node's log otherwise.
+    parent_id: ?[]const u8 = null,
     work_id: ?[]const u8 = null,
     after_live_sequence: u64 = 0,
     live_active: bool = false,
@@ -114,7 +124,7 @@ pub const Request = union(enum) {
     rename: Rename,
     kernel: Kernel,
     prompt: Prompt,
-    cancel: SessionRef,
+    cancel: Cancel,
     permission: Permission,
     stop: SessionRef,
     heartbeat: HeartbeatRequest,
@@ -324,6 +334,8 @@ pub const Child = struct {
 
 pub const Children = struct {
     ok: bool = true,
+    /// The node these are the children of; empty from older supervisors.
+    node_id: []const u8 = "",
     children: []const Child = &.{},
 };
 
@@ -331,10 +343,11 @@ pub fn RootHistory(comptime HistoryJson: type) type {
     return struct { ok: bool = true, history: HistoryJson };
 }
 
-pub fn ChildHistory(comptime LiveJson: type) type {
+pub fn ChildHistory(comptime HistoryJson: type, comptime LiveJson: type) type {
     return struct {
         ok: bool = true,
         child_id: []const u8,
+        parent_id: []const u8 = "",
         work_id: []const u8,
         live_active: bool,
         live_sequence: u64,
@@ -346,7 +359,7 @@ pub fn ChildHistory(comptime LiveJson: type) type {
         last_failure: ?[]const u8 = null,
         active_prompt: ?[]const u8 = null,
         /// Present only when `live_reset` asks the viewer to rebuild.
-        history: ?[]const types.HistoryTurn = null,
+        history: ?HistoryJson = null,
         live_events: LiveJson,
     };
 }
@@ -381,6 +394,12 @@ test "requests round trip with their command beside the fields" {
         .{ .heartbeat = .{ .session_id = "s", .action = .set, .interval_ms = 5000, .prompt = "check" } },
         .{ .permission = .{ .session_id = "s", .request_id = 7, .option = .allow_always } },
         .{ .history = .{ .session_id = "s", .child_id = "c", .after_live_sequence = 3 } },
+        // Node-targeted requests name the node beside the root session.
+        .{ .prompt = .{ .session_id = "s", .node_id = "grandchild", .text = "follow up" } },
+        .{ .children = .{ .session_id = "s", .node_id = "child", .watch = true } },
+        .{ .command = .{ .session_id = "s", .node_id = "child", .name = "last_reply" } },
+        .{ .cancel = .{ .session_id = "s", .node_id = "child" } },
+        .{ .history = .{ .session_id = "s", .child_id = "grandchild", .parent_id = "child" } },
     };
     for (requests) |request| {
         const bytes = try encode(arena, request);
@@ -392,6 +411,8 @@ test "requests round trip with their command beside the fields" {
     try std.testing.expectEqualStrings("session", create.create.name);
     try std.testing.expect(create.create.@"resume" == null);
     try std.testing.expectEqualStrings("s", (try Request.parse(arena, "{\"command\":\"stop\",\"session_id\":\"s\"}")).sessionId().?);
+    // A request without a node addresses the root.
+    try std.testing.expect((try Request.parse(arena, "{\"command\":\"prompt\",\"session_id\":\"s\",\"text\":\"x\"}")).prompt.node_id == null);
 }
 
 test "framed and bare requests parse to the same request" {
