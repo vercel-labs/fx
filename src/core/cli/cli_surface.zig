@@ -4579,6 +4579,25 @@ test "global context limits reject missing values and stop at the command" {
     try std.testing.expectEqual(@as(usize, 3), parsed.remaining.len);
 }
 
+test "--instances takes a whole number of at least 1" {
+    const invalid = [_][]const [:0]const u8{
+        &.{ @constCast("--instances"), @constCast("0") },
+        &.{@constCast("--instances=0")},
+        &.{ @constCast("--instances"), @constCast("two") },
+        &.{@constCast("--instances=-1")},
+        &.{@constCast("--instances=")},
+    };
+    for (invalid) |args| try std.testing.expectError(error.InvalidInstancesValue, parseGlobalLaunchArgs(std.testing.allocator, args));
+    // A bare `--instances` is the shared parser's missing value.
+    try std.testing.expectError(error.InvalidFlag, parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--instances")}));
+    try std.testing.expectEqualStrings("--instances", launchFlagFailure(&.{@constCast("--instances")}).?.missing_value);
+    try std.testing.expectEqualStrings("--instances takes a whole number of at least 1", globalLaunchErrorMessage(error.InvalidInstancesValue).?);
+
+    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("--instances"), @constCast("3") });
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?usize, 3), parsed.modifiers.instances);
+}
+
 test "global launch modifiers own repeatable additional directories and suppression" {
     var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
         @constCast("--add-dir"),
