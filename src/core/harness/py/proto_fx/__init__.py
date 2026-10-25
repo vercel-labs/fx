@@ -56,7 +56,7 @@ from ._client import (  # noqa: F401
     KernelError,
     PermissionDenied,
     Refused,
-    StaleWriteError, Unstorable,
+    StaleWriteError,
     ToolFailed,
     Unavailable,
     available,
