@@ -3,7 +3,8 @@
 
 Each mutant plants one realistic design bug in a temporary copy of a spec
 and runs TLC on it. The run passes only if TLC reports the expected
-invariant as violated. Run after changing any spec:
+invariant, action property, or temporal property as violated. Run after
+changing any spec:
 
     ./mutants.py
 
@@ -11,6 +12,7 @@ Needs the same Java runtime and tla2tools.jar as check.sh.
 """
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -19,7 +21,11 @@ import tempfile
 HERE = pathlib.Path(__file__).resolve().parent
 JAR = os.environ.get("TLA2TOOLS_JAR", os.path.expanduser("~/.local/share/tla/tla2tools.jar"))
 
-# (spec, bug description, text to replace, replacement, invariant that must fail)
+# (spec, bug description, text to replace, replacement, property that must
+# fail[, config]). The property is an invariant, an action property, or a
+# temporal (liveness) property. TLC does not name the temporal property it
+# found violated, so a mutant that expects one runs under its own config,
+# whose PROPERTIES list only that one property.
 MUTANTS = [
     ("Wiring", "a fork reuses a session that exists",
      "    /\\ f \\notin {cur, next}\n    /\\ ~made[f]\n",
@@ -195,6 +201,10 @@ MUTANTS = [
      "    /\\ InUse < Slots\n    /\\ holds' = [holds EXCEPT ![c] = TRUE]\n",
      "    /\\ holds' = [holds EXCEPT ![c] = TRUE]\n",
      "SlotsBounded"),
+    ("Tree", "a waiting parent never lends its slot, so its child never runs",
+     "    /\\ holds' = [holds EXCEPT ![p] = FALSE]\n    /\\ UNCHANGED cancel\n",
+     "    /\\ UNCHANGED <<holds, cancel>>\n",
+     "WaitersRun", "Tree.liveness.cfg"),
     ("PromptImages", "an item leaves out an image kept inline",
      'images |-> [d \\in Digests |-> IF d \\in turn.asked THEN turn.form[d] ELSE "none"]',
      'images |-> [d \\in Digests |-> IF d \\in turn.asked /\\ turn.form[d] = "ref" THEN "ref" ELSE "none"]',
@@ -218,6 +228,24 @@ def find_java():
     return None
 
 
+def temporal_caught(output, expected, config):
+    """A temporal violation counts for `expected` only when no invariant
+    broke first, and TLC names the property or the config checks no other."""
+    if "Temporal properties were violated" not in output or re.search(r"Invariant \w+ is violated", output):
+        return False
+    if re.search(rf"Temporal propert\w* {re.escape(expected)}\b[^\n]* violated", output):
+        return True
+    lines = [line.strip() for line in config.read_text().splitlines()]
+    if "PROPERTIES" not in lines:
+        return False
+    listed = []
+    for line in lines[lines.index("PROPERTIES") + 1:]:
+        if not line or line.isupper():
+            break
+        listed.append(line)
+    return listed == [expected]
+
+
 def main():
     java = find_java()
     if java is None or not os.path.isfile(JAR):
@@ -227,7 +255,7 @@ def main():
     # Spec names on the command line run only their mutants.
     wanted = set(sys.argv[1:])
     with tempfile.TemporaryDirectory(prefix="session-manager-mutants-") as tmp:
-        for index, (spec, desc, old, new, expected) in enumerate(MUTANTS):
+        for index, (spec, desc, old, new, expected, *config) in enumerate(MUTANTS):
             if wanted and spec not in wanted:
                 continue
             work = pathlib.Path(tmp) / f"{index:02d}-{spec}"
@@ -238,9 +266,11 @@ def main():
                 survivors += 1
                 continue
             (work / f"{spec}.tla").write_text(text.replace(old, new, 1))
-            # A smaller model, when the full one is too large to search per mutant.
+            # The mutant's own config, or a smaller model when the full one is
+            # too large to search per mutant.
             small = HERE / f"{spec}.mutants.cfg"
-            shutil.copy(small if small.exists() else HERE / f"{spec}.cfg", work / f"{spec}.cfg")
+            source = HERE / config[0] if config else small if small.exists() else HERE / f"{spec}.cfg"
+            shutil.copy(source, work / f"{spec}.cfg")
             run = subprocess.run(
                 [java, "-XX:+UseParallelGC", "-cp", JAR, "tlc2.TLC", "-deadlock",
                  "-workers", "auto", "-cleanup", "-metadir", str(work / "states"),
@@ -249,7 +279,8 @@ def main():
             )
             output = run.stdout + run.stderr
             if (f"Invariant {expected} is violated" in output
-                    or f"Action property {expected} is violated" in output):
+                    or f"Action property {expected} is violated" in output
+                    or temporal_caught(output, expected, source)):
                 print(f"{spec:15s} {desc:42s} caught by {expected}")
             else:
                 print(f"{spec:15s} {desc:42s} SURVIVED (expected {expected} to fail)")
