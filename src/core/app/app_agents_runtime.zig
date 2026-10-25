@@ -59,7 +59,7 @@ pub const ChildAgent = struct {
     screen: ScreenSlot = .{},
     /// Slot-thread turns bound to this agent's worker. The agent is freed
     /// only once none is left.
-    bound: std.atomic.Value(u32) = .init(0),
+    bound: subagent_execution.HostedRelease = .{},
     /// Whether this process has built the agent's notebook from its saved
     /// conversation. Later turns append to it live.
     view_built: bool = false,
@@ -86,7 +86,7 @@ pub const ChildAgent = struct {
     /// The footer's name for it on its own screen, marked done while none of
     /// its turns is going. Valid until the next call; only the main
     /// loop paints.
-    pub fn footerLabel(self: *ChildAgent) []const u8 {
+    fn footerLabel(self: *ChildAgent) []const u8 {
         if (self.workGoing()) return self.displayName();
         return std.mem.print(&self.label_buf, "{s} · done", .{self.displayName()}) catch self.displayName();
     }
@@ -95,7 +95,7 @@ pub const ChildAgent = struct {
     /// its events not yet applied: main's run, the user's, or steering left
     /// over from either. Its paced output is checked where its screen is;
     /// see `turnGoing`.
-    pub fn workGoing(self: *ChildAgent) bool {
+    fn workGoing(self: *ChildAgent) bool {
         if (self.agent.child_run) |*run| if (run.inFlight()) return true;
         return self.agent.worker.isProcessing() or
             self.agent.worker.queuedPromptCount() > 0 or
@@ -135,7 +135,18 @@ pub const Post = struct {
     /// is going. Only the main loop reads or writes it.
     held: bool = false,
 
+    /// Set when the main loop settles the post, to wake the slot thread.
+    settled: std.Io.Event = .unset,
+
     pub const State = enum(u8) { posted, taken, failed, closed };
+
+    /// Settles the post. Wakes the slot thread before the store: once it
+    /// sees the new state it may return and free the post, so nothing
+    /// touches the post afterwards.
+    pub fn settle(self: *Post, state: State) void {
+        self.settled.set(io_mod.getIo());
+        self.state.store(state, .release);
+    }
 };
 
 pub const PostError = error{ OutOfMemory, Cancelled, Failed };
@@ -157,9 +168,18 @@ pub fn postAndWait(mailbox: *Mailbox, post: *Post, cancel: *std.atomic.Value(boo
             .posted => {},
         }
         if (cancel.load(.seq_cst) and withdraw(mailbox, post)) return error.Cancelled;
-        io_mod.sleep(2 * std.time.ns_per_ms);
+        // Settling wakes this at once; the timeout only rechecks `cancel`,
+        // which its setter does not signal.
+        post.settled.waitTimeout(io_mod.getIo(), wake_check) catch {};
     }
 }
+
+/// How long a slot thread sleeps before it rechecks a cancel no one signals.
+const wake_check: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } };
+
+/// How long the main loop waits for slot threads to let go of a child agent
+/// before it gives up on freeing it.
+const release_timeout_ms: i64 = 5_000;
 
 /// Takes `post` back if the loop has not taken it yet.
 fn withdraw(mailbox: *Mailbox, post: *Post) bool {
@@ -174,19 +194,19 @@ fn withdraw(mailbox: *Mailbox, post: *Post) bool {
 
 /// Waits until the main loop ends the run `completion` belongs to. A run
 /// always ends: its turn finishes, or shutdown ends it after joining the
-/// child's worker. While `cancel` is set, the turn on `worker` is cancelled
-/// again every 25 ms: a worker clears its cancel flag when a turn begins, so
-/// a cancel that lands before then would otherwise be lost.
+/// child's worker. The end wakes this at once. While `cancel` is set, each
+/// wake also cancels the turn on `worker` again: a worker clears its cancel
+/// flag when a turn begins, the same worker code main's Esc uses, so a
+/// cancel that lands before then would otherwise be lost.
 pub fn waitForCompletion(
     completion: *agents.ChildRunCompletion,
     cancel: *std.atomic.Value(bool),
     worker: *worker_runtime.WorkerRuntime,
 ) agents.ChildRunCompletion.Outcome {
-    var polls: usize = 0;
-    while (true) : (polls += 1) {
+    while (true) {
         if (completion.result()) |outcome| return outcome;
-        if (polls % 12 == 0 and cancel.load(.seq_cst)) worker.requestTurnCancel();
-        io_mod.sleep(2 * std.time.ns_per_ms);
+        if (cancel.load(.seq_cst)) worker.requestTurnCancel();
+        completion.done.waitTimeout(io_mod.getIo(), wake_check) catch {};
     }
 }
 
@@ -626,6 +646,21 @@ pub fn Runtime(comptime App: type) type {
             return null;
         }
 
+        /// Where a notice on a subagent's screen sends the user back to: the
+        /// instance whose tree holds it, by the name the waiting note uses,
+        /// and the key that reaches it. Null off a subagent's screen.
+        pub const Home = struct { name: []const u8, key: []const u8 };
+
+        pub fn homeOfScreen(app: *App, name_buf: []u8) ?Home {
+            const child = app.agent_on_screen orelse return null;
+            if (child.agent.role != .subagent) return null;
+            const root = rootInstance(app, child);
+            const hosted: ?*ChildAgent = if (root == &app.main_agent) null else for (app.child_agents.items) |entry| {
+                if (&entry.agent == root) break entry;
+            } else null;
+            return .{ .name = noteName(app, hosted, name_buf), .key = keyToward(app, hosted) };
+        }
+
         /// The key that reaches agent `target`, null for the first instance,
         /// from the one on screen in fewer presses while several instances
         /// are open. With one, main is back and its subagents ahead, as
@@ -856,7 +891,9 @@ pub fn Runtime(comptime App: type) type {
             // Each run still in flight ended once its worker was joined; its
             // slot thread holds the worker until it frees the turn context.
             for (app.child_agents.items) |child| {
-                while (child.bound.load(.acquire) > 0) io_mod.sleep(2 * std.time.ns_per_ms);
+                if (!child.bound.waitReleased(release_timeout_ms)) {
+                    debug_trace.logf("host", "child_release_timeout child={s} at=shutdown", .{child.id});
+                }
             }
         }
 
@@ -891,7 +928,7 @@ pub fn Runtime(comptime App: type) type {
             app.child_mailbox.mutex.lockUncancelable(io_mod.getIo());
             defer app.child_mailbox.mutex.unlock(io_mod.getIo());
             app.child_mailbox.closed = true;
-            for (app.child_mailbox.posts.items) |post| post.state.store(.closed, .release);
+            for (app.child_mailbox.posts.items) |post| post.settle(.closed);
             app.child_mailbox.posts.clearRetainingCapacity();
         }
 
@@ -914,7 +951,7 @@ pub fn Runtime(comptime App: type) type {
                 if (post.run != null) if (findChild(app, post.turn.child_id orelse "")) |child| if (turnGoing(app, child)) {
                     held.append(mailbox_alloc, post) catch {
                         debug_trace.eventf("host", "child_handoff_failed", .{}, "agent={s} kind=run reason=OutOfMemory", .{child.id});
-                        post.state.store(.failed, .release);
+                        post.settle(.failed);
                         continue;
                     };
                     if (!post.held) debug_trace.eventf("host", "child_run_held", .{}, "agent={s} reason=turn_going", .{child.id});
@@ -924,10 +961,10 @@ pub fn Runtime(comptime App: type) type {
                 const kind = if (post.run == null) "bind" else "run";
                 const taken = if (post.run == null) bindPost(app, post) else startPost(app, post);
                 if (taken) |_| {
-                    post.state.store(.taken, .release);
+                    post.settle(.taken);
                 } else |err| {
                     debug_trace.eventf("host", "child_handoff_failed", .{}, "agent={s} kind={s} reason={s}", .{ post.turn.child_id orelse "", kind, @errorName(err) });
-                    post.state.store(.failed, .release);
+                    post.settle(.failed);
                 }
             }
             if (held.items.len == 0) return;
@@ -935,9 +972,9 @@ pub fn Runtime(comptime App: type) type {
             app.child_mailbox.mutex.lockUncancelable(io_mod.getIo());
             defer app.child_mailbox.mutex.unlock(io_mod.getIo());
             if (app.child_mailbox.closed) {
-                for (held.items) |post| post.state.store(.closed, .release);
+                for (held.items) |post| post.settle(.closed);
             } else app.child_mailbox.posts.insertSlice(mailbox_alloc, 0, held.items) catch {
-                for (held.items) |post| post.state.store(.failed, .release);
+                for (held.items) |post| post.settle(.failed);
             };
         }
 
@@ -973,7 +1010,7 @@ pub fn Runtime(comptime App: type) type {
         fn bindPost(app: *App, post: *Post) !void {
             const child = try ensureChild(app, post.turn.child_id orelse return error.ChildNotAttached);
             if (post.turn.live_authority) |resolver| if (hostWithResolver(app, resolver)) |host| setParentHost(app, child, host);
-            _ = child.bound.fetchAdd(1, .acq_rel);
+            child.bound.hold();
             post.turn.hosted_worker = &child.agent.worker;
             post.turn.hosted_release = &child.bound;
         }
@@ -1118,7 +1155,10 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Moves a resume request made on a subagent's screen to the instance
-        /// whose tree holds it, whose session is the one to resume.
+        /// whose tree holds it, whose session is the one to resume. A plain
+        /// request on an instance that has saved nothing moves on to the
+        /// first open instance that has, because resuming any session of
+        /// the host brings its whole group back.
         pub fn liftResumeIntent(app: *App) void {
             for (app.child_agents.items) |child| {
                 if (child.agent.role != .subagent) continue;
@@ -1127,6 +1167,23 @@ pub fn Runtime(comptime App: type) type {
                 child.agent.session_persistence.resume_handoff_intent = .none;
                 rootInstance(app, child).session_persistence.resume_handoff_intent = intent;
             }
+            var holder: ?*AppAgent = null;
+            var saved: ?*AppAgent = null;
+            if (firstOpen(app)) noteResumeCandidate(&app.main_agent, &holder, &saved);
+            for (app.child_agents.items) |child| {
+                if (child.agent.role == .instance) noteResumeCandidate(&child.agent, &holder, &saved);
+            }
+            const from = holder orelse return;
+            const to = saved orelse return;
+            if (from == to or app_session_runtime.Runtime(App).savedSessionId(from) != null) return;
+            from.session_persistence.resume_handoff_intent = .none;
+            to.session_persistence.resume_handoff_intent = .requested;
+            debug_trace.logf("host", "resume_intent_moved reason=unsaved_instance", .{});
+        }
+
+        fn noteResumeCandidate(agent: *AppAgent, holder: *?*AppAgent, saved: *?*AppAgent) void {
+            if (holder.* == null and agent.session_persistence.resume_handoff_intent == .requested) holder.* = agent;
+            if (saved.* == null and app_session_runtime.Runtime(App).savedSessionId(agent) != null) saved.* = agent;
         }
 
         /// Shows `next` when instance `root`, which `hosted` holds or null for
@@ -1197,7 +1254,10 @@ pub fn Runtime(comptime App: type) type {
             visit(app, child, {}, shutdownInContext) catch |err| {
                 app_session_runtime.Runtime(App).recordShutdownFailure(firstInstance(app) orelse &app.main_agent, err);
             };
-            while (child.bound.load(.acquire) > 0) io_mod.sleep(2 * std.time.ns_per_ms);
+            // A slot thread that never lets go leaves the agent allocated, so
+            // it reads no freed memory, rather than freezing the screen.
+            const released = child.bound.waitReleased(release_timeout_ms);
+            if (!released) debug_trace.logf("host", "child_release_timeout child={s} at=drop kept_allocated=true", .{child.id});
             {
                 app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
                 defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
@@ -1206,6 +1266,7 @@ pub fn Runtime(comptime App: type) type {
                     break;
                 };
             }
+            if (!released) return;
             child.screen.deinit(app.alloc);
             if (child.name.len > 0) app.alloc.free(child.name);
             app.alloc.free(child.id);
@@ -1391,7 +1452,7 @@ test "a slot thread's hand-off returns once the main loop takes it" {
             while (true) {
                 box.mutex.lockUncancelable(io_mod.getIo());
                 if (box.posts.pop()) |taken| {
-                    taken.state.store(.taken, .release);
+                    taken.settle(.taken);
                     box.mutex.unlock(io_mod.getIo());
                     return;
                 }

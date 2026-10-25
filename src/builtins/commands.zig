@@ -354,7 +354,7 @@ pub const top_level_flags = [_]TopLevelFlag{
     },
     .{
         .usage = "--instances <n>",
-        .description = "Start n fx instances in one interactive session, each with its own conversation; Alt+Left and Alt+Right switch between them",
+        .description = "Start n fx instances in one interactive session, each with its own conversation; Alt+Left and Alt+Right switch between them when no word is left to jump",
     },
     .{
         .usage = "--fast, --no-fast",

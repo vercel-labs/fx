@@ -190,6 +190,29 @@ pub fn testHookCount() usize {
     return @max(count, 1);
 }
 
+/// Why an instance couldn't start or come back, as words for the user. The
+/// error's name stays in the debug trace.
+fn failureText(err: anyerror) []const u8 {
+    return switch (err) {
+        error.SessionNotFound => "its saved session is gone",
+        error.SessionBusy => "another fx is using that session; close it there and try again",
+        error.SessionStoreUnavailable, error.SessionPersistenceUnavailable => "fx can't open its saved sessions right now",
+        error.OutOfMemory => "fx ran out of memory",
+        error.SystemResources,
+        error.ThreadQuotaExceeded,
+        error.LockedMemoryLimitExceeded,
+        => "the system won't start another thread; close an instance and try again",
+        else => "something unexpected went wrong; run fx with FX_TRACE=1 to log why",
+    };
+}
+
+test "instance failures read as sentences, not error names" {
+    try std.testing.expectEqualStrings("its saved session is gone", failureText(error.SessionNotFound));
+    try std.testing.expect(std.mem.find(u8, failureText(error.SessionBusy), "another fx") != null);
+    try std.testing.expect(std.mem.find(u8, failureText(error.Unexpected), "FX_TRACE=1") != null);
+    try std.testing.expect(std.mem.find(u8, failureText(error.ThreadQuotaExceeded), "Thread") == null);
+}
+
 pub fn Runtime(comptime App: type) type {
     return struct {
         const AgentsRuntime = app_agents_runtime.Runtime(App);
@@ -288,52 +311,62 @@ pub fn Runtime(comptime App: type) type {
             return child;
         }
 
-        /// Keeps the host record in step with the open instances: a
-        /// file listing their sessions and profiles while two or more are
-        /// open, or one runs in a profile other than `main`, so resuming it
-        /// brings that profile back; none otherwise. Runs on the main loop
-        /// and touches the disk only when the list changes, so a launch, a
-        /// close, `/new`, and an in-app `/resume` all count alike. Waits
-        /// while an instance has no session yet, such as during the startup
-        /// picker.
+        /// Keeps the host record in step with the open instances' saved
+        /// sessions: a file listing them and their profiles while two or
+        /// more are saved, or one runs in a profile other than `main`, so
+        /// resuming it brings that profile back; none otherwise. An instance
+        /// that holds no turn yet has nothing to resume, so it joins the
+        /// record when its first turn saves its session. Runs on the main
+        /// loop and touches the disk only when the list changes, so a
+        /// launch, a close, a first turn, `/new`, and an in-app `/resume`
+        /// all count alike.
         pub fn syncRecord(app: *App) void {
             const state = &app.instances;
             var count: usize = 0;
             var same = true;
             var profiled = false;
-            if (AgentsRuntime.firstOpen(app)) {
-                const id = SessionRuntime.activeSessionId(&app.main_agent) orelse return;
-                const profile = profileName(&app.main_agent);
-                same = same and matchesWritten(state, count, id, profile);
-                profiled = profiled or !std.mem.eql(u8, profile, profiles.main_name);
-                count += 1;
-            }
+            if (AgentsRuntime.firstOpen(app)) noteMember(state, &app.main_agent, &count, &same, &profiled);
             for (app.child_agents.items) |child| {
-                if (child.agent.role != .instance) continue;
-                const id = SessionRuntime.activeSessionId(&child.agent) orelse return;
-                const profile = profileName(&child.agent);
-                same = same and matchesWritten(state, count, id, profile);
-                profiled = profiled or !std.mem.eql(u8, profile, profiles.main_name);
-                count += 1;
+                if (child.agent.role == .instance) noteMember(state, &child.agent, &count, &same, &profiled);
             }
             if (same and count == state.written.items.len) return;
             if (count < 2 and !profiled) {
-                if (state.written.items.len == 0) return;
                 state.clearWritten(app.alloc);
-                if (state.has_group) withHostsDir(app, removeRecord);
+                if (state.has_group) {
+                    withHostsDir(app, removeRecord);
+                    state.has_group = false;
+                }
                 return;
             }
             state.clearWritten(app.alloc);
-            if (AgentsRuntime.firstOpen(app)) appendWritten(app, &app.main_agent) catch return;
+            if (AgentsRuntime.firstOpen(app)) appendWritten(app, &app.main_agent) catch |err| return dropRecordUpdate(app, err);
             for (app.child_agents.items) |child| {
                 if (child.agent.role != .instance) continue;
-                appendWritten(app, &child.agent) catch return;
+                appendWritten(app, &child.agent) catch |err| return dropRecordUpdate(app, err);
             }
             if (!state.has_group) {
                 state.group_id = host_record.newGroupId();
                 state.has_group = true;
+                withHostsDir(app, pruneRecords);
             }
             withHostsDir(app, writeRecord);
+        }
+
+        /// Counts instance `agent` toward the record when its session is
+        /// saved, noting whether it still matches the written entry.
+        fn noteMember(state: *const State, agent: *agents.Agent, count: *usize, same: *bool, profiled: *bool) void {
+            const id = SessionRuntime.savedSessionId(agent) orelse return;
+            const profile = profileName(agent);
+            same.* = same.* and matchesWritten(state, count.*, id, profile);
+            profiled.* = profiled.* or !std.mem.eql(u8, profile, profiles.main_name);
+            count.* += 1;
+        }
+
+        /// Leaves the record as it was on disk when listing the instances
+        /// failed; the next pass of the main loop tries again.
+        fn dropRecordUpdate(app: *App, err: anyerror) void {
+            app.instances.clearWritten(app.alloc);
+            debug_trace.logf("host", "host_record_update_dropped err={s}", .{@errorName(err)});
         }
 
         /// The profile instance `agent` runs in: `main` unless one was applied.
@@ -347,9 +380,10 @@ pub fn Runtime(comptime App: type) type {
             return std.mem.eql(u8, entry.id, id) and std.mem.eql(u8, entry.profile, profile);
         }
 
-        /// Lists `agent`, which has a session, with its profile.
+        /// Lists `agent` with its profile when its session is saved.
         fn appendWritten(app: *App, agent: *agents.Agent) !void {
-            const id = try app.alloc.dupe(u8, SessionRuntime.activeSessionId(agent).?);
+            const saved = SessionRuntime.savedSessionId(agent) orelse return;
+            const id = try app.alloc.dupe(u8, saved);
             errdefer app.alloc.free(id);
             const profile = try app.alloc.dupe(u8, profileName(agent));
             errdefer app.alloc.free(profile);
@@ -357,8 +391,14 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn withHostsDir(app: *App, comptime body: fn (*App, []const u8) anyerror!void) void {
-            const home = io_mod.homeDir() orelse return;
-            const dir = profile_paths.hostsDir(app.alloc, home) catch return;
+            const home = io_mod.homeDir() orelse {
+                debug_trace.logf("host", "host_record_skipped reason=no_home", .{});
+                return;
+            };
+            const dir = profile_paths.hostsDir(app.alloc, home) catch |err| {
+                debug_trace.logf("host", "host_record_skipped reason=hosts_dir err={s}", .{@errorName(err)});
+                return;
+            };
             defer app.alloc.free(dir);
             body(app, dir) catch |err| {
                 debug_trace.logf("host", "host_record_failed err={s}", .{@errorName(err)});
@@ -389,26 +429,49 @@ pub fn Runtime(comptime App: type) type {
             debug_trace.eventf("host", "host_record_removed", .{}, "group={s}", .{&app.instances.group_id});
         }
 
+        /// Keeps the folder to the newest records when a new group starts.
+        fn pruneRecords(app: *App, dir: []const u8) anyerror!void {
+            var loaded = try host_record.loadAll(app.alloc, dir);
+            defer loaded.deinit();
+            _ = try host_record.pruneOldest(app.alloc, dir, loaded.records, &app.instances.group_id);
+        }
+
         /// Brings back the group of the session the first instance resumed
         /// at startup. The first instance runs in the profile its session
         /// ran in, unless `--profile` named one. Every other session its
         /// record lists comes back as an instance in its own profile with
         /// its saved conversation, after the first and in their saved order,
-        /// and the host keeps the group's id. A session that can't load is
-        /// skipped with a notice. The first instance stays on screen. Runs
-        /// before the first instance takes a turn: startup and the startup
-        /// picker call it before the main loop reads input.
+        /// and the host keeps the group's id. A session that is gone, such
+        /// as one deleted since, is left out, and the record follows; any
+        /// other that can't load is skipped with a notice. The first
+        /// instance stays on screen. Runs before the first instance takes a
+        /// turn: startup and the startup picker call it before the main loop
+        /// reads input. Records past the newest `host_record.max_records`
+        /// are removed on the way.
         pub fn restoreGroup(app: *App) void {
             const resumed = SessionRuntime.activeSessionId(&app.main_agent) orelse return;
-            const home = io_mod.homeDir() orelse return;
-            const dir = profile_paths.hostsDir(app.alloc, home) catch return;
+            const home = io_mod.homeDir() orelse {
+                debug_trace.logf("host", "host_restore_skipped reason=no_home", .{});
+                return;
+            };
+            const dir = profile_paths.hostsDir(app.alloc, home) catch |err| {
+                debug_trace.logf("host", "host_restore_failed err={s}", .{@errorName(err)});
+                return;
+            };
             defer app.alloc.free(dir);
             var loaded = host_record.loadAll(app.alloc, dir) catch |err| {
                 debug_trace.logf("host", "host_restore_failed err={s}", .{@errorName(err)});
                 return;
             };
             defer loaded.deinit();
-            var restore = (host_record.chooseRestore(app.alloc, loaded.records, resumed) catch return) orelse return;
+            const chosen = host_record.chooseRestore(app.alloc, loaded.records, resumed) catch |err| {
+                debug_trace.logf("host", "host_restore_failed session={s} err={s}", .{ resumed, @errorName(err) });
+                return;
+            };
+            _ = host_record.pruneOldest(app.alloc, dir, loaded.records, if (chosen) |value| value.group_id else null) catch |err| {
+                debug_trace.logf("host", "host_record_prune_failed err={s}", .{@errorName(err)});
+            };
+            var restore = chosen orelse return;
             defer restore.deinit(app.alloc);
             if (restore.group_id.len == host_record.group_id_len) {
                 @memcpy(&app.instances.group_id, restore.group_id);
@@ -423,17 +486,83 @@ pub fn Runtime(comptime App: type) type {
             for (restore.others) |member| {
                 _ = launchResumed(app, member.id, member.profile) catch |err| {
                     debug_trace.logf("host", "host_restore_skipped session={s} err={s}", .{ member.id, @errorName(err) });
-                    const reason = if (member.profile) |name| app_profile_runtime.failureReason(app.alloc, name) catch null else null;
-                    defer if (reason) |text| app.alloc.free(text);
-                    const body = if (reason) |text|
-                        app.alloc.print("Couldn't bring back session {s} with this one: {s}", .{ member.id, text }) catch continue
-                    else
-                        app.alloc.print("Couldn't bring back session {s} with this one: {s}.", .{ member.id, @errorName(err) }) catch continue;
-                    defer app.alloc.free(body);
-                    app.writeDomainNotice(.{ .topic = "instances", .tone = .neutral, .body = body }, true) catch {};
+                    if (err == error.SessionNotFound) continue;
+                    var prefix_buf: [192]u8 = undefined;
+                    const prefix = std.mem.print(&prefix_buf, "Couldn't bring back session {s} with this one", .{member.id}) catch "Couldn't bring back a session with this one";
+                    writeFailure(app, .neutral, prefix, member.profile, err);
                     continue;
                 };
             }
+        }
+
+        /// Launches another instance on the host and shows it. A failure
+        /// leaves the host as it was and says why.
+        pub fn launchAndShow(app: *App, profile_name: ?[]const u8) !void {
+            const child = launch(app, profile_name) catch |err| {
+                debug_trace.logf("host", "instance launch failed profile={s} err={s}", .{ profile_name orelse "default", @errorName(err) });
+                writeFailure(app, .@"error", "Couldn't start another fx instance", profile_name, err);
+                return;
+            };
+            try AgentsRuntime.show(app, child);
+        }
+
+        /// Opens the instances startup was asked for after the first one: the
+        /// resumed session's group first, then fresh ones up to
+        /// `--instances` or the test hook. The first stays on screen. One
+        /// that fails to start stops the rest and says how many are open.
+        pub fn launchStartupInstances(app: *App) void {
+            if (app.instances.restore_pending) {
+                app.instances.restore_pending = false;
+                restoreGroup(app);
+            }
+            while (app.instances.launched < app.instances.startup_count) {
+                _ = launch(app, null) catch |err| {
+                    debug_trace.logf("host", "startup instance launch failed index={d} err={s}", .{ app.instances.launched, @errorName(err) });
+                    var prefix_buf: [128]u8 = undefined;
+                    const prefix = std.mem.print(&prefix_buf, "Started {d} of {d} fx instances", .{
+                        AgentsRuntime.openInstanceCount(app),
+                        app.instances.startup_count + 1,
+                    }) catch "Couldn't start every fx instance";
+                    writeFailure(app, .@"error", prefix, null, err);
+                    return;
+                };
+            }
+        }
+
+        /// `/close`: closes the instance on screen and every subagent in its
+        /// tree. The next instance takes over and the host keeps running, the
+        /// first instance included. Closing the only open instance ends the
+        /// host, as `/exit` does.
+        pub fn closeOnScreen(app: *App) !void {
+            if (app.agent_on_screen) |child| if (child.agent.role == .subagent) {
+                try app.writeDomainNotice(.{ .topic = "instances", .tone = .neutral, .body = "/close closes an fx instance. This screen is a subagent's." }, true);
+                return;
+            };
+            if (AgentsRuntime.openInstanceCount(app) <= 1) {
+                SessionRuntime.requestResumeHandoff(agents.screenAgentOf(app));
+                app.should_exit = true;
+                return;
+            }
+            if (app.agent_on_screen) |child| {
+                try AgentsRuntime.closeInstance(app, child);
+                return;
+            }
+            try AgentsRuntime.closeFirstInstance(app);
+        }
+
+        /// Writes `prefix`, then why it failed: what a profile that won't
+        /// load says, as `fx --profile` does, or `failureText`'s sentence.
+        fn writeFailure(app: *App, tone: types.NoticeTone, prefix: []const u8, profile_name: ?[]const u8, err: anyerror) void {
+            const reason = if (profile_name) |name| app_profile_runtime.failureReason(app.alloc, name) catch null else null;
+            defer if (reason) |text| app.alloc.free(text);
+            const body = if (reason) |text|
+                app.alloc.print("{s}: {s}", .{ prefix, text }) catch return
+            else
+                app.alloc.print("{s}: {s}.", .{ prefix, failureText(err) }) catch return;
+            defer app.alloc.free(body);
+            app.writeDomainNotice(.{ .topic = "instances", .tone = tone, .body = body }, true) catch |write_err| {
+                debug_trace.logf("host", "instance_notice_dropped err={s}", .{@errorName(write_err)});
+            };
         }
 
         /// Puts the first instance back in profile `name`, the one its
@@ -445,10 +574,10 @@ pub fn Runtime(comptime App: type) type {
                 debug_trace.logf("host", "host_restore_profile_failed name={s} err={s}", .{ name, @errorName(err) });
                 const reason = app_profile_runtime.failureReason(app.alloc, name) catch null;
                 defer if (reason) |text| app.alloc.free(text);
-                const body = app.alloc.print("Couldn't use profile '{s}', which this session ran in: {s}", .{
-                    name,
-                    if (reason) |text| text else @errorName(err),
-                }) catch return;
+                const body = if (reason) |text|
+                    app.alloc.print("Couldn't use profile '{s}', which this session ran in: {s}", .{ name, text }) catch return
+                else
+                    app.alloc.print("Couldn't use profile '{s}', which this session ran in: {s}.", .{ name, failureText(err) }) catch return;
                 defer app.alloc.free(body);
                 app.writeDomainNotice(.{ .topic = "instances", .tone = .@"error", .body = body }, true) catch {};
             };

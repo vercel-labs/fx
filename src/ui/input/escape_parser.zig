@@ -81,7 +81,8 @@ fn modifiedArrowAction(byte: u8, modifiers: u16, meta_prefixed: bool) ?InputEsca
         else => null,
     };
     if (meta_prefixed or (modifiers & alt_modifier) != 0) {
-        // Alt+←/→ switch agents; with Shift or Ctrl they keep the word
+        // Alt+←/→ may switch agents (see `switchesAgents` in
+        // app_input_runtime.zig); with Shift or Ctrl they keep the word
         // jump and selection.
         const switches = (modifiers & (shift_modifier | ctrl_modifier)) == 0;
         return switch (byte) {
@@ -530,17 +531,20 @@ pub fn consumeInputEscapeByteWithMouse(
                 // ESC o is Meta-O, not a Ctrl-O terminal report.
                 return .ignore;
             }
+            // ESC b and ESC f are what Terminal.app sends for Option+←/→,
+            // so they switch agents where Alt+←/→ would; their composer
+            // shortcut keeps the word jump everywhere else.
             if (byte == 'b') {
                 stage.* = 0;
                 param.* = 0;
                 param2.* = 0;
-                return .word_left;
+                return .{ .switch_agent = .previous };
             }
             if (byte == 'f') {
                 stage.* = 0;
                 param.* = 0;
                 param2.* = 0;
-                return .word_right;
+                return .{ .switch_agent = .next };
             }
             if (byte == 'd') {
                 stage.* = 0;

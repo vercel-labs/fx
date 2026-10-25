@@ -2268,11 +2268,12 @@ test "input escape parser preserves double escape meta behavior" {
     try expectEscapeAction("\x1b[B", moveEscape(.paragraph_down, false));
     try expectEscapeAction("\x1bOA", moveEscape(.paragraph_up, false));
     try expectEscapeAction("\x1bOB", moveEscape(.paragraph_down, false));
-    // Meta-prefixed Left and Right are Alt+←/→, which switch agents;
-    // Alt+B and Alt+F keep the word jump.
+    // Meta-prefixed Left and Right are Alt+←/→, and ESC b and ESC f are
+    // Terminal.app's Option+←/→; all four may switch agents. Alt+B and
+    // Alt+F reported as keys keep the word jump.
     try expectEscapeAction("\x1b[D", .{ .switch_agent = .previous });
     try expectEscapeAction("\x1b[C", .{ .switch_agent = .next });
-    try expectEscapeAction("\x1bb", .word_left);
+    try expectEscapeAction("\x1bb", .{ .switch_agent = .previous });
     try expectEscapeAction("\x1bd", .{ .composer_shortcut = .delete_word_right });
 
     var stage: u8 = 1;
@@ -3544,19 +3545,19 @@ test "unrelated file input clears the pending separator claim" {
     try std.testing.expectEqualStrings("@AGENTS.md  ", runtime.edit_state.input.items);
 }
 
-test "input escape parser handles ESC b as word_left" {
+test "input escape parser handles ESC b as Option+Left" {
     var stage: u8 = 1;
     var param: u16 = 0;
     var param2: u16 = 0;
-    try std.testing.expectEqual(@as(?InputEscapeAction, .word_left), consumeInputEscapeByte(&stage, &param, &param2, 'b'));
+    try std.testing.expectEqual(@as(?InputEscapeAction, .{ .switch_agent = .previous }), consumeInputEscapeByte(&stage, &param, &param2, 'b'));
     try std.testing.expectEqual(@as(u8, 0), stage);
 }
 
-test "input escape parser handles ESC f as word_right" {
+test "input escape parser handles ESC f as Option+Right" {
     var stage: u8 = 1;
     var param: u16 = 0;
     var param2: u16 = 0;
-    try std.testing.expectEqual(@as(?InputEscapeAction, .word_right), consumeInputEscapeByte(&stage, &param, &param2, 'f'));
+    try std.testing.expectEqual(@as(?InputEscapeAction, .{ .switch_agent = .next }), consumeInputEscapeByte(&stage, &param, &param2, 'f'));
     try std.testing.expectEqual(@as(u8, 0), stage);
 }
 

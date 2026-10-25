@@ -203,8 +203,11 @@ fn Runtime(comptime App: type) type {
             deliver(player, .turn_end, .@"error", ready.turn_end_error);
         }
 
+        /// `session_id` is the session of the agent whose turn needs
+        /// attention, which need not be the one on screen.
         pub fn dispatchAttentionRequired(
             app: *App,
+            session_id: ?[]const u8,
             turn_id: u64,
             kind: hooks.AttentionKind,
         ) void {
@@ -213,7 +216,7 @@ fn Runtime(comptime App: type) type {
                 .scope = .{
                     .kind = .interactive,
                     .workspace_root = app.workspace_root,
-                    .session_id = app_session_runtime.Runtime(App).activeSessionId(agents.screenAgentOf(app)),
+                    .session_id = session_id,
                 },
                 .outcome_allocator = app.alloc,
             }, .{
@@ -359,11 +362,12 @@ fn ProviderAdapter(comptime App: type) type {
 
         fn dispatchAttentionRequired(
             raw: *anyopaque,
+            session_id: ?[]const u8,
             turn_id: u64,
             kind: hooks.AttentionKind,
         ) void {
             const app: *App = @ptrCast(@alignCast(raw));
-            Concrete.dispatchAttentionRequired(app, turn_id, kind);
+            Concrete.dispatchAttentionRequired(app, session_id, turn_id, kind);
         }
     };
 }

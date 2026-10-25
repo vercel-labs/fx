@@ -829,7 +829,7 @@ pub fn Runtime(comptime App: type) type {
                     .selection_failure = agent.session_persistence.session_picker.selection_failure,
                 } else .{},
                 .fork_menu = if (comptime agents.hasAgentField(App, "session_persistence"))
-                    agent.session_persistence.fork_menu.projection()
+                    app_session_runtime.forkMenuProjection(&agent.session_persistence.fork_menu)
                 else
                     .{},
                 .effort_menu = render_input.effortMenuProjection(&app.input_runtime.effort_menu),

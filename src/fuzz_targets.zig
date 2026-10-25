@@ -10,6 +10,7 @@ test {
     _ = @import("core/agent/assistant_presentation.zig");
     _ = @import("core/agent/runtime/execution_memory.zig");
     _ = @import("core/agent/runtime/vision_contracts.zig");
+    _ = @import("core/app/host_record.zig");
     _ = @import("core/images/image_attachments.zig");
     _ = @import("core/images/image_data.zig");
     _ = @import("core/images/image_route.zig");
@@ -18,6 +19,7 @@ test {
     _ = @import("core/output/diff.zig");
     _ = @import("core/mcp_host/wire_tests.zig");
     _ = @import("core/session/session_adapter.zig");
+    _ = @import("core/profiles/profiles.zig");
     _ = @import("core/session/session_codec.zig");
     _ = @import("core/session/session_event.zig");
     _ = @import("core/shared/display_width.zig");

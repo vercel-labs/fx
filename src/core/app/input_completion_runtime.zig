@@ -513,7 +513,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             if (!menu.active()) return false;
             menu.move(delta);
             menu.window_start = fork_menu_presentation.windowStart(
-                menu.projection(),
+                app_session_runtime.forkMenuProjection(menu),
                 app.shell.layout.cols,
                 try inlineMenuRowBudget(app, agent, fork_menu_presentation.max_inline_rows),
             );

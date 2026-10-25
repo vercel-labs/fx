@@ -14,79 +14,13 @@ const compaction_activity = @import("../output/compaction_activity.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
 
-pub const PendingPhase = enum {
-    awaiting_frame,
-    awaiting_adoption,
-    adopted,
-    awaiting_auth,
-    queued,
-};
-
-const PendingPhaseError = error{InvalidPendingPhase};
-
-pub const PendingPromptDraft = struct {
-    turn_id: u64,
-    prompt: []u8,
-    images: []types.ImageAttachment,
-    skill_display_spans: []worker_runtime.SkillDisplaySpan,
-
-    fn deinit(self: PendingPromptDraft, alloc: std.mem.Allocator) void {
-        alloc.free(self.prompt);
-        types.freeImageAttachmentSlice(alloc, self.images);
-        worker_runtime.freeSkillDisplaySpans(alloc, self.skill_display_spans);
-    }
-};
-
-pub const PendingSubmission = struct {
-    draft: PendingPromptDraft,
-    phase: PendingPhase = .awaiting_frame,
-    credential_admitted: bool = false,
-    skill_refresh_generation: ?u64 = null,
-
-    fn init(draft: PendingPromptDraft) PendingSubmission {
-        std.debug.assert(draft.turn_id != 0);
-        return .{ .draft = draft };
-    }
-
-    pub fn deinit(self: *PendingSubmission, alloc: std.mem.Allocator) void {
-        self.draft.deinit(alloc);
-        self.* = undefined;
-    }
-
-    fn ownsTurnStartHold(self: PendingSubmission) bool {
-        return self.phase != .queued;
-    }
-
-    fn markFrameCommitted(self: *PendingSubmission) bool {
-        if (self.phase != .awaiting_frame) return false;
-        self.phase = .awaiting_adoption;
-        return true;
-    }
-
-    fn markAdopted(self: *PendingSubmission) PendingPhaseError!void {
-        if (self.phase != .awaiting_adoption) return error.InvalidPendingPhase;
-        self.phase = .adopted;
-    }
-
-    fn markQueued(self: *PendingSubmission) bool {
-        if (self.phase != .adopted) return false;
-        self.phase = .queued;
-        return true;
-    }
-};
-
-pub const PendingSkillRefresh = enum {
-    pending,
-    current,
-};
-
-pub const State = struct {
-    pending: ?PendingSubmission = null,
-    retry_after_auth: bool = false,
-    compaction_pending: bool = false,
-    /// Identity only; auth retains its existing pending execution flag.
-    compaction_operation: ?compaction_activity.OperationId = null,
-};
+const submission_state = @import("submission_state.zig");
+pub const PendingPhase = submission_state.PendingPhase;
+const PendingPhaseError = submission_state.PendingPhaseError;
+pub const PendingPromptDraft = submission_state.PendingPromptDraft;
+pub const PendingSubmission = submission_state.PendingSubmission;
+pub const PendingSkillRefresh = submission_state.PendingSkillRefresh;
+pub const State = submission_state.State;
 
 fn buildPendingPromptDraft(
     alloc: std.mem.Allocator,
@@ -762,11 +696,15 @@ pub fn SubmitRuntime(comptime App: type) type {
             if (comptime @hasDecl(App, "prepareSubagentOnScreen")) {
                 app.prepareSubagentOnScreen(agents.screenAgentOf(app)) catch |err| {
                     debug_trace.logf("host", "own turn refused agent={s} reason={s}", .{ app.screenAgentId(), @errorName(err) });
+                    var name_buf: [32]u8 = undefined;
+                    var body_buf: [160]u8 = undefined;
+                    const home = homeHint(app, &name_buf);
                     try app.writeDomainNotice(.{
                         .topic = "subagent",
                         .tone = .@"error",
                         .body = if (err == error.OneOffChild)
-                            "This subagent ran a single task and can't take messages. Press Alt+← to go back to main."
+                            std.mem.print(&body_buf, "This subagent ran a single task and can't take messages. Press {s} to go back to {s}.", .{ home.key, home.name }) catch
+                                "This subagent ran a single task and can't take messages."
                         else
                             "This subagent can't take a message right now, so your message wasn't sent.",
                     }, true);
@@ -932,6 +870,15 @@ pub fn SubmitRuntime(comptime App: type) type {
             }
         }
 
+        /// The instance a notice on a subagent's screen sends the user back
+        /// to; `main` and Alt+← for an app without instances.
+        fn homeHint(app: *App, name_buf: []u8) struct { name: []const u8, key: []const u8 } {
+            if (comptime @hasDecl(App, "subagentHome")) {
+                if (app.subagentHome(name_buf)) |home| return .{ .name = home.name, .key = home.key };
+            }
+            return .{ .name = "main", .key = "Alt+←" };
+        }
+
         /// `/resume`, `/new`, `/fork`, `/clear`, and `/reset` replace main's
         /// session, so they don't run on a subagent's screen. On a
         /// subagent they would swap its saved conversation for a fresh one
@@ -943,9 +890,11 @@ pub fn SubmitRuntime(comptime App: type) type {
                 .new_session, .resume_session, .fork_session, .clear_screen, .reset_session => {},
                 else => return false,
             }
-            var body_buf: [160]u8 = undefined;
-            const body = std.mem.print(&body_buf, "{s} works on main's screen. Press Alt+← to go back to main.", .{command.command}) catch
-                "This command works on main's screen. Press Alt+← to go back to main.";
+            var name_buf: [32]u8 = undefined;
+            var body_buf: [192]u8 = undefined;
+            const home = homeHint(app, &name_buf);
+            const body = std.mem.print(&body_buf, "{s} works on {s}'s screen. Press {s} to go back to {s}.", .{ command.command, home.name, home.key, home.name }) catch
+                "This command works on an fx instance's screen, not a subagent's.";
             try app.writeDomainNotice(.{ .topic = "subagent", .tone = .neutral, .body = body }, true);
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             app.shell.render_requests.request(.footer);

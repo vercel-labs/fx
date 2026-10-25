@@ -856,12 +856,14 @@ const App = struct {
         NotificationAppRuntime.playMaxCue(self, .toggle);
     }
 
+    /// `agent`'s turn needs the user: an approval or a question.
     pub fn dispatchAttentionRequired(
         self: *App,
+        agent: *agents.Agent,
         turn_id: u64,
         kind: hooks.AttentionKind,
     ) void {
-        NotificationAppRuntime.dispatchAttentionRequired(self, turn_id, kind);
+        NotificationAppRuntime.dispatchAttentionRequired(self, SessionAppRuntime.activeSessionId(agent), turn_id, kind);
     }
 
     /// Must be called after init() returns so the AutoUpgrade thread
@@ -3229,60 +3231,19 @@ const App = struct {
         return AgentsAppRuntime.prepareOwnTurn(self, agent);
     }
 
-    /// Launches another instance on the host and shows it. A failure
-    /// leaves the host as it was and says why.
+    /// `/launch`: another instance on the host, shown.
     pub fn launchInstance(self: *App, profile_name: ?[]const u8) !void {
-        const child = InstancesAppRuntime.launch(self, profile_name) catch |err| {
-            debug_trace.logf("host", "instance launch failed profile={s} err={s}", .{ profile_name orelse "default", @errorName(err) });
-            // A profile that won't load says why, as `fx --profile` does.
-            const reason = if (profile_name) |name| app_profile_runtime.failureReason(self.alloc, name) catch null else null;
-            defer if (reason) |text| self.alloc.free(text);
-            var body_buf: [512]u8 = undefined;
-            const body = if (reason) |text|
-                std.mem.print(&body_buf, "Couldn't start another fx instance: {s}", .{text}) catch "Couldn't start another fx instance."
-            else
-                std.mem.print(&body_buf, "Couldn't start another fx instance: {s}.", .{@errorName(err)}) catch "Couldn't start another fx instance.";
-            try self.writeDomainNotice(.{ .topic = "instances", .tone = .@"error", .body = body }, true);
-            return;
-        };
-        try AgentsAppRuntime.show(self, child);
+        try InstancesAppRuntime.launchAndShow(self, profile_name);
     }
 
-    /// Opens the instances startup was asked for after the first one: the
-    /// resumed session's group first, then fresh ones up to
-    /// `--instances` or the test hook. The first stays on screen.
+    /// The instances startup was asked for after the first one.
     pub fn launchStartupInstances(self: *App) void {
-        if (self.instances.restore_pending) {
-            self.instances.restore_pending = false;
-            InstancesAppRuntime.restoreGroup(self);
-        }
-        while (self.instances.launched < self.instances.startup_count) {
-            _ = InstancesAppRuntime.launch(self, null) catch |err| {
-                debug_trace.logf("host", "startup instance launch failed index={d} err={s}", .{ self.instances.launched, @errorName(err) });
-                return;
-            };
-        }
+        InstancesAppRuntime.launchStartupInstances(self);
     }
 
-    /// `/close`: closes the instance on screen and every subagent in its
-    /// tree. The next instance takes over and the host keeps running, the
-    /// first instance included. Closing the only open instance
-    /// ends the host, as `/exit` does.
+    /// `/close`: the instance on screen and its subagents.
     pub fn closeInstanceOnScreen(self: *App) !void {
-        if (self.agent_on_screen) |child| if (child.agent.role == .subagent) {
-            try self.writeDomainNotice(.{ .topic = "instances", .tone = .neutral, .body = "/close closes an fx instance. This screen is a subagent's." }, true);
-            return;
-        };
-        if (AgentsAppRuntime.openInstanceCount(self) <= 1) {
-            SessionAppRuntime.requestResumeHandoff(self.screenAgent());
-            self.should_exit = true;
-            return;
-        }
-        if (self.agent_on_screen) |child| {
-            try AgentsAppRuntime.closeInstance(self, child);
-            return;
-        }
-        try AgentsAppRuntime.closeFirstInstance(self);
+        try InstancesAppRuntime.closeOnScreen(self);
     }
 
     /// Applies profile `name` to instance `agent`.
@@ -3316,6 +3277,11 @@ const App = struct {
     pub fn subagentOnScreen(self: *const App) bool {
         const on_screen = self.agent_on_screen orelse return false;
         return on_screen.agent.role == .subagent;
+    }
+
+    /// The instance a notice on a subagent's screen points back to.
+    pub fn subagentHome(self: *App, name_buf: []u8) ?AgentsAppRuntime.Home {
+        return AgentsAppRuntime.homeOfScreen(self, name_buf);
     }
 
     /// The trace name of the agent on screen: `main` or the subagent's id.
@@ -5134,6 +5100,7 @@ test {
     _ = @import("ui/render_request.zig");
     _ = @import("core/app/app_runtime_setup.zig");
     _ = @import("core/app/app_session_runtime.zig");
+    _ = @import("core/app/session_persistence.zig");
     _ = @import("core/app/app_upgrade_runtime.zig");
     _ = @import("core/app/app_worker_runtime.zig");
     _ = @import("ui/event_loop.zig");
