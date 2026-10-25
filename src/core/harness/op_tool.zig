@@ -41,7 +41,8 @@ pub fn callTool(call: *protocol.Call, tool_name: []const u8, arguments_json: []c
     if (call.lease.cancelled()) return error.Cancelled;
     const call_id = (try call.lease.nextCallId(call.arena)) orelse
         return call.fail(.refused, "this command already made its limit of harness requests", .{});
-    const outcome = try services.callTool(call.arena, .{ .call_id = call_id, .name = tool_name, .arguments_json = arguments_json });
+    const caller = try call.lease.describeCaller(call.arena, call.peer_pid);
+    const outcome = try services.callTool(call.arena, .{ .call_id = call_id, .name = tool_name, .arguments_json = arguments_json, .caller = caller });
     return switch (outcome.status) {
         .success, .failure => call.ok(.{ .status = @tagName(outcome.status), .output = outcome.output }),
         .denied => .{ .failure = .{ .kind = .permission_denied, .message = try call.arena.print("permission to run {s} was denied", .{tool_name}), .output = outcome.output } },

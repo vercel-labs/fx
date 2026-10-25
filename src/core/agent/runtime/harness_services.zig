@@ -89,7 +89,7 @@ fn callTool(context: *anyopaque, arena: Allocator, request: harness_services.Too
     if (try runtime_tool_admission.toolAvailabilityFailure(deps, arena, call)) |failure| return .{ .status = .refused, .output = failure.model_output };
     debug_trace.eventf("harness", "tool_requested", self.trace, "call_id={s} tool_name={s}", .{ call.id, call.name });
 
-    const admitted = (try admit(self, arena, call)) orelse return .{ .status = .cancelled, .output = "" };
+    const admitted = (try admit(self, arena, call, request.caller)) orelse return .{ .status = .cancelled, .output = "" };
     const permit = switch (admitted) {
         .outcome => |outcome| return outcome,
         .permit => |permit| permit,
@@ -159,7 +159,7 @@ const Admission = union(enum) {
 /// Live authority and the permission request, one harness call at a time
 /// per turn, so one person sees one harness prompt at a time. Null when
 /// the turn was cancelled while it waited.
-fn admit(self: *Turn, arena: Allocator, call: types.ToolCall) !?Admission {
+fn admit(self: *Turn, arena: Allocator, call: types.ToolCall, caller: []const u8) !?Admission {
     const deps = self.deps;
     const io = io_mod.getIo();
     self.lock.lockUncancelable(io);
@@ -202,6 +202,7 @@ fn admit(self: *Turn, arena: Allocator, call: types.ToolCall) !?Admission {
         .pending_assistant = .{ .role = .assistant, .tool_calls = calls },
         .target_call_id = call.id,
         .origin = .harness,
+        .harness_caller = caller,
         .credential = self.credential,
         .trusted_root_context = auto_classifier_context.rootUserRequestContext(self.root_user_intent_context) orelse "",
         .current_turn_untrusted_messages = self.current_turn_messages,

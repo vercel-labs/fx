@@ -493,7 +493,24 @@ pub fn executeToolCallAuthorized(
     if (request.command_replay_capture) |continued| {
         replay_continuation_transferred = result.command_replay_capture == continued;
     }
+    if (result.status == .success) noteHarnessFileTool(execution_ctx, request.call);
     return result;
+}
+
+/// A file the node just read or wrote through its file tools is what the
+/// agent now knows of it, which arms the harness's stale-write guard.
+fn noteHarnessFileTool(ctx: Context, call: types.ToolCall) void {
+    const file_tools = [_][]const u8{ "read_file", "edit_file", "write_file" };
+    for (file_tools) |name| {
+        if (std.mem.eql(u8, name, call.name)) break;
+    } else return;
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Args = struct { path: []const u8 };
+    const args = std.json.parseFromSliceLeaky(Args, arena, call.arguments_json, .{ .ignore_unknown_fields = true }) catch return;
+    const target = pathing.resolveWorkspaceOrExternalPath(arena, ctx.workspace_root, args.path) catch return;
+    harness_mod.noteFileTool(ctx.lifecycle_scope.session_id, &ctx.session.kernel, target);
 }
 
 fn classifyToolExecutionError(err: anyerror) diagnostics.ToolCallOutcome {

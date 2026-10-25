@@ -21,6 +21,10 @@ pub const FileApprovalRequest = struct {
     scope: FileApprovalScope,
 };
 
+/// Appended to the label of a request that Python made through
+/// `proto_fx`, followed by the asking process in parentheses.
+pub const harness_marker = " · via harness";
+
 pub const RequestOrigin = union(enum) {
     active_session,
     subagent: []const u8,

@@ -19,16 +19,7 @@ PROTOCOL_VERSION = 1
 _ids = itertools.count(1)
 
 
-class HarnessError(Exception):
-    """A request the host refused or could not complete."""
-
-    kind = "internal"
-
-    def __init__(self, message: str, kind: str | None = None):
-        super().__init__(message)
-        self.message = message
-        if kind is not None:
-            self.kind = kind
+from _proto_fx_guard import HarnessError, StaleWriteError  # noqa: E402,F401  (one class for the guard and the library)
 
 
 class Unavailable(HarnessError):
@@ -73,14 +64,29 @@ class Cancelled(HarnessError):
     kind = "cancelled"
 
 
+class AnchorError(HarnessError):
+    """``fs.replace`` found the old text another number of times than ``count``; nothing was written."""
+
+    kind = "anchor_mismatch"
+
+
 _KINDS = {
     cls.kind: cls
-    for cls in (Unavailable, PermissionDenied, Refused, ToolFailed, KernelError, Cancelled)
+    for cls in (Unavailable, PermissionDenied, Refused, ToolFailed, KernelError, Cancelled, StaleWriteError, AnchorError)
 }
 
 
+_ENDED = (
+    "Harness access lasts only while the shell call that started this command runs; "
+    "a command left running in the background after its call returned keeps running without it. "
+    "Run Python that needs proto_fx in a command that finishes within its call."
+)
+
+
 def available() -> bool:
-    """Whether this process can reach a proto-fx host."""
+    """Whether this process can reach a proto-fx host: a proto-fx agent command started it, on Python 3.10 or newer."""
+    if sys.version_info < (3, 10):
+        return False
     return bool(os.environ.get("PROTO_FX_HARNESS_SOCKET") and os.environ.get("PROTO_FX_HARNESS_TOKEN"))
 
 
@@ -105,13 +111,23 @@ def _stream_event(event: str, data: Any) -> None:
 
 def request(op: str, args: dict[str, Any] | None = None, on_event: Callable[[str, Any], None] | None = _stream_event) -> Any:
     """Sends one request and returns the host's value, or raises a HarnessError."""
+    if sys.version_info < (3, 10):
+        raise Unavailable("proto_fx needs Python 3.10 or newer; this is %d.%d" % sys.version_info[:2])
     path, token = _endpoint()
+    try:
+        import _proto_fx_guard
+
+        _proto_fx_guard.flush()
+    except Exception:
+        pass
     rid = next(_ids)
     line = json.dumps({"v": PROTOCOL_VERSION, "token": token, "id": rid, "op": op, "args": args or {}}) + "\n"
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         try:
             sock.connect(path)
+        except (FileNotFoundError, ConnectionRefusedError):
+            raise Unavailable("the proto-fx host no longer listens for this command. " + _ENDED, "unauthorized") from None
         except OSError as err:
             raise Unavailable("the proto-fx host is not reachable: %s" % err) from None
         sock.sendall(line.encode())
@@ -127,7 +143,7 @@ def request(op: str, args: dict[str, Any] | None = None, on_event: Callable[[str
             error = msg.get("error") or {}
             kind = error.get("kind", "internal")
             message = error.get("message", "the host refused the request")
-            cls = _KINDS.get(kind, HarnessError)
+            cls = Unavailable if kind == "unauthorized" else _KINDS.get(kind, HarnessError)
             if cls in (ToolFailed, KernelError):
                 raise cls(message, kind, output=error.get("output", ""))
             raise cls(message, kind)

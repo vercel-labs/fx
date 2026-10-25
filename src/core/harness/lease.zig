@@ -14,6 +14,9 @@ pub const socket_env = "PROTO_FX_HARNESS_SOCKET";
 pub const token_env = "PROTO_FX_HARNESS_TOKEN";
 pub const depth_env = "PROTO_FX_HARNESS_DEPTH";
 pub const python_path_env = "PYTHONPATH";
+/// The staged folder again, so a login shell whose startup files reassign
+/// PYTHONPATH can put it back (`shell_resolver.harness_python_path_restore`).
+pub const python_path_marker_env = "PROTO_FX_HARNESS_PYTHONPATH";
 
 /// Harness requests one command may make, a bound on automatic reviews and
 /// on a runaway loop.
@@ -62,10 +65,16 @@ pub const Lease = struct {
     /// so a cell's own `import proto_fx` reaches this node.
     bound_lock: std.Io.Mutex = .init,
     bound: std.ArrayList(Bound) = .empty,
-    /// The socket and token variables, set once the channel names the socket.
-    env_pairs: [2][2][]const u8 = undefined,
+    /// The socket, token and harness-folder variables, set once the channel
+    /// names the socket.
+    env_pairs: [3][2][]const u8 = undefined,
+    /// The Python processes this command reported, newest last, so an
+    /// approval can name the one that asked. Guarded by `bound_lock`.
+    reported: [8]Reported = undefined,
+    reported_len: usize = 0,
 
     pub const Bound = struct { manager: *const anyopaque, generation: u64 };
+    pub const Reported = struct { pid: i64, argv: [96]u8, argv_len: usize };
 
     pub fn create(alloc: Allocator, options: Options, python_dir: []const u8) !*Lease {
         const lease = try alloc.create(Lease);
@@ -127,7 +136,7 @@ pub const Lease = struct {
 
     pub fn bindChannel(self: *Lease, channel: *channel_mod.Channel) void {
         self.channel = channel;
-        self.env_pairs = .{ .{ socket_env, channel.socket_path }, .{ token_env, &self.token } };
+        self.env_pairs = .{ .{ socket_env, channel.socket_path }, .{ token_env, &self.token }, .{ python_path_marker_env, self.python_dir } };
     }
 
     pub fn socketPath(self: *const Lease) []const u8 {
@@ -144,6 +153,38 @@ pub const Lease = struct {
             .set = &self.env_pairs,
             .unset = &.{depth_env},
         };
+    }
+
+    /// Remembers a reported Python process and a short form of its argv.
+    pub fn noteProcess(self: *Lease, pid: i64, argv: []const u8) void {
+        const io = io_mod.getIo();
+        self.bound_lock.lockUncancelable(io);
+        defer self.bound_lock.unlock(io);
+        if (self.reported_len == self.reported.len) {
+            @memmove(self.reported[0 .. self.reported.len - 1], self.reported[1..]);
+            self.reported_len -= 1;
+        }
+        var entry: Reported = .{ .pid = pid, .argv = undefined, .argv_len = @min(argv.len, 96) };
+        @memcpy(entry.argv[0..entry.argv_len], argv[0..entry.argv_len]);
+        self.reported[self.reported_len] = entry;
+        self.reported_len += 1;
+    }
+
+    /// What asked, for approvals: "python pid 42: python3 fix.py", or the
+    /// pid alone when that process never reported (a kernel, or a child of
+    /// the command's top-level Python).
+    pub fn describeCaller(self: *Lease, arena: Allocator, pid: i64) ![]const u8 {
+        if (pid <= 0) return "python";
+        const io = io_mod.getIo();
+        self.bound_lock.lockUncancelable(io);
+        defer self.bound_lock.unlock(io);
+        var index = self.reported_len;
+        while (index > 0) {
+            index -= 1;
+            const entry = self.reported[index];
+            if (entry.pid == pid) return arena.print("python pid {d}: {s}", .{ pid, entry.argv[0..entry.argv_len] });
+        }
+        return arena.print("python pid {d}", .{pid});
     }
 
     /// Whether `manager`, at `generation`, already has this lease's token.

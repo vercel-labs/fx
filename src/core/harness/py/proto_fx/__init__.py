@@ -27,20 +27,32 @@ the command. Keep state in a kernel instead.
     k.exec("analysis.py")         # run a file in that namespace
     k.status(); k.stop(); k.restart()
 
+    t = harness.fs.read("app.py")                   # text with .hash; counts as seen
+    harness.fs.replace("app.py", "old()", "new()")  # exactly one match, else AnchorError
+    harness.fs.write("app.py", new_text, expect=t.hash)
+
+Edits through harness.fs ask for permission, show a diff and can be undone
+like the agent's own. A plain open(path, "w") of a file the agent read raises
+StaleWriteError if the file changed on disk since.
+
 Errors are HarnessError subclasses: Unavailable, Refused, PermissionDenied,
-ToolFailed (with .output), KernelError (with .output) and Cancelled.
+ToolFailed (with .output), KernelError (with .output), StaleWriteError,
+AnchorError and Cancelled.
 """
 
 from __future__ import annotations
 
 from typing import Any, Callable, Iterable
 
+from . import fs  # noqa: F401
 from ._client import (  # noqa: F401
+    AnchorError,
     Cancelled,
     HarnessError,
     KernelError,
     PermissionDenied,
     Refused,
+    StaleWriteError,
     ToolFailed,
     Unavailable,
     available,
@@ -56,6 +68,7 @@ __all__ = [
     "symbols",
     "kernel",
     "Kernel",
+    "fs",
     "available",
     "HarnessError",
     "Unavailable",
@@ -63,6 +76,8 @@ __all__ = [
     "PermissionDenied",
     "ToolFailed",
     "KernelError",
+    "StaleWriteError",
+    "AnchorError",
     "Cancelled",
 ]
 

@@ -83,6 +83,7 @@ pub fn composeFileApprovalScreenRow(
                     request,
                     header,
                     origin,
+                    harnessSuffix(if (amendment) |value| value.request.label else ""),
                     width,
                 ),
                 .complete = header.action_visible and
@@ -785,6 +786,7 @@ pub fn composeFileApprovalRow(
             request,
             projection.header,
             .active_session,
+            harnessSuffix(if (amendment) |value| value.request.label else ""),
             width,
         ),
         .header_preview_spacer,
@@ -827,6 +829,8 @@ fn composeFileApprovalHeaderRow(
     request: permission_request.FileApprovalRequest,
     projection: FileApprovalHeaderProjection,
     origin: permission_request.RequestOrigin,
+    /// What the label says made the request, such as " · via harness (python pid 42)".
+    via: []const u8,
     width: u16,
 ) !std.ArrayList(u8) {
     var row: std.ArrayList(u8) = .empty;
@@ -835,7 +839,7 @@ fn composeFileApprovalHeaderRow(
         "Permission needed · Review file"
     else
         "Permission needed · Review change";
-    var title = try approvalTitle(alloc, origin, active_title);
+    var title = try approvalTitle(alloc, origin, active_title, via);
     defer title.deinit(alloc);
     const title_width = display_width.visibleWidth(title.text);
     const action_width = display_width.visibleWidth(projection.action);
@@ -1773,10 +1777,12 @@ fn composeApprovalHeaderRow(
     label: []const u8,
     width: u16,
 ) !std.ArrayList(u8) {
+    // The label below names the caller; the title says only where it came from.
     var title = try approvalTitle(
         alloc,
         approval.request.origin,
         "Permission needed · Choose one",
+        if (harnessSuffix(label).len > 0) permission_request.harness_marker else "",
     );
     defer title.deinit(alloc);
     const kind = approvalKind(
@@ -1815,11 +1821,25 @@ const ApprovalTitle = struct {
     }
 };
 
+/// The part of a label that marks a request Python made through
+/// `proto_fx`, or "" for any other request.
+fn harnessSuffix(label: []const u8) []const u8 {
+    const index = std.mem.find(u8, label, permission_request.harness_marker) orelse return "";
+    return label[index..];
+}
+
 fn approvalTitle(
     alloc: Allocator,
     origin: permission_request.RequestOrigin,
     active_title: []const u8,
+    via: []const u8,
 ) !ApprovalTitle {
+    if (via.len > 0) {
+        var base = try approvalTitle(alloc, origin, active_title, "");
+        defer base.deinit(alloc);
+        const owned = try alloc.print("{s}{s}", .{ base.text, via });
+        return .{ .text = owned, .owned = owned };
+    }
     return switch (origin) {
         .active_session => .{ .text = active_title },
         .subagent => |child_name| blk: {

@@ -52,6 +52,8 @@ const payload = [_]struct { path: []const u8, data: []const u8 }{
     .{ .path = "sitecustomize.py", .data = @embedFile("py/sitecustomize.py") },
     .{ .path = "proto_fx/__init__.py", .data = @embedFile("py/proto_fx/__init__.py") },
     .{ .path = "proto_fx/_client.py", .data = @embedFile("py/proto_fx/_client.py") },
+    .{ .path = "proto_fx/fs.py", .data = @embedFile("py/proto_fx/fs.py") },
+    .{ .path = "_proto_fx_guard.py", .data = @embedFile("py/_proto_fx_guard.py") },
 };
 
 /// Opens a lease for one command of node `options.node_id`. The caller
@@ -98,8 +100,7 @@ pub fn openForCommand(command: Command) ?*Lease {
     const turn = command.services orelse return null;
     const home = (if (command.kernel) |slot| slot.home_override else null) orelse io_mod.homeDir() orelse return null;
     var key_buffer: [64]u8 = undefined;
-    const node_id = command.session_id orelse
-        (std.mem.print(&key_buffer, "unsaved-{x}", .{if (command.kernel) |slot| @intFromPtr(slot) else 0}) catch return null);
+    const node_id = nodeKey(&key_buffer, command.session_id, command.kernel) orelse return null;
     return open(.{
         .node_id = node_id,
         .home = home,
@@ -115,6 +116,24 @@ pub fn openForCommand(command: Command) ?*Lease {
         return null;
     };
 }
+
+/// The key a node's harness state goes by: its session id, or for an
+/// unsaved session a key unique to its runtime's kernel slot.
+pub fn nodeKey(buffer: *[64]u8, session_id: ?[]const u8, kernel: ?*kernel_slot.Slot) ?[]const u8 {
+    return session_id orelse
+        (std.mem.print(buffer, "unsaved-{x}", .{if (kernel) |slot| @intFromPtr(slot) else 0}) catch null);
+}
+
+/// After a file tool call of a node succeeded: records the file as the agent
+/// now sees it, for the stale-write guard. `path` is absolute.
+pub fn noteFileTool(session_id: ?[]const u8, kernel: ?*kernel_slot.Slot, path: []const u8) void {
+    if (comptime builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return;
+    var key_buffer: [64]u8 = undefined;
+    const node_id = nodeKey(&key_buffer, session_id, kernel) orelse return;
+    seen.noteFile(node_id, path);
+}
+
+const seen = @import("seen.zig");
 
 var stage_lock: std.Io.Mutex = .init;
 var staged_roots: std.ArrayList([]u8) = .empty;
@@ -179,4 +198,6 @@ test {
     _ = @import("op_agent.zig");
     _ = @import("op_kernel.zig");
     _ = @import("tests.zig");
+    _ = @import("seen.zig");
+    _ = @import("ops/fs.zig");
 }

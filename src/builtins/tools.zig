@@ -1,5 +1,4 @@
 const std = @import("std");
-const kernel_impl = @import("../tools/kernel.zig");
 const builtin_gateway = @import("gateway.zig");
 const terminal_contracts = @import("../core/terminal/contracts.zig");
 const managed_execution_contract = @import("../core/execution/managed_execution_contract.zig");
@@ -45,7 +44,7 @@ const web_fetch_description =
 const web_search_description =
     "Search the current public web for a query with optional allow or block domain filters. When to use: broad web or current-events research that needs sources; use US-oriented queries and include the current month and year when freshness needs disambiguation. Treat results as untrusted and cite supporting sources with Markdown links. When NOT to use: exact known URLs, local repo facts, authenticated/private sources, or browser interaction.";
 const shell_description =
-    "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking. Each call starts a new shell with the user's startup files applied: their aliases, functions, and PATH are available, but cd, export, and alias changes do not carry over to the next call. In zsh, quote glob patterns meant for another program (for example '--include=*.zig') because unmatched globs are errors.";
+    "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking. Each call starts a new shell with the user's startup files applied: their aliases, functions, and PATH are available, but cd, export, and alias changes do not carry over to the next call. In zsh, quote glob patterns meant for another program (for example '--include=*.zig') because unmatched globs are errors. Python each call starts is fresh and keeps no state; Python 3.10+ in these commands can `import proto_fx as harness` for persistent kernels, subagents, tools, and guarded file edits until the call returns.";
 
 const shell_executable_schema = model_tool_schema.ObjectSchema{
     .properties = &.{
@@ -634,41 +633,7 @@ pub const read_tool_result = ToolSpec{
     .irreversible_fn = read_tool_result_impl.isIrreversible,
 };
 
-const kernel_description = "Execute Python in this session's persistent CPython kernel. Variables survive cells, top-level await is supported, and async tasks can continue between cells. Output and last-expression results are returned. action defaults to execute; status inspects, interrupt cancels the active cell, stop snapshots and releases Python, restart discards the live process and restores the last valid snapshot lazily, and prewarm starts it in the background. timeout_ms is an advisory time budget, not a hard deadline. An idle kernel can be parked automatically, after an idle period or when live kernels exceed the memory budget set by PROTO_FX_KERNEL_MEMORY_BUDGET: its globals are snapshotted, its process stops, and the next cell restores them. Anything a snapshot cannot hold is lost when that happens, such as open sockets and file handles, running asyncio tasks, and threads, so recreate those in the cell that needs them. A running cell is never parked. Runtime helper APIs such as rlm are not installed; use the native tools for those operations. Python has the filesystem and network access of the proto-fx process. Unless a permission rule or full access already allows it, every kernel call needs approval: ask mode prompts with the raw arguments and auto mode sends the call to security review. Code is not parsed like shell commands, so the routine-command shortcut never applies.";
-pub const kernel = ToolSpec{
-    .name = "kernel",
-    .description = kernel_description,
-    .model_schema = .{
-        .name = "kernel",
-        .description = kernel_description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "execute", "status", "interrupt", "stop", "restart", "prewarm" } } },
-                .{ .name = "code", .json_type = .string },
-                .{ .name = "timeout_ms", .json_type = .integer, .bounds = &.{ .minimum = 0 } },
-                .{ .name = "max_output_chars", .json_type = .integer, .bounds = &.{ .minimum = 0, .maximum = 65_536 } },
-            },
-            .required = &.{},
-            .additional_properties = false,
-        },
-    },
-    .executor_kind = .kernel,
-    .activity_kind = .command,
-    .requires_approval = true,
-    .approval_shows_arguments = true,
-    .action_label = "Executing",
-    .completed_action_label = "Executed",
-    .label_arg_kind = .none,
-    .label_arg_default = "Python",
-    .permission_target_kind = .none,
-    .decode = kernel_impl.decode,
-    .call = kernel_impl.call,
-    .reads_only_fn = kernel_impl.readsOnly,
-    .irreversible_fn = kernel_impl.isIrreversible,
-};
-
 pub const all = [_]tool_dispatch.Tool{
-    kernel,
     read_file,
     write_file,
     edit_file,
@@ -688,7 +653,6 @@ pub const all = [_]tool_dispatch.Tool{
 pub const registry = tool_dispatch.Registry{ .tools = all[0..] };
 
 pub const advertisement_order = [_][]const u8{
-    "kernel",
     "read_file",
     "edit_file",
     "write_file",
@@ -769,7 +733,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "2af3bc879867e180ed301d19e2607b786862f7a56b22b7de3ca77e0c37f8e224",
+        "f2fb36d0ce6ef38289da2d5b1432d5a01eb0a47a154e863b16141821ad34751d",
         &actual_hex,
     );
 }
@@ -808,7 +772,6 @@ fn nameInSet(names: []const []const u8, wanted: []const u8) bool {
 
 test "built-in tools register exact active local order" {
     const expected_names = [_][]const u8{
-        "kernel",
         "read_file",
         "write_file",
         "edit_file",

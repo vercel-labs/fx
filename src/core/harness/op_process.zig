@@ -19,6 +19,7 @@ pub const process = struct {
     pub fn handle(call: *protocol.Call, args: Args) !protocol.Reply {
         const count = call.lease.processes.fetchAdd(1, .monotonic) + 1;
         const argv = std.mem.join(call.arena, " ", args.argv) catch "";
+        call.lease.noteProcess(args.pid, argv);
         debug_trace.logf("harness", "python ran node={s} call={s} pid={d} ppid={d} version={s} executable={s} cwd={s} argv={s} count={d}", .{
             call.lease.node_id,
             call.lease.parent_call_id,

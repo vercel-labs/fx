@@ -246,6 +246,9 @@ pub const ReviewTurnContext = struct {
     /// Borrowed current-turn messages used only to derive compact host
     /// provenance before provider review. Their content is never serialized.
     current_turn_untrusted_messages: []const types.ChatMessage = &.{},
+    /// For `.harness` origin: the Python that asked, such as "python pid 42:
+    /// python3 fix.py". Shown in approval prompts; never review authority.
+    harness_caller: []const u8 = "",
 };
 
 pub const ReviewRequest = struct {

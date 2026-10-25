@@ -14,7 +14,7 @@ zig build -Doptimize=ReleaseSafe
 
 Setup discovers `/v1/models` (then `/models` where appropriate), saves the returned model catalog, and selects the first model. Use `--model MODEL` to choose explicitly without discovery, or `--api-key-env VARIABLE_NAME` for a bearer-authenticated endpoint. Only the variable name is saved, not the key. Configuration and session data live under `~/.proto-fx`.
 
-The native agent needs no language runtime. The optional `kernel` tool provisions a dedicated Python 3.11 environment with `dill` on first use through `uv`. Install [uv](https://docs.astral.sh/uv/) first, or set `PROTO_FX_KERNEL_PYTHON` to an existing Python 3.11+ interpreter with `dill` installed.
+The native agent needs no language runtime. Persistent Python kernels, which agent Python reaches through `import proto_fx as harness` and people control with `/kernel`, use the project's own environment when it has Python 3.11 or newer, and otherwise provision a dedicated Python 3.11 environment with `dill` on first use through `uv`. Install [uv](https://docs.astral.sh/uv/) first, or set `PROTO_FX_KERNEL_PYTHON` to an existing Python 3.11+ interpreter with `dill` installed.
 
 ## Terminal workflow
 

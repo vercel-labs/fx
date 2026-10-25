@@ -28,6 +28,8 @@ pub const ToolRequest = struct {
     call_id: []const u8,
     name: []const u8,
     arguments_json: []const u8,
+    /// Who asked, for approvals, such as "python pid 42: python3 fix.py".
+    caller: []const u8 = "",
 };
 
 pub const CompletionRequest = struct {

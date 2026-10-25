@@ -208,17 +208,40 @@ fn serve(channel: *Channel, stream: std.Io.net.Stream) void {
     };
     const lease = authenticate(channel, envelope.token) orelse {
         debug_trace.logf("harness", "unauthorized request node={s} op={s}", .{ channel.node_id, envelope.op });
-        respond(arena, sink, envelope.id, .{ .failure = .{ .kind = .unauthorized, .message = "this token names no running command of this agent; proto_fx works only while the command that started it runs" } });
+        respond(arena, sink, envelope.id, .{ .failure = .{ .kind = .unauthorized, .message = "this token names no running command of this agent. Harness access lasts only while the shell call that started the command runs; a command left running in the background after its call returned keeps running without it. Run Python that needs proto_fx in a command that finishes within its call." } });
         return;
     };
     defer release(channel, lease);
-    var call: protocol.Call = .{ .arena = arena, .lease = lease, .id = envelope.id, .sink = sink };
+    var call: protocol.Call = .{ .arena = arena, .lease = lease, .id = envelope.id, .sink = sink, .peer_pid = peerPid(stream.socket.handle) };
     const reply = ops.dispatch(&call, envelope.op, envelope.args) catch |err| switch (err) {
         error.OutOfMemory => protocol.Reply{ .failure = .{ .kind = .internal, .message = "out of memory" } },
         error.Cancelled => protocol.Reply{ .failure = .{ .kind = .cancelled, .message = "the agent's turn was cancelled" } },
         else => protocol.Reply{ .failure = .{ .kind = .internal, .message = @errorName(err) } },
     };
     respond(arena, sink, envelope.id, reply);
+}
+
+/// The process at the other end of a Unix socket, from the kernel, so a
+/// client cannot claim another pid. 0 when the platform does not say.
+fn peerPid(fd: std.posix.fd_t) i64 {
+    const builtin = @import("builtin");
+    switch (comptime builtin.target.os.tag) {
+        .macos => {
+            // SOL_LOCAL and LOCAL_PEERPID from <sys/un.h>.
+            var pid: c_int = 0;
+            var len: std.c.socklen_t = @sizeOf(c_int);
+            if (std.c.getsockopt(fd, 0, 0x002, &pid, &len) != 0) return 0;
+            return pid;
+        },
+        .linux => {
+            const Ucred = extern struct { pid: i32, uid: u32, gid: u32 };
+            var cred: Ucred = .{ .pid = 0, .uid = 0, .gid = 0 };
+            var len: std.c.socklen_t = @sizeOf(Ucred);
+            if (std.c.getsockopt(fd, std.posix.SOL.SOCKET, std.os.linux.SO.PEERCRED, &cred, &len) != 0) return 0;
+            return cred.pid;
+        },
+        else => return 0,
+    }
 }
 
 fn respond(arena: Allocator, sink: protocol.Sink, id: i64, reply: protocol.Reply) void {

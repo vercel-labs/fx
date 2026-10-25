@@ -18,6 +18,11 @@ pub const all = .{
     @import("op_kernel.zig").stop,
     @import("op_kernel.zig").restart,
     @import("op_kernel.zig").list,
+    @import("ops/fs.zig").read,
+    @import("ops/fs.zig").replace,
+    @import("ops/fs.zig").write,
+    @import("ops/fs.zig").check,
+    @import("ops/fs.zig").note,
 };
 
 /// The names every op answers to, for `hello`.

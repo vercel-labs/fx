@@ -1,7 +1,8 @@
 # proto-fx harness hook. proto-fx puts this folder first on PYTHONPATH only
 # for the agent's own shell commands. It must stay cheap: it imports nothing
 # beyond what the interpreter already loaded, and does nothing more unless
-# PROTO_FX_HARNESS_TOKEN is set. -I, -E and -S skip it, as Python skips any
+# PROTO_FX_HARNESS_TOKEN is set; then it adds the small stale-write guard
+# (_proto_fx_guard.py) as an audit hook. -I, -E and -S skip it, as Python skips any
 # sitecustomize then. Keep this file valid on old interpreters: no f-strings,
 # no annotations.
 import os
@@ -86,13 +87,22 @@ def _proto_fx_main():
         depth = 1
     # Children of this Python inherit a deeper count and stay quiet.
     os.environ["PROTO_FX_HARNESS_DEPTH"] = str(depth + 1)
-    if depth > 0:
-        return
     if sys.version_info < (3, 10):
-        sys.stderr.write(
-            "proto-fx: the proto_fx harness needs Python 3.10 or newer; %s is %d.%d, so this run has no harness.\n"
-            % (sys.executable or "python", sys.version_info[0], sys.version_info[1])
-        )
+        if depth == 0:
+            sys.stderr.write(
+                "proto-fx: the proto_fx harness needs Python 3.10 or newer; %s is %d.%d, so this run has no harness.\n"
+                % (sys.executable or "python", sys.version_info[0], sys.version_info[1])
+            )
+        return
+    # Every Python of the command guards its writes; only the top-level one
+    # reports itself.
+    try:
+        import _proto_fx_guard
+
+        sys.addaudithook(_proto_fx_guard.hook)
+    except Exception:
+        pass
+    if depth > 0:
         return
     try:
         _proto_fx_report(path, token)

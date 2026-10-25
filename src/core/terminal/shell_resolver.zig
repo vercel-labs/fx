@@ -193,6 +193,17 @@ const captured_zsh_user_prelude = "\\builtin trap - TERM; ";
 /// snapshot replay have run.
 const zsh_command_prelude = "\\builtin unsetopt equals; ";
 
+/// Runs after the startup files of a full-startup `user` command and before
+/// the command: when the agent's harness is on (PROTO_FX_HARNESS_PYTHONPATH,
+/// `src/core/harness/lease.zig`) and a startup file reassigned PYTHONPATH
+/// without it, puts the harness folder back in front. It does nothing for
+/// any other command. Snapshot runs need no restore: the harness is applied
+/// on top of the captured environment.
+pub const harness_python_path_restore =
+    "if [ -n \"${PROTO_FX_HARNESS_PYTHONPATH-}\" ]; then case \":${PYTHONPATH-}:\" in " ++
+    "*\":$PROTO_FX_HARNESS_PYTHONPATH:\"*) ;; " ++
+    "*) export PYTHONPATH=\"$PROTO_FX_HARNESS_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}\";; esac; fi\n";
+
 pub fn capturedInvocation(
     alloc: Allocator,
     environment_value: Environment,
@@ -220,9 +231,9 @@ pub fn capturedInvocation(
                 invocation.append("expand_aliases");
             }
             const effective_command = if (shellKind(path) == .zsh)
-                try std.mem.concat(alloc, u8, &.{ captured_zsh_user_prelude, zsh_command_prelude, command })
+                try std.mem.concat(alloc, u8, &.{ harness_python_path_restore, captured_zsh_user_prelude, zsh_command_prelude, command })
             else
-                command;
+                try std.mem.concat(alloc, u8, &.{ harness_python_path_restore, command });
             invocation.setCommand(effective_command);
             return invocation;
         },
@@ -613,11 +624,11 @@ test "captured profiles use exact non-PTY argv" {
         bash_clean.argv(),
     );
     const bash_user = try capturedInvocation(arena, .{ .user = "/bin/bash" }, "printf user");
-    try std.testing.expectEqualSlices(
-        []const u8,
-        &.{ "/bin/bash", "--login", "-O", "expand_aliases", "-c", "printf user" },
-        bash_user.argv(),
-    );
+    const expected_bash_user = [_][]const u8{ "/bin/bash", "--login", "-O", "expand_aliases", "-c", harness_python_path_restore ++ "printf user" };
+    try std.testing.expectEqual(expected_bash_user.len, bash_user.argv().len);
+    for (&expected_bash_user, bash_user.argv()) |expected, actual| {
+        try std.testing.expectEqualStrings(expected, actual);
+    }
     const zsh_clean = try capturedInvocation(arena, .{ .clean = "/bin/zsh" }, "printf clean");
     const expected_zsh_clean = [_][]const u8{
         "/bin/zsh",
@@ -635,7 +646,7 @@ test "captured profiles use exact non-PTY argv" {
         "-l",
         "-i",
         "-c",
-        "\\builtin trap - TERM; \\builtin unsetopt equals; printf user",
+        harness_python_path_restore ++ "\\builtin trap - TERM; \\builtin unsetopt equals; printf user",
     };
     try std.testing.expectEqual(expected_zsh_user.len, zsh_user.argv().len);
     for (&expected_zsh_user, zsh_user.argv()) |expected, actual| {

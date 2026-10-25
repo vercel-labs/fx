@@ -107,10 +107,6 @@ fn toolRequiresApproval(input: Input, name: []const u8) bool {
     return if (registeredTool(input, name)) |spec| spec.requires_approval else false;
 }
 
-fn approvalShowsArguments(input: Input, name: []const u8) bool {
-    return if (registeredTool(input, name)) |spec| spec.approval_shows_arguments else false;
-}
-
 fn registeredTerminalCallReadsOnly(
     input: Input,
     arena: Allocator,
@@ -1806,7 +1802,7 @@ fn requestFileMutationPermissionOutcomeFromAdmission(
             const prompter = input.permission_prompter orelse break :blk unavailable;
             var authorization = pending.authorization;
             const request_view = try fileMutationPermissionRequest(
-                "file_mutation",
+                try harnessMarkedLabel(input, arena, "file_mutation"),
                 authorization,
             );
             const review = if (authorization.prepared) |*prepared|
@@ -2421,7 +2417,29 @@ fn writeIdentityField(writer: *std.Io.Writer, value: []const u8) !void {
     try writer.writeAll(value);
 }
 
+/// Marks a request that Python made through `proto_fx` rather than the
+/// model, so the approval names its origin wherever the label shows: the
+/// approval prompt, the transcript and ACP permission titles.
 fn interactivePermissionRequest(
+    input: Input,
+    arena: Allocator,
+    call: ToolCall,
+    label_override: ?[]const u8,
+) !permission_request.PermissionRequest {
+    var request = try interactivePermissionRequestUnmarked(input, arena, call, label_override);
+    request.label = try harnessMarkedLabel(input, arena, request.label);
+    return request;
+}
+
+fn harnessMarkedLabel(input: Input, arena: Allocator, label: []const u8) ![]const u8 {
+    const review = input.permission_review_turn orelse return label;
+    if (review.origin != .harness) return label;
+    const caller = if (review.harness_caller.len > 0) review.harness_caller else "python";
+    const encoded = try text_utils.encodeTerminalSafe(arena, caller, 96);
+    return arena.print("{s}{s} ({s})", .{ label, permission_request.harness_marker, encoded.bytes });
+}
+
+fn interactivePermissionRequestUnmarked(
     input: Input,
     arena: Allocator,
     call: ToolCall,
@@ -2448,7 +2466,7 @@ fn interactivePermissionRequest(
             .amendment_allowed = true,
         };
     }
-    const tool_arguments_preview = if (isAvailableDynamicTool(input, call.name) or approvalShowsArguments(input, call.name)) blk: {
+    const tool_arguments_preview = if (isAvailableDynamicTool(input, call.name)) blk: {
         const encoded = try text_utils.encodeTerminalSafe(
             arena,
             call.arguments_json,

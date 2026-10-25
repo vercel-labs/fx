@@ -30,6 +30,10 @@ pub const ErrorKind = enum {
     cancelled,
     /// Too many requests are in flight for this node.
     busy,
+    /// The file changed on disk since the agent last saw it.
+    stale,
+    /// `fs.replace` found another number of anchors than it was told to.
+    anchor_mismatch,
     internal,
 };
 
@@ -69,6 +73,9 @@ pub const Call = struct {
     lease: *lease_mod.Lease,
     id: i64,
     sink: Sink,
+    /// The connecting process, from the socket's peer credentials; 0 when
+    /// the platform does not say. Used only to name the caller in approvals.
+    peer_pid: i64 = 0,
 
     /// Streams a text event to the client. Failures only drop the event.
     pub fn event(self: *const Call, name: []const u8, data: []const u8) void {
