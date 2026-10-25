@@ -970,6 +970,34 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
   );
 
   test(
+    "/effort sets the effort of the instance on screen and no other's",
+    async () => {
+      const requests: Array<{ body: string; headers: Headers }> = [];
+      await withHost(echoMarker, {
+        args: "--instances 2 --model openai/gpt-5 --effort high",
+        env: { FX_MODEL: undefined },
+        models: PREFERENCE_MODELS,
+        requests,
+      }, async ({ session }) => {
+        await session.sendKeys("M-Right");
+        await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+        await session.waitForComposer(15_000);
+        await session.sendText("/effort low");
+        await session.waitForText("Reasoning effort set to", 15_000);
+        await session.waitForComposer(15_000);
+        await promptMarker(session, "EFFORT_SECOND");
+        await session.sendKeys("M-Left");
+        await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+        await session.waitForComposer(15_000);
+        await promptMarker(session, "EFFORT_FIRST");
+      });
+      expect(preferencesOf(requests, "EFFORT_SECOND")?.reasoning).toBe("low");
+      expect(preferencesOf(requests, "EFFORT_FIRST")?.reasoning).toBe("high");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "/launch <profile> uses the profile's model unless the process chose one",
     async () => {
       for (const [fxModel, expected] of [[undefined, "profile/model"], ["openai/gpt-5", "openai/gpt-5"]] as const) {
