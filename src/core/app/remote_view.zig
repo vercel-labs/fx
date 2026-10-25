@@ -108,7 +108,10 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn showKernel(app: *App, kernel: client_protocol.KernelInfo) !void {
-            const body = try std.json.Stringify.valueAlloc(app.alloc, kernel, .{});
+            const body = if (kernel.diagnostics.len == 0)
+                try app.alloc.dupe(u8, kernel.state)
+            else
+                try app.alloc.print("{s}\n{s}", .{ kernel.state, kernel.diagnostics });
             defer app.alloc.free(body);
             try notice(app, "kernel", body);
         }
