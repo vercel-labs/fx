@@ -23,8 +23,6 @@ const Allocator = std.mem.Allocator;
 const event_bytes_limit = 2 * 1024 * 1024;
 const max_pending = 64;
 const max_prompt_bytes = 1024 * 1024;
-const max_heartbeat_prompt_bytes = 64 * 1024;
-const max_heartbeat_interval_ms: u64 = 365 * 24 * 60 * 60 * 1000;
 const tick_ms = 200;
 
 pub const Record = @import("record.zig").Record;
@@ -52,6 +50,11 @@ pub const Session = struct {
     thread: ?std.Thread = null,
     /// A new session whose open failed. The accept loop reaps it.
     retired: std.atomic.Value(bool) = .init(false),
+    /// This session has work an idle exit would cut short: a queued or
+    /// running request, a turn or host job, a running subagent, a kernel
+    /// cell, or an armed heartbeat. `submit` sets it; the executor
+    /// recomputes it under `jobs_mutex` after every request and tick.
+    holds_daemon: std.atomic.Value(bool) = .init(false),
 
     // Executor-owned.
     host: ?*acp.PersistentHost = null,
@@ -139,6 +142,7 @@ pub const Session = struct {
             job.destroy(alloc);
             return;
         };
+        self.holds_daemon.store(true, .release);
         self.jobs_cond.signal(io_mod.getIo());
     }
 
@@ -150,6 +154,29 @@ pub const Session = struct {
         self.jobs_mutex.unlock(io_mod.getIo());
         thread.join();
         self.thread = null;
+    }
+
+    /// Recomputes `holds_daemon`. Executor-only, since it reads the host.
+    fn noteWork(self: *Session) void {
+        const working = self.hasWork();
+        self.jobs_mutex.lockUncancelable(io_mod.getIo());
+        defer self.jobs_mutex.unlock(io_mod.getIo());
+        self.holds_daemon.store(working or self.jobs.items.len > 0, .release);
+    }
+
+    fn hasWork(self: *Session) bool {
+        const host = self.host orelse return false;
+        if (host.busy() or self.record.heartbeatArmed()) return true;
+        // A cell runs inside a turn, so this only catches one that outlives
+        // its turn's cancellation.
+        if (host.state.active_session) |*active| if (active.session_rt.kernel.current()) |manager| {
+            if (manager.executing()) return true;
+        };
+        var arena_state = std.heap.ArenaAllocator.init(self.daemon.alloc);
+        defer arena_state.deinit();
+        // An unreadable registry keeps the supervisor up rather than risk
+        // cutting a child's work short.
+        return child_views.anyRunning(arena_state.allocator(), host, self.id) catch true;
     }
 
     const Next = union(enum) { job: *Job, tick, push, quit };
@@ -187,6 +214,7 @@ pub const Session = struct {
                 self.next_tick_ms = now + tick_ms;
             }
             self.pushUpdates();
+            self.noteWork();
             if (self.retired.load(.acquire)) break;
         }
         // Requests that arrived after shutdown began get an answer.
@@ -569,32 +597,10 @@ pub const Session = struct {
         const alloc = self.daemon.alloc;
         if (request.action == .status) return protocol.encode(arena, protocol.HeartbeatState{ .heartbeat = self.record.heartbeat });
         var next_record = try self.record.clone(alloc);
-        var committed = false;
-        defer if (!committed) next_record.deinit(alloc);
-        const now = io_mod.milliTimestamp();
-        switch (request.action) {
-            .status => unreachable,
-            .set => {
-                const interval = request.interval_ms orelse return error.IntervalRequired;
-                if (interval < 1000 or interval > max_heartbeat_interval_ms) return error.InvalidInterval;
-                const text = request.prompt orelse return error.PromptRequired;
-                if (text.len == 0 or text.len > max_heartbeat_prompt_bytes) return error.InvalidPrompt;
-                next_record.setHeartbeat(alloc, .{
-                    .prompt = try alloc.dupe(u8, text),
-                    .interval_ms = interval,
-                    .next_run_ms = now + @as(i64, @intCast(interval)),
-                    .paused = false,
-                });
-            },
-            .pause => next_record.heartbeat.paused = true,
-            .@"resume" => {
-                if (next_record.heartbeat.interval_ms == 0) return error.HeartbeatNotConfigured;
-                next_record.heartbeat.paused = false;
-                next_record.heartbeat.next_run_ms = now + @as(i64, @intCast(next_record.heartbeat.interval_ms));
-            },
-            .clear => next_record.setHeartbeat(alloc, .{}),
-        }
-        committed = true;
+        next_record.applyHeartbeat(alloc, request, io_mod.milliTimestamp()) catch |err| {
+            next_record.deinit(alloc);
+            return err;
+        };
         try self.daemon.commit(self, &next_record, false);
         if (request.action != .@"resume") self.withdrawHeartbeat();
         return protocol.encode(arena, protocol.HeartbeatState{ .heartbeat = self.record.heartbeat });
@@ -619,8 +625,7 @@ pub const Session = struct {
         host.pumpChildApprovals() catch |err| {
             std.debug.print("proto-fx: child approval projection failed: {s}\n", .{@errorName(err)});
         };
-        const beat = self.record.heartbeat;
-        if (!beat.paused and beat.interval_ms > 0 and !self.record.stopped and now >= beat.next_run_ms) {
+        if (self.record.heartbeatArmed() and now >= self.record.heartbeat.next_run_ms) {
             // Coalesce to one admitted fire. Steering interrupts only a
             // streaming reply; tools, compaction and approvals wait safely.
             self.events_mutex.lockUncancelable(io_mod.getIo());

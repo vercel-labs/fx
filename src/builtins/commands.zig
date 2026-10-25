@@ -29,7 +29,10 @@ pub const top_level_specs = [_]TopLevelSpec{
             .{ .flag = "stop", .description = "Stop the supervisor and every session it runs" },
             json_option,
         },
-        .details = &.{"Stopping the supervisor cancels active work, saves supported kernel globals, and releases its processes. Closing the terminal only detaches."},
+        .details = &.{
+            "Stopping the supervisor cancels active work, saves supported kernel globals, and releases its processes. Closing the terminal only detaches.",
+            "With no terminal attached, no running turn, subagent, or kernel cell, and no active heartbeat, the supervisor stops the same way after 10 minutes. Set PROTO_FX_DAEMON_IDLE_MS to change that delay in milliseconds, or to 0 to keep it running. The next proto-fx launch starts it again and reopens your sessions.",
+        },
     },
     .{
         .kind = .daemon_serve,

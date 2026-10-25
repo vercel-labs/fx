@@ -1,18 +1,18 @@
 //! A session-owned CPython kernel. TUI attach/detach never changes its lifetime.
-//! One pump drains both pipes, including between calls; command callers serialize on the gate.
+//! One pump (`pump.zig`) drains both pipes, including between calls; command callers serialize on the gate.
 //! Waiters sleep on `Manager.changed`, which the pump and every state change broadcast.
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const protocol = @import("protocol.zig");
 const bootstrap = @import("bootstrap.zig");
+const pump = @import("pump.zig");
 const Allocator = std.mem.Allocator;
 const Buffer = protocol.Buffer;
 const Cancel = ?*const std.atomic.Value(bool);
 const now = io_mod.monotonicMilliTimestamp;
-const max_log_bytes = 5 * 1024 * 1024;
-const diagnostic_cap = 8192;
-const background_cap = 65_536;
+pub const diagnostic_cap = 8192;
+pub const background_cap = 65_536;
 /// Longest a waiter sleeps before rechecking cancel flags, which nothing signals.
 const poll_slice_ms = 50;
 var boot_mutex: std.Io.Mutex = .init;
@@ -209,6 +209,13 @@ pub const Manager = struct {
         return self.state;
     }
 
+    /// A cell is running in the kernel now.
+    pub fn executing(self: *Manager) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return self.active == .execute;
+    }
+
     pub fn diagnostics(self: *Manager, alloc: Allocator) ![]u8 {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -396,9 +403,9 @@ pub const Manager = struct {
             const flags = std.posix.system.fcntl(file.handle, std.posix.F.GETFL);
             if (flags < 0 or std.posix.system.fcntl(file.handle, std.posix.F.SETFL, @as(usize, @intCast(flags)) | (@as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK"))) < 0) return error.KernelPipeSetupFailed;
         }
-        if (self.persist) self.openLog();
+        if (self.persist) pump.openLog(self);
         self.pump_stop.store(false, .release);
-        self.pump_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, pump, .{ self, self.child.?.stdout.?, self.child.?.stderr.? });
+        self.pump_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, pump.run, .{ self, self.child.?.stdout.?, self.child.?.stderr.? });
         const deadline = now() + 30_000;
         self.mutex.lockUncancelable(io);
         while (self.state == .starting) {
@@ -491,7 +498,7 @@ pub const Manager = struct {
         self.changed.waitTimeout(io_mod.getIo(), &self.mutex, .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } }) catch {};
     }
 
-    fn notify(self: *Manager) void {
+    pub fn notify(self: *Manager) void {
         self.changed.broadcast(io_mod.getIo());
     }
 
@@ -624,123 +631,14 @@ pub const Manager = struct {
         self.notify();
     }
 
-    fn sendSnapshot(self: *Manager, id: u64) !void {
+    /// The pump's debounced save uses this too.
+    pub fn sendSnapshot(self: *Manager, id: u64) !void {
         try self.send(.{ .snapshot = .{ .id = id, .path = self.snapshot_path } }, null, 1000);
-    }
-
-    fn pump(self: *Manager, stdout: std.Io.File, stderr: std.Io.File) void {
-        var repair_after_exit = false;
-        defer if (repair_after_exit) self.scheduleRepair();
-        defer {
-            // Reap on EOF or corruption, not only on the next tool call. The writer lock
-            // makes closing pipes and signaling the unreaped PID safe against interrupts.
-            self.writer.lockUncancelable(io_mod.getIo());
-            if (self.child) |*child| child.kill(io_mod.getIo());
-            self.writer.unlock(io_mod.getIo());
-        }
-        var pending: std.ArrayList(u8) = .empty;
-        defer pending.deinit(self.alloc);
-        var buffer: [64 * 1024]u8 = undefined;
-        var stderr_open = true;
-        while (!self.pump_stop.load(.acquire)) {
-            self.mutex.lockUncancelable(io_mod.getIo());
-            const idle_unclaimed = self.active == .none and !self.caller_waiting and self.save_guard == .open;
-            const wake_at = if (self.active == .snapshot and !self.caller_waiting)
-                self.request_started + 5000
-            else if (idle_unclaimed)
-                self.save_due orelse std.math.maxInt(i64)
-            else
-                std.math.maxInt(i64);
-            self.mutex.unlock(io_mod.getIo());
-            const poll_timeout: i32 = @intCast(@min(1000, @max(0, wake_at - now())));
-            var fds = [_]std.posix.pollfd{
-                .{ .fd = stdout.handle, .events = std.posix.POLL.IN, .revents = 0 },
-                .{ .fd = if (stderr_open) stderr.handle else -1, .events = std.posix.POLL.IN, .revents = 0 },
-            };
-            _ = std.posix.poll(&fds, poll_timeout) catch {
-                self.fail("Kernel pipe polling failed.");
-                return;
-            };
-            // Drain diagnostics first: an early interpreter exit can make stdout EOF and
-            // its explanatory stderr readable in the same poll.
-            for ([_]usize{ 1, 0 }) |index| {
-                const fd = &fds[index];
-                if (fd.revents == 0) continue;
-                const rc = std.c.read(fd.fd, &buffer, buffer.len);
-                if (rc == 0) {
-                    if (index == 1) {
-                        stderr_open = false;
-                        continue;
-                    }
-                    if (!self.pump_stop.load(.acquire)) self.fail("Python kernel exited; the next call will start a replacement.");
-                    return;
-                }
-                if (rc < 0) continue;
-                const bytes = buffer[0..@intCast(rc)];
-                if (index == 1) {
-                    self.log(bytes);
-                    continue;
-                }
-                pending.appendSlice(self.alloc, bytes) catch {
-                    self.fail("Kernel output allocation failed.");
-                    return;
-                };
-                var consumed: usize = 0;
-                while (std.mem.findScalarPos(u8, pending.items, consumed, '\n')) |newline| {
-                    if (newline - consumed > protocol.max_frame_bytes) {
-                        repair_after_exit = self.status() == .running;
-                        self.fail("Kernel protocol frame exceeded 32 MiB.");
-                        return;
-                    }
-                    self.handleEvent(pending.items[consumed..newline]) catch {
-                        repair_after_exit = self.status() == .running;
-                        self.fail("Invalid kernel protocol frame; restoring a replacement in the background.");
-                        return;
-                    };
-                    consumed = newline + 1;
-                }
-                if (consumed > 0) {
-                    @memmove(pending.items[0 .. pending.items.len - consumed], pending.items[consumed..]);
-                    pending.items.len -= consumed;
-                }
-                if (pending.items.len > protocol.max_frame_bytes) {
-                    repair_after_exit = self.status() == .running;
-                    self.fail("Kernel protocol frame exceeded 32 MiB.");
-                    return;
-                }
-                if (pending.items.len == 0 and pending.capacity > 256 * 1024) {
-                    pending.deinit(self.alloc);
-                    pending = .empty;
-                }
-            }
-            self.mutex.lockUncancelable(io_mod.getIo());
-            const save_reached = if (self.save_due) |due| now() >= due else false;
-            const should_save = self.persist and self.state == .running and self.active == .none and !self.caller_waiting and self.save_guard == .open and save_reached and !self.stopping.load(.acquire);
-            const snapshot_hung = self.active == .snapshot and !self.caller_waiting and now() - self.request_started > 5000;
-            // Reserve the slot while holding the state lock, so a foreground execute cannot race it.
-            var save_id: u64 = 0;
-            if (should_save) {
-                self.sequence += 1;
-                save_id = self.sequence;
-                self.active_id = save_id;
-                self.active = .snapshot;
-                self.request_started = now();
-            }
-            self.mutex.unlock(io_mod.getIo());
-            if (snapshot_hung) {
-                self.fail("Kernel snapshot timed out; preserving the previous save.");
-                return;
-            }
-            if (save_id != 0) self.sendSnapshot(save_id) catch {
-                self.fail("Could not save the Python namespace.");
-                return;
-            };
-        }
     }
 
     /// Only the pump schedules a repair, after it has reaped the damaged child. A replacement
     /// corrupting during its own startup is discarded, not put into an automatic respawn loop.
-    fn scheduleRepair(self: *Manager) void {
+    pub fn scheduleRepair(self: *Manager) void {
         if (self.disposed.load(.acquire) or self.stopping.load(.acquire)) return;
         if (self.repairing.swap(true, .acq_rel)) return;
         if (self.repair_thread) |thread| thread.join();
@@ -761,118 +659,12 @@ pub const Manager = struct {
         };
     }
 
-    fn handleEvent(self: *Manager, line: []const u8) !void {
-        if (std.mem.trim(u8, line, " \r\t").len == 0) return;
-        var arena = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena.deinit();
-        const event = try std.json.parseFromSliceLeaky(protocol.Event, arena.allocator(), line, .{ .ignore_unknown_fields = true });
-        self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
-        defer self.notify();
-        const id = event.requestId();
-        const matches = id != 0 and id == self.active_id and self.active != .none;
-        switch (event.event) {
-            .ready => {
-                if (event.protocol != protocol.version) return error.KernelProtocolVersionMismatch;
-                if (self.state != .starting) return error.DuplicateKernelReady;
-                self.state = .running;
-            },
-            .stdout, .stderr => {
-                if (matches and self.active == .execute) {
-                    const stream: Stream = if (event.event == .stdout) .stdout else .stderr;
-                    const destination = if (stream == .stdout) &self.out else &self.err;
-                    try destination.append(self.alloc, event.text, self.cap);
-                    if (self.sink) |sink| sink.write(sink.context, stream, event.text);
-                } else try self.background.append(self.alloc, event.text, background_cap);
-            },
-            .result => {
-                if (id == 0) return error.InvalidKernelFrame;
-                if (matches and self.active == .execute) try self.value.append(self.alloc, event.text, self.cap);
-            },
-            .@"error" => {
-                if (!matches) return self.diagnostic.append(self.alloc, event.evalue, diagnostic_cap);
-                self.request_status = .failed;
-                for (event.traceback) |entry| try self.err.append(self.alloc, entry, self.cap);
-                if (event.traceback.len == 0) {
-                    try self.err.append(self.alloc, event.ename, self.cap);
-                    try self.err.append(self.alloc, ": ", self.cap);
-                    try self.err.append(self.alloc, event.evalue, self.cap);
-                }
-            },
-            .done => {
-                if (id == 0) return error.InvalidKernelFrame;
-                if (!matches) return;
-                if ((event.status orelse .@"error") != .ok) self.request_status = .failed;
-                const ok = self.request_status == .ok;
-                switch (self.active) {
-                    .restore => self.save_guard = if (ok and event.failed.len == 0) .open else .protected_unreported,
-                    .execute => if (ok) {
-                        self.save_due = now() + 1500;
-                    },
-                    // Failed snapshots are not tight-loop retried; a later cell schedules one.
-                    .snapshot => {
-                        self.save_due = null;
-                        if (!ok) try self.diagnostic.append(self.alloc, event.reason orelse "Snapshot failed", diagnostic_cap);
-                    },
-                    .shutdown, .none => {},
-                }
-                self.completed_id = id;
-                self.active = .none;
-            },
-        }
-    }
-
-    fn fail(self: *Manager, reason: []const u8) void {
+    pub fn fail(self: *Manager, reason: []const u8) void {
         self.mutex.lockUncancelable(io_mod.getIo());
         self.state = .failed;
         self.diagnostic.append(self.alloc, reason, diagnostic_cap) catch {};
         self.mutex.unlock(io_mod.getIo());
         self.notify();
-    }
-
-    fn openLog(self: *Manager) void {
-        self.openLogChecked() catch {
-            self.mutex.lockUncancelable(io_mod.getIo());
-            self.diagnostic.append(self.alloc, "Cannot open or rotate kernel stderr log.\n", diagnostic_cap) catch {};
-            self.mutex.unlock(io_mod.getIo());
-        };
-    }
-
-    fn openLogChecked(self: *Manager) !void {
-        const io = io_mod.getIo();
-        var dir = try std.Io.Dir.openDirAbsolute(io, self.artifact_dir, .{});
-        defer dir.close(io);
-        try dir.setPermissions(io, .fromMode(0o700));
-        var file = try dir.createFile(io, "kernel-stderr.log", .{ .truncate = false, .permissions = .fromMode(0o600) });
-        errdefer file.close(io);
-        try file.setPermissions(io, .fromMode(0o600));
-        var size = (try file.stat(io)).size;
-        if (size >= max_log_bytes) {
-            // Rename atomically over the previous generation; never truncate a log on boot.
-            try dir.rename("kernel-stderr.log", dir, "kernel-stderr.log.old", io);
-            const replacement = try dir.createFile(io, "kernel-stderr.log", .{ .permissions = .fromMode(0o600) });
-            file.close(io);
-            file = replacement;
-            size = 0;
-        }
-        self.stderr_log = file;
-        self.stderr_log_bytes = @intCast(size);
-    }
-
-    fn log(self: *Manager, bytes: []const u8) void {
-        self.mutex.lockUncancelable(io_mod.getIo());
-        self.diagnostic.append(self.alloc, bytes, diagnostic_cap) catch {};
-        self.mutex.unlock(io_mod.getIo());
-        if (self.stderr_log) |file| {
-            const keep = @min(bytes.len, max_log_bytes -| self.stderr_log_bytes);
-            file.writePositionalAll(io_mod.getIo(), bytes[0..keep], self.stderr_log_bytes) catch {};
-            self.stderr_log_bytes += keep;
-            if (keep > 0 and keep < bytes.len) {
-                const marker = "\n[kernel stderr log reached its 5 MiB budget; further output is omitted]\n";
-                file.writePositionalAll(io_mod.getIo(), marker, self.stderr_log_bytes) catch {};
-                self.stderr_log_bytes += marker.len;
-            }
-        }
     }
 };
 
@@ -1004,4 +796,5 @@ test "kernel live cells persist globals across stop, restart and interrupt" {
 
 test {
     _ = protocol;
+    _ = pump;
 }

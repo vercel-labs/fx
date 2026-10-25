@@ -27,6 +27,19 @@ pub fn children(arena: Allocator, host: *acp.PersistentHost, session_id: []const
     return protocol.encode(arena, protocol.Children{ .children = rows.items });
 }
 
+/// Whether any of the session's subagents is running or waiting for an
+/// approval. Interrupted work was recovered when the host opened.
+pub fn anyRunning(arena: Allocator, host: *acp.PersistentHost, session_id: []const u8) !bool {
+    const registry_children = host.state.subagent_v2_children orelse return false;
+    const store = child_state.Store{ .children = registry_children, .parent_id = session_id };
+    const registry = try store.load(arena);
+    for (registry.children) |*child| switch (child.phase) {
+        .running, .awaiting_approval => return true,
+        else => {},
+    };
+    return false;
+}
+
 fn childStatus(child: *const child_state.Child, live_active: bool) []const u8 {
     if (live_active and child.phase == .idle) return "running";
     if (child.phase == .finished) if (child.last_outcome) |outcome| return @tagName(outcome);

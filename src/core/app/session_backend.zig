@@ -14,6 +14,7 @@
 //!
 //!   operation                         in_process                  detached
 //!   submit a prompt                   worker queue                supervisor `prompt`
+//!   admit a prompt before its card    always                      focused node takes it
 //!   admit a prompt / credentials      local credential checks     daemon owns credentials
 //!   cancel the turn                   worker interrupt            supervisor `cancel`
 //!   answer a permission request       local approval flow         supervisor `permission`
@@ -98,6 +99,16 @@ pub fn Ops(comptime App: type) type {
                 };
             };
             return .{ .workspace_root = if (comptime @hasField(App, "workspace_root")) app.workspace_root else "" };
+        }
+
+        /// Whether the backend takes the composer's prompt and pending images
+        /// now, asked before the prompt's card is shown. A backend that
+        /// refuses has told the person why.
+        pub fn admitPrompt(app: *App) !bool {
+            if (comptime !has_backend or !@hasField(App, "remote")) return true;
+            if (app.backend == .in_process) return true;
+            const Detached = remote_backend.Runtime(App);
+            return try Detached.admit(app, Detached.focus(app), app.pending_images.items) != null;
         }
 
         pub fn selectModel(app: *App, selection: ModelSelection) !void {

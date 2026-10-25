@@ -88,20 +88,27 @@ pub fn Runtime(comptime App: type) type {
 
         // Session lifecycle and turns.
 
-        pub fn submit(app: *App, target: Node, prompt: []const u8, images: []const types.ImageAttachment) !bool {
+        /// The session `target` takes a prompt in, or null after telling the
+        /// person why it cannot. The frontend asks before it shows the
+        /// prompt's card, so a refused prompt shows only the refusal.
+        pub fn admit(app: *App, target: Node, images: []const types.ImageAttachment) !?[]const u8 {
             if (images.len > 0) {
                 try notice(app, "images", "Image forwarding is not supported by the detached frontend yet. Remove the image attachments before sending; no prompt was submitted.");
-                return false;
+                return null;
             }
             if (app.remote.link == .stopped) {
                 try app.writeDomainNotice(.{ .topic = "session", .tone = .warning, .body = "Supervisor stopped. Relaunch proto-fx to reconnect." }, true);
-                return false;
+                return null;
             }
             if (target.root_id.len == 0) {
                 try app.writeDomainNotice(.{ .topic = "session", .tone = .warning, .body = "The session is still connecting. Please send again when it is ready." }, true);
-                return false;
+                return null;
             }
-            const session_id = try wireSession(app, target, "sending a message") orelse return false;
+            return wireSession(app, target, "sending a message");
+        }
+
+        pub fn submit(app: *App, target: Node, prompt: []const u8, images: []const types.ImageAttachment) !bool {
+            const session_id = try admit(app, target, images) orelse return false;
             // `remote_view` skips the host's echo of a prompt shown here.
             const text = try app.alloc.dupe(u8, prompt);
             errdefer app.alloc.free(text);

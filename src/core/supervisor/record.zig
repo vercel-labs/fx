@@ -3,6 +3,9 @@ const std = @import("std");
 const protocol = @import("protocol.zig");
 const Allocator = std.mem.Allocator;
 
+const max_heartbeat_prompt_bytes = 64 * 1024;
+const max_heartbeat_interval_ms: u64 = 365 * 24 * 60 * 60 * 1000;
+
 /// What the supervisor saves and lists about a session. Only the executor
 /// changes it, and only by `commit` for saved fields; readers lock it.
 pub const Record = struct {
@@ -80,6 +83,38 @@ pub const Record = struct {
         return (self.live and self.saved) or self.stopped or self.failure != null;
     }
 
+    /// Applies a heartbeat change other than `status` at time `now`. On
+    /// failure the record is unchanged.
+    pub fn applyHeartbeat(self: *Record, alloc: Allocator, request: protocol.HeartbeatRequest, now: i64) !void {
+        switch (request.action) {
+            .status => {},
+            .set => {
+                const interval = request.interval_ms orelse return error.IntervalRequired;
+                if (interval < 1000 or interval > max_heartbeat_interval_ms) return error.InvalidInterval;
+                const text = request.prompt orelse return error.PromptRequired;
+                if (text.len == 0 or text.len > max_heartbeat_prompt_bytes) return error.InvalidPrompt;
+                self.setHeartbeat(alloc, .{
+                    .prompt = try alloc.dupe(u8, text),
+                    .interval_ms = interval,
+                    .next_run_ms = now + @as(i64, @intCast(interval)),
+                    .paused = false,
+                });
+            },
+            .pause => self.heartbeat.paused = true,
+            .@"resume" => {
+                if (self.heartbeat.interval_ms == 0) return error.HeartbeatNotConfigured;
+                self.heartbeat.paused = false;
+                self.heartbeat.next_run_ms = now + @as(i64, @intCast(self.heartbeat.interval_ms));
+            },
+            .clear => self.setHeartbeat(alloc, .{}),
+        }
+    }
+
+    /// The heartbeat fires on schedule while the host is open.
+    pub fn heartbeatArmed(self: *const Record) bool {
+        return !self.stopped and !self.heartbeat.paused and self.heartbeat.interval_ms > 0;
+    }
+
     pub fn status(self: *const Record, pending: usize) protocol.Status {
         if (self.failure != null) return .@"error";
         if (self.stopped) return .stopped;
@@ -116,4 +151,28 @@ test "record clones own their strings" {
     try std.testing.expectEqualStrings("first", record.name);
     try std.testing.expectEqualStrings("check", copy.heartbeat.prompt);
     try std.testing.expect(copy.heartbeat.prompt.ptr != record.heartbeat.prompt.ptr);
+    try std.testing.expect(copy.heartbeatArmed());
+    copy.heartbeat.paused = true;
+    try std.testing.expect(!copy.heartbeatArmed());
+    copy.heartbeat.paused = false;
+    copy.stopped = true;
+    try std.testing.expect(!copy.heartbeatArmed());
+}
+
+test "heartbeat changes validate before they touch the record" {
+    const alloc = std.testing.allocator;
+    var record = try Record.init(alloc, "session");
+    defer record.deinit(alloc);
+    try std.testing.expectError(error.HeartbeatNotConfigured, record.applyHeartbeat(alloc, .{ .session_id = "s", .action = .@"resume" }, 0));
+    try std.testing.expectError(error.InvalidInterval, record.applyHeartbeat(alloc, .{ .session_id = "s", .action = .set, .interval_ms = 10, .prompt = "check" }, 0));
+    try std.testing.expect(!record.heartbeatArmed());
+    try record.applyHeartbeat(alloc, .{ .session_id = "s", .action = .set, .interval_ms = 5000, .prompt = "check" }, 100);
+    try std.testing.expect(record.heartbeatArmed());
+    try std.testing.expectEqual(@as(i64, 5100), record.heartbeat.next_run_ms);
+    try record.applyHeartbeat(alloc, .{ .session_id = "s", .action = .pause }, 200);
+    try std.testing.expect(!record.heartbeatArmed());
+    try record.applyHeartbeat(alloc, .{ .session_id = "s", .action = .@"resume" }, 300);
+    try std.testing.expectEqual(@as(i64, 5300), record.heartbeat.next_run_ms);
+    try record.applyHeartbeat(alloc, .{ .session_id = "s", .action = .clear }, 400);
+    try std.testing.expect(!record.heartbeatArmed() and record.heartbeat.prompt.len == 0);
 }

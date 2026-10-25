@@ -1107,6 +1107,10 @@ pub fn SubmitRuntime(comptime App: type) type {
         ) !PromptAdmission {
             // Sending a prompt clears MCP notices the user has seen.
             if (comptime @hasField(App, "mcp") and @hasDecl(@FieldType(App, "mcp"), "dismissHostStatus")) app.mcp.dismissHostStatus();
+            // Ask the backend first: the pending flow shows the prompt's card
+            // before the backend sees it, and a refused prompt must show only
+            // the refusal.
+            if (!try session_backend.Ops(App).admitPrompt(app)) return .rejected;
             switch (try installPendingSubmission(app, prompt, skill_tokens)) {
                 .installed => return .pending,
                 .unavailable => {},

@@ -9,6 +9,11 @@
 //! under `route_mutex`. The registry (`sessions`, `last_attached_id`) and
 //! the state file change only under `registry_mutex`; a session's own record
 //! changes only through `commit`, which saves it first.
+//!
+//! An unused supervisor exits by itself: once no client is connected and no
+//! session has running work or an armed heartbeat for `idle_env`
+//! milliseconds, it shuts down as `daemon stop` does. It also stops when its
+//! socket is removed, and leaves without saving when its state directory is.
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const acp_config = @import("../cli/acp_runner.zig");
@@ -222,6 +227,16 @@ pub const Daemon = struct {
         self.connections.deinit(self.alloc);
         if (self.last_attached_id) |id| self.alloc.free(id);
         self.saved_index.deinit(self.alloc);
+    }
+
+    /// Whether anything keeps the supervisor from exiting idle: a client
+    /// connection, or a session with running work or an armed heartbeat
+    /// (`Session.holds_daemon`). An idle kernel does not: shutdown saves its
+    /// globals and the next use restores them. Holds `route_mutex`.
+    fn holdsOpen(self: *Daemon) bool {
+        if (self.connections.items.len > 0) return true;
+        for (self.sessions.items) |session| if (session.holds_daemon.load(.acquire)) return true;
+        return false;
     }
 
     pub fn noteListChange(self: *Daemon) void {
@@ -564,7 +579,8 @@ fn newJob(alloc: Allocator) !*Job {
     return job;
 }
 
-/// Runs until an explicit shutdown request. The caller initializes std.Io/env first.
+/// Runs until a shutdown request, an idle timeout, or the removal of its
+/// socket or state directory. The caller initializes std.Io/env first.
 pub fn run(alloc: Allocator, cfg: acp_config.Config) !void {
     _ = setsid();
     const io = io_mod.getIo();
@@ -585,6 +601,7 @@ pub fn run(alloc: Allocator, cfg: acp_config.Config) !void {
     var listener = try address.listen(io, .{});
     defer listener.deinit(io);
     defer std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
+    const anchor = try Anchor.init(dir_path, socket_path);
     const state_path = try std.Io.Dir.path.join(alloc, &.{ dir_path, "sessions.json" });
     defer alloc.free(state_path);
     const incarnation = try alloc.print("{d}-{d}", .{ io_mod.milliTimestamp(), std.c.getpid() });
@@ -594,21 +611,120 @@ pub fn run(alloc: Allocator, cfg: acp_config.Config) !void {
     defer daemon.deinit();
     try daemon.restore();
     try daemon.discoverSaved();
-    while (!daemon.stopping.load(.acquire)) {
+    const idle_limit_ms = idleLimitMs(io_mod.getenv(idle_env));
+    var idle_since = io_mod.milliTimestamp();
+    const exit: Exit = while (true) {
+        if (daemon.stopping.load(.acquire)) break .requested;
         daemon.reapConnections(false);
+        const now = io_mod.milliTimestamp();
         {
             daemon.route_mutex.lockUncancelable(io);
             defer daemon.route_mutex.unlock(io);
             daemon.reapRetired();
             daemon.pushList();
+            if (daemon.holdsOpen()) idle_since = now;
+        }
+        if (idle_limit_ms > 0 and now - idle_since >= idle_limit_ms) break .idle;
+        switch (anchor.check()) {
+            .present => {},
+            .socket_removed => break .socket_removed,
+            .state_removed => break .state_removed,
         }
         var fds = [_]std.posix.pollfd{.{ .fd = listener.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
         if (try std.posix.poll(&fds, 200) == 0) continue;
         const stream = try listener.accept(io);
         daemon.serve(stream) catch stream.close(io);
-    }
-    // No request routes after this; then save while the hosts are still
-    // open: each live, saved session is owned and reopens on the next start.
+    };
+    // No request routes after this.
     daemon.closeConnections();
+    if (exit == .state_removed) {
+        // Saving, or closing hosts that snapshot kernels and write logs,
+        // would recreate the profile someone deleted. Leave at once: the
+        // kernels and tool processes watch for their owner to exit.
+        std.debug.print("proto-fx: the supervisor state directory was removed; exiting without saving\n", .{});
+        std.c._exit(0);
+    }
+    // Save while the hosts are still open: each live, saved session is
+    // owned and reopens on the next start.
     try daemon.persist();
+}
+
+/// Why the accept loop ended. Every reason but `state_removed` shuts down
+/// the way `daemon stop` does.
+const Exit = enum { requested, idle, socket_removed, state_removed };
+
+/// Names how long an unused supervisor waits before it exits; 0 disables it.
+pub const idle_env = "PROTO_FX_DAEMON_IDLE_MS";
+const default_idle_ms: i64 = 10 * 60 * 1000;
+
+fn idleLimitMs(raw: ?[]const u8) i64 {
+    const text = raw orelse return default_idle_ms;
+    return std.fmt.parseInt(i64, text, 10) catch default_idle_ms;
+}
+
+/// The supervisor's socket and state directory as it created them. Another
+/// file at either path, or none, means this supervisor can no longer be
+/// reached or can no longer save.
+const Anchor = struct {
+    dir_path: []const u8,
+    dir_inode: std.Io.File.INode,
+    socket_path: []const u8,
+    socket_inode: std.Io.File.INode,
+
+    const Check = enum { present, socket_removed, state_removed };
+
+    fn init(dir_path: []const u8, socket_path: []const u8) !Anchor {
+        return .{
+            .dir_path = dir_path,
+            .dir_inode = try statPath(dir_path) orelse return error.FileNotFound,
+            .socket_path = socket_path,
+            .socket_inode = try statPath(socket_path) orelse return error.FileNotFound,
+        };
+    }
+
+    fn check(self: *const Anchor) Check {
+        if (same(self.socket_path, self.socket_inode)) return .present;
+        return if (same(self.dir_path, self.dir_inode)) .socket_removed else .state_removed;
+    }
+
+    /// An unreadable path counts as unchanged: only a missing or replaced
+    /// one ends the supervisor.
+    fn same(path: []const u8, inode: std.Io.File.INode) bool {
+        const current = statPath(path) catch return true;
+        return if (current) |found| found == inode else false;
+    }
+
+    fn statPath(path: []const u8) !?std.Io.File.INode {
+        const found = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{}) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => return null,
+            else => return err,
+        };
+        return found.inode;
+    }
+};
+
+test "the idle limit defaults to ten minutes and zero disables it" {
+    try std.testing.expectEqual(default_idle_ms, idleLimitMs(null));
+    try std.testing.expectEqual(default_idle_ms, idleLimitMs("soon"));
+    try std.testing.expectEqual(@as(i64, 1500), idleLimitMs("1500"));
+    try std.testing.expectEqual(@as(i64, 0), idleLimitMs("0"));
+}
+
+test "an anchor tells a removed socket from a removed state directory" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const alloc = std.testing.allocator;
+    try tmp.dir.createDirPath(io, "state");
+    const dir_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "state");
+    defer alloc.free(dir_path);
+    const socket_path = try std.Io.Dir.path.join(alloc, &.{ dir_path, "control.sock" });
+    defer alloc.free(socket_path);
+    (try std.Io.Dir.cwd().createFile(io, socket_path, .{})).close(io);
+    const anchor = try Anchor.init(dir_path, socket_path);
+    try std.testing.expectEqual(Anchor.Check.present, anchor.check());
+    try std.Io.Dir.deleteFileAbsolute(io, socket_path);
+    try std.testing.expectEqual(Anchor.Check.socket_removed, anchor.check());
+    try tmp.dir.deleteTree(io, "state");
+    try std.testing.expectEqual(Anchor.Check.state_removed, anchor.check());
 }
