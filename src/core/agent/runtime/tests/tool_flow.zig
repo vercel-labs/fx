@@ -745,7 +745,7 @@ test "parallel skill admission binds identities preserves denies and isolates fa
         .{ .permission = @constCast("skill"), .pattern = @constCast("*"), .action = .allow },
         .{ .permission = @constCast("skill"), .pattern = @constCast("denied-name"), .action = .deny },
     };
-    var probe: Probe = .{ .workspace_root = root, .registry = .{ .tools = &.{ builtin_tools.skill, builtin_tools.glob_files } }, .rules = .{ .rules = &rules } };
+    var probe: Probe = .{ .workspace_root = root, .registry = .{ .tools = &.{ builtin_tools.skill, builtin_tools.read_file } }, .rules = .{ .rules = &rules } };
     defer probe.worker.deinit(alloc);
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
@@ -756,7 +756,7 @@ test "parallel skill admission binds identities preserves denies and isolates fa
     var gateway = FakeGateway.init(alloc, &.{
         .{ .tool_calls = &.{
             .{ .id = "allowed", .name = "skill", .arguments_json = allowed_args },
-            .{ .id = "glob", .name = "glob_files", .arguments_json = "{\"pattern\":\"**/*.md\"}" },
+            .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"README.md\"}" },
             .{ .id = "denied", .name = "skill", .arguments_json = denied_args },
             .{ .id = "invalid", .name = "skill", .arguments_json = "{\"location\":\"skill:invalid\"}" },
         } },
@@ -1706,7 +1706,7 @@ test "parallel streamed cancellation closes every concrete tool action" {
     const calls = [_]ToolCall{
         toolCall("call_read", "read_file", "{\"path\":\"README.md\"}"),
         toolCall("call_fetch", "web_fetch", "{\"url\":\"https://example.com\"}"),
-        toolCall("call_glob", "glob_files", "{\"pattern\":\"README.md\"}"),
+        toolCall("call_read_result", "read_tool_result", "{\"handle\":\"T1\"}"),
         .{
             .id = "call_search",
             .name = "exa_search",
@@ -2662,7 +2662,7 @@ test "modern serial preparation classifies once and disabled context keeps legac
     }
 }
 
-test "modern directory glob executes while nested project instructions load" {
+test "modern nested file read executes while nested project instructions load" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2678,6 +2678,13 @@ test "modern directory glob executes while nested project instructions load" {
             std.testing.io,
             "MODERN_DIRECTORY_SCOPE_RULE",
         );
+        var target = try tmp.dir.createFile(
+            std.testing.io,
+            "workspace/nested/first.txt",
+            .{},
+        );
+        defer target.close(std.testing.io);
+        try target.writeStreamingAll(std.testing.io, "first");
     }
     const workspace = try io_mod.dirRealpathAlloc(
         alloc,
@@ -2688,8 +2695,8 @@ test "modern directory glob executes while nested project instructions load" {
 
     const first_calls = [_]ToolCall{toolCall(
         "inspect_directory_a",
-        "glob_files",
-        "{\"pattern\":\"*\",\"path\":\"nested\"}",
+        "read_file",
+        "{\"path\":\"nested/first.txt\"}",
     )};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &first_calls },
@@ -4919,10 +4926,11 @@ test "initial session grants follow active registry metadata" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var provider_glob = builtin_tools.glob_files;
-    provider_glob.name = "provider_glob";
-    provider_glob.model_schema.name = "provider_glob";
-    const tools = [_]tool_dispatch.Tool{provider_glob};
+    var provider_read = builtin_tools.read_file;
+    provider_read.name = "provider_read";
+    provider_read.model_schema.name = "provider_read";
+    provider_read.permission_target_kind = .path_optional_existing;
+    const tools = [_]tool_dispatch.Tool{provider_read};
 
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.tool_registry = .{ .tools = tools[0..] };
@@ -4936,7 +4944,7 @@ test "initial session grants follow active registry metadata" {
         arena,
         &local_grants,
         "/tmp/workspace",
-        .{ .id = "provider-glob", .name = "provider_glob", .arguments_json = "{\"pattern\":\"*\"}" },
+        .{ .id = "provider-read", .name = "provider_read", .arguments_json = "{\"path\":\".\"}" },
         "/tmp/workspace/src",
     );
 
@@ -5315,9 +5323,9 @@ test "processQueuedPrompt includes structured failure detail in tool status" {
     try expectBodyContains(&gateway, 1, "browser_cdp_error");
 }
 
-test "processQueuedPrompt caps chatty grep_files model output" {
+test "processQueuedPrompt caps chatty read_file model output" {
     const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{toolCall("call_1", "grep_files", "{\"pattern\":\"x\"}")};
+    const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"notes.txt\"}")};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
         .{ .content = "Final" },
@@ -5335,7 +5343,7 @@ test "processQueuedPrompt caps chatty grep_files model output" {
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    try expectBodyContains(&gateway, 1, "tool result truncated for grep_files");
+    try expectBodyContains(&gateway, 1, "tool result truncated for read_file");
     try expectBodyContains(&gateway, 1, "original 2054 bytes; cap is 1024 bytes");
 }
 

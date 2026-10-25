@@ -187,7 +187,7 @@ pub fn welcomeTitle(alloc: std.mem.Allocator) ![]u8 {
         build_options.git_commit,
     );
     return alloc.print(
-        "{s}proto-fx{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
+        "{s}proto-𝒇x{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
         .{ subtitle_style, reset_style, dim_style, build_label },
     );
 }
@@ -930,7 +930,7 @@ test "welcomeMessage shows version and help hint" {
     const message = try welcomeMessage(std.testing.allocator, 80);
     defer std.testing.allocator.free(message);
 
-    try std.testing.expect(std.mem.find(u8, message, "proto-fx") != null);
+    try std.testing.expect(std.mem.find(u8, message, "proto-𝒇x") != null);
     try std.testing.expect(std.mem.find(u8, message, build_options.app_version) != null);
     try std.testing.expect(std.mem.find(u8, message, "/help") != null);
 }
@@ -948,7 +948,7 @@ test "welcomeMessage keeps only the app name bright" {
         build_options.git_commit,
     );
     const expected = try std.testing.allocator.print(
-        "{s}proto-fx{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
+        "{s}proto-𝒇x{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
         .{ subtitle_style, reset_style, dim_style, build_label },
     );
     defer std.testing.allocator.free(expected);

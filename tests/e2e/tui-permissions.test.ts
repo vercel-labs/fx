@@ -1694,19 +1694,18 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
   );
 
   test(
-    "search preflight failure shows the target resolution reason",
+    "read preflight failure shows the target resolution reason",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([
-        toolCall("grep_preflight_failure", "grep_files", {
-          pattern: "upgrade",
+        toolCall("read_preflight_failure", "read_file", {
           path: "missing-map/behavior-index",
         }),
         finalText("search failure handled"),
       ]);
       const { session, stderrPath } = await launch(root, gateway);
 
-      await session.sendText("Search the generated map once.");
+      await session.sendText("Read the generated map once.");
       const settled = await session.waitForText(
         "search failure handled",
         TIMEOUT,

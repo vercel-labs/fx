@@ -98,7 +98,7 @@ process.exit(Number(process.env.FX_TEST_EXIT ?? "0"));\n`, { mode: 0o755 });
     const row = matrixRowById("slash-command-definition-search");
     expect(row).toBeDefined();
 
-    const toolCalls: RecordedToolCall[] = [{ name: "grep_files" }];
+    const toolCalls: RecordedToolCall[] = [{ name: "read_file" }];
     const score = scoreAbTrial(row!, {
       exit_code: 0,
       model: "provider/test-model",
@@ -109,7 +109,7 @@ process.exit(Number(process.env.FX_TEST_EXIT ?? "0"));\n`, { mode: 0o755 });
     });
 
     expect(score.passed).toBe(true);
-    expect(score.firstTool).toBe("grep_files");
+    expect(score.firstTool).toBe("read_file");
     expect(score.forbiddenTools).toEqual([]);
   });
 
@@ -124,7 +124,7 @@ process.exit(Number(process.env.FX_TEST_EXIT ?? "0"));\n`, { mode: 0o755 });
         "Slash commands are defined in src/core/slash_commands/. command_specs.zig is the central registry.",
       session_id: "",
       steps: 1,
-      tool_calls: [{ name: "glob_files", status: "success" }],
+      tool_calls: [{ name: "read_file", status: "success" }],
     });
 
     expect(score.passed).toBe(true);
@@ -141,7 +141,7 @@ process.exit(Number(process.env.FX_TEST_EXIT ?? "0"));\n`, { mode: 0o755 });
         "The changelog is maintained in CHANGELOG.md. Contributors are listed as GitHub handles when known; no handle is needed from you.",
       session_id: "",
       steps: 2,
-      tool_calls: [{ name: "glob_files", status: "success" }],
+      tool_calls: [{ name: "read_file", status: "success" }],
     });
 
     expect(score.passed).toBe(true);

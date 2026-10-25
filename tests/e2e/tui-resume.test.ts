@@ -3672,12 +3672,12 @@ test.skipIf(!tmuxAvailable())(
       JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
     );
     writeFileSync(join(workspace, "README.md"), "READ_FULL_DETAIL_MARKER\n");
-    writeFileSync(join(workspace, "LIST_FULL_DETAIL_MARKER"), "");
+    writeFileSync(join(workspace, "LIST_FULL_DETAIL_MARKER"), "LIST_FULL_DETAIL_MARKER\n");
     writeFileSync(stderrPath, "");
 
     const gateway = startFakeGateway([
       fakeGatewaySse([
-        { type: "tool-call", toolCallId: "parallel-glob", toolName: "glob_files", input: { pattern: "*" } },
+        { type: "tool-call", toolCallId: "parallel-list", toolName: "read_file", input: { path: "LIST_FULL_DETAIL_MARKER" } },
         { type: "tool-call", toolCallId: "parallel-read", toolName: "read_file", input: { path: "README.md" } },
         { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
       ]),

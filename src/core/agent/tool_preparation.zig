@@ -472,7 +472,6 @@ fn applicableTargetsFromPermissionTargets(
 
 fn filesystemTargetKind(kind: tool_dispatch.ExecutorKind) ?context_contract.TargetKind {
     return switch (kind) {
-        .glob_files, .grep_files => .directory,
         .read_file => .file,
         else => null,
     };
@@ -577,7 +576,7 @@ const RetainedTargetCollector = struct {
         if (call.provenance == .provider_executed or call.argument_integrity != .valid or call.arguments_json.len > 64 * 1024) return;
         const tool = self.registry.lookup(call.name) orelse return;
         const is_directory = switch (tool.executor_kind) {
-            .glob_files, .grep_files, .terminal, .run_command => true,
+            .terminal, .run_command => true,
             .read_file, .write_file, .edit_file => false,
             else => return,
         };
@@ -649,7 +648,7 @@ fn checkRetainedTargetsAllocations(alloc: Allocator, history: []const types.Hist
 test "retained context targets use bounded typed history without executing calls" {
     const alloc = std.testing.allocator;
     const tools = @import("../../builtins/tools.zig");
-    const registry = tool_dispatch.Registry{ .tools = &.{ tools.read_file, tools.write_file, tools.grep_files, tools.shell } };
+    const registry = tool_dispatch.Registry{ .tools = &.{ tools.read_file, tools.write_file, tools.shell } };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "nested");
@@ -658,7 +657,7 @@ test "retained context targets use bounded typed history without executing calls
     const calls = [_]ToolCall{
         .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"nested/missing.txt\"}" },
         .{ .id = "write", .name = "write_file", .arguments_json = "{\"path\":\"nested/new.txt\"}" },
-        .{ .id = "search", .name = "grep_files", .arguments_json = "{\"query\":\"not a path\"}" },
+        .{ .id = "root_shell", .name = "shell", .arguments_json = "{\"request\":{\"action\":\"run\",\"command\":\"never execute\",\"cwd\":\".\"}}" },
         .{ .id = "shell", .name = "shell", .arguments_json = "{\"request\":{\"action\":\"run\",\"command\":\"never execute\",\"cwd\":\"nested\"}}" },
         .{ .id = "bad", .name = "shell", .arguments_json = "[]" },
         .{ .id = "external", .name = "read_file", .arguments_json = "{\"path\":\"/tmp/outside.txt\"}" },

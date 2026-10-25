@@ -850,25 +850,19 @@ while :; do sleep 1; done
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-late-tool-success-")));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
-      const corpus = join(workspace, "corpus");
       const stderrPath = join(root, "stderr.log");
       const tracePath = join(root, "trace.log");
-      const releasePath = join(root, "grep-release");
+      const releasePath = join(root, "tool-release");
       const pattern = "LATE_SUCCESS_NEEDLE";
-      const callId = "late_success_grep";
+      const callId = "late_success_shell";
+      const command =
+        `while [ ! -e ${JSON.stringify(releasePath)} ]; do sleep 0.05; done; printf '%s\\n' '${pattern}'`;
       mkdirSync(join(home, ".fx"), { recursive: true });
-      mkdirSync(corpus, { recursive: true });
+      mkdirSync(workspace);
       writeFileSync(join(home, ".fx", "settings.json"), "{}");
-      for (let index = 0; index < 3; index += 1) {
-        writeFileSync(join(corpus, `candidate-${index}.txt`), "ordinary corpus text\n");
-      }
 
       gateway = startFakeGateway([
-        fakeGatewayToolCall(callId, "grep_files", {
-          path: "corpus",
-          pattern,
-          head_limit: 5,
-        }),
+        fakeShellRun(callId, command, { profile: "clean" }),
       ]);
       session = await TmuxSession.create({
         cwd: realpathSync(workspace),
@@ -886,15 +880,12 @@ while :; do sleep 1; done
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: `${TRACE_SCOPES},tool,ui_activity`,
           FX_TRACE_LOG: tracePath,
-          // The search holds its result until this file exists, so it is
-          // still running when the turn is cancelled.
-          FX_E2E_GREP_RELEASE: releasePath,
         },
       });
       await session.waitForComposer(TIMEOUT);
 
-      await session.sendText("Search the prepared corpus.");
-      await session.waitForText(`Searching ${pattern}`, TIMEOUT);
+      await session.sendText("Run the prepared held command.");
+      await session.waitForText("Running while", TIMEOUT);
       expect(readTrace(tracePath)).not.toContain(
         `event=after_tool_execution call_id=${callId}`,
       );
@@ -918,16 +909,16 @@ while :; do sleep 1; done
       const completedToolIndex = traceLines.findIndex((line) =>
         line.includes("event=after_tool_execution") &&
         line.includes(`call_id=${callId}`) &&
-        line.includes("name=grep_files") &&
+        line.includes("name=shell") &&
         line.includes("result_kind=model_output")
       );
       expect(completedToolIndex).toBeGreaterThanOrEqual(0);
       const cancelIndex = traceLines.findIndex((line) => line.includes("event=cancel_requested"));
       expect(cancelIndex).toBeGreaterThanOrEqual(0);
       expect(cancelIndex).toBeLessThan(completedToolIndex);
-      await session.waitForText(`Searched ${pattern}`, TIMEOUT);
+      await session.waitForText("Ran while", TIMEOUT);
       const scrollback = await session.captureFullScrollback();
-      expect(scrollback).toContain(`Searched ${pattern}`);
+      expect(scrollback).toContain("Ran while");
       expect(countOccurrences(scrollback, "What can fx do differently?")).toBe(1);
       expect(scrollback).not.toContain("system: cancelled");
       expect(scrollback).not.toContain("Cancelling");

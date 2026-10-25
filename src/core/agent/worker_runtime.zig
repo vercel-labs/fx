@@ -6298,19 +6298,19 @@ test "typed lifecycle worker events duplicate and free every payload variant" {
         } },
         .{ .provisional = .{
             .id = .{ .turn_id = 1, .call_id = "provisional" },
-            .tool_name = "glob_files",
-            .activity_kind = .list,
+            .tool_name = "read_tool_result",
+            .activity_kind = .read,
         } },
         .{ .authoritative_started = .{
             .id = .{ .turn_id = 1, .call_id = "final" },
             .presentation_group_id = .{ .turn_id = 1, .anchor_step_id = 3 },
             .reconciles_provisional_call_id = "provisional",
-            .tool_name = "glob_files",
-            .activity_kind = .list,
+            .tool_name = "read_tool_result",
+            .activity_kind = .read,
         } },
         .{ .progress = .{
             .id = .{ .turn_id = 1, .call_id = "final" },
-            .text = "Listing files",
+            .text = "Reading output",
         } },
         .{ .terminal = .{
             .id = .{ .turn_id = 1, .call_id = "final" },

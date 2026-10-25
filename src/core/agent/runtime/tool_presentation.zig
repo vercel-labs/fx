@@ -941,7 +941,7 @@ test "read_tool_result rows name the earlier call whose output they read" {
             try std.testing.expect(target == null);
         }
     }
-    const other: ToolCall = .{ .id = "grep", .name = "grep_files", .arguments_json = "{\"pattern\":\"x\"}" };
+    const other: ToolCall = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"README.md\"}" };
     try std.testing.expect(try readToolResultDisplayTarget(arena, registry, other, sources) == null);
 }
 
@@ -1665,13 +1665,13 @@ pub fn formatToolStatusWithStats(
 }
 
 const test_tools = [_]tool_dispatch.Tool{
-    test_builtin_tools.glob_files,
     test_builtin_tools.read_file,
     test_builtin_tools.write_file,
     test_builtin_tools.edit_file,
     test_builtin_tools.shell,
     test_builtin_tools.ask_user_question,
     test_builtin_tools.skill,
+    test_builtin_tools.read_tool_result,
 };
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 const custom_activity_tool = blk: {
@@ -2007,7 +2007,7 @@ test "provisional lifecycle formats labeled and unlabeled eligible tools" {
     defer statuses.deinit(alloc);
 
     try statuses.publish(&hooks, alloc, 7, "read_1", "read_file", activityKind(hooks.tool_registry, "read_file"), eligibleActionLabel("read_file"), "src/main.zig", null);
-    try statuses.publish(&hooks, alloc, 7, "list_1", "glob_files", activityKind(hooks.tool_registry, "glob_files"), eligibleActionLabel("glob_files"), null, null);
+    try statuses.publish(&hooks, alloc, 7, "list_1", "read_tool_result", activityKind(hooks.tool_registry, "read_tool_result"), eligibleActionLabel("read_tool_result"), null, null);
 
     try std.testing.expectEqual(@as(usize, 4), capture.events.items.len);
     switch (capture.events.items[0]) {
@@ -2031,7 +2031,7 @@ test "provisional lifecycle formats labeled and unlabeled eligible tools" {
         else => return error.TestExpectedEqual,
     }
     switch (capture.events.items[3]) {
-        .progress => |event| try std.testing.expectEqualStrings("● Matching\x1b[0m", event.text),
+        .progress => |event| try std.testing.expectEqualStrings("● Reading\x1b[0m", event.text),
         else => return error.TestExpectedEqual,
     }
 }
@@ -2792,9 +2792,9 @@ test "permission target preflight failure reports the actionable reason" {
         arena,
         5,
         .{
-            .id = "grep_preflight",
-            .name = "grep_files",
-            .arguments_json = "{\"pattern\":\"upgrade\",\"path\":\"/tmp/missing\"}",
+            .id = "read_preflight",
+            .name = "read_file",
+            .arguments_json = "{\"path\":\"/tmp/missing\"}",
         },
         true,
         null,
@@ -2813,7 +2813,7 @@ test "permission target preflight failure reports the actionable reason" {
     const terminal = capture.events.items[0].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
-        "Failed grep_files: Path not found: /tmp/missing",
+        "Failed read_file: Path not found: /tmp/missing",
         terminal.outcome.summary,
     );
 }

@@ -55,6 +55,7 @@ const libfx_journal = @import("libfx_journal.zig");
 const journal_events = @import("../core/agent/runtime/journal.zig");
 const libfx_steering = @import("libfx_steering.zig");
 const session_child_store = @import("../core/session/session_child_store.zig");
+const result_store = @import("../core/session/result_store.zig");
 const session_runtime = @import("../core/session/session.zig");
 const subagent_agent_adapter = @import("../core/subagent/agent_adapter.zig");
 const subagent_domain = @import("../core/subagent/domain.zig");
@@ -2721,10 +2722,48 @@ fn completeToolCallTransport(
 }
 
 fn publishCommittedFileHandoff(
-    _: *anyopaque,
-    _: file_mutation.CommittedFileHandoff,
+    raw_ctx: *anyopaque,
+    handoff: file_mutation.CommittedFileHandoff,
 ) agent_runtime.SecondaryPublicationReport {
-    return .{ .diff = .skipped, .tracker = .skipped };
+    return .{ .diff = .skipped, .tracker = publishCommittedTracker(raw_ctx, handoff) };
+}
+
+/// Records a committed write or edit so `/undo` can reverse it later. The
+/// session tracker owns the copies; a failed copy leaves the operation
+/// unrecorded rather than half-owned.
+fn publishCommittedTracker(
+    raw_ctx: *anyopaque,
+    handoff: file_mutation.CommittedFileHandoff,
+) agent_runtime.SecondarySinkOutcome {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*active| active else return .failed;
+    const path = ctx.state.alloc.dupe(u8, handoff.tracker.raw_path) catch |err| {
+        debug_trace.logf("acp", "committed file tracker path clone failed err={s}", .{@errorName(err)});
+        return .failed;
+    };
+    const previous_content = if (handoff.tracker.previous_content) |content|
+        ctx.state.alloc.dupe(u8, content) catch |err| {
+            ctx.state.alloc.free(path);
+            debug_trace.logf("acp", "committed file tracker preimage clone failed err={s}", .{@errorName(err)});
+            return .failed;
+        }
+    else
+        null;
+    session.changes.pushOperation(ctx.state.alloc, .{
+        .kind = switch (handoff.tracker.kind) {
+            .write => .write,
+            .edit => .edit,
+        },
+        .path = path,
+        .previous_content = previous_content,
+        .timestamp_ms = handoff.tracker.committed_at_ms,
+    }) catch |err| {
+        ctx.state.alloc.free(path);
+        if (previous_content) |content| ctx.state.alloc.free(content);
+        debug_trace.logf("acp", "committed file tracker publication failed err={s}", .{@errorName(err)});
+        return .failed;
+    };
+    return .published;
 }
 
 fn publishDeferredToolCompletion(
@@ -3061,6 +3100,65 @@ fn persistAcpHistoryTurn(
 fn keepImageWindow(alloc: Allocator, session: *server.ActiveSessionState) Allocator.Error!void {
     const journal = if (session.journal) |*value| value else return;
     try journal.dropOutsideWindow(alloc, alloc, session.session_rt.agent.history.items);
+}
+
+pub const ManualCompaction = enum { compacted, nothing_to_compact };
+
+/// Compacts the active session's history outside a turn, on an explicit
+/// frontend request. The summary is published through the same commit effect
+/// automatic compaction uses, so the next prompt starts from the compacted
+/// history.
+pub fn compactNow(state: *server.ServerState, alloc: Allocator) !ManualCompaction {
+    if (state.active_prompt != null) return error.SessionBusy;
+    const session = if (state.active_session) |*active| active else return error.NoActiveSession;
+
+    // The result borrows this arena, and the commit effect has already copied
+    // what the session keeps, so nothing here outlives the call.
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+
+    var ctx = AcpContext{
+        .alloc = arena_state.allocator(),
+        .state = state,
+        .session_id = session.session_id,
+    };
+    const deps = agentRuntimeDeps(&ctx);
+    const capabilities = deps.available_model_capabilities(deps.ctx, session.model);
+    var provider_options = model_capabilities.resolveProviderOptionsForCapabilities(capabilities, session.effort, session.fast_mode);
+    provider_options.prompt_caching = state.cfg.provider_set.select(session.provider).capabilities.gateway_prompt_caching;
+
+    var summary_model: agent_runtime.CompactorCaller = .{
+        .observer = null,
+        .stream_provider = deps.agent_stream_provider,
+        .cooperative_transport_pulse = deps.cooperative_transport_pulse,
+        .provider = session.provider,
+        .model = session.model,
+        .api_key = session.api_key,
+        .credential_source = session.credential_source,
+        .account_id = session.account_id,
+        .gateway_team = state.gateway_team,
+        .session_id = session.session_id,
+        .retry_count = state.cfg.gateway_retry_count,
+        .provider_options = provider_options,
+        .max_output_tokens = model_capabilities.requestOutputTokens(capabilities),
+        .capabilities_context = deps.ctx,
+        .capabilities_fn = deps.available_model_capabilities,
+    };
+
+    session.cancel_flag.store(false, .seq_cst);
+    const result = try agent_runtime.compactContext(arena_state.allocator(), &deps, .{
+        .activity_origin = .manual,
+        .compactor = .{
+            .history = session.session_rt.agent.history.items,
+            .append_messages = session_runtime.appendHistoryChatMessages,
+            .size = agent_runtime.compactionSize(&session.session_rt.agent, capabilities, state.auto_compact_percent, session.model),
+            .caller = summary_model.caller(),
+            .records = if (sessionChildCapability(session)) |capability| result_store.compactorStore(capability) else null,
+            .cancel_flag = &session.cancel_flag,
+            .trace_ctx = .{ .turn_id = debug_trace.nextTurnId() },
+        },
+    });
+    return if (result == null) .nothing_to_compact else .compacted;
 }
 
 fn commitContextCompaction(
@@ -3857,7 +3955,6 @@ test "mapToolKind maps common tools" {
     try std.testing.expectEqual(acp_types.ToolCallKind.read, mapToolKind("read_file"));
     try std.testing.expectEqual(acp_types.ToolCallKind.edit, mapToolKind("write_file"));
     try std.testing.expectEqual(acp_types.ToolCallKind.edit, mapToolKind("edit_file"));
-    try std.testing.expectEqual(acp_types.ToolCallKind.search, mapToolKind("grep_files"));
     try std.testing.expectEqual(acp_types.ToolCallKind.fetch, mapToolKind("web_fetch"));
     try std.testing.expectEqual(acp_types.ToolCallKind.search, mapToolKind("exa_search"));
     try std.testing.expectEqual(acp_types.ToolCallKind.execute, mapToolKind("run_command"));
@@ -4287,7 +4384,6 @@ test "parsePromptInput releases partial resource state across allocation failure
 }
 
 test "mapToolKind maps surviving tools" {
-    try std.testing.expectEqual(acp_types.ToolCallKind.read, mapToolKind("glob_files"));
     try std.testing.expectEqual(acp_types.ToolCallKind.other, mapToolKind("skill"));
     try std.testing.expectEqual(acp_types.ToolCallKind.other, mapToolKind("install_skill"));
 }

@@ -5863,7 +5863,7 @@ test "consumeSseStream isolates interleaved streamed inputs by exact event id" {
     const payload =
         "data: {\"type\":\"tool-input-start\",\"id\":\"A\",\"toolName\":\"read_file\"}\n\n" ++
         "data: {\"type\":\"tool-input-delta\",\"id\":\"A\",\"delta\":\"{\\\"path\\\":\"}\n\n" ++
-        "data: {\"type\":\"tool-input-start\",\"id\":\"B\",\"toolName\":\"grep_files\"}\n\n" ++
+        "data: {\"type\":\"tool-input-start\",\"id\":\"B\",\"toolName\":\"read_file\"}\n\n" ++
         "data: {\"type\":\"tool-input-delta\",\"id\":\"B\",\"delta\":\"{\\\"pattern\\\":\"}\n\n" ++
         "data: {\"type\":\"tool-input-delta\",\"id\":\"A\",\"delta\":\"\\\"alpha-A.txt\\\"}\"}\n\n" ++
         "data: {\"type\":\"tool-input-end\",\"id\":\"A\"}\n\n" ++
@@ -5910,7 +5910,7 @@ test "consumeSseStream isolates interleaved streamed inputs by exact event id" {
     try std.testing.expectEqualStrings("{\"path\":\"alpha-A.txt\"}", completion.tool_calls[0].arguments_json);
     try std.testing.expect(completion.tool_calls[0].provisional_id == null);
     try std.testing.expectEqualStrings("B", completion.tool_calls[1].id);
-    try std.testing.expectEqualStrings("grep_files", completion.tool_calls[1].name);
+    try std.testing.expectEqualStrings("read_file", completion.tool_calls[1].name);
     try std.testing.expectEqualStrings("{\"pattern\":\"needle-B\"}", completion.tool_calls[1].arguments_json);
     try std.testing.expect(completion.tool_calls[1].provisional_id == null);
     try std.testing.expect(completion.provider_result_identity_failure == null);
@@ -5984,7 +5984,7 @@ test "consumeSseStream ignores conflicting and late stream events without mutati
     const payload =
         "data: {\"type\":\"tool-input-start\",\"id\":\"X\",\"toolName\":\"read_file\"}\n\n" ++
         "data: {\"type\":\"tool-input-start\",\"id\":\"X\",\"toolName\":\"read_file\"}\n\n" ++
-        "data: {\"type\":\"tool-input-start\",\"id\":\"X\",\"toolName\":\"grep_files\"}\n\n" ++
+        "data: {\"type\":\"tool-input-start\",\"id\":\"X\",\"toolName\":\"read_file\"}\n\n" ++
         "data: {\"type\":\"tool-input-delta\",\"id\":\"X\",\"delta\":\"{\\\"path\\\":\\\"stable.txt\\\"}\"}\n\n" ++
         "data: {\"type\":\"tool-input-end\",\"id\":\"X\"}\n\n" ++
         "data: {\"type\":\"tool-input-delta\",\"id\":\"X\",\"delta\":\"LATE_PREFIX_SENTINEL\"}\n\n" ++
@@ -6129,7 +6129,7 @@ test "consumeSseStream rejects fallback from an open stream" {
 test "consumeSseStream keeps unmatched valid finals independent and alias-free" {
     const payload =
         "data: {\"type\":\"tool-input-start\",\"id\":\"streamed\",\"toolName\":\"read_file\"}\n\n" ++
-        "data: {\"type\":\"tool-call\",\"toolCallId\":\"final\",\"toolName\":\"grep_files\",\"input\":{\"pattern\":\"needle\"}}\n\n" ++
+        "data: {\"type\":\"tool-call\",\"toolCallId\":\"final\",\"toolName\":\"read_file\",\"input\":{\"pattern\":\"needle\"}}\n\n" ++
         "data: [DONE]\n\n";
 
     var reader = std.Io.Reader.fixed(payload);
@@ -6141,7 +6141,7 @@ test "consumeSseStream keeps unmatched valid finals independent and alias-free" 
     defer deinitGatewayCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqualStrings("final", completion.tool_calls[0].id);
-    try std.testing.expectEqualStrings("grep_files", completion.tool_calls[0].name);
+    try std.testing.expectEqualStrings("read_file", completion.tool_calls[0].name);
     try std.testing.expectEqualStrings("{\"pattern\":\"needle\"}", completion.tool_calls[0].arguments_json);
     try std.testing.expect(completion.tool_calls[0].provisional_id == null);
     try std.testing.expect(completion.provider_result_identity_failure == null);
@@ -6710,7 +6710,7 @@ test "consumeSseStream unfiltered trace excludes all payload keys and values" {
         "data: {\"type\":\"FX_UNKNOWN_TYPE_SENTINEL\",\"FX_DYNAMIC_KEY_SENTINEL\":\"FX_UNKNOWN_VALUE_SENTINEL\"}\n\n" ++
         "data: {\"type\":\"text-delta\",\"id\":\"text\",\"delta\":\"FX_MODEL_TEXT_SENTINEL\"}\n\n" ++
         "data: {\"type\":\"tool-input-start\",\"id\":\"safe_call\",\"toolName\":\"read_file\"}\n\n" ++
-        "data: {\"type\":\"tool-input-start\",\"id\":\"safe_call\",\"toolName\":\"grep_files\"}\n\n" ++
+        "data: {\"type\":\"tool-input-start\",\"id\":\"safe_call\",\"toolName\":\"read_file\"}\n\n" ++
         "data: {\"type\":\"tool-input-delta\",\"id\":\"safe_call\",\"delta\":\"{\\\"FX_ARGUMENT_KEY_SENTINEL\\\":\\\"FX_PATH_VALUE_SENTINEL\\\"}\"}\n\n" ++
         "data: {\"type\":\"tool-input-end\",\"id\":\"safe_call\"}\n\n" ++
         "data: {\"type\":\"tool-input-delta\",\"id\":\"safe_call\",\"delta\":\"FX_LATE_PREFIX_SENTINEL\"}\n\n" ++

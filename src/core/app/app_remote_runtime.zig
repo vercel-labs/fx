@@ -12,8 +12,9 @@ const sessions = @import("app_session_runtime.zig");
 const session_catalog = @import("../session/session_catalog.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const diff = @import("../output/diff.zig");
+const metrics_line = @import("../output/metrics_line.zig");
 const Allocator = std.mem.Allocator;
-const Kind = enum { startup, startup_last, startup_remembered, attach, poll, list, children, history, submit, cancel, rpc, heartbeat, kernel, rename, config };
+const Kind = enum { startup, startup_last, startup_remembered, attach, poll, list, children, history, submit, cancel, rpc, heartbeat, kernel, rename, config, command };
 const Request = struct {
     alloc: Allocator,
     kind: Kind,
@@ -198,7 +199,7 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
             if (std.mem.eql(u8, name, "/help")) {
-                try notice(app, "proto-fx", "← sessions · → subagents (empty composer)\n/heartbeat status|start <seconds> <prompt>|pause|resume|stop\n/kernel status|prewarm|interrupt|stop|restart\n/resume [id|last] · /subagents · /rename <title> · /model <id> · /permissions ask|auto|full-access");
+                try notice(app, "proto-fx", "← sessions · → subagents (empty composer)\n/session  /compact · /clear · /context · /model <id> · /effort <level> · /fast on|off · /ultrafast on|off · /permissions ask|auto|full-access · /undo\n/app  /copy · /stats · /settings · /shell reload\n/allowlist · /mcp · /workspace [add PATH|remove PATH|clear] · /resume [id|last] · /subagents · /rename <title>\n/heartbeat status|start <seconds> <prompt>|pause|resume|stop\n/kernel status|prewarm|interrupt|stop|restart");
                 return false;
             }
             if (std.mem.eql(u8, name, "/resume")) {
@@ -225,9 +226,179 @@ pub fn Runtime(comptime App: type) type {
                 try notice(app, "session", body);
                 return true;
             }
-            for ([_][]const u8{ "/compact", "/clear", "/undo", "/settings", "/effort", "/fast", "/ultrafast", "/context", "/allowlist", "/workspace", "/shell", "/mcp", "/stats", "/copy" }) |unsupported| {
-                if (!std.mem.eql(u8, name, unsupported)) continue;
-                try notice(app, name, "This command is not available for detached sessions yet. Use /new, /resume, /model, /permissions, /heartbeat or /kernel.");
+            if (std.mem.eql(u8, name, "/copy")) {
+                if (app.remote.current_id.len == 0) {
+                    try notice(app, "session", "Open a session before copying a reply.");
+                    return true;
+                }
+                try app.remote.enqueue(.command, .{
+                    .command = "command",
+                    .session_id = app.remote.current_id,
+                    .name = "last_reply",
+                });
+                return true;
+            }
+            if (std.mem.eql(u8, name, "/stats")) {
+                var buf: [256]u8 = undefined;
+                const body = try metrics_line.write(&buf, app.metrics);
+                try notice(app, "stats", body);
+                return true;
+            }
+            if (std.mem.eql(u8, name, "/workspace")) {
+                if (app.remote.child_id.len > 0) {
+                    try notice(app, "subagent", "This child transcript is read-only. Press Left to return to the parent before changing its workspace.");
+                    return true;
+                }
+                if (app.remote.current_id.len == 0) {
+                    try notice(app, "session", "Open a session before changing its workspace.");
+                    return true;
+                }
+                const usage = "usage: /workspace [add PATH|remove PATH|clear]";
+                if (rest.len == 0 or std.mem.eql(u8, rest, "list")) {
+                    try app.remote.enqueue(.command, .{
+                        .command = "command",
+                        .session_id = app.remote.current_id,
+                        .name = "workspace",
+                    });
+                    return true;
+                }
+                if (std.mem.eql(u8, rest, "clear")) {
+                    try app.remote.enqueue(.command, .{
+                        .command = "command",
+                        .session_id = app.remote.current_id,
+                        .name = "workspace",
+                        .action = "clear",
+                    });
+                    return true;
+                }
+                const verb_end = std.mem.findAny(u8, rest, " \t") orelse {
+                    try notice(app, "", usage);
+                    return true;
+                };
+                const verb = rest[0..verb_end];
+                const path = std.mem.trim(u8, rest[verb_end..], " \t");
+                if (path.len == 0 or
+                    (!std.mem.eql(u8, verb, "add") and !std.mem.eql(u8, verb, "remove")))
+                {
+                    try notice(app, "", usage);
+                    return true;
+                }
+                try app.remote.enqueue(.command, .{
+                    .command = "command",
+                    .session_id = app.remote.current_id,
+                    .name = "workspace",
+                    .action = verb,
+                    .path = path,
+                });
+                return true;
+            }
+            if (std.mem.eql(u8, name, "/shell")) {
+                if (app.remote.child_id.len > 0) {
+                    try notice(app, "subagent", "This child transcript is read-only. Press Left to return to the parent before reloading its shell.");
+                    return true;
+                }
+                if (!std.mem.eql(u8, rest, "reload")) {
+                    try notice(app, "", "usage: /shell reload");
+                    return true;
+                }
+                if (app.remote.current_id.len == 0) {
+                    try notice(app, "session", "Open a session before reloading its shell.");
+                    return true;
+                }
+                try app.remote.enqueue(.command, .{
+                    .command = "command",
+                    .session_id = app.remote.current_id,
+                    .name = "shell_reload",
+                });
+                return true;
+            }
+            if (std.mem.eql(u8, name, "/context")) {
+                if (app.remote.child_id.len > 0) {
+                    try notice(app, "subagent", "This child transcript is read-only. Press Left to return to the parent before checking its context.");
+                    return true;
+                }
+                if (app.remote.current_id.len == 0) {
+                    try notice(app, "session", "Open a session before checking its context.");
+                    return true;
+                }
+                try app.remote.enqueue(.command, .{
+                    .command = "command",
+                    .session_id = app.remote.current_id,
+                    .name = "context",
+                });
+                return true;
+            }
+            if (std.mem.eql(u8, name, "/compact")) {
+                if (app.remote.child_id.len > 0) {
+                    try notice(app, "subagent", "This child transcript is read-only. Press Left to return to the parent before compacting it.");
+                    return true;
+                }
+                if (app.remote.current_id.len == 0) {
+                    try notice(app, "session", "Open a session before compacting it.");
+                    return true;
+                }
+                try app.remote.enqueue(.command, .{
+                    .command = "command",
+                    .session_id = app.remote.current_id,
+                    .name = "compact",
+                });
+                try notice(app, "session", "Compacting context...");
+                return true;
+            }
+            if (std.mem.eql(u8, name, "/clear")) {
+                if (app.remote.child_id.len > 0) {
+                    try notice(app, "subagent", "This child transcript is read-only. Press Left to return to the parent before clearing.");
+                    return true;
+                }
+                // `/clear` carries the current session to the background and
+                // starts a fresh conversation, exactly like `/new` in this
+                // host; the daemon keeps the old session and its processes.
+                try newSession(app);
+                return true;
+            }
+            if (std.mem.eql(u8, name, "/undo")) {
+                if (app.remote.child_id.len > 0) {
+                    try notice(app, "subagent", "This child transcript is read-only. Press Left to return to the parent before undoing.");
+                    return true;
+                }
+                if (app.remote.current_id.len == 0) {
+                    try notice(app, "session", "Open a session before undoing a file operation.");
+                    return true;
+                }
+                try app.remote.enqueue(.command, .{
+                    .command = "command",
+                    .session_id = app.remote.current_id,
+                    .name = "undo",
+                });
+                return true;
+            }
+            if (optionIdForCommand(name)) |option| {
+                try forwardSessionOption(app, option, rest);
+                return true;
+            }
+            if (std.mem.eql(u8, name, "/mcp")) {
+                if (app.remote.child_id.len > 0) {
+                    try notice(app, "subagent", "This child transcript is read-only. Press Left to return to the parent before managing MCP servers.");
+                    return true;
+                }
+                if (app.remote.current_id.len == 0) {
+                    try notice(app, "session", "Open a session before managing MCP servers.");
+                    return true;
+                }
+                if (rest.len == 0) {
+                    try app.remote.enqueue(.command, .{
+                        .command = "command",
+                        .session_id = app.remote.current_id,
+                        .name = "mcp_status",
+                    });
+                    return true;
+                }
+                try app.remote.enqueue(.command, .{
+                    .command = "command",
+                    .session_id = app.remote.current_id,
+                    .name = "mcp_verb",
+                    .line = rest,
+                });
                 return true;
             }
             if (std.mem.eql(u8, name, "/fork")) {
@@ -298,6 +469,149 @@ pub fn Runtime(comptime App: type) type {
 
         fn notice(app: *App, topic: []const u8, body: []const u8) !void {
             try app.writeDomainNotice(.{ .topic = topic, .tone = .neutral, .body = body }, true);
+        }
+
+        /// `/effort`, `/fast`, and `/ultrafast` each name one host config
+        /// option. The host owns the accepted values and the rejection text,
+        /// so this only normalizes a boolean toggle; every other value passes
+        /// through untouched.
+        fn forwardSessionOption(app: *App, option: []const u8, rest: []const u8) !void {
+            if (app.remote.child_id.len > 0) {
+                try notice(app, "subagent", "This child transcript is read-only. Press Left to return to the parent before changing its configuration.");
+                return;
+            }
+            if (app.remote.current_id.len == 0) {
+                try notice(app, "session", "Open a session before changing its configuration.");
+                return;
+            }
+
+            var value = rest;
+            if (!std.mem.eql(u8, option, "effort")) {
+                const enabled = parseToggle(rest) orelse {
+                    try notice(app, "", if (std.mem.eql(u8, option, "fast")) "usage: /fast on|off" else "usage: /ultrafast on|off");
+                    return;
+                };
+                value = if (enabled) "true" else "false";
+            } else if (value.len == 0) {
+                try notice(app, "", "usage: /effort auto|minimal|low|medium|high");
+                return;
+            }
+
+            try app.remote.enqueue(.config, .{
+                .command = "option",
+                .session_id = app.remote.current_id,
+                .config_id = option,
+                .value = value,
+            });
+        }
+
+        /// Renders the result of a forwarded `fx/command`. The host owns the
+        /// effect and its data; the frontend owns how it reads on screen.
+        fn applyCommandResult(app: *App, value: std.json.Value) !void {
+            const result = field(value, "result") orelse return;
+            const command = string(result, "command") orelse return;
+            if (std.mem.eql(u8, command, "last_reply")) {
+                return applyLastReply(app, string(result, "text") orelse "");
+            }
+            if (std.mem.eql(u8, command, "compact")) {
+                return applyCompaction(app, string(result, "compaction") orelse "");
+            }
+            if (std.mem.eql(u8, command, "undo")) {
+                return applyUndo(app, result);
+            }
+            if (std.mem.eql(u8, command, "context")) {
+                return applyContext(app, result);
+            }
+            if (std.mem.eql(u8, command, "mcp_verb")) {
+                try notice(app, "mcp", string(result, "text") orelse "");
+                return;
+            }
+            if (std.mem.eql(u8, command, "mcp_status")) {
+                try notice(app, "mcp", string(result, "text") orelse "");
+                return;
+            }
+            if (std.mem.eql(u8, command, "permissions_reload")) {
+                try notice(app, "permissions", "Session permissions reloaded.");
+                return;
+            }
+            if (std.mem.eql(u8, command, "workspace")) {
+                try notice(app, "workspace", string(result, "text") orelse "");
+                return;
+            }
+            if (std.mem.eql(u8, command, "shell_reload")) {
+                try notice(app, "shell", "The next command reloads your shell startup files. Remembered command approvals were reset.");
+                return;
+            }
+        }
+
+        fn applyLastReply(app: *App, text: []const u8) !void {
+            if (text.len == 0) {
+                try notice(app, "clipboard", "No assistant reply to copy.");
+                return;
+            }
+            if (!copyToClipboard(app, text)) {
+                try notice(app, "clipboard", "Failed to copy to clipboard.");
+                return;
+            }
+            try notice(app, "clipboard", "Copied to clipboard.");
+        }
+
+        fn applyCompaction(app: *App, outcome: []const u8) !void {
+            if (std.mem.eql(u8, outcome, "compacted")) {
+                try notice(app, "session", "Context compacted.");
+            } else if (std.mem.eql(u8, outcome, "nothing_to_compact")) {
+                try notice(app, "session", "No context to compact.");
+            }
+        }
+
+        fn applyContext(app: *App, result: std.json.Value) !void {
+            const used = integer(result, "used") orelse 0;
+            const percent = integer(result, "auto_compact_percent") orelse 0;
+            var buf: [192]u8 = undefined;
+            const body = if (integer(result, "total")) |total|
+                try std.mem.print(&buf, "context: {d} / {d} tokens ({d}%) · auto-compact at {d}%", .{
+                    used,
+                    total,
+                    if (total > 0) @divTrunc(used * 100, total) else 0,
+                    percent,
+                })
+            else
+                try std.mem.print(&buf, "context: {d} tokens · auto-compact at {d}%", .{ used, percent });
+            try notice(app, "context", body);
+        }
+
+        /// The host reports what happened to the file; the frontend renders the
+        /// path safely, because a repository can name a file with control bytes.
+        fn applyUndo(app: *App, result: std.json.Value) !void {
+            const outcome = string(result, "outcome") orelse return;
+            if (std.mem.eql(u8, outcome, "nothing_to_undo")) {
+                try notice(app, "undo", "Nothing to undo.");
+                return;
+            }
+            var arena_state = std.heap.ArenaAllocator.init(app.alloc);
+            defer arena_state.deinit();
+            const alloc = arena_state.allocator();
+            const path = string(result, "path") orelse "";
+            var safe = try text_utils.encodeTerminalSafe(alloc, path, std.Io.Dir.max_path_bytes);
+            defer safe.deinit(alloc);
+            const body = if (std.mem.eql(u8, outcome, "restored"))
+                try alloc.print("Restored {s}", .{safe.bytes})
+            else if (std.mem.eql(u8, outcome, "deleted"))
+                try alloc.print("Deleted {s} (was newly created)", .{safe.bytes})
+            else
+                try alloc.print("Could not undo {s}", .{safe.bytes});
+            try notice(app, "undo", body);
+        }
+
+        /// Replaces the host's live permission rules with what this process
+        /// just wrote to the profile or project settings.
+        pub fn reloadPermissions(app: *App) !void {
+            if (app.remote.current_id.len == 0) return;
+            try app.remote.enqueue(.command, .{
+                .command = "command",
+                .session_id = app.remote.current_id,
+                .name = "permissions_reload",
+            });
         }
 
         pub fn newSession(app: *App) !void {
@@ -530,6 +844,9 @@ pub fn Runtime(comptime App: type) type {
                     app.remote.next_poll_ms = 0;
                 },
                 .rpc => app.remote.permission_response_queued = false,
+                // The daemon accepts a session command and reports its result
+                // through the event stream, so poll for it right away.
+                .command => app.remote.next_poll_ms = 0,
                 .submit, .cancel => app.remote.next_poll_ms = 0,
             }
             app.shell.render_requests.request(.footer);
@@ -911,6 +1228,30 @@ pub fn Runtime(comptime App: type) type {
                 try notice(app, "session", "Some live output exceeded the replay buffer. Reopen this session after its turn finishes to load the complete saved transcript.");
                 return;
             }
+            if (std.mem.eql(u8, method, "fx/mcp_notice")) {
+                const params = field(frame, "params") orelse return;
+                if (string(params, "session_id")) |id| if (!std.mem.eql(u8, id, app.remote.current_id)) return;
+                const text = string(params, "text") orelse return;
+                try app.writeDomainNotice(.{
+                    .topic = "mcp",
+                    .tone = if (boolean(params, "warning")) .warning else .neutral,
+                    .body = text,
+                }, true);
+                app.shell.render_requests.request(.footer);
+                return;
+            }
+            if (std.mem.eql(u8, method, "fx/command_result")) {
+                const params = field(frame, "params") orelse return;
+                if (field(params, "ok")) |ok| if (ok == .bool and !ok.bool) {
+                    const message = string(params, "error") orelse "The session command failed";
+                    try app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = message }, true);
+                    app.shell.render_requests.request(.footer);
+                    return;
+                };
+                try applyCommandResult(app, params);
+                app.shell.render_requests.request(.footer);
+                return;
+            }
             if (std.mem.eql(u8, method, "proto/native_presentation")) {
                 if (!app.remote.native_presentation) return;
                 const params = field(frame, "params") orelse return;
@@ -1047,6 +1388,33 @@ pub fn Runtime(comptime App: type) type {
 fn field(value: std.json.Value, key: []const u8) ?std.json.Value {
     return if (value == .object) value.object.get(key) else null;
 }
+
+/// Test hosts and embedders need not offer a clipboard; production hosts do.
+fn copyToClipboard(app: anytype, text: []const u8) bool {
+    const Host = @TypeOf(app.*);
+    return if (comptime @hasDecl(Host, "clipboard"))
+        app.clipboard().copy(text) catch false
+    else
+        false;
+}
+
+/// The host config option each speed or effort command names, or null when
+/// the command belongs to something else.
+fn optionIdForCommand(name: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "/effort")) return "effort";
+    if (std.mem.eql(u8, name, "/fast")) return "fast";
+    if (std.mem.eql(u8, name, "/ultrafast")) return "ultrafast";
+    return null;
+}
+
+/// The words a person types for a boolean config option. The host speaks
+/// `true` and `false`; the frontend accepts both and the on/off shorthand.
+fn parseToggle(raw: []const u8) ?bool {
+    if (std.ascii.eqlIgnoreCase(raw, "on") or std.ascii.eqlIgnoreCase(raw, "true") or std.mem.eql(u8, raw, "1")) return true;
+    if (std.ascii.eqlIgnoreCase(raw, "off") or std.ascii.eqlIgnoreCase(raw, "false") or std.mem.eql(u8, raw, "0")) return false;
+    return null;
+}
+
 fn string(value: std.json.Value, key: []const u8) ?[]const u8 {
     const v = field(value, key) orelse return null;
     return if (v == .string) v.string else null;
@@ -1253,4 +1621,24 @@ test "root native presentation preserves tool detail through steering and resets
     try std.testing.expectError(error.TestAppendRejected, app.apply(
         \\{"assistant_presentation":{"code_block":{"language":"zig","code":"const x = 1;"}}}
     ));
+}
+
+test "parseToggle accepts the words a person types for a boolean option" {
+    try std.testing.expect(parseToggle("on").?);
+    try std.testing.expect(parseToggle("ON").?);
+    try std.testing.expect(parseToggle("true").?);
+    try std.testing.expect(parseToggle("1").?);
+    try std.testing.expect(!parseToggle("off").?);
+    try std.testing.expect(!parseToggle("False").?);
+    try std.testing.expect(!parseToggle("0").?);
+    try std.testing.expect(parseToggle("maybe") == null);
+    try std.testing.expect(parseToggle("") == null);
+}
+
+test "optionIdForCommand maps only the option commands" {
+    try std.testing.expectEqualStrings("effort", optionIdForCommand("/effort").?);
+    try std.testing.expectEqualStrings("fast", optionIdForCommand("/fast").?);
+    try std.testing.expectEqualStrings("ultrafast", optionIdForCommand("/ultrafast").?);
+    try std.testing.expect(optionIdForCommand("/copy") == null);
+    try std.testing.expect(optionIdForCommand("/effortx") == null);
 }

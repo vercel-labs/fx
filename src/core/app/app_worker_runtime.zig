@@ -3682,7 +3682,7 @@ test "core.app_worker_runtime publishes rendered block before opening tool entri
         .tool_name = "read_file",
         .activity_kind = .read,
     } });
-    try queueToolStart(&app, 1, "grep_b", "grep");
+    try queueToolStart(&app, 1, "shell_b", "shell");
 
     try Runtime(FakeApp).tick(&app, bridge.handlers());
 
@@ -3710,7 +3710,7 @@ test "core.app_worker_runtime publishes rendered block before opening tool entri
         app.shell.lifecycle.entries.items[1].raw_bytes.bytes,
     );
     try std.testing.expectEqualStrings(
-        "● grep\x1b[0m\n",
+        "● shell\x1b[0m\n",
         app.shell.lifecycle.entries.items[2].raw_bytes.bytes,
     );
     try std.testing.expectEqual(@as(usize, 2), app.shell.lifecyclePinCount());

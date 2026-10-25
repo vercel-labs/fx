@@ -1678,7 +1678,7 @@ test "common Stop interruption keeps only completed calls from a partially attem
     const calls = [_]ToolCall{
         toolCall("call_completed", "read_file", "{\"path\":\"README.md\"}"),
         toolCall("call_cancelled", "browser_snapshot", "{}"),
-        toolCall("call_unattempted", "grep_files", "{\"pattern\":\"Hooks\"}"),
+        toolCall("call_unattempted", "read_file", "{\"path\":\"Hooks\"}"),
     };
     var gateway = FakeGateway.init(alloc, &.{
         .{ .content = "candidate" },
@@ -1858,8 +1858,8 @@ test "common Stop parallel cancellation preserves ordinary cancelled peer as com
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
         toolCall("call_ordinary_cancel", "read_file", "{\"path\":\"README.md\"}"),
-        toolCall("call_owner_signal", "grep_files", "{\"pattern\":\"Hooks\"}"),
-        toolCall("call_completed_peer", "glob_files", "{\"pattern\":\"src/main.zig\"}"),
+        toolCall("call_owner_signal", "web_fetch", "{\"url\":\"https://example.com\"}"),
+        toolCall("call_completed_peer", "read_tool_result", "{\"handle\":\"T1\"}"),
     };
     var gateway = FakeGateway.init(alloc, &.{
         .{ .content = "candidate" },
@@ -1871,7 +1871,7 @@ test "common Stop parallel cancellation preserves ordinary cancelled peer as com
     var fixture = PromptFixture{};
     deps.ordinary_cancel_on_execute_name = "read_file";
     deps.cancel_on_execute = &fixture.cancel_flag;
-    deps.cancel_on_execute_name = "grep_files";
+    deps.cancel_on_execute_name = "web_fetch";
     deps.cancel_on_execute_delay_ms = 50;
     var lifecycle_runtime = lifecycle_hooks.Runtime.init(alloc);
     defer lifecycle_runtime.deinit();

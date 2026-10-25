@@ -89,13 +89,13 @@ test "browser rows keep title and right-aligned meta only" {
     });
     state.selected = 1;
 
-    const first = try composeRow(alloc, &state, 1, 40, 10);
+    var first = try composeRow(alloc, &state, 1, 40, 10);
     defer first.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, first.items, "session abc12345") != null);
     try std.testing.expect(std.mem.find(u8, first.items, "12m") != null);
     try std.testing.expect(std.mem.find(u8, first.items, "/Users/") == null);
 
-    const selected = try composeRow(alloc, &state, 2, 40, 10);
+    var selected = try composeRow(alloc, &state, 2, 40, 10);
     defer selected.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, selected.items, "• Review the footer layout") != null);
     try std.testing.expect(std.mem.find(u8, selected.items, "now") != null);

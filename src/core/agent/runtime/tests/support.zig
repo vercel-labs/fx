@@ -151,8 +151,6 @@ fn discardVisionToolOutput(
 ) anyerror!void {}
 
 const test_tools = [_]tool_dispatch.Tool{
-    builtin_tools.glob_files,
-    builtin_tools.grep_files,
     builtin_tools.read_file,
     builtin_tools.write_file,
     builtin_tools.edit_file,

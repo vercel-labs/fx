@@ -131,55 +131,6 @@ const test_edit_file = blk: {
     break :blk spec;
 };
 
-const test_glob_files = blk: {
-    var spec = test_read_file;
-    spec.name = "glob_files";
-    spec.description = "Test filename matching. When to use: exercise registered search projection. When NOT to use: assert product-specific filesystem behavior.";
-    spec.model_schema = .{
-        .name = "glob_files",
-        .description = spec.description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "pattern", .json_type = .string },
-                .{ .name = "path", .json_type = .string },
-            },
-            .required = &.{"pattern"},
-        },
-    };
-    spec.executor_kind = .glob_files;
-    spec.activity_kind = .list;
-    spec.action_label = "Matching";
-    spec.completed_action_label = "Matched";
-    spec.label_arg_kind = .pattern;
-    spec.label_arg_default = "pattern";
-    break :blk spec;
-};
-
-const test_grep_files = blk: {
-    var spec = test_read_file;
-    spec.name = "grep_files";
-    spec.description = "Test text search. When to use: exercise registered search projection. When NOT to use: assert product-specific filesystem behavior.";
-    spec.model_schema = .{
-        .name = "grep_files",
-        .description = spec.description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "pattern", .json_type = .string },
-            },
-            .required = &.{"pattern"},
-        },
-    };
-    spec.executor_kind = .grep_files;
-    spec.activity_kind = .read;
-    spec.requires_approval = false;
-    spec.action_label = "Searching";
-    spec.completed_action_label = "Searched";
-    spec.label_arg_kind = .pattern;
-    spec.label_arg_default = "pattern";
-    spec.permission_target_kind = .path_optional_existing;
-    break :blk spec;
-};
-
 fn writeTestWebSearchProviderAdvertisement(
     _: Allocator,
     writer: *std.Io.Writer,
@@ -442,8 +393,6 @@ pub fn containsName(names: []const []const u8, expected: []const u8) bool {
 }
 
 const test_all_tools = [_]tool_dispatch.Tool{
-    test_glob_files,
-    test_grep_files,
     test_read_file,
     test_write_file,
     test_edit_file,
@@ -462,8 +411,6 @@ const test_all_tools = [_]tool_dispatch.Tool{
 
 const test_order = [_][]const u8{
     "read_file",
-    "glob_files",
-    "grep_files",
     "edit_file",
     "write_file",
     "shell",
@@ -479,8 +426,6 @@ const test_order = [_][]const u8{
 
 const test_read_only_names = [_][]const u8{
     "read_file",
-    "glob_files",
-    "grep_files",
 };
 
 const test_tool_set = tool_set_contract.ToolSet{

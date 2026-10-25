@@ -20,8 +20,6 @@ const question_answer = @import("../core/agent/question_answer.zig");
 const subagent_impl = @import("../tools/agent/subagent.zig");
 const vision_impl = @import("../tools/agent/vision.zig");
 const edit_file_impl = @import("../tools/filesystem/edit_file.zig");
-const glob_files_impl = @import("../tools/filesystem/glob_files.zig");
-const grep_files_impl = @import("../tools/filesystem/grep_files.zig");
 const read_file_impl = @import("../tools/filesystem/read_file.zig");
 const write_file_impl = @import("../tools/filesystem/write_file.zig");
 const read_tool_result_impl = @import("../tools/session/read_tool_result.zig");
@@ -36,10 +34,6 @@ const Allocator = std.mem.Allocator;
 
 pub const ToolSpec = tool_specs.ToolSpec;
 
-const glob_files_description =
-    "Find file paths matching a glob pattern, with mode=count for exact path counts without listing entries. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: locate files by name, extension, or directory pattern; narrow path or pattern if candidate caps appear. When NOT to use: search file contents, read files, run find, or count non-file concepts.";
-const grep_files_description =
-    "Search text files for a literal substring, optionally narrowed by path/include, with output modes for matching lines, files-with-matches, or counts plus head_limit/offset pagination and bounded context_lines for matches mode. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. Use include as the type/path filter, such as *.zig. When to use: find exact symbols, strings, TODOs, or usage sites. When NOT to use: regex is not supported; avoid unknown-concept exploration, filename lookup, known-path reads, and shell grep; do not repeat the same or equivalent search after a caller search only finds a definition.";
 const read_file_description =
     "Read one file with bounded line-numbered output and optional start_line/line_count range. UTF-8 text returns as numbered lines; image files (PNG, JPEG, GIF, WebP up to 3.9MB) attach to the result so you can see them. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: inspect an exact known path before editing or explaining code, or view an image file. When NOT to use: list directories, search many files, read non-image binary data, or bypass dedicated search tools.";
 const write_file_description =
@@ -141,71 +135,6 @@ const vision_description =
     "Inspect authorized images attached by the user or local image paths supplied in the conversation, and return structured factual evidence. Pass exactly one source: image_ids for attached images, or paths for local images. When to use: read visible text, UI state, objects, layout, or other visual details needed for the task. When NOT to use: inspect paths the user did not supply, infer details not visible in an image, or repeat evidence already available in the conversation.";
 const read_tool_result_description =
     "Read a stored tool result or captured command output by opaque handle from the active session or process. Pass handle with query to find a known literal line, or with an optional byte range. Turns, tool calls and earlier compactions saved by compaction open by their ID as the handle, like M12, T12 or L2, and search finds them by text without a handle. When to use: inspect more after a tool-result preview or command-output handle says retained output is available, or recover details of a compacted turn, tool call or earlier compaction. When NOT to use: read arbitrary files, search the workspace, recover secrets, or inspect results from another session or process.";
-
-pub const glob_files = ToolSpec{
-    .name = "glob_files",
-    .description = glob_files_description,
-    .model_schema = .{
-        .name = "glob_files",
-        .description = glob_files_description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "pattern", .json_type = .string, .description = "Glob pattern to match, such as src/**/*.zig or *.md." },
-                .{ .name = "path", .json_type = .string, .bounds = &.{ .min_length = 1 }, .description = "Optional search root relative to the workspace root, or an external path using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. Omit this field to use the current directory; never send an empty string. Narrow it when possible." },
-                .{ .name = "mode", .json_type = .string, .shape = &.{ .enum_values = &.{ "matches", "count" } }, .description = "Use matches to return sample paths, or count to return an exact matching path count without listing entries." },
-            },
-            .required = &.{"pattern"},
-        },
-    },
-    .executor_kind = .glob_files,
-    .activity_kind = .list,
-    .requires_approval = false,
-    .action_label = "Matching",
-    .completed_action_label = "Matched",
-    .label_arg_kind = .pattern,
-    .label_arg_default = "pattern",
-    .permission_target_kind = .path_optional_existing,
-    .decode = glob_files_impl.decode,
-    .validate = glob_files_impl.validate,
-    .call = glob_files_impl.call,
-    .reads_only_fn = glob_files_impl.readsOnly,
-    .irreversible_fn = glob_files_impl.isIrreversible,
-};
-
-pub const grep_files = ToolSpec{
-    .name = "grep_files",
-    .description = grep_files_description,
-    .model_schema = .{
-        .name = "grep_files",
-        .description = grep_files_description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "pattern", .json_type = .string, .description = "Literal plain-text pattern to search for." },
-                .{ .name = "path", .json_type = .string, .bounds = &.{ .min_length = 1 }, .description = "Optional search root relative to the workspace root, or an external path using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. Omit this field to use the current directory; never send an empty string. Narrow it when possible." },
-                .{ .name = "include", .json_type = .string, .description = "Optional glob pattern applied to candidate file paths before reading files, such as *.zig or src/**/*.ts." },
-                .{ .name = "case_insensitive", .json_type = .boolean, .description = "Search case-insensitively when true." },
-                .{ .name = "mode", .json_type = .string, .shape = &.{ .enum_values = &.{ "matches", "files_with_matches", "count" } }, .description = "Use matches for line matches, files_with_matches for unique matching paths, or count for exact matching-line and matching-file counts." },
-                .{ .name = "head_limit", .json_type = .integer, .description = "Optional positive maximum results to return for matches or files_with_matches. Defaults to the normal output cap." },
-                .{ .name = "offset", .json_type = .integer, .description = "Optional zero-based result offset for matches or files_with_matches pagination. Defaults to 0." },
-                .{ .name = "context_lines", .json_type = .integer, .description = "Optional non-negative number of lines before and after each emitted match in matches mode. Bounded by the tool." },
-            },
-            .required = &.{"pattern"},
-        },
-    },
-    .executor_kind = .grep_files,
-    .activity_kind = .read,
-    .requires_approval = false,
-    .action_label = "Searching",
-    .completed_action_label = "Searched",
-    .label_arg_kind = .pattern,
-    .label_arg_default = "pattern",
-    .permission_target_kind = .path_optional_existing,
-    .decode = grep_files_impl.decode,
-    .validate = grep_files_impl.validate,
-    .call = grep_files_impl.call,
-    .reads_only_fn = grep_files_impl.readsOnly,
-    .irreversible_fn = grep_files_impl.isIrreversible,
-};
 
 pub const read_file = ToolSpec{
     .name = "read_file",
@@ -739,8 +668,6 @@ pub const kernel = ToolSpec{
 
 pub const all = [_]tool_dispatch.Tool{
     kernel,
-    glob_files,
-    grep_files,
     read_file,
     write_file,
     edit_file,
@@ -762,8 +689,6 @@ pub const registry = tool_dispatch.Registry{ .tools = all[0..] };
 pub const advertisement_order = [_][]const u8{
     "kernel",
     "read_file",
-    "glob_files",
-    "grep_files",
     "edit_file",
     "write_file",
     "shell",
@@ -779,8 +704,6 @@ pub const advertisement_order = [_][]const u8{
 
 pub const read_only_tool_names = [_][]const u8{
     "read_file",
-    "glob_files",
-    "grep_files",
 };
 
 pub fn isReadOnlyToolName(name: []const u8) bool {
@@ -845,7 +768,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "bb643f827a9ffa27608b14c0e26b3b0a195f2909e7f1f7763c161f585adb6449",
+        "5e9bcac47bf4a450c37c7dda065e67e882e84a9d96ad89521026b9739f29a28e",
         &actual_hex,
     );
 }
@@ -884,8 +807,7 @@ fn nameInSet(names: []const []const u8, wanted: []const u8) bool {
 
 test "built-in tools register exact active local order" {
     const expected_names = [_][]const u8{
-        "glob_files",
-        "grep_files",
+        "kernel",
         "read_file",
         "write_file",
         "edit_file",
@@ -1032,78 +954,6 @@ test "built-in tool lookup and metadata use registered defaults" {
     try std.testing.expect(lookup("mcp_search_tools") == null);
     try std.testing.expect(lookup("run_command") == null);
     try std.testing.expect(lookup("missing_tool") == null);
-}
-
-test "built-in glob_files owns product metadata schema and callbacks" {
-    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, glob_files);
-    defer std.testing.allocator.free(schema_json);
-
-    try std.testing.expectEqualStrings("glob_files", glob_files.name);
-    try std.testing.expect(std.mem.find(u8, glob_files.description, "exact path counts without listing entries") != null);
-    try std.testing.expect(std.mem.find(u8, glob_files.description, "candidate caps") != null);
-    try std.testing.expect(std.mem.find(u8, glob_files.description, "external access is subject to permission policy") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"pattern\"]") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"mode\":{\"type\":\"string\",\"enum\":[\"matches\",\"count\"]") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"path\":{\"type\":\"string\",\"minLength\":1") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "Omit this field to use the current directory") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "external path") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "~/...") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "../...") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "permission policy") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "outside the workspace") == null);
-    try std.testing.expectEqual(tool_dispatch.ExecutorKind.glob_files, glob_files.executor_kind);
-    try std.testing.expectEqual(types.ToolActivityKind.list, glob_files.activity_kind);
-    try std.testing.expect(!glob_files.requires_approval);
-    try std.testing.expectEqual(tool_dispatch.LabelArgKind.pattern, glob_files.label_arg_kind);
-    try std.testing.expectEqualStrings("pattern", glob_files.label_arg_default);
-    try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.path_optional_existing, glob_files.permission_target_kind);
-    try std.testing.expectEqualStrings("Matching", glob_files.action_label);
-    try std.testing.expectEqualStrings("Matched", glob_files.completed_action_label);
-    try std.testing.expect(glob_files.decode == glob_files_impl.decode);
-    try std.testing.expect(glob_files.validate.? == glob_files_impl.validate);
-    try std.testing.expect(glob_files.call == glob_files_impl.call);
-    try std.testing.expect(glob_files.reads_only_fn == glob_files_impl.readsOnly);
-    try std.testing.expect(glob_files.irreversible_fn == glob_files_impl.isIrreversible);
-}
-
-test "built-in grep_files owns product metadata schema and callbacks" {
-    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, grep_files);
-    defer std.testing.allocator.free(schema_json);
-
-    try std.testing.expectEqualStrings("grep_files", grep_files.name);
-    try std.testing.expect(std.mem.find(u8, grep_files.description, "literal substring") != null);
-    try std.testing.expect(std.mem.find(u8, grep_files.description, "type/path filter") != null);
-    try std.testing.expect(std.mem.find(u8, grep_files.description, "regex is not supported") != null);
-    try std.testing.expect(std.mem.find(u8, grep_files.description, "do not repeat the same or equivalent search") != null);
-    try std.testing.expect(std.mem.find(u8, grep_files.description, "glob_files") == null);
-    try std.testing.expect(std.mem.find(u8, grep_files.description, "read_file") == null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"pattern\"]") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"include\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"case_insensitive\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"files_with_matches\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"head_limit\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"offset\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"context_lines\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"path\":{\"type\":\"string\",\"minLength\":1") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "Omit this field to use the current directory") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "external path") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "~/...") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "../...") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "permission") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "outside the workspace") == null);
-    try std.testing.expectEqual(tool_dispatch.ExecutorKind.grep_files, grep_files.executor_kind);
-    try std.testing.expectEqual(types.ToolActivityKind.read, grep_files.activity_kind);
-    try std.testing.expect(!grep_files.requires_approval);
-    try std.testing.expectEqual(tool_dispatch.LabelArgKind.pattern, grep_files.label_arg_kind);
-    try std.testing.expectEqualStrings("pattern", grep_files.label_arg_default);
-    try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.path_optional_existing, grep_files.permission_target_kind);
-    try std.testing.expectEqualStrings("Searching", grep_files.action_label);
-    try std.testing.expectEqualStrings("Searched", grep_files.completed_action_label);
-    try std.testing.expect(grep_files.decode == grep_files_impl.decode);
-    try std.testing.expect(grep_files.validate.? == grep_files_impl.validate);
-    try std.testing.expect(grep_files.call == grep_files_impl.call);
-    try std.testing.expect(grep_files.reads_only_fn == grep_files_impl.readsOnly);
-    try std.testing.expect(grep_files.irreversible_fn == grep_files_impl.isIrreversible);
 }
 
 test "built-in read_file owns product metadata schema and callbacks" {
@@ -1715,8 +1565,6 @@ test "built-in registry uses executable web_fetch implementation" {
 test "built-in read-only tool set matches plan inspection tools" {
     const expected_names = [_][]const u8{
         "read_file",
-        "glob_files",
-        "grep_files",
     };
 
     try std.testing.expectEqual(expected_names.len, read_only_tool_names.len);

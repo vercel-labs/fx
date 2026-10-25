@@ -791,8 +791,6 @@ fn fileEvidenceActionForTool(tool_name: []const u8) types.FileEvidenceAction {
     if (std.mem.eql(u8, tool_name, "read_file")) return .read;
     if (std.mem.eql(u8, tool_name, "write_file")) return .write;
     if (std.mem.eql(u8, tool_name, "edit_file")) return .edit;
-    if (std.mem.eql(u8, tool_name, "grep_files")) return .search;
-    if (std.mem.eql(u8, tool_name, "glob_files")) return .search;
     return .unknown;
 }
 
@@ -1125,35 +1123,6 @@ test "file evidence does not parse unknown tool arguments" {
     try std.testing.expectEqual(@as(usize, 0), files.items.len);
 }
 
-test "search file evidence normalizes missing and empty roots" {
-    const alloc = std.testing.allocator;
-    var files: std.ArrayList(types.FileEvidence) = .empty;
-    defer {
-        for (files.items) |file| freeTransientFileEvidence(alloc, file);
-        files.deinit(alloc);
-    }
-
-    const calls = [_]ToolCall{
-        .{
-            .id = "call_empty_root",
-            .name = "grep_files",
-            .arguments_json = "{\"pattern\":\"needle\",\"path\":\"\"}",
-        },
-        .{
-            .id = "call_default_root",
-            .name = "glob_files",
-            .arguments_json = "{\"pattern\":\"*.zig\"}",
-        },
-    };
-    for (calls) |call| {
-        try appendFileEvidenceForTool(alloc, &files, call, .success, null);
-    }
-
-    try std.testing.expectEqual(@as(usize, 2), files.items.len);
-    try std.testing.expectEqualStrings(".", files.items[0].path);
-    try std.testing.expectEqualStrings(".", files.items[1].path);
-}
-
 test "read evidence trusts typed model coverage instead of output text" {
     const alloc = std.testing.allocator;
     var files: std.ArrayList(types.FileEvidence) = .empty;
@@ -1281,9 +1250,9 @@ test "normal execution-memory builders produce identical durable projection" {
             .arguments_json = "{\"path\":\"notes.txt\"}",
         },
         .{
-            .id = "call_search",
-            .name = "grep_files",
-            .arguments_json = "{\"path\":\"src\",\"query\":\"needle\"}",
+            .id = "call_read_second",
+            .name = "read_file",
+            .arguments_json = "{\"path\":\"src\"}",
         },
     };
     var second_calls = [_]ToolCall{.{
@@ -1316,10 +1285,10 @@ test "normal execution-memory builders produce identical durable projection" {
             .role = .tool,
             .content = "search failed",
             .tool_call_id = first_calls[1].id,
-            .tool_name = "grep_files",
+            .tool_name = "read_file",
             .tool_result_status = .failure,
             .tool_result_memory = .{
-                .output_handle = "result-call_search-grep_files.txt",
+                .output_handle = "result-call_read_second-read_file.txt",
                 .preview = "search preview",
                 .output_bytes = 128,
                 .stored_output_bytes = 64,
@@ -1368,10 +1337,10 @@ test "normal execution-memory builders produce identical durable projection" {
             .role = .tool,
             .content = .{ .text = "search failed" },
             .tool_call_id = first_calls[1].id,
-            .tool_name = "grep_files",
+            .tool_name = "read_file",
             .tool_result_status = .failure,
             .tool_result_memory = .{
-                .output_handle = "result-call_search-grep_files.txt",
+                .output_handle = "result-call_read_second-read_file.txt",
                 .preview = "search preview",
                 .output_bytes = 128,
                 .stored_output_bytes = 64,
@@ -1410,7 +1379,7 @@ test "normal execution-memory builders produce identical durable projection" {
         chat_memory.tool_steps[0].tool_calls[0].name,
     );
     try std.testing.expectEqualStrings(
-        "grep_files",
+        "read_file",
         chat_memory.tool_steps[0].tool_calls[1].name,
     );
     try std.testing.expectEqualStrings(
@@ -1418,7 +1387,7 @@ test "normal execution-memory builders produce identical durable projection" {
         chat_memory.tool_steps[0].tool_results[0].tool_name,
     );
     try std.testing.expectEqualStrings(
-        "grep_files",
+        "read_file",
         chat_memory.tool_steps[0].tool_results[1].tool_name,
     );
     try std.testing.expectEqualStrings("notes.txt", chat_memory.files[0].path);

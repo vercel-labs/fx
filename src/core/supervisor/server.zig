@@ -5,6 +5,9 @@ const acp = @import("../../acp/server.zig");
 const acp_config = @import("../cli/acp_runner.zig");
 const jsonrpc = @import("../../acp/jsonrpc.zig");
 const session_adapter = @import("../session/session_adapter.zig");
+const session_store = @import("../session/session_store.zig");
+const session_layout = @import("../session/session_layout.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 const child_state = @import("../subagent/child_state.zig");
 const live_presentation = @import("../subagent/live_presentation.zig");
 const types = @import("../shared/types.zig");
@@ -43,6 +46,10 @@ const Session = struct {
     history_sequence: u64 = 0,
     history_dirty: bool = true,
     heartbeat_request: ?i64 = null,
+    /// The frontend's session command currently running on its own thread.
+    /// One at a time keeps compaction, undo, and file mutations from overlapping.
+    host_command_active: std.atomic.Value(bool) = .init(false),
+    host_command_tasks: std.ArrayList(*HostCommandTask) = .empty,
 
     fn publish(raw: ?*anyopaque, frame: []const u8) !void {
         const self: *Session = @ptrCast(@alignCast(raw.?));
@@ -113,6 +120,24 @@ const Session = struct {
         return id;
     }
 
+    /// Sends one host request whose params the caller already serialized.
+    fn dispatchRaw(self: *Session, method: []const u8, params_json: []const u8) !i64 {
+        const host = self.host orelse return error.SessionStopped;
+        const id = self.next_request;
+        self.next_request += 1;
+        var out: std.Io.Writer.Allocating = .init(self.daemon.alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+        try std.json.Stringify.value(id, .{}, &out.writer);
+        try out.writer.writeAll(",\"method\":");
+        try std.json.Stringify.value(method, .{}, &out.writer);
+        try out.writer.writeAll(",\"params\":");
+        try out.writer.writeAll(params_json);
+        try out.writer.writeByte('}');
+        try host.dispatchFrame(out.written());
+        return id;
+    }
+
     fn open(self: *Session, resume_id: ?[]const u8) !void {
         var cfg = self.daemon.cfg;
         cfg.home_override = self.daemon.home;
@@ -131,22 +156,62 @@ const Session = struct {
             self.logOpenFailure();
             return error.SessionInitializationFailed;
         }
+        // The host already appends this workspace's project servers. The
+        // profile's own servers are opt-in per session, and a detached session
+        // should behave like the local TUI, so ask for them explicitly.
         if (resume_id) |id| {
-            _ = try self.dispatch("session/load", .{ .sessionId = id, .cwd = self.cwd, .mcpServers = [_]struct {}{} });
+            _ = try self.dispatch("session/load", .{
+                .sessionId = id,
+                .cwd = self.cwd,
+                .mcpServers = [_]struct {}{},
+                ._meta = .{ .fx = .{ .profileMcpServers = true } },
+            });
         } else {
-            _ = try self.dispatch("session/new", .{ .cwd = self.cwd, .mcpServers = [_]struct {}{} });
+            _ = try self.dispatch("session/new", .{
+                .cwd = self.cwd,
+                .mcpServers = [_]struct {}{},
+                ._meta = .{ .fx = .{ .profileMcpServers = true } },
+            });
         }
         const active = host.state.active_session orelse {
             self.logOpenFailure();
             return error.SessionOpenFailed;
         };
-        if (active.v2) |saved| try saved.retainForBackground();
         if (self.id.len == 0) self.id = try self.daemon.alloc.dupe(u8, active.session_id);
         self.stopped = false;
         if (self.failure) |failure| self.daemon.alloc.free(failure);
         self.failure = null;
         self.history_dirty = true;
         try self.refreshHistory();
+    }
+
+    /// Whether the active ACP session has a log on disk. A session created by
+    /// `session/new` stays in memory until its first prompt unless a heartbeat
+    /// needs it to survive a daemon restart.
+    fn saved(self: *const Session) bool {
+        const host = self.host orelse return false;
+        const active = host.state.active_session orelse return false;
+        const v2 = active.v2 orelse return false;
+        return v2.saved();
+    }
+
+    /// Whether the browser should list this session. A live session appears
+    /// once its first turn is on disk; an inactive one appears only while its
+    /// folder still exists, so deleted sessions leave the browser.
+    fn listable(self: *Session) bool {
+        if (self.host != null) return self.saved();
+        if (self.id.len == 0) return false;
+        const path = std.Io.Dir.path.join(self.daemon.alloc, &.{
+            self.daemon.home,
+            profile_paths.root_dir_name,
+            profile_paths.sessions_dir_name,
+            session_layout.sessions_v2_dir,
+            self.id,
+        }) catch return true;
+        defer self.daemon.alloc.free(path);
+        var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), path, .{}) catch return false;
+        dir.close(io_mod.getIo());
+        return true;
     }
 
     fn logOpenFailure(self: *Session) void {
@@ -161,6 +226,9 @@ const Session = struct {
 
     fn prompt(self: *Session, text: []const u8) !i64 {
         if (text.len == 0 or text.len > 1024 * 1024) return error.InvalidPrompt;
+        // A frontend command owns the session while it runs. Turns and
+        // commands never overlap, so neither can read half-published history.
+        if (self.host_command_active.load(.acquire)) return error.SessionBusy;
         try self.refreshHistory();
         if (std.mem.eql(u8, self.name, "session")) {
             const line = std.mem.trim(u8, text[0 .. std.mem.findScalar(u8, text, '\n') orelse text.len], " \t\r");
@@ -219,7 +287,22 @@ const Session = struct {
     }
 
     fn nativeCommand(self: *Session, method: []const u8, params: anytype, w: *std.Io.Writer) !void {
-        const request = try self.dispatch(method, params);
+        const payload = try self.nativeResult(method, params);
+        defer self.daemon.alloc.free(payload);
+        try w.writeAll(payload);
+    }
+
+    /// Runs a native host command and returns its response as an owned
+    /// `{"ok":...}` object. Caller owns the slice.
+    fn nativeResult(self: *Session, method: []const u8, params: anytype) ![]u8 {
+        return self.awaitNative(try self.dispatch(method, params));
+    }
+
+    fn nativeResultRaw(self: *Session, method: []const u8, params_json: []const u8) ![]u8 {
+        return self.awaitNative(try self.dispatchRaw(method, params_json));
+    }
+
+    fn awaitNative(self: *Session, request: i64) ![]u8 {
         self.events_mutex.lockUncancelable(io_mod.getIo());
         defer self.events_mutex.unlock(io_mod.getIo());
         for (self.events.items) |event| {
@@ -227,12 +310,108 @@ const Session = struct {
             defer parsed.deinit();
             const id = objectField(parsed.value, "id") orelse continue;
             if (id != .integer or id.integer != request) continue;
+            var out: std.Io.Writer.Allocating = .init(self.daemon.alloc);
+            errdefer out.deinit();
             if (objectField(parsed.value, "error")) |failure| {
-                return std.json.Stringify.value(.{ .ok = false, .@"error" = stringField(failure, "message") orelse "NativeCommandFailed" }, .{}, w);
+                try std.json.Stringify.value(.{ .ok = false, .@"error" = stringField(failure, "message") orelse "NativeCommandFailed" }, .{}, &out.writer);
+            } else if (objectField(parsed.value, "result")) |result| {
+                try out.writer.writeAll("{\"ok\":true,\"result\":");
+                try std.json.Stringify.value(result, .{}, &out.writer);
+                try out.writer.writeByte('}');
+            } else {
+                return error.NativeCommandIncomplete;
             }
-            if (objectField(parsed.value, "result") != null) return w.writeAll("{\"ok\":true}");
+            return try out.toOwnedSlice();
         }
         return error.NativeCommandIncomplete;
+    }
+
+    /// Starts one frontend session command. It runs on its own thread so a
+    /// slow compaction never blocks the daemon's request loop, and its result
+    /// reaches the frontend through the session's event stream.
+    fn enqueueHostCommand(self: *Session, name: []const u8, action: ?[]const u8, path: ?[]const u8, line: ?[]const u8) !void {
+        if (self.host_command_active.swap(true, .acq_rel)) return error.CommandInFlight;
+        errdefer self.host_command_active.store(false, .release);
+        self.pruneHostCommandTasks();
+        const alloc = self.daemon.alloc;
+        const task = try alloc.create(HostCommandTask);
+        errdefer alloc.destroy(task);
+        const owned_action = if (action) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (owned_action) |value| alloc.free(value);
+        const owned_path = if (path) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (owned_path) |value| alloc.free(value);
+        const owned_line = if (line) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (owned_line) |value| alloc.free(value);
+        task.* = .{
+            .alloc = alloc,
+            .session = self,
+            .name = try alloc.dupe(u8, name),
+            .action = owned_action,
+            .path = owned_path,
+            .line = owned_line,
+        };
+        errdefer alloc.free(task.name);
+        try self.host_command_tasks.append(alloc, task);
+        errdefer _ = self.host_command_tasks.pop();
+        task.thread = try std.Thread.spawn(.{}, runHostCommand, .{task});
+    }
+
+    /// Reclaims tasks that finished since the last command.
+    fn pruneHostCommandTasks(self: *Session) void {
+        const alloc = self.daemon.alloc;
+        var index: usize = 0;
+        while (index < self.host_command_tasks.items.len) {
+            const task = self.host_command_tasks.items[index];
+            if (!task.done.load(.acquire)) {
+                index += 1;
+                continue;
+            }
+            if (task.thread) |thread| thread.join();
+            alloc.free(task.name);
+            if (task.action) |value| alloc.free(value);
+            if (task.path) |value| alloc.free(value);
+            if (task.line) |value| alloc.free(value);
+            alloc.destroy(task);
+            _ = self.host_command_tasks.orderedRemove(index);
+        }
+    }
+
+    fn publishHostCommand(self: *Session, name: []const u8, action: ?[]const u8, path: ?[]const u8, line: ?[]const u8) void {
+        const alloc = self.daemon.alloc;
+        var params: std.Io.Writer.Allocating = .init(alloc);
+        defer params.deinit();
+        params.writer.writeAll("{\"sessionId\":") catch return;
+        std.json.Stringify.value(self.id, .{}, &params.writer) catch return;
+        params.writer.writeAll(",\"command\":") catch return;
+        std.json.Stringify.value(name, .{}, &params.writer) catch return;
+        if (action) |value| {
+            params.writer.writeAll(",\"action\":") catch return;
+            std.json.Stringify.value(value, .{}, &params.writer) catch return;
+        }
+        if (path) |value| {
+            params.writer.writeAll(",\"path\":") catch return;
+            std.json.Stringify.value(value, .{}, &params.writer) catch return;
+        }
+        if (line) |value| {
+            params.writer.writeAll(",\"line\":") catch return;
+            std.json.Stringify.value(value, .{}, &params.writer) catch return;
+        }
+        params.writer.writeByte('}') catch return;
+        const payload = self.nativeResultRaw("fx/command", params.writer.buffered()) catch |err| blk: {
+            var failure: std.Io.Writer.Allocating = .init(alloc);
+            std.json.Stringify.value(.{ .ok = false, .@"error" = @errorName(err) }, .{}, &failure.writer) catch return;
+            break :blk failure.toOwnedSlice() catch return;
+        };
+        defer alloc.free(payload);
+
+        var frame: std.Io.Writer.Allocating = .init(alloc);
+        defer frame.deinit();
+        frame.writer.writeAll("{\"method\":\"fx/command_result\",\"params\":{\"name\":") catch return;
+        std.json.Stringify.value(name, .{}, &frame.writer) catch return;
+        frame.writer.writeByte(',') catch return;
+        frame.writer.writeAll(payload[1..]) catch return;
+        frame.writer.writeByte('}') catch return;
+        Session.publish(@ptrCast(self), frame.writer.buffered()) catch return;
     }
 
     fn status(self: *Session) []const u8 {
@@ -338,6 +517,15 @@ const Session = struct {
 
     fn deinit(self: *Session) void {
         const alloc = self.daemon.alloc;
+        for (self.host_command_tasks.items) |task| {
+            if (task.thread) |thread| thread.join();
+            alloc.free(task.name);
+            if (task.action) |value| alloc.free(value);
+            if (task.path) |value| alloc.free(value);
+            if (task.line) |value| alloc.free(value);
+            alloc.destroy(task);
+        }
+        self.host_command_tasks.deinit(alloc);
         if (self.host) |host| host.deinit();
         for (self.events.items) |event| alloc.free(event.frame);
         self.events.deinit(alloc);
@@ -352,6 +540,25 @@ const Session = struct {
         alloc.destroy(self);
     }
 };
+
+const HostCommandTask = struct {
+    alloc: Allocator,
+    session: *Session,
+    name: []u8,
+    action: ?[]u8 = null,
+    path: ?[]u8 = null,
+    line: ?[]u8 = null,
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+};
+
+fn runHostCommand(task: *HostCommandTask) void {
+    defer {
+        task.session.host_command_active.store(false, .release);
+        task.done.store(true, .release);
+    }
+    task.session.publishHostCommand(task.name, task.action, task.path, task.line);
+}
 
 const Daemon = struct {
     alloc: Allocator,
@@ -419,6 +626,28 @@ const Daemon = struct {
             for (summaries.items) |*summary| summary.deinit(self.alloc);
             summaries.deinit(self.alloc);
         }
+        // A registry row without a live host must still have a conversation on
+        // disk. Otherwise it is a launch whose first prompt never arrived, or a
+        // session the user deleted, and it should leave the browser for good.
+        var pruned = false;
+        var index: usize = 0;
+        while (index < self.sessions.items.len) {
+            const session = self.sessions.items[index];
+            if (session.host != null or hasConversation(summaries.items, session.id)) {
+                index += 1;
+                continue;
+            }
+            if (self.last_attached_id) |attached| {
+                if (std.mem.eql(u8, attached, session.id)) {
+                    self.alloc.free(attached);
+                    self.last_attached_id = null;
+                }
+            }
+            _ = self.sessions.orderedRemove(index);
+            session.deinit();
+            pruned = true;
+        }
+        if (pruned) try self.persist();
         for (summaries.items) |summary| {
             if (self.sessions.items.len >= max_sessions) break;
             if (self.find(summary.id) != null) continue;
@@ -436,7 +665,7 @@ const Daemon = struct {
         try out.writer.writeAll("{\"version\":1,\"sessions\":[");
         for (self.sessions.items, 0..) |session, index| {
             if (index != 0) try out.writer.writeByte(',');
-            try std.json.Stringify.value(.{ .id = session.id, .name = session.name, .cwd = session.cwd, .stopped = session.stopped, .heartbeat = session.heartbeat, .updated_at_ms = session.updated_at_ms, .owned = session.host != null or session.stopped or session.failure != null }, .{}, &out.writer);
+            try std.json.Stringify.value(.{ .id = session.id, .name = session.name, .cwd = session.cwd, .stopped = session.stopped, .heartbeat = session.heartbeat, .updated_at_ms = session.updated_at_ms, .owned = (session.host != null and session.saved()) or session.stopped or session.failure != null }, .{}, &out.writer);
         }
         try out.writer.writeAll("],\"last_attached_id\":");
         try std.json.Stringify.value(self.last_attached_id, .{}, &out.writer);
@@ -532,8 +761,11 @@ const Daemon = struct {
         if (std.mem.eql(u8, command, "list")) {
             try self.discoverSaved();
             try w.writeAll("{\"ok\":true,\"sessions\":[");
-            for (self.sessions.items, 0..) |session, index| {
-                if (index != 0) try w.writeByte(',');
+            var wrote_session = false;
+            for (self.sessions.items) |session| {
+                if (!session.listable()) continue;
+                if (wrote_session) try w.writeByte(',');
+                wrote_session = true;
                 try session.summary(w);
             }
             try w.writeAll("],\"last_attached_id\":");
@@ -569,6 +801,35 @@ const Daemon = struct {
         if (std.mem.eql(u8, command, "model")) {
             if ((session.host orelse return error.SessionStopped).busy()) return error.SessionBusy;
             return session.nativeCommand("session/set_config_option", .{ .sessionId = id, .configId = "model", .value = stringField(value, "model") orelse return error.ModelRequired }, w);
+        }
+        // A frontend-owned slash command that only sets a host config option
+        // names the option here; the host validates the value and answers.
+        if (std.mem.eql(u8, command, "option")) {
+            return session.nativeCommand("session/set_config_option", .{
+                .sessionId = id,
+                .configId = stringField(value, "config_id") orelse return error.ConfigIdRequired,
+                .value = stringField(value, "value") orelse return error.ValueRequired,
+            }, w);
+        }
+        // The frontend's session commands run on the host, which owns their
+        // effects and results. The daemon accepts the request and reports the
+        // result through the event stream, so a slow command never blocks it.
+        if (std.mem.eql(u8, command, "command")) {
+            if ((session.host orelse return error.SessionStopped).busy()) {
+                return w.writeAll("{\"ok\":false,\"error\":\"Session is busy\"}");
+            }
+            session.enqueueHostCommand(
+                stringField(value, "name") orelse return error.HostCommandRequired,
+                stringField(value, "action"),
+                stringField(value, "path"),
+                stringField(value, "line"),
+            ) catch |err| {
+                if (err == error.CommandInFlight) {
+                    return w.writeAll("{\"ok\":false,\"error\":\"A session command is still running\"}");
+                }
+                return err;
+            };
+            return w.writeAll("{\"ok\":true,\"accepted\":true}");
         }
         if (std.mem.eql(u8, command, "rename")) {
             const name = std.mem.trim(u8, stringField(value, "name") orelse return error.NameRequired, " \t\r\n");
@@ -724,6 +985,13 @@ const Daemon = struct {
         return error.UnknownCommand;
     }
 };
+
+/// Whether the daemon's saved-session summaries hold `id`, which means the
+/// session still has conversation content a viewer can open.
+fn hasConversation(summaries: []const session_store.SessionSummary, id: []const u8) bool {
+    for (summaries) |summary| if (std.mem.eql(u8, summary.id, id)) return true;
+    return false;
+}
 
 fn historyBelongsToWork(turn: types.HistoryTurn, work_id: []const u8) bool {
     const saved_work = switch (turn) {

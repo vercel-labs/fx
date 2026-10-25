@@ -224,20 +224,14 @@ function toolEvent(index: number, fileLines: number): object {
     case 2:
       return {
         ...common,
-        toolName: "grep_files",
-        input: {
-          pattern: marker,
-          path,
-          mode: "matches",
-          head_limit: 20,
-          context_lines: 1,
-        },
+        toolName: "read_file",
+        input: { path, start_line: 1, line_count: 20 },
       };
     case 3:
       return {
         ...common,
-        toolName: "glob_files",
-        input: { pattern: path, mode: "matches" },
+        toolName: "read_file",
+        input: { path, start_line: 1, line_count: fileLines },
       };
     default:
       return {

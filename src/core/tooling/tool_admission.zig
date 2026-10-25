@@ -2144,7 +2144,7 @@ fn defaultRunCommandPermissionOutcome(
 
 const unsafe_git_hold_output =
     "fx did not run this git command. It could not run git here with every program this repository's config " ++
-    "names turned off, and plain git could start them. Inspect files with read_file, glob_files or grep_files, " ++
+    "names turned off, and plain git could start them. Inspect files with read_file, " ++
     "or ask the user to run git themselves.";
 
 pub fn runCommandContext(
@@ -2705,9 +2705,9 @@ test "permission target failures name the unresolved path without hiding runtime
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const call: ToolCall = .{
-        .id = "grep_missing",
-        .name = "grep_files",
-        .arguments_json = "{\"pattern\":\"x\",\"path\":\"missing/dir\"}",
+        .id = "read_missing",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"missing/dir\"}",
     };
     const not_found = (try permissionTargetResolutionFailureMessage(arena, call, error.FileNotFound)).?;
     try std.testing.expectEqualStrings("Path not found: missing/dir", not_found);
@@ -2749,7 +2749,7 @@ test "permission target failures name the unresolved path without hiding runtime
     const mixed_file_failure = (try permissionTargetResolutionFailureMessage(arena, mixed_file_call, error.FileNotFound)).?;
     try std.testing.expectEqualStrings("Path not found: missing/dir", mixed_file_failure);
 
-    const no_path_call: ToolCall = .{ .id = "no_path", .name = "grep_files", .arguments_json = "{\"pattern\":\"x\"}" };
+    const no_path_call: ToolCall = .{ .id = "no_path", .name = "read_file", .arguments_json = "{}" };
     const bare_failure = (try permissionTargetResolutionFailureMessage(arena, no_path_call, error.FileNotFound)).?;
     try std.testing.expectEqualStrings("Path not found", bare_failure);
 
@@ -3128,7 +3128,7 @@ test "dynamic MCP admission checks built-in and advertised names before runtime 
         },
     };
 
-    try std.testing.expect(!isAvailableDynamicTool(input, "glob_files"));
+    try std.testing.expect(!isAvailableDynamicTool(input, "read_file"));
     try std.testing.expect(!isAvailableDynamicTool(input, "mcp_unadvertised"));
     try std.testing.expectEqual(@as(usize, 0), mcp.calls);
     try std.testing.expect(isAvailableDynamicTool(input, "mcp_example"));
@@ -3174,8 +3174,8 @@ test "interactive dynamic MCP approval projects bounded terminal-safe arguments 
 
     const non_dynamic = try interactivePermissionRequest(input, arena, .{
         .id = "builtin",
-        .name = "glob_files",
-        .arguments_json = "{\"pattern\":\"*\"}",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"README.md\"}",
     }, null);
     try std.testing.expectEqual(@as(?[]const u8, null), non_dynamic.tool_arguments_preview);
 
@@ -3845,7 +3845,6 @@ const FakeAutoClassifier = struct {
 };
 
 const test_admission_registry = tool_dispatch.Registry{ .tools = &.{
-    test_builtin_tools.glob_files,
     test_builtin_tools.shell,
     test_builtin_tools.shell,
     test_builtin_tools.write_file,
@@ -4957,22 +4956,23 @@ test "permission rule display follows supplied registry metadata" {
         permission_auto_classifier.Classifier.disabled(),
     );
 
-    var provider_glob = test_builtin_tools.glob_files;
-    provider_glob.name = "provider_glob";
-    provider_glob.model_schema.name = "provider_glob";
-    const tools = [_]tool_dispatch.Tool{provider_glob};
+    var provider_read = test_builtin_tools.read_file;
+    provider_read.name = "provider_read";
+    provider_read.model_schema.name = "provider_read";
+    provider_read.permission_target_kind = .path_optional_existing;
+    const tools = [_]tool_dispatch.Tool{provider_read};
     input.tool_registry = .{ .tools = tools[0..] };
     var rules = [_]types.PermissionRule{.{
-        .permission = @constCast("provider_glob"),
+        .permission = @constCast("provider_read"),
         .pattern = @constCast("."),
         .action = .deny,
     }};
     input.permission_rules = .{ .rules = rules[0..] };
 
     const outcome = try requestPermissionOutcome(input, arena_state.allocator(), .{
-        .id = "provider-glob",
-        .name = "provider_glob",
-        .arguments_json = "{\"pattern\":\"*\"}",
+        .id = "provider-read",
+        .name = "provider_read",
+        .arguments_json = "{\"path\":\".\"}",
     }, .ask, &.{});
     try std.testing.expectEqual(ToolPermissionDecision.policy_denied, outcome.decision);
 }

@@ -850,7 +850,6 @@ describe("gateway stream lifecycle", () => {
           expect(toolResultOutput(body, "whole_main")).toContain("skill_discovery_warning");
           return fakeGatewaySse([
             { type: "tool-call", toolCallId: "whole_reference", toolName: "skill", input: { location, resource: "references/rules.txt" } },
-            { type: "tool-call", toolCallId: "ordinary_glob", toolName: "glob_files", input: { pattern: "*.txt" } },
             { type: "tool-call", toolCallId: "stale_skill", toolName: "skill", input: { location: "skill:0000000000000000:0/missing" } },
             { type: "finish", finishReason: { unified: "tool-calls", raw: "tool_use" } },
           ]);
@@ -883,11 +882,10 @@ describe("gateway stream lifecycle", () => {
       const output = parseAskJson(result.stdout);
       expect(output.exit_code).toBe(0);
       expect(output.session_id).not.toBe("");
-      expect(output.tool_calls).toHaveLength(4);
+      expect(output.tool_calls).toHaveLength(3);
       expect(output.tool_calls[0]).toEqual({ name: "skill", status: "success" });
       expect(output.tool_calls.slice(1)).toEqual(expect.arrayContaining([
         { name: "skill", status: "success" },
-        { name: "glob_files", status: "success" },
         { name: "skill", status: "error" },
       ]));
       expect(gateway.requestCount()).toBe(3);
@@ -3714,61 +3712,6 @@ describe("gateway stream lifecycle", () => {
       expect(readFileSync(targetPath, "utf8")).toBe("phase three\n");
     } finally {
       gateway.stop();
-      rmSync(root.root, { recursive: true, force: true });
-    }
-  });
-
-  test("OS filesystem access denial reaches the next gateway request", async () => {
-    const root = createFixtureRoot("os-filesystem-access-denial");
-    const tracePath = join(root.root, "trace.log");
-    const blockedPath = join(root.root, "blocked");
-    const callId = "os_access_denial_1";
-    mkdirSync(blockedPath);
-    chmodSync(blockedPath, 0);
-    const responses = [
-      fakeGatewayToolCall("os_access_denial_context", "glob_files", { pattern: "*", path: blockedPath }),
-      fakeGatewayToolCall(callId, "glob_files", { pattern: "*", path: blockedPath }),
-      fakeGatewayFinalText("Reported the operating-system access denial."),
-    ];
-    const gateway = startGateway(() =>
-      responses.shift() ?? new Response("unexpected request", { status: 500 })
-    );
-
-    try {
-      const result = await runFx(
-        ["ask", "--json", "--auto", "--no-save", "Inspect the blocked directory."],
-        {
-          cwd: root.workspace,
-          env: fixtureEnv(root, gateway, tracePath),
-          timeoutMs: 15_000,
-        },
-      );
-      const json = parseAskJson(result.stdout);
-      const followup = JSON.parse(gateway.requests[2].body) as {
-        prompt: Array<{ role: string; content: Array<Record<string, unknown>> }>;
-      };
-      const parts = followup.prompt.flatMap((message) => message.content ?? []);
-      const resultPart = parts.find((part) =>
-        part.type === "tool-result" &&
-        part.toolCallId === callId &&
-        part.toolName === "glob_files"
-      );
-      const output = contentText(resultPart?.output);
-
-      expect(result.code).toBe(0);
-      expect(result.stderr).toContain("Matching *");
-      expect(json.error).toBeUndefined();
-      expect(gateway.requestCount()).toBe(3);
-      expect(output).toContain("tool_execution_failed");
-      expect(output).toContain("glob_files");
-      expect(output).toContain(blockedPath);
-      expect(output).toContain("AccessDenied");
-      expect(output).toContain("Do not retry");
-      expect(output).toContain("symlink");
-      expect(output).toContain("fx permissions");
-    } finally {
-      gateway.stop();
-      chmodSync(blockedPath, 0o700);
       rmSync(root.root, { recursive: true, force: true });
     }
   });
@@ -7831,9 +7774,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     writeFileSync(join(root.workspace, "not-dir"), "UNCHANGED\n");
     symlinkSync("loop", join(root.workspace, "loop"));
     const badCalls = [
-      { id: "missing-search", name: "glob_files", input: { path: "missing", pattern: "*" }, expected: "Path not found: missing" },
-      { id: "not-dir-search", name: "grep_files", input: { path: "not-dir/child", pattern: "test" }, expected: "Path is not a directory: not-dir/child" },
-      { id: "loop-search", name: "glob_files", input: { path: "loop/child", pattern: "*" }, expected: 'Cannot resolve path "loop/child": SymLinkLoop' },
+      { id: "missing-search", name: "read_file", input: { path: "missing" }, expected: "Path not found: missing" },
+      { id: "not-dir-search", name: "read_file", input: { path: "not-dir/child" }, expected: "Path is not a directory: not-dir/child" },
+      { id: "loop-search", name: "read_file", input: { path: "loop/child" }, expected: 'Cannot resolve path "loop/child": SymLinkLoop' },
     ];
     let childRequests = 0;
     const gateway = startDynamicFakeGateway((body) => {
@@ -7885,65 +7828,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 30_000);
-
-  test("subagent search recovers when its target disappears during approval", async () => {
-    const root = createFixtureRoot("subagent-search-recheck");
-    const trace = join(root.root, "trace.log"), stderr = join(root.root, "stderr.log");
-    const target = join(root.workspace, "search-target");
-    mkdirSync(target);
-    writeFileSync(join(target, "match.txt"), "APPROVAL_SEARCH\n");
-    writeFileSync(join(root.workspace, "notes.txt"), "AFTER_APPROVAL\n");
-    writeFileSync(join(root.home, ".fx/settings.json"), JSON.stringify({ permission: { grep_files: "ask" } }));
-    let childRequests = 0;
-    const gateway = startDynamicFakeGateway((body) => {
-      if (hasCurrentToolResult(body, "approval-child")) {
-        expect(JSON.parse(toolResultOutput(body, "approval-child")).ok).toBe(true);
-        return fakeGatewayFinalText("APPROVAL_RECOVERY_COMPLETE");
-      }
-      if (!body.includes('"name":"subagent"')) {
-        childRequests++;
-        if (hasCurrentToolResult(body, "after-approval")) {
-          expect(toolResultOutput(body, "after-approval")).toContain("AFTER_APPROVAL");
-          return fakeGatewayFinalText("CHILD_RECOVERED");
-        }
-        if (hasCurrentToolResult(body, "approval-search")) {
-          expect(toolResultOutput(body, "approval-search")).toContain("Path not found: search-target");
-          return fakeGatewayToolCall("after-approval", "read_file", { path: "notes.txt" });
-        }
-        return fakeGatewayToolCall("approval-search", "grep_files", { pattern: "APPROVAL_SEARCH", path: "search-target" });
-      }
-      return fakeGatewayToolCall("approval-child", "subagent", { request: { action: "run", task: "Search the fixture, then read notes.txt." } });
-    }, { classifierDecision: "clear" });
-    let session: TmuxSession | null = null;
-    try {
-      session = await TmuxSession.create({
-        cmd: FX_BIN, cwd: root.workspace, isolated: true, remainOnExit: true, width: 120, height: 38, stderrPath: stderr,
-        env: { ...fixtureEnv(root, gateway, trace), FX_PERMISSION_MODE: "auto", FX_DISABLE_KEYCHAIN: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0",
-          FX_TRACE_SCOPES: "agent,tool,permission,subagent" },
-      });
-      await session.waitForStableComposer(15_000);
-      await session.sendText("Delegate the prepared search.");
-      await session.waitForPane(pane => pane.includes("APPROVAL_SEARCH") && pane.includes("esc cancel"), 15_000);
-      expect(existsSync(join(target, "match.txt"))).toBe(true);
-      renameSync(target, join(root.workspace, "moved-target"));
-      await session.sendKeys("Enter");
-      await session.waitForText("APPROVAL_RECOVERY_COMPLETE", 15_000);
-      await session.waitForStableComposer(15_000);
-      expect(childRequests).toBe(3);
-      const lines = readFileSync(trace, "utf8").split("\n").filter(line => line.includes("call_id=approval-search "));
-      expect(lines.some(line => line.includes("event=permission_decision") && line.includes("decision=once"))).toBe(true);
-      expect(lines.some(line => line.includes("event=execution_start"))).toBe(false);
-      expect(readFileSync(join(root.workspace, "moved-target/match.txt"), "utf8")).toBe("APPROVAL_SEARCH\n");
-      await session.sendText("/quit");
-      await session.waitForPane(() => session!.paneStatus().dead, 10_000);
-      expect(session.paneStatus().status).toBe(0);
-      expect(readFileSync(stderr, "utf8")).toBe("");
-    } finally {
-      await session?.kill();
-      gateway.stop();
-      rmSync(root.root, { recursive: true, force: true });
-    }
-  }, 60_000);
 
   test("ask fake Gateway exercises one-off and chat-created persistent subagents", async () => {
     const root = createFixtureRoot("subagent-managed-flow");

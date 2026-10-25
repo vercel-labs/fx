@@ -368,8 +368,8 @@ fn testRequest() permission_auto_classifier.ReviewRequest {
         .role = .assistant,
         .tool_calls = &.{.{
             .id = "call_1",
-            .name = "glob_files",
-            .arguments_json = "{\"pattern\":\"*\"}",
+            .name = "read_file",
+            .arguments_json = "{\"path\":\"README.md\"}",
         }},
     };
     return .{
@@ -382,8 +382,8 @@ fn testRequest() permission_auto_classifier.ReviewRequest {
         },
         .targets = &.{},
         .action = .{ .tool = .{
-            .tool_name = "glob_files",
-            .arguments_json = "{\"pattern\":\"*\"}",
+            .tool_name = "read_file",
+            .arguments_json = "{\"path\":\"README.md\"}",
         } },
     };
 }

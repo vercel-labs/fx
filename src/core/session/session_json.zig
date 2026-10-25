@@ -1790,7 +1790,7 @@ test "legacy interrupted session sanitizes duplicate-key tool arguments" {
         "{\"schema_version\":1,\"id\":\"legacy-interrupted\",\"created_at_ms\":1,\"updated_at_ms\":2," ++
         "\"workspace_root\":\"/tmp/workspace\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[" ++
         "{\"kind\":\"interrupted\",\"user\":{\"text\":\"inspect\",\"images\":[]},\"assistant\":\"working\"," ++
-        "\"tool_call\":{\"id\":\"call_bad\",\"name\":\"glob_files\",\"arguments_json\":\"{\\\"depth\\\":1,\\\"depth\\\":2}\",\"provider_result\":null}," ++
+        "\"tool_call\":{\"id\":\"call_bad\",\"name\":\"read_file\",\"arguments_json\":\"{\\\"depth\\\":1,\\\"depth\\\":2}\",\"provider_result\":null}," ++
         "\"completed_tool_names\":[]}]}";
 
     var loaded = try parseStoredSession(TestStoredSession, std.testing.allocator, json);
@@ -1806,7 +1806,7 @@ test "legacy session JSON rejects ambiguous malformed tool result pairings" {
         "\"output\":\"stale\",\"output_handle\":null,\"preview\":null,\"output_bytes\":5,\"stored_output_bytes\":5," ++
         "\"truncated\":false,\"provider_native\":false,\"created_at_ms\":1}";
     const list_result =
-        "{\"tool_call_id\":\"call_bad\",\"tool_name\":\"glob_files\",\"status\":\"success\"," ++
+        "{\"tool_call_id\":\"call_bad\",\"tool_name\":\"read_tool_result\",\"status\":\"success\"," ++
         "\"output\":\"stale\",\"output_handle\":null,\"preview\":null,\"output_bytes\":5,\"stored_output_bytes\":5," ++
         "\"truncated\":false,\"provider_native\":false,\"created_at_ms\":1}";
     const cases = [_]struct {

@@ -748,6 +748,7 @@ pub fn Commands(comptime App: type) type {
                 .unchanged => 0,
                 .committed => |committed| committed.permission_rules_removed,
             };
+            if (removed > 0) notifyPermissionRulesChanged(app);
 
             var detailed = loadDetailedSettingsForNotice(app) catch |err| {
                 const msg = try app.alloc.print(
@@ -1111,12 +1112,26 @@ pub fn Commands(comptime App: type) type {
             }
         }
 
+        /// This process writes the settings files; a detached host enforces
+        /// its own copy of the rules and must reload them after a change.
+        fn notifyPermissionRulesChanged(app: *App) void {
+            if (comptime !@hasField(App, "remote")) return;
+            if (!app.remote.active) return;
+            if (comptime !@hasDecl(App, "reloadSessionPermissions")) return;
+            app.reloadSessionPermissions() catch |err| debug_trace.logf(
+                "permissions",
+                "session permission reload failed err={s}",
+                .{@errorName(err)},
+            );
+        }
+
         fn finishAllowlistMutation(
             app: *App,
             permission_scope: config_runtime.PermissionScope,
             verb: []const u8,
             target: AllowlistTarget,
         ) !void {
+            notifyPermissionRulesChanged(app);
             var detailed = loadDetailedSettingsForNotice(app) catch |err| {
                 const detail = try app.alloc.print(
                     "saved but effective source unknown and runtime reload failed ({s})",
@@ -1544,8 +1559,6 @@ fn isKnownAllowlistTool(tool_registry: tool_dispatch.Registry, name: []const u8)
     const categories = [_][]const u8{
         "edit",
         "read",
-        "glob",
-        "grep",
         "skill",
         permissions.web_search_permission,
     };
@@ -1710,8 +1723,6 @@ fn isWorkspacePathToolPermission(permission: []const u8) bool {
     const path_permissions = [_][]const u8{
         "edit",
         "read",
-        "glob",
-        "grep",
     };
     for (path_permissions) |path_permission| {
         if (std.mem.eql(u8, permission, path_permission)) return true;

@@ -155,11 +155,11 @@ describe("agent quality baseline matrix", () => {
     expect(row).toBeDefined();
 
     const localOnly: RecordedToolCall[] = [
-      { name: "glob_files" },
       { name: "read_file" },
+      { name: "shell" },
     ];
     const webSearch: RecordedToolCall[] = [
-      { name: "glob_files" },
+      { name: "read_file" },
       { name: "web_search" },
       { name: "web_search" },
     ];
@@ -177,8 +177,6 @@ describe("agent quality baseline matrix", () => {
     const largeOutput = matrixRowById("large-output-retained");
 
     expect(slashCommand?.expectedFirstTool.tools).toEqual([
-      "glob_files",
-      "grep_files",
       "read_file",
     ]);
     expect(slashCommand?.targetResult).toContain(
@@ -186,9 +184,9 @@ describe("agent quality baseline matrix", () => {
     );
     expect(firstToolMatchesExpectation(changelog!, { name: "task" })).toBe(false);
 
-    expect(commandPolicy?.expectedFirstTool.tools).toContain("grep_files");
+    expect(commandPolicy?.expectedFirstTool.tools).toContain("shell");
     expect(commandPolicy?.targetResult).toContain("local search tools only");
-    expect(forbiddenToolsUsed(commandPolicy!, [{ name: "grep_files" }])).toEqual([]);
+    expect(forbiddenToolsUsed(commandPolicy!, [{ name: "shell" }])).toEqual([]);
 
     expect(commandPolicyProgress?.failureCategory).toBe("approval loop");
     expect(commandPolicyProgress?.userPrompt).toBe(
@@ -207,7 +205,7 @@ describe("agent quality baseline matrix", () => {
       "web_search",
     ]);
 
-    expect(mcpConcept?.expectedFirstTool.tools).toContain("glob_files");
+    expect(mcpConcept?.expectedFirstTool.tools).toContain("read_file");
     expect(mcpConcept?.targetResult).toContain("local inspection");
 
     expect(largeOutput?.failureCategory).toBe("large output");
@@ -371,9 +369,9 @@ describe("agent quality baseline matrix", () => {
     expect(firstToolMatchesExpectation(broadWeb!, { name: "web_fetch" })).toBe(false);
     expect(forbiddenToolsUsed(broadWeb!, [
       { name: "web_fetch" },
-      { name: "grep_files" },
+      { name: "shell" },
       { name: "web_search" },
-    ])).toEqual(["web_fetch", "grep_files"]);
+    ])).toEqual(["web_fetch", "shell"]);
 
     expect(localRepo?.forbiddenTools).toContain("web_search");
     expect(broadWeb?.expectedUserVisibleBehavior).toContain("linked sources");

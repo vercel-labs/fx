@@ -23,7 +23,6 @@ const file_mutation = @import("file_mutation.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
 const hooks = @import("../hooks/hooks.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
-const glob_pattern = @import("../workspace/glob_pattern.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const command_admission = @import("../permissions/command_admission.zig");
@@ -2354,8 +2353,6 @@ const test_captured_shell = blk: {
 };
 
 const test_tool_registry = tool_dispatch.Registry{ .tools = &.{
-    test_builtin_tools.glob_files,
-    test_builtin_tools.grep_files,
     test_builtin_tools.read_file,
     test_builtin_tools.write_file,
     test_builtin_tools.edit_file,
@@ -3049,8 +3046,6 @@ test "read-only local runtime tools are registered in built-in registry" {
         name: []const u8,
         kind: tool_specs.ExecutorKind,
     }{
-        .{ .name = "glob_files", .kind = .glob_files },
-        .{ .name = "grep_files", .kind = .grep_files },
         .{ .name = "read_file", .kind = .read_file },
         .{ .name = "read_tool_result", .kind = .read_tool_result },
     };
@@ -3970,8 +3965,8 @@ test "request tool permission keeps safe defaults while local writes bypass revi
 
     try std.testing.expectEqual(ToolPermissionDecision.once, (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
         .id = "1",
-        .name = "glob_files",
-        .arguments_json = "{\"pattern\":\"*\"}",
+        .name = "read_tool_result",
+        .arguments_json = "{\"handle\":\"T1\"}",
     }, .ask, &.{})).decision);
 
     try std.testing.expectEqual(ToolPermissionDecision.once, (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
@@ -4885,13 +4880,13 @@ test "request tool permission honors configured deny and allow rules" {
     const arena = arena_state.allocator();
 
     var deny_rules = [_]types.PermissionRule{
-        .{ .permission = @constCast("grep"), .pattern = @constCast("src"), .action = .deny },
+        .{ .permission = @constCast("read"), .pattern = @constCast("*"), .action = .deny },
     };
     rt.permission_rules = .{ .rules = &deny_rules };
     try std.testing.expectEqual(ToolPermissionDecision.policy_denied, (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
         .id = "1",
-        .name = "grep_files",
-        .arguments_json = "{\"pattern\":\"TODO\",\"path\":\"src\"}",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"src/app.zig\"}",
     }, .ask, &.{})).decision);
 
     var allow_rules = [_]types.PermissionRule{
@@ -4904,67 +4899,6 @@ test "request tool permission honors configured deny and allow rules" {
         .name = "read_file",
         .arguments_json = "{\"path\":\"src/app.zig\"}",
     }, .ask, &.{})).decision);
-}
-
-test "executeToolCall rejects overlong glob pattern with failure status" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(root);
-
-    const pattern = try alloc.alloc(u8, glob_pattern.max_pattern_bytes + 1);
-    defer alloc.free(pattern);
-    @memset(pattern, 'a');
-
-    var rt = TestRuntime{ .workspace_root = root };
-    defer rt.deinit(alloc);
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const args = try arena.print("{{\"pattern\":\"{s}\"}}", .{pattern});
-
-    const result = try executeToolCall(rt.context(), arena, .{
-        .id = "glob",
-        .name = "glob_files",
-        .arguments_json = args,
-    });
-
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    const expected = try arena.print("glob_files field \"pattern\" must be at most {d} bytes", .{glob_pattern.max_pattern_bytes});
-    try std.testing.expectEqualStrings(expected, result.model_output);
-}
-
-test "executeToolCall glob_files finds match beyond former traversal cap" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    var i: usize = 0;
-    while (i < 2050) : (i += 1) {
-        var name_buf: [64]u8 = undefined;
-        const name = try std.mem.print(&name_buf, "workspace/many/file-{d:0>4}.txt", .{i});
-        try writeTestFile(tmp.dir, name, "not here\n");
-    }
-    try writeTestFile(tmp.dir, "workspace/zzzz/target.zig", "target\n");
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(root);
-
-    var rt = TestRuntime{ .workspace_root = root };
-    defer rt.deinit(alloc);
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-
-    const result = try executeToolCall(rt.context(), arena_state.allocator(), .{
-        .id = "glob",
-        .name = "glob_files",
-        .arguments_json = "{\"pattern\":\"**/*.zig\"}",
-    });
-
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
-    try expectContains(result.model_output, "zzzz/target.zig");
-    try std.testing.expect(std.mem.find(u8, result.model_output, "traversal cap") == null);
 }
 
 test "executeToolCall carries authoritative read coverage metadata" {
@@ -5001,97 +4935,6 @@ test "executeToolCall carries authoritative read coverage metadata" {
     );
 }
 
-test "executeToolCall traces non-text grep skips in normal runtime" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try writeTestFile(tmp.dir, "workspace/binaryish/blob.bin", "binary\x00needle\x01\n");
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(root);
-    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "trace.log" });
-    defer alloc.free(trace_path);
-
-    debug_trace.resetForTest();
-    try debug_trace.configureForTest(alloc, trace_path);
-    defer debug_trace.resetForTest();
-
-    var rt = TestRuntime{ .workspace_root = root };
-    defer rt.deinit(alloc);
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-
-    const result = try executeToolCall(rt.context(), arena_state.allocator(), .{
-        .id = "grep",
-        .name = "grep_files",
-        .arguments_json = "{\"pattern\":\"needle\",\"path\":\"binaryish\"}",
-    });
-
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
-    try std.testing.expectEqualStrings("[grep] no matches for needle\n", result.model_output);
-
-    const trace = try readTraceFileForTest(alloc, trace_path);
-    defer alloc.free(trace);
-    try expectContains(trace, "grep_files skipped non-text file path=");
-    try expectContains(trace, "binaryish/blob.bin");
-}
-
-test "executeToolCall searches large files in normal runtime" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try writeLargeTestFile(tmp.dir, "workspace/oversized/huge.txt", "needle hidden\n", 260 * 1024);
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(root);
-    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "trace.log" });
-    defer alloc.free(trace_path);
-
-    debug_trace.resetForTest();
-    try debug_trace.configureForTest(alloc, trace_path);
-    defer debug_trace.resetForTest();
-
-    var rt = TestRuntime{ .workspace_root = root };
-    defer rt.deinit(alloc);
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-
-    const result = try executeToolCall(rt.context(), arena_state.allocator(), .{
-        .id = "grep",
-        .name = "grep_files",
-        .arguments_json = "{\"pattern\":\"needle\",\"path\":\"oversized\"}",
-    });
-
-    // A 260 KiB file, its second line one long run, is searched in full.
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
-    try std.testing.expectEqualStrings("[grep] 1 matches for needle\n - oversized/huge.txt:1: needle hidden\n", result.model_output);
-
-    const trace = try readTraceFileForTest(alloc, trace_path);
-    defer alloc.free(trace);
-    try std.testing.expect(std.mem.find(u8, trace, "grep_files skipped") == null);
-}
-
-test "executeToolCall returns failure status for missing grep path" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(root);
-
-    var rt = TestRuntime{ .workspace_root = root };
-    defer rt.deinit(alloc);
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-
-    const result = try executeToolCall(rt.context(), arena_state.allocator(), .{
-        .id = "grep",
-        .name = "grep_files",
-        .arguments_json = "{\"pattern\":\"needle\",\"path\":\"missing/nope.txt\"}",
-    });
-
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try expectContains(result.model_output, "Unable to resolve grep search root: missing/nope.txt (FileNotFound)");
-}
-
 test "executeToolCall returns friendly failure for missing read_file path" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5118,32 +4961,8 @@ test "executeToolCall returns friendly failure for missing read_file path" {
     try expectToolErrorDetailString(result.model_output, "field", "path");
     try expectToolErrorDetailString(result.model_output, "path", "missing/nope.txt");
     try expectToolErrorDetailString(result.model_output, "error", "FileNotFound");
-    try expectContains(result.model_output, "glob_files");
+    try expectContains(result.model_output, "shell");
     try expectNotContains(result.model_output, "Tool read_file failed: FileNotFound");
-}
-
-test "executeToolCall preserves explicit ignored directory grep roots" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try writeTestFile(tmp.dir, "workspace/node_modules/pkg/index.js", "needle module\n");
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(root);
-
-    var rt = TestRuntime{ .workspace_root = root };
-    rt.ignored_list_entries = &.{"node_modules"};
-    defer rt.deinit(alloc);
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-
-    const result = try executeToolCall(rt.context(), arena_state.allocator(), .{
-        .id = "grep",
-        .name = "grep_files",
-        .arguments_json = "{\"pattern\":\"needle\",\"path\":\"node_modules\"}",
-    });
-
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
-    try expectContains(result.model_output, "node_modules/pkg/index.js:1: needle module");
 }
 
 test "effective command timeout uses the earlier remaining budget" {
@@ -6296,7 +6115,7 @@ fn fileGrantOfferMatchesExpectation(
     expected_target: []const u8,
     expected_workspace: bool,
 ) bool {
-    const workspace_permissions = [_][]const u8{ "edit", "read", "glob", "grep" };
+    const workspace_permissions = [_][]const u8{ "edit", "read" };
     for (offer.grants) |grant| {
         if (!std.mem.eql(u8, grant.target_path, expected_target)) return false;
     }
@@ -6399,18 +6218,25 @@ fn waitForPermissionPrompt(worker: *WorkerRuntime, expected: []const u8) !u64 {
 }
 
 test "configured ask rule prompts the worker" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "workspace/note.txt", "hello\n");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+
     var rules = [_]types.PermissionRule{
-        .{ .permission = @constCast("glob"), .pattern = @constCast("."), .action = .ask },
+        .{ .permission = @constCast("read"), .pattern = @constCast("*"), .action = .ask },
     };
     var rt = TestRuntime{
-        .workspace_root = "/tmp/workspace",
+        .workspace_root = root,
         .permission_rules = .{ .rules = &rules },
         .permission_mode = .auto,
     };
     defer rt.deinit(std.testing.allocator);
 
     var state = PermissionThreadState{};
-    const thread = try std.Thread.spawn(.{}, runPermissionRequest, .{ &state, rt.context(), ToolCall{ .id = "1", .name = "glob_files", .arguments_json = "{\"pattern\":\"*\"}" }, PermissionMode.auto });
+    const thread = try std.Thread.spawn(.{}, runPermissionRequest, .{ &state, rt.context(), ToolCall{ .id = "1", .name = "read_file", .arguments_json = "{\"path\":\"note.txt\"}" }, PermissionMode.auto });
     var thread_joined = false;
     defer if (!thread_joined) {
         rt.worker.requestShutdown();
@@ -6418,7 +6244,7 @@ test "configured ask rule prompts the worker" {
     };
 
     rt.worker.worker_processing = true;
-    const request_id = try waitForPermissionPrompt(&rt.worker, "glob_files");
+    const request_id = try waitForPermissionPrompt(&rt.worker, "read_file");
     try std.testing.expectEqual(
         worker_runtime.PermissionSubmissionResult.accepted,
         rt.worker.submitPermissionResponse(

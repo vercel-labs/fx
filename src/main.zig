@@ -1389,6 +1389,12 @@ const App = struct {
         try SessionAppRuntime.clearSession(self);
     }
 
+    /// The frontend writes settings files; a detached host enforces its own
+    /// copy of the permission rules and must reload them.
+    pub fn reloadSessionPermissions(self: *App) !void {
+        if (self.remote.active) try RemoteRuntime.reloadPermissions(self);
+    }
+
     pub fn newSession(self: *App) !void {
         if (self.remote.active) return RemoteRuntime.newSession(self);
         try SessionAppRuntime.newSession(self);

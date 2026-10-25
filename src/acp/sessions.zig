@@ -424,6 +424,9 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
             .message = "MCP servers are unavailable in this runtime",
         });
     }
+    state.mcp_profile_owned = state.cfg.allow_acp_mcp and
+        mcp_configs.items.items.len == 0 and
+        profileMcpRequested(alloc, msg.params_raw);
     if (state.cfg.allow_acp_mcp) {
         try appendProfileMcpConfigsIfRequested(state, alloc, msg.params_raw, &mcp_configs);
         try appendProjectMcpConfigs(state, alloc, workspace_root, &mcp_configs);
@@ -434,6 +437,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         workspace_root,
         state.client_elicitation,
         server.legacyUrlCompletionSink(state),
+        server.mcpNotify(state),
     );
     defer mcp_preparation.deinit(alloc);
     switch (mcp_preparation) {
@@ -804,6 +808,9 @@ fn handleRestoreSession(
         defer alloc.free(message);
         return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = message });
     }
+    state.mcp_profile_owned = state.cfg.allow_acp_mcp and
+        mcp_configs.items.items.len == 0 and
+        profileMcpRequested(alloc, msg.params_raw);
     if (!state.cfg.allow_acp_mcp) {
         if (mcp_configs.items.items.len > 0) {
             return state.writer.writeError(alloc, msg.id, .{
@@ -821,6 +828,7 @@ fn handleRestoreSession(
         workspace_root,
         state.client_elicitation,
         server.legacyUrlCompletionSink(state),
+        server.mcpNotify(state),
     );
     defer mcp_preparation.deinit(alloc);
     switch (mcp_preparation) {

@@ -662,6 +662,13 @@ fn currentFingerprint(shell_path: []const u8, snapshot_zdotdir: ?[]const u8) Fin
 var process_owner: Owner = .{};
 
 /// The owner shared by every host and subagent in this process.
+/// Marks the cached shell startup files stale in this process, so the next
+/// command reloads them. The owner exists per process, so the engine host
+/// calls this in its own process rather than the terminal client's.
+pub fn reloadForUser() void {
+    processOwner().markDirty(.user_reload);
+}
+
 pub fn processOwner() *Owner {
     return &process_owner;
 }

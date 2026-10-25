@@ -769,7 +769,7 @@ test "filesystem access denial JSON preserves recovery details" {
     const errors = [_]anyerror{ error.AccessDenied, error.PermissionDenied };
 
     for (errors) |err| {
-        const payload = try filesystemAccessDeniedJson(alloc, "glob_files", "/tmp/blocked", err);
+        const payload = try filesystemAccessDeniedJson(alloc, "read_file", "/tmp/blocked", err);
         defer alloc.free(payload);
 
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
@@ -779,7 +779,7 @@ test "filesystem access denial JSON preserves recovery details" {
         const details = error_obj.get("details").?.object;
         const suggestion = error_obj.get("suggestion").?.string;
         try std.testing.expectEqualStrings("tool_execution_failed", error_obj.get("type").?.string);
-        try std.testing.expectEqualStrings("glob_files", error_obj.get("tool_name").?.string);
+        try std.testing.expectEqualStrings("read_file", error_obj.get("tool_name").?.string);
         try std.testing.expectEqualStrings("/tmp/blocked", details.get("path").?.string);
         try std.testing.expectEqualStrings(@errorName(err), details.get("error").?.string);
         try std.testing.expect(std.mem.find(u8, suggestion, "Do not retry") != null);

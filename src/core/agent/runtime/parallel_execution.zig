@@ -21,10 +21,8 @@ pub fn isReadOnlyCall(registry: tool_dispatch.Registry, call: ToolCall) bool {
 
     const tool = registry.lookup(call.name) orelse return false;
     return switch (tool.executor_kind) {
-        .glob_files => tool.activity_kind == .list,
         .read_file,
         .read_tool_result,
-        .grep_files,
         .skill,
         .web_fetch,
         .web_search,
@@ -641,15 +639,15 @@ test "parallel classifier keeps only a leading safe read-only group" {
     const builtin_tools = @import("../../../builtins/tools.zig");
     const tools = [_]tool_dispatch.Tool{
         builtin_tools.read_file,
-        builtin_tools.grep_files,
+        builtin_tools.read_tool_result,
         builtin_tools.write_file,
     };
     const registry = tool_dispatch.Registry{ .tools = &tools };
     const calls = [_]ToolCall{
         toolCall("read_1", "read_file", "{\"path\":\"src/main.zig\"}"),
-        toolCall("grep_1", "grep_files", "{\"pattern\":\"processQueuedPrompt\"}"),
+        toolCall("read_2", "read_tool_result", "{\"handle\":\"T1\"}"),
         toolCall("write_1", "write_file", "{\"path\":\"tmp.txt\",\"content\":\"x\"}"),
-        toolCall("read_2", "read_file", "{\"path\":\"README.md\"}"),
+        toolCall("read_3", "read_file", "{\"path\":\"README.md\"}"),
     };
 
     try std.testing.expectEqual(@as(usize, 2), parallelReadOnlyPrefixLen(registry, &calls));
@@ -784,8 +782,8 @@ test "parallel read-only execution preserves order and failure fan-in" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
         toolCall("first", "read_file", "{\"path\":\"a\"}"),
-        toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
-        toolCall("third", "glob_files", "{\"pattern\":\"c\"}"),
+        toolCall("second", "read_file", "{\"path\":\"b\"}"),
+        toolCall("third", "read_file", "{\"path\":\"c\"}"),
     };
     const plans = [_]ParallelTestPlan{
         .{ .output = "first output", .delay_ms = 20 },
@@ -814,7 +812,7 @@ test "parallel completion observer runs before slower siblings finish while resu
     var release_slow: std.Io.Event = .unset;
     const calls = [_]ToolCall{
         toolCall("slow", "read_file", "{\"path\":\"slow\"}"),
-        toolCall("fast", "grep_files", "{\"pattern\":\"fast\"}"),
+        toolCall("fast", "read_file", "{\"path\":\"fast\"}"),
     };
     const plans = [_]ParallelTestPlan{
         .{ .output = "slow output", .gate = &release_slow },
@@ -857,8 +855,8 @@ test "parallel read-only execution preserves exact cancelled identity and comple
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
         toolCall("first", "read_file", "{\"path\":\"a\"}"),
-        toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
-        toolCall("third", "glob_files", "{\"pattern\":\"c\"}"),
+        toolCall("second", "read_file", "{\"path\":\"b\"}"),
+        toolCall("third", "read_file", "{\"path\":\"c\"}"),
     };
     const plans = [_]ParallelTestPlan{
         .{ .output = "first output", .delay_ms = 10 },
@@ -882,7 +880,7 @@ test "parallel workers start no execution when owner cancellation is already set
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
         toolCall("first", "read_file", "{\"path\":\"a\"}"),
-        toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
+        toolCall("second", "read_file", "{\"path\":\"b\"}"),
     };
     const plans = [_]ParallelTestPlan{
         .{ .output = "must not execute" },
@@ -904,8 +902,8 @@ test "parallel read-only execution does not relabel earlier ordinary cancellatio
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
         toolCall("first", "read_file", "{\"path\":\"a\"}"),
-        toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
-        toolCall("third", "glob_files", "{\"pattern\":\"c\"}"),
+        toolCall("second", "read_file", "{\"path\":\"b\"}"),
+        toolCall("third", "read_file", "{\"path\":\"c\"}"),
     };
     const plans = [_]ParallelTestPlan{
         .{ .err = error.Cancelled, .delay_ms = 1 },
@@ -939,7 +937,7 @@ test "parallel read-only execution reports no active call when cancellation foll
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
         toolCall("first", "read_file", "{\"path\":\"a\"}"),
-        toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
+        toolCall("second", "read_file", "{\"path\":\"b\"}"),
     };
     const plans = [_]ParallelTestPlan{
         .{ .output = "first output", .delay_ms = 5, .cancel = true },
@@ -959,7 +957,7 @@ test "parallel read-only execution reports no active call when cancellation foll
 fn checkParallelRunAllocationFailures(alloc: Allocator) !void {
     const calls = [_]ToolCall{
         toolCall("first", "read_file", "{\"path\":\"a\"}"),
-        toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
+        toolCall("second", "read_file", "{\"path\":\"b\"}"),
     };
     const plans = [_]ParallelTestPlan{
         .{ .output = "first output" },

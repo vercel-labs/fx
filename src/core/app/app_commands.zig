@@ -11,6 +11,7 @@ const credentials = @import("../auth/credentials.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const host = @import("../hosts/host.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
+const metrics_line = @import("../output/metrics_line.zig");
 const command_router = @import("../slash_commands/command_router.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -154,7 +155,7 @@ fn handleShellCommand(app: anytype, rest: []const u8) !void {
         try app.writeDomainNotice(.{ .topic = "", .tone = .@"error", .body = "usage: /shell reload" }, true);
         return;
     }
-    shell_snapshot.processOwner().markDirty(.user_reload);
+    shell_snapshot.reloadForUser();
     try app.writeDomainNotice(.{
         .topic = "shell",
         .tone = .neutral,
@@ -793,11 +794,7 @@ pub fn Handlers(comptime App: type) type {
         fn commandShowStats(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             var buf: [256]u8 = undefined;
-            const body = try std.mem.print(
-                &buf,
-                "ansi_bytes={d}, redraws={d}, debounced_resizes={d}, footer_updates={d}, stream_chunks={d}",
-                .{ app.metrics.ansi_bytes, app.metrics.full_redraws, app.metrics.debounced_resizes, app.metrics.footer_line_updates, app.metrics.stream_chunks },
-            );
+            const body = try metrics_line.write(&buf, app.metrics);
             try app.writeDomainNotice(.{
                 .topic = "stats",
                 .tone = .neutral,
@@ -3230,6 +3227,9 @@ fn handleNotificationsCommand(app: anytype, rest: []const u8) !void {
 pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     const App = @TypeOf(app.*);
     var snapshot: settings_catalog.Snapshot = .{};
+    if (comptime @hasField(App, "remote")) {
+        if (app.remote.active) snapshot.session_controls = false;
+    }
     if (comptime provider_runtime.supported(App)) snapshot.model = provider_runtime.model(app);
     if (comptime @hasField(App, "effort")) snapshot.effort = app.effort.displayLabel();
     if (comptime @hasField(App, "fast_mode")) snapshot.fast_mode = app.fast_mode;

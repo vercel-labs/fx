@@ -222,6 +222,7 @@ const CANONICAL_PRE_TOOL_TEXT =
   "FX_MODEL_TEXT_SENTINEL before tools must remain contiguous.";
 const CANONICAL_FINAL_TEXT = "FX_FINAL_RESPONSE_SENTINEL completed.";
 const CANONICAL_READ_PATH = "alpha-FX_PATH_SENTINEL.txt";
+const CANONICAL_SECOND_PATH = "beta.txt";
 const CANONICAL_GREP_PATTERN = "FX_PATTERN_SENTINEL";
 const APPROVAL_PROMPT = "Would you like to allow this action?";
 const SPLIT_NEW_USER_PROMPT = "SPLIT_NEW_USER_PROMPT";
@@ -249,8 +250,8 @@ const CANONICAL_A_B_SSE =
   'data: {"type":"text-end","id":"text_before"}\n\n' +
   'data: {"type":"tool-input-start","id":"read_a","toolName":"read_file"}\n\n' +
   'data: {"type":"tool-input-delta","id":"read_a","delta":"{\\"path\\":\\"alpha-FX_PATH_SENTINEL"}\n\n' +
-  'data: {"type":"tool-input-start","id":"grep_b","toolName":"grep_files"}\n\n' +
-  'data: {"type":"tool-input-delta","id":"grep_b","delta":"{\\"pattern\\":\\"FX_PATTERN_SENTINEL\\",\\"path\\":\\""}\n\n' +
+  'data: {"type":"tool-input-start","id":"read_b","toolName":"read_file"}\n\n' +
+  'data: {"type":"tool-input-delta","id":"read_b","delta":"{\\"path\\":\\"beta"}\n\n' +
   'data: {"type":"tool-input-delta","id":"read_a","delta":".txt\\"}"}\n\n' +
   'data: {"type":"tool-input-end","id":"read_a"}\n\n' +
   `data: ${JSON.stringify({
@@ -259,13 +260,13 @@ const CANONICAL_A_B_SSE =
     toolName: "read_file",
     input: { path: CANONICAL_READ_PATH },
   })}\n\n` +
-  'data: {"type":"tool-input-delta","id":"grep_b","delta":".\\"}"}\n\n' +
-  'data: {"type":"tool-input-end","id":"grep_b"}\n\n' +
+  'data: {"type":"tool-input-delta","id":"read_b","delta":".txt\\"}"}\n\n' +
+  'data: {"type":"tool-input-end","id":"read_b"}\n\n' +
   `data: ${JSON.stringify({
     type: "tool-call",
-    toolCallId: "grep_b",
-    toolName: "grep_files",
-    input: { pattern: CANONICAL_GREP_PATTERN, path: "." },
+    toolCallId: "read_b",
+    toolName: "read_file",
+    input: { path: CANONICAL_SECOND_PATH },
   })}\n\n` +
   'data: {"type":"finish","finishReason":{"unified":"tool-calls","raw":"tool-calls"},"usage":{"inputTokens":{"total":11},"outputTokens":{"total":17}}}\n\n' +
   "data: [DONE]\n\n";
@@ -1313,9 +1314,6 @@ async function runCanonicalLifecycleFixture(
         read: {
           "*": "ask",
         },
-        grep: {
-          "*": "ask",
-        },
       },
     }),
   );
@@ -1392,11 +1390,11 @@ async function runCanonicalLifecycleFixture(
     approval = await session.waitForPane(
       (pane) =>
         pane.includes(APPROVAL_PROMPT) &&
-        pane.includes(`grep_files ${CANONICAL_GREP_PATTERN}`),
+        pane.includes(`read_file ${CANONICAL_SECOND_PATH}`),
       TIMEOUT,
     );
     if (!approval.includes(APPROVAL_PROMPT)) {
-      throw new Error("grep_files approval prompt did not render");
+      throw new Error("second read_file approval prompt did not render");
     }
     await session.sendKeys("Enter");
 
@@ -2333,6 +2331,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(workspacePath, { recursive: true });
       writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(workspacePath, "notes.txt"), "history\n");
       const workspace = realpathSync(workspacePath);
       const finalText = "Follow-up accepted after HTTP 503.";
 
@@ -2341,7 +2340,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       queuedGateway = startDynamicFakeGateway(() => {
         responseIndex += 1;
         if (responseIndex === 1) {
-          return fakeGatewayToolCall("list_1", "glob_files", { pattern: "*", path: "." });
+          return fakeGatewayToolCall("list_1", "read_file", { path: "notes.txt" });
         }
         if (responseIndex >= 2 && responseIndex <= 11) {
           // A 1s hint keeps the ten-failure chain inside the test budget now
@@ -5088,7 +5087,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(countTraceEvent(observed.trace, "before_tool_execution")).toBe(0);
         expect(observed.trace).toContain("LifecycleReconciliationCollision");
         expect(observed.pane).toContain("● Reading");
-        expect(observed.pane).toContain(`Searching ${CANONICAL_GREP_PATTERN}`);
+        expect(observed.pane).toContain(`Reading ${CANONICAL_SECOND_PATH}`);
         expect(normalizedPane).not.toContain(CANONICAL_PRE_TOOL_TEXT);
         expect(observed.stderr).toBe(
           stage === "baseline-silent"
@@ -5113,7 +5112,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           normalizedPane.indexOf(CANONICAL_READ_PATH),
         );
         expect(normalizedPane.indexOf(CANONICAL_PRE_TOOL_TEXT)).toBeLessThan(
-          normalizedPane.indexOf(CANONICAL_GREP_PATTERN),
+          normalizedPane.indexOf(CANONICAL_SECOND_PATH),
         );
       }
       expect(
@@ -5122,21 +5121,21 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(
         countOccurrences(
           normalizedPane,
-          `└ Searched ${CANONICAL_GREP_PATTERN}`,
+          `└ Read ${CANONICAL_SECOND_PATH}`,
         ),
       ).toBe(1);
       expect(countOccurrences(normalizedPane, CANONICAL_FINAL_TEXT)).toBe(1);
 
       const resultIds = collectToolResultIds(observed.parsedRequests[1]).sort();
-      expect(resultIds).toEqual(["grep_b", "read_a"]);
+      expect(resultIds).toEqual(["read_a", "read_b"]);
       expect(
         collectTypedToolResults(observed.parsedRequests[1]).sort((a, b) =>
           a.toolCallId.localeCompare(b.toolCallId)
         ),
       ).toEqual([
         {
-          toolCallId: "grep_b",
-          toolName: "grep_files",
+          toolCallId: "read_b",
+          toolName: "read_file",
           outputType: "text",
         },
         {
@@ -5147,7 +5146,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       ]);
       expect(countTraceEvent(observed.trace, "before_tool_execution", "read_a"))
         .toBe(1);
-      expect(countTraceEvent(observed.trace, "before_tool_execution", "grep_b"))
+      expect(countTraceEvent(observed.trace, "before_tool_execution", "read_b"))
         .toBe(1);
       for (
         const sentinel of [
@@ -5469,8 +5468,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const tableGateway = startFakeGateway([
         fakeGatewaySerializedToolCall(
           "launch-history-list",
-          "glob_files",
-          JSON.stringify({ pattern: "*", path: "." }),
+          "read_file",
+          JSON.stringify({ path: "docs/source-01.md" }),
           "I'll inspect the docs and determine their authorship.",
         ),
         fakeGatewaySerializedToolCall(

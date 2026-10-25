@@ -1031,7 +1031,7 @@ test "inline cap and stored preview keep complete codepoints" {
 
     const inline_text = "x" ++ text_utils.repeat("\xc3\xa9", 300);
     for ([_]usize{ 128, 129 }) |cap| {
-        const prepared = try prepare(alloc, null, "call/2", "grep_files", inline_text.len, inline_text, cap);
+        const prepared = try prepare(alloc, null, "call/2", "read_file", inline_text.len, inline_text, cap);
         defer alloc.free(prepared.model_output);
         const marker_start = std.mem.find(u8, prepared.model_output, "\n... [tool result truncated").?;
         const prefix = prepared.model_output[0..marker_start];
@@ -1258,7 +1258,7 @@ test "stored result reads support ranges and literal queries" {
     const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(dir);
 
-    const handle = try storeLargeResult(alloc, dir, "call", "grep_files", "alpha\nneedle one\nbeta\nneedle two\n");
+    const handle = try storeLargeResult(alloc, dir, "call", "read_file", "alpha\nneedle one\nbeta\nneedle two\n");
     defer alloc.free(handle);
     const ranged = try readByRange(alloc, dir, handle, 1, 5);
     defer alloc.free(ranged);
@@ -1277,7 +1277,7 @@ test "range reads snap to utf8 rune boundaries" {
     const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(dir);
 
-    const handle = try storeLargeResult(alloc, dir, "call", "grep_files", "ab\xc3\xa9\xc3\xa9cd");
+    const handle = try storeLargeResult(alloc, dir, "call", "read_file", "ab\xc3\xa9\xc3\xa9cd");
     defer alloc.free(handle);
 
     const tail = try readByRange(alloc, dir, handle, 4, 3);
@@ -1430,7 +1430,7 @@ test "managed result create read stat delete remains contained after route swap"
         alloc,
         &capability,
         "managed",
-        "grep_files",
+        "read_file",
         "alpha\nneedle\n",
     );
     defer alloc.free(handle);

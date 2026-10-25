@@ -7814,6 +7814,11 @@ test "fx ask JSON captures parallel tool results without corrupting records" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "workspace/README.md", .{ .truncate = true });
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), "readable\n");
+    }
     const root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(root);
 
@@ -7855,8 +7860,8 @@ test "fx ask JSON captures parallel tool results without corrupting records" {
                     .result_allocator = arena,
                     .call = .{
                         .id = "parallel-capture",
-                        .name = "glob_files",
-                        .arguments_json = "{\"pattern\":\"*\"}",
+                        .name = "read_file",
+                        .arguments_json = "{\"path\":\"README.md\"}",
                     },
                     .authority = .ordinary,
                     .session_grants = &.{},
@@ -7893,7 +7898,7 @@ test "fx ask JSON captures parallel tool results without corrupting records" {
     try std.testing.expect(!failed.load(.seq_cst));
     try std.testing.expectEqual(expected_count, ctx.tool_call_records.items.len);
     for (ctx.tool_call_records.items) |record| {
-        try std.testing.expectEqualStrings("glob_files", record.name);
+        try std.testing.expectEqualStrings("read_file", record.name);
         try std.testing.expectEqualStrings("success", record.status);
     }
 }

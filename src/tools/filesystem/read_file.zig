@@ -195,7 +195,7 @@ fn readFileFailure(alloc: Allocator, err: anyerror, path: []const u8) tool_dispa
             .tool_name = "read_file",
             .message = "read_file requires a regular file",
             .details = &details,
-            .suggestion = "Use glob_files to inspect directory contents, then choose a regular file.",
+            .suggestion = "Use shell to inspect directory contents, then choose a regular file.",
         }) };
     }
     const details = [_]tool_result_errors.Detail{
@@ -207,7 +207,7 @@ fn readFileFailure(alloc: Allocator, err: anyerror, path: []const u8) tool_dispa
         .tool_name = "read_file",
         .message = "read_file failed",
         .details = &details,
-        .suggestion = "Run glob_files to discover matching paths, or check the path relative to the workspace.",
+        .suggestion = "Run shell to discover matching paths, or check the path relative to the workspace.",
     }) };
 }
 
@@ -627,7 +627,7 @@ test "read_file non-regular paths return structured recovery" {
             try std.testing.expect(tool_result_errors.isToolExecutionFailedOutput(body));
             try std.testing.expect(std.mem.find(u8, body, "read_file requires a regular file") != null);
             try std.testing.expect(std.mem.find(u8, body, "NotRegularFile") != null);
-            try std.testing.expect(std.mem.find(u8, body, "glob_files") != null);
+            try std.testing.expect(std.mem.find(u8, body, "shell") != null);
         },
         .success => |body| {
             defer alloc.free(body);

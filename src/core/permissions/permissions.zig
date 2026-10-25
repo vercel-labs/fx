@@ -1065,8 +1065,6 @@ pub fn resolveFileToolPath(
 
 const external_path_tools = [_][]const u8{
     "read_file",
-    "glob_files",
-    "grep_files",
     "write_file",
     "edit_file",
 };
@@ -1081,8 +1079,6 @@ pub fn allowsExternalPath(tool_name: []const u8) bool {
 test "allowsExternalPath preserves the exact eligible tool set" {
     const expected = [_][]const u8{
         "read_file",
-        "glob_files",
-        "grep_files",
         "write_file",
         "edit_file",
     };
@@ -1185,8 +1181,6 @@ pub fn sessionGrantAllowed(grants: []const types.PermissionGrant, tool_name: []c
 const path_always_permissions = [_][]const u8{
     "edit",
     "read",
-    "glob",
-    "grep",
 };
 
 pub fn suggestedSessionGrants(alloc: std.mem.Allocator, workspace_root: []const u8, tool_name: []const u8, target_path: []const u8, target_kind: PermissionTargetKind) ![]types.PermissionGrant {
@@ -1445,8 +1439,6 @@ pub fn liveSessionGrants(alloc: std.mem.Allocator, grants: []const types.Permiss
 pub fn permissionNameForTool(tool_name: []const u8) []const u8 {
     if (std.mem.eql(u8, tool_name, "read_file")) return "read";
     if (std.mem.eql(u8, tool_name, "write_file") or std.mem.eql(u8, tool_name, "edit_file")) return "edit";
-    if (std.mem.eql(u8, tool_name, "glob_files")) return "glob";
-    if (std.mem.eql(u8, tool_name, "grep_files")) return "grep";
     if (std.mem.eql(u8, tool_name, "run_command")) return "bash";
     if (isWebFetchToolName(tool_name)) return web_fetch_permission;
     if (std.mem.eql(u8, tool_name, "skill") or std.mem.eql(u8, tool_name, "install_skill")) return "skill";
@@ -2209,8 +2201,6 @@ test "permissionTargetForCall covers active target kinds" {
 
     const workspace = try @import("../shared/io.zig").dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const src_dir = try std.Io.Dir.path.join(alloc, &.{ workspace, "src" });
-    defer alloc.free(src_dir);
     const app_file = try std.Io.Dir.path.join(alloc, &.{ workspace, "src/app.zig" });
     defer alloc.free(app_file);
 
@@ -2223,21 +2213,6 @@ test "permissionTargetForCall covers active target kinds" {
         target_kind: PermissionTargetKind,
         expected: []const u8,
     }{
-        .{
-            .call = .{ .id = "grep", .name = "grep_files", .arguments_json = "{\"pattern\":\"main\",\"path\":\"src\"}" },
-            .target_kind = .path_optional_existing,
-            .expected = src_dir,
-        },
-        .{
-            .call = .{ .id = "glob_root", .name = "glob_files", .arguments_json = "{\"pattern\":\"*.zig\",\"path\":\"\"}" },
-            .target_kind = .path_optional_existing,
-            .expected = workspace,
-        },
-        .{
-            .call = .{ .id = "grep_root", .name = "grep_files", .arguments_json = "{\"pattern\":\"main\"}" },
-            .target_kind = .path_optional_existing,
-            .expected = workspace,
-        },
         .{
             .call = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"src/app.zig\"}" },
             .target_kind = .path_existing,
@@ -2307,7 +2282,7 @@ test "permissionTargetForCall resolves external absolute file tool targets" {
     );
 }
 
-test "command cwd and grep accept explicit external paths" {
+test "command cwd and read accept explicit external paths" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2345,8 +2320,8 @@ test "command cwd and grep accept explicit external paths" {
 
     const search_call = types.ToolCall{
         .id = "search",
-        .name = "grep_files",
-        .arguments_json = try arena_state.allocator().print("{{\"pattern\":\"needle\",\"path\":\"{s}\"}}", .{shared}),
+        .name = "read_file",
+        .arguments_json = try arena_state.allocator().print("{{\"path\":\"{s}\"}}", .{shared}),
     };
     const search_target = try permissionTargetForCallInScope(arena_state.allocator(), active_scope, search_call, .path_optional_existing);
     try std.testing.expectEqualStrings(shared, search_target);

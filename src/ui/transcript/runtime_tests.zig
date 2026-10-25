@@ -11985,13 +11985,13 @@ test "historical tool detail insertion preserves entry id order" {
         20,
         .{
             .id = "updated-call",
-            .name = "glob_files",
+            .name = "read_file",
             .arguments_json = "{\"path\":\"src\"}",
         },
-        .list,
+        .read,
         .{
             .tool_call_id = @constCast("updated-call"),
-            .tool_name = @constCast("glob_files"),
+            .tool_name = @constCast("read_file"),
             .status = .success,
             .output = @constCast("updated result"),
             .output_bytes = 14,
@@ -12000,7 +12000,7 @@ test "historical tool detail insertion preserves entry id order" {
     );
     try std.testing.expectEqual(@as(usize, 3), runtime.tool_details.items.len);
     const updated = runtime.toolDetailForEntry(20).?;
-    try std.testing.expectEqualStrings("glob_files", updated.tool_name);
+    try std.testing.expectEqualStrings("read_file", updated.tool_name);
     try std.testing.expectEqualStrings("{\"path\":\"src\"}", updated.arguments_json.?);
     try std.testing.expectEqualStrings("updated result", updated.result.?);
 }
@@ -14612,8 +14612,8 @@ test "transcript lifecycle identity updates are idempotent and atomic" {
         runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
             .id = lifecycleId(1, "target"),
             .reconciles_provisional_call_id = "alias",
-            .tool_name = "glob_files",
-            .activity_kind = .list,
+            .tool_name = "read_file",
+            .activity_kind = .read,
         } }),
     );
     try std.testing.expectEqual(alias_before, runtime.toolActivityRecord(lifecycleId(1, "alias")).?.entry_id);
@@ -15252,7 +15252,7 @@ test "post-cancel sibling settlement preserves one turn cancellation" {
         _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
             .id = sibling,
             .reconciles_provisional_call_id = null,
-            .tool_name = "grep_files",
+            .tool_name = "read_file",
             .activity_kind = .read,
         } });
         if (sibling_reports_terminal) {

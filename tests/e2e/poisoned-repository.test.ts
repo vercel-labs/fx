@@ -183,12 +183,10 @@ describe("poisoned repository", () => {
   );
 
   test(
-    "glob, grep and auto-run git status answer without running the repository's programs",
+    "auto-run git status answers without running the repository's programs",
     async () => {
       const fixture = poisonedRepository();
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("glob", "glob_files", { pattern: "**/alpha-*.txt" }),
-        fakeGatewayToolCall("grep", "grep_files", { pattern: "needle" }),
         fakeGatewayToolCall("status", "shell", {
           request: { action: "run", command: "git status --short", profile: "clean", yield_time_ms: 30_000 },
         }),
@@ -208,13 +206,7 @@ describe("poisoned repository", () => {
       expect(gateway.classifierRequests).toHaveLength(0);
 
       const bodies = gateway.requests.map((request: { body: string }) => request.body);
-      const glob = toolResult(bodies[1]!, "glob");
-      expect(glob).toContain("alpha-tracked.txt");
-      expect(glob).toContain("notes/alpha-untracked.txt");
-      const grep = toolResult(bodies[2]!, "grep");
-      expect(grep).toContain("needle tracked two");
-      expect(grep).toContain("needle untracked");
-      const status = toolResult(bodies[3]!, "status");
+      const status = toolResult(bodies[1]!, "status");
       expect(status).toContain("M alpha-tracked.txt");
       expect(status).toContain("?? notes/");
     },
@@ -252,8 +244,8 @@ describe("poisoned repository", () => {
     TIMEOUT,
   );
 
-  test(
-    "a repository config that includes itself cannot stall the file listing",
+  tmuxTest(
+    "a repository config that includes itself cannot stall @ completion",
     async () => {
       const fixture = poisonedRepository();
       // Each include of the config reads it again with its includes, so four
@@ -261,28 +253,32 @@ describe("poisoned repository", () => {
       // chain. git refuses the file; fx must answer from it quickly.
       const config = join(fixture.workspace, ".git", "config");
       writeFileSync(config, readFileSync(config, "utf8") + "[include]\n\tpath = config\n".repeat(4));
-      const gateway = startFakeGateway([
-        fakeGatewayToolCall("glob", "glob_files", { pattern: "**/alpha-*.txt" }),
-        fakeGatewayFinalText("inspection complete"),
-      ], { classifierResponses: [] });
+      const gateway = startFakeGateway([], { classifierResponses: [] });
       gateways.push(gateway);
+      const stderrPath = join(fixture.base, "stderr.log");
 
       const started = Date.now();
-      const result = await runFx(
-        ["ask", "--quiet", "--json", "--no-save", "Inspect the repository."],
-        { cwd: fixture.workspace, env: fxEnv(fixture, gateway), timeoutMs: 15_000 },
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: fxEnv(fixture, gateway),
+        stderrPath,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendLiteral("@alpha");
+      await session.waitForPane(
+        (pane) => pane.includes("alpha-tracked.txt") && pane.includes("alpha-untracked.txt"),
+        TIMEOUT,
       );
-      expect(result.code, result.stderr).toBe(0);
       expect(Date.now() - started).toBeLessThan(10_000);
-      expect(result.stderr).not.toMatch(/panic/i);
-      expect(sentinelRuns(fixture)).toEqual([]);
+      await session.sendKeys("Escape");
+      await session.sendKeys("C-u");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
 
-      const bodies = gateway.requests.map((request: { body: string }) => request.body);
-      const glob = toolResult(bodies[1]!, "glob");
-      expect(glob).toContain("alpha-tracked.txt");
-      expect(glob).toContain("notes/alpha-untracked.txt");
-      // The config files past the limit are left unread, which the listing says.
-      expect(glob).toContain("candidate list may be incomplete");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(sentinelRuns(fixture)).toEqual([]);
+      expect(gateway.requests).toHaveLength(0);
     },
     TIMEOUT,
   );
@@ -316,8 +312,8 @@ describe("poisoned repository", () => {
 // Dotfile managers often make `~/.gitconfig` a symlink. Files the user's own
 // excludes file ignores must stay out of glob and grep through it, as in git.
 describe("user git config through a symlink", () => {
-  test(
-    "glob and grep honor an excludes file named by a symlinked ~/.gitconfig",
+  tmuxTest(
+    "@ completion honors an excludes file named by a symlinked ~/.gitconfig",
     async () => {
       const base = realpathSync(mkdtempSync(join(tmpdir(), "fx-linked-gitconfig-")));
       const fixture: Fixture = { base, home: join(base, "home"), workspace: join(base, "workspace"), log: join(base, "unused.log") };
@@ -334,24 +330,26 @@ describe("user git config through a symlink", () => {
       writeFileSync(join(fixture.workspace, "api.secret"), "needle hidden\n");
       expect(git(fixture, ["ls-files", "-co", "--exclude-standard"]).trim()).toBe("public.txt");
 
-      const gateway = startFakeGateway([
-        fakeGatewayToolCall("glob", "glob_files", { pattern: "**/*" }),
-        fakeGatewayToolCall("grep", "grep_files", { pattern: "needle" }),
-        fakeGatewayFinalText("inspection complete"),
-      ], { classifierResponses: [] });
+      const gateway = startFakeGateway([], { classifierResponses: [] });
       gateways.push(gateway);
-      const result = await runFx(
-        ["ask", "--quiet", "--json", "--no-save", "Inspect the repository."],
-        { cwd: fixture.workspace, env: { ...fxEnv(fixture, gateway), GIT_CONFIG_NOSYSTEM: "1" }, timeoutMs: TIMEOUT },
-      );
-      expect(result.code, result.stderr).toBe(0);
-      const bodies = gateway.requests.map((request: { body: string }) => request.body);
-      const glob = toolResult(bodies[1]!, "glob");
-      expect(glob).toContain("public.txt");
-      expect(glob).not.toContain("api.secret");
-      const grep = toolResult(bodies[2]!, "grep");
-      expect(grep).toContain("needle public");
-      expect(grep).not.toContain("needle hidden");
+      const stderrPath = join(base, "stderr.log");
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: { ...fxEnv(fixture, gateway), GIT_CONFIG_NOSYSTEM: "1" },
+        stderrPath,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendLiteral("@");
+      await session.waitForPane((pane) => pane.includes("public.txt"), TIMEOUT);
+      const pane = await session.capturePane();
+      expect(pane).not.toContain("api.secret");
+      await session.sendKeys("Escape");
+      await session.sendKeys("C-u");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
   );

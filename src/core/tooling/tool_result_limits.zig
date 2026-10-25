@@ -180,18 +180,18 @@ test "prepareInlineResult preserves assignments without reclassifying lengths" {
 test "prepareModelOutput caps chatty output with explicit marker" {
     const alloc = std.testing.allocator;
     var bytes: [256]u8 = @splat('x');
-    const output = try prepareModelOutput(alloc, "grep_files", bytes[0..], 128);
+    const output = try prepareModelOutput(alloc, "read_file", bytes[0..], 128);
     defer alloc.free(@constCast(output));
 
     try std.testing.expect(output.len <= 128);
-    try std.testing.expect(std.mem.find(u8, output, "... [tool result truncated for grep_files: original 256 bytes; cap is 128 bytes]") != null);
+    try std.testing.expect(std.mem.find(u8, output, "... [tool result truncated for read_file: original 256 bytes; cap is 128 bytes]") != null);
 }
 
 test "prepareModelOutput keeps complete codepoints at the cap" {
     const alloc = std.testing.allocator;
     const text = "x" ++ text_utils.repeat("\xc3\xa9", 300);
     for ([_]usize{ 128, 129 }) |cap| {
-        const output = try prepareModelOutput(alloc, "grep_files", text, cap);
+        const output = try prepareModelOutput(alloc, "read_file", text, cap);
         defer alloc.free(@constCast(output));
         try std.testing.expect(output.len <= cap);
         const marker_start = std.mem.find(u8, output, "\n... [tool result truncated").?;

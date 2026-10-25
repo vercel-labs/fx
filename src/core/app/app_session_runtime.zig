@@ -9704,8 +9704,8 @@ test "appendFinishedPrompt keeps the session alive when the turn cannot be saved
     var evidence = [_]types.FileEvidence{.{
         .path = @constCast(""),
         .tool_call_id = @constCast("call_poison"),
-        .tool_name = @constCast("grep_files"),
-        .action = .search,
+        .tool_name = @constCast("read_file"),
+        .action = .read,
         .status = .success,
     }};
     const poisoned = types.HistoryTurn{ .assistant = .{

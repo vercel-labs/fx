@@ -8,6 +8,7 @@ const host_target = @import("../core/hosts/target.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const sessions = @import("sessions.zig");
+const host_commands = @import("commands.zig");
 const prompt_handler = @import("prompt.zig");
 const prompt_test_controls = @import("prompt_test_controls.zig");
 const app_lifecycle = @import("../core/app/app_lifecycle.zig");
@@ -25,6 +26,10 @@ const model_catalog = @import("../core/gateway/model_catalog.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const hooks = @import("../core/hooks/hooks.zig");
 const mcp_host = @import("../core/mcp_host/host.zig");
+const mcp_verbs = @import("../core/mcp_host/verbs.zig");
+const mcp_runtime = @import("../core/mcp_host/runtime.zig");
+const builtin_mcp = @import("../builtins/mcp.zig");
+const command_lex = @import("../core/shell_command/command_lex.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
 const session_codec = @import("../core/session/session_codec.zig");
@@ -32,6 +37,10 @@ const session_log = @import("../core/session/session_log.zig");
 const session_store = @import("../core/session/session_store.zig");
 const session_adapter = @import("../core/session/session_adapter.zig");
 const session_runtime = @import("../core/session/session.zig");
+const change_tracker_mod = @import("../core/workspace/change_tracker.zig");
+const shell_snapshot = @import("../core/terminal/shell_snapshot.zig");
+const workspace_commands = @import("../core/workspace/workspace_commands.zig");
+const output_contracts = @import("../core/output/output_contracts.zig");
 const session_title_generation = @import("../core/session/session_title_generation.zig");
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
 const terminal_client_runtime = @import("../core/terminal/client.zig");
@@ -88,6 +97,7 @@ const AcpMethod = enum {
     libfx_snapshot,
     libfx_journal_open,
     libfx_journal_images,
+    fx_command,
     mcp_message,
     unknown,
 
@@ -114,6 +124,7 @@ const AcpMethod = enum {
         if (std.mem.eql(u8, method, "libfx/snapshot")) return .libfx_snapshot;
         if (std.mem.eql(u8, method, "libfx/journal_open")) return .libfx_journal_open;
         if (std.mem.eql(u8, method, "libfx/journal_images")) return .libfx_journal_images;
+        if (std.mem.eql(u8, method, "fx/command")) return .fx_command;
         if (std.mem.eql(u8, method, "mcp/message")) return .mcp_message;
         return .unknown;
     }
@@ -133,6 +144,7 @@ const AcpMethod = enum {
             .libfx_withdraw,
             .libfx_handoff,
             .libfx_follow_up,
+            .fx_command,
             => false,
             .session_list,
             .session_remove,
@@ -254,6 +266,8 @@ pub const ActiveSessionState = struct {
     /// profile or project configuration.
     session_grants: []types.PermissionGrant = &.{},
     session_rt: session_runtime.SessionRuntime,
+    /// File operations this session can still reverse, newest last.
+    changes: change_tracker_mod.ChangeTracker = .{},
     title_task: ?*session_title_generation.Task = null,
     /// The session's MCP servers; null when it has none.
     mcp_host: ?*mcp_host.Host = null,
@@ -324,6 +338,9 @@ pub const ServerState = struct {
     client_elicitation: elicitation.Capabilities = .{},
     workspace_root: []u8 = &.{},
     workspace_access: workspace_access.WorkspaceAccess = .{},
+    /// The active session's MCP servers came from this machine's profile and
+    /// project, so a verb that edits them may reload the live host.
+    mcp_profile_owned: bool = false,
     api_key: []u8 = &.{},
     credential_source: ?types.CredentialSource = null,
     gateway_source_preference: ?types.CredentialSource = null,
@@ -756,6 +773,7 @@ fn destroyActiveSession(state: *ServerState) void {
     active.steering.deinit(state.alloc);
     if (active.journal) |*journal| journal.deinit(state.alloc);
     active.staged_images.deinit(state.alloc);
+    active.changes.deinit(state.alloc);
     types.freePermissionGrantSlice(state.alloc, active.session_grants);
     if (comptime !host_target.is_wasm) {
         if (active.mcp_host) |h| h.destroy();
@@ -1633,6 +1651,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .session_prompt => startPrompt(state, alloc, msg),
         .session_set_config_option => handleSetConfigOption(state, alloc, msg),
         .session_set_mode => handleSetMode(state, alloc, msg),
+        .fx_command => handleHostCommand(state, alloc, msg),
         .libfx_checkpoint => handleKernelCheckpoint(state, alloc, msg),
         .libfx_restore => handleKernelRestore(state, alloc, msg),
         .libfx_new => sessions.handleNewLibfxSession(state, alloc, msg),
@@ -4203,6 +4222,390 @@ fn commitActiveSessionUltrafast(
     preferences.ultrafast_mode = ultrafast;
     try v2.setPreferences(preferences);
     session.ultrafast_mode = ultrafast;
+}
+
+/// Handles `fx/command`: a detached frontend names one session command and
+/// receives its typed result. Each command decides for itself whether it can
+/// run while a prompt is active.
+fn handleHostCommand(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
+    const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "Missing params",
+    });
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Invalid params",
+        });
+    defer parsed.deinit();
+    if (parsed.value != .object) return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "Params must be object",
+    });
+    if (!try requireParsedActiveSessionTarget(state, alloc, msg.id, parsed.value)) return;
+
+    const command = host_commands.parse(parsed.value) catch |err| return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = switch (err) {
+            error.MissingCommand => "Missing command",
+            error.UnknownCommand => "Unknown command",
+            error.MissingPath => "Missing path",
+        },
+    });
+    const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_request,
+        .message = "No active session",
+    });
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    switch (command) {
+        .last_reply => try host_commands.writeResult(&out.writer, command, .{
+            .text = session.session_rt.lastAssistantReply() orelse "",
+        }),
+        .undo => {
+            if (state.active_prompt != null) return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = "Session is busy",
+            });
+            const result = session.changes.undoLast(state.alloc);
+            defer switch (result) {
+                .restored => |path| state.alloc.free(path),
+                .deleted => |path| state.alloc.free(path),
+                .unavailable => |path| state.alloc.free(path),
+                .empty => {},
+            };
+            try host_commands.writeResult(&out.writer, command, .{ .undo = .{
+                .outcome = switch (result) {
+                    .restored => .restored,
+                    .deleted => .deleted,
+                    .unavailable => .unavailable,
+                    .empty => .nothing_to_undo,
+                },
+                .path = switch (result) {
+                    .restored => |path| path,
+                    .deleted => |path| path,
+                    .unavailable => |path| path,
+                    .empty => "",
+                },
+            } });
+        },
+        .mcp_verb => |line| {
+            const outcome = try runMcpVerb(state, alloc, line);
+            defer alloc.free(outcome.text);
+            if (!outcome.ok) {
+                return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.invalid_request,
+                    .message = outcome.text,
+                });
+            }
+            try host_commands.writeResult(&out.writer, command, .{ .text = outcome.text });
+        },
+        .mcp_status => {
+            const text = try mcpStatusText(state, alloc);
+            defer alloc.free(text);
+            try host_commands.writeResult(&out.writer, command, .{ .text = text });
+        },
+        .permissions_reload => {
+            try reloadPermissionRules(state, alloc);
+            try host_commands.writeResult(&out.writer, command, .ack);
+        },
+        .workspace => |action| {
+            const outcome = try runWorkspaceCommand(state, alloc, action);
+            defer alloc.free(outcome.text);
+            if (!outcome.ok) {
+                return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.invalid_request,
+                    .message = outcome.text,
+                });
+            }
+            try host_commands.writeResult(&out.writer, command, .{ .text = outcome.text });
+        },
+        .shell_reload => {
+            shell_snapshot.reloadForUser();
+            try host_commands.writeResult(&out.writer, command, .ack);
+        },
+        .context => {
+            const capabilities = activeSessionCapabilities(state, session);
+            try host_commands.writeResult(&out.writer, command, .{ .context = .{
+                .used = session.context_used.load(.acquire),
+                .total = capabilities.context_window,
+                .auto_compact_percent = state.auto_compact_percent,
+            } });
+        },
+        .compact => {
+            const outcome = prompt_handler.compactNow(state, alloc) catch |err| return state.writer.writeError(alloc, msg.id, .{
+                .code = switch (err) {
+                    error.SessionBusy => ErrorCode.invalid_request,
+                    error.NoActiveSession => ErrorCode.invalid_request,
+                    else => ErrorCode.internal_error,
+                },
+                .message = switch (err) {
+                    error.SessionBusy => "Session is busy",
+                    error.NoActiveSession => "No active session",
+                    error.Cancelled => "Compaction was cancelled",
+                    else => "Compaction failed",
+                },
+            });
+            try host_commands.writeResult(&out.writer, command, .{
+                .compaction = switch (outcome) {
+                    .compacted => .compacted,
+                    .nothing_to_compact => .nothing_to_compact,
+                },
+            });
+        },
+    }
+    try state.writer.writeResponse(alloc, msg.id, out.written());
+}
+
+const McpVerbHosts = struct {
+    state: *ServerState,
+    reload_requested: bool = false,
+
+    fn get(raw: *anyopaque, notify: ?mcp_runtime.Notify) anyerror!?*mcp_host.Host {
+        _ = notify;
+        const self: *McpVerbHosts = @ptrCast(@alignCast(raw));
+        const active = if (self.state.active_session) |*session| session else return null;
+        return active.mcp_host;
+    }
+
+    fn release(raw: *anyopaque, host: *mcp_host.Host) void {
+        _ = raw;
+        _ = host;
+    }
+
+    fn changed(raw: *anyopaque) void {
+        const self: *McpVerbHosts = @ptrCast(@alignCast(raw));
+        self.reload_requested = true;
+    }
+};
+
+const McpVerbOutcome = struct {
+    ok: bool,
+    text: []u8,
+};
+
+/// Runs one `/mcp` verb line against this session's MCP host. Config edits
+/// reload the live host so the next turn sees the change without a restart.
+fn runMcpVerb(state: *ServerState, alloc: Allocator, line: []const u8) !McpVerbOutcome {
+    const active = if (state.active_session) |*session| session else {
+        return .{ .ok = false, .text = try alloc.dupe(u8, "Open a session before running an MCP command.") };
+    };
+    const home = state.cfg.home_override orelse io_mod.homeDir() orelse {
+        return .{ .ok = false, .text = try alloc.dupe(u8, "MCP commands need HOME to be set.") };
+    };
+    var parsed = command_lex.tokenize_argv(alloc, line) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .ok = false, .text = try alloc.dupe(u8, "/mcp: that command line has an unmatched quote or a character fx doesn't take here.") },
+    };
+    defer parsed.deinit(alloc);
+    const args = try alloc.alloc([]const u8, parsed.tokens.len);
+    defer alloc.free(args);
+    for (parsed.tokens, args) |token, *arg| arg.* = token.value;
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    var err_out: std.Io.Writer.Allocating = .init(alloc);
+    defer err_out.deinit();
+    var hosts = McpVerbHosts{ .state = state };
+    const code = mcp_verbs.run(.{
+        .gpa = alloc,
+        .out = &out.writer,
+        .err = &err_out.writer,
+        .surface = .shell,
+        .home = home,
+        .workspace_root = active.workspace_root,
+        .hosts = .{
+            .context = &hosts,
+            .get = McpVerbHosts.get,
+            .release = McpVerbHosts.release,
+            .changed = McpVerbHosts.changed,
+        },
+    }, args);
+
+    var text: std.Io.Writer.Allocating = .init(alloc);
+    defer text.deinit();
+    for ([_]*std.Io.Writer.Allocating{ &out, &err_out }) |writer| {
+        const body = std.mem.trimEnd(u8, writer.written(), "\n");
+        if (body.len == 0) continue;
+        if (text.written().len > 0) try text.writer.writeByte('\n');
+        try text.writer.writeAll(body);
+    }
+    if (text.written().len == 0) {
+        try text.writer.writeAll(if (code == 0) "MCP command completed." else "MCP command failed.");
+    }
+
+    var ok = code == 0;
+    if (hosts.reload_requested) {
+        if (state.mcp_profile_owned) {
+            reloadMcpHost(state, alloc) catch |err| {
+                ok = false;
+                const with_failure = try alloc.print("{s}\nMCP configuration changed, but the live session could not reload it: {s}", .{ text.written(), @errorName(err) });
+                text.deinit();
+                return .{ .ok = ok, .text = with_failure };
+            };
+        } else {
+            ok = false;
+            const with_note = try alloc.print("{s}\nThese MCP servers belong to the client that opened the session; configuration changes apply to new sessions.", .{text.written()});
+            text.deinit();
+            return .{ .ok = ok, .text = with_note };
+        }
+    }
+    return .{ .ok = ok, .text = try text.toOwnedSlice() };
+}
+
+/// Rebuilds the session's MCP host from this machine's profile and project
+/// configuration after a verb changed it. The previous host is destroyed only
+/// after the replacement exists.
+fn reloadMcpHost(state: *ServerState, alloc: Allocator) !void {
+    const active = if (state.active_session) |*session| session else return;
+    const previous = active.mcp_host;
+    const next = try builtin_mcp.loadHost(alloc, active.workspace_root, builtin_tools.registry, .{ .reuse = previous });
+    if (next) |host| {
+        if (host != previous) if (previous) |old| old.destroy();
+        active.mcp_host = host;
+    } else {
+        if (previous) |old| old.destroy();
+        active.mcp_host = null;
+    }
+}
+
+/// Routes MCP host notices, such as a sign-in address, to the frontend that
+/// owns this session's transcript.
+pub fn mcpNotify(state: *ServerState) mcp_runtime.Notify {
+    return .{ .context = state, .notice = pushMcpNotice };
+}
+
+fn pushMcpNotice(raw: *anyopaque, notice: mcp_runtime.Notice) void {
+    const state: *ServerState = @ptrCast(@alignCast(raw));
+    var text: std.Io.Writer.Allocating = .init(state.alloc);
+    defer text.deinit();
+    var warning = false;
+    switch (notice) {
+        .authorize => |n| text.writer.print(
+            "Sign in to {s} in your browser. If it didn't open, go to:\n  {s}",
+            .{ n.server, n.url },
+        ) catch return,
+        .signed_in => |server| text.writer.print("Signed in to {s}.", .{server}) catch return,
+        .sign_in_failed => |n| {
+            warning = true;
+            text.writer.print("Couldn't sign in to {s}: {s}.", .{ n.server, n.reason }) catch return;
+        },
+        .needs_login => return,
+        .not_saved => |n| {
+            warning = true;
+            text.writer.print("Couldn't save {s}'s login: {s}.", .{ n.server, n.reason }) catch return;
+        },
+    }
+    const session_id = if (state.active_session) |active| active.session_id else "";
+    var params: std.Io.Writer.Allocating = .init(state.alloc);
+    defer params.deinit();
+    params.writer.writeAll("{\"session_id\":") catch return;
+    std.json.Stringify.value(session_id, .{}, &params.writer) catch return;
+    params.writer.writeAll(",\"text\":") catch return;
+    std.json.Stringify.value(text.written(), .{}, &params.writer) catch return;
+    params.writer.print(",\"warning\":{}", .{warning}) catch return;
+    params.writer.writeByte('}') catch return;
+    state.writer.writeNotification(state.alloc, "fx/mcp_notice", params.written()) catch {};
+}
+
+/// One line per attached MCP server: state, tool count, and the last failure.
+fn mcpStatusText(state: *ServerState, alloc: Allocator) ![]u8 {
+    const active = if (state.active_session) |*session| session else return alloc.dupe(u8, "No active session.");
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const host = active.mcp_host orelse {
+        return alloc.dupe(u8, "No MCP servers are attached to this session.\nUse /mcp list|show|add|remove|login|logout|approve|reject.");
+    };
+    const statuses = try host.runtime.statuses(alloc);
+    defer alloc.free(statuses);
+    try out.writer.print("MCP servers: {d}", .{statuses.len});
+    for (statuses) |status| {
+        try out.writer.print("\n- {s}: {s}", .{ status.name, @tagName(status.state) });
+        if (status.tools > 0) try out.writer.print(" · {d} tools", .{status.tools});
+        if (status.needs_login) try out.writer.writeAll(" · login required");
+        if (status.last_error) |message| try out.writer.print(" · {s}", .{message});
+    }
+    try out.writer.writeAll("\nUse /mcp list|show|add|remove|login|logout|approve|reject.");
+    return out.toOwnedSlice();
+}
+
+/// Re-reads the configured permission rules after this process changed the
+/// profile or project settings, and makes them the live session's rules.
+fn reloadPermissionRules(state: *ServerState, alloc: Allocator) !void {
+    var settings = try config_runtime.loadMergedSettings(alloc, state.workspace_root);
+    defer settings.deinit(alloc);
+
+    var next = try types.dupePermissionRuleSet(state.alloc, settings.permission_rules);
+    errdefer next.deinit(state.alloc);
+    var previous = state.permission_rules;
+    state.permission_rules = next;
+    if (state.active_session) |*active| active.permission_rules = state.permission_rules;
+    previous.deinit(state.alloc);
+}
+
+const WorkspaceOutcome = struct {
+    ok: bool,
+    text: []u8,
+};
+
+/// Runs one workspace action against the host's live access set. The text is
+/// the same snapshot `/workspace` prints locally; a rejection comes back with
+/// `ok = false` so the frontend can render it as an error.
+fn runWorkspaceCommand(state: *ServerState, alloc: Allocator, action: host_commands.WorkspaceAction) !WorkspaceOutcome {
+    const command_action: workspace_commands.Action = switch (action) {
+        .list => return .{ .ok = true, .text = try workspaceSnapshotText(state, alloc, null) },
+        .add => |path| .{ .add = path },
+        .remove => |path| .{ .remove = path },
+        .clear => .clear,
+    };
+
+    var phase: workspace_commands.FailurePhase = .stage;
+    var result = workspace_commands.execute(alloc, state.workspace_root, &state.workspace_access, command_action, &phase) catch |err| {
+        const reason = output_contracts.workspaceErrorMessage(err) orelse "workspace update failed";
+        const prefix: []const u8 = switch (phase) {
+            .stage => "Workspace update rejected",
+            .commit => "Workspace settings were not changed",
+            .reconcile => "Workspace settings are uncertain and could not be reloaded",
+        };
+        return .{ .ok = false, .text = try alloc.print("{s}: {s}", .{ prefix, reason }) };
+    };
+    defer result.deinit(alloc);
+
+    switch (result) {
+        .updated => |*updated| {
+            installWorkspaceAccess(state, alloc, &updated.access);
+            return .{ .ok = true, .text = try workspaceSnapshotText(state, alloc, updated.mutation) };
+        },
+        .indeterminate => |*reconciliation| {
+            const text: []const u8 = switch (reconciliation.*) {
+                .intended => |*access| blk: {
+                    installWorkspaceAccess(state, alloc, access);
+                    reconciliation.* = .unconfirmed;
+                    break :blk "Workspace settings durability is uncertain; reloaded settings match the requested update.";
+                },
+                .previous => |*access| blk: {
+                    installWorkspaceAccess(state, alloc, access);
+                    reconciliation.* = .unconfirmed;
+                    break :blk "Workspace settings durability is uncertain; reloaded settings match the previous state, so the update is not active.";
+                },
+                .unconfirmed => "Workspace settings durability is uncertain; reloaded settings match neither the requested nor previous state, so runtime access is unchanged.",
+            };
+            return .{ .ok = true, .text = try alloc.dupe(u8, text) };
+        },
+    }
+}
+
+fn installWorkspaceAccess(state: *ServerState, alloc: Allocator, access: *workspace_access.WorkspaceAccess) void {
+    state.workspace_access.deinit(alloc);
+    state.workspace_access = access.*;
+    access.* = .{};
+}
+
+fn workspaceSnapshotText(state: *ServerState, alloc: Allocator, mutation: ?workspace_commands.Mutation) ![]u8 {
+    var snapshot = output_contracts.WorkspaceSnapshot.fromAccess(state.workspace_root, &state.workspace_access);
+    snapshot.mutation = mutation;
+    return snapshot.renderInteractiveBody(alloc);
 }
 
 /// Handles the older `session/set_mode`, modeled with the `mode` option in

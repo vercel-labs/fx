@@ -4,6 +4,7 @@ const acp_types = @import("types.zig");
 const builtin_tools = @import("../builtins/tools.zig");
 const mcp_contract = @import("../core/mcp/mcp_contract.zig");
 const mcp_host = @import("../core/mcp_host/host.zig");
+const runtime_mod = @import("../core/mcp_host/runtime.zig");
 const io_mod = @import("../core/shared/io.zig");
 const build_options = @import("build_options");
 const http_config = @import("../core/mcp/http_config.zig");
@@ -128,6 +129,7 @@ pub fn prepare(
     workspace_root: []const u8,
     questions: elicitation.Capabilities,
     url_completions: ?tool_mcp_runtime.LegacyUrlCompletionSink,
+    notify: ?runtime_mod.Notify,
 ) Allocator.Error!Preparation {
     if (configs.items.items.len == 0) return .none;
     const home = io_mod.homeDir() orelse return .{ .failed = try alloc.dupe(u8, "MCP servers need HOME to be set.") };
@@ -143,6 +145,7 @@ pub fn prepare(
         .workspace_root = workspace_root,
         .questions = questions,
         .url_completions = url_completions,
+        .notify = notify,
     }, builtin_tools.registry) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .failed = try alloc.print("MCP servers could not start: {s}", .{@errorName(err)}) },

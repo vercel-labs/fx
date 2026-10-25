@@ -809,45 +809,6 @@ describe("filesystem path handling", () => {
   );
 
   test(
-    "empty optional search paths use the workspace root",
-    async () => {
-      const root = createIsolatedRoot();
-      try {
-        const fixture = join(root.workspace, "empty-root.txt");
-        writeFileSync(fixture, "EMPTY_ROOT_NEEDLE\n");
-        const cases = [
-          {
-            id: "glob_empty_root_1",
-            name: "glob_files",
-            input: { pattern: "empty-root.txt", path: "" },
-            expected: "empty-root.txt",
-          },
-          {
-            id: "grep_empty_root_1",
-            name: "grep_files",
-            input: { pattern: "EMPTY_ROOT_NEEDLE", path: "" },
-            expected: "EMPTY_ROOT_NEEDLE",
-          },
-        ];
-
-        for (const scenario of cases) {
-          await runFirstCallToolScenario({
-            root,
-            id: scenario.id,
-            name: scenario.name,
-            input: scenario.input,
-            expectedResultRequest: [root.workspace],
-            expectedResultOutput: [scenario.expected],
-          });
-        }
-      } finally {
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
     "active added roots reach read cwd and search admission without loading their instructions",
     async () => {
       const root = createIsolatedRoot();
@@ -862,12 +823,6 @@ describe("filesystem path handling", () => {
             name: "read_file",
             input: { path: join(root.external, "fixture.txt"), line_count: 10 },
             expected: "ADDED_ROOT_NEEDLE",
-          },
-          {
-            id: "added_search_1",
-            name: "grep_files",
-            input: { pattern: "ADDED_ROOT_NEEDLE", path: root.external },
-            expected: "fixture.txt",
           },
           {
             id: "added_cwd_1",
@@ -1568,16 +1523,9 @@ describe("filesystem path handling", () => {
 
         const cases = [
           {
-            id: "glob_external_1",
-            name: "glob_files",
-            input: { pattern: "*.txt", path: "../external" },
-            expectedContext: [root.external],
-            expectedResult: [externalFile],
-          },
-          {
-            id: "grep_external_1",
-            name: "grep_files",
-            input: { pattern: "EDGE_NEEDLE", path: "../external" },
+            id: "read_external_1",
+            name: "read_file",
+            input: { path: "../external/fixture.txt" },
             expectedContext: [root.external],
             expectedResult: [externalFile, "EDGE_NEEDLE"],
           },
@@ -1593,59 +1541,6 @@ describe("filesystem path handling", () => {
             expectedResultOutput: scenario.expectedResult,
           });
         }
-      } finally {
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "grep_files searches a file larger than 200 KiB by path and by include",
-    async () => {
-      const root = createIsolatedRoot();
-      try {
-        mkdirSync(join(root.workspace, "src"), { recursive: true });
-        // 3,000 lines of 100 bytes, then the match on line 3,001.
-        writeFileSync(
-          join(root.workspace, "src", "big.txt"),
-          `${"x".repeat(99)}\n`.repeat(3000) + "LARGE_FILE_NEEDLE\n",
-        );
-        const cases = [
-          { id: "grep_large_path_1", input: { pattern: "LARGE_FILE_NEEDLE", path: "src/big.txt" } },
-          { id: "grep_large_include_1", input: { pattern: "LARGE_FILE_NEEDLE", include: "src/*.txt" } },
-        ];
-        for (const scenario of cases) {
-          await runFirstCallToolScenario({
-            root,
-            id: scenario.id,
-            name: "grep_files",
-            input: scenario.input,
-            expectedResultRequest: [],
-            expectedResultOutput: ["big.txt:3001", "LARGE_FILE_NEEDLE"],
-          });
-        }
-      } finally {
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "glob pattern cannot escape the separately approved search root",
-    async () => {
-      const root = createIsolatedRoot();
-      try {
-        writeFileSync(join(root.external, "outside.txt"), "OUTSIDE\n");
-        await runTerminalToolScenario({
-          root,
-          id: "glob_escape_1",
-          name: "glob_files",
-          input: { pattern: "../external/*.txt", path: "." },
-          expectedResultRequest: ["PathOutsideWorkspace"],
-        });
-
       } finally {
         rmSync(root.root, { recursive: true, force: true });
       }
@@ -1815,8 +1710,6 @@ describe("filesystem path handling", () => {
             "read_file",
             "write_file",
             "edit_file",
-            "glob_files",
-            "grep_files",
             "shell",
           ]));
           return toolCall("terminal_fallback_1", "shell", { request: {

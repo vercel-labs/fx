@@ -487,9 +487,9 @@ fn v1Unreadable(store: *Store, alloc: Allocator, id: []const u8, err: anyerror) 
     return store.problem.set("{s}", .{stuck.reason});
 }
 
-/// A page of saved root sessions as v1 pages them: newest first, one
-/// workspace when `workspace` is set, and only what follows `continuation`.
-/// It reads only the part of v2's index the page needs (D62), and those of
+/// A page of saved root sessions with conversation content, as v1 pages them:
+/// newest first, one workspace when `workspace` is set, and only what follows
+/// `continuation`. It reads only the part of v2's index the page needs (D62), and those of
 /// v1's roots not converted yet that can reach the page, each one v2 does
 /// not hold (D59). Caller owns the page.
 pub fn listPage(
@@ -561,6 +561,7 @@ fn v2Window(
         defer page.deinit();
         for (page.items) |item| {
             if (cut) |at| if (item.updated_ms != at) return;
+            if (!summaryHasConversation(store, alloc, item)) continue;
             var summary = try summaryOf(alloc, scratch.allocator(), item);
             if (continuation) |position| if (!session_summary_codec.summaryFollowsContinuation(summary, position)) {
                 summary.deinit(alloc);
@@ -1505,18 +1506,6 @@ pub const Session = struct {
     /// A fork before the first prompt holds no turn and is saved (D90).
     pub fn saved(self: *const Session) bool {
         return self.handle.onDisk();
-    }
-
-    /// A detached session owner must retain even an empty root (for example a
-    /// scheduled first prompt). The manager publishes on a lifecycle frame;
-    /// this closed empty frame stores the seed but adds no conversation item,
-    /// so restoring it yields empty history and never replays execution.
-    pub fn retainForBackground(self: *Session) !void {
-        self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
-        if (self.saved()) return;
-        _ = try self.write(&.{ .turn_started, .turn_committed });
-        self.last_turn += 1;
     }
 
     /// The session's folder under `~/.fx/sessions/v2`, for display. Caller owns it.
@@ -4495,10 +4484,25 @@ fn historyToolCall(call: session_event.ConversationToolCall) types.ToolCall {
 
 const list_page_size: usize = 256;
 
-/// Every saved root session, newest first, as v1's picker summaries, leaving
-/// out `active_id`. A saved session always has a turn (D2), so each one can
-/// be resumed. Stops with `error.Cancelled` once `cancel` is set. Caller
-/// owns the list and every summary; safe from any thread.
+/// Whether `item`'s log holds conversation content, so a viewer can show it.
+/// A session retained for a background owner writes a closed placeholder turn
+/// with no item; that empty root is not a conversation and stays unlisted.
+/// Unreadable or longer logs stay listed, as they always did.
+fn summaryHasConversation(store: *Store, alloc: Allocator, item: sm.Summary) bool {
+    if (item.turns > 1) return true;
+    var page = store.manager.read(alloc, item.id, .start, .forward, list_page_size) catch return true;
+    defer page.deinit();
+    if (page.entries.len == 0) return true;
+    for (page.entries) |entry| {
+        if (entry.body) |body| if (body == .item) return true;
+    }
+    return page.next != null;
+}
+
+/// Every saved root session with conversation content, newest first, as v1's
+/// picker summaries, leaving out `active_id`. Stops with `error.Cancelled`
+/// once `cancel` is set. Caller owns the list and every summary; safe from any
+/// thread.
 pub fn listSummaries(
     store: *Store,
     alloc: Allocator,
@@ -4521,6 +4525,7 @@ pub fn listSummaries(
         for (page.items) |item| {
             if (item.role != .root) continue;
             if (active_id) |active| if (std.mem.eql(u8, active, item.id)) continue;
+            if (!summaryHasConversation(store, alloc, item)) continue;
             list.appendAssumeCapacity(try summaryOf(alloc, scratch.allocator(), item));
         }
     }
@@ -6189,6 +6194,38 @@ test "the picker lists saved root sessions newest first, without the open one" {
 
     cancel.store(true, .release);
     try testing.expectError(error.Cancelled, listSummaries(&t.store, testing.allocator, null, &cancel));
+}
+
+test "listing hides a retained empty session but keeps a conversation" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const retained = try t.store.manager.openNew(.{ .workspace = "/w", .host = .acp });
+    _ = try retained.append(&.{ .turn_started, .turn_committed });
+    const retained_id = try testing.allocator.dupe(u8, retained.id());
+    defer testing.allocator.free(retained_id);
+    retained.release();
+
+    const chat = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try chat.commitTurn(assistantTurn("question", "answer"), types.ConversationLanguage.default());
+    const chat_id = try testing.allocator.dupe(u8, chat.id());
+    defer testing.allocator.free(chat_id);
+    chat.close();
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var summaries = try listSummaries(&t.store, testing.allocator, null, &cancel);
+    defer {
+        for (summaries.items) |*summary| summary.deinit(testing.allocator);
+        summaries.deinit(testing.allocator);
+    }
+    try testing.expectEqual(@as(usize, 1), summaries.items.len);
+    try testing.expectEqualStrings(chat_id, summaries.items[0].id);
+
+    var page = try listPage(&t.store, testing.allocator, null, null, 10);
+    defer page.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), page.summaries.items.len);
+    try testing.expectEqualStrings(chat_id, page.summaries.items[0].id);
 }
 
 test "-c resumes the session this host last opened" {

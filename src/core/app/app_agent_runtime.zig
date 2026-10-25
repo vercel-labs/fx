@@ -1386,7 +1386,6 @@ const test_gateway_chat_url = "https://gateway.test/chat";
 const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.web_search,
     test_builtin_tools.shell,
-    test_builtin_tools.grep_files,
     test_builtin_tools.skill,
     test_builtin_tools.install_skill,
     test_builtin_tools.subagent,
@@ -2169,7 +2168,7 @@ test "app agent runtime formats active completed denied and MCP tool actions" {
 
     const malformed_registered: ToolCall = .{
         .id = "malformed_registered",
-        .name = "grep_files",
+        .name = "shell",
         .arguments_json = "{",
     };
     const malformed_completed = try app.describeToolActionCompleted(arena, malformed_registered);

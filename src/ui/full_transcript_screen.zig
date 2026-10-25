@@ -894,8 +894,8 @@ test "full projection retains consecutive in-memory tool details" {
     var details = [_]ToolDetailRecord{
         .{
             .entry_id = 1,
-            .tool_name = try alloc.dupe(u8, "glob_files"),
-            .arguments_json = try alloc.dupe(u8, "{\"path\":\".\"}"),
+            .tool_name = try alloc.dupe(u8, "read_file"),
+            .arguments_json = try alloc.dupe(u8, "{\"path\":\"README.md\"}"),
             .result = try alloc.dupe(u8, "LIST_FULL_DETAIL_MARKER"),
         },
         .{
@@ -1398,7 +1398,7 @@ test "stored tool result repeats its rail on every physical wrap row" {
         alloc,
         &capability,
         "wrapped-detail",
-        "grep_files",
+        "read_file",
         "alpha beta gamma delta epsilon zeta",
     );
     defer alloc.free(handle);

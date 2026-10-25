@@ -1592,7 +1592,7 @@ test "saved output sources name commands, paths, URLs, and MCP tools" {
         .{ .call = .{ .id = "file", .name = "read_file", .arguments_json = "{\"path\":\"src/\\u001b[2Jmain.zig\"}" }, .expected = "src/\\x1b[2Jmain.zig" },
         .{ .call = .{ .id = "fetch", .name = "web_fetch", .arguments_json = "{\"url\":\"https://fx.sh/docs\"}" }, .expected = "https://fx.sh/docs" },
         .{ .call = .{ .id = "mcp", .name = "mcp_linear_list_issues", .arguments_json = "{}" }, .expected = "mcp_linear_list_issues" },
-        .{ .call = .{ .id = "grep", .name = "grep_files", .arguments_json = "{\"pattern\":\"needle\"}" }, .expected = null },
+        .{ .call = .{ .id = "ask", .name = "ask_user_question", .arguments_json = "{}" }, .expected = null },
         .{ .call = .{ .id = "bad", .name = "read_file", .arguments_json = "not json" }, .expected = null },
     };
     for (cases) |case| {

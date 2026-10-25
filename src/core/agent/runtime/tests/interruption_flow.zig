@@ -368,7 +368,7 @@ test "processQueuedPrompt persists completed tool names when cancelled during ne
 
     const calls = [_]ToolCall{
         toolCall("call_read", "read_file", "{\"path\":\"README.md\"}"),
-        toolCall("call_glob", "glob_files", "{\"pattern\":\"*\"}"),
+        toolCall("call_read_result", "read_tool_result", "{\"handle\":\"T1\"}"),
     };
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
@@ -387,7 +387,7 @@ test "processQueuedPrompt persists completed tool names when cancelled during ne
 
     try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
     try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
-    try std.testing.expectEqualStrings("glob_files", hooks.executed_names.items[1]);
+    try std.testing.expectEqualStrings("read_tool_result", hooks.executed_names.items[1]);
     try std.testing.expectEqual(@as(usize, 1), hooks.interrupted_history_count);
     try std.testing.expectEqual(@as(usize, 1), hooks.interrupted_event_count);
     try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
@@ -395,13 +395,13 @@ test "processQueuedPrompt persists completed tool names when cancelled during ne
     try std.testing.expect(hooks.history_turns.items[0].interrupted.tool_call == null);
     try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items[0].interrupted.completed_tool_names.len);
     try std.testing.expectEqualStrings("read_file", hooks.history_turns.items[0].interrupted.completed_tool_names[0]);
-    try std.testing.expectEqualStrings("glob_files", hooks.history_turns.items[0].interrupted.completed_tool_names[1]);
+    try std.testing.expectEqualStrings("read_tool_result", hooks.history_turns.items[0].interrupted.completed_tool_names[1]);
 
     const trace = try readTraceFile(alloc, trace_path, 65536);
     defer alloc.free(trace);
-    try std.testing.expect(std.mem.find(u8, trace, "active_tool=false completed_tool_count=2 completed_tool_names=read_file,glob_files") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "active_tool=false completed_tool_count=2 completed_tool_names=read_file,read_tool_result") != null);
 
-    const follow_completions = [_]FakeCompletion{.{ .content = "I ran 2 tools: read_file and glob_files." }};
+    const follow_completions = [_]FakeCompletion{.{ .content = "I ran 2 tools: read_file and read_tool_result." }};
     var follow_gateway = FakeGateway.init(alloc, &follow_completions);
     defer follow_gateway.deinit();
     var follow_hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -415,7 +415,7 @@ test "processQueuedPrompt persists completed tool names when cancelled during ne
 
     const expected_order = [_][]const u8{
         "use all ur tools 1 by 1 - I need u to test them",
-        "Interrupted by user after completing 2 tool calls: read_file, glob_files.",
+        "Interrupted by user after completing 2 tool calls: read_file, read_tool_result.",
         "<turn_aborted>",
         "how many did u run up until now ?",
     };

@@ -1532,7 +1532,7 @@ test "small minimal tool groups surface canonical action targets" {
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
-        .{ .entry_id = 2, .tool_name = @constCast("grep_files"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
         .{ .entry_id = 3, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .outcome = null },
     };
 
@@ -2793,8 +2793,8 @@ test "visible assistant messages split groups while silent entries do not" {
         .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
         .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
         .{ .entry_id = 3, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
-        .{ .entry_id = 4, .tool_name = @constCast("glob_files"), .activity_kind = .list, .outcome = .completed },
-        .{ .entry_id = 5, .tool_name = @constCast("glob_files"), .activity_kind = .list, .outcome = .completed },
+        .{ .entry_id = 4, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+        .{ .entry_id = 5, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
         .{ .entry_id = 7, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .completed },
         .{ .entry_id = 9, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
         .{ .entry_id = 10, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
@@ -2806,8 +2806,8 @@ test "visible assistant messages split groups while silent entries do not" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 5 tool calls · 3 read · 2 list\n" ++
-            "├ read_file\n├ read_file\n├ read_file\n├ glob_files\n└ glob_files",
+        "● 5 tool calls · 5 read\n" ++
+            "├ read_file\n├ read_file\n├ read_file\n├ read_file\n└ read_file",
         projection.entry_actions.items[0].override.bytes,
     );
     for (projection.entry_actions.items[1..5]) |action| {
@@ -2999,7 +2999,7 @@ test "expanded tool title stays primary while the group summary stays secondary"
         .{ .raw_bytes = .{ .id = 1, .bytes = "Listed .", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
-        .{ .entry_id = 1, .tool_name = @constCast("glob_files"), .activity_kind = .list },
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read },
     };
 
     var projection = try buildExpandedStyledInterruptible(alloc, &entries, &details, 80, .{
@@ -3010,7 +3010,7 @@ test "expanded tool title stays primary while the group summary stays secondary"
     defer projection.deinit(alloc);
     const expanded = projection.entry_actions.items[0].override.bytes;
 
-    try std.testing.expect(std.mem.find(u8, expanded, "<secondary>1 tool call · 1 list<reset>") != null);
+    try std.testing.expect(std.mem.find(u8, expanded, "<secondary>1 tool call · 1 read<reset>") != null);
     try std.testing.expect(std.mem.find(u8, expanded, "\n└ Listed .") != null);
     try std.testing.expect(std.mem.find(u8, expanded, "\n│\n") == null);
     try std.testing.expect(std.mem.find(u8, expanded, "<secondary>└ Listed .") == null);
@@ -3022,7 +3022,7 @@ test "expanded tool relationships materialize at multiple widths" {
         .{ .raw_bytes = .{ .id = 1, .bytes = "Listed .", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
-        .{ .entry_id = 1, .tool_name = @constCast("glob_files"), .activity_kind = .list },
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read },
     };
     const style = SummaryStyle{
         .marker_style = "\x1b[38;5;81m",
@@ -3061,7 +3061,7 @@ test "expanded tool relationships materialize at multiple widths" {
         try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 2);
     }
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;81m●\x1b[0m \x1b[1;3m1 tool call · 1 list\x1b[0m\n└ Listed .",
+        "\x1b[38;5;81m●\x1b[0m \x1b[1;3m1 tool call · 1 read\x1b[0m\n└ Listed .",
         wide.entry_actions.items[0].override.bytes,
     );
 }

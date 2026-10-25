@@ -64,6 +64,10 @@ pub const Snapshot = struct {
     startup_scrollback: bool = true,
     prompt_history: bool = true,
     sound_level: []const u8 = "on",
+    /// False for a frontend that does not own the session. Only the settings
+    /// this process applies itself stay available; session controls live on
+    /// the host and are reached through their dedicated commands.
+    session_controls: bool = true,
 
     pub fn value(self: Snapshot, id: SettingId) []const u8 {
         return switch (id) {
@@ -377,7 +381,16 @@ fn staticOptionsFor(id: SettingId) []const []const u8 {
 }
 
 fn matches(snapshot: Snapshot, spec: Spec, category: Category, query: []const u8) bool {
+    if (!snapshot.session_controls and hostOwnedSetting(spec.id)) return false;
     return (category == .all or spec.category == category) and matchesQuery(snapshot, spec, query);
+}
+
+/// Settings only the engine can apply to the live conversation.
+fn hostOwnedSetting(id: SettingId) bool {
+    return switch (id) {
+        .model, .effort, .fast_mode, .ultrafast_mode, .permission_mode => true,
+        else => false,
+    };
 }
 
 fn matchesQuery(snapshot: Snapshot, spec: Spec, query: []const u8) bool {
@@ -579,4 +592,18 @@ test "status line menu describes toggle changes without performing effects" {
 
     menu.close();
     try std.testing.expect(menu.selectedChange(enabled) == null);
+}
+
+test "a frontend without session controls lists only its own settings" {
+    const controlled = Snapshot{};
+    try std.testing.expect(itemAt(controlled, .all, "", 0) != null);
+    try std.testing.expect(itemAt(controlled, .agent, "", 0) != null);
+
+    const detached = Snapshot{ .session_controls = false };
+    var index: usize = 0;
+    while (itemAt(detached, .all, "", index)) |item| : (index += 1) {
+        try std.testing.expect(!hostOwnedSetting(item.id));
+    }
+    try std.testing.expect(index > 0);
+    try std.testing.expect(itemAt(detached, .agent, "", 0) == null);
 }

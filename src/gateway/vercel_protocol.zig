@@ -2156,13 +2156,13 @@ test "gateway request validation accepts out-of-order tool results by id" {
         },
         .{
             .id = "call_2",
-            .name = "glob_files",
+            .name = "read_file",
             .arguments_json = "{\"pattern\":\"*\"}",
         },
     };
     const messages = [_]ChatMessage{
         .{ .role = .assistant, .tool_calls = calls[0..] },
-        .{ .role = .tool, .content = "second", .tool_call_id = "call_2", .tool_name = "glob_files" },
+        .{ .role = .tool, .content = "second", .tool_call_id = "call_2", .tool_name = "read_file" },
         .{ .role = .tool, .content = "first", .tool_call_id = "call_1", .tool_name = "read_file" },
     };
 
@@ -2182,7 +2182,7 @@ test "gateway request validation rejects duplicate tool result ids" {
         },
         .{
             .id = "call_2",
-            .name = "glob_files",
+            .name = "read_file",
             .arguments_json = "{\"pattern\":\"*\"}",
         },
     };
