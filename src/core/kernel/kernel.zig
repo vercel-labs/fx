@@ -1,12 +1,12 @@
 //! A session-owned CPython kernel. TUI attach/detach never changes its lifetime.
-//! One pump (`pump.zig`) drains both pipes, including between calls; command callers serialize on the gate.
-//! Waiters sleep on `Manager.changed`, which the pump and every state change broadcast.
+//! One reader thread (`reader.zig`) drains both pipes, including between calls; command callers serialize on the gate.
+//! Waiters sleep on `Manager.changed`, which the reader and every state change broadcast.
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const protocol = @import("protocol.zig");
 const bootstrap = @import("bootstrap.zig");
-const pump = @import("pump.zig");
+const reader = @import("reader.zig");
 const Allocator = std.mem.Allocator;
 const Buffer = protocol.Buffer;
 const Cancel = ?*const std.atomic.Value(bool);
@@ -25,7 +25,7 @@ pub const Status = enum { ok, failed, aborted };
 pub const Stream = enum { stdout, stderr };
 pub const StreamSink = struct {
     context: ?*anyopaque = null,
-    /// Called on the pump thread. Must be short and must not reenter the manager.
+    /// Called on the reader thread. Must be short and must not reenter the manager.
     write: *const fn (?*anyopaque, Stream, []const u8) void,
 };
 pub const Options = struct {
@@ -97,11 +97,11 @@ pub const Manager = struct {
     gate_held: bool = false,
     writer: std.Io.Mutex = .init,
     stopping: std.atomic.Value(bool) = .init(false),
-    pump_stop: std.atomic.Value(bool) = .init(false),
+    reader_stop: std.atomic.Value(bool) = .init(false),
     disposed: std.atomic.Value(bool) = .init(false),
     state: State = .idle,
     child: ?std.process.Child = null,
-    pump_thread: ?std.Thread = null,
+    reader_thread: ?std.Thread = null,
     prewarm_thread: ?std.Thread = null,
     repair_thread: ?std.Thread = null,
     repairing: std.atomic.Value(bool) = .init(false),
@@ -122,7 +122,7 @@ pub const Manager = struct {
     value: Buffer = .{},
     background: Buffer = .{},
     diagnostic: Buffer = .{},
-    /// When the pump takes a debounced background snapshot; null when nothing is pending.
+    /// When the reader takes a debounced background snapshot; null when nothing is pending.
     save_due: ?i64 = null,
     save_guard: SaveGuard = .open,
     next_restore: NextRestore = .restore,
@@ -159,7 +159,7 @@ pub const Manager = struct {
         self.state = .disposed;
         self.mutex.unlock(io_mod.getIo());
         self.unlockGate();
-        // The stopped pump can no longer schedule repairs; a queued repair observes disposed.
+        // The stopped reader can no longer schedule repairs; a queued repair observes disposed.
         if (self.repair_thread) |thread| thread.join();
         self.out.deinit(self.alloc);
         self.err.deinit(self.alloc);
@@ -326,7 +326,7 @@ pub const Manager = struct {
     pub fn restart(self: *Manager) void {
         self.stopping.store(true, .release);
         // An explicit restart must also break a cell that catches KeyboardInterrupt.
-        // Signal the unreaped PID; only the pump/cleanup owns waiting and closing pipes.
+        // Signal the unreaped PID; only the reader/cleanup owns waiting and closing pipes.
         self.writer.lockUncancelable(io_mod.getIo());
         if (self.child) |child| if (child.id) |pid| {
             std.posix.kill(pid, .KILL) catch {};
@@ -403,9 +403,9 @@ pub const Manager = struct {
             const flags = std.posix.system.fcntl(file.handle, std.posix.F.GETFL);
             if (flags < 0 or std.posix.system.fcntl(file.handle, std.posix.F.SETFL, @as(usize, @intCast(flags)) | (@as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK"))) < 0) return error.KernelPipeSetupFailed;
         }
-        if (self.persist) pump.openLog(self);
-        self.pump_stop.store(false, .release);
-        self.pump_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, pump.run, .{ self, self.child.?.stdout.?, self.child.?.stderr.? });
+        if (self.persist) reader.openLog(self);
+        self.reader_stop.store(false, .release);
+        self.reader_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, reader.run, .{ self, self.child.?.stdout.?, self.child.?.stderr.? });
         const deadline = now() + 30_000;
         self.mutex.lockUncancelable(io);
         while (self.state == .starting) {
@@ -605,15 +605,15 @@ pub const Manager = struct {
                 self.waitDone(id, 5000) catch {};
             } else |_| {}
         }
-        self.pump_stop.store(true, .release);
-        // Signal before join so an EOF wakes the pump even while the child was blocked.
+        self.reader_stop.store(true, .release);
+        // Signal before join so an EOF wakes the reader even while the child was blocked.
         self.writer.lockUncancelable(io_mod.getIo());
         if (self.child) |child| if (child.id) |pid| {
             std.posix.kill(pid, .TERM) catch {};
         };
         self.writer.unlock(io_mod.getIo());
-        if (self.pump_thread) |thread| thread.join();
-        self.pump_thread = null;
+        if (self.reader_thread) |thread| thread.join();
+        self.reader_thread = null;
         self.writer.lockUncancelable(io_mod.getIo());
         if (self.child) |*child| child.kill(io_mod.getIo());
         self.child = null;
@@ -631,12 +631,12 @@ pub const Manager = struct {
         self.notify();
     }
 
-    /// The pump's debounced save uses this too.
+    /// The reader's debounced save uses this too.
     pub fn sendSnapshot(self: *Manager, id: u64) !void {
         try self.send(.{ .snapshot = .{ .id = id, .path = self.snapshot_path } }, null, 1000);
     }
 
-    /// Only the pump schedules a repair, after it has reaped the damaged child. A replacement
+    /// Only the reader schedules a repair, after it has reaped the damaged child. A replacement
     /// corrupting during its own startup is discarded, not put into an automatic respawn loop.
     pub fn scheduleRepair(self: *Manager) void {
         if (self.disposed.load(.acquire) or self.stopping.load(.acquire)) return;
@@ -796,5 +796,5 @@ test "kernel live cells persist globals across stop, restart and interrupt" {
 
 test {
     _ = protocol;
-    _ = pump;
+    _ = reader;
 }

@@ -42,7 +42,7 @@ pub const Request = union(enum) {
     }
 };
 
-/// One runtime-to-host frame. Unknown event names fail parsing, so the pump replaces the kernel.
+/// One runtime-to-host frame. Unknown event names fail parsing, so the reader replaces the kernel.
 pub const Event = struct {
     event: Kind,
     id: ?[]const u8 = null,

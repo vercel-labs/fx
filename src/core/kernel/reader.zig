@@ -1,4 +1,4 @@
-//! The kernel's event pump: the one thread that drains the Python process's
+//! The kernel's output reader: the one thread that drains the Python process's
 //! stdout and stderr between and during calls. It turns protocol frames into
 //! request progress on the `Manager`, takes debounced background snapshots,
 //! and keeps the bounded stderr log. Lifecycle (start, stop, repair) and the
@@ -14,7 +14,7 @@ const diagnostic_cap = kernel.diagnostic_cap;
 const background_cap = kernel.background_cap;
 const max_log_bytes = 5 * 1024 * 1024;
 
-/// Runs until `pump_stop` is set or the process's stdout closes.
+/// Runs until `reader_stop` is set or the process's stdout closes.
 pub fn run(self: *Manager, stdout: std.Io.File, stderr: std.Io.File) void {
     var repair_after_exit = false;
     defer if (repair_after_exit) self.scheduleRepair();
@@ -29,7 +29,7 @@ pub fn run(self: *Manager, stdout: std.Io.File, stderr: std.Io.File) void {
     defer pending.deinit(self.alloc);
     var buffer: [64 * 1024]u8 = undefined;
     var stderr_open = true;
-    while (!self.pump_stop.load(.acquire)) {
+    while (!self.reader_stop.load(.acquire)) {
         self.mutex.lockUncancelable(io_mod.getIo());
         const idle_unclaimed = self.active == .none and !self.caller_waiting and self.save_guard == .open;
         const wake_at = if (self.active == .snapshot and !self.caller_waiting)
@@ -59,7 +59,7 @@ pub fn run(self: *Manager, stdout: std.Io.File, stderr: std.Io.File) void {
                     stderr_open = false;
                     continue;
                 }
-                if (!self.pump_stop.load(.acquire)) self.fail("Python kernel exited; the next call will start a replacement.");
+                if (!self.reader_stop.load(.acquire)) self.fail("Python kernel exited; the next call will start a replacement.");
                 return;
             }
             if (rc < 0) continue;
