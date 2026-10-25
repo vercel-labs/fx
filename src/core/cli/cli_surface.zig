@@ -63,6 +63,7 @@ const TopLevelKind = command_specs.TopLevelKind;
 
 pub const Command = union(enum) {
     daemon: []const [:0]const u8,
+    daemon_serve,
     interactive,
     help,
     ask: []const [:0]const u8,
@@ -242,6 +243,9 @@ pub const Config = struct {
         mcp_health.inspectLocalConfigUnavailable,
     load_mcp_host: ?mcp_host.LoadFn = null,
     acp_runner: acp_runner.Runner,
+    /// Runs the detached supervisor, which hosts ACP engines with the same
+    /// configuration `acp` gets.
+    supervisor_runner: acp_runner.Runner = acp_runner.unavailable,
 };
 
 const LocalSurfaceOptions = struct {
@@ -558,6 +562,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
     switch (command[0]) {
         '-', 'h' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .help)) return .help;
+            if (args.len == 1 and command_specs.matchesTopLevel(command_catalog, command, .daemon_serve)) return .daemon_serve;
             if (command_specs.matchesTopLevel(command_catalog, command, .@"resume") or
                 std.mem.startsWith(u8, command, resume_id_alias_prefix))
             {
@@ -1114,35 +1119,7 @@ fn runNonInteractiveWithDeps(
                 try writeStderr(deps, "usage: proto-fx acp [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]\n");
                 return .handled_failure;
             };
-            try cfg.acp_runner.run(alloc, .{
-                .auth_mode = cfg.auth_mode,
-                .default_model = cfg.default_model,
-                .default_agent_step_limit = cfg.default_agent_step_limit,
-                .gateway_retry_count = cfg.gateway_retry_count,
-                .gateway_chat_url = cfg.gateway_provider.chat_url.resolve(cfg.gateway_chat_url),
-                .gateway_models_path = cfg.models_path,
-                .gateway_provider = cfg.gateway_provider,
-                .provider_set = cfg.provider_set,
-                .process_provider = cfg.process_provider,
-                .secret_store = cfg.secret_store,
-                .prompt_policy = cfg.prompt_policy,
-                .ignored_list_entries = cfg.ignored_list_entries,
-                .max_list_entries = cfg.max_list_entries,
-                .max_read_file_bytes = cfg.max_read_file_bytes,
-                .max_read_file_lines = cfg.max_read_file_lines,
-                .max_read_file_line_len = cfg.max_read_file_line_len,
-                .max_command_output_bytes = cfg.max_command_output_bytes,
-                .max_tool_result_bytes = cfg.max_tool_result_bytes,
-                .max_history_turns = cfg.max_history_turns,
-                .context_registry = cfg.context_registry,
-                .mode_registry = cfg.mode_registry,
-                .context_limit_overrides = global_args.modifiers.context_limit_overrides,
-                .additional_directories = global_args.modifiers.additional_directories,
-                .saved_directories_suppressed = global_args.modifiers.saved_directories_suppressed,
-                .model_override = acp_opts.model,
-                .ultrafast_override = acp_opts.ultrafast_override orelse global_args.modifiers.ultrafast_override,
-                .log_file = acp_opts.log_file,
-            });
+            try cfg.acp_runner.run(alloc, acpRunnerConfig(cfg, global_args.modifiers, acp_opts));
             return .handled_success;
         },
         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
@@ -1301,26 +1278,9 @@ fn runNonInteractiveWithDeps(
             else
                 .handled_failure;
         },
-        .daemon => |rest| {
-            if (rest.len > 1 or (rest.len == 1 and !std.mem.eql(u8, rest[0], "status") and !std.mem.eql(u8, rest[0], "stop"))) {
-                try writeStderr(deps, "usage: proto-fx daemon [status|stop]\n");
-                return .handled_failure;
-            }
-            var client = try @import("../supervisor/client.zig").Client.init(alloc);
-            defer client.deinit();
-            const stop = rest.len == 1 and std.mem.eql(u8, rest[0], "stop");
-            var response = client.request(alloc, .{ .command = if (stop) "shutdown" else "list" }) catch |err| {
-                const message = try alloc.print("proto-fx daemon: {s} (no answering supervisor)\n", .{@errorName(err)});
-                defer alloc.free(message);
-                try writeStderr(deps, message);
-                return .handled_failure;
-            };
-            defer response.deinit();
-            var out: std.Io.Writer.Allocating = .init(alloc);
-            defer out.deinit();
-            try std.json.Stringify.value(response.value, .{ .whitespace = .indent_2 }, &out.writer);
-            try writeStdout(deps, out.written());
-            try writeStdout(deps, "\n");
+        .daemon => |rest| return runDaemonCommand(alloc, cfg, rest, deps),
+        .daemon_serve => {
+            try cfg.supervisor_runner.run(alloc, acpRunnerConfig(cfg, global_args.modifiers, .{}));
             return .handled_success;
         },
         .setup => |rest| {
@@ -3055,6 +3015,86 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
         error.ConflictingProviderStrictFlags => "--provider-strict and --no-provider-strict cannot be used together",
         else => null,
     };
+}
+
+/// The engine configuration `acp` runs with. The detached supervisor builds
+/// each session's host from the same one, so both resolve the endpoint, auth
+/// mode, and launch modifiers alike.
+fn acpRunnerConfig(cfg: Config, modifiers: LaunchModifiers, opts: AcpOptions) acp_runner.Config {
+    return .{
+        .auth_mode = cfg.auth_mode,
+        .default_model = cfg.default_model,
+        .default_agent_step_limit = cfg.default_agent_step_limit,
+        .gateway_retry_count = cfg.gateway_retry_count,
+        .gateway_chat_url = cfg.gateway_provider.chat_url.resolve(cfg.gateway_chat_url),
+        .gateway_models_path = cfg.models_path,
+        .gateway_provider = cfg.gateway_provider,
+        .provider_set = cfg.provider_set,
+        .process_provider = cfg.process_provider,
+        .secret_store = cfg.secret_store,
+        .prompt_policy = cfg.prompt_policy,
+        .ignored_list_entries = cfg.ignored_list_entries,
+        .max_list_entries = cfg.max_list_entries,
+        .max_read_file_bytes = cfg.max_read_file_bytes,
+        .max_read_file_lines = cfg.max_read_file_lines,
+        .max_read_file_line_len = cfg.max_read_file_line_len,
+        .max_command_output_bytes = cfg.max_command_output_bytes,
+        .max_tool_result_bytes = cfg.max_tool_result_bytes,
+        .max_history_turns = cfg.max_history_turns,
+        .context_registry = cfg.context_registry,
+        .mode_registry = cfg.mode_registry,
+        .context_limit_overrides = modifiers.context_limit_overrides,
+        .additional_directories = modifiers.additional_directories,
+        .saved_directories_suppressed = modifiers.saved_directories_suppressed,
+        .model_override = opts.model,
+        .ultrafast_override = opts.ultrafast_override orelse modifiers.ultrafast_override,
+        .log_file = opts.log_file,
+    };
+}
+
+/// `daemon [status|stop] [--json]`, rendered from one snapshot.
+fn runDaemonCommand(alloc: Allocator, cfg: Config, rest: []const [:0]const u8, deps: RunDeps) !RunResult {
+    var action: output_contracts.DaemonSnapshot.Action = .status;
+    var format: output_contracts.OutputFormat = .text;
+    var action_seen = false;
+    for (rest) |arg| {
+        if (std.mem.eql(u8, arg, "--json") and format == .text) {
+            format = .json;
+        } else if (!action_seen and (std.mem.eql(u8, arg, "status") or std.mem.eql(u8, arg, "stop"))) {
+            action_seen = true;
+            action = if (std.mem.eql(u8, arg, "stop")) .stop else .status;
+        } else {
+            try writeTopLevelUsage(cfg.command_catalog, deps, .daemon);
+            return .handled_failure;
+        }
+    }
+    const supervisor_client = @import("../supervisor/client.zig");
+    const supervisor_protocol = @import("../supervisor/protocol.zig");
+    var client = try supervisor_client.Client.init(alloc);
+    defer client.deinit();
+    var response = client.request(alloc, if (action == .stop) .shutdown else .list) catch |err| {
+        const message = try alloc.print("proto-fx daemon: {s} (no answering supervisor)\n", .{@errorName(err)});
+        defer alloc.free(message);
+        try writeStderr(deps, message);
+        return .handled_failure;
+    };
+    defer response.deinit();
+    var listed = try std.json.parseFromValue(supervisor_protocol.SessionList, alloc, response.value, .{ .ignore_unknown_fields = true });
+    defer listed.deinit();
+    if (!listed.value.ok) {
+        try writeStderr(deps, "proto-fx daemon: the supervisor refused the request\n");
+        return .handled_failure;
+    }
+    const snapshot: output_contracts.DaemonSnapshot = .{
+        .action = action,
+        .sessions = listed.value.sessions,
+        .last_attached_id = listed.value.last_attached_id,
+    };
+    const rendered = try snapshot.render(alloc, format);
+    defer alloc.free(rendered);
+    try writeStdout(deps, rendered);
+    if (format == .json) try writeStdout(deps, "\n");
+    return .handled_success;
 }
 
 fn parseAcpArgs(args: []const [:0]const u8) !AcpOptions {

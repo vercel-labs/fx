@@ -8,6 +8,8 @@ const Allocator = std.mem.Allocator;
 
 pub const TopLevelKind = enum {
     daemon,
+    /// The detached supervisor itself, which proto-fx starts on demand.
+    daemon_serve,
     help,
     ask,
     acp,

@@ -22,6 +22,7 @@ const app_host_config_runtime = @import("core/app/app_host_config_runtime.zig");
 const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
 const acp_runner = @import("core/cli/acp_runner.zig");
 const acp_server = @import("acp/server.zig");
+const supervisor_client = @import("core/supervisor/client.zig");
 const app_input_runtime = @import("core/app/app_input_runtime.zig");
 const input_full_transcript_runtime = @import("core/app/input_full_transcript_runtime.zig");
 const input_submit_runtime = @import("core/app/input_submit_runtime.zig");
@@ -3297,14 +3298,6 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
 
     var cli_arg_buf: [64][:0]const u8 = undefined;
     const cli_args = if (raw_args.len <= 1) &.{} else try cliArgsFromRaw(raw_args, &cli_arg_buf);
-    if (cli_args.len == 1 and std.mem.eql(u8, cli_args[0], "--proto-daemon")) {
-        io_mod.setRawEnviron(raw_env);
-        var threaded = std.Io.Threaded.init(processAllocator(), processIoOptions(argsFromRaw(raw_args), environBlockFromRaw(raw_env)));
-        defer threaded.deinit();
-        io_mod.setIo(threaded.io());
-        try @import("core/supervisor/server.zig").run(processAllocator(), daemonConfig());
-        return;
-    }
     if (command_runner.isForegroundSessionInvocation(cli_args)) {
         io_mod.setRawEnviron(raw_env);
         const process_args = argsFromRaw(raw_args);
@@ -3560,6 +3553,7 @@ fn needsFullEntryConfig(args: []const [:0]const u8) bool {
     const command = cli_surface.commandAfterGlobalLaunchArgs(args) orelse return false;
     return std.mem.eql(u8, command, "ask") or
         std.mem.eql(u8, command, "acp") or
+        std.mem.eql(u8, command, supervisor_client.daemon_argument) or
         std.mem.eql(u8, command, "pr") or
         std.mem.eql(u8, command, "issue");
 }
@@ -3597,6 +3591,12 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
         std.mem.eql(u8, command, "credits") or
         // Reads AI Gateway usage reports over HTTP with a deadline.
         std.mem.eql(u8, command, "usage");
+}
+
+test "the supervisor runs as a hidden command with the full entry config" {
+    const args = &.{@as([:0]const u8, supervisor_client.daemon_argument)};
+    try std.testing.expect(needsFullEntryConfig(args));
+    try std.testing.expect(cli_surface.parse(builtin_commands.top_level_registry, args) == .daemon_serve);
 }
 
 test "auth and upgrade commands use early threaded io without full entry config" {
@@ -3846,32 +3846,6 @@ test "native app preserves the built-in tool set without workspace metadata" {
     try std.testing.expectEqual(builtin_tools.advertisement_set.order.len, advertised.order.len);
 }
 
-fn daemonConfig() acp_runner.Config {
-    const cfg = fullEntryConfig(.local);
-    return .{
-        .default_model = cfg.default_model,
-        .default_agent_step_limit = cfg.default_agent_step_limit,
-        .gateway_retry_count = cfg.gateway_retry_count,
-        .gateway_chat_url = cfg.gateway_chat_url,
-        .gateway_models_path = cfg.models_path,
-        .gateway_provider = cfg.gateway_provider,
-        .provider_set = cfg.provider_set,
-        .process_provider = cfg.process_provider,
-        .secret_store = cfg.secret_store,
-        .prompt_policy = cfg.prompt_policy,
-        .ignored_list_entries = cfg.ignored_list_entries,
-        .max_list_entries = cfg.max_list_entries,
-        .max_read_file_bytes = cfg.max_read_file_bytes,
-        .max_read_file_lines = cfg.max_read_file_lines,
-        .max_read_file_line_len = cfg.max_read_file_line_len,
-        .max_command_output_bytes = cfg.max_command_output_bytes,
-        .max_tool_result_bytes = cfg.max_tool_result_bytes,
-        .max_history_turns = cfg.max_history_turns,
-        .context_registry = cfg.context_registry,
-        .mode_registry = cfg.mode_registry,
-    };
-}
-
 fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
@@ -3906,6 +3880,7 @@ fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_host = builtin_mcp.loadHost,
         .acp_runner = .{ .run_fn = runAcpServer },
+        .supervisor_runner = .{ .run_fn = runSupervisor },
     };
 }
 
@@ -3943,6 +3918,7 @@ fn localEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_host = builtin_mcp.loadHost,
         .acp_runner = .{ .run_fn = runAcpServer },
+        .supervisor_runner = .{ .run_fn = runSupervisor },
     };
 }
 
@@ -3980,11 +3956,16 @@ fn emptyEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_host = builtin_mcp.loadHost,
         .acp_runner = .{ .run_fn = runAcpServer },
+        .supervisor_runner = .{ .run_fn = runSupervisor },
     };
 }
 
 fn runAcpServer(_: ?*anyopaque, alloc: Allocator, cfg: acp_runner.Config) anyerror!void {
     return acp_server.run(alloc, cfg);
+}
+
+fn runSupervisor(_: ?*anyopaque, alloc: Allocator, cfg: acp_runner.Config) anyerror!void {
+    return @import("core/supervisor/server.zig").run(alloc, cfg);
 }
 
 fn handleSigWinchNative(_: std.posix.SIG) callconv(.c) void {
@@ -4777,6 +4758,12 @@ test {
     _ = @import("ui/render_request.zig");
     _ = @import("core/app/app_runtime_setup.zig");
     _ = @import("core/app/app_session_runtime.zig");
+    _ = @import("core/app/app_remote_runtime.zig");
+    _ = @import("core/supervisor/protocol.zig");
+    _ = @import("core/supervisor/record.zig");
+    _ = @import("core/supervisor/session.zig");
+    _ = @import("core/supervisor/server.zig");
+    _ = @import("acp/server.zig");
     _ = @import("core/app/app_upgrade_runtime.zig");
     _ = @import("core/app/app_worker_runtime.zig");
     _ = @import("ui/event_loop.zig");

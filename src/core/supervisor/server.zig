@@ -1,678 +1,260 @@
-//! Same-executable detached session owner. Existing ACP hosts run the native fx engine.
+//! Same-executable detached session owner. Existing ACP hosts run the native
+//! fx engine, each on its session's executor thread (`session.zig`).
+//!
+//! The accept loop answers supervisor-wide requests itself and hands every
+//! session request, with its connection, to that session's executor, so a
+//! slow open or command in one session never stalls another. The registry
+//! (`sessions`, `last_attached_id`) and the state file change only under
+//! `registry_mutex`; a session's own record changes only through `commit`,
+//! which saves it first.
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
-const acp = @import("../../acp/server.zig");
 const acp_config = @import("../cli/acp_runner.zig");
-const jsonrpc = @import("../../acp/jsonrpc.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const session_store = @import("../session/session_store.zig");
-const session_layout = @import("../session/session_layout.zig");
-const profile_paths = @import("../shared/profile_paths.zig");
-const child_state = @import("../subagent/child_state.zig");
-const live_presentation = @import("../subagent/live_presentation.zig");
-const types = @import("../shared/types.zig");
+const protocol = @import("protocol.zig");
 const client = @import("client.zig");
+const session_mod = @import("session.zig");
+const Session = session_mod.Session;
+const Record = session_mod.Record;
 const Allocator = std.mem.Allocator;
 extern "c" fn setsid() c_int;
 
 const max_sessions = 128;
-const event_bytes_limit = 2 * 1024 * 1024;
-const Event = struct { sequence: u64, frame: []u8 };
-const Heartbeat = struct {
-    prompt: []const u8 = "",
-    interval_ms: u64 = 0,
-    next_run_ms: i64 = 0,
-    paused: bool = true,
-    run_count: u64 = 0,
+/// How long `list` reuses the store's saved-session index. The browser
+/// polls every 750 ms; a commit invalidates the index at once.
+const saved_index_ttl_ms = 2_000;
+
+/// The state file, `sessions.json`.
+const SavedState = struct {
+    version: u32 = 1,
+    sessions: []const SavedRow = &.{},
+    last_attached_id: ?[]const u8 = null,
 };
 
-const Session = struct {
-    daemon: *Daemon,
-    id: []u8 = &.{},
-    name: []u8,
-    cwd: []u8,
-    host: ?*acp.PersistentHost = null,
+const SavedRow = struct {
+    id: []const u8,
+    name: []const u8 = "session",
+    cwd: []const u8,
     stopped: bool = false,
+    heartbeat: protocol.Heartbeat = .{},
     updated_at_ms: i64 = 0,
-    failure: ?[]u8 = null,
-    heartbeat: Heartbeat = .{},
-    next_request: i64 = 10,
-    events_mutex: std.Io.Mutex = .init,
-    events: std.ArrayList(Event) = .empty,
-    pending: std.ArrayList([]u8) = .empty,
-    event_bytes: usize = 0,
-    sequence: u64 = 0,
-    history_json: ?[]u8 = null,
-    history_sequence: u64 = 0,
-    history_dirty: bool = true,
-    heartbeat_request: ?i64 = null,
-    /// The frontend's session command currently running on its own thread.
-    /// One at a time keeps compaction, undo, and file mutations from overlapping.
-    host_command_active: std.atomic.Value(bool) = .init(false),
-    host_command_tasks: std.ArrayList(*HostCommandTask) = .empty,
+    owned: bool = true,
 
-    fn publish(raw: ?*anyopaque, frame: []const u8) !void {
-        const self: *Session = @ptrCast(@alignCast(raw.?));
-        const alloc = self.daemon.alloc;
-        const bounded = if (frame.len > event_bytes_limit)
-            "{\"method\":\"proto/replay_gap\",\"params\":{\"reason\":\"large event is available in saved history\"}}"
-        else
-            std.mem.trim(u8, frame, "\r\n");
-        const copy = try alloc.dupe(u8, bounded);
-        errdefer alloc.free(copy);
-        self.events_mutex.lockUncancelable(io_mod.getIo());
-        defer self.events_mutex.unlock(io_mod.getIo());
-        self.sequence += 1;
-        // Keep requests independently of the replay window: detached approvals survive.
-        var parsed = std.json.parseFromSlice(std.json.Value, alloc, copy, .{}) catch null;
-        defer if (parsed) |*value| value.deinit();
-        if (parsed) |value| {
-            if (stringField(value.value, "method")) |method| {
-                if (std.mem.eql(u8, method, "proto/permission_retired")) {
-                    if (objectField(value.value, "params")) |params| if (objectField(params, "request_id")) |id| {
-                        var index: usize = 0;
-                        while (index < self.pending.items.len) {
-                            const old = std.json.parseFromSlice(std.json.Value, alloc, self.pending.items[index], .{}) catch {
-                                index += 1;
-                                continue;
-                            };
-                            defer old.deinit();
-                            const old_id = objectField(old.value, "id");
-                            if (id == .integer and old_id != null and old_id.? == .integer and old_id.?.integer == id.integer) {
-                                alloc.free(self.pending.orderedRemove(index));
-                                break;
-                            }
-                            index += 1;
-                        }
-                    };
-                }
-            }
-            if (value.value == .object and !value.value.object.contains("method")) {
-                if (value.value.object.get("id")) |id| {
-                    if (id == .integer and self.heartbeat_request == id.integer) self.heartbeat_request = null;
-                }
-            }
-            if (value.value == .object and value.value.object.contains("method") and value.value.object.contains("id")) {
-                if (self.pending.items.len < 64) {
-                    const pending = try alloc.dupe(u8, copy);
-                    errdefer alloc.free(pending);
-                    try self.pending.append(alloc, pending);
-                }
-            }
-        }
-        while (self.events.items.len > 0 and self.event_bytes + copy.len > event_bytes_limit) {
-            const oldest = self.events.orderedRemove(0);
-            self.event_bytes -= oldest.frame.len;
-            alloc.free(oldest.frame);
-        }
-        try self.events.append(alloc, .{ .sequence = self.sequence, .frame = copy });
-        self.event_bytes += copy.len;
-    }
-
-    fn dispatch(self: *Session, method: []const u8, params: anytype) !i64 {
-        const host = self.host orelse return error.SessionStopped;
-        const id = self.next_request;
-        self.next_request += 1;
-        var out: std.Io.Writer.Allocating = .init(self.daemon.alloc);
-        defer out.deinit();
-        try std.json.Stringify.value(.{ .jsonrpc = "2.0", .id = id, .method = method, .params = params }, .{}, &out.writer);
-        try host.dispatchFrame(out.written());
-        return id;
-    }
-
-    /// Sends one host request whose params the caller already serialized.
-    fn dispatchRaw(self: *Session, method: []const u8, params_json: []const u8) !i64 {
-        const host = self.host orelse return error.SessionStopped;
-        const id = self.next_request;
-        self.next_request += 1;
-        var out: std.Io.Writer.Allocating = .init(self.daemon.alloc);
-        defer out.deinit();
-        try out.writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
-        try std.json.Stringify.value(id, .{}, &out.writer);
-        try out.writer.writeAll(",\"method\":");
-        try std.json.Stringify.value(method, .{}, &out.writer);
-        try out.writer.writeAll(",\"params\":");
-        try out.writer.writeAll(params_json);
-        try out.writer.writeByte('}');
-        try host.dispatchFrame(out.written());
-        return id;
-    }
-
-    fn open(self: *Session, resume_id: ?[]const u8) !void {
-        var cfg = self.daemon.cfg;
-        cfg.home_override = self.daemon.home;
-        cfg.workspace_root_override = self.cwd;
-        const host = try acp.PersistentHost.init(self.daemon.alloc, cfg, self, publish);
-        errdefer host.deinit();
-        host.state.native_presentation = true;
-        self.host = host;
-        errdefer self.host = null;
-        _ = try self.dispatch("initialize", .{
-            .protocolVersion = 1,
-            .clientCapabilities = .{},
-            .clientInfo = .{ .name = "proto-fx", .version = "phase1" },
-        });
-        if (!host.state.initialized) {
-            self.logOpenFailure();
-            return error.SessionInitializationFailed;
-        }
-        // The host already appends this workspace's project servers. The
-        // profile's own servers are opt-in per session, and a detached session
-        // should behave like the local TUI, so ask for them explicitly.
-        if (resume_id) |id| {
-            _ = try self.dispatch("session/load", .{
-                .sessionId = id,
-                .cwd = self.cwd,
-                .mcpServers = [_]struct {}{},
-                ._meta = .{ .fx = .{ .profileMcpServers = true } },
-            });
-        } else {
-            _ = try self.dispatch("session/new", .{
-                .cwd = self.cwd,
-                .mcpServers = [_]struct {}{},
-                ._meta = .{ .fx = .{ .profileMcpServers = true } },
-            });
-        }
-        const active = host.state.active_session orelse {
-            self.logOpenFailure();
-            return error.SessionOpenFailed;
+    fn of(id: []const u8, cwd: []const u8, record: *const Record) SavedRow {
+        return .{
+            .id = id,
+            .name = record.name,
+            .cwd = cwd,
+            .stopped = record.stopped,
+            .heartbeat = record.heartbeat,
+            .updated_at_ms = record.updated_at_ms,
+            .owned = record.reopens(),
         };
-        if (self.id.len == 0) self.id = try self.daemon.alloc.dupe(u8, active.session_id);
-        self.stopped = false;
-        if (self.failure) |failure| self.daemon.alloc.free(failure);
-        self.failure = null;
-        self.history_dirty = true;
-        try self.refreshHistory();
-    }
-
-    /// Whether the active ACP session has a log on disk. A session created by
-    /// `session/new` stays in memory until its first prompt unless a heartbeat
-    /// needs it to survive a daemon restart.
-    fn saved(self: *const Session) bool {
-        const host = self.host orelse return false;
-        const active = host.state.active_session orelse return false;
-        const v2 = active.v2 orelse return false;
-        return v2.saved();
-    }
-
-    /// Whether the browser should list this session. A live session appears
-    /// once its first turn is on disk; an inactive one appears only while its
-    /// folder still exists, so deleted sessions leave the browser.
-    fn listable(self: *Session) bool {
-        if (self.host != null) return self.saved();
-        if (self.id.len == 0) return false;
-        const path = std.Io.Dir.path.join(self.daemon.alloc, &.{
-            self.daemon.home,
-            profile_paths.root_dir_name,
-            profile_paths.sessions_dir_name,
-            session_layout.sessions_v2_dir,
-            self.id,
-        }) catch return true;
-        defer self.daemon.alloc.free(path);
-        var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), path, .{}) catch return false;
-        dir.close(io_mod.getIo());
-        return true;
-    }
-
-    fn logOpenFailure(self: *Session) void {
-        for (self.events.items) |event| {
-            const parsed = std.json.parseFromSlice(std.json.Value, self.daemon.alloc, event.frame, .{}) catch continue;
-            defer parsed.deinit();
-            if (objectField(parsed.value, "error")) |failure| {
-                std.debug.print("proto-fx: session startup: {s}\n", .{stringField(failure, "message") orelse "unknown ACP error"});
-            }
-        }
-    }
-
-    fn prompt(self: *Session, text: []const u8) !i64 {
-        if (text.len == 0 or text.len > 1024 * 1024) return error.InvalidPrompt;
-        // A frontend command owns the session while it runs. Turns and
-        // commands never overlap, so neither can read half-published history.
-        if (self.host_command_active.load(.acquire)) return error.SessionBusy;
-        try self.refreshHistory();
-        if (std.mem.eql(u8, self.name, "session")) {
-            const line = std.mem.trim(u8, text[0 .. std.mem.findScalar(u8, text, '\n') orelse text.len], " \t\r");
-            var end = @min(line.len, 96);
-            while (end > 0 and end < line.len and line[end] & 0xc0 == 0x80) end -= 1;
-            if (end > 0) {
-                const name = try self.daemon.alloc.dupe(u8, line[0..end]);
-                self.daemon.alloc.free(self.name);
-                self.name = name;
-                try self.daemon.persist();
-            }
-        }
-        self.updated_at_ms = io_mod.milliTimestamp();
-        self.history_dirty = true;
-        const blocks = [_]struct { type: []const u8, text: []const u8 }{.{ .type = "text", .text = text }};
-        return self.dispatch("session/prompt", .{ .sessionId = self.id, .prompt = &blocks, ._meta = .{ .fx = .{ .steer = true } } });
-    }
-
-    // Serialize completed history only when the worker has been joined. During a
-    // turn this is the immutable pre-turn checkpoint; events supply its live tail.
-    fn refreshHistory(self: *Session) !void {
-        const host = self.host orelse return;
-        if (host.busy() or !self.history_dirty) return;
-        var arena = std.heap.ArenaAllocator.init(self.daemon.alloc);
-        defer arena.deinit();
-        const history = try host.state.active_session.?.session_rt.snapshotHistory(arena.allocator());
-        var out: std.Io.Writer.Allocating = .init(self.daemon.alloc);
-        defer out.deinit();
-        try std.json.Stringify.value(history, .{}, &out.writer);
-        const owned = try self.daemon.alloc.dupe(u8, out.written());
-        if (self.history_json) |old| self.daemon.alloc.free(old);
-        self.history_json = owned;
-        self.history_sequence = self.sequence;
-        self.history_dirty = false;
-    }
-
-    fn clearPending(self: *Session) void {
-        self.events_mutex.lockUncancelable(io_mod.getIo());
-        defer self.events_mutex.unlock(io_mod.getIo());
-        for (self.pending.items) |frame| self.daemon.alloc.free(frame);
-        self.pending.clearRetainingCapacity();
-        self.heartbeat_request = null;
-    }
-
-    fn withdrawHeartbeat(self: *Session) void {
-        const host = self.host orelse return;
-        self.events_mutex.lockUncancelable(io_mod.getIo());
-        const request = self.heartbeat_request;
-        self.events_mutex.unlock(io_mod.getIo());
-        const id = request orelse return;
-        if (host.withdrawSteeringRequest(id)) {
-            self.events_mutex.lockUncancelable(io_mod.getIo());
-            if (self.heartbeat_request == id) self.heartbeat_request = null;
-            self.events_mutex.unlock(io_mod.getIo());
-        }
-    }
-
-    fn nativeCommand(self: *Session, method: []const u8, params: anytype, w: *std.Io.Writer) !void {
-        const payload = try self.nativeResult(method, params);
-        defer self.daemon.alloc.free(payload);
-        try w.writeAll(payload);
-    }
-
-    /// Runs a native host command and returns its response as an owned
-    /// `{"ok":...}` object. Caller owns the slice.
-    fn nativeResult(self: *Session, method: []const u8, params: anytype) ![]u8 {
-        return self.awaitNative(try self.dispatch(method, params));
-    }
-
-    fn nativeResultRaw(self: *Session, method: []const u8, params_json: []const u8) ![]u8 {
-        return self.awaitNative(try self.dispatchRaw(method, params_json));
-    }
-
-    fn awaitNative(self: *Session, request: i64) ![]u8 {
-        self.events_mutex.lockUncancelable(io_mod.getIo());
-        defer self.events_mutex.unlock(io_mod.getIo());
-        for (self.events.items) |event| {
-            const parsed = std.json.parseFromSlice(std.json.Value, self.daemon.alloc, event.frame, .{}) catch continue;
-            defer parsed.deinit();
-            const id = objectField(parsed.value, "id") orelse continue;
-            if (id != .integer or id.integer != request) continue;
-            var out: std.Io.Writer.Allocating = .init(self.daemon.alloc);
-            errdefer out.deinit();
-            if (objectField(parsed.value, "error")) |failure| {
-                try std.json.Stringify.value(.{ .ok = false, .@"error" = stringField(failure, "message") orelse "NativeCommandFailed" }, .{}, &out.writer);
-            } else if (objectField(parsed.value, "result")) |result| {
-                try out.writer.writeAll("{\"ok\":true,\"result\":");
-                try std.json.Stringify.value(result, .{}, &out.writer);
-                try out.writer.writeByte('}');
-            } else {
-                return error.NativeCommandIncomplete;
-            }
-            return try out.toOwnedSlice();
-        }
-        return error.NativeCommandIncomplete;
-    }
-
-    /// Starts one frontend session command. It runs on its own thread so a
-    /// slow compaction never blocks the daemon's request loop, and its result
-    /// reaches the frontend through the session's event stream.
-    fn enqueueHostCommand(self: *Session, name: []const u8, action: ?[]const u8, path: ?[]const u8, line: ?[]const u8) !void {
-        if (self.host_command_active.swap(true, .acq_rel)) return error.CommandInFlight;
-        errdefer self.host_command_active.store(false, .release);
-        self.pruneHostCommandTasks();
-        const alloc = self.daemon.alloc;
-        const task = try alloc.create(HostCommandTask);
-        errdefer alloc.destroy(task);
-        const owned_action = if (action) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (owned_action) |value| alloc.free(value);
-        const owned_path = if (path) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (owned_path) |value| alloc.free(value);
-        const owned_line = if (line) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (owned_line) |value| alloc.free(value);
-        task.* = .{
-            .alloc = alloc,
-            .session = self,
-            .name = try alloc.dupe(u8, name),
-            .action = owned_action,
-            .path = owned_path,
-            .line = owned_line,
-        };
-        errdefer alloc.free(task.name);
-        try self.host_command_tasks.append(alloc, task);
-        errdefer _ = self.host_command_tasks.pop();
-        task.thread = try std.Thread.spawn(.{}, runHostCommand, .{task});
-    }
-
-    /// Reclaims tasks that finished since the last command.
-    fn pruneHostCommandTasks(self: *Session) void {
-        const alloc = self.daemon.alloc;
-        var index: usize = 0;
-        while (index < self.host_command_tasks.items.len) {
-            const task = self.host_command_tasks.items[index];
-            if (!task.done.load(.acquire)) {
-                index += 1;
-                continue;
-            }
-            if (task.thread) |thread| thread.join();
-            alloc.free(task.name);
-            if (task.action) |value| alloc.free(value);
-            if (task.path) |value| alloc.free(value);
-            if (task.line) |value| alloc.free(value);
-            alloc.destroy(task);
-            _ = self.host_command_tasks.orderedRemove(index);
-        }
-    }
-
-    fn publishHostCommand(self: *Session, name: []const u8, action: ?[]const u8, path: ?[]const u8, line: ?[]const u8) void {
-        const alloc = self.daemon.alloc;
-        var params: std.Io.Writer.Allocating = .init(alloc);
-        defer params.deinit();
-        params.writer.writeAll("{\"sessionId\":") catch return;
-        std.json.Stringify.value(self.id, .{}, &params.writer) catch return;
-        params.writer.writeAll(",\"command\":") catch return;
-        std.json.Stringify.value(name, .{}, &params.writer) catch return;
-        if (action) |value| {
-            params.writer.writeAll(",\"action\":") catch return;
-            std.json.Stringify.value(value, .{}, &params.writer) catch return;
-        }
-        if (path) |value| {
-            params.writer.writeAll(",\"path\":") catch return;
-            std.json.Stringify.value(value, .{}, &params.writer) catch return;
-        }
-        if (line) |value| {
-            params.writer.writeAll(",\"line\":") catch return;
-            std.json.Stringify.value(value, .{}, &params.writer) catch return;
-        }
-        params.writer.writeByte('}') catch return;
-        const payload = self.nativeResultRaw("fx/command", params.writer.buffered()) catch |err| blk: {
-            var failure: std.Io.Writer.Allocating = .init(alloc);
-            std.json.Stringify.value(.{ .ok = false, .@"error" = @errorName(err) }, .{}, &failure.writer) catch return;
-            break :blk failure.toOwnedSlice() catch return;
-        };
-        defer alloc.free(payload);
-
-        var frame: std.Io.Writer.Allocating = .init(alloc);
-        defer frame.deinit();
-        frame.writer.writeAll("{\"method\":\"fx/command_result\",\"params\":{\"name\":") catch return;
-        std.json.Stringify.value(name, .{}, &frame.writer) catch return;
-        frame.writer.writeByte(',') catch return;
-        frame.writer.writeAll(payload[1..]) catch return;
-        frame.writer.writeByte('}') catch return;
-        Session.publish(@ptrCast(self), frame.writer.buffered()) catch return;
-    }
-
-    fn status(self: *Session) []const u8 {
-        if (self.failure != null) return "error";
-        if (self.stopped) return "stopped";
-        if (self.host) |host| {
-            const busy = host.busy();
-            self.events_mutex.lockUncancelable(io_mod.getIo());
-            defer self.events_mutex.unlock(io_mod.getIo());
-            if (self.pending.items.len > 0) return "awaiting_approval";
-            return if (busy) "running" else "idle";
-        }
-        return "saved";
-    }
-
-    fn summary(self: *Session, w: *std.Io.Writer) !void {
-        const model = if (self.host) |host| if (host.state.active_session) |active| active.model else "" else "";
-        try std.json.Stringify.value(.{
-            .id = self.id,
-            .name = self.name,
-            .cwd = self.cwd,
-            .model = model,
-            .mode = if (self.host) |host| if (host.state.active_session) |active| active.mode else "auto" else "auto",
-            .status = self.status(),
-            .heartbeat = self.heartbeat,
-            .error_message = self.failure,
-            .updated_at_ms = self.updated_at_ms,
-        }, .{}, w);
-    }
-
-    fn snapshot(self: *Session, w: *std.Io.Writer, after: u64, include_history: bool) !void {
-        try self.refreshHistory();
-        try w.writeAll("{\"ok\":true,\"incarnation\":");
-        try jsonrpc.writeJsonStr(self.daemon.incarnation, w);
-        try w.writeAll(",\"native_presentation\":true,\"session_id\":");
-        try jsonrpc.writeJsonStr(self.id, w);
-        try w.writeAll(",\"session\":");
-        try self.summary(w);
-        if (include_history) {
-            try w.print(",\"history_sequence\":{d},\"history\":", .{self.history_sequence});
-            try w.writeAll(self.history_json orelse "[]");
-        }
-        const checkpoint = if (include_history) self.history_sequence else after;
-        self.events_mutex.lockUncancelable(io_mod.getIo());
-        defer self.events_mutex.unlock(io_mod.getIo());
-        const oldest = if (self.events.items.len > 0) self.events.items[0].sequence else self.sequence;
-        try w.print(",\"sequence\":{d},\"oldest_sequence\":{d},\"events\":[", .{ self.sequence, oldest });
-        var comma = false;
-        for (self.events.items) |event| {
-            if (event.sequence <= checkpoint) continue;
-            if (comma) try w.writeByte(',');
-            comma = true;
-            try w.print("{{\"sequence\":{d},\"frame\":", .{event.sequence});
-            try w.writeAll(event.frame);
-            try w.writeByte('}');
-        }
-        try w.writeAll("],\"pending\":[");
-        for (self.pending.items, 0..) |frame, i| {
-            if (i != 0) try w.writeByte(',');
-            try w.writeAll(frame);
-        }
-        try w.writeAll("]}");
-    }
-
-    fn answer(self: *Session, frame: std.json.Value) !void {
-        if (frame != .object) return error.InvalidFrame;
-        const id = frame.object.get("id") orelse return error.InvalidFrame;
-        if (id != .integer or frame.object.contains("method") or frame.object.contains("result") == frame.object.contains("error")) return error.InvalidFrame;
-        var out: std.Io.Writer.Allocating = .init(self.daemon.alloc);
-        defer out.deinit();
-        try std.json.Stringify.value(frame, .{}, &out.writer);
-        const host = self.host orelse return error.SessionStopped;
-        self.events_mutex.lockUncancelable(io_mod.getIo());
-        var found: ?usize = null;
-        for (self.pending.items, 0..) |pending, i| {
-            const parsed = std.json.parseFromSlice(std.json.Value, self.daemon.alloc, pending, .{}) catch continue;
-            defer parsed.deinit();
-            if (parsed.value.object.get("id")) |pending_id| {
-                if (pending_id == .integer and pending_id.integer == id.integer) {
-                    found = i;
-                    break;
-                }
-            }
-        }
-        self.events_mutex.unlock(io_mod.getIo());
-        if (found == null) return error.RequestAlreadyAnswered;
-        try host.dispatchFrame(out.written());
-        // An invalid/stale reply must not consume the visible request before
-        // its authoritative owner has accepted it. Child retirement may have
-        // already removed this row during dispatch.
-        self.events_mutex.lockUncancelable(io_mod.getIo());
-        defer self.events_mutex.unlock(io_mod.getIo());
-        for (self.pending.items, 0..) |pending, index| {
-            const parsed = std.json.parseFromSlice(std.json.Value, self.daemon.alloc, pending, .{}) catch continue;
-            defer parsed.deinit();
-            const pending_id = objectField(parsed.value, "id") orelse continue;
-            if (pending_id == .integer and pending_id.integer == id.integer) {
-                self.daemon.alloc.free(self.pending.orderedRemove(index));
-                break;
-            }
-        }
-    }
-
-    fn deinit(self: *Session) void {
-        const alloc = self.daemon.alloc;
-        for (self.host_command_tasks.items) |task| {
-            if (task.thread) |thread| thread.join();
-            alloc.free(task.name);
-            if (task.action) |value| alloc.free(value);
-            if (task.path) |value| alloc.free(value);
-            if (task.line) |value| alloc.free(value);
-            alloc.destroy(task);
-        }
-        self.host_command_tasks.deinit(alloc);
-        if (self.host) |host| host.deinit();
-        for (self.events.items) |event| alloc.free(event.frame);
-        self.events.deinit(alloc);
-        for (self.pending.items) |frame| alloc.free(frame);
-        self.pending.deinit(alloc);
-        if (self.history_json) |history| alloc.free(history);
-        if (self.id.len > 0) alloc.free(self.id);
-        alloc.free(self.name);
-        alloc.free(self.cwd);
-        if (self.failure) |failure| alloc.free(failure);
-        if (self.heartbeat.prompt.len > 0) alloc.free(self.heartbeat.prompt);
-        alloc.destroy(self);
     }
 };
 
-const HostCommandTask = struct {
-    alloc: Allocator,
-    session: *Session,
-    name: []u8,
-    action: ?[]u8 = null,
-    path: ?[]u8 = null,
-    line: ?[]u8 = null,
-    thread: ?std.Thread = null,
-    done: std.atomic.Value(bool) = .init(false),
+/// The ids of root sessions the store holds a conversation for.
+const SavedIndex = struct {
+    ids: std.StringHashMapUnmanaged(void) = .empty,
+    summaries: std.ArrayList(session_store.SessionSummary) = .empty,
+    refreshed_ms: i64 = 0,
+
+    fn deinit(self: *SavedIndex, alloc: Allocator) void {
+        self.ids.deinit(alloc);
+        for (self.summaries.items) |*summary| summary.deinit(alloc);
+        self.summaries.deinit(alloc);
+        self.* = .{};
+    }
+
+    pub fn contains(self: *const SavedIndex, id: []const u8) bool {
+        return self.ids.contains(id);
+    }
 };
 
-fn runHostCommand(task: *HostCommandTask) void {
-    defer {
-        task.session.host_command_active.store(false, .release);
-        task.done.store(true, .release);
-    }
-    task.session.publishHostCommand(task.name, task.action, task.path, task.line);
-}
-
-const Daemon = struct {
+pub const Daemon = struct {
     alloc: Allocator,
     cfg: acp_config.Config,
     home: []const u8,
     state_path: []const u8,
     incarnation: []const u8,
+    registry_mutex: std.Io.Mutex = .init,
     sessions: std.ArrayList(*Session) = .empty,
-    stopping: bool = false,
     last_attached_id: ?[]u8 = null,
+    stopping: bool = false,
+    saved_index: SavedIndex = .{},
+    saved_index_stale: std.atomic.Value(bool) = .init(true),
 
-    fn markAttached(self: *Daemon, session: *Session) !void {
-        if (self.last_attached_id) |old| if (std.mem.eql(u8, old, session.id)) return;
-        const id = try self.alloc.dupe(u8, session.id);
-        if (self.last_attached_id) |old| self.alloc.free(old);
-        self.last_attached_id = id;
+    fn deinit(self: *Daemon) void {
+        // Stop every executor before freeing any session: a running one may
+        // still save the registry, which reads every session.
+        for (self.sessions.items) |session| session.stopExecutor();
+        for (self.sessions.items) |session| session.destroy();
+        self.sessions.deinit(self.alloc);
+        if (self.last_attached_id) |id| self.alloc.free(id);
+        self.saved_index.deinit(self.alloc);
     }
 
     fn find(self: *Daemon, id: []const u8) ?*Session {
-        for (self.sessions.items) |session| if (std.mem.eql(u8, session.id, id)) return session;
+        self.registry_mutex.lockUncancelable(io_mod.getIo());
+        defer self.registry_mutex.unlock(io_mod.getIo());
+        for (self.sessions.items) |session| if (session.idEquals(id)) return session;
         return null;
     }
 
-    fn allocateSession(self: *Daemon, cwd: []const u8, name: []const u8) !*Session {
+    /// Saves the registry with `next` in place of `session`'s record, then
+    /// makes it current; `attach` also records `session` as the one the user
+    /// last attached. Takes ownership of `next`: on failure nothing changes.
+    pub fn commit(self: *Daemon, session: *Session, next: *Record, attach: bool) !void {
+        defer next.deinit(self.alloc);
+        self.registry_mutex.lockUncancelable(io_mod.getIo());
+        defer self.registry_mutex.unlock(io_mod.getIo());
+        const attached = if (attach) session.id else self.last_attached_id;
+        try self.persistLocked(.{ .session = session, .record = next }, attached);
+        if (attach and !(self.last_attached_id != null and std.mem.eql(u8, self.last_attached_id.?, session.id))) {
+            const id = try self.alloc.dupe(u8, session.id);
+            if (self.last_attached_id) |old| self.alloc.free(old);
+            self.last_attached_id = id;
+        }
+        session.record_mutex.lockUncancelable(io_mod.getIo());
+        std.mem.swap(Record, &session.record, next);
+        session.record_mutex.unlock(io_mod.getIo());
+        self.saved_index_stale.store(true, .release);
+    }
+
+    fn persist(self: *Daemon) !void {
+        self.registry_mutex.lockUncancelable(io_mod.getIo());
+        defer self.registry_mutex.unlock(io_mod.getIo());
+        try self.persistLocked(null, self.last_attached_id);
+    }
+
+    const Replacement = struct { session: *Session, record: *const Record };
+
+    /// Writes the state file. Holds `registry_mutex`; each other session's
+    /// record is read under its own lock.
+    fn persistLocked(self: *Daemon, replacement: ?Replacement, last_attached_id: ?[]const u8) !void {
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var rows: std.ArrayList(SavedRow) = .empty;
+        for (self.sessions.items) |session| {
+            if (replacement) |swap| if (swap.session == session) {
+                try rows.append(arena, try dupeRow(arena, SavedRow.of(session.id, session.cwd, swap.record)));
+                continue;
+            };
+            session.record_mutex.lockUncancelable(io_mod.getIo());
+            defer session.record_mutex.unlock(io_mod.getIo());
+            if (session.id.len == 0) continue;
+            try rows.append(arena, try dupeRow(arena, SavedRow.of(session.id, session.cwd, &session.record)));
+        }
+        const bytes = try std.json.Stringify.valueAlloc(arena, SavedState{ .sessions = rows.items, .last_attached_id = last_attached_id }, .{});
+        try io_mod.writeFileAtomic(self.alloc, self.state_path, bytes);
+    }
+
+    fn dupeRow(arena: Allocator, row: SavedRow) !SavedRow {
+        var copy = row;
+        copy.id = try arena.dupe(u8, row.id);
+        copy.name = try arena.dupe(u8, row.name);
+        copy.cwd = try arena.dupe(u8, row.cwd);
+        copy.heartbeat.prompt = try arena.dupe(u8, row.heartbeat.prompt);
+        return copy;
+    }
+
+    /// Adds a session to the registry. A saved-only discovery row makes room
+    /// when the registry is full, so it never blocks a new live session.
+    fn register(self: *Daemon, id: []const u8, cwd: []const u8, name: []const u8) !*Session {
+        const session = try Session.create(self, id, cwd, name);
+        errdefer session.destroy();
+        self.registry_mutex.lockUncancelable(io_mod.getIo());
+        defer self.registry_mutex.unlock(io_mod.getIo());
         if (self.sessions.items.len >= max_sessions) {
-            // Saved-only discovery rows must never prevent a new live session.
             for (self.sessions.items, 0..) |entry, index| {
-                if (entry.host == null and !entry.stopped and entry.failure == null) {
+                if (!entry.hasExecutor() and !entry.record.stopped and entry.record.failure == null) {
                     _ = self.sessions.orderedRemove(index);
-                    entry.deinit();
+                    entry.destroy();
                     break;
                 }
             } else return error.SessionLimit;
         }
-        const root = try self.alloc.dupe(u8, cwd);
-        errdefer self.alloc.free(root);
-        const owned_name = try self.alloc.dupe(u8, name);
-        errdefer self.alloc.free(owned_name);
-        const session = try self.alloc.create(Session);
-        session.* = .{ .daemon = self, .cwd = root, .name = owned_name, .updated_at_ms = io_mod.milliTimestamp() };
+        try self.sessions.append(self.alloc, session);
         return session;
     }
 
-    fn create(self: *Daemon, cwd: []const u8, name: []const u8, resume_id: ?[]const u8) !*Session {
-        if (resume_id) |id| if (self.find(id)) |existing| {
-            if (existing.host == null) try existing.open(id);
-            return existing;
-        };
-        const root = try io_mod.realpathAlloc(self.alloc, cwd);
-        defer self.alloc.free(root);
-        const session = try self.allocateSession(root, name);
-        errdefer session.deinit();
-        try self.sessions.ensureUnusedCapacity(self.alloc, 1);
-        try session.open(resume_id);
-        self.sessions.appendAssumeCapacity(session);
-        return session;
+    /// Drops sessions whose first open failed. Their executors have ended.
+    fn reapRetired(self: *Daemon) void {
+        var index: usize = 0;
+        while (index < self.sessions.items.len) {
+            const session = self.sessions.items[index];
+            if (!session.retired.load(.acquire)) {
+                index += 1;
+                continue;
+            }
+            self.registry_mutex.lockUncancelable(io_mod.getIo());
+            _ = self.sessions.orderedRemove(index);
+            self.registry_mutex.unlock(io_mod.getIo());
+            session.destroy();
+        }
     }
 
+    /// Refreshes the saved-session index when it is stale, adds a row for
+    /// each saved session the registry lacks, and drops idle rows whose
+    /// conversation is gone: a launch whose first prompt never arrived, or a
+    /// session the user deleted.
     fn discoverSaved(self: *Daemon) !void {
+        const now = io_mod.milliTimestamp();
+        if (!self.saved_index_stale.swap(false, .acq_rel) and now - self.saved_index.refreshed_ms < saved_index_ttl_ms) return;
+        errdefer self.saved_index_stale.store(true, .release);
         var store = try session_adapter.Store.open(self.alloc, self.home);
         defer store.deinit(self.alloc);
         const cancel = std.atomic.Value(bool).init(false);
-        var summaries = try session_adapter.listSummaries(&store, self.alloc, null, &cancel);
-        defer {
-            for (summaries.items) |*summary| summary.deinit(self.alloc);
-            summaries.deinit(self.alloc);
-        }
-        // A registry row without a live host must still have a conversation on
-        // disk. Otherwise it is a launch whose first prompt never arrived, or a
-        // session the user deleted, and it should leave the browser for good.
+        var next: SavedIndex = .{ .summaries = try session_adapter.listSummaries(&store, self.alloc, null, &cancel), .refreshed_ms = now };
+        errdefer next.deinit(self.alloc);
+        for (next.summaries.items) |summary| try next.ids.put(self.alloc, summary.id, {});
+        self.saved_index.deinit(self.alloc);
+        self.saved_index = next;
+
         var pruned = false;
         var index: usize = 0;
         while (index < self.sessions.items.len) {
             const session = self.sessions.items[index];
-            if (session.host != null or hasConversation(summaries.items, session.id)) {
+            if (session.hasExecutor() or session.id.len == 0 or self.saved_index.contains(session.id)) {
                 index += 1;
                 continue;
             }
-            if (self.last_attached_id) |attached| {
-                if (std.mem.eql(u8, attached, session.id)) {
-                    self.alloc.free(attached);
-                    self.last_attached_id = null;
-                }
-            }
+            self.registry_mutex.lockUncancelable(io_mod.getIo());
             _ = self.sessions.orderedRemove(index);
-            session.deinit();
+            if (self.last_attached_id) |attached| if (std.mem.eql(u8, attached, session.id)) {
+                self.alloc.free(attached);
+                self.last_attached_id = null;
+            };
+            self.registry_mutex.unlock(io_mod.getIo());
+            session.destroy();
             pruned = true;
         }
         if (pruned) try self.persist();
-        for (summaries.items) |summary| {
+        for (self.saved_index.summaries.items) |summary| {
             if (self.sessions.items.len >= max_sessions) break;
             if (self.find(summary.id) != null) continue;
             const cwd = summary.workspace_root orelse summary.origin_workspace_root orelse continue;
-            const session = try self.allocateSession(cwd, summary.title orelse "session");
-            errdefer session.deinit();
-            session.id = try self.alloc.dupe(u8, summary.id);
-            try self.sessions.append(self.alloc, session);
+            _ = try self.register(summary.id, cwd, summary.title orelse "session");
         }
     }
 
-    fn persist(self: *Daemon) !void {
-        var out: std.Io.Writer.Allocating = .init(self.alloc);
-        defer out.deinit();
-        try out.writer.writeAll("{\"version\":1,\"sessions\":[");
-        for (self.sessions.items, 0..) |session, index| {
-            if (index != 0) try out.writer.writeByte(',');
-            try std.json.Stringify.value(.{ .id = session.id, .name = session.name, .cwd = session.cwd, .stopped = session.stopped, .heartbeat = session.heartbeat, .updated_at_ms = session.updated_at_ms, .owned = (session.host != null and session.saved()) or session.stopped or session.failure != null }, .{}, &out.writer);
+    fn list(self: *Daemon, arena: Allocator) ![]const u8 {
+        try self.discoverSaved();
+        var rows: std.ArrayList(protocol.SessionSummary) = .empty;
+        for (self.sessions.items) |session| {
+            if (!session.listable(&self.saved_index)) continue;
+            try rows.append(arena, try session.summary(arena));
         }
-        try out.writer.writeAll("],\"last_attached_id\":");
-        try std.json.Stringify.value(self.last_attached_id, .{}, &out.writer);
-        try out.writer.writeByte('}');
-        try io_mod.writeFileAtomic(self.alloc, self.state_path, out.written());
+        self.registry_mutex.lockUncancelable(io_mod.getIo());
+        defer self.registry_mutex.unlock(io_mod.getIo());
+        const attached = if (self.last_attached_id) |id| try arena.dupe(u8, id) else null;
+        return protocol.encode(arena, protocol.SessionList{ .sessions = rows.items, .last_attached_id = attached });
     }
 
+    /// Restores the registry from the state file. Sessions this supervisor
+    /// owned reopen on their executors; a failure is recorded on the session.
     fn restore(self: *Daemon) !void {
         var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), self.state_path, .{}) catch |err| {
             if (err == error.FileNotFound) return;
@@ -681,341 +263,78 @@ const Daemon = struct {
         defer file.close(io_mod.getIo());
         const bytes = try io_mod.readFileToEnd(self.alloc, &file, 16 * 1024 * 1024);
         defer self.alloc.free(bytes);
-        const parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, bytes, .{});
+        const parsed = try std.json.parseFromSlice(SavedState, self.alloc, bytes, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
-        const rows = objectField(parsed.value, "sessions") orelse return error.InvalidDaemonState;
-        if (rows != .array) return error.InvalidDaemonState;
-        for (rows.array.items) |row| {
-            const id = stringField(row, "id") orelse continue;
-            const cwd = stringField(row, "cwd") orelse continue;
-            const name = stringField(row, "name") orelse "session";
-            const session = try self.allocateSession(cwd, name);
-            errdefer session.deinit();
-            session.id = try self.alloc.dupe(u8, id);
-            session.updated_at_ms = @intCast(uintField(row, "updated_at_ms") orelse 0);
-            if (objectField(row, "heartbeat")) |heartbeat| {
-                const prompt = stringField(heartbeat, "prompt") orelse "";
-                session.heartbeat = .{
-                    .prompt = if (prompt.len > 0) try self.alloc.dupe(u8, prompt) else "",
-                    .interval_ms = uintField(heartbeat, "interval_ms") orelse 0,
-                    .next_run_ms = @intCast(uintField(heartbeat, "next_run_ms") orelse 0),
-                    .paused = boolField(heartbeat, "paused") orelse true,
-                    .run_count = uintField(heartbeat, "run_count") orelse 0,
-                };
+        for (parsed.value.sessions) |row| {
+            if (row.id.len == 0 or self.find(row.id) != null) continue;
+            const session = try self.register(row.id, row.cwd, row.name);
+            session.record.updated_at_ms = row.updated_at_ms;
+            session.record.stopped = row.stopped;
+            session.record.heartbeat = row.heartbeat;
+            session.record.heartbeat.prompt = if (row.heartbeat.prompt.len > 0) try self.alloc.dupe(u8, row.heartbeat.prompt) else "";
+            if (!row.stopped and row.owned) {
+                const job = try newJob(self.alloc);
+                job.request = .{ .create = .{ .cwd = session.cwd, .@"resume" = session.id } };
+                job.record_failure = true;
+                session.submit(job);
             }
-            if (boolField(row, "stopped") orelse false) {
-                session.stopped = true;
-            } else if (boolField(row, "owned") orelse true) {
-                session.open(id) catch |err| {
-                    session.failure = try self.alloc.dupe(u8, @errorName(err));
-                    std.debug.print("proto-fx: cannot restore session {s}: {s}\n", .{ id, @errorName(err) });
-                };
-            }
-            try self.sessions.append(self.alloc, session);
         }
-        if (stringField(parsed.value, "last_attached_id")) |id| {
-            if (self.find(id)) |session| try self.markAttached(session);
+        if (parsed.value.last_attached_id) |id| if (self.find(id) != null) {
+            self.last_attached_id = try self.alloc.dupe(u8, id);
+        };
+    }
+
+    /// Answers one connection. Session requests move, with the connection,
+    /// to that session's executor; the rest are answered here.
+    fn route(self: *Daemon, stream: std.Io.net.Stream) void {
+        const job = newJob(self.alloc) catch {
+            stream.close(io_mod.getIo());
+            return;
+        };
+        job.reply = stream;
+        const arena = job.arena.allocator();
+        const answer: ?[]const u8 = self.routeJob(job) catch |err| (protocol.encode(arena, protocol.Failure{ .@"error" = @errorName(err) }) catch null);
+        if (answer) |bytes| {
+            client.writeFrame(stream, bytes) catch {};
+            job.destroy(self.alloc);
         }
     }
 
-    fn tick(self: *Daemon) void {
-        const now = io_mod.milliTimestamp();
-        var changed = false;
-        for (self.sessions.items) |session| {
-            if (session.host) |host| host.pumpChildApprovals() catch |err| {
-                std.debug.print("proto-fx: child approval projection failed: {s}\n", .{@errorName(err)});
-            };
-            const heartbeat = &session.heartbeat;
-            if (heartbeat.paused or heartbeat.interval_ms == 0 or session.stopped or session.host == null) continue;
-            if (now < heartbeat.next_run_ms) continue;
-            // Coalesce to one admitted fire. Existing steering interrupts only a
-            // streaming reply; tools, compaction and approvals wait safely.
-            session.events_mutex.lockUncancelable(io_mod.getIo());
-            const waiting = session.heartbeat_request != null;
-            if (!waiting) session.heartbeat_request = session.next_request;
-            session.events_mutex.unlock(io_mod.getIo());
-            if (waiting) continue;
-            _ = session.prompt(heartbeat.prompt) catch |err| {
-                session.events_mutex.lockUncancelable(io_mod.getIo());
-                session.heartbeat_request = null;
-                session.events_mutex.unlock(io_mod.getIo());
-                std.debug.print("proto-fx: heartbeat admission failed: {s}\n", .{@errorName(err)});
-                heartbeat.next_run_ms = now + @as(i64, @intCast(heartbeat.interval_ms));
-                changed = true;
-                continue;
-            };
-            heartbeat.next_run_ms = now + @as(i64, @intCast(heartbeat.interval_ms));
-            heartbeat.run_count += 1;
-            changed = true;
+    /// Returns the answer for a request handled here, or null when `job`
+    /// moved to an executor.
+    fn routeJob(self: *Daemon, job: *session_mod.Job) !?[]const u8 {
+        const arena = job.arena.allocator();
+        const bytes = try client.readFrame(arena, job.reply.?, 2000);
+        job.request = protocol.Request.parse(arena, bytes) catch return error.InvalidRequest;
+        switch (job.request) {
+            .ping => return try protocol.encode(arena, protocol.Pong{}),
+            .shutdown => {
+                self.stopping = true;
+                return try protocol.encode(arena, protocol.Ack{});
+            },
+            .list => return try self.list(arena),
+            .create => |request| {
+                const existing = if (request.@"resume") |id| self.find(id) else null;
+                const session = existing orelse new: {
+                    const root = try io_mod.realpathAlloc(arena, request.cwd);
+                    break :new try self.register("", root, request.name);
+                };
+                session.submit(job);
+                return null;
+            },
+            else => {
+                const session = self.find(job.request.sessionId().?) orelse return error.SessionNotFound;
+                session.submit(job);
+                return null;
+            },
         }
-        if (changed) self.persist() catch |err| std.debug.print("proto-fx: heartbeat save failed: {s}\n", .{@errorName(err)});
-    }
-
-    fn handle(self: *Daemon, value: std.json.Value, w: *std.Io.Writer, arena: Allocator) !void {
-        const command = stringField(value, "command") orelse return error.CommandRequired;
-        if (std.mem.eql(u8, command, "ping")) return w.writeAll("{\"ok\":true,\"version\":1}");
-        if (std.mem.eql(u8, command, "shutdown")) {
-            self.stopping = true;
-            return w.writeAll("{\"ok\":true}");
-        }
-        if (std.mem.eql(u8, command, "list")) {
-            try self.discoverSaved();
-            try w.writeAll("{\"ok\":true,\"sessions\":[");
-            var wrote_session = false;
-            for (self.sessions.items) |session| {
-                if (!session.listable()) continue;
-                if (wrote_session) try w.writeByte(',');
-                wrote_session = true;
-                try session.summary(w);
-            }
-            try w.writeAll("],\"last_attached_id\":");
-            try std.json.Stringify.value(self.last_attached_id, .{}, w);
-            return w.writeByte('}');
-        }
-        if (std.mem.eql(u8, command, "create")) {
-            const session = try self.create(stringField(value, "cwd") orelse return error.CwdRequired, stringField(value, "name") orelse "session", stringField(value, "resume"));
-            try self.markAttached(session);
-            try self.persist();
-            return session.snapshot(w, 0, true);
-        }
-        const id = stringField(value, "session_id") orelse return error.SessionIdRequired;
-        const session = self.find(id) orelse return error.SessionNotFound;
-        if (std.mem.eql(u8, command, "attach")) {
-            const after = uintField(value, "after_sequence") orelse 0;
-            const include_history = boolField(value, "include_history") orelse (after == 0);
-            // Background frontend polls observe a stop; only a deliberate
-            // attachment reopens the stopped/saved session.
-            if (session.host == null and include_history) {
-                try session.open(session.id);
-                try self.persist();
-            }
-            if (include_history) {
-                try self.markAttached(session);
-                try self.persist();
-            }
-            return session.snapshot(w, after, include_history);
-        }
-        if (std.mem.eql(u8, command, "mode")) {
-            return session.nativeCommand("session/set_mode", .{ .sessionId = id, .modeId = stringField(value, "mode") orelse return error.ModeRequired }, w);
-        }
-        if (std.mem.eql(u8, command, "model")) {
-            if ((session.host orelse return error.SessionStopped).busy()) return error.SessionBusy;
-            return session.nativeCommand("session/set_config_option", .{ .sessionId = id, .configId = "model", .value = stringField(value, "model") orelse return error.ModelRequired }, w);
-        }
-        // A frontend-owned slash command that only sets a host config option
-        // names the option here; the host validates the value and answers.
-        if (std.mem.eql(u8, command, "option")) {
-            return session.nativeCommand("session/set_config_option", .{
-                .sessionId = id,
-                .configId = stringField(value, "config_id") orelse return error.ConfigIdRequired,
-                .value = stringField(value, "value") orelse return error.ValueRequired,
-            }, w);
-        }
-        // The frontend's session commands run on the host, which owns their
-        // effects and results. The daemon accepts the request and reports the
-        // result through the event stream, so a slow command never blocks it.
-        if (std.mem.eql(u8, command, "command")) {
-            if ((session.host orelse return error.SessionStopped).busy()) {
-                return w.writeAll("{\"ok\":false,\"error\":\"Session is busy\"}");
-            }
-            session.enqueueHostCommand(
-                stringField(value, "name") orelse return error.HostCommandRequired,
-                stringField(value, "action"),
-                stringField(value, "path"),
-                stringField(value, "line"),
-            ) catch |err| {
-                if (err == error.CommandInFlight) {
-                    return w.writeAll("{\"ok\":false,\"error\":\"A session command is still running\"}");
-                }
-                return err;
-            };
-            return w.writeAll("{\"ok\":true,\"accepted\":true}");
-        }
-        if (std.mem.eql(u8, command, "rename")) {
-            const name = std.mem.trim(u8, stringField(value, "name") orelse return error.NameRequired, " \t\r\n");
-            if (name.len == 0 or name.len > 256) return error.InvalidName;
-            const owned = try self.alloc.dupe(u8, name);
-            self.alloc.free(session.name);
-            session.name = owned;
-            try self.persist();
-            return w.writeAll("{\"ok\":true}");
-        }
-        if (std.mem.eql(u8, command, "kernel")) {
-            const info = try (session.host orelse return error.SessionStopped).kernelControl(arena, stringField(value, "action") orelse "status");
-            return std.json.Stringify.value(.{ .ok = true, .kernel = info }, .{}, w);
-        }
-        if (std.mem.eql(u8, command, "prompt")) {
-            const request_id = try session.prompt(stringField(value, "text") orelse return error.PromptRequired);
-            return std.json.Stringify.value(.{ .ok = true, .admitted = true, .request_id = request_id }, .{}, w);
-        }
-        if (std.mem.eql(u8, command, "cancel")) {
-            _ = try session.dispatch("session/cancel", .{ .sessionId = id });
-            session.clearPending();
-            session.host.?.refreshChildApprovals();
-            return w.writeAll("{\"ok\":true}");
-        }
-        if (std.mem.eql(u8, command, "rpc")) {
-            try session.answer(objectField(value, "frame") orelse return error.FrameRequired);
-            return w.writeAll("{\"ok\":true}");
-        }
-        if (std.mem.eql(u8, command, "stop")) {
-            session.heartbeat.paused = true;
-            session.stopped = true;
-            try self.persist();
-            if (session.host) |host| host.deinit();
-            session.host = null;
-            session.clearPending();
-            return w.writeAll("{\"ok\":true}");
-        }
-        if (std.mem.eql(u8, command, "heartbeat")) {
-            const action = stringField(value, "action") orelse "set";
-            if (std.mem.eql(u8, action, "status")) return std.json.Stringify.value(.{ .ok = true, .heartbeat = session.heartbeat }, .{}, w);
-            if (std.mem.eql(u8, action, "set")) {
-                const interval = uintField(value, "interval_ms") orelse return error.IntervalRequired;
-                if (interval < 1000 or interval > 365 * 24 * 60 * 60 * 1000) return error.InvalidInterval;
-                const prompt = stringField(value, "prompt") orelse return error.PromptRequired;
-                if (prompt.len == 0 or prompt.len > 65536) return error.InvalidPrompt;
-                const owned = try self.alloc.dupe(u8, prompt);
-                session.withdrawHeartbeat();
-                if (session.heartbeat.prompt.len > 0) self.alloc.free(session.heartbeat.prompt);
-                session.heartbeat = .{ .prompt = owned, .interval_ms = interval, .next_run_ms = io_mod.milliTimestamp() + @as(i64, @intCast(interval)), .paused = false };
-            } else if (std.mem.eql(u8, action, "pause")) {
-                session.heartbeat.paused = true;
-                session.withdrawHeartbeat();
-            } else if (std.mem.eql(u8, action, "resume")) {
-                if (session.heartbeat.interval_ms == 0) return error.HeartbeatNotConfigured;
-                session.heartbeat.paused = false;
-                session.heartbeat.next_run_ms = io_mod.milliTimestamp() + @as(i64, @intCast(session.heartbeat.interval_ms));
-            } else if (std.mem.eql(u8, action, "clear")) {
-                session.withdrawHeartbeat();
-                if (session.heartbeat.prompt.len > 0) self.alloc.free(session.heartbeat.prompt);
-                session.heartbeat = .{};
-            } else return error.InvalidHeartbeatAction;
-            try self.persist();
-            return std.json.Stringify.value(.{ .ok = true, .heartbeat = session.heartbeat }, .{}, w);
-        }
-        const host = session.host orelse return error.SessionStopped;
-        if (std.mem.eql(u8, command, "children")) {
-            try w.writeAll("{\"ok\":true,\"children\":[");
-            if (host.state.subagent_v2_children) |children| {
-                const store = child_state.Store{ .children = children, .parent_id = session.id };
-                var registry = try store.load(arena);
-                defer registry.deinit(arena);
-                for (registry.children, 0..) |child, index| {
-                    if (index != 0) try w.writeByte(',');
-                    try std.json.Stringify.value(.{
-                        .id = child.id,
-                        .parent_id = id,
-                        .name = child.agentName() orelse "subagent",
-                        .status = if (child.phase == .finished) if (child.last_outcome) |outcome| @tagName(outcome) else @tagName(child.phase) else @tagName(child.phase),
-                        .detail = if (child.active) |active| active.message else child.instructions(),
-                        .depth = @as(u8, 1),
-                    }, .{}, w);
-                }
-            }
-            return w.writeAll("]}");
-        }
-        if (std.mem.eql(u8, command, "history")) {
-            if (stringField(value, "child_id")) |child_id| {
-                const children = host.state.subagent_v2_children orelse return error.ChildNotFound;
-                const store = child_state.Store{ .children = children, .parent_id = session.id };
-                var registry = try store.load(arena);
-                defer registry.deinit(arena);
-                for (registry.children) |row| {
-                    if (!std.mem.eql(u8, row.id, child_id)) continue;
-                    const work_id = if (row.active) |active| active.id else row.last_work_id orelse "";
-                    const after = uintField(value, "after_live_sequence") orelse 0;
-                    const include_history = boolField(value, "include_history") orelse true;
-                    const changed_work = !std.mem.eql(u8, stringField(value, "work_id") orelse "", work_id);
-                    const live = if (host.state.subagent_host) |child_host|
-                        try child_host.managed.snapshotPresentation(arena, child_id, work_id, after, include_history or changed_work)
-                    else
-                        null;
-                    const live_active = live != null or row.phase == .running or row.phase == .awaiting_approval;
-                    const snapshot: live_presentation.Snapshot = live orelse .{};
-                    const live_reset = include_history or changed_work or snapshot.reset or
-                        (boolField(value, "live_active") orelse false) != live_active;
-                    var metadata: std.Io.Writer.Allocating = .init(arena);
-                    defer metadata.deinit();
-                    try std.json.Stringify.value(.{
-                        .ok = true,
-                        .child_id = child_id,
-                        .work_id = work_id,
-                        .live_active = live_active,
-                        .live_sequence = snapshot.sequence,
-                        .oldest_live_sequence = snapshot.oldest_sequence,
-                        .live_reset = live_reset,
-                        .name = row.agentName() orelse "subagent",
-                        .status = if (live_active and row.phase == .idle) "running" else if (row.phase == .finished) if (row.last_outcome) |outcome| @tagName(outcome) else @tagName(row.phase) else @tagName(row.phase),
-                        .last_outcome = if (row.last_outcome) |outcome| @tagName(outcome) else null,
-                        .last_failure = if (row.last_failure) |failure| failure.view() else null,
-                        .active_prompt = if (live_active) if (row.active) |active| active.message else null else null,
-                    }, .{}, &metadata.writer);
-                    const encoded = metadata.written();
-                    try w.writeAll(encoded[0 .. encoded.len - 1]);
-                    if (live_reset) {
-                        // Current-work commits/compaction can race this read.
-                        // Work identity excludes them from the immutable prior
-                        // history view until settlement replaces the live tail.
-                        const history: []types.HistoryTurn = host.state.sessions_v2.?.childHistory(arena, child_id) catch |err| switch (err) {
-                            error.NotFound, error.FileNotFound => if (live_active) &.{} else return err,
-                            else => return err,
-                        };
-                        try w.writeAll(",\"history\":[");
-                        var comma = false;
-                        for (history) |turn| {
-                            if (live_active and historyBelongsToWork(turn, work_id)) continue;
-                            if (comma) try w.writeByte(',');
-                            comma = true;
-                            try std.json.Stringify.value(turn, .{}, w);
-                        }
-                        try w.writeByte(']');
-                    }
-                    try w.writeAll(",\"live_events\":");
-                    try w.writeAll(snapshot.events_json);
-                    return w.writeByte('}');
-                }
-                return error.ChildNotFound;
-            }
-            try session.refreshHistory();
-            try w.writeAll("{\"ok\":true,\"history\":");
-            try w.writeAll(session.history_json orelse "[]");
-            return w.writeByte('}');
-        }
-        return error.UnknownCommand;
     }
 };
 
-/// Whether the daemon's saved-session summaries hold `id`, which means the
-/// session still has conversation content a viewer can open.
-fn hasConversation(summaries: []const session_store.SessionSummary, id: []const u8) bool {
-    for (summaries) |summary| if (std.mem.eql(u8, summary.id, id)) return true;
-    return false;
-}
-
-fn historyBelongsToWork(turn: types.HistoryTurn, work_id: []const u8) bool {
-    const saved_work = switch (turn) {
-        .assistant => |entry| entry.user.work_id,
-        .interrupted => |entry| entry.user.work_id,
-        .compacted_summary => null,
-    } orelse return false;
-    return std.mem.eql(u8, saved_work, work_id);
-}
-
-fn objectField(value: std.json.Value, key: []const u8) ?std.json.Value {
-    return if (value == .object) value.object.get(key) else null;
-}
-fn stringField(value: std.json.Value, key: []const u8) ?[]const u8 {
-    const field = objectField(value, key) orelse return null;
-    return if (field == .string) field.string else null;
-}
-fn uintField(value: std.json.Value, key: []const u8) ?u64 {
-    const field = objectField(value, key) orelse return null;
-    return if (field == .integer and field.integer >= 0) @intCast(field.integer) else null;
-}
-fn boolField(value: std.json.Value, key: []const u8) ?bool {
-    const field = objectField(value, key) orelse return null;
-    return if (field == .bool) field.bool else null;
+fn newJob(alloc: Allocator) !*session_mod.Job {
+    const job = try alloc.create(session_mod.Job);
+    job.* = .{ .arena = std.heap.ArenaAllocator.init(alloc), .request = .ping };
+    return job;
 }
 
 /// Runs until an explicit shutdown request. The caller initializes std.Io/env first.
@@ -1044,35 +363,23 @@ pub fn run(alloc: Allocator, cfg: acp_config.Config) !void {
     const incarnation = try alloc.print("{d}-{d}", .{ io_mod.milliTimestamp(), std.c.getpid() });
     defer alloc.free(incarnation);
     var daemon = Daemon{ .alloc = alloc, .cfg = cfg, .home = io_mod.homeDir() orelse return error.HomeUnavailable, .state_path = state_path, .incarnation = incarnation };
-    defer {
-        for (daemon.sessions.items) |session| session.deinit();
-        daemon.sessions.deinit(alloc);
-        if (daemon.last_attached_id) |id| alloc.free(id);
-    }
+    // Executors close their hosts as the registry is freed.
+    defer daemon.deinit();
     try daemon.restore();
     try daemon.discoverSaved();
     while (!daemon.stopping) {
-        daemon.tick();
+        daemon.reapRetired();
         var fds = [_]std.posix.pollfd{.{ .fd = listener.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
         if (try std.posix.poll(&fds, 200) == 0) continue;
         const stream = try listener.accept(io);
-        defer stream.close(io);
         const send_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
-        try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&send_timeout));
-        var arena = std.heap.ArenaAllocator.init(alloc);
-        defer arena.deinit();
-        const request_alloc = arena.allocator();
-        const bytes = client.readFrame(request_alloc, stream, 2000) catch continue;
-        const parsed = std.json.parseFromSlice(std.json.Value, request_alloc, bytes, .{}) catch {
-            client.writeFrame(stream, "{\"ok\":false,\"error\":\"InvalidJson\"}") catch {};
+        std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&send_timeout)) catch {
+            stream.close(io);
             continue;
         };
-        var out: std.Io.Writer.Allocating = .init(request_alloc);
-        daemon.handle(parsed.value, &out.writer, request_alloc) catch |err| {
-            out.clearRetainingCapacity();
-            try std.json.Stringify.value(.{ .ok = false, .@"error" = @errorName(err) }, .{}, &out.writer);
-        };
-        client.writeFrame(stream, out.written()) catch {};
+        daemon.route(stream);
     }
+    // Save while the hosts are still open: each live, saved session is owned
+    // and reopens on the next start.
     try daemon.persist();
 }

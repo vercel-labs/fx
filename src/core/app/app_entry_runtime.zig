@@ -98,6 +98,7 @@ pub const Config = struct {
         mcp_health.inspectLocalConfigUnavailable,
     load_mcp_host: ?mcp_host.LoadFn = null,
     acp_runner: acp_runner.Runner,
+    supervisor_runner: acp_runner.Runner = acp_runner.unavailable,
 };
 
 pub const RunOutcome = union(enum) {
@@ -500,6 +501,7 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .inspect_mcp_local_config = cfg.inspect_mcp_local_config,
         .load_mcp_host = cfg.load_mcp_host,
         .acp_runner = cfg.acp_runner,
+        .supervisor_runner = cfg.supervisor_runner,
     };
 }
 

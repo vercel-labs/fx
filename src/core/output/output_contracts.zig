@@ -22,6 +22,7 @@ const update_notes = @import("../upgrade/update_notes.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
+const supervisor_protocol = @import("../supervisor/protocol.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -1697,6 +1698,85 @@ pub const SessionConvertSnapshot = struct {
         return out.toOwnedSlice();
     }
 };
+
+/// `proto-fx daemon`: what the supervisor holds, or that it is stopping.
+pub const DaemonSnapshot = struct {
+    action: Action,
+    sessions: []const supervisor_protocol.SessionSummary = &.{},
+    last_attached_id: ?[]const u8 = null,
+
+    pub const Action = enum { status, stop };
+
+    pub fn render(self: DaemonSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    pub fn renderText(self: DaemonSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        if (self.action == .stop) {
+            try out.writer.writeAll("The supervisor is stopping. Its sessions resume when proto-fx starts it again.\n");
+            return out.toOwnedSlice();
+        }
+        try out.writer.print("Supervisor running · {d} session{s}\n", .{ self.sessions.len, if (self.sessions.len == 1) "" else "s" });
+        for (self.sessions) |session| {
+            const short_id = session.id[0..@min(session.id.len, 8)];
+            const marker: []const u8 = if (self.last_attached_id) |id| if (std.mem.eql(u8, id, session.id)) "*" else " " else " ";
+            var name = try text_utils.encodeTerminalSafeInline(alloc, session.name, 64);
+            defer name.deinit(alloc);
+            var cwd = try text_utils.encodeTerminalSafeInline(alloc, session.cwd, 256);
+            defer cwd.deinit(alloc);
+            try out.writer.print("{s} {s}  {s}  {s}  {s}\n", .{ marker, short_id, @tagName(session.status), name.bytes, cwd.bytes });
+            if (session.heartbeat.interval_ms > 0) {
+                try out.writer.print("    heartbeat every {d}s, {s}, {d} run{s}\n", .{
+                    session.heartbeat.interval_ms / 1000,
+                    if (session.heartbeat.paused) "paused" else "running",
+                    session.heartbeat.run_count,
+                    if (session.heartbeat.run_count == 1) "" else "s",
+                });
+            }
+            if (session.error_message) |message| try out.writer.print("    error: {s}\n", .{message});
+        }
+        return out.toOwnedSlice();
+    }
+
+    pub fn renderJson(self: DaemonSnapshot, alloc: Allocator) ![]u8 {
+        return std.json.Stringify.valueAlloc(alloc, .{
+            .kind = "daemon",
+            .action = @tagName(self.action),
+            .sessions = self.sessions,
+            .last_attached_id = self.last_attached_id,
+        }, .{});
+    }
+};
+
+test "proto-fx daemon renders status and stop as text and JSON from one snapshot" {
+    const alloc = std.testing.allocator;
+    const sessions = [_]supervisor_protocol.SessionSummary{.{
+        .id = "0123456789abcdef",
+        .name = "fix the build",
+        .cwd = "/Users/example/work",
+        .status = .running,
+        .heartbeat = .{ .prompt = "check", .interval_ms = 60_000, .paused = false, .run_count = 2 },
+    }};
+    const status: DaemonSnapshot = .{ .action = .status, .sessions = &sessions, .last_attached_id = "0123456789abcdef" };
+    const text = try status.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(
+        "Supervisor running · 1 session\n* 01234567  running  fix the build  /Users/example/work\n    heartbeat every 60s, running, 2 runs\n",
+        text,
+    );
+    const json = try status.render(alloc, .json);
+    defer alloc.free(json);
+    try std.testing.expect(std.mem.startsWith(u8, json, "{\"kind\":\"daemon\",\"action\":\"status\",\"sessions\":[{\"id\":\"0123456789abcdef\""));
+    const stop: DaemonSnapshot = .{ .action = .stop };
+    const stop_json = try stop.render(alloc, .json);
+    defer alloc.free(stop_json);
+    try std.testing.expectEqualStrings("{\"kind\":\"daemon\",\"action\":\"stop\",\"sessions\":[],\"last_attached_id\":null}", stop_json);
+}
 
 test "proto-fx sessions convert names each file it left out, in text and JSON" {
     const alloc = std.testing.allocator;

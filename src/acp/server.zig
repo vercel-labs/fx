@@ -368,6 +368,8 @@ pub const ServerState = struct {
     session_titles: bool = true,
     active_session: ?ActiveSessionState = null,
     active_prompt: ?*ActivePrompt = null,
+    /// A long `fx/command`, such as compaction, running on its own thread.
+    host_job: ?*HostJob = null,
     /// Detached hosts steer streaming replies while preserving native ACP tools.
     interruptible_steering: bool = false,
     /// Only the detached native frontend consumes native presentation frames.
@@ -405,6 +407,8 @@ pub const ServerState = struct {
         // an active prompt waiting on one.
         self.terminal_client.closeOwnedTerminals();
         reapActivePrompt(self, true);
+        cancelHostJob(self);
+        reapHostJob(self, true);
         self.managed_executions.deinit();
         self.terminal_client.deinit();
         closeActiveSession(self) catch |err| {
@@ -882,8 +886,9 @@ pub fn run(alloc: Allocator, cfg: Config) !void {
     return runWithTransport(alloc, cfg, jsonrpc.Reader.init(), jsonrpc.Writer.init());
 }
 
-/// A native, persistent headless session owner. A daemon serializes calls to
-/// dispatchFrame; its writer callback may run on the prompt and child threads.
+/// A native, persistent headless session owner. It has one owner thread:
+/// every call, from dispatchFrame to deinit, comes from that thread. Its
+/// writer callback may also run on the prompt, child, and host job threads.
 /// Disconnecting a frontend does not destroy this owner.
 pub const PersistentHost = struct {
     state: ServerState,
@@ -950,9 +955,10 @@ pub const PersistentHost = struct {
         }
     }
 
+    /// A turn or a host job is running. Neither may overlap a history read.
     pub fn busy(self: *PersistentHost) bool {
         reapActivePrompt(&self.state, false);
-        return self.state.active_prompt != null;
+        return self.state.active_prompt != null or hostJobRunning(&self.state);
     }
 
     fn retireChildApproval(self: *PersistentHost) void {
@@ -1599,6 +1605,14 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         if (!try requireActiveSessionTarget(state, alloc, msg)) return;
         handleCancel(state, true);
         return state.writer.writeResponse(alloc, msg.id, "null");
+    }
+
+    // A host job owns the session until it ends; only cancel reaches it.
+    if (hostJobRunning(state)) {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "A session command is still running",
+        });
     }
 
     if (method.isLibfx() and !state.cfg.minimal_kernel) {
@@ -3488,6 +3502,7 @@ fn handleCancel(state: *ServerState, notify_client: bool) void {
         // back what never reached the model.
         if (state.cfg.minimal_kernel or state.interruptible_steering) session.steering.cancelForUser(&session.cancel_flag);
     }
+    if (state.host_job) |job| job.cancel.store(true, .seq_cst);
     cancelPendingOutbound(state, notify_client);
     clearPendingLegacyUrls(state);
 }
@@ -4290,16 +4305,15 @@ fn handleHostCommand(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messag
                 },
             } });
         },
-        .mcp_verb => |line| {
-            const outcome = try runMcpVerb(state, alloc, line);
-            defer alloc.free(outcome.text);
-            if (!outcome.ok) {
-                return state.writer.writeError(alloc, msg.id, .{
-                    .code = ErrorCode.invalid_request,
-                    .message = outcome.text,
-                });
-            }
-            try host_commands.writeResult(&out.writer, command, .{ .text = outcome.text });
+        // Both can wait on the network for minutes, so they answer from
+        // their own thread. Neither runs beside a turn.
+        .mcp_verb, .compact => {
+            if (state.active_prompt != null) return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = "Session is busy",
+            });
+            if (comptime host_target.is_wasm) return writeLongHostCommand(state, alloc, msg.id.?, command, null);
+            return startHostJob(state, msg.id.?, command);
         },
         .mcp_status => {
             const text = try mcpStatusText(state, alloc);
@@ -4333,8 +4347,120 @@ fn handleHostCommand(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messag
                 .auto_compact_percent = state.auto_compact_percent,
             } });
         },
+    }
+    try state.writer.writeResponse(alloc, msg.id, out.written());
+}
+
+/// A long `fx/command` running on its own thread. The host owns it: one at a
+/// time, dispatch refuses other work while it runs (except cancel), and the
+/// host cancels and joins it before it ends. Its answer goes out through the
+/// host's writer under the request's own id.
+const HostJob = struct {
+    state: *ServerState,
+    id: jsonrpc.RequestId,
+    command: host_commands.Command,
+    /// Ends an MCP verb waiting on a server; compaction stops on the
+    /// session's cancel flag, which cancel sets too.
+    cancel: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+    thread: std.Thread = undefined,
+
+    fn destroy(job: *HostJob) void {
+        const alloc = job.state.alloc;
+        switch (job.id) {
+            .string => |value| alloc.free(value),
+            else => {},
+        }
+        switch (job.command) {
+            .mcp_verb => |line| alloc.free(line),
+            else => {},
+        }
+        alloc.destroy(job);
+    }
+
+    fn run(job: *HostJob) void {
+        defer job.done.store(true, .release);
+        const state = job.state;
+        writeLongHostCommand(state, state.alloc, job.id, job.command, &job.cancel) catch |err| {
+            state.writer.writeError(state.alloc, job.id, .{
+                .code = ErrorCode.internal_error,
+                .message = @errorName(err),
+            }) catch {};
+        };
+    }
+};
+
+fn startHostJob(state: *ServerState, id: jsonrpc.RequestId, command: host_commands.Command) !void {
+    const alloc = state.alloc;
+    const job = try alloc.create(HostJob);
+    errdefer alloc.destroy(job);
+    const owned_id: jsonrpc.RequestId = switch (id) {
+        .string => |value| .{ .string = try alloc.dupe(u8, value) },
+        else => id,
+    };
+    errdefer switch (owned_id) {
+        .string => |value| alloc.free(value),
+        else => {},
+    };
+    const owned_command: host_commands.Command = switch (command) {
+        .mcp_verb => |line| .{ .mcp_verb = try alloc.dupe(u8, line) },
+        else => command,
+    };
+    job.* = .{ .state = state, .id = owned_id, .command = owned_command };
+    errdefer switch (owned_command) {
+        .mcp_verb => |line| alloc.free(line),
+        else => {},
+    };
+    job.thread = try std.Thread.spawn(.{}, HostJob.run, .{job});
+    state.host_job = job;
+}
+
+/// Joins a finished host job, or waits for the running one.
+fn reapHostJob(state: *ServerState, wait: bool) void {
+    if (comptime host_target.is_wasm) return;
+    const job = state.host_job orelse return;
+    if (!wait and !job.done.load(.acquire)) return;
+    job.thread.join();
+    job.destroy();
+    state.host_job = null;
+}
+
+fn cancelHostJob(state: *ServerState) void {
+    const job = state.host_job orelse return;
+    job.cancel.store(true, .seq_cst);
+    if (state.active_session) |*session| session.cancel_flag.store(true, .seq_cst);
+}
+
+/// Whether a host job still runs. Reaps one that finished.
+fn hostJobRunning(state: *ServerState) bool {
+    reapHostJob(state, false);
+    return state.host_job != null;
+}
+
+/// Runs compaction or an MCP verb and answers request `id`.
+fn writeLongHostCommand(
+    state: *ServerState,
+    alloc: Allocator,
+    id: jsonrpc.RequestId,
+    command: host_commands.Command,
+    cancel: ?*const std.atomic.Value(bool),
+) !void {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    switch (command) {
+        .mcp_verb => |line| {
+            const outcome = try runMcpVerb(state, alloc, line, cancel);
+            defer alloc.free(outcome.text);
+            if (!outcome.ok) {
+                return state.writer.writeError(alloc, id, .{
+                    .code = ErrorCode.invalid_request,
+                    .message = outcome.text,
+                });
+            }
+            try host_commands.writeResult(&out.writer, command, .{ .text = outcome.text });
+        },
         .compact => {
-            const outcome = prompt_handler.compactNow(state, alloc) catch |err| return state.writer.writeError(alloc, msg.id, .{
+            const outcome = prompt_handler.compactNow(state, alloc) catch |err| return state.writer.writeError(alloc, id, .{
                 .code = switch (err) {
                     error.SessionBusy => ErrorCode.invalid_request,
                     error.NoActiveSession => ErrorCode.invalid_request,
@@ -4354,8 +4480,46 @@ fn handleHostCommand(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messag
                 },
             });
         },
+        else => unreachable,
     }
-    try state.writer.writeResponse(alloc, msg.id, out.written());
+    try state.writer.writeResponse(alloc, id, out.written());
+}
+
+test "a running host job refuses other requests until cancel ends it" {
+    const alloc = std.testing.allocator;
+    const Capture = struct {
+        refused: bool = false,
+        fn write(raw: ?*anyopaque, frame: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (std.mem.find(u8, frame, "A session command is still running") != null) self.refused = true;
+        }
+        // Stands in for compaction: runs until cancelled.
+        fn work(job: *HostJob) void {
+            while (!job.cancel.load(.acquire)) std.Thread.yield() catch {};
+            job.done.store(true, .release);
+        }
+    };
+    var capture = Capture{};
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&capture, Capture.write),
+        .initialized = true,
+    };
+    defer state.pending_outbound.deinit(alloc);
+    const job = try alloc.create(HostJob);
+    job.* = .{ .state = &state, .id = .{ .integer = 1 }, .command = .compact };
+    job.thread = try std.Thread.spawn(.{}, Capture.work, .{job});
+    state.host_job = job;
+
+    var msg = jsonrpc.Message{ .id = .{ .integer = 2 }, .method = "session/set_mode" };
+    try dispatch(&state, alloc, &msg);
+    try std.testing.expect(capture.refused);
+    try std.testing.expect(hostJobRunning(&state));
+
+    handleCancel(&state, false);
+    reapHostJob(&state, true);
+    try std.testing.expect(state.host_job == null);
 }
 
 const McpVerbHosts = struct {
@@ -4387,7 +4551,7 @@ const McpVerbOutcome = struct {
 
 /// Runs one `/mcp` verb line against this session's MCP host. Config edits
 /// reload the live host so the next turn sees the change without a restart.
-fn runMcpVerb(state: *ServerState, alloc: Allocator, line: []const u8) !McpVerbOutcome {
+fn runMcpVerb(state: *ServerState, alloc: Allocator, line: []const u8, cancel: ?*const std.atomic.Value(bool)) !McpVerbOutcome {
     const active = if (state.active_session) |*session| session else {
         return .{ .ok = false, .text = try alloc.dupe(u8, "Open a session before running an MCP command.") };
     };
@@ -4421,6 +4585,7 @@ fn runMcpVerb(state: *ServerState, alloc: Allocator, line: []const u8) !McpVerbO
             .release = McpVerbHosts.release,
             .changed = McpVerbHosts.changed,
         },
+        .cancel = cancel,
     }, args);
 
     var text: std.Io.Writer.Allocating = .init(alloc);

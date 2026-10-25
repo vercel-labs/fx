@@ -2,10 +2,13 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const protocol = @import("protocol.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Response = std.json.Parsed(std.json.Value);
 pub const max_frame_bytes = 8 * 1024 * 1024;
+/// The hidden command that runs the supervisor (`cli_surface.zig`).
+pub const daemon_argument = "--proto-daemon";
 
 pub const Client = struct {
     alloc: Allocator,
@@ -21,16 +24,13 @@ pub const Client = struct {
         self.* = undefined;
     }
 
-    /// Executes one local command. Run this on a frontend I/O worker, never while painting.
-    /// Commands: ping, list, create{cwd,name?,resume?}, attach{session_id,after_sequence?},
-    /// prompt{session_id,text}, cancel{session_id}, rpc{session_id,frame:<ACP object>},
-    /// children{session_id}, history{session_id,child_id?}, heartbeat{session_id,action,interval_ms?,prompt?},
-    /// stop{session_id}, shutdown. The response owns all strings until deinit().
-    pub fn request(self: *const Client, alloc: Allocator, command: anytype) !Response {
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-        try std.json.Stringify.value(command, .{}, &out.writer);
-        return self.requestJson(alloc, out.written());
+    /// Executes one local request (`protocol.Request`). Run this on a
+    /// frontend I/O worker, never while painting. The response owns all
+    /// strings until deinit().
+    pub fn request(self: *const Client, alloc: Allocator, command: protocol.Request) !Response {
+        const json = try protocol.encode(alloc, command);
+        defer alloc.free(json);
+        return self.requestJson(alloc, json);
     }
 
     pub fn requestJson(self: *const Client, alloc: Allocator, json: []const u8) !Response {
@@ -46,12 +46,9 @@ pub const Client = struct {
     /// Launches this executable in detached daemon mode if no daemon answers.
     /// Startup races converge on the daemon's exclusive owner lock.
     pub fn ensureRunning(self: *const Client, executable: []const u8) !void {
-        if (self.request(self.alloc, .{ .command = "ping" })) |response| {
-            response.deinit();
-            return;
-        } else |_| {}
+        if (self.ping()) |_| return else |err| if (err == error.DaemonVersionMismatch) return err;
         var child = try std.process.spawn(io_mod.getIo(), .{
-            .argv = &.{ executable, "--proto-daemon" },
+            .argv = &.{ executable, daemon_argument },
             .stdin = .ignore,
             .stdout = .ignore,
             .stderr = .ignore,
@@ -60,13 +57,19 @@ pub const Client = struct {
         _ = &child;
         const deadline = io_mod.milliTimestamp() + 15_000;
         while (io_mod.milliTimestamp() < deadline) {
-            if (self.request(self.alloc, .{ .command = "ping" })) |response| {
-                response.deinit();
-                return;
-            } else |_| {}
+            if (self.ping()) |_| return else |err| if (err == error.DaemonVersionMismatch) return err;
             io_mod.sleep(30 * std.time.ns_per_ms);
         }
         return error.DaemonStartupTimeout;
+    }
+
+    /// A supervisor of another protocol version is still running: stop it
+    /// with `proto-fx daemon stop`, which every version understands.
+    fn ping(self: *const Client) !void {
+        const response = try self.request(self.alloc, .ping);
+        defer response.deinit();
+        const pong = std.json.parseFromValueLeaky(protocol.Pong, self.alloc, response.value, .{ .ignore_unknown_fields = true }) catch return error.DaemonVersionMismatch;
+        if (!pong.ok or pong.version != protocol.version) return error.DaemonVersionMismatch;
     }
 };
 

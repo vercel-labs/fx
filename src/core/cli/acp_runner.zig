@@ -80,3 +80,10 @@ pub const Runner = struct {
         return self.run_fn(self.context, alloc, cfg);
     }
 };
+
+/// For hosts that cannot run this server, such as test entry configs.
+pub const unavailable: Runner = .{ .run_fn = runUnavailable };
+
+fn runUnavailable(_: ?*anyopaque, _: Allocator, _: Config) anyerror!void {
+    return error.RunnerUnavailable;
+}

@@ -2,6 +2,7 @@
 //! state releases only client resources, never the supervisor's sessions.
 const std = @import("std");
 const client_mod = @import("../supervisor/client.zig");
+const client_protocol = @import("../supervisor/protocol.zig");
 const io_mod = @import("../shared/io.zig");
 const browser_mod = @import("../input/session_browser.zig");
 const types = @import("../shared/types.zig");
@@ -14,6 +15,7 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const diff = @import("../output/diff.zig");
 const metrics_line = @import("../output/metrics_line.zig");
 const Allocator = std.mem.Allocator;
+const SnapshotView = client_protocol.Snapshot([]const types.HistoryTurn, std.json.Value);
 const Kind = enum { startup, startup_last, startup_remembered, attach, poll, list, children, history, submit, cancel, rpc, heartbeat, kernel, rename, config, command };
 const Request = struct {
     alloc: Allocator,
@@ -122,13 +124,10 @@ pub const State = struct {
         self.child_status_len = 0;
     }
 
-    fn enqueue(self: *State, kind: Kind, command: anytype) !void {
+    fn enqueue(self: *State, kind: Kind, request: client_protocol.Request) !void {
         const alloc = self.allocator orelse return error.RemoteNotInitialized;
         if (self.queue.items.len >= 32) return error.RemoteQueueFull;
-        var writer: std.Io.Writer.Allocating = .init(alloc);
-        defer writer.deinit();
-        try std.json.Stringify.value(command, .{}, &writer.writer);
-        const json = try writer.toOwnedSlice();
+        const json = try client_protocol.encode(alloc, request);
         errdefer alloc.free(json);
         try self.queue.append(alloc, .{ .alloc = alloc, .kind = kind, .json = json, .generation = self.generation });
     }
@@ -165,14 +164,14 @@ pub fn Runtime(comptime App: type) type {
                 switch (target) {
                     .pick => {
                         app.input_runtime.session_browser.open(.sessions);
-                        try remote.enqueue(.list, .{ .command = "list" });
+                        try remote.enqueue(.list, .list);
                     },
-                    .last => try remote.enqueue(.startup_last, .{ .command = "list" }),
-                    .remembered => try remote.enqueue(.startup_remembered, .{ .command = "list" }),
-                    .id => |id| try remote.enqueue(.startup, .{ .command = "create", .cwd = app.workspace_root, .@"resume" = id }),
+                    .last => try remote.enqueue(.startup_last, .list),
+                    .remembered => try remote.enqueue(.startup_remembered, .list),
+                    .id => |id| try remote.enqueue(.startup, .{ .create = .{ .cwd = app.workspace_root, .@"resume" = id } }),
                 }
             } else {
-                try remote.enqueue(.startup, .{ .command = "create", .cwd = app.workspace_root, .@"resume" = resume_id });
+                try remote.enqueue(.startup, .{ .create = .{ .cwd = app.workspace_root, .@"resume" = resume_id } });
             }
             remote.queue.items[0].executable = try app.alloc.dupe(u8, executable);
             try remote.startNext();
@@ -204,7 +203,7 @@ pub fn Runtime(comptime App: type) type {
             }
             if (std.mem.eql(u8, name, "/resume")) {
                 if (rest.len == 0) try openSessionBrowser(app, .sessions) else if (std.mem.eql(u8, rest, "last")) {
-                    try app.remote.enqueue(.startup_last, .{ .command = "list" });
+                    try app.remote.enqueue(.startup_last, .list);
                 } else try switchSession(app, rest);
                 return true;
             }
@@ -213,7 +212,7 @@ pub fn Runtime(comptime App: type) type {
                     try notice(app, "", "usage: /rename <title>");
                 } else if (app.remote.current_id.len == 0) {
                     try notice(app, "session", "Open a session before renaming it.");
-                } else try app.remote.enqueue(.rename, .{ .command = "rename", .session_id = app.remote.current_id, .name = rest });
+                } else try app.remote.enqueue(.rename, .{ .rename = .{ .session_id = app.remote.current_id, .name = rest } });
                 return true;
             }
             if (std.mem.eql(u8, name, "/subagents")) {
@@ -231,11 +230,10 @@ pub fn Runtime(comptime App: type) type {
                     try notice(app, "session", "Open a session before copying a reply.");
                     return true;
                 }
-                try app.remote.enqueue(.command, .{
-                    .command = "command",
+                try app.remote.enqueue(.command, .{ .command = .{
                     .session_id = app.remote.current_id,
                     .name = "last_reply",
-                });
+                } });
                 return true;
             }
             if (std.mem.eql(u8, name, "/stats")) {
@@ -255,20 +253,18 @@ pub fn Runtime(comptime App: type) type {
                 }
                 const usage = "usage: /workspace [add PATH|remove PATH|clear]";
                 if (rest.len == 0 or std.mem.eql(u8, rest, "list")) {
-                    try app.remote.enqueue(.command, .{
-                        .command = "command",
+                    try app.remote.enqueue(.command, .{ .command = .{
                         .session_id = app.remote.current_id,
                         .name = "workspace",
-                    });
+                    } });
                     return true;
                 }
                 if (std.mem.eql(u8, rest, "clear")) {
-                    try app.remote.enqueue(.command, .{
-                        .command = "command",
+                    try app.remote.enqueue(.command, .{ .command = .{
                         .session_id = app.remote.current_id,
                         .name = "workspace",
                         .action = "clear",
-                    });
+                    } });
                     return true;
                 }
                 const verb_end = std.mem.findAny(u8, rest, " \t") orelse {
@@ -283,13 +279,12 @@ pub fn Runtime(comptime App: type) type {
                     try notice(app, "", usage);
                     return true;
                 }
-                try app.remote.enqueue(.command, .{
-                    .command = "command",
+                try app.remote.enqueue(.command, .{ .command = .{
                     .session_id = app.remote.current_id,
                     .name = "workspace",
                     .action = verb,
                     .path = path,
-                });
+                } });
                 return true;
             }
             if (std.mem.eql(u8, name, "/shell")) {
@@ -305,11 +300,10 @@ pub fn Runtime(comptime App: type) type {
                     try notice(app, "session", "Open a session before reloading its shell.");
                     return true;
                 }
-                try app.remote.enqueue(.command, .{
-                    .command = "command",
+                try app.remote.enqueue(.command, .{ .command = .{
                     .session_id = app.remote.current_id,
                     .name = "shell_reload",
-                });
+                } });
                 return true;
             }
             if (std.mem.eql(u8, name, "/context")) {
@@ -321,11 +315,10 @@ pub fn Runtime(comptime App: type) type {
                     try notice(app, "session", "Open a session before checking its context.");
                     return true;
                 }
-                try app.remote.enqueue(.command, .{
-                    .command = "command",
+                try app.remote.enqueue(.command, .{ .command = .{
                     .session_id = app.remote.current_id,
                     .name = "context",
-                });
+                } });
                 return true;
             }
             if (std.mem.eql(u8, name, "/compact")) {
@@ -337,11 +330,10 @@ pub fn Runtime(comptime App: type) type {
                     try notice(app, "session", "Open a session before compacting it.");
                     return true;
                 }
-                try app.remote.enqueue(.command, .{
-                    .command = "command",
+                try app.remote.enqueue(.command, .{ .command = .{
                     .session_id = app.remote.current_id,
                     .name = "compact",
-                });
+                } });
                 try notice(app, "session", "Compacting context...");
                 return true;
             }
@@ -365,11 +357,10 @@ pub fn Runtime(comptime App: type) type {
                     try notice(app, "session", "Open a session before undoing a file operation.");
                     return true;
                 }
-                try app.remote.enqueue(.command, .{
-                    .command = "command",
+                try app.remote.enqueue(.command, .{ .command = .{
                     .session_id = app.remote.current_id,
                     .name = "undo",
-                });
+                } });
                 return true;
             }
             if (optionIdForCommand(name)) |option| {
@@ -386,19 +377,17 @@ pub fn Runtime(comptime App: type) type {
                     return true;
                 }
                 if (rest.len == 0) {
-                    try app.remote.enqueue(.command, .{
-                        .command = "command",
+                    try app.remote.enqueue(.command, .{ .command = .{
                         .session_id = app.remote.current_id,
                         .name = "mcp_status",
-                    });
+                    } });
                     return true;
                 }
-                try app.remote.enqueue(.command, .{
-                    .command = "command",
+                try app.remote.enqueue(.command, .{ .command = .{
                     .session_id = app.remote.current_id,
                     .name = "mcp_verb",
                     .line = rest,
-                });
+                } });
                 return true;
             }
             if (std.mem.eql(u8, name, "/fork")) {
@@ -421,13 +410,13 @@ pub fn Runtime(comptime App: type) type {
                 } else if (app.remote.current_id.len == 0) {
                     try notice(app, "session", "Open a session before changing its configuration.");
                 } else if (is_model) {
-                    try app.remote.enqueue(.config, .{ .command = "model", .session_id = app.remote.current_id, .model = rest });
+                    try app.remote.enqueue(.config, .{ .model = .{ .session_id = app.remote.current_id, .model = rest } });
                 } else if (types.PermissionMode.parse(rest)) |mode| {
-                    try app.remote.enqueue(.config, .{ .command = "mode", .session_id = app.remote.current_id, .mode = switch (mode) {
+                    try app.remote.enqueue(.config, .{ .mode = .{ .session_id = app.remote.current_id, .mode = switch (mode) {
                         .ask => "ask",
                         .auto => "auto",
                         .yolo => "full-access",
-                    } });
+                    } } });
                 } else try notice(app, "", "usage: /permissions ask|auto|full-access");
                 return true;
             }
@@ -444,7 +433,7 @@ pub fn Runtime(comptime App: type) type {
             if (kernel) {
                 if (args.len == 0) for ([_][]const u8{ "status", "restart", "stop", "prewarm", "interrupt" }) |allowed| {
                     if (!std.mem.eql(u8, action, allowed)) continue;
-                    try app.remote.enqueue(.kernel, .{ .command = "kernel", .session_id = app.remote.current_id, .action = action });
+                    try app.remote.enqueue(.kernel, .{ .kernel = .{ .session_id = app.remote.current_id, .action = action } });
                     return true;
                 };
                 try notice(app, "", "usage: /kernel status|restart|stop|prewarm|interrupt");
@@ -455,12 +444,12 @@ pub fn Runtime(comptime App: type) type {
                 const seconds = std.fmt.parseInt(u64, args[0..seconds_end], 10) catch 0;
                 const prompt = std.mem.trim(u8, args[seconds_end..], " \t");
                 if (seconds > 0 and seconds <= 365 * 24 * 60 * 60 and prompt.len > 0) {
-                    try app.remote.enqueue(.heartbeat, .{ .command = "heartbeat", .session_id = app.remote.current_id, .action = "set", .interval_ms = seconds * 1000, .prompt = prompt });
+                    try app.remote.enqueue(.heartbeat, .{ .heartbeat = .{ .session_id = app.remote.current_id, .action = .set, .interval_ms = seconds * 1000, .prompt = prompt } });
                     return true;
                 }
             } else if (args.len == 0) for ([_][]const u8{ "status", "pause", "resume", "stop" }) |allowed| {
                 if (!std.mem.eql(u8, action, allowed)) continue;
-                try app.remote.enqueue(.heartbeat, .{ .command = "heartbeat", .session_id = app.remote.current_id, .action = if (std.mem.eql(u8, action, "stop")) "clear" else action });
+                try app.remote.enqueue(.heartbeat, .{ .heartbeat = .{ .session_id = app.remote.current_id, .action = if (std.mem.eql(u8, action, "stop")) .clear else std.meta.stringToEnum(client_protocol.HeartbeatAction, action).? } });
                 return true;
             };
             try notice(app, "", "usage: /heartbeat status|start <seconds> <prompt>|pause|resume|stop");
@@ -497,12 +486,11 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
 
-            try app.remote.enqueue(.config, .{
-                .command = "option",
+            try app.remote.enqueue(.config, .{ .option = .{
                 .session_id = app.remote.current_id,
                 .config_id = option,
                 .value = value,
-            });
+            } });
         }
 
         /// Renders the result of a forwarded `fx/command`. The host owns the
@@ -607,11 +595,10 @@ pub fn Runtime(comptime App: type) type {
         /// just wrote to the profile or project settings.
         pub fn reloadPermissions(app: *App) !void {
             if (app.remote.current_id.len == 0) return;
-            try app.remote.enqueue(.command, .{
-                .command = "command",
+            try app.remote.enqueue(.command, .{ .command = .{
                 .session_id = app.remote.current_id,
                 .name = "permissions_reload",
-            });
+            } });
         }
 
         pub fn newSession(app: *App) !void {
@@ -626,7 +613,7 @@ pub fn Runtime(comptime App: type) type {
             app.remote.native_presentation = false;
             app.input_runtime.session_browser.close();
             resetTranscript(app);
-            try app.remote.enqueue(.startup, .{ .command = "create", .cwd = app.workspace_root });
+            try app.remote.enqueue(.startup, .{ .create = .{ .cwd = app.workspace_root } });
         }
 
         pub fn submit(app: *App, prompt: []const u8, images: []const types.ImageAttachment) !bool {
@@ -647,7 +634,7 @@ pub fn Runtime(comptime App: type) type {
             if (app.remote.submitted_text.items.len >= 32) app.alloc.free(app.remote.submitted_text.orderedRemove(0));
             try app.remote.submitted_text.append(app.alloc, text);
             errdefer _ = app.remote.submitted_text.pop();
-            try app.remote.enqueue(.submit, .{ .command = "prompt", .session_id = app.remote.current_id, .text = prompt });
+            try app.remote.enqueue(.submit, .{ .prompt = .{ .session_id = app.remote.current_id, .text = prompt } });
             app.stream.active = true;
             app.shell.render_requests.request(.footer);
             return true;
@@ -655,7 +642,7 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn cancel(app: *App) !void {
             if (app.remote.current_id.len == 0) return;
-            try app.remote.enqueue(.cancel, .{ .command = "cancel", .session_id = app.remote.current_id });
+            try app.remote.enqueue(.cancel, .{ .cancel = .{ .session_id = app.remote.current_id } });
         }
 
         pub fn openSessionBrowser(app: *App, scope: browser_mod.Scope) !void {
@@ -667,9 +654,9 @@ pub fn Runtime(comptime App: type) type {
 
         fn refreshBrowser(app: *App) !void {
             if (app.input_runtime.session_browser.scope == .sessions) {
-                try app.remote.enqueue(.list, .{ .command = "list" });
+                try app.remote.enqueue(.list, .list);
             } else if (app.remote.current_id.len > 0) {
-                try app.remote.enqueue(.children, .{ .command = "children", .session_id = app.remote.current_id });
+                try app.remote.enqueue(.children, .{ .children = .{ .session_id = app.remote.current_id } });
             } else {
                 try app.input_runtime.session_browser.replaceRows(app.alloc, &.{});
             }
@@ -709,7 +696,7 @@ pub fn Runtime(comptime App: type) type {
             app.remote.sequence = 0;
             app.remote.native_presentation = false;
             resetTranscript(app);
-            try app.remote.enqueue(.attach, .{ .command = "attach", .session_id = app.remote.current_id, .after_sequence = 0 });
+            try app.remote.enqueue(.attach, .{ .attach = .{ .session_id = app.remote.current_id, .after_sequence = 0 } });
         }
 
         pub fn browserBack(app: *App) !void {
@@ -765,7 +752,7 @@ pub fn Runtime(comptime App: type) type {
             }
             const now = io_mod.milliTimestamp();
             if (remote.task == null and remote.queue.items.len == 0 and remote.current_id.len > 0 and now >= remote.next_poll_ms) {
-                try remote.enqueue(.poll, .{ .command = "attach", .session_id = remote.current_id, .after_sequence = remote.sequence, .include_history = false });
+                try remote.enqueue(.poll, .{ .attach = .{ .session_id = remote.current_id, .after_sequence = remote.sequence, .include_history = false } });
                 remote.next_poll_ms = now + 100;
             }
             if (app.input_runtime.session_browser.active and now >= remote.next_list_ms and remote.queue.items.len < 2) try refreshBrowser(app);
@@ -779,62 +766,83 @@ pub fn Runtime(comptime App: type) type {
             const remote = &app.remote;
             if (remote.task) |task| if (task.request.kind == .history and task.request.generation == remote.generation) return;
             for (remote.queue.items) |request| if (request.kind == .history and request.generation == remote.generation) return;
-            try remote.enqueue(.history, .{
-                .command = "history",
+            try remote.enqueue(.history, .{ .history = .{
                 .session_id = remote.current_id,
                 .child_id = remote.child_id,
                 .work_id = if (remote.child_work_id.len > 0) remote.child_work_id else null,
                 .after_live_sequence = remote.child_sequence,
                 .live_active = remote.child_live_active,
                 .include_history = remote.child_history_count == null,
-            });
+            } });
             remote.next_child_poll_ms = io_mod.milliTimestamp() + 150;
         }
 
+        fn decode(comptime T: type, app: *App, value: std.json.Value) !std.json.Parsed(T) {
+            return std.json.parseFromValue(T, app.alloc, value, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+        }
+
         fn applyResponse(app: *App, kind: Kind, value: std.json.Value) !void {
-            if (field(value, "ok")) |ok| {
-                if (ok == .bool and !ok.bool) {
-                    const message = string(value, "error") orelse "The local session request failed";
-                    if (kind == .list or kind == .children) app.input_runtime.session_browser.fail(message);
-                    try app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = message }, true);
-                    return;
-                }
+            var outcome = try decode(client_protocol.Outcome, app, value);
+            defer outcome.deinit();
+            if (!outcome.value.ok) {
+                const message = outcome.value.@"error" orelse "The local session request failed";
+                if (kind == .list or kind == .children) app.input_runtime.session_browser.fail(message);
+                try app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = message }, true);
+                return;
             }
             switch (kind) {
-                .startup, .attach, .poll => try applySnapshot(app, value),
-                .list, .children => try applyRows(app, kind, value),
+                .startup, .attach, .poll => {
+                    var snapshot = try decode(SnapshotView, app, value);
+                    defer snapshot.deinit();
+                    try applySnapshot(app, snapshot.value);
+                },
+                .list => {
+                    var listed = try decode(client_protocol.SessionList, app, value);
+                    defer listed.deinit();
+                    try applySessionRows(app, listed.value.sessions);
+                },
+                .children => {
+                    var listed = try decode(client_protocol.Children, app, value);
+                    defer listed.deinit();
+                    try applyChildRows(app, listed.value.children);
+                },
                 .startup_last, .startup_remembered => {
-                    const rows = array(value, "sessions");
+                    var listed = try decode(client_protocol.SessionList, app, value);
+                    defer listed.deinit();
                     var selected: ?[]const u8 = null;
-                    if (kind == .startup_remembered) selected = string(value, "last_attached_id");
+                    if (kind == .startup_remembered) selected = listed.value.last_attached_id;
                     if (selected == null or selected.?.len == 0) {
                         var updated: i64 = -1;
-                        for (rows) |row| {
-                            if (!std.mem.eql(u8, string(row, "cwd") orelse "", app.workspace_root)) continue;
-                            const timestamp = integer(row, "updated_at_ms") orelse 0;
-                            if (timestamp >= updated) {
-                                selected = string(row, "id");
-                                updated = timestamp;
+                        for (listed.value.sessions) |row| {
+                            if (!std.mem.eql(u8, row.cwd, app.workspace_root)) continue;
+                            if (row.updated_at_ms >= updated) {
+                                selected = row.id;
+                                updated = row.updated_at_ms;
                             }
                         }
                     }
                     if (selected) |id| try switchSession(app, id) else try newSession(app);
                 },
                 .heartbeat => {
-                    const heartbeat = field(value, "heartbeat") orelse return;
-                    const interval = integer(heartbeat, "interval_ms") orelse 0;
-                    const paused = if (field(heartbeat, "paused")) |v| v == .bool and v.bool else true;
-                    const body = if (interval == 0) try app.alloc.dupe(u8, "No heartbeat configured.") else try app.alloc.print("{s} · every {d}s · {s}", .{ if (paused) "Paused" else "Running", @divTrunc(interval, 1000), string(heartbeat, "prompt") orelse "" });
+                    var state = try decode(client_protocol.HeartbeatState, app, value);
+                    defer state.deinit();
+                    const heartbeat = state.value.heartbeat;
+                    const body = if (heartbeat.interval_ms == 0) try app.alloc.dupe(u8, "No heartbeat configured.") else try app.alloc.print("{s} · every {d}s · {s}", .{ if (heartbeat.paused) "Paused" else "Running", @divTrunc(heartbeat.interval_ms, 1000), heartbeat.prompt });
                     defer app.alloc.free(body);
                     try notice(app, "heartbeat", body);
                 },
                 .kernel => {
-                    var out: std.Io.Writer.Allocating = .init(app.alloc);
-                    defer out.deinit();
-                    try std.json.Stringify.value(field(value, "kernel") orelse value, .{}, &out.writer);
-                    try notice(app, "kernel", out.written());
+                    var state = try decode(client_protocol.KernelState, app, value);
+                    defer state.deinit();
+                    const body = try std.json.Stringify.valueAlloc(app.alloc, state.value.kernel, .{});
+                    defer app.alloc.free(body);
+                    try notice(app, "kernel", body);
                 },
-                .history => try applyChildSnapshot(app, value),
+                .history => {
+                    var child = try decode(client_protocol.ChildHistory(std.json.Value), app, value);
+                    defer child.deinit();
+                    try applyChildSnapshot(app, child.value);
+                },
                 .config => {
                     try notice(app, "session", "Session configuration updated.");
                     app.remote.next_poll_ms = 0;
@@ -852,96 +860,96 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        fn applyRows(app: *App, kind: Kind, value: std.json.Value) !void {
+        fn applySessionRows(app: *App, sessions_listed: []const client_protocol.SessionSummary) !void {
             const browser = &app.input_runtime.session_browser;
-            if (!browser.active or (kind == .list) != (browser.scope == .sessions)) return;
-            const values = array(value, if (kind == .list) "sessions" else "children");
+            if (!browser.active or browser.scope != .sessions) return;
             var arena: std.heap.ArenaAllocator = .init(app.alloc);
             defer arena.deinit();
             const a = arena.allocator();
-            const rows = try a.alloc(browser_mod.Row, values.len);
+            const rows = try a.alloc(browser_mod.Row, sessions_listed.len);
             const now_ms = io_mod.milliTimestamp();
-            for (values, rows) |item, *row| {
-                const id = string(item, "id") orelse "";
-                const name = string(item, "name") orelse "";
-                const status = string(item, "status") orelse "";
-                const detail = string(item, if (kind == .list) "cwd" else "detail") orelse "";
-                const updated_at_ms = integer(item, "updated_at_ms") orelse 0;
+            for (sessions_listed, rows) |item, *row| {
                 var age_buf: [32]u8 = undefined;
-                const age = session_catalog.relativeActivityAgeCompact(&age_buf, updated_at_ms, now_ms);
-                const named = name.len > 0 and !std.mem.eql(u8, name, "session");
-                const short_id = if (id.len > 8) id[0..8] else id;
-                const title = if (kind == .list and !named)
-                    try a.print("session {s}", .{short_id})
-                else if (name.len > 0)
-                    name
-                else
-                    id;
-                const meta = if (kind == .list)
-                    if (std.mem.eql(u8, status, "running") or std.mem.eql(u8, status, "awaiting_approval")) status else age
-                else
-                    status;
+                const age = session_catalog.relativeActivityAgeCompact(&age_buf, item.updated_at_ms, now_ms);
+                const named = item.name.len > 0 and !std.mem.eql(u8, item.name, "session");
+                const short_id = if (item.id.len > 8) item.id[0..8] else item.id;
+                const active = item.status == .running or item.status == .awaiting_approval;
                 row.* = .{
-                    .id = id,
-                    .parent_id = string(item, "parent_id") orelse "",
-                    .title = title,
-                    .status = status,
-                    .detail = if (kind == .list) "" else detail,
-                    .meta = try a.dupe(u8, meta),
-                    .depth = @intCast(integer(item, "depth") orelse 0),
-                    .current = std.mem.eql(u8, id, app.remote.current_id),
+                    .id = item.id,
+                    .parent_id = "",
+                    .title = if (named) item.name else try a.print("session {s}", .{short_id}),
+                    .status = @tagName(item.status),
+                    .detail = "",
+                    .meta = try a.dupe(u8, if (active) @tagName(item.status) else age),
+                    .depth = 0,
+                    .current = std.mem.eql(u8, item.id, app.remote.current_id),
                 };
             }
             try browser.replaceRows(app.alloc, rows);
         }
 
-        fn applyChildSnapshot(app: *App, value: std.json.Value) !void {
+        fn applyChildRows(app: *App, children: []const client_protocol.Child) !void {
+            const browser = &app.input_runtime.session_browser;
+            if (!browser.active or browser.scope != .subagents) return;
+            var arena: std.heap.ArenaAllocator = .init(app.alloc);
+            defer arena.deinit();
+            const rows = try arena.allocator().alloc(browser_mod.Row, children.len);
+            for (children, rows) |item, *row| {
+                row.* = .{
+                    .id = item.id,
+                    .parent_id = item.parent_id,
+                    .title = if (item.name.len > 0) item.name else item.id,
+                    .status = item.status,
+                    .detail = item.detail,
+                    .meta = item.status,
+                    .depth = item.depth,
+                    .current = std.mem.eql(u8, item.id, app.remote.current_id),
+                };
+            }
+            try browser.replaceRows(app.alloc, rows);
+        }
+
+        fn applyChildSnapshot(app: *App, value: client_protocol.ChildHistory(std.json.Value)) !void {
             const remote = &app.remote;
-            if (remote.child_id.len == 0) return;
-            const child_id = string(value, "child_id") orelse return applyLegacyChildSnapshot(app, value);
-            if (!std.mem.eql(u8, remote.child_id, child_id)) return;
-            const work_id = string(value, "work_id") orelse "";
-            const sequence: u64 = @intCast(@max(0, integer(value, "live_sequence") orelse 0));
-            const live_active = boolean(value, "live_active");
-            const reset = boolean(value, "live_reset") or remote.child_history_count == null or
-                !std.mem.eql(u8, work_id, remote.child_work_id) or sequence < remote.child_sequence or
+            if (remote.child_id.len == 0 or !std.mem.eql(u8, remote.child_id, value.child_id)) return;
+            const live_active = value.live_active;
+            const reset = value.live_reset or remote.child_history_count == null or
+                !std.mem.eql(u8, value.work_id, remote.child_work_id) or value.live_sequence < remote.child_sequence or
                 live_active != remote.child_live_active;
             if (reset) {
-                const history_value = field(value, "history") orelse {
+                const history = value.history orelse {
                     // Ask for a complete baseline rather than joining unrelated tails.
                     remote.child_history_count = null;
                     remote.next_child_poll_ms = 0;
                     return;
                 };
-                const owned_work = try app.alloc.dupe(u8, work_id);
+                const owned_work = try app.alloc.dupe(u8, value.work_id);
                 errdefer app.alloc.free(owned_work);
-                const active_prompt = string(value, "active_prompt") orelse "";
+                const active_prompt = value.active_prompt orelse "";
                 const owned_prompt = try app.alloc.dupe(u8, active_prompt);
                 errdefer app.alloc.free(owned_prompt);
-                var history = try std.json.parseFromValue([]types.HistoryTurn, app.alloc, history_value, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
-                defer history.deinit();
                 resetTranscriptContents(app);
-                try sessions.Runtime(App).replayRemoteHistory(app, history.value);
+                try sessions.Runtime(App).replayRemoteHistory(app, history);
                 remote.turn_id = app.shell.finalizedToolTurnWatermark() + 1;
                 remote.native_turn_offset = remote.turn_id;
-                const outcome = if (live_active) string(value, "status") orelse "running" else string(value, "last_outcome") orelse string(value, "status") orelse "idle";
-                const body = try app.alloc.print("{s} · {s} · read-only child transcript · left returns to parent", .{ string(value, "name") orelse "Subagent", outcome });
+                const outcome = if (live_active) value.status else value.last_outcome orelse value.status;
+                const body = try app.alloc.print("{s} · {s} · read-only child transcript · left returns to parent", .{ value.name, outcome });
                 defer app.alloc.free(body);
                 try notice(app, "subagent", body);
-                if (!live_active) if (string(value, "last_failure")) |failure| try notice(app, "subagent", failure);
+                if (!live_active) if (value.last_failure) |failure| try notice(app, "subagent", failure);
                 if (live_active and active_prompt.len > 0) try app.writeUserPromptCard(.{ .text = @constCast(active_prompt) });
-                if ((integer(value, "oldest_live_sequence") orelse 0) > 1) {
+                if (value.oldest_live_sequence > 1) {
                     try notice(app, "subagent", "Earlier live output exceeded the preview buffer. The complete transcript will load when this work finishes.");
                 }
                 if (remote.child_work_id.len > 0) app.alloc.free(remote.child_work_id);
                 remote.child_work_id = owned_work;
                 if (remote.child_prompt.len > 0) app.alloc.free(remote.child_prompt);
                 remote.child_prompt = owned_prompt;
-                remote.child_history_count = history.value.len;
+                remote.child_history_count = history.len;
                 remote.child_sequence = 0;
                 if (live_active) app.stream.turn_started_ms = io_mod.milliTimestamp();
             }
-            const status = string(value, "status") orelse "idle";
+            const status = value.status;
             remote.child_status_len = @min(status.len, remote.child_status.len);
             @memcpy(remote.child_status[0..remote.child_status_len], status[0..remote.child_status_len]);
             remote.child_live_active = live_active;
@@ -952,7 +960,8 @@ pub fn Runtime(comptime App: type) type {
                 app.stream.turn_started_ms += io_mod.milliTimestamp() - app.stream.waiting_since_ms;
                 app.stream.waiting_since_ms = 0;
             }
-            for (array(value, "live_events")) |entry| {
+            const live_events = itemsOf(value.live_events);
+            for (live_events) |entry| {
                 const event_sequence: u64 = @intCast(@max(0, integer(entry, "sequence") orelse 0));
                 if (event_sequence <= remote.child_sequence) continue;
                 if (string(entry, "text")) |text| {
@@ -963,32 +972,9 @@ pub fn Runtime(comptime App: type) type {
                 }
                 remote.child_sequence = event_sequence;
             }
-            remote.child_sequence = @max(remote.child_sequence, sequence);
+            remote.child_sequence = @max(remote.child_sequence, value.live_sequence);
             try callbacks.Bindings(App).worker_tool_lifecycle_presenter(app).finish_batch(app.alloc);
-            if (reset or array(value, "live_events").len > 0) app.shell.render_requests.request(.transcript);
-        }
-
-        fn applyLegacyChildSnapshot(app: *App, value: std.json.Value) !void {
-            const remote = &app.remote;
-            const history_value = field(value, "history") orelse return;
-            const count = array(value, "history").len;
-            const status = string(value, "status") orelse "idle";
-            const prompt = string(value, "active_prompt") orelse "";
-            if (remote.child_history_count == count and std.mem.eql(u8, status, remote.child_status[0..remote.child_status_len]) and std.mem.eql(u8, prompt, remote.child_prompt)) return;
-            const owned_prompt = try app.alloc.dupe(u8, prompt);
-            errdefer app.alloc.free(owned_prompt);
-            var history = try std.json.parseFromValue([]types.HistoryTurn, app.alloc, history_value, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
-            defer history.deinit();
-            resetTranscriptContents(app);
-            try sessions.Runtime(App).replayRemoteHistory(app, history.value);
-            try notice(app, "subagent", "This supervisor shows completed child history only. Restart the supervisor when its running work can be stopped to enable live child progress.");
-            if (prompt.len > 0) try app.writeUserPromptCard(.{ .text = @constCast(prompt) });
-            if (remote.child_prompt.len > 0) app.alloc.free(remote.child_prompt);
-            remote.child_prompt = owned_prompt;
-            remote.child_history_count = count;
-            remote.child_status_len = @min(status.len, remote.child_status.len);
-            @memcpy(remote.child_status[0..remote.child_status_len], status[0..remote.child_status_len]);
-            app.stream.active = childIsRunning(app);
+            if (reset or live_events.len > 0) app.shell.render_requests.request(.transcript);
         }
 
         fn nativeLifecycleId(app: *App, id: types.ToolLifecycleId) !types.ToolLifecycleId {
@@ -1115,78 +1101,64 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        fn applySnapshot(app: *App, value: std.json.Value) !void {
+        fn applySnapshot(app: *App, value: SnapshotView) !void {
             const remote = &app.remote;
-            if (string(value, "incarnation")) |incarnation| {
-                const changed = if (remote.incarnation.len > 0) !std.mem.eql(u8, remote.incarnation, incarnation) else remote.sequence > 0;
-                if (remote.incarnation.len == 0 or changed) {
-                    const owned = try app.alloc.dupe(u8, incarnation);
-                    if (remote.incarnation.len > 0) app.alloc.free(remote.incarnation);
-                    remote.incarnation = owned;
-                }
-                if (changed) {
-                    // Never replay a command after a connection's execution owner changes.
-                    for (remote.queue.items) |*request| request.deinit();
-                    remote.queue.clearRetainingCapacity();
-                    const session_id = string(value, "session_id") orelse remote.current_id;
-                    try switchSession(app, session_id);
-                    remote.reconnect_notice = true;
-                    return;
-                }
+            const changed = if (remote.incarnation.len > 0) !std.mem.eql(u8, remote.incarnation, value.incarnation) else remote.sequence > 0;
+            if (remote.incarnation.len == 0 or changed) {
+                const owned = try app.alloc.dupe(u8, value.incarnation);
+                if (remote.incarnation.len > 0) app.alloc.free(remote.incarnation);
+                remote.incarnation = owned;
             }
-            if (remote.current_id.len == 0) {
-                const id = string(value, "session_id") orelse return;
-                remote.current_id = try app.alloc.dupe(u8, id);
+            if (changed) {
+                // Never replay a command after a connection's execution owner changes.
+                for (remote.queue.items) |*request| request.deinit();
+                remote.queue.clearRetainingCapacity();
+                try switchSession(app, value.session_id);
+                remote.reconnect_notice = true;
+                return;
             }
-            if (field(value, "history")) |history_value| {
+            if (remote.current_id.len == 0) remote.current_id = try app.alloc.dupe(u8, value.session_id);
+            if (value.history) |history| {
                 resetTranscript(app);
-                var history = try std.json.parseFromValue([]types.HistoryTurn, app.alloc, history_value, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
-                defer history.deinit();
-                try sessions.Runtime(App).replayRemoteHistory(app, history.value);
+                try sessions.Runtime(App).replayRemoteHistory(app, history);
                 remote.turn_id = app.shell.finalizedToolTurnWatermark() + 1;
                 remote.native_turn_offset = remote.turn_id;
-                remote.sequence = @intCast(integer(value, "history_sequence") orelse 0);
+                remote.sequence = value.history_sequence orelse 0;
             }
             // Select the presentation lane before applying any frames, including
-            // the initial attachment tail. Older supervisors retain ACP projection.
-            remote.native_presentation = boolean(value, "native_presentation");
-            const summary = field(value, "session") orelse .null;
-            if (string(summary, "cwd")) |cwd| if (!std.mem.eql(u8, cwd, remote.cwd)) {
-                const owned = try app.alloc.dupe(u8, cwd);
+            // the initial attachment tail.
+            remote.native_presentation = value.native_presentation;
+            const summary = value.session;
+            if (!std.mem.eql(u8, summary.cwd, remote.cwd)) {
+                const owned = try app.alloc.dupe(u8, summary.cwd);
                 errdefer app.alloc.free(owned);
-                const label = try text_utils.encodeTerminalSafeInline(app.alloc, std.Io.Dir.path.basename(cwd), 128);
+                const label = try text_utils.encodeTerminalSafeInline(app.alloc, std.Io.Dir.path.basename(summary.cwd), 128);
                 if (remote.cwd.len > 0) app.alloc.free(remote.cwd);
                 if (remote.workspace_label.len > 0) app.alloc.free(remote.workspace_label);
                 remote.cwd = owned;
                 remote.workspace_label = label.bytes;
-            };
-            if (string(summary, "name")) |name| {
-                if (!std.mem.eql(u8, name, app.session_title.items)) {
-                    try sessions.Runtime(App).setCachedSessionTitle(app, name);
-                }
             }
-            if (string(summary, "model")) |model| if (!std.mem.eql(u8, model, remote.model)) {
-                const owned = try app.alloc.dupe(u8, model);
+            if (!std.mem.eql(u8, summary.name, app.session_title.items)) {
+                try sessions.Runtime(App).setCachedSessionTitle(app, summary.name);
+            }
+            if (!std.mem.eql(u8, summary.model, remote.model)) {
+                const owned = try app.alloc.dupe(u8, summary.model);
                 if (remote.model.len > 0) app.alloc.free(remote.model);
                 remote.model = owned;
-            };
-            if (string(summary, "mode")) |mode| {
-                remote.permission_mode = types.PermissionMode.parse(mode) orelse remote.permission_mode;
-                // The inactive local engine mirrors the attached projection for settings panels.
-                app.permission_engine.mode = remote.permission_mode;
             }
-            const status = string(summary, "status") orelse "idle";
-            const running = std.mem.eql(u8, status, "running") or std.mem.eql(u8, status, "awaiting_approval");
-            for (array(value, "events")) |event| {
-                const sequence: u64 = @intCast(integer(event, "sequence") orelse 0);
-                if (sequence <= remote.sequence) continue;
-                if (remote.child_id.len == 0) if (field(event, "frame")) |frame| try applyFrame(app, frame);
-                remote.sequence = sequence;
+            remote.permission_mode = types.PermissionMode.parse(summary.mode) orelse remote.permission_mode;
+            // The inactive local engine mirrors the attached projection for settings panels.
+            app.permission_engine.mode = remote.permission_mode;
+            const running = summary.status == .running or summary.status == .awaiting_approval;
+            for (value.events) |event| {
+                if (event.sequence <= remote.sequence) continue;
+                if (remote.child_id.len == 0) try applyFrame(app, event.frame);
+                remote.sequence = event.sequence;
             }
             if (remote.child_id.len == 0) {
                 try callbacks.Bindings(App).worker_tool_lifecycle_presenter(app).finish_batch(app.alloc);
                 if (!running and !remote.native_presentation) try flushMarkdown(app);
-                if (running and std.mem.eql(u8, status, "awaiting_approval")) {
+                if (summary.status == .awaiting_approval) {
                     if (app.stream.waiting_since_ms == 0) app.stream.waiting_since_ms = io_mod.milliTimestamp();
                 } else if (app.stream.waiting_since_ms != 0) {
                     app.stream.turn_started_ms += io_mod.milliTimestamp() - app.stream.waiting_since_ms;
@@ -1204,11 +1176,10 @@ pub fn Runtime(comptime App: type) type {
                 try notice(app, "session", "Supervisor restarted; restored this session. Unsent requests were not replayed.");
             }
             if (!remote.permission_response_queued) {
-                const pending = array(value, "pending");
-                if (pending.len == 0) {
+                if (value.pending.len == 0) {
                     remote.pending_permission_id = null;
                     app.approval_prompt.clear(app.alloc);
-                } else for (pending) |frame| {
+                } else for (value.pending) |frame| {
                     if (std.mem.eql(u8, string(frame, "method") orelse "", "session/request_permission")) {
                         try showPermission(app, frame);
                         break;
@@ -1224,7 +1195,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn applyFrame(app: *App, frame: std.json.Value) !void {
             const method = string(frame, "method") orelse return;
-            if (std.mem.eql(u8, method, "proto/replay_gap")) {
+            if (std.mem.eql(u8, method, client_protocol.replay_gap_method)) {
                 try notice(app, "session", "Some live output exceeded the replay buffer. Reopen this session after its turn finishes to load the complete saved transcript.");
                 return;
             }
@@ -1240,14 +1211,16 @@ pub fn Runtime(comptime App: type) type {
                 app.shell.render_requests.request(.footer);
                 return;
             }
-            if (std.mem.eql(u8, method, "fx/command_result")) {
+            if (std.mem.eql(u8, method, client_protocol.command_result_method)) {
                 const params = field(frame, "params") orelse return;
-                if (field(params, "ok")) |ok| if (ok == .bool and !ok.bool) {
-                    const message = string(params, "error") orelse "The session command failed";
+                var result = try decode(client_protocol.CommandResult(std.json.Value), app, params);
+                defer result.deinit();
+                if (!result.value.ok) {
+                    const message = result.value.@"error" orelse "The session command failed";
                     try app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = message }, true);
                     app.shell.render_requests.request(.footer);
                     return;
-                };
+                }
                 try applyCommandResult(app, params);
                 app.shell.render_requests.request(.footer);
                 return;
@@ -1372,12 +1345,12 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn resolvePermission(app: *App, decision: types.ToolPermissionDecision) !bool {
             const id = app.remote.pending_permission_id orelse return false;
-            const option = switch (decision) {
-                .once => "allow_once",
-                .always => "allow_always",
-                .deny, .policy_denied, .permission_required => "reject_once",
+            const option: client_protocol.PermissionOption = switch (decision) {
+                .once => .allow_once,
+                .always => .allow_always,
+                .deny, .policy_denied, .permission_required => .reject_once,
             };
-            try app.remote.enqueue(.rpc, .{ .command = "rpc", .session_id = app.remote.current_id, .frame = .{ .jsonrpc = "2.0", .id = id, .result = .{ .outcome = .{ .outcome = "selected", .optionId = option } } } });
+            try app.remote.enqueue(.rpc, .{ .permission = .{ .session_id = app.remote.current_id, .request_id = id, .option = option } });
             app.remote.permission_response_queued = true;
             app.approval_prompt.clear(app.alloc);
             app.shell.render_requests.request(.modal);
@@ -1428,8 +1401,10 @@ fn boolean(value: std.json.Value, key: []const u8) bool {
     return v == .bool and v.bool;
 }
 fn array(value: std.json.Value, key: []const u8) []const std.json.Value {
-    const v = field(value, key) orelse return &.{};
-    return if (v == .array) v.array.items else &.{};
+    return itemsOf(field(value, key) orelse return &.{});
+}
+fn itemsOf(value: std.json.Value) []const std.json.Value {
+    return if (value == .array) value.array.items else &.{};
 }
 fn toolKind(kind: []const u8) types.ToolActivityKind {
     if (std.mem.eql(u8, kind, "read")) return .read;

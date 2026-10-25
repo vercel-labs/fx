@@ -19,7 +19,25 @@ pub const SlashRegistry = command_specs.SlashRegistry;
 const json_option = command_specs.OptionDoc{ .flag = "--json", .description = "Emit machine-readable JSON instead of text" };
 
 pub const top_level_specs = [_]TopLevelSpec{
-    .{ .kind = .daemon, .token = "daemon", .usage = "daemon [status|stop]", .summary = "Inspect or gracefully stop the detached supervisor", .details = &.{"Stopping the supervisor cancels active work, saves supported kernel globals, and releases its processes. Closing the terminal only detaches."} },
+    .{
+        .kind = .daemon,
+        .token = "daemon",
+        .usage = "daemon [status|stop] [--json]",
+        .summary = "Inspect or gracefully stop the detached supervisor",
+        .options = &.{
+            .{ .flag = "status", .description = "List the sessions the supervisor holds (default)" },
+            .{ .flag = "stop", .description = "Stop the supervisor and every session it runs" },
+            json_option,
+        },
+        .details = &.{"Stopping the supervisor cancels active work, saves supported kernel globals, and releases its processes. Closing the terminal only detaches."},
+    },
+    .{
+        .kind = .daemon_serve,
+        .token = "--proto-daemon",
+        .usage = "--proto-daemon",
+        .summary = "Run the detached supervisor; proto-fx starts it when needed",
+        .hidden_from_top_level_help = true,
+    },
     .{
         .kind = .help,
         .token = "help",
@@ -292,7 +310,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     } },
     .{ .entries = &.{
         .{ .kind = .sessions, .usage = "sessions" },
-        .{ .kind = .daemon, .usage = "daemon [status|stop]" },
+        .{ .kind = .daemon, .usage = "daemon [status|stop] [--json]" },
         .{ .kind = .session, .usage = "session <last|id>" },
         .{ .usage = "session resume [last|id]", .summary = "Resume the latest workspace session or a session by id" },
         .{ .usage = "session recover <id>", .summary = "Copy a recoverable corrupt session" },

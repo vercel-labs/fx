@@ -3112,13 +3112,14 @@ pub fn compactNow(state: *server.ServerState, alloc: Allocator) !ManualCompactio
     if (state.active_prompt != null) return error.SessionBusy;
     const session = if (state.active_session) |*active| active else return error.NoActiveSession;
 
-    // The result borrows this arena, and the commit effect has already copied
-    // what the session keeps, so nothing here outlives the call.
+    // The result borrows this arena. The commit effect hands the compacted
+    // history to the session, so the context allocates with the session's
+    // allocator, as a prompt's does.
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
 
     var ctx = AcpContext{
-        .alloc = arena_state.allocator(),
+        .alloc = alloc,
         .state = state,
         .session_id = session.session_id,
     };
