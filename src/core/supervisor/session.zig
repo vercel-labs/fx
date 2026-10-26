@@ -23,6 +23,10 @@ const Conn = server.Conn;
 const Allocator = std.mem.Allocator;
 
 const event_bytes_limit = 2 * 1024 * 1024;
+/// Saved history at or below this size travels inside the snapshot reply.
+/// A longer history is read with `history_chunk` frames, so one huge turn
+/// still reaches the client without exceeding the socket's frame limit.
+const snapshot_history_budget = 2 * 1024 * 1024;
 const max_pending = 64;
 const max_prompt_bytes = 1024 * 1024;
 const tick_ms = 200;
@@ -66,6 +70,7 @@ pub const Session = struct {
     host: ?*acp.PersistentHost = null,
     next_request: i64 = 10,
     history_json: ?[]u8 = null,
+    history_turn_count: usize = 0,
     history_sequence: u64 = 0,
     history_dirty: bool = true,
     next_tick_ms: i64 = 0,
@@ -316,6 +321,7 @@ pub const Session = struct {
                 if (request.watch) if (job.watcher()) |conn| try self.watchers.watchChild(self.daemon.alloc, conn, view);
                 return protocol.encode(arena, view);
             },
+            .history_chunk => |request| return self.historyChunk(arena, request),
             .unwatch => |request| {
                 if (job.watcher()) |conn| self.watchers.unwatch(self.daemon.alloc, conn, request.topic);
                 return protocol.encode(arena, protocol.Ack{});
@@ -804,6 +810,7 @@ pub const Session = struct {
         const owned = try std.json.Stringify.valueAlloc(self.daemon.alloc, history, .{});
         if (self.history_json) |old| self.daemon.alloc.free(old);
         self.history_json = owned;
+        self.history_turn_count = history.len;
         self.events_mutex.lockUncancelable(io_mod.getIo());
         self.history_sequence = self.sequence;
         self.events_mutex.unlock(io_mod.getIo());
@@ -828,12 +835,16 @@ pub const Session = struct {
         }
         const pending = try arena.alloc(Frame, self.pending.items.len);
         for (self.pending.items, pending) |entry, *out| out.* = .{ .bytes = entry.frame };
+        const history_json = self.history_json orelse "[]";
+        const history_fits = history_json.len <= snapshot_history_budget;
         const bytes = try protocol.encode(arena, protocol.Snapshot(Frame, Frame){
             .incarnation = self.daemon.incarnation,
             .session_id = self.id,
             .session = session_summary,
             .history_sequence = if (include_history) self.history_sequence else null,
-            .history = if (include_history) .{ .bytes = self.history_json orelse "[]" } else null,
+            .history = if (include_history and history_fits) .{ .bytes = history_json } else null,
+            .history_deferred = include_history and !history_fits,
+            .history_turn_count = self.history_turn_count,
             .sequence = self.sequence,
             .oldest_sequence = if (self.events.items.len > 0) self.events.items[0].sequence else self.sequence,
             .events = events.items,
@@ -902,6 +913,26 @@ pub const Session = struct {
         if (self.host == null) return error.SessionStopped;
         try self.refreshHistory();
         return protocol.encode(arena, protocol.RootHistory(protocol.RawJson){ .history = .{ .bytes = self.history_json orelse "[]" } });
+    }
+
+    /// One bounded slice of the saved history array's JSON text. The client
+    /// concatenates slices and parses once, so a turn larger than a frame
+    /// still loads without changing the saved shape.
+    fn historyChunk(self: *Session, arena: Allocator, request: protocol.HistoryChunk) ![]const u8 {
+        if (self.host == null) return error.SessionStopped;
+        try self.refreshHistory();
+        const bytes = self.history_json orelse "[]";
+        const start = @min(request.offset, bytes.len);
+        const limit = @min(@max(request.max_bytes, 1), protocol.history_chunk_max_bytes);
+        const end = @min(start + limit, bytes.len);
+        return protocol.encode(arena, protocol.HistoryChunkResponse{
+            .session_id = self.id,
+            .offset = start,
+            .next_offset = end,
+            .total_bytes = bytes.len,
+            .history_sequence = self.history_sequence,
+            .chunk = bytes[start..end],
+        });
     }
 
     pub fn children(self: *Session, arena: Allocator, node_id: []const u8) ![]const u8 {

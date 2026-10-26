@@ -3896,7 +3896,7 @@ pub fn Runtime(comptime App: type) type {
                         has_prior_turns: bool = false,
 
                         pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
-                            return replayHistoryToSinkIncremental(self.app, self.sink, &.{turn}, &self.has_prior_turns, self.labels);
+                            return replayHistoryToSinkIncremental(self.app, self.sink, &.{turn}, .{}, &self.has_prior_turns, self.labels);
                         }
                     };
                     var visitor = Visitor{ .app = app, .sink = sink, .labels = labels };
@@ -3955,12 +3955,157 @@ pub fn Runtime(comptime App: type) type {
             return replayHistoryToSink(app, &sink, history, &labels);
         }
 
-        /// Reuses the normal transcript projection without taking persistence ownership.
+        /// The inline transcript keeps a bounded tail. Replaying a whole
+        /// long session would render hundreds of edits only for retention to
+        /// discard them, so the newest turns and tool steps that fit this
+        /// budget are the only ones projected.
+        const remote_history_replay_budget_bytes: usize = 512 * 1024;
+        /// Diff records are larger than the history bytes that produced them.
+        /// Give a resumed transcript enough room for the tail it projected so
+        /// retention does not immediately prune the tool rows it just built.
+        const remote_history_retention_bytes: usize = 4 * 1024 * 1024;
+
+        const ReplayStart = struct {
+            turn: usize = 0,
+            step: usize = 0,
+
+            fn omitted(self: ReplayStart) bool {
+                return self.turn > 0 or self.step > 0;
+            }
+        };
+
+        fn toolStepReplayCost(step: types.ToolExecutionStep) usize {
+            var cost: usize = 128;
+            if (step.assistant) |assistant| cost +|= assistant.len;
+            for (step.tool_calls) |call| {
+                cost +|= 64 +| call.name.len +| call.arguments_json.len;
+            }
+            for (step.tool_results) |result| {
+                cost +|= 96 +| result.tool_name.len +| result.output.len;
+                if (result.preview) |preview| cost +|= preview.len;
+                if (result.output_handle) |handle| cost +|= handle.len;
+                for (result.permission_feedback) |feedback| cost +|= feedback.len;
+                for (result.tool_images) |image| cost +|= image.data.len;
+                if (result.committed_file_presentation) |file| {
+                    cost +|= file.path.len;
+                    for (file.lines) |line| cost +|= 32 +| line.text.len;
+                    if (file.previous_content) |content| cost +|= content.len;
+                    if (file.after_content) |content| cost +|= content.len;
+                }
+            }
+            return cost;
+        }
+
+        fn turnFixedReplayCost(turn: types.HistoryTurn) usize {
+            return switch (turn) {
+                .compacted_summary => |summary| summary.summary.len +| 64,
+                .assistant => |entry| blk: {
+                    var cost = entry.user.text.len +| entry.assistant.len +| 128;
+                    for (entry.execution.steering) |steering| {
+                        cost +|= steering.text.len;
+                        if (steering.assistant_prefix) |prefix| cost +|= prefix.len;
+                    }
+                    for (entry.execution.files) |file| cost +|= file.path.len +| file.tool_name.len;
+                    break :blk cost;
+                },
+                .interrupted => |entry| blk: {
+                    var cost = entry.user.text.len +| 128;
+                    if (entry.assistant) |assistant| cost +|= assistant.len;
+                    for (entry.execution.steering) |steering| {
+                        cost +|= steering.text.len;
+                        if (steering.assistant_prefix) |prefix| cost +|= prefix.len;
+                    }
+                    for (entry.execution.files) |file| cost +|= file.path.len +| file.tool_name.len;
+                    break :blk cost;
+                },
+            };
+        }
+
+        fn turnSteps(turn: types.HistoryTurn) []const types.ToolExecutionStep {
+            return switch (turn) {
+                .compacted_summary => &.{},
+                .assistant => |entry| entry.execution.tool_steps,
+                .interrupted => |entry| entry.execution.tool_steps,
+            };
+        }
+
+        fn stepReplayStart(steps: []const types.ToolExecutionStep, budget: usize) usize {
+            var remaining = budget;
+            var start = steps.len;
+            while (start > 0) {
+                const cost = toolStepReplayCost(steps[start - 1]);
+                if (cost > remaining) break;
+                remaining -= cost;
+                start -= 1;
+            }
+            return start;
+        }
+
+        fn replayStartForBudget(history: []const types.HistoryTurn) ReplayStart {
+            var remaining = remote_history_replay_budget_bytes;
+            var start = ReplayStart{ .turn = history.len };
+            var index = history.len;
+            var first = true;
+            while (index > 0) {
+                index -= 1;
+                const turn = history[index];
+                const fixed = turnFixedReplayCost(turn);
+                if (!first and fixed > remaining) break;
+                remaining -|= fixed;
+                start.turn = index;
+                const steps = turnSteps(turn);
+                start.step = stepReplayStart(steps, remaining);
+                var included_steps_cost: usize = 0;
+                for (steps[start.step..]) |step| included_steps_cost +|= toolStepReplayCost(step);
+                remaining -|= included_steps_cost;
+                first = false;
+                // Older steps of this turn did not fit. Earlier turns are
+                // older still, so the visible transcript stops here.
+                if (start.step > 0) break;
+            }
+            return start;
+        }
+
+        /// Reuses the normal transcript projection without taking persistence
+        /// ownership. Retention stays out of the way until every projected
+        /// turn is in place: enforcing it per append prunes the agent's
+        /// replies and tool calls, and repeats a whole-transcript scan for
+        /// every row.
         pub fn replayRemoteHistory(app: *App, history: []const types.HistoryTurn) !void {
             var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
             defer labels.deinit(app.alloc);
             var sink = LiveHistorySink(App){ .app = app };
-            try replayHistoryToSink(app, &sink, history, &labels);
+            const start = replayStartForBudget(history);
+            debug_trace.logf(
+                "session",
+                "remote history replay turns={d} start_turn={d} start_step={d}",
+                .{ history.len, start.turn, start.step },
+            );
+            if (start.omitted()) {
+                try sink.appendNotice(.{
+                    .topic = "session resumed",
+                    .tone = .neutral,
+                    .body = "Older transcript entries are not shown; the newest work is above.",
+                });
+            }
+            if (comptime @hasField(@TypeOf(app.shell), "retention_suspended") and
+                @hasDecl(@TypeOf(app.shell), "enforceStructuredRetentionAndReport"))
+            {
+                const was_suspended = app.shell.retention_suspended;
+                app.shell.max_retained_transcript_bytes = @max(
+                    app.shell.max_retained_transcript_bytes,
+                    remote_history_retention_bytes,
+                );
+                app.shell.retention_suspended = true;
+                replayHistoryToSinkFrom(app, &sink, history, start, &labels) catch |err| {
+                    app.shell.retention_suspended = was_suspended;
+                    return err;
+                };
+                app.shell.retention_suspended = was_suspended;
+                _ = try app.shell.enforceStructuredRetentionAndReport(app.alloc, null);
+                return;
+            }
+            try replayHistoryToSinkFrom(app, &sink, history, start, &labels);
         }
 
         fn replayHistoryToSink(
@@ -3969,18 +4114,32 @@ pub fn Runtime(comptime App: type) type {
             history: []const types.HistoryTurn,
             labels: *HistoricalSessionLabels,
         ) !void {
-            var has_prior_turns = false;
-            return replayHistoryToSinkIncremental(app, sink, history, &has_prior_turns, labels);
+            const start: ReplayStart = .{};
+            return replayHistoryToSinkFrom(app, sink, history, start, labels);
+        }
+
+        fn replayHistoryToSinkFrom(
+            app: *App,
+            sink: anytype,
+            history: []const types.HistoryTurn,
+            start: ReplayStart,
+            labels: *HistoricalSessionLabels,
+        ) !void {
+            var has_prior_turns = start.omitted();
+            return replayHistoryToSinkIncremental(app, sink, history, start, &has_prior_turns, labels);
         }
 
         fn replayHistoryToSinkIncremental(
             app: *App,
             sink: anytype,
             history: []const types.HistoryTurn,
+            start: ReplayStart,
             has_prior_turns: *bool,
             labels: *HistoricalSessionLabels,
         ) !void {
-            for (history) |turn| {
+            for (history, 0..) |turn, turn_index| {
+                if (turn_index < start.turn) continue;
+                const first_step = if (turn_index == start.turn) start.step else 0;
                 switch (turn) {
                     .compacted_summary => {},
                     .assistant => |entry| {
@@ -3989,7 +4148,7 @@ pub fn Runtime(comptime App: type) type {
                         }
                         try sink.appendUserTurn(entry.user, has_prior_turns.*);
                         has_prior_turns.* = true;
-                        try writeExecutionHistoryToSink(app, sink, entry.execution, labels);
+                        try writeExecutionHistoryToSinkFrom(app, sink, entry.execution, labels, first_step);
                         if (entry.execution.turn_summary) |summary| {
                             sink.setCreatedAtMs(summary.completed_at_ms);
                         }
@@ -4006,7 +4165,7 @@ pub fn Runtime(comptime App: type) type {
                         }
                         try sink.appendUserTurn(entry.user, has_prior_turns.*);
                         has_prior_turns.* = true;
-                        try writeExecutionHistoryToSink(app, sink, entry.execution, labels);
+                        try writeExecutionHistoryToSinkFrom(app, sink, entry.execution, labels, first_step);
                         if (entry.execution.turn_summary) |summary| {
                             sink.setCreatedAtMs(summary.completed_at_ms);
                         }
@@ -4101,8 +4260,29 @@ pub fn Runtime(comptime App: type) type {
             execution: types.ExecutionMemory,
             labels: *HistoricalSessionLabels,
         ) !void {
+            return writeExecutionHistoryToSinkFrom(app, sink, execution, labels, 0);
+        }
+
+        fn writeExecutionHistoryToSinkFrom(
+            app: *App,
+            sink: anytype,
+            execution: types.ExecutionMemory,
+            labels: *HistoricalSessionLabels,
+            first_step: usize,
+        ) !void {
             var steering_index: usize = 0;
+            while (steering_index < execution.steering.len and
+                execution.steering[steering_index].after_tool_step_count < first_step)
+            {
+                steering_index += 1;
+            }
             for (execution.tool_steps, 0..) |step, step_index| {
+                if (step_index < first_step) continue;
+                debug_trace.logf(
+                    "session",
+                    "history step={d} first={d} calls={d} results={d}",
+                    .{ step_index, first_step, step.tool_calls.len, step.tool_results.len },
+                );
                 try writePersistedSteeringAtBoundary(
                     app,
                     sink,

@@ -11,11 +11,12 @@ const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 const remote_view = @import("remote_view.zig");
 const remote_backend = @import("remote_backend.zig");
+const sessions = @import("app_session_runtime.zig");
 const Allocator = std.mem.Allocator;
 const SnapshotView = remote_view.SnapshotView;
 /// What a reply answers. `poll` is a pushed session update, and `resync` the
 /// resubscribe after a reconnect.
-pub const Kind = enum { startup, startup_last, startup_remembered, attach, poll, resync, list, children, history, submit, cancel, rpc, heartbeat, kernel, rename, config, command, delete, unwatch };
+pub const Kind = enum { startup, startup_last, startup_remembered, attach, poll, resync, list, children, history, history_chunk, submit, cancel, rpc, heartbeat, kernel, rename, config, command, delete, unwatch };
 /// A request waiting to be sent, or sent and waiting for its reply.
 const Request = struct {
     kind: Kind,
@@ -48,6 +49,22 @@ const Link = enum {
     /// The supervisor stopped on purpose; nothing reconnects.
     stopped,
 };
+/// Saved history arriving in bounded slices. The bytes are the history
+/// array's JSON text, concatenated before one parse and one replay.
+pub const HistoryLoad = struct {
+    active: bool = false,
+    generation: u64 = 0,
+    offset: usize = 0,
+    total: usize = 0,
+    sequence: u64 = 0,
+    bytes: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *HistoryLoad, alloc: Allocator) void {
+        self.bytes.deinit(alloc);
+        self.* = .{};
+    }
+};
+
 pub const State = struct {
     allocator: ?Allocator = null,
     connection: ?*client_mod.Connection = null,
@@ -61,6 +78,9 @@ pub const State = struct {
     watching: struct { list: bool = false, children: bool = false, child: bool = false } = .{},
     /// The attached root session.
     current_id: []u8 = &.{},
+    /// Whether the saved transcript for `current_id` has finished loading.
+    history_loaded: bool = false,
+    history_load: HistoryLoad = .{},
     /// The node below the root that the composer shows, empty at the root.
     /// A prompt typed there is a message to that node.
     child_id: []u8 = &.{},
@@ -101,6 +121,7 @@ pub const State = struct {
         self.queue.deinit(alloc);
         dropRequests(alloc, &self.sent);
         self.sent.deinit(alloc);
+        self.history_load.deinit(alloc);
         if (self.current_id.len > 0) alloc.free(self.current_id);
         if (self.child_id.len > 0) alloc.free(self.child_id);
         if (self.child_name.len > 0) alloc.free(self.child_name);
@@ -170,6 +191,24 @@ pub const State = struct {
     pub fn dropQueued(self: *State) void {
         const alloc = self.allocator orelse return;
         dropRequests(alloc, &self.queue);
+    }
+
+    /// Discards a partial saved-history transfer. The transcript it was
+    /// rebuilding is no longer the one the person sees.
+    pub fn cancelHistoryLoad(self: *State) void {
+        const alloc = self.allocator orelse return;
+        self.history_load.deinit(alloc);
+    }
+
+    /// Starts collecting the saved history checkpointed at `sequence`.
+    pub fn beginHistoryLoad(self: *State, sequence: u64) void {
+        self.cancelHistoryLoad();
+        self.history_load = .{
+            .active = true,
+            .generation = self.generation,
+            .sequence = sequence,
+        };
+        self.history_loaded = false;
     }
 
     pub fn enqueue(self: *State, kind: Kind, request: client_protocol.Request) !void {
@@ -325,7 +364,12 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             remote.link = .resyncing;
-            try remote.sendNow(.resync, .{ .attach = .{ .session_id = remote.current_id, .after_sequence = remote.sequence, .include_history = false } });
+            remote.cancelHistoryLoad();
+            try remote.sendNow(.resync, .{ .attach = .{
+                .session_id = remote.current_id,
+                .after_sequence = remote.sequence,
+                .include_history = !remote.history_loaded,
+            } });
             if (app.input_runtime.session_browser.active) try refreshBrowser(app);
             if (remote.child_id.len > 0) {
                 remote.child_history_count = null;
@@ -339,6 +383,10 @@ pub fn Runtime(comptime App: type) type {
             // Nothing sent before the outage will be answered.
             dropRequests(app.alloc, &remote.sent);
             remote.permission_response_queued = false;
+            if (remote.history_load.active) {
+                remote.cancelHistoryLoad();
+                remote.history_loaded = false;
+            }
             if (app.input_runtime.session_browser.active) app.input_runtime.session_browser.fail(@errorName(failure));
             if (!remote.connected_once) {
                 try app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = @errorName(failure) }, true);
@@ -477,6 +525,7 @@ pub fn Runtime(comptime App: type) type {
                     defer child.deinit();
                     try View.applyChildSnapshot(app, child.value);
                 },
+                .history_chunk => try applyHistoryChunk(app, value),
                 .config => try View.notice(app, "session", "Session configuration updated."),
                 .rename => try View.notice(app, "session", "Session renamed."),
                 .delete => {
@@ -489,6 +538,76 @@ pub fn Runtime(comptime App: type) type {
                 .command, .submit, .cancel, .unwatch => {},
             }
             app.shell.render_requests.request(.footer);
+        }
+
+        /// Appends one saved-history slice and, on the last one, parses and
+        /// replays the whole transcript once.
+        fn applyHistoryChunk(app: *App, value: std.json.Value) !void {
+            var page = try decode(client_protocol.HistoryChunkResponse, app, value);
+            defer page.deinit();
+            const remote = &app.remote;
+            if (!remote.history_load.active or remote.history_load.generation != remote.generation) return;
+            if (!std.mem.eql(u8, page.value.session_id, remote.current_id)) return;
+            if (page.value.history_sequence != remote.history_load.sequence or
+                page.value.offset != remote.history_load.offset)
+            {
+                // A turn committed while the transcript loaded, or a stale
+                // slice arrived. Start again from the checkpoint that exists.
+                remote.beginHistoryLoad(page.value.history_sequence);
+                try remote.enqueue(.history_chunk, .{ .history_chunk = .{
+                    .session_id = remote.current_id,
+                    .offset = 0,
+                } });
+                return;
+            }
+            try remote.history_load.bytes.appendSlice(app.alloc, page.value.chunk);
+            remote.history_load.offset = page.value.next_offset;
+            remote.history_load.total = page.value.total_bytes;
+            if (page.value.next_offset < page.value.total_bytes) {
+                try remote.enqueue(.history_chunk, .{ .history_chunk = .{
+                    .session_id = remote.current_id,
+                    .offset = page.value.next_offset,
+                } });
+                return;
+            }
+
+            const bytes = try remote.history_load.bytes.toOwnedSlice(app.alloc);
+            defer app.alloc.free(bytes);
+            const sequence = remote.history_load.sequence;
+            remote.history_load.deinit(app.alloc);
+            remote.history_loaded = true;
+            remote.sequence = sequence;
+            const parsed = std.json.parseFromSlice(
+                []types.HistoryTurn,
+                app.alloc,
+                bytes,
+                .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
+            ) catch |err| {
+                var message_buf: [128]u8 = undefined;
+                const message = std.mem.print(
+                    &message_buf,
+                    "The saved transcript could not be loaded ({s}).",
+                    .{@errorName(err)},
+                ) catch "The saved transcript could not be loaded.";
+                try View.notice(app, "session", message);
+                try remote.sendNow(.resync, .{ .attach = .{
+                    .session_id = remote.current_id,
+                    .after_sequence = sequence,
+                    .include_history = false,
+                } });
+                return;
+            };
+            defer parsed.deinit();
+            try sessions.Runtime(App).replayRemoteHistory(app, parsed.value);
+            remote.native_turn_offset = app.shell.finalizedToolTurnWatermark() + 1;
+            // Events that followed the saved checkpoint were held back while
+            // the transcript loaded. Ask for them now that it is in place.
+            try remote.sendNow(.resync, .{ .attach = .{
+                .session_id = remote.current_id,
+                .after_sequence = sequence,
+                .include_history = false,
+            } });
+            app.shell.render_requests.request(.transcript);
         }
     };
 }

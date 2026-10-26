@@ -26,6 +26,7 @@ const browser_mod = @import("../input/session_browser.zig");
 const app_commands = @import("app_commands.zig");
 const remote_runtime = @import("app_remote_runtime.zig");
 const remote_view = @import("remote_view.zig");
+const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 
 /// A session the supervisor runs: the attached root, or a node below it.
 pub const Node = struct {
@@ -111,6 +112,10 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{ .topic = "session", .tone = .warning, .body = "Supervisor stopped. Relaunch proto-fx to reconnect." }, true);
                 return null;
             }
+            if (app.remote.history_load.active) {
+                try app.writeDomainNotice(.{ .topic = "session", .tone = .neutral, .body = "The saved transcript is still loading. Please send again when it is ready." }, true);
+                return null;
+            }
             if (target.root_id.len == 0) {
                 try app.writeDomainNotice(.{ .topic = "session", .tone = .warning, .body = "The session is still connecting. Please send again when it is ready." }, true);
                 return null;
@@ -171,6 +176,9 @@ pub fn Runtime(comptime App: type) type {
             app.remote.generation +%= 1;
             app.remote.sequence = 0;
             app.input_runtime.session_browser.close();
+            if (comptime @hasField(@TypeOf(app.shell), "max_retained_transcript_bytes")) {
+                app.shell.max_retained_transcript_bytes = transcript_runtime.default_max_retained_transcript_bytes;
+            }
             View.resetTranscript(app);
             try app.remote.enqueue(.startup, .{ .create = .{ .cwd = app.workspace_root } });
         }
@@ -195,6 +203,9 @@ pub fn Runtime(comptime App: type) type {
             leaveChild(app);
             app.remote.generation +%= 1;
             app.remote.sequence = 0;
+            if (comptime @hasField(@TypeOf(app.shell), "max_retained_transcript_bytes")) {
+                app.shell.max_retained_transcript_bytes = transcript_runtime.default_max_retained_transcript_bytes;
+            }
             View.resetTranscript(app);
         }
 

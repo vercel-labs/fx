@@ -4294,7 +4294,7 @@ pub fn wrapAssistantText(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
     return transcript_blocks.wrapAssistantText(alloc, text, cols);
 }
 
-const default_max_retained_transcript_bytes: usize = 1024 * 1024;
+pub const default_max_retained_transcript_bytes: usize = 1024 * 1024;
 const full_transcript_snapshot_clone_max_bytes: usize = 8 * 1024 * 1024;
 const resume_publication_rows_per_frame: u32 = 64;
 
@@ -4645,6 +4645,10 @@ pub const TranscriptRuntime = struct {
     /// its own conservative budget instead of borrowing the smaller
     /// visible byte-cache limit.
     max_retained_transcript_bytes: usize = default_max_retained_transcript_bytes,
+    /// Set while a saved transcript is replayed. The replay appends the whole
+    /// conversation first and trims once at the end, so a mid-history entry
+    /// cannot trigger pruning that drops the agent's replies or tool calls.
+    retention_suspended: bool = false,
     painting: bool = false,
     /// Renderer-local cache state set by transcript mutations. The same
     /// mutation must request `.transcript`; this flag never authorizes a

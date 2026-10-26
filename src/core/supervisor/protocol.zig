@@ -22,7 +22,7 @@ const Allocator = std.mem.Allocator;
 
 /// Bumped whenever a request or response changes shape. A client refuses a
 /// supervisor that answers `ping` with another version.
-pub const version: u32 = 7;
+pub const version: u32 = 8;
 
 pub const Heartbeat = struct {
     prompt: []const u8 = "",
@@ -111,6 +111,21 @@ pub const History = struct {
     watch: bool = false,
 };
 
+/// One slice of the root session's saved history, which a snapshot defers
+/// when the whole transcript would exceed one frame. `offset` counts bytes of
+/// the history array's JSON text, so a single oversized turn still travels in
+/// bounded frames.
+pub const HistoryChunk = struct {
+    session_id: []const u8,
+    offset: usize = 0,
+    max_bytes: usize = 512 * 1024,
+};
+
+/// The largest slice a `history_chunk` request may ask for. A JSON string can
+/// escape to several times its source length, so this stays well below the
+/// frame limit.
+pub const history_chunk_max_bytes: usize = 512 * 1024;
+
 pub const Request = union(enum) {
     ping,
     shutdown,
@@ -131,6 +146,7 @@ pub const Request = union(enum) {
     heartbeat: HeartbeatRequest,
     children: ChildrenRequest,
     history: History,
+    history_chunk: HistoryChunk,
     unwatch: Unwatch,
 
     pub const Tag = std.meta.Tag(Request);
@@ -288,6 +304,11 @@ pub fn Snapshot(comptime HistoryJson: type, comptime Frame: type) type {
         session: SessionSummary,
         history_sequence: ?u64 = null,
         history: ?HistoryJson = null,
+        /// True when `include_history` asked for saved turns but the encoded
+        /// history exceeded the snapshot budget. The client then reads
+        /// `history_chunk` slices until `total_bytes`.
+        history_deferred: bool = false,
+        history_turn_count: usize = 0,
         sequence: u64 = 0,
         oldest_sequence: u64 = 0,
         events: []const Event(Frame) = &.{},
@@ -343,6 +364,19 @@ pub const Children = struct {
 pub fn RootHistory(comptime HistoryJson: type) type {
     return struct { ok: bool = true, history: HistoryJson };
 }
+
+/// One byte slice of the saved history array, which the client concatenates
+/// before parsing. `history_sequence` names the checkpoint the bytes came
+/// from, so a client can restart when a turn commits mid-transfer.
+pub const HistoryChunkResponse = struct {
+    ok: bool = true,
+    session_id: []const u8,
+    offset: usize,
+    next_offset: usize,
+    total_bytes: usize,
+    history_sequence: u64,
+    chunk: []const u8,
+};
 
 pub fn ChildHistory(comptime HistoryJson: type, comptime LiveJson: type) type {
     return struct {

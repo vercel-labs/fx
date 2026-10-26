@@ -145,6 +145,8 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "reasoning_preview")) {
                 app.reasoning_preview.clearRetainingCapacity();
             }
+            app.remote.cancelHistoryLoad();
+            app.remote.history_loaded = false;
             _ = app.shell.worker_status_state().clear();
             app.shell.render_requests.request(.transcript);
         }
@@ -462,11 +464,24 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             if (remote.current_id.len == 0) remote.current_id = try app.alloc.dupe(u8, value.session_id);
+            var history_deferred = false;
             if (value.history) |history| {
                 resetTranscript(app);
                 try sessions.Runtime(App).replayRemoteHistory(app, history);
+                remote.history_loaded = true;
                 remote.native_turn_offset = app.shell.finalizedToolTurnWatermark() + 1;
                 remote.sequence = value.history_sequence orelse 0;
+            } else if (value.history_deferred) {
+                // One oversized transcript arrives as bounded slices. Keep
+                // the live events out until the saved baseline is in place.
+                resetTranscript(app);
+                remote.beginHistoryLoad(value.history_sequence orelse 0);
+                remote.sequence = remote.history_load.sequence;
+                history_deferred = true;
+                try remote.enqueue(.history_chunk, .{ .history_chunk = .{
+                    .session_id = remote.current_id,
+                    .offset = 0,
+                } });
             }
             const summary = value.session;
             if (!std.mem.eql(u8, summary.cwd, remote.cwd)) {
@@ -491,14 +506,16 @@ pub fn Runtime(comptime App: type) type {
             app.permission_engine.mode = remote.permission_mode;
             const running = summary.status == .running or summary.status == .awaiting_approval;
             const generation = remote.generation;
-            for (value.events) |event| {
-                if (event.sequence <= remote.sequence) continue;
-                // A command's result answers the node the person focuses,
-                // which may be a subagent; the rest is the root's transcript.
-                if (remote.child_id.len == 0 or isCommandResult(event.frame)) try applyFrame(app, event.frame);
-                // A fork's result switched sessions: the rest belongs to the old one.
-                if (remote.generation != generation) return;
-                remote.sequence = event.sequence;
+            if (!history_deferred) {
+                for (value.events) |event| {
+                    if (event.sequence <= remote.sequence) continue;
+                    // A command's result answers the node the person focuses,
+                    // which may be a subagent; the rest is the root's transcript.
+                    if (remote.child_id.len == 0 or isCommandResult(event.frame)) try applyFrame(app, event.frame);
+                    // A fork's result switched sessions: the rest belongs to the old one.
+                    if (remote.generation != generation) return;
+                    remote.sequence = event.sequence;
+                }
             }
             if (remote.child_id.len == 0) {
                 try callbacks.Bindings(App).worker_tool_lifecycle_presenter(app).finish_batch(app.alloc);
