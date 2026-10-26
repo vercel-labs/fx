@@ -294,6 +294,9 @@ pub fn Runtime(comptime App: type) type {
             if (app.remote.native_source_turn_id == source_turn_id) return;
             app.remote.native_source_turn_id = source_turn_id;
             app.stream = .{ .active = true, .turn_started_ms = io_mod.milliTimestamp() };
+            if (comptime @hasField(App, "reasoning_preview")) {
+                app.reasoning_preview.clearRetainingCapacity();
+            }
             _ = app.shell.worker_status_state().clear();
             app.shell.render_requests.requestAnimationReset();
             app.shell.render_requests.request(.footer);
@@ -310,6 +313,17 @@ pub fn Runtime(comptime App: type) type {
         /// The offset is fixed for the displayed history baseline: user echoes
         /// (including steering) must not change an in-flight tool's identity.
         fn applyNativeEvent(app: *App, event: std.json.Value) !void {
+            // A void presentation event travels as its tag with an empty
+            // payload object.
+            if (field(event, "reasoning_preview_begin") != null) {
+                if (comptime @hasField(App, "reasoning_preview")) {
+                    if (app.reasoning_preview.items.len > 0) {
+                        app.reasoning_preview.clearRetainingCapacity();
+                        app.shell.render_requests.request(.footer);
+                    }
+                }
+                return;
+            }
             if (field(event, "tool_lifecycle")) |value| {
                 var parsed = try std.json.parseFromValue(types.ToolLifecycleEvent, app.alloc, value, .{ .ignore_unknown_fields = true });
                 defer parsed.deinit();
@@ -376,6 +390,11 @@ pub fn Runtime(comptime App: type) type {
                 if (parsed.value.step_id >= app.stream.phase_step_id) {
                     app.stream.phase = parsed.value.phase;
                     app.stream.phase_step_id = parsed.value.step_id;
+                    // A visible text block supersedes the reasoning that
+                    // preceded it.
+                    if (parsed.value.phase == .generating and comptime @hasField(App, "reasoning_preview")) {
+                        app.reasoning_preview.clearRetainingCapacity();
+                    }
                 }
             } else if (field(event, "turn_token_update")) |value| {
                 var parsed = try std.json.parseFromValue(types.TurnTokenProgress, app.alloc, value, .{});
@@ -613,6 +632,7 @@ const NativePresentationTestApp = struct {
     alloc: Allocator = std.testing.allocator,
     remote: remote_runtime.State = .{ .native_turn_offset = 100 },
     stream: types.StreamState = .{ .active = true },
+    reasoning_preview: std.ArrayList(u8) = .empty,
     user_prompt_count: usize = 0,
     reject_semantic: bool = false,
     metrics: types.Metrics = .{},
@@ -801,6 +821,29 @@ test "own prompt echoes are skipped once while other prompts get a card" {
     // A heartbeat or another client can send the same words later.
     try app.frame(echo);
     try std.testing.expectEqual(@as(usize, 1), app.user_prompt_count);
+}
+
+test "native child reasoning preview flushes at a trace boundary and drops for text" {
+    var app: NativePresentationTestApp = .{};
+    defer app.shell.deinit(app.alloc);
+    defer app.remote.deinit(app.alloc);
+    defer app.reasoning_preview.deinit(app.alloc);
+    app.remote.native_source_turn_id = 1;
+
+    try app.apply("{\"reasoning_preview\":\"first trace\"}");
+    try std.testing.expectEqualStrings("first trace", app.reasoning_preview.items);
+
+    // The supervisor carries a void presentation event as its tag with an
+    // empty payload object.
+    try app.apply("{\"reasoning_preview_begin\":{}}");
+    try std.testing.expectEqual(@as(usize, 0), app.reasoning_preview.items.len);
+
+    try app.apply("{\"reasoning_preview\":\"running trace\"}");
+    try app.apply("{\"turn_phase_update\":{\"turn_id\":1,\"step_id\":2,\"phase\":\"running\"}}");
+    try std.testing.expectEqualStrings("running trace", app.reasoning_preview.items);
+
+    try app.apply("{\"turn_phase_update\":{\"turn_id\":1,\"step_id\":2,\"phase\":\"generating\"}}");
+    try std.testing.expectEqual(@as(usize, 0), app.reasoning_preview.items.len);
 }
 
 test "host command results render from their typed fields" {

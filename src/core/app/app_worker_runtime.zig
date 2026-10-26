@@ -350,6 +350,7 @@ pub fn Runtime(comptime App: type) type {
                 .turn_token_update,
                 .turn_phase_update,
                 .reasoning_preview,
+                .reasoning_preview_begin,
                 .diff_block,
                 .restore_failed_prompt,
                 => .drop,
@@ -1163,6 +1164,16 @@ pub fn Runtime(comptime App: type) type {
                             app.shell.render_requests.request(.footer);
                         }
                     },
+                    .reasoning_preview_begin => {
+                        // The model started a new trace; do not carry the
+                        // previous step's tail into it.
+                        if (comptime @hasField(App, "reasoning_preview")) {
+                            if (app.reasoning_preview.items.len > 0) {
+                                app.reasoning_preview.clearRetainingCapacity();
+                                app.shell.render_requests.request(.footer);
+                            }
+                        }
+                    },
                     .diff_block => |payload| {
                         drain_owns_current = false;
                         try handlers.diff_block(handlers.ctx, payload);
@@ -1377,6 +1388,13 @@ pub fn Runtime(comptime App: type) type {
             const changed = app.stream.phase != update.phase;
             app.stream.phase = update.phase;
             app.stream.phase_step_id = update.step_id;
+            if (comptime @hasField(App, "reasoning_preview")) {
+                // A visible text block supersedes the reasoning that preceded
+                // it; the trace must not resurface around a later tool call.
+                if (update.phase == .generating and app.reasoning_preview.items.len > 0) {
+                    app.reasoning_preview.clearRetainingCapacity();
+                }
+            }
             if (changed) app.shell.render_requests.request(.footer);
         }
     };
@@ -2573,6 +2591,60 @@ test "core.app_worker_runtime keeps the newest reasoning preview for the footer"
 
     try std.testing.expectEqualStrings("first second", app.reasoning_preview.items);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+}
+
+test "core.app_worker_runtime flushes the reasoning preview when a new trace begins" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    app.worker.processing = true;
+    app.stream.active = true;
+    app.stream.phase_step_id = 11;
+    const earlier = try std.heap.c_allocator.dupe(u8, "earlier trace");
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .reasoning_preview = earlier });
+    std.heap.c_allocator.free(earlier);
+    try tickNoop(&app);
+    try std.testing.expectEqualStrings("earlier trace", app.reasoning_preview.items);
+
+    // The next step's first reasoning chunk starts a fresh trace.
+    try app.worker.pushEvent(std.heap.c_allocator, .reasoning_preview_begin);
+    const current = try std.heap.c_allocator.dupe(u8, "current trace");
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .reasoning_preview = current });
+    std.heap.c_allocator.free(current);
+    try tickNoop(&app);
+
+    try std.testing.expectEqualStrings("current trace", app.reasoning_preview.items);
+}
+
+test "core.app_worker_runtime keeps the reasoning preview through tool work and drops it for text" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    app.worker.processing = true;
+    app.worker.active_turn_id = 7;
+    app.stream = .{ .active = true, .phase = .thinking, .phase_step_id = 11 };
+    const trace = try std.heap.c_allocator.dupe(u8, "trace");
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .reasoning_preview = trace });
+    std.heap.c_allocator.free(trace);
+    try tickNoop(&app);
+
+    // Tool work keeps the trace that produced the call visible.
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .turn_phase_update = .{
+        .turn_id = 7,
+        .step_id = 11,
+        .phase = .running,
+    } });
+    try tickNoop(&app);
+    try std.testing.expectEqualStrings("trace", app.reasoning_preview.items);
+
+    // Visible text supersedes it; a later tool call must not resurrect it.
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .turn_phase_update = .{
+        .turn_id = 7,
+        .step_id = 11,
+        .phase = .generating,
+    } });
+    try tickNoop(&app);
+    try std.testing.expectEqual(@as(usize, 0), app.reasoning_preview.items.len);
 }
 
 test "core.app_worker_runtime applies only current monotonic turn phase updates" {

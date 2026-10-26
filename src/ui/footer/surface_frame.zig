@@ -1727,7 +1727,7 @@ test "surface footer measurement preserves the reasoning preview detail" {
         "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu " ++
         "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu " ++
         "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu";
-    const ctx = RenderContext{
+    var ctx = RenderContext{
         .stream = .{ .active = true, .phase = .thinking },
         .reasoning_preview = preview,
         .has_api_key = true,
@@ -1735,18 +1735,31 @@ test "surface footer measurement preserves the reasoning preview detail" {
         .input = &input,
     };
 
-    var measurement = try measureSurfaceFooter(alloc, &shell, approval.projection(), ctx);
-    defer measurement.deinit(alloc);
+    // Tool work keeps the trace on screen; a visible text block releases it.
+    const cases = [_]struct { phase: types.TurnPhase, shown: bool }{
+        .{ .phase = .thinking, .shown = true },
+        .{ .phase = .running, .shown = true },
+        .{ .phase = .generating, .shown = false },
+    };
+    for (cases) |case| {
+        ctx.stream.phase = case.phase;
+        var measurement = try measureSurfaceFooter(alloc, &shell, approval.projection(), ctx);
+        defer measurement.deinit(alloc);
 
-    switch (measurement.activity_projection) {
-        .turn_thinking => |thinking| {
-            try std.testing.expectEqualStrings(preview, thinking.detail);
-            try std.testing.expectEqual(@as(u16, 4), render_input.activityProjectionRows(
-                measurement.activity_projection,
-                shell.layout.cols,
-            ));
-        },
-        .none, .tool_slot => return error.TestUnexpectedResult,
+        switch (measurement.activity_projection) {
+            .turn_thinking => |thinking| {
+                try std.testing.expectEqual(case.shown, thinking.detail.len > 0);
+                if (case.shown) try std.testing.expectEqualStrings(preview, thinking.detail);
+                try std.testing.expectEqual(
+                    @as(u16, if (case.shown) 4 else 1),
+                    render_input.activityProjectionRows(
+                        measurement.activity_projection,
+                        shell.layout.cols,
+                    ),
+                );
+            },
+            .none, .tool_slot => return error.TestUnexpectedResult,
+        }
     }
 }
 

@@ -86,6 +86,10 @@ pub const StreamChunkContext = struct {
     /// one full-only transcript record.
     reasoning_text: std.ArrayList(u8) = .empty,
     reasoning_published: bool = false,
+    /// The display preview is filling for the current reasoning trace. Cleared
+    /// where visible text or a tool call closes the trace, so the next trace
+    /// begins from an empty preview instead of appending to the old one.
+    reasoning_preview_started: bool = false,
     response_language_expected: ?response_language.Script = null,
     response_language_accepted: bool = false,
     response_language_hold_until_completion: bool = false,
@@ -138,6 +142,8 @@ pub const StreamChunkContext = struct {
     /// whole stream. Providers that expose no visible reasoning publish
     /// nothing.
     pub fn publishReasoningRecord(self: *StreamChunkContext) void {
+        // Text or a tool call closes the trace whose tail the display shows.
+        self.reasoning_preview_started = false;
         if (self.reasoning_published or self.reasoning_text.items.len == 0) return;
         self.reasoning_published = true;
         // Event payloads travel through the worker queue, which frees them
@@ -196,6 +202,9 @@ pub const StreamChunkContext = struct {
         self.first_model_output_at_ms = null;
         self.streamed_output_bytes = 0;
         self.published_phase = null;
+        // A retried attempt streams its own trace; the interrupted attempt's
+        // preview tail must not merge into it.
+        self.reasoning_preview_started = false;
     }
 
     pub fn accepted_source(self: *const StreamChunkContext) []const u8 {
@@ -284,6 +293,17 @@ pub fn onStreamContentChunk(ctx: *anyopaque, chunk: []const u8) void {
     }
 }
 
+/// Starts a new display trace. The previous trace's tail no longer describes
+/// the reasoning the model is streaming now, so the display drops it before
+/// the first chunk of the new trace arrives.
+fn beginReasoningPreview(stream_ctx: *StreamChunkContext) void {
+    if (stream_ctx.reasoning_preview_started) return;
+    stream_ctx.reasoning_preview_started = true;
+    stream_ctx.hooks.push_event(stream_ctx.hooks.ctx, .reasoning_preview_begin) catch |err| {
+        debug_trace.logf("agent", "reasoning preview begin publication failed err={s}", .{@errorName(err)});
+    };
+}
+
 pub fn onStreamReasoningChunk(ctx: *anyopaque, chunk: []const u8) void {
     const stream_ctx: *StreamChunkContext = @ptrCast(@alignCast(ctx));
     stream_ctx.markModelOutput();
@@ -295,6 +315,7 @@ pub fn onStreamReasoningChunk(ctx: *anyopaque, chunk: []const u8) void {
         };
     }
     if (chunk.len > 0) {
+        beginReasoningPreview(stream_ctx);
         stream_ctx.reasoning_text.appendSlice(stream_ctx.alloc, chunk) catch |err| {
             debug_trace.logf("agent", "reasoning retention failed err={s}", .{@errorName(err)});
         };
@@ -820,6 +841,7 @@ const StreamCapture = struct {
     token_progress_updates: std.ArrayList(types.TurnTokenProgress) = .empty,
     phase_updates: std.ArrayList(types.TurnPhase) = .empty,
     reasoning_previews: std.ArrayList([]u8) = .empty,
+    reasoning_preview_begins: usize = 0,
     reasoning_records: std.ArrayList([]u8) = .empty,
     trace: std.ArrayList(StreamTraceEntry) = .empty,
     presentation_order: std.ArrayList(PresentationEntry) = .empty,
@@ -945,6 +967,10 @@ const StreamCapture = struct {
                 try self.reasoning_previews.append(self.capture_alloc, try self.capture_alloc.dupe(u8, text));
                 return;
             },
+            .reasoning_preview_begin => {
+                self.reasoning_preview_begins += 1;
+                return;
+            },
             .semantic_notice => |notice| {
                 defer types.freeSemanticNotice(std.heap.c_allocator, notice);
                 try self.reasoning_records.append(self.capture_alloc, try self.capture_alloc.dupe(u8, notice.body));
@@ -1054,6 +1080,7 @@ test "reasoning streams a preview and publishes one record at the step boundary"
 
     onStreamReasoningChunk(&stream_ctx, "weigh ");
     onStreamReasoningChunk(&stream_ctx, "options");
+    try std.testing.expectEqual(@as(usize, 1), capture.reasoning_preview_begins);
     try std.testing.expectEqual(@as(usize, 2), capture.reasoning_previews.items.len);
     try std.testing.expectEqualStrings("weigh ", capture.reasoning_previews.items[0]);
     try std.testing.expectEqualStrings("options", capture.reasoning_previews.items[1]);
@@ -1066,6 +1093,7 @@ test "reasoning streams a preview and publishes one record at the step boundary"
     try std.testing.expectEqualStrings("weigh options", capture.reasoning_records.items[0]);
 
     onStreamReasoningChunk(&stream_ctx, "later");
+    try std.testing.expectEqual(@as(usize, 2), capture.reasoning_preview_begins);
     try std.testing.expectEqual(@as(usize, 1), capture.reasoning_records.items.len);
 }
 

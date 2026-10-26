@@ -701,9 +701,10 @@ fn turnActivityProjection(
 
     var visible_stream = ctx.stream;
     visible_stream.last_activity_kind = null;
-    // The preview belongs to the thinking phase: once text or a tool call
-    // starts, the status row describes what is happening instead.
-    const detail: []const u8 = if (visible_stream.phase == .thinking) ctx.reasoning_preview else "";
+    // The last reasoning trace stays visible through tool work. A visible text
+    // block (intermediate message or final response) replaces it, so only the
+    // generating phase hides the preview.
+    const detail: []const u8 = if (visible_stream.phase == .generating) "" else ctx.reasoning_preview;
     if (activity_status.buildTurnLabel(buf, visible_stream, ctx.now_ms)) |label| {
         return .{ .turn_thinking = .{ .label = label, .detail = detail } };
     }
@@ -1253,7 +1254,7 @@ test "thinking activity reserves rows for the reasoning preview" {
     );
 }
 
-test "frame-owned thinking activity carries only the thinking phase preview" {
+test "frame-owned activity keeps the reasoning preview until a text block starts" {
     var input = InputRuntime{};
     defer input.deinit(std.testing.allocator);
     var shell = TranscriptRuntime{};
@@ -1276,6 +1277,17 @@ test "frame-owned thinking activity carries only the thinking phase preview" {
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
 
+    // Tool work keeps the trace that produced the call on screen.
+    ctx.stream.phase = .running;
+    switch (frameOwnedActivityProjection(&buf, &shell, ctx, null)) {
+        .turn_thinking => |thinking| try std.testing.expectEqualStrings(
+            "first line\nsecond line",
+            thinking.detail,
+        ),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+
+    // A visible text block replaces the trace.
     ctx.stream.phase = .generating;
     switch (frameOwnedActivityProjection(&buf, &shell, ctx, null)) {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings("", thinking.detail),
