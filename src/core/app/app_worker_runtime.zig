@@ -351,6 +351,7 @@ pub fn Runtime(comptime App: type) type {
                 .turn_phase_update,
                 .reasoning_preview,
                 .reasoning_preview_begin,
+                .assistant_text_started,
                 .diff_block,
                 .restore_failed_prompt,
                 => .drop,
@@ -750,10 +751,9 @@ pub fn Runtime(comptime App: type) type {
                 // The worker can become idle before its final UI events reach
                 // this thread. Keep any open command block until the queued
                 // turn boundary finalizes it instead of discarding output.
+                // The reasoning tail also stays: an idle instant between a
+                // model step and its tool call is not a new turn.
                 app.stream = .{};
-                if (comptime @hasField(App, "reasoning_preview")) {
-                    app.reasoning_preview.clearRetainingCapacity();
-                }
                 app.shell.render_requests.request(.footer);
             } else if (modal_active and !app.stream.active) {
                 app.stream.active = true;
@@ -1177,6 +1177,17 @@ pub fn Runtime(comptime App: type) type {
                             }
                         }
                     },
+                    .assistant_text_started => {
+                        // A visible text block supersedes the reasoning that
+                        // preceded it. Tool-call argument streaming does not.
+                        app.stream.assistant_text_started = true;
+                        if (comptime @hasField(App, "reasoning_preview")) {
+                            if (app.reasoning_preview.items.len > 0) {
+                                app.reasoning_preview.clearRetainingCapacity();
+                            }
+                        }
+                        app.shell.render_requests.request(.footer);
+                    },
                     .diff_block => |payload| {
                         drain_owns_current = false;
                         try handlers.diff_block(handlers.ctx, payload);
@@ -1389,15 +1400,11 @@ pub fn Runtime(comptime App: type) type {
             if (update.step_id < app.stream.phase_step_id) return;
 
             const changed = app.stream.phase != update.phase;
+            if (update.step_id != app.stream.phase_step_id) {
+                app.stream.assistant_text_started = false;
+            }
             app.stream.phase = update.phase;
             app.stream.phase_step_id = update.step_id;
-            if (comptime @hasField(App, "reasoning_preview")) {
-                // A visible text block supersedes the reasoning that preceded
-                // it; the trace must not resurface around a later tool call.
-                if (update.phase == .generating and app.reasoning_preview.items.len > 0) {
-                    app.reasoning_preview.clearRetainingCapacity();
-                }
-            }
             if (changed) app.shell.render_requests.request(.footer);
         }
     };
@@ -2640,14 +2647,20 @@ test "core.app_worker_runtime keeps the reasoning preview through tool work and 
     try tickNoop(&app);
     try std.testing.expectEqualStrings("trace", app.reasoning_preview.items);
 
-    // Visible text supersedes it; a later tool call must not resurrect it.
+    // Generating tool-call arguments is not visible text.
     try app.worker.pushEvent(std.heap.c_allocator, .{ .turn_phase_update = .{
         .turn_id = 7,
         .step_id = 11,
         .phase = .generating,
     } });
     try tickNoop(&app);
+    try std.testing.expectEqualStrings("trace", app.reasoning_preview.items);
+
+    // Visible text supersedes it; a later tool call must not resurrect it.
+    try app.worker.pushEvent(std.heap.c_allocator, .assistant_text_started);
+    try tickNoop(&app);
     try std.testing.expectEqual(@as(usize, 0), app.reasoning_preview.items.len);
+    try std.testing.expect(app.stream.assistant_text_started);
 }
 
 test "core.app_worker_runtime applies only current monotonic turn phase updates" {

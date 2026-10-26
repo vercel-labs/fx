@@ -90,6 +90,10 @@ pub const StreamChunkContext = struct {
     /// where visible text or a tool call closes the trace, so the next trace
     /// begins from an empty preview instead of appending to the old one.
     reasoning_preview_started: bool = false,
+    /// The first visible assistant text of this step has been announced, so
+    /// the footer drops the reasoning preview. Tool-call arguments do not
+    /// count as visible text.
+    assistant_text_started_published: bool = false,
     response_language_expected: ?response_language.Script = null,
     response_language_accepted: bool = false,
     response_language_hold_until_completion: bool = false,
@@ -205,6 +209,7 @@ pub const StreamChunkContext = struct {
         // A retried attempt streams its own trace; the interrupted attempt's
         // preview tail must not merge into it.
         self.reasoning_preview_started = false;
+        self.assistant_text_started_published = false;
     }
 
     pub fn accepted_source(self: *const StreamChunkContext) []const u8 {
@@ -301,6 +306,16 @@ fn beginReasoningPreview(stream_ctx: *StreamChunkContext) void {
     stream_ctx.reasoning_preview_started = true;
     stream_ctx.hooks.push_event(stream_ctx.hooks.ctx, .reasoning_preview_begin) catch |err| {
         debug_trace.logf("agent", "reasoning preview begin publication failed err={s}", .{@errorName(err)});
+    };
+}
+
+/// Announces the step's first visible assistant text. A tool call's argument
+/// stream also completes a response, but it is not text the person can read.
+fn publishAssistantTextStarted(stream_ctx: *StreamChunkContext) void {
+    if (stream_ctx.assistant_text_started_published) return;
+    stream_ctx.assistant_text_started_published = true;
+    stream_ctx.hooks.push_event(stream_ctx.hooks.ctx, .assistant_text_started) catch |err| {
+        debug_trace.logf("agent", "assistant text start publication failed err={s}", .{@errorName(err)});
     };
 }
 
@@ -462,7 +477,10 @@ fn publishAssistantChunkResolved(stream_ctx: *StreamChunkContext, chunk: []const
     try stream_ctx.start_response();
     try stream_ctx.hooks.push_text(stream_ctx.hooks.ctx, .{ .assistant_source = chunk });
     if (!stream_ctx.hooks.render_assistant_text) {
-        if (std.mem.trim(u8, chunk, " \t\r\n").len > 0) stream_ctx.saw_visible_text = true;
+        if (!stream_ctx.saw_visible_text and std.mem.trim(u8, chunk, " \t\r\n").len > 0) {
+            stream_ctx.saw_visible_text = true;
+            publishAssistantTextStarted(stream_ctx);
+        }
         stream_ctx.recordTextOutput(chunk);
         return;
     }
@@ -484,6 +502,7 @@ fn publishAssistantChunkResolved(stream_ctx: *StreamChunkContext, chunk: []const
             initial_prefix_to_emit = stream_ctx.initial_line_prefix.items;
         }
         stream_ctx.saw_visible_text = true;
+        publishAssistantTextStarted(stream_ctx);
         clear_initial_line_prefix = true;
     }
 
@@ -569,6 +588,10 @@ pub fn flushAssistantStream(stream_ctx: *StreamChunkContext) !void {
         .thematic_rule = semantic_thematic_rule_completion,
     });
     if (out.items.len == 0) return;
+    if (!stream_ctx.saw_visible_text) {
+        stream_ctx.saw_visible_text = true;
+        publishAssistantTextStarted(stream_ctx);
+    }
     const text = if (stream_ctx.trailing_newline_count >= 2 and beginsFootnoteProjection(out.items))
         out.items[1..]
     else
@@ -842,6 +865,7 @@ const StreamCapture = struct {
     phase_updates: std.ArrayList(types.TurnPhase) = .empty,
     reasoning_previews: std.ArrayList([]u8) = .empty,
     reasoning_preview_begins: usize = 0,
+    assistant_text_starts: usize = 0,
     reasoning_records: std.ArrayList([]u8) = .empty,
     trace: std.ArrayList(StreamTraceEntry) = .empty,
     presentation_order: std.ArrayList(PresentationEntry) = .empty,
@@ -971,6 +995,10 @@ const StreamCapture = struct {
                 self.reasoning_preview_begins += 1;
                 return;
             },
+            .assistant_text_started => {
+                self.assistant_text_starts += 1;
+                return;
+            },
             .semantic_notice => |notice| {
                 defer types.freeSemanticNotice(std.heap.c_allocator, notice);
                 try self.reasoning_records.append(self.capture_alloc, try self.capture_alloc.dupe(u8, notice.body));
@@ -1091,6 +1119,7 @@ test "reasoning streams a preview and publishes one record at the step boundary"
     onStreamContentChunk(&stream_ctx, "answer");
     try std.testing.expectEqual(@as(usize, 1), capture.reasoning_records.items.len);
     try std.testing.expectEqualStrings("weigh options", capture.reasoning_records.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), capture.assistant_text_starts);
 
     onStreamReasoningChunk(&stream_ctx, "later");
     try std.testing.expectEqual(@as(usize, 2), capture.reasoning_preview_begins);
@@ -1110,10 +1139,33 @@ test "reasoning publishes its record when a tool-only step ends" {
     };
 
     onStreamReasoningChunk(&stream_ctx, "call the tool");
+    try stream_ctx.start_response();
     stream_ctx.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), capture.reasoning_records.items.len);
     try std.testing.expectEqualStrings("call the tool", capture.reasoning_records.items[0]);
+    // Completing a response so it can carry a tool call is not visible text.
+    try std.testing.expectEqual(@as(usize, 0), capture.assistant_text_starts);
+}
+
+test "starting a response does not announce visible text" {
+    const alloc = std.testing.allocator;
+    var capture = StreamCapture{};
+    defer capture.deinit(alloc);
+    var hook_set = capture.hooks();
+    var stream_ctx = StreamChunkContext{
+        .hooks = &hook_set,
+        .turn_id = 8,
+        .step_id = 9,
+        .alloc = alloc,
+    };
+    defer stream_ctx.deinit();
+
+    try stream_ctx.start_response();
+    try std.testing.expectEqual(@as(usize, 0), capture.assistant_text_starts);
+
+    onStreamContentChunk(&stream_ctx, "visible");
+    try std.testing.expectEqual(@as(usize, 1), capture.assistant_text_starts);
 }
 
 const PresentationEntry = enum { text, table, code_block, thematic_rule };
@@ -2217,7 +2269,7 @@ test "streamed presentation suppresses callback-time failures" {
         onStreamContentChunk(&stream_ctx, "visible\n");
 
         try std.testing.expectEqualStrings("visible\n", stream_ctx.raw_text.items);
-        try std.testing.expectEqual(@as(usize, 1), capture.event_calls);
+        try std.testing.expectEqual(@as(usize, 2), capture.event_calls);
         try std.testing.expectEqual(@as(usize, 1), capture.text_calls);
     }
 
@@ -2231,7 +2283,7 @@ test "streamed presentation suppresses callback-time failures" {
         onStreamContentChunk(&stream_ctx, "visible\n");
 
         try std.testing.expectEqualStrings("visible\n", stream_ctx.raw_text.items);
-        try std.testing.expectEqual(@as(usize, 1), capture.event_calls);
+        try std.testing.expectEqual(@as(usize, 2), capture.event_calls);
         try std.testing.expectEqual(@as(usize, 1), capture.text_calls);
     }
 
@@ -2265,7 +2317,7 @@ test "flushAssistantStream does not publish rendered token updates" {
     try streamAssistantChunk(&stream_ctx, "pending");
 
     try flushAssistantStream(&stream_ctx);
-    try std.testing.expectEqual(@as(usize, 0), capture.event_calls);
+    try std.testing.expectEqual(@as(usize, 1), capture.event_calls);
     try std.testing.expectEqual(@as(usize, 1), capture.text_calls);
 }
 

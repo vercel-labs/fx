@@ -510,6 +510,9 @@ pub const WorkerEvent = union(enum) {
     /// A new reasoning trace begins for the active step, so the display drops
     /// the previous trace's tail before the first preview chunk arrives.
     reasoning_preview_begin,
+    /// A visible assistant text block started, which supersedes the reasoning
+    /// preview even while the phase is also `generating`.
+    assistant_text_started,
     diff_block: diff_mod.DiffEntryPayload,
     context_compaction: ContextCompaction,
     finish_prompt: types.FinishedPrompt,
@@ -3980,6 +3983,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
         .route_recovery_status => |status| .{ .route_recovery_status = status },
         .clear_route_recovery_status => .clear_route_recovery_status,
         .reasoning_preview_begin => .reasoning_preview_begin,
+        .assistant_text_started => .assistant_text_started,
         .provider_resolved => |slug| .{ .provider_resolved = try alloc.dupe(u8, slug) },
         .api_status_text => |text| .{ .api_status_text = try alloc.dupe(u8, text) },
         .credential_refreshed => |credential| .{
@@ -4077,6 +4081,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
         .route_recovery_status => {},
         .clear_route_recovery_status => {},
         .reasoning_preview_begin => {},
+        .assistant_text_started => {},
         .provider_resolved => |slug| alloc.free(slug),
         .api_status_text => |text| alloc.free(text),
         .reasoning_preview => |text| alloc.free(text),

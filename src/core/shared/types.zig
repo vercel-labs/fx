@@ -298,6 +298,10 @@ pub const StreamState = struct {
     /// not waiting. While set, the turn clock freezes at this instant;
     /// on resume the wait is excluded by shifting turn_started_ms forward.
     waiting_since_ms: i64 = 0,
+    /// A visible assistant text block has begun this step. Tool-call
+    /// argument streaming also publishes `generating`, but only visible text
+    /// replaces the reasoning preview.
+    assistant_text_started: bool = false,
 };
 
 pub const RouteRecoveryUnsafeReason = enum {

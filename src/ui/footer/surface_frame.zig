@@ -1735,14 +1735,17 @@ test "surface footer measurement preserves the reasoning preview detail" {
         .input = &input,
     };
 
-    // Tool work keeps the trace on screen; a visible text block releases it.
-    const cases = [_]struct { phase: types.TurnPhase, shown: bool }{
-        .{ .phase = .thinking, .shown = true },
-        .{ .phase = .running, .shown = true },
-        .{ .phase = .generating, .shown = false },
+    // Tool work and tool-call argument generation keep the trace on screen;
+    // a visible text block releases it.
+    const cases = [_]struct { phase: types.TurnPhase, text_started: bool, shown: bool }{
+        .{ .phase = .thinking, .text_started = false, .shown = true },
+        .{ .phase = .running, .text_started = false, .shown = true },
+        .{ .phase = .generating, .text_started = false, .shown = true },
+        .{ .phase = .generating, .text_started = true, .shown = false },
     };
     for (cases) |case| {
         ctx.stream.phase = case.phase;
+        ctx.stream.assistant_text_started = case.text_started;
         var measurement = try measureSurfaceFooter(alloc, &shell, approval.projection(), ctx);
         defer measurement.deinit(alloc);
 

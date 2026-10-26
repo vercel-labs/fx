@@ -326,6 +326,14 @@ pub fn Runtime(comptime App: type) type {
                 }
                 return;
             }
+            if (field(event, "assistant_text_started") != null) {
+                app.stream.assistant_text_started = true;
+                if (comptime @hasField(App, "reasoning_preview")) {
+                    app.reasoning_preview.clearRetainingCapacity();
+                }
+                app.shell.render_requests.request(.footer);
+                return;
+            }
             if (field(event, "tool_lifecycle")) |value| {
                 var parsed = try std.json.parseFromValue(types.ToolLifecycleEvent, app.alloc, value, .{ .ignore_unknown_fields = true });
                 defer parsed.deinit();
@@ -390,13 +398,11 @@ pub fn Runtime(comptime App: type) type {
                 defer parsed.deinit();
                 beginNativeTurn(app, parsed.value.turn_id);
                 if (parsed.value.step_id >= app.stream.phase_step_id) {
+                    if (parsed.value.step_id != app.stream.phase_step_id) {
+                        app.stream.assistant_text_started = false;
+                    }
                     app.stream.phase = parsed.value.phase;
                     app.stream.phase_step_id = parsed.value.step_id;
-                    // A visible text block supersedes the reasoning that
-                    // preceded it.
-                    if (parsed.value.phase == .generating and comptime @hasField(App, "reasoning_preview")) {
-                        app.reasoning_preview.clearRetainingCapacity();
-                    }
                 }
             } else if (field(event, "turn_token_update")) |value| {
                 var parsed = try std.json.parseFromValue(types.TurnTokenProgress, app.alloc, value, .{});
@@ -840,7 +846,7 @@ test "own prompt echoes are skipped once while other prompts get a card" {
     try std.testing.expectEqual(@as(usize, 1), app.user_prompt_count);
 }
 
-test "native child reasoning preview flushes at a trace boundary and drops for text" {
+test "native child reasoning preview flushes at a trace boundary and drops for visible text" {
     var app: NativePresentationTestApp = .{};
     defer app.shell.deinit(app.alloc);
     defer app.remote.deinit(app.alloc);
@@ -859,8 +865,13 @@ test "native child reasoning preview flushes at a trace boundary and drops for t
     try app.apply("{\"turn_phase_update\":{\"turn_id\":1,\"step_id\":2,\"phase\":\"running\"}}");
     try std.testing.expectEqualStrings("running trace", app.reasoning_preview.items);
 
+    // Generating tool-call arguments keeps the trace; visible text drops it.
     try app.apply("{\"turn_phase_update\":{\"turn_id\":1,\"step_id\":2,\"phase\":\"generating\"}}");
+    try std.testing.expectEqualStrings("running trace", app.reasoning_preview.items);
+
+    try app.apply("{\"assistant_text_started\":{}}");
     try std.testing.expectEqual(@as(usize, 0), app.reasoning_preview.items.len);
+    try std.testing.expect(app.stream.assistant_text_started);
 }
 
 test "host command results render from their typed fields" {
