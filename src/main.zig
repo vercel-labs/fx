@@ -2955,7 +2955,17 @@ const App = struct {
     fn deliverSessionEvents(self: *App) !void {
         switch (self.backend) {
             .in_process => try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).workerEventHandlers(self)),
-            .detached => if (comptime !host_target.is_wasm) try RemoteRuntime.poll(self),
+            .detached => if (comptime !host_target.is_wasm) {
+                try RemoteRuntime.poll(self);
+                // The supervisor sends no timer events, so the shimmer clock
+                // needs this loop pass the in-process tick gets for free.
+                _ = WorkerAppRuntime.advanceVisibleAnimation(
+                    self,
+                    app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
+                    io_mod.milliTimestamp(),
+                    std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake),
+                );
+            },
         }
     }
 

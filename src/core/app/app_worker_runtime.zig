@@ -831,7 +831,10 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
-        fn advanceVisibleAnimation(
+        /// Schedules the next shimmer frame for a live activity row. Every host
+        /// loop must call this on each pass: the 50ms cadence is timer-owned,
+        /// not event-owned, so a quiet tool run still advances its counter.
+        pub fn advanceVisibleAnimation(
             app: *App,
             presenter: activity_runtime.LifecyclePresenter,
             now_ms: i64,
