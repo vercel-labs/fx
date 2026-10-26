@@ -598,7 +598,15 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             defer parsed.deinit();
-            try sessions.Runtime(App).replayRemoteHistory(app, parsed.value);
+            sessions.Runtime(App).replayRemoteHistory(app, parsed.value) catch |err| {
+                var message_buf: [128]u8 = undefined;
+                const message = std.mem.print(
+                    &message_buf,
+                    "The saved transcript could not be rendered ({s}).",
+                    .{@errorName(err)},
+                ) catch "The saved transcript could not be rendered.";
+                try View.notice(app, "session", message);
+            };
             remote.native_turn_offset = app.shell.finalizedToolTurnWatermark() + 1;
             // Events that followed the saved checkpoint were held back while
             // the transcript loaded. Ask for them now that it is in place.

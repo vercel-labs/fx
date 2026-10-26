@@ -3245,6 +3245,10 @@ pub fn Runtime(comptime App: type) type {
         fn LiveHistorySink(comptime SinkApp: type) type {
             return struct {
                 app: *SinkApp,
+                /// A resumed inline transcript keeps tool status rows but not
+                /// their full diffs: one long edit would fill the visible
+                /// cache and push the tool rows out of the scrollback.
+                suppress_diffs: bool = false,
 
                 const Self = @This();
 
@@ -3400,6 +3404,10 @@ pub fn Runtime(comptime App: type) type {
                 }
 
                 fn appendDiff(self: *Self, payload: diff.DiffEntryPayload) !void {
+                    if (self.suppress_diffs) {
+                        diff.freeDiffEntryPayload(std.heap.c_allocator, payload);
+                        return;
+                    }
                     try self.app.registerAndEmitDiffBlock(payload);
                 }
 
@@ -4074,7 +4082,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn replayRemoteHistory(app: *App, history: []const types.HistoryTurn) !void {
             var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
             defer labels.deinit(app.alloc);
-            var sink = LiveHistorySink(App){ .app = app };
+            var sink = LiveHistorySink(App){ .app = app, .suppress_diffs = true };
             const start = replayStartForBudget(history);
             debug_trace.logf(
                 "session",
@@ -4278,11 +4286,6 @@ pub fn Runtime(comptime App: type) type {
             }
             for (execution.tool_steps, 0..) |step, step_index| {
                 if (step_index < first_step) continue;
-                debug_trace.logf(
-                    "session",
-                    "history step={d} first={d} calls={d} results={d}",
-                    .{ step_index, first_step, step.tool_calls.len, step.tool_results.len },
-                );
                 try writePersistedSteeringAtBoundary(
                     app,
                     sink,

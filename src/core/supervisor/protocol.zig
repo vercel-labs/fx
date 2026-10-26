@@ -435,6 +435,7 @@ test "requests round trip with their command beside the fields" {
         .{ .command = .{ .session_id = "s", .node_id = "child", .name = "last_reply" } },
         .{ .cancel = .{ .session_id = "s", .node_id = "child" } },
         .{ .history = .{ .session_id = "s", .child_id = "grandchild", .parent_id = "child" } },
+        .{ .history_chunk = .{ .session_id = "s", .offset = 1024, .max_bytes = 4096 } },
     };
     for (requests) |request| {
         const bytes = try encode(arena, request);

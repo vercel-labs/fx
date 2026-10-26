@@ -9338,6 +9338,27 @@ test "pruned command ranges bridge after their separator is retained then remove
     );
 }
 
+test "suspended retention keeps a replayed history intact until it is released" {
+    var sink = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+
+    const alloc = std.testing.allocator;
+    var runtime = commandOutputTestRuntime(sink);
+    defer runtime.deinit(alloc);
+
+    runtime.max_retained_transcript_bytes = 0;
+    runtime.retention_suspended = true;
+    _ = try runtime.appendReplaceableTranscriptLineSilent(alloc, "first saved row\n");
+    _ = try runtime.appendReplaceableTranscriptLineSilent(alloc, "second saved row\n");
+    try std.testing.expectEqual(@as(usize, 2), runtime.entries.items.len);
+    try std.testing.expect(!(try runtime.enforceStructuredRetentionAndReport(alloc, null)));
+    try std.testing.expectEqual(@as(usize, 2), runtime.entries.items.len);
+
+    runtime.retention_suspended = false;
+    _ = try runtime.enforceStructuredRetentionAndReport(alloc, null);
+    try std.testing.expect(runtime.entries.items.len < 2);
+}
+
 test "command output detail retargets when first split source row is pruned" {
     var sink = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), "/dev/null", .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
