@@ -138,6 +138,10 @@ pub fn HistoryPage(comptime Fragments: type) type {
         /// The page's fragments, oldest first, and their estimated bytes.
         fragments: Fragments,
         page_bytes: usize,
+        /// The session's checklist at the checkpoint as an ACP plan update
+        /// (D233), for the panel above the composer (D252); null when it
+        /// has none.
+        checklist: ?[]const u8 = null,
     };
 }
 

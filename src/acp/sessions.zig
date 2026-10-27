@@ -991,6 +991,7 @@ fn handleRestoreSession(
         try sendActiveHistoryUpdates(state, alloc, session_id, &sources);
     }
     try sendActiveSessionInfoUpdate(state, alloc);
+    try sendRestoredChecklist(state, alloc, session_id);
 
     try writeLoadSessionResponse(
         state,
@@ -1655,6 +1656,22 @@ fn sendUserHistoryTurn(
         try out.writer.writeAll("}");
         try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
     }
+}
+
+/// A restored session's checklist as an ACP plan, so a client shows it
+/// before the next checklist call (D233, D252). Nothing when it is empty.
+fn sendRestoredChecklist(state: *server.ServerState, alloc: Allocator, session_id: []const u8) !void {
+    const active = if (state.active_session) |*value| value else return;
+    var list = (try active.session_rt.checklist.snapshot(alloc)) orelse return;
+    defer list.deinit();
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("{\"sessionId\":");
+    try writeJsonStr(session_id, &out.writer);
+    try out.writer.writeAll(",\"update\":");
+    try acp_types.writePlanUpdate(&out.writer, &list);
+    try out.writer.writeAll("}");
+    try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
 
 fn sendUserHistoryChunk(

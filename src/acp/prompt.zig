@@ -553,9 +553,9 @@ const AcpContext = struct {
     }
 
     /// The session's checklist as an ACP plan, after each successful
-    /// checklist call (D233). An empty checklist sends an empty plan.
+    /// checklist call (D233). An empty checklist sends an empty plan. The
+    /// native frontend reads it too, for its panel above the composer (D252).
     fn sendChecklistPlan(self: *AcpContext) !void {
-        if (!self.publishesCards()) return;
         const session = if (self.state.active_session) |*active| active else return;
         var list = (try session.session_rt.checklist.snapshot(self.alloc)) orelse checklist.List.init(self.alloc);
         defer list.deinit();

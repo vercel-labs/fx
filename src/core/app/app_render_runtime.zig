@@ -551,6 +551,20 @@ pub fn Runtime(comptime App: type) type {
         var fast_picker_labels_buf: [3][]const u8 = undefined;
         var provider_picker_column: provider_picker_runtime.ColumnBuffer = .{};
         var tool_preview_cache: tool_input_preview_view.Cache = .{};
+        /// Keeps the checklist panel on an in-process session's list
+        /// (D252). A detached session's list arrives as ACP plan updates.
+        fn followChecklist(app: *App) void {
+            if (comptime !@hasField(App, "checklist_panel")) return;
+            if (comptime !(@hasField(App, "session") and @hasField(@FieldType(App, "session"), "checklist"))) return;
+            _ = app.checklist_panel.follow(app.alloc, &app.session.checklist) catch |err|
+                debug_trace.logf("checklist", "panel follow failed err={s}", .{@errorName(err)});
+        }
+
+        fn checklistView(app: *App) ?*const @import("../checklist/checklist.zig").List {
+            if (comptime !@hasField(App, "checklist_panel")) return null;
+            return app.checklist_panel.visible();
+        }
+
         noinline fn footerContext(
             app: *App,
             upgrade_status_buf: *[64]u8,
@@ -760,6 +774,7 @@ pub fn Runtime(comptime App: type) type {
                 .permission_mode = if (comptime @hasField(App, "permission_engine")) app.permission_engine.mode else .ask,
                 .steering_messages = steering.messages,
                 .steering_waits_for_boundary = steering.waits_for_boundary,
+                .checklist = checklistView(app),
                 .fast_indicator_active = fast_indicator_active,
                 .effort = visible_effort,
                 .model_supports_effort = model_supports_effort,
@@ -1278,6 +1293,7 @@ pub fn Runtime(comptime App: type) type {
             var upgrade_status_buf: [64]u8 = undefined;
             var steering = try buildSteeringProjection(App, app);
             defer steering.deinit(app.alloc);
+            followChecklist(app);
             const shimmer_pos = if (snapshot.animation_candidate) |candidate|
                 candidate.phase
             else
@@ -1290,7 +1306,7 @@ pub fn Runtime(comptime App: type) type {
             );
             const file_picker_receipt = input_completion_runtime.CompletionRuntime(App).filePickerView(app).receipt;
             var footer_ctx = main_footer_ctx;
-            const render_reconciliation = switch (try reconcileBeforeFrameRender(app, render_input.steeringBannerRows(footer_ctx, app.shell.layout.cols))) {
+            const render_reconciliation = switch (try reconcileBeforeFrameRender(app, render_input.bannerRows(footer_ctx, app.shell.layout.cols))) {
                 .inline_render => |inline_render| inline_render,
                 .file_approval_screen => return renderApprovalScreen(app),
                 .model_hub_screen => return renderModelHubScreen(app),

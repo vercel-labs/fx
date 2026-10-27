@@ -21,6 +21,8 @@ const server = @import("server.zig");
 const watch_mod = @import("watch.zig");
 const child_views = @import("child_views.zig");
 const host_commands = @import("../../acp/commands.zig");
+const acp_types = @import("../../acp/types.zig");
+const checklist_store = @import("../checklist/store.zig");
 const kernel_slot = @import("../kernel/slot.zig");
 const session_delete = @import("session_delete.zig");
 const wake = @import("wake.zig");
@@ -809,7 +811,19 @@ pub const Session = struct {
         const sequence = self.log.sequence;
         self.events_mutex.unlock(io_mod.getIo());
         try self.history.replace(self.daemon.alloc, history, sequence);
+        self.history.setChecklist(self.daemon.alloc, try checklistPlan(self.daemon.alloc, &active.session_rt.checklist));
         self.history_dirty = false;
+    }
+
+    /// The checklist as an ACP plan update for history pages (D252); null
+    /// when it holds no tasks. Caller owns the bytes.
+    fn checklistPlan(alloc: Allocator, store: *checklist_store.Store) !?[]u8 {
+        var list = (try store.snapshot(alloc)) orelse return null;
+        defer list.deinit();
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try acp_types.writePlanUpdate(&out.writer, &list);
+        return try out.toOwnedSlice();
     }
 
     /// A snapshot response and the event sequence and version it covers.

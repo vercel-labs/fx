@@ -136,11 +136,20 @@ pub const Saved = struct {
     generation: u64 = 1,
     /// The event sequence the turns were checkpointed at.
     sequence: u64 = 0,
+    /// The session's checklist at the checkpoint as an ACP plan update; owned.
+    checklist: ?[]u8 = null,
 
     pub fn deinit(self: *Saved, alloc: Allocator) void {
         if (self.turns.len > 0) types.freeHistoryTurnSlice(alloc, self.turns);
         alloc.free(self.fingerprints);
+        if (self.checklist) |bytes| alloc.free(bytes);
         self.* = .{};
+    }
+
+    /// Replaces the checklist; takes ownership of `plan`.
+    pub fn setChecklist(self: *Saved, alloc: Allocator, plan: ?[]u8) void {
+        if (self.checklist) |bytes| alloc.free(bytes);
+        self.checklist = plan;
     }
 
     /// Takes ownership of `turns` on success. A history that does not extend
@@ -152,8 +161,10 @@ pub const Saved = struct {
         const extends = fingerprints.len >= self.fingerprints.len and
             std.mem.eql(u64, self.fingerprints, fingerprints[0..self.fingerprints.len]);
         const generation = if (extends) self.generation else self.generation + 1;
+        const checklist = self.checklist;
+        self.checklist = null;
         self.deinit(alloc);
-        self.* = .{ .turns = turns, .fingerprints = fingerprints, .generation = generation, .sequence = sequence };
+        self.* = .{ .turns = turns, .fingerprints = fingerprints, .generation = generation, .sequence = sequence, .checklist = checklist };
     }
 };
 
@@ -178,6 +189,7 @@ pub fn encodeReply(
             .has_older = page.has_older,
             .page_bytes = page.bytes,
             .fragments = page.fragments,
+            .checklist = saved.checklist,
         });
         if (bytes.len <= max_frame_bytes) return bytes;
         if (budget <= min_page_bytes) return error.HistoryPageTooLarge;

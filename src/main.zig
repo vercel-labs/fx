@@ -12,6 +12,7 @@ const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
 const model_role_runtime = @import("core/app/model_role_runtime.zig");
 const model_hub = @import("core/model_hub/hub.zig");
+const checklist_panel = @import("core/checklist/panel.zig");
 const model_hub_runtime = @import("core/app/model_hub_runtime.zig");
 const provider_picker_runtime = @import("core/app/provider_picker_runtime.zig");
 const auth_runtime = @import("core/auth/auth_runtime.zig");
@@ -639,6 +640,8 @@ const App = struct {
     model_roles: model_role_runtime.State = .{},
     /// The model hub `/model` and `/provider` open (D221).
     model_hub: model_hub.State = .{},
+    /// The live checklist above the composer (D252).
+    checklist_panel: checklist_panel.State = .{},
     diff_entries: std.ArrayList(@import("core/output/diff.zig").DiffEntry) = .empty,
     next_diff_id: u32 = 1,
 
@@ -1061,6 +1064,7 @@ const App = struct {
         self.terminal_client.deinit();
         self.managed_executions.deinit();
         self.model_hub.deinit(self.alloc);
+        self.checklist_panel.deinit();
         self.model_cache.deinit();
         self.usage_dashboard.deinit();
         InputSubmitRuntime.clearPendingSubmission(self, "shutdown");
@@ -4947,6 +4951,7 @@ test {
     _ = @import("core/checklist/store.zig");
     _ = @import("tools/session/checklist.zig");
     _ = @import("core/checklist/presentation.zig");
+    _ = @import("core/checklist/panel.zig");
     _ = @import("core/agent/runtime/checklist_reminder.zig");
     _ = @import("core/browser/websocket.zig");
     _ = @import("core/browser/cdp.zig");

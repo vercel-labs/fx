@@ -18,6 +18,8 @@ const command_specs = @import("../../core/slash_commands/command_specs.zig");
 const settings_catalog = @import("../../core/config/settings_catalog.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
 const display_width = @import("../../core/shared/display_width.zig");
+const checklist = @import("../../core/checklist/checklist.zig");
+const checklist_panel = @import("checklist_panel.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const types = @import("../../core/shared/types.zig");
 const workspace_access = @import("../../core/workspace/workspace_access.zig");
@@ -389,6 +391,8 @@ pub const RenderContext = struct {
     permission_mode: types.PermissionMode = .ask,
     steering_messages: []const []const u8 = &.{},
     steering_waits_for_boundary: bool = false,
+    /// The session's checklist while the panel above the composer shows it (D252).
+    checklist: ?*const checklist.List = null,
     fast_indicator_active: bool = false,
     effort: types.ReasoningEffort = .auto,
     model_supports_effort: bool = false,
@@ -578,6 +582,33 @@ pub fn steeringBannerRows(ctx: RenderContext, width: u16) u16 {
         ctx.steering_waits_for_boundary,
         width,
     );
+}
+
+/// The rows above the composer: the checklist panel, then any steering
+/// messages, then one gap before the composer.
+pub fn bannerRowsFor(
+    messages: []const []const u8,
+    waits_for_boundary: bool,
+    list: ?*const checklist.List,
+    width: u16,
+) u16 {
+    const steering = steeringBannerRowsForMessages(messages, waits_for_boundary, width);
+    const panel_rows = checklist_panel.wantedRows(list);
+    if (panel_rows == 0) return steering;
+    return panel_rows +| if (steering > 0) steering else steering_composer_gap_rows;
+}
+
+pub fn bannerRows(ctx: RenderContext, width: u16) u16 {
+    return bannerRowsFor(ctx.steering_messages, ctx.steering_waits_for_boundary, ctx.checklist, width);
+}
+
+/// The rows the steering messages take, without the composer gap.
+pub fn steeringMessageRows(ctx: RenderContext, width: u16) u16 {
+    var rows: u16 = 0;
+    for (ctx.steering_messages) |message| {
+        rows +|= steering_message_layout(message, width, ctx.steering_waits_for_boundary, max_steering_message_rows).row_count;
+    }
+    return rows;
 }
 
 test "steering banner reserves message rows and one composer gap" {

@@ -637,6 +637,11 @@ pub fn SubmitRuntime(comptime App: type) type {
         }
 
         pub fn submit(app: *App, max_prompt_history: usize) !void {
+            // A prompt after the checklist settled puts its panel away (D252).
+            if (comptime @hasField(App, "checklist_panel")) {
+                const text = std.mem.trim(u8, app.input_runtime.edit_state.input.items, " \t\r\n");
+                if (text.len > 0 and text[0] != '/') app.checklist_panel.promptSent();
+            }
             if (comptime @hasField(App, "worker")) {
                 if (comptime @hasDecl(@TypeOf(app.worker), "compactionActivitySnapshot")) {
                     const observed = app.worker.compactionActivitySnapshot();

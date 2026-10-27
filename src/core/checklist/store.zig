@@ -67,6 +67,20 @@ pub const Store = struct {
         return try list.clone(gpa);
     }
 
+    pub const Changed = struct { list: ?List, revision: u64 };
+
+    /// A copy of the list when it changed after `revision`, with the
+    /// revision it reflects, for the live panel (D252); null when it did
+    /// not change. The copy is null when the list holds no tasks. Caller
+    /// owns it.
+    pub fn snapshotSince(self: *Store, gpa: Allocator, revision: u64) Allocator.Error!?Changed {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.revision == revision) return null;
+        const copy: ?List = if (self.list) |*value| (if (value.taskCount() > 0) try value.clone(gpa) else null) else null;
+        return .{ .list = copy, .revision = self.revision };
+    }
+
     /// Replaces the list with a saved one, or clears it for null. A saved
     /// list that does not read is dropped with the reason returned.
     pub fn restore(self: *Store, json: ?[]const u8) error{ OutOfMemory, InvalidChecklist }!void {

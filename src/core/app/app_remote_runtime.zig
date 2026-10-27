@@ -727,8 +727,27 @@ pub fn Runtime(comptime App: type) type {
             remote.history_window.deinit(app.alloc);
             remote.history_window = window;
             try rebuildTranscript(app);
+            try adoptChecklist(app, page.checklist);
             remote.sequence = page.history_sequence;
             try resync(app, page.history_sequence);
+        }
+
+        /// The checklist panel follows the session the history belongs to
+        /// (D252): its saved plan, or nothing.
+        fn adoptChecklist(app: *App, plan: ?[]const u8) !void {
+            if (comptime !@hasField(App, "checklist_panel")) return;
+            const text = plan orelse {
+                app.checklist_panel.adopt(null);
+                return;
+            };
+            var parsed = std.json.parseFromSlice(std.json.Value, app.alloc, text, .{}) catch |err| {
+                debug_trace.logf("checklist", "saved plan unreadable err={s}", .{@errorName(err)});
+                app.checklist_panel.adopt(null);
+                return;
+            };
+            defer parsed.deinit();
+            const entries = if (parsed.value == .object) parsed.value.object.get("entries") else null;
+            try app.checklist_panel.adoptPlan(app.alloc, if (entries) |value| itemsOf(value) else &.{});
         }
 
         fn beginOlderPage(app: *App, page: client_protocol.HistoryPage([]const history_page.Fragment)) !void {

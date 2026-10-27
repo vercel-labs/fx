@@ -9217,3 +9217,41 @@ test "a retained frame with recovery pending settles instead of repainting at re
     try std.testing.expect(frames < 20);
     try expectGridContains(&h, "settled row 29");
 }
+
+test "the checklist panel sits above the composer with steering under it, and shrinks in a short terminal" {
+    const checklist = @import("../core/checklist/checklist.zig");
+    var list = try checklist.testList(std.testing.allocator, &.{
+        .{ "Build", &.{ .{ "Write parser", .completed }, .{ "Add tests", .in_progress }, .{ "Docs", .pending } } },
+        .{ "Ship", &.{.{ "Tag release", .pending }} },
+    });
+    defer list.deinit();
+    for ([_][2]u16{ .{ 96, 18 }, .{ 40, 18 }, .{ 40, 9 } }) |size| {
+        var h = try Harness.init(std.testing.allocator, size[0], size[1], 4);
+        defer h.deinit();
+        var input = InputRuntime{};
+        defer input.deinit(h.alloc);
+        var approval: approval_prompt.ApprovalPrompt = .{};
+        defer approval.deinit(h.alloc);
+        try h.shell.initViewport(&h.metrics, 4);
+        _ = try appendCompletedToolStatus(&h, "Opening file");
+        try h.renderTranscriptFrame();
+
+        var ctx = defaultFooterContext(&input);
+        ctx.checklist = &list;
+        ctx.steering_messages = &.{"pending steering"};
+        ctx.steering_waits_for_boundary = true;
+        h.frame_redraw = true;
+        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+        try h.flush();
+
+        const header = try findRowContaining(&h, "Checklist · 1 of 4 done");
+        // Steering keeps its row under the panel.
+        const steering = try findRowContaining(&h, "pending steering");
+        try std.testing.expect(steering > header);
+        if (size[1] >= 18) {
+            try expectGridContains(&h, "→ Add tests");
+            try expectGridContains(&h, "Ship · 0/1");
+            try std.testing.expect(try findRowContaining(&h, "Add tests") < steering);
+        }
+    }
+}

@@ -602,6 +602,13 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 };
                 try app.writeUserPromptCard(.{ .text = @constCast(text) });
+            } else if (std.mem.eql(u8, kind, "plan")) {
+                // The session's checklist after a checklist call (D233), for
+                // the panel above the composer (D252).
+                if (comptime !@hasField(App, "checklist_panel")) return;
+                if (string(params, "sessionId")) |id| if (app.remote.current_id.len > 0 and !std.mem.eql(u8, id, app.remote.current_id)) return;
+                try app.checklist_panel.adoptPlan(app.alloc, itemsOf(field(update, "entries") orelse .null));
+                app.shell.render_requests.request(.footer);
             } else if (std.mem.eql(u8, kind, "notice")) {
                 // A row outside any turn, such as a message between two
                 // workers the supervisor relays (D187).

@@ -17,6 +17,7 @@ const footer_viewport = @import("viewport.zig");
 const approval_ui = @import("approval_ui.zig");
 const compact_command_menu_presentation = @import("compact_command_menu_presentation.zig");
 const input_presentation = @import("input_presentation.zig");
+const checklist_panel = @import("checklist_panel.zig");
 const interaction_state = @import("interaction_state.zig");
 const picker_presentation = @import("picker_presentation.zig");
 const model_menu_presentation = @import("model_menu_presentation.zig");
@@ -563,6 +564,9 @@ const InputCursorPlacement = struct {
     col: u16,
 };
 
+/// Paints the rows above the composer: the checklist panel (D252), then
+/// steering messages, then one gap. Steering keeps its rows when room is
+/// short; the panel takes what is left.
 fn pushSteeringRows(
     alloc: Allocator,
     frame: *footer_viewport.ComposedFooterFrame,
@@ -570,12 +574,28 @@ fn pushSteeringRows(
     ctx: render_input.RenderContext,
     width: u16,
 ) !void {
-    if (ctx.steering_messages.len == 0 or
+    if ((ctx.steering_messages.len == 0 and ctx.checklist == null) or
         !plan.footer.banner_active or
         plan.footer.banner_rows == 0) return;
 
     const gap_rows: u16 = @intFromBool(plan.footer.banner_rows > 1);
-    const steering_row_budget = plan.footer.banner_rows -| gap_rows;
+    const content_rows = plan.footer.banner_rows -| gap_rows;
+    const steering_row_budget = @min(render_input.steeringMessageRows(ctx, width), content_rows);
+    var painted: u16 = 0;
+    if (ctx.checklist) |list| {
+        const panel_budget = content_rows - steering_row_budget;
+        var panel_rows: std.ArrayList(std.ArrayList(u8)) = .empty;
+        defer {
+            for (panel_rows.items) |*row| row.deinit(alloc);
+            panel_rows.deinit(alloc);
+        }
+        if (panel_budget > 0) try checklist_panel.compose(alloc, list, width, panel_budget, &panel_rows);
+        for (panel_rows.items) |*row| {
+            try pushFooterBandRow(alloc, frame, plan, plan.footer.banner +| painted, row);
+            painted +|= 1;
+        }
+    }
+
     var visible_start = ctx.steering_messages.len;
     var remaining_rows = steering_row_budget;
     var oldest_row_limit: u16 = 0;
@@ -593,9 +613,9 @@ fn pushSteeringRows(
         remaining_rows -= candidate_rows;
     }
 
-    var painted: u16 = 0;
-    for (ctx.steering_messages[visible_start..], visible_start..) |message, index| {
-        if (painted >= steering_row_budget) break;
+    var steering_painted: u16 = 0;
+    if (steering_row_budget > 0) for (ctx.steering_messages[visible_start..], visible_start..) |message, index| {
+        if (steering_painted >= steering_row_budget) break;
         const row_limit = if (index == visible_start)
             oldest_row_limit
         else
@@ -609,7 +629,7 @@ fn pushSteeringRows(
         );
         defer rows.deinit(alloc);
         for (rows.rows.items) |*row| {
-            if (painted >= steering_row_budget) break;
+            if (steering_painted >= steering_row_budget) break;
             try pushFooterBandRow(
                 alloc,
                 frame,
@@ -618,8 +638,9 @@ fn pushSteeringRows(
                 row,
             );
             painted +|= 1;
+            steering_painted +|= 1;
         }
-    }
+    };
 
     if (painted < plan.footer.banner_rows) {
         var gap: std.ArrayList(u8) = .empty;

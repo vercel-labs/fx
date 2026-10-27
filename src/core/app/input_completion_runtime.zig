@@ -579,9 +579,10 @@ pub fn CompletionRuntime(comptime App: type) type {
             }
             var steering = try app.worker.snapshotSteeringPresentation(app.alloc);
             defer steering.deinit(app.alloc);
-            const requested_banner_rows = render_input.steeringBannerRowsForMessages(
+            const requested_banner_rows = render_input.bannerRowsFor(
                 steering.messages,
                 steering.waits_for_boundary,
+                if (comptime @hasField(App, "checklist_panel")) app.checklist_panel.visible() else null,
                 app.shell.layout.cols,
             );
             return .{

@@ -2863,6 +2863,23 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   thinking, in the same setting. **Alternative:** a second
   `model_role_thinking` table that could disagree with the chain.
 
+- **D252 Decision:** the terminal shows the session's checklist live above
+  the composer, after proto's checklist widget and in place of D234's
+  "not ported": "Checklist · 2 of 5 done", the phase in work with its
+  open tasks (at most five, then "… N more") after its last finished
+  one, and the phases after it as one line each. Once every task is done
+  or dropped it collapses to "✓ Checklist · 5 of 5 done", and the next
+  prompt the person sends puts it away until the list changes. Steering
+  messages keep their rows under it and a short terminal trims the panel
+  first; every row is one line cut at the width. The terminal keeps a
+  copy (`core/checklist/panel.zig`): in process it follows the session's
+  store; detached it takes the ACP plan the host now sends to the native
+  frontend too (D233), and the plan saved with each history page, so a
+  resumed or reattached session shows it at once. An ACP client also
+  gets the plan when it loads a session with a checklist. **Why:** proto
+  keeps the plan in view while it works. **Alternative:** a slash command
+  that prints the list, which goes stale as soon as it scrolls away.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

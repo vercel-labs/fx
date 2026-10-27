@@ -352,7 +352,7 @@ fn steeringBannerRowsForLayout(
     composer_top_chrome_rows: u16,
     input_extra: u16,
 ) u16 {
-    const requested = render_input.steeringBannerRows(ctx, terminal_cols);
+    const requested = render_input.bannerRows(ctx, terminal_cols);
     return clampSteeringBannerRows(
         requested,
         terminal_rows,
@@ -700,7 +700,7 @@ fn buildFooterSurfaceProjection(
         .composer_top_chrome_rows = composer_top_chrome_rows,
         .picker_rows = picker_rows,
         .top_gap_rows = if (viewer_active or modal_active) 1 else 0,
-        .footer_gap_active = !viewer_active and (modal_active or ctx.steering_messages.len > 0),
+        .footer_gap_active = !viewer_active and (modal_active or ctx.steering_messages.len > 0 or ctx.checklist != null),
         .banner_active = banner_active,
         .banner_rows = banner_rows,
         .footer_extra = geometry.input_extra + banner_rows + picker_extra,
