@@ -22,8 +22,9 @@ pub const FileApprovalRequest = struct {
 };
 
 /// Appended to the label of a request that Python made through
-/// `proto_fx`, followed by the asking process in parentheses.
-pub const harness_marker = " · via harness";
+/// `proto_fx`, followed by the asking command in parentheses when known.
+/// People read the command, never a process id.
+pub const harness_marker = " · from Python";
 
 pub const RequestOrigin = union(enum) {
     active_session,

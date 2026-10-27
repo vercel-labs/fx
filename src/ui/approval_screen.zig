@@ -1786,7 +1786,7 @@ test "subagent file approval renders its bounded preview without a live review" 
     try std.testing.expect(std.mem.find(
         u8,
         rendered.bytes,
-        "Subagent approval-child needs permission",
+        "Worker approval-child needs permission",
     ) != null);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "note.txt") != null);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "changed") != null);

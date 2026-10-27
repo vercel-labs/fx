@@ -2389,7 +2389,7 @@ test "vision failure uses the generic failed terminal lifecycle" {
         hooks.lifecycle_events.items[2].terminal.outcome.kind,
     );
     try std.testing.expectEqualStrings(
-        "Failed vision: provider response stayed invalid after one retry",
+        "Failed vision · provider response stayed invalid after one retry",
         hooks.lifecycle_events.items[2].terminal.outcome.summary,
     );
     const persisted = hooks.history_turns.items[0].assistant.execution.tool_steps[0].tool_results[0];
@@ -3128,7 +3128,7 @@ test "modern mixed batch materializes unsupported terminal before admission" {
         .failed,
     );
     try std.testing.expectEqualStrings(
-        "Failed missing_tool",
+        "Failed missing_tool · Unsupported tool: missing_tool",
         hooks.lifecycle_events.items[5].terminal.outcome.summary,
     );
 
@@ -5259,12 +5259,12 @@ test "processQueuedPrompt command output completion fires on command success and
     try std.testing.expectEqual(@as(usize, 1), error_hooks.command_complete_count);
     try expectLogOrder(
         &error_hooks,
-        "status:finished:Failed terminal",
+        "status:finished:Failed terminal · Tool terminal failed: AccessDenied",
         "command_output_complete:",
     );
     try expectBodyContains(&error_gateway, 1, "Tool terminal failed: AccessDenied");
     try std.testing.expectEqualStrings(
-        "Failed terminal",
+        "Failed terminal · Tool terminal failed: AccessDenied",
         error_hooks.lifecycle_events.items[2].terminal.outcome.summary,
     );
     try std.testing.expectEqual(
@@ -5310,7 +5310,7 @@ test "processQueuedPrompt includes structured failure detail in tool status" {
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
     try std.testing.expectEqualStrings(
-        "Failed browser_snapshot: Browser/CDP cdp failed during discover_targets: Browser is not reachable",
+        "Failed browser_snapshot · Browser/CDP cdp failed during discover_targets: Browser is not reachable",
         hooks.lifecycle_events.items[2].terminal.outcome.summary,
     );
     try std.testing.expectEqual(
@@ -5465,7 +5465,7 @@ test "parallel permission preflight failure terminalizes its started lifecycle" 
     const terminal = hooks.lifecycle_events.items[9].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
-        "Failed read_file: permission preflight failed",
+        "Failed read_file · permission preflight failed",
         terminal.outcome.summary,
     );
 }

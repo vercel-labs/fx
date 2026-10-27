@@ -3,8 +3,11 @@
 //! JSON result, so a replayed call renders the same card.
 //!
 //! "Listed jobs · 1 of 3 running · 1 failed"
-//! "  ◐ bg_1  shell  bun run build  1m2s"
-//! "  ✗ bg_2  shell  npm test       4.1s"
+//! "  ◐ bun run build  1m2s"
+//! "  ✗ npm test       4.1s"
+//!
+//! People read labels, never job ids: the ids stay in the JSON result the
+//! model reads.
 const std = @import("std");
 const jobs = @import("jobs.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -26,6 +29,7 @@ pub const RowJob = struct {
 const Result = struct {
     op: []const u8 = "",
     id: ?[]const u8 = null,
+    label: ?[]const u8 = null,
     jobs: []const RowJob = &.{},
     pending: []const RowJob = &.{},
     timed_out: bool = false,
@@ -61,21 +65,24 @@ pub fn statusText(arena: Allocator, output: []const u8) !?[]const u8 {
             try writer.writeAll("Waited · nothing left to wait on");
         }
     } else if (std.mem.eql(u8, op, "inspect")) {
-        try writer.print("Inspected {s}", .{result.id orelse "job"});
-        try writeRows(arena, writer, result.jobs);
+        // One job: its state and duration fit on the phrase itself.
+        try writer.print("Inspected {s}", .{try jobName(arena, result)});
+        if (result.jobs.len == 1) {
+            const row = result.jobs[0];
+            try writer.print(" · {s} · {s}", .{ stateWord(stateOf(row)), jobs.formatDuration(&buf, row.duration_ms) });
+        } else try writeRows(arena, writer, result.jobs);
     } else if (std.mem.eql(u8, op, "logs")) {
-        try writer.print("Read logs {s}", .{result.id orelse "job"});
-        if (result.retained_bytes > 0) try writer.print(" · {d} bytes", .{result.retained_bytes});
+        try writer.print("Read logs of {s}", .{try jobName(arena, result)});
     } else if (std.mem.eql(u8, op, "cancel") or std.mem.eql(u8, op, "signal")) {
-        try writer.print("{s} {s}", .{ if (std.mem.eql(u8, op, "cancel")) "Cancelled" else "Signalled", result.id orelse "job" });
-        if (result.signal) |signal| try writer.print(" {s}", .{signal});
-        if (result.receipt) |receipt| try writer.print(" · {s}", .{receiptWord(receipt)});
+        try writer.print("{s} {s}", .{ if (std.mem.eql(u8, op, "cancel")) "Cancelled" else "Signalled", try jobName(arena, result) });
+        if (result.signal) |signal| try writer.print(" with {s}", .{signal});
+        if (result.receipt) |receipt| if (receiptWord(receipt)) |word| try writer.print(" · {s}", .{word});
     } else return null;
     return out.written();
 }
 
 /// The row of a shell run that went to the background:
-/// "Backgrounded npm run build · bg_3". Null for any other shell result.
+/// "Backgrounded npm run build". Null for any other shell result.
 pub fn backgroundedShellText(arena: Allocator, args_json: []const u8, output: []const u8) !?[]const u8 {
     const Run = struct { state: []const u8 = "", job_id: ?[]const u8 = null };
     const run = std.json.parseFromSliceLeaky(Run, arena, output, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
@@ -87,12 +94,33 @@ pub fn backgroundedShellText(arena: Allocator, args_json: []const u8, output: []
     const Args = struct { command: []const u8 = "" };
     const args = std.json.parseFromSliceLeaky(Args, arena, args_json, .{ .ignore_unknown_fields = true }) catch Args{};
     const command = try text_utils.encodeTerminalSafeInline(arena, args.command, 160);
-    return try arena.print("Backgrounded {s} · {s}", .{ command.bytes, job_id });
+    _ = job_id;
+    return try arena.print("Backgrounded {s}", .{command.bytes});
 }
 
-fn receiptWord(receipt: []const u8) []const u8 {
+/// What a person calls the job: its label, from the result or its row.
+fn jobName(arena: Allocator, result: Result) ![]const u8 {
+    const raw = result.label orelse if (result.jobs.len > 0 and result.jobs[0].label.len > 0) result.jobs[0].label else return "a job";
+    const safe = try text_utils.encodeTerminalSafeInline(arena, raw, max_label_cols * 4);
+    return clipCols(safe.bytes, max_label_cols);
+}
+
+/// Only an unusual receipt is worth a word; a cancel that settled is the
+/// phrase itself.
+fn receiptWord(receipt: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, receipt, "already_settled")) return "already settled";
-    return receipt;
+    if (std.mem.eql(u8, receipt, "requested")) return "tearing down";
+    return null;
+}
+
+fn stateWord(state: jobs.State) []const u8 {
+    return switch (state) {
+        .queued => "queued",
+        .running => "running",
+        .completed => "done",
+        .failed => "failed",
+        .cancelled => "cancelled",
+    };
 }
 
 fn writeCounts(writer: *std.Io.Writer, rows: []const RowJob) !void {
@@ -132,27 +160,20 @@ pub fn glyph(state: jobs.State) []const u8 {
     };
 }
 
-/// Rows aligned in columns: glyph, id, kind, label, duration.
+/// Rows aligned in columns: glyph, label, duration. A worker turn's label
+/// is its worker's, so it reads "parser" beside "npm test".
 fn writeRows(arena: Allocator, writer: *std.Io.Writer, rows: []const RowJob) !void {
     const shown = rows[0..@min(rows.len, max_rows)];
-    var id_cols: usize = 0;
-    var kind_cols: usize = 0;
     var label_cols: usize = 0;
     const labels = try arena.alloc([]const u8, shown.len);
     for (shown, labels) |row, *label| {
-        const safe = try text_utils.encodeTerminalSafeInline(arena, row.label, max_label_cols * 4);
+        const safe = try text_utils.encodeTerminalSafeInline(arena, if (row.label.len > 0) row.label else row.kind, max_label_cols * 4);
         label.* = clipCols(safe.bytes, max_label_cols);
-        id_cols = @max(id_cols, row.id.len);
-        kind_cols = @max(kind_cols, row.kind.len);
         label_cols = @max(label_cols, cols(label.*));
     }
     var buf: [32]u8 = undefined;
     for (shown, labels) |row, label| {
         try writer.print("\n  {s} ", .{glyph(stateOf(row))});
-        try pad(writer, row.id, id_cols);
-        try writer.writeAll("  ");
-        try pad(writer, row.kind, kind_cols);
-        try writer.writeAll("  ");
         try pad(writer, label, label_cols);
         try writer.print("  {s}", .{jobs.formatDuration(&buf, row.duration_ms)});
         if (row.tearing_down) try writer.writeAll(" · tearing down");
@@ -191,9 +212,9 @@ test "a list card counts states and aligns its rows" {
     ;
     try std.testing.expectEqualStrings(
         "Listed jobs · 1 of 3 running · 1 done · 1 failed\n" ++
-            "  ◐ bg_1  shell   bun run build  1m2s\n" ++
-            "  ✗ bg_2  shell   npm test       4.1s\n" ++
-            "  ✓ w-t1  worker  parser         850ms",
+            "  ◐ bun run build  1m2s\n" ++
+            "  ✗ npm test       4.1s\n" ++
+            "  ✓ parser         850ms",
         (try statusText(arena, output)).?,
     );
 }
@@ -207,22 +228,34 @@ test "wait cards report what settled or that the window passed" {
         (try statusText(arena, "{\"op\":\"wait\",\"timed_out\":true,\"waited_ms\":30000,\"pending\":[{\"id\":\"bg_1\"}]}")).?,
     );
     try std.testing.expectEqualStrings(
-        "Waited · 1 settled\n  ✓ bg_3  shell  make  2m",
+        "Waited · 1 settled\n  ✓ make  2m",
         (try statusText(arena, "{\"op\":\"wait\",\"jobs\":[{\"id\":\"bg_3\",\"kind\":\"shell\",\"label\":\"make\",\"state\":\"completed\",\"duration_ms\":120000}]}")).?,
     );
     try std.testing.expectEqualStrings(
-        "Cancelled bg_3 · settled",
-        (try statusText(arena, "{\"op\":\"cancel\",\"id\":\"bg_3\",\"receipt\":\"settled\"}")).?,
+        "Cancelled npm test",
+        (try statusText(arena, "{\"op\":\"cancel\",\"id\":\"bg_3\",\"label\":\"npm test\",\"receipt\":\"settled\"}")).?,
+    );
+    try std.testing.expectEqualStrings(
+        "Cancelled a job · already settled",
+        (try statusText(arena, "{\"op\":\"cancel\",\"id\":\"bg_3\",\"receipt\":\"already_settled\"}")).?,
+    );
+    try std.testing.expectEqualStrings(
+        "Inspected npm test · running · 4.1s",
+        (try statusText(arena, "{\"op\":\"inspect\",\"id\":\"bg_3\",\"jobs\":[{\"id\":\"bg_3\",\"kind\":\"shell\",\"label\":\"npm test\",\"state\":\"running\",\"duration_ms\":4100}]}")).?,
+    );
+    try std.testing.expectEqualStrings(
+        "Read logs of npm test",
+        (try statusText(arena, "{\"op\":\"logs\",\"id\":\"bg_3\",\"label\":\"npm test\",\"retained_bytes\":12}")).?,
     );
     try std.testing.expect((try statusText(arena, "not json")) == null);
 }
 
-test "a backgrounded shell run names its job" {
+test "a backgrounded shell run names its command, not its job id" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     try std.testing.expectEqualStrings(
-        "Backgrounded sleep 90 · bg_3",
+        "Backgrounded sleep 90",
         (try backgroundedShellText(arena, "{\"action\":\"run\",\"command\":\"sleep 90\"}", "{\"state\":\"running\",\"job_id\":\"bg_3\"}")).?,
     );
     try std.testing.expect((try backgroundedShellText(arena, "{}", "{\"state\":\"completed\"}")) == null);

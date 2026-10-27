@@ -198,6 +198,7 @@ fn run(ctx: tool_dispatch.DispatchContext, registry: *jobs.Registry, arena: Allo
             const tail = try registry.logs(arena, id, max_log_bytes);
             const text = lastLines(tail.text, input.lines orelse default_log_lines);
             try field(&json, "id", id);
+            if (try registry.find(arena, id)) |job| try field(&json, "label", job.label);
             try field(&json, "output", text);
             try json.objectField("retained_bytes");
             try json.write(tail.retained_bytes);
@@ -218,8 +219,10 @@ fn run(ctx: tool_dispatch.DispatchContext, registry: *jobs.Registry, arena: Allo
                 return error.SignalUnsupported;
             }
             const force = input.signal == .SIGKILL;
+            const found = try registry.find(arena, id);
             const cancelled = try registry.cancel(arena, id, force);
             try field(&json, "id", id);
+            if (found) |job| try field(&json, "label", job.label);
             if (input.signal) |signal| try field(&json, "signal", @tagName(signal));
             try field(&json, "receipt", @tagName(cancelled.status));
             if (cancelled.settled) |settled| {

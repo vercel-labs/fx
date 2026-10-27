@@ -16,7 +16,7 @@ pub fn composeRow(alloc: std.mem.Allocator, state: *const browser.State, index: 
     if (width == 0 or index >= budget) return row;
     if (index == 0) {
         try row.appendSlice(alloc, render.selected_completion_style);
-        try row_text.appendSingleLineEllipsized(alloc, &row, if (state.scope == .sessions) "Sessions" else "Subagents", width);
+        try row_text.appendSingleLineEllipsized(alloc, &row, if (state.scope == .sessions) "Sessions" else "Workers", width);
         try row.appendSlice(alloc, render.reset_style);
         return row;
     }
@@ -24,7 +24,7 @@ pub fn composeRow(alloc: std.mem.Allocator, state: *const browser.State, index: 
     const total = rowCount(state, budget);
     if (state.loading or state.error_len > 0 or count == 0) {
         if (index != 1) return row;
-        const text = if (state.error_len > 0) state.error_buf[0..state.error_len] else if (state.loading) "Loading…" else if (state.query_len > 0) "No matching sessions" else if (state.scope == .subagents) "No subagents in this session" else "No sessions yet";
+        const text = if (state.error_len > 0) state.error_buf[0..state.error_len] else if (state.loading) "Loading…" else if (state.query_len > 0) "No matching sessions" else if (state.scope == .subagents) "No workers in this session" else "No sessions yet";
         try row.appendSlice(alloc, render.dim_style);
         try row_text.appendSingleLineEllipsized(alloc, &row, text, width);
         try row.appendSlice(alloc, render.reset_style);

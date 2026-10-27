@@ -108,19 +108,32 @@ pub fn isSystemNotice(text: []const u8) bool {
 }
 
 /// The transcript row for one delivered job, in proto-fx's notice voice:
-/// "Background job completed · bg_3 · shell · npm test · 1m2s".
+/// "npm test finished · 1m2s". A person reads the job's label, never its
+/// id; a job without a label is named by its kind.
 pub fn rowText(buf: []u8, row: Row) []const u8 {
-    const phrase = if (std.mem.eql(u8, row.state, "failed"))
-        "Background job failed"
+    const verb = if (std.mem.eql(u8, row.state, "failed"))
+        "failed"
     else if (std.mem.eql(u8, row.state, "cancelled"))
-        "Background job cancelled"
+        "was cancelled"
     else
-        "Background job completed";
+        "finished";
     var duration_buf: [32]u8 = undefined;
     const duration = jobs.formatDuration(&duration_buf, row.duration_ms);
     const label = oneLine(row.label);
-    if (label.len == 0) return std.mem.print(buf, "{s} · {s} · {s} · {s}", .{ phrase, row.id, row.kind, duration }) catch buf[0..0];
-    return std.mem.print(buf, "{s} · {s} · {s} · {s} · {s}", .{ phrase, row.id, row.kind, label, duration }) catch buf[0..0];
+    const name = if (label.len > 0) label else if (std.mem.eql(u8, row.kind, "worker")) "A worker" else "A background job";
+    // A worker's later turns share its label; the turn number tells them apart.
+    if (workerTurn(row)) |turn| if (turn > 1)
+        return std.mem.print(buf, "{s} turn {d} {s} · {s}", .{ name, turn, verb, duration }) catch buf[0..0];
+    return std.mem.print(buf, "{s} {s} · {s}", .{ name, verb, duration }) catch buf[0..0];
+}
+
+/// The turn a worker job ran, from its "<worker>-tN" id.
+fn workerTurn(row: Row) ?u32 {
+    if (!std.mem.eql(u8, row.kind, "worker")) return null;
+    const dash = std.mem.findScalarLast(u8, row.id, '-') orelse return null;
+    const suffix = row.id[dash + 1 ..];
+    if (suffix.len < 2 or suffix[0] != 't') return null;
+    return std.fmt.parseUnsigned(u32, suffix[1..], 10) catch null;
 }
 
 pub fn rowFailed(row: Row) bool {
@@ -149,8 +162,10 @@ test "a notice round-trips its job rows and reads as fx's words" {
     const rows = parse(arena, built.text).?;
     try std.testing.expectEqual(@as(usize, 2), rows.len);
     var buf: [256]u8 = undefined;
-    try std.testing.expectEqualStrings("Background job completed · bg_3 · shell · npm test · 1m2s", rowText(&buf, rows[0]));
-    try std.testing.expectEqualStrings("Background job failed · w-t1 · worker · parser · 4.1s", rowText(&buf, rows[1]));
+    try std.testing.expectEqualStrings("npm test finished · 1m2s", rowText(&buf, rows[0]));
+    try std.testing.expectEqualStrings("parser failed · 4.1s", rowText(&buf, rows[1]));
+    try std.testing.expectEqualStrings("A worker turn 2 finished · 850ms", rowText(&buf, .{ .id = "w-t2", .kind = "worker", .state = "completed", .duration_ms = 850 }));
+    try std.testing.expectEqualStrings("parser turn 3 finished · 1.0s", rowText(&buf, .{ .id = "w-t3", .kind = "worker", .label = "parser", .state = "completed", .duration_ms = 1000 }));
     try std.testing.expect(parse(arena, "plain prompt") == null);
 
     const one = (try build(arena, settled[0..1], 100_000)).?;

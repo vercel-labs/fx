@@ -261,7 +261,8 @@ pub fn Runtime(comptime App: type) type {
             const remote = &app.remote;
             const owned = try app.alloc.dupe(u8, id);
             errdefer app.alloc.free(owned);
-            const owned_name = try app.alloc.dupe(u8, if (name.len > 0) name else id[id.len -| 8..]);
+            // An unnamed node reads "worker" in the breadcrumb, never its id.
+            const owned_name = try app.alloc.dupe(u8, if (name.len > 0) name else "worker");
             errdefer app.alloc.free(owned_name);
             if (remote.child_id.len > 0 and std.mem.eql(u8, parent_id, remote.child_id)) {
                 // Descending: the node shown now becomes an ancestor.

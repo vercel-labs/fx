@@ -2178,13 +2178,13 @@ test "subagent progress publishes a complete two-line lifecycle row" {
         .context_window = 100_000,
     });
 
-    try std.testing.expectEqualStrings("● Subagent working · inspect auth\n  openai/gpt-5.5 · high · Subagent · 12k", capture.text.?);
+    try std.testing.expectEqualStrings("● Running worker · inspect auth\n  openai/gpt-5.5 · high · Worker · 12k", capture.text.?);
 }
 
 test "subagent session title is derived only from the current request identity" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { arguments_json: []const u8, expected: []const u8 }{
-        .{ .arguments_json = "{\"action\":\"run\",\"task\":\"inspect auth\"}", .expected = "Subagent" },
+        .{ .arguments_json = "{\"action\":\"run\",\"task\":\"inspect auth\"}", .expected = "Worker" },
         .{ .arguments_json = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"inspect auth\"}", .expected = "reviewer" },
     };
     for (cases) |case| {

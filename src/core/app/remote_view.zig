@@ -171,12 +171,12 @@ pub fn Runtime(comptime App: type) type {
                 var age_buf: [32]u8 = undefined;
                 const age = session_catalog.relativeActivityAgeCompact(&age_buf, item.updated_at_ms, now_ms);
                 const named = item.name.len > 0 and !std.mem.eql(u8, item.name, "session");
-                const short_id = if (item.id.len > 8) item.id[0..8] else item.id;
                 const active = item.status == .running or item.status == .awaiting_approval;
+                // People tell untitled sessions apart by their age, never an id.
                 row.* = .{
                     .id = item.id,
                     .parent_id = "",
-                    .title = if (named) item.name else try a.print("session {s}", .{short_id}),
+                    .title = if (named) item.name else "Untitled session",
                     .status = @tagName(item.status),
                     .detail = "",
                     .meta = try a.dupe(u8, if (active) @tagName(item.status) else age),
@@ -208,7 +208,7 @@ pub fn Runtime(comptime App: type) type {
                 row.* = .{
                     .id = item.id,
                     .parent_id = item.parent_id,
-                    .title = if (item.name.len > 0) item.name else item.id,
+                    .title = if (item.name.len > 0) item.name else "Worker",
                     .status = item.status,
                     .detail = item.detail,
                     .meta = item.status,

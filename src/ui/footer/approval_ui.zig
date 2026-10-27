@@ -829,7 +829,7 @@ fn composeFileApprovalHeaderRow(
     request: permission_request.FileApprovalRequest,
     projection: FileApprovalHeaderProjection,
     origin: permission_request.RequestOrigin,
-    /// What the label says made the request, such as " · via harness (python pid 42)".
+    /// What the label says made the request, such as " · from Python (python3 fix.py)".
     via: []const u8,
     width: u16,
 ) !std.ArrayList(u8) {
@@ -1850,7 +1850,7 @@ fn approvalTitle(
             );
             defer encoded.deinit(alloc);
             const owned = try alloc.print(
-                "Subagent {s} needs permission",
+                "Worker {s} needs permission",
                 .{encoded.bytes},
             );
             break :blk .{ .text = owned, .owned = owned };
@@ -1865,7 +1865,7 @@ fn approvalKind(label: []const u8, dynamic_mcp: bool) []const u8 {
     if (commandLabelPrefix(label) != null) return "Command";
     if (std.mem.startsWith(u8, label, "write_file ")) return "Write file";
     if (std.mem.startsWith(u8, label, "edit_file ")) return "Edit file";
-    if (std.mem.startsWith(u8, label, "task ")) return "Subagent";
+    if (std.mem.startsWith(u8, label, "task ")) return "Worker";
     if (std.mem.startsWith(u8, label, "skill ")) return "Skill";
     return "Tool";
 }
@@ -2860,7 +2860,7 @@ test "subagent approval header identifies requester and preserves command kind" 
     try std.testing.expect(std.mem.find(
         u8,
         header.items,
-        "Subagent approval-child needs permission",
+        "Worker approval-child needs permission",
     ) != null);
     try std.testing.expect(std.mem.find(u8, header.items, "Command") != null);
 
@@ -2934,7 +2934,7 @@ test "file approval uses compact review header path question and pointer marker"
     try std.testing.expect(std.mem.find(
         u8,
         child_header.text.items,
-        "Subagent approval-child needs permission",
+        "Worker approval-child needs permission",
     ) != null);
     try std.testing.expect(
         std.mem.find(u8, child_header.text.items, "Edit") != null,

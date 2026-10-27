@@ -3,8 +3,11 @@
 //! matched, then the top hits as continuation rows.
 //!
 //!   ● Recalled "retry storms" · 3 matches
-//!     #12 assistant · Use exponential backoff for retry storms.
-//!     #40 shell · {"command":"rg backoff"}
+//!     assistant · Use exponential backoff for retry storms.
+//!     shell · {"command":"rg backoff"}
+//!
+//! Entry numbers are addresses the model reads; people read the kind and
+//! the text.
 const std = @import("std");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_args = @import("tool_args.zig");
@@ -84,17 +87,24 @@ fn writeHits(arena: Allocator, writer: *std.Io.Writer, lines: *std.mem.SplitIter
     }
 }
 
-/// `#12 [assistant] text` as `#12 assistant · text`, clipped and
-/// terminal-safe.
+/// `#12 [assistant] text` as `assistant · text`, clipped with an
+/// ellipsis and terminal-safe.
 fn hitLabel(arena: Allocator, line: []const u8) !?[]const u8 {
     const open = std.mem.find(u8, line, " [") orelse return null;
     const close = std.mem.findScalarPos(u8, line, open, ']') orelse return null;
     const rest = std.mem.trim(u8, line[close + 1 ..], " ");
     const joined = if (rest.len == 0)
-        try arena.print("{s} {s}", .{ line[0..open], line[open + 2 .. close] })
+        line[open + 2 .. close]
     else
-        try arena.print("{s} {s} · {s}", .{ line[0..open], line[open + 2 .. close], rest });
-    return (try text_utils.encodeTerminalSafeInline(arena, joined, hit_bytes)).bytes;
+        try arena.print("{s} · {s}", .{ line[open + 2 .. close], rest });
+    const encoded = try text_utils.encodeTerminalSafeInline(arena, joined, hit_bytes);
+    return try ellipsize(arena, encoded.bytes);
+}
+
+/// Three dots, the recall tool's and the encoder's, read as one ellipsis.
+fn ellipsize(arena: Allocator, text: []const u8) ![]const u8 {
+    if (std.mem.find(u8, text, "...") == null) return text;
+    return std.mem.replaceOwned(u8, arena, text, "...", "…");
 }
 
 const testing = std.testing;
@@ -110,12 +120,13 @@ test "a recall row names the query, the match count and the top hits" {
     try expectLine(
         "{\"query\":\"retry storms\"}",
         "Found 2 matches for \"retry storms\":\n\n#12 [assistant] Use exponential backoff for retry storms.\n  use history://n/turn/4\n\n#40 [shell] {\"command\":\"rg retry\"}\n  use history://n/turn/9",
-        "Recalled \"retry storms\" · 2 matches\n#12 assistant · Use exponential backoff for retry storms.\n#40 shell · {\"command\":\"rg retry\"}",
+        "Recalled \"retry storms\" · 2 matches\nassistant · Use exponential backoff for retry storms.\nshell · {\"command\":\"rg retry\"}",
     );
-    try expectLine("{\"query\":\"deploy\",\"page\":2}", "Page 2/3 (12 matches) for \"deploy\":\n\n#3 [user] deploy", "Recalled \"deploy\" · 12 matches · Page 2/3\n#3 user · deploy");
+    try expectLine("{\"query\":\"deploy\",\"page\":2}", "Page 2/3 (12 matches) for \"deploy\":\n\n#3 [user] deploy", "Recalled \"deploy\" · 12 matches · Page 2/3\nuser · deploy");
     try expectLine("{\"query\":\"k8s\"}", "No matches for \"k8s\" in session history.", "Recalled \"k8s\" · no matches");
     try expectLine("{}", "Session history (40 entries):\n\n#39 [user] turn 9 · hi", "Recalled session history · 40 entries");
-    try expectLine("{\"query\":\"#12\"}", "#12 [assistant] turn 4\nfull text", "Recalled #12 assistant · turn 4");
+    try expectLine("{\"query\":\"#12\"}", "#12 [assistant] turn 4\nfull text", "Recalled assistant · turn 4");
+    try expectLine("{\"query\":\"x\"}", "Found 1 match for \"x\":\n\n#5 [shell] {\"command\": \"seq 1 3000\"...", "Recalled \"x\" · 1 match\nshell · {\"command\": \"seq 1 3000\"…");
     try expectLine("{}", "Searching session history failed: Io", null);
     const other: types.ToolCall = .{ .id = "c", .name = "read_file", .arguments_json = "{}" };
     try testing.expect((try statusLine(testing.allocator, other, "Found 1 match")) == null);

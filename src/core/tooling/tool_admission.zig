@@ -2434,9 +2434,33 @@ fn interactivePermissionRequest(
 fn harnessMarkedLabel(input: Input, arena: Allocator, label: []const u8) ![]const u8 {
     const review = input.permission_review_turn orelse return label;
     if (review.origin != .harness) return label;
-    const caller = if (review.harness_caller.len > 0) review.harness_caller else "python";
-    const encoded = try text_utils.encodeTerminalSafe(arena, caller, 96);
+    const command = harnessCallerCommand(review.harness_caller);
+    if (command.len == 0) return arena.print("{s}{s}", .{ label, permission_request.harness_marker });
+    const encoded = try text_utils.encodeTerminalSafe(arena, command, 96);
     return arena.print("{s}{s} ({s})", .{ label, permission_request.harness_marker, encoded.bytes });
+}
+
+/// The command in a harness caller such as "python pid 42: python3 fix.py",
+/// its program named without its directory. The pid is for the security
+/// reviewer; a person reads the command alone.
+fn harnessCallerCommand(caller: []const u8) []const u8 {
+    if (!std.mem.startsWith(u8, caller, "python pid ")) return "";
+    const colon = std.mem.find(u8, caller, ": ") orelse return "";
+    const command = std.mem.trim(u8, caller[colon + 2 ..], " ");
+    // The lease keeps the first 96 bytes of argv; a long interpreter path
+    // can fill them, and a cut program name says nothing.
+    const program_end = std.mem.findScalar(u8, command, ' ') orelse
+        if (command.len >= 80) return "" else command.len;
+    const slash = std.mem.findScalarLast(u8, command[0..program_end], '/') orelse return command;
+    return command[slash + 1 ..];
+}
+
+test "a harness approval names the asking command, never its pid" {
+    try std.testing.expectEqualStrings("python3 fix.py", harnessCallerCommand("python pid 42: python3 fix.py"));
+    try std.testing.expectEqualStrings("Python -c 'x'", harnessCallerCommand("python pid 42: /opt/Python.app/Contents/MacOS/Python -c 'x'"));
+    try std.testing.expectEqualStrings("", harnessCallerCommand("python pid 42"));
+    try std.testing.expectEqualStrings("", harnessCallerCommand("python"));
+    try std.testing.expectEqualStrings("", harnessCallerCommand("python pid 42: /opt/homebrew/Cellar/python@3.13/3.13.16/Frameworks/Python.framework/Versions/3.13/Resour"));
 }
 
 fn interactivePermissionRequestUnmarked(

@@ -73,7 +73,7 @@ pub fn subagentAction(
         else => null,
     };
     var named = false;
-    var raw_name: []const u8 = "Subagent";
+    var raw_name: []const u8 = "Worker";
     var raw_preview: []const u8 = "";
     if (fleet_presentation.parseCall(outer)) |fleet_call| {
         // A worker op's running and settled rows are the fleet's own; a run,
@@ -84,7 +84,7 @@ pub fn subagentAction(
             return .{ .label = row.label, .detail = row.detail };
         }
         named = fleet_call.target != null;
-        raw_name = fleet_call.target orelse if (fleet_call.op == .run) "Subagent" else "Fleet";
+        raw_name = fleet_call.target orelse if (fleet_call.op == .run) "Worker" else "Fleet";
         raw_preview = fleet_call.message orelse "";
     } else {
         const args = if (outer.get("request")) |request| switch (request) {
@@ -94,17 +94,18 @@ pub fn subagentAction(
         const action = tool_args.optionalStringArg(args, "action") orelse return null;
         named = std.mem.eql(u8, action, "message");
         if (!named and !std.mem.eql(u8, action, "run")) return null;
-        raw_name = if (named) tool_args.optionalStringArg(args, "agent") orelse return null else "Subagent";
+        raw_name = if (named) tool_args.optionalStringArg(args, "agent") orelse return null else "Worker";
         raw_preview = tool_args.optionalStringArg(args, if (named) "message" else "task") orelse return null;
     }
     if (state == .feedback and !named) return null;
     const name = try text_utils.encodeTerminalSafe(scratch, raw_name, 64);
     const preview = try subagentPreview(scratch, raw_preview);
+    // An unnamed delegation reads as a worker run: "Ran worker · <task>".
     const label = switch (state) {
         .identity => try alloc.dupe(u8, name.bytes),
-        .active => try alloc.print("{s} working", .{name.bytes}),
+        .active => if (named) try alloc.print("{s} working", .{name.bytes}) else try alloc.dupe(u8, "Running worker"),
         .pending => try alloc.print("{s} still running", .{name.bytes}),
-        .completed => try alloc.print("{s} {s}", .{ name.bytes, if (named) "replied" else "finished" }),
+        .completed => if (named) try alloc.print("{s} replied", .{name.bytes}) else try alloc.dupe(u8, "Ran worker"),
         .feedback => |delivery| try alloc.print("{s} feedback {s}", .{ name.bytes, switch (delivery) {
             .queued => "queued",
             .applied => "applied",
@@ -209,6 +210,29 @@ pub fn jobsStatusLine(alloc: Allocator, call: ToolCall, output: []const u8) Allo
     return if (text) |value| try alloc.dupe(u8, value) else null;
 }
 
+/// Whether a shell run's result left an interactive session running, which
+/// its row calls "Started" rather than "Ran". A run that became a
+/// background job is "Backgrounded" instead.
+pub fn startedTerminalSession(arena: Allocator, call: ToolCall, output: []const u8) Allocator.Error!bool {
+    if (!std.mem.eql(u8, call.name, "shell")) return false;
+    const Run = struct { state: []const u8 = "", backend: []const u8 = "", job_id: ?[]const u8 = null };
+    const run = std.json.parseFromSliceLeaky(Run, arena, output, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    return run.job_id == null and std.mem.eql(u8, run.state, "running") and std.mem.eql(u8, run.backend, "tty");
+}
+
+test "a tty run left running reads as started" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const call: ToolCall = .{ .id = "c", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"cat\",\"tty\":true}" };
+    try std.testing.expect(try startedTerminalSession(arena, call, "{\"session_id\":\"shell-x\",\"state\":\"running\",\"backend\":\"tty\"}"));
+    try std.testing.expect(!try startedTerminalSession(arena, call, "{\"state\":\"running\",\"backend\":\"captured\",\"job_id\":\"bg_1\"}"));
+    try std.testing.expect(!try startedTerminalSession(arena, call, "{\"state\":\"completed\",\"backend\":\"tty\"}"));
+}
+
 /// Only structured child terminal failures change the failure label.
 pub fn subagentFailureLabel(alloc: Allocator, call: ToolCall, output: []const u8) Allocator.Error![]const u8 {
     if (!isFleetCall(call)) return "Failed";
@@ -233,19 +257,19 @@ test "subagent pending result does not claim completion" {
     const call = ToolCall{ .id = "call", .name = "subagent", .arguments_json = "{\"action\":\"run\",\"task\":\"work\"}" };
     const line = (try subagentStatusLine(alloc, call, "{\"ok\":true,\"pending\":true}")).?;
     defer alloc.free(line);
-    try std.testing.expectEqualStrings("Subagent still running · work", line);
+    try std.testing.expectEqualStrings("Worker still running · work", line);
     try std.testing.expect((try subagentStatusLine(alloc, call, "{\"ok\":true,\"result\":\"done\"}")) == null);
 }
 
 test "subagent rows project request identity state and bounded safe previews" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { args: []const u8, state: SubagentActionState, label: []const u8, detail: []const u8 }{
-        .{ .args = "{\"request\":{\"action\":\"run\",\"task\":\" Check\\n cancellation\\tcleanup \"}}", .state = .active, .label = "Subagent working", .detail = "· Check cancellation cleanup" },
-        .{ .args = "{\"action\":\"run\",\"task\":\"Check cleanup\"}", .state = .completed, .label = "Subagent finished", .detail = "· Check cleanup" },
+        .{ .args = "{\"request\":{\"action\":\"run\",\"task\":\" Check\\n cancellation\\tcleanup \"}}", .state = .active, .label = "Running worker", .detail = "· Check cancellation cleanup" },
+        .{ .args = "{\"action\":\"run\",\"task\":\"Check cleanup\"}", .state = .completed, .label = "Ran worker", .detail = "· Check cleanup" },
         .{ .args = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check replay\",\"instructions\":\"Never display this\"}}", .state = .completed, .label = "reviewer replied", .detail = "· Check replay" },
         .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check again\"}", .state = .{ .stopped = "Failed" }, .label = "reviewer failed", .detail = "· Check again" },
         .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check again\"}", .state = .{ .stopped = "Cancelled" }, .label = "reviewer interrupted", .detail = "· Check again" },
-        .{ .args = "{\"action\":\"run\",\"task\":\"Check again\"}", .state = .{ .stopped = "Denied" }, .label = "Denied Subagent", .detail = "· Check again" },
+        .{ .args = "{\"action\":\"run\",\"task\":\"Check again\"}", .state = .{ .stopped = "Denied" }, .label = "Denied Worker", .detail = "· Check again" },
     };
     for (cases) |case| {
         const action = (try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = case.args }, case.state)).?;

@@ -6,6 +6,7 @@ const permission_auto_classifier = @import("../../permissions/auto_classifier.zi
 const types = @import("../../shared/types.zig");
 const shared_theme = @import("../../shared/theme.zig");
 const text_utils = @import("../../shared/text_utils.zig");
+const human_text = @import("../../shared/human_text.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const tool_args = @import("../../tooling/tool_args.zig");
 const tool_specs = @import("../../tooling/tool_specs.zig");
@@ -1242,14 +1243,23 @@ pub fn finishExecutedToolStatus(
     } else switch (result.status) {
         .success => if (file_mutation_contract.resultIsNoop(call.name, result.model_output))
             result.model_output
-        else
-            try hooks.describe_tool_action_completed(
+        else blk: {
+            const completed = try hooks.describe_tool_action_completed(
                 hooks.ctx,
                 arena,
                 call,
                 display_target,
                 advertised_dynamic_tool_names,
-            ),
+            );
+            // A run that left a terminal session open started it; it has
+            // not run to an end.
+            if (std.mem.startsWith(u8, completed, "Ran ") and
+                try tooling_presentation.startedTerminalSession(arena, call, result.model_output))
+            {
+                break :blk try arena.print("Started {s}", .{completed["Ran ".len..]});
+            }
+            break :blk completed;
+        },
         .failure => blk: {
             const base = try hooks.describe_tool_action_denied(
                 hooks.ctx,
@@ -1277,25 +1287,30 @@ pub fn finishExecutedToolStatus(
                     );
                 }
             }
+            // The row says why in a few words: the tool's own detail, or the
+            // line of its failure text that names the error.
             const detail = (try failureStatusDetail(
                 arena,
                 call,
                 result,
                 safe_result,
                 advertised_dynamic_tool_names,
-            )) orelse break :blk base;
+            )) orelse try human_text.failureReason(arena, safe_result) orelse break :blk base;
             if (detail.len == 0) break :blk base;
-            break :blk try arena.print("{s}: {s}", .{ base, detail });
+            break :blk try arena.print("{s} · {s}", .{ base, detail });
         },
     };
+    // Ids are for the model; a person reads "the job". A command's own
+    // text is never rewritten.
+    const human_line = if (isShellRun(arena, call)) base_line else try human_text.scrubIds(arena, base_line);
     const summary_line = if (result.web_fetch_completion) |completion|
-        try formatWebFetchCompletion(arena, base_line, completion)
+        try formatWebFetchCompletion(arena, human_line, completion)
     else if (result.web_search_completion) |completion|
-        try formatWebSearchCompletion(arena, base_line, completion)
+        try formatWebSearchCompletion(arena, human_line, completion)
     else if (result.subagent_completion) |status|
-        renderedSubagentSummary(hooks, arena, base_line, status)
+        renderedSubagentSummary(hooks, arena, human_line, status)
     else
-        base_line;
+        human_line;
     const line = if (diff_entry) |payload| blk: {
         break :blk try formatToolStatusWithStats(arena, summary_line, payload.additions, payload.deletions, hooks.diff_marker_styles);
     } else summary_line;
@@ -1334,6 +1349,13 @@ pub fn finishExecutedToolStatus(
             .command_artifact_handle = command_artifact_handle,
         },
     });
+}
+
+fn isShellRun(arena: Allocator, call: ToolCall) bool {
+    if (!std.mem.eql(u8, call.name, "shell")) return false;
+    const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch return true;
+    const action = tool_args.optionalStringArg(args, "action") orelse return true;
+    return std.mem.eql(u8, action, "run");
 }
 
 fn presentedToolResult(
@@ -1623,24 +1645,53 @@ fn renderedSubagentSummary(
     return arena.print("{s}\n  {s}", .{ base, status_line }) catch base;
 }
 
+/// " · 2 searches · 17ms": the count and the time, in the row's dim voice.
 fn formatWebSearchCompletion(arena: Allocator, base: []const u8, completion: types.WebSearchCompletion) ![]const u8 {
     return arena.print(
-        "{s} \x1b[38;5;245m| {d} search{s} | {d}ms\x1b[0m",
+        "{s} \x1b[38;5;245m· {d} search{s} · {d}ms\x1b[0m",
         .{ base, completion.searches, if (completion.searches == 1) "" else "es", completion.duration_ms },
     );
 }
 
+/// "Fetched fx.sh/docs · 363ms": the page a person would type, then the
+/// time. A status other than 200 and a missing artifact are worth a word;
+/// sizes, cache state and the repeated verb are not.
 fn formatWebFetchCompletion(arena: Allocator, base: []const u8, completion: types.WebFetchCompletion) ![]const u8 {
-    const cache = if (completion.cache_hit) "cache hit" else "fetched";
-    const artifact = switch (completion.artifact_state) {
-        .none => "",
-        .stored => " | artifact stored",
-        .unavailable => " | artifact unavailable",
-    };
-    return arena.print(
-        "{s} \x1b[38;5;245m| {s} | {d} bytes | HTTP {d} | {d}ms | {s}{s}\x1b[0m",
-        .{ base, completion.url(), completion.bytes, completion.status, completion.duration_ms, cache, artifact },
-    );
+    const verb_end = std.mem.findScalar(u8, base, ' ') orelse base.len;
+    const page = webPageName(completion.url());
+    var out: std.Io.Writer.Allocating = .init(arena);
+    if (page.len > 0)
+        try out.writer.print("{s} {s}", .{ base[0..verb_end], page })
+    else
+        try out.writer.writeAll(base);
+    try out.writer.print(" \x1b[38;5;245m· {d}ms", .{completion.duration_ms});
+    if (completion.status != 200 and completion.status != 0) try out.writer.print(" · HTTP {d}", .{completion.status});
+    if (completion.artifact_state == .unavailable) try out.writer.writeAll(" · not saved");
+    try out.writer.writeAll("\x1b[0m");
+    return out.written();
+}
+
+/// A URL as a person names the page: host and path, without the scheme,
+/// a trailing slash, the query or the fragment.
+fn webPageName(url: []const u8) []const u8 {
+    var rest = url;
+    for ([_][]const u8{ "https://", "http://" }) |scheme| {
+        if (std.ascii.startsWithIgnoreCase(rest, scheme)) rest = rest[scheme.len..];
+    }
+    if (std.mem.startsWith(u8, rest, "www.")) rest = rest[4..];
+    rest = rest[0 .. std.mem.findAny(u8, rest, "?#") orelse rest.len];
+    return std.mem.trimEnd(u8, rest, "/");
+}
+
+test "a fetched page reads as host and path with its time" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var completion: types.WebFetchCompletion = .{ .bytes = 3898, .status = 200, .duration_ms = 363 };
+    completion.setUrl("https://fx.sh/docs/?a=1");
+    try std.testing.expectEqualStrings("Fetched fx.sh/docs \x1b[38;5;245m· 363ms\x1b[0m", try formatWebFetchCompletion(arena, "Fetched https://fx.sh/docs/?a=1", completion));
+    completion.status = 404;
+    try std.testing.expectEqualStrings("Fetched fx.sh/docs \x1b[38;5;245m· 363ms · HTTP 404\x1b[0m", try formatWebFetchCompletion(arena, "Fetched https://fx.sh/docs/?a=1", completion));
 }
 
 pub fn formatToolStatusWithStats(
@@ -2527,7 +2578,7 @@ test "malformed final settlement retains diagnostics and consumes identity once"
                 terminal_count += 1;
                 try std.testing.expectEqualStrings(if (streamed) "streamed_id" else "final_id", terminal.id.call_id);
                 try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
-                try std.testing.expectEqualStrings("Failed shell: invalid JSON arguments", terminal.outcome.summary);
+                try std.testing.expectEqualStrings("Failed shell · invalid JSON arguments", terminal.outcome.summary);
                 try std.testing.expectEqualStrings(result.model_output, terminal.result.?);
                 try std.testing.expectEqual(@as(usize, 15), terminal.result_memory.?.output_bytes);
             },
@@ -2671,7 +2722,7 @@ test "subagent completion preview updates progress without publishing a terminal
         .progress => |progress| {
             try std.testing.expectEqual(@as(u64, 3), progress.id.turn_id);
             try std.testing.expectEqualStrings("child", progress.id.call_id);
-            try std.testing.expectEqualStrings("● Subagent still running · inspect auth", progress.text);
+            try std.testing.expectEqualStrings("● Worker still running · inspect auth", progress.text);
         },
         else => return error.TestExpectedEqual,
     }
@@ -2774,7 +2825,7 @@ test "file edit preflight failure reports the exact mismatch" {
     const terminal = capture.events.items[0].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
-        "Failed edit_file: old_string not found in file",
+        "Failed edit_file · old_string not found in file",
         terminal.outcome.summary,
     );
 }
@@ -2815,7 +2866,7 @@ test "permission target preflight failure reports the actionable reason" {
     const terminal = capture.events.items[0].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
-        "Failed read_file: Path not found: /tmp/missing",
+        "Failed read_file · Path not found: /tmp/missing",
         terminal.outcome.summary,
     );
 }
@@ -2854,7 +2905,7 @@ test "dynamic MCP failure flattens a multi-line detail into a terminal-safe summ
     const terminal = capture.events.items[0].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
-        "Failed mcp_plain_getThreads: Invalid input:\\x1b[31m labels require at least one item retry rejected",
+        "Failed mcp_plain_getThreads · Invalid input:\\x1b[31m labels require at least one item retry rejected",
         terminal.outcome.summary,
     );
     try std.testing.expect(std.mem.findScalar(u8, terminal.outcome.summary, 0x1b) == null);
@@ -2895,7 +2946,7 @@ test "dynamic MCP failure flattens a pretty-printed JSON error body" {
     const terminal = capture.events.items[0].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
-        "Failed mcp_vercel_web_fetch_vercel_url: { \"success\": false, \"info\": \"Unable to create share\" }",
+        "Failed mcp_vercel_web_fetch_vercel_url · { \"success\": false, \"info\": \"Unable to create share\" }",
         terminal.outcome.summary,
     );
 }
@@ -2948,7 +2999,7 @@ test "terminal path scope failure appends the exact status detail" {
     const terminal = capture.events.items[0].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
-        "Failed start: path is outside the workspace",
+        "Failed start · path is outside the workspace",
         terminal.outcome.summary,
     );
 }

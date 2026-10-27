@@ -1,9 +1,11 @@
 //! The fleet tool's transcript rows (D112): proto's fleet cards in fx's
 //! row idiom. A call shows one `● <verb> <worker> · <message>` row while it
-//! runs; its result replaces it with the receipt, and list and inspect add
-//! one continuation row per worker under it.
+//! runs; its result replaces it with the receipt, and a list adds one
+//! continuation row per worker under it. People read worker labels; worker
+//! and job ids stay in the result the model reads.
 const std = @import("std");
 const text_utils = @import("../shared/text_utils.zig");
+const human_text = @import("../shared/human_text.zig");
 const tool_args = @import("tool_args.zig");
 
 const Allocator = std.mem.Allocator;
@@ -14,28 +16,34 @@ pub const Call = struct {
     op: Op,
     /// A labelled run, a spawn's label, or the worker id a call names.
     target: ?[]const u8 = null,
+    /// Whether `target` is a label a person reads, not a worker id.
+    target_is_label: bool = true,
     message: ?[]const u8 = null,
 };
 
 /// The fleet call `args` describe; null for the older `subagent` shapes.
 pub fn parseCall(args: std.json.ObjectMap) ?Call {
     const op = std.meta.stringToEnum(Op, tool_args.optionalStringArg(args, "op") orelse return null) orelse return null;
+    const label = tool_args.optionalStringArg(args, "label");
     return .{
         .op = op,
-        .target = tool_args.optionalStringArg(args, "label") orelse tool_args.optionalStringArg(args, "id"),
+        .target = label orelse tool_args.optionalStringArg(args, "id"),
+        .target_is_label = label != null,
         .message = tool_args.optionalStringArg(args, "message"),
     };
 }
 
+/// A run's worker as a person names it: its label, or the task's first words.
+fn runName(arena: Allocator, call: Call) ![]const u8 {
+    if (call.target_is_label) if (call.target) |label| return safe(arena, label, 48);
+    return preview_line(arena, call.message orelse "", 40);
+}
+
 /// The running row's text, `<verb> <worker>` and a detail. Owned by `alloc`.
 pub fn activeRow(alloc: Allocator, scratch: Allocator, call: Call, completed: bool) !struct { label: []u8, detail: []u8 } {
-    const target = try safe(scratch, call.target orelse switch (call.op) {
-        .run => "Subagent",
-        .spawn => "worker",
-        else => "worker",
-    }, 64);
+    const target = try safe(scratch, if (call.target_is_label) call.target orelse "worker" else "worker", 64);
     const label = switch (call.op) {
-        .run => try alloc.print("{s} {s}", .{ target, if (completed) "finished" else "working" }),
+        .run => try alloc.print("{s} worker {s}", .{ if (completed) "Ran" else "Running", try runName(scratch, call) }),
         .spawn => try alloc.print("{s} {s}", .{ if (completed) "Spawned" else "Spawning", target }),
         .send => try alloc.print("{s} {s}", .{ if (completed) "Sent to" else "Sending to", target }),
         .list => try alloc.dupe(u8, if (completed) "Listed workers" else "Listing workers"),
@@ -83,7 +91,6 @@ pub fn settledRow(alloc: Allocator, call: Call, output: []const u8, now_ms: i64)
 }
 
 fn settledRowWriting(alloc: Allocator, call: Call, output: []const u8, now_ms: i64) !?[]u8 {
-    if (call.op == .run) return null;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -91,27 +98,33 @@ fn settledRowWriting(alloc: Allocator, call: Call, output: []const u8, now_ms: i
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const w = &out.writer;
-    const name = try safe(arena, body.label orelse call.target orelse "worker", 64);
+    const name = try safe(arena, body.label orelse if (call.target_is_label) call.target orelse "worker" else "worker", 64);
     if (!body.ok and !std.mem.eql(u8, body.receipt orelse "", "terminal")) {
         // Errors: what was asked, then the first line of why, as proto does.
         try w.print("Fleet {s} {s}", .{ @tagName(call.op), if (body.receipt != null) "rejected" else "failed" });
-        if (call.target) |target| try w.print(" · {s}", .{try safe(arena, target, 64)});
-        if (body.result) |text| try w.print("\n{s}", .{try preview_line(arena, text, 160)});
+        if (call.target_is_label) if (call.target) |target| try w.print(" · {s}", .{try safe(arena, target, 64)});
+        if (body.result) |text| try w.print("\n{s}", .{try preview_line(arena, try human_text.scrubIds(arena, text), 160)});
         return try out.toOwnedSlice();
     }
     switch (call.op) {
-        .run => unreachable,
+        // A blocking run's row carries its outcome: the reply's first line.
+        .run => {
+            try w.print("Ran worker {s}", .{try runName(arena, call)});
+            const reply = std.mem.trim(u8, body.result orelse "", " \t\r\n");
+            if (reply.len > 0) try w.print("\n{s}", .{try preview_line(arena, firstLine(reply), 120)});
+        },
+        // The task is the row's detail; a receipt is worth a word only when
+        // the turn did not simply start.
         .spawn, .send => {
             const turn = body.turn orelse 0;
             const receipt = body.receipt orelse "accepted";
-            try w.print("{s} {s} · ", .{ if (call.op == .spawn) "Spawned" else "Sent to", name });
+            try w.print("{s} {s}", .{ if (call.op == .spawn) "Spawned" else "Sent to", name });
             if (std.mem.eql(u8, receipt, "steered")) {
-                try w.print("steered into turn {d}", .{turn});
+                try w.print(" · steered into turn {d}", .{turn});
             } else if (std.mem.eql(u8, receipt, "queued")) {
-                try w.print("queued as turn {d}", .{turn});
-            } else try w.print("turn {d} accepted", .{turn});
-            if (body.job) |job| try w.print("\njob {s}", .{try safe(arena, job, 80)});
-            if (call.message) |message| try w.print("{s}{s}", .{ if (body.job == null) "\n" else " · ", try preview_line(arena, message, 120) });
+                try w.print(" · queued as turn {d}", .{turn});
+            }
+            if (call.message) |message| try w.print(" · {s}", .{try preview_line(arena, message, 80)});
         },
         .terminate => {
             try w.print("Terminated {s}", .{name});
@@ -120,44 +133,69 @@ fn settledRowWriting(alloc: Allocator, call: Call, output: []const u8, now_ms: i
         .list, .inspect => {
             const workers = body.workers orelse &.{};
             if (workers.len == 0) {
-                try w.writeAll("Fleet workers · none");
+                try w.writeAll(if (call.op == .inspect) "Inspected worker · not found" else "Listed workers · none");
                 return try out.toOwnedSlice();
             }
-            var on_air: usize = 0;
-            for (workers) |worker| {
-                if (std.mem.eql(u8, worker.state, "running")) on_air += 1;
-            }
             if (call.op == .inspect) {
-                try w.print("Inspected {s}", .{try safe(arena, workers[0].label, 64)});
-            } else try w.print("Fleet workers ({d})", .{workers.len});
-            if (on_air > 0) try w.print(" · {d} on air", .{on_air});
-            for (workers, 0..) |worker, index| {
-                const last = index + 1 == workers.len;
-                try w.print("\n{s} ", .{if (last) "└" else "├"});
-                try writeWorker(w, arena, worker, now_ms);
-                if (call.op == .inspect) try writeInspectRows(w, arena, worker);
+                // One worker: its state fits on the phrase, and only its
+                // last activity earns a row.
+                try w.print("Inspected {s} · ", .{try safe(arena, workers[0].label, 64)});
+                try writeWorker(w, arena, workers[0], now_ms, false);
+                try writeInspectRows(w, arena, workers[0]);
+                return try out.toOwnedSlice();
+            }
+            try w.writeAll("Listed workers");
+            try writeStateCounts(w, arena, workers);
+            for (workers) |worker| {
+                try w.writeAll("\n");
+                try writeWorker(w, arena, worker, now_ms, true);
             }
         },
     }
     return try out.toOwnedSlice();
 }
 
-fn writeWorker(w: *std.Io.Writer, arena: Allocator, worker: Worker, now_ms: i64) !void {
-    try w.print("{s} · {s} · {d}t", .{ try safe(arena, worker.label, 48), try safe(arena, worker.state, 32), worker.turns });
-    if (worker.queued > 0) try w.print("+{d}q", .{worker.queued});
-    if (worker.started_ms) |started| if (now_ms > started) {
+/// "1 running · 2 idle": how many workers are in each state, in first-seen order.
+fn writeStateCounts(w: *std.Io.Writer, arena: Allocator, workers: []const Worker) !void {
+    var seen: [8][]const u8 = undefined;
+    var counts: [8]usize = @splat(0);
+    var kinds: usize = 0;
+    for (workers) |worker| {
+        const index = for (seen[0..kinds], 0..) |state, i| {
+            if (std.mem.eql(u8, state, worker.state)) break i;
+        } else blk: {
+            if (kinds == seen.len) continue;
+            seen[kinds] = worker.state;
+            kinds += 1;
+            break :blk kinds - 1;
+        };
+        counts[index] += 1;
+    }
+    for (seen[0..kinds], counts[0..kinds]) |state, count| {
+        try w.print(" · {d} {s}", .{ count, try safe(arena, state, 32) });
+    }
+}
+
+/// One worker: label, state and turns, then how long its turn has run.
+/// A list row leads with the label; an inspect phrase already named it.
+fn writeWorker(w: *std.Io.Writer, arena: Allocator, worker: Worker, now_ms: i64, with_label: bool) !void {
+    if (with_label) try w.print("{s} · ", .{try safe(arena, worker.label, 48)});
+    try w.print("{s} · {d} turn{s}", .{ try safe(arena, worker.state, 32), worker.turns, if (worker.turns == 1) "" else "s" });
+    if (worker.queued > 0) try w.print(" · {d} queued", .{worker.queued});
+    if (worker.started_ms) |started| if (now_ms > started and std.mem.eql(u8, worker.state, "running")) {
         var buf: [32]u8 = undefined;
         try w.print(" · {s}", .{formatDuration(&buf, @intCast(now_ms - started))});
     };
-    if (worker.model) |model| try w.print(" · {s}", .{try safe(arena, model, 48)});
 }
 
 fn writeInspectRows(w: *std.Io.Writer, arena: Allocator, worker: Worker) !void {
-    try w.print("\n  id {s}", .{try safe(arena, worker.id, 64)});
-    if (worker.job) |job| try w.print("\n  job {s}", .{try safe(arena, job, 80)});
-    for (worker.queued_jobs) |job| try w.print("\n  queued {s}", .{try safe(arena, job, 80)});
-    if (worker.activity) |activity| try w.print("\n  last {s}", .{try preview_line(arena, activity, 100)});
-    if (std.mem.eql(u8, worker.lifecycle, "terminal")) try w.writeAll("\n  terminal · browse it in the session tree");
+    if (std.mem.eql(u8, worker.lifecycle, "terminal")) {
+        try w.writeAll("\nterminated · browse it in the session tree");
+    } else if (worker.activity) |activity| try w.print("\nlast: {s}", .{try preview_line(arena, activity, 100)});
+}
+
+fn firstLine(text: []const u8) []const u8 {
+    return text[0 .. std.mem.findAny(u8, text, "\r\n") orelse text.len];
 }
 
 /// proto's duration form: 850ms, 4.1s, 1m2s, 2m, 1h5m, 2d3h.
@@ -216,15 +254,20 @@ test "fleet receipts and worker lists become rows" {
     const alloc = std.testing.allocator;
     const spawn = (try settledRow(alloc, .{ .op = .spawn, .target = "parser", .message = "Fix the tokenizer\nin src/lex.ts" }, "{\"ok\":true,\"result\":\"x\",\"error_code\":null,\"receipt\":\"accepted\",\"worker\":\"W1\",\"label\":\"parser\",\"job\":\"W1-t1\",\"turn\":1}", 0)).?;
     defer alloc.free(spawn);
-    try std.testing.expectEqualStrings("Spawned parser · turn 1 accepted\njob W1-t1 · Fix the tokenizer in src/lex.ts", spawn);
-    const queued = (try settledRow(alloc, .{ .op = .send, .target = "W1", .message = "more" }, "{\"ok\":true,\"result\":\"x\",\"error_code\":null,\"receipt\":\"queued\",\"worker\":\"W1\",\"label\":\"parser\",\"job\":\"W1-t3\",\"turn\":3}", 0)).?;
+    try std.testing.expectEqualStrings("Spawned parser · Fix the tokenizer in src/lex.ts", spawn);
+    const queued = (try settledRow(alloc, .{ .op = .send, .target = "W1", .target_is_label = false, .message = "more" }, "{\"ok\":true,\"result\":\"x\",\"error_code\":null,\"receipt\":\"queued\",\"worker\":\"W1\",\"label\":\"parser\",\"job\":\"W1-t3\",\"turn\":3}", 0)).?;
     defer alloc.free(queued);
-    try std.testing.expectEqualStrings("Sent to parser · queued as turn 3\njob W1-t3 · more", queued);
+    try std.testing.expectEqualStrings("Sent to parser · queued as turn 3 · more", queued);
     const listed = (try settledRow(alloc, .{ .op = .list }, "{\"ok\":true,\"result\":\"x\",\"error_code\":null,\"workers\":[{\"id\":\"W1\",\"label\":\"parser\",\"lifecycle\":\"live\",\"state\":\"running\",\"turns\":2,\"queued\":1,\"started_ms\":1000,\"model\":\"m\"},{\"id\":\"W2\",\"label\":\"lexer\",\"lifecycle\":\"terminal\",\"state\":\"terminated\",\"turns\":1,\"queued\":0}]}", 13_300)).?;
     defer alloc.free(listed);
-    try std.testing.expectEqualStrings("Fleet workers (2) · 1 on air\n├ parser · running · 2t+1q · 12.3s · m\n└ lexer · terminated · 1t", listed);
-    const rejected = (try settledRow(alloc, .{ .op = .send, .target = "W9", .message = "x" }, "{\"ok\":false,\"result\":\"Unknown worker `W9`.\",\"error_code\":\"unknown_worker\",\"receipt\":\"rejected\"}", 0)).?;
+    try std.testing.expectEqualStrings("Listed workers · 1 running · 1 terminated\nparser · running · 2 turns · 1 queued · 12.3s\nlexer · terminated · 1 turn", listed);
+    const inspected = (try settledRow(alloc, .{ .op = .inspect, .target = "W1", .target_is_label = false }, "{\"ok\":true,\"workers\":[{\"id\":\"W1\",\"label\":\"parser\",\"lifecycle\":\"live\",\"state\":\"idle\",\"turns\":1,\"job\":\"W1-t1\",\"activity\":\"Read src/lex.ts\"}]}", 0)).?;
+    defer alloc.free(inspected);
+    try std.testing.expectEqualStrings("Inspected parser · idle · 1 turn\nlast: Read src/lex.ts", inspected);
+    const ran = (try settledRow(alloc, .{ .op = .run, .message = "Summarize the repository in one line" }, "{\"ok\":true,\"result\":\"A tiny app.\\nNo tests.\"}", 0)).?;
+    defer alloc.free(ran);
+    try std.testing.expectEqualStrings("Ran worker Summarize the repository in one line\nA tiny app.", ran);
+    const rejected = (try settledRow(alloc, .{ .op = .send, .target = "W9", .target_is_label = false, .message = "x" }, "{\"ok\":false,\"result\":\"Unknown worker `W9`.\",\"error_code\":\"unknown_worker\",\"receipt\":\"rejected\"}", 0)).?;
     defer alloc.free(rejected);
-    try std.testing.expectEqualStrings("Fleet send rejected · W9\nUnknown worker `W9`.", rejected);
-    try std.testing.expect(try settledRow(alloc, .{ .op = .run }, "{\"ok\":true}", 0) == null);
+    try std.testing.expectEqualStrings("Fleet send rejected\nUnknown worker `W9`.", rejected);
 }
