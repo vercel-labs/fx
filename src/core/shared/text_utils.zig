@@ -627,6 +627,44 @@ fn writeCodepointEscape(buf: *[12]u8, codepoint: u21) []const u8 {
     return buf[0 .. digit_end + 1];
 }
 
+/// Blanks in place what a terminal could act on: C0 controls other than
+/// `\n`, DEL, malformed bytes, and non-printing codepoints such as C1
+/// controls and bidi overrides. Returns how many bytes it settled; the rest
+/// is a sequence cut short that a later chunk completes.
+pub fn blankTerminalUnsafe(bytes: []u8) usize {
+    var index: usize = 0;
+    while (index < bytes.len) {
+        const byte = bytes[index];
+        if (byte < 0x80) {
+            if ((byte < 0x20 and byte != '\n') or byte == 0x7f) bytes[index] = ' ';
+            index += 1;
+            continue;
+        }
+        const sequence_len = std.unicode.utf8ByteSequenceLength(byte) catch {
+            bytes[index] = ' ';
+            index += 1;
+            continue;
+        };
+        if (index + sequence_len > bytes.len) return index;
+        const sequence = bytes[index .. index + sequence_len];
+        const codepoint = display_width.decodeUtf8Sequence(sequence) catch {
+            bytes[index] = ' ';
+            index += 1;
+            continue;
+        };
+        if (isNonPrintingCodepoint(codepoint)) @memset(sequence, ' ');
+        index += sequence_len;
+    }
+    return index;
+}
+
+test "blankTerminalUnsafe keeps text and newlines and waits for a cut sequence" {
+    var text = "a\x1b[2Jb\n\xc2\x9bc\u{202e}d\xe7\x95".*;
+    const settled = blankTerminalUnsafe(&text);
+    try std.testing.expectEqualStrings("a [2Jb\n  c   d", text[0..settled]);
+    try std.testing.expectEqual(text.len - 2, settled);
+}
+
 fn isNonPrintingCodepoint(codepoint: u21) bool {
     return (codepoint >= 0x80 and codepoint <= 0x9f) or
         (codepoint >= 0x200b and codepoint <= 0x200f) or

@@ -86,6 +86,13 @@ pub const StreamChunkContext = struct {
     /// one full-only transcript record.
     reasoning_text: std.ArrayList(u8) = .empty,
     reasoning_published: bool = false,
+    /// `reasoning_text` reached `reasoning_record_max_bytes`; the record
+    /// ends with a marker and the rest of the trace is only previewed.
+    reasoning_truncated: bool = false,
+    /// Preview bytes not sent yet. Chunks go out in batches, so a long trace
+    /// does not flood the event log a detached view replays.
+    reasoning_preview_pending: std.ArrayList(u8) = .empty,
+    reasoning_preview_sent_ms: i64 = 0,
     /// The display preview is filling for the current reasoning trace. Cleared
     /// where visible text or a tool call closes the trace, so the next trace
     /// begins from an empty preview instead of appending to the old one.
@@ -139,6 +146,7 @@ pub const StreamChunkContext = struct {
         self.initial_line_prefix.deinit(self.alloc);
         self.provisional_statuses.deinit(self.alloc);
         self.reasoning_text.deinit(self.alloc);
+        self.reasoning_preview_pending.deinit(self.alloc);
     }
 
     /// Publishes this step's reasoning once, as a full-only transcript record
@@ -147,9 +155,11 @@ pub const StreamChunkContext = struct {
     /// nothing.
     pub fn publishReasoningRecord(self: *StreamChunkContext) void {
         // Text or a tool call closes the trace whose tail the display shows.
+        flushReasoningPreview(self, io_mod.milliTimestamp());
         self.reasoning_preview_started = false;
         if (self.reasoning_published or self.reasoning_text.items.len == 0) return;
         self.reasoning_published = true;
+        if (self.reasoning_truncated) self.reasoning_text.appendSlice(self.alloc, reasoning_truncated_marker) catch {};
         // Event payloads travel through the worker queue, which frees them
         // with the process allocator.
         const owned = types.dupeSemanticNotice(std.heap.c_allocator, .{
@@ -209,6 +219,7 @@ pub const StreamChunkContext = struct {
         // A retried attempt streams its own trace; the interrupted attempt's
         // preview tail must not merge into it.
         self.reasoning_preview_started = false;
+        self.reasoning_preview_pending.clearRetainingCapacity();
         self.assistant_text_started_published = false;
     }
 
@@ -304,6 +315,9 @@ pub fn onStreamContentChunk(ctx: *anyopaque, chunk: []const u8) void {
 fn beginReasoningPreview(stream_ctx: *StreamChunkContext) void {
     if (stream_ctx.reasoning_preview_started) return;
     stream_ctx.reasoning_preview_started = true;
+    // The new trace's first chunk goes out at once.
+    stream_ctx.reasoning_preview_pending.clearRetainingCapacity();
+    stream_ctx.reasoning_preview_sent_ms = 0;
     stream_ctx.hooks.push_event(stream_ctx.hooks.ctx, .reasoning_preview_begin) catch |err| {
         debug_trace.logf("agent", "reasoning preview begin publication failed err={s}", .{@errorName(err)});
     };
@@ -319,6 +333,52 @@ fn publishAssistantTextStarted(stream_ctx: *StreamChunkContext) void {
     };
 }
 
+/// The step's reasoning record keeps at most this much of the trace.
+const reasoning_record_max_bytes: usize = 256 * 1024;
+const reasoning_truncated_marker = "\n\n[reasoning truncated]";
+/// Preview chunks wait for this many bytes or this long, whichever first.
+const reasoning_preview_batch_bytes: usize = 512;
+const reasoning_preview_batch_ms: i64 = 100;
+
+/// Keeps the trace for the step's record, up to its cap on a codepoint
+/// boundary.
+fn retainReasoning(stream_ctx: *StreamChunkContext, chunk: []const u8) void {
+    if (stream_ctx.reasoning_truncated) return;
+    const room = reasoning_record_max_bytes -| stream_ctx.reasoning_text.items.len;
+    var kept = chunk;
+    if (chunk.len > room) {
+        var cut = room;
+        while (cut > 0 and (chunk[cut] & 0xc0) == 0x80) cut -= 1;
+        kept = chunk[0..cut];
+        stream_ctx.reasoning_truncated = true;
+    }
+    stream_ctx.reasoning_text.appendSlice(stream_ctx.alloc, kept) catch |err| {
+        debug_trace.logf("agent", "reasoning retention failed err={s}", .{@errorName(err)});
+    };
+}
+
+/// Sends the batched preview bytes as one event.
+fn flushReasoningPreview(stream_ctx: *StreamChunkContext, now_ms: i64) void {
+    const pending = &stream_ctx.reasoning_preview_pending;
+    if (pending.items.len == 0) return;
+    defer pending.clearRetainingCapacity();
+    stream_ctx.reasoning_preview_sent_ms = now_ms;
+    // The display keeps only the newest `ReasoningTail.capacity` bytes.
+    var bytes = pending.items;
+    if (bytes.len > types.ReasoningTail.capacity) {
+        bytes = bytes[bytes.len - types.ReasoningTail.capacity ..];
+        while (bytes.len > 0 and (bytes[0] & 0xc0) == 0x80) bytes = bytes[1..];
+    }
+    const owned = std.heap.c_allocator.dupe(u8, bytes) catch |err| {
+        debug_trace.logf("agent", "reasoning preview allocation failed err={s}", .{@errorName(err)});
+        return;
+    };
+    stream_ctx.hooks.push_event(stream_ctx.hooks.ctx, .{ .reasoning_preview = owned }) catch |err| {
+        std.heap.c_allocator.free(owned);
+        debug_trace.logf("agent", "reasoning preview publication failed err={s}", .{@errorName(err)});
+    };
+}
+
 pub fn onStreamReasoningChunk(ctx: *anyopaque, chunk: []const u8) void {
     const stream_ctx: *StreamChunkContext = @ptrCast(@alignCast(ctx));
     stream_ctx.markModelOutput();
@@ -331,18 +391,17 @@ pub fn onStreamReasoningChunk(ctx: *anyopaque, chunk: []const u8) void {
     }
     if (chunk.len > 0) {
         beginReasoningPreview(stream_ctx);
-        stream_ctx.reasoning_text.appendSlice(stream_ctx.alloc, chunk) catch |err| {
-            debug_trace.logf("agent", "reasoning retention failed err={s}", .{@errorName(err)});
-        };
+        retainReasoning(stream_ctx, chunk);
         // Display-only preview; the durable record is published at step end.
-        const owned = std.heap.c_allocator.dupe(u8, chunk) catch |err| {
-            debug_trace.logf("agent", "reasoning preview allocation failed err={s}", .{@errorName(err)});
-            return;
+        stream_ctx.reasoning_preview_pending.appendSlice(stream_ctx.alloc, chunk) catch |err| {
+            debug_trace.logf("agent", "reasoning preview retention failed err={s}", .{@errorName(err)});
         };
-        stream_ctx.hooks.push_event(stream_ctx.hooks.ctx, .{ .reasoning_preview = owned }) catch |err| {
-            std.heap.c_allocator.free(owned);
-            debug_trace.logf("agent", "reasoning preview publication failed err={s}", .{@errorName(err)});
-        };
+        const now_ms = io_mod.milliTimestamp();
+        if (stream_ctx.reasoning_preview_pending.items.len >= reasoning_preview_batch_bytes or
+            now_ms - stream_ctx.reasoning_preview_sent_ms >= reasoning_preview_batch_ms)
+        {
+            flushReasoningPreview(stream_ctx, now_ms);
+        }
     }
     if (stream_ctx.hooks.push_reasoning_delta) |push| {
         push(stream_ctx.hooks.ctx, chunk) catch |err| {
@@ -1106,17 +1165,21 @@ test "reasoning streams a preview and publishes one record at the step boundary"
     };
     defer stream_ctx.deinit();
 
+    // The first chunk shows at once; the next waits for its batch, which
+    // the step's end sends.
     onStreamReasoningChunk(&stream_ctx, "weigh ");
+    stream_ctx.reasoning_preview_sent_ms = std.math.maxInt(i64) / 2;
     onStreamReasoningChunk(&stream_ctx, "options");
     try std.testing.expectEqual(@as(usize, 1), capture.reasoning_preview_begins);
-    try std.testing.expectEqual(@as(usize, 2), capture.reasoning_previews.items.len);
+    try std.testing.expectEqual(@as(usize, 1), capture.reasoning_previews.items.len);
     try std.testing.expectEqualStrings("weigh ", capture.reasoning_previews.items[0]);
-    try std.testing.expectEqualStrings("options", capture.reasoning_previews.items[1]);
     try std.testing.expectEqual(@as(usize, 0), capture.reasoning_records.items.len);
 
     // Visible text closes the thinking phase and publishes the full record
     // above the response it produced.
     onStreamContentChunk(&stream_ctx, "answer");
+    try std.testing.expectEqual(@as(usize, 2), capture.reasoning_previews.items.len);
+    try std.testing.expectEqualStrings("options", capture.reasoning_previews.items[1]);
     try std.testing.expectEqual(@as(usize, 1), capture.reasoning_records.items.len);
     try std.testing.expectEqualStrings("weigh options", capture.reasoning_records.items[0]);
     try std.testing.expectEqual(@as(usize, 1), capture.assistant_text_starts);
@@ -1124,6 +1187,25 @@ test "reasoning streams a preview and publishes one record at the step boundary"
     onStreamReasoningChunk(&stream_ctx, "later");
     try std.testing.expectEqual(@as(usize, 2), capture.reasoning_preview_begins);
     try std.testing.expectEqual(@as(usize, 1), capture.reasoning_records.items.len);
+}
+
+test "a reasoning record past its cap ends with a marker" {
+    const alloc = std.testing.allocator;
+    var capture = StreamCapture{};
+    defer capture.deinit(alloc);
+    var hook_set = capture.hooks();
+    var stream_ctx = StreamChunkContext{ .hooks = &hook_set, .turn_id = 1, .step_id = 1, .alloc = alloc };
+    defer stream_ctx.deinit();
+
+    const big = try alloc.alloc(u8, reasoning_record_max_bytes + 10);
+    defer alloc.free(big);
+    @memset(big, 'r');
+    onStreamReasoningChunk(&stream_ctx, big);
+    onStreamReasoningChunk(&stream_ctx, "more");
+    stream_ctx.publishReasoningRecord();
+    const record = capture.reasoning_records.items[0];
+    try std.testing.expectEqual(reasoning_record_max_bytes + reasoning_truncated_marker.len, record.len);
+    try std.testing.expect(std.mem.endsWith(u8, record, reasoning_truncated_marker));
 }
 
 test "reasoning publishes its record when a tool-only step ends" {

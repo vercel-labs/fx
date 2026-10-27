@@ -348,8 +348,9 @@ const max_static_status_activity_rows: u16 = 3;
 pub const RenderContext = struct {
     slash_registry: command_specs.SlashRegistry = .{},
     stream: StreamState,
-    /// Tail of the reasoning streamed for the active step. Borrowed; empty
-    /// hides the preview.
+    /// Tail of the reasoning streamed for the active step, borrowed from the
+    /// app's `stream.reasoning` (the copy in `stream` dies with this
+    /// context). Empty hides the preview.
     reasoning_preview: []const u8 = "",
     compaction: @import("../../core/output/compaction_activity.zig").Snapshot = .{},
     pending_prompt_activity: bool = false,
@@ -701,10 +702,9 @@ fn turnActivityProjection(
 
     var visible_stream = ctx.stream;
     visible_stream.last_activity_kind = null;
-    // The last reasoning trace stays visible through tool work. A visible text
-    // block (intermediate message or final response) replaces it; generating
-    // tool-call arguments does not count as visible text.
-    const detail: []const u8 = if (visible_stream.assistant_text_started) "" else ctx.reasoning_preview;
+    // The last reasoning trace stays visible through tool work until visible
+    // text starts (`types.ReasoningTail`).
+    const detail = ctx.reasoning_preview;
     if (activity_status.buildTurnLabel(buf, visible_stream, ctx.now_ms)) |label| {
         return .{ .turn_thinking = .{ .label = label, .detail = detail } };
     }
@@ -1297,8 +1297,12 @@ test "frame-owned activity keeps the reasoning preview until a text block starts
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
 
-    // A visible text block replaces the trace.
-    ctx.stream.assistant_text_started = true;
+    // A visible text block replaces the trace: the app's tail then shows
+    // nothing.
+    var tail: types.ReasoningTail = .{};
+    _ = tail.apply(.{ .chunk = "first line\nsecond line" });
+    _ = tail.apply(.text_started);
+    ctx.reasoning_preview = tail.text();
     switch (frameOwnedActivityProjection(&buf, &shell, ctx, null)) {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings("", thinking.detail),
         .none, .tool_slot => return error.TestUnexpectedResult,

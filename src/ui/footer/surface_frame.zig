@@ -1745,7 +1745,8 @@ test "surface footer measurement preserves the reasoning preview detail" {
     };
     for (cases) |case| {
         ctx.stream.phase = case.phase;
-        ctx.stream.assistant_text_started = case.text_started;
+        // The app's tail shows nothing once visible text starts.
+        ctx.reasoning_preview = if (case.text_started) "" else preview;
         var measurement = try measureSurfaceFooter(alloc, &shell, approval.projection(), ctx);
         defer measurement.deinit(alloc);
 

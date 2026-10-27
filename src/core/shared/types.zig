@@ -298,11 +298,129 @@ pub const StreamState = struct {
     /// not waiting. While set, the turn clock freezes at this instant;
     /// on resume the wait is excluded by shifting turn_started_ms forward.
     waiting_since_ms: i64 = 0,
-    /// A visible assistant text block has begun this step. Tool-call
-    /// argument streaming also publishes `generating`, but only visible text
-    /// replaces the reasoning preview.
-    assistant_text_started: bool = false,
+    /// The tail of the reasoning the footer previews. Resetting the stream
+    /// clears it with everything else.
+    reasoning: ReasoningTail = .{},
+
+    /// Applies the phase of step `step_id`; an older step's is ignored, and
+    /// a new step starts without visible text. True when the phase changed.
+    pub fn applyPhase(self: *StreamState, step_id: u64, phase: TurnPhase) bool {
+        if (step_id < self.phase_step_id) return false;
+        if (step_id != self.phase_step_id) self.reasoning.newStep();
+        const changed = self.phase != phase;
+        self.phase = phase;
+        self.phase_step_id = step_id;
+        return changed;
+    }
 };
+
+/// The newest bytes of the current reasoning trace, made terminal safe, for
+/// the footer's preview. Both backends apply the same three events to it.
+pub const ReasoningTail = struct {
+    pub const capacity: usize = 4096;
+
+    buf: [capacity]u8 = undefined,
+    len: usize = 0,
+    /// The leading bytes already made terminal safe. Any rest is a sequence
+    /// the next chunk completes.
+    safe: usize = 0,
+    /// A visible assistant text block began this step. Tool-call argument
+    /// streaming does not count: only visible text replaces the preview.
+    text_started: bool = false,
+
+    pub const Event = union(enum) {
+        /// A new trace begins; the previous one's tail no longer applies.
+        begin,
+        chunk: []const u8,
+        text_started,
+    };
+
+    /// What the footer shows; empty once this step's text started.
+    pub fn text(self: *const ReasoningTail) []const u8 {
+        return if (self.text_started) "" else self.buf[0..self.safe];
+    }
+
+    /// Applies one event. True when the preview changed.
+    pub fn apply(self: *ReasoningTail, event: Event) bool {
+        const before = self.text().len;
+        switch (event) {
+            .begin => self.clear(),
+            .chunk => |bytes| self.append(bytes),
+            .text_started => {
+                self.text_started = true;
+                self.clear();
+            },
+        }
+        return before != 0 or self.text().len != 0;
+    }
+
+    /// A new step: its own text has not started.
+    pub fn newStep(self: *ReasoningTail) void {
+        self.text_started = false;
+    }
+
+    fn clear(self: *ReasoningTail) void {
+        self.len = 0;
+        self.safe = 0;
+    }
+
+    fn append(self: *ReasoningTail, chunk: []const u8) void {
+        var input = chunk;
+        if (input.len >= capacity) {
+            input = input[input.len - capacity ..];
+            while (input.len > 0 and (input[0] & 0xc0) == 0x80) input = input[1..];
+            self.clear();
+        }
+        if (self.len + input.len > capacity) self.dropFront(self.len + input.len - capacity);
+        @memcpy(self.buf[self.len..][0..input.len], input);
+        self.len += input.len;
+        self.safe += text_utils.blankTerminalUnsafe(self.buf[self.safe..self.len]);
+    }
+
+    /// Drops at least `excess` leading bytes, at a line boundary when the
+    /// text has one, else at a codepoint boundary.
+    fn dropFront(self: *ReasoningTail, excess: usize) void {
+        var cut = excess;
+        while (cut < self.len and self.buf[cut] != '\n') cut += 1;
+        if (cut < self.len) {
+            cut += 1;
+        } else {
+            cut = excess;
+            while (cut < self.len and (self.buf[cut] & 0xc0) == 0x80) cut += 1;
+        }
+        @memmove(self.buf[0 .. self.len - cut], self.buf[cut..self.len]);
+        self.len -= cut;
+        self.safe -= @min(self.safe, cut);
+    }
+};
+
+test "the reasoning tail keeps the newest trace, safe for the terminal" {
+    var tail: ReasoningTail = .{};
+    try std.testing.expect(tail.apply(.{ .chunk = "first line\nsecond \x1b[2J" }));
+    try std.testing.expectEqualStrings("first line\nsecond  [2J", tail.text());
+    // A codepoint cut across chunks waits for its rest.
+    _ = tail.apply(.{ .chunk = "\xe7" });
+    try std.testing.expectEqualStrings("first line\nsecond  [2J", tail.text());
+    _ = tail.apply(.{ .chunk = "\x95\x8c" });
+    try std.testing.expectEqualStrings("first line\nsecond  [2J\u{754c}", tail.text());
+
+    // Past the capacity it drops whole leading lines.
+    const filler: [ReasoningTail.capacity]u8 = @splat('x');
+    _ = tail.apply(.{ .chunk = filler[0 .. ReasoningTail.capacity - 8] });
+    try std.testing.expect(tail.len <= ReasoningTail.capacity);
+    try std.testing.expect(std.mem.startsWith(u8, tail.text(), "  [2J\u{754c}x"));
+    _ = tail.apply(.{ .chunk = &filler });
+    try std.testing.expectEqual(ReasoningTail.capacity, tail.text().len);
+
+    // Visible text hides it for the rest of the step; a new trace starts empty.
+    try std.testing.expect(tail.apply(.text_started));
+    try std.testing.expectEqualStrings("", tail.text());
+    try std.testing.expect(!tail.apply(.{ .chunk = "later" }));
+    tail.newStep();
+    try std.testing.expectEqualStrings("later", tail.text());
+    try std.testing.expect(tail.apply(.begin));
+    try std.testing.expectEqualStrings("", tail.text());
+}
 
 pub const RouteRecoveryUnsafeReason = enum {
     assistant_output,

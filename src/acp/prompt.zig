@@ -3421,6 +3421,9 @@ const native_lane = struct {
         deps.push_tool_lifecycle = pushToolLifecycleNative;
         deps.push_diff_block = pushDiffBlockNative;
         deps.push_command_output_complete = pushCommandOutputCompleteNative;
+        // The frontend shows reasoning from `reasoning_preview` events, so
+        // ACP thought chunks would only fill the replay log.
+        deps.push_reasoning_delta = null;
     }
 
     fn actionInput(ctx: *AcpContext, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) tool_presentation.ToolActionInput {

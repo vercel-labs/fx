@@ -580,46 +580,8 @@ test "lifecycle transition reports focus changes from immutable snapshots" {
 
 /// Visual rows of live reasoning the activity band shows at most.
 pub const reasoning_preview_row_limit: usize = 3;
-/// Newest reasoning bytes kept for the inline preview.
-pub const reasoning_preview_max_bytes: usize = 4096;
 /// Preview rows align under the status label's marker.
 pub const reasoning_preview_indent_width: usize = 2;
-
-/// Keeps the newest reasoning bytes after `chunk` joins `list`. The buffer is
-/// display-only, so a dropped prefix lands on a line boundary when the text
-/// has one; an unbroken line keeps its newest bytes without splitting a
-/// codepoint.
-pub fn appendReasoningPreviewTail(
-    list: *std.ArrayList(u8),
-    alloc: std.mem.Allocator,
-    chunk: []const u8,
-) !void {
-    if (chunk.len == 0) return;
-    var start: usize = 0;
-    if (chunk.len >= reasoning_preview_max_bytes) {
-        start = chunk.len - reasoning_preview_max_bytes;
-        while (start < chunk.len and (chunk[start] & 0xc0) == 0x80) start += 1;
-        list.clearRetainingCapacity();
-    }
-    try list.appendSlice(alloc, chunk[start..]);
-    if (list.items.len <= reasoning_preview_max_bytes) return;
-
-    const excess = list.items.len - reasoning_preview_max_bytes;
-    var cut = excess;
-    while (cut < list.items.len and list.items[cut] != '\n') cut += 1;
-    if (cut == list.items.len) {
-        cut = excess;
-        while (cut < list.items.len and (list.items[cut] & 0xc0) == 0x80) cut += 1;
-    } else {
-        cut += 1;
-    }
-    if (cut >= list.items.len) {
-        list.clearRetainingCapacity();
-        return;
-    }
-    @memmove(list.items[0 .. list.items.len - cut], list.items[cut..]);
-    list.shrinkRetainingCapacity(list.items.len - cut);
-}
 
 const PreviewSpan = struct { start: usize, len: usize };
 
@@ -685,20 +647,6 @@ pub fn reasoningPreviewRows(
         out[i] = text[span.start .. span.start + span.len];
     }
     return out[0..stored];
-}
-
-test "reasoning preview keeps the newest bounded tail on a line boundary" {
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(std.testing.allocator);
-    try appendReasoningPreviewTail(&list, std.testing.allocator, "first line\nsecond line\n");
-    try std.testing.expectEqualStrings("first line\nsecond line\n", list.items);
-
-    const filler = try std.testing.allocator.alloc(u8, reasoning_preview_max_bytes);
-    defer std.testing.allocator.free(filler);
-    @memset(filler, 'x');
-    try appendReasoningPreviewTail(&list, std.testing.allocator, filler);
-    try std.testing.expect(list.items.len <= reasoning_preview_max_bytes);
-    try std.testing.expect(list.items.len > 0);
 }
 
 test "reasoning preview rows keep only the newest three visual rows" {

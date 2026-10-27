@@ -823,17 +823,12 @@ pub fn Runtime(comptime App: type) type {
             if (app.shell.worker_status_state().expire_transient(now_ms)) {
                 app.shell.render_requests.request(.footer);
             }
-            _ = advanceVisibleAnimation(
-                app,
-                event_handlers.tool_lifecycle,
-                now_ms,
-                std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake),
-            );
         }
 
-        /// Schedules the next shimmer frame for a live activity row. Every host
-        /// loop must call this on each pass: the 50ms cadence is timer-owned,
-        /// not event-owned, so a quiet tool run still advances its counter.
+        /// Schedules the next shimmer frame for a live activity row. The host
+        /// loop calls this on each pass after either backend delivers its
+        /// events: the 50ms cadence is timer-owned, not event-owned, so a
+        /// quiet tool run still advances its counter.
         pub fn advanceVisibleAnimation(
             app: *App,
             presenter: activity_runtime.LifecyclePresenter,
@@ -1157,36 +1152,15 @@ pub fn Runtime(comptime App: type) type {
                     .turn_phase_update => |update| {
                         applyTurnPhase(app, update);
                     },
-                    .reasoning_preview => |text| {
-                        if (comptime @hasField(App, "reasoning_preview")) {
-                            try activity_runtime.appendReasoningPreviewTail(
-                                &app.reasoning_preview,
-                                app.alloc,
-                                text,
-                            );
-                            app.shell.render_requests.request(.footer);
-                        }
-                    },
-                    .reasoning_preview_begin => {
-                        // The model started a new trace; do not carry the
-                        // previous step's tail into it.
-                        if (comptime @hasField(App, "reasoning_preview")) {
-                            if (app.reasoning_preview.items.len > 0) {
-                                app.reasoning_preview.clearRetainingCapacity();
-                                app.shell.render_requests.request(.footer);
-                            }
-                        }
-                    },
-                    .assistant_text_started => {
-                        // A visible text block supersedes the reasoning that
-                        // preceded it. Tool-call argument streaming does not.
-                        app.stream.assistant_text_started = true;
-                        if (comptime @hasField(App, "reasoning_preview")) {
-                            if (app.reasoning_preview.items.len > 0) {
-                                app.reasoning_preview.clearRetainingCapacity();
-                            }
-                        }
-                        app.shell.render_requests.request(.footer);
+                    // The detached view applies the same three events
+                    // (`remote_view.zig`).
+                    inline .reasoning_preview, .reasoning_preview_begin, .assistant_text_started => |payload, tag| {
+                        const update: types.ReasoningTail.Event = switch (tag) {
+                            .reasoning_preview => .{ .chunk = payload },
+                            .reasoning_preview_begin => .begin,
+                            else => .text_started,
+                        };
+                        if (app.stream.reasoning.apply(update)) app.shell.render_requests.request(.footer);
                     },
                     .diff_block => |payload| {
                         drain_owns_current = false;
@@ -1360,9 +1334,6 @@ pub fn Runtime(comptime App: type) type {
 
         fn resetStream(app: *App, clear_route_recovery: bool) void {
             app.stream = .{};
-            if (comptime @hasField(App, "reasoning_preview")) {
-                app.reasoning_preview.clearRetainingCapacity();
-            }
             if (clear_route_recovery and app.shell.worker_status_state().clear()) {
                 app.shell.render_requests.request(.footer);
             }
@@ -1397,15 +1368,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn applyTurnPhase(app: *App, update: types.TurnPhaseUpdate) void {
             if (!app.stream.active or update.turn_id != app.worker.activeTurnId()) return;
-            if (update.step_id < app.stream.phase_step_id) return;
-
-            const changed = app.stream.phase != update.phase;
-            if (update.step_id != app.stream.phase_step_id) {
-                app.stream.assistant_text_started = false;
-            }
-            app.stream.phase = update.phase;
-            app.stream.phase_step_id = update.step_id;
-            if (changed) app.shell.render_requests.request(.footer);
+            if (app.stream.applyPhase(update.step_id, update.phase)) app.shell.render_requests.request(.footer);
         }
     };
 }
@@ -1936,7 +1899,6 @@ const FakeApp = struct {
     question_prompt: FakeQuestionPrompt = .{},
     input_runtime: InputRuntime = .{},
     stream: types.StreamState = .{},
-    reasoning_preview: std.ArrayList(u8) = .empty,
     shell: FakeShell = .{},
     pacer: FakePacer = .{},
     subagents: FakeSubagents = .{},
@@ -1972,7 +1934,6 @@ const FakeApp = struct {
         self.shell.deinit(self.alloc);
         self.subagents.deinit(self.alloc);
         self.transcript.deinit(self.alloc);
-        self.reasoning_preview.deinit(self.alloc);
     }
 
     fn pacerCallbacks(self: *FakeApp) void {
@@ -2356,6 +2317,12 @@ fn tickNoop(app: *FakeApp) !void {
     try Runtime(FakeApp).tick(app, NoopBridge.handlers(app));
 }
 
+/// One host loop pass: the tick, then the shimmer clock the host advances.
+fn tickAndAnimateNoop(app: *FakeApp) !void {
+    try tickNoop(app);
+    _ = Runtime(FakeApp).advanceVisibleAnimation(app, NoopBridge.lifecyclePresenter(app), io_mod.milliTimestamp(), std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake));
+}
+
 fn test_awake_timestamp(milliseconds: i64) std.Io.Clock.Timestamp {
     return .{
         .clock = .awake,
@@ -2599,7 +2566,7 @@ test "core.app_worker_runtime keeps the newest reasoning preview for the footer"
 
     try tickNoop(&app);
 
-    try std.testing.expectEqualStrings("first second", app.reasoning_preview.items);
+    try std.testing.expectEqualStrings("first second", app.stream.reasoning.text());
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
@@ -2614,7 +2581,7 @@ test "core.app_worker_runtime flushes the reasoning preview when a new trace beg
     try app.worker.pushEvent(std.heap.c_allocator, .{ .reasoning_preview = earlier });
     std.heap.c_allocator.free(earlier);
     try tickNoop(&app);
-    try std.testing.expectEqualStrings("earlier trace", app.reasoning_preview.items);
+    try std.testing.expectEqualStrings("earlier trace", app.stream.reasoning.text());
 
     // The next step's first reasoning chunk starts a fresh trace.
     try app.worker.pushEvent(std.heap.c_allocator, .reasoning_preview_begin);
@@ -2623,7 +2590,7 @@ test "core.app_worker_runtime flushes the reasoning preview when a new trace beg
     std.heap.c_allocator.free(current);
     try tickNoop(&app);
 
-    try std.testing.expectEqualStrings("current trace", app.reasoning_preview.items);
+    try std.testing.expectEqualStrings("current trace", app.stream.reasoning.text());
 }
 
 test "core.app_worker_runtime keeps the reasoning preview through tool work and drops it for text" {
@@ -2645,7 +2612,7 @@ test "core.app_worker_runtime keeps the reasoning preview through tool work and 
         .phase = .running,
     } });
     try tickNoop(&app);
-    try std.testing.expectEqualStrings("trace", app.reasoning_preview.items);
+    try std.testing.expectEqualStrings("trace", app.stream.reasoning.text());
 
     // Generating tool-call arguments is not visible text.
     try app.worker.pushEvent(std.heap.c_allocator, .{ .turn_phase_update = .{
@@ -2654,13 +2621,13 @@ test "core.app_worker_runtime keeps the reasoning preview through tool work and 
         .phase = .generating,
     } });
     try tickNoop(&app);
-    try std.testing.expectEqualStrings("trace", app.reasoning_preview.items);
+    try std.testing.expectEqualStrings("trace", app.stream.reasoning.text());
 
     // Visible text supersedes it; a later tool call must not resurrect it.
     try app.worker.pushEvent(std.heap.c_allocator, .assistant_text_started);
     try tickNoop(&app);
-    try std.testing.expectEqual(@as(usize, 0), app.reasoning_preview.items.len);
-    try std.testing.expect(app.stream.assistant_text_started);
+    try std.testing.expectEqual(@as(usize, 0), app.stream.reasoning.text().len);
+    try std.testing.expect(app.stream.reasoning.text_started);
 }
 
 test "core.app_worker_runtime applies only current monotonic turn phase updates" {
@@ -2821,25 +2788,25 @@ test "core.app_worker_runtime ticks animation for completed assistant presentati
     app.shell.render_requests.animation_visible = true;
     app.shell.render_requests.animation_next_deadline_ms = 1;
     app.pacer.completed_assistant_presentation_tail = true;
-    try tickNoop(&app);
+    try tickAndAnimateNoop(&app);
     try std.testing.expect(app.shell.render_requests.hasReason(.animation));
 
     app.shell.render_requests.clearReason(.animation);
     app.shell.render_requests.animation_next_deadline_ms = 1;
     app.pacer.completed_assistant_presentation_tail = false;
-    try tickNoop(&app);
+    try tickAndAnimateNoop(&app);
     try std.testing.expect(!app.shell.render_requests.hasReason(.animation));
 
     app.shell.render_requests.animation_next_deadline_ms = 1;
     app.pacer.completed_assistant_presentation_tail = true;
     app.question_prompt.active = true;
-    try tickNoop(&app);
+    try tickAndAnimateNoop(&app);
     try std.testing.expect(!app.shell.render_requests.hasReason(.animation));
 
     app.question_prompt.active = false;
     app.approval_prompt.force_active = true;
     app.shell.render_requests.animation_next_deadline_ms = 1;
-    try tickNoop(&app);
+    try tickAndAnimateNoop(&app);
     try std.testing.expect(!app.shell.render_requests.hasReason(.animation));
 }
 

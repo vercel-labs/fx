@@ -143,9 +143,6 @@ pub fn Runtime(comptime App: type) type {
             app.remote.submitted_text.clearRetainingCapacity();
             app.shell.clearTranscriptPreservingWelcome(app.alloc);
             app.stream = .{};
-            if (comptime @hasField(App, "reasoning_preview")) {
-                app.reasoning_preview.clearRetainingCapacity();
-            }
             app.remote.resetHistory(app.alloc);
             _ = app.shell.worker_status_state().clear();
             app.shell.render_requests.request(.transcript);
@@ -302,9 +299,6 @@ pub fn Runtime(comptime App: type) type {
             if (app.remote.native_source_turn_id == source_turn_id) return;
             app.remote.native_source_turn_id = source_turn_id;
             app.stream = .{ .active = true, .turn_started_ms = io_mod.milliTimestamp() };
-            if (comptime @hasField(App, "reasoning_preview")) {
-                app.reasoning_preview.clearRetainingCapacity();
-            }
             _ = app.shell.worker_status_state().clear();
             app.shell.render_requests.requestAnimationReset();
             app.shell.render_requests.request(.footer);
@@ -323,21 +317,16 @@ pub fn Runtime(comptime App: type) type {
         fn applyNativeEvent(app: *App, event: std.json.Value) !void {
             // A void presentation event travels as its tag with an empty
             // payload object.
-            if (field(event, "reasoning_preview_begin") != null) {
-                if (comptime @hasField(App, "reasoning_preview")) {
-                    if (app.reasoning_preview.items.len > 0) {
-                        app.reasoning_preview.clearRetainingCapacity();
-                        app.shell.render_requests.request(.footer);
-                    }
-                }
-                return;
-            }
-            if (field(event, "assistant_text_started") != null) {
-                app.stream.assistant_text_started = true;
-                if (comptime @hasField(App, "reasoning_preview")) {
-                    app.reasoning_preview.clearRetainingCapacity();
-                }
-                app.shell.render_requests.request(.footer);
+            const reasoning: ?types.ReasoningTail.Event = if (field(event, "reasoning_preview_begin") != null)
+                .begin
+            else if (field(event, "assistant_text_started") != null)
+                .text_started
+            else if (field(event, "reasoning_preview")) |value|
+                if (value == .string) .{ .chunk = value.string } else null
+            else
+                null;
+            if (reasoning) |update| {
+                if (app.stream.reasoning.apply(update)) app.shell.render_requests.request(.footer);
                 return;
             }
             if (field(event, "tool_lifecycle")) |value| {
@@ -403,26 +392,11 @@ pub fn Runtime(comptime App: type) type {
                 var parsed = try std.json.parseFromValue(types.TurnPhaseUpdate, app.alloc, value, .{});
                 defer parsed.deinit();
                 beginNativeTurn(app, parsed.value.turn_id);
-                if (parsed.value.step_id >= app.stream.phase_step_id) {
-                    if (parsed.value.step_id != app.stream.phase_step_id) {
-                        app.stream.assistant_text_started = false;
-                    }
-                    app.stream.phase = parsed.value.phase;
-                    app.stream.phase_step_id = parsed.value.step_id;
-                }
+                _ = app.stream.applyPhase(parsed.value.step_id, parsed.value.phase);
             } else if (field(event, "turn_token_update")) |value| {
                 var parsed = try std.json.parseFromValue(types.TurnTokenProgress, app.alloc, value, .{});
                 defer parsed.deinit();
                 app.stream.token_progress = parsed.value;
-            } else if (field(event, "reasoning_preview")) |value| {
-                if (value == .string and comptime @hasField(App, "reasoning_preview")) {
-                    try activity_runtime.appendReasoningPreviewTail(
-                        &app.reasoning_preview,
-                        app.alloc,
-                        value.string,
-                    );
-                    app.shell.render_requests.request(.footer);
-                }
             } else if (field(event, "assistant_presentation")) |value| {
                 var parsed = try std.json.parseFromValue(presentation.Event, app.alloc, value, .{});
                 defer parsed.deinit();
@@ -650,7 +624,6 @@ const NativePresentationTestApp = struct {
     alloc: Allocator = std.testing.allocator,
     remote: remote_runtime.State = .{ .native_turn_offset = 100 },
     stream: types.StreamState = .{ .active = true },
-    reasoning_preview: std.ArrayList(u8) = .empty,
     user_prompt_count: usize = 0,
     reject_semantic: bool = false,
     metrics: types.Metrics = .{},
@@ -845,28 +818,27 @@ test "native child reasoning preview flushes at a trace boundary and drops for v
     var app: NativePresentationTestApp = .{};
     defer app.shell.deinit(app.alloc);
     defer app.remote.deinit(app.alloc);
-    defer app.reasoning_preview.deinit(app.alloc);
     app.remote.native_source_turn_id = 1;
 
     try app.apply("{\"reasoning_preview\":\"first trace\"}");
-    try std.testing.expectEqualStrings("first trace", app.reasoning_preview.items);
+    try std.testing.expectEqualStrings("first trace", app.stream.reasoning.text());
 
     // The supervisor carries a void presentation event as its tag with an
     // empty payload object.
     try app.apply("{\"reasoning_preview_begin\":{}}");
-    try std.testing.expectEqual(@as(usize, 0), app.reasoning_preview.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.stream.reasoning.text().len);
 
     try app.apply("{\"reasoning_preview\":\"running trace\"}");
     try app.apply("{\"turn_phase_update\":{\"turn_id\":1,\"step_id\":2,\"phase\":\"running\"}}");
-    try std.testing.expectEqualStrings("running trace", app.reasoning_preview.items);
+    try std.testing.expectEqualStrings("running trace", app.stream.reasoning.text());
 
     // Generating tool-call arguments keeps the trace; visible text drops it.
     try app.apply("{\"turn_phase_update\":{\"turn_id\":1,\"step_id\":2,\"phase\":\"generating\"}}");
-    try std.testing.expectEqualStrings("running trace", app.reasoning_preview.items);
+    try std.testing.expectEqualStrings("running trace", app.stream.reasoning.text());
 
     try app.apply("{\"assistant_text_started\":{}}");
-    try std.testing.expectEqual(@as(usize, 0), app.reasoning_preview.items.len);
-    try std.testing.expect(app.stream.assistant_text_started);
+    try std.testing.expectEqual(@as(usize, 0), app.stream.reasoning.text().len);
+    try std.testing.expect(app.stream.reasoning.text_started);
 }
 
 test "host command results render from their typed fields" {

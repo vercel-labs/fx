@@ -727,7 +727,7 @@ pub fn Runtime(comptime App: type) type {
             return .{
                 .slash_registry = app.slashRegistry(),
                 .stream = visible_stream,
-                .reasoning_preview = if (comptime @hasField(App, "reasoning_preview")) app.reasoning_preview.items else "",
+                .reasoning_preview = app.stream.reasoning.text(),
                 .compaction = if (comptime @hasDecl(@TypeOf(app.worker), "compactionActivitySnapshot")) app.worker.compactionActivitySnapshot() else .{},
                 .pending_prompt_activity = pendingPromptActivityVisible(app),
                 .completed_assistant_presentation_tail = app.pacer.hasCompletedAssistantPresentationTail(),
