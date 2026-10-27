@@ -54,6 +54,8 @@ const tool_fixture =
 const Collector = struct {
     content: std.ArrayList(u8) = .empty,
     reasoning: std.ArrayList(u8) = .empty,
+    /// "id:name" per tool start, then "id#index:fragment" per input delta.
+    tools: std.ArrayList(u8) = .empty,
     alloc: Allocator,
 
     fn emit(raw: *anyopaque, event: stream_provider.Event) void {
@@ -61,7 +63,8 @@ const Collector = struct {
         switch (event) {
             .content_delta => |text| self.content.appendSlice(self.alloc, text) catch {},
             .reasoning_delta => |text| self.reasoning.appendSlice(self.alloc, text) catch {},
-            else => {},
+            .tool_started => |tool| self.tools.print(self.alloc, "[{s}:{s}]", .{ tool.id, tool.name }) catch {},
+            .tool_input_delta => |delta| self.tools.print(self.alloc, "[{s}#{d}:{s}]", .{ delta.id, delta.index, delta.chunk }) catch {},
         }
     }
 };
@@ -77,9 +80,12 @@ test "anthropic stream reduces thinking signature redaction text tool input and 
     var collector: Collector = .{ .alloc = alloc };
     defer collector.content.deinit(alloc);
     defer collector.reasoning.deinit(alloc);
+    defer collector.tools.deinit(alloc);
     var result = try run(alloc, tool_fixture, request(), .{ .context = &collector, .emit_fn = Collector.emit });
     defer result.deinit(alloc);
     const completion = result.completed.completion;
+    // The call is announced once, then its input streams under its id.
+    try std.testing.expectEqualStrings("[toolu_01:mcp.weather][toolu_01#0:{\"city\": \"Pa][toolu_01#0:ris\"}]", collector.tools.items);
     try std.testing.expectEqualStrings("Checking.", completion.content.?);
     try std.testing.expectEqualStrings("Checking.", collector.content.items);
     try std.testing.expectEqualStrings("The user wants weather.", collector.reasoning.items);

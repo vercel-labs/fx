@@ -2814,3 +2814,28 @@ test "chat completions prose resembling a call stays prose and cancellation afte
     try test_accept(&cancelled, "[DONE]");
     try std.testing.expectError(error.Cancelled, cancelled.finish(true));
 }
+
+test "chat completions streams each call's start once and its arguments by id" {
+    const alloc = std.testing.allocator;
+    const Collector = struct {
+        events: std.ArrayList(u8) = .empty,
+        fn emit(context: *anyopaque, event: stream_provider.Event) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            switch (event) {
+                .tool_started => |tool| self.events.print(std.testing.allocator, "[{s}:{s}]", .{ tool.id, tool.name }) catch {},
+                .tool_input_delta => |delta| self.events.print(std.testing.allocator, "[{s}#{d}:{s}]", .{ delta.id, delta.index, delta.chunk }) catch {},
+                else => {},
+            }
+        }
+    };
+    var collector: Collector = .{};
+    defer collector.events.deinit(alloc);
+    const first = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"pa\"}}]}}]}";
+    const second = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"th\\\":\\\"x\\\"}\"}}]}}]}";
+    var source = std.Io.Reader.fixed("data: " ++ first ++ "\n\ndata: " ++ second ++ "\n\ndata: " ++ test_tools_finish ++ "\n\ndata: [DONE]\n\n");
+    var cancelled = std.atomic.Value(bool).init(false);
+    var result = try consume_stream(alloc, &source, test_tool_request(), .{}, .{ .context = &collector, .emit_fn = Collector.emit }, &cancelled, null);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"path\":\"x\"}", result.completed.completion.tool_calls[0].arguments_json);
+    try std.testing.expectEqualStrings("[call-1:read_file][call-1#0:{\"pa][call-1#0:th\":\"x\"}]", collector.events.items);
+}
