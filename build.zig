@@ -96,6 +96,9 @@ pub fn build(b: *std.Build) void {
     session_manager.sanitize_thread = sanitize_thread;
 
     b.installArtifact(exe);
+    // The E2E, eval and conformance harnesses and the release workflows run
+    // zig-out/bin/fx, so the same binary is also installed under that name.
+    b.getInstallStep().dependOn(&b.addInstallBinFile(exe.getEmittedBin(), "fx").step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
