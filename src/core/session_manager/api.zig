@@ -790,7 +790,11 @@ fn checkEvents(gpa: std.mem.Allocator, events: []const Event, import: bool) Appe
         .child_queued => |c| {
             try checkId(c.child);
             try checkWorkId(c.work_id);
-            if (c.data) |data| try checkChildData(gpa, data);
+            // A queued item carries its message until it starts (D102).
+            if (c.data) |data| {
+                if (data.len > max_queued_data_bytes) return error.TooLarge;
+                try checkJson(gpa, data);
+            }
         },
         .child_terminated => |c| {
             try checkId(c.child);
@@ -829,6 +833,7 @@ fn checkChildData(gpa: std.mem.Allocator, raw: []const u8) AppendError!void {
 }
 
 pub const max_child_data_bytes = 4096;
+pub const max_queued_data_bytes = 512 * 1024;
 
 fn checkWorkId(work_id: []const u8) error{InvalidArgument}!void {
     if (work_id.len == 0 or work_id.len > 255) return error.InvalidArgument;

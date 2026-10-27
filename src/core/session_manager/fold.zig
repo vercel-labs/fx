@@ -448,7 +448,7 @@ pub fn plan(state: *const State, events: []const Event, out: []schema.Body) Tran
                 break :blk .{ .child_finished = c };
             },
             .child_queued => |c| blk: {
-                if (state.findChild(c.child) == null) return error.InvalidTransition;
+                if (!fold_queue.knownAt(state, events[0..i], c.child)) return error.InvalidTransition;
                 if (abandonedAt(state, events[0..i], c.child)) return error.InvalidTransition;
                 var queue = queueAt(state, events[0..i], c.child);
                 if (queue.len() >= max_queued_work or queue.contains(c.work_id)) return error.InvalidTransition;
@@ -459,7 +459,7 @@ pub fn plan(state: *const State, events: []const Event, out: []schema.Body) Tran
             // finished first (`tests/tla/session_manager/Fleet.tla`
             // NoWorkAfterTerminate).
             .child_terminated => |c| blk: {
-                if (state.findChild(c.child) == null) return error.InvalidTransition;
+                if (!fold_queue.knownAt(state, events[0..i], c.child)) return error.InvalidTransition;
                 if (abandonedAt(state, events[0..i], c.child)) return error.InvalidTransition;
                 if (openWorkAt(state, events[0..i], c.child) != null) return error.InvalidTransition;
                 break :blk .{ .child_terminated = c };

@@ -92,6 +92,16 @@ pub const QueueView = struct {
     }
 };
 
+/// Whether `child` is spawned in `state` or by `earlier` events of the batch.
+pub fn knownAt(state: *const State, earlier: []const Event, child: []const u8) bool {
+    if (state.findChild(child) != null) return true;
+    for (earlier) |event| switch (event) {
+        .child_spawned => |c| if (std.mem.eql(u8, c.child, child)) return true,
+        else => {},
+    };
+    return false;
+}
+
 pub fn queueAt(state: *const State, earlier: []const Event, child: []const u8) QueueView {
     var view: QueueView = .{};
     if (state.findChild(child)) |index| view.folded = state.children.items[index].queue.items;

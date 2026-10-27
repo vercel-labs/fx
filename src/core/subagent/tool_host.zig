@@ -75,6 +75,7 @@ test {
     _ = @import("slot_pool.zig");
     _ = @import("tree.zig");
     _ = @import("turn_jobs.zig");
+    _ = @import("fleet_state.zig");
 }
 
 test "managed execution receipts retain the pending contract" {

@@ -8,6 +8,7 @@ const session_child_store = @import("../session/session_child_store.zig");
 const session_store = @import("../session/session_store.zig");
 const types = @import("../shared/types.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const fleet_state = @import("fleet_state.zig");
 
 const Allocator = std.mem.Allocator;
 const schema_version: u64 = 2;
@@ -57,6 +58,8 @@ pub const ActiveWork = struct {
     root_user_evidence_complete: bool = false,
     permission_mode: types.PermissionMode = .yolo,
     created_at_ms: i64,
+    /// The worker's turn number this work is (D101); 0 when unknown.
+    turn: u32 = 0,
 
     pub fn deinit(self: *ActiveWork, alloc: Allocator) void {
         alloc.free(self.id);
@@ -84,6 +87,7 @@ pub const ActiveWork = struct {
             .root_user_evidence_complete = self.root_user_evidence_complete,
             .permission_mode = self.permission_mode,
             .created_at_ms = self.created_at_ms,
+            .turn = self.turn,
         };
     }
 
@@ -129,6 +133,12 @@ pub const Child = struct {
     last_request_fingerprint: ?[32]u8 = null,
     last_outcome: ?Outcome = null,
     last_failure: ?types.ModelFailureDiagnostic = null,
+    /// Work waiting behind the active work, oldest first (D102).
+    queue: []ActiveWork = &.{},
+    /// Terminated: browsable and read-only, never given work again (D102).
+    terminated: bool = false,
+    /// The highest turn number the worker accepted (D101).
+    turns: u32 = 0,
 
     pub fn deinit(self: *Child, alloc: Allocator) void {
         alloc.free(self.id);
@@ -138,6 +148,7 @@ pub const Child = struct {
         }
         if (self.active) |*active| active.deinit(alloc);
         if (self.last_work_id) |id| alloc.free(id);
+        freeWorks(alloc, self.queue);
         self.* = undefined;
     }
 
@@ -154,6 +165,8 @@ pub const Child = struct {
         };
         var active = if (self.active) |value| try value.clone(alloc) else null;
         errdefer if (active) |*value| value.deinit(alloc);
+        const queue = try cloneWorks(alloc, self.queue);
+        errdefer freeWorks(alloc, queue);
         return .{
             .id = id,
             .kind = kind,
@@ -164,6 +177,9 @@ pub const Child = struct {
             .last_request_fingerprint = self.last_request_fingerprint,
             .last_outcome = self.last_outcome,
             .last_failure = self.last_failure,
+            .queue = queue,
+            .terminated = self.terminated,
+            .turns = self.turns,
         };
     }
 
@@ -226,8 +242,10 @@ pub const Registry = struct {
         return null;
     }
 
+    /// The live worker named `agent`; a terminated one frees its name (D102).
     pub fn findPersistent(self: *Registry, agent: []const u8) ?*Child {
         for (self.children) |*child| {
+            if (child.terminated) continue;
             const name = child.agentName() orelse continue;
             if (std.mem.eql(u8, name, agent)) return child;
         }
@@ -608,6 +626,8 @@ const SpawnData = struct {
     /// A named child's name; null for a one-off.
     agent: ?[]const u8 = null,
     fingerprint: []const u8,
+    /// The worker's turn number for this work (D101).
+    turn: ?u32 = null,
 };
 
 /// fx's data on a `child_finished` line.
@@ -673,16 +693,23 @@ fn childFromFolded(alloc: Allocator, entry: session_adapter.Child) !Child {
         if (!domain.validAgentName(agent)) return error.InvalidState;
         kind = .{ .persistent = .{ .agent = try alloc.dupe(u8, agent), .instructions = &.{} } };
     }
+    const queue = try fleet_state.foldedQueue(alloc, entry.queue);
+    errdefer freeWorks(alloc, queue);
+    var turns = spawn.turn orelse 0;
+    for (queue) |work| turns = @max(turns, work.turn);
     return .{
         .id = id,
         .kind = kind,
-        .phase = switch (last_outcome) {
+        .phase = if (entry.terminated != null) .finished else switch (last_outcome) {
             .interrupted, .lost => .interrupted,
             .completed, .failed, .cancelled => switch (kind) {
                 .one_off => .finished,
                 .persistent => .idle,
             },
         },
+        .queue = queue,
+        .terminated = entry.terminated != null,
+        .turns = turns,
         .work_generation = entry.seq,
         .last_work_id = work_id,
         .last_request_fingerprint = fingerprint,
@@ -720,10 +747,11 @@ fn planLines(arena: Allocator, old: Registry, next: Registry) ![]session_adapter
                 try lines.append(arena, .{ .spawned = .{
                     .child = after.id,
                     .work_id = work_id,
-                    .data = try stringifyAlloc(arena, SpawnData{ .agent = after.agentName(), .fingerprint = &fingerprint }),
+                    .data = try stringifyAlloc(arena, SpawnData{ .agent = after.agentName(), .fingerprint = &fingerprint, .turn = if (after.active.?.turn == 0) null else after.active.?.turn }),
                 } });
             }
         }
+        try fleet_state.planQueueLines(arena, &lines, findChild(old, after.id), after);
     }
     return lines.toOwnedSlice(arena);
 }
@@ -1027,6 +1055,7 @@ fn validateRegistry(registry: Registry) !void {
         }
         for (registry.children[0..index]) |prior| {
             if (std.mem.eql(u8, prior.id, child.id)) return error.InvalidState;
+            if (prior.terminated or child.terminated) continue;
             if (child.agentName()) |agent| {
                 if (prior.agentName()) |prior_agent| {
                     if (std.mem.eql(u8, prior_agent, agent)) return error.InvalidState;
@@ -1093,6 +1122,26 @@ fn cloneStrings(alloc: Allocator, source: []const []u8) ![][]u8 {
         built += 1;
     }
     return result;
+}
+
+pub fn freeWorks(alloc: Allocator, works: []ActiveWork) void {
+    for (works) |*work| work.deinit(alloc);
+    if (works.len > 0) alloc.free(works);
+}
+
+pub fn cloneWorks(alloc: Allocator, works: []const ActiveWork) ![]ActiveWork {
+    if (works.len == 0) return &.{};
+    const out = try alloc.alloc(ActiveWork, works.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |*work| work.deinit(alloc);
+        alloc.free(out);
+    }
+    for (works) |work| {
+        out[built] = try work.clone(alloc);
+        built += 1;
+    }
+    return out;
 }
 
 fn freeStrings(alloc: Allocator, values: [][]u8) void {
