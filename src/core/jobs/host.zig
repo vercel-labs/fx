@@ -61,6 +61,15 @@ pub const Host = struct {
     }
 };
 
+/// How long a shell command runs before it becomes a background job:
+/// `FX_AUTO_BACKGROUND_MS`, or proto's minute. 0 backgrounds at once.
+pub fn autoBackgroundMs() u32 {
+    const contract = @import("../execution/managed_execution_contract.zig");
+    const raw = io_mod.getenv("FX_AUTO_BACKGROUND_MS") orelse return contract.default_auto_background_ms;
+    const value = std.fmt.parseUnsigned(u32, raw, 10) catch return contract.default_auto_background_ms;
+    return @min(value, contract.max_auto_background_ms);
+}
+
 pub const Notice = struct {
     text: []const u8,
     tokens: []const result_commit.Token,

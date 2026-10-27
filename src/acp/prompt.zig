@@ -591,6 +591,7 @@ const AcpContext = struct {
             .terminal_client = &self.state.terminal_client,
             .managed_executions = &self.state.managed_executions,
             .jobs = self.state.jobs,
+            .auto_background_ms = @import("../core/jobs/host.zig").autoBackgroundMs(),
             .ephemeral_command_replay = self.state.managed_executions.replayStore(),
             .web_fetch_runtime = &self.state.web_fetch_runtime,
             .web_fetch_artifact_store = session.session_rt.webFetchArtifactStore(),

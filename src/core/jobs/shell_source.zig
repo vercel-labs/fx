@@ -254,3 +254,88 @@ test "result text states the outcome before the output" {
     snapshot.state = .{ .stopped = null };
     try std.testing.expectEqual(jobs.State.cancelled, jobState(snapshot.state));
 }
+
+fn startTestJob(runtime: *managed_execution.Runtime, execution_id: []const u8, command: []const u8) !void {
+    var input = managed_execution.StartCapturedInput{
+        .execution_id = execution_id,
+        .command = command,
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 5_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 0,
+    };
+    input.authority = .{ .shell_allowed = .{
+        .fingerprint = .init(.{
+            .command = input.command,
+            .resolved_cwd = input.cwd,
+            .target_os = @import("builtin").target.os.tag,
+            .environment = input.environment,
+        }),
+        .source = .yolo,
+    } };
+    var started = try runtime.startCaptured(std.testing.allocator, input);
+    defer started.deinit(std.testing.allocator);
+    // The model got the running handle: the command is now a job.
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+}
+
+test "a backgrounded command reaches a wait once and is not delivered again" {
+    if (comptime @import("builtin").target.os.tag == .wasi) return;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var runtime = managed_execution.Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+    try startTestJob(&runtime, "shell-7", "sleep 0.2; printf done");
+    var shell: Source = .{ .runtime = &runtime };
+    var registry = jobs.Registry.init(std.testing.allocator);
+    defer registry.deinit();
+    registry.addSource(shell.source());
+
+    const listed = try registry.list(arena);
+    try std.testing.expectEqual(@as(usize, 1), listed.len);
+    try std.testing.expectEqualStrings("bg_7", listed[0].id);
+    const outcome = try registry.wait(arena, &.{"bg_7"}, 5_000, null);
+    try std.testing.expectEqual(@as(usize, 1), outcome.settled.len);
+    try std.testing.expectEqual(jobs.State.completed, outcome.settled[0].job.state);
+    try std.testing.expect(std.mem.endsWith(u8, outcome.settled[0].text, "\ndone"));
+    // Reserved by the wait until its result commits.
+    try std.testing.expectEqual(@as(usize, 0), (try registry.takeDeliveries(arena)).len);
+    try outcome.settled[0].token.commit();
+    try std.testing.expectEqual(@as(usize, 0), (try registry.takeDeliveries(arena)).len);
+    try std.testing.expect((try registry.find(arena, "bg_7")).?.delivered);
+}
+
+test "a backgrounded command nobody waits on is delivered automatically once" {
+    if (comptime @import("builtin").target.os.tag == .wasi) return;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var runtime = managed_execution.Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+    try startTestJob(&runtime, "shell-8", "printf out; exit 3");
+    var shell: Source = .{ .runtime = &runtime };
+    var registry = jobs.Registry.init(std.testing.allocator);
+    defer registry.deinit();
+    registry.addSource(shell.source());
+
+    var delivered: []jobs.Settled = &.{};
+    var tries: usize = 0;
+    while (delivered.len == 0 and tries < 200) : (tries += 1) {
+        delivered = try registry.takeDeliveries(arena);
+        if (delivered.len == 0) @import("../shared/io.zig").sleep(10 * std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(usize, 1), delivered.len);
+    try std.testing.expectEqual(jobs.State.failed, delivered[0].job.state);
+    try std.testing.expect(std.mem.find(u8, delivered[0].text, "exit 3") != null);
+    // A refused notice leaves it deliverable; a committed one does not.
+    delivered[0].token.cancel();
+    const again = try registry.takeDeliveries(arena);
+    try std.testing.expectEqual(@as(usize, 1), again.len);
+    try again[0].token.commit();
+    try std.testing.expectEqual(@as(usize, 0), (try registry.takeDeliveries(arena)).len);
+    try std.testing.expectEqual(jobs.Cancelled{ .status = .already_settled }, try registry.cancel(arena, "bg_8", false));
+}

@@ -1781,6 +1781,31 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   follows see the same state. **Alternative:** checking from a connection
   thread, which a request queued between the check and the stop defeats.
 
+- **D110 Decision:** a settled background job's result reaches the model
+  exactly once. Each job source keeps one reservation at a time per job
+  (the managed execution runtime's delivery state for shell jobs, a
+  delivery table for fleet turns); a consumer reserves the result, and
+  commits it once the model has it or releases it so it stays deliverable.
+  A `jobs wait` leases its targets, counted so overlapping waits keep the
+  lease, and automatic delivery skips leased jobs; when the wait returns,
+  what it did not take is delivered automatically. `tests/tla/jobs/Jobs.tla`
+  checks `ExactlyOnceDelivery` and `NoDeliveryUnderLease`. **Why:** a shell
+  `interact`, a wait and the notice all read the same output, and only the
+  source can tell whether it was handed over. **Alternative:** a delivered
+  flag in the registry, which a shell interact bypasses.
+
+- **D111 Decision:** jobs that settle with nobody waiting are delivered by
+  the supervisor's tick as one async-result notice, a `<system-notice>` fx
+  writes. It steers a running turn at its next safe boundary without
+  cutting a streaming reply short, and wakes an idle session with a turn of
+  its own, as proto does for finished background work. Steering keeps the
+  notice out of the user envelope, saves it whole, and the transcript shows
+  one status row per job. The notice commits when the host admits the
+  prompt; a busy host leaves it for the next tick. **Why:** the model
+  should react to a result as soon as it can, and a stopped session must
+  not run. **Alternative:** holding results for the next user prompt,
+  which leaves a finished build unread until the person types.
+
 - **D112 Decision:** the `subagent` tool becomes the `fleet` tool, one tool
   with the ops `run`, `spawn`, `send`, `list`, `inspect` and `terminate`.
   `run` waits for its one turn, as `subagent` did, and with a label runs it
