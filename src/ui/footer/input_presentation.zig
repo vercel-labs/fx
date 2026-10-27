@@ -401,8 +401,9 @@ fn authPickerInteractionHint(view: auth_runtime.PickerView, width: u16) ?[]const
     if (!view.active or view.include_skip) return null;
 
     if (view.stage == .api_key and view.api_key_inline) {
+        // A configured provider's key goes to the profile's key file.
         const key_variants = [_][]const u8{
-            "enter saves     esc cancels     " ++ credentials.stored_key_backend_label,
+            if (view.api_key_for_provider) "enter saves     esc cancels     profile file" else "enter saves     esc cancels     " ++ credentials.stored_key_backend_label,
             "enter saves  esc cancels",
             "enter  esc",
         };
@@ -593,6 +594,13 @@ fn runningJobsText(count: u32, mcp_status: []const u8, out: []u8) []const u8 {
     const noun = if (count == 1) "job" else "jobs";
     if (mcp_status.len == 0) return std.mem.print(out, "{d} {s} running", .{ count, noun }) catch "";
     return std.mem.print(out, "{d} {s} running" ++ statusline_gap ++ "{s}", .{ count, noun, mcp_status }) catch "";
+}
+
+test "a configured provider's key field names the profile file it saves to" {
+    var view: auth_runtime.PickerView = .{ .active = true, .available_sources = .empty, .selected_choice = null, .active_source = null, .include_skip = false, .stage = .api_key, .api_key_inline = true };
+    try std.testing.expectEqualStrings("enter saves     esc cancels     " ++ credentials.stored_key_backend_label, authPickerInteractionHint(view, 120).?);
+    view.api_key_for_provider = true;
+    try std.testing.expectEqualStrings("enter saves     esc cancels     profile file", authPickerInteractionHint(view, 120).?);
 }
 
 test "the footer counts running background jobs" {

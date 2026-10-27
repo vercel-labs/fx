@@ -1338,6 +1338,9 @@ pub const PickerView = struct {
     sign_in_code_mask_count: usize = 0,
     api_key_mask_count: usize = 0,
     api_key_inline: bool = false,
+    /// The key field saves for a configured provider, in the profile's
+    /// provider key file rather than the gateway's credential store.
+    api_key_for_provider: bool = false,
 
     pub fn activeSourceLabel(self: PickerView) []const u8 {
         return sourceLabelOrMissing(self.active_source);
@@ -2262,6 +2265,7 @@ pub const Runtime = struct {
             .sign_in_code_mask_count = @min(self.sign_in_code_input.items.len, max_manual_code_mask_glyphs),
             .api_key_mask_count = self.apiKeyMaskCount(),
             .api_key_inline = self.api_key_inline,
+            .api_key_for_provider = self.api_key_provider != null,
         };
     }
 
