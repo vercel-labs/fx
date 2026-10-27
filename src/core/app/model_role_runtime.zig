@@ -131,9 +131,13 @@ pub const Host = struct {
         return model;
     }
 
-    /// The model for session titles; null disables generated titles.
+    /// The model for session titles: the title role, the provider's own
+    /// low-cost model, then, as proto does, the session's model (D206).
+    /// Null disables generated titles.
     pub fn titleModel(self: Host) ?[]const u8 {
-        return self.resolve(.title) orelse self.set.select(self.provider).title_model;
+        if (self.resolve(.title) orelse self.set.select(self.provider).title_model) |model| return model;
+        if (self.current_model.len == 0 or self.current_model[0] == '@') return null;
+        return self.current_model;
     }
 
     /// The permission reviewer's model; empty keeps the reviewer's default.
@@ -375,4 +379,15 @@ test "review falls back to the legacy gateway setting and titles to the bundle" 
     try state.assign(alloc, .smol, "codex-mini");
     try std.testing.expectEqualStrings("codex-mini", view.compactModel());
     try std.testing.expectEqualStrings("codex-mini", view.titleModel().?);
+}
+
+test "a provider without a low-cost model titles with the session's model" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    try state.init(alloc, .{}, "codex", "main");
+    var view: Host = .{ .state = &state, .provider = .codex, .current_model = "gpt-main", .set = .{ .gateway = .{ .title_model = "luna" }, .codex = .{}, .grok = .{} } };
+    try std.testing.expectEqualStrings("gpt-main", view.titleModel().?);
+    view.current_model = "@default";
+    try std.testing.expect(view.titleModel() == null);
 }

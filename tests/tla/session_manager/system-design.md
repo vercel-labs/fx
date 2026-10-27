@@ -2416,6 +2416,15 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   putting the hint in the transport's failure detail, which the auth
   snapshot drops.
 
+- **D206 Decision:** a session's title model is the `title` role, the
+  provider's own low-cost model, then the session's model, as proto's
+  title generator ends with the session model. A provider defined in
+  models.json without a `reviewer_model` therefore still gets generated
+  titles, in the terminal UI's daemon-hosted sessions, `ask` and ACP
+  alike. **Why:** such sessions kept the raw first prompt as their
+  title. **Alternative:** requiring `reviewer_model`, which few
+  definitions set.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a
