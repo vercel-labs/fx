@@ -4806,17 +4806,34 @@ pub fn listSummaries(
     return list;
 }
 
-/// Deletes the v2 session `id` and the terminal and side folders fx keeps
-/// beside it. A session another process holds is Busy, and one that is gone
-/// is SessionNotFound.
-pub fn deleteSession(store: *Store, id: []const u8) !void {
+/// The sessions a delete of `id` removes, root first: the v2 session and
+/// the children it owns. SessionLegacy when only a v1 folder not converted
+/// yet holds `id` (D59), which this delete does not remove; SessionNotFound
+/// when nothing does. Caller owns the list and each id.
+pub fn sessionFamily(store: *Store, alloc: Allocator, id: []const u8) ![][]u8 {
     session_layout.validateSessionId(id) catch return error.SessionNotFound;
-    store.manager.delete(id) catch |err| switch (err) {
-        error.NotFound, error.InvalidArgument => return error.SessionNotFound,
+    return store.manager.family(alloc, id) catch |err| switch (err) {
+        error.NotFound, error.InvalidArgument => {
+            var v1 = (store.openProfileFolder(profile_paths.sessions_dir_name) catch return error.SessionNotFound) orelse return error.SessionNotFound;
+            defer v1.close();
+            const stat = v1.dir.statFile(io_mod.getIo(), id, .{ .follow_symlinks = false }) catch return error.SessionNotFound;
+            return if (stat.kind == .directory) error.SessionLegacy else error.SessionNotFound;
+        },
+        else => return err,
+    };
+}
+
+/// Deletes the v2 session `family[0]` with the children it owns, then the
+/// terminal and side folders fx keeps beside each member. A session another
+/// process holds is SessionBusy; one already gone deletes only those folders.
+pub fn deleteSession(store: *Store, family: []const []const u8) !void {
+    if (family.len == 0) return;
+    store.manager.delete(family[0]) catch |err| switch (err) {
+        error.NotFound, error.InvalidArgument => {},
         error.Busy => return error.SessionBusy,
         else => return err,
     };
-    store.removeFiles(id, "deleted");
+    for (family) |member| store.removeFiles(member, "deleted");
 }
 
 fn summaryOf(alloc: Allocator, scratch: Allocator, item: sm.Summary) !session_store.SessionSummary {
@@ -6786,15 +6803,32 @@ test "deleting a saved session removes its history and the folders beside it" {
         owner.close();
     }
 
-    try deleteSession(&t.store, id);
+    const family = try sessionFamily(&t.store, testing.allocator, id);
+    defer {
+        for (family) |member| testing.allocator.free(member);
+        testing.allocator.free(family);
+    }
+    try testing.expectEqual(@as(usize, 1), family.len);
+    try deleteSession(&t.store, family);
     try testing.expectError(error.NotFound, t.store.manager.peek(testing.allocator, id));
     try testing.expect(!pathExists(&t, &.{ profile_paths.root_dir_name, profile_paths.sessions_dir_name, session_layout.sessions_v2_dir, id }));
     try testing.expect(!pathExists(&t, &.{ profile_paths.root_dir_name, terminal_dir_name, id }));
     try testing.expect(!pathExists(&t, &.{ profile_paths.root_dir_name, files_dir_name, id }));
 
     // A second delete finds nothing, and a forged id never reaches the disk.
-    try testing.expectError(error.SessionNotFound, deleteSession(&t.store, id));
-    try testing.expectError(error.SessionNotFound, deleteSession(&t.store, "../escape"));
+    try testing.expectError(error.SessionNotFound, sessionFamily(&t.store, testing.allocator, id));
+    try testing.expectError(error.SessionNotFound, sessionFamily(&t.store, testing.allocator, "../escape"));
+}
+
+test "a legacy session is refused for deletion and kept" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const root_id = (try v1.fixture("family", 3))[0];
+    try testing.expectError(error.SessionLegacy, sessionFamily(&t.store, testing.allocator, root_id));
+    try testing.expect(pathExists(&t, &.{ profile_paths.root_dir_name, profile_paths.sessions_dir_name, root_id }));
 }
 
 test "recover copies the folders outside the manager, never a link, and says when it left one out" {

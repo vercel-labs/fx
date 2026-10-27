@@ -285,6 +285,35 @@ pub fn nodeBlobDir(alloc: Allocator, home: []const u8, id: []const u8) ![]u8 {
     return std.Io.Dir.path.join(alloc, &.{ home, profile_paths.root_dir_name, profile_paths.sessions_dir_name, session_layout.sessions_v2_dir, id, "blobs" });
 }
 
+/// Removes the saved kernels of deleted session `id`: `kernels/<id>` and
+/// each `kernels/<id>@<name>`. One the pool still holds stays, since its
+/// final snapshot would write the folder again. True when none is left.
+pub fn removeSaved(alloc: Allocator, home: []const u8, id: []const u8) bool {
+    session_paths.validateSessionId(id) catch return false;
+    const io = io_mod.getIo();
+    const root = std.Io.Dir.path.join(alloc, &.{ home, profile_paths.root_dir_name, "kernels" }) catch return false;
+    defer alloc.free(root);
+    var dir = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch |err| return err == error.FileNotFound;
+    defer dir.close(io);
+    var removed_all = true;
+    var it = dir.iterate();
+    while (it.next(io) catch return false) |entry| {
+        if (entry.kind != .directory or !std.mem.startsWith(u8, entry.name, id)) continue;
+        const rest = entry.name[id.len..];
+        if (rest.len > 0 and !(rest[0] == '@' and validName(rest[1..]))) continue;
+        const path = std.Io.Dir.path.join(alloc, &.{ root, entry.name }) catch return false;
+        defer alloc.free(path);
+        if (pool.stateOf(path) != null) {
+            removed_all = false;
+            continue;
+        }
+        dir.deleteTree(io, entry.name) catch {
+            removed_all = false;
+        };
+    }
+    return removed_all;
+}
+
 /// The kernel a node gets without naming one.
 pub const default_name = "default";
 /// Named kernels one node may hold besides its default one.
@@ -350,4 +379,23 @@ test "kernel slot controls report no kernel until one is created" {
 test {
     _ = kernel;
     _ = pool;
+}
+
+test "removing a deleted session's kernels keeps every other session's" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(home);
+    const kernels = profile_paths.root_dir_name ++ "/kernels/";
+    for ([_][]const u8{ "abcdefghijkl", "abcdefghijkl@a", "abcdefghijklm", "abcdefghijkm@a" }) |name| {
+        const path = try std.mem.concat(std.testing.allocator, u8, &.{ kernels, name });
+        defer std.testing.allocator.free(path);
+        try tmp.dir.createDirPath(io, path);
+    }
+    try std.testing.expect(removeSaved(std.testing.allocator, home, "abcdefghijkl"));
+    var dir = try tmp.dir.openDir(io, kernels, .{});
+    defer dir.close(io);
+    for ([_][]const u8{ "abcdefghijkl", "abcdefghijkl@a" }) |name| try std.testing.expectError(error.FileNotFound, dir.statFile(io, name, .{}));
+    for ([_][]const u8{ "abcdefghijklm", "abcdefghijkm@a" }) |name| _ = try dir.statFile(io, name, .{});
 }

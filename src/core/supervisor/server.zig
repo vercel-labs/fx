@@ -329,8 +329,11 @@ pub const Daemon = struct {
         return session;
     }
 
-    /// Drops sessions whose first open failed. Their executors have ended.
+    /// Drops sessions whose first open failed or that were deleted, then
+    /// saves the registry without them. Their executors have ended or are
+    /// ending. Holds `route_mutex`, so no request reaches a dropped one.
     fn reapRetired(self: *Daemon) void {
+        var reaped = false;
         var index: usize = 0;
         while (index < self.sessions.items.len) {
             const session = self.sessions.items[index];
@@ -340,9 +343,18 @@ pub const Daemon = struct {
             }
             self.registry_mutex.lockUncancelable(io_mod.getIo());
             _ = self.sessions.orderedRemove(index);
+            if (self.last_attached_id) |attached| if (session.id.len > 0 and std.mem.eql(u8, attached, session.id)) {
+                self.alloc.free(attached);
+                self.last_attached_id = null;
+            };
             self.registry_mutex.unlock(io_mod.getIo());
             session.destroy();
+            reaped = true;
         }
+        if (!reaped) return;
+        self.saved_index_stale.store(true, .release);
+        self.noteListChange();
+        self.persist() catch |err| std.debug.print("proto-fx: saving the session registry failed: {s}\n", .{@errorName(err)});
     }
 
     /// Refreshes the saved-session index when it is stale, adds a row for
@@ -489,60 +501,6 @@ pub const Daemon = struct {
         return protocol.encode(arena, protocol.SessionList{ .sessions = rows.items, .last_attached_id = attached });
     }
 
-    /// Deletes `session` and its saved history. The session in view and one
-    /// another client watches are refused: deleting the former would leave
-    /// the composer without a session, and deleting the latter would drop a
-    /// live view. The registry and state file drop it before its files do,
-    /// so a restart cannot reopen what the user deleted.
-    fn deleteSession(self: *Daemon, session: *Session, id: []const u8, arena: Allocator) ![]const u8 {
-        {
-            self.registry_mutex.lockUncancelable(io_mod.getIo());
-            defer self.registry_mutex.unlock(io_mod.getIo());
-            if (self.last_attached_id) |attached| if (std.mem.eql(u8, attached, id)) return error.SessionInUse;
-        }
-        if (session.hasViewers()) return error.SessionInUse;
-        if (session.isActive()) return error.SessionBusy;
-        const owned_id = try self.alloc.dupe(u8, id);
-        defer self.alloc.free(owned_id);
-        {
-            self.registry_mutex.lockUncancelable(io_mod.getIo());
-            defer self.registry_mutex.unlock(io_mod.getIo());
-            for (self.sessions.items, 0..) |entry, index| if (entry == session) {
-                _ = self.sessions.orderedRemove(index);
-                break;
-            };
-        }
-        self.persist() catch |err| {
-            // Put it back: the registry and state file still agree, and its
-            // executor is untouched.
-            self.registry_mutex.lockUncancelable(io_mod.getIo());
-            self.sessions.append(self.alloc, session) catch {};
-            self.registry_mutex.unlock(io_mod.getIo());
-            return err;
-        };
-        session.stopExecutor();
-        session.destroy();
-        var store = session_adapter.Store.open(self.alloc, self.home) catch |err| {
-            self.saved_index_stale.store(true, .release);
-            self.noteListChange();
-            return err;
-        };
-        defer store.deinit(self.alloc);
-        session_adapter.deleteSession(&store, owned_id) catch |err| switch (err) {
-            // A session that never reached the disk has no history left to
-            // remove; the live row is already gone.
-            error.SessionNotFound => {},
-            else => {
-                self.saved_index_stale.store(true, .release);
-                self.noteListChange();
-                return err;
-            },
-        };
-        self.saved_index_stale.store(true, .release);
-        self.noteListChange();
-        return protocol.encode(arena, protocol.Ack{});
-    }
-
     /// Restores the registry from the state file. Sessions this supervisor
     /// owned reopen on their executors; a failure is recorded on the session.
     fn restore(self: *Daemon) !void {
@@ -610,10 +568,12 @@ pub const Daemon = struct {
                 if (job.watcher()) |conn| self.unwatchList(conn);
                 return try protocol.encode(arena, protocol.Ack{});
             },
-            .delete => |request| {
-                const session = self.find(request.session_id) orelse return error.SessionNotFound;
-                const reply = try self.deleteSession(session, request.session_id, arena);
-                return reply;
+            // A delete runs on the session's executor (`session_delete.zig`);
+            // one the registry no longer holds is already gone, unless the
+            // saved index still lists it.
+            .delete => |request| if (self.find(request.session_id) == null) {
+                if (self.saved_index.contains(request.session_id)) return try protocol.encode(arena, protocol.Failure{ .@"error" = "The supervisor has not loaded this session, so it was not deleted." });
+                return try protocol.encode(arena, protocol.Ack{});
             },
             .create => |request| {
                 const existing = if (request.@"resume") |id| self.find(id) else null;
@@ -769,9 +729,10 @@ test "the idle limit defaults to ten minutes and zero disables it" {
     try std.testing.expectEqual(@as(i64, 0), idleLimitMs("0"));
 }
 
-test "deleting a session refuses the attached and busy ones, then drops the rest" {
+test "a delete runs on the executor: refused while in use or busy, else saved stopped and reaped" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
+    const session_delete = @import("session_delete.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
@@ -782,30 +743,29 @@ test "deleting a session refuses the attached and busy ones, then drops the rest
     defer daemon.deinit();
 
     const session = try daemon.register("S1", "/w", "one");
+    daemon.last_attached_id = try alloc.dupe(u8, "S1");
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
+    const refused = session_delete.Refusal.busy.text();
 
-    // The session the user last attached stays.
-    daemon.last_attached_id = try alloc.dupe(u8, "S1");
-    try std.testing.expectError(error.SessionInUse, daemon.deleteSession(session, "S1", a));
-    try std.testing.expect(daemon.find("S1") != null);
-    alloc.free(daemon.last_attached_id.?);
-    daemon.last_attached_id = null;
-
-    // A turn or host request keeps it too.
-    session.record_mutex.lockUncancelable(io_mod.getIo());
+    // A turn keeps it, and so does an armed heartbeat.
     session.record.running = true;
-    session.record_mutex.unlock(io_mod.getIo());
-    try std.testing.expectError(error.SessionBusy, daemon.deleteSession(session, "S1", a));
-    try std.testing.expect(daemon.find("S1") != null);
-    session.record_mutex.lockUncancelable(io_mod.getIo());
+    try std.testing.expect(std.mem.find(u8, try session_delete.run(session, a), refused) != null);
     session.record.running = false;
-    session.record_mutex.unlock(io_mod.getIo());
+    session.record.heartbeat.interval_ms = 60_000;
+    session.record.heartbeat.paused = false;
+    try std.testing.expect(std.mem.find(u8, try session_delete.run(session, a), session_delete.Refusal.heartbeat.text()) != null);
+    session.record.heartbeat.paused = true;
+    try std.testing.expect(!session.retired.load(.acquire));
 
-    _ = try daemon.deleteSession(session, "S1", a);
+    // The last attached session is no longer special; with no viewer and no
+    // work it goes, and the registry drops it.
+    try std.testing.expectEqualStrings("{\"ok\":true}", try session_delete.run(session, a));
+    try std.testing.expect(session.retired.load(.acquire));
+    daemon.reapRetired();
     try std.testing.expect(daemon.find("S1") == null);
-    try std.testing.expectEqual(@as(usize, 0), daemon.sessions.items.len);
+    try std.testing.expect(daemon.last_attached_id == null);
     const saved = try tmp.dir.readFileAlloc(io, "sessions.json", alloc, .limited(1 << 16));
     defer alloc.free(saved);
     try std.testing.expect(std.mem.find(u8, saved, "S1") == null);

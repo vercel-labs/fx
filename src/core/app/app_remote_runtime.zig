@@ -513,19 +513,11 @@ pub fn Runtime(comptime App: type) type {
                 const message = outcome.value.@"error" orelse "The local session request failed";
                 if (kind == .history_page) return failHistoryPage(app, message);
                 if (kind == .list or kind == .children) app.input_runtime.session_browser.fail(message);
+                // The supervisor words a refused delete itself
+                // (`supervisor/session_delete.zig`).
                 if (kind == .delete) {
                     app.input_runtime.session_browser.cancelDelete();
-                    const friendly = if (std.mem.eql(u8, message, "SessionInUse"))
-                        "The session is open in another view or another fx process and was not deleted."
-                    else if (std.mem.eql(u8, message, "SessionBusy"))
-                        "The session is still busy and was not deleted."
-                    else if (std.mem.eql(u8, message, "SessionNotFound"))
-                        "The session was already deleted."
-                    else
-                        message;
-                    try app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = friendly }, true);
                     app.shell.render_requests.request(.footer);
-                    return;
                 }
                 try app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = message }, true);
                 return;

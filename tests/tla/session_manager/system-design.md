@@ -1767,6 +1767,20 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   undo at any turn must give that turn's exact Python state. **Alternative:**
   one snapshot file per kernel, which kept only the newest state.
 
+- **D100 Decision:** the supervisor deletes a session as a job on that
+  session's executor. The job refuses while a client watches the session,
+  another request waits behind it, or a turn, host request, running child,
+  or armed heartbeat is outstanding. It then saves the session stopped and
+  closes its host, deletes the v2 family through the manager (D13), the
+  terminal and side folders of every member, and their kernel folders, and
+  marks the session retired; the accept loop drops the row and saves the
+  registry last. A crash after the stopped save never reopens the session,
+  and discovery prunes a stopped row whose conversation is gone. A v1 root
+  not converted yet (D59) is refused, not reported deleted. **Why:** only
+  the executor starts work on a session, so its check and the stop that
+  follows see the same state. **Alternative:** checking from a connection
+  thread, which a request queued between the check and the stop defeats.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

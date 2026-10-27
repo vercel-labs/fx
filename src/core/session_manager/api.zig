@@ -487,6 +487,39 @@ pub const Manager = struct {
         return m.deleteDepth(id, 0);
     }
 
+    /// `id` and every child `delete` would remove with it, root first.
+    /// Caller owns the list and each id.
+    pub fn family(m: *Manager, gpa: std.mem.Allocator, id: []const u8) DeleteError![][]u8 {
+        try checkId(id);
+        if (!try readyToRead(m)) return error.NotFound;
+        var ids: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (ids.items) |member| gpa.free(member);
+            ids.deinit(gpa);
+        }
+        try ids.append(gpa, try gpa.dupe(u8, id));
+        var start: usize = 0;
+        // The same depth `delete` walks.
+        var depth: usize = 0;
+        while (depth < 8 and start < ids.items.len) : (depth += 1) {
+            const end = ids.items.len;
+            for (start..end) |index| {
+                const children = session_mod.childrenOf(&m.env, ids.items[index]) catch |err| switch (err) {
+                    error.NotFound => if (index == 0) return err else continue,
+                    else => return err,
+                };
+                defer {
+                    for (children) |child| m.gpa.free(child);
+                    m.gpa.free(children);
+                }
+                try ids.ensureUnusedCapacity(gpa, children.len);
+                for (children) |child| ids.appendAssumeCapacity(try gpa.dupe(u8, child));
+            }
+            start = end;
+        }
+        return ids.toOwnedSlice(gpa);
+    }
+
     fn deleteDepth(m: *Manager, id: []const u8, depth: usize) DeleteError!void {
         const children = try session_mod.childrenOf(&m.env, id);
         defer {
@@ -1220,6 +1253,16 @@ const api_tests = struct {
         try testing.expectEqual(@as(usize, 2), ids.len);
         for (ids) |id| try testing.expect(!std.mem.eql(u8, id, c_id));
 
+        // The family is what a delete removes: the root, then its child.
+        const members = try m.family(gpa, p_id);
+        defer {
+            for (members) |member| gpa.free(member);
+            gpa.free(members);
+        }
+        try testing.expectEqual(@as(usize, 2), members.len);
+        try testing.expectEqualStrings(p_id, members[0]);
+        try testing.expectEqualStrings(c_id, members[1]);
+
         try testing.expectError(error.Busy, m.delete(p_id));
         p.release();
         try m.delete(p_id);
@@ -1231,6 +1274,7 @@ const api_tests = struct {
         // A deleted id never comes back, not even through an import.
         try testing.expectError(error.Exists, m.openImport(.{ .id = p_id, .workspace = "/w", .host = .app, .created_ms = 1 }));
         try testing.expectError(error.NotFound, m.delete(p_id));
+        try testing.expectError(error.NotFound, m.family(gpa, p_id));
     }
 
     test "a child opens under the id its parent recorded, until its first turn creates the log (D34)" {

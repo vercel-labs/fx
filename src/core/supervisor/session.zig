@@ -22,6 +22,7 @@ const watch_mod = @import("watch.zig");
 const child_views = @import("child_views.zig");
 const host_commands = @import("../../acp/commands.zig");
 const kernel_slot = @import("../kernel/slot.zig");
+const session_delete = @import("session_delete.zig");
 const Daemon = server.Daemon;
 const Conn = server.Conn;
 const Allocator = std.mem.Allocator;
@@ -49,15 +50,12 @@ pub const Session = struct {
     jobs_mutex: std.Io.Mutex = .init,
     jobs_cond: std.Io.Condition = .init,
     jobs: std.ArrayList(*Job) = .empty,
-    /// True while the executor runs a job it removed from the queue. Set and
-    /// cleared under `jobs_mutex`, so deletion sees a queued and a running
-    /// request alike.
-    executing: bool = false,
     quit: bool = false,
     /// `publish` added something watchers have not seen.
     push_due: bool = false,
     thread: ?std.Thread = null,
-    /// A new session whose open failed. The accept loop reaps it.
+    /// A new session whose open failed, or a deleted one. The accept loop
+    /// reaps it.
     retired: std.atomic.Value(bool) = .init(false),
     /// This session has work an idle exit would cut short: a queued or
     /// running request, a turn or host job, a running subagent, a kernel
@@ -145,6 +143,12 @@ pub const Session = struct {
         }
         self.jobs_mutex.lockUncancelable(io_mod.getIo());
         defer self.jobs_mutex.unlock(io_mod.getIo());
+        // The executor ended or is ending: nothing would run the job.
+        if (self.quit) {
+            server.answerFailure(job, "SupervisorStopping");
+            job.destroy(alloc);
+            return;
+        }
         self.jobs.append(alloc, job) catch {
             server.answerFailure(job, "OutOfMemory");
             job.destroy(alloc);
@@ -193,10 +197,7 @@ pub const Session = struct {
         defer self.jobs_mutex.unlock(io);
         while (true) {
             if (self.quit) return .quit;
-            if (self.jobs.items.len > 0) {
-                self.executing = true;
-                return .{ .job = self.jobs.orderedRemove(0) };
-            }
+            if (self.jobs.items.len > 0) return .{ .job = self.jobs.orderedRemove(0) };
             if (self.push_due) {
                 self.push_due = false;
                 return .push;
@@ -214,12 +215,7 @@ pub const Session = struct {
         while (true) {
             switch (self.next()) {
                 .quit => break,
-                .job => |job| {
-                    self.run(job);
-                    self.jobs_mutex.lockUncancelable(io_mod.getIo());
-                    self.executing = false;
-                    self.jobs_mutex.unlock(io_mod.getIo());
-                },
+                .job => |job| self.run(job),
                 .tick, .push => {},
             }
             const now = io_mod.milliTimestamp();
@@ -231,8 +227,10 @@ pub const Session = struct {
             self.noteWork();
             if (self.retired.load(.acquire)) break;
         }
-        // Requests that arrived after shutdown began get an answer.
+        // Requests that arrived after shutdown began get an answer, and
+        // `submit` refuses the rest.
         self.jobs_mutex.lockUncancelable(io_mod.getIo());
+        self.quit = true;
         const left = self.jobs.toOwnedSlice(self.daemon.alloc) catch &.{};
         self.jobs_mutex.unlock(io_mod.getIo());
         defer self.daemon.alloc.free(left);
@@ -325,7 +323,8 @@ pub const Session = struct {
                 if (job.watcher()) |conn| self.watchers.unwatch(self.daemon.alloc, conn, request.topic);
                 return protocol.encode(arena, protocol.Ack{});
             },
-            .ping, .shutdown, .list, .delete => return error.UnknownCommand,
+            .delete => return session_delete.run(self, arena),
+            .ping, .shutdown, .list => return error.UnknownCommand,
         }
     }
 
@@ -605,7 +604,8 @@ pub const Session = struct {
         return self.pending.items.len;
     }
 
-    fn stop(self: *Session, arena: Allocator) ![]const u8 {
+    /// Saves the session stopped, then closes its host. Executor-only.
+    pub fn stop(self: *Session, arena: Allocator) ![]const u8 {
         var next_record = try self.record.clone(self.daemon.alloc);
         next_record.stopped = true;
         next_record.heartbeat.paused = true;
@@ -756,28 +756,6 @@ pub const Session = struct {
     }
 
     // -- views ---------------------------------------------------------------
-
-    /// Whether a turn or a host request still needs its executor. Deletion
-    /// refuses one rather than waiting for work it would cut off.
-    pub fn isActive(self: *Session) bool {
-        const pending = self.pendingCount();
-        const queued = blk: {
-            self.jobs_mutex.lockUncancelable(io_mod.getIo());
-            defer self.jobs_mutex.unlock(io_mod.getIo());
-            break :blk self.executing or self.jobs.items.len > 0;
-        };
-        self.record_mutex.lockUncancelable(io_mod.getIo());
-        defer self.record_mutex.unlock(io_mod.getIo());
-        return queued or self.record.running or pending > 0;
-    }
-
-    /// Whether a connection watches this session. Deletion refuses one in
-    /// use rather than dropping a viewer's live view.
-    pub fn hasViewers(self: *Session) bool {
-        self.watchers.mutex.lockUncancelable(io_mod.getIo());
-        defer self.watchers.mutex.unlock(io_mod.getIo());
-        return self.watchers.items.items.len > 0;
-    }
 
     /// The summary the accept loop lists. Locks the record; strings borrow
     /// `arena`.
