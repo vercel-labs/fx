@@ -134,6 +134,8 @@ pub const NodeRefusal = enum {
     nothing_to_fork,
     /// `/compact` on a subagent: its own turns compact it.
     compact,
+    /// Its parent's fleet terminated it (D102).
+    terminated,
 
     pub fn text(self: NodeRefusal) []const u8 {
         return switch (self) {
@@ -144,6 +146,7 @@ pub const NodeRefusal = enum {
             .message_running => "Another message to a subagent is still running. Send this one when it finishes.",
             .capacity => "Every subagent run slot of this session is in use. Send your message when one finishes.",
             .abandoned => "This subagent was abandoned when its parent was rewound. You can read it, but it takes no messages or changes.",
+            .terminated => "This worker was terminated by its parent. You can read it, but it takes no messages or changes.",
             .rewind_past_compaction => "This subagent's latest turn is covered by a compaction, so it cannot be rewound.",
             .invalid_effort => "usage: /effort auto|minimal|low|medium|high",
             .nothing_to_fork => "This subagent has no turn to fork yet.",

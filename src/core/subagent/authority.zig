@@ -549,7 +549,7 @@ test "authority capture permits registry access and rejects changed work" {
                 },
             }
             self.store.save(alloc, registry) catch return error.HostAuthorityUnavailable;
-            return HostAuthority.capture(alloc, &.{ "read_file", "subagent" }, &.{}, .{}, &.{}) catch
+            return HostAuthority.capture(alloc, &.{ "read_file", "fleet" }, &.{}, .{}, &.{}) catch
                 return error.OutOfMemory;
         }
     };
@@ -602,7 +602,7 @@ test "authority capture permits registry access and rejects changed work" {
                 try std.testing.expectEqualStrings("read_file", snapshot.tools[0]);
                 var current = try store.load(alloc);
                 defer current.deinit(alloc);
-                var host = try HostAuthority.capture(alloc, &.{ "read_file", "subagent" }, &.{}, .{}, &.{});
+                var host = try HostAuthority.capture(alloc, &.{ "read_file", "fleet" }, &.{}, .{}, &.{});
                 defer host.deinit(alloc);
                 try std.testing.expectEqual(
                     authorityGeneration("authority-child", parent.parent.id(), current.generation, host.generation),

@@ -276,7 +276,7 @@ pub const Messages = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
         const node = (try resolve(arena, state, node_id)) orelse return .unknown_node;
-        if (node.abandoned) return .abandoned;
+        if (node.readOnly()) |refusal| return refusal;
         // The node's parent runs the message, as its own `message` call.
         const above = node.path[0 .. node.path.len - 1];
         const lease: ?*node_hosts.Entry = if (above.len == 0) null else node_ops.lease(root, above) catch |err| return switch (err) {
@@ -347,6 +347,15 @@ const Resolved = struct {
     /// The node, or one of its ancestors, was abandoned by a rewind of its
     /// parent (D97): it is read-only.
     abandoned: bool,
+    /// The node, or one of its ancestors, was terminated (D102): read-only too.
+    terminated: bool = false,
+
+    /// Why a change to this node is refused, or null when it may change.
+    fn readOnly(self: Resolved) ?host_commands.NodeRefusal {
+        if (self.abandoned) return .abandoned;
+        if (self.terminated) return .terminated;
+        return null;
+    }
 };
 
 /// More hops than any tree has levels, so a damaged parent chain ends.
@@ -359,6 +368,7 @@ fn resolve(arena: Allocator, state: *server.ServerState, node_id: []const u8) !?
     const active = if (state.active_session) |*session| session else return null;
     var path: std.ArrayList([]const u8) = .empty;
     var abandoned = false;
+    var terminated = false;
     var current = node_id;
     for (0..max_resolve_hops) |_| {
         const peeked = store.manager.peek(arena, current) catch return null;
@@ -366,10 +376,12 @@ fn resolve(arena: Allocator, state: *server.ServerState, node_id: []const u8) !?
         if (!std.mem.eql(u8, peeked.root, active.session_id)) return null;
         const above = store.manager.peek(arena, parent) catch return null;
         for (above.state.children.items) |child| {
-            if (std.mem.eql(u8, child.id, current) and child.abandoned) abandoned = true;
+            if (!std.mem.eql(u8, child.id, current)) continue;
+            if (child.abandoned) abandoned = true;
+            if (child.terminated != null) terminated = true;
         }
         try path.insert(arena, 0, current);
-        if (std.mem.eql(u8, parent, active.session_id)) return .{ .path = path.items, .abandoned = abandoned };
+        if (std.mem.eql(u8, parent, active.session_id)) return .{ .path = path.items, .abandoned = abandoned, .terminated = terminated };
         current = parent;
     }
     return null;
@@ -401,7 +413,7 @@ pub fn runCommand(arena: Allocator, state: *server.ServerState, node_id: []const
         // A node has no file journal of its own: undo on it rewinds its
         // newest turn (D97).
         .undo => {
-            if (node.abandoned) return .abandoned;
+            if (node.readOnly()) |refusal| return refusal;
             const outcome = node_ops.rewindLatest(arena, root, node.path) catch |err| return switch (err) {
                 error.NodeUnavailable => .unknown_node,
                 else => err,
@@ -437,7 +449,7 @@ pub fn runCommand(arena: Allocator, state: *server.ServerState, node_id: []const
                 try host_commands.writeResult(out, command, .{ .text = text });
                 return null;
             };
-            if (node.abandoned) return .abandoned;
+            if (node.readOnly()) |refusal| return refusal;
             const effort: ?types.ReasoningEffort = if (command == .effort) types.ReasoningEffort.parse(wanted) orelse return .invalid_effort else null;
             const entry = node_ops.lease(root, node.path) catch |err| return switch (err) {
                 error.NodeBusy => .node_running,
@@ -492,7 +504,7 @@ pub fn kernelControl(alloc: Allocator, state: *server.ServerState, node_id: []co
     const root = state.subagent_host orelse return error.NoActiveSession;
     const active = if (state.active_session) |*session| session else return error.NoActiveSession;
     const node = (try resolve(arena_state.allocator(), state, node_id)) orelse return error.ChildNotFound;
-    if (node.abandoned and action != .status) return error.NodeAbandoned;
+    if (node.readOnly() != null and action != .status) return error.NodeAbandoned;
     if (action != .status and action != .interrupt and root.tree.nodes.subtreeBusy(node_id)) return error.SessionBusy;
     var slot: kernel.Slot = .{ .home_override = state.cfg.home_override, .retainer = root.tree };
     defer slot.deinit();

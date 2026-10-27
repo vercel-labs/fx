@@ -406,13 +406,13 @@ test "a child advertises its admitted built-ins and every dynamic tool" {
     const alloc = std.testing.allocator;
     const builtin_tools = @import("../../builtins/tools.zig");
     const registry: tool_dispatch.Registry = .{ .tools = &.{ builtin_tools.read_file, builtin_tools.fleet } };
-    const advertised = [_][]const u8{ "read_file", "subagent", "mcp_lookup" };
+    const advertised = [_][]const u8{ "read_file", "fleet", "mcp_lookup" };
     const leaf = try admittedNames(alloc, registry, &.{"read_file"}, &advertised);
     defer alloc.free(leaf);
     try std.testing.expectEqual(@as(usize, 2), leaf.len);
     try std.testing.expectEqualStrings("read_file", leaf[0]);
     try std.testing.expectEqualStrings("mcp_lookup", leaf[1]);
-    const spawner = try admittedNames(alloc, registry, &.{ "read_file", "subagent" }, &advertised);
+    const spawner = try admittedNames(alloc, registry, &.{ "read_file", "fleet" }, &advertised);
     defer alloc.free(spawner);
     try std.testing.expectEqual(@as(usize, 3), spawner.len);
 }

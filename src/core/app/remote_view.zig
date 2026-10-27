@@ -267,8 +267,9 @@ pub fn Runtime(comptime App: type) type {
             remote.child_status_len = @min(status.len, remote.child_status.len);
             @memcpy(remote.child_status[0..remote.child_status_len], status[0..remote.child_status_len]);
             remote.child_live_active = live_active;
+            remote.rebuildBreadcrumb(app.alloc) catch {};
             app.stream.active = remote.viewedChildRunning() or remote.submissionQueued();
-            if (std.mem.eql(u8, status, "awaiting_approval")) {
+            if (std.mem.eql(u8, @TypeOf(remote.*).statusPhase(status), "awaiting_approval")) {
                 if (app.stream.waiting_since_ms == 0) app.stream.waiting_since_ms = io_mod.milliTimestamp();
             } else if (app.stream.waiting_since_ms != 0) {
                 app.stream.turn_started_ms += io_mod.milliTimestamp() - app.stream.waiting_since_ms;

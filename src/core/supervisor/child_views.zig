@@ -80,7 +80,7 @@ fn liveRows(read: *const Read, node: *tool_host.Runtime) anyerror!Found {
             .id = child.id,
             .parent_id = node.node_id,
             .name = child.agentName() orelse "subagent",
-            .status = liveStatus(child),
+            .status = try liveStatus(read.arena, child),
             .detail = if (child.active) |active| active.message else child.instructions(),
             .depth = node.depth + 1,
             .work_id = work_id,
@@ -112,10 +112,12 @@ fn liveRows(read: *const Read, node: *tool_host.Runtime) anyerror!Found {
     return .{ .rows = all, .live = live };
 }
 
-fn liveStatus(child: *const child_state.Child) []const u8 {
-    if (child.phase != .finished) return @tagName(child.phase);
-    const outcome = child.last_outcome orelse return "finished";
-    return @tagName(outcome);
+fn liveStatus(arena: Allocator, child: *const child_state.Child) ![]const u8 {
+    if (child.terminated) return "terminated";
+    const base = if (child.phase != .finished) @tagName(child.phase) else if (child.last_outcome) |outcome| @tagName(outcome) else "finished";
+    // A worker's queued turns wait behind this one (D102).
+    if (child.queue.len > 0) return arena.print("{s} · {d} queued", .{ base, child.queue.len });
+    return base;
 }
 
 /// fx's data on the saved `child_spawned` and `child_finished` lines.
@@ -146,6 +148,10 @@ fn savedRows(arena: Allocator, store: *session_adapter.Store, node_id: []const u
         // Saved work with no live host stopped: its parent's turn ended.
         const status = if (child.abandoned)
             "abandoned"
+        else if (child.terminated != null)
+            "terminated"
+        else if (child.queue.items.len > 0)
+            try arena.print("{s} · {d} queued", .{ if (child.open) "interrupted" else "idle", child.queue.items.len })
         else if (child.open)
             "interrupted"
         else if (outcome) |value|
