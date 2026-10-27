@@ -39,11 +39,6 @@ pub fn supported(comptime App: type) bool {
 
 pub fn Runtime(comptime App: type) type {
     return struct {
-        pub fn active(app: *const App) bool {
-            if (comptime !supported(App)) return false;
-            return app.model_hub.active;
-        }
-
         /// Opens the hub. `/provider <name>` starts on that provider.
         pub fn open(app: *App, start: hub.Start, args: []const u8) !void {
             if (comptime !supported(App)) return;
@@ -72,7 +67,7 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        pub fn close(app: *App) void {
+        fn close(app: *App) void {
             if (comptime !supported(App)) return;
             if (!app.model_hub.active) return;
             app.model_hub.close(app.alloc);
@@ -309,7 +304,7 @@ pub fn Runtime(comptime App: type) type {
             return view_model orelse provider_runtime.model(app);
         }
 
-        pub fn buildSnapshot(app: *App) !hub.Snapshot {
+        fn buildSnapshot(app: *App) !hub.Snapshot {
             var builder: catalog.Builder = .init(app.alloc);
             errdefer builder.deinit();
             const arena = builder.arena();

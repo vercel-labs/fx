@@ -26,7 +26,7 @@ pub const Paint = struct {
 };
 
 /// Below this width the sidebar and the list take turns.
-pub const compact_width: u16 = 64;
+const compact_width: u16 = 64;
 const min_rows: u16 = 6;
 
 pub fn paint(alloc: Allocator, state: *const hub.State, rows: u16, cols: u16, clear: bool) !Paint {

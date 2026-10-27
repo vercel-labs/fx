@@ -240,7 +240,7 @@ fn modelBefore(providers: []const Provider, a: Model, b: Model) bool {
 /// A fuzzy match score for `query` against `text`, or null when the query's
 /// characters do not all appear in order. Higher is better: consecutive
 /// characters and matches at word starts score more.
-pub fn fuzzyScore(text: []const u8, query: []const u8) ?u32 {
+fn fuzzyScore(text: []const u8, query: []const u8) ?u32 {
     if (query.len == 0) return 0;
     var score: u32 = 0;
     var position: usize = 0;

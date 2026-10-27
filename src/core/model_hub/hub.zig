@@ -84,7 +84,7 @@ pub const Effect = union(enum) {
     toggle_web_search: usize,
 };
 
-pub const max_query_bytes = 128;
+const max_query_bytes = 128;
 const page_rows = 10;
 
 pub const State = struct {
