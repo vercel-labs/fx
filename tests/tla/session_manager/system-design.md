@@ -1846,6 +1846,35 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   terminated worker must never run again. **Alternative:** a queue kept
   only in memory, which a restart loses.
 
+- **D120 Decision:** the model's `checkpoint(goal)` and `rewind(report)`
+  reuse D97's `rewound` line, with a seq `from`: written inside the open
+  turn, it drops that turn's items from `from` up to the line, and
+  abandons the children first spawned after them; the turn and its number
+  stay, and replay skips exactly those items. A checkpoint belongs to the
+  running turn and is read from its messages: the newest successful
+  `checkpoint` call with no successful `rewind` after it. So it survives
+  whatever keeps the turn, a detached client or a resumed turn, holds at
+  most one open, and closes with the turn. A rewind keeps the steps
+  through the checkpoint's and its own step, whose result carries the
+  report; the agent loop applies it when the step ends, the saved turn
+  first and then its messages. It keeps the node's kernels and store,
+  because an exploration usually computes results worth keeping in
+  variables, and it never undoes file edits; the tool descriptions say
+  both. It is refused while a worker or child node of the node runs, and
+  it only closes the checkpoint when a compaction came after it, whose
+  summary already covers the exploration. A reply while a checkpoint is
+  open gets a hidden reminder instead of ending the turn, at most three
+  a turn; then the turn ends and the person is told. The footer names
+  the open checkpoint, and the compact transcript shows a rewind as one
+  `branch · ctrl+o` divider. `Checkpoint.tla` checks `AtMostOneOpen`,
+  `DropsOnlySinceCheckpoint`, `NoRewindWhileBusy`, `KeepsPython` and
+  `RemindersBounded`. **Why:** proto's investigations keep only their
+  findings in context, and fx can do the same without a second rewind
+  path. **Alternative:** restoring the kernels to the checkpoint, which
+  D99 makes exact but throws away what the exploration computed; or a
+  checkpoint that outlives its turn, whose rewind would have to drop a
+  person's later prompts.
+
 - **D125 Decision:** recall reads a node's history from its log, not from
   the compactor's M and T records. The log keeps every turn word for word
   after a compaction (only the context restarts at the summary), it leaves
