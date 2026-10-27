@@ -2268,6 +2268,120 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   did too. **Why:** proto's `model: "@worker"`. **Alternative:** letting
   the model resolve roles itself from a listing.
 
+- **D175 Decision:** stream rules (TTSR) are proto's: Markdown whose
+  frontmatter holds `description`, `globs`, `scope` (`text`, `thinking`,
+  `tool`, `tool:<name>`, `tool:<name>(<glob>)`), `interruptMode`
+  (`never`, `prose-only`, `tool-only`, `always`) and a `match:` tree, with
+  the body as the instruction (`src/core/ttsr`). Sources in priority order:
+  `<workspace>/.proto-fx/rules`, `~/.proto-fx/rules`, Cursor's
+  `.cursor/rules/*.mdc` (project and home), Windsurf's `.windsurf/rules`
+  and `global_rules.md`, then 27 built-in rules ported from proto. proto's
+  two Python kernel rules are left out, since they teach a prelude
+  proto-fx lacks, and `tool:bash` scopes become `tool:shell`. A Cursor
+  `globs: *.ts,*.tsx` string splits on commas. Only rules with a
+  condition stream. **Why:** proto's rule files work unchanged.
+  **Alternative:** a proto-fx rule format, which would split the corpus.
+
+- **D176 Decision:** an interrupting match cancels the stream through the
+  turn's cancel flag. Where the loop observes a cancel, it first asks the
+  coordinator whether a rule raised it; if so it clears the flag, finishes
+  any provisional tool rows as cancelled, appends the rule's
+  `<system-interrupt>` envelope as a user message to the within-turn
+  suffix (after the partial reply when `ttsr.context_mode` is `keep`), and
+  runs the step again. A tool call's final arguments settle once more
+  before any call runs, so `ast:` and `llm:` conditions can interrupt a
+  call that never executes. A person's cancel that lands in the same
+  instant as a rule's is taken as the rule's retry; a second cancel stops
+  the turn. **Why:** every provider already honors the cancel flag, so no
+  transport changes; the suffix keeps the cached prefix intact (D131).
+  **Alternative:** a second abort flag every transport would have to
+  poll.
+
+- **D177 Decision:** a match that does not interrupt is not lost. A tool
+  call's rule rides with that call's result; a prose rule is added once the
+  reply ends: the reply stays in the turn, the rule follows it as a user
+  message, and the turn runs one more step so the model can act on it, as
+  proto's follow-up does. Each injection shows one transcript row in
+  proto-fx's notice voice, `! rule: <name> · <description> · response
+  restarted | added to the tool result | added after the reply`, never an
+  id. **Why:** proto's `never` mode and `ttsr_triggered` notification.
+  **Alternative:** silent injection, which hides why the model changed
+  course.
+
+- **D178 Decision:** the repeat ledger is derived, not stored. Injections
+  persist as steering: `steeringText` keeps a `<system-interrupt>` or
+  `<system-reminder>` envelope whole, so a saved turn carries them and a
+  resumed one restores them to the model. Before each request the
+  coordinator rebuilds the ledger from history plus the turn so far: a
+  rule's last injection is the number of assistant messages before it,
+  `repeat_mode: once` never fires it again, and `after-gap` waits
+  `repeat_gap` assistant messages. A resumed transcript shows a restored
+  injection as `! rule: <names> · rule applied`. A cancelled turn keeps
+  its injections like steering
+  (`tests/tla/session_manager/rollout/pr-1092/PR1092Steering.tla`
+  `SavedExactlyMarkedTail`). **Why:** proto's `ttsr_injection` entries
+  would add a session-log kind; the envelope already is the record, and a
+  compaction or rewind that drops it lets the rule fire again, which is
+  what the model then needs. **Alternative:** a `set` key holding the
+  ledger, which can disagree with the context the model sees.
+
+- **D179 Decision:** a reminder for a tool call follows the results as its
+  own user message, `<system-reminder>` envelopes joined, instead of being
+  prepended to the result as proto does. **Why:** proto-fx saves a result
+  as an artifact when the tool finishes, before the next request, so text
+  prepended later would vanish on resume and the ledger with it.
+  **Alternative:** rewriting the saved artifact, which other readers of it
+  (recall, `read_tool_result`) would then see.
+
+- **D180 Decision:** conditions run on proto-fx's own engines: a
+  backtracking regex engine for JavaScript's dialect (classes, anchors,
+  `\b`, groups, lookahead and lookbehind, greedy and lazy quantifiers, a
+  leading `(?ims)`) on bytes with a step budget, a YAML subset for
+  frontmatter, and proto's lexical regions for `in: code|string|comment|
+  prose`. A rule whose regexes are plain literals is evaluated only once a
+  literal appears, scanning just new bytes plus an overlap, as proto's
+  manager does. A shell command is matched as the command, and source a
+  heredoc writes (`cat > f.ts <<EOF`, `tee`) is matched in the target
+  file's language; `write_file` and `edit_file` are matched on the
+  content and new text with their path. **Why:** no dependency, and a
+  pathological pattern cannot stall the stream. **Alternative:** linking
+  a regex library.
+
+- **D181 Decision:** `ast:` is a token-tree subset of ast-grep: comments
+  and whitespace are trivia, a string is one token, brackets nest, `$X`
+  binds one expression (it never crosses `,`, `;` or an unbalanced
+  closer) and must repeat identically, `$$$X` binds any balanced run, and
+  `where:` tests bindings with regexes. `selector: predefined_type` is
+  the one selector, matching a TypeScript built-in type keyword in a type
+  position; `strictness` is accepted and ignored. AST conditions settle
+  only on a call's final arguments, as in proto. **Why:** proto-fx ships
+  no tree-sitter grammars, and every built-in `ast:` rule fits the subset.
+  **Alternative:** the Python harness's AST, which parses only Python.
+
+- **D182 Decision:** `llm:` conditions ask a judge only on settled
+  buffers: a call's final arguments, or the finished reply's prose. The
+  judge uses proto's prompt, takes the last yes or no in the answer,
+  caches by question, roles and buffer, and spends at most 64 calls a
+  turn. The model comes from `AgentRuntimeDeps.resolve_judge_model`, given
+  the rule's roles (`tiny`, `smol` by default); unset, or answering null,
+  the request's own model and connection answer. `proto-fx ttsr test` and
+  `scan` never call a model, so a judged condition does not match there.
+  **Why:** model roles bind this seam without touching the rule engine.
+  **Alternative:** the title model, which is not every provider's.
+
+- **D183 Decision:** settings live in the profile's `ttsr` group
+  (`enabled`, `context_mode`, `interrupt_mode`, `repeat_mode`,
+  `repeat_gap`, `builtin_rules`, `disabled_rules`), with
+  `workspaces["<root>"].ttsr` over it and `PROTO_FX_TTSR=0` to switch
+  rules off for a run. `proto-fx ttsr list|test|scan [--json]` renders
+  one snapshot per subcommand; `scan` lists files through the workspace
+  indexer, so git's ignore rules apply. Hosts opt in with
+  `AgentRuntimeDeps.ttsr_enabled`: the terminal, `ask`, ACP and fleet
+  workers do; unit tests do not, and a test turn reads only its
+  workspace's rules. **Why:** a rule set the person did not write must
+  not change unrelated tests. **Alternative:** project `.fx.json` keys,
+  which may hold only repo-safe defaults.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a
