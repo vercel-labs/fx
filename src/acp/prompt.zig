@@ -263,6 +263,8 @@ const AcpContext = struct {
     observer: ?*observation.Observer = null,
 
     fn deinitPublishedToolCalls(self: *AcpContext) void {
+        // A command that outlives this turn must not stream into it.
+        self.state.managed_executions.detachOutputChunks(@ptrCast(self));
         var keys = self.published_tool_calls.keyIterator();
         while (keys.next()) |key| self.alloc.free(key.*);
         self.published_tool_calls.deinit(self.alloc);

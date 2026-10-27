@@ -224,6 +224,8 @@ const Entry = struct {
     output_chunk_lifecycle_id: ?types.ToolLifecycleId = null,
     output_chunk_ctx: ?*anyopaque = null,
     on_output_chunk: ?command_runner.CommandOutputCallback = null,
+    /// Held while a chunk is forwarded, so detaching waits for it.
+    chunk_mutex: std.Io.Mutex = .init,
     output_handle: ?[]const u8 = null,
     output_framed_bytes: usize = 0,
     stdout_bytes: usize = 0,
@@ -479,8 +481,10 @@ const Entry = struct {
             .cancel_flag = &self.cancel,
             .force_cancel_flag = &self.force_cancel,
             .output_chunk_lifecycle_id = self.output_chunk_lifecycle_id,
-            .output_chunk_ctx = self.output_chunk_ctx,
-            .on_output_chunk = self.on_output_chunk,
+            // Live output goes through the entry, so the turn that started
+            // the command can detach before it ends (`detachOutputChunks`).
+            .output_chunk_ctx = if (self.on_output_chunk != null) self else null,
+            .on_output_chunk = if (self.on_output_chunk != null) forwardOutputChunk else null,
             .accepted_output_chunk_ctx = self,
             .on_accepted_output_chunk = appendOutput,
             .callback_projection = .raw,
@@ -520,6 +524,17 @@ const Entry = struct {
         self.barrier = next.barrier;
         self.ended_ms = io_mod.milliTimestamp();
         self.mutex.unlock(zio);
+    }
+
+    /// Hands one live output chunk to the turn watching this command, if it
+    /// is still attached.
+    fn forwardOutputChunk(raw: *anyopaque, id: ?types.ToolLifecycleId, stream: command_contract.CommandOutputStream, chunk: []const u8) !void {
+        const self: *Entry = @ptrCast(@alignCast(raw));
+        const zio = io_mod.getIo();
+        self.chunk_mutex.lockUncancelable(zio);
+        defer self.chunk_mutex.unlock(zio);
+        const callback = self.on_output_chunk orelse return;
+        return callback(self.output_chunk_ctx orelse return, id, stream, chunk);
     }
 
     fn finalizeReplayLocked(self: *Entry) void {
@@ -1049,6 +1064,24 @@ pub const Runtime = struct {
             });
         }
         return result.toOwnedSlice(alloc);
+    }
+
+    /// Stops live output reaching `ctx`, the turn that is ending. A command
+    /// that outlives its turn, such as a background job, keeps running and
+    /// keeps its output for delivery. Returns after any chunk being handed
+    /// to `ctx` has been.
+    pub fn detachOutputChunks(self: *Runtime, ctx: *anyopaque) void {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        for (self.entries) |candidate| {
+            const entry = candidate orelse continue;
+            entry.chunk_mutex.lockUncancelable(zio);
+            defer entry.chunk_mutex.unlock(zio);
+            if (entry.output_chunk_ctx != ctx) continue;
+            entry.on_output_chunk = null;
+            entry.output_chunk_ctx = null;
+        }
     }
 
     /// Every captured execution published while it ran, with whether its
@@ -2288,4 +2321,43 @@ test "TTY cursor advances monotonically and delivers each delta once" {
         .max_output_bytes = 64,
         .published_running = true,
     }));
+}
+
+test "a command that outlives its turn stops streaming into it once detached" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    const Counter = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        fn append(raw: *anyopaque, _: ?types.ToolLifecycleId, _: command_contract.CommandOutputStream, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.calls.fetchAdd(1, .seq_cst);
+        }
+    };
+    var counter: Counter = .{};
+    var input = StartCapturedInput{
+        .execution_id = "shell-detach",
+        .command = "sleep 0.3; printf late",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 5_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 0,
+        .output_chunk_ctx = &counter,
+        .on_output_chunk = Counter.append,
+    };
+    input.authority = testAuthority(input);
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+    runtime.detachOutputChunks(&counter);
+    var settled = try runtime.wait(alloc, input.execution_id, 5_000, null);
+    defer settled.deinit(alloc);
+    try std.testing.expect(settled.snapshot.state != .running);
+    try std.testing.expectEqualStrings("late", settled.snapshot.output_delta);
+    try std.testing.expectEqual(@as(usize, 0), counter.calls.load(.seq_cst));
+    try runtime.commitDelivery(settled.snapshot.execution_id, settled.reservation_id);
 }
