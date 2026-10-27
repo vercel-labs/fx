@@ -1801,8 +1801,10 @@ pub const Usage = struct {
     reasoning_tokens: ?u64 = null,
 };
 
-/// Absolute per-turn token totals. Input covers only user-submitted prompt text
-/// and stays estimated; output may become exact from provider usage.
+/// Absolute per-turn token totals. Input is the prompt tokens providers read
+/// without their cache, summed over the turn's requests, as proto counts
+/// them; before the first usage report it is the submitted prompt's estimate
+/// (D211). Output may become exact from provider usage.
 pub const TurnTokenProgress = struct {
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,

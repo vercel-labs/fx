@@ -2550,6 +2550,15 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   as a whole and running `/bin/sh -c`, which let a watch run a command
   shell run would deny.
 
+- **D211 Decision:** a turn's input token figure (`↑` on the activity
+  row and the turn summary) is the prompt tokens its requests' providers
+  read without their cache, summed over the turn, as proto's usage row
+  counts input; before the first usage report it is the submitted
+  prompt's estimate. **Why:** counting only the typed prompt showed `↑5`
+  for a turn that sent thousands of tokens. **Alternative:** the whole
+  prompt of every request, which counts a cached prefix again at every
+  step and grows with the square of the turn's length.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

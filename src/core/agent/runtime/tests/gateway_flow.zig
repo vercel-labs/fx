@@ -4627,10 +4627,10 @@ test "processQueuedPrompt emits submitted prompt token update before streamed ou
     try std.testing.expectEqual(@as(u64, 0), hooks.token_updates.items[0].output_tokens);
     try std.testing.expect(!hooks.token_updates.items[0].input_exact);
     try std.testing.expect(!hooks.token_updates.items[0].output_exact);
+    // Provider usage then replaces the estimate (D211).
     try std.testing.expectEqual(types.TurnTokenProgress{
-        .input_tokens = prompt_estimator.estimate(),
+        .input_tokens = 100,
         .output_tokens = 5,
-        .input_exact = false,
     }, hooks.token_updates.items[hooks.token_updates.items.len - 1]);
     var input_idx: ?usize = null;
     var text_idx: ?usize = null;
@@ -4648,7 +4648,7 @@ test "processQueuedPrompt emits submitted prompt token update before streamed ou
     try std.testing.expect(input_idx.? < text_idx.?);
 }
 
-test "processQueuedPrompt excludes assistant-authored subagent prompts from input progress" {
+test "processQueuedPrompt counts a subagent's provider prompt tokens, never its assistant-authored prompt" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{
         .content = "done",
@@ -4665,7 +4665,7 @@ test "processQueuedPrompt excludes assistant-authored subagent prompts from inpu
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(types.TurnTokenProgress{
-        .input_tokens = 0,
+        .input_tokens = 40_000,
         .output_tokens = 5,
     }, hooks.finish_summary.?.token_progress);
 }
@@ -4767,9 +4767,8 @@ test "processQueuedPrompt final summary counts submitted input once across Gatew
     var prompt_estimator = token_estimate.StreamingEstimator{};
     prompt_estimator.consume(job.prompt);
     try std.testing.expectEqual(types.TurnTokenProgress{
-        .input_tokens = prompt_estimator.estimate(),
+        .input_tokens = 300_000,
         .output_tokens = 50_000,
-        .input_exact = false,
     }, summary.token_progress);
     try std.testing.expect(summary.turn_duration_ms >= summary.thinking_duration_ms);
 }

@@ -83,6 +83,9 @@ pub const TurnSummaryAccumulator = struct {
     thinking_duration_ms: u64 = 0,
     settled_token_progress: types.TurnTokenProgress = .{},
     active_token_request: ?ActiveTokenRequest = null,
+    /// Whether a request reported its prompt tokens yet. Until one does, the
+    /// input figure is the submitted prompt's estimate (D211).
+    input_reported: bool = false,
 
     pub fn init(turn_started_at_ms: i64, submitted_prompt: []const u8) TurnSummaryAccumulator {
         var estimator = token_estimate.StreamingEstimator{};
@@ -135,6 +138,7 @@ pub const TurnSummaryAccumulator = struct {
         const before = self.tokenProgress();
         const active = self.active_token_request orelse return .invalid;
 
+        if (usage.input_tokens) |prompt| self.settleInputTokens(prompt, usage.cache_read_tokens orelse 0, !delivery_ambiguous);
         const output_tokens = usage.output_tokens orelse active.outputEstimate();
         self.settleOutputTokens(
             output_tokens,
@@ -160,6 +164,22 @@ pub const TurnSummaryAccumulator = struct {
             progress.output_exact = false;
         }
         return progress;
+    }
+
+    /// Counts a request's prompt tokens as proto does: what the provider
+    /// read without its cache, so a step that reuses a cached prefix adds
+    /// only what was new (D211). `prompt` is the whole prompt; cache reads
+    /// come off it.
+    fn settleInputTokens(self: *TurnSummaryAccumulator, prompt: u64, cache_read: u64, exact: bool) void {
+        const uncached = prompt -| cache_read;
+        if (!self.input_reported) {
+            self.input_reported = true;
+            self.settled_token_progress.input_tokens = uncached;
+            self.settled_token_progress.input_exact = exact;
+            return;
+        }
+        self.settled_token_progress.input_tokens +|= uncached;
+        self.settled_token_progress.input_exact = self.settled_token_progress.input_exact and exact;
     }
 
     fn settleOutputTokens(self: *TurnSummaryAccumulator, output_tokens: u64, output_exact: bool) void {
@@ -340,16 +360,19 @@ test "gateway call metrics retain provider terminal stop reason" {
     try std.testing.expectEqualStrings("missing_provider_finish", calls[2].terminalStopReason());
 }
 
-test "turn token progress counts only the submitted prompt once" {
+test "turn token progress counts provider prompt tokens not read from cache" {
     var accumulator = TurnSummaryAccumulator.init(0, "open it for me");
+    // Before any usage, the submitted prompt's estimate stands in.
+    try std.testing.expectEqual(@as(u64, 4), accumulator.tokenProgress().input_tokens);
     accumulator.prepareTokenRequest();
     _ = accumulator.reconcileTokenRequest(.{
         .input_tokens = 16_000,
+        .cache_read_tokens = 12_000,
         .output_tokens = 5,
     }, true);
 
     try std.testing.expectEqual(types.TurnTokenProgress{
-        .input_tokens = 4,
+        .input_tokens = 4_000,
         .output_tokens = 5,
         .input_exact = false,
         .output_exact = false,
@@ -381,7 +404,7 @@ test "turn token progress honors aggregate completion ambiguity" {
     }, true);
 
     try std.testing.expectEqual(types.TurnTokenProgress{
-        .input_tokens = 2,
+        .input_tokens = 100,
         .output_tokens = 20,
         .input_exact = false,
         .output_exact = false,
@@ -397,31 +420,31 @@ test "turn token progress uses exact provider output on unambiguous completion" 
     }, false);
 
     try std.testing.expectEqual(types.TurnTokenProgress{
-        .input_tokens = 2,
+        .input_tokens = 100,
         .output_tokens = 20,
-        .input_exact = false,
     }, accumulator.tokenProgress());
 }
 
-test "turn token progress accumulates output steps while counting submitted input once" {
+test "turn token progress adds each step's uncached prompt tokens" {
     var accumulator = TurnSummaryAccumulator.init(0, "submitted prompt");
 
     accumulator.prepareTokenRequest();
     _ = accumulator.reconcileTokenRequest(.{
-        .input_tokens = 10,
+        .input_tokens = 9_000,
         .output_tokens = 5,
     }, false);
 
+    // The second step reuses the first step's prefix from the cache.
     accumulator.prepareTokenRequest();
     _ = accumulator.reconcileTokenRequest(.{
-        .input_tokens = 20,
+        .input_tokens = 9_400,
+        .cache_read_tokens = 9_000,
         .output_tokens = 7,
     }, false);
 
     try std.testing.expectEqual(types.TurnTokenProgress{
-        .input_tokens = 5,
+        .input_tokens = 9_400,
         .output_tokens = 12,
-        .input_exact = false,
     }, accumulator.tokenProgress());
     try std.testing.expectEqual(accumulator.tokenProgress(), accumulator.finish().token_progress);
 }
@@ -431,7 +454,7 @@ test "turn token progress keeps missing usage and terminal delivery approximate"
     accumulator.prepareTokenRequest();
     _ = accumulator.consumeReasoning("reasoning");
     _ = accumulator.consumeContent("answer");
-    _ = accumulator.reconcileTokenRequest(.{ .input_tokens = 40 }, false);
+    _ = accumulator.reconcileTokenRequest(.{ .output_tokens = null }, false);
 
     try std.testing.expectEqual(types.TurnTokenProgress{
         .input_tokens = 2,
