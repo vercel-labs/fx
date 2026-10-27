@@ -162,11 +162,16 @@ pub const Channel = struct {
             var buffers = [_][]u8{&buffer};
             const count = (try stream.readWithControl(io_mod.getIo(), &buffers, &.{})).data_len;
             if (count == 0) return;
+            // The bytes held before this read have no newline, so only the
+            // new ones are searched: a frame of many reads scans once.
+            const scanned = inbound.items.len;
             try inbound.appendSlice(alloc, buffer[0..count]);
             var start: usize = 0;
-            while (std.mem.findScalarPos(u8, inbound.items, start, '\n')) |end| {
+            var from = scanned;
+            while (std.mem.findScalarPos(u8, inbound.items, from, '\n')) |end| {
                 handler.frame(inbound.items[start..end]);
                 start = end + 1;
+                from = start;
             }
             if (start > 0) {
                 const rest = inbound.items.len - start;
