@@ -871,7 +871,7 @@ pub fn Runtime(comptime App: type) type {
                     "",
                 .esc_clear_armed = app.input_runtime.gestures.escapeClearArmed(),
                 .esc_interrupt_armed = app.input_runtime.gestures.escapeInterruptArmed(),
-                .question = agent.question_prompt.projection(),
+                .question = shownQuestion(app, agent),
                 .statusline = statusline,
                 .activity = activityProjection(app),
                 .input = &app.input_runtime,
@@ -1156,7 +1156,7 @@ pub fn Runtime(comptime App: type) type {
                 try requestNormalViewportRecovery(app);
             }
 
-            const question_active = agent.question_prompt.isActive();
+            const question_active = shownQuestion(app, agent) != null;
             if (question_active) {
                 if (try app_lifecycle.closeFullTranscriptIfActive(
                     app.alloc,
@@ -1172,7 +1172,7 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
 
-            const approval = agent.approval_prompt.projection();
+            const approval = shownApproval(app, agent);
             if (approval) |projection| {
                 const approval_screen_active = try approval_screen.needsScreen(
                     app.alloc,
@@ -1321,7 +1321,7 @@ pub fn Runtime(comptime App: type) type {
                     presentation_shell.footer_reserved_base_rows = footer_reserved_base_rows_before_footer_prepare;
                 }
             }
-            const visible_approval = agent.approval_prompt.projection();
+            const visible_approval = shownApproval(app, agent);
             {
                 footer_ctx.transcript_depth = presentation_shell.transcriptPresentationDepth();
                 if (presentation_shell.fullTranscriptActive()) {
@@ -2036,6 +2036,20 @@ pub fn Runtime(comptime App: type) type {
         fn agentsMenuActive(app: *const App) bool {
             if (comptime !@hasField(App, "instances")) return false;
             return app.instances.agents_menu.open;
+        }
+
+        // The open agent list takes the footer from the shown agent's
+        // approval or question, so the list stays visible while it previews
+        // an agent that is waiting. The prompt itself is untouched and
+        // returns when the list closes.
+        fn shownApproval(app: *const App, agent: *AppAgent) ?approval_prompt.Projection {
+            if (agentsMenuActive(app)) return null;
+            return agent.approval_prompt.projection();
+        }
+
+        fn shownQuestion(app: *const App, agent: *AppAgent) ?question_prompt.Projection {
+            if (agentsMenuActive(app)) return null;
+            return agent.question_prompt.projection();
         }
 
         fn forkMenuActive(_: *const App, agent: *const AppAgent) bool {
