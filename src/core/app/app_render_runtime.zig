@@ -5121,6 +5121,7 @@ test "rewrite publication does not delay explicit clear or resume" {
 
 test "core.app_render_runtime resume publication preserves the pre-scroll origin through the coordinator" {
     const alloc = std.testing.allocator;
+    const batch = transcript_runtime.resume_publication_rows_per_frame;
     const cases = [_]struct { origin: u16, rows: u16, post_top: u16 }{
         .{ .origin = 1, .rows = 3, .post_top = 1 },
         .{ .origin = 5, .rows = 3, .post_top = 5 },
@@ -5128,8 +5129,8 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
         .{ .origin = 8, .rows = 6, .post_top = 4 },
         .{ .origin = 1, .rows = 12, .post_top = 1 },
         .{ .origin = 5, .rows = 12, .post_top = 1 },
-        .{ .origin = 1, .rows = 80, .post_top = 1 },
-        .{ .origin = 5, .rows = 80, .post_top = 1 },
+        .{ .origin = 1, .rows = batch + 16, .post_top = 1 },
+        .{ .origin = 5, .rows = batch + 16, .post_top = 1 },
     };
     for (cases) |case| {
         errdefer std.debug.panic("resume origin={d} rows={d}", .{ case.origin, case.rows });
@@ -5150,7 +5151,7 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
             var buf: [32]u8 = undefined;
             try flow.appendSlice(alloc, try std.mem.print(
                 &buf,
-                "{s}ORIGIN_ROW_{d:0>3}",
+                "{s}ORIGIN_ROW_{d:0>4}",
                 .{ if (i == 0) "" else "\n", i },
             ));
         }
@@ -5176,7 +5177,7 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
         try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
         const first = try readCoordinatorFrameBytes(alloc, file, &read_offset);
         defer alloc.free(first);
-        const document_start = std.mem.find(u8, first, "ORIGIN_ROW_000") orelse return error.MissingResumeDocument;
+        const document_start = std.mem.find(u8, first, "ORIGIN_ROW_0000") orelse return error.MissingResumeDocument;
         var physical = try vt_emulator.Grid.init(alloc, 80, 12);
         defer physical.deinit();
         if (case.rows > 9) {
@@ -5191,9 +5192,9 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
         try std.testing.expectEqual(case.post_top, app.shell.committed_frame_layout.transcript_area.top);
 
         const history_rows: u32 = case.rows -| 9;
-        const first_history = @min(history_rows, 64);
+        const first_history = @min(history_rows, batch);
         const diagnostic = app.shell.transcriptCommitDiagnostic();
-        if (history_rows > 64) {
+        if (history_rows > batch) {
             try std.testing.expectEqual(first_history, diagnostic.history_visual_offset);
             try std.testing.expectEqual(history_rows - first_history, diagnostic.remaining_inline_rows);
         }
@@ -5202,9 +5203,9 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
         defer row.deinit(alloc);
         try physical.rowTextTrimmed(case.post_top, &row);
         var expected_buf: [32]u8 = undefined;
-        try std.testing.expectEqualStrings(try std.mem.print(&expected_buf, "ORIGIN_ROW_{d:0>3}", .{first_history}), row.items);
+        try std.testing.expectEqualStrings(try std.mem.print(&expected_buf, "ORIGIN_ROW_{d:0>4}", .{first_history}), row.items);
 
-        if (history_rows > 64) {
+        if (history_rows > batch) {
             try std.testing.expectEqual(.recovering, diagnostic.state);
             const receipt = app.shell.transcript_commit_state.recovering;
             try std.testing.expect(receipt.materialized_flow_len != null);
@@ -5213,7 +5214,7 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
             const next = try readCoordinatorFrameBytes(alloc, file, &read_offset);
             defer alloc.free(next);
             // Recovery continues the materialized suffix instead of replaying row zero.
-            try std.testing.expect(std.mem.find(u8, next, "ORIGIN_ROW_000") == null);
+            try std.testing.expect(std.mem.find(u8, next, "ORIGIN_ROW_0000") == null);
             const suffix_start = std.mem.find(u8, next, "ORIGIN_ROW_") orelse return error.MissingResumeSuffix;
             var receipt_cursor_buf: [32]u8 = undefined;
             const receipt_cursor = try std.mem.print(&receipt_cursor_buf, "\x1b[{d};{d}H", .{ receipt.cursor_row, receipt.cursor_col });
@@ -5223,7 +5224,7 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
             physical_scroll_rows += next_stats.scroll_rows;
             row.clearRetainingCapacity();
             try physical.rowTextTrimmed(case.post_top, &row);
-            try std.testing.expectEqualStrings(try std.mem.print(&expected_buf, "ORIGIN_ROW_{d:0>3}", .{history_rows}), row.items);
+            try std.testing.expectEqualStrings(try std.mem.print(&expected_buf, "ORIGIN_ROW_{d:0>4}", .{history_rows}), row.items);
             try std.testing.expectEqual(@as(u32, 0), app.shell.transcriptCommitDiagnostic().remaining_inline_rows);
         }
         for (0..3) |_| {
@@ -5234,7 +5235,7 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
         try std.testing.expectEqual(history_rows, app.shell.transcriptCommitDiagnostic().history_visual_offset);
         try std.testing.expectEqual(history_rows + case.origin - case.post_top, physical_scroll_rows);
         try std.testing.expect(app.shell.pending_resume_source == null);
-        try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, try std.mem.print(&expected_buf, "ORIGIN_ROW_{d:0>3}", .{case.rows - 1})));
+        try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, try std.mem.print(&expected_buf, "ORIGIN_ROW_{d:0>4}", .{case.rows - 1})));
 
         const anchor = app.shell.transcript_commit_state.stable;
         read_offset = try file.length(std.testing.io);

@@ -4296,7 +4296,10 @@ pub fn wrapAssistantText(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
 
 pub const default_max_retained_transcript_bytes: usize = 1024 * 1024;
 const full_transcript_snapshot_clone_max_bytes: usize = 8 * 1024 * 1024;
-const resume_publication_rows_per_frame: u32 = 64;
+/// A resumed transcript publishes into the terminal's scrollback this many
+/// rows a frame. Each frame costs about the same however many rows it
+/// carries, so a large resume publishes in a few frames, not dozens.
+pub const resume_publication_rows_per_frame: u32 = 1024;
 
 pub const PaintTraceState = struct {
     transcript_top: u16 = 0,
@@ -13315,9 +13318,10 @@ test "pending resume publication yields after a bounded row batch" {
         .line_count = 1,
     } };
 
+    const rows = resume_publication_rows_per_frame * 3;
     try std.testing.expectEqual(
-        @as(u16, 1_000),
-        runtime.plannedTranscriptRows(&prepared, 0, 0, 1_000, 0),
+        @as(u16, rows),
+        runtime.plannedTranscriptRows(&prepared, 0, 0, rows, 0),
     );
     runtime.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
         &runtime,
@@ -13326,7 +13330,7 @@ test "pending resume publication yields after a bounded row batch" {
     );
     try std.testing.expectEqual(
         @as(u16, resume_publication_rows_per_frame),
-        runtime.plannedTranscriptRows(&prepared, 0, 0, 1_000, 0),
+        runtime.plannedTranscriptRows(&prepared, 0, 0, rows, 0),
     );
 }
 
