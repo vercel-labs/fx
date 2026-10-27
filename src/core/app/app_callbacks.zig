@@ -1291,13 +1291,22 @@ pub fn Bindings(comptime App: type) type {
 
         fn agentPushHttpError(ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            const auth_failure = auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
+            var auth_failure = auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
+            if (comptime provider_runtime.supported(App)) {
+                const provider = provider_runtime.provider(app);
+                if (auth_failure) |*failure| if (provider == .configured) {
+                    failure.provider = provider.label();
+                };
+            }
             const message = if (auth_failure) |failure|
                 try failure.renderText(std.heap.c_allocator)
             else
                 try gateway_error_format.formatHttpErrorMessage(std.heap.c_allocator, status, detail);
             defer std.heap.c_allocator.free(message);
-            const label = if (auth_failure) |failure|
+            const label = if (auth_failure) |failure| if (failure.provider != null)
+                // The message already says how to fix it (D205).
+                try std.heap.c_allocator.print("⚠ {s}", .{message})
+            else
                 try std.heap.c_allocator.print(
                     "⚠ {s} · {s}",
                     .{
@@ -1311,9 +1320,7 @@ pub fn Bindings(comptime App: type) type {
                             .configured => "Check the configured provider auth environment variable.",
                         },
                     },
-                )
-            else
-                try std.heap.c_allocator.print("⚠ {s}", .{message});
+                ) else try std.heap.c_allocator.print("⚠ {s}", .{message});
             defer std.heap.c_allocator.free(label);
             try app_worker_runtime.Runtime(App).pushEvent(app, .{ .api_status_text = label });
         }

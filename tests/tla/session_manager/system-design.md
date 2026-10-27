@@ -2405,6 +2405,17 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   the keychain entry ourselves and passing its access token, which skips
   Claude Code's refresh and breaks once the token expires.
 
+- **D205 Decision:** a configured provider that refuses its credential
+  is named in the failure, with its fix: a preset says to run
+  `/login <id>` in the terminal UI or `proto-fx login <id>` from `ask`
+  (for `anthropic`, also `claude auth login`), and a provider defined in
+  models.json says to check the key its definition names. The terminal
+  UI, `ask` and ACP, which serves the terminal UI's sessions, all read
+  the session's provider. **Why:** "configured provider authentication
+  failed" names neither the provider nor the fix. **Alternative:**
+  putting the hint in the transport's failure detail, which the auth
+  snapshot drops.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

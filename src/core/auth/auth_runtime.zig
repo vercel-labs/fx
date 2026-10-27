@@ -14,6 +14,7 @@ const model_catalog = @import("../gateway/model_catalog.zig");
 const provider_catalog = @import("provider_catalog.zig");
 const provider_picker_catalog = @import("provider_picker_catalog.zig");
 const provider_keys = @import("provider_keys.zig");
+const provider_auth_hint = @import("provider_auth_hint.zig");
 const openrouter_oauth = @import("openrouter_oauth.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
@@ -132,6 +133,10 @@ pub const FailureSnapshot = struct {
     source: credentials.Source,
     reason: FailureReason,
     http_status: ?std.http.Status = null,
+    /// The configured provider's id when `source` is `.configured`, so the
+    /// text names it and says how to fix it (D205). Borrowed.
+    provider: ?[]const u8 = null,
+    surface: provider_auth_hint.Surface = .terminal,
 
     pub fn fromHttp(status: std.http.Status, source: ?credentials.Source) ?FailureSnapshot {
         if (status != .unauthorized) return null;
@@ -147,8 +152,9 @@ pub const FailureSnapshot = struct {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
+        const provider = if (self.source == .configured) self.provider else null;
         try out.writer.print("{s} {s}", .{
-            credentials.sourceLabel(self.source),
+            provider orelse credentials.sourceLabel(self.source),
             switch (self.reason) {
                 .credential_refresh_failed => "credential refresh failed",
                 .http_unauthorized => "authentication failed",
@@ -156,6 +162,10 @@ pub const FailureSnapshot = struct {
         });
         if (self.http_status) |status| {
             try out.writer.print(" · HTTP {d}", .{@backingInt(status)});
+        }
+        if (provider) |id| {
+            try out.writer.writeAll(". ");
+            try provider_auth_hint.write(&out.writer, id, self.surface);
         }
         return try out.toOwnedSlice();
     }
@@ -3452,6 +3462,19 @@ test "auth failure snapshot names every selected source without exposing styling
         try std.testing.expectEqual(@as(i64, 401), parsed.value.object.get("http_status").?.integer);
         try std.testing.expect(std.mem.find(u8, json, "\x1b") == null);
     }
+}
+
+test "a configured provider's rejection names it and says how to sign in again" {
+    var snapshot = FailureSnapshot.fromHttp(.unauthorized, .configured).?;
+    snapshot.provider = "anthropic";
+    const message = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(message);
+    try std.testing.expect(std.mem.startsWith(u8, message, "anthropic authentication failed · HTTP 401. Run /login anthropic"));
+    snapshot.surface = .cli;
+    const cli = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(cli);
+    try std.testing.expect(std.mem.find(u8, cli, "Run `proto-fx login anthropic`") != null);
+    _ = provider_auth_hint;
 }
 
 test "auth failure snapshot keeps refresh failures distinct from HTTP rejection" {

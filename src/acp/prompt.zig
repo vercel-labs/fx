@@ -3460,7 +3460,10 @@ fn pushCommandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
 fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     var buf: [1024]u8 = undefined;
-    const auth_failure = auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
+    var auth_failure = auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
+    if (auth_failure) |*failure| if (ctx.state.active_session) |session| if (session.provider == .configured) {
+        failure.provider = session.provider.label();
+    };
     const owned_message = if (auth_failure) |failure|
         try failure.renderText(ctx.alloc)
     else

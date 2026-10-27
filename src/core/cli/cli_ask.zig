@@ -3328,7 +3328,11 @@ fn pushCommandOutputComplete(raw_ctx: *anyopaque, _: ?types.ToolLifecycleId) !vo
 fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     ctx.failed = true;
-    const auth_failure = auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
+    var auth_failure = auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
+    if (auth_failure) |*failure| if (ctx.provider == .configured) {
+        failure.provider = ctx.provider.label();
+        failure.surface = .cli;
+    };
     ctx.auth_failure = auth_failure;
     const message = if (auth_failure) |failure|
         try failure.renderText(ctx.alloc)
