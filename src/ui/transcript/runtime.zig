@@ -10067,7 +10067,14 @@ pub const TranscriptRuntime = struct {
                     transition.cursor_col,
                 },
             );
-            if (transition.normal_buffer_recovery_pending or
+            // Recovery advances only through a frame that paints or
+            // accepts rows. A frame that kept the committed body and
+            // accepted none would plan the same transition again, so
+            // asking for one repainted forever at rest (D244); new
+            // content, input or a resize asks for the next frame.
+            const recovery_can_advance = transition.normal_buffer_recovery_pending and
+                !(retained_body and commit.accepted.semantic_rows == 0);
+            if (recovery_can_advance or
                 (commit.accepted.semantic_rows > 0 and if (self.committedRetentionIdentity()) |identity| identity.publication_entries.len > 0 else false))
             {
                 self.markTranscriptDirty();

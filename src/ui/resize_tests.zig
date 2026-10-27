@@ -9179,3 +9179,41 @@ fn expectFuzzShadowMatchesScreen(h: *Harness) !void {
         return error.TestShadowTerminalDiverged;
     }
 }
+
+/// Renders frames while the transcript asks for one, at most `limit`.
+fn settleTranscriptFrames(h: *Harness, input: *InputRuntime, approval: *approval_prompt.ApprovalPrompt, limit: usize) !usize {
+    var frames: usize = 0;
+    while (frames < limit and (h.shell.transcript_band_dirty or h.shell.render_requests.hasPending())) : (frames += 1) {
+        try renderTestFooter(h, input, approval, &h.frame_redraw);
+        try h.flush();
+    }
+    return frames;
+}
+
+test "a retained frame with recovery pending settles instead of repainting at rest" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 60, 12, 4);
+    defer h.deinit();
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval: approval_prompt.ApprovalPrompt = .{};
+    defer approval.deinit(alloc);
+    try h.shell.initViewport(&h.metrics, 1);
+    for (0..30) |index| {
+        var buffer: [32]u8 = undefined;
+        try h.shell.writeTranscript(alloc, &h.metrics, try std.mem.print(&buffer, "settled row {d}\n", .{index}), true);
+    }
+    h.frame_redraw = true;
+    const first = try settleTranscriptFrames(&h, &input, &approval, 20);
+    try std.testing.expect(first < 20);
+    try std.testing.expect(h.shell.transcript_commit_state == .stable);
+
+    // A recovery the anchor still records with nothing left to restore:
+    // after a long turn the next frame retains the committed body and
+    // accepts no rows, so asking for another frame would repeat it forever.
+    h.shell.transcript_commit_state.stable.normal_buffer_recovery_pending = true;
+    h.shell.markTranscriptDirty();
+    const frames = try settleTranscriptFrames(&h, &input, &approval, 20);
+    try std.testing.expect(frames < 20);
+    try expectGridContains(&h, "settled row 29");
+}

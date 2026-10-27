@@ -2745,6 +2745,14 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   intermediate data and handoffs there across turns. **Alternative:** a
   folder inside the session's own directory, which the session log's
   layout checks own.
+- **D244 Decision:** a committed transcript frame that kept its body and
+  accepted no rows does not ask for another frame for a pending
+  normal-buffer recovery; new content, input or a resize asks for the next
+  one. **Why:** after a long turn the anchor could keep a recovery with
+  nothing left to restore, and every frame planned the same retained
+  transition again, so the idle TUI repainted every 10 ms at 40% CPU.
+  **Alternative:** clearing the recovery flag whenever history reaches the
+  viewport, which changes when a later paint replays history.
 
 - **D230 Decision:** the `checklist` tool keeps proto's contract: phases
   of tasks named by their exact content, never by ids; one operation per
