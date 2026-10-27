@@ -463,6 +463,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .refresh_gateway_credential = refreshGatewayCredential,
         .format_tool_execution_error = formatToolExecutionError,
         .report_usage = reportUsage,
+        .ttsr_enabled = !@import("builtin").is_test,
     };
 }
 

@@ -23,6 +23,7 @@ const runtime_tool_presentation = @import("tool_presentation.zig");
 const runtime_tool_input_preview = @import("tool_input_preview.zig");
 const stream_provider = @import("../stream_provider.zig");
 const response_language = @import("response_language.zig");
+const ttsr = @import("../../ttsr/ttsr.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -113,6 +114,8 @@ pub const StreamChunkContext = struct {
     response_language_accepted: bool = false,
     response_language_hold_until_completion: bool = false,
     response_language_next_probe_bytes: usize = 5,
+    /// The turn's stream rules, fed every delta (`core/ttsr`).
+    rules: ?*ttsr.Coordinator = null,
 
     fn markModelOutput(self: *StreamChunkContext) void {
         if (self.first_model_output_at_ms == null) self.first_model_output_at_ms = io_mod.milliTimestamp();
@@ -235,6 +238,7 @@ pub const StreamChunkContext = struct {
         self.assistant_text_started_published = false;
         self.tool_input_preview.deinit(self.alloc);
         self.tool_input_preview = .{};
+        if (self.rules) |rules| rules.beginAttempt(rules.cancel_flag);
     }
 
     pub fn accepted_source(self: *const StreamChunkContext) []const u8 {
@@ -306,6 +310,11 @@ pub const StreamChunkContext = struct {
 
 pub fn onStreamContentChunk(ctx: *anyopaque, chunk: []const u8) void {
     const stream_ctx: *StreamChunkContext = @ptrCast(@alignCast(ctx));
+    if (stream_ctx.rules) |rules| {
+        // A rule interrupted the response; what still arrives is dropped.
+        if (rules.abort_requested) return;
+        rules.onText(chunk);
+    }
     // Reasoning ends where visible text begins; publishing here keeps the
     // full-only record above the response it produced.
     stream_ctx.publishReasoningRecord();
@@ -411,6 +420,10 @@ fn flushReasoningPreview(stream_ctx: *StreamChunkContext, now_ms: i64) void {
 
 pub fn onStreamReasoningChunk(ctx: *anyopaque, chunk: []const u8) void {
     const stream_ctx: *StreamChunkContext = @ptrCast(@alignCast(ctx));
+    if (stream_ctx.rules) |rules| {
+        if (rules.abort_requested) return;
+        rules.onThinking(chunk);
+    }
     stream_ctx.markModelOutput();
     stream_ctx.streamed_output_bytes += chunk.len;
     publishTurnPhase(stream_ctx, .thinking);
@@ -455,6 +468,10 @@ pub fn publishTurnPhase(stream_ctx: *StreamChunkContext, phase: types.TurnPhase)
 
 pub fn onStreamToolInputChunk(ctx: *anyopaque, delta: stream_provider.ToolInputDelta) void {
     const stream_ctx: *StreamChunkContext = @ptrCast(@alignCast(ctx));
+    if (stream_ctx.rules) |rules| {
+        if (rules.abort_requested) return;
+        rules.onToolInput(delta.id, delta.chunk);
+    }
     const chunk = delta.chunk;
     stream_ctx.streamed_output_bytes += chunk.len;
     stream_ctx.tool_input_preview.feed(stream_ctx.alloc, delta.id, chunk);
@@ -498,6 +515,10 @@ pub fn pushTokenProgressUpdate(stream_ctx: *StreamChunkContext, update: runtime_
 
 pub fn onStreamToolStart(ctx: *anyopaque, tool_id: []const u8, tool_name: []const u8, label_value: ?[]const u8, arguments_json: ?[]const u8) void {
     const stream_ctx: *StreamChunkContext = @ptrCast(@alignCast(ctx));
+    if (stream_ctx.rules) |rules| {
+        if (rules.abort_requested) return;
+        rules.onToolStart(tool_id, tool_name, arguments_json);
+    }
     // The model's reasoning precedes the calls it produced.
     stream_ctx.publishReasoningRecord();
     const first_tool_in_step = !stream_ctx.saw_tool_start;

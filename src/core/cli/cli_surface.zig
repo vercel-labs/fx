@@ -12,6 +12,7 @@ const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
 const cli_replay = @import("cli_replay.zig");
 const cli_search = @import("cli_search.zig");
+const cli_ttsr = @import("cli_ttsr.zig");
 const cli_read = @import("cli_read.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const collections = @import("../shared/collections.zig");
@@ -96,6 +97,7 @@ pub const Command = union(enum) {
     replay: []const [:0]const u8,
     workspace: []const [:0]const u8,
     search: []const [:0]const u8,
+    ttsr: []const [:0]const u8,
     read: []const [:0]const u8,
     unknown: []const u8,
 };
@@ -626,6 +628,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
         },
         't' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .teams)) return .{ .teams = args[1..] };
+            if (command_specs.matchesTopLevel(command_catalog, command, .ttsr)) return .{ .ttsr = args[1..] };
         },
         'u' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .usage)) return .{ .usage = args[1..] };
@@ -1685,6 +1688,25 @@ fn runNonInteractiveWithDeps(
             const workspace = try cli_read.currentWorkspace(alloc);
             defer alloc.free(workspace);
             const result = try cli_read.run(alloc, options, workspace);
+            defer alloc.free(result.output);
+            if (result.succeeded or result.format == .json) {
+                try writeFormattedOutput(deps, result.output, result.format);
+            } else {
+                try writeStderr(deps, result.output);
+            }
+            return if (result.succeeded) .handled_success else .handled_failure;
+        },
+        .ttsr => |rest| {
+            const options = cli_ttsr.parseArgs(rest) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    try writeTopLevelUsage(cfg.command_catalog, deps, .ttsr);
+                    return .handled_failure;
+                },
+            };
+            const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+            defer alloc.free(workspace_root);
+            const result = try cli_ttsr.run(alloc, options, workspace_root, io_mod.homeDir());
             defer alloc.free(result.output);
             if (result.succeeded or result.format == .json) {
                 try writeFormattedOutput(deps, result.output, result.format);

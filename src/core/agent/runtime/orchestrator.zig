@@ -49,6 +49,7 @@ const runtime_lifecycle = @import("lifecycle.zig");
 const runtime_prompt_context = @import("prompt_context.zig");
 const compactor = @import("../../compactor/compactor.zig");
 const runtime_text_completion = @import("text_completion.zig");
+const runtime_stream_rules = @import("stream_rules.zig");
 const runtime_harness_services = @import("harness_services.zig");
 const compaction_activity = @import("../../output/compaction_activity.zig");
 const runtime_telemetry = @import("telemetry.zig");
@@ -7108,6 +7109,10 @@ fn processQueuedPromptLoop(
     else
         .none;
     var restore_recovery_source = job.recovery_checkpoint != null;
+    // The workspace's stream rules for this turn (D175).
+    var stream_rules = runtime_stream_rules.init(deps, &config);
+    stream_rules.begin();
+    defer stream_rules.end();
     var step: usize = 0;
     // Hidden reminders this turn spent on an open checkpoint (D120).
     var checkpoint_reminders: usize = 0;
@@ -7162,6 +7167,7 @@ fn processQueuedPromptLoop(
             );
             return;
         }
+        try runtime_stream_rules.beforeStep(&stream_rules, arena, history_messages.items, &within_turn_suffix);
         // The turn's context was captured once when it began (D130, D131).
         var turn_context: std.ArrayList(ChatMessage) = .empty;
         try session_runtime.appendTurnContextChatMessages(overlay_arena, &turn_context, job.turn_context, job.skill_context);
@@ -7218,6 +7224,8 @@ fn processQueuedPromptLoop(
             },
         };
         defer stream_ctx.deinit();
+        stream_ctx.rules = stream_rules.coordinator;
+        runtime_stream_rules.beginAttempt(&stream_rules, config.cancel_flag);
 
         if (restore_recovery_source) {
             const checkpoint = job.recovery_checkpoint.?;
@@ -7899,6 +7907,13 @@ fn processQueuedPromptLoop(
                 .cancel_flag = config.cancel_flag,
                 .provider_attempt_owner = .agent,
             };
+            stream_rules.bind(.{
+                .credential = model_request.credential,
+                .session_id = model_request.session_id,
+                .model = gateway_model,
+                .provider_options = model_request.provider_options,
+                .trace_ctx = step_ctx,
+            });
             stream_result = streamMainCompletion(deps, arena, model_request) catch |err| {
                 parent_turn_delivery.observeGatewayDelivery(
                     deps,
@@ -8130,6 +8145,17 @@ fn processQueuedPromptLoop(
                     );
                     const interruption_source = stream_ctx.interruption_source_or("");
                     try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
+                    // A rule's interrupt, not the person's: retry with it (D176).
+                    if (try runtime_stream_rules.retryAfterInterrupt(&stream_rules, arena, config.cancel_flag, &within_turn_suffix, interruption_source)) {
+                        reset_recovery_after_immediate_steering(
+                            &latest_recovery_diagnostic,
+                            &recovery_strategy,
+                            &recovery_cause,
+                            &retry_pacing,
+                            &preserved_tool_evidence,
+                        );
+                        continue :agent_steps_loop;
+                    }
                     if (try append_immediate_steering_after_cancel(
                         deps,
                         arena,
@@ -8780,6 +8806,17 @@ fn processQueuedPromptLoop(
                 const interruption_source = stream_ctx.interruption_source_or(
                     attempt_completion.content orelse "",
                 );
+                try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
+                if (try runtime_stream_rules.retryAfterInterrupt(&stream_rules, arena, config.cancel_flag, &within_turn_suffix, interruption_source)) {
+                    reset_recovery_after_immediate_steering(
+                        &latest_recovery_diagnostic,
+                        &recovery_strategy,
+                        &recovery_cause,
+                        &retry_pacing,
+                        &preserved_tool_evidence,
+                    );
+                    continue :agent_steps_loop;
+                }
                 if (try append_immediate_steering_after_cancel(
                     deps,
                     arena,
@@ -9626,6 +9663,24 @@ fn processQueuedPromptLoop(
             return;
         }
 
+        // A rule over a call's final arguments may interrupt before it runs.
+        if (disposition == .completed and completion.tool_calls.len > 0 and
+            runtime_stream_rules.settleToolCalls(&stream_rules, completion.tool_calls))
+        {
+            try finishPendingCancelledCalls(
+                deps,
+                &stream_ctx.provisional_statuses,
+                stream_ctx.alloc,
+                arena,
+                config,
+                turn_id,
+                completion.tool_calls,
+                advertised_dynamic_tool_names,
+            );
+            try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
+            if (try runtime_stream_rules.retryAfterInterrupt(&stream_rules, arena, config.cancel_flag, &within_turn_suffix, partial_assistant)) continue :agent_steps_loop;
+        }
+
         if (completion.tool_calls.len == 0) {
             const has_content =
                 std.mem.trim(u8, partial_assistant, " \t\r\n").len > 0;
@@ -9680,6 +9735,9 @@ fn processQueuedPromptLoop(
                 try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, history_text, history_replay)) continue;
             if (disposition == .completed and agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                 try checkpoint_rewind.remind(deps, arena, &within_turn_suffix, &checkpoint_reminders, history_text, history_replay)) continue;
+            // Prose rules that did not interrupt join the turn now (D177).
+            if (disposition == .completed and agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+                try runtime_stream_rules.deferAfterReply(&stream_rules, arena, &within_turn_suffix, history_text, history_replay)) continue;
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 if (!has_content) {

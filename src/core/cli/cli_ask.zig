@@ -2011,6 +2011,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .tool_registry = ctx.toolRegistry(),
         .context_registry = ctx.deps.context_registry,
         .context_enabled = ctx.context_enabled,
+        .ttsr_enabled = !@import("builtin").is_test,
         .finalize_turn = finalizeTurn,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .append_runtime_context = appendRuntimeContext,
@@ -3023,6 +3024,14 @@ fn pushEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
                 },
                 .compacted_summary, .interrupted => {},
             };
+        },
+        // A stream rule stepped in; other semantic notices stay
+        // transcript-only here.
+        .semantic_notice => |notice| if (std.mem.eql(u8, notice.topic, "rule")) {
+            if (ctx.presenter) |presenter| return presenter.pushNotice(notice);
+            try ctx.writeStderr("[rule] ");
+            try ctx.writeStderr(notice.body);
+            try ctx.writeStderr("\n");
         },
         else => {},
     }

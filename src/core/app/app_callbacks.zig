@@ -374,6 +374,8 @@ pub fn Bindings(comptime App: type) type {
                 .record_tool_call_rejected = agentRecordToolCallRejected,
                 .record_tool_call_failed = agentRecordToolCallFailed,
                 .report_usage = agentReportUsage,
+                // Stream rules run for real sessions; unit tests stay hermetic.
+                .ttsr_enabled = !@import("builtin").is_test,
                 .report_inner_tool_usage = agentReportInnerToolUsage,
                 .diff_marker_styles = .{
                     .added = ui_render.diff_added_marker_style,

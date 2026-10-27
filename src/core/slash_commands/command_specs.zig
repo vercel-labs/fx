@@ -36,6 +36,7 @@ pub const TopLevelKind = enum {
     workspace,
     search,
     read,
+    ttsr,
 };
 
 pub const SlashKind = enum {

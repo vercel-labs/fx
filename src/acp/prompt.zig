@@ -2010,6 +2010,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .observer = ctx.observer,
         .agent_stream_provider = server.streamProviderFor(ctx.state, ctx.state.active_session.?.provider),
         .report_usage = reportUsage,
+        .ttsr_enabled = !std_builtin.is_test,
         .flush_assistant_stream_per_content_chunk = host_target.is_wasm,
         .render_assistant_text = false,
         .tool_registry = ctx.toolRegistry(),

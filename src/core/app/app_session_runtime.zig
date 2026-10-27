@@ -1,4 +1,5 @@
 const std = @import("std");
+const ttsr = @import("../ttsr/ttsr.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
@@ -4356,8 +4357,18 @@ pub fn Runtime(comptime App: type) type {
                     if (prefix.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, prefix);
                 }
                 if (steering.text.len == 0) continue;
-                try sink.appendUserTurn(.{ .text = steering.text }, true);
+                try writeSteeringToSink(app, sink, steering.text);
             }
+        }
+
+        /// A stream rule's saved injection reads as the rule row the live
+        /// turn showed; other steering is the person's own update.
+        fn writeSteeringToSink(app: *App, sink: anytype, text: []u8) !void {
+            if (try ttsr.envelope.restoredNotice(app.alloc, text)) |body| {
+                defer app.alloc.free(body);
+                return sink.appendNotice(.{ .topic = "rule", .tone = .warning, .body = body });
+            }
+            try sink.appendUserTurn(.{ .text = text }, true);
         }
 
         fn writePersistedSteeringAtBoundary(
@@ -4374,9 +4385,7 @@ pub fn Runtime(comptime App: type) type {
                 if (item.assistant_prefix) |prefix| {
                     if (prefix.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, prefix);
                 }
-                if (item.text.len > 0) {
-                    try sink.appendUserTurn(.{ .text = item.text }, true);
-                }
+                if (item.text.len > 0) try writeSteeringToSink(app, sink, item.text);
                 index.* += 1;
             }
         }

@@ -22,6 +22,7 @@ comptime {
     std.debug.assert(command_replay_store.model_handle_notice_reserve_bytes < tool_result_limits.min_configured_tool_result_bytes);
 }
 const job_notice = @import("../../jobs/notice.zig");
+const ttsr = @import("../../ttsr/ttsr.zig");
 const ChatMessage = types.ChatMessage;
 const ToolCall = types.ToolCall;
 const Config = runtime_config.Config;
@@ -47,7 +48,7 @@ pub fn parentSteeringMessage(alloc: Allocator, text: []const u8) ![]u8 {
 pub fn steeringMessage(alloc: Allocator, text: []const u8) ![]u8 {
     // fx's own notices, such as settled background jobs, carry their own
     // envelope and never read as the user's live update.
-    if (job_notice.isSystemNotice(text)) return alloc.dupe(u8, text);
+    if (job_notice.isSystemNotice(text) or ttsr.envelope.isInjection(text)) return alloc.dupe(u8, text);
     return alloc.print(steering_open ++ "{s}" ++ steering_close, .{text});
 }
 
@@ -384,6 +385,9 @@ fn isSteering(message: ChatMessage) bool {
 fn steeringText(content: []const u8) ?[]const u8 {
     // A system notice is its own envelope; persisted text keeps it whole.
     if (job_notice.isSystemNotice(content)) return content;
+    // So is a stream rule's injection: the saved text is what rebuilds the
+    // repeat ledger on resume (D178).
+    if (ttsr.envelope.isInjection(content)) return content;
     if (std.mem.startsWith(u8, content, parent_steering_open) and std.mem.endsWith(u8, content, parent_steering_close)) {
         // Keep the sender label in persisted text and ordinary history replay.
         return content[parent_steering_open.len .. content.len - parent_steering_close.len];

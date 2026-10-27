@@ -42,6 +42,9 @@ pub const OutputFormat = enum {
 /// `proto-fx search` output.
 pub const WebSearchSnapshot = @import("web_search_snapshot.zig").Snapshot;
 
+/// `proto-fx ttsr` output.
+pub const TtsrSnapshots = @import("ttsr_snapshot.zig");
+
 /// `proto-fx read` output.
 pub const ReadSnapshot = @import("read_snapshot.zig").Snapshot;
 

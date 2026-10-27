@@ -211,6 +211,11 @@ pub const FakeCompletion = struct {
     cancel_before_output: bool = false,
     cancel_after_chunks: bool = false,
     cancel_during_tool_stream: bool = false,
+    /// Stream tool calls' arguments as input deltas, one call at a time.
+    streamed_tool_inputs: []const ToolCall = &.{},
+    /// Stop with `error.Cancelled` once the request's cancel flag is set
+    /// after any streamed output, as a real transport does.
+    honor_cancel: bool = false,
 };
 
 /// Fails a model request whose prompt ends on an assistant message, and one the
@@ -327,8 +332,18 @@ pub const FakeGateway = struct {
             recordNetworkFailureEvidence(request, err);
             return err;
         }
+        if (completion.honor_cancel and request.cancel_flag.load(.seq_cst)) return error.Cancelled;
         for (completion.streamed_tool_starts) |call| {
             request.events.emit(.{ .tool_started = .{ .id = call.id, .name = call.name } });
+        }
+        for (completion.streamed_tool_inputs, 0..) |call, index| {
+            request.events.emit(.{ .tool_started = .{ .id = call.id, .name = call.name } });
+            var offset: usize = 0;
+            while (offset < call.arguments_json.len) : (offset += 8) {
+                const end = @min(offset + 8, call.arguments_json.len);
+                request.events.emit(.{ .tool_input_delta = .{ .id = call.id, .index = index, .chunk = call.arguments_json[offset..end] } });
+                if (completion.honor_cancel and request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+            }
         }
         if (completion.stream_error_after_tool_starts) |err| {
             recordNetworkFailureEvidence(request, err);
@@ -494,6 +509,7 @@ pub const FakeAgentRuntimeDeps = struct {
     live_tool_authority: ?runtime_deps.LiveToolAuthorityProvider = null,
     tool_activity_recorder: ?runtime_deps.ToolActivityRecorder = null,
     tool_registry: tool_dispatch.Registry = test_tool_registry,
+    ttsr_enabled: bool = false,
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
     root_permission_mode: ?PermissionMode = null,
@@ -783,6 +799,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .tool_activity_recorder = self.tool_activity_recorder,
             .context_registry = self.context_registry,
             .context_enabled = self.context_enabled,
+            .ttsr_enabled = self.ttsr_enabled,
             .snapshot_root_permission_mode = if (self.root_permission_mode != null)
                 snapshotRootPermissionMode
             else
@@ -1708,6 +1725,9 @@ pub const FakeAgentRuntimeDeps = struct {
         defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
         if (self.steering_worker) |worker| try worker.pushEvent(self.alloc, event);
         switch (event) {
+            .semantic_notice => |notice| if (std.mem.eql(u8, notice.topic, "rule")) {
+                try self.record("rule_notice:{s}", .{notice.body});
+            },
             .full_detail_record => |notice| {
                 const owned = try types.dupeSemanticNotice(self.alloc, notice);
                 errdefer types.freeSemanticNotice(self.alloc, owned);
