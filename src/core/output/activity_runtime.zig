@@ -48,6 +48,9 @@ pub const ActivityProjection = union(enum) {
         /// status row while the turn is still thinking. Borrowed, and empty
         /// when the provider sent no visible reasoning.
         detail: []const u8 = "",
+        /// `detail` is the live tool block: rows already styled and cut to
+        /// the width, one per line, painted as they are.
+        detail_styled: bool = false,
     };
 
     pub const ToolSlot = struct {

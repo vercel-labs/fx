@@ -20,6 +20,8 @@ const runtime_deps = @import("deps.zig");
 const runtime_telemetry = @import("telemetry.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
 const runtime_tool_presentation = @import("tool_presentation.zig");
+const runtime_tool_input_preview = @import("tool_input_preview.zig");
+const stream_provider = @import("../stream_provider.zig");
 const response_language = @import("response_language.zig");
 
 const Allocator = std.mem.Allocator;
@@ -101,6 +103,8 @@ pub const StreamChunkContext = struct {
     /// the footer drops the reasoning preview. Tool-call arguments do not
     /// count as visible text.
     assistant_text_started_published: bool = false,
+    /// The newest tool call's streaming arguments, previewed for display.
+    tool_input_preview: runtime_tool_input_preview.Tracker = .{},
     response_language_expected: ?response_language.Script = null,
     response_language_accepted: bool = false,
     response_language_hold_until_completion: bool = false,
@@ -147,6 +151,9 @@ pub const StreamChunkContext = struct {
         self.provisional_statuses.deinit(self.alloc);
         self.reasoning_text.deinit(self.alloc);
         self.reasoning_preview_pending.deinit(self.alloc);
+        // The last call's final arguments stay shown until it starts.
+        flushToolInputPreview(self, true);
+        self.tool_input_preview.deinit(self.alloc);
     }
 
     /// Publishes this step's reasoning once, as a full-only transcript record
@@ -221,6 +228,8 @@ pub const StreamChunkContext = struct {
         self.reasoning_preview_started = false;
         self.reasoning_preview_pending.clearRetainingCapacity();
         self.assistant_text_started_published = false;
+        self.tool_input_preview.deinit(self.alloc);
+        self.tool_input_preview = .{};
     }
 
     pub fn accepted_source(self: *const StreamChunkContext) []const u8 {
@@ -357,6 +366,22 @@ fn retainReasoning(stream_ctx: *StreamChunkContext, chunk: []const u8) void {
     };
 }
 
+/// Sends the newest call's preview when it changed and is due. Display-only:
+/// the call's arguments reach the transcript when it starts.
+fn flushToolInputPreview(stream_ctx: *StreamChunkContext, force: bool) void {
+    const preview = stream_ctx.tool_input_preview.due(io_mod.milliTimestamp(), force) orelse return;
+    // Event payloads travel through the worker queue, which frees them with
+    // the process allocator.
+    const owned = preview.dupe(std.heap.c_allocator) catch |err| {
+        debug_trace.logf("agent", "tool input preview allocation failed err={s}", .{@errorName(err)});
+        return;
+    };
+    stream_ctx.hooks.push_event(stream_ctx.hooks.ctx, .{ .tool_input_preview = owned }) catch |err| {
+        owned.deinit(std.heap.c_allocator);
+        debug_trace.logf("agent", "tool input preview publication failed err={s}", .{@errorName(err)});
+    };
+}
+
 /// Sends the batched preview bytes as one event.
 fn flushReasoningPreview(stream_ctx: *StreamChunkContext, now_ms: i64) void {
     const pending = &stream_ctx.reasoning_preview_pending;
@@ -423,9 +448,12 @@ pub fn publishTurnPhase(stream_ctx: *StreamChunkContext, phase: types.TurnPhase)
     stream_ctx.published_phase = phase;
 }
 
-pub fn onStreamToolInputChunk(ctx: *anyopaque, chunk: []const u8) void {
+pub fn onStreamToolInputChunk(ctx: *anyopaque, delta: stream_provider.ToolInputDelta) void {
     const stream_ctx: *StreamChunkContext = @ptrCast(@alignCast(ctx));
+    const chunk = delta.chunk;
     stream_ctx.streamed_output_bytes += chunk.len;
+    stream_ctx.tool_input_preview.feed(stream_ctx.alloc, delta.id, chunk);
+    flushToolInputPreview(stream_ctx, false);
     publishTurnPhase(stream_ctx, .running);
     if (stream_ctx.token_progress) |progress| {
         pushTokenProgressUpdate(stream_ctx, progress.consumeToolInput(chunk)) catch |err| {
@@ -451,6 +479,12 @@ pub fn onStreamToolStart(ctx: *anyopaque, tool_id: []const u8, tool_name: []cons
     stream_ctx.publishReasoningRecord();
     const first_tool_in_step = !stream_ctx.saw_tool_start;
     recordStreamToolStart(ctx, tool_name);
+    // The previous call's arguments are complete; the newest call is shown.
+    flushToolInputPreview(stream_ctx, true);
+    stream_ctx.tool_input_preview.start(stream_ctx.alloc, tool_id, tool_name) catch |err| {
+        debug_trace.logf("agent", "tool input preview start failed err={s}", .{@errorName(err)});
+    };
+    if (arguments_json) |json| stream_ctx.tool_input_preview.feed(stream_ctx.alloc, tool_id, json);
     const preflight = runtime_tool_presentation.ProvisionalToolStatuses.preflight(stream_ctx.hooks.tool_registry, tool_name) orelse {
         publishTurnPhase(stream_ctx, .running);
         return;

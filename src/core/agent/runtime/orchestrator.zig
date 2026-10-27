@@ -5070,7 +5070,7 @@ fn onProviderEvent(raw: *anyopaque, event: agent_stream_provider.Event) void {
     switch (event) {
         .content_delta => |chunk| runtime_assistant_stream.onStreamContentChunk(ctx.stream, chunk),
         .reasoning_delta => |chunk| runtime_assistant_stream.onStreamReasoningChunk(ctx.stream, chunk),
-        .tool_input_delta => |chunk| runtime_assistant_stream.onStreamToolInputChunk(ctx.stream, chunk),
+        .tool_input_delta => |delta| runtime_assistant_stream.onStreamToolInputChunk(ctx.stream, delta),
         .tool_started => |tool| if (ctx.required_vision)
             onRequiredVisionStreamToolStart(ctx.stream, tool.id, tool.name, tool.label, tool.arguments_json)
         else

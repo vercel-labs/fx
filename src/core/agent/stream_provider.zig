@@ -15,6 +15,15 @@ const Allocator = std.mem.Allocator;
 /// Transport parser callback shapes. Provider boundaries expose `EventSink`;
 /// concrete reducers may use these adapters internally.
 pub const StreamCallback = *const fn (ctx: *anyopaque, chunk: []const u8) void;
+/// One fragment of a tool call's JSON arguments as the model streams them.
+/// `id` names the call and `index` is its position among this response's
+/// calls; all three slices and values are borrowed for synchronous delivery.
+pub const ToolInputDelta = struct {
+    id: []const u8,
+    index: usize,
+    chunk: []const u8,
+};
+pub const ToolInputCallback = *const fn (ctx: *anyopaque, delta: ToolInputDelta) void;
 pub const ToolStartCallback = *const fn (
     ctx: *anyopaque,
     tool_id: []const u8,
@@ -33,7 +42,7 @@ pub const Event = union(enum) {
         /// Complete arguments borrowed only for synchronous event delivery.
         arguments_json: ?[]const u8 = null,
     },
-    tool_input_delta: []const u8,
+    tool_input_delta: ToolInputDelta,
 };
 
 pub const EventSink = struct {

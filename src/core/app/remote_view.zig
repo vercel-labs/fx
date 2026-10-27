@@ -9,6 +9,7 @@ const host_commands = @import("../../acp/commands.zig");
 const io_mod = @import("../shared/io.zig");
 const browser_mod = @import("../input/session_browser.zig");
 const types = @import("../shared/types.zig");
+const tool_input_preview = @import("../shared/tool_input_preview.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const presentation = @import("../agent/assistant_presentation.zig");
 const callbacks = @import("app_callbacks.zig");
@@ -327,7 +328,16 @@ pub fn Runtime(comptime App: type) type {
             else
                 null;
             if (reasoning) |update| {
-                if (app.stream.reasoning.apply(update)) app.shell.render_requests.request(.footer);
+                var changed = app.stream.reasoning.apply(update);
+                if (update != .chunk) changed = app.stream.tool_preview.clear() or changed;
+                if (changed) app.shell.render_requests.request(.footer);
+                return;
+            }
+            if (field(event, "tool_input_preview")) |value| {
+                var parsed = try std.json.parseFromValue(tool_input_preview.Preview, app.alloc, value, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                app.stream.tool_preview.apply(parsed.value);
+                app.shell.render_requests.request(.footer);
                 return;
             }
             if (field(event, "tool_lifecycle")) |value| {
@@ -369,6 +379,10 @@ pub fn Runtime(comptime App: type) type {
                         .subagent => app.stream.subagent_count += 1,
                         .ask => {},
                     }
+                }
+                switch (lifecycle) {
+                    .authoritative_started, .terminal, .turn_finished => _ = app.stream.tool_preview.clear(),
+                    .provisional, .progress => {},
                 }
                 switch (lifecycle) {
                     .provisional, .authoritative_started, .progress => app.stream.phase = .running,

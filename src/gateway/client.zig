@@ -216,6 +216,7 @@ pub const GatewayJsonResult = union(enum) {
 
 pub const StreamCallback = agent_stream_provider.StreamCallback;
 pub const ToolStartCallback = agent_stream_provider.ToolStartCallback;
+pub const ToolInputCallback = agent_stream_provider.ToolInputCallback;
 
 const gateway_retry_base_delay_ns: u64 = 150 * std.time.ns_per_ms;
 /// Max time the post-stream body drain may take before the pooled connection
@@ -1191,7 +1192,7 @@ pub const StreamRequest = struct {
     delivery: ?*DeliveryCertainty = null,
     admission: ?agent_stream_provider.Admission = null,
     on_reasoning_chunk: ?StreamCallback = null,
-    on_tool_input_chunk: ?StreamCallback = null,
+    on_tool_input_chunk: ?ToolInputCallback = null,
     provider_attempt_owner: ProviderAttemptOwner = .transport,
     /// Long-lived pooled HTTP client owned by the provider runtime. When set,
     /// requests reuse pooled keep-alive connections instead of dialing per
@@ -3586,7 +3587,7 @@ fn consumeSseStreamTraced(
     on_content_chunk: StreamCallback,
     on_tool_start: ?ToolStartCallback,
     on_reasoning_chunk: ?StreamCallback,
-    on_tool_input_chunk: ?StreamCallback,
+    on_tool_input_chunk: ?ToolInputCallback,
     cancel_flag: *std.atomic.Value(bool),
     resolved_model_trace: ?ResolvedModelTrace,
     expected_provider_tool_name: ?[]const u8,
@@ -3779,7 +3780,7 @@ fn consumeSseStreamTraced(
                 const delta_value = root.object.get("delta") orelse continue;
                 if (delta_value != .string) continue;
                 try record.arguments.appendSlice(alloc, delta_value.string);
-                if (on_tool_input_chunk) |callback| callback(callback_ctx, delta_value.string);
+                if (on_tool_input_chunk) |callback| callback(callback_ctx, .{ .id = record.id.items, .index = index, .chunk = delta_value.string });
             } else {
                 record.state = .ended;
             }

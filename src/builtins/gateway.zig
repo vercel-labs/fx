@@ -660,8 +660,8 @@ const EventBridge = struct {
         sink(raw).emit(.{ .reasoning_delta = chunk });
     }
 
-    fn toolInput(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .tool_input_delta = chunk });
+    fn toolInput(raw: *anyopaque, delta: agent_stream_provider_contract.ToolInputDelta) void {
+        sink(raw).emit(.{ .tool_input_delta = delta });
     }
 
     fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8, arguments_json: ?[]const u8) void {

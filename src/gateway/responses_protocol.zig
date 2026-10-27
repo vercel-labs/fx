@@ -695,7 +695,7 @@ pub const StreamCallbacks = struct {
     on_content: stream_provider.StreamCallback,
     on_tool_start: ?stream_provider.ToolStartCallback = null,
     on_reasoning: ?stream_provider.StreamCallback = null,
-    on_tool_input: ?stream_provider.StreamCallback = null,
+    on_tool_input: ?stream_provider.ToolInputCallback = null,
 };
 
 const ToolAccumulator = struct {
@@ -737,6 +737,7 @@ const ToolAccumulator = struct {
     fn finalizeArguments(
         self: *ToolAccumulator,
         alloc: std.mem.Allocator,
+        call_index: usize,
         arguments: []const u8,
         callbacks: StreamCallbacks,
         limits: StreamLimits,
@@ -750,7 +751,7 @@ const ToolAccumulator = struct {
         if (std.mem.startsWith(u8, arguments, self.arguments.items)) {
             const suffix = arguments[previous_len..];
             try appendToolArguments(alloc, &self.arguments, suffix, limits.tool_arguments_bytes);
-            if (suffix.len > 0) if (callbacks.on_tool_input) |callback| callback(callbacks.context, suffix);
+            if (suffix.len > 0) if (callbacks.on_tool_input) |callback| callback(callbacks.context, .{ .id = self.id, .index = call_index, .chunk = suffix });
         } else {
             try self.arguments.ensureTotalCapacity(alloc, arguments.len);
             self.arguments.clearRetainingCapacity();
@@ -995,14 +996,14 @@ pub const Reducer = struct {
             try self.tools.items[index].reconcileIdentity(alloc, parsed.value.object, "item_id", limits);
             if (self.tools.items[index].arguments_finalized and delta.len > 0) return error.ResponsesToolCallConflict;
             try appendToolArguments(alloc, &self.tools.items[index].arguments, delta, limits.tool_arguments_bytes);
-            if (callbacks.on_tool_input) |callback| callback(callbacks.context, delta);
+            if (callbacks.on_tool_input) |callback| callback(callbacks.context, .{ .id = self.tools.items[index].id, .index = index, .chunk = delta });
         } else if (std.mem.eql(u8, event_type, "response.function_call_arguments.done")) {
             const output_index = try optional_index(parsed.value.object, "output_index") orelse return false;
             try self.check_output_kind(output_index, .function_call);
             const arguments = stringField(parsed.value.object, "arguments") orelse return error.InvalidEvent;
             const index = findTool(self.tools.items, output_index) orelse return error.ResponsesToolCallConflict;
             try self.tools.items[index].reconcileIdentity(alloc, parsed.value.object, "item_id", limits);
-            try self.tools.items[index].finalizeArguments(alloc, arguments, callbacks, limits);
+            try self.tools.items[index].finalizeArguments(alloc, index, arguments, callbacks, limits);
         } else if (std.mem.eql(u8, event_type, "response.output_item.done")) {
             const output_index = try optional_index(parsed.value.object, "output_index") orelse return false;
             const item = parsed.value.object.get("item") orelse return false;
@@ -1273,7 +1274,7 @@ pub const Reducer = struct {
         try tool.reconcileIdentity(alloc, fields, "id", limits);
         if (fields.get("arguments")) |value| {
             if (value != .string) return error.InvalidEvent;
-            try tool.finalizeArguments(alloc, value.string, callbacks, limits);
+            try tool.finalizeArguments(alloc, index, value.string, callbacks, limits);
         }
     }
 

@@ -403,8 +403,8 @@ const EventBridge = struct {
         sink(raw).emit(.{ .reasoning_delta = chunk });
     }
 
-    fn toolInput(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .tool_input_delta = chunk });
+    fn toolInput(raw: *anyopaque, delta: stream_provider.ToolInputDelta) void {
+        sink(raw).emit(.{ .tool_input_delta = delta });
     }
 
     fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8, arguments_json: ?[]const u8) void {
@@ -434,7 +434,7 @@ fn consumeSse(
     on_content_chunk: stream_provider.StreamCallback,
     on_tool_start: ?stream_provider.ToolStartCallback,
     on_reasoning_chunk: ?stream_provider.StreamCallback,
-    on_tool_input_chunk: ?stream_provider.StreamCallback,
+    on_tool_input_chunk: ?stream_provider.ToolInputCallback,
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
     progress: ?sse_stream.Progress,

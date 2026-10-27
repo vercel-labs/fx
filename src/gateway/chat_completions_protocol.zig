@@ -711,6 +711,10 @@ const Tool = struct {
     id: ?[]u8 = null,
     name: std.ArrayList(u8) = .empty,
     arguments: std.ArrayList(u8) = .empty,
+    /// Presentation progress: the start was told and how many argument
+    /// bytes were already streamed out.
+    announced: bool = false,
+    emitted: usize = 0,
 
     fn deinit(self: *Tool, alloc: Allocator) void {
         if (self.id) |id| alloc.free(id);
@@ -925,6 +929,24 @@ pub const Reducer = struct {
         if (destination.*) |prior| {
             if (!std.mem.eql(u8, prior, text)) return error.ConflictingIdentity;
         } else destination.* = try self.alloc.dupe(u8, text);
+    }
+
+    /// Tells `sink` about each call once its id and name arrived, then about
+    /// the argument bytes it gained since the last report. Presentation only;
+    /// slices borrow reducer storage for the synchronous call.
+    pub fn emit_tool_progress(self: *Reducer, sink: stream_provider.EventSink) void {
+        for (self.tools.items, 0..) |*tool, index| {
+            const id = tool.id orelse continue;
+            if (!tool.announced) {
+                if (tool.name.items.len == 0) continue;
+                tool.announced = true;
+                sink.emit(.{ .tool_started = .{ .id = id, .name = tool.name.items } });
+            }
+            if (tool.arguments.items.len > tool.emitted) {
+                sink.emit(.{ .tool_input_delta = .{ .id = id, .index = index, .chunk = tool.arguments.items[tool.emitted..] } });
+                tool.emitted = tool.arguments.items.len;
+            }
+        }
     }
 
     fn accept_tools(self: *Reducer, value: std.json.Value) Error!void {
@@ -1152,6 +1174,8 @@ pub fn consume_stream(alloc: Allocator, source: *std.Io.Reader, request: stream_
                 if (cancel_flag.load(.seq_cst)) return error.Cancelled;
                 sink.emit(.{ .content_delta = text });
             }
+            if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+            reducer.emit_tool_progress(sink);
         }
         if (reducer.phase == .done) return reducer.finish(cancel_flag.load(.seq_cst));
     }

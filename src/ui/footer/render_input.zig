@@ -352,6 +352,9 @@ pub const RenderContext = struct {
     /// app's `stream.reasoning` (the copy in `stream` dies with this
     /// context). Empty hides the preview.
     reasoning_preview: []const u8 = "",
+    /// The streaming tool call's block, styled rows joined by newlines and
+    /// cut to the width. Takes the reasoning preview's place while set.
+    tool_preview: []const u8 = "",
     compaction: @import("../../core/output/compaction_activity.zig").Snapshot = .{},
     pending_prompt_activity: bool = false,
     completed_assistant_presentation_tail: bool = false,
@@ -652,12 +655,19 @@ pub fn activityOverlayInput(
 
 pub fn activityProjectionRows(projection: ActivityProjection, cols: u16) u16 {
     return switch (projection) {
-        .turn_thinking => |thinking| if (thinking.tone == .thinking)
+        .turn_thinking => |thinking| if (thinking.tone == .thinking and thinking.detail_styled)
+            1 +| styledRowCount(thinking.detail)
+        else if (thinking.tone == .thinking)
             1 +| activity_runtime.reasoningPreviewRowCount(thinking.detail, cols)
         else
             wrappedStatusRowCount(thinking.label, cols, max_static_status_activity_rows),
         .none, .tool_slot => 1,
     };
+}
+
+fn styledRowCount(rows: []const u8) u16 {
+    if (rows.len == 0) return 0;
+    return @intCast(@min(std.math.maxInt(u16), std.mem.count(u8, rows, "\n") + 1));
 }
 
 pub fn frameOwnedActivityProjection(
@@ -709,13 +719,16 @@ fn turnActivityProjection(
     visible_stream.last_activity_kind = null;
     // The last reasoning trace stays visible through tool work until visible
     // text starts (`types.ReasoningTail`).
-    const detail = ctx.reasoning_preview;
+    // A streaming tool call's block takes the reasoning tail's place.
+    const styled = ctx.tool_preview.len > 0;
+    const detail = if (styled) ctx.tool_preview else ctx.reasoning_preview;
     if (activity_status.buildTurnLabel(buf, visible_stream, ctx.now_ms)) |label| {
-        return .{ .turn_thinking = .{ .label = label, .detail = detail } };
+        return .{ .turn_thinking = .{ .label = label, .detail = detail, .detail_styled = styled } };
     }
     return .{ .turn_thinking = .{
         .label = "• Thinking",
         .detail = detail,
+        .detail_styled = styled,
     } };
 }
 

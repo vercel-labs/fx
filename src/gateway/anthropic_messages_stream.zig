@@ -33,6 +33,10 @@ const Tool = struct {
     name: []u8,
     arguments: std.ArrayList(u8) = .empty,
     streamed: bool = false,
+    /// Presentation progress: the start was told and how many argument
+    /// bytes were already streamed out.
+    announced: bool = false,
+    emitted: usize = 0,
 };
 
 /// What one accepted event contributes to presentation. Slices borrow
@@ -242,6 +246,7 @@ pub const Reducer = struct {
                 const tool = &self.tools.items[block.slot];
                 if (!tool.streamed) {
                     tool.arguments.clearRetainingCapacity();
+                    tool.emitted = 0;
                     tool.streamed = true;
                 }
                 const fragment = try string(delta.get("partial_json") orelse return error.InvalidChunk);
@@ -249,6 +254,23 @@ pub const Reducer = struct {
                 try tool.arguments.appendSlice(self.alloc, fragment);
                 return .{};
             },
+        }
+    }
+
+    /// Tells `sink` about each tool_use block once it starts, then about the
+    /// input bytes it gained since the last report. Presentation only; slices
+    /// borrow reducer storage for the synchronous call.
+    pub fn emit_tool_progress(self: *Reducer, sink: stream_provider.EventSink) void {
+        for (self.tools.items, 0..) |*tool, index| {
+            if (!tool.announced) {
+                tool.announced = true;
+                sink.emit(.{ .tool_started = .{ .id = tool.id, .name = tool.name } });
+            }
+            // Input sent whole at start streams out only if no deltas replace it.
+            if (tool.arguments.items.len > tool.emitted) {
+                sink.emit(.{ .tool_input_delta = .{ .id = tool.id, .index = index, .chunk = tool.arguments.items[tool.emitted..] } });
+                tool.emitted = tool.arguments.items.len;
+            }
         }
     }
 
@@ -454,6 +476,8 @@ pub fn consume_stream(alloc: Allocator, source: *std.Io.Reader, request: stream_
                 if (cancel_flag.load(.seq_cst)) return error.Cancelled;
                 sink.emit(.{ .content_delta = text });
             }
+            if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+            reducer.emit_tool_progress(sink);
         }
         if (reducer.phase == .done or reducer.phase == .failed) return reducer.finish(cancel_flag.load(.seq_cst));
     }

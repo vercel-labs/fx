@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("testing_allocator.zig");
 const text_utils = @import("text_utils.zig");
+const tool_input_preview = @import("tool_input_preview.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 
 pub const Layout = struct {
@@ -301,6 +302,8 @@ pub const StreamState = struct {
     /// The tail of the reasoning the footer previews. Resetting the stream
     /// clears it with everything else.
     reasoning: ReasoningTail = .{},
+    /// The newest tool call's streaming arguments, shown until it starts.
+    tool_preview: tool_input_preview.Tail = .{},
 
     /// Applies the phase of step `step_id`; an older step's is ignored, and
     /// a new step starts without visible text. True when the phase changed.

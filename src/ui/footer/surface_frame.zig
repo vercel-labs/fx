@@ -67,6 +67,7 @@ pub const SurfaceFooterFrame = struct {
     composed: footer_viewport.ComposedFooterFrame,
     activity_label: std.ArrayList(u8) = .empty,
     activity_detail: std.ArrayList(u8) = .empty,
+    activity_detail_styled: bool = false,
     tool_activity_label: std.ArrayList(u8) = .empty,
     shimmer_pos: i16 = -render_request.animation_padding,
     thinking_blink: ?bool = null,
@@ -858,6 +859,10 @@ fn assembleSurfaceFooterFrame(
         .composed = composed,
         .activity_label = activity_label,
         .activity_detail = activity_detail,
+        .activity_detail_styled = switch (assembly.activity_projection) {
+            .turn_thinking => |thinking| thinking.detail_styled,
+            else => false,
+        },
         .tool_activity_label = tool_activity_label,
         .shimmer_pos = assembly.planner_input.ctx.shimmer_pos,
         .thinking_blink = render_input.frameActivityBlink(assembly.planner_input.ctx),
@@ -1169,6 +1174,7 @@ pub noinline fn measureSurfaceFooter(
                     // Borrowed from the frame's RenderContext, which outlives the
                     // measurement; the layout reserves its rows.
                     .detail = thinking.detail,
+                    .detail_styled = thinking.detail_styled,
                 },
             };
         },

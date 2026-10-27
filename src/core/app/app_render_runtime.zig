@@ -33,6 +33,7 @@ const surface_invalidation = @import("../../ui/footer/surface_invalidation.zig")
 const interaction_state = @import("../../ui/footer/interaction_state.zig");
 const approval_prompt = @import("../permissions/approval_prompt.zig");
 const render_input = @import("../../ui/footer/render_input.zig");
+const tool_input_preview_view = @import("../../ui/footer/tool_input_preview_view.zig");
 const picker_presentation = @import("../../ui/footer/picker_presentation.zig");
 const input_presentation = @import("../../ui/footer/input_presentation.zig");
 const footer_viewport = @import("../../ui/footer/viewport.zig");
@@ -533,6 +534,7 @@ pub fn Runtime(comptime App: type) type {
         var effort_picker_labels_buf: [types.ReasoningEffort.max_options + 1][]const u8 = undefined;
         var fast_picker_labels_buf: [3][]const u8 = undefined;
         var provider_picker_column: provider_picker_runtime.ColumnBuffer = .{};
+        var tool_preview_cache: tool_input_preview_view.Cache = .{};
         noinline fn footerContext(
             app: *App,
             upgrade_status_buf: *[64]u8,
@@ -728,6 +730,7 @@ pub fn Runtime(comptime App: type) type {
                 .slash_registry = app.slashRegistry(),
                 .stream = visible_stream,
                 .reasoning_preview = app.stream.reasoning.text(),
+                .tool_preview = tool_preview_cache.view(&app.stream.tool_preview, app.shell.layout.cols, app.shell.layout.rows),
                 .compaction = if (comptime @hasDecl(@TypeOf(app.worker), "compactionActivitySnapshot")) app.worker.compactionActivitySnapshot() else .{},
                 .pending_prompt_activity = pendingPromptActivityVisible(app),
                 .completed_assistant_presentation_tail = app.pacer.hasCompletedAssistantPresentationTail(),
@@ -2288,6 +2291,7 @@ fn FramePaintContext(comptime App: type) type {
             self.activity_result = try shimmer_runtime.paintActivityIntoSurface(surface, .{
                 .label = self.footer_frame.label(),
                 .detail = self.footer_frame.detail(),
+                .detail_styled = self.footer_frame.activity_detail_styled,
                 .tool_label = self.footer_frame.toolLabel(),
                 .shimmer_pos = self.footer_frame.shimmer_pos,
                 .style = self.activity_style,

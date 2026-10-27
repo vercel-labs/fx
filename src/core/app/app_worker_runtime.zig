@@ -352,6 +352,7 @@ pub fn Runtime(comptime App: type) type {
                 .reasoning_preview,
                 .reasoning_preview_begin,
                 .assistant_text_started,
+                .tool_input_preview,
                 .diff_block,
                 .restore_failed_prompt,
                 => .drop,
@@ -1160,7 +1161,15 @@ pub fn Runtime(comptime App: type) type {
                             .reasoning_preview_begin => .begin,
                             else => .text_started,
                         };
-                        if (app.stream.reasoning.apply(update)) app.shell.render_requests.request(.footer);
+                        var changed = app.stream.reasoning.apply(update);
+                        // A new trace or visible text means the previewed
+                        // call is behind the turn.
+                        if (tag != .reasoning_preview) changed = app.stream.tool_preview.clear() or changed;
+                        if (changed) app.shell.render_requests.request(.footer);
+                    },
+                    .tool_input_preview => |preview| {
+                        app.stream.tool_preview.apply(preview);
+                        app.shell.render_requests.request(.footer);
                     },
                     .diff_block => |payload| {
                         drain_owns_current = false;
@@ -1188,6 +1197,12 @@ pub fn Runtime(comptime App: type) type {
                                 }
                             },
                             .progress, .terminal, .turn_finished => {},
+                        }
+                        // A call that starts or ends supersedes the preview
+                        // of the arguments still streaming.
+                        switch (lifecycle) {
+                            .provisional, .progress => {},
+                            .authoritative_started, .terminal, .turn_finished => if (app.stream.tool_preview.clear()) app.shell.render_requests.request(.footer),
                         }
                         try applyToolLifecycle(app, handlers.tool_lifecycle, lifecycle);
                     },

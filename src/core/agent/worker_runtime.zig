@@ -18,6 +18,7 @@ const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const compactor = @import("../compactor/compactor.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
 const types = @import("../shared/types.zig");
+const tool_input_preview = @import("../shared/tool_input_preview.zig");
 const model_provider = @import("../config/model_provider.zig");
 const assistant_presentation = @import("assistant_presentation.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
@@ -531,6 +532,9 @@ pub const WorkerEvent = union(enum) {
     /// A visible assistant text block started, which supersedes the reasoning
     /// preview even while the phase is also `generating`.
     assistant_text_started,
+    /// The newest tool call's arguments as the model streams them. Owned by
+    /// the event; display-only, superseded when the call starts.
+    tool_input_preview: tool_input_preview.Preview,
     diff_block: diff_mod.DiffEntryPayload,
     context_compaction: ContextCompaction,
     finish_prompt: types.FinishedPrompt,
@@ -4025,6 +4029,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
         .turn_token_update => |update| .{ .turn_token_update = update },
         .turn_phase_update => |update| .{ .turn_phase_update = update },
         .reasoning_preview => |text| .{ .reasoning_preview = try alloc.dupe(u8, text) },
+        .tool_input_preview => |preview| .{ .tool_input_preview = try preview.dupe(alloc) },
         .diff_block => |payload| blk: {
             const preview = try alloc.dupe(u8, payload.preview);
             errdefer alloc.free(preview);
@@ -4103,6 +4108,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
         .provider_resolved => |slug| alloc.free(slug),
         .api_status_text => |text| alloc.free(text),
         .reasoning_preview => |text| alloc.free(text),
+        .tool_input_preview => |preview| preview.deinit(alloc),
         .credential_refreshed => |credential| {
             var owned = credential;
             owned.deinit(alloc);

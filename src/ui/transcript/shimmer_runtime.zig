@@ -19,6 +19,8 @@ pub const ActivityPaintInput = struct {
     /// Reasoning tail painted under the status row while the turn is still
     /// thinking. Empty paints nothing.
     detail: []const u8 = "",
+    /// `detail` holds styled rows that already fit the width.
+    detail_styled: bool = false,
     tool_label: ?[]const u8 = null,
     shimmer_pos: i16,
     style: ActivityPaintStyle = .thinking,
@@ -250,7 +252,10 @@ fn paintPlannedActivityRow(
     std.debug.assert(result.rows_touched <= max_rows);
 
     if (!overlay and max_rows > 1 and input.detail.len > 0) {
-        try paintActivityDetailRows(surface, input.detail, row + 1, max_rows - 1);
+        if (input.detail_styled)
+            try paintStyledDetailRows(surface, input.detail, row + 1, max_rows - 1)
+        else
+            try paintActivityDetailRows(surface, input.detail, row + 1, max_rows - 1);
     }
 
     return .{
@@ -258,6 +263,24 @@ fn paintPlannedActivityRow(
         .row = row,
         .overlay = overlay,
     };
+}
+
+/// Paints the streaming tool block below the status row, one styled row per
+/// line, as the renderer cut them.
+fn paintStyledDetailRows(
+    surface: *frame_surface.FrameSurface,
+    rows: []const u8,
+    first_row: u16,
+    max_rows: u16,
+) !void {
+    var lines = std.mem.splitScalar(u8, rows, '\n');
+    var index: u16 = 0;
+    while (lines.next()) |line| : (index += 1) {
+        if (index >= max_rows) break;
+        const target = first_row + index;
+        if (!surface.plan.activity_band.containsRow(target)) break;
+        _ = try surface.writeAnsiBandNoWrap(target, 1, line, .activity, .same_owner);
+    }
 }
 
 /// Paints the wrapped reasoning tail below the status row. Each row already
