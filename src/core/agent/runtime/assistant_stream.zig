@@ -105,6 +105,10 @@ pub const StreamChunkContext = struct {
     assistant_text_started_published: bool = false,
     /// The newest tool call's streaming arguments, previewed for display.
     tool_input_preview: runtime_tool_input_preview.Tracker = .{},
+    /// Tool-input token progress not yet published. Arguments arrive in
+    /// many small fragments, so the display hears about them in batches.
+    tool_input_tokens_pending: bool = false,
+    tool_input_tokens_sent_ms: i64 = 0,
     response_language_expected: ?response_language.Script = null,
     response_language_accepted: bool = false,
     response_language_hold_until_completion: bool = false,
@@ -153,6 +157,7 @@ pub const StreamChunkContext = struct {
         self.reasoning_preview_pending.deinit(self.alloc);
         // The last call's final arguments stay shown until it starts.
         flushToolInputPreview(self, true);
+        flushToolInputTokens(self, true);
         self.tool_input_preview.deinit(self.alloc);
     }
 
@@ -456,10 +461,28 @@ pub fn onStreamToolInputChunk(ctx: *anyopaque, delta: stream_provider.ToolInputD
     flushToolInputPreview(stream_ctx, false);
     publishTurnPhase(stream_ctx, .running);
     if (stream_ctx.token_progress) |progress| {
-        pushTokenProgressUpdate(stream_ctx, progress.consumeToolInput(chunk)) catch |err| {
-            debug_trace.logf("agent", "token progress publication failed source=tool_input err={s}", .{@errorName(err)});
-        };
+        switch (progress.consumeToolInput(chunk)) {
+            .unchanged => {},
+            .changed => stream_ctx.tool_input_tokens_pending = true,
+            .invalid => pushTokenProgressUpdate(stream_ctx, .invalid) catch {},
+        }
+        flushToolInputTokens(stream_ctx, false);
     }
+}
+
+/// Every fragment still counts; the display is told at most every
+/// `tool_input_tokens_batch_ms`, and once more when the step ends.
+const tool_input_tokens_batch_ms: i64 = 100;
+
+fn flushToolInputTokens(stream_ctx: *StreamChunkContext, force: bool) void {
+    if (!stream_ctx.tool_input_tokens_pending) return;
+    const now_ms = io_mod.milliTimestamp();
+    if (!force and now_ms - stream_ctx.tool_input_tokens_sent_ms < tool_input_tokens_batch_ms) return;
+    stream_ctx.tool_input_tokens_pending = false;
+    stream_ctx.tool_input_tokens_sent_ms = now_ms;
+    pushTokenProgressUpdate(stream_ctx, .changed) catch |err| {
+        debug_trace.logf("agent", "token progress publication failed source=tool_input err={s}", .{@errorName(err)});
+    };
 }
 
 pub fn pushTokenProgressUpdate(stream_ctx: *StreamChunkContext, update: runtime_telemetry.TokenProgressUpdate) !void {
