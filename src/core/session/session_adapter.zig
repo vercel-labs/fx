@@ -116,9 +116,9 @@ pub const Child = struct {
     seq: u64,
     /// A rewind of the parent dropped the turn that first spawned it (D97).
     abandoned: bool = false,
-    /// Work waiting behind the open item, oldest first (D102).
+    /// Work waiting behind the open item, oldest first (D113).
     queue: []QueuedWork = &.{},
-    /// fx's data on `child_terminated`; set once the child is terminal (D102).
+    /// fx's data on `child_terminated`; set once the child is terminal (D113).
     terminated: ?[]u8 = null,
 };
 

@@ -37,10 +37,10 @@ pub const Child = struct {
     /// A rewind of this session dropped the turn that first spawned it
     /// (D97): it stays listed, read-only, and takes no more work.
     abandoned: bool = false,
-    /// Work waiting behind the open item, oldest first (D102).
+    /// Work waiting behind the open item, oldest first (D113).
     queue: std.ArrayList(Queued) = .empty,
     /// fx's `data` from `child_terminated`; set once the child is
-    /// terminal (D102): listed, read-only, and taking no more work.
+    /// terminal (D113): listed, read-only, and taking no more work.
     terminated: ?[]u8 = null,
 
     fn deinit(child: Child, gpa: std.mem.Allocator) void {
@@ -91,7 +91,7 @@ pub const Child = struct {
             optionalEql(a.terminated, b.terminated);
     }
 
-    /// Whether the child may take work: not abandoned (D97) or terminal (D102).
+    /// Whether the child may take work: not abandoned (D97) or terminal (D113).
     pub fn closed(child: Child) bool {
         return child.abandoned or child.terminated != null;
     }
@@ -208,7 +208,7 @@ pub const State = struct {
         errdefer if (data) |d| gpa.free(d);
         if (state.findChild(spawned.child)) |i| {
             const known = &state.children.items[i];
-            // A queued item starts from the front of the queue (D102).
+            // A queued item starts from the front of the queue (D113).
             if (known.queue.items.len > 0 and std.mem.eql(u8, known.queue.items[0].work_id, spawned.work_id)) {
                 known.queue.orderedRemove(0).deinit(gpa);
             }
@@ -229,7 +229,7 @@ pub const State = struct {
     /// not a line the manager writes, and changes nothing.
     fn finishChild(state: *State, gpa: std.mem.Allocator, seq: u64, finished: schema.Body.Finished) error{OutOfMemory}!void {
         const known = &state.children.items[state.findChild(finished.child) orelse return];
-        // A cancelled queued item leaves the queue and never ran (D102).
+        // A cancelled queued item leaves the queue and never ran (D113).
         for (known.queue.items, 0..) |item, index| {
             if (!std.mem.eql(u8, item.work_id, finished.work_id)) continue;
             known.queue.orderedRemove(index).deinit(gpa);
@@ -367,7 +367,7 @@ pub const Event = union(enum) {
     /// The kernel's globals at this turn's end (D99). Inside a turn.
     kernel_snapshot: KernelSnapshot,
     /// Work waiting behind a child's open item, and a child made terminal
-    /// (D102).
+    /// (D113).
     child_queued: schema.Body.WorkItem,
     child_terminated: schema.Body.Terminated,
 };
@@ -429,7 +429,7 @@ pub fn plan(state: *const State, events: []const Event, out: []schema.Body) Tran
             // OneOpenWork); a finish names exactly that one.
             .child_spawned => |c| blk: {
                 if (openWorkAt(state, events[0..i], c.child) != null) return error.InvalidTransition;
-                // An abandoned or terminal child takes no more work (D97, D102).
+                // An abandoned or terminal child takes no more work (D97, D113).
                 if (abandonedAt(state, events[0..i], c.child)) return error.InvalidTransition;
                 // Queued work starts in order (`tests/tla/session_manager/Fleet.tla`
                 // QueueInOrder).
@@ -563,7 +563,7 @@ pub fn encodeState(gpa: std.mem.Allocator, out: *std.ArrayList(u8), state: *cons
         if (child.finish_data) |data| try appendRawField(gpa, out, "finish_data", data);
         if (child.abandoned) try out.appendSlice(gpa, ",\"abandoned\":true");
         // Written only for workers that have them, so older snapshots read
-        // the same (D102).
+        // the same (D113).
         if (child.queue.items.len > 0) {
             try out.appendSlice(gpa, ",\"queue\":[");
             for (child.queue.items, 0..) |item, q| {

@@ -790,7 +790,7 @@ fn checkEvents(gpa: std.mem.Allocator, events: []const Event, import: bool) Appe
         .child_queued => |c| {
             try checkId(c.child);
             try checkWorkId(c.work_id);
-            // A queued item carries its message until it starts (D102).
+            // A queued item carries its message until it starts (D113).
             if (c.data) |data| {
                 if (data.len > max_queued_data_bytes) return error.TooLarge;
                 try checkJson(gpa, data);

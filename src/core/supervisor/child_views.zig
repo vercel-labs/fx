@@ -115,7 +115,7 @@ fn liveRows(read: *const Read, node: *tool_host.Runtime) anyerror!Found {
 fn liveStatus(arena: Allocator, child: *const child_state.Child) ![]const u8 {
     if (child.terminated) return "terminated";
     const base = if (child.phase != .finished) @tagName(child.phase) else if (child.last_outcome) |outcome| @tagName(outcome) else "finished";
-    // A worker's queued turns wait behind this one (D102).
+    // A worker's queued turns wait behind this one (D113).
     if (child.queue.len > 0) return arena.print("{s} · {d} queued", .{ base, child.queue.len });
     return base;
 }

@@ -85,7 +85,7 @@ const Feedback = struct {
 };
 
 /// Told when a worker's turn starts from its queue and when any turn
-/// settles (D101), on the worker's own thread with no lock held.
+/// settles (D112), on the worker's own thread with no lock held.
 pub const TurnHook = struct {
     context: *anyopaque,
     started_fn: *const fn (context: *anyopaque, child_id: []const u8, work_id: []const u8) void,
@@ -469,7 +469,7 @@ pub const Owner = struct {
     const Finished = struct {
         observation: Observation,
         /// The queued work that starts next on this slot, owned; null when
-        /// the worker goes idle (D102).
+        /// the worker goes idle (D113).
         next_work_id: ?[]u8 = null,
     };
 

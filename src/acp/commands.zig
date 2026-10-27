@@ -134,7 +134,7 @@ pub const NodeRefusal = enum {
     nothing_to_fork,
     /// `/compact` on a subagent: its own turns compact it.
     compact,
-    /// Its parent's fleet terminated it (D102).
+    /// Its parent's fleet terminated it (D113).
     terminated,
 
     pub fn text(self: NodeRefusal) []const u8 {

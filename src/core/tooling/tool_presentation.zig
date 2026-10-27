@@ -32,7 +32,7 @@ pub const ToolActionInput = struct {
     is_available_dynamic_mcp_tool: bool = false,
 };
 
-/// The fleet tool, or the `subagent` tool older histories name (D101).
+/// The fleet tool, or the `subagent` tool older histories name (D112).
 pub fn isFleetCall(call: ToolCall) bool {
     return std.mem.eql(u8, call.name, "fleet") or std.mem.eql(u8, call.name, "subagent");
 }
@@ -75,7 +75,7 @@ pub fn subagentAction(
     var raw_preview: []const u8 = "";
     if (fleet_presentation.parseCall(outer)) |fleet_call| {
         // A worker op's running and settled rows are the fleet's own; a run,
-        // and every op's identity and stop, read like a delegation (D101).
+        // and every op's identity and stop, read like a delegation (D112).
         const own_row = fleet_call.op != .run and (state == .active or state == .completed);
         if (own_row) {
             const row = try fleet_presentation.activeRow(alloc, scratch, fleet_call, state == .completed);

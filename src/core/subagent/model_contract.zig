@@ -102,7 +102,7 @@ fn collectScoredMatches(
     return out.toOwnedSlice(alloc);
 }
 
-/// The fleet's operations (D101). `run` blocks until its one turn ends;
+/// The fleet's operations (D112). `run` blocks until its one turn ends;
 /// `message` is `run` on a named worker, which it spawns when new. `spawn`
 /// and `send` return a turn receipt at once and the turn's result arrives
 /// when it settles.
@@ -472,7 +472,7 @@ pub fn withSchemaAlloc(alloc: Allocator, message: []const u8, schema_json: []con
 
 pub const steering_pending_result = "The subagent is still running. Handle the user's steering now. Its result will arrive automatically; do not delegate again to poll for it.";
 
-/// What became of a tracked worker input (D101).
+/// What became of a tracked worker input (D112).
 pub const Receipt = enum { accepted, queued, steered, rejected, terminal };
 
 pub const Result = struct {

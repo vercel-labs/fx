@@ -1,5 +1,5 @@
-//! A worker's turn queue and tombstone in its parent's registry (D101,
-//! D102). The registry is the in-memory truth; `planQueueLines` writes
+//! A worker's turn queue and tombstone in its parent's registry (D112,
+//! D113). The registry is the in-memory truth; `planQueueLines` writes
 //! what changed to the parent's log, where `child_queued`, a cancelled
 //! `child_finished` and `child_terminated` lines keep both across restarts.
 const std = @import("std");
@@ -102,6 +102,9 @@ pub fn terminate(registry: *Registry, alloc: Allocator, child_id: []const u8) Qu
     const child = registry.findById(child_id) orelse return error.ChildNotFound;
     if (child.terminated) return error.Terminated;
     if (child.active != null) return error.InvalidState;
+    // A terminal worker takes no more turns, so its count is the turns it
+    // ran, as a reload reads it back.
+    child.turns -|= @intCast(child.queue.len);
     child_state.freeWorks(alloc, child.queue);
     child.queue = &.{};
     child.terminated = true;
@@ -181,7 +184,7 @@ fn testWork(alloc: Allocator, id: []const u8, turn: u32) !ActiveWork {
     return .{ .id = try alloc.dupe(u8, id), .message = try alloc.dupe(u8, "next step"), .created_at_ms = 5, .turn = turn, .request_fingerprint = @splat(7) };
 }
 
-test "a worker's queue and tombstone survive the parent's log (D102)" {
+test "a worker's queue and tombstone survive the parent's log (D113)" {
     const alloc = std.testing.allocator;
     var parent: child_state.TestParent = undefined;
     try parent.init(alloc);

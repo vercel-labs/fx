@@ -185,7 +185,7 @@ pub fn validAgentName(name: []const u8) bool {
     return true;
 }
 
-/// A worker label: 1 to 48 ASCII letters, digits, `_` or `-` (D101).
+/// A worker label: 1 to 48 ASCII letters, digits, `_` or `-` (D112).
 pub fn validLabel(label: []const u8) bool {
     if (label.len == 0 or label.len > 48) return false;
     for (label) |byte| {

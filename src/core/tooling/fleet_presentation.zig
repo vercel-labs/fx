@@ -1,4 +1,4 @@
-//! The fleet tool's transcript rows (D101): proto's fleet cards in fx's
+//! The fleet tool's transcript rows (D112): proto's fleet cards in fx's
 //! row idiom. A call shows one `● <verb> <worker> · <message>` row while it
 //! runs; its result replaces it with the receipt, and list and inspect add
 //! one continuation row per worker under it.

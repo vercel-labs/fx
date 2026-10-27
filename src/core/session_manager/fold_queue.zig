@@ -1,4 +1,4 @@
-//! A worker's queue in the fold (D102): queued work items, and the view of
+//! A worker's queue in the fold (D113): queued work items, and the view of
 //! a child's queue that planning a batch reads.
 const std = @import("std");
 const fold = @import("fold.zig");
@@ -7,7 +7,7 @@ const schema = @import("schema.zig");
 const State = fold.State;
 const Event = fold.Event;
 
-/// One queued work item of a child (D102). Owns its slices.
+/// One queued work item of a child (D113). Owns its slices.
 pub const Queued = struct {
     work_id: []u8,
     data: ?[]u8 = null,
@@ -24,7 +24,7 @@ pub const Queued = struct {
     }
 };
 
-/// The most work items one child may have queued (D102).
+/// The most work items one child may have queued (D113).
 pub const max_queued_work: usize = 8;
 
 /// A child's queue after `earlier` events of the batch, without copying:
@@ -38,7 +38,7 @@ pub fn enqueue(gpa: std.mem.Allocator, child: *fold.Child, seq: u64, queued: sch
     child.seq = seq;
 }
 
-/// Makes the child terminal and drops its queue (D102).
+/// Makes the child terminal and drops its queue (D113).
 pub fn terminate(gpa: std.mem.Allocator, child: *fold.Child, seq: u64, terminated: schema.Body.Terminated) error{OutOfMemory}!void {
     const data = try gpa.dupe(u8, terminated.data orelse "{}");
     if (child.terminated) |old| gpa.free(old);
@@ -131,7 +131,7 @@ fn step(state: *State, seq: *u64, event: Event) !void {
     try fold.apply(testing.allocator, state, 0, .{ .seq = seq.*, .offset = 0, .body = one[0] });
 }
 
-test "queued work starts in order, a cancel drops it, and terminate ends the child (D102)" {
+test "queued work starts in order, a cancel drops it, and terminate ends the child (D113)" {
     var state: State = .{};
     defer state.deinit(testing.allocator);
     var one: [1]schema.Body = undefined;

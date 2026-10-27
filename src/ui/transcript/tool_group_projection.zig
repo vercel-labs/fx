@@ -397,7 +397,7 @@ fn subagentStatusContinuation(
     return if (continuation.len == 0) null else continuation;
 }
 
-/// A status continuation's rows: a fleet card has several (D101).
+/// A status continuation's rows: a fleet card has several (D112).
 const ContinuationRows = struct {
     lines: std.mem.SplitIterator(u8, .scalar),
 

@@ -20,7 +20,7 @@ const Allocator = std.mem.Allocator;
 /// never offered it.
 pub const spawn_tool_name = "fleet";
 
-/// The spawn tool's name before the fleet (D101), still in older sessions'
+/// The spawn tool's name before the fleet (D112), still in older sessions'
 /// histories.
 pub const legacy_spawn_tool_name = "subagent";
 

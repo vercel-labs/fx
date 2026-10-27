@@ -253,7 +253,7 @@ pub const State = struct {
     }
 
     /// A node status's phase, without the queued count a worker adds
-    /// (`running · 2 queued`, D102).
+    /// (`running · 2 queued`, D113).
     pub fn statusPhase(status: []const u8) []const u8 {
         return status[0 .. std.mem.find(u8, status, " · ") orelse status.len];
     }
@@ -267,7 +267,7 @@ pub const State = struct {
             try path.writer.writeAll("root");
             for (self.child_ancestors.items) |hop| try path.writer.print(" › {s}", .{hop.name});
             try path.writer.print(" › {s}", .{self.child_name});
-            // A terminated worker, or one with queued turns, says so (D102).
+            // A terminated worker, or one with queued turns, says so (D113).
             const status = self.child_status[0..self.child_status_len];
             if (std.mem.eql(u8, status, "terminated") or std.mem.find(u8, status, "queued") != null) try path.writer.print(" · {s}", .{status});
         }

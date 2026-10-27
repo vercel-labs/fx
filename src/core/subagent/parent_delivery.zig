@@ -1,9 +1,7 @@
-//! Results of a node's children that settled after the call that started
-//! them returned, delivered into the node's own turn: a blocking call the
-//! user steered away from, and every fleet turn (D101). The in-process app
-//! and the ACP host (which the supervisor runs) share it, so both deliver
-//! the same way: the parent's step waits while such work runs, and each
-//! settled result enters one step as untrusted context, acknowledged once.
+//! Results of a node's children that settled after the blocking call that
+//! started them returned because the user steered the parent away: each
+//! enters one of the parent's steps as untrusted context, acknowledged once.
+//! Fleet turns never come here; the jobs registry delivers them (D112).
 const std = @import("std");
 const deps = @import("../agent/runtime/deps.zig");
 const debug_trace = @import("../shared/debug_trace.zig");

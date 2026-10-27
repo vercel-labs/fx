@@ -58,7 +58,7 @@ pub const ActiveWork = struct {
     root_user_evidence_complete: bool = false,
     permission_mode: types.PermissionMode = .yolo,
     created_at_ms: i64,
-    /// The worker's turn number this work is (D101); 0 when unknown.
+    /// The worker's turn number this work is (D112); 0 when unknown.
     turn: u32 = 0,
 
     pub fn deinit(self: *ActiveWork, alloc: Allocator) void {
@@ -133,11 +133,11 @@ pub const Child = struct {
     last_request_fingerprint: ?[32]u8 = null,
     last_outcome: ?Outcome = null,
     last_failure: ?types.ModelFailureDiagnostic = null,
-    /// Work waiting behind the active work, oldest first (D102).
+    /// Work waiting behind the active work, oldest first (D113).
     queue: []ActiveWork = &.{},
-    /// Terminated: browsable and read-only, never given work again (D102).
+    /// Terminated: browsable and read-only, never given work again (D113).
     terminated: bool = false,
-    /// The highest turn number the worker accepted (D101).
+    /// The highest turn number the worker accepted (D112).
     turns: u32 = 0,
 
     pub fn deinit(self: *Child, alloc: Allocator) void {
@@ -242,7 +242,7 @@ pub const Registry = struct {
         return null;
     }
 
-    /// The live worker named `agent`; a terminated one frees its name (D102).
+    /// The live worker named `agent`; a terminated one frees its name (D113).
     pub fn findPersistent(self: *Registry, agent: []const u8) ?*Child {
         for (self.children) |*child| {
             if (child.terminated) continue;
@@ -626,7 +626,7 @@ const SpawnData = struct {
     /// A named child's name; null for a one-off.
     agent: ?[]const u8 = null,
     fingerprint: []const u8,
-    /// The worker's turn number for this work (D101).
+    /// The worker's turn number for this work (D112).
     turn: ?u32 = null,
 };
 

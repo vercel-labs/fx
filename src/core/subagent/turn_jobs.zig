@@ -1,17 +1,18 @@
-//! Fleet turn jobs (D101): one job per accepted worker turn, with the id
+//! Fleet turn jobs (D112): one job per accepted worker turn, with the id
 //! `<node_id>-t<turn>`, where `node_id` is the worker's session id and
 //! `turn` its 1-based turn number, reserved when the turn is accepted (a
 //! queued turn that is cancelled keeps its number).
 //!
-//! The fleet owns turn state; this file is the read-only view the jobs
-//! registry reads (`turnJobs`, `turnJob`), the exactly-once hand-off of a
-//! settled result (`claim`), and the wait hooks: a generation that moves
-//! whenever a job changes (`generation`, `waitChange`) and one listener
-//! called when a job settles. A settled result is delivered once: to the
-//! caller that claims it, or else to the parent's next step, never both.
+//! The fleet owns turn state; this file is what the jobs registry reads:
+//! the turns (`turnJobs`, `turnJob`), a hook called when one settles
+//! (`setSettleHook`), and the controls `cancelTurn` and `turnLog`. The fleet
+//! never hands a turn's result to the model itself: the jobs registry
+//! delivers each settled turn once, by its summary handle, a
+//! `read_tool_result` handle of the result the fleet stores as it settles.
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const tool_host = @import("tool_host.zig");
+const fleet_host = @import("fleet_host.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -42,8 +43,8 @@ pub const TurnJob = struct {
     state: State,
     /// Milliseconds since the epoch; 0 while queued.
     started_ms: i64 = 0,
-    /// 0 until the job settles.
-    ended_ms: i64 = 0,
+    /// Null until the job settles.
+    ended_ms: ?i64 = null,
     /// The `read_tool_result` handle of the whole result when it was too
     /// long to deliver inline; null otherwise.
     summary_handle: ?[]const u8 = null,
@@ -53,47 +54,69 @@ pub const TurnJob = struct {
     result: ?[]const u8 = null,
     /// The first line of the turn's message, for cards.
     message_preview: []const u8 = "",
-    /// The result reached the parent, by a claim or the parent's step.
-    delivered: bool = false,
 };
 
-/// Called on the worker's own thread, after the job's state is visible
-/// through `turnJob`. It must not block.
-pub const Listener = struct {
-    context: *anyopaque,
-    settled_fn: *const fn (context: *anyopaque, node_id: []const u8, job_id: []const u8) void,
+/// The subagent host whose workers' turns these are.
+pub const Runtime = tool_host.Runtime;
+
+/// Called on the worker's own thread once the job's state and summary
+/// handle are visible through `turnJob`. It must not block.
+pub const SettleHook = struct {
+    ctx: *anyopaque,
+    settled: *const fn (ctx: *anyopaque, job_id: []const u8) void,
 };
 
-/// Every turn job of `runtime`'s workers, oldest first. Owned by `alloc`.
-pub fn turnJobs(runtime: *tool_host.Runtime, alloc: Allocator) ![]TurnJob {
-    return runtime.fleet.snapshot(alloc);
+/// Every turn job of `runtime`'s workers, oldest first. Owned by `arena`.
+pub fn turnJobs(arena: Allocator, runtime: *Runtime) ![]TurnJob {
+    return runtime.fleet.snapshot(arena);
 }
 
-/// The job `id` of `runtime`'s workers, or null. Owned by `alloc`.
-pub fn turnJob(runtime: *tool_host.Runtime, alloc: Allocator, id: []const u8) !?TurnJob {
-    return runtime.fleet.get(alloc, id);
+/// The job `id` of `runtime`'s workers, or null. Owned by `arena`.
+pub fn turnJob(arena: Allocator, runtime: *Runtime, id: []const u8) !?TurnJob {
+    return runtime.fleet.get(arena, id);
 }
 
-/// Takes the settled result of job `id` exactly once: null when the job is
-/// unknown, still queued or running, or already delivered.
-pub fn claim(runtime: *tool_host.Runtime, alloc: Allocator, id: []const u8) !?TurnJob {
-    return runtime.fleet.claim(alloc, id);
+/// Installs the hook called when a turn settles; null removes it.
+pub fn setSettleHook(runtime: *Runtime, hook: ?SettleHook) void {
+    runtime.fleet.setHook(hook);
 }
 
-/// Moves whenever any job is accepted, starts, settles or is delivered.
-pub fn generation(runtime: *tool_host.Runtime) u64 {
+/// Whether `id` names a turn job: `<node_id>-t<digits>`.
+pub fn isTurnJobId(id: []const u8) bool {
+    return parseId(id) != null;
+}
+
+/// Moves whenever any job is accepted, starts or settles.
+pub fn generation(runtime: *Runtime) u64 {
     return runtime.fleet.currentGeneration();
 }
 
 /// Waits until the generation differs from `seen`, or `timeout_ms` passes,
 /// or `cancel` is set; returns the generation it saw last.
-pub fn waitChange(runtime: *tool_host.Runtime, seen: u64, timeout_ms: u64, cancel: ?*const std.atomic.Value(bool)) u64 {
+pub fn waitChange(runtime: *Runtime, seen: u64, timeout_ms: u64, cancel: ?*const std.atomic.Value(bool)) u64 {
     return runtime.fleet.waitChange(seen, timeout_ms, cancel);
 }
 
-/// Replaces the one settle listener; null removes it.
-pub fn setListener(runtime: *tool_host.Runtime, listener: ?Listener) void {
-    runtime.fleet.setListener(listener);
+pub const CancelOutcome = enum { cancelled, already_settled, unknown };
+
+/// Cancels one turn: a queued one leaves the worker's queue, a running one
+/// stops at its next safe point. The worker stays addressable.
+pub fn cancelTurn(runtime: *Runtime, id: []const u8) !CancelOutcome {
+    return fleet_host.cancelTurn(runtime, id);
+}
+
+/// A bounded log of turn `id`: its message, state and, once settled, the
+/// start of its result. Null when unknown. Owned by `arena`.
+pub fn turnLog(arena: Allocator, runtime: *Runtime, id: []const u8, max_bytes: usize) !?[]const u8 {
+    const job = (try runtime.fleet.get(arena, id)) orelse return null;
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try out.writer.print("{s} · {s} · turn {d} of worker {s}\n> {s}\n", .{ job.id, @tagName(job.state), job.turn, job.label, job.message_preview });
+    if (job.result) |result| try out.writer.writeAll(result);
+    const text = out.written();
+    if (text.len <= max_bytes) return text;
+    var cut_at = max_bytes;
+    while (cut_at > 0 and (text[cut_at] & 0xC0) == 0x80) cut_at -= 1;
+    return text[0..cut_at];
 }
 
 /// Writes `<node_id>-t<turn>` into `buf`.
@@ -122,7 +145,7 @@ pub const Ledger = struct {
     mutex: std.Io.Mutex = .init,
     entries: std.ArrayList(Entry) = .empty,
     generation: std.atomic.Value(u64) = .init(0),
-    listener: ?Listener = null,
+    hook: ?SettleHook = null,
 
     const Entry = struct {
         id: []u8,
@@ -136,7 +159,6 @@ pub const Ledger = struct {
         ended_ms: i64 = 0,
         result: ?[]u8 = null,
         handle: ?[]u8 = null,
-        delivered: bool = false,
 
         fn deinit(self: Entry, alloc: Allocator) void {
             alloc.free(self.id);
@@ -166,12 +188,11 @@ pub const Ledger = struct {
                 .agent = "worker",
                 .state = self.state,
                 .started_ms = self.started_ms,
-                .ended_ms = self.ended_ms,
+                .ended_ms = if (self.state.settled()) self.ended_ms else null,
                 .summary_handle = if (self.handle) |value| try alloc.dupe(u8, value) else null,
                 .turn = self.turn,
                 .result = result,
                 .message_preview = preview,
-                .delivered = self.delivered,
             };
         }
     };
@@ -184,8 +205,6 @@ pub const Ledger = struct {
         message: []const u8,
         state: State,
         now_ms: i64,
-        /// The caller takes the result itself, as a blocking run does.
-        delivered: bool = false,
     };
 
     pub fn init(alloc: Allocator) Ledger {
@@ -229,7 +248,6 @@ pub const Ledger = struct {
             .turn = input.turn,
             .state = input.state,
             .started_ms = if (input.state == .running) input.now_ms else 0,
-            .delivered = input.delivered,
         });
         self.bump();
     }
@@ -248,7 +266,7 @@ pub const Ledger = struct {
     /// Settles the job of `work_id` once; `result` and `handle` are copied.
     pub fn settle(self: *Ledger, work_id: []const u8, state: State, result: []const u8, handle: ?[]const u8, now_ms: i64) !void {
         std.debug.assert(state.settled());
-        const listener, const node_id, const job_id = blk: {
+        const hook, const job_id = blk: {
             self.mutex.lockUncancelable(io_mod.getIo());
             defer self.mutex.unlock(io_mod.getIo());
             const entry = self.findWorkLocked(work_id) orelse return;
@@ -261,11 +279,10 @@ pub const Ledger = struct {
             if (entry.started_ms == 0) entry.started_ms = now_ms;
             entry.ended_ms = now_ms;
             self.bump();
-            break :blk .{ self.listener, entry.node_id, entry.id };
+            break :blk .{ self.hook, entry.id };
         };
-        // Entries are pruned only by `accept` on the parent's thread, which
-        // cannot run while this worker's turn is still being settled.
-        if (listener) |value| value.settled_fn(value.context, node_id, job_id);
+        // Only settled entries are pruned, by `accept`, so this one stays.
+        if (hook) |value| value.settled(value.ctx, job_id);
     }
 
     pub fn snapshot(self: *Ledger, alloc: Allocator) ![]TurnJob {
@@ -293,61 +310,6 @@ pub const Ledger = struct {
         return null;
     }
 
-    pub fn claim(self: *Ledger, alloc: Allocator, id: []const u8) !?TurnJob {
-        self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
-        for (self.entries.items) |*entry| {
-            if (!std.mem.eql(u8, entry.id, id)) continue;
-            if (!entry.state.settled() or entry.delivered) return null;
-            const job = try entry.view(alloc);
-            entry.delivered = true;
-            self.bump();
-            return job;
-        }
-        return null;
-    }
-
-    /// Claims every settled, undelivered job, oldest first, for the
-    /// parent's next step. Owned by `alloc`.
-    pub fn claimSettled(self: *Ledger, alloc: Allocator) ![]TurnJob {
-        self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
-        var out: std.ArrayList(TurnJob) = .empty;
-        errdefer {
-            for (out.items) |job| freeJob(alloc, job);
-            out.deinit(alloc);
-        }
-        for (self.entries.items) |entry| {
-            if (!entry.state.settled() or entry.delivered) continue;
-            const job = try entry.view(alloc);
-            out.append(alloc, job) catch |err| {
-                freeJob(alloc, job);
-                return err;
-            };
-        }
-        for (self.entries.items) |*entry| {
-            if (entry.state.settled()) entry.delivered = true;
-        }
-        if (out.items.len > 0) self.bump();
-        return out.toOwnedSlice(alloc);
-    }
-
-    /// Whether any job's result has yet to reach the parent.
-    pub fn pendingDelivery(self: *Ledger) bool {
-        self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
-        for (self.entries.items) |entry| if (!entry.delivered) return true;
-        return false;
-    }
-
-    /// Whether a settled result waits for the parent.
-    pub fn settledUndelivered(self: *Ledger) bool {
-        self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
-        for (self.entries.items) |entry| if (entry.state.settled() and !entry.delivered) return true;
-        return false;
-    }
-
     /// Whether a job tracks the work `work_id`.
     pub fn has(self: *Ledger, work_id: []const u8) bool {
         self.mutex.lockUncancelable(io_mod.getIo());
@@ -355,9 +317,28 @@ pub const Ledger = struct {
         return self.findWorkLocked(work_id) != null;
     }
 
-    /// A terminated worker's jobs (D102): its queued ones settle as
-    /// cancelled with `result`, and none is delivered later, since the
-    /// terminate's own result reports them.
+    /// Whether any job is queued or running.
+    pub fn active(self: *Ledger) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.entries.items) |entry| if (!entry.state.settled()) return true;
+        return false;
+    }
+
+    /// The work and worker of job `id`, copied into `arena`.
+    pub fn workOf(self: *Ledger, arena: Allocator, id: []const u8) !?struct { work_id: []const u8, node_id: []const u8, state: State } {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.entries.items) |entry| if (std.mem.eql(u8, entry.id, id)) return .{
+            .work_id = try arena.dupe(u8, entry.work_id),
+            .node_id = try arena.dupe(u8, entry.node_id),
+            .state = entry.state,
+        };
+        return null;
+    }
+
+    /// A terminated worker's queued jobs settle as cancelled with `result`
+    /// (D113).
     pub fn discardWorker(self: *Ledger, node_id: []const u8, result: []const u8, now_ms: i64) !void {
         var work_ids: std.ArrayList([]u8) = .empty;
         defer {
@@ -373,12 +354,6 @@ pub const Ledger = struct {
             }
         }
         for (work_ids.items) |work_id| try self.settle(work_id, .cancelled, result, null, now_ms);
-        self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
-        for (self.entries.items) |*entry| {
-            if (std.mem.eql(u8, entry.node_id, node_id) and entry.state.settled()) entry.delivered = true;
-        }
-        self.bump();
     }
 
     pub fn currentGeneration(self: *Ledger) u64 {
@@ -396,10 +371,10 @@ pub const Ledger = struct {
         }
     }
 
-    pub fn setListener(self: *Ledger, listener: ?Listener) void {
+    pub fn setHook(self: *Ledger, hook: ?SettleHook) void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        self.listener = listener;
+        self.hook = hook;
     }
 
     fn findWorkLocked(self: *Ledger, work_id: []const u8) ?*Entry {
@@ -407,13 +382,12 @@ pub const Ledger = struct {
         return null;
     }
 
-    /// Drops the oldest delivered jobs once the ledger is full; jobs whose
-    /// result has not reached the parent are never dropped.
+    /// Drops the oldest settled jobs once the ledger is full.
     fn pruneLocked(self: *Ledger) void {
         var index: usize = 0;
         while (self.entries.items.len >= max_jobs and index < self.entries.items.len) {
             const entry = self.entries.items[index];
-            if (entry.state.settled() and entry.delivered) {
+            if (entry.state.settled()) {
                 entry.deinit(self.alloc);
                 _ = self.entries.orderedRemove(index);
             } else index += 1;
@@ -458,37 +432,43 @@ test "job ids name the worker and its turn" {
     try std.testing.expect(parseId("x-t0") == null);
 }
 
-test "a settled job is delivered exactly once" {
+test "a turn settles once and calls its hook" {
     const alloc = std.testing.allocator;
     var ledger = Ledger.init(alloc);
     defer ledger.deinit();
+    const Counter = struct {
+        calls: usize = 0,
+        fn settled(ctx: *anyopaque, job_id: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            std.debug.assert(std.mem.eql(u8, job_id, "w-t1"));
+        }
+    };
+    var counter: Counter = .{};
+    ledger.setHook(.{ .ctx = &counter, .settled = Counter.settled });
     try ledger.accept(.{ .node_id = "w", .label = "parser", .work_id = "op1", .turn = 1, .message = "fix it\nmore", .state = .running, .now_ms = 10 });
     try ledger.accept(.{ .node_id = "w", .label = "parser", .work_id = "op2", .turn = 2, .message = "then this", .state = .queued, .now_ms = 11 });
     try ledger.accept(.{ .node_id = "w", .label = "parser", .work_id = "op1", .turn = 9, .message = "replay", .state = .queued, .now_ms = 12 });
-    try std.testing.expect(ledger.pendingDelivery());
-    try std.testing.expect(try ledger.claim(alloc, "w-t1") == null);
+    try std.testing.expect(ledger.active());
     const before = ledger.currentGeneration();
-    try ledger.settle("op1", .completed, "{\"ok\":true}", null, 20);
+    try ledger.settle("op1", .completed, "{\"ok\":true}", "h1", 20);
     try std.testing.expect(ledger.currentGeneration() != before);
     try ledger.settle("op1", .failed, "{\"ok\":false}", null, 21);
-    const job = (try ledger.claim(alloc, "w-t1")).?;
-    defer freeJob(alloc, job);
-    try std.testing.expectEqual(State.completed, job.state);
-    try std.testing.expectEqualStrings("fix it", job.message_preview);
-    try std.testing.expect(try ledger.claim(alloc, "w-t1") == null);
-    const rest = try ledger.claimSettled(alloc);
-    defer freeJobs(alloc, rest);
-    try std.testing.expectEqual(@as(usize, 0), rest.len);
-    ledger.start("op2", 30);
-    try ledger.discardWorker("x", "{\"ok\":false}", 31);
+    try std.testing.expectEqual(@as(usize, 1), counter.calls);
     {
-        const view = (try ledger.get(alloc, "w-t2")).?;
-        defer freeJob(alloc, view);
-        try std.testing.expectEqual(State.running, view.state);
+        const job = (try ledger.get(alloc, "w-t1")).?;
+        defer freeJob(alloc, job);
+        try std.testing.expectEqual(State.completed, job.state);
+        try std.testing.expectEqualStrings("fix it", job.message_preview);
+        try std.testing.expectEqualStrings("h1", job.summary_handle.?);
+        try std.testing.expectEqual(@as(?i64, 20), job.ended_ms);
     }
-    try ledger.settle("op2", .cancelled, "{\"ok\":false}", null, 40);
-    const settled = try ledger.claimSettled(alloc);
-    defer freeJobs(alloc, settled);
-    try std.testing.expectEqual(@as(usize, 1), settled.len);
-    try std.testing.expect(!ledger.pendingDelivery());
+    ledger.setHook(null);
+    try ledger.discardWorker("w", "{\"ok\":false}", 31);
+    try std.testing.expect(!ledger.active());
+    const jobs = try ledger.snapshot(alloc);
+    defer freeJobs(alloc, jobs);
+    try std.testing.expectEqual(State.cancelled, jobs[1].state);
+    try std.testing.expect(isTurnJobId("worker-1a2b-t3"));
+    try std.testing.expect(!isTurnJobId("worker-tx"));
 }

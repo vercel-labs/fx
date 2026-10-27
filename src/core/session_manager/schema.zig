@@ -192,10 +192,10 @@ pub const Body = union(Kind) {
     /// `data` is fx's raw JSON about the child or the work (D22).
     pub const WorkItem = struct { child: []const u8, work_id: []const u8, data: ?[]const u8 = null };
     pub const Finished = struct { child: []const u8, work_id: []const u8, outcome: Outcome, data: ?[]const u8 = null };
-    /// A worker's turn waits behind its running one (D102): `child_queued`
+    /// A worker's turn waits behind its running one (D113): `child_queued`
     /// adds `work_id` to the end of the child's queue, its `child_spawned`
     /// takes it from the front, and a cancelled `child_finished` drops it.
-    /// The child is terminal after `child_terminated` (D102): it takes no
+    /// The child is terminal after `child_terminated` (D113): it takes no
     /// more work and its queue is gone. `data` is fx's raw JSON.
     pub const Terminated = struct { child: []const u8, data: ?[]const u8 = null };
     pub const Snapshot = struct { covers_seq: u64, state: []const u8, compaction_offset: ?u64 };

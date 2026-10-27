@@ -194,7 +194,7 @@ pub const Runtime = struct {
     admission_mutex: std.Io.Mutex = .init,
     yielded_mutex: std.Io.Mutex = .init,
     yielded: std.ArrayList(YieldedWork) = .empty,
-    /// The turn jobs of this node's workers (D101).
+    /// The turn jobs of this node's workers (D112).
     fleet: turn_jobs.Ledger,
 
     const YieldedWork = struct { child_id: []u8, work_id: []u8, max_result_bytes: usize, result: ?ManagedExecutionResult = null, delivered: bool = false };
@@ -335,7 +335,7 @@ pub const Runtime = struct {
     /// result waits for delivery.
     pub fn idle(self: *Runtime) bool {
         if (self.managed.anyRunning()) return false;
-        if (self.fleet.pendingDelivery()) return false;
+        if (self.fleet.active()) return false;
         self.yielded_mutex.lockUncancelable(io_mod.getIo());
         defer self.yielded_mutex.unlock(io_mod.getIo());
         for (self.yielded.items) |item| if (!item.delivered) return false;
@@ -1064,20 +1064,10 @@ pub const Runtime = struct {
                 .delivered = item.delivered,
             });
         }
-        // Fleet turns that settled since the parent's last step (D101). A
-        // claim by the jobs tool takes one first, so each reaches the parent
-        // once; the acknowledgement marks the rest delivered.
+        // Workers whose queue a cancel left waiting start at the parent's
+        // next step (D113). Their results reach the parent through the jobs
+        // registry, never here (D112).
         fleet_host.pumpQueues(self);
-        for (try self.fleet.snapshot(arena)) |job| {
-            if (!job.state.settled() or job.delivered) continue;
-            try results.append(arena, .{
-                .child_id = job.node_id,
-                .work_id = job.id,
-                .body = job.result orelse "{}",
-                .max_result_bytes = tool_result_limits.min_configured_tool_result_bytes,
-                .delivered = false,
-            });
-        }
         for (try self.managed.feedbackUpdates(arena)) |update| {
             try results.append(arena, .{
                 .child_id = update.child_id,
@@ -1097,12 +1087,6 @@ pub const Runtime = struct {
     }
 
     pub fn acknowledgeYielded(self: *Runtime, child_id: []const u8, work_id: []const u8) void {
-        if (turn_jobs.parseId(work_id) != null) {
-            var arena_state = std.heap.ArenaAllocator.init(self.alloc);
-            defer arena_state.deinit();
-            _ = self.fleet.claim(arena_state.allocator(), work_id) catch null;
-            return;
-        }
         for (self.yielded.items) |*item| {
             if (item.delivered or !std.mem.eql(u8, item.child_id, child_id) or !std.mem.eql(u8, item.work_id, work_id)) continue;
             item.delivered = true;
@@ -1125,11 +1109,11 @@ pub const Runtime = struct {
     }
 
     /// Main-loop-only after tool dispatch drains; completed but undelivered work counts.
-    pub fn hasPendingYielded(self: *Runtime) bool {
+    pub fn hasPendingYielded(self: *const Runtime) bool {
         for (self.yielded.items) |item| {
             if (!item.delivered) return true;
         }
-        return self.fleet.pendingDelivery();
+        return false;
     }
 
     pub fn waitYielded(self: *Runtime, worker: *worker_runtime.WorkerRuntime) !bool {
@@ -1142,7 +1126,6 @@ pub const Runtime = struct {
                 debug_trace.eventf("subagent", "steering_parent_woken", .{ .turn_id = worker.activeTurnId() }, "cancel_requested={} plain_steering={}", .{ cancelled, steering });
                 return true;
             }
-            if (self.fleet.settledUndelivered()) return true;
             for (self.yielded.items) |item| {
                 if (item.delivered) continue;
                 const state = try self.managed.wait(item.child_id, .{ .clock = .awake, .raw = .fromMilliseconds(0) });
@@ -1207,7 +1190,7 @@ pub const Runtime = struct {
         );
     }
 
-    fn storeFullResult(self: *Runtime, alloc: Allocator, work_id: []const u8, full: []const u8) ![]u8 {
+    pub fn storeFullResult(self: *Runtime, alloc: Allocator, work_id: []const u8, full: []const u8) ![]u8 {
         const capability = try self.children.parent.childCapability();
         return result_store.storeLargeResultManaged(alloc, capability, work_id, tree_mod.spawn_tool_name, full);
     }

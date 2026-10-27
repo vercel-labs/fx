@@ -347,7 +347,7 @@ const Resolved = struct {
     /// The node, or one of its ancestors, was abandoned by a rewind of its
     /// parent (D97): it is read-only.
     abandoned: bool,
-    /// The node, or one of its ancestors, was terminated (D102): read-only too.
+    /// The node, or one of its ancestors, was terminated (D113): read-only too.
     terminated: bool = false,
 
     /// Why a change to this node is refused, or null when it may change.

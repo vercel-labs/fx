@@ -1,4 +1,4 @@
-//! The fleet's worker operations on a node's host (D101, D102): `spawn`
+//! The fleet's worker operations on a node's host (D112, D113): `spawn`
 //! and `send` answer with a turn receipt at once, and the turn's result
 //! reaches the parent when it settles (`turn_jobs.zig`); `list`, `inspect`
 //! and `terminate` read or end workers. `run` and `message` stay in
@@ -93,7 +93,7 @@ fn spawn(self: *Runtime, alloc: Allocator, request: model_contract.Request, ctx:
     }
     const model_note = if (value.model) |model| try arena.print("model `{s}`, ", .{model}) else "";
     const text = try arena.print(
-        "Spawned worker `{s}` (label `{s}`, {s}turn 1 job `{s}`); receipt: accepted. The immutable worker id is the only routing address; labels never route. Its result is delivered automatically when the turn settles; do not poll with list or inspect. Continue it with fleet op \"send\" id `{s}`.",
+        "Spawned worker `{s}` (label `{s}`, {s}turn 1 job `{s}`); receipt: accepted. The immutable worker id is the only routing address; labels never route. Its result is delivered automatically when the turn settles; to block on it, wait on that job with the jobs tool. Do not poll with list or inspect. Continue it with fleet op \"send\" id `{s}`.",
         .{ child_id, label, model_note, job, child_id },
     );
     return encode(alloc, .{ .ok = true, .result = text, .receipt = .accepted, .worker = child_id, .label = label, .turn = 1, .job = job });
@@ -209,7 +209,7 @@ fn replayedTurn(child: Child, operation_id: []const u8) ?struct { receipt: model
 }
 
 /// The hook a node's managed owner calls as its workers' turns start and
-/// settle, which keeps the turn jobs current (D101).
+/// settle, which keeps the turn jobs current (D112).
 pub fn turnHook(self: *Runtime) @import("managed_owner.zig").TurnHook {
     return .{ .context = self, .started_fn = turnStarted, .settled_fn = turnSettled };
 }
@@ -221,7 +221,9 @@ fn turnStarted(context: *anyopaque, _: []const u8, work_id: []const u8) void {
 
 fn turnSettled(context: *anyopaque, child_id: []const u8, work_id: []const u8, observation: @import("managed_owner.zig").Observation) void {
     const self: *Runtime = @ptrCast(@alignCast(context));
-    if (!self.fleet.has(work_id)) return;
+    const tracked = self.fleet.has(work_id);
+    debug_trace.logf("subagent", "fleet turn settled child_id={s} work_id={s} tracked={}", .{ child_id, work_id, tracked });
+    if (!tracked) return;
     const now = io_mod.milliTimestamp();
     const state: turn_jobs.State = switch (observation.outcome orelse .failed) {
         .completed => .completed,
@@ -235,8 +237,44 @@ fn turnSettled(context: *anyopaque, child_id: []const u8, work_id: []const u8, o
     };
     defer self.alloc.free(result.body);
     if (result.final_status) |status| self.alloc.free(status.model);
-    self.fleet.settle(work_id, state, result.body, null, now) catch |err|
+    // The jobs registry hands the model this handle, never the fleet (D112).
+    const handle = self.storeFullResult(self.alloc, work_id, result.body) catch |err| blk: {
+        debug_trace.logf("subagent", "fleet summary not stored child_id={s} err={s}", .{ child_id, @errorName(err) });
+        break :blk null;
+    };
+    defer if (handle) |value| self.alloc.free(value);
+    debug_trace.logf("subagent", "fleet job settled child_id={s} state={s} result_bytes={d}", .{ child_id, @tagName(state), result.body.len });
+    self.fleet.settle(work_id, state, result.body, handle, now) catch |err|
         debug_trace.logf("subagent", "fleet settle failed child_id={s} work_id={s} err={s}", .{ child_id, work_id, @errorName(err) });
+}
+
+/// `turn_jobs.cancelTurn`: a queued turn leaves its worker's queue and
+/// settles cancelled; a running one is asked to stop.
+pub fn cancelTurn(self: *Runtime, id: []const u8) !turn_jobs.CancelOutcome {
+    var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const work = (try self.fleet.workOf(arena, id)) orelse return .unknown;
+    switch (work.state) {
+        .completed, .failed, .cancelled => return .already_settled,
+        .running => {
+            self.managed.cancel(work.node_id) catch return .already_settled;
+            return .cancelled;
+        },
+        .queued => {
+            self.admission_mutex.lockUncancelable(io_mod.getIo());
+            defer self.admission_mutex.unlock(io_mod.getIo());
+            {
+                var lock = self.managed.state_store.acquireLock();
+                defer lock.release();
+                var registry = try self.managed.state_store.load(arena);
+                if (!try fleet_state.cancelQueued(&registry, arena, work.node_id, work.work_id)) return .already_settled;
+                try self.managed.state_store.save(arena, registry);
+            }
+            try self.fleet.settle(work.work_id, .cancelled, "{\"ok\":false,\"result\":\"This queued turn was cancelled before it ran.\",\"error_code\":\"turn_cancelled\"}", null, io_mod.milliTimestamp());
+            return .cancelled;
+        },
+    }
 }
 
 /// Starts a new turn on an idle worker, or queues it behind a busy one.

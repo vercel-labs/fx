@@ -1781,7 +1781,7 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   follows see the same state. **Alternative:** checking from a connection
   thread, which a request queued between the check and the stop defeats.
 
-- **D101 Decision:** the `subagent` tool becomes the `fleet` tool, one tool
+- **D112 Decision:** the `subagent` tool becomes the `fleet` tool, one tool
   with the ops `run`, `spawn`, `send`, `list`, `inspect` and `terminate`.
   `run` waits for its one turn, as `subagent` did, and with a label runs it
   on that named worker (the old `message`). `spawn` and `send` answer at
@@ -1789,14 +1789,16 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   naming the turn job `<worker id>-t<turn>`, the turn number reserved at
   acceptance and saved on the work's `child_spawned` or `child_queued`
   line. The node's host keeps each job in a ledger (`turn_jobs.zig`) that
-  the jobs tool reads; a settled result reaches the parent once, by a
-  claim or by the parent's next step, and the parent's step waits while a
-  job's result is outstanding. `Fleet.tla` checks `ExactlyOnceDelivery`.
+  the jobs registry reads. When a turn settles, the fleet stores its result
+  behind a `read_tool_result` handle and calls the registry's settle hook;
+  the fleet never hands a result to the model itself, and the registry
+  delivers each settled turn once, to a waiter or as an async notice.
+  `Fleet.tla` checks `ExactlyOnceDelivery` for those two takers.
   **Why:** proto's workers run beside their parent and report as they
   settle. **Alternative:** keeping `message` for peers, which fx has no
   bus for; it stays `run` with a label.
 
-- **D102 Decision:** a worker's queued turns and its tombstone live in its
+- **D113 Decision:** a worker's queued turns and its tombstone live in its
   parent's log. Two manager line kinds: `child_queued {child, work_id,
   data}` appends to the child's queue, which its next `child_spawned`
   takes from the front and a cancelled `child_finished` drops from;
