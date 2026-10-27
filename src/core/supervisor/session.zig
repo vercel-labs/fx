@@ -77,6 +77,10 @@ pub const Session = struct {
     pending: std.ArrayList(Pending) = .empty,
     commands: std.ArrayList(PendingCommand) = .empty,
     heartbeat_request: ?i64 = null,
+    /// Job notices sent to the host and not answered yet.
+    notice_requests: std.ArrayList(i64) = .empty,
+    /// Their answers, for the executor to settle: whether the model got it.
+    notice_answers: std.ArrayList(NoticeAnswer) = .empty,
     capture: ?Capture = null,
     /// Counts every change a watcher sees: events, pending requests, and
     /// the record.
@@ -87,6 +91,7 @@ pub const Session = struct {
     views: child_views.Cache,
 
     const Capture = struct { id: i64, frame: ?[]u8 = null };
+    const NoticeAnswer = struct { id: i64, delivered: bool };
 
     pub fn create(daemon: *Daemon, id: []const u8, cwd: []const u8, name: []const u8) !*Session {
         const alloc = daemon.alloc;
@@ -110,6 +115,8 @@ pub const Session = struct {
         self.pending.deinit(alloc);
         for (self.commands.items) |command| alloc.free(command.name);
         self.commands.deinit(alloc);
+        self.notice_requests.deinit(alloc);
+        self.notice_answers.deinit(alloc);
         self.watchers.deinit(alloc);
         self.views.deinit();
         self.jobs.deinit(alloc);
@@ -421,6 +428,8 @@ pub const Session = struct {
         /// Keep the response the host writes before dispatchFrame returns.
         capture,
         heartbeat,
+        /// A job notice: its answer says whether the model got it.
+        job_notice,
         /// Turn the answer, whenever it comes, into a command result event.
         command: []const u8,
     };
@@ -444,6 +453,11 @@ pub const Session = struct {
                 self.events_mutex.lockUncancelable(io_mod.getIo());
                 defer self.events_mutex.unlock(io_mod.getIo());
                 self.heartbeat_request = id;
+            },
+            .job_notice => {
+                self.events_mutex.lockUncancelable(io_mod.getIo());
+                defer self.events_mutex.unlock(io_mod.getIo());
+                try self.notice_requests.append(alloc, id);
             },
             .command => |name| {
                 const owned = try alloc.dupe(u8, name);
@@ -554,7 +568,11 @@ pub const Session = struct {
             .sessionId = self.id,
             .prompt = &blocks,
             ._meta = .{ .fx = .{ .steer = true, .notice = origin == .job_notice } },
-        }, if (origin == .heartbeat) .heartbeat else .none);
+        }, switch (origin) {
+            .heartbeat => .heartbeat,
+            .job_notice => .job_notice,
+            .user => .none,
+        });
     }
 
     fn answerPermission(self: *Session, request_id: i64, option: protocol.PermissionOption) !void {
@@ -690,18 +708,44 @@ pub const Session = struct {
     /// its jobs for the next tick.
     fn deliverJobNotice(self: *Session) void {
         const host = self.host orelse return;
+        self.settleJobNotices(host);
         var arena_state = std.heap.ArenaAllocator.init(self.daemon.alloc);
         defer arena_state.deinit();
         const notice = (host.takeJobNotice(arena_state.allocator()) catch |err| {
             std.debug.print("proto-fx: job delivery failed: {s}\n", .{@errorName(err)});
             return;
         }) orelse return;
-        _ = self.prompt(notice.text, .job_notice) catch |err| {
+        const request_id = self.prompt(notice.text, .job_notice) catch |err| {
             notice.release();
             if (err != error.SessionBusy) std.debug.print("proto-fx: job notice admission failed: {s}\n", .{@errorName(err)});
             return;
         };
-        notice.commit();
+        host.jobNoticeAdmitted(notice, request_id);
+    }
+
+    /// Commits each answered notice the model got, and releases the rest so
+    /// their jobs are delivered again. Runs after `jobNoticeAdmitted` for the
+    /// same request, since both run on the executor.
+    fn settleJobNotices(self: *Session, host: anytype) void {
+        self.events_mutex.lockUncancelable(io_mod.getIo());
+        const answers = self.notice_answers.toOwnedSlice(self.daemon.alloc) catch &.{};
+        self.events_mutex.unlock(io_mod.getIo());
+        defer self.daemon.alloc.free(answers);
+        for (answers) |answer| host.jobNoticeAnswered(answer.id, answer.delivered);
+    }
+
+    /// Whether the host's answer to a notice says the model got it: a turn
+    /// it ran, or a steer the turn took rather than dropped.
+    fn noticeDelivered(head: Head) bool {
+        if (head.@"error" != null) return false;
+        const result = head.result orelse return true;
+        if (result != .object) return true;
+        const meta = result.object.get("_meta") orelse return true;
+        if (meta != .object) return true;
+        const fx = meta.object.get("fx") orelse return true;
+        if (fx != .object) return true;
+        const steering = fx.object.get("steering") orelse return true;
+        return !(steering == .string and std.mem.eql(u8, steering.string, "dropped"));
     }
 
     fn fireHeartbeat(self: *Session, now: i64) void {
@@ -951,6 +995,11 @@ pub const Session = struct {
                 return .silent;
             };
             if (self.heartbeat_request == response_id) self.heartbeat_request = null;
+            for (self.notice_requests.items, 0..) |notice_id, index| if (notice_id == response_id) {
+                _ = self.notice_requests.swapRemove(index);
+                try self.notice_answers.append(alloc, .{ .id = response_id, .delivered = noticeDelivered(head) });
+                return .silent;
+            };
             for (self.commands.items, 0..) |command, index| {
                 if (command.id != response_id) continue;
                 defer alloc.free(command.name);

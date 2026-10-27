@@ -936,6 +936,7 @@ pub const PersistentHost = struct {
         errdefer self.state.deinit();
         self.jobs.init(alloc, &self.state.managed_executions, &self.state.subagent_host);
         errdefer self.jobs.deinit();
+        self.jobs.withdraw = .{ .ctx = self, .func = withdrawNoticeSteer };
         self.state.jobs = &self.jobs.registry;
         self.state.sessions_v2 = if (cfg.home_override) |home|
             try session_adapter.Store.open(alloc, home)
@@ -1005,6 +1006,21 @@ pub const PersistentHost = struct {
 
     pub fn runningJobs(self: *PersistentHost) usize {
         return self.jobs.runningCount();
+    }
+
+    /// The loop admitted `notice` as request `request_id`.
+    pub fn jobNoticeAdmitted(self: *PersistentHost, notice: jobs_mod.host.Notice, request_id: i64) void {
+        self.jobs.admitted(notice, request_id);
+    }
+
+    /// The loop answered notice `request_id`.
+    pub fn jobNoticeAnswered(self: *PersistentHost, request_id: i64, delivered: bool) void {
+        self.jobs.answered(request_id, delivered);
+    }
+
+    fn withdrawNoticeSteer(raw: *anyopaque, request_id: i64) bool {
+        const self: *PersistentHost = @ptrCast(@alignCast(raw));
+        return self.withdrawSteeringRequest(request_id);
     }
 
     pub fn withdrawSteeringRequest(self: *PersistentHost, id: i64) bool {

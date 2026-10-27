@@ -3,7 +3,8 @@
 # each config's expected verdict.
 #
 # Jobs: a settled job's result reaches the model exactly once, through a
-# leased `jobs wait` or the automatic async-result notice (D110, D111).
+# leased `jobs wait` or the automatic async-result notice (D110, D111),
+# and a wait takes back a queued notice the model has not read yet.
 #
 # The design config must pass every invariant and liveness property. Each
 # Jobs-<mutation>.cfg enables one broken rule and must be rejected by the
@@ -22,4 +23,5 @@ Jobs Jobs-double_reserve ExactlyOnceDelivery -deadlock
 Jobs Jobs-ignore_lease NoDeliveryUnderLease -deadlock
 Jobs Jobs-release_delivered ExactlyOnceDelivery -deadlock
 Jobs Jobs-lease_leak temporal -deadlock
+Jobs Jobs-reclaim_absorbed ExactlyOnceDelivery -deadlock
 EOF

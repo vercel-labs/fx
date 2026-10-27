@@ -130,6 +130,14 @@ pub const Registry = struct {
     /// Job ids an explicit wait holds, counted so overlapping waits keep
     /// automatic delivery off until the last one ends.
     leases: std.array_hash_map.String(u32) = .empty,
+    /// Takes back a queued notice that holds a job's result, so a wait gets
+    /// it instead (`host.zig`).
+    reclaimer: ?Reclaimer = null,
+
+    pub const Reclaimer = struct {
+        ctx: *anyopaque,
+        func: *const fn (ctx: *anyopaque, job_id: []const u8) bool,
+    };
 
     pub fn init(alloc: Allocator) Registry {
         return .{ .alloc = alloc };
@@ -237,6 +245,11 @@ pub const Registry = struct {
         defer self.releaseLeases(ids);
         const started = io_mod.milliTimestamp();
         while (true) {
+            // A result a notice queued but the model has not read yet goes
+            // to this wait instead.
+            if (self.reclaimer) |reclaimer| for (ids) |id| {
+                _ = reclaimer.func(reclaimer.ctx, id);
+            };
             const settled = try self.reserveTargets(arena, ids);
             if (settled.len > 0) return .{ .settled = settled, .pending = try self.pendingTargets(arena, ids), .timed_out = false };
             const pending = try self.pendingTargets(arena, ids);

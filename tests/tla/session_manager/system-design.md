@@ -1800,8 +1800,17 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   cutting a streaming reply short, and wakes an idle session with a turn of
   its own, as proto does for finished background work. Steering keeps the
   notice out of the user envelope, saves it whole, and the transcript shows
-  one status row per job. The notice commits when the host admits the
-  prompt; a busy host leaves it for the next tick. **Why:** the model
+  one status row per job. The notice's results stay reserved until the
+  host answers it: a steer the turn took, or a turn it ran, commits them;
+  a dropped steer or a failed turn releases them for a later tick, after a
+  backoff. Until the turn hands a queued notice to the model, a wait on
+  one of its jobs withdraws it and returns the result itself, as proto's
+  wait makes a queued delivery stale (`Jobs.tla` `WaitReclaim`). A turn
+  the notice starts is saved with the `job_notice` user origin, never
+  inferred from its text: the auto reviewer's trusted root requests skip
+  it and keep the person's latest request current, the notice reaches the
+  reviewer only as untrusted evidence, and it cannot invoke a skill.
+  **Why:** the model
   should react to a result as soon as it can, and a stopped session must
   not run. **Alternative:** holding results for the next user prompt,
   which leaves a finished build unread until the person types.

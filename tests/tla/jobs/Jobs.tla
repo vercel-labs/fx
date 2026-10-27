@@ -22,13 +22,18 @@
 (*   ignore_lease      automatic delivery takes a result a wait leases     *)
 (*   release_delivered a release reopens a result already committed        *)
 (*   lease_leak        a wait keeps its leases after it returns            *)
+(*   reclaim_absorbed  a wait takes back a notice the model already read   *)
+(*                                                                         *)
+(* A notice the loop admitted is queued until the turn hands it to the     *)
+(* model (Absorb); until then a wait on one of its jobs takes it back      *)
+(* (WaitReclaim), as proto's wait makes a queued delivery stale.           *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS Jobs, Waits, Mutation
 
 ASSUME Mutation \in {"none", "double_reserve", "ignore_lease",
-                     "release_delivered", "lease_leak"}
+                     "release_delivered", "lease_leak", "reclaim_absorbed"}
 
 Async == "async"
 Consumers == Waits \cup {Async}
@@ -42,9 +47,10 @@ VARIABLES
     pc,         \* wait -> "idle" | "waiting" | "holding" | "done"
     targets,    \* wait -> jobs it waits on
     leased,     \* wait -> jobs whose lease it still holds
-    stolen      \* automatic delivery reserved a leased result
+    stolen,     \* automatic delivery reserved a leased result
+    absorbed    \* job -> its queued notice reached the model
 
-vars == <<state, delivery, holders, received, leases, pc, targets, leased, stolen>>
+vars == <<state, delivery, holders, received, leases, pc, targets, leased, stolen, absorbed>>
 
 TypeOK ==
     /\ state \in [Jobs -> {"running", "settled"}]
@@ -56,6 +62,7 @@ TypeOK ==
     /\ targets \in [Waits -> SUBSET Jobs]
     /\ leased \in [Waits -> SUBSET Jobs]
     /\ stolen \in BOOLEAN
+    /\ absorbed \in [Jobs -> BOOLEAN]
 
 Init ==
     /\ state = [j \in Jobs |-> "running"]
@@ -67,11 +74,12 @@ Init ==
     /\ targets = [w \in Waits |-> {}]
     /\ leased = [w \in Waits |-> {}]
     /\ stolen = FALSE
+    /\ absorbed = [j \in Jobs |-> FALSE]
 
 Settle(j) ==
     /\ state[j] = "running"
     /\ state' = [state EXCEPT ![j] = "settled"]
-    /\ UNCHANGED <<delivery, holders, received, leases, pc, targets, leased, stolen>>
+    /\ UNCHANGED <<delivery, holders, received, leases, pc, targets, leased, stolen, absorbed>>
 
 \* A result one consumer may reserve now.
 Reservable(j) ==
@@ -97,7 +105,7 @@ WaitStart(w, t) ==
     /\ targets' = [targets EXCEPT ![w] = t]
     /\ leased' = [leased EXCEPT ![w] = t]
     /\ leases' = [j \in Jobs |-> IF j \in t THEN leases[j] + 1 ELSE leases[j]]
-    /\ UNCHANGED <<state, delivery, holders, received, stolen>>
+    /\ UNCHANGED <<state, delivery, holders, received, stolen, absorbed>>
 
 \* reserveTargets: a target settled; the wait reserves it and returns,
 \* ending its leases.
@@ -108,14 +116,14 @@ WaitTake(w, j) ==
     /\ Reserve(w, j)
     /\ pc' = [pc EXCEPT ![w] = "holding"]
     /\ ReleaseLeases(w)
-    /\ UNCHANGED <<state, received, targets, stolen>>
+    /\ UNCHANGED <<state, received, targets, stolen, absorbed>>
 
 \* The window passed, or every target was delivered elsewhere.
 WaitReturnEmpty(w) ==
     /\ pc[w] = "waiting"
     /\ pc' = [pc EXCEPT ![w] = "done"]
     /\ ReleaseLeases(w)
-    /\ UNCHANGED <<state, delivery, holders, received, targets, stolen>>
+    /\ UNCHANGED <<state, delivery, holders, received, targets, stolen, absorbed>>
 
 Commit(c, j) ==
     /\ c \in holders[j]
@@ -134,14 +142,14 @@ WaitCommit(w) ==
     /\ pc[w] = "holding"
     /\ \E j \in Jobs : w \in holders[j] /\ Commit(w, j)
     /\ pc' = [pc EXCEPT ![w] = "done"]
-    /\ UNCHANGED <<state, leases, targets, leased, stolen>>
+    /\ UNCHANGED <<state, leases, targets, leased, stolen, absorbed>>
 
 \* The turn dropped the wait's tool result: the reservation is cancelled.
 WaitDrop(w) ==
     /\ pc[w] = "holding"
     /\ \E j \in Jobs : w \in holders[j] /\ Release(w, j)
     /\ pc' = [pc EXCEPT ![w] = "done"]
-    /\ UNCHANGED <<state, leases, targets, leased, stolen>>
+    /\ UNCHANGED <<state, leases, targets, leased, stolen, absorbed>>
 
 \* Registry.takeDeliveries: a settled result no wait leases.
 AsyncTake(j) ==
@@ -149,16 +157,39 @@ AsyncTake(j) ==
     /\ (leases[j] = 0 \/ Mutation = "ignore_lease")
     /\ Reserve(Async, j)
     /\ stolen' = (stolen \/ leases[j] > 0)
+    /\ absorbed' = [absorbed EXCEPT ![j] = FALSE]
     /\ UNCHANGED <<state, received, leases, pc, targets, leased>>
 
-\* The supervisor's prompt admitted the notice.
-AsyncCommit(j) ==
-    /\ Commit(Async, j)
-    /\ UNCHANGED <<state, leases, pc, targets, leased, stolen>>
+\* The turn hands the queued notice to the model (a steer it takes, or the
+\* prompt of a turn it runs).
+AsyncAbsorb(j) ==
+    /\ Async \in holders[j]
+    /\ ~absorbed[j]
+    /\ absorbed' = [absorbed EXCEPT ![j] = TRUE]
+    /\ received' = [received EXCEPT ![j] = @ + 1]
+    /\ UNCHANGED <<state, delivery, holders, leases, pc, targets, leased, stolen>>
 
-\* The prompt was refused (the session was busy): try again later.
+\* The host answered the notice as delivered.
+AsyncCommit(j) ==
+    /\ Async \in holders[j]
+    /\ absorbed[j]
+    /\ delivery' = [delivery EXCEPT ![j] = "delivered"]
+    /\ holders' = [holders EXCEPT ![j] = @ \ {Async}]
+    /\ UNCHANGED <<state, received, leases, pc, targets, leased, stolen, absorbed>>
+
+\* The loop refused or dropped the notice before the model read it.
 AsyncRelease(j) ==
+    /\ ~absorbed[j]
     /\ Release(Async, j)
+    /\ UNCHANGED <<state, leases, pc, targets, leased, stolen, absorbed>>
+
+\* A waiting wait takes back a queued notice holding its target.
+WaitReclaim(w, j) ==
+    /\ pc[w] = "waiting"
+    /\ j \in targets[w]
+    /\ (~absorbed[j] \/ Mutation = "reclaim_absorbed")
+    /\ Release(Async, j)
+    /\ absorbed' = [absorbed EXCEPT ![j] = FALSE]
     /\ UNCHANGED <<state, leases, pc, targets, leased, stolen>>
 
 \* A broken release that reopens a committed result.
@@ -166,12 +197,12 @@ ReopenDelivered(j) ==
     /\ Mutation = "release_delivered"
     /\ delivery[j] = "delivered"
     /\ delivery' = [delivery EXCEPT ![j] = "open"]
-    /\ UNCHANGED <<state, holders, received, leases, pc, targets, leased, stolen>>
+    /\ UNCHANGED <<state, holders, received, leases, pc, targets, leased, stolen, absorbed>>
 
 Next ==
-    \/ \E j \in Jobs : Settle(j) \/ AsyncTake(j) \/ AsyncCommit(j) \/ AsyncRelease(j) \/ ReopenDelivered(j)
+    \/ \E j \in Jobs : Settle(j) \/ AsyncTake(j) \/ AsyncAbsorb(j) \/ AsyncCommit(j) \/ AsyncRelease(j) \/ ReopenDelivered(j)
     \/ \E w \in Waits : \/ \E t \in SUBSET Jobs : WaitStart(w, t)
-                        \/ \E j \in Jobs : WaitTake(w, j)
+                        \/ \E j \in Jobs : WaitTake(w, j) \/ WaitReclaim(w, j)
                         \/ WaitReturnEmpty(w) \/ WaitCommit(w) \/ WaitDrop(w)
 
 \* Terminal state: every job delivered and every wait over.
@@ -183,7 +214,7 @@ SafetySpec == Init /\ [][Next \/ (Done /\ UNCHANGED vars)]_vars
 
 Spec ==
     /\ SafetySpec
-    /\ \A j \in Jobs : WF_vars(Settle(j)) /\ WF_vars(AsyncTake(j)) /\ SF_vars(AsyncCommit(j))
+    /\ \A j \in Jobs : WF_vars(Settle(j)) /\ WF_vars(AsyncTake(j)) /\ SF_vars(AsyncAbsorb(j)) /\ SF_vars(AsyncCommit(j))
     /\ \A w \in Waits : WF_vars(WaitCommit(w) \/ WaitDrop(w)) /\ WF_vars(WaitReturnEmpty(w))
 
 (***************************************************************************)
