@@ -1892,6 +1892,61 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   **Alternative:** searching the compactor's records, which miss turns not
   compacted yet and know no turn numbers.
 
+- **D130 Decision:** a request's instructions hold only text that stays the
+  same for the whole session. The context fx captures for a turn (the
+  `<fx-turn-context>` facts, access, permission mode and runtime guidance,
+  and the instructions of a skill the person invoked) rides as user
+  messages just before the person's text and is saved on the user turn as
+  `turn_context` and `skill_context`, so later steps and turns resend the
+  bytes the turn first sent. The runtime context is saved only when it
+  differs from the latest one in the active window, so an unchanged
+  workspace adds nothing and a compaction that drops it brings it back.
+  The compactor leaves these messages out of summaries. **Why:** a prefix
+  cache matches from the first byte, and the volatile context sat in the
+  head, so a new date, a `git checkout` or a skill rewrote every request
+  after it; proto keeps volatile context out of the cached head the same
+  way. **Alternative:** a separate context lane between instructions and
+  messages, which `validate_prompt_lanes` would have to admit for every
+  provider and which Codex still flattens into `instructions`.
+
+- **D131 Decision:** the turn context is captured once, when the turn
+  starts, not on every step. A permission mode or branch that changes
+  mid-turn reaches the model on its next turn. **Why:** a per-step capture
+  either rewrites the history it follows or adds a message per step.
+  **Alternative:** appending a delta at the tail whenever it changes,
+  which the next turn's projection could not repeat byte for byte.
+
+- **D132 Decision:** subagent results that settle mid-turn
+  (`parent_delivery.prepare`) ride as one labelled user message at the
+  tail of that step's request, never as an instruction. **Why:** they are
+  untrusted child output, and at the tail they cost only themselves in
+  the cache. **Alternative:** keeping them in the instructions, which
+  rewrote the head on every delivery and acknowledgement.
+
+- **D133 Decision:** a request carries its session id
+  (`RequestData.session_id`), and Codex sends it as `prompt_cache_key`, as
+  the Codex CLI and proto do, so the session's requests reach the server
+  that holds their prefix. `prompt_cache_retention` is not sent, since the
+  ChatGPT Codex endpoint does not document it. Dynamic tools stay
+  append-only within a turn: a selection appends, a refreshed definition
+  keeps its place, and only a retired or unavailable tool leaves.
+  **Why:** OpenAI routes cache hits by that key. **Alternative:** relying
+  on the `session-id` header, which the backend does not use for cache
+  routing.
+
+- **D134 Decision:** the chat completions protocol marks Anthropic-style
+  `cache_control` breakpoints for `anthropic/*` models, or when a route
+  sets `prompt_caching`: one on the last instruction and one on the latest
+  user or assistant text, as proto's completions provider does with its
+  rolling tail. It reads cache usage from
+  `prompt_tokens_details.cached_tokens`, `cache_write_tokens` and
+  `prompt_cache_hit_tokens`. The Vercel gateway keeps `caching: "auto"`,
+  which places breakpoints for each upstream provider itself. **Why:**
+  Anthropic models behind OpenAI-compatible routers cache only at explicit
+  breakpoints, and other routes cache by prefix on their own.
+  **Alternative:** explicit gateway breakpoints, which the gateway already
+  derives and which would tie fx to each upstream's limits.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

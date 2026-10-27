@@ -4813,7 +4813,7 @@ test "processQueuedPrompt enables Gateway automatic caching across model familie
     }
 }
 
-test "processQueuedPrompt places transient overlay before history and current prompt" {
+test "processQueuedPrompt places the turn context after history and before the current prompt" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{ .content = "No" }};
     var gateway = FakeGateway.init(alloc, &completions);
@@ -4842,9 +4842,9 @@ test "processQueuedPrompt places transient overlay before history and current pr
     const current_idx = std.mem.find(u8, body, "is it still running") orelse return error.TestExpectedEqual;
     const runtime_idx = std.mem.find(u8, body, "runtime tail context unique") orelse return error.TestExpectedEqual;
     try std.testing.expect(system_idx < static_idx);
-    try std.testing.expect(static_idx < runtime_idx);
-    try std.testing.expect(runtime_idx < history_idx);
-    try std.testing.expect(history_idx < current_idx);
+    try std.testing.expect(static_idx < history_idx);
+    try std.testing.expect(history_idx < runtime_idx);
+    try std.testing.expect(runtime_idx < current_idx);
     try expectGatewayPromptFinalUserText(&gateway, 0, "is it still running");
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
 }
@@ -5226,8 +5226,8 @@ test "processQueuedPrompt keeps supplied system prompt components in stable orde
     try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
-    const first_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .system, .system, .user, .assistant, .user };
-    const second_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .system, .system, .user, .assistant, .user, .assistant, .tool };
+    const first_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .system, .user, .assistant, .user, .user };
+    const second_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .system, .user, .assistant, .user, .user, .assistant, .tool };
     try expectGatewayPromptRoles(&gateway, 0, &first_roles);
     try expectGatewayPromptRoles(&gateway, 1, &second_roles);
     inline for (&.{ @as(usize, 0), @as(usize, 1) }) |request_index| {
@@ -5246,8 +5246,8 @@ test "processQueuedPrompt keeps supplied system prompt components in stable orde
             "host guidance-order instructions",
             "model guidance-order overlay",
             "static guidance-order context",
-            "transient guidance-order context",
             "past assistant guidance-order needle",
+            "transient guidance-order context",
             "user prompt",
         };
         try expectBodyContainsInOrder(&gateway, request_index, &order);
@@ -5488,7 +5488,7 @@ test "processQueuedPrompt keeps completed history before the final current user 
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
-    const expected_roles = [_]types.ChatRole{ .system, .system, .system, .user, .assistant, .user };
+    const expected_roles = [_]types.ChatRole{ .system, .system, .user, .assistant, .user, .user };
     try expectGatewayPromptRoles(&gateway, 0, &expected_roles);
     try expectGatewayPromptTextCount(&gateway, 0, "prior user structural needle", 1);
     try expectGatewayPromptTextCount(&gateway, 0, "prior assistant structural needle", 1);
@@ -5498,8 +5498,9 @@ test "processQueuedPrompt keeps completed history before the final current user 
     const history_idx = std.mem.find(u8, body, "prior assistant structural needle") orelse return error.TestExpectedEqual;
     const runtime_idx = std.mem.find(u8, body, "runtime context structural needle") orelse return error.TestExpectedEqual;
     const current_idx = std.mem.find(u8, body, "current structural prompt needle") orelse return error.TestExpectedEqual;
-    try std.testing.expect(runtime_idx < history_idx);
-    try std.testing.expect(history_idx < current_idx);
+    // The turn's context rides after history, just before the prompt (D130).
+    try std.testing.expect(history_idx < runtime_idx);
+    try std.testing.expect(runtime_idx < current_idx);
     try expectGatewayPromptFinalUserText(&gateway, 0, "current structural prompt needle");
     try expectGatewayPromptTextCount(&gateway, 0, "Earlier messages are session history from previous turns.", 0);
     try expectGatewayPromptTextCount(&gateway, 0, "Do not re-run, re-answer, or continue earlier user turns", 0);
