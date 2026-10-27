@@ -2706,6 +2706,17 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   that provider. **Why:** the columns only follow keystrokes, so pasted
   text fell through to "Unknown command". **Alternative:** keeping the
   router blind to arguments, which leaves pasting broken.
+- **D240 Decision:** a dynamic tool the model selects stays advertised for
+  the rest of the session, not only the turn. The session runtime keeps the
+  turn's dynamic tool list when the turn ends, however it ends, and the next
+  turn appends it after the host's own dynamic tools in first-selected
+  order; a refreshed definition keeps its place and only a retired tool
+  leaves. The list is in memory only: a reset or resume clears it.
+  **Why:** dropping the tools at the turn's end and selecting them again
+  later rewrote the tools prefix, so the provider's cache missed from the
+  first tool on; proto keeps every declared tool and appends new ones.
+  **Alternative:** saving the selections in the session log, which would
+  advertise tools whose MCP server may be gone after a restart.
 
 - **D230 Decision:** the `checklist` tool keeps proto's contract: phases
   of tasks named by their exact content, never by ids; one operation per

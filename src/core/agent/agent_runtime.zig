@@ -49,6 +49,7 @@ pub const normalizeAssistantTextForDisplay = runtime_assistant_stream.normalizeA
 test {
     _ = @import("runtime/observation.zig");
     _ = @import("runtime/gateway_step.zig");
+    _ = @import("runtime/dynamic_tool_set.zig");
     _ = @import("stream_provider.zig");
     _ = @import("../compactor/compactor.zig");
     _ = @import("runtime/parallel_execution.zig");

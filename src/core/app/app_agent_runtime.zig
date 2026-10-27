@@ -1290,6 +1290,10 @@ pub fn Runtime(comptime App: type) type {
                 .access_scope = workspace.access_scope,
                 .session_child_capability = session_child_capability,
                 .context_limits = if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
+                .session_dynamic_tools = if (comptime @hasField(@TypeOf(app.session), "dynamic_tools"))
+                    .{ .set = &app.session.dynamic_tools, .alloc = app.alloc }
+                else
+                    null,
             };
         }
     };

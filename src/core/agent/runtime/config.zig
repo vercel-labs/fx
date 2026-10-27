@@ -11,6 +11,7 @@ const model_response_recovery = @import("model_response_recovery.zig");
 const provider_set = @import("../../gateway/provider_set.zig");
 const model_tool_schema = @import("../../tooling/model_tool_schema.zig");
 const stream_provider = @import("../stream_provider.zig");
+const dynamic_tool_set = @import("dynamic_tool_set.zig");
 
 const ReasoningEffort = types.ReasoningEffort;
 
@@ -36,6 +37,10 @@ pub const Config = struct {
     advertised_tool_names: []const []const u8 = &.{},
     advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
     initial_dynamic_tools: []const stream_provider.DynamicFunctionTool = &.{},
+    /// The session's selected dynamic tools (D240). The turn advertises
+    /// them after `initial_dynamic_tools` and records its own selections
+    /// back, so they stay in the tools prefix for the rest of the session.
+    session_dynamic_tools: ?dynamic_tool_set.SessionDynamicTools = null,
     provider_capabilities: provider_set.Bundle.Capabilities = .{
         .gateway_prompt_caching = true,
         .fx_search = true,

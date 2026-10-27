@@ -173,3 +173,77 @@ test "a turn's context survives the session's own save and load" {
     try std.testing.expectEqualStrings("user prompt", messages.items[1].content.?);
     try expectBodyContains(&gateway, 0, "date_utc: 2026-10-27");
 }
+
+fn toolsOf(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try std.json.Stringify.value(parsed.value.object.get("tools") orelse return error.TestExpectedTools, .{}, &out.writer);
+    return out.toOwnedSlice();
+}
+
+fn echoSchema(comptime name: []const u8) []const u8 {
+    return "{\"type\":\"function\",\"name\":\"" ++ name ++ "\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}}}}";
+}
+
+test "a dynamic tool selected in one turn stays in the tools of later turns, appended in order" {
+    const alloc = std.testing.allocator;
+    const select_first = [_]types.ToolCall{toolCall("select_one", "mcp_select_tool", "{\"name\":\"mcp_fixture_echo\"}")};
+    const select_second = [_]types.ToolCall{toolCall("select_two", "mcp_select_tool", "{\"name\":\"mcp_fixture_lookup\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &select_first },
+        .{ .content = "First answer" },
+        .{ .content = "Second answer" },
+        .{ .tool_calls = &select_second },
+        .{ .content = "Third answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "selected", .selected_dynamic_tools = &.{.{ .name = "mcp_fixture_echo", .schema_json = echoSchema("mcp_fixture_echo") }} } },
+        .{ .result = .{ .model_output = "selected", .selected_dynamic_tools = &.{.{ .name = "mcp_fixture_lookup", .schema_json = echoSchema("mcp_fixture_lookup") }} } },
+    };
+    var set: @import("../dynamic_tool_set.zig").DynamicToolSet = .{};
+    defer set.deinit(alloc);
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.session_dynamic_tools = .{ .set = &set, .alloc = alloc };
+
+    // Turn one selects a tool; its second request advertises it.
+    var first = fixture.job();
+    first.permission_mode = .auto;
+    try runFakePrompt(&gateway, &hooks, config, first);
+    try std.testing.expectEqual(@as(usize, 1), set.count());
+    try expectBodyNotContains(&gateway, 0, "mcp_fixture_echo\",\"description");
+    const turn_one_tools = try toolsOf(alloc, gateway.request_bodies.items[1]);
+    defer alloc.free(turn_one_tools);
+    try std.testing.expect(std.mem.find(u8, turn_one_tools, "mcp_fixture_echo") != null);
+
+    // Turn two selects nothing and still sends the same tools.
+    var second = fixture.job();
+    second.prompt = @constCast("second prompt");
+    second.permission_mode = .auto;
+    second.history = hooks.history_turns.items;
+    try runFakePrompt(&gateway, &hooks, config, second);
+    const turn_two_tools = try toolsOf(alloc, gateway.request_bodies.items[2]);
+    defer alloc.free(turn_two_tools);
+    try std.testing.expectEqualStrings(turn_one_tools, turn_two_tools);
+    try expectRepeatsPrefix(&gateway, 1, 2);
+
+    // Turn three selects another tool, which goes after the first, so
+    // the earlier tool bytes stay where they were.
+    var third = fixture.job();
+    third.prompt = @constCast("third prompt");
+    third.permission_mode = .auto;
+    third.history = hooks.history_turns.items;
+    try runFakePrompt(&gateway, &hooks, config, third);
+    try std.testing.expectEqual(@as(usize, 5), gateway.request_bodies.items.len);
+    const turn_three_tools = try toolsOf(alloc, gateway.request_bodies.items[4]);
+    defer alloc.free(turn_three_tools);
+    try std.testing.expect(std.mem.startsWith(u8, turn_three_tools, turn_one_tools[0 .. turn_one_tools.len - 1]));
+    try std.testing.expect(std.mem.find(u8, turn_three_tools[turn_one_tools.len - 1 ..], "mcp_fixture_lookup") != null);
+    try std.testing.expectEqual(@as(usize, 2), set.count());
+}

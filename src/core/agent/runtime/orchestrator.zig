@@ -7021,6 +7021,11 @@ fn processQueuedPromptLoop(
     for (config.initial_dynamic_tools) |tool| {
         selected_dynamic_tools.appendAssumeCapacity(tool);
     }
+    if (config.session_dynamic_tools) |session_tools| try session_tools.set.restoreInto(arena, &selected_dynamic_tools);
+    // Whatever way the turn ends, the next one advertises what it selected.
+    defer if (config.session_dynamic_tools) |session_tools| session_tools.set.remember(session_tools.alloc, selected_dynamic_tools.items) catch |err| {
+        debug_trace.logf("mcp", "session dynamic tools not remembered err={s}", .{@errorName(err)});
+    };
     const current_user_effective = current_user_message;
     const initial_pending_image_ids = try arena.alloc(usize, job.images.len);
     for (job.images, 0..) |attachment, index| initial_pending_image_ids[index] = attachment.id;

@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const kernel_agent = @import("../agent/runtime/agent.zig");
+const dynamic_tool_set = @import("../agent/runtime/dynamic_tool_set.zig");
 const kernel_slot = @import("../kernel/slot.zig");
 const browser_slot = @import("../browser/slot.zig");
 const checklist_store = @import("../checklist/store.zig");
@@ -1376,6 +1377,8 @@ pub const SessionRuntime = struct {
     /// save it with each committed turn and load it on resume.
     checklist: checklist_store.Store = .{},
     agent: kernel_agent.Agent = .{},
+    /// Dynamic tools selected during the session (D240). In memory only.
+    dynamic_tools: dynamic_tool_set.DynamicToolSet = .{},
     context_notice_hashes: std.AutoHashMapUnmanaged(u64, void) = .empty,
     context_notice_lock: std.Io.Mutex = .init,
     web_fetch_artifacts: WebFetchArtifactState = .none,
@@ -1415,6 +1418,7 @@ pub const SessionRuntime = struct {
         self.clearWebFetchArtifacts();
         self.permission_state.deinit(alloc);
         self.agent.deinit(alloc);
+        self.dynamic_tools.deinit(alloc);
         self.context_notice_hashes.deinit(alloc);
     }
 
@@ -1425,6 +1429,7 @@ pub const SessionRuntime = struct {
         self.clearWebFetchArtifacts();
         self.clearPermissionState(alloc);
         self.clearHistory(alloc);
+        self.dynamic_tools.clear(alloc);
         self.clearContextNotices();
         self.setConversationLanguage(ConversationLanguage.default());
         self.has_stale_shell_handles = false;
@@ -1437,6 +1442,7 @@ pub const SessionRuntime = struct {
         self.clearWebFetchArtifacts();
         self.clearPermissionState(alloc);
         self.clearHistory(alloc);
+        self.dynamic_tools.clear(alloc);
         self.clearContextNotices();
         self.setConversationLanguage(language);
         self.has_stale_shell_handles = false;
