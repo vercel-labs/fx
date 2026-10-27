@@ -1914,8 +1914,8 @@ const App = struct {
         try self.mcp.reloadHost(self.alloc, self.workspace_root, self.toolRegistry());
     }
 
-    pub fn snapshotMcpModelCatalog(self: *App, alloc: Allocator) !mcp_model_catalog.Report {
-        return self.mcp.snapshotModelCatalog(alloc, self.alloc);
+    pub fn snapshotMcpModelCatalog(self: *App, alloc: Allocator) !mcp_model_catalog.Snapshot {
+        return self.mcp.snapshotModelCatalog(alloc);
     }
 
     fn effectiveToolSet(self: *const App) tool_set_contract.ToolSet {

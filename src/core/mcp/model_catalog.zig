@@ -2,6 +2,7 @@ const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
+const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -57,19 +58,7 @@ pub const PromptSection = struct {
     }
 };
 
-/// A catalog snapshot paired with an optional model-visible note describing
-/// how server availability changed since the previously reported snapshot.
-/// Ownership follows the `render` convention: callers using a request arena
-/// may skip deinit and let the arena retain both values; a caller that frees
-/// the snapshot itself must keep `change_notice` alive for as long as the
-/// request messages reference it.
-pub const Report = struct {
-    snapshot: Snapshot,
-    change_notice: ?[]u8 = null,
-};
-
-/// One server's availability as previously shown to the model. Names are
-/// owned by the caller's long-lived baseline allocator.
+/// One server's availability as the session's instructions show it.
 pub const BaselineEntry = struct {
     name: []u8,
     availability: Availability,
@@ -77,10 +66,12 @@ pub const BaselineEntry = struct {
 
 const max_change_notice_transitions: usize = 8;
 
-/// Renders a model-visible note describing availability changes between the
-/// previously reported baseline and the current snapshot. Returns null when
-/// availability is unchanged; tool-count-only changes do not render. The
-/// caller owns the returned slice.
+/// Renders a model-visible note describing how current availability differs
+/// from the baseline the instructions show. Returns null when nothing
+/// differs. Tool-count-only changes and moves between `ready`,
+/// `available_on_demand` and `discovering` do not render: each means the
+/// server can be searched, and the model learns its tools from the search.
+/// The caller owns the returned slice.
 pub fn renderChangeNotice(
     alloc: Allocator,
     baseline: []const BaselineEntry,
@@ -96,6 +87,7 @@ pub fn renderChangeNotice(
             try renderAdditionLine(&body.writer, &transitions, &omitted, server.name, server.availability);
             continue;
         };
+        if (usable(entry.availability) and usable(server.availability)) continue;
         if (entry.availability == server.availability) continue;
         try renderTransitionLine(&body.writer, &transitions, &omitted, server.name, entry.availability, server.availability, server.tool_count);
     }
@@ -107,9 +99,16 @@ pub fn renderChangeNotice(
     if (omitted > 0) {
         body.writer.print("  and {d} more change{s}\n", .{ omitted, if (omitted == 1) "" else "s" }) catch return error.OutOfMemory;
     }
-    const change_header = "MCP server availability changed since earlier in this session:\n";
-    const change_footer = "The <mcp_servers> section above is current. Treat earlier claims in this conversation that a listed server required authentication or was unavailable as outdated; re-run capability_search before concluding a server cannot be used.\n";
+    const change_header = "MCP server availability now differs from the <mcp_servers> list in the instructions:\n";
+    const change_footer = "These states replace the ones that list shows. Treat earlier claims in this conversation that a listed server required authentication or was unavailable as outdated; re-run capability_search before concluding a server cannot be used.\n";
     return std.mem.concat(alloc, u8, &.{ change_header, body.written(), change_footer }) catch return error.OutOfMemory;
+}
+
+fn usable(availability: Availability) bool {
+    return switch (availability) {
+        .ready, .available_on_demand, .discovering => true,
+        else => false,
+    };
 }
 
 fn renderAdditionLine(
@@ -182,6 +181,65 @@ fn findCurrentEntry(current: []const ServerSummary, name: []const u8) ?ServerSum
     }
     return null;
 }
+
+/// The MCP catalog a session's instructions carry (D260). The first render
+/// in a session is kept and repeated byte for byte on every later turn, so
+/// a server that connects, signs in or fails never rewrites the cached head
+/// of the request. How availability differs from it rides in the turn
+/// context instead (`changeNotice`). `reset` starts over for a new session.
+pub const SessionHead = struct {
+    lock: std.Io.Mutex = .init,
+    /// The section text, owned by the allocator passed to `instructions`.
+    text: ?[]u8 = null,
+    baseline: []BaselineEntry = &.{},
+
+    /// Returns the session's catalog section, rendering and keeping
+    /// `snapshot` on the first call. The result is owned by `arena`; `gpa`
+    /// owns what the head keeps and must be the one passed to `reset`.
+    pub fn instructions(self: *SessionHead, gpa: Allocator, arena: Allocator, snapshot: Snapshot) Allocator.Error!PromptSection {
+        self.lock.lockUncancelable(io_mod.getIo());
+        defer self.lock.unlock(io_mod.getIo());
+        if (self.text) |text| return .{ .text = try arena.dupe(u8, text) };
+        const section = try render(arena, snapshot);
+        const text = try gpa.dupe(u8, section.text);
+        errdefer gpa.free(text);
+        const baseline = try gpa.alloc(BaselineEntry, snapshot.servers.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (baseline[0..initialized]) |entry| gpa.free(entry.name);
+            gpa.free(baseline);
+        }
+        for (snapshot.servers, baseline) |server, *entry| {
+            entry.* = .{ .name = try gpa.dupe(u8, server.name), .availability = server.availability };
+            initialized += 1;
+        }
+        self.text = text;
+        self.baseline = baseline;
+        return section;
+    }
+
+    /// Returns a note on how `current` differs from the catalog the
+    /// instructions show, owned by `arena`, or null when nothing differs or
+    /// no turn has rendered the instructions yet. It is the same text for
+    /// as long as the difference lasts, so the turn context that carries it
+    /// repeats only when it changes (D130).
+    pub fn changeNotice(self: *SessionHead, arena: Allocator, current: []const ServerSummary) Allocator.Error!?[]u8 {
+        self.lock.lockUncancelable(io_mod.getIo());
+        defer self.lock.unlock(io_mod.getIo());
+        if (self.text == null) return null;
+        return renderChangeNotice(arena, self.baseline, current);
+    }
+
+    pub fn reset(self: *SessionHead, gpa: Allocator) void {
+        self.lock.lockUncancelable(io_mod.getIo());
+        defer self.lock.unlock(io_mod.getIo());
+        if (self.text) |text| gpa.free(text);
+        for (self.baseline) |entry| gpa.free(entry.name);
+        gpa.free(self.baseline);
+        self.text = null;
+        self.baseline = &.{};
+    }
+};
 
 /// Returns an owned prompt section. The caller releases it with `deinit` unless
 /// both values are intentionally retained by the supplied request arena.
@@ -486,4 +544,80 @@ test "renderChangeNotice bounds the transition list and encodes names" {
     try std.testing.expect(std.mem.find(u8, notice.?, "server&lt;7&gt;: failed -> ready") != null);
     try std.testing.expect(std.mem.find(u8, notice.?, "server&lt;8&gt;") == null);
     try std.testing.expect(std.mem.find(u8, notice.?, "and 2 more changes") != null);
+}
+
+test "renderChangeNotice ignores moves between searchable states" {
+    const alloc = std.testing.allocator;
+    const baseline = [_]BaselineEntry{
+        .{ .name = @constCast("fixture"), .availability = .available_on_demand },
+        .{ .name = @constCast("linear"), .availability = .discovering },
+    };
+    const current = [_]ServerSummary{
+        .{ .name = @constCast("fixture"), .availability = .ready, .tool_count = 1 },
+        .{ .name = @constCast("linear"), .availability = .ready, .tool_count = 74 },
+    };
+
+    try std.testing.expectEqual(@as(?[]u8, null), try renderChangeNotice(alloc, &baseline, &current));
+}
+
+test "a session head repeats its first catalog and reports differences apart" {
+    const alloc = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var head: SessionHead = .{};
+    defer head.reset(alloc);
+
+    try std.testing.expectEqual(@as(?[]u8, null), try head.changeNotice(arena, &.{}));
+    var first = try ownedSnapshot(alloc, &.{
+        .{ .name = "fixture", .availability = .available_on_demand },
+        .{ .name = "linear", .availability = .authentication_required },
+    });
+    defer first.deinit(alloc);
+    const start = try head.instructions(alloc, arena, first);
+
+    var later = try ownedSnapshot(alloc, &.{
+        .{ .name = "fixture", .availability = .ready, .tool_count = 1 },
+        .{ .name = "linear", .availability = .authentication_required },
+    });
+    defer later.deinit(alloc);
+    const again = try head.instructions(alloc, arena, later);
+    try std.testing.expectEqualStrings(start.text, again.text);
+    try std.testing.expect(std.mem.find(u8, again.text, "state=\"available_on_demand\"") != null);
+    try std.testing.expectEqual(@as(?[]u8, null), try head.changeNotice(arena, later.servers));
+
+    var signed_in = try ownedSnapshot(alloc, &.{
+        .{ .name = "fixture", .availability = .ready, .tool_count = 1 },
+        .{ .name = "linear", .availability = .ready, .tool_count = 74 },
+    });
+    defer signed_in.deinit(alloc);
+    const notice = (try head.changeNotice(arena, signed_in.servers)).?;
+    try std.testing.expect(std.mem.find(u8, notice, "linear: authentication_required -> ready (74 tools)") != null);
+    try std.testing.expect(std.mem.find(u8, notice, "fixture") == null);
+    // The same difference renders the same bytes on every turn.
+    try std.testing.expectEqualStrings(notice, (try head.changeNotice(arena, signed_in.servers)).?);
+
+    head.reset(alloc);
+    const fresh = try head.instructions(alloc, arena, signed_in);
+    try std.testing.expect(std.mem.find(u8, fresh.text, "<server name=\"linear\" state=\"ready\" tools=\"74\" />") != null);
+}
+
+fn checkSessionHeadAllocationFailures(alloc: Allocator) !void {
+    var servers = [_]ServerSummary{
+        .{ .name = @constCast("alpha"), .availability = .ready, .tool_count = 2 },
+        .{ .name = @constCast("beta"), .availability = .failed },
+    };
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    var head: SessionHead = .{};
+    defer head.reset(alloc);
+    _ = try head.instructions(alloc, arena_state.allocator(), .{ .servers = &servers });
+}
+
+test "a session head cleans up every partial allocation" {
+    try std.testing.checkAllAllocationFailures(
+        testing_allocator.no_resize,
+        checkSessionHeadAllocationFailures,
+        .{},
+    );
 }

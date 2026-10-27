@@ -898,19 +898,19 @@ pub fn Runtime(comptime App: type) type {
             try app.contextRegistry().appendDefaultStatic(.{
                 .project_context = project_context orelse modelVisibleProjectContext(app),
             }, arena, messages);
-            var report = if (comptime @hasDecl(App, "snapshotMcpModelCatalog"))
+            var snapshot = if (comptime @hasDecl(App, "snapshotMcpModelCatalog"))
                 try app.snapshotMcpModelCatalog(arena)
             else
-                mcp_model_catalog.Report{ .snapshot = try mcp_model_catalog.Snapshot.empty(arena) };
-            // The request arena retains the change notice, which outlives this
-            // function inside `messages`; only the snapshot names are released.
-            defer report.snapshot.deinit(arena);
-            const section = try mcp_model_catalog.render(arena, report.snapshot);
+                try mcp_model_catalog.Snapshot.empty(arena);
+            defer snapshot.deinit(arena);
+            // The session's first catalog stays in the instructions; later
+            // changes ride in the turn context (D260).
+            const section = if (comptime @hasField(@TypeOf(app.session), "mcp_catalog"))
+                try app.session.mcp_catalog.instructions(app.alloc, arena, snapshot)
+            else
+                try mcp_model_catalog.render(arena, snapshot);
             if (section.text.len > 0) {
                 try messages.append(arena, .{ .role = .system, .content = section.text });
-            }
-            if (report.change_notice) |notice| {
-                try messages.append(arena, .{ .role = .system, .content = notice });
             }
             if (section.notice) |notice| try pushMcpModelCatalogNotice(app, notice);
         }
@@ -965,6 +965,17 @@ pub fn Runtime(comptime App: type) type {
                 .permission_mode = permission_snapshot.mode,
                 .stale_shell_handles = app.session.has_stale_shell_handles,
             }, arena, messages);
+            try appendMcpCatalogChange(app, arena, messages);
+        }
+
+        /// How MCP availability differs from the catalog in the session's
+        /// instructions, as part of the turn context (D260).
+        fn appendMcpCatalogChange(app: *App, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+            if (comptime !@hasDecl(App, "snapshotMcpModelCatalog") or !@hasField(@TypeOf(app.session), "mcp_catalog")) return;
+            var snapshot = try app.snapshotMcpModelCatalog(arena);
+            defer snapshot.deinit(arena);
+            const notice = try app.session.mcp_catalog.changeNotice(arena, snapshot.servers) orelse return;
+            try messages.append(arena, .{ .role = .system, .content = notice });
         }
 
         pub fn refreshProjectContext(app: *App, targets: []const context_contract.ApplicableTarget) context_contract.ProviderError!void {
@@ -1643,7 +1654,7 @@ const FakeApp = struct {
     mcp_name: []const u8 = "mcp_lookup",
     mcp_has_tool_calls: usize = 0,
     mcp_result: []const u8 = "{\"ok\":true}",
-    mcp_change_notice: ?[]const u8 = null,
+    mcp_servers: []const mcp_model_catalog.ServerSummary = &.{},
     diff_blocks: usize = 0,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{
@@ -1687,11 +1698,13 @@ const FakeApp = struct {
     pub fn snapshotMcpModelCatalog(
         self: *FakeApp,
         alloc: Allocator,
-    ) !mcp_model_catalog.Report {
-        return .{
-            .snapshot = try mcp_model_catalog.Snapshot.empty(alloc),
-            .change_notice = if (self.mcp_change_notice) |notice| try alloc.dupe(u8, notice) else null,
-        };
+    ) !mcp_model_catalog.Snapshot {
+        const servers = try alloc.alloc(mcp_model_catalog.ServerSummary, self.mcp_servers.len);
+        for (self.mcp_servers, servers) |server, *out| {
+            out.* = server;
+            out.name = try alloc.dupe(u8, server.name);
+        }
+        return .{ .servers = servers };
     }
 
     fn promptPolicy(_: *const FakeApp) prompt_policy_contract.Policy {
@@ -2668,24 +2681,41 @@ test "app agent runtime prefers active queued project context snapshot" {
     try std.testing.expectEqualStrings("test.default_context", tool_context.context_registry.defaultProvider().id);
 }
 
-test "app agent runtime shows MCP availability changes to the model" {
+test "app agent runtime keeps the session's first MCP catalog and reports changes in the turn context" {
     const alloc = std.testing.allocator;
     var app = try FakeApp.init(alloc);
     defer app.deinit();
-    app.mcp_change_notice = "MCP server availability changed since earlier in this session:\n  linear: authentication_required -> ready (74 tools)\n";
+    app.mcp_servers = &.{
+        .{ .name = @constCast("fixture"), .availability = .available_on_demand },
+        .{ .name = @constCast("linear"), .availability = .authentication_required },
+    };
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var messages: std.ArrayList(ChatMessage) = .empty;
-    defer messages.deinit(arena);
+    var first: std.ArrayList(ChatMessage) = .empty;
+    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, null, &first, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    var first_turn: std.ArrayList(ChatMessage) = .empty;
+    try Runtime(FakeApp).appendTransientRuntimeContextMessage(&app, arena, &first_turn, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try std.testing.expectEqual(@as(usize, 1), first_turn.items.len);
 
-    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, null, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    // capability_search connected one server and a login finished another.
+    app.mcp_servers = &.{
+        .{ .name = @constCast("fixture"), .availability = .ready, .tool_count = 1 },
+        .{ .name = @constCast("linear"), .availability = .ready, .tool_count = 74 },
+    };
+    var second: std.ArrayList(ChatMessage) = .empty;
+    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, null, &second, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try std.testing.expectEqual(first.items.len, second.items.len);
+    for (first.items, second.items) |was, now| try std.testing.expectEqualStrings(was.content.?, now.content.?);
+    try std.testing.expect(std.mem.find(u8, second.items[1].content.?, "state=\"available_on_demand\"") != null);
 
-    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
-    try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
-    try std.testing.expectEqual(types.ChatRole.system, messages.items[2].role);
-    try std.testing.expect(std.mem.find(u8, messages.items[2].content.?, "linear: authentication_required -> ready (74 tools)") != null);
+    var second_turn: std.ArrayList(ChatMessage) = .empty;
+    try Runtime(FakeApp).appendTransientRuntimeContextMessage(&app, arena, &second_turn, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try std.testing.expectEqual(@as(usize, 2), second_turn.items.len);
+    const notice = second_turn.items[1].content.?;
+    try std.testing.expect(std.mem.find(u8, notice, "linear: authentication_required -> ready (74 tools)") != null);
+    try std.testing.expect(std.mem.find(u8, notice, "fixture") == null);
 }
 
 fn makeQueuedPrompt(alloc: Allocator) !worker_runtime.QueuedPrompt {

@@ -2727,6 +2727,22 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   first byte. **Alternative:** appending it to the tool result that found
   it, which saves it with the turn but rewrites a result the session has
   already streamed, and freezes a rule file that later changes.
+- **D260 Decision:** the MCP catalog in a session's instructions is the one
+  its first turn rendered, repeated byte for byte for the rest of the
+  session (`model_catalog.SessionHead` on the session runtime). How
+  availability now differs from it rides in the turn context as one note,
+  the same text for as long as the difference lasts, so it is saved with
+  the turn once and comes back after a compaction like the rest of the
+  turn context (D130). Moves between `ready`, `available_on_demand` and
+  `discovering` and tool counts are not differences: each means the server
+  can be searched, and the search result names its tools. A reset or
+  resume renders the catalog afresh. **Why:** a server that
+  `capability_search` connected turned `available_on_demand` into
+  `ready tools="1"` in the instructions, so the next turn missed the cache
+  from the first byte; proto rebuilds its prompt only when its mounted
+  tools change, not on use. **Alternative:** dropping server state from
+  the instructions, which hides a server that needs a login until a search
+  fails.
 - **D242 Decision:** a saved turn's "Session file evidence" message is
   projected after the turn's last message, not between its tool results
   and its final answer. **Why:** the turn's own requests never carried it,

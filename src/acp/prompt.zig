@@ -2410,6 +2410,14 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         .interactive = false,
         .permission_mode = ctx.captured_permission_mode orelse session.permission_mode,
     }, arena, messages);
+    // How MCP availability differs from the catalog in the session's
+    // instructions rides in the turn context (D260).
+    if (ctx.state.cfg.minimal_kernel) return;
+    const mcp_host = session.mcp_host orelse return;
+    var snapshot = try mcp_host.catalog.modelSnapshot(arena);
+    defer snapshot.deinit(arena);
+    const notice = try session.session_rt.mcp_catalog.changeNotice(arena, snapshot.servers) orelse return;
+    try messages.append(arena, .{ .role = .system, .content = notice });
 }
 
 fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) !void {
@@ -2427,7 +2435,11 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, project_context: ?
     else
         try mcp_model_catalog.Snapshot.empty(arena);
     defer snapshot.deinit(arena);
-    const section = try mcp_model_catalog.render(arena, snapshot);
+    // The session's first catalog stays in the instructions (D260).
+    const section = if (active_session) |session|
+        try session.session_rt.mcp_catalog.instructions(ctx.state.alloc, arena, snapshot)
+    else
+        try mcp_model_catalog.render(arena, snapshot);
     if (section.text.len > 0) {
         try messages.append(arena, .{ .role = .system, .content = section.text });
     }
