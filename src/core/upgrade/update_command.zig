@@ -293,16 +293,48 @@ pub fn backgroundCheckDue(alloc: Allocator, home: []const u8, build: Build, sett
 }
 
 /// Starts the background check in its own process group, detached from the
-/// terminal, and does not wait for it.
+/// terminal. Startup never waits for it: a detached thread reaps it when it
+/// ends, so it is not left a zombie for the rest of the session (D214).
 pub fn startBackgroundCheck(executable: []const u8) void {
-    // Not waited for: like the supervisor, it outlives nothing it needs.
-    if (std.process.spawn(io_mod.getIo(), .{
+    const child = std.process.spawn(io_mod.getIo(), .{
         .argv = &.{ executable, "update", "--check", "--background" },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
         .pgid = 0,
-    })) |_| {} else |_| {}
+    }) catch return;
+    reapInBackground(child);
+}
+
+/// Waits for `child` on a detached thread. Without a thread it is waited
+/// for when the terminal exits, by the system.
+fn reapInBackground(child: std.process.Child) void {
+    const thread = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, reap, .{child}) catch return;
+    thread.detach();
+}
+
+fn reap(child: std.process.Child) void {
+    var owned = child;
+    _ = owned.wait(io_mod.getIo()) catch {};
+}
+
+test "a background check child is reaped without the caller waiting" {
+    const child = try std.process.spawn(std.testing.io, .{
+        .argv = &.{ "/bin/sh", "-c", "exit 0" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+    const pid = child.id.?;
+    reapInBackground(child);
+    // Once reaped, the pid no longer names a process of ours.
+    var waited: usize = 0;
+    while (waited < 500) : (waited += 1) {
+        if (std.posix.system.kill(pid, @fromBackingInt(@intCast(0))) != 0) return;
+        io_mod.sleep(10 * std.time.ns_per_ms);
+    }
+    return error.TestChildNotReaped;
 }
 
 /// After `/update` ends the terminal: updates, then says what happens next.

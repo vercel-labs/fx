@@ -2584,6 +2584,12 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   the built-in low-cost model, which would change every gateway search
   for people who set no roles.
 
+- **D214 Decision:** the terminal reaps its startup update check's
+  process on a detached thread that waits for it; startup never waits.
+  **Why:** the check ran unwaited and stayed a zombie until the terminal
+  exited. **Alternative:** a double fork, which needs a second process
+  only to be reparented.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a
