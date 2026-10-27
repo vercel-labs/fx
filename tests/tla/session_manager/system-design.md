@@ -1947,6 +1947,51 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   **Alternative:** explicit gateway breakpoints, which the gateway already
   derives and which would tie fx to each upstream's limits.
 
+- **D140 Decision:** `proto-fx update` defaults to the source method: the
+  binary records its git checkout and compiler at build time, fetches,
+  fast-forwards the current branch with `merge --ff-only @{u}`, rebuilds
+  with the same optimize mode, starts the new binary once, and renames it
+  over the running path from a temporary file in the same directory. It
+  refuses a dirty, diverged, or detached checkout before changing
+  anything. **Why:** the fork has no releases yet, and a rename never
+  truncates the inode a running terminal or supervisor executes.
+  **Alternative:** `git pull` and a copy over the target, which can merge
+  and can corrupt a running binary.
+
+- **D141 Decision:** the release method, behind `update.method`, installs
+  the latest GitHub release asset `proto-fx-<platform>` of `update.repo`
+  only when its sha256 matches the API's `digest` or a `<asset>.sha256`
+  asset. **Why:** a download is never trusted without a checksum.
+  **Alternative:** the upstream fx CDN, which serves another product.
+
+- **D142 Decision:** `ping` answers with the supervisor's executable, its
+  inode at startup, whether a session holds it (running work or an armed
+  heartbeat), and its open connection count, all optional, so the protocol
+  version stays 13. After an update the supervisor is stopped only when
+  its binary was replaced, nothing holds it, and the asking connection is
+  the only one; otherwise it keeps the old binary until its idle exit.
+  Detached sessions are saved by the stop and resume on the next start.
+  **Why:** a restart must never cut a running turn or another terminal.
+  **Alternative:** a protocol bump, which would make every new client
+  refuse a still-running older supervisor.
+
+- **D143 Decision:** the startup check only reads `update-check.json` and,
+  at most once a day and never for a build in `zig-out/bin`, starts
+  `proto-fx update --check --background` detached. One-shot commands never
+  check. The notice waits until the first session transcript is rebuilt.
+  **Why:** startup must not wait on the network or spend the latency
+  budget. **Alternative:** a fetch on a startup thread, which would race
+  process exit.
+
+- **D144 Decision:** `/update` ends the terminal like `/quit`, then the
+  entry runtime updates in cooked mode with the build's output on stderr
+  and relaunches `resume <session> --upgrade-relaunch <revision>`, even
+  when the update fails, as proto does. A detached session names itself in
+  the relaunch request; the relaunched terminal reports the new and old
+  revisions. **Why:** a build is long and noisy, and the session lives in
+  the supervisor, not the terminal. **Alternative:** building on a
+  background thread inside the running terminal.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a
