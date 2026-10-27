@@ -19,6 +19,9 @@ pub const Method = enum {
     oauth,
     /// A pasted AI Gateway key held in the keychain or profile.
     api_key,
+    /// A Claude subscription token from `claude setup-token`, run through
+    /// Claude Code (D166).
+    claude_code,
 };
 
 pub const max_provider_options = provider_catalog.entries.len + provider_catalog.preset_entries.len;
@@ -101,12 +104,14 @@ pub fn methodSlug(method: Method) []const u8 {
     return switch (method) {
         .oauth => "oauth",
         .api_key => "api-key",
+        .claude_code => "claude-code",
     };
 }
 
 pub fn parseMethod(value: []const u8) ?Method {
     if (std.ascii.eqlIgnoreCase(value, methodSlug(.oauth))) return .oauth;
     if (std.ascii.eqlIgnoreCase(value, methodSlug(.api_key))) return .api_key;
+    if (std.ascii.eqlIgnoreCase(value, methodSlug(.claude_code))) return .claude_code;
     return null;
 }
 
@@ -141,6 +146,7 @@ pub fn providerMethods(id: model_provider.ProviderId) []const Method {
         .configured => if (provider_registry.presetFor(id.label())) |preset| switch (preset.login) {
             .browser_or_key => &.{ .oauth, .api_key },
             .key => &.{.api_key},
+            .claude_or_key => &.{ .claude_code, .api_key },
         } else &.{},
     };
 }
@@ -151,6 +157,7 @@ pub fn methodMatchesSource(method: Method, source: types.CredentialSource) bool 
     return switch (method) {
         .oauth => source == .fx_login or source == .vercel_oidc_token,
         .api_key => source == .ai_gateway_api_key or source == .stored_key,
+        .claude_code => false,
     };
 }
 

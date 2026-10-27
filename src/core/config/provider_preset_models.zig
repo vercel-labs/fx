@@ -183,3 +183,42 @@ pub const openrouter = blk: {
         .{ .id = "qwen/qwen3-coder-plus", .context_window = 1000000, .max_output_tokens = 65536, .supports_tool_use = true, .supports_vision = false },
     };
 };
+
+/// Anthropic's models from proto's catalog (packages/catalog/src/models/
+/// anthropic.json), current ones first, plus Claude Haiku 5.5 (D168). Both of
+/// the `anthropic` provider's modes take these ids.
+pub const anthropic = blk: {
+    @setEvalBranchQuota(200_000);
+    break :blk [_]ModelMetadata{
+        .{ .id = "claude-fable-5-1", .context_window = 1000000, .max_output_tokens = 128000, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &.{ E.literal("low"), E.literal("medium"), E.literal("high"), E.literal("xhigh"), E.literal("max") }, .thinking = .adaptive },
+        .{ .id = "claude-opus-5-5", .context_window = 1000000, .max_output_tokens = 128000, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &.{ E.literal("low"), E.literal("medium"), E.literal("high"), E.literal("xhigh"), E.literal("max") }, .thinking = .adaptive },
+        .{ .id = "claude-sonnet-5-5", .context_window = 1000000, .max_output_tokens = 128000, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &.{ E.literal("low"), E.literal("medium"), E.literal("high"), E.literal("xhigh"), E.literal("max") }, .thinking = .adaptive },
+        .{ .id = "claude-haiku-5-5", .context_window = 200000, .max_output_tokens = 64000, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &.{ E.literal("low"), E.literal("medium"), E.literal("high") }, .thinking = .adaptive },
+        .{ .id = "claude-3-5-sonnet-20240620", .context_window = 200000, .max_output_tokens = 8192, .supports_tool_use = true, .supports_vision = true },
+        .{ .id = "claude-3-5-sonnet-20241022", .context_window = 200000, .max_output_tokens = 8192, .supports_tool_use = true, .supports_vision = true },
+        .{ .id = "claude-3-7-sonnet-20250219", .context_window = 200000, .max_output_tokens = 64000, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &.{ E.literal("minimal"), E.literal("low"), E.literal("medium"), E.literal("high"), E.literal("xhigh") }, .thinking = .budget },
+        .{ .id = "claude-3-haiku-20240307", .context_window = 200000, .max_output_tokens = 4096, .supports_tool_use = true, .supports_vision = true },
+        .{ .id = "claude-3-opus-20240229", .context_window = 200000, .max_output_tokens = 4096, .supports_tool_use = true, .supports_vision = true },
+        .{ .id = "claude-3-sonnet-20240229", .context_window = 200000, .max_output_tokens = 4096, .supports_tool_use = true, .supports_vision = true },
+        .{ .id = "claude-fable-5", .context_window = 1000000, .max_output_tokens = 128000, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &.{ E.literal("low"), E.literal("medium"), E.literal("high"), E.literal("xhigh"), E.literal("max") }, .thinking = .adaptive },
+        .{ .id = "claude-haiku-4-5", .context_window = 200000, .max_output_tokens = 64000, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &.{ E.literal("minimal"), E.literal("low"), E.literal("medium"), E.literal("high"), E.literal("xhigh") }, .thinking = .budget },
+        .{ .id = "claude-haiku-4-5-20251001", .context_window = 200000, .max_output_tokens = 64000, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &.{ E.literal("minimal"), E.literal("low"), E.literal("medium"), E.literal("high"), E.literal("xhigh") }, .thinking = .budget },
+        .{ .id = "claude-mythos-5", .context_window = 1000000, .max_output_tokens = 128000, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &.{ E.literal("low"), E.literal("medium"), E.literal("high"), E.literal("xhigh"), E.literal("max") }, .thinking = .adaptive },
+        .{ .id = "claude-opus-4-0", .context_window = 200000, .max_output_tokens = 32000, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &.{ E.literal("minimal"), E.literal("low"), E.literal("medium"), E.literal("high"), E.literal("xhigh") }, .thinking = .budget },
+        .{ .id = "claude-opus-4-1", .context_window = 200000, .max_output_tokens = 32000, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &.{ E.literal("minimal"), E.literal("low"), E.literal("medium"), E.literal("high"), E.literal("xhigh") }, .thinking = .budget },
+        .{ .id = "claude-opus-4-1-20250805", .context_window = 200000, .max_output_tokens = 32000, .supports_tool_use = true, .supports_vision = true },
+        .{ .id = "claude-opus-4-20250514", .context_window = 200000, .max_output_tokens = 32000, .supports_tool_use = true, .supports_vision = true },
+        .{ .id = "claude-opus-4-5", .context_window = 200000, .max_output_tokens = 64000, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &.{ E.literal("minimal"), E.literal("low"), E.literal("medium"), E.literal("high"), E.literal("xhigh") }, .thinking = .budget },
+        .{ .id = "claude-opus-4-5-20251101", .context_window = 200000, .max_output_tokens = 64000, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &.{ E.literal("minimal"), E.literal("low"), E.literal("medium"), E.literal("high"), E.literal("xhigh") }, .thinking = .budget },
+        .{ .id = "claude-opus-4-6", .context_window = 1000000, .max_output_tokens = 128000, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &.{ E.literal("low"), E.literal("medium"), E.literal("high"), E.literal("max") }, .thinking = .adaptive },
+        .{ .id = "claude-opus-4-7", .context_window = 1000000, .max_output_tokens = 128000, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &.{ E.literal("low"), E.literal("medium"), E.literal("high"), E.literal("xhigh"), E.literal("max") }, .thinking = .adaptive },
+        .{ .id = "claude-opus-4-8", .context_window = 1000000, .max_output_tokens = 128000, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &.{ E.literal("low"), E.literal("medium"), E.literal("high"), E.literal("xhigh"), E.literal("max") }, .thinking = .adaptive },
+        .{ .id = "claude-opus-5", .context_window = 1000000, .max_output_tokens = 128000, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &.{ E.literal("low"), E.literal("medium"), E.literal("high"), E.literal("xhigh"), E.literal("max") }, .thinking = .adaptive },
+        .{ .id = "claude-sonnet-4-0", .context_window = 200000, .max_output_tokens = 64000, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &.{ E.literal("minimal"), E.literal("low"), E.literal("medium"), E.literal("high"), E.literal("xhigh") }, .thinking = .budget },
+        .{ .id = "claude-sonnet-4-20250514", .context_window = 200000, .max_output_tokens = 64000, .supports_tool_use = true, .supports_vision = true },
+        .{ .id = "claude-sonnet-4-5", .context_window = 1000000, .max_output_tokens = 64000, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &.{ E.literal("minimal"), E.literal("low"), E.literal("medium"), E.literal("high"), E.literal("xhigh") }, .thinking = .budget },
+        .{ .id = "claude-sonnet-4-5-20250929", .context_window = 1000000, .max_output_tokens = 64000, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &.{ E.literal("minimal"), E.literal("low"), E.literal("medium"), E.literal("high"), E.literal("xhigh") }, .thinking = .budget },
+        .{ .id = "claude-sonnet-4-6", .context_window = 1000000, .max_output_tokens = 128000, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &.{ E.literal("low"), E.literal("medium"), E.literal("high") }, .thinking = .adaptive },
+        .{ .id = "claude-sonnet-5", .context_window = 1000000, .max_output_tokens = 128000, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &.{ E.literal("low"), E.literal("medium"), E.literal("high"), E.literal("xhigh"), E.literal("max") }, .thinking = .adaptive },
+    };
+};

@@ -1,4 +1,5 @@
 const std = @import("std");
+const claude_tool_stub = @import("gateway/claude_tool_stub.zig");
 const job_notice = @import("core/jobs/notice.zig");
 const text_utils = @import("core/shared/text_utils.zig");
 const builtin = @import("builtin");
@@ -3480,6 +3481,17 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
         }
     }
 
+    // The tool stub Claude Code starts for the anthropic provider (D167).
+    if (raw_args.len == 3 and std.mem.eql(u8, std.mem.sliceTo(raw_args[1], 0), claude_tool_stub.argv_marker)) {
+        io_mod.setRawEnviron(raw_env);
+        const process_args = argsFromRaw(raw_args);
+        var threaded = std.Io.Threaded.init(processAllocator(), processIoOptions(process_args, environBlockFromRaw(raw_env)));
+        defer threaded.deinit();
+        io_mod.setIo(threaded.io());
+        try claude_tool_stub.run(processAllocator(), std.mem.sliceTo(raw_args[2], 0));
+        return;
+    }
+
     if (shouldRunBenchmarkNoArgRaw(raw_args, raw_env)) {
         switch (cli_surface.parse(builtin_commands.top_level_registry, &.{})) {
             .interactive => exitFast(0),
@@ -4926,6 +4938,7 @@ test {
     _ = @import("gateway/openrouter_catalog.zig");
     _ = @import("gateway/openai_responses.zig");
     _ = @import("gateway/routed_provider.zig");
+    _ = @import("gateway/claude_agent.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");

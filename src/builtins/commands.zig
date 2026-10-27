@@ -130,7 +130,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .token = "login",
         .usage = "login [PROVIDER]",
         .summary = "Sign in to a subscription or a built-in API provider",
-        .details = &.{"PROVIDER is codex, grok, openrouter, opencode-zen or opencode-go."},
+        .details = &.{ "PROVIDER is codex, grok, anthropic, openrouter, opencode-zen or opencode-go.", "anthropic takes a Claude subscription token from `claude setup-token`, run through Claude Code, or an Anthropic API key." },
     },
     .{
         .kind = .logout,

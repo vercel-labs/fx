@@ -1881,7 +1881,9 @@ fn maybeStartAskTitleTask(
     const title_model = bundle.title_model orelse return null;
     const agent_stream = bundle.agent_stream orelse return null;
     const excerpt = session_title_generation.promptExcerpt(prompt) orelse return null;
-    if (ctx.credential_source != .host_managed and ctx.api_key.len == 0) return null;
+    // A configured provider with a title model resolves its own credential,
+    // as the anthropic provider does (D168).
+    if (ctx.credential_source != .host_managed and ctx.credential_source != .configured and ctx.api_key.len == 0) return null;
     const task = session_title_generation.Task.create(.{
         .session_id = session_id,
         .model = title_model,

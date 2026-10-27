@@ -1,5 +1,6 @@
 //! `fx login` for the built-in configured providers (D147): OpenRouter's
-//! browser flow, or a pasted key for OpenCode, saved to the provider key file.
+//! browser flow, or a pasted key for OpenCode, or for Anthropic a Claude
+//! subscription token or API key (D166), saved to the provider key file.
 const std = @import("std");
 const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
@@ -13,9 +14,12 @@ pub fn run(alloc: Allocator, id: []const u8, transport: oauth_transport.Provider
     const preset = provider_registry.presetFor(id) orelse return error.ConfiguredProviderUsesEnvironmentAuth;
     switch (preset.login) {
         .browser_or_key => return openrouter_oauth.runLogin(alloc, transport, url_opener),
-        .key => {},
+        .key, .claude_or_key => {},
     }
-    const prompt = try alloc.print("Paste your {s} API key from {s} and press enter:\n", .{ preset.name, preset.key_url });
+    const prompt = if (preset.login == .claude_or_key)
+        try alloc.print("Paste a Claude subscription token from `claude setup-token` to use Claude Code, or an Anthropic API key from {s}, and press enter:\n", .{preset.key_url})
+    else
+        try alloc.print("Paste your {s} API key from {s} and press enter:\n", .{ preset.name, preset.key_url });
     defer alloc.free(prompt);
     try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), prompt);
     var line: openrouter_oauth.LineReader = .{};

@@ -2150,6 +2150,68 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   could fill. **Why:** no extraction to disk and no new process for
   listings. **Alternative:** shelling out to `unzip` and `tar`.
 
+- **D165 Decision:** `anthropic` is a built-in preset with its own
+  transport, as proto sends provider `anthropic` through the Claude Agent
+  SDK. It runs Claude through the installed `claude` executable, found at
+  `PROTO_FX_CLAUDE_EXECUTABLE`, proto's `PI_CLAUDE_EXECUTABLE`, `PATH`,
+  then the installers' directories. With an Anthropic API key it uses the
+  Messages transport (`src/gateway/anthropic_messages.zig`) instead. A user's own `anthropic` definition
+  in settings.json stays a plain Messages endpoint. **Why:** a Claude
+  subscription is only usable through Claude Code; proto-fx has no SDK to
+  embed, so it drives the CLI the SDK wraps. **Alternative:** the Messages
+  API only, which leaves subscribers out.
+
+- **D166 Decision:** the credential picks the mode. A key `/login` saved
+  wins over the environment; one starting `sk-ant-oat` (from `claude
+  setup-token`) runs Claude Code with `CLAUDE_CODE_OAUTH_TOKEN`, any other
+  key runs Messages with `x-api-key`. Without a saved key,
+  `CLAUDE_CODE_OAUTH_TOKEN` selects Claude Code and `ANTHROPIC_API_KEY`
+  selects Messages; with neither, Claude Code runs on whatever its
+  environment carries. `/login anthropic` offers `claude-code` and
+  `api-key`. **Why:** one key file entry and no hidden mode flag; the key
+  says what it is. **Alternative:** a stored mode beside the key, which
+  can disagree with it.
+
+- **D167 Decision:** each model request is one `claude -p` run in
+  stream-json both ways, one turn, `--tools ""`, `--setting-sources ""`,
+  `--strict-mcp-config`, `--permission-prompts none`,
+  `--system-prompt-file` with `--system-prompt-snapshot off`, and
+  `--resume` of a session transcript seeded with every message but the
+  last. The request is first built as a Messages body, so history,
+  thinking signatures and tool results project as on the API; cache
+  breakpoints are dropped because Claude places its own. A trailing tool
+  result stays in the transcript and the prompt becomes proto's "Continue
+  from the tool results above." Tools are served by `proto-fx
+  __claude-tools`, a stdio MCP stub that lists them as `mcp__proto_fx__*`
+  and refuses every call; Claude's own attempt is denied for want of an
+  approver, and proto-fx stops the run at the first `message_stop`. The
+  SSE events inside `stream_event` lines go through the Messages reducer,
+  so text, thinking, `tool_input_delta` and cache usage match the
+  Messages transport and D155. A forced tool choice, which Claude Code lacks, becomes a system
+  line asking for exactly one call. **Why:** proto's SDK path, without
+  the SDK. **Alternative:** the SDK's in-process MCP over the control
+  protocol, which needs a second reader on the child's stdout.
+
+- **D168 Decision:** the catalog is proto's Anthropic list with the
+  current models first (Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku
+  5.5); the default is `claude-opus-5-5` and the reviewer and title model
+  is `claude-haiku-5-5`, proto's smol choice, both patchable in
+  models.json. `proto-fx ask` generates titles for a configured provider
+  that names a title model, since its transport resolves its own
+  credential. **Why:** proto's defaults. **Alternative:** the gateway's
+  title model, which this provider cannot reach.
+
+- **D169 Decision:** a run never touches the user's `~/.claude`. Each one
+  gets a private temporary directory as `CLAUDE_CONFIG_DIR`, holding the
+  transcript, system prompt, tool list and stderr, and removed on every
+  exit path. Variables that would nest Claude Code or move it to another
+  cloud are removed, nonessential traffic, auto compaction, tool search
+  and auto memory are off, and the child leads its own process group so a
+  cancel or deadline kills it and the stub together. **Why:** proto's
+  isolation, and a session proto-fx starts must not appear in the user's
+  Claude Code history. **Alternative:** the user's own config directory,
+  which would leak seeded sessions into it.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

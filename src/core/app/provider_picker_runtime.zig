@@ -290,11 +290,15 @@ pub fn Runtime(comptime App: type) type {
                     // A preset saves its own key or signs in with OpenRouter;
                     // the gateway's key inventory does not apply (D147).
                     if (provider == .configured) {
-                        if (method == .api_key) {
-                            try openKeyStage(app, query.prefix, .api_key);
+                        if (method == .api_key or method == .claude_code) {
+                            try openKeyStageFor(app, query.prefix, .api_key, method);
                             app.auth.openProviderKeyPickerInline(app.alloc, provider);
                             if (provider_registry.presetFor(provider.label())) |preset| {
-                                const body = try app.alloc.print("Paste your {s} key. Get one at {s}.", .{ preset.name, preset.key_url });
+                                // Claude Code takes the token `claude setup-token` prints (D166).
+                                const body = if (method == .claude_code)
+                                    try app.alloc.print("Paste the Claude subscription token that `claude setup-token` prints. {s} then runs through Claude Code.", .{preset.name})
+                                else
+                                    try app.alloc.print("Paste your {s} key. Get one at {s}.", .{ preset.name, preset.key_url });
                                 defer app.alloc.free(body);
                                 try app.writeDomainNotice(.{ .topic = "auth", .tone = .neutral, .body = body }, true);
                             }
@@ -391,9 +395,13 @@ pub fn Runtime(comptime App: type) type {
         /// which-key list, or the masked entry field (whose bytes the auth
         /// runtime owns; the composer only carries the breadcrumb).
         fn openKeyStage(app: *App, prefix: []const u8, stage: ProviderPickerStage) !void {
+            try openKeyStageFor(app, prefix, stage, .api_key);
+        }
+
+        fn openKeyStageFor(app: *App, prefix: []const u8, stage: ProviderPickerStage, method: provider_picker_catalog.Method) !void {
             const provider_slug = try app.alloc.dupe(u8, app.input_runtime.picker.provider_picker_pending_provider.items);
             defer app.alloc.free(provider_slug);
-            const method_slug = provider_picker_catalog.methodSlug(.api_key);
+            const method_slug = provider_picker_catalog.methodSlug(method);
             const stable_prefix = try app.alloc.dupe(u8, prefix);
             defer app.alloc.free(stable_prefix);
 

@@ -20,6 +20,9 @@ pub const Login = enum {
     browser_or_key,
     /// A pasted key only.
     key,
+    /// Claude Code with a subscription token from `claude setup-token`, or
+    /// a pasted Anthropic API key (D166).
+    claude_or_key,
 };
 
 pub const Preset = struct {
@@ -38,6 +41,20 @@ pub const Preset = struct {
 };
 
 pub const presets = [_]Preset{
+    .{
+        .id = "anthropic",
+        .name = "Anthropic",
+        .description = "Claude through Claude Code with a subscription, or an Anthropic API key",
+        .key_url = "https://console.anthropic.com/settings/keys",
+        .key_prefix = "sk-ant-",
+        .login = .claude_or_key,
+        // The transport resolves its own credential and picks Claude Code or
+        // the Messages API by the key's kind (D165, D166).
+        .json =
+        \\{"protocol":"anthropic-messages","base_url":"https://api.anthropic.com/v1","auth":{"type":"none"},"default_model":"claude-opus-5-5","reviewer_model":"claude-haiku-5-5"}
+        ,
+        .models = &preset_models.anthropic,
+    },
     .{
         .id = "openrouter",
         .name = "OpenRouter",
@@ -172,6 +189,11 @@ test "presets join the registry with their built-in models and routes" {
     try extend(alloc, &registry, null);
     const value = registry.?;
     try std.testing.expectEqual(@as(usize, 0), value.userCount());
+    const claude = value.get("anthropic").?;
+    try std.testing.expect(claude.preset and !claude.mixed());
+    try std.testing.expectEqualStrings("claude-opus-5-5", claude.default_model.?);
+    try std.testing.expectEqualStrings("claude-haiku-5-5", claude.reviewer_model.?);
+    for ([_][]const u8{ "claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-4-8" }) |id| try std.testing.expect(claude.model(id) != null);
     const router = value.get("openrouter").?;
     try std.testing.expect(router.preset);
     try std.testing.expectEqual(configured.CatalogSource.openrouter, router.catalog);

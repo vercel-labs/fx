@@ -53,14 +53,14 @@ fn definition_at(raw: ?*anyopaque) *const definitions.Definition {
     return @ptrCast(@alignCast(raw.?));
 }
 
-fn bound_identity(definition: *const definitions.Definition) model_provider.ProviderId {
+pub fn bound_identity(definition: *const definitions.Definition) model_provider.ProviderId {
     var identity = model_provider.parse(definition.id).?;
     identity.configured.binding = definition.binding_identity();
     return identity;
 }
 
 /// Options for a profile-defined endpoint. `provider` points at `identity`.
-fn definition_options(definition: *const definitions.Definition, model: []const u8, identity: *const model_provider.ProviderId) codec.Options {
+pub fn definition_options(definition: *const definitions.Definition, model: []const u8, identity: *const model_provider.ProviderId) codec.Options {
     const metadata = definition.model(model);
     const mode: codec.ThinkingMode = if (metadata) |value| switch (value.thinking orelse .budget) {
         .budget => .budget,
