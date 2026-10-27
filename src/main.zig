@@ -4843,6 +4843,7 @@ test {
     _ = @import("core/app/remote_backend.zig");
     _ = @import("core/app/remote_view.zig");
     _ = @import("core/app/session_backend.zig");
+    _ = @import("core/supervisor/history_page.zig");
     _ = @import("core/supervisor/protocol.zig");
     _ = @import("core/supervisor/record.zig");
     _ = @import("core/supervisor/session.zig");

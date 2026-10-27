@@ -926,9 +926,6 @@ pub fn enforceStructuredRetentionAndReport(
     alloc: Allocator,
     protected_id: ?u32,
 ) !bool {
-    if (comptime @hasField(@TypeOf(self.*), "retention_suspended")) {
-        if (self.retention_suspended) return false;
-    }
     if (comptime @hasField(@TypeOf(self.*), "retention_prefix_trims")) {
         if (hasCommittedRetentionSource(self) and retainedStructuredBytes(self) > self.max_retained_transcript_bytes) {
             var shadow = try cloneRecordedMutationState(self, alloc);
@@ -951,9 +948,6 @@ fn enforceStructuredRetentionWithTrims(
     protected_id: ?u32,
     prefix_trims: ?*std.ArrayList(RetentionPrefixTrim),
 ) !bool {
-    if (comptime @hasField(@TypeOf(self.*), "retention_suspended")) {
-        if (self.retention_suspended) return false;
-    }
     const cap = self.max_retained_transcript_bytes;
     var entry_ids: EntryIdSet = .empty;
     defer entry_ids.deinit(alloc);
@@ -2125,7 +2119,6 @@ fn cloneMutationState(self: anytype, alloc: Allocator) !@TypeOf(self.*) {
         .transcript_cache_origin_untrimmed = self.transcript_cache_origin_untrimmed,
         .max_transcript_bytes = self.max_transcript_bytes,
         .max_retained_transcript_bytes = self.max_retained_transcript_bytes,
-        .retention_suspended = self.retention_suspended,
         .command_output_display = self.command_output_display,
         .command_output_render = self.command_output_render,
         .collapse_tool_calls = self.collapse_tool_calls,

@@ -10,6 +10,7 @@ const client_protocol = @import("../supervisor/protocol.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
+const history_page = @import("../supervisor/history_page.zig");
 const remote_view = @import("remote_view.zig");
 const remote_backend = @import("remote_backend.zig");
 const sessions = @import("app_session_runtime.zig");
@@ -50,16 +51,54 @@ const Link = enum {
     /// The supervisor stopped on purpose; nothing reconnects.
     stopped,
 };
-/// One saved-history page in flight. The window it extends lives in `State`.
+/// One saved-history page in flight.
 pub const HistoryLoad = struct {
     active: bool = false,
+    /// The view generation that asked; a page for another view is dropped.
     generation: u64 = 0,
-    sequence: u64 = 0,
-    /// The first page replaces the window; an older page prepends to it.
+    /// The newest page replaces the window; an older one extends it.
     initial: bool = false,
 
-    fn deinit(self: *HistoryLoad) void {
+    fn reset(self: *HistoryLoad) void {
         self.* = .{};
+    }
+};
+
+/// The most saved history the transcript holds. Paging further back stops
+/// here, so a client's memory stays bounded however long the session.
+pub const history_window_max_bytes: usize = 8 * 1024 * 1024;
+
+/// The saved history the transcript shows: owned fragments, oldest first,
+/// from `start` to the end of the first `turn_count` saved turns. Live events
+/// after the checkpoint it was loaded at follow it.
+pub const HistoryWindow = struct {
+    fragments: std.ArrayList(history_page.Fragment) = .empty,
+    bytes: usize = 0,
+    start: history_page.Cursor = .{},
+    turn_count: usize = 0,
+    generation: u64 = 0,
+    has_older: bool = false,
+
+    pub fn deinit(self: *HistoryWindow, alloc: Allocator) void {
+        for (self.fragments.items) |fragment| types.freeHistoryTurn(alloc, fragment.turn);
+        self.fragments.deinit(alloc);
+        self.* = .{};
+    }
+
+    /// Owned copies of `fragments`. The caller frees each turn and the list.
+    fn copies(alloc: Allocator, fragments: []const history_page.Fragment) !std.ArrayList(history_page.Fragment) {
+        var list: std.ArrayList(history_page.Fragment) = .empty;
+        errdefer {
+            for (list.items) |fragment| types.freeHistoryTurn(alloc, fragment.turn);
+            list.deinit(alloc);
+        }
+        try list.ensureTotalCapacity(alloc, fragments.len);
+        for (fragments) |fragment| {
+            var copy = fragment;
+            copy.turn = try types.dupeHistoryTurn(alloc, fragment.turn);
+            list.appendAssumeCapacity(copy);
+        }
+        return list;
     }
 };
 
@@ -79,14 +118,7 @@ pub const State = struct {
     /// Whether the saved transcript for `current_id` has finished loading.
     history_loaded: bool = false,
     history_load: HistoryLoad = .{},
-    /// The saved fragments currently projected, oldest first. An older page
-    /// prepends to this window and the whole window is replayed once.
-    history_window: std.ArrayList(types.HistoryTurn) = .empty,
-    history_window_bytes: usize = 0,
-    history_cursor_turn: usize = 0,
-    history_cursor_step: usize = 0,
-    history_cursor_tail_included: bool = false,
-    history_has_older: bool = false,
+    history_window: HistoryWindow = .{},
     /// The node below the root that the composer shows, empty at the root.
     /// A prompt typed there is a message to that node.
     child_id: []u8 = &.{},
@@ -127,8 +159,6 @@ pub const State = struct {
         self.queue.deinit(alloc);
         dropRequests(alloc, &self.sent);
         self.sent.deinit(alloc);
-        self.history_load.deinit();
-        self.clearHistoryWindow(alloc);
         self.history_window.deinit(alloc);
         if (self.current_id.len > 0) alloc.free(self.current_id);
         if (self.child_id.len > 0) alloc.free(self.child_id);
@@ -204,37 +234,30 @@ pub const State = struct {
     /// Discards a partial saved-history transfer. The transcript it was
     /// rebuilding is no longer the one the person sees.
     pub fn cancelHistoryLoad(self: *State) void {
-        self.history_load.deinit();
+        self.history_load.reset();
     }
 
-    fn clearHistoryWindow(self: *State, alloc: Allocator) void {
-        for (self.history_window.items) |turn| types.freeHistoryTurn(alloc, turn);
-        self.history_window.clearRetainingCapacity();
-        self.history_window_bytes = 0;
-        self.history_cursor_turn = 0;
-        self.history_cursor_step = 0;
-        self.history_cursor_tail_included = false;
-        self.history_has_older = false;
-    }
-
-    /// Clears the transcript's saved-history window when the attached session
-    /// or node changes.
+    /// Clears the saved-history window when the attached session or node
+    /// changes.
     pub fn resetHistory(self: *State, alloc: Allocator) void {
         self.cancelHistoryLoad();
-        self.clearHistoryWindow(alloc);
+        self.history_window.deinit(alloc);
         self.history_loaded = false;
     }
 
-    /// Starts collecting the first or next saved-history page checkpointed at
-    /// `sequence`.
-    pub fn beginHistoryLoad(self: *State, sequence: u64, initial: bool) void {
+    /// Asks for the newest saved-history page, which replaces the window, or
+    /// the page before the window, which extends it.
+    pub fn requestHistoryPage(self: *State, initial: bool) !void {
         self.cancelHistoryLoad();
-        self.history_load = .{
-            .active = true,
-            .generation = self.generation,
-            .sequence = sequence,
-            .initial = initial,
-        };
+        const window = &self.history_window;
+        try self.enqueue(.history_page, .{ .history_page = if (initial) .{
+            .session_id = self.current_id,
+        } else .{
+            .session_id = self.current_id,
+            .before = window.start,
+            .after_turn = window.turn_count,
+        } });
+        self.history_load = .{ .active = true, .generation = self.generation, .initial = initial };
         if (initial) self.history_loaded = false;
     }
 
@@ -370,15 +393,7 @@ pub fn Runtime(comptime App: type) type {
                     }
                 },
             };
-            if (comptime @hasDecl(@TypeOf(app.shell), "takeFullTranscriptHistoryRequest")) {
-                if (app.shell.takeFullTranscriptHistoryRequest()) {
-                    debug_trace.logf("session", "full transcript requested older history older={s} loaded={s}", .{
-                        if (app.remote.history_has_older) "true" else "false",
-                        if (app.remote.history_loaded) "true" else "false",
-                    });
-                    try Backend.loadOlderHistory(app);
-                }
-            }
+            if (app.shell.takeFullTranscriptHistoryRequest()) try Backend.loadOlderHistory(app);
             try unwatchClosedViews(app);
             try remote.flush();
         }
@@ -420,8 +435,9 @@ pub fn Runtime(comptime App: type) type {
             dropRequests(app.alloc, &remote.sent);
             remote.permission_response_queued = false;
             if (remote.history_load.active) {
+                // An unfinished newest page leaves no transcript to keep.
+                if (remote.history_load.initial) remote.history_loaded = false;
                 remote.cancelHistoryLoad();
-                remote.history_loaded = false;
             }
             if (app.input_runtime.session_browser.active) app.input_runtime.session_browser.fail(@errorName(failure));
             if (!remote.connected_once) {
@@ -495,6 +511,7 @@ pub fn Runtime(comptime App: type) type {
             defer outcome.deinit();
             if (!outcome.value.ok) {
                 const message = outcome.value.@"error" orelse "The local session request failed";
+                if (kind == .history_page) return failHistoryPage(app, message);
                 if (kind == .list or kind == .children) app.input_runtime.session_browser.fail(message);
                 if (kind == .delete) {
                     app.input_runtime.session_browser.cancelDelete();
@@ -576,97 +593,105 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        /// Replaces or prepends one saved-history page, then rebuilds the
-        /// loaded window once. The page fragments already carry only the
-        /// steps and turn text they own, so the replay cannot duplicate a
-        /// prompt or final reply.
+        /// A page request failed. The load ends so prompts are not held
+        /// back, and the live events after the checkpoint still show.
+        fn failHistoryPage(app: *App, message: []const u8) !void {
+            const remote = &app.remote;
+            if (!remote.history_load.active) return;
+            const initial = remote.history_load.initial;
+            remote.cancelHistoryLoad();
+            const body = try app.alloc.print("The saved transcript could not be loaded ({s}).", .{message});
+            defer app.alloc.free(body);
+            try View.notice(app, "session", body);
+            if (initial) try resync(app, remote.sequence);
+        }
+
+        /// Adds one saved-history page to the window and rebuilds the
+        /// transcript from it. The newest page replaces the window; an older
+        /// page goes before it, with the turns committed since after it, so
+        /// no live turn is lost. Events after the page's checkpoint follow.
         fn applyHistoryPage(app: *App, value: std.json.Value) !void {
-            var page = try decode(client_protocol.HistoryPage([]const types.HistoryTurn), app, value);
-            defer page.deinit();
+            var parsed = try decode(client_protocol.HistoryPage([]const history_page.Fragment), app, value);
+            defer parsed.deinit();
+            const page = parsed.value;
             const remote = &app.remote;
             if (!remote.history_load.active or remote.history_load.generation != remote.generation) return;
-            if (!std.mem.eql(u8, page.value.session_id, remote.current_id)) return;
+            if (!std.mem.eql(u8, page.session_id, remote.current_id)) return;
+            const initial = remote.history_load.initial;
+            remote.history_load.reset();
             debug_trace.logf(
                 "session",
-                "history page turns={d} start={d}:{d} tail={s} bytes={d} older={s} initial={s}",
-                .{
-                    page.value.turns.len,
-                    page.value.start_turn,
-                    page.value.start_step,
-                    if (page.value.start_tail_included) "true" else "false",
-                    page.value.page_bytes,
-                    if (page.value.has_older) "true" else "false",
-                    if (remote.history_load.initial) "true" else "false",
-                },
+                "history page fragments={d} newer={d} start={d}:{d} bytes={d} older={} initial={}",
+                .{ page.fragments.len, page.newer.len, page.start.turn, page.start.step, page.page_bytes, page.has_older, initial },
             );
-            if (page.value.history_sequence != remote.history_load.sequence) {
-                // A turn committed while the page loaded. Reload the tail.
-                remote.beginHistoryLoad(page.value.history_sequence, true);
-                try remote.enqueue(.history_page, .{ .history_page = .{
-                    .session_id = remote.current_id,
-                } });
-                return;
-            }
-
-            const initial = remote.history_load.initial;
-            if (page.value.turns.len == 0 and !initial) {
-                remote.history_load.deinit();
-                remote.history_has_older = false;
-                try View.notice(app, "session", "No older transcript entries remain.");
-                return;
-            }
-            var window: std.ArrayList(types.HistoryTurn) = .empty;
-            errdefer {
-                for (window.items) |turn| types.freeHistoryTurn(app.alloc, turn);
-                window.deinit(app.alloc);
-            }
-            for (page.value.turns) |turn| {
-                try window.append(app.alloc, try types.dupeHistoryTurn(app.alloc, turn));
-            }
+            const old = &remote.history_window;
             if (!initial) {
-                try window.appendSlice(app.alloc, remote.history_window.items);
-                remote.history_window.items.len = 0;
-                remote.history_window.deinit(app.alloc);
-            } else {
-                for (remote.history_window.items) |turn| types.freeHistoryTurn(app.alloc, turn);
-                remote.history_window.clearRetainingCapacity();
-                remote.history_window.deinit(app.alloc);
+                if (page.generation != old.generation or !page.newer_complete) {
+                    // The saved history was rewritten, or too much happened
+                    // since the window loaded. Start again from the newest.
+                    return remote.requestHistoryPage(true);
+                }
+                if (page.fragments.len == 0) {
+                    old.has_older = false;
+                    return View.notice(app, "session", "No older transcript entries remain.");
+                }
             }
-            remote.history_window = .empty;
-            remote.history_load.deinit();
 
-            const sequence = page.value.history_sequence;
-            const window_bytes = if (initial)
-                page.value.page_bytes
-            else
-                remote.history_window_bytes +| page.value.page_bytes;
-            const full_transcript_active = if (comptime @hasDecl(@TypeOf(app.shell), "fullTranscriptActive"))
-                app.shell.fullTranscriptActive()
-            else
-                false;
-            if (!initial and full_transcript_active and
-                comptime @hasDecl(@TypeOf(app.shell), "resetTranscriptPreservingFullTranscript"))
-            {
-                app.shell.resetTranscriptPreservingFullTranscript(app.alloc);
-            } else {
-                View.resetTranscript(app);
-            }
-            if (initial and page.value.has_older) {
-                try View.notice(app, "session", "Older transcript entries load when you scroll up in the full transcript.");
-            }
+            const window = try extendWindow(app.alloc, old, page, initial);
+            old.deinit(app.alloc);
             remote.history_window = window;
-            remote.history_window_bytes = window_bytes;
-            remote.history_cursor_turn = page.value.start_turn;
-            remote.history_cursor_step = page.value.start_step;
-            remote.history_cursor_tail_included = page.value.start_tail_included;
-            remote.history_has_older = page.value.has_older;
+            try rebuildTranscript(app, initial);
+            remote.sequence = page.history_sequence;
+            try resync(app, page.history_sequence);
+        }
+
+        /// The window after `page`: the page alone when it is the newest,
+        /// otherwise the page, then `old`, whose fragments move, then the
+        /// turns committed since.
+        fn extendWindow(
+            alloc: Allocator,
+            old: *HistoryWindow,
+            page: client_protocol.HistoryPage([]const history_page.Fragment),
+            initial: bool,
+        ) !HistoryWindow {
+            var window: HistoryWindow = .{
+                .fragments = try HistoryWindow.copies(alloc, page.fragments),
+                .bytes = page.page_bytes,
+                .start = page.start,
+                .turn_count = page.turn_count,
+                .generation = page.generation,
+                .has_older = page.has_older,
+            };
+            if (initial) return window;
+            errdefer window.deinit(alloc);
+            var later = try HistoryWindow.copies(alloc, page.newer);
+            defer later.deinit(alloc);
+            errdefer for (later.items) |fragment| types.freeHistoryTurn(alloc, fragment.turn);
+            try window.fragments.ensureUnusedCapacity(alloc, old.fragments.items.len + later.items.len);
+            window.fragments.appendSliceAssumeCapacity(old.fragments.items);
+            window.fragments.appendSliceAssumeCapacity(later.items);
+            window.bytes +|= old.bytes +| page.newer_bytes;
+            old.fragments.clearRetainingCapacity();
+            later.clearRetainingCapacity();
+            return window;
+        }
+
+        /// Replays the window into a cleared transcript. A full-transcript
+        /// screen reading older history stays open at the oldest entry.
+        fn rebuildTranscript(app: *App, initial: bool) !void {
+            const remote = &app.remote;
+            const reader = if (initial) null else app.shell.fullTranscriptReader();
+            // Clearing the shown transcript resets the history state too;
+            // the window is the content being rebuilt, so it stays.
+            const window = remote.history_window;
+            remote.history_window = .{};
+            View.resetTranscriptContents(app);
+            remote.history_window = window;
             remote.history_loaded = true;
-            remote.sequence = sequence;
-            sessions.Runtime(App).replayRemoteHistoryWindow(
-                app,
-                remote.history_window.items,
-                remote.history_window_bytes,
-            ) catch |err| {
+            sessions.Runtime(App).replayRemoteHistory(app, window.fragments.items, .{
+                .window_bytes = window.bytes,
+                .older_notice = if (window.has_older) "Older transcript entries load when you page up in the full transcript." else null,
+            }) catch |err| {
                 var message_buf: [128]u8 = undefined;
                 const message = std.mem.print(
                     &message_buf,
@@ -676,21 +701,19 @@ pub fn Runtime(comptime App: type) type {
                 try View.notice(app, "session", message);
             };
             remote.native_turn_offset = app.shell.finalizedToolTurnWatermark() + 1;
-            if (!initial and full_transcript_active) {
-                if (comptime @hasDecl(@TypeOf(app.shell), "showOldestFullTranscriptPage")) {
-                    app.shell.showOldestFullTranscriptPage();
-                }
-            } else if (initial) {
-                // Events that followed the saved checkpoint were held back
-                // while the transcript loaded. Ask for them now.
-                try remote.sendNow(.resync, .{ .attach = .{
-                    .session_id = remote.current_id,
-                    .after_sequence = sequence,
-                    .include_history = false,
-                } });
-            }
+            if (reader) |state| app.shell.reopenFullTranscriptAtOldest(state);
             app.shell.render_requests.request(.transcript);
             app.shell.render_requests.request(.modal);
+        }
+
+        /// Asks for the live events after `sequence`, which a history load
+        /// held back.
+        fn resync(app: *App, sequence: u64) !void {
+            try app.remote.sendNow(.resync, .{ .attach = .{
+                .session_id = app.remote.current_id,
+                .after_sequence = sequence,
+                .include_history = false,
+            } });
         }
     };
 }

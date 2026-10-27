@@ -11,6 +11,9 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
+const history_page = @import("history_page.zig");
+const max_frame_bytes = @import("channel.zig").max_frame_bytes;
+const EventLog = @import("event_log.zig").EventLog;
 const acp = @import("../../acp/server.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const protocol = @import("protocol.zig");
@@ -23,161 +26,9 @@ const Daemon = server.Daemon;
 const Conn = server.Conn;
 const Allocator = std.mem.Allocator;
 
-const event_bytes_limit = 2 * 1024 * 1024;
-/// Saved history at or below this size travels inside the snapshot reply.
-/// A longer history is read with `history_page` fragments, so one huge turn
-/// still reaches the client without exceeding the socket's frame limit.
-const snapshot_history_budget = 2 * 1024 * 1024;
 const max_pending = 64;
 const max_prompt_bytes = 1024 * 1024;
 const tick_ms = 200;
-
-fn historyTurnSteps(turn: types.HistoryTurn) []const types.ToolExecutionStep {
-    return switch (turn) {
-        .compacted_summary => &.{},
-        .assistant => |entry| entry.execution.tool_steps,
-        .interrupted => |entry| entry.execution.tool_steps,
-    };
-}
-
-fn historyTurnUser(turn: types.HistoryTurn) ?types.UserTurn {
-    return switch (turn) {
-        .compacted_summary => null,
-        .assistant => |entry| entry.user,
-        .interrupted => |entry| entry.user,
-    };
-}
-
-fn historyToolStepBytes(step: types.ToolExecutionStep) usize {
-    var total: usize = 128;
-    if (step.assistant) |assistant| total +|= assistant.len;
-    for (step.tool_calls) |call| {
-        total +|= 64 +| call.name.len +| call.arguments_json.len;
-        if (call.provider_result) |result| total +|= result.len;
-    }
-    for (step.tool_results) |result| {
-        total +|= 96 +| result.tool_name.len +| result.output.len;
-        if (result.preview) |preview| total +|= preview.len;
-        if (result.output_handle) |handle| total +|= handle.len;
-        for (result.permission_feedback) |feedback| total +|= feedback.len;
-        for (result.tool_images) |image| total +|= image.data.len +| image.mime_type.len;
-        if (result.committed_file_presentation) |file| {
-            total +|= file.path.len;
-            for (file.lines) |line| total +|= 32 +| line.text.len;
-            if (file.previous_content) |content| total +|= content.len;
-            if (file.after_content) |content| total +|= content.len;
-        }
-    }
-    if (step.provider_replay) |replay| total +|= replay.parts_json.len;
-    return total;
-}
-
-fn historyUserBytes(user: types.UserTurn) usize {
-    var total = user.text.len +| 16;
-    for (user.images) |image| total +|= image.path.len +| image.media_type.len;
-    if (user.work_id) |work| total +|= work.len;
-    return total;
-}
-
-fn historyTurnTailBytes(turn: types.HistoryTurn) usize {
-    return switch (turn) {
-        .compacted_summary => 0,
-        .assistant => |entry| entry.assistant.len +| 64,
-        .interrupted => |entry| blk: {
-            var total: usize = 64;
-            if (entry.assistant) |assistant| total +|= assistant.len;
-            if (entry.cancelled_command != null) total +|= 128;
-            break :blk total;
-        },
-    };
-}
-
-fn historySteeringBytes(steering: []const types.PersistedSteering) usize {
-    var total: usize = 0;
-    for (steering) |item| {
-        total +|= item.text.len +| 32;
-        if (item.assistant_prefix) |prefix| total +|= prefix.len;
-    }
-    return total;
-}
-
-fn historyPageSteering(
-    arena: Allocator,
-    steering: []const types.PersistedSteering,
-    first_step: usize,
-    end_step: usize,
-    tail_included: bool,
-) ![]types.PersistedSteering {
-    var kept: std.ArrayList(types.PersistedSteering) = .empty;
-    for (steering) |item| {
-        const boundary = item.after_tool_step_count;
-        if (boundary < first_step) continue;
-        if (boundary == first_step and first_step > 0) continue;
-        if (boundary > end_step) continue;
-        if (boundary == end_step and !tail_included) continue;
-        var copy = item;
-        copy.after_tool_step_count = boundary - first_step;
-        try kept.append(arena, copy);
-    }
-    return kept.items;
-}
-
-fn historyPageFragment(
-    arena: Allocator,
-    turn: types.HistoryTurn,
-    first_step: usize,
-    end_step: usize,
-    include_user: bool,
-    include_tail: bool,
-) !types.HistoryTurn {
-    switch (turn) {
-        .compacted_summary => unreachable,
-        .assistant => |entry| {
-            var copy = entry;
-            if (!include_user) {
-                copy.user.text = @constCast("");
-                copy.user.images = &.{};
-                copy.user.work_id = null;
-            }
-            copy.assistant = if (include_tail) entry.assistant else @constCast("");
-            copy.execution.tool_steps = entry.execution.tool_steps[first_step..end_step];
-            copy.execution.files = &.{};
-            copy.execution.steering = try historyPageSteering(
-                arena,
-                entry.execution.steering,
-                first_step,
-                end_step,
-                include_tail,
-            );
-            if (!include_tail) copy.execution.turn_summary = null;
-            copy.provider_replay = null;
-            return .{ .assistant = copy };
-        },
-        .interrupted => |entry| {
-            var copy = entry;
-            if (!include_user) {
-                copy.user.text = @constCast("");
-                copy.user.images = &.{};
-                copy.user.work_id = null;
-            }
-            copy.assistant = if (include_tail) entry.assistant else null;
-            copy.tool_call = if (include_tail) entry.tool_call else null;
-            copy.completed_tool_names = &.{};
-            copy.cancelled_command = if (include_tail) entry.cancelled_command else null;
-            copy.execution.tool_steps = entry.execution.tool_steps[first_step..end_step];
-            copy.execution.files = &.{};
-            copy.execution.steering = try historyPageSteering(
-                arena,
-                entry.execution.steering,
-                first_step,
-                end_step,
-                include_tail,
-            );
-            if (!include_tail) copy.execution.turn_summary = null;
-            return .{ .interrupted = copy };
-        },
-    }
-}
 
 pub const Record = @import("record.zig").Record;
 
@@ -217,19 +68,14 @@ pub const Session = struct {
     // Executor-owned.
     host: ?*acp.PersistentHost = null,
     next_request: i64 = 10,
-    history_json: ?[]u8 = null,
-    /// The saved turns behind `history_json`, kept for backwards pages.
-    history_turns: []types.HistoryTurn = &.{},
-    history_turn_count: usize = 0,
-    history_sequence: u64 = 0,
+    /// The completed turns viewers page through, checkpointed while idle.
+    history: history_page.Saved = .{},
     history_dirty: bool = true,
     next_tick_ms: i64 = 0,
 
     // Guarded by `events_mutex`; `publish` runs on host threads.
     events_mutex: std.Io.Mutex = .init,
-    events: std.ArrayList(Event) = .empty,
-    event_bytes: usize = 0,
-    sequence: u64 = 0,
+    log: EventLog = .{},
     pending: std.ArrayList(Pending) = .empty,
     commands: std.ArrayList(PendingCommand) = .empty,
     heartbeat_request: ?i64 = null,
@@ -242,7 +88,6 @@ pub const Session = struct {
     /// Recently viewed node transcripts. Executor-owned.
     views: child_views.Cache,
 
-    const Event = struct { sequence: u64, frame: []u8 };
     const Capture = struct { id: i64, frame: ?[]u8 = null };
 
     pub fn create(daemon: *Daemon, id: []const u8, cwd: []const u8, name: []const u8) !*Session {
@@ -262,8 +107,7 @@ pub const Session = struct {
     pub fn destroy(self: *Session) void {
         const alloc = self.daemon.alloc;
         self.stopExecutor();
-        for (self.events.items) |event| alloc.free(event.frame);
-        self.events.deinit(alloc);
+        self.log.deinit(alloc);
         self.clearPending();
         self.pending.deinit(alloc);
         for (self.commands.items) |command| alloc.free(command.name);
@@ -271,8 +115,7 @@ pub const Session = struct {
         self.watchers.deinit(alloc);
         self.views.deinit();
         self.jobs.deinit(alloc);
-        if (self.history_json) |history| alloc.free(history);
-        if (self.history_turns.len > 0) types.freeHistoryTurnSlice(alloc, self.history_turns);
+        self.history.deinit(alloc);
         alloc.free(self.id);
         alloc.free(self.cwd);
         self.record.deinit(alloc);
@@ -467,13 +310,17 @@ pub const Session = struct {
                 return bytes;
             },
             .history => |request| {
-                if (request.child_id == null) return self.rootHistory(arena);
+                // The root's saved history is read in pages.
+                if (request.child_id == null) return error.UseHistoryPage;
                 const view = try self.childView(arena, request);
                 if (request.watch) if (job.watcher()) |conn| try self.watchers.watchChild(self.daemon.alloc, conn, view);
                 return protocol.encode(arena, view);
             },
-            .history_chunk => |request| return self.historyChunk(arena, request),
-            .history_page => |request| return self.historyPage(arena, request),
+            .history_page => |request| {
+                if (self.host == null) return error.SessionStopped;
+                try self.refreshHistory();
+                return history_page.encodeReply(arena, &self.history, self.id, request, max_frame_bytes);
+            },
             .unwatch => |request| {
                 if (job.watcher()) |conn| self.watchers.unwatch(self.daemon.alloc, conn, request.topic);
                 return protocol.encode(arena, protocol.Ack{});
@@ -958,15 +805,10 @@ pub const Session = struct {
         const active = if (host.state.active_session) |*session| session else return;
         const history = try active.session_rt.snapshotHistory(self.daemon.alloc);
         errdefer if (history.len > 0) types.freeHistoryTurnSlice(self.daemon.alloc, history);
-        const owned = try std.json.Stringify.valueAlloc(self.daemon.alloc, history, .{});
-        if (self.history_json) |old| self.daemon.alloc.free(old);
-        if (self.history_turns.len > 0) types.freeHistoryTurnSlice(self.daemon.alloc, self.history_turns);
-        self.history_json = owned;
-        self.history_turns = history;
-        self.history_turn_count = history.len;
         self.events_mutex.lockUncancelable(io_mod.getIo());
-        self.history_sequence = self.sequence;
+        const sequence = self.log.sequence;
         self.events_mutex.unlock(io_mod.getIo());
+        try self.history.replace(self.daemon.alloc, history, sequence);
         self.history_dirty = false;
     }
 
@@ -977,33 +819,23 @@ pub const Session = struct {
         try self.refreshHistory();
         const pending_count = self.pendingCount();
         const session_summary = try self.record.summary(arena, self.id, self.cwd, pending_count);
-        const checkpoint = if (include_history) self.history_sequence else after;
+        const checkpoint = if (include_history) self.history.sequence else after;
         const Frame = protocol.RawJson;
         self.events_mutex.lockUncancelable(io_mod.getIo());
         defer self.events_mutex.unlock(io_mod.getIo());
-        var events: std.ArrayList(protocol.Event(Frame)) = .empty;
-        for (self.events.items) |event| {
-            if (event.sequence <= checkpoint) continue;
-            try events.append(arena, .{ .sequence = event.sequence, .frame = .{ .bytes = event.frame } });
-        }
         const pending = try arena.alloc(Frame, self.pending.items.len);
         for (self.pending.items, pending) |entry, *out| out.* = .{ .bytes = entry.frame };
-        const history_json = self.history_json orelse "[]";
-        const history_fits = history_json.len <= snapshot_history_budget;
-        const bytes = try protocol.encode(arena, protocol.Snapshot(Frame, Frame){
+        const bytes = try protocol.encode(arena, protocol.Snapshot(Frame){
             .incarnation = self.daemon.incarnation,
             .session_id = self.id,
             .session = session_summary,
-            .history_sequence = if (include_history) self.history_sequence else null,
-            .history = if (include_history and history_fits) .{ .bytes = history_json } else null,
-            .history_deferred = include_history and !history_fits,
-            .history_turn_count = self.history_turn_count,
-            .sequence = self.sequence,
-            .oldest_sequence = if (self.events.items.len > 0) self.events.items[0].sequence else self.sequence,
-            .events = events.items,
+            .history_sequence = if (include_history) self.history.sequence else null,
+            .sequence = self.log.sequence,
+            .oldest_sequence = self.log.oldest(),
+            .events = try self.log.after(arena, checkpoint),
             .pending = pending,
         });
-        return .{ .bytes = bytes, .sequence = self.sequence, .version = self.version };
+        return .{ .bytes = bytes, .sequence = self.log.sequence, .version = self.version };
     }
 
     // -- watchers ------------------------------------------------------------
@@ -1062,184 +894,6 @@ pub const Session = struct {
         self.watchers.pushViews(self.daemon.alloc, self);
     }
 
-    fn rootHistory(self: *Session, arena: Allocator) ![]const u8 {
-        if (self.host == null) return error.SessionStopped;
-        try self.refreshHistory();
-        return protocol.encode(arena, protocol.RootHistory(protocol.RawJson){ .history = .{ .bytes = self.history_json orelse "[]" } });
-    }
-
-    /// One bounded slice of the saved history array's JSON text. The client
-    /// concatenates slices and parses once, so a turn larger than a frame
-    /// still loads without changing the saved shape.
-    fn historyChunk(self: *Session, arena: Allocator, request: protocol.HistoryChunk) ![]const u8 {
-        if (self.host == null) return error.SessionStopped;
-        try self.refreshHistory();
-        const bytes = self.history_json orelse "[]";
-        const start = @min(request.offset, bytes.len);
-        const limit = @min(@max(request.max_bytes, 1), protocol.history_chunk_max_bytes);
-        const end = @min(start + limit, bytes.len);
-        return protocol.encode(arena, protocol.HistoryChunkResponse{
-            .session_id = self.id,
-            .offset = start,
-            .next_offset = end,
-            .total_bytes = bytes.len,
-            .history_sequence = self.history_sequence,
-            .chunk = bytes[start..end],
-        });
-    }
-
-    fn emptyHistoryPage(
-        self: *Session,
-        arena: Allocator,
-        turn: usize,
-        step: usize,
-        tail_included: bool,
-    ) ![]const u8 {
-        return protocol.encode(arena, protocol.HistoryPage([]const types.HistoryTurn){
-            .session_id = self.id,
-            .start_turn = turn,
-            .start_step = step,
-            .start_tail_included = tail_included,
-            .end_turn = turn,
-            .end_step = step,
-            .end_tail_included = tail_included,
-            .turns = &.{},
-            .has_older = turn > 0 or step > 0,
-            .history_sequence = self.history_sequence,
-        });
-    }
-
-    /// The saved turn fragments immediately older than the request's cursor.
-    /// A fragment owns no bytes: it borrows the stored turn and narrows its
-    /// step range, so a page can split one very long turn without copying the
-    /// whole conversation.
-    fn historyPage(
-        self: *Session,
-        arena: Allocator,
-        request: protocol.HistoryPageRequest,
-    ) ![]const u8 {
-        if (self.host == null) return error.SessionStopped;
-        try self.refreshHistory();
-        const total = self.history_turns.len;
-        if (total == 0) return self.emptyHistoryPage(arena, 0, 0, false);
-
-        const initial_request = request.before_turn == null;
-        var cursor_turn = request.before_turn orelse total;
-        var cursor_step = request.before_step orelse 0;
-        var cursor_tail_included = request.before_tail_included;
-        if (cursor_turn > total) cursor_turn = total;
-        if (cursor_turn == total) {
-            cursor_turn = total - 1;
-            cursor_step = historyTurnSteps(self.history_turns[cursor_turn]).len;
-            cursor_tail_included = false;
-        }
-        if (!initial_request and cursor_step == 0) {
-            if (cursor_turn == 0) return self.emptyHistoryPage(arena, 0, 0, false);
-            cursor_turn -= 1;
-            cursor_step = historyTurnSteps(self.history_turns[cursor_turn]).len;
-            cursor_tail_included = false;
-        }
-
-        const end_turn = cursor_turn;
-        const end_step = cursor_step;
-        const end_tail_included = cursor_tail_included;
-        const page_limit: usize = @min(
-            @max(request.max_bytes, 1),
-            @as(usize, protocol.history_page_max_bytes),
-        );
-        var limit = page_limit;
-        var fragments: std.ArrayList(types.HistoryTurn) = .empty;
-        var start_turn = cursor_turn;
-        var start_step = cursor_step;
-        var start_tail_included = cursor_tail_included;
-
-        while (true) {
-            const turn = self.history_turns[cursor_turn];
-            const steps = historyTurnSteps(turn);
-            if (turn == .compacted_summary) {
-                if (cursor_turn == 0) {
-                    start_turn = 0;
-                    start_step = 0;
-                    start_tail_included = false;
-                    break;
-                }
-                cursor_turn -= 1;
-                cursor_step = historyTurnSteps(self.history_turns[cursor_turn]).len;
-                cursor_tail_included = false;
-                continue;
-            }
-
-            const end = cursor_step;
-            const include_tail = !cursor_tail_included and end == steps.len;
-            const fixed = historyTurnTailBytes(turn) +|
-                historySteeringBytes(switch (turn) {
-                    .assistant => |entry| entry.execution.steering,
-                    .interrupted => |entry| entry.execution.steering,
-                    .compacted_summary => &.{},
-                });
-            if (fixed > limit and fragments.items.len > 0) break;
-            limit -|= fixed;
-
-            var first = end;
-            while (first > 0) {
-                const cost = historyToolStepBytes(steps[first - 1]);
-                if (cost > limit) break;
-                limit -= cost;
-                first -= 1;
-            }
-            if (first == end and end > 0 and fragments.items.len == 0) {
-                // Always make progress through a step too large for the page
-                // budget. The response still stays near one tool result.
-                first = end - 1;
-                limit = 0;
-            }
-            const include_user = first == 0;
-            if (include_user) {
-                if (historyTurnUser(turn)) |user| {
-                    const user_cost = historyUserBytes(user);
-                    limit -|= user_cost;
-                }
-            }
-            if (first == end and !include_tail and !include_user and end > 0) break;
-
-            const fragment = try historyPageFragment(
-                arena,
-                turn,
-                first,
-                end,
-                include_user,
-                include_tail,
-            );
-            try fragments.append(arena, fragment);
-            start_turn = cursor_turn;
-            start_step = first;
-            start_tail_included = include_tail or cursor_tail_included;
-
-            if (first > 0) break;
-            if (cursor_turn == 0) break;
-            cursor_turn -= 1;
-            cursor_step = historyTurnSteps(self.history_turns[cursor_turn]).len;
-            cursor_tail_included = false;
-            if (limit == 0) break;
-        }
-
-        std.mem.reverse(types.HistoryTurn, fragments.items);
-        const page_bytes = page_limit -| limit;
-        return protocol.encode(arena, protocol.HistoryPage([]types.HistoryTurn){
-            .session_id = self.id,
-            .start_turn = start_turn,
-            .start_step = start_step,
-            .start_tail_included = start_tail_included,
-            .end_turn = end_turn,
-            .end_step = end_step,
-            .end_tail_included = end_tail_included,
-            .turns = fragments.items,
-            .page_bytes = page_bytes,
-            .has_older = start_turn > 0 or start_step > 0,
-            .history_sequence = self.history_sequence,
-        });
-    }
-
     pub fn children(self: *Session, arena: Allocator, node_id: []const u8) ![]const u8 {
         return child_views.children(arena, self.host orelse return error.SessionStopped, node_id);
     }
@@ -1285,7 +939,7 @@ pub const Session = struct {
         const alloc = self.daemon.alloc;
         // A frame this cannot read is still a frame the viewer may.
         const head = parsed orelse {
-            try self.appendEvent(boundedFrame(trimmed));
+            try self.appendEvent(trimmed);
             return .event;
         };
         const id: ?i64 = if (head.id) |value| if (value == .integer) value.integer else null else null;
@@ -1328,75 +982,13 @@ pub const Session = struct {
             try self.pending.append(alloc, .{ .id = request_id, .frame = copy });
             outcome = .pending_changed;
         };
-        try self.appendEvent(boundedFrame(trimmed));
+        try self.appendEvent(trimmed);
         return outcome;
     }
 
-    fn boundedFrame(frame: []const u8) []const u8 {
-        if (frame.len <= event_bytes_limit) return frame;
-        return "{\"method\":\"" ++ protocol.replay_gap_method ++ "\",\"params\":{\"reason\":\"large event is available in saved history\"}}";
-    }
-
-    /// Appends one frame to the bounded replay log. Holds `events_mutex`.
+    /// Appends one frame to the replay log. Holds `events_mutex`.
     fn appendEvent(self: *Session, frame: []const u8) !void {
-        const alloc = self.daemon.alloc;
-        const copy = try alloc.dupe(u8, frame);
-        errdefer alloc.free(copy);
-        while (self.events.items.len > 0 and self.event_bytes + copy.len > event_bytes_limit) {
-            const oldest = self.events.orderedRemove(0);
-            self.event_bytes -= oldest.frame.len;
-            alloc.free(oldest.frame);
-        }
-        try self.events.ensureUnusedCapacity(alloc, 1);
-        self.sequence += 1;
-        self.events.appendAssumeCapacity(.{ .sequence = self.sequence, .frame = copy });
-        self.event_bytes += copy.len;
+        try self.log.append(self.daemon.alloc, frame);
         self.version += 1;
     }
 };
-
-test "history page fragments keep only the turn text they own" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var steps = [_]types.ToolExecutionStep{ .{}, .{} };
-    var steering = [_]types.PersistedSteering{.{
-        .text = @constCast("steer"),
-        .after_tool_step_count = 1,
-    }};
-    const turn = types.HistoryTurn{ .assistant = .{
-        .user = .{ .text = @constCast("question") },
-        .assistant = @constCast("answer"),
-        .execution = .{
-            .tool_steps = &steps,
-            .steering = &steering,
-            .turn_summary = .{},
-        },
-    } };
-
-    const middle = try historyPageFragment(arena, turn, 1, 2, false, false);
-    switch (middle) {
-        .assistant => |entry| {
-            try std.testing.expectEqual(@as(usize, 0), entry.user.text.len);
-            try std.testing.expectEqual(@as(usize, 0), entry.assistant.len);
-            try std.testing.expectEqual(@as(usize, 1), entry.execution.tool_steps.len);
-            try std.testing.expect(entry.execution.turn_summary == null);
-            try std.testing.expectEqual(@as(usize, 0), entry.execution.steering.len);
-        },
-        .interrupted, .compacted_summary => return error.TestUnexpectedResult,
-    }
-
-    const whole = try historyPageFragment(arena, turn, 0, 2, true, true);
-    switch (whole) {
-        .assistant => |entry| {
-            try std.testing.expectEqualStrings("question", entry.user.text);
-            try std.testing.expectEqualStrings("answer", entry.assistant);
-            try std.testing.expectEqual(@as(usize, 2), entry.execution.tool_steps.len);
-            try std.testing.expect(entry.execution.turn_summary != null);
-            try std.testing.expectEqual(@as(usize, 1), entry.execution.steering.len);
-            try std.testing.expectEqual(@as(usize, 1), entry.execution.steering[0].after_tool_step_count);
-        },
-        .interrupted, .compacted_summary => return error.TestUnexpectedResult,
-    }
-}

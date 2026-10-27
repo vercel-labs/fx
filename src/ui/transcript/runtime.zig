@@ -4647,10 +4647,6 @@ pub const TranscriptRuntime = struct {
     /// its own conservative budget instead of borrowing the smaller
     /// visible byte-cache limit.
     max_retained_transcript_bytes: usize = default_max_retained_transcript_bytes,
-    /// Set while a saved transcript is replayed. The replay appends the whole
-    /// conversation first and trims once at the end, so a mid-history entry
-    /// cannot trigger pruning that drops the agent's replies or tool calls.
-    retention_suspended: bool = false,
     painting: bool = false,
     /// Renderer-local cache state set by transcript mutations. The same
     /// mutation must request `.transcript`; this flag never authorizes a
@@ -5291,16 +5287,6 @@ pub const TranscriptRuntime = struct {
     /// Clears session content but keeps the leading welcome entry. A remote
     /// attach clears the transcript before replaying the supervisor's history;
     /// the banner is client chrome and stays above that history.
-    /// Clears the projected entries for an older history page without
-    /// surrendering the full-transcript screen the person is reading.
-    pub fn resetTranscriptPreservingFullTranscript(self: *TranscriptRuntime, alloc: Allocator) void {
-        const saved = self.full_transcript;
-        const anchor = self.full_transcript_page_anchor;
-        self.clearTranscriptPreservingWelcome(alloc);
-        self.full_transcript = saved;
-        self.full_transcript_page_anchor = anchor;
-    }
-
     pub fn clearTranscriptPreservingWelcome(self: *TranscriptRuntime, alloc: Allocator) void {
         const welcome = if (self.entries.items.len > 0 and
             self.entries.items[0] == .raw_bytes and
@@ -7234,9 +7220,16 @@ pub const TranscriptRuntime = struct {
         return requested;
     }
 
-    /// After prepending an older saved page, show its beginning instead of
-    /// jumping back to the tail.
-    pub fn showOldestFullTranscriptPage(self: *TranscriptRuntime) void {
+    /// The open full-transcript screen, captured before a remote client
+    /// rebuilds the entries under it; null when the screen is closed.
+    pub fn fullTranscriptReader(self: *const TranscriptRuntime) ?transcript_presentation.State {
+        return if (self.fullTranscriptActive()) self.full_transcript else null;
+    }
+
+    /// Reopens a captured full-transcript screen at the oldest entry, where
+    /// an older saved page was just added, instead of jumping to the tail.
+    pub fn reopenFullTranscriptAtOldest(self: *TranscriptRuntime, reader: transcript_presentation.State) void {
+        self.full_transcript = reader;
         if (self.full_transcript.depth != .full or self.entries.items.len == 0) return;
         self.full_transcript_page_anchor = .{ .entry_index = 0 };
         self.full_transcript_open_request = null;

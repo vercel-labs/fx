@@ -34,7 +34,6 @@ pub const ResumeProjection = struct {
         var detached = try transcript_store.cloneDetachedPresentationState(source, alloc);
         const retention_cap = detached.max_retained_transcript_bytes;
         detached.max_retained_transcript_bytes = std.math.maxInt(usize);
-        detached.retention_suspended = true;
         return .{
             .runtime = detached,
             .alloc = alloc,
@@ -394,7 +393,6 @@ pub const ResumeProjection = struct {
         );
 
         self.runtime.max_retained_transcript_bytes = self.retention_cap;
-        self.runtime.retention_suspended = false;
         const retention_changed = try self.runtime.enforceStructuredRetentionAndReport(
             self.alloc,
             null,

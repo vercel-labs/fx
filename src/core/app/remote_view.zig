@@ -4,6 +4,7 @@
 //! anything; `remote_backend.zig` does, over `app_remote_runtime.zig`.
 const std = @import("std");
 const client_protocol = @import("../supervisor/protocol.zig");
+const history_page = @import("../supervisor/history_page.zig");
 const host_commands = @import("../../acp/commands.zig");
 const io_mod = @import("../shared/io.zig");
 const browser_mod = @import("../input/session_browser.zig");
@@ -24,7 +25,7 @@ const string = remote_runtime.string;
 const integer = remote_runtime.integer;
 const boolean = remote_runtime.boolean;
 const itemsOf = remote_runtime.itemsOf;
-pub const SnapshotView = client_protocol.Snapshot([]const types.HistoryTurn, std.json.Value);
+pub const SnapshotView = client_protocol.Snapshot(std.json.Value);
 
 pub fn Runtime(comptime App: type) type {
     return struct {
@@ -240,7 +241,13 @@ pub fn Runtime(comptime App: type) type {
                 const owned_prompt = try app.alloc.dupe(u8, active_prompt);
                 errdefer app.alloc.free(owned_prompt);
                 resetTranscriptContents(app);
-                try sessions.Runtime(App).replayRemoteHistory(app, history);
+                var page_arena = std.heap.ArenaAllocator.init(app.alloc);
+                defer page_arena.deinit();
+                const page = try history_page.build(page_arena.allocator(), history, null, history_page.default_page_bytes);
+                try sessions.Runtime(App).replayRemoteHistory(app, page.fragments, .{
+                    .window_bytes = page.bytes,
+                    .older_notice = if (page.has_older) "Older transcript entries are not shown; the newest work is above." else null,
+                });
                 remote.native_turn_offset = app.shell.finalizedToolTurnWatermark() + 1;
                 const outcome = if (live_active) value.status else value.last_outcome orelse value.status;
                 const body = try app.alloc.print("{s} · {s} · subagent transcript · left returns to parent, right lists its subagents", .{ value.name, outcome });
@@ -469,23 +476,13 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             if (remote.current_id.len == 0) remote.current_id = try app.alloc.dupe(u8, value.session_id);
-            var history_deferred = false;
-            if (value.history) |history| {
+            const loading_history = value.history_sequence != null;
+            if (value.history_sequence) |checkpoint| {
+                // The saved transcript arrives in pages, newest first. Keep
+                // the live events out until it is in place.
                 resetTranscript(app);
-                try sessions.Runtime(App).replayRemoteHistory(app, history);
-                remote.history_loaded = true;
-                remote.native_turn_offset = app.shell.finalizedToolTurnWatermark() + 1;
-                remote.sequence = value.history_sequence orelse 0;
-            } else if (value.history_deferred) {
-                // One oversized transcript arrives as a bounded tail page.
-                // Keep the live events out until the saved baseline is in place.
-                resetTranscript(app);
-                remote.beginHistoryLoad(value.history_sequence orelse 0, true);
-                remote.sequence = remote.history_load.sequence;
-                history_deferred = true;
-                try remote.enqueue(.history_page, .{ .history_page = .{
-                    .session_id = remote.current_id,
-                } });
+                remote.sequence = checkpoint;
+                try remote.requestHistoryPage(true);
             }
             const summary = value.session;
             if (!std.mem.eql(u8, summary.cwd, remote.cwd)) {
@@ -510,7 +507,7 @@ pub fn Runtime(comptime App: type) type {
             app.permission_engine.mode = remote.permission_mode;
             const running = summary.status == .running or summary.status == .awaiting_approval;
             const generation = remote.generation;
-            if (!history_deferred) {
+            if (!loading_history) {
                 for (value.events) |event| {
                     if (event.sequence <= remote.sequence) continue;
                     // A command's result answers the node the person focuses,

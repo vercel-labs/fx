@@ -17,12 +17,12 @@
 //! JSON type as a parameter: the supervisor writes cached bytes through
 //! `RawJson`, and a client reads them as `std.json.Value` or a typed slice.
 const std = @import("std");
-const types = @import("../shared/types.zig");
+const history_page = @import("history_page.zig");
 const Allocator = std.mem.Allocator;
 
 /// Bumped whenever a request or response changes shape. A client refuses a
 /// supervisor that answers `ping` with another version.
-pub const version: u32 = 9;
+pub const version: u32 = 10;
 
 pub const Heartbeat = struct {
     prompt: []const u8 = "",
@@ -111,56 +111,42 @@ pub const History = struct {
     watch: bool = false,
 };
 
-/// One slice of the root session's saved history, which a snapshot defers
-/// when the whole transcript would exceed one frame. `offset` counts bytes of
-/// the history array's JSON text, so a single oversized turn still travels in
-/// bounded frames.
-pub const HistoryChunk = struct {
-    session_id: []const u8,
-    offset: usize = 0,
-    max_bytes: usize = 512 * 1024,
-};
-
-/// The largest slice a `history_chunk` request may ask for. A JSON string can
-/// escape to several times its source length, so this stays well below the
-/// frame limit.
-pub const history_chunk_max_bytes: usize = 512 * 1024;
-
-/// One backwards page of saved history. `before_turn` and `before_step` name
-/// the oldest turn fragment a viewer already holds; the reply contains the
-/// fragments immediately older than that cursor. A turn fragment may carry
-/// only part of its tool steps, so a single very long turn still pages.
+/// One page of the root session's saved history, read backwards from the
+/// newest turn (`history_page.zig`). Root only: a node's transcript arrives
+/// whole through `history`.
 pub const HistoryPageRequest = struct {
     session_id: []const u8,
-    before_turn: ?usize = null,
-    before_step: ?usize = null,
-    /// The existing window already carries the turn's final assistant text.
-    before_tail_included: bool = false,
-    max_bytes: usize = 512 * 1024,
+    /// Where the history the viewer holds begins; null asks for the newest
+    /// page.
+    before: ?history_page.Cursor = null,
+    /// How many turns the viewer's window ends with. The reply then also
+    /// carries the turns committed since, so the window stays contiguous.
+    after_turn: ?usize = null,
+    max_bytes: usize = history_page.default_page_bytes,
 };
 
-pub const history_page_max_bytes: usize = 2 * 1024 * 1024;
-
-pub fn HistoryPage(comptime Turns: type) type {
+pub fn HistoryPage(comptime Fragments: type) type {
     return struct {
         ok: bool = true,
         session_id: []const u8,
-        /// The oldest cursor this page covers; the viewer's next request
-        /// passes this back as `before_turn` and `before_step`.
-        start_turn: usize,
-        start_step: usize,
-        start_tail_included: bool = false,
-        /// The cursor the page ended at, copied from the request or the tail.
-        end_turn: usize,
-        end_step: usize,
-        end_tail_included: bool = false,
-        /// The fragments in chronological order.
-        turns: Turns,
-        /// An estimate of the fragment bytes, used to size the viewer's
-        /// retained transcript budget.
-        page_bytes: usize = 0,
-        has_older: bool = false,
-        history_sequence: u64 = 0,
+        /// Changes when the saved history is rewritten, as by a compaction or
+        /// a rewind; a cursor from another generation no longer applies.
+        generation: u64,
+        /// The event sequence the saved history was checkpointed at.
+        history_sequence: u64,
+        turn_count: usize,
+        /// Where the viewer's history begins once it adds this page.
+        start: history_page.Cursor,
+        has_older: bool,
+        /// The page's fragments, oldest first, and their estimated bytes.
+        fragments: Fragments,
+        page_bytes: usize,
+        /// The whole turns after `after_turn`, when the request named it.
+        newer: Fragments,
+        newer_bytes: usize,
+        /// False when those turns did not fit; the viewer reloads the newest
+        /// page instead.
+        newer_complete: bool,
     };
 }
 
@@ -184,7 +170,6 @@ pub const Request = union(enum) {
     heartbeat: HeartbeatRequest,
     children: ChildrenRequest,
     history: History,
-    history_chunk: HistoryChunk,
     history_page: HistoryPageRequest,
     unwatch: Unwatch,
 
@@ -333,21 +318,17 @@ pub fn Event(comptime Frame: type) type {
     return struct { sequence: u64, frame: Frame };
 }
 
-/// What `create` and `attach` return: the session, its saved history when
-/// asked for, and the live events after the caller's sequence.
-pub fn Snapshot(comptime HistoryJson: type, comptime Frame: type) type {
+/// What `create` and `attach` return: the session and the live events after
+/// the caller's sequence. When `include_history` asked for the saved
+/// transcript, `history_sequence` names its checkpoint and the client reads
+/// it with `history_page`; the events from that checkpoint on follow it.
+pub fn Snapshot(comptime Frame: type) type {
     return struct {
         ok: bool = true,
         incarnation: []const u8,
         session_id: []const u8,
         session: SessionSummary,
         history_sequence: ?u64 = null,
-        history: ?HistoryJson = null,
-        /// True when `include_history` asked for saved turns but the encoded
-        /// history exceeded the snapshot budget. The client then reads
-        /// `history_chunk` slices until `total_bytes`.
-        history_deferred: bool = false,
-        history_turn_count: usize = 0,
         sequence: u64 = 0,
         oldest_sequence: u64 = 0,
         events: []const Event(Frame) = &.{},
@@ -398,23 +379,6 @@ pub const Children = struct {
     /// The node these are the children of; empty from older supervisors.
     node_id: []const u8 = "",
     children: []const Child = &.{},
-};
-
-pub fn RootHistory(comptime HistoryJson: type) type {
-    return struct { ok: bool = true, history: HistoryJson };
-}
-
-/// One byte slice of the saved history array, which the client concatenates
-/// before parsing. `history_sequence` names the checkpoint the bytes came
-/// from, so a client can restart when a turn commits mid-transfer.
-pub const HistoryChunkResponse = struct {
-    ok: bool = true,
-    session_id: []const u8,
-    offset: usize,
-    next_offset: usize,
-    total_bytes: usize,
-    history_sequence: u64,
-    chunk: []const u8,
 };
 
 pub fn ChildHistory(comptime HistoryJson: type, comptime LiveJson: type) type {
@@ -474,8 +438,7 @@ test "requests round trip with their command beside the fields" {
         .{ .command = .{ .session_id = "s", .node_id = "child", .name = "last_reply" } },
         .{ .cancel = .{ .session_id = "s", .node_id = "child" } },
         .{ .history = .{ .session_id = "s", .child_id = "grandchild", .parent_id = "child" } },
-        .{ .history_chunk = .{ .session_id = "s", .offset = 1024, .max_bytes = 4096 } },
-        .{ .history_page = .{ .session_id = "s", .before_turn = 3, .before_step = 7 } },
+        .{ .history_page = .{ .session_id = "s", .before = .{ .turn = 3, .step = 7 }, .after_turn = 9 } },
     };
     for (requests) |request| {
         const bytes = try encode(arena, request);
@@ -536,20 +499,20 @@ test "unknown and malformed requests are rejected" {
 
 test "raw json fields are copied into the encoded response" {
     const alloc = std.testing.allocator;
-    const Encoded = Snapshot(RawJson, RawJson);
+    const Encoded = Snapshot(RawJson);
     const events = [_]Event(RawJson){.{ .sequence = 4, .frame = .{ .bytes = "{\"method\":\"x\"}" } }};
     const bytes = try encode(alloc, Encoded{
         .incarnation = "i",
         .session_id = "s",
         .session = .{ .id = "s", .name = "n", .cwd = "/w" },
-        .history = .{ .bytes = "[]" },
+        .history_sequence = 2,
         .sequence = 4,
         .events = &events,
     });
     defer alloc.free(bytes);
-    const Decoded = Snapshot([]const types.HistoryTurn, std.json.Value);
+    const Decoded = Snapshot(std.json.Value);
     const parsed = try std.json.parseFromSlice(Decoded, alloc, bytes, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(usize, 0), parsed.value.history.?.len);
+    try std.testing.expectEqual(@as(u64, 2), parsed.value.history_sequence.?);
     try std.testing.expectEqualStrings("x", parsed.value.events[0].frame.object.get("method").?.string);
 }

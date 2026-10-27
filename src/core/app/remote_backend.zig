@@ -188,23 +188,22 @@ pub fn Runtime(comptime App: type) type {
             try app.remote.enqueue(.attach, .{ .attach = .{ .session_id = app.remote.current_id, .after_sequence = 0 } });
         }
 
-        /// Fetches the saved-history page immediately older than the loaded
-        /// window. The full transcript asks for it when PgUp reaches the top.
+        /// Fetches the saved-history page before the loaded window. The full
+        /// transcript asks for it when PgUp reaches the top.
         pub fn loadOlderHistory(app: *App) !void {
             const remote = &app.remote;
-            if (remote.link != .ready or
-                !remote.history_loaded or
-                !remote.history_has_older or
-                remote.history_load.active or
-                remote.current_id.len == 0) return;
-            remote.beginHistoryLoad(remote.sequence, false);
-            try remote.enqueue(.history_page, .{ .history_page = .{
-                .session_id = remote.current_id,
-                .before_turn = remote.history_cursor_turn,
-                .before_step = remote.history_cursor_step,
-                .before_tail_included = remote.history_cursor_tail_included,
-                .max_bytes = client_protocol.history_page_max_bytes,
-            } });
+            if (remote.child_id.len > 0) {
+                // A node's transcript arrives whole and shows its newest work.
+                return notice(app, "session", "Older entries page at the root session only.");
+            }
+            if (remote.link != .ready or !remote.history_loaded or
+                remote.history_load.active or remote.current_id.len == 0) return;
+            const window = &remote.history_window;
+            if (!window.has_older) return;
+            if (window.bytes >= remote_runtime.history_window_max_bytes) {
+                return notice(app, "session", "The transcript holds as much saved history as it can; older entries stay in the saved session.");
+            }
+            try remote.requestHistoryPage(false);
         }
 
         /// Opens saved session `id`, which the supervisor may not hold yet,
