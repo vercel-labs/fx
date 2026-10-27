@@ -192,6 +192,7 @@ pub const TurnContext = struct {
             restored.history,
             restored.permission_state orelse .{},
         );
+        try child.loadChecklist(&runtime.checklist);
         return .{
             .alloc = alloc,
             .runtime = runtime,
@@ -457,6 +458,9 @@ pub const TurnContext = struct {
         const child = self.child;
         child.prepareTurn(&prepared) catch |err| return commitFailed(child, work_id, "prepare", err);
         child.commitTurn(prepared, self.runtime.languageSnapshot()) catch |err| return commitFailed(child, work_id, "commit", err);
+        child.saveChecklist(&self.runtime.checklist) catch |err| {
+            debug_trace.logf("subagent", "event=checklist_save_failed err={s}", .{@errorName(err)});
+        };
         self.runtime.commitPreparedHistoryEntry(self.alloc, prepared);
         prepared_owned = false;
     }

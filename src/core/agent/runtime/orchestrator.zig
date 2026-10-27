@@ -63,6 +63,7 @@ const runtime_assistant_stream = @import("assistant_stream.zig");
 const runtime_tool_presentation = @import("tool_presentation.zig");
 const runtime_execution_memory = @import("execution_memory.zig");
 const checkpoint_rewind = @import("checkpoint_rewind.zig");
+const checklist_reminder = @import("checklist_reminder.zig");
 const request_image_budget = @import("request_image_budget.zig");
 const execution_memory_helpers = @import("../execution_memory.zig");
 const runtime_agent = @import("agent.zig");
@@ -7116,6 +7117,8 @@ fn processQueuedPromptLoop(
     var step: usize = 0;
     // Hidden reminders this turn spent on an open checkpoint (D120).
     var checkpoint_reminders: usize = 0;
+    // Reminders this turn spent on open checklist tasks (D232).
+    var checklist_reminders: checklist_reminder.State = .{};
     agent_steps_loop: while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
         current_step_index = step + 1;
         if (deps.observer) |observer| observer.beginStep(current_step_index);
@@ -9735,6 +9738,8 @@ fn processQueuedPromptLoop(
                 try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, history_text, history_replay)) continue;
             if (disposition == .completed and agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                 try checkpoint_rewind.remind(deps, arena, &within_turn_suffix, &checkpoint_reminders, history_text, history_replay)) continue;
+            if (disposition == .completed and agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+                try checklist_reminder.remind(deps, arena, &within_turn_suffix, &checklist_reminders, history_text, history_replay)) continue;
             // Prose rules that did not interrupt join the turn now (D177).
             if (disposition == .completed and agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                 try runtime_stream_rules.deferAfterReply(&stream_rules, arena, &within_turn_suffix, history_text, history_replay)) continue;
@@ -12622,6 +12627,8 @@ fn processQueuedPromptLoop(
                 try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, raw_final, final_provider_replay)) continue;
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                 try checkpoint_rewind.remind(deps, arena, &within_turn_suffix, &checkpoint_reminders, raw_final, final_provider_replay)) continue;
+            if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+                try checklist_reminder.remind(deps, arena, &within_turn_suffix, &checklist_reminders, raw_final, final_provider_replay)) continue;
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });

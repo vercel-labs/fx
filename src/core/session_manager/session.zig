@@ -1129,7 +1129,7 @@ fn needsSync(bodies: []const schema.Body) bool {
         // that cites them comes later in the log, which keeps a prefix (D50).
         .set => |s| switch (s.key) {
             .permissions, .usage, .moved_files => return true,
-            .prefs, .title, .workspace, .language, .client_prompt, .tool_identities, .compaction_records, .v1_source => {},
+            .prefs, .title, .workspace, .language, .client_prompt, .tool_identities, .compaction_records, .v1_source, .checklist => {},
         },
         else => {},
     };

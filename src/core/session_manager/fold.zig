@@ -143,6 +143,7 @@ pub const State = struct {
     moved_files: ?[]u8 = null,
     compaction_records: ?[]u8 = null,
     v1_source: ?[]u8 = null,
+    checklist: ?[]u8 = null,
     /// Every child spawned in this session, in first-spawn order (D22).
     children: std.ArrayList(Child) = .empty,
     /// The turns rewinds dropped, oldest rewind first (D97).
@@ -304,7 +305,7 @@ pub fn isDropped(ranges: []const Dropped, turn: u64) bool {
     return false;
 }
 
-const setting_fields = .{ "prefs", "title", "permissions", "usage", "workspace", "language", "client_prompt", "tool_identities", "moved_files", "compaction_records", "v1_source" };
+const setting_fields = .{ "prefs", "title", "permissions", "usage", "workspace", "language", "client_prompt", "tool_identities", "moved_files", "compaction_records", "v1_source", "checklist" };
 
 fn optionalEql(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null or b == null) return a == null and b == null;

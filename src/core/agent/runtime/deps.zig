@@ -309,6 +309,9 @@ pub const AgentRuntimeDeps = struct {
     /// Loads the workspace's stream rules (TTSR) for each turn. Hosts that
     /// run real sessions turn it on; tests and embedders stay without rules.
     ttsr_enabled: bool = false,
+    /// The session's checklist; a turn that stops with open tasks is
+    /// reminded of them (D232). Null in hosts without one.
+    checklist: ?*@import("../../checklist/store.zig").Store = null,
     /// Resolves the model roles an `llm:` rule condition names, in order, to
     /// a model id. Null, or a null answer, uses the session's own model. The
     /// terminal, `ask` and ACP resolve them through model roles (D207).

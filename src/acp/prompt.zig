@@ -88,6 +88,7 @@ const tool_result_errors = @import("../core/tooling/tool_result_errors.zig");
 const tool_runtime = @import("../core/tooling/tool_runtime.zig");
 const command_output_content = @import("../core/tooling/command_output_content.zig");
 const builtin_tools = @import("../builtins/tools.zig");
+const checklist = @import("../core/checklist/checklist.zig");
 const test_builtin_gateway = if (std_builtin.is_test)
     @import("../builtins/gateway.zig")
 else
@@ -549,6 +550,19 @@ const AcpContext = struct {
             try self.sendUpdate(out.writer.buffered());
         }
         self.markCardFinished(tool_call_id);
+    }
+
+    /// The session's checklist as an ACP plan, after each successful
+    /// checklist call (D233). An empty checklist sends an empty plan.
+    fn sendChecklistPlan(self: *AcpContext) !void {
+        if (!self.publishesCards()) return;
+        const session = if (self.state.active_session) |*active| active else return;
+        var list = (try session.session_rt.checklist.snapshot(self.alloc)) orelse checklist.List.init(self.alloc);
+        defer list.deinit();
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        defer out.deinit();
+        try acp_types.writePlanUpdate(&out.writer, &list);
+        try self.sendUpdate(out.writer.buffered());
     }
 
     fn toolContext(self: *AcpContext) tool_runtime.Context {
@@ -2016,6 +2030,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .agent_stream_provider = server.streamProviderFor(ctx.state, ctx.state.active_session.?.provider),
         .report_usage = reportUsage,
         .ttsr_enabled = !std_builtin.is_test,
+        .checklist = &session.session_rt.checklist,
         .resolve_judge_model = resolveJudgeModel,
         .flush_assistant_stream_per_content_chunk = host_target.is_wasm,
         .render_assistant_text = false,
@@ -2795,6 +2810,9 @@ fn completeToolCallTransport(
         output_text,
         result.command_result_json,
     ) catch {};
+    if (std.mem.eql(u8, call.name, checklist.tool_name)) ctx.sendChecklistPlan() catch |err| {
+        debug_trace.logf("acp", "checklist plan publication failed err={s}", .{@errorName(err)});
+    };
     return result;
 }
 
@@ -3148,6 +3166,9 @@ fn persistAcpHistoryTurn(
             // A failed write may still have reached the log: keep its images.
             if (session_adapter.writeMayHaveLanded(err)) if (current_prompt_input) |input| input.retainImageSnapshots();
             return err;
+        };
+        v2.saveChecklist(&session.session_rt.checklist) catch |err| {
+            debug_trace.logf("acp", "event=checklist_save_failed err={s}", .{@errorName(err)});
         };
         session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
         prepared_owned = false;

@@ -377,6 +377,7 @@ pub fn Bindings(comptime App: type) type {
                 .report_usage = agentReportUsage,
                 // Stream rules run for real sessions; unit tests stay hermetic.
                 .ttsr_enabled = !@import("builtin").is_test,
+                .checklist = if (comptime @hasField(App, "session") and @hasField(@FieldType(App, "session"), "checklist")) &app.session.checklist else null,
                 .resolve_judge_model = if (comptime @hasField(App, "model_roles")) agentResolveJudgeModel else null,
                 .report_inner_tool_usage = agentReportInnerToolUsage,
                 .diff_marker_styles = .{

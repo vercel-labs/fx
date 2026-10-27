@@ -22,6 +22,7 @@ const text_utils = @import("../../core/shared/text_utils.zig");
 const tool_args = @import("../../core/tooling/tool_args.zig");
 const python_outline = @import("python_outline.zig");
 const browser_summary = @import("../../core/browser/script_summary.zig");
+const checklist_presentation = @import("../../core/checklist/presentation.zig");
 
 const Allocator = std.mem.Allocator;
 const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
@@ -125,6 +126,8 @@ pub fn tierOf(arena: Allocator, item: Item) Tier {
     // Opening a page and running a script are what happened; closing is routine.
     if (std.mem.eql(u8, name, "browser")) return if (isOneOf(op, &.{"close"})) .routine else .outcome;
     if (std.mem.eql(u8, name, "fleet")) return if (isOneOf(op, &.{ "spawn", "run", "terminate" })) .outcome else .routine;
+    // Changing the plan is what happened; looking at it is routine.
+    if (std.mem.eql(u8, name, "checklist")) return if (isOneOf(op, &.{"view"})) .routine else .outcome;
     const kind = record.activity_kind orelse return .outcome;
     return switch (kind) {
         .write, .edit, .command, .subagent => .outcome,
@@ -138,7 +141,7 @@ fn isChange(detail: ?*const ToolDetailRecord) bool {
     const record = detail orelse return false;
     const kind = record.activity_kind orelse return false;
     if (kind == .write or kind == .edit) return true;
-    if (std.mem.eql(u8, record.tool_name, "fleet") or isOneOf(record.tool_name, &.{ "checkpoint", "rewind" })) return true;
+    if (std.mem.eql(u8, record.tool_name, "fleet") or isOneOf(record.tool_name, &.{ "checkpoint", "rewind", "checklist" })) return true;
     return false;
 }
 
@@ -382,6 +385,18 @@ fn appendItem(arena: Allocator, rows: *std.ArrayList(Row), item: Item, style: St
         if (firstRow(continuation)) |row| try appendBody(arena, rows, item.entry_id, row);
     }
     if (tail) try appendCommandBody(arena, rows, item);
+    if (item.detail) |record| if (try checklistView(arena, record)) |view| {
+        for (view.body) |line| try appendBody(arena, rows, item.entry_id, try safeLine(arena, line));
+    };
+}
+
+/// A settled checklist call in proto-fx's voice (D234): what changed, and
+/// under it the list or the progress.
+fn checklistView(arena: Allocator, record: *const ToolDetailRecord) !?checklist_presentation.View {
+    if (!std.mem.eql(u8, record.tool_name, "checklist") or isLive(record)) return null;
+    if (record.outcome != null and record.outcome.? != .completed and record.outcome.? != .failed) return null;
+    const json = record.arguments_json orelse return null;
+    return checklist_presentation.view(arena, json, record.result orelse "", isFailure(record));
 }
 
 fn styleOf(arena: Allocator, item: Item) Style {
@@ -406,6 +421,7 @@ fn firstRow(text: []const u8) ?[]const u8 {
 fn itemText(arena: Allocator, item: Item) ![]const u8 {
     const record = item.detail orelse return item.phrase;
     if (std.mem.eql(u8, record.tool_name, "browser")) return browserText(arena, item, record);
+    if (try checklistView(arena, record)) |view| return view.headline;
     if (!isCommandRun(arena, record)) return item.phrase;
     if (commandFailed(record)) {
         const label = switch (record.command_process_presentation.?) {
@@ -885,4 +901,23 @@ test "browser rows read by what they opened and did, with the script and its out
     const joined = try std.mem.join(arena, "\n", texts.items);
     try std.testing.expect(std.mem.find(u8, joined, "Opened example.com") != null);
     try std.testing.expect(std.mem.find(u8, joined, "Filled #name, clicked Sign in +1\nawait tab.fill('#name', 'Ada');\nawait tab.click('text/Sign in');\nreturn await tab.text('#out');\nOutput\nHello Ada") != null);
+}
+
+test "checklist rows read by what changed, with the list or the progress under them" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var planned = testRecord(1, "checklist", .read, "{\"op\":\"init\",\"items\":[\"Write parser\",\"Add tests\"]}");
+    planned.result = @constCast("Initialized 2 tasks in 1 phases; in progress: \"Write parser\"\n  Tasks:\n    - [ ] Write parser (in progress)\n    - [ ] Add tests");
+    var done = testRecord(2, "checklist", .read, "{\"op\":\"done\",\"task\":\"Write parser\"}");
+    done.result = @constCast("done \"Write parser\" (1/2 done) → in progress: \"Add tests\"");
+    const items = [_]Item{
+        .{ .entry_id = 1, .detail = &planned, .phrase = "Updated checklist" },
+        .{ .entry_id = 2, .detail = &done, .phrase = "Updated checklist" },
+    };
+    const rows = try plan(arena, &items, false);
+    var texts: std.ArrayList([]const u8) = .empty;
+    for (rows) |row| try texts.append(arena, row.text);
+    const joined = try std.mem.join(arena, "\n", texts.items);
+    try std.testing.expectEqualStrings("Planned 2 tasks\n→ Write parser\n○ Add tests\nCompleted Write parser\n1 of 2 done · next: Add tests", joined);
 }

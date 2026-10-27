@@ -3,6 +3,7 @@ const build_options = @import("build_options");
 const jsonrpc = @import("jsonrpc.zig");
 const core_types = @import("../core/shared/types.zig");
 const io_mod = @import("../core/shared/io.zig");
+const checklist = @import("../core/checklist/checklist.zig");
 
 const Allocator = std.mem.Allocator;
 const writeJsonStr = jsonrpc.writeJsonStr;
@@ -292,6 +293,56 @@ pub fn writeToolCallUpdateWithCommandResult(
         try w.writeAll(json);
     }
     try w.writeAll("}");
+}
+
+/// The session's checklist as an ACP agent plan (D233): one entry per
+/// task in phase order. ACP plans know pending, in_progress and completed,
+/// so a blocked task reads as pending and a dropped one as completed; the
+/// phase and fx's own status ride in `_meta.fx`.
+pub fn writePlanUpdate(w: *std.Io.Writer, list: *const checklist.List) !void {
+    try w.writeAll("{\"sessionUpdate\":\"plan\",\"entries\":[");
+    var first = true;
+    for (list.phases.items) |phase| for (phase.tasks.items) |task| {
+        if (!first) try w.writeAll(",");
+        first = false;
+        try w.writeAll("{\"content\":");
+        try writeJsonStr(task.content, w);
+        try w.writeAll(",\"priority\":\"medium\",\"status\":");
+        try writeJsonStr(switch (task.status) {
+            .pending, .blocked => "pending",
+            .in_progress => "in_progress",
+            .completed, .abandoned => "completed",
+        }, w);
+        try w.writeAll(",\"_meta\":{\"fx\":{\"phase\":");
+        try writeJsonStr(phase.name, w);
+        try w.writeAll(",\"status\":");
+        try writeJsonStr(@tagName(task.status), w);
+        if (task.blocker) |reason| {
+            try w.writeAll(",\"blocker\":");
+            try writeJsonStr(reason, w);
+        }
+        try w.writeAll("}}}");
+    };
+    try w.writeAll("]}");
+}
+
+test "a checklist becomes an ACP plan with fx's phase and status kept" {
+    var list = try checklist.testList(std.testing.allocator, &.{
+        .{ "Build", &.{ .{ "Write parser", .completed }, .{ "Add tests", .in_progress } } },
+        .{ "Ship", &.{ .{ "Tag release", .blocked }, .{ "Old idea", .abandoned } } },
+    });
+    defer list.deinit();
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writePlanUpdate(&out.writer, &list);
+    try std.testing.expectEqualStrings(
+        "{\"sessionUpdate\":\"plan\",\"entries\":[" ++
+            "{\"content\":\"Write parser\",\"priority\":\"medium\",\"status\":\"completed\",\"_meta\":{\"fx\":{\"phase\":\"Build\",\"status\":\"completed\"}}}," ++
+            "{\"content\":\"Add tests\",\"priority\":\"medium\",\"status\":\"in_progress\",\"_meta\":{\"fx\":{\"phase\":\"Build\",\"status\":\"in_progress\"}}}," ++
+            "{\"content\":\"Tag release\",\"priority\":\"medium\",\"status\":\"pending\",\"_meta\":{\"fx\":{\"phase\":\"Ship\",\"status\":\"blocked\"}}}," ++
+            "{\"content\":\"Old idea\",\"priority\":\"medium\",\"status\":\"completed\",\"_meta\":{\"fx\":{\"phase\":\"Ship\",\"status\":\"abandoned\"}}}]}",
+        out.written(),
+    );
 }
 
 pub const AgentCapabilities = struct {

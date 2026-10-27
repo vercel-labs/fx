@@ -510,6 +510,7 @@ pub const FakeAgentRuntimeDeps = struct {
     tool_activity_recorder: ?runtime_deps.ToolActivityRecorder = null,
     tool_registry: tool_dispatch.Registry = test_tool_registry,
     ttsr_enabled: bool = false,
+    checklist: ?*@import("../../../checklist/store.zig").Store = null,
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
     root_permission_mode: ?PermissionMode = null,
@@ -800,6 +801,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .context_registry = self.context_registry,
             .context_enabled = self.context_enabled,
             .ttsr_enabled = self.ttsr_enabled,
+            .checklist = self.checklist,
             .snapshot_root_permission_mode = if (self.root_permission_mode != null)
                 snapshotRootPermissionMode
             else
@@ -1727,6 +1729,8 @@ pub const FakeAgentRuntimeDeps = struct {
         switch (event) {
             .semantic_notice => |notice| if (std.mem.eql(u8, notice.topic, "rule")) {
                 try self.record("rule_notice:{s}", .{notice.body});
+            } else if (std.mem.eql(u8, notice.topic, "checklist")) {
+                try self.record("checklist_notice:{s}", .{notice.body});
             },
             .full_detail_record => |notice| {
                 const owned = try types.dupeSemanticNotice(self.alloc, notice);

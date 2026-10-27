@@ -467,6 +467,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .format_tool_execution_error = formatToolExecutionError,
         .report_usage = reportUsage,
         .ttsr_enabled = !@import("builtin").is_test,
+        .checklist = &context.turn.runtime.checklist,
     };
 }
 

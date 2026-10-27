@@ -268,6 +268,8 @@ pub const DispatchContext = struct {
     kernel: ?*@import("../kernel/slot.zig").Slot = null,
     /// The session node's browser, which the browser tool opens (D197).
     browser: ?*@import("../browser/slot.zig").Slot = null,
+    /// The session's checklist, which the checklist tool changes (D231).
+    checklist: ?*@import("../checklist/store.zig").Store = null,
     /// The running turn's services for `proto_fx` in agent shell commands.
     harness: ?@import("../harness/services.zig").Services = null,
     permission_mode: permission_gate.PermissionMode = .ask,
@@ -446,6 +448,8 @@ pub const ExecutorKind = enum {
     checkpoint,
     /// Real Chromium tabs over the DevTools protocol (D195).
     browser,
+    /// The model's session checklist (D230).
+    checklist,
 };
 
 pub const ApprovalPolicy = enum {

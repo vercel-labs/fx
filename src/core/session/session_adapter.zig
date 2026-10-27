@@ -73,6 +73,7 @@ pub const python_api = struct {
 const child_state = @import("../subagent/child_state.zig");
 const artifact_digest = @import("artifact_digest.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
+const checklist_store = @import("../checklist/store.zig");
 const model_provider = @import("../config/model_provider.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const history_range = @import("../shared/history_range.zig");
@@ -2658,6 +2659,41 @@ pub const Session = struct {
         const value = try session_codec.encodePermissionState(self.alloc, state);
         defer self.alloc.free(value);
         _ = try self.write(&.{.{ .set = .{ .key = .permissions, .value = value } }});
+    }
+
+    // -- the model's checklist (D231) ------------------------------------------
+
+    /// Loads the session's saved checklist into `store`, or clears it when
+    /// none is saved. A saved list that does not read is dropped with a
+    /// trace line; the session still opens.
+    pub fn loadChecklist(self: *Session, store: *checklist_store.Store) !void {
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const raw = blk: {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            defer self.mutex.unlock(io_mod.getIo());
+            break :blk (try self.handle.state(scratch.allocator())).checklist;
+        };
+        store.restore(raw) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidChecklist => {
+                debug_trace.logf("session", "event=checklist_dropped session={s} reason=invalid", .{self.handle.id()});
+                try store.restore(null);
+            },
+        };
+    }
+
+    /// Saves `store`'s checklist when it changed since its last save. Hosts
+    /// call it after each turn they commit.
+    pub fn saveChecklist(self: *Session, store: *checklist_store.Store) !void {
+        const pending = (try store.pendingSave(self.alloc)) orelse return;
+        defer self.alloc.free(pending.json);
+        {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            defer self.mutex.unlock(io_mod.getIo());
+            _ = try self.write(&.{.{ .set = .{ .key = .checklist, .value = pending.json } }});
+        }
+        store.markSaved(pending.revision);
     }
 
     // -- an ACP client's settings (D46) ---------------------------------------
@@ -5668,6 +5704,38 @@ test "a new session commits turns, and resume gives them back with its settings"
     var st = try r.handle.state(testing.allocator);
     defer st.deinit(testing.allocator);
     try testing.expectEqualStrings("\"first question\"", st.title.?);
+}
+
+test "a session's checklist is saved after a turn and comes back on resume (D231)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "test-model".*;
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    var store: checklist_store.Store = .{ .gpa = testing.allocator };
+    defer store.deinit();
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    _ = try store.run(scratch.allocator(), "{\"op\":\"init\",\"items\":[\"Write parser\",\"Add tests\"]}");
+    _ = try store.run(scratch.allocator(), "{\"op\":\"done\",\"task\":\"Write parser\"}");
+    try s.commitTurn(assistantTurn("plan it", "planned"), types.ConversationLanguage.default());
+    try s.saveChecklist(&store);
+    // Nothing changed: no second line.
+    try s.saveChecklist(&store);
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var resumed: checklist_store.Store = .{ .gpa = testing.allocator };
+    defer resumed.deinit();
+    try r.loadChecklist(&resumed);
+    var list = (try resumed.snapshot(testing.allocator)).?;
+    defer list.deinit();
+    try testing.expectEqualStrings("Write parser", list.phases.items[0].tasks.items[0].content);
+    try testing.expectEqual(@import("../checklist/checklist.zig").Status.completed, list.phases.items[0].tasks.items[0].status);
+    try testing.expectEqual(@import("../checklist/checklist.zig").Status.in_progress, list.phases.items[0].tasks.items[1].status);
 }
 
 test "a result the model saw whole comes back whole after a resume, or says its body is unavailable" {

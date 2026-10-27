@@ -57,6 +57,7 @@ test {
     _ = @import("runtime/tests/tool_flow.zig");
     _ = @import("runtime/tests/interruption_flow.zig");
     _ = @import("runtime/tests/stream_rules_flow.zig");
+    _ = @import("runtime/tests/checklist_flow.zig");
     _ = @import("runtime/tests/finalization_flow.zig");
     _ = @import("runtime/agent.zig");
     _ = @import("runtime/orchestrator.zig");

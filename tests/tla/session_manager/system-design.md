@@ -2707,6 +2707,63 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   text fell through to "Unknown command". **Alternative:** keeping the
   router blind to arguments, which leaves pasting broken.
 
+- **D230 Decision:** the `checklist` tool keeps proto's contract: phases
+  of tasks named by their exact content, never by ids; one operation per
+  call (`init`, `start`, `done`, `drop`, `block`, `unblock`, `rm`,
+  `append`, `view`); after each change the earliest pending task becomes
+  the one in progress, blocked tasks never start on their own and
+  completed tasks never reopen; a call without `op` that clearly means
+  `init` or `append` is read as that. `init` and `view` return the tree,
+  other changes a short acknowledgement with the progress and the task
+  now in progress, errors only the error and the hint to view. The
+  contract lives in `src/core/checklist/`, the tool in
+  `src/tools/session/checklist.zig`. proto's Markdown import and export,
+  the `/checklist` command and the eager prelude are not ported. **Why:**
+  proto's tool, which models already use well. **Alternative:** a
+  whole-list `todo_write` that rewrites every task on each call.
+
+- **D231 Decision:** a session's checklist lives in its session runtime
+  beside the kernel and the browser (`checklist_store.Store`), not in the
+  model's history, so compaction never touches it. Each host that commits
+  a turn saves the list after the commit, when it changed, as the
+  session's `checklist` setting (`set` line, whole list as JSON), and
+  loads it back on resume: the terminal, `ask`, ACP and its daemon, and
+  workers. A saved list that does not read is dropped with a trace line.
+  The JS-host (WASM) sessions keep it in memory only. A rewind, which
+  drops turns, keeps the list as it is. Older binaries do not know the
+  `checklist` key. **Why:** a setting is one line and survives any
+  compaction or rewind of history. **Alternative:** replaying every
+  checklist call from the log on resume, which a compaction inside a
+  turn would cut.
+
+- **D232 Decision:** a turn whose model stops with checklist tasks still
+  pending or in progress gets a hidden reminder that lists them by phase,
+  is never saved, and keeps the turn going, at most three times a turn,
+  and not again until the model has run a tool since the last one. A
+  reply whose last line asks the person something gets none, and blocked
+  tasks never count. The person sees a `checklist` notice row, "1 item
+  still open · reminder 1 of 3". **Why:** proto's stop reminder, bounded
+  like the checkpoint reminder (D120). **Alternative:** proto's mid-run
+  nudge after twelve file changes, which is not ported.
+
+- **D233 Decision:** an ACP client receives the checklist as an agent
+  plan after each successful checklist call: one entry per task in phase
+  order; blocked reads as pending and dropped as completed, with the
+  phase and fx's own status in `_meta.fx`. **Why:** ACP's plan is the
+  protocol's form of proto's RPC checklist state. **Alternative:** a
+  custom `_fx/checklist` notification no client renders.
+
+- **D234 Decision:** a checklist row in the transcript says what changed,
+  "Planned 5 tasks in 2 phases", "Completed Write parser", "Blocked Tag
+  release · waiting on review", and under it the list after `init` and
+  `view` (phase with its count, then tasks with ✓ done, → in progress,
+  ○ pending, × dropped, ! blocked), or the progress after other changes,
+  "3 of 5 done · Write files complete, next: Verify". A long list keeps
+  its open tasks. Viewing is routine and folds; changes stay. **Why:**
+  proto's framed checklist in proto-fx's row style. **Alternative:**
+  proto's live panel above the composer, which needs the checklist in the
+  terminal's own state and is not ported.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

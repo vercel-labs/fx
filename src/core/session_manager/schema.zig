@@ -118,8 +118,9 @@ pub const MailEnd = enum { delivered, read, dropped };
 /// and its line lists every moved blob (D47). `compaction_records` names
 /// the blob that maps fx's compactor record names to blobs, and its line
 /// lists the map and the records it adds (D50). `v1_source` is fx's record
-/// of the v1 session a converted one was copied from (D60).
-pub const SetKey = enum { prefs, title, permissions, usage, workspace, language, client_prompt, tool_identities, moved_files, compaction_records, v1_source };
+/// of the v1 session a converted one was copied from (D60). `checklist`
+/// is the model's checklist as JSON (D231).
+pub const SetKey = enum { prefs, title, permissions, usage, workspace, language, client_prompt, tool_identities, moved_files, compaction_records, v1_source, checklist };
 
 pub const ForkOrigin = struct { id: []const u8, seq: u64 };
 /// Where a fork of a tree's node came from (D98): the source tree's root

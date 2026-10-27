@@ -2263,6 +2263,7 @@ pub fn Runtime(comptime App: type) type {
                 state.history,
                 state.permission_state,
             );
+            if (app.session_persistence.v2) |v2| try v2.loadChecklist(&app.session.checklist);
             updateStaleShellHandles(app, state.history);
             try replacePreferences(
                 app.alloc,
@@ -2889,6 +2890,9 @@ pub fn Runtime(comptime App: type) type {
             const failure: anyerror = saved: {
                 v2.prepareTurn(prepared) catch |err| break :saved err;
                 v2.commitTurn(prepared.*, app.session.languageSnapshot()) catch |err| break :saved err;
+                v2.saveChecklist(&app.session.checklist) catch |err| {
+                    debug_trace.logf("session", "event=checklist_save_failed err={s}", .{@errorName(err)});
+                };
                 return null;
             };
             switch (mode) {

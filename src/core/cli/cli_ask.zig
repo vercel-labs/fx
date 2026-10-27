@@ -960,6 +960,7 @@ const AskContext = struct {
                 restored.history,
                 restored.permission_state orelse .{},
             );
+            try v2.loadChecklist(&self.session.checklist);
             updateStaleShellHandles(self, restored.history);
             if (restored.preferences) |preferences| {
                 self.v2_preferences = preferences;
@@ -2022,6 +2023,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .context_registry = ctx.deps.context_registry,
         .context_enabled = ctx.context_enabled,
         .ttsr_enabled = !@import("builtin").is_test,
+        .checklist = &ctx.session.checklist,
         .resolve_judge_model = resolveJudgeModel,
         .finalize_turn = finalizeTurn,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
@@ -2953,6 +2955,9 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
             // A failed write may still have reached the log: keep its images.
             if (session_adapter.writeMayHaveLanded(err)) ctx.prompt_snapshot_committed = true;
             return err;
+        };
+        v2.saveChecklist(&ctx.session.checklist) catch |err| {
+            debug_trace.logf("session", "event=checklist_save_failed err={s}", .{@errorName(err)});
         };
         ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
         prepared_owned = false;

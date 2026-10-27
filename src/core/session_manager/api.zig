@@ -775,7 +775,7 @@ fn checkEvents(gpa: std.mem.Allocator, events: []const Event, import: bool) Appe
             switch (s.key) {
                 .title, .workspace, .client_prompt => try checkJsonString(gpa, s.value),
                 .language => try checkLanguage(gpa, s.value),
-                .prefs, .permissions, .usage, .tool_identities, .moved_files, .compaction_records, .v1_source => try checkJson(gpa, s.value),
+                .prefs, .permissions, .usage, .tool_identities, .moved_files, .compaction_records, .v1_source, .checklist => try checkJson(gpa, s.value),
             }
             for (s.blobs) |hash| if (!schema.validBlobHash(hash)) return error.InvalidArgument;
         },

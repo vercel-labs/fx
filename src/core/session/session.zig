@@ -3,6 +3,7 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const kernel_agent = @import("../agent/runtime/agent.zig");
 const kernel_slot = @import("../kernel/slot.zig");
 const browser_slot = @import("../browser/slot.zig");
+const checklist_store = @import("../checklist/store.zig");
 const core_types = @import("../shared/types.zig");
 const history_range = @import("../shared/history_range.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -1371,6 +1372,9 @@ pub const SessionRuntime = struct {
     /// The session node's browser (D197). Attach and detach never change its
     /// lifetime; closing or resetting the session closes it.
     browser: browser_slot.Slot = .{},
+    /// The model's checklist (D231). Compaction never touches it; hosts
+    /// save it with each committed turn and load it on resume.
+    checklist: checklist_store.Store = .{},
     agent: kernel_agent.Agent = .{},
     context_notice_hashes: std.AutoHashMapUnmanaged(u64, void) = .empty,
     context_notice_lock: std.Io.Mutex = .init,
@@ -1407,6 +1411,7 @@ pub const SessionRuntime = struct {
     pub fn deinit(self: *SessionRuntime, alloc: Allocator) void {
         self.kernel.deinit();
         self.browser.deinit();
+        self.checklist.deinit();
         self.clearWebFetchArtifacts();
         self.permission_state.deinit(alloc);
         self.agent.deinit(alloc);
@@ -1416,6 +1421,7 @@ pub const SessionRuntime = struct {
     pub fn reset(self: *SessionRuntime, alloc: Allocator) void {
         self.kernel.deinit();
         self.browser.deinit();
+        self.checklist.clear();
         self.clearWebFetchArtifacts();
         self.clearPermissionState(alloc);
         self.clearHistory(alloc);
@@ -1425,6 +1431,9 @@ pub const SessionRuntime = struct {
     }
 
     pub fn restore(self: *SessionRuntime, alloc: Allocator, language: ConversationLanguage, history: []const HistoryTurn) !void {
+        // The session's own saved checklist replaces this one after the
+        // restore (`session_adapter.Session.loadChecklist`).
+        self.checklist.restore(null) catch {};
         self.clearWebFetchArtifacts();
         self.clearPermissionState(alloc);
         self.clearHistory(alloc);

@@ -24,6 +24,7 @@ const write_file_impl = @import("../tools/filesystem/write_file.zig");
 const read_tool_result_impl = @import("../tools/session/read_tool_result.zig");
 const recall_impl = @import("../tools/session/recall.zig");
 const checkpoint_impl = @import("../tools/session/checkpoint.zig");
+const checklist_impl = @import("../tools/session/checklist.zig");
 const shell_impl = @import("../tools/shell/shell.zig");
 const jobs_impl = @import("../tools/jobs/jobs.zig");
 const install_skill_impl = @import("../tools/skills/install_skill.zig");
@@ -162,6 +163,14 @@ const read_tool_result_description =
     "Read a stored tool result or captured command output by opaque handle from the active session or process. Pass handle with query to find a known literal line, or with an optional byte range. Turns, tool calls, and earlier compactions saved by compaction open by their ID as the handle, such as M12, T12, or L2, and search finds them by text without a handle. Use when: inspect more after a tool-result preview or command-output handle indicates that retained output is available, or recover details of a compacted turn, tool call, or earlier compaction. Do not use when: read arbitrary files, search the workspace, recover secrets, or inspect results from another session or process.";
 const checkpoint_description =
     "Context checkpoint: start before exploratory work; a later `rewind` keeps only your concise report, which minimizes context cost for investigations with many intermediate calls. MUST `rewind` before replying after starting a checkpoint; NEVER checkpoint while one is active. A checkpoint lasts for the current turn.";
+const checklist_description =
+    "Keep a phased task checklist for this session and move tasks through it as you work. Use when: a request takes 3 or more steps, the user gives a plan or a list of items, or work spans turns. Tasks are named by their exact content, NEVER by ids. After each change the earliest pending task (phase order) becomes in_progress; only the earliest in_progress task stays; blocked tasks never start on their own (unblock first); completed tasks never reopen.\n" ++
+    "- init: list [{phase, items}], or single-phase items; replaces the checklist.\n" ++
+    "- start | done | drop: task or phase. start picks a phase's current or first pending task; done and drop close the target.\n" ++
+    "- block | unblock: task or phase, optional reason. Blocked means waiting on the user or an outside service; if you can clear it yourself, append a task for that instead.\n" ++
+    "- rm: task or phase; omit both to clear everything. append: phase and items; creates the phase.\n" ++
+    "- view: the full list with counts. Lost the exact task text: view, NEVER guess.\n" ++
+    "init and view print the tree; other changes print a short acknowledgement. Task content: 5-10 words, what not how, unique. Phase: a short noun phrase, never numbered. When the user gives a multi-step plan or N items, init every item as its own task. Ending a turn with open tasks brings a reminder to finish them or mark them done.";
 const rewind_description =
     "End the active checkpoint: rewind context to it, replacing the intermediate exploration with your report. Only the report stays in context, so give the findings, paths and names you still need, and the Python variables that hold computed results. Python variables, the proto_fx store and files keep what the exploration left: rewind does not undo file edits. Refused while a worker or child node you started still runs.";
 
@@ -866,6 +875,47 @@ pub const rewind = ToolSpec{
     .irreversible_fn = checkpoint_impl.isIrreversible,
 };
 
+const checklist_list_schema = model_tool_schema.ObjectSchema{
+    .properties = &.{
+        .{ .name = "phase", .json_type = .string, .description = "Phase name." },
+        .{ .name = "items", .json_type = .array, .bounds = &.{ .min_items = 1 }, .shape = &.{ .array_values = .{ .json_type = .string } }, .description = "Tasks for this phase." },
+    },
+    .required = &.{ "phase", "items" },
+    .additional_properties = false,
+};
+
+pub const checklist = ToolSpec{
+    .name = "checklist",
+    .description = checklist_description,
+    .model_schema = .{
+        .name = "checklist",
+        .description = checklist_description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "op", .json_type = .string, .shape = &.{ .enum_values = &.{ "init", "start", "done", "rm", "drop", "block", "unblock", "append", "view" } } },
+                .{ .name = "list", .json_type = .array, .shape = &.{ .array_objects = &checklist_list_schema }, .description = "init: the phased task list." },
+                .{ .name = "task", .json_type = .string, .description = "Task content." },
+                .{ .name = "phase", .json_type = .string, .description = "Phase name." },
+                .{ .name = "items", .json_type = .array, .shape = &.{ .array_values = .{ .json_type = .string } }, .description = "Tasks for single-phase init or append." },
+                .{ .name = "reason", .json_type = .string, .description = "block: what the task waits on." },
+            },
+            .required = &.{"op"},
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .checklist,
+    .activity_kind = .read,
+    .requires_approval = false,
+    .action_label = "Updating checklist",
+    .completed_action_label = "Updated checklist",
+    .label_arg_kind = .none,
+    .permission_target_kind = .none,
+    .decode = checklist_impl.decode,
+    .call = checklist_impl.call,
+    .reads_only_fn = checklist_impl.readsOnly,
+    .irreversible_fn = checklist_impl.isIrreversible,
+};
+
 pub const all = [_]tool_dispatch.Tool{
     read_file,
     write_file,
@@ -886,6 +936,7 @@ pub const all = [_]tool_dispatch.Tool{
     recall,
     checkpoint,
     rewind,
+    checklist,
 };
 
 pub const registry = tool_dispatch.Registry{ .tools = all[0..] };
@@ -908,6 +959,7 @@ pub const advertisement_order = [_][]const u8{
     "recall",
     "checkpoint",
     "rewind",
+    "checklist",
 };
 
 pub const read_only_tool_names = [_][]const u8{
@@ -982,7 +1034,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "f0077b90483ca51abca8a25dc00ec2e9cff70c9f2495070c277ae49c4d81bd21",
+        "6a2a646eebb3b30a6856661567c62fd39b9f9f5ce4888b709b2c8890825bd961",
         &actual_hex,
     );
 }
@@ -1040,6 +1092,7 @@ test "built-in tools register exact active local order" {
         "recall",
         "checkpoint",
         "rewind",
+        "checklist",
     };
 
     try std.testing.expectEqual(expected_names.len, all.len);

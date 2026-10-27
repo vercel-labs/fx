@@ -941,6 +941,7 @@ fn handleRestoreSession(
         durable.history,
         durable.permission_state,
     );
+    try v2.?.loadChecklist(&session_rt.checklist);
     // Read before the active session is released, so an unreadable prompt
     // fails this restore without replacing a different active session. A
     // same-session `cwd` rebind has already released it above.
