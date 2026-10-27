@@ -389,7 +389,8 @@ fn statusContinuation(
     detail: ?*const ToolDetailRecord,
 ) ?[]const u8 {
     const record = detail orelse return null;
-    if (record.activity_kind != .subagent and !std.mem.eql(u8, record.tool_name, "jobs")) return null;
+    // A fleet, jobs or recall card carries rows below its status (D112).
+    if (record.activity_kind != .subagent and !std.mem.eql(u8, record.tool_name, "jobs") and !std.mem.eql(u8, record.tool_name, "recall")) return null;
     const text = switch (entry) {
         .raw_bytes => |raw| raw.bytes,
         else => return null,

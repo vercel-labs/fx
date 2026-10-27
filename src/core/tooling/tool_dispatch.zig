@@ -286,6 +286,9 @@ pub const DispatchContext = struct {
     auto_background_ms: u32 = @import("../execution/managed_execution_contract.zig").default_auto_background_ms,
     tool_result_dir: ?[]const u8 = null,
     session_child_capability: ?*session_child_store.SessionChildCapability = null,
+    /// The calling node and its tree, for recall and the internal URLs
+    /// read_file opens; null outside a node host.
+    node_view: ?@import("../recall/recall.zig").NodeView = null,
     ephemeral_command_replay: ?*command_replay_store.EphemeralStore = null,
     terminal_client: ?*terminal_client_runtime.Runtime = null,
     terminal_owner_session_id: ?[]const u8 = null,

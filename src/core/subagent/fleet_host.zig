@@ -132,7 +132,7 @@ fn findWorker(arena: Allocator, registry: *child_state.Registry, id: []const u8)
             .receipt = .terminal,
             .worker = child.id,
             .label = label,
-            .result = try arena.print("Worker `{s}` (label `{s}`) is terminal; receipt: terminal, reason=explicit-kill. It takes no more input. Browse it in the session tree, or spawn a new worker.", .{ child.id, label }),
+            .result = try arena.print("Worker `{s}` (label `{s}`) is terminal; receipt: terminal, reason=explicit-kill. It takes no more input. Recover at history://{s} or agent://{s}, or spawn a new worker.", .{ child.id, label, child.id, child.id }),
         } };
         return .{ .found = child };
     }
@@ -387,7 +387,7 @@ fn terminate(self: *Runtime, alloc: Allocator, id: []const u8) !Result {
     }
     try self.fleet.discardWorker(child_id, "{\"ok\":false,\"result\":\"The worker was terminated before this turn ran.\",\"error_code\":\"worker_terminated\"}", io_mod.milliTimestamp());
     const cancel_note = if (running) " Its in-flight turn was cancelled." else "";
-    const text = try arena.print("Worker `{s}` (label `{s}`) is terminal; receipt: terminal, reason=explicit-kill.{s} Pending inputs were discarded. Browse it in the session tree.", .{ child_id, label, cancel_note });
+    const text = try arena.print("Worker `{s}` (label `{s}`) is terminal; receipt: terminal, reason=explicit-kill.{s} Pending inputs were discarded. Recover at history://{s} or agent://{s}.", .{ child_id, label, cancel_note, child_id, child_id });
     return encode(alloc, .{ .ok = true, .result = text, .receipt = .terminal, .worker = child_id, .label = label, .error_code = if (running) "turn_cancelled" else null });
 }
 
@@ -437,6 +437,21 @@ fn list(self: *Runtime, alloc: Allocator, only: ?[]const u8) !Result {
     var workers: std.Io.Writer.Allocating = .init(arena);
     try std.json.Stringify.value(rows.items, .{ .emit_null_optional_fields = false }, &workers.writer);
     return encode(alloc, .{ .ok = true, .result = text.written(), .workers = workers.written() });
+}
+
+/// The inspect text of `id` when it is one of this node's workers, for
+/// `agent://`; null otherwise. Owned by `arena`.
+pub fn inspectText(self: *Runtime, arena: Allocator, id: []const u8) !?[]const u8 {
+    var registry = blk: {
+        var lock = self.managed.state_store.acquireLock();
+        defer lock.release();
+        break :blk try self.managed.state_store.load(arena);
+    };
+    const child = registry.findById(id) orelse return null;
+    const label = child.agentName() orelse return null;
+    var text: std.Io.Writer.Allocating = .init(arena);
+    try writeInspect(&text.writer, try rowFor(self, arena, child.*, label, try self.fleet.snapshot(arena)));
+    return text.written();
 }
 
 fn rowFor(self: *Runtime, arena: Allocator, child: Child, label: []const u8, jobs: []const turn_jobs.TurnJob) !Row {
@@ -501,10 +516,8 @@ fn writeInspect(writer: *std.Io.Writer, row: Row) !void {
         try writer.writeByte('\n');
     }
     if (row.activity) |activity| try writer.print("last activity: {s}\n", .{activity});
-    if (std.mem.eql(u8, row.lifecycle, "terminal"))
-        try writer.writeAll("terminal: explicit-kill. Browse it in the session tree.")
-    else
-        try writer.writeAll("Browse its transcript in the session tree.");
+    if (std.mem.eql(u8, row.lifecycle, "terminal")) try writer.writeAll("terminal: explicit-kill. ");
+    try writer.print("Transcript: history://{s}", .{row.id});
 }
 
 test "generated labels are valid and readable" {

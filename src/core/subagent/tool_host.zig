@@ -308,6 +308,12 @@ pub const Runtime = struct {
         });
     }
 
+    /// This node and its tree for recall and the internal URLs read_file
+    /// opens. Borrows the runtime.
+    pub fn nodeView(self: *Runtime) @import("../recall/recall.zig").NodeView {
+        return @import("recall_source.zig").view(self);
+    }
+
     /// Joins every child first, so no node closes while a descendant runs
     /// (`tests/tla/session_manager/Tree.tla` AncestorsOutliveDescendants).
     /// The root host then closes every node host of the tree, deepest

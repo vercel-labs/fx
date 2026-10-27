@@ -430,6 +430,53 @@ pub const Store = struct {
         alloc.free(ids);
     }
 
+    /// Calls `visitor.turn(turn, number)` for every turn session `id` keeps,
+    /// oldest first, with its turn number: compacted turns word for word,
+    /// turns a rewind dropped left out (D97). Read without its lock. Each
+    /// turn is freed after its call; pages are freed as they are read.
+    pub fn visitTurns(store: *Store, alloc: Allocator, id: []const u8, visitor: anytype) !void {
+        const Sink = struct {
+            alloc: Allocator,
+            visitor: @TypeOf(visitor),
+
+            fn turn(sink: *@This(), value: types.HistoryTurn, number: ?u64) !void {
+                defer types.freeHistoryTurn(sink.alloc, value);
+                try sink.visitor.turn(value, number orelse 0);
+            }
+
+            fn summary(_: *@This(), _: []const u8) !void {}
+        };
+        var sink: Sink = .{ .alloc = alloc, .visitor = visitor };
+        try replay(.{ .store = store, .id = id }, alloc, alloc, .start, null, ReplaySink.init(&sink));
+    }
+
+    /// Where a saved session sits in its tree and how far its log has come,
+    /// read without its lock. Strings are owned by `arena`.
+    pub const NodeInfo = struct {
+        root: []const u8,
+        parent: ?[]const u8,
+        depth: u64,
+        /// The newest line; it changes whenever the log grows.
+        last_seq: u64,
+        /// Turns started and not dropped by a rewind.
+        turns: u64,
+        running: bool,
+    };
+
+    pub fn nodeInfo(store: *Store, arena: Allocator, id: []const u8) !NodeInfo {
+        const peeked = try store.manager.peek(arena, id);
+        var dropped: u64 = 0;
+        for (peeked.state.dropped.items) |range| dropped += range.through -| range.turn + 1;
+        return .{
+            .root = peeked.root,
+            .parent = peeked.parent,
+            .depth = peeked.depth,
+            .last_seq = peeked.state.last_seq,
+            .turns = peeked.state.last_turn -| dropped,
+            .running = peeked.state.open_turn != null,
+        };
+    }
+
     /// The context tokens a session's latest model call used, as
     /// `Session.setContextUsage` saved them; null before any. Read without
     /// its lock.
@@ -6132,6 +6179,50 @@ test "a finished turn keeps no trace of its running calls" {
     try testing.expectEqual(@as(usize, 1), restored.history.len);
     try testing.expectEqualStrings("answered", restored.history[0].assistant.assistant);
     try testing.expectEqual(@as(usize, 0), restored.history[0].assistant.execution.tool_steps.len);
+}
+
+test "a node's turn visit numbers kept turns, compacted ones included, and leaves out what a rewind dropped" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    try commitPrompt(s, "one");
+    try commitPrompt(s, "two");
+    try s.commitCompaction(.{ .summary = @constCast("summary"), .removed_turn_count = 2, .compaction_count = 1 }, false, null);
+    try commitPrompt(s, "three");
+    const points = try s.forkPoints(testing.allocator);
+    defer Session.freeForkPoints(testing.allocator, points);
+    var rewound = try s.rewind(testing.allocator, points[2].turn);
+    defer rewound.deinit(testing.allocator);
+    try commitPrompt(s, "four");
+
+    const Visitor = struct {
+        seen: std.ArrayList(u8) = .empty,
+        numbers: std.ArrayList(u64) = .empty,
+
+        pub fn turn(self: *@This(), value: types.HistoryTurn, number: u64) !void {
+            try self.seen.appendSlice(testing.allocator, value.assistant.user.text);
+            try self.numbers.append(testing.allocator, number);
+        }
+    };
+    var visitor: Visitor = .{};
+    defer visitor.seen.deinit(testing.allocator);
+    defer visitor.numbers.deinit(testing.allocator);
+    try t.store.visitTurns(testing.allocator, s.id(), &visitor);
+    try testing.expectEqualStrings("onetwofour", visitor.seen.items);
+    try testing.expectEqual(points[0].turn, visitor.numbers.items[0]);
+    try testing.expect(visitor.numbers.items[2] > points[2].turn);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const info = try t.store.nodeInfo(arena.allocator(), s.id());
+    try testing.expectEqualStrings(s.id(), info.root);
+    try testing.expect(info.parent == null);
+    try testing.expectEqual(@as(u64, 3), info.turns);
+    try testing.expect(!info.running);
+    try testing.expect(info.last_seq > 0);
 }
 
 test "the history visit shows every turn, even those a compaction summarized" {

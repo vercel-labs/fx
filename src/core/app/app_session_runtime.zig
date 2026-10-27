@@ -4464,7 +4464,7 @@ pub fn Runtime(comptime App: type) type {
                     decision.label,
                     &.{},
                 )
-            else if (try tooling_presentation.subagentStatusLine(action_arena.allocator(), call, result.output)) |line|
+            else if (try tooling_presentation.resultStatusLine(action_arena.allocator(), call, result.output)) |line|
                 line
             else if (try tooling_presentation.jobsStatusLine(action_arena.allocator(), call, result.output)) |line|
                 line

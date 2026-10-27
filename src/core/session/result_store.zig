@@ -502,6 +502,21 @@ pub fn readByRangeManaged(
     );
 }
 
+/// Up to `max_bytes` from the start of stored output `handle`, cut at a
+/// UTF-8 boundary, for recall's index. Caller owns.
+pub fn readHeadManaged(
+    alloc: Allocator,
+    capability: *session_child_store.SessionChildCapability,
+    handle: []const u8,
+    max_bytes: usize,
+) ![]u8 {
+    try validateHandle(handle);
+    const text = try readStoredTextManaged(alloc, capability, handle);
+    if (text.len <= max_bytes) return text;
+    defer alloc.free(text);
+    return alloc.dupe(u8, text[0..text_utils.utf8BackwardBoundary(text, max_bytes)]);
+}
+
 pub fn readForReplayManaged(
     alloc: Allocator,
     capability: *session_child_store.SessionChildCapability,

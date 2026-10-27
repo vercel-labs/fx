@@ -1222,7 +1222,7 @@ pub fn finishExecutedToolStatus(
     else
         null;
     const outcome_decision = command_decision orelse terminal_action_decision;
-    const base_line = if (try tooling_presentation.subagentStatusLine(arena, call, result.model_output)) |line|
+    const base_line = if (try tooling_presentation.resultStatusLine(arena, call, result.model_output)) |line|
         line
     else if (try tooling_presentation.jobsStatusLine(arena, call, result.model_output)) |line|
         line

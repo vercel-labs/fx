@@ -5018,6 +5018,9 @@ test {
     _ = @import("tools/jobs/jobs.zig");
     _ = @import("core/jobs/jobs.zig");
     _ = @import("core/subagent/turn_jobs.zig");
+    _ = @import("core/recall/recall.zig");
+    _ = @import("tools/session/recall.zig");
+    _ = @import("core/tooling/recall_presentation.zig");
     _ = @import("tools/skills/install_skill.zig");
     _ = @import("tools/skills/skill.zig");
     _ = @import("core/upgrade/upgrade_helpers.zig");

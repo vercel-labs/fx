@@ -1846,6 +1846,23 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   terminated worker must never run again. **Alternative:** a queue kept
   only in memory, which a restart loses.
 
+- **D125 Decision:** recall reads a node's history from its log, not from
+  the compactor's M and T records. The log keeps every turn word for word
+  after a compaction (only the context restarts at the summary), it leaves
+  out turns a rewind dropped (D97), and it numbers turns as
+  `history://<id>/turn/<n>` names them, so a hit on a compacted turn opens
+  through `read_file` like any other; reading the records as well would
+  find each compacted turn twice. Each node's index is built on first use
+  and cached in its tree, at most four nodes, labelled with the log's newest
+  line seen before the build; a call whose node logged a newer line builds
+  again. The tree frees the cache after every node host closed.
+  `RecallCache.tla` checks `FreshAtStart`, `CacheBounded` and
+  `NoUseAfterFree`. Every node of a tree may read every other through
+  `history://` and `agent://`, as in proto; other trees are refused.
+  **Why:** one source for the agent's own history and the nodes it reads.
+  **Alternative:** searching the compactor's records, which miss turns not
+  compacted yet and know no turn numbers.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

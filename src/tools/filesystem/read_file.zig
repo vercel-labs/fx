@@ -8,6 +8,7 @@ const png_downscale = @import("../../core/images/png_downscale.zig");
 const core_types = @import("../../core/shared/types.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
+const recall = @import("../../core/recall/recall.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -119,6 +120,7 @@ fn replaceOwnedPath(alloc: Allocator, input: *Input, owned: []u8) void {
 /// Reads the validated file and returns an owned tool result body.
 pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const input = erased.as(Input);
+    if (recall.isInternalUrl(input.path)) return readInternalUrl(ctx, input);
 
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena_state.deinit();
@@ -178,6 +180,31 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
     });
 
     return .{ .success = try formatReadOutput(ctx.allocator, rel, &selected, records.items, scan, snapshot_covers_full_file) };
+}
+
+/// `history://` and `agent://` render a node of this session tree as text,
+/// read in the same numbered line windows as a file.
+fn readInternalUrl(ctx: tool_dispatch.DispatchContext, input: *Input) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    const view = ctx.node_view orelse return .{
+        .failure = try ctx.allocator.print("{s} is unavailable: this run has no saved session tree.", .{input.path}),
+    };
+    const resource = recall.readUrl(ctx.allocator, view, input.path) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .failure = try ctx.allocator.print("Reading {s} failed: {s}", .{ input.path, @errorName(err) }) },
+    };
+    const text = switch (resource) {
+        .failure => |failure| return .{ .failure = failure },
+        .text => |text| text,
+    };
+    defer ctx.allocator.free(text);
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    var selected = input.*;
+    selected.line_count = @min(selected.line_count, ctx.max_read_file_lines);
+    var records: std.ArrayList(LineRecord) = .empty;
+    defer freeLineRecords(arena_state.allocator(), &records);
+    const scan = try selectLinesFromContent(arena_state.allocator(), text, &selected, ctx.max_read_file_line_len, &records);
+    return .{ .success = try formatReadOutput(ctx.allocator, input.path, &selected, records.items, scan, true) };
 }
 
 fn readFileFailure(alloc: Allocator, err: anyerror, path: []const u8) tool_dispatch.DispatchError!tool_dispatch.ToolResult {

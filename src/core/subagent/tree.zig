@@ -13,6 +13,7 @@ const slot_pool = @import("slot_pool.zig");
 const node_hosts = @import("node_hosts.zig");
 const tool_host = @import("tool_host.zig");
 const kernel_pool = @import("../kernel/slot.zig").pool;
+const recall = @import("../recall/recall.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -97,6 +98,9 @@ pub const Tree = struct {
     /// The open hosts of the nodes below the root (D96). Viewers read a
     /// node's children and live output through them (`withHost`).
     nodes: node_hosts.Registry,
+    /// The recall indexes of this tree's nodes, freed after every host
+    /// closed (`tests/tla/session_manager/RecallCache.tla` `NoUseAfterFree`).
+    recall_cache: recall.Cache,
 
     /// Caller owns; free with `destroy`.
     pub fn create(alloc: Allocator, root_id: []const u8, store: *session_adapter.Store, policy: SpawnPolicy) !*Tree {
@@ -110,6 +114,7 @@ pub const Tree = struct {
             .approvals = .{ .alloc = alloc },
             .slots = .{ .capacity = policy.tree_slots },
             .nodes = node_hosts.Registry.init(alloc, node_hosts.Limits.fromEnv()),
+            .recall_cache = recall.Cache.init(alloc),
         };
         return tree;
     }
@@ -121,6 +126,7 @@ pub const Tree = struct {
         self.nodes.closeAll();
         kernel_pool.releaseRetained(self);
         self.approvals.deinit();
+        self.recall_cache.deinit();
         const alloc = self.alloc;
         alloc.free(self.root_id);
         alloc.destroy(self);

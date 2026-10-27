@@ -13,6 +13,7 @@ const terminal_client_runtime = @import("../terminal/client.zig");
 const terminal_ui_projection = @import("../terminal/ui_projection.zig");
 const types = @import("../shared/types.zig");
 const fleet_presentation = @import("fleet_presentation.zig");
+const recall_presentation = @import("recall_presentation.zig");
 const io_mod = @import("../shared/io.zig");
 const test_builtin_tools = if (builtin.is_test)
     @import("../../builtins/tools.zig")
@@ -149,6 +150,13 @@ fn subagentPreview(alloc: Allocator, raw: []const u8) Allocator.Error![]u8 {
     }
     const encoded = try text_utils.encodeTerminalSafe(alloc, buffer[0..len], 120);
     return encoded.bytes;
+}
+
+/// The settled row a tool builds from its own result: a fleet call's
+/// receipt, or a recall call's matches. Null for every other call.
+pub fn resultStatusLine(alloc: Allocator, call: ToolCall, output: []const u8) Allocator.Error!?[]u8 {
+    if (try recall_presentation.statusLine(alloc, call, output)) |line| return line;
+    return subagentStatusLine(alloc, call, output);
 }
 
 pub fn subagentStatusLine(alloc: Allocator, call: ToolCall, output: []const u8) Allocator.Error!?[]u8 {

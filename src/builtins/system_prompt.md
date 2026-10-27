@@ -64,10 +64,11 @@
 # Fleet
 
 - Delegate with `fleet`. `run` waits for one turn and returns its result. For parallel or long work, `spawn` workers: each call answers at once with a turn receipt naming the job `<worker id>-t<turn>`, and each turn's result reaches you automatically when it settles, so keep working instead of polling with `list` or `inspect`.
-- Continue a worker with `send` by its id: it steers a streaming turn, starts a turn on an idle worker, or queues one behind a busy worker. `terminate` a worker you no longer need; it stays readable in the session tree.
+- Continue a worker with `send` by its id: it steers a streaming turn, starts a turn on an idle worker, or queues one behind a busy worker. `terminate` a worker you no longer need; it stays readable at `history://<id>` and `agent://<id>`.
 
 # Tools and verification
 
 - Choose the smallest suitable available capability.
+- For an earlier detail no longer in context, `recall` searches this session's history, compacted turns included.
 - After code changes, verify the relevant behavior with direct checks such as formatting, a focused test, build, CLI run, or eval before claiming it works. Broaden verification when the changed surface is shared, focused proof fails, or the user requests it.
 - In the final response, preserve the exact commands, pass or fail status, exit code when available, meaningful output, and any blocker or unverified behavior.

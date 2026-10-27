@@ -22,6 +22,7 @@ const edit_file_impl = @import("../tools/filesystem/edit_file.zig");
 const read_file_impl = @import("../tools/filesystem/read_file.zig");
 const write_file_impl = @import("../tools/filesystem/write_file.zig");
 const read_tool_result_impl = @import("../tools/session/read_tool_result.zig");
+const recall_impl = @import("../tools/session/recall.zig");
 const shell_impl = @import("../tools/shell/shell.zig");
 const jobs_impl = @import("../tools/jobs/jobs.zig");
 const install_skill_impl = @import("../tools/skills/install_skill.zig");
@@ -121,7 +122,7 @@ const fleet_description =
     \\- `run`: `message` (required), optional `label`, `model`, `effort`, `schema`. Runs one turn and waits for its result. Without `label` the child is temporary; with `label` the turn runs on that named worker, which is spawned when new.
     \\- `spawn`: `message` (required; the worker's only initial context: include files, constraints, acceptance criteria), optional `label` (1 to 48 of A-Z a-z 0-9 _ -, generated when omitted), `instructions` (the worker's own system overlay), `model`, `effort`, `schema`. Answers at once with a turn receipt; the turn's result is delivered automatically when it settles. Never poll with `list` or `inspect`.
     \\- `send`: `id` + `message`. A worker streaming a turn is steered inside it (receipt steered, same job). An idle worker starts a new turn (accepted, new job). A busy worker that is not streaming queues it as its own turn (queued; it starts after the current turn). A full queue is rejected and nothing is queued.
-    \\- `terminate`: `id`. Cancels the in-flight turn, discards queued inputs, and makes the worker terminal: read-only, browsable in the session tree, no longer addressable. Stopping only one turn is not terminate.
+    \\- `terminate`: `id`. Cancels the in-flight turn, discards queued inputs, and makes the worker terminal: no longer addressable, still readable at `history://<id>` and `agent://<id>`. Stopping only one turn is not terminate.
     \\- `list`: your workers with lifecycle, turn state, current and queued jobs, and model. `inspect`: `id`; one worker in full.
     \\Every accepted input names its turn job `<worker id>-t<turn>`. Lifecycle is live or terminal; turn state is running, awaiting approval, idle or interrupted. `model` is a catalog ID such as openai/gpt-5.6-terra (unambiguous partial names resolve; unknown or ambiguous ones are rejected with candidates) and with `effort` applies when a worker is created; both inherit the parent's when omitted. `schema` is a JSON Schema the turn's final reply must match as one JSON value. fx owns timing, identities, cancellation, permissions, persistence, and cleanup.
 ;
@@ -681,6 +682,39 @@ pub const read_tool_result = ToolSpec{
     .irreversible_fn = read_tool_result_impl.isIrreversible,
 };
 
+const recall_description =
+    "Search this session's history, including turns compaction dropped from your context and the tool outputs they hold. No query lists recent entries; a query ranks matching entries, five per page, with rarer words ranking higher; `#N` expands entry N. Each hit names the turn to read whole with read_file `history://<node>/turn/<n>`, and a long tool output's read_tool_result handle. read_file also opens `history://` (this session tree's nodes), `history://<id>` (a node's transcript) and `agent://<id>` (a node's state and last reply). Use when: an earlier detail, decision, command or output is no longer in your context. Do not use when: searching the workspace or reading files.";
+
+const recall_properties = [_]model_tool_schema.Property{
+    .{ .name = "query", .json_type = .string, .description = "Words to search for, matched anywhere in an entry; `#N` expands entry N; omit to list recent entries." },
+    .{ .name = "page", .json_type = .integer, .description = "Result page, 1-based. Defaults to 1." },
+};
+
+pub const recall = ToolSpec{
+    .name = "recall",
+    .description = recall_description,
+    .model_schema = .{
+        .name = "recall",
+        .description = recall_description,
+        .input_schema = .{
+            .properties = &recall_properties,
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .read_tool_result,
+    .activity_kind = .read,
+    .requires_approval = false,
+    .action_label = "Recalling",
+    .completed_action_label = "Recalled",
+    .label_arg_kind = .query,
+    .label_arg_default = "session history",
+    .permission_target_kind = .none,
+    .decode = recall_impl.decode,
+    .call = recall_impl.call,
+    .reads_only_fn = recall_impl.readsOnly,
+    .irreversible_fn = recall_impl.isIrreversible,
+};
+
 pub const all = [_]tool_dispatch.Tool{
     read_file,
     write_file,
@@ -697,6 +731,7 @@ pub const all = [_]tool_dispatch.Tool{
     ask_user_question,
     vision,
     read_tool_result,
+    recall,
 };
 
 pub const registry = tool_dispatch.Registry{ .tools = all[0..] };
@@ -715,10 +750,12 @@ pub const advertisement_order = [_][]const u8{
     "ask_user_question",
     "web_fetch",
     "web_search",
+    "recall",
 };
 
 pub const read_only_tool_names = [_][]const u8{
     "read_file",
+    "recall",
 };
 
 pub fn isReadOnlyToolName(name: []const u8) bool {
@@ -837,6 +874,7 @@ test "built-in tools register exact active local order" {
         "ask_user_question",
         "vision",
         "read_tool_result",
+        "recall",
     };
 
     try std.testing.expectEqual(expected_names.len, all.len);
@@ -1539,6 +1577,7 @@ test "built-in registry uses executable web_fetch implementation" {
 test "built-in read-only tool set matches plan inspection tools" {
     const expected_names = [_][]const u8{
         "read_file",
+        "recall",
     };
 
     try std.testing.expectEqual(expected_names.len, read_only_tool_names.len);
