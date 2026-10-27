@@ -2927,7 +2927,8 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   role carries the session's startup level, so a deep role on the default
   model (`cento/claude-cento:high`) cycles back to the default instead of
   being taken for it. A detached frontend sends the role's level to the
-  host as the session's effort option after the model. **Why:** the
+  host as the session's effort option after the model, and with no last
+  role a level it cannot see is taken as the startup level. **Why:** the
   integration pass found Deep then Default unreachable and the deep
   level dropped when the session ran on the supervisor. **Alternative:**
   proto's plain index step, which can switch to an identical model and

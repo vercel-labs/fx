@@ -47,7 +47,8 @@ fn cycleStep(view: Host, backward: bool) ?Step {
     const order = view.state.table.cycleOrder();
     if (order.len == 0) return null;
     var start: usize = if (backward) 0 else order.len - 1;
-    var current_effort = view.current_effort;
+    // An unknown level (a detached frontend) is taken as the startup one.
+    var current_effort = view.current_effort orelse view.state.default_effort;
     const last: ?usize = if (view.state.last_cycled) |role| std.mem.findScalar(Role, order, role) else null;
     const resumed = if (last) |index| if (view.pick(order[index])) |picked| std.mem.eql(u8, picked.model, view.current_model) else false else false;
     if (resumed) {
@@ -526,6 +527,13 @@ test "cycling reaches the default role when the deep role differs only in thinki
     view.current_effort = null;
     try std.testing.expectEqual(Role.default, cycleStep(view, false).?.role);
     try std.testing.expectEqual(Role.small, cycleStep(view, true).?.role);
+    // Without a last role it is taken to be at the startup level, so roles
+    // that differ from the default only in level still cycle.
+    try state.assign(alloc, .small, "main:low");
+    state.last_cycled = null;
+    step = cycleStep(view, false).?;
+    try std.testing.expectEqual(Role.small, step.role);
+    try std.testing.expectEqualStrings("low", step.effort.?.label());
 }
 
 test "the default role stays on the profile's model after the session switches" {
