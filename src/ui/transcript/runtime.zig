@@ -4591,6 +4591,8 @@ pub const TranscriptRuntime = struct {
     full_transcript_page_load: full_transcript_worker.Load = .{},
     full_transcript_window_load: full_transcript_worker.WindowLoad = .{},
     full_transcript_page_anchor: full_transcript_page.Anchor = .tail,
+    /// A PgUp at the oldest loaded page asked for more saved history.
+    full_transcript_history_request: bool = false,
     full_transcript_installed_page: ?InstalledFullTranscriptPage = null,
     full_transcript_installed_page_retired: bool = false,
     full_transcript_failed_request: ?full_transcript_page.Request = null,
@@ -5289,6 +5291,16 @@ pub const TranscriptRuntime = struct {
     /// Clears session content but keeps the leading welcome entry. A remote
     /// attach clears the transcript before replaying the supervisor's history;
     /// the banner is client chrome and stays above that history.
+    /// Clears the projected entries for an older history page without
+    /// surrendering the full-transcript screen the person is reading.
+    pub fn resetTranscriptPreservingFullTranscript(self: *TranscriptRuntime, alloc: Allocator) void {
+        const saved = self.full_transcript;
+        const anchor = self.full_transcript_page_anchor;
+        self.clearTranscriptPreservingWelcome(alloc);
+        self.full_transcript = saved;
+        self.full_transcript_page_anchor = anchor;
+    }
+
     pub fn clearTranscriptPreservingWelcome(self: *TranscriptRuntime, alloc: Allocator) void {
         const welcome = if (self.entries.items.len > 0 and
             self.entries.items[0] == .raw_bytes and
@@ -7122,6 +7134,7 @@ pub const TranscriptRuntime = struct {
 
     fn resetFullTranscriptPageNavigation(self: *TranscriptRuntime) void {
         self.full_transcript_page_anchor = .tail;
+        self.full_transcript_history_request = false;
         self.full_transcript_prepared_page_visible = false;
         self.full_transcript_open_request = null;
         self.full_transcript_restore_open_pending = false;
@@ -7195,6 +7208,11 @@ pub const TranscriptRuntime = struct {
                     self.entries.items[boundary_index].id(),
                 );
             }
+        } else if (direction == .up and before == 0 and
+            self.full_transcript.scroll_rows == 0)
+        {
+            // The loaded page is the oldest one; the app may fetch another.
+            self.full_transcript_history_request = true;
         }
         debug_trace.logf(
             "full_transcript_cache",
@@ -7208,6 +7226,28 @@ pub const TranscriptRuntime = struct {
                 self.full_transcript.scroll_rows,
             },
         );
+    }
+
+    pub fn takeFullTranscriptHistoryRequest(self: *TranscriptRuntime) bool {
+        const requested = self.full_transcript_history_request;
+        self.full_transcript_history_request = false;
+        return requested;
+    }
+
+    /// After prepending an older saved page, show its beginning instead of
+    /// jumping back to the tail.
+    pub fn showOldestFullTranscriptPage(self: *TranscriptRuntime) void {
+        if (self.full_transcript.depth != .full or self.entries.items.len == 0) return;
+        self.full_transcript_page_anchor = .{ .entry_index = 0 };
+        self.full_transcript_open_request = null;
+        self.full_transcript_restore_open_pending = false;
+        self.full_transcript_failed_request = null;
+        self.full_transcript_failure_pending = false;
+        self.full_transcript_page_load.cancelActive();
+        self.full_transcript = self.full_transcript.select_page_boundary(
+            self.entries.items[0].id(),
+        );
+        self.full_transcript_prepared_page_visible = false;
     }
 
     pub const FullTranscriptScrollUnit = enum {

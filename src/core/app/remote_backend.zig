@@ -188,6 +188,25 @@ pub fn Runtime(comptime App: type) type {
             try app.remote.enqueue(.attach, .{ .attach = .{ .session_id = app.remote.current_id, .after_sequence = 0 } });
         }
 
+        /// Fetches the saved-history page immediately older than the loaded
+        /// window. The full transcript asks for it when PgUp reaches the top.
+        pub fn loadOlderHistory(app: *App) !void {
+            const remote = &app.remote;
+            if (remote.link != .ready or
+                !remote.history_loaded or
+                !remote.history_has_older or
+                remote.history_load.active or
+                remote.current_id.len == 0) return;
+            remote.beginHistoryLoad(remote.sequence, false);
+            try remote.enqueue(.history_page, .{ .history_page = .{
+                .session_id = remote.current_id,
+                .before_turn = remote.history_cursor_turn,
+                .before_step = remote.history_cursor_step,
+                .before_tail_included = remote.history_cursor_tail_included,
+                .max_bytes = client_protocol.history_page_max_bytes,
+            } });
+        }
+
         /// Opens saved session `id`, which the supervisor may not hold yet,
         /// such as a fork (D98), and focuses it.
         pub fn openSavedSession(app: *App, id: []const u8) !void {

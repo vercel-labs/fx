@@ -4074,6 +4074,38 @@ pub fn Runtime(comptime App: type) type {
             return start;
         }
 
+        /// Replays a page window the supervisor already bounded. Unlike the
+        /// one-shot tail replay, this projects every fragment it is given,
+        /// including older pages prepended to the window.
+        pub fn replayRemoteHistoryWindow(
+            app: *App,
+            history: []const types.HistoryTurn,
+            window_bytes: usize,
+        ) !void {
+            var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
+            defer labels.deinit(app.alloc);
+            var sink = LiveHistorySink(App){ .app = app, .suppress_diffs = true };
+            if (comptime @hasField(@TypeOf(app.shell), "retention_suspended") and
+                @hasDecl(@TypeOf(app.shell), "enforceStructuredRetentionAndReport"))
+            {
+                const floor = 4 * 1024 * 1024 +| window_bytes *| 2;
+                app.shell.max_retained_transcript_bytes = @max(
+                    app.shell.max_retained_transcript_bytes,
+                    floor,
+                );
+                const was_suspended = app.shell.retention_suspended;
+                app.shell.retention_suspended = true;
+                replayHistoryToSinkFrom(app, &sink, history, .{}, &labels) catch |err| {
+                    app.shell.retention_suspended = was_suspended;
+                    return err;
+                };
+                app.shell.retention_suspended = was_suspended;
+                _ = try app.shell.enforceStructuredRetentionAndReport(app.alloc, null);
+                return;
+            }
+            try replayHistoryToSinkFrom(app, &sink, history, .{}, &labels);
+        }
+
         /// Reuses the normal transcript projection without taking persistence
         /// ownership. Retention stays out of the way until every projected
         /// turn is in place: enforcing it per append prunes the agent's
@@ -4154,7 +4186,9 @@ pub fn Runtime(comptime App: type) type {
                         if (entry.execution.turn_summary) |summary| {
                             sink.setCreatedAtMs(summary.started_at_ms);
                         }
-                        try sink.appendUserTurn(entry.user, has_prior_turns.*);
+                        if (entry.user.text.len > 0 or entry.user.images.len > 0) {
+                            try sink.appendUserTurn(entry.user, has_prior_turns.*);
+                        }
                         has_prior_turns.* = true;
                         try writeExecutionHistoryToSinkFrom(app, sink, entry.execution, labels, first_step);
                         if (entry.execution.turn_summary) |summary| {
@@ -4171,7 +4205,9 @@ pub fn Runtime(comptime App: type) type {
                         if (entry.execution.turn_summary) |summary| {
                             sink.setCreatedAtMs(summary.started_at_ms);
                         }
-                        try sink.appendUserTurn(entry.user, has_prior_turns.*);
+                        if (entry.user.text.len > 0 or entry.user.images.len > 0) {
+                            try sink.appendUserTurn(entry.user, has_prior_turns.*);
+                        }
                         has_prior_turns.* = true;
                         try writeExecutionHistoryToSinkFrom(app, sink, entry.execution, labels, first_step);
                         if (entry.execution.turn_summary) |summary| {

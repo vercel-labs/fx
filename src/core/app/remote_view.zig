@@ -145,8 +145,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "reasoning_preview")) {
                 app.reasoning_preview.clearRetainingCapacity();
             }
-            app.remote.cancelHistoryLoad();
-            app.remote.history_loaded = false;
+            app.remote.resetHistory(app.alloc);
             _ = app.shell.worker_status_state().clear();
             app.shell.render_requests.request(.transcript);
         }
@@ -478,15 +477,14 @@ pub fn Runtime(comptime App: type) type {
                 remote.native_turn_offset = app.shell.finalizedToolTurnWatermark() + 1;
                 remote.sequence = value.history_sequence orelse 0;
             } else if (value.history_deferred) {
-                // One oversized transcript arrives as bounded slices. Keep
-                // the live events out until the saved baseline is in place.
+                // One oversized transcript arrives as a bounded tail page.
+                // Keep the live events out until the saved baseline is in place.
                 resetTranscript(app);
-                remote.beginHistoryLoad(value.history_sequence orelse 0);
+                remote.beginHistoryLoad(value.history_sequence orelse 0, true);
                 remote.sequence = remote.history_load.sequence;
                 history_deferred = true;
-                try remote.enqueue(.history_chunk, .{ .history_chunk = .{
+                try remote.enqueue(.history_page, .{ .history_page = .{
                     .session_id = remote.current_id,
-                    .offset = 0,
                 } });
             }
             const summary = value.session;

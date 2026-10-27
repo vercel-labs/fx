@@ -22,7 +22,7 @@ const Allocator = std.mem.Allocator;
 
 /// Bumped whenever a request or response changes shape. A client refuses a
 /// supervisor that answers `ping` with another version.
-pub const version: u32 = 8;
+pub const version: u32 = 9;
 
 pub const Heartbeat = struct {
     prompt: []const u8 = "",
@@ -126,6 +126,44 @@ pub const HistoryChunk = struct {
 /// frame limit.
 pub const history_chunk_max_bytes: usize = 512 * 1024;
 
+/// One backwards page of saved history. `before_turn` and `before_step` name
+/// the oldest turn fragment a viewer already holds; the reply contains the
+/// fragments immediately older than that cursor. A turn fragment may carry
+/// only part of its tool steps, so a single very long turn still pages.
+pub const HistoryPageRequest = struct {
+    session_id: []const u8,
+    before_turn: ?usize = null,
+    before_step: ?usize = null,
+    /// The existing window already carries the turn's final assistant text.
+    before_tail_included: bool = false,
+    max_bytes: usize = 512 * 1024,
+};
+
+pub const history_page_max_bytes: usize = 2 * 1024 * 1024;
+
+pub fn HistoryPage(comptime Turns: type) type {
+    return struct {
+        ok: bool = true,
+        session_id: []const u8,
+        /// The oldest cursor this page covers; the viewer's next request
+        /// passes this back as `before_turn` and `before_step`.
+        start_turn: usize,
+        start_step: usize,
+        start_tail_included: bool = false,
+        /// The cursor the page ended at, copied from the request or the tail.
+        end_turn: usize,
+        end_step: usize,
+        end_tail_included: bool = false,
+        /// The fragments in chronological order.
+        turns: Turns,
+        /// An estimate of the fragment bytes, used to size the viewer's
+        /// retained transcript budget.
+        page_bytes: usize = 0,
+        has_older: bool = false,
+        history_sequence: u64 = 0,
+    };
+}
+
 pub const Request = union(enum) {
     ping,
     shutdown,
@@ -147,6 +185,7 @@ pub const Request = union(enum) {
     children: ChildrenRequest,
     history: History,
     history_chunk: HistoryChunk,
+    history_page: HistoryPageRequest,
     unwatch: Unwatch,
 
     pub const Tag = std.meta.Tag(Request);
@@ -436,6 +475,7 @@ test "requests round trip with their command beside the fields" {
         .{ .cancel = .{ .session_id = "s", .node_id = "child" } },
         .{ .history = .{ .session_id = "s", .child_id = "grandchild", .parent_id = "child" } },
         .{ .history_chunk = .{ .session_id = "s", .offset = 1024, .max_bytes = 4096 } },
+        .{ .history_page = .{ .session_id = "s", .before_turn = 3, .before_step = 7 } },
     };
     for (requests) |request| {
         const bytes = try encode(arena, request);
