@@ -140,6 +140,19 @@ pub const Host = struct {
         return self.current_model;
     }
 
+    /// The web search side worker's model: the profile's smol role when
+    /// it sets one on this provider, else the session's model, as before
+    /// roles (D213).
+    pub fn searchWorkerModel(self: Host) []const u8 {
+        const configured = blk: {
+            self.state.mutex.lockUncancelable(io_mod.getIo());
+            defer self.state.mutex.unlock(io_mod.getIo());
+            break :blk self.state.table.get(.smol) != null;
+        };
+        if (!configured) return self.current_model;
+        return self.resolve(.smol) orelse self.current_model;
+    }
+
     /// The permission reviewer's model; empty keeps the reviewer's default.
     pub fn reviewModel(self: Host) []const u8 {
         // FX_REVIEW_MODEL, a gateway override, outranks the profile's role.
@@ -213,6 +226,10 @@ pub fn resolveModel(app: anytype, role: Role) ?[]const u8 {
 
 pub fn titleModel(app: anytype) ?[]const u8 {
     return host(app).titleModel();
+}
+
+pub fn searchWorkerModel(app: anytype) []const u8 {
+    return host(app).searchWorkerModel();
 }
 
 pub fn reviewModel(app: anytype) []const u8 {
@@ -415,4 +432,23 @@ test "a judge takes the first of its roles that resolves" {
     try std.testing.expectEqualStrings("codex-mini", view.judgeModel(&.{ "tiny", "smol" }).?);
     try state.assign(alloc, .review, "codex-strict");
     try std.testing.expectEqualStrings("codex-strict", view.judgeModel(&.{ "nope", "review", "smol" }).?);
+}
+
+test "the web search worker takes the profile's smol role, else the session's model" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    try state.init(alloc, .{}, "gateway", "main");
+    var view: Host = .{ .state = &state, .provider = .gateway, .current_model = "main", .set = .{ .gateway = .{ .title_model = "luna" }, .codex = .{}, .grok = .{} } };
+    // Without a smol entry the session's model stays, not the bundle's.
+    try std.testing.expectEqualStrings("main", view.searchWorkerModel());
+    try state.assign(alloc, .smol, "swift");
+    try std.testing.expectEqualStrings("swift", view.searchWorkerModel());
+    // A smol model on another provider leaves the session's model.
+    try state.assign(alloc, .smol, "codex/mini");
+    try std.testing.expectEqualStrings("main", view.searchWorkerModel());
+    view.provider = .codex;
+    try std.testing.expectEqualStrings("mini", view.searchWorkerModel());
+    try state.assign(alloc, .smol, null);
+    try std.testing.expectEqualStrings("main", view.searchWorkerModel());
 }

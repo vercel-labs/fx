@@ -2575,6 +2575,15 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   started lost them. **Alternative:** a side file beside the session,
   which the session manager's log and snapshots would not order.
 
+- **D213 Decision:** the web search side worker's model is the profile's
+  smol role when it names a model on the session's provider, else the
+  session's model as before, in the interactive app, the ACP server and
+  `ask`. The role's built-in fallback to the provider's low-cost model
+  does not apply here. **Why:** proto runs side work on its smol model;
+  without a smol entry the search keeps the model it used. **Alternative:**
+  the built-in low-cost model, which would change every gateway search
+  for people who set no roles.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

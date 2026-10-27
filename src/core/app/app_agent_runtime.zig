@@ -327,7 +327,7 @@ pub fn Runtime(comptime App: type) type {
                         .api_key = app.auth.apiKey() orelse "",
                         .credential_source = app.auth.credentialSource(),
                         .gateway_team = app.auth.gatewayTeam(),
-                        .worker_model = provider_runtime.model(app),
+                        .worker_model = if (comptime @hasField(App, "model_roles")) model_role_runtime.searchWorkerModel(app) else provider_runtime.model(app),
                         .gateway_retry_count = gateway_retry_count,
                         .gateway_chat_url = gateway_chat_url,
                     });
@@ -806,7 +806,7 @@ pub fn Runtime(comptime App: type) type {
                         .api_key = credential_secret,
                         .credential_source = credential_source,
                         .gateway_team = credential.tenant(),
-                        .worker_model = provider_runtime.model(app),
+                        .worker_model = if (comptime @hasField(App, "model_roles")) model_role_runtime.searchWorkerModel(app) else provider_runtime.model(app),
                         .gateway_retry_count = gateway_retry_count,
                         .gateway_chat_url = gateway_chat_url,
                     });
@@ -832,7 +832,7 @@ pub fn Runtime(comptime App: type) type {
                 .credential_source = app.auth.credentialSource(),
                 .gateway_team = app.auth.gatewayTeam(),
                 .account_id = app.auth.accountId(),
-                .worker_model = provider_runtime.model(app),
+                .worker_model = if (comptime @hasField(App, "model_roles")) model_role_runtime.searchWorkerModel(app) else provider_runtime.model(app),
                 .gateway_retry_count = gateway_retry_count,
                 .gateway_chat_url = gateway_chat_url,
             };

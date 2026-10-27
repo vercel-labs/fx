@@ -998,6 +998,13 @@ const AskContext = struct {
         self.v2_children = children;
     }
 
+    /// The web search side worker's model: the profile's smol role, else
+    /// the session's model (D213).
+    fn searchWorkerModel(self: *AskContext) []const u8 {
+        const startup = self.role_startup orelse return self.model;
+        return startup.roleModel(.smol, null) orelse self.model;
+    }
+
     /// The credentials a bank web search may use; borrowed from `self`.
     fn webSearchInputs(self: *AskContext) web_search_runtime.Inputs {
         var inputs: web_search_runtime.Inputs = .{
@@ -1005,7 +1012,7 @@ const AskContext = struct {
             .credential_source = self.credential_source,
             .gateway_team = self.gateway_team,
             .account_id = self.account_id,
-            .worker_model = self.model,
+            .worker_model = self.searchWorkerModel(),
             .gateway_retry_count = self.cfg.gateway_retry_count,
             .gateway_chat_url = self.cfg.gateway_chat_url,
         };
@@ -1038,7 +1045,7 @@ const AskContext = struct {
                 .api_key = self.api_key,
                 .credential_source = self.credential_source,
                 .gateway_team = self.gateway_team,
-                .worker_model = self.model,
+                .worker_model = self.searchWorkerModel(),
                 .gateway_retry_count = self.cfg.gateway_retry_count,
                 .gateway_chat_url = self.cfg.gateway_chat_url,
             });

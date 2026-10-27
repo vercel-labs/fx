@@ -167,7 +167,7 @@ fn webSearchInputs(state: *server.ServerState, session: *const server.ActiveSess
         .credential_source = session.credential_source,
         .gateway_team = state.gateway_team,
         .account_id = session.account_id,
-        .worker_model = session.model,
+        .worker_model = server.roleHost(state, session).searchWorkerModel(),
         .gateway_retry_count = state.cfg.gateway_retry_count,
         .gateway_chat_url = state.cfg.gateway_chat_url,
     };
@@ -561,7 +561,7 @@ const AcpContext = struct {
                 .api_key = session.api_key,
                 .credential_source = session.credential_source,
                 .gateway_team = self.state.gateway_team,
-                .worker_model = session.model,
+                .worker_model = server.roleHost(self.state, session).searchWorkerModel(),
                 .gateway_retry_count = self.state.cfg.gateway_retry_count,
                 .gateway_chat_url = self.state.cfg.gateway_chat_url,
             });
