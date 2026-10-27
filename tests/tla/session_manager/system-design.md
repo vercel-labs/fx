@@ -2764,6 +2764,21 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   proto's live panel above the composer, which needs the checklist in the
   terminal's own state and is not ported.
 
+- **D235 Decision:** every document a browser tab loads during a browser
+  call answers to the same domain policy as `open` (D198): `tab.goto`
+  checks its URL first and, when refused, throws to the script without
+  requesting it; every other document load, a redirect, a clicked link
+  or a script's `location` change, pauses through CDP `Fetch` and is
+  failed as blocked by the client, with a "navigation blocked" note in
+  the run's output. An http(s) URL answers to web_fetch's `domain:<host>`
+  rules: a deny refuses it, and an ask refuses it too with a hint to use
+  `open`, since a script cannot stop to ask. Other schemes than
+  about:blank are refused. Full access skips the rules, as admission
+  does. The transcript row of a run that hit a refusal ends in
+  "· navigation blocked". **Why:** a script must not reach a domain the
+  person denied. **Alternative:** checking only `tab.goto`, which a
+  redirect or a link would get around.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

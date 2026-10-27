@@ -14,6 +14,7 @@ const profile_paths = @import("../../core/shared/profile_paths.zig");
 const output_mod = @import("output.zig");
 const page_mod = @import("page.zig");
 const run_mod = @import("run.zig");
+const navigation_policy = @import("navigation_policy.zig");
 
 const Allocator = std.mem.Allocator;
 const DispatchContext = tool_dispatch.DispatchContext;
@@ -196,12 +197,18 @@ pub fn call(ctx: DispatchContext, erased: tool_dispatch.ToolInput) tool_dispatch
     if (slot.browser) |b| if (!b.alive()) slot.closeLocked();
     var settings = config_runtime.loadBrowserSettings(alloc) catch browser_settings.Settings{};
     defer settings.deinit(alloc);
-    if (slot.browser) |b| b.conn.cancel = ctx.cancel_flag;
+    // Every navigation this call performs answers to the domain rules (D235).
+    const policy: navigation_policy.Policy = .{ .rules = ctx.navigation_rules };
+    if (slot.browser) |b| {
+        b.conn.cancel = ctx.cancel_flag;
+        b.guard = policy.guard();
+    }
     defer if (slot.browser) |b| {
         b.conn.cancel = null;
+        b.guard = null;
     };
     const result = switch (input.action) {
-        .open => open(ctx, slot, input, &settings),
+        .open => open(ctx, slot, input, &settings, &policy),
         .close => close(alloc, slot, input),
         .run => runAction(ctx, slot, input, &settings),
     };
@@ -210,7 +217,7 @@ pub fn call(ctx: DispatchContext, erased: tool_dispatch.ToolInput) tool_dispatch
     return result;
 }
 
-fn open(ctx: DispatchContext, slot: *slot_mod.Slot, input: *Input, settings: *browser_settings.Settings) tool_dispatch.DispatchError!ToolResult {
+fn open(ctx: DispatchContext, slot: *slot_mod.Slot, input: *Input, settings: *browser_settings.Settings, policy: *const navigation_policy.Policy) tool_dispatch.DispatchError!ToolResult {
     const alloc = ctx.allocator;
     const requested_cdp = input.cdp_url orelse settings.cdp_url;
     if (slot.browser) |b| {
@@ -223,6 +230,7 @@ fn open(ctx: DispatchContext, slot: *slot_mod.Slot, input: *Input, settings: *br
         // never the call's arena.
         slot.browser = startBrowser(ctx.lifecycle_allocator, requested_cdp, settings, ctx.cancel_flag) catch |err| return .{ .failure = try startFailure(alloc, err, requested_cdp) };
         slot.browser.?.conn.cancel = ctx.cancel_flag;
+        slot.browser.?.guard = policy.guard();
     }
     const browser = slot.browser.?;
     const timeout_ms = input.timeout_s * 1000;
@@ -240,6 +248,11 @@ fn open(ctx: DispatchContext, slot: *slot_mod.Slot, input: *Input, settings: *br
     if (input.url) |url| {
         browser.navigate(tab, url, input.dom_only, timeout_ms) catch |err| {
             const message = switch (err) {
+                error.NavigationRefused => blk: {
+                    const reason = browser.takeRefused();
+                    defer if (reason) |text| browser.alloc.free(text);
+                    break :blk try alloc.print("did not load {s}: {s}", .{ url, reason orelse "refused by the domain rules" });
+                },
                 error.NavigationFailed => try alloc.print("could not load {s}: {s}", .{ url, browser.conn.lastError() }),
                 error.Timeout => try alloc.print("{s} did not finish loading within {d}s; the tab stays open on what loaded", .{ url, input.timeout_s }),
                 else => try protocolMessage(alloc, browser, err, "navigation failed"),

@@ -73,6 +73,12 @@ pub fn perform(ctx: *Context, page: *Page, op: []const u8, args: Value) Failure!
             const url = cdp.stringField(args, "url") orelse return page.fail("tab.goto needs a url", .{});
             const dom_only = if (cdp.stringField(args, "waitUntil")) |w| std.mem.eql(u8, w, "domcontentloaded") else false;
             browser.navigate(tab, url, dom_only, waitBudget(ctx, args, remaining(ctx))) catch |err| switch (err) {
+                // A refused URL is never requested; the script sees why (D235).
+                error.NavigationRefused => {
+                    const reason = browser.takeRefused();
+                    defer if (reason) |text| browser.alloc.free(text);
+                    return page.fail("tab.goto({s}) refused: {s}", .{ url, reason orelse "refused by the domain rules" });
+                },
                 error.NavigationFailed => return page.fail("tab.goto({s}) failed: {s}", .{ url, browser.conn.lastError() }),
                 error.Timeout => return page.fail("tab.goto({s}) timed out waiting for the page to load", .{url}),
                 else => return page.protocolFailure(err, "tab.goto"),

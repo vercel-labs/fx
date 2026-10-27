@@ -268,6 +268,9 @@ pub const DispatchContext = struct {
     kernel: ?*@import("../kernel/slot.zig").Slot = null,
     /// The session node's browser, which the browser tool opens (D197).
     browser: ?*@import("../browser/slot.zig").Slot = null,
+    /// The configured rules the browser's navigations answer to as web_fetch
+    /// domains (D235); empty in full access.
+    navigation_rules: core_types.PermissionRuleSet = .{},
     /// The session's checklist, which the checklist tool changes (D231).
     checklist: ?*@import("../checklist/store.zig").Store = null,
     /// The running turn's services for `proto_fx` in agent shell commands.

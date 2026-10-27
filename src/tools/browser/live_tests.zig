@@ -7,6 +7,8 @@ const launch = @import("../../core/browser/launch.zig");
 const slot_mod = @import("../../core/browser/slot.zig");
 const output_mod = @import("output.zig");
 const run_mod = @import("run.zig");
+const navigation_policy = @import("navigation_policy.zig");
+const types = @import("../../core/shared/types.zig");
 
 const form_page =
     "data:text/html,<title>Form</title><h1>Sign up</h1><form onsubmit=\"event.preventDefault();document.getElementById('out').textContent='Hello '+this.who.value+' ('+this.plan.value+')'\">" ++
@@ -113,4 +115,36 @@ test "a launched browser fills and submits a form, observes, screenshots, and le
         return;
     };
     return error.BrowserStillRunning;
+}
+
+test "a script's goto and a clicked link to a denied domain never load (D235)" {
+    const alloc = std.testing.allocator;
+    const exe = (try testExe(alloc)) orelse return error.SkipZigTest;
+    defer alloc.free(exe);
+    var process = try launch.launch(alloc, .{ .exe = exe, .kind = kindFor(exe) });
+    var slot: slot_mod.Slot = .{};
+    slot.browser = browser_mod.Browser.connect(alloc, process.ws_url, .{ .launched = process }, "headless test") catch |err| {
+        process.stop(alloc);
+        return err;
+    };
+    defer slot.deinit();
+    const browser = slot.browser.?;
+    const tab = try browser.openTab("main", null, .accept);
+    try browser.navigate(tab, "data:text/html,<title>Links</title><a id=go href=\"https://blocked.example/secret\">go</a>", false, 10_000);
+
+    var rules = [_]types.PermissionRule{.{ .permission = @constCast("web_fetch"), .pattern = @constCast("domain:blocked.example"), .action = .deny }};
+    const policy: navigation_policy.Policy = .{ .rules = .{ .rules = rules[0..] } };
+    browser.guard = policy.guard();
+    defer browser.guard = null;
+
+    var images: usize = 0;
+    const went = try runScript(alloc, browser, "await tab.goto('https://blocked.example/login'); return 'loaded';", &images);
+    defer alloc.free(went.text);
+    try std.testing.expect(went.failed);
+    try std.testing.expect(std.mem.find(u8, went.text, "tab.goto(https://blocked.example/login) refused: https://blocked.example/login is denied by the web_fetch rule for domain:blocked.example") != null);
+
+    const clicked = try runScript(alloc, browser, "await tab.click('#go'); await sleep(300); return await tab.url();", &images);
+    defer alloc.free(clicked.text);
+    try std.testing.expect(std.mem.find(u8, clicked.text, "navigation blocked: https://blocked.example/secret is denied") != null);
+    try std.testing.expect(std.mem.find(u8, clicked.text, "https://blocked.example/secret\n") == null);
 }

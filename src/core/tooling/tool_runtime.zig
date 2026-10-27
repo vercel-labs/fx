@@ -1190,6 +1190,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .subtree_busy = if (ctx.subagent_host) |host| .{ .ctx = host, .busy_fn = subtreeBusy } else null,
         .kernel = &ctx.session.kernel,
         .browser = &ctx.session.browser,
+        .navigation_rules = if (ctx.permission_mode == .yolo) .{} else ctx.permission_rules,
         .checklist = &ctx.session.checklist,
         .harness = ctx.harness,
         .observer = ctx.observer,

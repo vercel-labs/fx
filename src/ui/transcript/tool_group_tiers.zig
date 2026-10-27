@@ -472,6 +472,11 @@ fn browserText(arena: Allocator, item: Item, record: *const ToolDetailRecord) ![
     if (isFailure(record)) {
         if (try human_text.failureReason(arena, record.result orelse "")) |reason| return arena.print("Failed · {s}", .{reason});
     }
+    // The script names what it tried; a refused navigation did not happen (D235).
+    const output = record.result orelse "";
+    if (std.mem.find(u8, output, "navigation blocked: ") != null or std.mem.find(u8, output, ") refused: ") != null) {
+        return arena.print("{s} · navigation blocked", .{summary});
+    }
     return summary;
 }
 
@@ -901,6 +906,11 @@ test "browser rows read by what they opened and did, with the script and its out
     const joined = try std.mem.join(arena, "\n", texts.items);
     try std.testing.expect(std.mem.find(u8, joined, "Opened example.com") != null);
     try std.testing.expect(std.mem.find(u8, joined, "Filled #name, clicked Sign in +1\nawait tab.fill('#name', 'Ada');\nawait tab.click('text/Sign in');\nreturn await tab.text('#out');\nOutput\nHello Ada") != null);
+
+    var blocked = testRecord(3, "browser", .command, "{\"action\":\"run\",\"code\":\"await tab.click('#go');\"}");
+    blocked.result = @constCast("[main: navigation blocked: http://localhost/ is denied by the web_fetch rule for domain:localhost]");
+    const blocked_rows = try plan(arena, &.{.{ .entry_id = 3, .detail = &blocked, .phrase = "Ran browser script on main" }}, false);
+    try std.testing.expectEqualStrings("Clicked #go · navigation blocked", blocked_rows[0].text);
 }
 
 test "checklist rows read by what changed, with the list or the progress under them" {

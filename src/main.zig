@@ -4961,6 +4961,7 @@ test {
     _ = @import("tools/browser/observe.zig");
     _ = @import("tools/browser/output.zig");
     _ = @import("tools/browser/run.zig");
+    _ = @import("tools/browser/navigation_policy.zig");
     _ = @import("tools/browser/live_tests.zig");
     _ = checkpoint_indicator;
     _ = @import("acp/libfx_journal.zig");

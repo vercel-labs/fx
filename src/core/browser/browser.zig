@@ -54,6 +54,18 @@ pub const Backend = union(enum) {
     connected: []u8,
 };
 
+/// Decides whether a tab may load a document (D235): null allows it, a
+/// reason refuses it. Set for the length of one tool call.
+pub const NavigationGuard = struct {
+    ctx: *const anyopaque,
+    refuse_fn: *const fn (ctx: *const anyopaque, alloc: Allocator, url: []const u8) ?[]u8,
+
+    /// The reason `url` may not load, owned by `alloc`, or null.
+    pub fn refuse(self: NavigationGuard, alloc: Allocator, url: []const u8) ?[]u8 {
+        return self.refuse_fn(self.ctx, alloc, url);
+    }
+};
+
 pub const Controller = struct {
     target_id: []u8,
     session_id: []u8,
@@ -74,6 +86,11 @@ pub const Browser = struct {
     notes: std.ArrayList([]u8) = .empty,
     /// Whether the controller should file console lines (only while a run is active).
     collecting: bool = false,
+    /// The domain policy every document a tab loads answers to, while a
+    /// call runs (D235). Without one, paused loads wait for the next call.
+    guard: ?NavigationGuard = null,
+    /// Why the last refused load was refused, owned.
+    refused: ?[]u8 = null,
 
     /// Connects to `ws_url`. On failure the backend is left to the caller.
     pub fn connect(alloc: Allocator, ws_url: []const u8, backend: Backend, label: []const u8) !*Browser {
@@ -127,6 +144,7 @@ pub const Browser = struct {
         self.bindings.deinit(alloc);
         self.clearNotes();
         self.notes.deinit(alloc);
+        if (self.refused) |reason| alloc.free(reason);
         self.conn.deinit();
         alloc.destroy(self.client);
         switch (self.backend) {
@@ -210,6 +228,12 @@ pub const Browser = struct {
         errdefer self.releaseTab(tab);
         var enabled = try self.call(tab.session_id, "Page.enable", .{});
         enabled.deinit(self.alloc);
+        // Every document the tab loads, a redirect or a link's target too,
+        // pauses for the navigation guard (D235).
+        var fetching = try self.call(tab.session_id, "Fetch.enable", .{ .patterns = [_]struct { urlPattern: []const u8, resourceType: []const u8, requestStage: []const u8 }{
+            .{ .urlPattern = "*", .resourceType = "Document", .requestStage = "Request" },
+        } });
+        fetching.deinit(self.alloc);
         // The headless default is a small window; a launched browser gets a
         // desktop viewport, a borrowed one keeps its own unless asked.
         if (viewport != null or self.backend == .launched) try self.setViewport(tab, viewport orelse default_viewport);
@@ -242,14 +266,38 @@ pub const Browser = struct {
         self.alloc.destroy(tab);
     }
 
-    /// Navigates `tab` and waits for its load (or DOM ready) event.
+    /// The reason the guard refuses `url`, owned by `alloc`, or null.
+    pub fn refusal(self: *Browser, alloc: Allocator, url: []const u8) ?[]u8 {
+        const guard = self.guard orelse return null;
+        return guard.refuse(alloc, url);
+    }
+
+    /// Takes the reason the last load was refused, if one was; caller owns it.
+    pub fn takeRefused(self: *Browser) ?[]u8 {
+        const reason = self.refused orelse return null;
+        self.refused = null;
+        return reason;
+    }
+
+    /// Navigates `tab` and waits for its load (or DOM ready) event. A URL
+    /// the guard refuses is never requested: `error.NavigationRefused`, with
+    /// the reason in `refused`.
     pub fn navigate(self: *Browser, tab: *Tab, url: []const u8, wait_dom_only: bool, timeout_ms: i64) !void {
+        if (self.refusal(self.alloc, url)) |reason| {
+            if (self.refused) |old| self.alloc.free(old);
+            self.refused = reason;
+            return error.NavigationRefused;
+        }
+        if (self.refused) |old| self.alloc.free(old);
+        self.refused = null;
         tab.elements.clearRetainingCapacity();
         const loads = tab.loads;
         const ready = tab.dom_ready;
         var result = try self.call(tab.session_id, "Page.navigate", .{ .url = url });
         defer result.deinit(self.alloc);
         if (cdp.stringField(result.value(), "errorText")) |text| {
+            // A redirect the guard refused fails the load.
+            if (self.refused != null) return error.NavigationRefused;
             self.setError(text);
             return error.NavigationFailed;
         }
@@ -369,6 +417,10 @@ fn onEvent(ctx: *anyopaque, conn: *cdp.Connection, event: *const cdp.Event) bool
         return true;
     };
     const tab = self.tabForSession(session_id) orelse return false;
+    if (std.mem.eql(u8, method, "Fetch.requestPaused")) {
+        guardPausedLoad(self, tab, params);
+        return true;
+    }
     if (std.mem.eql(u8, method, "Page.frameNavigated")) {
         const frame = if (params == .object) params.object.get("frame") else null;
         if (frame) |f| if (f == .object and f.object.get("parentId") == null) {
@@ -401,6 +453,22 @@ fn onEvent(ctx: *anyopaque, conn: *cdp.Connection, event: *const cdp.Event) bool
     }
     if (std.mem.startsWith(u8, method, "Page.")) return true;
     return false;
+}
+
+/// Lets a paused document load go on, or fails it as blocked by the client
+/// with the guard's reason noted for the run (D235).
+fn guardPausedLoad(self: *Browser, tab: *Tab, params: Value) void {
+    const request_id = cdp.stringField(params, "requestId") orelse return;
+    const request = if (params == .object) params.object.get("request") else null;
+    const url = if (request) |r| cdp.stringField(r, "url") orelse "" else "";
+    if (self.refusal(self.alloc, url)) |reason| {
+        self.note("[{s}: navigation blocked: {s}]", .{ tab.name, reason });
+        if (self.refused) |old| self.alloc.free(old);
+        self.refused = reason;
+        self.callIgnored(tab.session_id, "Fetch.failRequest", .{ .requestId = request_id, .errorReason = "BlockedByClient" }) catch {};
+        return;
+    }
+    self.callIgnored(tab.session_id, "Fetch.continueRequest", .{ .requestId = request_id }) catch {};
 }
 
 fn noteConsoleArg(writer: *std.Io.Writer, arg: Value) !void {
