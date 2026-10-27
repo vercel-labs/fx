@@ -19,13 +19,15 @@ pub const Method = enum {
     oauth,
     /// A pasted AI Gateway key held in the keychain or profile.
     api_key,
+    /// The user's own Claude Code login, run through Claude Code (D184).
+    claude_code,
     /// A Claude subscription token from `claude setup-token`, run through
     /// Claude Code (D166).
-    claude_code,
+    claude_token,
 };
 
 pub const max_provider_options = provider_catalog.entries.len + provider_catalog.preset_entries.len;
-const max_method_options = 2;
+const max_method_options = 3;
 /// The team column lists at most this many teams; accounts beyond it see the
 /// first 128 and can still change teams through the sign-in flow.
 pub const max_team_options = 128;
@@ -105,6 +107,7 @@ pub fn methodSlug(method: Method) []const u8 {
         .oauth => "oauth",
         .api_key => "api-key",
         .claude_code => "claude-code",
+        .claude_token => "claude-token",
     };
 }
 
@@ -112,6 +115,7 @@ pub fn parseMethod(value: []const u8) ?Method {
     if (std.ascii.eqlIgnoreCase(value, methodSlug(.oauth))) return .oauth;
     if (std.ascii.eqlIgnoreCase(value, methodSlug(.api_key))) return .api_key;
     if (std.ascii.eqlIgnoreCase(value, methodSlug(.claude_code))) return .claude_code;
+    if (std.ascii.eqlIgnoreCase(value, methodSlug(.claude_token))) return .claude_token;
     return null;
 }
 
@@ -146,7 +150,7 @@ pub fn providerMethods(id: model_provider.ProviderId) []const Method {
         .configured => if (provider_registry.presetFor(id.label())) |preset| switch (preset.login) {
             .browser_or_key => &.{ .oauth, .api_key },
             .key => &.{.api_key},
-            .claude_or_key => &.{ .claude_code, .api_key },
+            .claude_or_key => &.{ .claude_code, .claude_token, .api_key },
         } else &.{},
     };
 }
@@ -157,7 +161,17 @@ pub fn methodMatchesSource(method: Method, source: types.CredentialSource) bool 
     return switch (method) {
         .oauth => source == .fx_login or source == .vercel_oidc_token,
         .api_key => source == .ai_gateway_api_key or source == .stored_key,
-        .claude_code => false,
+        .claude_code, .claude_token => false,
+    };
+}
+
+/// What a method row says beside its slug, for methods whose slug alone is
+/// not self-explanatory.
+pub fn methodAnnotation(method: Method) []const u8 {
+    return switch (method) {
+        .claude_code => "your Claude Code login",
+        .claude_token => "paste a claude setup-token token",
+        .oauth, .api_key => "",
     };
 }
 
@@ -177,13 +191,15 @@ test "only the gateway and presets offer a method column" {
     try std.testing.expectEqual(@as(usize, 2), providerMethods(.gateway).len);
     try std.testing.expectEqual(@as(usize, 2), providerMethods(provider_catalog.parse("openrouter").?).len);
     try std.testing.expectEqual(Method.api_key, providerMethods(provider_catalog.parse("opencode-zen").?)[0]);
+    // Anthropic offers the installed Claude Code login first (D184).
+    try std.testing.expectEqualSlices(Method, &.{ .claude_code, .claude_token, .api_key }, providerMethods(provider_catalog.parse("anthropic").?));
     try std.testing.expectEqual(@as(usize, 0), providerMethods(model_provider.parse("local").?).len);
     try std.testing.expectEqual(@as(usize, 0), providerMethods(.codex).len);
     try std.testing.expectEqual(@as(usize, 0), providerMethods(.grok).len);
 }
 
 test "method slugs round trip and stay single tokens" {
-    for ([_]Method{ .oauth, .api_key }) |method| {
+    for ([_]Method{ .oauth, .api_key, .claude_code, .claude_token }) |method| {
         const slug = methodSlug(method);
         try std.testing.expectEqual(method, parseMethod(slug).?);
         try std.testing.expect(std.mem.findScalar(u8, slug, ' ') == null);

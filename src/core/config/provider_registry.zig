@@ -20,8 +20,9 @@ pub const Login = enum {
     browser_or_key,
     /// A pasted key only.
     key,
-    /// Claude Code with a subscription token from `claude setup-token`, or
-    /// a pasted Anthropic API key (D166).
+    /// Claude Code on the installed Claude Code's login (D184) or a
+    /// subscription token from `claude setup-token`, or a pasted Anthropic
+    /// API key (D166).
     claude_or_key,
 };
 

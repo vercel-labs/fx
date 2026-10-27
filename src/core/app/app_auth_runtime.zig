@@ -825,6 +825,12 @@ pub fn Runtime(comptime App: type) type {
             const body = try app.alloc.print("Saved the {s} key to the profile.", .{display});
             defer app.alloc.free(body);
             try writeAuthNotice(app, .{ .topic = "auth", .tone = .neutral, .body = body });
+            try selectConfiguredProvider(app, name);
+        }
+
+        /// Selects a configured provider whose credential just changed, or
+        /// resumes the waiting prompt when it is already the active one.
+        pub fn selectConfiguredProvider(app: *App, name: []const u8) !void {
             const target = model_provider.parse(name) orelse return;
             if (comptime @hasDecl(App, "selectProviderAfterLogin")) {
                 if (try app.selectProviderAfterLogin(target)) return;

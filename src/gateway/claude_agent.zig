@@ -6,7 +6,7 @@
 //! The key decides the mode (D166): a saved or `CLAUDE_CODE_OAUTH_TOKEN`
 //! subscription token (from `claude setup-token`) runs Claude Code, a saved or
 //! `ANTHROPIC_API_KEY` API key runs Messages, and with neither Claude Code
-//! runs on whatever credentials its environment carries.
+//! runs on the user's own Claude Code login (D184).
 //!
 //! In Claude Code mode each model request is one `claude -p` run with one
 //! turn, no built-in tools, no setting sources, an isolated config directory
@@ -63,7 +63,8 @@ pub fn owns(definition: *const definitions.Definition) bool {
 pub const Mode = union(enum) {
     /// An Anthropic API key for the Messages transport. Owned.
     api_key: []u8,
-    /// Claude Code, with the subscription token to hand it, if any. Owned.
+    /// Claude Code, with the subscription token to hand it, or null for the
+    /// user's own Claude Code login (D184). Owned.
     claude_code: ?[]u8,
 
     pub fn deinit(self: *Mode, alloc: Allocator) void {
@@ -92,6 +93,15 @@ pub fn resolveMode(alloc: Allocator, sources: ModeSources) Allocator.Error!Mode 
     if (sources.oauth_env) |token| if (token.len != 0) return .{ .claude_code = try alloc.dupe(u8, token) };
     if (sources.api_key_env) |key| if (key.len != 0) return .{ .api_key = try alloc.dupe(u8, key) };
     return .{ .claude_code = null };
+}
+
+/// The environment variable that takes precedence over the user's Claude
+/// Code login, if one is set.
+pub fn environmentOverride() ?[]const u8 {
+    for ([_][]const u8{ "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY" }) |name| {
+        if (io_mod.getenv(name)) |value| if (value.len != 0) return name;
+    }
+    return null;
 }
 
 fn currentMode(alloc: Allocator) !Mode {
@@ -384,19 +394,7 @@ pub fn effort(reasoning: ?types.ReasoningEffort) ?[]const u8 {
 fn childEnvironment(arena: Allocator, definition: *const definitions.Definition, token: ?[]const u8, scratch: []const u8, request: streams.ModelRequest) !std.process.Environ.Map {
     var env = try io_mod.cloneEnvironMap(arena);
     errdefer env.deinit();
-    for ([_][]const u8{ "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_SIMPLE" }) |key| _ = env.swapRemove(key);
-    try env.put("CLAUDE_CONFIG_DIR", try std.Io.Dir.path.join(arena, &.{ scratch, "config" }));
-    try env.put("CLAUDE_AGENT_SDK_CLIENT_APP", "proto-fx");
-    try env.put("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
-    try env.put("CLAUDE_CODE_TOTAL_TOKENS_REMINDER", "off");
-    try env.put("DISABLE_AUTO_COMPACT", "1");
-    try env.put("ENABLE_TOOL_SEARCH", "false");
-    try env.put("CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING", "1");
-    if (token) |value| {
-        _ = env.swapRemove("ANTHROPIC_API_KEY");
-        _ = env.swapRemove("ANTHROPIC_AUTH_TOKEN");
-        try env.put("CLAUDE_CODE_OAUTH_TOKEN", value);
-    }
+    try isolateEnvironment(arena, &env, try std.Io.Dir.path.join(arena, &.{ scratch, "config" }), token);
     // A models.json base URL other than Anthropic's own goes to Claude as is;
     // otherwise the user's ANTHROPIC_BASE_URL, if any, passes through.
     if (!std.mem.startsWith(u8, definition.base_url, "https://api.anthropic.com")) {
@@ -415,6 +413,46 @@ fn childEnvironment(arena: Allocator, definition: *const definitions.Definition,
     if (request.max_output_tokens) |limit| try env.put("CLAUDE_CODE_MAX_OUTPUT_TOKENS", try arena.print("{d}", .{limit}));
     if (request.provider_options.reasoning == null) try env.put("MAX_THINKING_TOKENS", "0");
     return env;
+}
+
+/// Claude Code's variable naming the config directory its sign-in belongs
+/// to: its keychain entry and `.credentials.json` are found by that
+/// directory, apart from `CLAUDE_CONFIG_DIR`. Empty means the default
+/// `~/.claude`.
+pub const secure_storage_env = "CLAUDE_SECURESTORAGE_CONFIG_DIR";
+
+/// Points `env` at the private `config_dir` for everything Claude writes
+/// (transcripts, `.claude.json`, plugin state) and adds proto's quieting
+/// switches. With a token Claude uses that; without one it keeps the user's
+/// own login, read from the keychain entry or credentials file of the config
+/// directory the user runs Claude Code with (D184). Refreshing an expired
+/// login writes the new one back there, as any Claude Code run does; nothing
+/// else is written outside `config_dir`.
+pub fn isolateEnvironment(arena: Allocator, env: *std.process.Environ.Map, config_dir: []const u8, token: ?[]const u8) !void {
+    for ([_][]const u8{ "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_SIMPLE" }) |key| _ = env.swapRemove(key);
+    if (token) |value| {
+        _ = env.swapRemove("ANTHROPIC_API_KEY");
+        _ = env.swapRemove("ANTHROPIC_AUTH_TOKEN");
+        try env.put("CLAUDE_CODE_OAUTH_TOKEN", value);
+    } else {
+        // An empty variable would read as a credential and hide the login.
+        for ([_][]const u8{ "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN" }) |key| {
+            if (env.get(key)) |value| if (value.len == 0) {
+                _ = env.swapRemove(key);
+            };
+        }
+        if (env.get(secure_storage_env) == null) {
+            const user_dir = try arena.dupe(u8, env.get("CLAUDE_CONFIG_DIR") orelse "");
+            try env.put(secure_storage_env, user_dir);
+        }
+    }
+    try env.put("CLAUDE_CONFIG_DIR", config_dir);
+    try env.put("CLAUDE_AGENT_SDK_CLIENT_APP", "proto-fx");
+    try env.put("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+    try env.put("CLAUDE_CODE_TOTAL_TOKENS_REMINDER", "off");
+    try env.put("DISABLE_AUTO_COMPACT", "1");
+    try env.put("ENABLE_TOOL_SEARCH", "false");
+    try env.put("CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING", "1");
 }
 
 /// Claude's project directory name for `path`, or an error when the path is
@@ -452,11 +490,11 @@ fn stderrTail(arena: Allocator, path: []const u8) ![]const u8 {
 
 /// A private directory under the system temporary directory, removed with
 /// everything Claude wrote into it.
-const Scratch = struct {
+pub const Scratch = struct {
     path: []const u8,
     dir: std.Io.Dir,
 
-    fn create(arena: Allocator) !Scratch {
+    pub fn create(arena: Allocator) !Scratch {
         const io = io_mod.getIo();
         const base = std.mem.trimEnd(u8, io_mod.getenv("TMPDIR") orelse "/tmp", "/");
         var attempts: u8 = 0;
@@ -478,7 +516,7 @@ const Scratch = struct {
         try self.dir.writeFile(io_mod.getIo(), .{ .sub_path = name, .data = data, .flags = .{ .permissions = .fromMode(0o600) } });
     }
 
-    fn remove(self: *Scratch) void {
+    pub fn remove(self: *Scratch) void {
         const io = io_mod.getIo();
         self.dir.close(io);
         std.Io.Dir.cwd().deleteTree(io, self.path) catch |err| debug_trace.logf("gateway", "claude_scratch_remove_failed err={s}", .{@errorName(err)});
@@ -489,4 +527,5 @@ test {
     _ = @import("claude_executable.zig");
     _ = @import("claude_agent_wire.zig");
     _ = @import("claude_tool_stub.zig");
+    _ = @import("claude_login.zig");
 }

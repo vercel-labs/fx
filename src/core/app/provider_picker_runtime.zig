@@ -22,6 +22,10 @@ const list_window = @import("../shared/list_window.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_auth_runtime = @import("app_auth_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
+const provider_keys = @import("../auth/provider_keys.zig");
+const host_target = @import("../hosts/target.zig");
+const claude_login = @import("../../gateway/claude_login.zig");
+const claude_agent = @import("../../gateway/claude_agent.zig");
 
 const ProviderPickerStage = picker_state.ProviderPickerStage;
 const max_options = provider_picker_catalog.max_column_options;
@@ -97,7 +101,7 @@ pub fn Runtime(comptime App: type) type {
                         column.labels[i] = provider_picker_catalog.methodSlug(method);
                         const in_use = provider.eql(active_provider) and
                             if (active_source) |source| provider_picker_catalog.methodMatchesSource(method, source) else false;
-                        column.annotations[i] = if (in_use) "current" else "";
+                        column.annotations[i] = if (in_use) "current" else provider_picker_catalog.methodAnnotation(method);
                     }
                     count = methods.len;
                 },
@@ -290,12 +294,19 @@ pub fn Runtime(comptime App: type) type {
                     // A preset saves its own key or signs in with OpenRouter;
                     // the gateway's key inventory does not apply (D147).
                     if (provider == .configured) {
-                        if (method == .api_key or method == .claude_code) {
+                        if (method == .claude_code) {
+                            app.input_runtime.picker.clearProviderPickerFlow();
+                            app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                            try useClaudeCodeLogin(app, provider);
+                            app.shell.render_requests.request(.footer);
+                            return true;
+                        }
+                        if (method == .api_key or method == .claude_token) {
                             try openKeyStageFor(app, query.prefix, .api_key, method);
                             app.auth.openProviderKeyPickerInline(app.alloc, provider);
                             if (provider_registry.presetFor(provider.label())) |preset| {
                                 // Claude Code takes the token `claude setup-token` prints (D166).
-                                const body = if (method == .claude_code)
+                                const body = if (method == .claude_token)
                                     try app.alloc.print("Paste the Claude subscription token that `claude setup-token` prints. {s} then runs through Claude Code.", .{preset.name})
                                 else
                                     try app.alloc.print("Paste your {s} key. Get one at {s}.", .{ preset.name, preset.key_url });
@@ -396,6 +407,35 @@ pub fn Runtime(comptime App: type) type {
         /// runtime owns; the composer only carries the breadcrumb).
         fn openKeyStage(app: *App, prefix: []const u8, stage: ProviderPickerStage) !void {
             try openKeyStageFor(app, prefix, stage, .api_key);
+        }
+
+        /// The `claude-code` method: checks that the installed Claude Code
+        /// is signed in, forgets a saved token or key that would win over
+        /// its login, and selects the provider (D184). Anything else leaves
+        /// the provider as it was and says what to do.
+        fn useClaudeCodeLogin(app: *App, provider: model_provider.ProviderId) !void {
+            if (comptime host_target.is_wasm) return;
+            try app.writeDomainNotice(.{ .topic = "auth", .tone = .neutral, .body = "Checking Claude Code\u{2026}" }, true);
+            if (comptime @hasDecl(App, "flushBeforeBlockingExternalWork")) try app.flushBeforeBlockingExternalWork();
+            var status = try claude_login.check(app.alloc);
+            defer status.deinit(app.alloc);
+            const text = try claude_login.describe(app.alloc, status);
+            defer app.alloc.free(text);
+            if (status != .signed_in) {
+                try app.writeDomainNotice(.{ .topic = "auth", .tone = .@"error", .body = text }, true);
+                return;
+            }
+            _ = provider_keys.delete(app.alloc, provider.label()) catch {
+                try app.writeDomainNotice(.{ .topic = "auth", .tone = .@"error", .body = "Could not remove the saved Anthropic key, which would take precedence over the Claude Code login." }, true);
+                return;
+            };
+            const body = if (claude_agent.environmentOverride()) |name|
+                try app.alloc.print("{s} {s} is set in the environment and still takes precedence; unset it to use this login.", .{ text, name })
+            else
+                try app.alloc.dupe(u8, text);
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{ .topic = "auth", .tone = .neutral, .body = body }, true);
+            try app_auth_runtime.Runtime(App).selectConfiguredProvider(app, provider.label());
         }
 
         fn openKeyStageFor(app: *App, prefix: []const u8, stage: ProviderPickerStage, method: provider_picker_catalog.Method) !void {

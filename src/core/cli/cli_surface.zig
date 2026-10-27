@@ -830,6 +830,12 @@ fn activateProviderSelection(
     };
 }
 
+fn hasSavedProviderKey(alloc: Allocator, id: []const u8) !bool {
+    const key = provider_keys.load(alloc, id) catch return false;
+    if (key) |value| secret.zeroAndFree(alloc, value);
+    return key != null;
+}
+
 fn runProviderLogin(alloc: Allocator, cfg: Config, provider: model_provider.ProviderId) !void {
     switch (provider) {
         .gateway => try login_flow.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
@@ -1166,7 +1172,11 @@ fn runNonInteractiveWithDeps(
                 .gateway => "Signed in to Vercel.\nAI Gateway access may still require billing or API setup for the selected account.\n",
                 .codex => "Signed in with Codex.\n",
                 .grok => "Signed in with Grok.\n",
-                .configured => "Saved the key to the profile.\n",
+                .configured => if (try hasSavedProviderKey(alloc, login_provider.label()))
+                    "Saved the key to the profile.\n"
+                else
+                    // anthropic kept the installed Claude Code's login (D184).
+                    "Using your Claude Code login.\n",
             });
             return .handled_success;
         },

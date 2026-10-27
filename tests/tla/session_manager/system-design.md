@@ -2166,9 +2166,9 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   setup-token`) runs Claude Code with `CLAUDE_CODE_OAUTH_TOKEN`, any other
   key runs Messages with `x-api-key`. Without a saved key,
   `CLAUDE_CODE_OAUTH_TOKEN` selects Claude Code and `ANTHROPIC_API_KEY`
-  selects Messages; with neither, Claude Code runs on whatever its
-  environment carries. `/login anthropic` offers `claude-code` and
-  `api-key`. **Why:** one key file entry and no hidden mode flag; the key
+  selects Messages; with neither, Claude Code runs on the user's own
+  Claude Code login (D184). `/login anthropic` offers `claude-code`,
+  `claude-token` and `api-key`. **Why:** one key file entry and no hidden mode flag; the key
   says what it is. **Alternative:** a stored mode beside the key, which
   can disagree with it.
 
@@ -2201,7 +2201,8 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   credential. **Why:** proto's defaults. **Alternative:** the gateway's
   title model, which this provider cannot reach.
 
-- **D169 Decision:** a run never touches the user's `~/.claude`. Each one
+- **D169 Decision:** a run never writes to the user's `~/.claude`, apart
+  from Claude Code refreshing an expired login (D184). Each one
   gets a private temporary directory as `CLAUDE_CONFIG_DIR`, holding the
   transcript, system prompt, tool list and stderr, and removed on every
   exit path. Variables that would nest Claude Code or move it to another
@@ -2381,6 +2382,28 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   workspace's rules. **Why:** a rule set the person did not write must
   not change unrelated tests. **Alternative:** project `.fx.json` keys,
   which may hold only repo-safe defaults.
+
+- **D184 Decision:** with no saved token or key, the `anthropic`
+  provider's Claude Code mode runs on the login of the user's installed
+  Claude Code, with nothing to paste. `CLAUDE_CONFIG_DIR` still points at
+  the run's private directory, so transcripts, `.claude.json` and plugin
+  state land there, and `CLAUDE_SECURESTORAGE_CONFIG_DIR` names the
+  directory the user signed in with (their own `CLAUDE_CONFIG_DIR`, or
+  empty for `~/.claude`), which is where Claude Code looks up its keychain
+  entry or `.credentials.json`. The setting sources stay empty, MCP stays
+  strict and built-in tools stay off, so the user's settings, hooks,
+  plugins and CLAUDE.md never reach the request. The one write outside the
+  private directory is Claude Code refreshing an expired login in that
+  same store, as any Claude Code run would; skipping it would strand the
+  rotated refresh token. `/login anthropic` offers `claude-code` first and
+  runs `claude auth status --json` under the same isolation: signed in, it
+  forgets any saved token or key, which would win, and selects the
+  provider; otherwise it says how to install or sign in, or to paste a
+  `claude setup-token` token (`claude-token`) or an API key. **Why:**
+  proto's Agent SDK path signs in once; asking subscribers for a token
+  their Claude Code already holds is friction. **Alternative:** reading
+  the keychain entry ourselves and passing its access token, which skips
+  Claude Code's refresh and breaks once the token expires.
 
 ## Design Risks And Failure Behavior
 

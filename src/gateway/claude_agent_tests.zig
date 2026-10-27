@@ -289,3 +289,39 @@ test "the claude command line runs one tool-less turn with the stub and the sess
     try std.testing.expectEqualStrings("-private-tmp-a-b", try agent.projectDirName(arena, "/private/tmp/a.b"));
     try std.testing.expectError(error.PathTooLong, agent.projectDirName(arena, &@as([201]u8, @splat('a'))));
 }
+
+test "Claude Code keeps the user's login unless a token is given, and writes only to its own directory" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var plain: std.process.Environ.Map = .init(arena);
+    try plain.put("CLAUDECODE", "1");
+    try plain.put("ANTHROPIC_API_KEY", "");
+    try agent.isolateEnvironment(arena, &plain, "/tmp/s/config", null);
+    try std.testing.expectEqualStrings("/tmp/s/config", plain.get("CLAUDE_CONFIG_DIR").?);
+    // Empty: the keychain entry and credentials of the default ~/.claude.
+    try std.testing.expectEqualStrings("", plain.get(agent.secure_storage_env).?);
+    try std.testing.expect(plain.get("ANTHROPIC_API_KEY") == null);
+    try std.testing.expect(plain.get("CLAUDECODE") == null);
+    try std.testing.expect(plain.get("CLAUDE_CODE_OAUTH_TOKEN") == null);
+
+    var own_dir: std.process.Environ.Map = .init(arena);
+    try own_dir.put("CLAUDE_CONFIG_DIR", "/Users/example/.claude-work");
+    try agent.isolateEnvironment(arena, &own_dir, "/tmp/s/config", null);
+    try std.testing.expectEqualStrings("/Users/example/.claude-work", own_dir.get(agent.secure_storage_env).?);
+    try std.testing.expectEqualStrings("/tmp/s/config", own_dir.get("CLAUDE_CONFIG_DIR").?);
+
+    var explicit: std.process.Environ.Map = .init(arena);
+    try explicit.put(agent.secure_storage_env, "/Users/example/secure");
+    try explicit.put("CLAUDE_CONFIG_DIR", "/Users/example/other");
+    try agent.isolateEnvironment(arena, &explicit, "/tmp/s/config", null);
+    try std.testing.expectEqualStrings("/Users/example/secure", explicit.get(agent.secure_storage_env).?);
+
+    var token: std.process.Environ.Map = .init(arena);
+    try token.put("ANTHROPIC_API_KEY", "sk-ant-api03-x");
+    try agent.isolateEnvironment(arena, &token, "/tmp/s/config", "sk-ant-oat01-abc");
+    try std.testing.expectEqualStrings("sk-ant-oat01-abc", token.get("CLAUDE_CODE_OAUTH_TOKEN").?);
+    try std.testing.expect(token.get("ANTHROPIC_API_KEY") == null);
+    try std.testing.expect(token.get(agent.secure_storage_env) == null);
+}
