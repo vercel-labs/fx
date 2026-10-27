@@ -464,7 +464,10 @@ pub fn Runtime(comptime App: type) type {
                 remote.reconnect_notice = true;
                 return;
             }
-            if (remote.current_id.len == 0) remote.current_id = try app.alloc.dupe(u8, value.session_id);
+            if (remote.current_id.len == 0) {
+                remote.current_id = try app.alloc.dupe(u8, value.session_id);
+                try Backend.applyPendingProvider(app);
+            }
             const loading_history = value.history_sequence != null;
             if (value.history_sequence) |checkpoint| {
                 // The saved transcript arrives in pages, newest first. Keep
@@ -877,4 +880,40 @@ test "host command results render from their typed fields" {
     try std.testing.expect(std.mem.find(u8, shown, "\x1b[31m.md") == null);
     try std.testing.expect(std.mem.find(u8, shown, "context: 500 / 1000 tokens (50%)") != null);
     try std.testing.expect(std.mem.find(u8, shown, "The session is busy") != null);
+}
+
+const LoginTestApp = struct {
+    alloc: Allocator = std.testing.allocator,
+    remote: remote_runtime.State = .{},
+    workspace_root: []const u8 = "/Users/example/project",
+    notices: usize = 0,
+
+    pub fn writeDomainNotice(self: *@This(), _: types.SemanticNotice, _: bool) !void {
+        self.notices += 1;
+    }
+};
+
+test "a provider chosen by /login before a session is open opens one and applies once it is" {
+    var app: LoginTestApp = .{};
+    defer app.remote.deinit(app.alloc);
+    app.remote.allocator = app.alloc;
+    const Backend = remote_backend.Runtime(LoginTestApp);
+    try Backend.selectProvider(&app, "openrouter");
+    try std.testing.expectEqualStrings("openrouter", app.remote.pending_provider.?);
+    try std.testing.expectEqual(@as(usize, 1), app.remote.queue.items.len);
+    try std.testing.expectEqual(remote_runtime.Kind.startup, app.remote.queue.items[0].kind);
+    // A second choice while the session opens replaces the first and opens
+    // no second session.
+    app.remote.sent = app.remote.queue;
+    app.remote.queue = .empty;
+    try Backend.selectProvider(&app, "opencode-zen");
+    try std.testing.expectEqual(@as(usize, 0), app.remote.queue.items.len);
+    try std.testing.expectEqualStrings("opencode-zen", app.remote.pending_provider.?);
+
+    app.remote.current_id = try app.alloc.dupe(u8, "fresh");
+    try Backend.applyPendingProvider(&app);
+    try std.testing.expect(app.remote.pending_provider == null);
+    try std.testing.expectEqual(@as(usize, 1), app.remote.queue.items.len);
+    try std.testing.expectEqual(remote_runtime.Kind.config, app.remote.queue.items[0].kind);
+    try std.testing.expect(std.mem.find(u8, app.remote.queue.items[0].json, "opencode-zen") != null);
 }

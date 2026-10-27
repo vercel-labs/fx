@@ -218,8 +218,13 @@ pub const State = struct {
     pending_permission_session: []u8 = &.{},
     permission_response_queued: bool = false,
     submitted_text: std.ArrayList([]u8) = .empty,
+    /// A provider `/login` chose while no session was open; the session
+    /// that opens next switches to it (D215).
+    pending_provider: ?[]u8 = null,
 
     pub fn deinit(self: *State, alloc: Allocator) void {
+        if (self.pending_provider) |provider| alloc.free(provider);
+        self.pending_provider = null;
         if (self.connection) |connection| connection.stop();
         if (self.pending_notice) |notice| alloc.free(notice);
         self.pending_notice = null;
@@ -395,7 +400,7 @@ pub const State = struct {
     }
 
     /// Whether a request of `kind` for the current view is queued or sent.
-    fn inFlight(self: *const State, kind: Kind) bool {
+    pub fn inFlight(self: *const State, kind: Kind) bool {
         for ([_][]const Request{ self.queue.items, self.sent.items }) |list| {
             for (list) |request| if (request.kind == kind and request.generation == self.generation) return true;
         }

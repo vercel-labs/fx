@@ -469,7 +469,29 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Switches the attached root session to `provider` after a login.
+        /// With no session open, as when the profile's provider had no
+        /// credential at startup, it opens one and switches it once it is
+        /// open (D215).
         pub fn selectProvider(app: *App, provider: []const u8) !void {
+            if (root(app).root_id.len > 0) return setOption(app, root(app), "provider", provider);
+            const owned = try app.alloc.dupe(u8, provider);
+            if (app.remote.pending_provider) |previous| app.alloc.free(previous);
+            app.remote.pending_provider = owned;
+            if (!app.remote.inFlight(.startup)) {
+                try app.remote.enqueue(.startup, .{ .create = .{ .cwd = app.workspace_root } });
+            }
+            const body = try app.alloc.print("Opening a session with {s}.", .{provider});
+            defer app.alloc.free(body);
+            try notice(app, "session", body);
+        }
+
+        /// Applies the provider `/login` chose before a session was open, now
+        /// that one is.
+        pub fn applyPendingProvider(app: *App) !void {
+            const provider = app.remote.pending_provider orelse return;
+            if (root(app).root_id.len == 0) return;
+            app.remote.pending_provider = null;
+            defer app.alloc.free(provider);
             try setOption(app, root(app), "provider", provider);
         }
 

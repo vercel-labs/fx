@@ -2590,6 +2590,16 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   exited. **Alternative:** a double fork, which needs a second process
   only to be reparented.
 
+- **D215 Decision:** when `/login` picks a provider while the terminal has
+  no session open, as when the profile's provider had no credential at
+  startup and the session could not open, the terminal keeps the choice,
+  asks the supervisor to open a session unless one is already opening,
+  and switches that session to the provider once it is open. A later
+  choice replaces an earlier one. **Why:** `/login` said "Open a session
+  before changing its configuration", which no command could do.
+  **Alternative:** opening the session with the provider named in the
+  create request, which the supervisor protocol does not carry.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a
