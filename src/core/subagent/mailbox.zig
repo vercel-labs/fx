@@ -533,7 +533,7 @@ fn post(root: *Runtime, arena: Allocator, session: *session_adapter.Session, nod
 }
 
 /// Writes `how` for each of `ids` that still waits in `session`'s mailbox.
-fn finishMail(root: *Runtime, arena: Allocator, session: *session_adapter.Session, ids: []const []const u8, how: @import("session_manager").MailEnd) void {
+fn finishMail(root: *Runtime, arena: Allocator, session: *session_adapter.Session, ids: []const []const u8, how: session_adapter.MailEnd) void {
     const b = bus(root);
     b.lock();
     defer b.unlock();

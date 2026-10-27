@@ -128,6 +128,7 @@ pub const QueuedWork = struct { work_id: []u8, data: ?[]u8 };
 pub const Mail = sm.fold_mail.Mail;
 pub const max_mailbox = sm.fold_mail.max_mailbox;
 pub const max_mail_body_bytes = sm.fold_mail.max_body_bytes;
+pub const MailEnd = sm.MailEnd;
 
 /// A line of a node's mailbox: a message in, or one out.
 pub const MailLine = union(enum) {
