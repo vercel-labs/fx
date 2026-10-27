@@ -3407,6 +3407,26 @@ fn finishPendingCancelledCalls(
     calls: []const ToolCall,
     advertised_dynamic_tool_names: []const []const u8,
 ) !void {
+    return finishPendingStoppedCalls(deps, provisional_statuses, provisional_alloc, arena, config, turn_id, calls, advertised_dynamic_tool_names, "Cancelled");
+}
+
+/// The label a stopped call's row starts with: a stream rule's interrupt
+/// restarts the response, so it is not shown as the person's cancel.
+fn stoppedLabel(rules: *const runtime_stream_rules.TurnRules) []const u8 {
+    return if (runtime_stream_rules.interrupted(rules)) types.rule_stopped_tool_status_label else "Cancelled";
+}
+
+fn finishPendingStoppedCalls(
+    deps: *const AgentRuntimeDeps,
+    provisional_statuses: *runtime_tool_presentation.ProvisionalToolStatuses,
+    provisional_alloc: Allocator,
+    arena: Allocator,
+    config: Config,
+    turn_id: u64,
+    calls: []const ToolCall,
+    advertised_dynamic_tool_names: []const []const u8,
+    label: []const u8,
+) !void {
     for (calls) |call| {
         if (providerExecutedResult(call)) |execution| {
             const prepared = try runtime_execution_memory.prepareToolExecutionOutput(arena, config, call, execution, null);
@@ -3434,7 +3454,7 @@ fn finishPendingCancelledCalls(
             call,
             false,
             null,
-            "Cancelled",
+            label,
             advertised_dynamic_tool_names,
         );
     }
@@ -8212,11 +8232,12 @@ fn processQueuedPromptLoop(
                         recovery_strategy != null or auto_retry_status_published,
                     );
                     pending_auto_retry_status = null;
-                    try stream_ctx.provisional_statuses.finishTrackedCancelled(
+                    try stream_ctx.provisional_statuses.finishTrackedStopped(
                         deps,
                         stream_ctx.alloc,
                         arena,
                         turn_id,
+                        stoppedLabel(&stream_rules),
                     );
                     const interruption_source = stream_ctx.interruption_source_or("");
                     try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
@@ -8868,7 +8889,7 @@ fn processQueuedPromptLoop(
             if (config.cancel_flag.load(.seq_cst)) {
                 runtime_telemetry.traceCancelObserved(step_ctx, false);
                 try clearAutoRetryStatusIfNeeded(deps, recovery_strategy != null);
-                try finishPendingCancelledCalls(
+                try finishPendingStoppedCalls(
                     deps,
                     &stream_ctx.provisional_statuses,
                     stream_ctx.alloc,
@@ -8877,6 +8898,7 @@ fn processQueuedPromptLoop(
                     turn_id,
                     attempt_completion.tool_calls,
                     advertised_dynamic_tool_names,
+                    stoppedLabel(&stream_rules),
                 );
                 const interruption_source = stream_ctx.interruption_source_or(
                     attempt_completion.content orelse "",
@@ -9742,7 +9764,7 @@ fn processQueuedPromptLoop(
         if (disposition == .completed and completion.tool_calls.len > 0 and
             runtime_stream_rules.settleToolCalls(&stream_rules, completion.tool_calls))
         {
-            try finishPendingCancelledCalls(
+            try finishPendingStoppedCalls(
                 deps,
                 &stream_ctx.provisional_statuses,
                 stream_ctx.alloc,
@@ -9751,6 +9773,7 @@ fn processQueuedPromptLoop(
                 turn_id,
                 completion.tool_calls,
                 advertised_dynamic_tool_names,
+                stoppedLabel(&stream_rules),
             );
             try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
             if (try runtime_stream_rules.retryAfterInterrupt(&stream_rules, arena, config.cancel_flag, &within_turn_suffix, partial_assistant)) continue :agent_steps_loop;

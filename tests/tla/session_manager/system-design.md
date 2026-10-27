@@ -2933,6 +2933,17 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   proto's plain index step, which can switch to an identical model and
   level.
 
+- **D266 Decision:** a tool call a stream rule stops before it runs is
+  settled as "Stopped by a rule: <target>" instead of "Cancelled", and
+  its row does not ask "What should change?", because the response
+  restarts with the rule (D176) and the person has nothing to answer.
+  The outcome stays `cancelled` on the wire, so ACP clients and detached
+  frontends see the same terminal state as before; only the summary
+  text, which already crosses the wire, changes. **Why:** the
+  integration pass showed a rule's interrupt rendered as the person's
+  cancel with a prompt for feedback. **Alternative:** a new outcome kind,
+  which every frontend and the supervisor protocol would need to learn.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

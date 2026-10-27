@@ -436,6 +436,18 @@ pub const ProvisionalToolStatuses = struct {
         arena: Allocator,
         turn_id: u64,
     ) !void {
+        return self.finishTrackedStopped(hooks, alloc, arena, turn_id, "Cancelled");
+    }
+
+    /// `finishTrackedCancelled` with the label each summary starts with.
+    pub fn finishTrackedStopped(
+        self: *ProvisionalToolStatuses,
+        hooks: *const AgentRuntimeDeps,
+        alloc: Allocator,
+        arena: Allocator,
+        turn_id: u64,
+        label: []const u8,
+    ) !void {
         while (self.tracked.items.len > 0) {
             const status = &self.tracked.items[self.tracked.items.len - 1];
             if (self.hasTerminal(status.id)) {
@@ -455,7 +467,7 @@ pub const ProvisionalToolStatuses = struct {
                 detail,
                 diff.max_encoded_label_bytes,
             );
-            const summary = try arena.print("Cancelled {s}", .{encoded.bytes});
+            const summary = try arena.print("{s} {s}", .{ label, encoded.bytes });
             try hooks.push_tool_lifecycle(hooks.ctx, .{ .terminal = .{
                 .id = .{ .turn_id = turn_id, .call_id = status.id },
                 .outcome = .{ .kind = .cancelled, .summary = summary },
@@ -1063,7 +1075,7 @@ fn finishDeniedToolStatusInternal(
         .terminal = .{
             .id = .{ .turn_id = turn_id, .call_id = call.id },
             .outcome = .{
-                .kind = if (std.mem.eql(u8, label, "Cancelled"))
+                .kind = if (std.mem.eql(u8, label, "Cancelled") or std.mem.eql(u8, label, types.rule_stopped_tool_status_label))
                     .cancelled
                 else if (std.mem.eql(u8, label, "Failed"))
                     .failed
@@ -2201,6 +2213,29 @@ test "provisional non-skill labels retain hints regardless of completed argument
         try std.testing.expectEqualStrings("● Reading\x1b[0m \x1b[38;5;245moriginal.txt\x1b[0m", capture.events.items[1].progress.text);
         try std.testing.expectEqualStrings("original.txt", statuses.tracked.items[0].label_value.?);
     }
+}
+
+test "a call a stream rule stopped is labeled as the rule's stop" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    var statuses = ProvisionalToolStatuses{};
+    defer statuses.deinit(alloc);
+
+    try statuses.publish(&hooks, alloc, 9, "read_1", "read_file", .read, "Reading", "save.py", null);
+    try statuses.finishTrackedStopped(&hooks, alloc, arena, 9, types.rule_stopped_tool_status_label);
+    var terminal_count: usize = 0;
+    for (capture.events.items) |event| {
+        if (event != .terminal) continue;
+        terminal_count += 1;
+        try std.testing.expectEqual(types.ToolOutcomeKind.cancelled, event.terminal.outcome.kind);
+        try std.testing.expectEqualStrings("Stopped by a rule: save.py", event.terminal.outcome.summary);
+    }
+    try std.testing.expectEqual(@as(usize, 1), terminal_count);
 }
 
 test "tracked provisional cancellation retains labels without exposing registered names" {

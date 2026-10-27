@@ -643,7 +643,9 @@ fn lifecycleTerminalLine(
     const cancelled = kind == .cancelled;
     const text_style = if (cancelled) ui_render.hint_style else "";
     const text_reset = if (cancelled) ui_render.reset_style else "";
-    const follow_up = if (cancelled) tool_group_projection.cancellation_follow_up else "";
+    // A stream rule's stop restarts the response; nothing is asked.
+    const by_rule = std.mem.startsWith(u8, summary[prefix_end..], types.rule_stopped_tool_status_label);
+    const follow_up = if (cancelled and !by_rule) tool_group_projection.cancellation_follow_up else "";
     const normalized = if (has_marker)
         try alloc.print(
             "{s}{s}{s}{s}{s}{s}{s}{s}",
@@ -2497,6 +2499,17 @@ test "full transcript opening waits for primary damage and remains cancellable" 
     committed.commit(0, 0, false);
     try std.testing.expect(runtime.requestFullTranscriptOpen());
     try std.testing.expect(runtime.full_transcript_open_request == null);
+}
+
+test "a rule-stopped call's row does not ask what should change" {
+    const alloc = std.testing.allocator;
+    const by_person = try lifecycleTerminalLine(alloc, .cancelled, "Cancelled save.py");
+    defer alloc.free(by_person);
+    try std.testing.expect(std.mem.find(u8, by_person, "What should change?") != null);
+    const by_rule = try lifecycleTerminalLine(alloc, .cancelled, "Stopped by a rule: save.py");
+    defer alloc.free(by_rule);
+    try std.testing.expect(std.mem.find(u8, by_rule, "What should change?") == null);
+    try std.testing.expect(std.mem.find(u8, by_rule, "Stopped by a rule: save.py") != null);
 }
 
 test "authoritative lifecycle detail is retained by its compact status entry" {

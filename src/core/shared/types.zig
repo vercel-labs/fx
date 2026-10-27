@@ -1357,6 +1357,9 @@ pub const TerminalActionPresentation = union(enum) {
 pub const deferred_tool_result_output = "Not executed";
 pub const context_deferred_tool_result_output = "Scoped project instructions were added before execution. Review them and reissue this tool call if it is still appropriate.";
 pub const context_deferred_tool_status_label = "Reading project instructions before continuing:";
+/// A call a stream rule stopped before it ran; the response restarts with
+/// the rule, so the transcript does not ask the person what to change.
+pub const rule_stopped_tool_status_label = "Stopped by a rule:";
 
 pub fn isContextDeferredToolResult(result: PersistedToolResult) bool {
     return result.status == .failure and
