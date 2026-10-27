@@ -23,17 +23,39 @@ const provider_set = @import("../gateway/provider_set.zig");
 
 const types = @import("../shared/types.zig");
 
-/// The next role in `cycle_order` whose model differs from the session's,
-/// with the thinking level the role names (D251).
+/// The next role in `cycle_order` whose model or thinking level differs
+/// from the session's, with the thinking level the role names (D251).
+/// As proto does, the cycle continues from the role it last picked while
+/// that role still names the session's model. A role without a level is
+/// effort-blind, except the default role, which returns to the startup
+/// level, so a deep role on the default model still cycles back (D265).
 pub const Step = struct { role: Role, model: []const u8, effort: ?types.ReasoningEffort = null };
+
+fn roleEffort(view: Host, role: Role, picked: Picked) ?types.ReasoningEffort {
+    if (picked.effort) |effort| return effort;
+    return if (role == .default) view.state.default_effort else null;
+}
+
+/// Unknown levels on either side compare equal.
+fn sameEffort(a: ?types.ReasoningEffort, b: ?types.ReasoningEffort) bool {
+    const left = a orelse return true;
+    const right = b orelse return true;
+    return std.mem.eql(u8, left.label(), right.label());
+}
 
 fn cycleStep(view: Host, backward: bool) ?Step {
     const order = view.state.table.cycleOrder();
     if (order.len == 0) return null;
     var start: usize = if (backward) 0 else order.len - 1;
-    for (order, 0..) |role, index| {
-        const model = view.resolve(role) orelse continue;
-        if (std.mem.eql(u8, model, view.current_model)) {
+    var current_effort = view.current_effort;
+    const last: ?usize = if (view.state.last_cycled) |role| std.mem.findScalar(Role, order, role) else null;
+    const resumed = if (last) |index| if (view.pick(order[index])) |picked| std.mem.eql(u8, picked.model, view.current_model) else false else false;
+    if (resumed) {
+        start = last.?;
+        current_effort = roleEffort(view, order[start], view.pick(order[start]).?);
+    } else for (order, 0..) |role, index| {
+        const picked = view.pick(role) orelse continue;
+        if (std.mem.eql(u8, picked.model, view.current_model) and sameEffort(roleEffort(view, role, picked), current_effort)) {
             start = index;
             break;
         }
@@ -42,8 +64,9 @@ fn cycleStep(view: Host, backward: bool) ?Step {
     while (offset <= order.len) : (offset += 1) {
         const index = if (backward) (start + order.len * 2 - offset) % order.len else (start + offset) % order.len;
         const picked = view.pick(order[index]) orelse continue;
-        if (std.mem.eql(u8, picked.model, view.current_model)) continue;
-        return .{ .role = order[index], .model = picked.model, .effort = picked.effort };
+        const effort = roleEffort(view, order[index], picked);
+        if (std.mem.eql(u8, picked.model, view.current_model) and sameEffort(effort, current_effort)) continue;
+        return .{ .role = order[index], .model = picked.model, .effort = effort };
     }
     return null;
 }
@@ -53,6 +76,11 @@ pub const State = struct {
     /// The profile's default model and the provider it belongs to; owned.
     default_provider: []u8 = &.{},
     default_model: []u8 = &.{},
+    /// The session's startup thinking level, which the default role
+    /// returns to when cycling (D265).
+    default_effort: ?types.ReasoningEffort = null,
+    /// The role Alt+P or `/role next` last switched to.
+    last_cycled: ?Role = null,
     /// Tables replaced while the app ran. Their bytes may still be borrowed.
     retired: std.ArrayList(model_roles.Table) = .empty,
     mutex: std.Io.Mutex = .init,
@@ -121,6 +149,8 @@ pub const Host = struct {
     provider: model_provider.ProviderId,
     /// The session's model; `@default` when the profile has none here.
     current_model: []const u8,
+    /// The session's thinking level; null matches roles on model alone.
+    current_effort: ?types.ReasoningEffort = null,
     set: provider_set.Set,
     /// The legacy `review_model` setting or FX_REVIEW_MODEL; empty for none.
     review_model: []const u8 = "",
@@ -245,6 +275,8 @@ pub fn host(app: anytype) Host {
         .state = @constCast(&app.model_roles),
         .provider = provider_runtime.provider(app),
         .current_model = view_model orelse provider_runtime.model(app),
+        // A detached frontend does not track the backend's level.
+        .current_effort = if (comptime @hasField(App, "effort")) if (view_model == null) app.effort else null else null,
         .set = app.providerSet(),
         .review_model = app.review_model,
         .known = if (comptime @hasField(App, "model_cache")) .{ .context = @ptrCast(@constCast(&app.model_cache)), .known_fn = knownInCache(@TypeOf(app.model_cache)) } else null,
@@ -357,6 +389,13 @@ pub fn Runtime(comptime App: type) type {
                 .fast_mode = app.fast_mode,
                 .ultrafast_mode = app.worker.agent_turn_settings.ultrafast_mode,
             });
+            app.model_roles.last_cycled = step.role;
+            // A detached session takes the level as its own option.
+            if (step.effort) |effort| if (comptime @hasField(App, "backend")) if (app.backend == .detached) {
+                const command = try app.alloc.print("/effort {s}", .{effort.label()});
+                defer app.alloc.free(command);
+                if (comptime @hasDecl(App, "handleCommand")) try app.handleCommand(command);
+            };
             const body = if (step.effort) |effort|
                 try app.alloc.print("{s} · {s} · {s}", .{ step.role.label(), model, effort.label() })
             else
@@ -444,6 +483,36 @@ test "cycling steps through roles with distinct models and tags list roles" {
     view.state = &lone;
     view.current_model = "main";
     try std.testing.expect(cycleStep(view, false) == null);
+}
+
+test "cycling reaches the default role when the deep role differs only in thinking level" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    try state.init(alloc, .{}, "gateway", "main");
+    state.default_effort = .auto;
+    try state.assign(alloc, .small, "fast");
+    try state.assign(alloc, .deep, "main:high");
+    var view: Host = .{ .state = &state, .provider = .gateway, .current_model = "main", .current_effort = .auto, .set = .{ .gateway = .{}, .codex = .{}, .grok = .{} } };
+    // Order: deep, default, small. The session starts on the default.
+    var step = cycleStep(view, false).?;
+    try std.testing.expectEqual(Role.small, step.role);
+    state.last_cycled = step.role;
+    view.current_model = "fast";
+    view.current_effort = null;
+    step = cycleStep(view, false).?;
+    try std.testing.expectEqual(Role.deep, step.role);
+    try std.testing.expectEqualStrings("high", step.effort.?.label());
+    state.last_cycled = step.role;
+    view.current_model = "main";
+    view.current_effort = types.ReasoningEffort.literal("high");
+    step = cycleStep(view, false).?;
+    try std.testing.expectEqual(Role.default, step.role);
+    try std.testing.expectEqualStrings("auto", step.effort.?.label());
+    // A detached frontend knows no level; the last role still places it.
+    view.current_effort = null;
+    try std.testing.expectEqual(Role.default, cycleStep(view, false).?.role);
+    try std.testing.expectEqual(Role.small, cycleStep(view, true).?.role);
 }
 
 test "review falls back to the legacy gateway setting and titles to the bundle" {

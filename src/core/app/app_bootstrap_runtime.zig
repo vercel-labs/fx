@@ -560,6 +560,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "model_roles")) {
                 var startup_provider = startup.provider;
                 try app.model_roles.init(app.alloc, startup.takeModelRoles(), startup_provider.label(), startup.configured_model);
+                app.model_roles.default_effort = startup.effort;
             }
             app.shell.setCommandOutputRenderPolicy(
                 app_render_runtime.Runtime(App).shellStyles(),

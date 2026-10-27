@@ -2920,6 +2920,19 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   tried in a live session. **Alternative:** judging with the profile's
   model only, which tests a different model than the session uses.
 
+- **D265 Decision:** Alt+P and `/role next` continue from the role they
+  last picked while that role still names the session's model, as
+  proto's `getLastModelChangeRole` does, and skip a role only when it
+  would change neither the model nor the thinking level. The default
+  role carries the session's startup level, so a deep role on the default
+  model (`cento/claude-cento:high`) cycles back to the default instead of
+  being taken for it. A detached frontend sends the role's level to the
+  host as the session's effort option after the model. **Why:** the
+  integration pass found Deep then Default unreachable and the deep
+  level dropped when the session ran on the supervisor. **Alternative:**
+  proto's plain index step, which can switch to an identical model and
+  level.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a
