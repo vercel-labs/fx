@@ -153,7 +153,7 @@ const fleet_properties = [_]model_tool_schema.Property{
     .{ .name = "peek", .json_type = .boolean, .description = "inbox only: read waiting messages without taking them." },
     .{ .name = "label", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = 48 }, .description = "spawn: the worker's display label. run: the named worker the turn runs on." },
     .{ .name = "instructions", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_instructions_bytes }, .description = "spawn only. The worker's own system overlay. Cannot replace fx's trusted base prompt or widen authority." },
-    .{ .name = "model", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_model_bytes }, .description = "run, spawn: the worker's model as a catalog ID, or @role such as @worker or @smol for the model the user assigned to that role. Inherits the parent's model when omitted; rejected for an existing worker." },
+    .{ .name = "model", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_model_bytes }, .description = "run, spawn: the worker's model as a catalog ID, or @role such as @worker or @small for the model the user assigned to that role. Inherits the parent's model when omitted; rejected for an existing worker." },
     .{ .name = "effort", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = types.ReasoningEffort.max_name_bytes }, .description = "run, spawn: the worker's reasoning effort. Inherits the parent's effort when omitted; rejected for an existing worker." },
     .{ .name = "schema", .json_type = .object, .description = "run, spawn: a JSON Schema the turn's final reply must match, as one JSON value." },
 };
@@ -1034,7 +1034,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "6a2a646eebb3b30a6856661567c62fd39b9f9f5ce4888b709b2c8890825bd961",
+        "0029d2e584f5a33d63f3983d59d23a0189415684c6cc7f34316ba9eef9ece2ce",
         &actual_hex,
     );
 }
