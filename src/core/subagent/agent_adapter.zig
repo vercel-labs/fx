@@ -198,7 +198,9 @@ pub fn run(
             admission.effort.label(),
         },
     );
-    if (!routed_config.tool_context.provider_capabilities.fx_search) {
+    // A bank-backed local search runs for any provider; only native
+    // provider search depends on the child's provider.
+    if (!routed_config.tool_context.provider_capabilities.fx_search and !routed_config.tool_context.web_search_runtime_ready) {
         routed_config.tool_context.web_search_backend = null;
         routed_config.tool_context.web_search_runtime_ready = false;
     }

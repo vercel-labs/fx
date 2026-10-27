@@ -582,7 +582,7 @@ const App = struct {
     agent_step_limit: usize = default_max_agent_steps,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{
-        .provider = if (host_profile.web_search) builtin_providers.native.gateway.fx_search else null,
+        .provider = if (host_profile.web_search) builtin_providers.native.webSearchProvider() else null,
     }),
     web_search_models_path: []const u8 = builtin_gateway.models_path,
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
@@ -2007,6 +2007,7 @@ const App = struct {
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
             .subagent_available = self.session_persistence.subagent_host != null,
+            .web_search = AgentAppRuntime.webSearchExposure(self, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl()),
         });
     }
 
@@ -5126,6 +5127,10 @@ test {
     _ = @import("core/tooling/web_fetch_runtime.zig");
     _ = @import("core/tooling/web_search_policy.zig");
     _ = @import("core/tooling/web_search_runtime.zig");
+    _ = @import("core/tooling/web_search_bank.zig");
+    _ = @import("builtins/web_search_bank.zig");
+    _ = @import("core/cli/cli_search.zig");
+    _ = @import("core/output/web_search_snapshot.zig");
     _ = @import("gateway/web_search.zig");
     _ = @import("gateway/web_search_types.zig");
     _ = @import("tools/web/content.zig");

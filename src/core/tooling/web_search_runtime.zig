@@ -16,6 +16,9 @@ else
 
 const Allocator = std.mem.Allocator;
 
+/// Upper bound on a model- or CLI-requested result count.
+pub const max_requested_results: u8 = 20;
+
 pub const ClockFn = *const fn (*anyopaque) i64;
 
 var default_clock_context: u8 = 0;
@@ -50,6 +53,9 @@ const OwnedInputs = struct {
     worker_model: []u8,
     gateway_retry_count: usize,
     gateway_chat_url: []u8,
+    account_id: ?[]u8 = null,
+    anthropic_base_url: ?[]u8 = null,
+    anthropic_bearer: bool = false,
     // The usage pointer and allocator borrow the parent session's lifetime.
 
     fn deinit(self: *OwnedInputs, alloc: Allocator) void {
@@ -57,6 +63,8 @@ const OwnedInputs = struct {
         if (self.gateway_team) |team| alloc.free(team);
         alloc.free(self.worker_model);
         alloc.free(self.gateway_chat_url);
+        if (self.account_id) |value| alloc.free(value);
+        if (self.anthropic_base_url) |value| alloc.free(value);
         self.* = undefined;
     }
 
@@ -68,6 +76,9 @@ const OwnedInputs = struct {
             .worker_model = self.worker_model,
             .gateway_retry_count = self.gateway_retry_count,
             .gateway_chat_url = self.gateway_chat_url,
+            .account_id = self.account_id,
+            .anthropic_base_url = self.anthropic_base_url,
+            .anthropic_bearer = self.anthropic_bearer,
         };
     }
 };
@@ -84,6 +95,9 @@ pub const Runtime = struct {
     worker_model: []const u8,
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
+    account_id: ?[]const u8 = null,
+    anthropic_base_url: ?[]const u8 = null,
+    anthropic_bearer: bool = false,
     config_mutex: std.Io.Mutex = .init,
     fallback_cancel_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
@@ -112,6 +126,15 @@ pub const Runtime = struct {
         self.worker_model = inputs.worker_model;
         self.gateway_retry_count = inputs.gateway_retry_count;
         self.gateway_chat_url = inputs.gateway_chat_url;
+        self.account_id = inputs.account_id;
+        self.anthropic_base_url = inputs.anthropic_base_url;
+        self.anthropic_bearer = inputs.anthropic_bearer;
+    }
+
+    /// Whether a local search with `inputs` would reach a backend.
+    pub fn available(self: *const Runtime, alloc: Allocator, inputs: Inputs) bool {
+        const provider = self.provider orelse return false;
+        return provider.available(alloc, inputs);
     }
 
     pub fn dispatchBackend(self: *Runtime) tool_dispatch.WebSearchBackend {
@@ -165,10 +188,11 @@ pub const Runtime = struct {
             .allowed_domains = input.allowed_domains,
             .blocked_domains = input.blocked_domains,
             .max_uses = self.policy.max_uses,
-            .max_results = self.policy.max_results,
+            .max_results = if (input.limit) |limit| @max(1, @min(limit, max_requested_results)) else self.policy.max_results,
             .max_output_tokens = self.policy.max_output_tokens,
             .max_output_chars = self.policy.max_output_chars,
             .timeout_ms = self.policy.timeout_ms,
+            .recency = input.recency,
             .cancel_flag = cancel_flag,
         };
 
@@ -201,6 +225,7 @@ pub const Runtime = struct {
                 .incomplete = hasTerminalIncomplete(results),
                 .duration_ms = duration_ms,
                 .web_search_requests = web_search_requests,
+                .answered_by = response.answered_by,
             },
             .inner_usage = usage,
         };
@@ -216,7 +241,14 @@ pub const Runtime = struct {
         const worker_model = try alloc.dupe(u8, self.worker_model);
         errdefer alloc.free(worker_model);
         const gateway_chat_url = try alloc.dupe(u8, self.gateway_chat_url);
+        errdefer alloc.free(gateway_chat_url);
+        const account_id = if (self.account_id) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (account_id) |value| alloc.free(value);
+        const anthropic_base_url = if (self.anthropic_base_url) |value| try alloc.dupe(u8, value) else null;
         return .{
+            .account_id = account_id,
+            .anthropic_base_url = anthropic_base_url,
+            .anthropic_bearer = self.anthropic_bearer,
             .api_key = api_key,
             .credential_source = self.credential_source,
             .gateway_team = gateway_team,

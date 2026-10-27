@@ -31,10 +31,25 @@ pub const BackendCapabilities = struct {
     result_bounds: BackendFeatureMode = .unsupported,
 };
 
+/// How recent results must be. Providers without a native filter ignore it.
+pub const Recency = enum {
+    day,
+    week,
+    month,
+    year,
+
+    pub fn parse(value: []const u8) ?Recency {
+        return std.meta.stringToEnum(Recency, value);
+    }
+};
+
 pub const Request = struct {
     query: []const u8,
     allowed_domains: ?[]const []const u8 = null,
     blocked_domains: ?[]const []const u8 = null,
+    recency: ?Recency = null,
+    /// Requested result count; null keeps the policy's `max_results`.
+    limit: ?u8 = null,
 };
 
 pub const ProviderRequest = struct {
@@ -47,6 +62,7 @@ pub const ProviderRequest = struct {
     max_output_tokens: u32 = 4096,
     max_output_chars: usize = 100_000,
     timeout_ms: u32 = 30_000,
+    recency: ?Recency = null,
     cancel_flag: *const std.atomic.Value(bool),
 };
 
@@ -63,10 +79,16 @@ pub const ProgressFn = *const fn (*anyopaque, Progress) void;
 pub const Source = struct {
     title: []const u8,
     url: []const u8,
+    /// Owned when nonempty; the empty default is static.
+    snippet: []const u8 = "",
+    /// Publication date or age as the provider reported it. Owned when nonempty.
+    date: []const u8 = "",
 
     pub fn deinit(self: Source, alloc: Allocator) void {
         alloc.free(self.title);
         alloc.free(self.url);
+        if (self.snippet.len > 0) alloc.free(self.snippet);
+        if (self.date.len > 0) alloc.free(self.date);
     }
 };
 
@@ -112,6 +134,8 @@ pub const ProviderResponse = struct {
     content: []const ResultItem = &.{},
     stop_reason: ?[]const u8 = null,
     usage: ?types.ToolUsage = null,
+    /// Static id of the search provider that answered; empty when unknown.
+    answered_by: []const u8 = "",
 
     pub fn takeContent(self: *ProviderResponse) []const ResultItem {
         const content = self.content;
@@ -126,6 +150,16 @@ pub const ProviderResponse = struct {
     }
 };
 
+/// Number of sources across the search blocks in `items`.
+pub fn sourceCount(items: []const ResultItem) usize {
+    var count: usize = 0;
+    for (items) |item| switch (item) {
+        .search => |search| count += search.content.len,
+        else => {},
+    };
+    return count;
+}
+
 /// Search output with a borrowed query and owned result allocations. The
 /// caller must call `deinit` with the allocator that received the output.
 pub const Output = struct {
@@ -134,6 +168,8 @@ pub const Output = struct {
     incomplete: bool = false,
     duration_ms: u64,
     web_search_requests: u32,
+    /// Static id of the search provider that answered; empty when unknown.
+    answered_by: []const u8 = "",
 
     pub fn deinit(self: *Output, alloc: Allocator) void {
         deinitItems(alloc, self.results);

@@ -11,6 +11,7 @@ const anthropic_messages = @import("../gateway/anthropic_messages.zig");
 const openai_responses = @import("../gateway/openai_responses.zig");
 const routed_provider = @import("../gateway/routed_provider.zig");
 const configured_provider = @import("../core/config/configured_provider.zig");
+const web_search_bank = @import("web_search_bank.zig");
 
 fn configuredBundle(_: ?*anyopaque, definition: *const configured_provider.Definition) provider_set.Bundle {
     // Models that speak different protocols route per request (D146).
@@ -24,6 +25,7 @@ fn configuredBundle(_: ?*anyopaque, definition: *const configured_provider.Defin
 
 pub const native = provider_set.Set{
     .configured_fn = configuredBundle,
+    .web_search = &web_search_bank.default_bank,
     .gateway = .{},
     .codex = .{
         .presentation = provider_catalog.find(.codex),

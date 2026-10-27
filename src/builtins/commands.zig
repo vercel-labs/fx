@@ -297,6 +297,23 @@ pub const top_level_specs = [_]TopLevelSpec{
         },
     },
     .{
+        .kind = .search,
+        .token = "search",
+        .usage = "search <query> [--provider <id>] [--recency <day|week|month|year>] [--limit <1-20>] [--json]",
+        .summary = "Search the web through the search provider bank",
+        .options = &.{
+            .{ .flag = "--provider <id>", .description = "Use only this provider: vercel, codex, xai, anthropic, perplexity, exa, brave, tavily, jina, kagi, searxng, or duckduckgo" },
+            .{ .flag = "--recency <window>", .description = "Only results from the past day, week, month, or year" },
+            .{ .flag = "--limit <1-20>", .description = "Maximum results (default: 10)" },
+            json_option,
+        },
+        .details = &.{
+            "Tries each available provider in order and falls back to the next one on an error, a rate limit, or no results. The output names the provider that answered.",
+            "Keys come from the environment: AI_GATEWAY_API_KEY, ANTHROPIC_API_KEY, XAI_API_KEY, PERPLEXITY_API_KEY, EXA_API_KEY, BRAVE_API_KEY, TAVILY_API_KEY, JINA_API_KEY, KAGI_API_KEY, and SEARXNG_ENDPOINT. --provider codex or xai uses your subscription login. --provider exa works without a key through Exa's rate-limited public endpoint. DuckDuckGo needs no key and is tried last.",
+            "In ~/.proto-fx/settings.json, \"web_search\": {\"order\": [...], \"exclude\": [...], \"searxng_url\": \"...\"} puts providers first, removes them, and points at a SearXNG instance.",
+        },
+    },
+    .{
         .kind = .workspace,
         .token = "workspace",
         .usage = "workspace [list|add PATH|remove PATH|clear] [--json]",
@@ -350,6 +367,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },
         .{ .kind = .update, .usage = "update" },
+        .{ .kind = .search, .usage = "search <query>" },
         .{ .kind = .acp, .usage = "acp" },
         .{ .kind = .help, .usage = "help" },
     } },

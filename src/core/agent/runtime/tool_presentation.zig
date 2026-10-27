@@ -1646,7 +1646,13 @@ fn renderedSubagentSummary(
 }
 
 /// " · 2 searches · 17ms": the count and the time, in the row's dim voice.
+/// A bank search names the provider that answered and its result count
+/// instead: " · brave · 8 results · 412ms".
 fn formatWebSearchCompletion(arena: Allocator, base: []const u8, completion: types.WebSearchCompletion) ![]const u8 {
+    if (completion.provider_len > 0) return arena.print(
+        "{s} \x1b[38;5;245m· {s} · {d} result{s} · {d}ms\x1b[0m",
+        .{ base, completion.provider(), completion.result_count, if (completion.result_count == 1) "" else "s", completion.duration_ms },
+    );
     return arena.print(
         "{s} \x1b[38;5;245m· {d} search{s} · {d}ms\x1b[0m",
         .{ base, completion.searches, if (completion.searches == 1) "" else "es", completion.duration_ms },
@@ -2642,6 +2648,16 @@ test "provisional lifecycle cleans up every copied-id allocation failure" {
         checkProvisionalLifecycleAllocationFailures,
         .{},
     );
+}
+
+test "bank web_search completion names the provider and result count" {
+    var completion = types.WebSearchCompletion{ .searches = 1, .duration_ms = 412, .result_count = 8 };
+    completion.setProvider("brave");
+    const line = try formatWebSearchCompletion(std.testing.allocator, "Searched zig 0.17", completion);
+    defer std.testing.allocator.free(line);
+
+    try std.testing.expect(std.mem.find(u8, line, "\u{b7} brave \u{b7} 8 results \u{b7} 412ms") != null);
+    try std.testing.expect(std.mem.find(u8, line, "searches") == null);
 }
 
 test "native web_search completion status includes searches and duration" {

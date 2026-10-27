@@ -74,6 +74,8 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const display_width = @import("../core/shared/display_width.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 const tool_projection_mod = @import("../core/tooling/tool_projection.zig");
+const configured_provider_mod = @import("../core/config/configured_provider.zig");
+const web_search_provider_mod = @import("../core/tooling/web_search_provider.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const tool_admission = @import("../core/tooling/tool_admission.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
@@ -155,6 +157,36 @@ fn fitsLibfxPrompt(images: []const PendingPromptImage) bool {
     var bytes: usize = 0;
     for (images) |image| bytes += image.bytes.len;
     return bytes <= image_attachments.max_libfx_prompt_images_bytes;
+}
+
+/// The credentials a bank web search may use in this session. Borrowed from
+/// `state` and `session`.
+fn webSearchInputs(state: *server.ServerState, session: *const server.ActiveSessionState) web_search_provider_mod.Inputs {
+    var inputs: web_search_provider_mod.Inputs = .{
+        .api_key = session.api_key,
+        .credential_source = session.credential_source,
+        .gateway_team = state.gateway_team,
+        .account_id = session.account_id,
+        .worker_model = session.model,
+        .gateway_retry_count = state.cfg.gateway_retry_count,
+        .gateway_chat_url = state.cfg.gateway_chat_url,
+    };
+    const registry = configured_provider_mod.Registry{ .definitions = state.cfg.provider_set.definitions };
+    if (session.provider == .configured) if (session.provider.bind(registry)) |bound| {
+        if (registry.get(bound.label())) |definition| if (definition.protocol == .@"anthropic-messages") {
+            inputs.anthropic_base_url = definition.base_url;
+            inputs.anthropic_bearer = definition.key_header == .authorization;
+        };
+    } else |_| {};
+    return inputs;
+}
+
+/// Native provider search, a bank function when a bank provider is
+/// available, or hidden.
+fn webSearchExposure(state: *server.ServerState, session: *const server.ActiveSessionState) tool_projection_mod.WebSearchExposure {
+    if (state.cfg.provider_set.select(session.provider).capabilities.fx_search) return .provider_native;
+    if (state.web_search_runtime.provider == null) return .hidden;
+    return if (state.web_search_runtime.available(state.alloc, webSearchInputs(state, session))) .local else .hidden;
 }
 
 test "a libfx prompt holds at most its limit of images and image bytes" {
@@ -522,6 +554,8 @@ const AcpContext = struct {
     fn toolContext(self: *AcpContext) tool_runtime.Context {
         const session = if (self.state.active_session) |*active| active else unreachable;
         const provider_capabilities = self.state.cfg.provider_set.select(session.provider).capabilities;
+        const local_web_search = webSearchExposure(self.state, session) == .local;
+        if (local_web_search) self.state.web_search_runtime.configure(webSearchInputs(self.state, session));
         if (provider_capabilities.fx_search) {
             self.state.web_search_runtime.configure(.{
                 .api_key = session.api_key,
@@ -598,8 +632,8 @@ const AcpContext = struct {
             .web_fetch_runtime = &self.state.web_fetch_runtime,
             .web_fetch_artifact_store = session.session_rt.webFetchArtifactStore(),
             .web_fetch_artifact_error = session.session_rt.webFetchArtifactError(),
-            .web_search_runtime_ready = false,
-            .web_search_backend = if (provider_capabilities.fx_search) self.state.web_search_runtime.dispatchBackend() else null,
+            .web_search_runtime_ready = local_web_search,
+            .web_search_backend = if (provider_capabilities.fx_search or local_web_search) self.state.web_search_runtime.dispatchBackend() else null,
             .model_capability_resolver = .{
                 .ctx = @ptrCast(self),
                 .resolve_fn = resolveModelCapabilities,
@@ -1126,6 +1160,7 @@ pub fn handlePrompt(
         .permission_mode = captured_permission_mode,
         .permission_rules = session.permission_rules,
         .subagent_available = state.subagent_host != null,
+        .web_search = webSearchExposure(state, session),
     });
     defer tool_projection.deinit(alloc);
 
@@ -1376,6 +1411,7 @@ pub fn runSubagentChild(
             .permission_mode = admission.permission_mode,
             .permission_rules = admission.rules,
             .subagent_available = true,
+            .web_search = webSearchExposure(state, active),
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(alloc);

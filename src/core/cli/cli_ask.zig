@@ -87,6 +87,7 @@ const tool_runtime = @import("../tooling/tool_runtime.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const tool_specs = @import("../tooling/tool_specs.zig");
 const web_fetch_runtime = @import("../tooling/web_fetch_runtime.zig");
+const configured_provider_mod = @import("../config/configured_provider.zig");
 const web_search_runtime = @import("../tooling/web_search_runtime.zig");
 const types = @import("../shared/types.zig");
 const history_range = @import("../shared/history_range.zig");
@@ -274,6 +275,7 @@ fn runAskChild(
             .permission_mode = admission.permission_mode,
             .permission_rules = admission.rules,
             .subagent_available = true,
+            .web_search = ctx.webSearchExposure(),
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(ctx.alloc);
@@ -662,7 +664,7 @@ const AskContext = struct {
             .mode_id = cfg.mode_registry.default_mode_id,
             .session = session_runtime.SessionRuntime.init(cfg.max_history_turns),
             .web_search_runtime = web_search_runtime.Runtime.init(.{
-                .provider = cfg.provider_set.gateway.fx_search,
+                .provider = cfg.provider_set.webSearchProvider() orelse cfg.provider_set.gateway.fx_search,
             }),
             .terminal_client = terminal_client_runtime.Runtime.init(
                 cfg.process_provider,
@@ -992,8 +994,41 @@ const AskContext = struct {
         self.v2_children = children;
     }
 
+    /// The credentials a bank web search may use; borrowed from `self`.
+    fn webSearchInputs(self: *AskContext) web_search_runtime.Inputs {
+        var inputs: web_search_runtime.Inputs = .{
+            .api_key = self.api_key,
+            .credential_source = self.credential_source,
+            .gateway_team = self.gateway_team,
+            .account_id = self.account_id,
+            .worker_model = self.model,
+            .gateway_retry_count = self.cfg.gateway_retry_count,
+            .gateway_chat_url = self.cfg.gateway_chat_url,
+        };
+        const registry = configured_provider_mod.Registry{ .definitions = self.cfg.provider_set.definitions };
+        if (self.provider == .configured) if (self.provider.bind(registry)) |bound| {
+            if (registry.get(bound.label())) |definition| if (definition.protocol == .@"anthropic-messages") {
+                inputs.anthropic_base_url = definition.base_url;
+                inputs.anthropic_bearer = definition.key_header == .authorization;
+            };
+        } else |_| {};
+        return inputs;
+    }
+
+    /// Native provider search, a bank function when a bank provider is
+    /// available, or hidden.
+    fn webSearchExposure(self: *AskContext) tool_projection_mod.WebSearchExposure {
+        if (self.cfg.provider_set.select(self.provider).capabilities.fx_search) return .provider_native;
+        if (self.web_search_runtime.provider == null) return .hidden;
+        return if (self.web_search_runtime.available(self.alloc, self.webSearchInputs())) .local else .hidden;
+    }
+
     fn toolContext(self: *AskContext) tool_runtime.Context {
         const provider_capabilities = self.cfg.provider_set.select(self.provider).capabilities;
+        const local_web_search = !provider_capabilities.fx_search and
+            self.web_search_runtime.provider != null and
+            self.web_search_runtime.available(self.alloc, self.webSearchInputs());
+        if (local_web_search) self.web_search_runtime.configure(self.webSearchInputs());
         if (provider_capabilities.fx_search) {
             self.web_search_runtime.configure(.{
                 .api_key = self.api_key,
@@ -1064,8 +1099,8 @@ const AskContext = struct {
             .web_fetch_artifact_error = self.session.webFetchArtifactError(),
             .web_fetch_progress_ctx = @ptrCast(self),
             .on_web_fetch_progress = onWebFetchProgress,
-            .web_search_runtime_ready = false,
-            .web_search_backend = if (provider_capabilities.fx_search) self.web_search_runtime.dispatchBackend() else null,
+            .web_search_runtime_ready = local_web_search,
+            .web_search_backend = if (provider_capabilities.fx_search or local_web_search) self.web_search_runtime.dispatchBackend() else null,
             .web_search_progress_ctx = @ptrCast(self),
             .on_web_search_progress = onWebSearchProgress,
             .model_capability_resolver = .{
@@ -1724,6 +1759,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .permission_mode = ctx.permission_mode,
         .permission_rules = ctx.permission_rules,
         .subagent_available = ctx.subagent_host != null,
+        .web_search = ctx.webSearchExposure(),
     }, session_child_capability != null);
     defer tool_projection.deinit(alloc);
 
@@ -3831,7 +3867,13 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
             try std.json.Stringify.value(text, .{}, &out.writer);
         }
         if (tc.web_search_completion) |completion| {
-            try out.writer.print(",\"web_search\":{{\"searches\":{d},\"duration_ms\":{d}}}", .{ completion.searches, completion.duration_ms });
+            try out.writer.print(",\"web_search\":{{\"searches\":{d},\"duration_ms\":{d}", .{ completion.searches, completion.duration_ms });
+            if (completion.provider_len > 0) {
+                try out.writer.writeAll(",\"provider\":");
+                try std.json.Stringify.value(completion.provider(), .{}, &out.writer);
+                try out.writer.print(",\"result_count\":{d}", .{completion.result_count});
+            }
+            try out.writer.writeAll("}");
         }
         if (tc.web_fetch_completion) |completion| {
             try out.writer.writeAll(",\"web_fetch\":{\"url\":");

@@ -5,6 +5,7 @@ const model_capabilities = @import("../config/model_capabilities.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const gateway_provider = @import("gateway_provider.zig");
 const web_search_provider = @import("../tooling/web_search_provider.zig");
+const web_search_bank = @import("../tooling/web_search_bank.zig");
 const auto_classifier = @import("../permissions/auto_classifier.zig");
 const model_catalog = @import("model_catalog.zig");
 
@@ -57,6 +58,15 @@ pub const Set = struct {
     /// Builds a configured provider's bundle; `configured_context` is passed through.
     configured_fn: ?*const fn (?*anyopaque, *const @import("../config/configured_provider.zig").Definition) Bundle = null,
     configured_context: ?*anyopaque = null,
+    /// The web search provider bank that runs web_search as a local tool
+    /// for providers without native search. Null disables it.
+    web_search: ?*const web_search_bank.Bank = null,
+
+    /// The bank as a web_search runtime provider, when there is one.
+    pub fn webSearchProvider(self: Set) ?web_search_provider.Provider {
+        const bank = self.web_search orelse return null;
+        return bank.provider();
+    }
 
     pub fn select(self: Set, provider: model_provider.ProviderId) Bundle {
         return switch (provider) {

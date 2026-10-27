@@ -1099,6 +1099,22 @@ pub const WebSearchProgress = union(enum) {
 pub const WebSearchCompletion = struct {
     searches: u32,
     duration_ms: u64,
+    /// Sources returned; zero when the backend does not count them.
+    result_count: u32 = 0,
+    provider_buf: [24]u8 = undefined,
+    provider_len: u8 = 0,
+
+    /// Copies the answering provider's id, truncated to the buffer.
+    pub fn setProvider(self: *WebSearchCompletion, id: []const u8) void {
+        const len = @min(id.len, self.provider_buf.len);
+        @memcpy(self.provider_buf[0..len], id[0..len]);
+        self.provider_len = @intCast(len);
+    }
+
+    /// The answering provider's id, or empty.
+    pub fn provider(self: *const WebSearchCompletion) []const u8 {
+        return self.provider_buf[0..self.provider_len];
+    }
 };
 
 pub const WebFetchProgress = union(enum) {

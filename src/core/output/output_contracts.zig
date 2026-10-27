@@ -39,6 +39,9 @@ pub const OutputFormat = enum {
     json,
 };
 
+/// `proto-fx search` output.
+pub const WebSearchSnapshot = @import("web_search_snapshot.zig").Snapshot;
+
 pub const CommandFailureSnapshot = struct {
     kind: []const u8,
     message: []const u8,

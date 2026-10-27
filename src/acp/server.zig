@@ -927,7 +927,7 @@ pub const PersistentHost = struct {
             .cfg = cfg,
             .presentation = .native,
             .writer = jsonrpc.Writer.initCallback(context, write),
-            .web_search_runtime = web_search_runtime.Runtime.init(.{ .provider = cfg.provider_set.gateway.fx_search }),
+            .web_search_runtime = web_search_runtime.Runtime.init(.{ .provider = cfg.provider_set.webSearchProvider() orelse cfg.provider_set.gateway.fx_search }),
             .terminal_client = terminal_client_runtime.Runtime.init(cfg.process_provider),
             .managed_executions = managed_execution.Runtime.init(alloc),
             .lifecycle_runtime = lifecycle_runtime,
@@ -1072,7 +1072,7 @@ pub fn runWithTransport(
         .cfg = cfg,
         .writer = writer_value,
         .web_search_runtime = web_search_runtime.Runtime.init(.{
-            .provider = cfg.provider_set.gateway.fx_search,
+            .provider = cfg.provider_set.webSearchProvider() orelse cfg.provider_set.gateway.fx_search,
         }),
         .terminal_client = terminal_client_runtime.Runtime.init(
             cfg.process_provider,

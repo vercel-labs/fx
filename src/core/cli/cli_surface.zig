@@ -10,6 +10,7 @@ const provider_keys = @import("../auth/provider_keys.zig");
 const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
 const cli_replay = @import("cli_replay.zig");
+const cli_search = @import("cli_search.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -92,6 +93,7 @@ pub const Command = union(enum) {
     update: []const [:0]const u8,
     replay: []const [:0]const u8,
     workspace: []const [:0]const u8,
+    search: []const [:0]const u8,
     unknown: []const u8,
 };
 
@@ -616,6 +618,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
                 return .{ .session = args[1..] };
             }
             if (command_specs.matchesTopLevel(command_catalog, command, .slack)) return .{ .slack = args[1..] };
+            if (command_specs.matchesTopLevel(command_catalog, command, .search)) return .{ .search = args[1..] };
         },
         't' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .teams)) return .{ .teams = args[1..] };
@@ -1642,6 +1645,31 @@ fn runNonInteractiveWithDeps(
         .replay => |rest| {
             const exit_code = try cli_replay.run(alloc, rest);
             return if (exit_code == 0) .handled_success else .handled_failure;
+        },
+        .search => |rest| {
+            const the_bank = cfg.provider_set.web_search orelse {
+                try writeStderr(deps, "proto-fx: web search is not available in this build\n");
+                return .handled_failure;
+            };
+            var options = cli_search.parseArgs(alloc, rest) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    try writeTopLevelUsage(cfg.command_catalog, deps, .search);
+                    return .handled_failure;
+                },
+            };
+            defer options.deinit(alloc);
+            const result = try cli_search.run(alloc, the_bank, options, .{
+                .transport = cfg.gateway_provider.oauth_transport,
+                .secret_store = cfg.secret_store,
+            });
+            defer alloc.free(result.output);
+            if (result.succeeded or result.format == .json) {
+                try writeFormattedOutput(deps, result.output, result.format);
+            } else {
+                try writeStderr(deps, result.output);
+            }
+            return if (result.succeeded) .handled_success else .handled_failure;
         },
         .unknown => |command| {
             try writeStderr(deps, "proto-fx: unknown subcommand: ");

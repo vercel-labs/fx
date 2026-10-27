@@ -43,8 +43,7 @@ pub const native = Profile{
     .skills = true,
     .clipboard = true,
     .url_opening = true,
-    // TODO(proto-fx): restore search after wiring a gateway-independent backend.
-    .web_search = false,
+    .web_search = true,
     .tools = true,
     .js_host_clipboard = false,
     .js_host_config = false,

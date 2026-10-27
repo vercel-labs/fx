@@ -12,6 +12,13 @@ pub const Inputs = struct {
     worker_model: []const u8,
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
+    /// Account of the active subscription credential, when it has one.
+    account_id: ?[]const u8 = null,
+    /// Messages API prefix of the active configured Anthropic-compatible
+    /// connection; its key is `api_key`. Null for every other provider.
+    anthropic_base_url: ?[]const u8 = null,
+    /// The configured connection sends its key as a bearer token.
+    anthropic_bearer: bool = false,
 };
 
 pub const PreferredBackendsFn = *const fn (?*anyopaque) anyerror!?[]const web_search_contract.SearchBackendId;
@@ -25,12 +32,23 @@ pub const ExecuteFn = *const fn (
     ?*anyopaque,
 ) anyerror!web_search_contract.ProviderResponse;
 
+pub const AvailableFn = *const fn (?*anyopaque, Allocator, Inputs) bool;
+
 pub const Provider = struct {
     context: ?*anyopaque = null,
     policy: web_search_policy.WebSearchPolicy,
     input_overhead_bytes: usize = 0,
     preferred_backends_fn: PreferredBackendsFn,
     execute_fn: ExecuteFn,
+    /// Whether a search with these credentials has a backend outside native
+    /// provider search. Null means never: such a provider, like the gateway
+    /// worker, serves only the provider that owns it.
+    available_fn: ?AvailableFn = null,
+
+    pub fn available(self: Provider, alloc: Allocator, inputs: Inputs) bool {
+        const available_fn = self.available_fn orelse return false;
+        return available_fn(self.context, alloc, inputs);
+    }
 
     pub fn preferredBackends(self: Provider) !?[]const web_search_contract.SearchBackendId {
         return self.preferred_backends_fn(self.context);

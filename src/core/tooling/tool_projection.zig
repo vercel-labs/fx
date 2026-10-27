@@ -8,10 +8,16 @@ const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
+/// How `web_search` reaches the model: as the provider's native search
+/// advertisement, as a function fx runs through the search provider bank,
+/// or not at all when neither has a backend.
+pub const WebSearchExposure = enum { provider_native, local, hidden };
+
 pub const Options = struct {
     permission_mode: types.PermissionMode = .auto,
     permission_rules: types.PermissionRuleSet = .{},
     subagent_available: bool = false,
+    web_search: WebSearchExposure = .provider_native,
 };
 
 const BuildKind = enum { full, read_only };
@@ -442,6 +448,29 @@ fn testToolSetForRegistry(tools: []const tool_dispatch.Tool) tool_set_contract.T
     };
 }
 
+test "web_search exposure advertises a local function or hides the tool" {
+    const alloc = std.testing.allocator;
+    var local = try buildTestModelToolProjection(alloc, .{ .web_search = .local });
+    defer local.deinit(alloc);
+    try expectContainsName(local.advertised_names, "web_search");
+    var has_function = false;
+    for (local.advertised_functions) |function| {
+        if (std.mem.eql(u8, function.name, "web_search")) has_function = true;
+    }
+    try std.testing.expect(has_function);
+    try std.testing.expect(std.mem.find(u8, local.custom_guidance, test_web_search.description) == null);
+
+    var hidden = try buildTestModelToolProjection(alloc, .{ .web_search = .hidden });
+    defer hidden.deinit(alloc);
+    try std.testing.expect(!containsName(hidden.advertised_names, "web_search"));
+    try std.testing.expect(std.mem.find(u8, hidden.custom_guidance, test_web_search.description) == null);
+
+    var native = try buildTestModelToolProjection(alloc, .{});
+    defer native.deinit(alloc);
+    try expectContainsName(native.advertised_names, "web_search");
+    for (native.advertised_functions) |function| try std.testing.expect(!std.mem.eql(u8, function.name, "web_search"));
+}
+
 fn buildTestModelToolProjection(alloc: Allocator, options: Options) !EffectiveToolProjection {
     return buildModelToolProjectionForSet(alloc, test_tool_set, options);
 }
@@ -506,6 +535,16 @@ fn appendBuiltinTool(
     if (!includeBuiltinForKind(tool.name, kind, tool_set)) return;
     if (std.mem.eql(u8, tool.name, "fleet") and !options.subagent_available) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
+    if (tool.executor_kind == .web_search) switch (options.web_search) {
+        .provider_native => {},
+        .hidden => return,
+        .local => {
+            if (options.permission_mode != .yolo and permissions.rulesDenyAllTargetsForTool(options.permission_rules, tool.name)) return;
+            try advertised_names.append(alloc, tool.name);
+            try advertised_functions.append(alloc, tool.model_schema);
+            return;
+        },
+    };
     if (options.permission_mode != .yolo) {
         if (tool.provider_executed and !providerExecutionIsAllowed(tool.name, options.permission_rules)) return;
         if (permissions.rulesDenyAllTargetsForTool(options.permission_rules, tool.name)) return;

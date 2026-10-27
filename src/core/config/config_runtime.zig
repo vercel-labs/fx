@@ -11,6 +11,7 @@ const settings_store = @import("settings_store.zig");
 const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
 const model_preferences = @import("model_preferences.zig");
+const web_search_bank = @import("../tooling/web_search_bank.zig");
 const configured_provider = @import("configured_provider.zig");
 const provider_registry = @import("provider_registry.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -390,6 +391,20 @@ pub fn loadConfiguredProviders(alloc: Allocator) !configured_provider.Registry {
     }
     try provider_registry.extend(alloc, &registry, paths.home_fx_dir);
     return registry.?;
+}
+
+/// Reads only the profile-global `web_search` object: provider order,
+/// exclusions, and the SearXNG endpoint. Caller owns the settings.
+pub fn loadWebSearchSettings(alloc: Allocator) !web_search_bank.Settings {
+    var paths = try discoverPaths(alloc, ".");
+    defer paths.deinit(alloc);
+    const bytes = (try readOptionalUserSettingsFile(alloc, paths)) orelse return .{};
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{ .duplicate_field_behavior = .@"error" });
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSettingsShape;
+    const value = parsed.value.object.get("web_search") orelse return .{};
+    return web_search_bank.parseSettings(alloc, value);
 }
 
 pub fn loadMergedSettings(alloc: Allocator, workspace_root: []const u8) !Settings {

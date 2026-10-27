@@ -1,5 +1,9 @@
 const std = @import("std");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
+const web_search_contract = @import("../../core/tooling/web_search_contract.zig");
+
+pub const Recency = web_search_contract.Recency;
+pub const max_limit: u8 = 20;
 
 const Allocator = std.mem.Allocator;
 
@@ -7,6 +11,8 @@ pub const Input = struct {
     query: []u8,
     allowed_domains: ?[][]u8 = null,
     blocked_domains: ?[][]u8 = null,
+    recency: ?Recency = null,
+    limit: ?u8 = null,
 
     pub fn deinit(self: *Input, alloc: Allocator) void {
         alloc.free(self.query);
@@ -59,8 +65,24 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
         .failure => |reason| return .{ .failure = reason },
     };
 
+    var recency: ?Recency = null;
+    if (parsed.value.object.get("recency")) |value| {
+        if (value != .string) return .{ .failure = try ctx.allocator.dupe(u8, "web_search field \"recency\" must be one of day, week, month, year") };
+        recency = Recency.parse(value.string) orelse
+            return .{ .failure = try ctx.allocator.dupe(u8, "web_search field \"recency\" must be one of day, week, month, year") };
+    }
+    var limit: ?u8 = null;
+    if (parsed.value.object.get("limit")) |value| {
+        if (value != .integer or value.integer < 1 or value.integer > max_limit) {
+            return .{ .failure = try ctx.allocator.print("web_search field \"limit\" must be an integer from 1 to {d}", .{max_limit}) };
+        }
+        limit = @intCast(value.integer);
+    }
+
     const input = try ctx.allocator.create(Input);
     input.* = owned.take();
+    input.recency = recency;
+    input.limit = limit;
     return .{ .input = .{ .ptr = input, .deinit_fn = inputDeinit } };
 }
 
@@ -161,6 +183,8 @@ fn unknownField(object: std.json.ObjectMap) ?[]const u8 {
         if (std.mem.eql(u8, entry.key_ptr.*, "query")) continue;
         if (std.mem.eql(u8, entry.key_ptr.*, "allowed_domains")) continue;
         if (std.mem.eql(u8, entry.key_ptr.*, "blocked_domains")) continue;
+        if (std.mem.eql(u8, entry.key_ptr.*, "recency")) continue;
+        if (std.mem.eql(u8, entry.key_ptr.*, "limit")) continue;
         return entry.key_ptr.*;
     }
     return null;

@@ -330,8 +330,19 @@ pub fn Runtime(comptime App: type) type {
                         .gateway_chat_url = gateway_chat_url,
                     });
                     ctx.web_search_backend = app.web_search_runtime.dispatchBackend();
+                    ctx.web_search_runtime_ready = false;
+                } else {
+                    // Providers without native search run web_search through
+                    // the search provider bank when it has a backend.
+                    const inputs = webSearchInputs(app, null, gateway_retry_count, gateway_chat_url);
+                    if (app.web_search_runtime.available(std.heap.c_allocator, inputs)) {
+                        app.web_search_runtime.configure(inputs);
+                        ctx.web_search_backend = app.web_search_runtime.dispatchBackend();
+                        ctx.web_search_runtime_ready = true;
+                    } else {
+                        ctx.web_search_runtime_ready = false;
+                    }
                 }
-                ctx.web_search_runtime_ready = false;
                 ctx.web_search_progress_ctx = @ptrCast(app);
                 ctx.on_web_search_progress = app_callbacks.Bindings(App).onWebSearchProgress;
             }
@@ -788,8 +799,66 @@ pub fn Runtime(comptime App: type) type {
                         .gateway_chat_url = gateway_chat_url,
                     });
                     ctx.web_search_backend = app.web_search_runtime.dispatchBackend();
+                } else if (ctx.web_search_runtime_ready) {
+                    app.web_search_runtime.configure(webSearchInputs(app, credential, gateway_retry_count, gateway_chat_url));
                 }
             }
+        }
+
+        /// The credentials a bank web search may use: the session's active
+        /// credential, or `lease` when a request carries one, plus the active
+        /// configured Anthropic-compatible connection. Borrowed from `app`
+        /// and `lease`.
+        fn webSearchInputs(
+            app: *App,
+            lease: ?types.CredentialLease,
+            gateway_retry_count: usize,
+            gateway_chat_url: []const u8,
+        ) web_search_runtime.Inputs {
+            var inputs: web_search_runtime.Inputs = .{
+                .api_key = app.auth.apiKey() orelse "",
+                .credential_source = app.auth.credentialSource(),
+                .gateway_team = app.auth.gatewayTeam(),
+                .account_id = app.auth.accountId(),
+                .worker_model = provider_runtime.model(app),
+                .gateway_retry_count = gateway_retry_count,
+                .gateway_chat_url = gateway_chat_url,
+            };
+            if (lease) |credential| if (credential.secret()) |secret_bytes| {
+                inputs.api_key = secret_bytes;
+                inputs.credential_source = credential.credentialSource();
+                inputs.account_id = credential.accountId();
+                inputs.gateway_team = credential.tenant();
+            };
+            if (comptime @hasDecl(App, "providerSet")) {
+                const set = app.providerSet();
+                const registry = @import("../config/configured_provider.zig").Registry{ .definitions = set.definitions };
+                const selected = provider_runtime.provider(app);
+                if (selected == .configured) if (selected.bind(registry)) |bound| {
+                    if (registry.get(bound.label())) |definition| if (definition.protocol == .@"anthropic-messages") {
+                        inputs.anthropic_base_url = definition.base_url;
+                        inputs.anthropic_bearer = definition.key_header == .authorization;
+                    };
+                } else |_| {};
+            }
+            return inputs;
+        }
+
+        /// How this turn's model sees web_search: native provider search,
+        /// a bank function when a bank provider is available, or hidden.
+        pub fn webSearchExposure(app: *App, gateway_retry_count: usize, gateway_chat_url: []const u8) tool_projection_mod.WebSearchExposure {
+            if (comptime !@hasField(App, "web_search_runtime")) return .hidden;
+            if (app.web_search_runtime.provider == null) return .hidden;
+            const selected = provider_runtime.provider(app);
+            const capabilities = if (comptime @hasDecl(App, "providerSet"))
+                app.providerSet().select(selected).capabilities
+            else
+                provider_set.Bundle.Capabilities{};
+            if (capabilities.fx_search) return .provider_native;
+            const inputs = webSearchInputs(app, null, gateway_retry_count, gateway_chat_url);
+            const exposure: tool_projection_mod.WebSearchExposure = if (app.web_search_runtime.available(std.heap.c_allocator, inputs)) .local else .hidden;
+            debug_trace.logf("web_search", "exposure={t} provider={t}", .{ exposure, selected });
+            return exposure;
         }
 
         pub fn appendStaticContextMessage(
