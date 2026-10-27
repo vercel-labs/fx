@@ -247,3 +247,46 @@ test "a dynamic tool selected in one turn stays in the tools of later turns, app
     try std.testing.expect(std.mem.find(u8, turn_three_tools[turn_one_tools.len - 1 ..], "mcp_fixture_lookup") != null);
     try std.testing.expectEqual(@as(usize, 2), set.count());
 }
+
+test "project context found mid-turn rides at the tail and leaves the instructions alone" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "nested");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "nested/AGENTS.md", .data = "NESTED_SCOPE_RULE" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "nested/input.txt", .data = "unchanged" });
+    const workspace = try @import("../../../shared/io.zig").dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+
+    const calls = [_]types.ToolCall{toolCall("nested_read", "read_file", "{\"path\":\"nested/input.txt\"}")};
+    const more = [_]types.ToolCall{toolCall("again", "read_file", "{\"path\":\"nested/input.txt\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .tool_calls = &more },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.context_enabled = true;
+    hooks.context_registry = .{ .default_provider = @import("../../../../builtins/context.zig").provider };
+    var fixture = PromptFixture{ .workspace_root = workspace };
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try expectBodyNotContains(&gateway, 0, "NESTED_SCOPE_RULE");
+    try expectRepeatsPrefix(&gateway, 0, 1);
+    try expectRepeatsPrefix(&gateway, 1, 2);
+    const head = try instructionsOf(alloc, gateway.request_bodies.items[0]);
+    defer alloc.free(head);
+    for (gateway.request_bodies.items[1..]) |body| {
+        const later = try instructionsOf(alloc, body);
+        defer alloc.free(later);
+        try std.testing.expectEqualStrings(head, later);
+    }
+    // After the result that found it, and sent once.
+    try test_support.expectBodyContainsInOrder(&gateway, 1, &.{ "nested_read", "NESTED_SCOPE_RULE" });
+    try std.testing.expectEqual(@as(usize, 1), test_support.countNeedle(gateway.request_bodies.items[2], "NESTED_SCOPE_RULE"));
+}

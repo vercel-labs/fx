@@ -2677,24 +2677,44 @@ pub const TestHooks = if (builtin.is_test) struct {
     pub var context_gate_commit: ?*const fn () Allocator.Error!void = null;
 } else struct {};
 
+/// Commits project context selected mid-turn. Its text waits in `pending`
+/// until the next step, which carries it at the tail of the request
+/// (D241), so the instructions and every earlier byte stay as sent.
 fn commitSelectedContext(
     arena: Allocator,
-    stable_prefix: *std.ArrayList(ChatMessage),
+    pending: *?[]const u8,
     context_delivery_state: *context_contract.DeliveryState,
     selected: *context_contract.ProviderContext,
 ) Allocator.Error!void {
     if (comptime builtin.is_test) {
         if (TestHooks.context_gate_commit) |hook| try hook();
     }
-    if (selected.content != null) try stable_prefix.ensureUnusedCapacity(arena, 1);
+    const joined: ?[]const u8 = if (selected.content) |content| if (pending.*) |earlier|
+        try arena.print("{s}\n\n{s}", .{ earlier, content })
+    else
+        content else null;
     try context_delivery_state.commit(arena, selected);
-    if (selected.content) |content| {
-        stable_prefix.appendAssumeCapacity(.{
-            .role = .system,
-            .content = content,
-        });
+    if (joined) |content| {
+        pending.* = content;
         selected.content = null;
     }
+}
+
+/// Appends context committed in the previous step as one user message at
+/// the tail of the turn so far (D241). It stays there for the turn's later
+/// steps; the next turn finds it again through the retained targets.
+fn deliverPendingProjectContext(
+    arena: Allocator,
+    pending: *?[]const u8,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+) Allocator.Error!void {
+    const content = pending.* orelse return;
+    try within_turn_suffix.append(arena, .{
+        .role = .user,
+        .content = content,
+        .context_origin = .turn_context,
+    });
+    pending.* = null;
 }
 
 fn candidateHasApplicableContextDelta(
@@ -6937,8 +6957,8 @@ fn processQueuedPromptLoop(
     // The image route core's turn state. This loop is its shell: it runs each
     // effect `image_route.step` returns and feeds the result back.
     var image_route_state = image_route.step(.{}, .{ .turn_started = request_capabilities.image_input_support }).state;
-    var stable_prefix = stable_prefix_ptr.*;
-    defer stable_prefix_ptr.* = stable_prefix;
+    // The instructions never change within a turn (D130, D241).
+    const stable_prefix = stable_prefix_ptr.*;
     const history_messages = history_messages_ptr.*;
     var within_turn_suffix = within_turn_suffix_ptr.*;
     defer within_turn_suffix_ptr.* = within_turn_suffix;
@@ -7016,6 +7036,7 @@ fn processQueuedPromptLoop(
     var last_tool_call_name: []const u8 = "none";
     var last_tool_call_id: []const u8 = "none";
     var last_gateway_message_count: usize = stable_prefix.items.len + history_messages.items.len + 1;
+    var pending_project_context: ?[]const u8 = null;
     var selected_dynamic_tools: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
     try selected_dynamic_tools.ensureTotalCapacity(arena, config.initial_dynamic_tools.len);
     for (config.initial_dynamic_tools) |tool| {
@@ -7175,6 +7196,7 @@ fn processQueuedPromptLoop(
             );
             return;
         }
+        try deliverPendingProjectContext(arena, &pending_project_context, &within_turn_suffix);
         try runtime_stream_rules.beforeStep(&stream_rules, arena, history_messages.items, &within_turn_suffix);
         // The turn's context was captured once when it began (D130, D131).
         var turn_context: std.ArrayList(ChatMessage) = .empty;
@@ -10233,7 +10255,7 @@ fn processQueuedPromptLoop(
 
             commitSelectedContext(
                 arena,
-                &stable_prefix,
+                &pending_project_context,
                 &context_delivery_state,
                 &selected,
             ) catch |err| {

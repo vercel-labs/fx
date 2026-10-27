@@ -2717,6 +2717,16 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   first tool on; proto keeps every declared tool and appends new ones.
   **Alternative:** saving the selections in the session log, which would
   advertise tools whose MCP server may be gone after a restart.
+- **D241 Decision:** project context a tool call reaches mid-turn, such as
+  a nested `AGENTS.md`, rides as one user context message at the tail of
+  the next step's request, after that step's tool results, and stays there
+  for the turn's later steps. The instructions never change within a turn.
+  It is not saved with the turn; the next turn rebuilds it from the
+  retained targets as before. **Why:** it was appended to the
+  instructions, so the step after a discovery missed the cache from the
+  first byte. **Alternative:** appending it to the tool result that found
+  it, which saves it with the turn but rewrites a result the session has
+  already streamed, and freezes a rule file that later changes.
 
 - **D230 Decision:** the `checklist` tool keeps proto's contract: phases
   of tasks named by their exact content, never by ids; one operation per
