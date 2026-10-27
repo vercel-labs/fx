@@ -1159,7 +1159,7 @@ pub fn publishSubagentCompletionPreview(
     result: ToolExecutionResult,
     advertised_dynamic_tool_names: []const []const u8,
 ) !bool {
-    if (!std.mem.eql(u8, call.name, "subagent")) return false;
+    if (!tooling_presentation.isFleetCall(call)) return false;
     const base_line = if (try tooling_presentation.subagentStatusLine(
         arena,
         call,

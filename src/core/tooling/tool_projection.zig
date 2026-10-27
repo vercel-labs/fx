@@ -254,10 +254,10 @@ const test_install_skill = blk: {
 
 const test_subagent = blk: {
     var spec = test_skill;
-    spec.name = "subagent";
+    spec.name = "fleet";
     spec.description = "Test subagent. When to use: exercise registered subagent projection. When NOT to use: assert product-specific child management.";
     spec.model_schema = .{
-        .name = "subagent",
+        .name = "fleet",
         .description = spec.description,
     };
     spec.executor_kind = .subagent;
@@ -414,7 +414,7 @@ const test_order = [_][]const u8{
     "edit_file",
     "write_file",
     "shell",
-    "subagent",
+    "fleet",
     "capability_search",
     "skill",
     "install_skill",
@@ -504,7 +504,7 @@ fn appendBuiltinTool(
 ) !void {
     if (!tool.model_visible) return;
     if (!includeBuiltinForKind(tool.name, kind, tool_set)) return;
-    if (std.mem.eql(u8, tool.name, "subagent") and !options.subagent_available) return;
+    if (std.mem.eql(u8, tool.name, "fleet") and !options.subagent_available) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
     if (options.permission_mode != .yolo) {
         if (tool.provider_executed and !providerExecutionIsAllowed(tool.name, options.permission_rules)) return;
@@ -718,7 +718,7 @@ test "base tool projection includes MCP discovery and explicit selection" {
 test "subagent and shell selection follow host capability" {
     var unavailable = try buildTestModelToolProjection(std.testing.allocator, .{});
     defer unavailable.deinit(std.testing.allocator);
-    try expectNotContainsName(unavailable.advertised_names, "subagent");
+    try expectNotContainsName(unavailable.advertised_names, "fleet");
     try expectNotContainsName(unavailable.advertised_names, "task");
     try expectContainsName(unavailable.advertised_names, "shell");
 
@@ -726,7 +726,7 @@ test "subagent and shell selection follow host capability" {
         .subagent_available = true,
     });
     defer available.deinit(std.testing.allocator);
-    try expectContainsName(available.advertised_names, "subagent");
+    try expectContainsName(available.advertised_names, "fleet");
     try expectNotContainsName(available.advertised_names, "task");
     try expectContainsName(available.advertised_names, "shell");
 }

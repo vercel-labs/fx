@@ -160,7 +160,7 @@ const test_tools = [_]tool_dispatch.Tool{
     builtin_tools.capability_search,
     builtin_tools.skill,
     builtin_tools.install_skill,
-    builtin_tools.subagent,
+    builtin_tools.fleet,
     builtin_tools.mcp_select_tool,
     builtin_tools.ask_user_question,
     builtin_tools.read_tool_result,

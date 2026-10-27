@@ -11,6 +11,8 @@ const terminal_contracts = @import("../terminal/contracts.zig");
 const terminal_client_runtime = @import("../terminal/client.zig");
 const terminal_ui_projection = @import("../terminal/ui_projection.zig");
 const types = @import("../shared/types.zig");
+const fleet_presentation = @import("fleet_presentation.zig");
+const io_mod = @import("../shared/io.zig");
 const test_builtin_tools = if (builtin.is_test)
     @import("../../builtins/tools.zig")
 else
@@ -29,6 +31,11 @@ pub const ToolActionInput = struct {
     display_target: ?[]const u8 = null,
     is_available_dynamic_mcp_tool: bool = false,
 };
+
+/// The fleet tool, or the `subagent` tool older histories name (D101).
+pub fn isFleetCall(call: ToolCall) bool {
+    return std.mem.eql(u8, call.name, "fleet") or std.mem.eql(u8, call.name, "subagent");
+}
 
 pub const SubagentActionState = union(enum) {
     identity,
@@ -55,7 +62,7 @@ pub fn subagentAction(
     call: ToolCall,
     state: SubagentActionState,
 ) Allocator.Error!?SubagentAction {
-    if (!std.mem.eql(u8, call.name, "subagent")) return null;
+    if (!isFleetCall(call)) return null;
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
@@ -63,16 +70,32 @@ pub fn subagentAction(
         error.OutOfMemory => error.OutOfMemory,
         else => null,
     };
-    const args = if (outer.get("request")) |request| switch (request) {
-        .object => |object| object,
-        else => return null,
-    } else outer;
-    const action = tool_args.optionalStringArg(args, "action") orelse return null;
-    const named = std.mem.eql(u8, action, "message");
-    if (!named and !std.mem.eql(u8, action, "run")) return null;
+    var named = false;
+    var raw_name: []const u8 = "Subagent";
+    var raw_preview: []const u8 = "";
+    if (fleet_presentation.parseCall(outer)) |fleet_call| {
+        // A worker op's running and settled rows are the fleet's own; a run,
+        // and every op's identity and stop, read like a delegation (D101).
+        const own_row = fleet_call.op != .run and (state == .active or state == .completed);
+        if (own_row) {
+            const row = try fleet_presentation.activeRow(alloc, scratch, fleet_call, state == .completed);
+            return .{ .label = row.label, .detail = row.detail };
+        }
+        named = fleet_call.target != null;
+        raw_name = fleet_call.target orelse if (fleet_call.op == .run) "Subagent" else "Fleet";
+        raw_preview = fleet_call.message orelse "";
+    } else {
+        const args = if (outer.get("request")) |request| switch (request) {
+            .object => |object| object,
+            else => return null,
+        } else outer;
+        const action = tool_args.optionalStringArg(args, "action") orelse return null;
+        named = std.mem.eql(u8, action, "message");
+        if (!named and !std.mem.eql(u8, action, "run")) return null;
+        raw_name = if (named) tool_args.optionalStringArg(args, "agent") orelse return null else "Subagent";
+        raw_preview = tool_args.optionalStringArg(args, if (named) "message" else "task") orelse return null;
+    }
     if (state == .feedback and !named) return null;
-    const raw_name = if (named) tool_args.optionalStringArg(args, "agent") orelse return null else "Subagent";
-    const raw_preview = tool_args.optionalStringArg(args, if (named) "message" else "task") orelse return null;
     const name = try text_utils.encodeTerminalSafe(scratch, raw_name, 64);
     const preview = try subagentPreview(scratch, raw_preview);
     const label = switch (state) {
@@ -128,7 +151,17 @@ fn subagentPreview(alloc: Allocator, raw: []const u8) Allocator.Error![]u8 {
 }
 
 pub fn subagentStatusLine(alloc: Allocator, call: ToolCall, output: []const u8) Allocator.Error!?[]u8 {
-    if (!std.mem.eql(u8, call.name, "subagent")) return null;
+    if (!isFleetCall(call)) return null;
+    fleet: {
+        var scratch_state = std.heap.ArenaAllocator.init(alloc);
+        defer scratch_state.deinit();
+        const args = tool_args.parseToolArgsObject(scratch_state.allocator(), call.arguments_json) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => break :fleet,
+        };
+        const fleet_call = fleet_presentation.parseCall(args) orelse break :fleet;
+        if (try fleet_presentation.settledRow(alloc, fleet_call, output, io_mod.milliTimestamp())) |row| return row;
+    }
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, output, .{}) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => null,
@@ -150,7 +183,7 @@ pub fn subagentStatusLine(alloc: Allocator, call: ToolCall, output: []const u8) 
 
 /// Only structured child terminal failures change the failure label.
 pub fn subagentFailureLabel(alloc: Allocator, call: ToolCall, output: []const u8) Allocator.Error![]const u8 {
-    if (!std.mem.eql(u8, call.name, "subagent")) return "Failed";
+    if (!isFleetCall(call)) return "Failed";
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, output, .{}) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => "Failed",
@@ -676,7 +709,7 @@ const ActionPhase = enum {
 
 fn formatPlainActionPhase(alloc: Allocator, input: ToolActionInput, phase: ActionPhase) ![]const u8 {
     const call = input.call;
-    if (input.tool_registry.lookup(call.name) != null) {
+    if (input.tool_registry.lookup(call.name) != null or isFleetCall(call)) {
         if (try formatSubagentPlainAction(alloc, call, phase.subagentState())) |line| return line;
     }
     if (file_mutation_contract.isToolName(call.name)) {

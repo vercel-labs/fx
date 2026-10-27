@@ -1,7 +1,7 @@
 //! `agent`: a subagent below the calling node. It is the node's own
-//! `subagent` tool, so the spawn policy, depth limit, tree budget, slot
+//! `fleet` tool's blocking `run`, so the spawn policy, depth limit, tree budget, slot
 //! lending and permission ceiling all apply, and a node at the depth limit,
-//! which has no `subagent` tool, is refused.
+//! which has no `fleet` tool, is refused.
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const op_tool = @import("op_tool.zig");
@@ -19,12 +19,9 @@ pub const agent = struct {
         if (args.prompt.len == 0) return call.fail(.bad_request, "agent needs a prompt", .{});
         const prompt = try withSchema(call.arena, args.prompt, args.schema);
         var json: std.Io.Writer.Allocating = .init(call.arena);
-        if (args.name) |agent_name| {
-            try std.json.Stringify.value(.{ .action = "message", .agent = agent_name, .message = prompt, .model = args.model }, .{ .emit_null_optional_fields = false }, &json.writer);
-        } else {
-            try std.json.Stringify.value(.{ .action = "run", .task = prompt, .model = args.model }, .{ .emit_null_optional_fields = false }, &json.writer);
-        }
-        const reply = try op_tool.callTool(call, "subagent", json.written());
+        // A blocking fleet run; a name makes it a turn of that named worker.
+        try std.json.Stringify.value(.{ .op = "run", .message = prompt, .label = args.name, .model = args.model }, .{ .emit_null_optional_fields = false }, &json.writer);
+        const reply = try op_tool.callTool(call, "fleet", json.written());
         const value = switch (reply) {
             .value => |value| value,
             else => return reply,
@@ -38,10 +35,10 @@ pub fn withSchema(arena: std.mem.Allocator, prompt: []const u8, schema: ?std.jso
     const value = schema orelse return prompt;
     var json: std.Io.Writer.Allocating = .init(arena);
     try std.json.Stringify.value(value, .{}, &json.writer);
-    return arena.print("{s}\n\nReply with only one JSON value that matches this JSON schema, with no prose and no code fence:\n{s}", .{ prompt, json.written() });
+    return @import("../subagent/model_contract.zig").withSchemaAlloc(arena, prompt, json.written());
 }
 
-/// Turns the subagent tool's `{status, output}` into `{text}`, or an error.
+/// Turns the fleet tool's `{status, output}` into `{text}`, or an error.
 fn decode(call: *protocol.Call, value: []const u8) !protocol.Reply {
     const Ran = struct { status: []const u8, output: []const u8 };
     const ran = std.json.parseFromSliceLeaky(Ran, call.arena, value, .{}) catch

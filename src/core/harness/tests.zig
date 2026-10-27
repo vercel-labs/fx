@@ -16,12 +16,12 @@ const Fake = struct {
         const self: *Fake = @ptrCast(@alignCast(context));
         _ = self.calls.fetchAdd(1, .monotonic);
         if (std.mem.eql(u8, request.name, "write_file")) return .{ .status = .denied, .output = "denied" };
-        if (std.mem.eql(u8, request.name, "subagent")) return .{ .status = .success, .output = "{\"ok\":true,\"result\":\"child says hi\",\"error_code\":null}" };
+        if (std.mem.eql(u8, request.name, "fleet")) return .{ .status = .success, .output = "{\"ok\":true,\"result\":\"child says hi\",\"error_code\":null}" };
         return .{ .status = .success, .output = try arena.print("{s} {s} {s}", .{ request.call_id, request.name, request.arguments_json }) };
     }
 
     fn toolNames(_: *anyopaque, _: Allocator) anyerror![]const []const u8 {
-        return &.{ "read_file", "subagent" };
+        return &.{ "read_file", "fleet" };
     }
 
     fn complete(_: *anyopaque, arena: Allocator, request: services_mod.CompletionRequest) anyerror!services_mod.CompletionOutcome {

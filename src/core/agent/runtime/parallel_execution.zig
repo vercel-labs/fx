@@ -694,7 +694,7 @@ test "host calls run together until a writer, which runs alone" {
 
 test "a subagent group holds at most max_parallel_subagent_calls calls" {
     const builtin_tools = @import("../../../builtins/tools.zig");
-    const registry = tool_dispatch.Registry{ .tools = &.{builtin_tools.subagent} };
+    const registry = tool_dispatch.Registry{ .tools = &.{builtin_tools.fleet} };
     var calls: [max_parallel_subagent_calls + 3]ToolCall = undefined;
     for (&calls) |*call| call.* = toolCall("child", "subagent", "{\"action\":\"run\",\"task\":\"t\"}");
     try std.testing.expectEqual(LeadingGroup{ .kind = .subagent, .len = max_parallel_subagent_calls }, leadingParallelGroup(registry, &calls));
@@ -722,7 +722,7 @@ test "a host group holds at most max_parallel_host_calls calls" {
 test "parallel classifier keeps one leading registered subagent group" {
     const builtin_tools = @import("../../../builtins/tools.zig");
     const tools = [_]tool_dispatch.Tool{
-        builtin_tools.subagent,
+        builtin_tools.fleet,
         builtin_tools.read_file,
     };
     const registry = tool_dispatch.Registry{ .tools = &tools };
@@ -771,7 +771,7 @@ test "parallel classifier rejects prompts approvals dynamic tools and mutations"
     const tools = [_]tool_dispatch.Tool{
         builtin_tools.ask_user_question,
         builtin_tools.mcp_select_tool,
-        builtin_tools.subagent,
+        builtin_tools.fleet,
         builtin_tools.install_skill,
         builtin_tools.shell,
         builtin_tools.read_file,

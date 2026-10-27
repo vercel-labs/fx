@@ -102,7 +102,11 @@ fn collectScoredMatches(
     return out.toOwnedSlice(alloc);
 }
 
-pub const Action = enum { run, message };
+/// The fleet's operations (D101). `run` blocks until its one turn ends;
+/// `message` is `run` on a named worker, which it spawns when new. `spawn`
+/// and `send` return a turn receipt at once and the turn's result arrives
+/// when it settles.
+pub const Action = enum { run, message, spawn, send, list, inspect, terminate };
 
 pub const RunInput = struct {
     task: []const u8,
@@ -116,9 +120,22 @@ pub const MessageInput = struct {
     model: ?[]const u8 = null,
     effort: ?[]const u8 = null,
 };
+pub const SpawnInput = struct {
+    message: []const u8,
+    label: ?[]const u8 = null,
+    instructions: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    effort: ?[]const u8 = null,
+};
+pub const SendInput = struct { id: []const u8, message: []const u8 };
 pub const RequestInput = union(Action) {
     run: RunInput,
     message: MessageInput,
+    spawn: SpawnInput,
+    send: SendInput,
+    list,
+    inspect: []const u8,
+    terminate: []const u8,
 };
 
 /// Creation-time routing overrides carried by a request. Both default to the
@@ -145,6 +162,20 @@ pub const Request = union(Action) {
         model: ?[]u8 = null,
         effort: ?types.ReasoningEffort = null,
     },
+    /// A new persistent worker; `agent` is its label, generated when the
+    /// caller gave none.
+    spawn: struct {
+        agent: ?[]u8 = null,
+        instructions: ?[]u8 = null,
+        message: []u8,
+        model: ?[]u8 = null,
+        effort: ?types.ReasoningEffort = null,
+    },
+    send: struct { id: []u8, message: []u8 },
+    list,
+    inspect: []u8,
+    terminate: []u8,
+
     pub fn deinit(self: *Request, alloc: Allocator) void {
         switch (self.*) {
             .run => |value| {
@@ -157,6 +188,18 @@ pub const Request = union(Action) {
                 alloc.free(value.message);
                 if (value.model) |model| alloc.free(model);
             },
+            .spawn => |value| {
+                if (value.agent) |agent| alloc.free(agent);
+                if (value.instructions) |instructions| alloc.free(instructions);
+                alloc.free(value.message);
+                if (value.model) |model| alloc.free(model);
+            },
+            .send => |value| {
+                alloc.free(value.id);
+                alloc.free(value.message);
+            },
+            .list => {},
+            .inspect, .terminate => |id| alloc.free(id),
         }
         self.* = undefined;
     }
@@ -168,7 +211,8 @@ pub const Request = union(Action) {
     pub fn agentName(self: Request) ?[]const u8 {
         return switch (self) {
             .message => |value| value.agent,
-            .run => null,
+            .spawn => |value| value.agent,
+            else => null,
         };
     }
 
@@ -177,6 +221,19 @@ pub const Request = union(Action) {
         return switch (self) {
             .run => |value| .{ .model = value.model, .effort = value.effort },
             .message => |value| .{ .model = value.model, .effort = value.effort },
+            .spawn => |value| .{ .model = value.model, .effort = value.effort },
+            else => .{},
+        };
+    }
+
+    /// The text a new turn runs with; null for the operations that run none.
+    pub fn turnMessage(self: Request) ?[]const u8 {
+        return switch (self) {
+            .run => |value| value.task,
+            .message => |value| value.message,
+            .spawn => |value| value.message,
+            .send => |value| value.message,
+            .list, .inspect, .terminate => null,
         };
     }
 };
@@ -189,6 +246,7 @@ pub const ValidationError = error{
     InvalidMessage,
     InvalidModel,
     InvalidEffort,
+    InvalidId,
 };
 
 pub fn validateRequest(
@@ -206,6 +264,43 @@ pub fn validateRequest(
                 .model = try dupeOptional(alloc, value.model),
                 .effort = effort,
             } };
+        },
+        .spawn => |value| blk: {
+            if (value.label) |label| if (!domain.validLabel(label)) return error.InvalidAgent;
+            if (value.instructions) |instructions| {
+                if (instructions.len == 0 or !domain.validInstructions(instructions)) return error.InvalidInstructions;
+            }
+            try validateText(value.message, domain.max_message_bytes, error.InvalidMessage);
+            const effort = try validateOverrideText(value.model, value.effort);
+            const agent = try dupeOptional(alloc, value.label);
+            errdefer if (agent) |owned| alloc.free(owned);
+            const instructions = try dupeOptional(alloc, value.instructions);
+            errdefer if (instructions) |owned| alloc.free(owned);
+            const message = try alloc.dupe(u8, value.message);
+            errdefer alloc.free(message);
+            break :blk .{ .spawn = .{
+                .agent = agent,
+                .instructions = instructions,
+                .message = message,
+                .model = try dupeOptional(alloc, value.model),
+                .effort = effort,
+            } };
+        },
+        .send => |value| blk: {
+            try validateWorkerId(value.id);
+            try validateText(value.message, domain.max_message_bytes, error.InvalidMessage);
+            const id = try alloc.dupe(u8, value.id);
+            errdefer alloc.free(id);
+            break :blk .{ .send = .{ .id = id, .message = try alloc.dupe(u8, value.message) } };
+        },
+        .list => .list,
+        .inspect => |id| blk: {
+            try validateWorkerId(id);
+            break :blk .{ .inspect = try alloc.dupe(u8, id) };
+        },
+        .terminate => |id| blk: {
+            try validateWorkerId(id);
+            break :blk .{ .terminate = try alloc.dupe(u8, id) };
         },
         .message => |value| blk: {
             if (!domain.validAgentName(value.agent)) return error.InvalidAgent;
@@ -236,6 +331,10 @@ pub fn validateRequest(
             } };
         },
     };
+}
+
+fn validateWorkerId(id: []const u8) ValidationError!void {
+    if (id.len == 0 or id.len > 128 or !std.unicode.utf8ValidateSlice(id) or std.mem.findScalar(u8, id, 0) != null) return error.InvalidId;
 }
 
 /// Validates override text without allocating. Returns the parsed effort.
@@ -291,7 +390,7 @@ pub const Plan = union(enum) {
 
 pub fn plan(request: Request, snapshot: ?Snapshot) Plan {
     return switch (request) {
-        .run => .create_one_off,
+        .run, .spawn, .send, .list, .inspect, .terminate => .create_one_off,
         .message => if (snapshot) |child| switch (child.kind) {
             .one_off => .{ .reject = .child_not_persistent },
             .persistent => switch (child.phase) {
@@ -313,6 +412,20 @@ pub fn requestFingerprint(request: Request) [32]u8 {
     hash.update("\x00");
     switch (request) {
         .run => |value| hash.update(value.task),
+        .spawn => |value| {
+            hash.update(value.agent orelse "");
+            hash.update("\x00");
+            hash.update(value.instructions orelse "");
+            hash.update("\x00");
+            hash.update(value.message);
+        },
+        .send => |value| {
+            hash.update(value.id);
+            hash.update("\x00");
+            hash.update(value.message);
+        },
+        .list => {},
+        .inspect, .terminate => |id| hash.update(id),
         .message => |value| {
             hash.update(value.agent);
             hash.update("\x00");
@@ -351,7 +464,16 @@ pub fn requestFingerprint(request: Request) [32]u8 {
     return hash.finalResult();
 }
 
+/// `message` with the instruction to reply with one JSON value matching
+/// the JSON schema `schema_json`, as `harness.agent(schema=)` asks.
+pub fn withSchemaAlloc(alloc: Allocator, message: []const u8, schema_json: []const u8) Allocator.Error![]u8 {
+    return alloc.print("{s}\n\nReply with only one JSON value that matches this JSON schema, with no prose and no code fence:\n{s}", .{ message, schema_json });
+}
+
 pub const steering_pending_result = "The subagent is still running. Handle the user's steering now. Its result will arrive automatically; do not delegate again to poll for it.";
+
+/// What became of a tracked worker input (D101).
+pub const Receipt = enum { accepted, queued, steered, rejected, terminal };
 
 pub const Result = struct {
     ok: bool,
@@ -359,6 +481,14 @@ pub const Result = struct {
     result: ?[]const u8 = null,
     error_code: ?[]const u8 = null,
     delivery: ?types.SteeringDelivery = null,
+    /// Fleet fields, for receipts and the fleet's cards.
+    receipt: ?Receipt = null,
+    worker: ?[]const u8 = null,
+    label: ?[]const u8 = null,
+    turn: ?u32 = null,
+    job: ?[]const u8 = null,
+    /// Raw JSON array of worker rows, for `list` and `inspect`.
+    workers: ?[]const u8 = null,
 };
 
 pub fn feedbackResult(delivery: types.SteeringDelivery) Result {
@@ -388,6 +518,15 @@ pub fn encodeResultAlloc(alloc: Allocator, result: Result) ![]u8 {
     );
     if (result.pending) try out.writer.writeAll(",\"pending\":true");
     if (result.delivery) |delivery| try out.writer.print(",\"delivery\":\"{s}\"", .{@tagName(delivery)});
+    if (result.receipt) |receipt| try out.writer.print(",\"receipt\":\"{s}\"", .{@tagName(receipt)});
+    inline for (.{ "worker", "label", "job" }) |name| {
+        if (@field(result, name)) |value| {
+            try out.writer.writeAll(",\"" ++ name ++ "\":");
+            try std.json.Stringify.value(value, .{}, &out.writer);
+        }
+    }
+    if (result.turn) |turn| try out.writer.print(",\"turn\":{d}", .{turn});
+    if (result.workers) |workers| try out.writer.print(",\"workers\":{s}", .{workers});
     try out.writer.writeByte('}');
     return out.toOwnedSlice();
 }
@@ -402,7 +541,7 @@ fn writeOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
 
 test "minimal request validation owns one-off and persistent intent" {
     const alloc = std.testing.allocator;
-    try std.testing.expectEqual(@as(usize, 2), @typeInfo(Action).@"enum".field_names.len);
+    try std.testing.expectEqual(@as(usize, 7), @typeInfo(Action).@"enum".field_names.len);
     var run = try validateRequest(alloc, .{ .run = .{ .task = "review this" } });
     defer run.deinit(alloc);
     try std.testing.expectEqual(Action.run, run.action());

@@ -40,6 +40,7 @@ const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const auto_classifier_context = @import("../../permissions/auto_classifier_context.zig");
 const subagent_model_contract = @import("../../subagent/model_contract.zig");
+const tooling_presentation = @import("../../tooling/tool_presentation.zig");
 
 const runtime_config = @import("config.zig");
 const runtime_finalization = @import("finalization.zig");
@@ -864,7 +865,7 @@ fn project_subagent_request_messages(
     provider: agent_stream_provider.Provider,
     selection: model_provider.ProviderSelection,
 ) ![]const ChatMessage {
-    if (!attempt_eligible or registry.lookup("subagent") == null) return source;
+    if (!attempt_eligible or (registry.lookup("fleet") == null and registry.lookup("subagent") == null)) return source;
 
     var calls: std.ArrayList(SubagentHistoryCall) = .empty;
     defer calls.deinit(alloc);
@@ -872,7 +873,7 @@ fn project_subagent_request_messages(
     for (source, 0..) |message, message_index| {
         if (message.role != .assistant) continue;
         for (message.tool_calls) |call| {
-            if (!std.mem.eql(u8, call.name, "subagent")) continue;
+            if (!tooling_presentation.isFleetCall(call)) continue;
             if (legacy_subagent_action(call.arguments_json)) |action| {
                 try calls.append(alloc, .{
                     .assistant_index = message_index,
@@ -964,7 +965,7 @@ fn project_subagent_request_messages(
                 projected_calls.deinit(alloc);
             }
             for (message.tool_calls) |call| {
-                const history_call = if (std.mem.eql(u8, call.name, "subagent"))
+                const history_call = if (tooling_presentation.isFleetCall(call))
                     find_subagent_history_call(calls.items, message_index, call.id)
                 else
                     null;

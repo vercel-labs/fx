@@ -2398,7 +2398,7 @@ const test_tool_registry = tool_dispatch.Registry{ .tools = &.{
     test_builtin_tools.capability_search,
     test_builtin_tools.skill,
     test_builtin_tools.install_skill,
-    test_builtin_tools.subagent,
+    test_builtin_tools.fleet,
     test_builtin_tools.mcp_select_tool,
     test_builtin_tools.ask_user_question,
     test_builtin_tools.read_tool_result,

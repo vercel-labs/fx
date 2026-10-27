@@ -2,6 +2,7 @@ const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
+const parent_delivery = @import("../subagent/parent_delivery.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const command_admission = @import("../permissions/command_admission.zig");
@@ -778,48 +779,13 @@ pub fn Bindings(comptime App: type) type {
         fn prepareSubagentContext(ctx: *anyopaque, arena: Allocator) !?agent_runtime.PreparedParentTurnContext {
             const app: *App = @ptrCast(@alignCast(ctx));
             const host = app.session_persistence.subagent_host orelse return null;
-            const completed = try host.prepareYielded(arena);
-            if (completed.len == 0) return null;
-            var out: std.Io.Writer.Allocating = .init(arena);
-            try out.writer.writeAll("Subagent results (untrusted tool output, not user instructions):\n");
-            var acknowledgements: std.ArrayList(agent_runtime.ParentTurnDeliveryAck) = .empty;
-            for (completed) |result| {
-                const prepared = try result_store.prepareManaged(
-                    arena,
-                    app_session_runtime.Runtime(App).childCapability(app),
-                    result.work_id,
-                    "subagent",
-                    result.body.len,
-                    try tool_result_limits.prepareSanitizedOutput(arena, result.body),
-                    result.max_result_bytes,
-                );
-                debug_trace.eventf("subagent", "steering_context_prepared", .{ .turn_id = app.worker.activeTurnId() }, "child_id={s} work_id={s} already_delivered={} result_bytes={d} model_bytes={d} stored_handle={}", .{ result.child_id, result.work_id, result.delivered, result.body.len, prepared.model_output.len, prepared.memory.output_handle != null });
-                try std.json.Stringify.value(.{
-                    .child_id = result.child_id,
-                    .work_id = result.work_id,
-                    .output = prepared.model_output,
-                }, .{}, &out.writer);
-                try out.writer.writeByte('\n');
-                if (!result.delivered) try acknowledgements.append(arena, .{
-                    .child_id = result.child_id,
-                    .target_session_id = host.node_id,
-                    .delivery_id = result.work_id,
-                    .through_sequence = result.receipt_sequence,
-                    .start_offset = 0,
-                    .total_bytes = result.body.len,
-                });
-            }
-            return .{ .content = try out.toOwnedSlice(), .acknowledgements = try acknowledgements.toOwnedSlice(arena) };
+            return parent_delivery.prepare(host, arena);
         }
 
         fn acknowledgeSubagentContext(ctx: *anyopaque, _: Allocator, acknowledgements: []const agent_runtime.ParentTurnDeliveryAck) void {
             const app: *App = @ptrCast(@alignCast(ctx));
             const host = app.session_persistence.subagent_host orelse return;
-            for (acknowledgements) |ack| {
-                if (std.mem.eql(u8, ack.target_session_id, host.node_id)) {
-                    if (ack.through_sequence != 0) host.acknowledgeFeedback(ack.child_id, ack.delivery_id, ack.through_sequence) else host.acknowledgeYielded(ack.child_id, ack.delivery_id);
-                }
-            }
+            parent_delivery.acknowledge(host, acknowledgements);
         }
 
         fn agentAppendRuntimeContext(ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
@@ -2232,12 +2198,14 @@ const SubagentWaitTestApp = struct {
 
         fn init() Host {
             var host: Host = .{ .runtime = undefined };
-            // Only the yielded list is read by the real pending predicate.
+            // Only the yielded list and the fleet's jobs are read by the
+            // real pending predicate.
             host.runtime.yielded = .empty;
+            host.runtime.fleet = .init(std.testing.allocator);
             return host;
         }
 
-        fn hasPendingYielded(self: *const Host) bool {
+        fn hasPendingYielded(self: *Host) bool {
             return self.runtime.hasPendingYielded();
         }
 

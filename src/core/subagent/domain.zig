@@ -175,15 +175,21 @@ pub fn validateId(id: []const u8) ValidationError!void {
     session_layout.validateSessionId(id) catch return error.InvalidId;
 }
 
+/// A named child's name as saved: a fleet label, or an older lowercase name
+/// of up to 64 bytes.
 pub fn validAgentName(name: []const u8) bool {
     if (name.len == 0 or name.len > max_agent_name_bytes) return false;
-    if (!std.ascii.isLower(name[0]) and !std.ascii.isDigit(name[0])) return false;
-    for (name[1..]) |byte| {
-        if (!std.ascii.isLower(byte) and !std.ascii.isDigit(byte) and
-            byte != '_' and byte != '-')
-        {
-            return false;
-        }
+    for (name) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-') return false;
+    }
+    return true;
+}
+
+/// A worker label: 1 to 48 ASCII letters, digits, `_` or `-` (D101).
+pub fn validLabel(label: []const u8) bool {
+    if (label.len == 0 or label.len > 48) return false;
+    for (label) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-') return false;
     }
     return true;
 }

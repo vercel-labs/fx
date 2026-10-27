@@ -405,7 +405,7 @@ fn admittedFunctions(
 test "a child advertises its admitted built-ins and every dynamic tool" {
     const alloc = std.testing.allocator;
     const builtin_tools = @import("../../builtins/tools.zig");
-    const registry: tool_dispatch.Registry = .{ .tools = &.{ builtin_tools.read_file, builtin_tools.subagent } };
+    const registry: tool_dispatch.Registry = .{ .tools = &.{ builtin_tools.read_file, builtin_tools.fleet } };
     const advertised = [_][]const u8{ "read_file", "subagent", "mcp_lookup" };
     const leaf = try admittedNames(alloc, registry, &.{"read_file"}, &advertised);
     defer alloc.free(leaf);

@@ -397,6 +397,23 @@ fn subagentStatusContinuation(
     return if (continuation.len == 0) null else continuation;
 }
 
+/// A status continuation's rows: a fleet card has several (D101).
+const ContinuationRows = struct {
+    lines: std.mem.SplitIterator(u8, .scalar),
+
+    fn next(self: *ContinuationRows) ?[]const u8 {
+        while (self.lines.next()) |line| {
+            const text = std.mem.trim(u8, line, " \t\r");
+            if (text.len > 0) return text;
+        }
+        return null;
+    }
+};
+
+fn continuationRows(continuation: []const u8) ContinuationRows {
+    return .{ .lines = std.mem.splitScalar(u8, continuation, '\n') };
+}
+
 fn clipSummary(
     alloc: std.mem.Allocator,
     text: []const u8,
@@ -659,8 +676,11 @@ fn formatSingleToolRow(
     const row = try scratch.print("● {s}", .{phrase});
     try appendStatusRow(alloc, scratch, &out.writer, &lines, single.entry_id, single.detail, row, true, cols, style);
     if (subagentStatusContinuation(single.entry, single.detail)) |continuation| {
-        const continuation_row = try scratch.print("  {s}", .{continuation});
-        try appendStatusRow(alloc, scratch, &out.writer, &lines, single.entry_id, null, continuation_row, false, cols, style);
+        var rows = continuationRows(continuation);
+        while (rows.next()) |text| {
+            const continuation_row = try scratch.print("  {s}", .{text});
+            try appendStatusRow(alloc, scratch, &out.writer, &lines, single.entry_id, null, continuation_row, false, cols, style);
+        }
     }
     const bytes = try out.toOwnedSlice();
     errdefer alloc.free(bytes);
@@ -734,11 +754,14 @@ fn formatGroupBlock(
         const child = try scratch.print("{s} {s}", .{ connector, display_phrase });
         try appendStatusRow(alloc, scratch, &out.writer, &lines, entry_id, detail, child, false, cols, style);
         if (subagentStatusContinuation(entry, detail)) |continuation| {
-            const continuation_row = try scratch.print(
-                "{s}{s}",
-                .{ if (last_static_row) "  " else "│ ", continuation },
-            );
-            try appendStatusRow(alloc, scratch, &out.writer, &lines, entry_id, null, continuation_row, false, cols, style);
+            var rows = continuationRows(continuation);
+            while (rows.next()) |text| {
+                const continuation_row = try scratch.print(
+                    "{s}{s}",
+                    .{ if (last_static_row) "  " else "│ ", text },
+                );
+                try appendStatusRow(alloc, scratch, &out.writer, &lines, entry_id, null, continuation_row, false, cols, style);
+            }
         }
     }
 
@@ -908,11 +931,14 @@ fn formatExpandedChild(
     else
         child;
     const continuation = subagentStatusContinuation(entry, detail) orelse return alloc.dupe(u8, accented);
-    return alloc.print("{s}\n{s}{s}", .{
-        accented,
-        if (std.mem.eql(u8, connector, "└")) "  " else "│ ",
-        continuation,
-    });
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.writeAll(accented);
+    var rows = continuationRows(continuation);
+    while (rows.next()) |text| {
+        try out.writer.print("\n{s}{s}", .{ if (std.mem.eql(u8, connector, "└")) "  " else "│ ", text });
+    }
+    return out.toOwnedSlice();
 }
 
 test "expanded subagent row preserves status continuation" {

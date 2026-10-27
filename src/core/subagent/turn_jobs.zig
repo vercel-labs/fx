@@ -348,9 +348,17 @@ pub const Ledger = struct {
         return false;
     }
 
-    /// Settles every queued job of `node_id` as cancelled, as a terminate
-    /// discards the worker's queue.
-    pub fn cancelQueued(self: *Ledger, node_id: []const u8, result: []const u8, now_ms: i64) !void {
+    /// Whether a job tracks the work `work_id`.
+    pub fn has(self: *Ledger, work_id: []const u8) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return self.findWorkLocked(work_id) != null;
+    }
+
+    /// A terminated worker's jobs (D102): its queued ones settle as
+    /// cancelled with `result`, and none is delivered later, since the
+    /// terminate's own result reports them.
+    pub fn discardWorker(self: *Ledger, node_id: []const u8, result: []const u8, now_ms: i64) !void {
         var work_ids: std.ArrayList([]u8) = .empty;
         defer {
             for (work_ids.items) |id| self.alloc.free(id);
@@ -365,6 +373,12 @@ pub const Ledger = struct {
             }
         }
         for (work_ids.items) |work_id| try self.settle(work_id, .cancelled, result, null, now_ms);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.entries.items) |*entry| {
+            if (std.mem.eql(u8, entry.node_id, node_id) and entry.state.settled()) entry.delivered = true;
+        }
+        self.bump();
     }
 
     pub fn currentGeneration(self: *Ledger) u64 {
@@ -466,7 +480,7 @@ test "a settled job is delivered exactly once" {
     defer freeJobs(alloc, rest);
     try std.testing.expectEqual(@as(usize, 0), rest.len);
     ledger.start("op2", 30);
-    try ledger.cancelQueued("w", "{\"ok\":false}", 31);
+    try ledger.discardWorker("x", "{\"ok\":false}", 31);
     {
         const view = (try ledger.get(alloc, "w-t2")).?;
         defer freeJob(alloc, view);

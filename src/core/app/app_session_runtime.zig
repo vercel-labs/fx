@@ -6818,7 +6818,7 @@ test "beginFreshPersistedSession and enableSessionStores create per-session stor
     defer host_authority.deinit(alloc);
     var found_subagent = false;
     for (host_authority.tools) |tool_name| {
-        if (std.mem.eql(u8, tool_name, "subagent")) found_subagent = true;
+        if (std.mem.eql(u8, tool_name, "fleet")) found_subagent = true;
     }
     try std.testing.expect(found_subagent);
 }

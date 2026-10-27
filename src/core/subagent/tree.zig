@@ -18,7 +18,16 @@ const Allocator = std.mem.Allocator;
 
 /// The tool that carries the spawn ability. A node that may not spawn is
 /// never offered it.
-pub const spawn_tool_name = "subagent";
+pub const spawn_tool_name = "fleet";
+
+/// The spawn tool's name before the fleet (D101), still in older sessions'
+/// histories.
+pub const legacy_spawn_tool_name = "subagent";
+
+/// Whether `name` is the spawn tool, now or as older histories name it.
+pub fn isSpawnToolName(name: []const u8) bool {
+    return std.mem.eql(u8, name, spawn_tool_name) or std.mem.eql(u8, name, legacy_spawn_tool_name);
+}
 
 /// Why a spawn was refused, as the parent's tool result names it.
 pub const SpawnRefusal = enum {
@@ -195,5 +204,5 @@ test "one spawn policy bounds depth, children per node and the tree" {
 }
 
 test "the spawn tool is the built-in subagent tool" {
-    try std.testing.expectEqualStrings(@import("../../builtins/tools.zig").subagent.name, spawn_tool_name);
+    try std.testing.expectEqualStrings(@import("../../builtins/tools.zig").fleet.name, spawn_tool_name);
 }

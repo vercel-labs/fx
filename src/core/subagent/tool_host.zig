@@ -26,6 +26,7 @@ const slot_pool = @import("slot_pool.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tree_mod = @import("tree.zig");
 const turn_jobs = @import("turn_jobs.zig");
+const fleet_host = @import("fleet_host.zig");
 const node_hosts = @import("node_hosts.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
@@ -76,6 +77,7 @@ test {
     _ = @import("tree.zig");
     _ = @import("turn_jobs.zig");
     _ = @import("fleet_state.zig");
+    _ = @import("fleet_host.zig");
 }
 
 test "managed execution receipts retain the pending contract" {
@@ -333,6 +335,7 @@ pub const Runtime = struct {
     /// result waits for delivery.
     pub fn idle(self: *Runtime) bool {
         if (self.managed.anyRunning()) return false;
+        if (self.fleet.pendingDelivery()) return false;
         self.yielded_mutex.lockUncancelable(io_mod.getIo());
         defer self.yielded_mutex.unlock(io_mod.getIo());
         for (self.yielded.items) |item| if (!item.delivered) return false;
@@ -425,7 +428,13 @@ pub const Runtime = struct {
         defer alloc.free(operation_id);
 
         return switch (request.*) {
-            .run, .message => blk: {
+            .list, .inspect, .terminate => fleet_host.execute(self, alloc, request, .{
+                .operation_id = operation_id,
+                .options = options,
+                .child_mode = .ask,
+                .resolved_model = null,
+            }),
+            .run, .message, .spawn, .send => blk: {
                 // A child is never wider than the node that asks for it.
                 const child_mode = authority.admitChildPermission(self.permission_ceiling, options.parent_permission_mode) catch
                     break :blk self.encodeManaged(alloc, .{ .ok = false, .error_code = @tagName(tree_mod.SpawnRefusal.permission_escalation) });
@@ -433,6 +442,12 @@ pub const Runtime = struct {
                     .rejected => |failure| break :blk try self.encodeManaged(alloc, failure),
                     .accepted => |model| model,
                 };
+                if (request.* == .spawn or request.* == .send) break :blk fleet_host.execute(self, alloc, request, .{
+                    .operation_id = operation_id,
+                    .options = options,
+                    .child_mode = child_mode,
+                    .resolved_model = resolved_model,
+                });
                 var admission_arena = std.heap.ArenaAllocator.init(self.alloc);
                 defer admission_arena.deinit();
                 var queued_receipt: ?ManagedExecutionResult = null;
@@ -624,6 +639,7 @@ pub const Runtime = struct {
             .approvals = self.approvals,
             .tree = self.tree,
             .node_path = self.node_path,
+            .turn_hook = fleet_host.turnHook(self),
         };
     }
 
@@ -863,17 +879,18 @@ pub const Runtime = struct {
                     registry.children[registry.children.len - 1].id,
                 );
             },
+            .spawn, .send, .list, .inspect, .terminate => unreachable,
         }
     }
 
     /// The spawn policy's one check for a new child (D91).
-    fn refuseNewChild(self: *Runtime, alloc: Allocator, registry: child_state.Registry) !?ManagedAdmission {
+    pub fn refuseNewChild(self: *Runtime, alloc: Allocator, registry: child_state.Registry) !?ManagedAdmission {
         const refusal = (try self.tree.admitNode(self.depth, registry.children.len)) orelse return null;
         debug_trace.logf("subagent", "admission rejected node_id={s} depth={d} code={s}", .{ self.node_id, self.depth, @tagName(refusal) });
         return try managedAdmissionRejected(alloc, null, @tagName(refusal));
     }
 
-    fn ensureManagedChildSession(
+    pub fn ensureManagedChildSession(
         self: *Runtime,
         child_id: []const u8,
         work_id: []const u8,
@@ -1047,6 +1064,20 @@ pub const Runtime = struct {
                 .delivered = item.delivered,
             });
         }
+        // Fleet turns that settled since the parent's last step (D101). A
+        // claim by the jobs tool takes one first, so each reaches the parent
+        // once; the acknowledgement marks the rest delivered.
+        fleet_host.pumpQueues(self);
+        for (try self.fleet.snapshot(arena)) |job| {
+            if (!job.state.settled() or job.delivered) continue;
+            try results.append(arena, .{
+                .child_id = job.node_id,
+                .work_id = job.id,
+                .body = job.result orelse "{}",
+                .max_result_bytes = tool_result_limits.min_configured_tool_result_bytes,
+                .delivered = false,
+            });
+        }
         for (try self.managed.feedbackUpdates(arena)) |update| {
             try results.append(arena, .{
                 .child_id = update.child_id,
@@ -1066,6 +1097,12 @@ pub const Runtime = struct {
     }
 
     pub fn acknowledgeYielded(self: *Runtime, child_id: []const u8, work_id: []const u8) void {
+        if (turn_jobs.parseId(work_id) != null) {
+            var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena_state.deinit();
+            _ = self.fleet.claim(arena_state.allocator(), work_id) catch null;
+            return;
+        }
         for (self.yielded.items) |*item| {
             if (item.delivered or !std.mem.eql(u8, item.child_id, child_id) or !std.mem.eql(u8, item.work_id, work_id)) continue;
             item.delivered = true;
@@ -1088,11 +1125,11 @@ pub const Runtime = struct {
     }
 
     /// Main-loop-only after tool dispatch drains; completed but undelivered work counts.
-    pub fn hasPendingYielded(self: *const Runtime) bool {
+    pub fn hasPendingYielded(self: *Runtime) bool {
         for (self.yielded.items) |item| {
             if (!item.delivered) return true;
         }
-        return false;
+        return self.fleet.pendingDelivery();
     }
 
     pub fn waitYielded(self: *Runtime, worker: *worker_runtime.WorkerRuntime) !bool {
@@ -1105,6 +1142,7 @@ pub const Runtime = struct {
                 debug_trace.eventf("subagent", "steering_parent_woken", .{ .turn_id = worker.activeTurnId() }, "cancel_requested={} plain_steering={}", .{ cancelled, steering });
                 return true;
             }
+            if (self.fleet.settledUndelivered()) return true;
             for (self.yielded.items) |item| {
                 if (item.delivered) continue;
                 const state = try self.managed.wait(item.child_id, .{ .clock = .awake, .raw = .fromMilliseconds(0) });
@@ -1133,7 +1171,7 @@ pub const Runtime = struct {
         self.yielded.clearRetainingCapacity();
     }
 
-    fn completeManagedResult(
+    pub fn completeManagedResult(
         self: *Runtime,
         alloc: Allocator,
         child_id: []const u8,
@@ -1308,7 +1346,7 @@ fn operationIdAlloc(
 }
 
 fn checkYieldedOwnership(alloc: Allocator) !void {
-    var runtime = Runtime{ .alloc = alloc, .children = undefined, .node_id = undefined, .tree = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
+    var runtime = Runtime{ .alloc = alloc, .children = undefined, .node_id = undefined, .tree = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined, .fleet = .init(alloc) };
     runtime.managed = .{ .alloc = alloc, .children = undefined, .state_store = undefined, .services = undefined, .authority_resolver = undefined, .approvals = undefined };
     defer runtime.yielded.deinit(alloc);
     defer while (runtime.yielded.items.len > 0) {
@@ -1347,7 +1385,7 @@ test "subagent admission preserves an undelivered result before advancing its ch
         .assistant = @constCast("ORIGINAL_RESULT"),
     } }};
     (try parent.openChild("frozen-child", &history)).close();
-    var runtime = Runtime{ .alloc = alloc, .children = &parent.children, .node_id = undefined, .tree = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
+    var runtime = Runtime{ .alloc = alloc, .children = &parent.children, .node_id = undefined, .tree = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined, .fleet = .init(alloc) };
     defer runtime.yielded.deinit(alloc);
     try runtime.retainYielded("frozen-child", "old-work", 4096, 64);
     defer runtime.removeYielded("frozen-child", "old-work");
@@ -1370,7 +1408,7 @@ test "subagent admission preserves an undelivered result before advancing its ch
 
 test "parallel subagent wait bookkeeping stays serialized" {
     const alloc = std.testing.allocator;
-    var runtime = Runtime{ .alloc = alloc, .children = undefined, .node_id = undefined, .tree = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
+    var runtime = Runtime{ .alloc = alloc, .children = undefined, .node_id = undefined, .tree = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined, .fleet = .init(alloc) };
     defer runtime.yielded.deinit(alloc);
     const Writer = struct {
         runtime: *Runtime,
@@ -1538,6 +1576,7 @@ fn checkFailedStartBookkeeping(action: model_contract.Action) !void {
     var request = try model_contract.validateRequest(alloc, switch (action) {
         .run => .{ .run = .{ .task = "review this" } },
         .message => .{ .message = .{ .agent = "reviewer", .message = "review this" } },
+        else => unreachable,
     });
     defer request.deinit(alloc);
     const options = ExecuteOptions{
@@ -1933,7 +1972,7 @@ fn managedAdmissionRejected(
     } };
 }
 
-fn makeManagedWork(
+pub fn makeManagedWork(
     alloc: Allocator,
     operation_id: []const u8,
     request_fingerprint: [32]u8,
@@ -1941,10 +1980,7 @@ fn makeManagedWork(
     options: ExecuteOptions,
     permission_mode: types.PermissionMode,
 ) !child_state.ActiveWork {
-    const message = switch (request) {
-        .run => |value| value.task,
-        .message => |value| value.message,
-    };
+    const message = request.turnMessage().?;
     const id = try alloc.dupe(u8, operation_id);
     errdefer alloc.free(id);
     const owned_message = try alloc.dupe(u8, message);
@@ -2027,7 +2063,7 @@ fn modelOverrideFailureMessage(
 /// wins over the raw override text. The returned value borrows the override or
 /// resolved model; the request, the resolved model, and the original defaults
 /// must outlive the result.
-fn effectiveDefaults(
+pub fn effectiveDefaults(
     defaults: Defaults,
     override: model_contract.Override,
     resolved_model: ?[]const u8,

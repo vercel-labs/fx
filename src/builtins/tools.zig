@@ -16,7 +16,7 @@ const capability_retrieval = @import("../core/tooling/capability_retrieval.zig")
 const permission_gate = @import("../core/permissions/permission_gate.zig");
 const ask_user_question_impl = @import("../tools/agent/ask_user_question.zig");
 const question_answer = @import("../core/agent/question_answer.zig");
-const subagent_impl = @import("../tools/agent/subagent.zig");
+const fleet_impl = @import("../tools/agent/fleet.zig");
 const vision_impl = @import("../tools/agent/vision.zig");
 const edit_file_impl = @import("../tools/filesystem/edit_file.zig");
 const read_file_impl = @import("../tools/filesystem/read_file.zig");
@@ -115,20 +115,28 @@ const ask_user_question_question_schema = model_tool_schema.ObjectSchema{
     .required = &.{ "question", "options" },
 };
 
-const subagent_description =
-    "Delegate work and receive one final result from the child. Use run for one temporary child and one task. Use message with a stable name to create or continue a persistent conversation in this parent session. A message sent to a working child queues feedback for its next safe boundary without cancelling its current tool. A delivery receipt is not the child's final result; that result arrives separately. Optional instructions replace only that child's system overlay between turns; fx preserves its trusted base prompt. Optional model and effort apply only when a child is created and are rejected for an existing child. fx owns timing, worker identities, cancellation, permissions, persistence, and cleanup.";
+const fleet_description =
+    \\Agent fleet: workers you own. `op` is required; fields an op does not take are rejected before anything happens. Route only by a worker's `id`; `label` is display text and never an address.
+    \\- `run`: `message` (required), optional `label`, `model`, `effort`, `schema`. Runs one turn and waits for its result. Without `label` the child is temporary; with `label` the turn runs on that named worker, which is spawned when new.
+    \\- `spawn`: `message` (required; the worker's only initial context: include files, constraints, acceptance criteria), optional `label` (1 to 48 of A-Z a-z 0-9 _ -, generated when omitted), `instructions` (the worker's own system overlay), `model`, `effort`, `schema`. Answers at once with a turn receipt; the turn's result is delivered automatically when it settles. Never poll with `list` or `inspect`.
+    \\- `send`: `id` + `message`. A worker streaming a turn is steered inside it (receipt steered, same job). An idle worker starts a new turn (accepted, new job). A busy worker that is not streaming queues it as its own turn (queued; it starts after the current turn). A full queue is rejected and nothing is queued.
+    \\- `terminate`: `id`. Cancels the in-flight turn, discards queued inputs, and makes the worker terminal: read-only, browsable in the session tree, no longer addressable. Stopping only one turn is not terminate.
+    \\- `list`: your workers with lifecycle, turn state, current and queued jobs, and model. `inspect`: `id`; one worker in full.
+    \\Every accepted input names its turn job `<worker id>-t<turn>`. Lifecycle is live or terminal; turn state is running, awaiting approval, idle or interrupted. `model` is a catalog ID such as openai/gpt-5.6-terra (unambiguous partial names resolve; unknown or ambiguous ones are rejected with candidates) and with `effort` applies when a worker is created; both inherit the parent's when omitted. `schema` is a JSON Schema the turn's final reply must match as one JSON value. fx owns timing, identities, cancellation, permissions, persistence, and cleanup.
+;
 
 // Flat so a model never writes the call's JSON by hand inside a wrapper; the
-// decoder in src/tools/agent/subagent.zig rejects a field the action does not
+// decoder in src/tools/agent/fleet.zig rejects a field the op does not
 // take, and the test below keeps these properties in step with it.
-const subagent_properties = [_]model_tool_schema.Property{
-    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "run", "message" } }, .description = "run starts one temporary child for task. message creates or continues the persistent child named agent; send each child its own call." },
-    .{ .name = "task", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_prompt_bytes }, .description = "Required for run. One complete task for a temporary child. The child accepts no follow-up." },
-    .{ .name = "agent", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_agent_name_bytes }, .description = "Required for message. Stable lowercase name for one persistent conversation in this parent session. A new valid name creates it; later calls continue it." },
-    .{ .name = "message", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_message_bytes }, .description = "Required for message. Message for that named agent: creates it on first use, continues an idle conversation, or queues feedback for a working child. Do not resend merely to poll for completion." },
-    .{ .name = "instructions", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_instructions_bytes }, .description = "message only. Optional persistent instructions for this child. Replaces its child-specific system overlay before this message when idle; rejected while the child is working. Omit to preserve the overlay or send live feedback. Cannot replace fx's trusted base prompt or widen authority." },
-    .{ .name = "model", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_model_bytes }, .description = "Optional model for the child, as a catalog model ID such as openai/gpt-5.6-terra. Unambiguous partial names resolve to catalog IDs; unknown or ambiguous names are rejected with candidate IDs. Inherits the parent's model when omitted. With message, applies only when the message creates the child and is rejected for an existing child." },
-    .{ .name = "effort", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = types.ReasoningEffort.max_name_bytes }, .description = "Optional reasoning effort for the child. Inherits the parent's effort when omitted. With message, applies only when the message creates the child and is rejected for an existing child." },
+const fleet_properties = [_]model_tool_schema.Property{
+    .{ .name = "op", .json_type = .string, .shape = &.{ .enum_values = &fleet_impl.ops }, .description = "run waits for one turn; spawn and send answer with a turn receipt; list, inspect and terminate manage your workers." },
+    .{ .name = "id", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = 128 }, .description = "send, inspect, terminate: the worker's id, never its label." },
+    .{ .name = "message", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_message_bytes }, .description = "run, spawn: the turn's complete task. send: the worker's next input. Do not resend to poll for a result." },
+    .{ .name = "label", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = 48 }, .description = "spawn: the worker's display label. run: the named worker the turn runs on." },
+    .{ .name = "instructions", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_instructions_bytes }, .description = "spawn only. The worker's own system overlay. Cannot replace fx's trusted base prompt or widen authority." },
+    .{ .name = "model", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_model_bytes }, .description = "run, spawn: the worker's model as a catalog ID. Inherits the parent's model when omitted; rejected for an existing worker." },
+    .{ .name = "effort", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = types.ReasoningEffort.max_name_bytes }, .description = "run, spawn: the worker's reasoning effort. Inherits the parent's effort when omitted; rejected for an existing worker." },
+    .{ .name = "schema", .json_type = .object, .description = "run, spawn: a JSON Schema the turn's final reply must match, as one JSON value." },
 };
 const vision_description =
     "Inspect authorized images attached by the user or local image paths supplied in the conversation, and return structured factual evidence. Pass exactly one source: image_ids for attached images, or paths for local images. Use when: read visible text, UI state, objects, layout, or other visual details needed for the task. Do not use when: inspect paths the user did not supply, infer details not visible in an image, or repeat evidence already available in the conversation.";
@@ -454,15 +462,15 @@ pub const install_skill = ToolSpec{
     },
 };
 
-pub const subagent = ToolSpec{
-    .name = "subagent",
-    .description = subagent_description,
+pub const fleet = ToolSpec{
+    .name = "fleet",
+    .description = fleet_description,
     .model_schema = .{
-        .name = "subagent",
-        .description = subagent_description,
+        .name = "fleet",
+        .description = fleet_description,
         .input_schema = .{
-            .properties = &subagent_properties,
-            .required = &.{"action"},
+            .properties = &fleet_properties,
+            .required = &.{"op"},
             .additional_properties = false,
         },
     },
@@ -472,14 +480,14 @@ pub const subagent = ToolSpec{
     .action_label = "Managing",
     .completed_action_label = "Managed",
     .label_arg_kind = .none,
-    .label_arg_default = "subagent",
+    .label_arg_default = "fleet",
     .permission_target_kind = .none,
-    .decode = subagent_impl.decode,
-    .validate = subagent_impl.validate,
-    .call = subagent_impl.call,
+    .decode = fleet_impl.decode,
+    .validate = fleet_impl.validate,
+    .call = fleet_impl.call,
     .runtime_provider = .subagent,
-    .reads_only_fn = subagent_impl.readsOnly,
-    .irreversible_fn = subagent_impl.isIrreversible,
+    .reads_only_fn = fleet_impl.readsOnly,
+    .irreversible_fn = fleet_impl.isIrreversible,
 };
 
 pub const mcp_select_tool = ToolSpec{
@@ -643,7 +651,7 @@ pub const all = [_]tool_dispatch.Tool{
     capability_search,
     skill,
     install_skill,
-    subagent,
+    fleet,
     mcp_select_tool,
     ask_user_question,
     vision,
@@ -657,7 +665,7 @@ pub const advertisement_order = [_][]const u8{
     "edit_file",
     "write_file",
     "shell",
-    "subagent",
+    "fleet",
     "capability_search",
     "skill",
     "install_skill",
@@ -733,7 +741,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "d7dfcd9beab4fb1b224765de3d3544ab2a13facb0e8afd2f966217a7f4a87fe9",
+        "86b20faf9f2e561ab085bba3b10bbb82812381e63f1b2eb0fdd0dcb341a11c44",
         &actual_hex,
     );
 }
@@ -781,7 +789,7 @@ test "built-in tools register exact active local order" {
         "capability_search",
         "skill",
         "install_skill",
-        "subagent",
+        "fleet",
         "mcp_select_tool",
         "ask_user_question",
         "vision",
@@ -1116,84 +1124,43 @@ test "built-in skill owns product metadata schema and callbacks" {
     try std.testing.expect(skill.irreversible_fn == skill_impl.isIrreversible);
 }
 
-test "built-in subagent owns product metadata schema and callbacks" {
-    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, subagent);
+test "built-in fleet owns product metadata schema and callbacks" {
+    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, fleet);
     defer std.testing.allocator.free(schema_json);
 
-    try std.testing.expectEqualStrings("subagent", subagent.name);
-    try std.testing.expect(std.mem.find(u8, subagent.description, "one temporary child") != null);
-    try std.testing.expect(std.mem.find(u8, subagent.description, "stable name") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"request\"") == null);
+    try std.testing.expectEqualStrings("fleet", fleet.name);
+    try std.testing.expect(std.mem.find(u8, fleet.description, "Route only by a worker's `id`") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"oneOf\"") == null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"action\"]") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"enum\":[\"run\",\"message\"]") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"instructions\":") != null);
-    // Creation-time routing overrides are advertised on both actions.
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"model\":") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"effort\":") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "Inherits the parent's model when omitted") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "rejected for an existing child") != null);
-    for ([_][]const u8{
-        "\"command\":",
-        "\"relationship\":",
-        "\"configure\":",
-        "\"notifications\":",
-        "\"sections\":",
-        "\"cursor\":",
-        "\"generation\":",
-        "\"reopen\"",
-        "\"provider\"",
-        "\"send\"",
-        "\"wait\"",
-        "\"stop\"",
-        "\"child_id\"",
-    }) |mechanism| {
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"op\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"enum\":[\"run\",\"spawn\",\"send\",\"list\",\"inspect\",\"terminate\"]") != null);
+    for ([_][]const u8{ "\"request\"", "\"action\"", "\"child_id\"", "\"provider\"" }) |mechanism| {
         try std.testing.expect(std.mem.find(u8, schema_json, mechanism) == null);
     }
-    try std.testing.expect(std.mem.find(u8, schema_json, "subagent_type") == null);
-    try std.testing.expectEqual(tool_dispatch.ExecutorKind.subagent, subagent.executor_kind);
-    try std.testing.expectEqual(types.ToolActivityKind.subagent, subagent.activity_kind);
-    try std.testing.expect(!subagent.requires_approval);
-    try std.testing.expectEqual(tool_dispatch.LabelArgKind.none, subagent.label_arg_kind);
-    try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, subagent.permission_target_kind);
-    try std.testing.expectEqualStrings("Managing", subagent.action_label);
-    try std.testing.expectEqualStrings("Managed", subagent.completed_action_label);
-    try std.testing.expect(subagent.decode == subagent_impl.decode);
-    try std.testing.expect(subagent.validate.? == subagent_impl.validate);
-    try std.testing.expect(subagent.call == subagent_impl.call);
-    try std.testing.expect(subagent.reads_only_fn == subagent_impl.readsOnly);
-    try std.testing.expect(subagent.irreversible_fn == subagent_impl.isIrreversible);
+    try std.testing.expectEqual(tool_dispatch.ExecutorKind.subagent, fleet.executor_kind);
+    try std.testing.expectEqual(types.ToolActivityKind.subagent, fleet.activity_kind);
+    try std.testing.expect(!fleet.requires_approval);
+    try std.testing.expect(fleet.decode == fleet_impl.decode);
+    try std.testing.expect(fleet.call == fleet_impl.call);
 }
 
-test "subagent schema fields match the decoder's action fields" {
-    const actions = [_]struct { name: []const u8, fields: []const []const u8 }{
-        .{ .name = "run", .fields = &subagent_impl.run_fields },
-        .{ .name = "message", .fields = &subagent_impl.message_fields },
-    };
-    // Every advertised property belongs to some action, and every field an
-    // action takes is advertised, so a flat call can always say what it means.
-    for (subagent_properties) |property| {
-        const used = used: for (actions) |action| {
-            for (action.fields) |field| {
+test "fleet schema fields match the decoder's op fields" {
+    const op_fields = [_][]const []const u8{ &fleet_impl.run_fields, &fleet_impl.spawn_fields, &fleet_impl.send_fields, &fleet_impl.list_fields, &fleet_impl.id_fields };
+    // Every advertised property belongs to some op, and every field an op
+    // takes is advertised, so a flat call can always say what it means.
+    for (fleet_properties) |property| {
+        const used = used: for (op_fields) |fields| {
+            for (fields) |field| {
                 if (std.mem.eql(u8, field, property.name)) break :used true;
             }
         } else false;
         try std.testing.expect(used);
     }
-    for (actions) |action| {
-        for (action.fields) |field| {
-            const advertised = for (subagent_properties) |property| {
-                if (std.mem.eql(u8, property.name, field)) break true;
-            } else false;
-            try std.testing.expect(advertised);
-        }
-        const action_property = subagent_properties[0];
-        try std.testing.expectEqualStrings("action", action_property.name);
-        const listed = for (action_property.shape.?.enum_values) |value| {
-            if (std.mem.eql(u8, value, action.name)) break true;
+    for (op_fields) |fields| for (fields) |field| {
+        const advertised = for (fleet_properties) |property| {
+            if (std.mem.eql(u8, property.name, field)) break true;
         } else false;
-        try std.testing.expect(listed);
-    }
+        try std.testing.expect(advertised);
+    };
 }
 
 test "built-in install_skill registers run_command compatibility" {
@@ -1566,12 +1533,12 @@ test "built-in install_skill registry order follows skill" {
     try std.testing.expect(skill_pos.? < install_skill_pos.?);
 }
 
-test "built-in subagent registry order follows install_skill" {
+test "built-in fleet registry order follows install_skill" {
     var install_skill_pos: ?usize = null;
     var subagent_pos: ?usize = null;
     for (all, 0..) |tool, index| {
         if (std.mem.eql(u8, tool.name, "install_skill")) install_skill_pos = index;
-        if (std.mem.eql(u8, tool.name, "subagent")) subagent_pos = index;
+        if (std.mem.eql(u8, tool.name, "fleet")) subagent_pos = index;
     }
 
     try std.testing.expect(install_skill_pos != null);

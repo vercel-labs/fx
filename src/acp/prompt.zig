@@ -62,6 +62,7 @@ const subagent_agent_adapter = @import("../core/subagent/agent_adapter.zig");
 const subagent_domain = @import("../core/subagent/domain.zig");
 const subagent_execution = @import("../core/subagent/execution.zig");
 const subagent_model_contract = @import("../core/subagent/model_contract.zig");
+const parent_delivery = @import("../core/subagent/parent_delivery.zig");
 const gateway_model_catalog = @import("../core/gateway/model_catalog.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
 const skill_invocation = @import("../core/skills/skill_invocation.zig");
@@ -1941,6 +1942,25 @@ fn localFileTargetPath(alloc: Allocator, uri_text: []const u8) Allocator.Error!?
     };
 }
 
+fn waitForSubagent(raw: *anyopaque, _: u64, _: u64) !bool {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw));
+    const node_host = ctx.state.subagent_host orelse return false;
+    if (!node_host.hasPendingYielded()) return false;
+    return node_host.waitYielded(&ctx.state.worker);
+}
+
+fn prepareSubagentContext(raw: *anyopaque, arena: Allocator) !?agent_runtime.PreparedParentTurnContext {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw));
+    const node_host = ctx.state.subagent_host orelse return null;
+    return parent_delivery.prepare(node_host, arena);
+}
+
+fn acknowledgeSubagentContext(raw: *anyopaque, _: Allocator, acknowledgements: []const agent_runtime.ParentTurnDeliveryAck) void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw));
+    const node_host = ctx.state.subagent_host orelse return;
+    parent_delivery.acknowledge(node_host, acknowledgements);
+}
+
 fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
     const session = if (ctx.state.active_session) |*active| active else unreachable;
     var deps: agent_runtime.AgentRuntimeDeps = .{
@@ -1955,6 +1975,11 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .context_enabled = ctx.state.context_enabled,
         .finalize_turn = finalizeTurn,
         .take_steering_boundary = takeSteeringBoundary,
+        // Fleet turns settle after their calls return (D101); the step
+        // waits for them and their results enter it once.
+        .wait_for_subagent = if (comptime host_target.is_wasm) null else waitForSubagent,
+        .prepare_parent_turn_context = if (comptime host_target.is_wasm) null else prepareSubagentContext,
+        .acknowledge_parent_turn_context = if (comptime host_target.is_wasm) null else acknowledgeSubagentContext,
         // The web core's host keeps its steering queue, so the core asks it
         // while a reply streams whether a steer should cut it short.
         .cooperative_transport_pulse = if (comptime host_target.is_wasm) .{ .ctx = @ptrCast(ctx), .run = pulseHostSteering } else null,
@@ -3966,7 +3991,7 @@ fn providerTerminalStatus(outcome: types.ToolOutcomeKind) ?acp_types.ToolCallSta
 
 test "ACP subagent titles and terminal descriptions share request projection" {
     const alloc = std.testing.allocator;
-    const call: ToolCall = .{ .id = "review", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check replay\"}}" };
+    const call: ToolCall = .{ .id = "review", .name = "fleet", .arguments_json = "{\"op\":\"run\",\"label\":\"reviewer\",\"message\":\"Check replay\"}" };
     const title = try describeToolTitle(builtin_tools.registry, alloc, call);
     defer alloc.free(title);
     try std.testing.expectEqualStrings("reviewer · Check replay", title);
@@ -5468,8 +5493,8 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
         deps.context_registry.?.defaultProvider().id,
     );
     try std.testing.expect(deps.request_prepared_file_mutation_permission != null);
-    try std.testing.expect(deps.prepare_parent_turn_context == null);
-    try std.testing.expect(deps.acknowledge_parent_turn_context == null);
+    try std.testing.expect(deps.prepare_parent_turn_context != null);
+    try std.testing.expect(deps.acknowledge_parent_turn_context != null);
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();

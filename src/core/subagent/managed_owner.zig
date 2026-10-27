@@ -18,6 +18,7 @@ const types = @import("../shared/types.zig");
 
 const slot_pool = @import("slot_pool.zig");
 const tree_mod = @import("tree.zig");
+const fleet_state = @import("fleet_state.zig");
 const Allocator = std.mem.Allocator;
 
 pub const StartResult = enum { started, already_running };
@@ -83,6 +84,14 @@ const Feedback = struct {
     }
 };
 
+/// Told when a worker's turn starts from its queue and when any turn
+/// settles (D101), on the worker's own thread with no lock held.
+pub const TurnHook = struct {
+    context: *anyopaque,
+    started_fn: *const fn (context: *anyopaque, child_id: []const u8, work_id: []const u8) void,
+    settled_fn: *const fn (context: *anyopaque, child_id: []const u8, work_id: []const u8, observation: Observation) void,
+};
+
 pub const FeedbackUpdate = struct {
     child_id: []const u8,
     operation_id: []const u8,
@@ -108,6 +117,7 @@ pub const Owner = struct {
     slots: std.ArrayList(*Slot) = .empty,
     feedback: std.ArrayList(*Feedback) = .empty,
     closed: bool = false,
+    turn_hook: ?TurnHook = null,
 
     fn feedbackReplayLocked(self: *Owner, operation_id: []const u8, fingerprint: [32]u8) ?FeedbackResult {
         for (self.feedback.items) |item| {
@@ -456,13 +466,24 @@ pub const Owner = struct {
         try self.state_store.save(self.alloc, registry);
     }
 
+    const Finished = struct {
+        observation: Observation,
+        /// The queued work that starts next on this slot, owned; null when
+        /// the worker goes idle (D102).
+        next_work_id: ?[]u8 = null,
+    };
+
+    /// Records the end of `work_id` and, when `advance`, starts the front
+    /// of the worker's queue in the same save, so the log never shows the
+    /// worker idle with work waiting.
     fn finish(
         self: *Owner,
         child_id: []const u8,
         work_id: []const u8,
         outcome: child_state.Outcome,
         failure: ?types.ModelFailureDiagnostic,
-    ) ?Observation {
+        advance: bool,
+    ) ?Finished {
         var lock = self.state_store.acquireLock();
         defer lock.release();
         var registry = self.state_store.load(self.alloc) catch |err| {
@@ -474,12 +495,18 @@ pub const Owner = struct {
             debugFailure(child_id, "state_finish", err);
             return null;
         };
+        const settled = blk: {
+            const child = registry.findById(child_id) orelse return null;
+            break :blk Observation{ .phase = child.phase, .outcome = child.last_outcome, .failure = child.last_failure };
+        };
+        const next = if (advance) fleet_state.startQueued(&registry, self.alloc, child_id) catch null else null;
+        const next_work_id = if (next) |child| self.alloc.dupe(u8, child.active.?.id) catch null else null;
         self.state_store.save(self.alloc, registry) catch |err| {
+            if (next_work_id) |id| self.alloc.free(id);
             debugFailure(child_id, "state_save", err);
             return null;
         };
-        const child = registry.findById(child_id) orelse return null;
-        return .{ .phase = child.phase, .outcome = child.last_outcome, .failure = child.last_failure };
+        return .{ .observation = settled, .next_work_id = next_work_id };
     }
 };
 
@@ -560,16 +587,35 @@ test "child feedback allocation failure preserves ownership" {
 
 fn slotMain(slot: *Slot) void {
     const owner = slot.owner;
-    const outcome = runOne(slot);
-    // Startup must not inspect the old slot between saved and in-memory completion.
-    // Take owner before registry, matching cancellation and approval lock ordering.
-    owner.mutex.lockUncancelable(io_mod.getIo());
-    const completed = owner.finish(slot.child_id, outcome.work_id, outcome.outcome, outcome.failure);
-    slot.presentation.deinit(owner.alloc);
-    slot.completion = if (completed) |value| .{ .published = value } else .unpublished;
-    slot.done.set(io_mod.getIo());
-    owner.mutex.unlock(io_mod.getIo());
-    outcome.deinit(owner.alloc);
+    while (true) {
+        const outcome = runOne(slot);
+        defer outcome.deinit(owner.alloc);
+        // Startup must not inspect the old slot between saved and in-memory completion.
+        // Take owner before registry, matching cancellation and approval lock ordering.
+        owner.mutex.lockUncancelable(io_mod.getIo());
+        // A worker runs its queued turns one after another on this slot
+        // (`tests/tla/session_manager/Fleet.tla` QueueInOrder); a cancel
+        // or shutdown stops at the turn it ended.
+        const advance = !owner.closed and !slot.cancel.load(.seq_cst) and !slot.shutdown.load(.seq_cst);
+        const completed = owner.finish(slot.child_id, outcome.work_id, outcome.outcome, outcome.failure, advance);
+        slot.presentation.deinit(owner.alloc);
+        const next_work_id = if (completed) |value| value.next_work_id else null;
+        if (next_work_id == null) {
+            slot.completion = if (completed) |value| .{ .published = value.observation } else .unpublished;
+            slot.done.set(io_mod.getIo());
+        }
+        owner.mutex.unlock(io_mod.getIo());
+        if (owner.turn_hook) |hook| {
+            hook.settled_fn(hook.context, slot.child_id, outcome.work_id, if (completed) |value| value.observation else .{
+                .phase = .idle,
+                .outcome = outcome.outcome,
+                .failure = outcome.failure,
+            });
+        }
+        const next = next_work_id orelse return;
+        defer owner.alloc.free(next);
+        if (owner.turn_hook) |hook| hook.started_fn(hook.context, slot.child_id, next);
+    }
 }
 
 const OneOutcome = struct {
@@ -626,6 +672,7 @@ fn runOne(slot: *Slot) OneOutcome {
     const presentation_work_id = owner.alloc.dupe(u8, snapshot.active.id) catch
         return failedOutcome(work_id, "presentation_ownership", error.OutOfMemory);
     owner.mutex.lockUncancelable(io_mod.getIo());
+    if (slot.presentation_work_id) |old| owner.alloc.free(old);
     slot.presentation_work_id = presentation_work_id;
     slot.worker = turn.workerRuntime();
     slot.work_id = turn.active_work_id;

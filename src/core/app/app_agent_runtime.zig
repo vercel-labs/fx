@@ -1371,7 +1371,7 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.shell,
     test_builtin_tools.skill,
     test_builtin_tools.install_skill,
-    test_builtin_tools.subagent,
+    test_builtin_tools.fleet,
 };
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 const custom_label_tool = tool_dispatch.Tool{
@@ -2395,8 +2395,8 @@ test "subagent labels show named request and reply" {
 
     const subagent_call: ToolCall = .{
         .id = "subagent",
-        .name = "subagent",
-        .arguments_json = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check replay\"}}",
+        .name = "fleet",
+        .arguments_json = "{\"op\":\"run\",\"label\":\"reviewer\",\"message\":\"Check replay\"}",
     };
 
     const active = try app.describeToolAction(arena, subagent_call);
