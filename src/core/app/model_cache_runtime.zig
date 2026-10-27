@@ -1,4 +1,5 @@
 const std = @import("std");
+const model_roles = @import("../config/model_roles.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
@@ -192,6 +193,20 @@ pub const ModelMenu = struct {
     window_start: usize = 0,
     query_buf: [256]u8 = undefined,
     query_len: usize = 0,
+    /// The role Enter assigns the highlighted model to; Ctrl+R steps it.
+    /// Null switches models as usual (D170).
+    assign_role: ?model_roles.Role = null,
+
+    /// Steps `assign_role` through the roles and back to none.
+    pub fn stepAssignRole(self: *ModelMenu) void {
+        const order = [_]model_roles.Role{ .smol, .slow, .worker, .tiny, .review, .title, .compact, .default, .designer, .commit, .advisor };
+        const current = self.assign_role orelse {
+            self.assign_role = order[0];
+            return;
+        };
+        const index = std.mem.findScalar(model_roles.Role, &order, current) orelse order.len - 1;
+        self.assign_role = if (index + 1 < order.len) order[index + 1] else null;
+    }
 
     pub fn deinit(self: *ModelMenu, alloc: Allocator) void {
         self.clearSnapshot(alloc);

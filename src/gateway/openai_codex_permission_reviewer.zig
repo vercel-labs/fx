@@ -21,7 +21,7 @@ fn reviewCodex(
 ) anyerror!permission_auto_classifier.ParseOutcome {
     return responses_reviewer.review(alloc, input, request, .{
         .source = .chatgpt_subscription,
-        .model = openai_codex_models.reviewer_model,
+        .model = if (input.reviewer_model.len > 0) input.reviewer_model else openai_codex_models.reviewer_model,
         .validate_fn = validateCredential,
         .build_fn = openai_codex.buildRequest,
         .send_fn = sendPrepared,

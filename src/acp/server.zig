@@ -1,4 +1,5 @@
 const std = @import("std");
+const model_role_runtime = @import("../core/app/model_role_runtime.zig");
 const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const managed_execution = @import("../core/execution/managed_execution.zig");
 const acp_runner = @import("../core/cli/acp_runner.zig");
@@ -344,6 +345,11 @@ pub fn steersInterruptibly(state: *const ServerState) bool {
 
 pub const ServerState = struct {
     configured_providers: @import("../core/config/configured_provider.zig").Registry = .{},
+    /// Profile model roles (D170), reread at each prompt so a frontend's
+    /// `/role` reaches the daemon's next turn.
+    model_roles: model_role_runtime.State = .{},
+    /// The legacy `review_model` setting or FX_REVIEW_MODEL. Owned.
+    review_model: []u8 = &.{},
     alloc: Allocator,
     cfg: Config,
     writer: jsonrpc.Writer,
@@ -466,8 +472,35 @@ pub const ServerState = struct {
         clearPendingLegacyUrls(self);
         self.pending_legacy_urls.deinit(self.alloc);
         self.configured_providers.deinit(self.alloc);
+        self.model_roles.deinit(self.alloc);
+        if (self.review_model.len > 0) self.alloc.free(self.review_model);
     }
 };
+
+/// The model-role host for `session`.
+pub fn roleHost(state: *ServerState, session: *const ActiveSessionState) model_role_runtime.Host {
+    return .{
+        .state = &state.model_roles,
+        .provider = session.provider,
+        .current_model = session.model,
+        .set = state.cfg.provider_set,
+        .review_model = state.review_model,
+    };
+}
+
+/// Rereads the profile's model roles; a failure keeps the current ones.
+pub fn refreshModelRoles(state: *ServerState) void {
+    var settings = config_runtime.loadMergedSettings(state.alloc, state.workspace_root) catch |err| {
+        debug_trace.logf("acp", "model roles reload failed err={s}", .{@errorName(err)});
+        return;
+    };
+    defer settings.deinit(state.alloc);
+    const table = settings.model_roles;
+    settings.model_roles = .{};
+    state.model_roles.reload(state.alloc, table) catch |err| {
+        debug_trace.logf("acp", "model roles reload failed err={s}", .{@errorName(err)});
+    };
+}
 
 fn credentialMatchesProvider(
     source: ?types.CredentialSource,
@@ -3105,6 +3138,11 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.agent_step_limit = startup.agent_step_limit;
     state.max_tool_result_bytes = startup.max_tool_result_bytes;
     state.auto_compact_percent = startup.auto_compact_percent;
+    if (state.model_roles.default_provider.len == 0) {
+        var startup_provider = startup.provider;
+        try state.model_roles.init(alloc, startup.takeModelRoles(), startup_provider.label(), startup.configured_model);
+        if (state.review_model.len == 0) state.review_model = startup.takeReviewModel();
+    } else try state.model_roles.reload(alloc, startup.takeModelRoles());
     state.context_limits = startup.context_limits;
     state.context_limits.applyCommandLine(state.cfg.context_limit_overrides);
     state.fast_mode = startup.fast_mode and

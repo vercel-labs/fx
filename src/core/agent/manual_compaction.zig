@@ -24,6 +24,8 @@ pub const Model = struct {
     gateway_team: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
     retry_count: usize,
+    /// The `compact` model role's model; empty uses `model`. Borrowed.
+    summary_model: []const u8 = "",
     effort: types.ReasoningEffort,
     fast_mode: bool,
     prompt_caching: bool,
@@ -63,6 +65,7 @@ pub fn run(arena: Allocator, deps: *const agent_runtime.AgentRuntimeDeps, reques
         .cooperative_transport_pulse = deps.cooperative_transport_pulse,
         .provider = model.provider,
         .model = model.model,
+        .summary_model = model.summary_model,
         .api_key = model.api_key,
         .credential_source = model.credential_source,
         .account_id = model.account_id,

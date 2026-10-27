@@ -190,6 +190,8 @@ pub const CompactorCaller = struct {
     provider: model_provider.ProviderId,
     /// The conversation's model.
     model: []const u8,
+    /// The `compact` role's model, when set; empty uses `model`.
+    summary_model: []const u8 = "",
     api_key: []const u8,
     credential_source: ?types.CredentialSource = null,
     account_id: ?[]const u8 = null,
@@ -211,6 +213,7 @@ pub const CompactorCaller = struct {
             .context = self,
             .vtable = &.{ .capabilities = capabilities, .send = send },
             .model = self.model,
+            .summary_model = self.summary_model,
             .provider = self.provider,
             .credential_source = self.credential_source,
             .sends_after_conversation = self.conversation != null,

@@ -1116,6 +1116,44 @@ pub const ModelListSnapshot = struct {
     limit: ?usize = null,
     private_models_hidden: bool = false,
     public_only_reason: ?credentials.CatalogPublicOnlyReason = null,
+    /// Every model role and what it picks on this provider (D170).
+    roles: []const RoleAssignment = &.{},
+
+    pub const RoleAssignment = struct {
+        role: []const u8,
+        /// Null when the role leaves the choice to its consumer.
+        model: ?[]const u8,
+        /// The profile's entry, when it differs from `model`.
+        configured: ?[]const u8 = null,
+    };
+
+    fn writeRolesText(self: ModelListSnapshot, w: *std.Io.Writer) !void {
+        var any = false;
+        for (self.roles) |entry| any = any or entry.model != null;
+        if (!any) return;
+        try w.writeAll("[models] roles\n");
+        for (self.roles) |entry| {
+            const model = entry.model orelse continue;
+            try w.print(" - {s}: {s}", .{ entry.role, model });
+            if (entry.configured) |raw| try w.print(" ({s})", .{raw});
+            try w.writeByte('\n');
+        }
+    }
+
+    fn writeRolesJson(self: ModelListSnapshot, w: *std.Io.Writer) !void {
+        try w.writeAll(",\"roles\":[");
+        for (self.roles, 0..) |entry, i| {
+            if (i > 0) try w.writeByte(',');
+            try w.writeAll("{\"role\":");
+            try std.json.Stringify.value(entry.role, .{}, w);
+            try w.writeAll(",\"model\":");
+            try std.json.Stringify.value(entry.model, .{}, w);
+            try w.writeAll(",\"configured\":");
+            try std.json.Stringify.value(entry.configured, .{}, w);
+            try w.writeByte('}');
+        }
+        try w.writeByte(']');
+    }
 
     pub fn render(self: ModelListSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
         return switch (format) {
@@ -1150,6 +1188,7 @@ pub const ModelListSnapshot = struct {
             try out.writer.print(" ... and {d} more\n", .{self.ids.len - shown});
         }
         if (self.catalogExplanation()) |explanation| try out.writer.print("[models] {s}\n", .{explanation});
+        try self.writeRolesText(&out.writer);
 
         return try out.toOwnedSlice();
     }
@@ -1207,7 +1246,9 @@ pub const ModelListSnapshot = struct {
                 try out.writer.writeByte('}');
             }
         }
-        try out.writer.writeAll("]}");
+        try out.writer.writeByte(']');
+        if (self.roles.len > 0) try self.writeRolesJson(&out.writer);
+        try out.writer.writeByte('}');
         return try out.toOwnedSlice();
     }
 
@@ -2813,6 +2854,28 @@ test "model list explains public-only and rejected-credential catalogs" {
     const quiet_body = try shown.renderInteractiveBody(alloc);
     defer alloc.free(quiet_body);
     try std.testing.expect(std.mem.find(u8, quiet_body, "team-private") == null);
+}
+
+test "model list shows role assignments in text and json" {
+    const alloc = std.testing.allocator;
+    const roles = [_]ModelListSnapshot.RoleAssignment{
+        .{ .role = "smol", .model = "fast" },
+        .{ .role = "worker", .model = "fast", .configured = "@smol" },
+        .{ .role = "slow", .model = null },
+    };
+    const snapshot: ModelListSnapshot = .{ .ids = &.{ "fast", "main" }, .roles = &roles };
+    const text = try snapshot.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "[models] roles\n - smol: fast\n - worker: fast (@smol)\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "slow") == null);
+    const json = try snapshot.render(alloc, .json);
+    defer alloc.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    const listed = parsed.value.object.get("roles").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), listed.len);
+    try std.testing.expectEqualStrings("@smol", listed[1].object.get("configured").?.string);
+    try std.testing.expect(listed[2].object.get("model").? == .null);
 }
 
 test "model list json describes each shown model when details are known" {

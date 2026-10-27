@@ -642,6 +642,11 @@ const AcpContext = struct {
                 .context = @ptrCast(self),
                 .resolve_fn = resolveModelOverride,
             },
+            .model_role_resolver = .{
+                .context = @ptrCast(self),
+                .resolve_fn = resolveModelRole,
+            },
+            .reviewer_model = server.roleHost(self.state, session).reviewModel(),
             .interactive = false,
             .lifecycle_view = self.state.lifecycle_view,
             .lifecycle_scope = .{
@@ -970,6 +975,8 @@ pub fn handlePrompt(
             .message = "Ultrafast mode requires a verified compatible Gateway model",
         } };
     }
+    // A frontend's `/role` writes the profile; this turn reads it (D170).
+    server.refreshModelRoles(state);
 
     const params = msg.params_raw orelse return .{
         .rpc_error = .{
@@ -1321,10 +1328,11 @@ fn maybeStartAcpTitleTask(
     if (session.session_rt.agent.history.items.len != 0) return;
     const session_id = if (session.v2) |v2| v2.id() else return;
     const bundle = state.cfg.provider_set.select(session.provider);
-    const title_model = bundle.title_model orelse return;
+    const title_model = server.roleHost(state, session).titleModel() orelse return;
     const agent_stream = bundle.agent_stream orelse return;
     const excerpt = session_title_generation.promptExcerpt(prompt_text) orelse return;
-    if (session.credential_source != .host_managed and session.api_key.len == 0) return;
+    // A configured provider without auth has no key and still answers.
+    if (session.credential_source != .host_managed and session.credential_source != .configured and session.api_key.len == 0) return;
     const task = session_title_generation.Task.create(.{
         .observer = observer,
         .session_id = session_id,
@@ -1514,6 +1522,7 @@ fn buildAgentConfig(
         .agent_step_limit = session.agent_step_limit,
         .max_tool_result_bytes = session.max_tool_result_bytes,
         .auto_compact_percent = state.auto_compact_percent,
+        .compact_model = server.roleHost(state, session).compactModel(),
         .cancel_flag = &session.cancel_flag,
         .fast_mode = session.fast_mode,
         .ultrafast_mode = session.ultrafast_mode,
@@ -2270,6 +2279,16 @@ fn resolveModelCapabilities(
 /// Subagent model overrides resolve against the same catalog the capability
 /// path uses. The resolve loads the catalog on first use; only cancellation
 /// or an unavailable catalog falls back to raw passthrough.
+fn resolveModelRole(raw_ctx: ?*anyopaque, name: []const u8) @import("../core/subagent/tool_host.zig").ModelRoleResolver.Lookup {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx.?));
+    const session = if (ctx.state.active_session) |*active| active else return .unavailable;
+    return switch (server.roleHost(ctx.state, session).lookup(name)) {
+        .model => |model| .{ .model = model },
+        .unknown_role => .unknown_role,
+        .unavailable => .unavailable,
+    };
+}
+
 fn resolveModelOverride(
     raw_ctx: ?*anyopaque,
     alloc: Allocator,
@@ -3171,6 +3190,7 @@ pub fn compactNow(state: *server.ServerState, alloc: Allocator) !ManualCompactio
             .gateway_team = state.gateway_team,
             .session_id = session.session_id,
             .retry_count = state.cfg.gateway_retry_count,
+            .summary_model = server.roleHost(state, session).compactModel(),
             .effort = session.effort,
             .fast_mode = session.fast_mode,
             .prompt_caching = state.cfg.provider_set.select(session.provider).capabilities.gateway_prompt_caching,

@@ -36,6 +36,7 @@ const display_width = @import("../shared/display_width.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 const session_commands = @import("../session/session_commands.zig");
+const model_role_runtime = @import("model_role_runtime.zig");
 const session_backend = @import("session_backend.zig");
 const info_panel = @import("../input/info_panel.zig");
 const usage = @import("../../usage/usage.zig");
@@ -250,6 +251,7 @@ pub fn Handlers(comptime App: type) type {
                 .manage_images = commandManageImages,
                 .handle_model = commandHandleModel,
                 .handle_effort = commandHandleEffort,
+                .handle_role = commandHandleRole,
                 .handle_permissions = commandHandlePermissions,
                 .handle_allowlist = commandHandleAllowlist,
                 .show_stats = commandShowStats,
@@ -521,6 +523,11 @@ pub fn Handlers(comptime App: type) type {
         fn commandManageImages(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try image_commands.Commands(App).managePending(app, rest);
+        }
+
+        fn commandHandleRole(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasField(App, "model_roles")) try model_role_runtime.Runtime(App).handle(app, rest);
         }
 
         fn commandHandleModel(ctx: *anyopaque, query: []const u8) !void {

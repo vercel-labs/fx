@@ -2211,6 +2211,62 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   isolation, and a session proto-fx starts must not appear in the user's
   Claude Code history. **Alternative:** the user's own config directory,
   which would leak seeded sessions into it.
+- **D170 Decision:** model roles follow proto's `model-roles.ts`. The
+  profile's `model_roles` maps `default`, `smol`, `slow`, `worker`,
+  `tiny`, `review`, `title` and `compact` (and proto's `designer`,
+  `commit` and `advisor`, stored for compatibility) to a reference, and
+  `cycle_order` lists the roles Alt+P, Alt+Shift+P and `/role next|prev`
+  step through, `slow`, `default`, `smol` by default. `/role` lists,
+  assigns and cycles; Ctrl+R in the `/model` catalog chooses the role
+  Enter assigns to, and each catalog row is tagged with the roles that pick
+  it. `proto-fx models [--json]` lists what each role picks. Both are
+  profile-only keys; a project `.fx.json` cannot set them. **Why:** one
+  place to say which model does which kind of work, as proto users
+  expect. **Alternative:** more per-feature keys like `review_model`.
+
+- **D171 Decision:** a reference is a bare model ID on the active
+  provider, `provider/model` when the prefix names a provider proto-fx
+  knows (`gateway`, `codex`, `grok`, or a configured provider), or
+  `@role`. Aliases chain; a chain that revisits a role or names an
+  unknown role falls back to `default`, which is the role's entry or the
+  profile's `model`. A gateway ID such as `openai/gpt-5` stays whole
+  unless `openai` is a configured provider. Side calls go through the
+  active provider's connection, so a role naming another provider leaves
+  its consumer on its own default. **Why:** proto's resolution without
+  cross-provider side calls proto-fx has no connection for.
+  **Alternative:** opening a second provider connection per role.
+
+- **D172 Decision:** consumers ask a role first and keep their old
+  default when it picks nothing: session titles ask `title`, which
+  follows `smol`, which falls back to the provider's built-in low-cost
+  model; the permission reviewer asks `review` (codex, grok and
+  configured providers now honour it), and the legacy `review_model`
+  fills `review` on the gateway only, as before, with `FX_REVIEW_MODEL`
+  still outranking both there; the compactor asks `compact` for the
+  summary model, and a summary model other than the conversation's
+  skips the after-conversation request whose cache only the
+  conversation's model can read. **Why:** no behaviour changes for a
+  profile without roles. **Alternative:** a fixed role default per
+  provider bundle.
+
+- **D173 Decision:** what a role resolved to is recorded as a concrete
+  model where the session already records its model: a role cycle or
+  `@role` worker writes the model ID into the session's or child's
+  preferences, never the `@role` text, so resume does not depend on later
+  role changes. Turns, reviews, titles and workers borrow resolved bytes;
+  a role change swaps in a new table under a mutex and keeps the old one
+  until exit. **Why:** stable resume and no dangling borrow without a
+  session schema change. **Alternative:** a `model_roles` snapshot in
+  session preferences.
+
+- **D174 Decision:** fleet `model` accepts `@role`. The tool host
+  resolves it on the parent's provider before any child exists: a known
+  role with a model runs the child on that model (catalog matching
+  still applies on the gateway), a role with none inherits the parent's
+  model, and an unknown role is refused with `unknown_model_role`. The
+  fleet schema's description changed, so the pinned tool-contract hash
+  did too. **Why:** proto's `model: "@worker"`. **Alternative:** letting
+  the model resolve roles itself from a listing.
 
 ## Design Risks And Failure Behavior
 

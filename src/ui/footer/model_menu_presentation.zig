@@ -3,6 +3,7 @@ const display_width = @import("../../core/shared/display_width.zig");
 const list_window = @import("../../core/shared/list_window.zig");
 const model_cache_runtime = @import("../../core/app/model_cache_runtime.zig");
 const model_capabilities = @import("../../core/config/model_capabilities.zig");
+const model_roles = @import("../../core/config/model_roles.zig");
 const ui_render = @import("../render.zig");
 const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
@@ -141,9 +142,11 @@ pub inline fn composeModelMenuRow(
     const item = projection.itemAt(display_index) orelse return row;
 
     if (item_row == 0) {
+        var role_buf: [model_roles.role_count]model_roles.Role = undefined;
         return composeTitleRow(
             alloc,
             item.*,
+            projection.role_tags.get(item.id, &role_buf),
             display_index == layout.selected,
             modelFactsColumn(projection, width),
             width,
@@ -156,6 +159,18 @@ fn composeHeaderRow(alloc: Allocator, projection: ModelMenuProjection, width: u1
     var row: std.ArrayList(u8) = .empty;
     defer row.deinit(alloc);
     try appendHeaderTitle(alloc, &row, projection.filteredItemCount());
+    if (projection.assign_role) |role| {
+        // Assigning a role replaces the provider tabs with what Enter does.
+        try row.appendSlice(alloc, "  ");
+        try row.appendSlice(alloc, ui_render.dim_style);
+        try row.appendSlice(alloc, "Enter assigns to ");
+        try row.appendSlice(alloc, ui_render.reset_style);
+        try appendProviderTab(alloc, &row, role.label(), true);
+        try row.appendSlice(alloc, ui_render.dim_style);
+        try row.appendSlice(alloc, "  ctrl+r next role");
+        try row.appendSlice(alloc, ui_render.reset_style);
+        return cloneClippedRow(alloc, row.items, width);
+    }
 
     const tabs = ProviderTabs.build(projection.items);
     const active_position = tabs.activePosition(projection.provider_index);
@@ -301,6 +316,7 @@ fn modelFactsColumn(projection: ModelMenuProjection, width: u16) ?usize {
 fn composeTitleRow(
     alloc: Allocator,
     item: model_cache_runtime.ModelMenuItem,
+    roles: []const model_roles.Role,
     selected: bool,
     facts_column: ?usize,
     width: u16,
@@ -320,8 +336,20 @@ fn composeTitleRow(
     const facts_start = facts_column orelse content_width;
     const show_facts = facts.items.len > 0 and facts_start >= prefix_width + 8 + 2;
     const id_budget = if (show_facts) facts_start - prefix_width - 2 else content_width -| prefix_width;
-    try row_text.appendSingleLineMiddleEllipsized(alloc, &row, item.id, id_budget);
+    // Role tags follow the ID when they fit beside it (D170).
+    var tags_width: usize = 0;
+    for (roles) |role| tags_width += 1 + role.label().len;
+    const show_tags = roles.len > 0 and display_width.visibleWidth(item.id) + tags_width <= id_budget;
+    try row_text.appendSingleLineMiddleEllipsized(alloc, &row, item.id, if (show_tags) id_budget - tags_width else id_budget);
     if (selected) try row.appendSlice(alloc, ui_render.reset_style);
+    if (show_tags) {
+        try row.appendSlice(alloc, ui_render.tag_style);
+        for (roles) |role| {
+            try row.append(alloc, ' ');
+            try row.appendSlice(alloc, role.label());
+        }
+        try row.appendSlice(alloc, ui_render.reset_style);
+    }
 
     if (show_facts) {
         try row_text.appendSpacesToColumn(alloc, &row, facts_start);
@@ -555,17 +583,36 @@ test "model menu keeps shared-prefix model ids distinguishable when narrow" {
         .capabilities = .{},
     };
 
-    var alpha_row = try composeTitleRow(alloc, alpha, true, null, 40);
+    var alpha_row = try composeTitleRow(alloc, alpha, &.{}, true, null, 40);
     defer alpha_row.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, alpha_row.items, "provider/very-lo") != null);
     try std.testing.expect(std.mem.find(u8, alpha_row.items, "reasoning-alpha") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(alpha_row.items) <= 40);
 
-    var beta_row = try composeTitleRow(alloc, beta, false, null, 40);
+    var beta_row = try composeTitleRow(alloc, beta, &.{}, false, null, 40);
     defer beta_row.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, beta_row.items, "provider/very-lo") != null);
     try std.testing.expect(std.mem.find(u8, beta_row.items, "reasoning-beta") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(beta_row.items) <= 40);
+}
+
+test "model menu rows tag role models and the header shows the role Enter assigns" {
+    const alloc = std.testing.allocator;
+    const item: model_cache_runtime.ModelMenuItem = .{ .id = @constCast("cento-smol"), .provider = "cento", .capabilities = .{} };
+    var row = try composeTitleRow(alloc, item, &.{ .smol, .worker }, false, null, 60);
+    defer row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, row.items, "cento-smol") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, " smol worker") != null);
+    // Tags drop rather than squeeze the ID.
+    var narrow = try composeTitleRow(alloc, item, &.{ .smol, .worker }, false, null, 16);
+    defer narrow.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, narrow.items, "worker") == null);
+
+    const items = [_]model_cache_runtime.ModelMenuItem{item};
+    var header = try composeHeaderRow(alloc, .{ .active = true, .load_state = .ready, .items = &items, .assign_role = .worker }, 80);
+    defer header.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, header.items, "Enter assigns to ") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "[worker]") != null);
 }
 
 test "model menu states and navigation budget stay bounded" {

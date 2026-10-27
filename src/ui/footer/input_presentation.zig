@@ -920,7 +920,8 @@ fn composeCatalogMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool,
         "enter esc",
     };
     const provider_variants = [_][]const u8{
-        "↑↓ navigate     tab provider     enter use     esc close",
+        "↑↓ navigate     tab provider     ctrl+r role     enter use     esc close",
+        "↑↓ navigate  tab provider  ctrl+r role  enter use  esc close",
         "↑↓ navigate  tab provider  enter use  esc close",
         "↑↓ move  tab provider  enter  esc",
         "enter use  esc close",
@@ -933,10 +934,10 @@ fn composeCatalogMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool,
         "enter resume  esc close",
         "enter esc",
     };
-    const variants = switch (tab_kind) {
-        .source => source_variants,
-        .provider => provider_variants,
-        .scope => scope_variants,
+    const variants: []const []const u8 = switch (tab_kind) {
+        .source => &source_variants,
+        .provider => &provider_variants,
+        .scope => &scope_variants,
     };
     var hint = variants[variants.len - 1];
     for (variants) |candidate| {

@@ -118,6 +118,20 @@ pub const ModelOverrideResolver = struct {
     }
 };
 
+/// Resolves a fleet `model` of the form `@role` to the model the role picks
+/// on the parent's provider (D174). The model must outlive `executeManaged`.
+pub const ModelRoleResolver = struct {
+    pub const Lookup = union(enum) {
+        model: []const u8,
+        unknown_role,
+        /// The role picks no model on this provider; the worker inherits.
+        unavailable,
+    };
+
+    context: ?*anyopaque = null,
+    resolve_fn: *const fn (?*anyopaque, []const u8) Lookup,
+};
+
 pub const ExecuteOptions = struct {
     observer: ?*execution_observation.Observer = null,
     invocation_id: []const u8,
@@ -134,6 +148,7 @@ pub const ExecuteOptions = struct {
     progress: ?ProgressSink = null,
     model_capability_resolver: ?model_capabilities.Resolver = null,
     model_override_resolver: ?ModelOverrideResolver = null,
+    model_role_resolver: ?ModelRoleResolver = null,
     /// The caller is this node's own turn, whose run slots its wait lends
     /// back (D92). A person's message from the frontend runs outside any
     /// turn and holds none, so it lends nothing.
@@ -575,22 +590,48 @@ pub const Runtime = struct {
         override: model_contract.Override,
         options: ExecuteOptions,
     ) !OverrideModelResolution {
-        const raw_model = override.model orelse return .{ .accepted = null };
+        var raw_model = override.model orelse return .{ .accepted = null };
+        var from_role = false;
+        if (raw_model[0] == '@') {
+            const roles = options.model_role_resolver orelse return .{ .rejected = .{
+                .ok = false,
+                .error_code = "unknown_model_role",
+                .result = try alloc.dupe(u8, "This host has no model roles; pass a catalog model ID."),
+            } };
+            switch (roles.resolve_fn(roles.context, raw_model[1..])) {
+                .model => |model| {
+                    debug_trace.logf("subagent", "model role resolved raw={s} model={s}", .{ raw_model, model });
+                    raw_model = model;
+                    from_role = true;
+                },
+                .unknown_role => return .{ .rejected = .{
+                    .ok = false,
+                    .error_code = "unknown_model_role",
+                    .result = try alloc.print("unknown model role '{s}'. Roles: @default, @smol, @slow, @worker, @tiny, @review, @title, @compact, @designer, @commit, @advisor.", .{raw_model}),
+                } },
+                .unavailable => {
+                    debug_trace.logf("subagent", "model role unset raw={s}; inheriting model={s}", .{ raw_model, options.defaults.model });
+                    return .{ .accepted = options.defaults.model };
+                },
+            }
+        }
+        // A role's model is used as given unless the catalog resolves it.
+        const passthrough: ?[]const u8 = if (from_role) raw_model else null;
         // Only the gateway catalog is an authoritative model list. Configured
         // providers (OpenAI-compatible endpoints) accept arbitrary model IDs,
         // so overrides for those children pass through to the provider.
         if (options.defaults.provider != .gateway) {
             debug_trace.logf("subagent", "model override resolution skipped raw={s} reason=non_gateway_provider", .{raw_model});
-            return .{ .accepted = null };
+            return .{ .accepted = passthrough };
         }
         const resolver = options.model_override_resolver orelse {
             debug_trace.logf("subagent", "model override resolution skipped raw={s} reason=no_resolver", .{raw_model});
-            return .{ .accepted = null };
+            return .{ .accepted = passthrough };
         };
         switch (try resolver.resolve(alloc, raw_model)) {
             .no_catalog => {
                 debug_trace.logf("subagent", "model override resolution skipped raw={s} reason=no_catalog", .{raw_model});
-                return .{ .accepted = null };
+                return .{ .accepted = passthrough };
             },
             .matched => |id| {
                 if (!std.mem.eql(u8, id, raw_model)) {
@@ -1831,6 +1872,60 @@ test "model override passes through for non-gateway providers" {
     try std.testing.expect(result.success);
     try std.testing.expectEqual(@as(usize, 1), fixture.runs);
     try std.testing.expectEqualStrings("unknown-model", fixture.observed_model.?);
+}
+
+const RoleResolverFixture = struct {
+    fn resolve(_: ?*anyopaque, name: []const u8) ModelRoleResolver.Lookup {
+        if (std.mem.eql(u8, name, "worker")) return .{ .model = "cento-worker" };
+        if (std.mem.eql(u8, name, "smol")) return .unavailable;
+        return .unknown_role;
+    }
+};
+
+test "a fleet @role model resolves before the child exists" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = OverrideResolverFixture{};
+    defer if (fixture.observed_model) |model| alloc.free(model);
+    const runtime = try overrideResolverFixtureRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    const options = ExecuteOptions{
+        .invocation_id = "role-resolve",
+        .defaults = .{ .provider = .codex, .model = "parent-model", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+        .model_role_resolver = .{ .resolve_fn = RoleResolverFixture.resolve },
+    };
+
+    // The child runs with the role's model, never the `@worker` text.
+    var worker = try model_contract.validateRequest(alloc, .{ .run = .{ .task = "probe", .model = "@worker" } });
+    defer worker.deinit(alloc);
+    try std.testing.expect((try runtime.executeManaged(arena, &worker, options)).success);
+    try std.testing.expectEqualStrings("cento-worker", fixture.observed_model.?);
+
+    // A role without a model on this provider inherits the parent's.
+    var smol = try model_contract.validateRequest(alloc, .{ .run = .{ .task = "probe", .model = "@smol" } });
+    defer smol.deinit(alloc);
+    alloc.free(fixture.observed_model.?);
+    fixture.observed_model = null;
+    var smol_options = options;
+    smol_options.invocation_id = "role-inherit";
+    try std.testing.expect((try runtime.executeManaged(arena, &smol, smol_options)).success);
+    try std.testing.expectEqualStrings("parent-model", fixture.observed_model.?);
+
+    var unknown = try model_contract.validateRequest(alloc, .{ .run = .{ .task = "probe", .model = "@nobody" } });
+    defer unknown.deinit(alloc);
+    var unknown_options = options;
+    unknown_options.invocation_id = "role-unknown";
+    const rejected = try runtime.executeManaged(arena, &unknown, unknown_options);
+    try std.testing.expect(!rejected.success);
+    try std.testing.expect(std.mem.find(u8, rejected.body, "\"error_code\":\"unknown_model_role\"") != null);
+    try std.testing.expectEqual(@as(usize, 2), fixture.runs);
 }
 
 fn formatFailedResult(alloc: Allocator, failure: ?[]const u8, partial: ?[]const u8) ![]u8 {

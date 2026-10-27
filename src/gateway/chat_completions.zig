@@ -358,7 +358,14 @@ pub fn review(raw: ?*anyopaque, alloc: Allocator, input: classifier.ProviderInpu
 /// A permission review sent through `transport` to the reviewer model.
 pub fn review_with(raw: ?*anyopaque, alloc: Allocator, input: classifier.ProviderInput, request: classifier.ReviewRequest, transport: ReviewTransport) !classifier.ParseOutcome {
     var state = Review{ .definition = definition_at(raw), .input = input, .transport = transport };
-    return classifier.Reviewer.withTransportModel(.{ .context = &state, .build_fn = build_review, .send_fn = send_review }, input.cancel_flag, classifier.Reviewer.default_timeout_ms, state.definition.reviewer_model orelse request.review_turn.model).review(alloc, request);
+    return classifier.Reviewer.withTransportModel(.{ .context = &state, .build_fn = build_review, .send_fn = send_review }, input.cancel_flag, classifier.Reviewer.default_timeout_ms, reviewerModel(state.definition, input, request)).review(alloc, request);
+}
+
+/// The `review` model role first, then the definition's reviewer, then the
+/// conversation's model (D172).
+pub fn reviewerModel(definition: *const definitions.Definition, input: classifier.ProviderInput, request: classifier.ReviewRequest) []const u8 {
+    if (input.reviewer_model.len > 0) return input.reviewer_model;
+    return definition.reviewer_model orelse request.review_turn.model;
 }
 fn build_review(raw: *anyopaque, alloc: Allocator, model: []const u8, _: []const u8, instructions: []const types.ChatMessage, messages: []const types.ChatMessage, target_id: []const u8, deadline: std.Io.Clock.Timestamp, cancel: *std.atomic.Value(bool)) ![]u8 {
     const state: *Review = @ptrCast(@alignCast(raw));

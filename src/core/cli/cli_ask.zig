@@ -1,4 +1,5 @@
 const std = @import("std");
+const model_roles = @import("../config/model_roles.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const std_builtin = @import("builtin");
 const command_admission = @import("../permissions/command_admission.zig");
@@ -572,6 +573,9 @@ const AskContext = struct {
     /// Resolved review-model override borrowed from the startup state for the
     /// duration of the run. Empty keeps the reviewer's compiled default.
     reviewer_model: []const u8 = "",
+    /// The startup state whose model roles this run resolves (D170).
+    /// Borrowed for the duration of the run.
+    role_startup: ?*const app_lifecycle.StartupState = null,
     agent_step_limit: usize = 0,
     max_tool_result_bytes: usize = 64 * 1024,
     auto_compact_percent: u8 = compactor.default_percent,
@@ -1111,6 +1115,10 @@ const AskContext = struct {
                 .context = @ptrCast(self),
                 .resolve_fn = resolveModelOverride,
             },
+            .model_role_resolver = .{
+                .context = @ptrCast(self),
+                .resolve_fn = resolveModelRole,
+            },
             .interactive = false,
             .lifecycle_view = self.lifecycle_view,
             .lifecycle_scope = self.lifecycleContext().scope,
@@ -1586,7 +1594,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.effort = toCoreReasoningEffort(startup.effort);
     ctx.first_call_tool_choice = startup.first_call_tool_choice;
     ctx.permission_mode = permission_mode;
-    ctx.reviewer_model = startup.review_model;
+    ctx.reviewer_model = startup.reviewModel();
+    ctx.role_startup = &startup;
     ctx.mode_id = mode_id;
     ctx.permission_rules = try takeCorePermissionRules(alloc, &startup);
     ctx.context_enabled = startup.context_enabled;
@@ -1817,6 +1826,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .agent_step_limit = startup.agent_step_limit,
         .max_tool_result_bytes = startup.max_tool_result_bytes,
         .auto_compact_percent = startup.auto_compact_percent,
+        .compact_model = startup.roleModel(.compact, null) orelse "",
         .cancel_flag = ctx.cancelFlag(),
         .fast_mode = ctx.fast_mode,
         .ultrafast_mode = ctx.ultrafast_mode,
@@ -1878,11 +1888,12 @@ fn maybeStartAskTitleTask(
     if (ctx.session.agent.history.items.len != 0) return null;
     const session_id = ctx.activeSessionId() orelse return null;
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
-    const title_model = bundle.title_model orelse return null;
+    const role_title = if (ctx.role_startup) |startup| startup.roleModel(.title, bundle.title_model) else null;
+    const title_model = role_title orelse bundle.title_model orelse return null;
     const agent_stream = bundle.agent_stream orelse return null;
     const excerpt = session_title_generation.promptExcerpt(prompt) orelse return null;
-    // A configured provider with a title model resolves its own credential,
-    // as the anthropic provider does (D168).
+    // A configured provider resolves its own credential (D168) or, without
+    // auth, has no key and still answers.
     if (ctx.credential_source != .host_managed and ctx.credential_source != .configured and ctx.api_key.len == 0) return null;
     const task = session_title_generation.Task.create(.{
         .session_id = session_id,
@@ -2143,6 +2154,14 @@ fn availableModelCapabilities(raw_ctx: *anyopaque, model: []const u8) model_capa
 /// Subagent model overrides resolve against the same catalog the capability
 /// path uses. The resolve loads the catalog on first use; only cancellation
 /// or an unavailable catalog falls back to raw passthrough.
+fn resolveModelRole(raw_ctx: ?*anyopaque, name: []const u8) subagent_tool_host.ModelRoleResolver.Lookup {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx.?));
+    const role = model_roles.Role.parse(name) orelse return .unknown_role;
+    const startup = ctx.role_startup orelse return .unavailable;
+    const bundle = ctx.cfg.provider_set.select(ctx.provider);
+    return if (startup.roleModel(role, bundle.title_model)) |model| .{ .model = model } else .unavailable;
+}
+
 fn resolveModelOverride(raw_ctx: ?*anyopaque, alloc: Allocator, raw_model: []const u8) Allocator.Error!subagent_model_contract.ModelCatalogMatch {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx.?));
     const bundle = ctx.cfg.provider_set.select(ctx.provider);

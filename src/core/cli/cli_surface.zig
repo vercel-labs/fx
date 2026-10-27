@@ -1,4 +1,5 @@
 const std = @import("std");
+const model_roles = @import("../config/model_roles.zig");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
@@ -1488,10 +1489,12 @@ fn runNonInteractiveWithDeps(
                 startup.provider,
             );
             defer alloc.free(details);
+            var role_rows: [model_roles.role_count]output_contracts.ModelListSnapshot.RoleAssignment = undefined;
 
             const text = try (output_contracts.ModelListSnapshot{
                 .ids = ids.items,
                 .details = details,
+                .roles = modelRoleAssignments(&startup, available_providers.select(startup.provider), &role_rows),
                 .provider = startup.provider,
                 .private_models_hidden = loaded.provenance.access.private_models_may_be_hidden,
                 .public_only_reason = loaded.provenance.access.public_only_reason,
@@ -2468,6 +2471,30 @@ fn modelDetails(
         };
     }
     return details;
+}
+
+/// What each model role picks on the startup provider, for `fx models`.
+fn modelRoleAssignments(
+    startup: anytype,
+    bundle: provider_set.Bundle,
+    out: *[model_roles.role_count]output_contracts.ModelListSnapshot.RoleAssignment,
+) []const output_contracts.ModelListSnapshot.RoleAssignment {
+    var provider = startup.provider;
+    const label = provider.label();
+    const ctx: model_roles.Context = .{
+        .provider = label,
+        .default_model = startup.configured_model,
+        .builtin_smol = bundle.title_model,
+        .legacy_review = if (startup.provider == .gateway and startup.review_model.len > 0) startup.review_model else null,
+        .configured = startup.configured_providers.definitions,
+    };
+    for (model_roles.all_roles, 0..) |role, index| {
+        const model = if (model_roles.resolve(&startup.model_roles, role, ctx)) |ref| ref.on(label) else null;
+        const raw = startup.model_roles.get(role);
+        const differs = raw != null and (model == null or !std.mem.eql(u8, raw.?, model.?));
+        out[index] = .{ .role = role.label(), .model = model, .configured = if (differs) raw else null };
+    }
+    return out[0..model_roles.role_count];
 }
 
 fn catalogFailureDetail(failure: model_catalog.Failure) []const u8 {
@@ -5042,7 +5069,7 @@ test "runIfRequested models passes startup team to fetch seam" {
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expect(probe.called);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"models\",\"count\":1,\"shown_count\":1,\"more_count\":0,\"private_models_hidden\":false,\"ids\":[\"private/blue-hornbill\"]}\n",
+        "{\"kind\":\"models\",\"count\":1,\"shown_count\":1,\"more_count\":0,\"private_models_hidden\":false,\"ids\":[\"private/blue-hornbill\"],\"roles\":[{\"role\":\"default\",\"model\":null,\"configured\":null},{\"role\":\"smol\",\"model\":\"openai/gpt-5.6-luna\",\"configured\":null},{\"role\":\"slow\",\"model\":null,\"configured\":null},{\"role\":\"worker\",\"model\":null,\"configured\":null},{\"role\":\"tiny\",\"model\":\"openai/gpt-5.6-luna\",\"configured\":null},{\"role\":\"review\",\"model\":null,\"configured\":null},{\"role\":\"title\",\"model\":\"openai/gpt-5.6-luna\",\"configured\":null},{\"role\":\"compact\",\"model\":null,\"configured\":null},{\"role\":\"designer\",\"model\":null,\"configured\":null},{\"role\":\"commit\",\"model\":null,\"configured\":null},{\"role\":\"advisor\",\"model\":null,\"configured\":null}]}\n",
         capture.stdout.written(),
     );
 }
@@ -5062,7 +5089,7 @@ test "runIfRequested models json describes each model from its catalog entry" {
     try std.testing.expectEqualStrings(
         "{\"kind\":\"models\",\"count\":1,\"shown_count\":1,\"more_count\":0,\"private_models_hidden\":false," ++
             "\"ids\":[\"private/blue-hornbill\"],\"models\":[{\"id\":\"private/blue-hornbill\",\"name\":\"Blue Hornbill\"," ++
-            "\"efforts\":[\"low\",\"high\"],\"fast\":true,\"ultrafast\":true}]}\n",
+            "\"efforts\":[\"low\",\"high\"],\"fast\":true,\"ultrafast\":true}],\"roles\":[{\"role\":\"default\",\"model\":null,\"configured\":null},{\"role\":\"smol\",\"model\":\"openai/gpt-5.6-luna\",\"configured\":null},{\"role\":\"slow\",\"model\":null,\"configured\":null},{\"role\":\"worker\",\"model\":null,\"configured\":null},{\"role\":\"tiny\",\"model\":\"openai/gpt-5.6-luna\",\"configured\":null},{\"role\":\"review\",\"model\":null,\"configured\":null},{\"role\":\"title\",\"model\":\"openai/gpt-5.6-luna\",\"configured\":null},{\"role\":\"compact\",\"model\":null,\"configured\":null},{\"role\":\"designer\",\"model\":null,\"configured\":null},{\"role\":\"commit\",\"model\":null,\"configured\":null},{\"role\":\"advisor\",\"model\":null,\"configured\":null}]}\n",
         capture.stdout.written(),
     );
 }

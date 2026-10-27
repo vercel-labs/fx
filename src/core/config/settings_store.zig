@@ -9,6 +9,7 @@ const compactor = @import("../compactor/compactor.zig");
 const context_limits = @import("context_limits.zig");
 const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
+const model_roles = @import("model_roles.zig");
 const configured_provider = @import("configured_provider.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
@@ -118,9 +119,12 @@ pub const UserSettingsPatch = struct {
     notification_turn_end: ?bool = null,
     notification_attention_required: ?bool = null,
     notification_max: ?bool = null,
+    /// Sets or clears one `model_roles` entry (D170).
+    model_role: ?ModelRolePatch = null,
 
     fn isEmpty(self: UserSettingsPatch) bool {
         return self.connections_json == null and self.model_preference == null and
+            self.model_role == null and
             self.provider == null and
             self.permission_mode == null and
             self.credential_source == null and
@@ -140,6 +144,12 @@ pub const UserSettingsPatch = struct {
             self.notification_attention_required == null and
             self.notification_max == null;
     }
+};
+
+/// `value` null removes the role's entry.
+pub const ModelRolePatch = struct {
+    role: model_roles.Role,
+    value: ?[]const u8,
 };
 
 pub const ModelPreferencePatch = struct {
@@ -922,6 +932,9 @@ pub fn validateProviderSlug(slug: []const u8) bool {
 
 fn validateUserPatch(patch: UserSettingsPatch) !void {
     if (patch.model_preference) |preference| try validateModel(preference.model);
+    if (patch.model_role) |role_patch| if (role_patch.value) |value| {
+        model_roles.validateRef(value) catch return error.InvalidDurableField;
+    };
 }
 
 fn validAdditionalDirectoryPath(path: []const u8) bool {
@@ -961,6 +974,28 @@ test "ultrafast user patch writes a profile-owned bool" {
     const application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .ultrafast_mode = false });
     try std.testing.expect(application.changed);
     try std.testing.expect(!root.object.get("ultrafast_mode").?.bool);
+}
+
+test "model role patch sets and clears one model_roles entry" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), "{\"model_roles\":{\"slow\":\"deep\"}}", .{});
+    defer parsed.deinit();
+    var root = parsed.value;
+
+    var application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .model_role = .{ .role = .worker, .value = "@smol" } });
+    try std.testing.expect(application.changed);
+    const roles = root.object.get("model_roles").?.object;
+    try std.testing.expectEqualStrings("@smol", roles.get("worker").?.string);
+    try std.testing.expectEqualStrings("deep", roles.get("slow").?.string);
+    application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .model_role = .{ .role = .slow, .value = null } });
+    try std.testing.expect(application.changed);
+    try std.testing.expect(root.object.get("model_roles").?.object.get("slow") == null);
+    application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .model_role = .{ .role = .slow, .value = null } });
+    try std.testing.expect(!application.changed);
+    try validateKnownSettingsObject(root.object, false);
+    try std.testing.expectError(error.InvalidDurableField, validateUserPatch(.{ .model_role = .{ .role = .smol, .value = "bad\nref" } }));
 }
 
 test "collapse tool calls user patch writes the profile preference" {
@@ -1063,6 +1098,16 @@ fn applyUserPatchToRoot(
     }
     if (patch.model_preference) |preference| {
         application.changed = try putModelPreference(arena, &root.object, preference) or application.changed;
+    }
+    if (patch.model_role) |role_patch| {
+        if (!root.object.contains("model_roles")) try root.object.put(arena, "model_roles", .{ .object = .empty });
+        const roles = root.object.getPtr("model_roles").?;
+        if (roles.* != .object) return error.InvalidSettingsFormat;
+        if (role_patch.value) |value| {
+            application.changed = try putString(arena, &roles.object, role_patch.role.label(), value) or application.changed;
+        } else if (roles.object.orderedRemove(role_patch.role.label())) {
+            application.changed = true;
+        }
     }
     if (patch.provider) |value| application.changed = try putString(arena, &root.object, "provider", value.label()) or application.changed;
     if (patch.permission_mode) |value| application.changed = try putString(arena, &root.object, "permission_mode", @tagName(value)) or application.changed;
@@ -1925,6 +1970,12 @@ fn validateKnownSettingsObject(
     if (object.get("codex_model")) |value| {
         if (value != .string) return error.InvalidSettingsFormat;
         try validateModel(value.string);
+    }
+    if (object.get("model_roles") != null or object.get("cycle_order") != null) {
+        // Every reference fits: at most `role_count` of `max_ref_bytes`.
+        var buf: [model_roles.role_count * model_roles.max_ref_bytes]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&buf);
+        _ = model_roles.Table.parse(fixed.allocator(), object.get("model_roles"), object.get("cycle_order")) catch return error.InvalidSettingsFormat;
     }
     if (object.get("grok_model")) |value| {
         if (value != .string) return error.InvalidSettingsFormat;

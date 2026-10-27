@@ -1,4 +1,6 @@
 const std = @import("std");
+const model_role_runtime = @import("model_role_runtime.zig");
+const subagent_tool_host = @import("../subagent/tool_host.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
@@ -245,7 +247,7 @@ pub fn Runtime(comptime App: type) type {
                 else
                     host.unavailable_secret_store,
                 .model = provider_runtime.model(app),
-                .reviewer_model = if (comptime @hasField(App, "review_model")) app.review_model else "",
+                .reviewer_model = if (comptime @hasField(App, "model_roles")) model_role_runtime.reviewModel(app) else if (comptime @hasField(App, "review_model")) app.review_model else "",
                 .gateway_retry_count = gateway_retry_count,
                 .gateway_chat_url = gateway_chat_url,
                 .gateway_models_path = if (comptime @hasField(App, "web_search_models_path")) app.web_search_models_path else "/v1/models",
@@ -359,7 +361,17 @@ pub fn Runtime(comptime App: type) type {
             }
             ctx.model_capability_resolver = app_callbacks.Bindings(App).modelCapabilityResolver(app);
             ctx.model_override_resolver = app_callbacks.Bindings(App).modelOverrideResolver(app);
+            if (comptime @hasField(App, "model_roles")) ctx.model_role_resolver = .{ .context = @ptrCast(app), .resolve_fn = resolveModelRole };
             return ctx;
+        }
+
+        fn resolveModelRole(raw: ?*anyopaque, name: []const u8) subagent_tool_host.ModelRoleResolver.Lookup {
+            const app: *App = @ptrCast(@alignCast(raw.?));
+            return switch (model_role_runtime.lookup(app, name)) {
+                .model => |model| .{ .model = model },
+                .unknown_role => .unknown_role,
+                .unavailable => .unavailable,
+            };
         }
 
         fn respondToMcpInput(
@@ -1122,6 +1134,7 @@ pub fn Runtime(comptime App: type) type {
                     .gateway_team = job.gateway_team,
                     .session_id = app_session_runtime.Runtime(App).activeSessionId(app),
                     .retry_count = gateway_retry_count,
+                    .summary_model = if (comptime @hasField(App, "model_roles")) model_role_runtime.compactModel(app) else "",
                     .effort = settings.effort,
                     .fast_mode = settings.fast_mode,
                     .prompt_caching = provider_capabilities.gateway_prompt_caching,
@@ -1264,6 +1277,7 @@ pub fn Runtime(comptime App: type) type {
                 .agent_step_limit = app.agent_step_limit,
                 .max_tool_result_bytes = job.agent_settings.max_tool_result_bytes,
                 .auto_compact_percent = job.agent_settings.auto_compact_percent,
+                .compact_model = if (comptime @hasField(App, "model_roles")) model_role_runtime.compactModel(app) else "",
                 .cancel_flag = &app.worker.worker_cancel_requested,
                 .review_enabled = false,
                 .fast_mode = job.agent_settings.fast_mode,

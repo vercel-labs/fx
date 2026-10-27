@@ -1,4 +1,5 @@
 const std = @import("std");
+const model_role_runtime = @import("model_role_runtime.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
 const question_prompt = @import("../agent/question_prompt.zig");
@@ -1105,6 +1106,13 @@ pub fn Runtime(comptime App: type) type {
                         try openModelPickerShortcut(app);
                     }
                 },
+                .cycle_role_model_forward, .cycle_role_model_backward => {
+                    if (comptime @hasField(App, "model_roles")) {
+                        if (app.stream.active or modelMenuActive(app)) return .done;
+                        try model_role_runtime.Runtime(App).cycle(app, resolved == .cycle_role_model_backward);
+                        app.shell.render_requests.request(.footer);
+                    }
+                },
                 .paste_start => dismissActiveMenusThenRedraw(app),
                 .paste_end => {},
                 .remapped_byte => unreachable,
@@ -1473,6 +1481,16 @@ pub fn Runtime(comptime App: type) type {
                             },
                             .inactive => unreachable,
                             .limit_exceeded => try input_limit_feedback.report(App, app, .composer, 1),
+                        }
+                    }
+                },
+                18 => {
+                    // Ctrl+R in the model catalog steps the role Enter
+                    // assigns the highlighted model to (D170).
+                    if (comptime @hasField(App, "model_cache") and @hasField(App, "model_roles")) {
+                        if (modelMenuActive(app)) {
+                            app.model_cache.menu.stepAssignRole();
+                            app.shell.render_requests.request(.footer);
                         }
                     }
                 },
@@ -2420,6 +2438,15 @@ pub fn Runtime(comptime App: type) type {
                 return true;
             };
             defer app.alloc.free(selected);
+
+            if (comptime @hasField(App, "model_roles")) if (app.model_cache.menu.assign_role) |role| {
+                app.model_cache.closeMenu();
+                app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                restoreModelPickerDraft(app);
+                try model_role_runtime.Runtime(App).assign(app, role, selected);
+                app.shell.render_requests.request(.footer);
+                return true;
+            };
 
             // Ctrl+P and `/model` both continue into the inline effort and
             // fast stages. A Ctrl+P draft stays stashed while those stages

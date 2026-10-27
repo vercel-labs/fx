@@ -7708,6 +7708,7 @@ fn processQueuedPromptLoop(
                         .cooperative_transport_pulse = deps.cooperative_transport_pulse,
                         .provider = job.provider,
                         .model = gateway_model,
+                        .summary_model = config.compact_model,
                         .api_key = active_api_key,
                         .credential_source = job.credential_source,
                         .account_id = job.account_id,

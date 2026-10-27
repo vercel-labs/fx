@@ -10,6 +10,7 @@ const workspace_access = @import("../workspace/workspace_access.zig");
 const settings_store = @import("settings_store.zig");
 const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
+const model_roles = @import("model_roles.zig");
 const model_preferences = @import("model_preferences.zig");
 const web_search_bank = @import("../tooling/web_search_bank.zig");
 const configured_provider = @import("configured_provider.zig");
@@ -73,6 +74,8 @@ pub const Settings = struct {
     /// Optional review-model override for automatic permission review. Owned by
     /// this Settings; freed in deinit. Null keeps the provider's default.
     review_model: ?[]const u8 = null,
+    /// Profile `model_roles` and `cycle_order` (D170). Owned.
+    model_roles: model_roles.Table = .{},
     statusline_context: ?bool = null,
     statusline_session: ?bool = null,
     statusline_workspace: ?bool = null,
@@ -92,6 +95,7 @@ pub const Settings = struct {
         if (self.providers) |*providers| providers.deinit(alloc);
         self.permission_rules.deinit(alloc);
         if (self.review_model) |value| alloc.free(value);
+        self.model_roles.deinit(alloc);
         if (self.theme) |value| alloc.free(value);
         if (self.provider_order) |order| {
             for (order) |slug| alloc.free(@constCast(slug));
@@ -885,6 +889,8 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "codex_model",
         "grok_model",
         "review_model",
+        "model_roles",
+        "cycle_order",
         "effort",
         "fast_mode",
         "ultrafast_mode",
@@ -1777,6 +1783,10 @@ fn parseProfileOnlyFields(
         }
     }
 
+    if (root.object.contains("model_roles") or root.object.contains("cycle_order")) {
+        settings.model_roles = try model_roles.Table.parse(alloc, root.object.get("model_roles"), root.object.get("cycle_order"));
+    }
+
     if (root.object.get("fast_mode")) |fast_mode_value| {
         const value = fast_mode_value;
         if (value != .bool) return error.InvalidFastModeType;
@@ -2051,6 +2061,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
         target.review_model = value;
         incoming.review_model = null;
     }
+    target.model_roles.overlay(alloc, &incoming.model_roles);
 
     if (incoming.statusline_context) |value| target.statusline_context = value;
     if (incoming.statusline_session) |value| target.statusline_session = value;
@@ -2956,6 +2967,23 @@ test "first_call_tool_choice ignores unknown strings and rejects invalid types" 
     try std.testing.expect(invalid_string.first_call_tool_choice == null);
 
     try std.testing.expectError(error.InvalidFirstCallToolChoiceType, parseSettingsJson(std.testing.allocator, "{\"first_call_tool_choice\":false}"));
+}
+
+test "model_roles parse from the profile, merge per role, and stay out of project defaults" {
+    var base = try parseSettingsJson(std.testing.allocator, "{\"model_roles\":{\"smol\":\"a\",\"worker\":\"@smol\"},\"review_model\":\"legacy\"}");
+    defer base.deinit(std.testing.allocator);
+    var over = try parseSettingsJson(std.testing.allocator, "{\"model_roles\":{\"smol\":\"b\"},\"cycle_order\":[\"smol\",\"default\"]}");
+    defer over.deinit(std.testing.allocator);
+    try mergeSettings(&base, &over, std.testing.allocator);
+    try std.testing.expectEqualStrings("b", base.model_roles.get(.smol).?);
+    try std.testing.expectEqualStrings("@smol", base.model_roles.get(.worker).?);
+    try std.testing.expectEqual(@as(usize, 2), base.model_roles.cycleOrder().len);
+    try std.testing.expectEqualStrings("legacy", base.review_model.?);
+    try std.testing.expectError(error.InvalidModelRolesType, parseSettingsJson(std.testing.allocator, "{\"model_roles\":\"x\"}"));
+
+    var project = try parseSettingsJsonForLayer(std.testing.allocator, "{\"model_roles\":{\"smol\":\"repo\"}}", .project);
+    defer project.deinit(std.testing.allocator);
+    try std.testing.expect(project.model_roles.get(.smol) == null);
 }
 
 test "review_model parses, merges, and yields to FX_REVIEW_MODEL" {

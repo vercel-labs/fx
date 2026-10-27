@@ -234,6 +234,7 @@ pub const Context = struct {
     host_sandbox_default: tool_admission.HostSandboxDefault = .none,
     model_capability_resolver: ?model_capabilities.Resolver = null,
     model_override_resolver: ?subagent_tool_host.ModelOverrideResolver = null,
+    model_role_resolver: ?subagent_tool_host.ModelRoleResolver = null,
     /// False when running outside an interactive TUI (e.g. ACP). Tools
     /// that require a live user (like `ask_user_question`) short-circuit
     /// in that case.
@@ -2255,6 +2256,7 @@ fn executeSubagentProvider(
         .progress = if (progress_bridge) |*bridge| bridge.sink() else null,
         .model_capability_resolver = ctx.model_capability_resolver,
         .model_override_resolver = ctx.model_override_resolver,
+        .model_role_resolver = ctx.model_role_resolver,
     }) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (err == error.Cancelled) return error.Cancelled;

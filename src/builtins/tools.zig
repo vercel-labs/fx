@@ -137,7 +137,7 @@ const fleet_properties = [_]model_tool_schema.Property{
     .{ .name = "message", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_message_bytes }, .description = "run, spawn: the turn's complete task. send: the worker's next input. Do not resend to poll for a result." },
     .{ .name = "label", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = 48 }, .description = "spawn: the worker's display label. run: the named worker the turn runs on." },
     .{ .name = "instructions", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_instructions_bytes }, .description = "spawn only. The worker's own system overlay. Cannot replace fx's trusted base prompt or widen authority." },
-    .{ .name = "model", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_model_bytes }, .description = "run, spawn: the worker's model as a catalog ID. Inherits the parent's model when omitted; rejected for an existing worker." },
+    .{ .name = "model", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_model_bytes }, .description = "run, spawn: the worker's model as a catalog ID, or @role such as @worker or @smol for the model the user assigned to that role. Inherits the parent's model when omitted; rejected for an existing worker." },
     .{ .name = "effort", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = types.ReasoningEffort.max_name_bytes }, .description = "run, spawn: the worker's reasoning effort. Inherits the parent's effort when omitted; rejected for an existing worker." },
     .{ .name = "schema", .json_type = .object, .description = "run, spawn: a JSON Schema the turn's final reply must match, as one JSON value." },
 };
@@ -889,7 +889,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "21d7156ac6a73c705e942da5465df8f21f5cb6d384af8bf999dc9a631d3b1f22",
+        "de0a57015278fe19b14907e38f5397c1a6dc960330201f4a4dad065b4176ab37",
         &actual_hex,
     );
 }

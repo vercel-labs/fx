@@ -21,6 +21,7 @@ pub const ParsedCommand = union(enum) {
     images: []const u8,
     model: []const u8,
     effort: []const u8,
+    role: []const u8,
     permissions: []const u8,
     allowlist: []const u8,
     stats,
@@ -68,6 +69,8 @@ pub const CommandHandlers = struct {
     manage_images: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_model: *const fn (ctx: *anyopaque, query: []const u8) anyerror!void,
     handle_effort: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
+    /// `/role`: model role assignments and cycling (D170).
+    handle_role: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void = unsupportedRole,
     handle_permissions: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_allowlist: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_stats: *const fn (ctx: *anyopaque) anyerror!void,
@@ -121,6 +124,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .image => .{ .image = payload },
         .model => .{ .model = payload },
         .effort => .{ .effort = payload },
+        .role => .{ .role = payload },
         .permissions => .{ .permissions = payload },
         .allowlist => .{ .allowlist = payload },
         .stats => .stats,
@@ -193,6 +197,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .images => |rest| try handlers.manage_images(handlers.ctx, rest),
         .model => |query| try handlers.handle_model(handlers.ctx, query),
         .effort => |rest| try handlers.handle_effort(handlers.ctx, rest),
+        .role => |rest| try handlers.handle_role(handlers.ctx, rest),
         .permissions => |rest| try handlers.handle_permissions(handlers.ctx, rest),
         .allowlist => |rest| try handlers.handle_allowlist(handlers.ctx, rest),
         .stats => try handlers.show_stats(handlers.ctx),
@@ -485,6 +490,11 @@ fn unexpectedNoPayload(ctx: *anyopaque) anyerror!void {
     return error.UnexpectedCallback;
 }
 
+/// Hosts without model roles leave `/role` to this.
+fn unsupportedRole(_: *anyopaque, _: []const u8) anyerror!void {
+    return error.UnsupportedCommand;
+}
+
 fn unexpectedPayload(ctx: *anyopaque, value: []const u8) anyerror!void {
     _ = ctx;
     _ = value;
@@ -562,6 +572,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .manage_images = unexpectedPayload,
         .handle_model = unexpectedPayload,
         .handle_effort = unexpectedPayload,
+        .handle_role = unexpectedPayload,
         .handle_permissions = unexpectedPayload,
         .handle_allowlist = unexpectedPayload,
         .show_stats = unexpectedNoPayload,

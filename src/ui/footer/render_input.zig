@@ -1,4 +1,5 @@
 const std = @import("std");
+const model_roles = @import("../../core/config/model_roles.zig");
 const session_browser = @import("../../core/input/session_browser.zig");
 const question_prompt = @import("../../core/agent/question_prompt.zig");
 const approval_prompt = @import("../../core/permissions/approval_prompt.zig");
@@ -88,6 +89,20 @@ pub const ModelMenuProjection = struct {
     selected_index: usize = 0,
     window_start: usize = 0,
     query: []const u8 = "",
+    /// The roles that pick each model, for the tags after its ID.
+    role_tags: RoleTags = .{},
+    /// The role Enter assigns the highlighted model to, if any.
+    assign_role: ?model_roles.Role = null,
+
+    pub const RoleTags = struct {
+        context: ?*const anyopaque = null,
+        tags_fn: ?*const fn (?*const anyopaque, []const u8, *[model_roles.role_count]model_roles.Role) usize = null,
+
+        pub fn get(self: RoleTags, model: []const u8, out: *[model_roles.role_count]model_roles.Role) []const model_roles.Role {
+            const tags = self.tags_fn orelse return &.{};
+            return out[0..tags(self.context, model, out)];
+        }
+    };
 
     pub fn providerFilter(self: ModelMenuProjection) model_cache_runtime.ModelProviderFilter {
         return @fromBackingInt(@intCast(@min(self.provider_index, model_cache_runtime.model_provider_filter_count - 1)));
@@ -340,6 +355,7 @@ pub fn modelMenuProjection(cache: *const model_cache_runtime.Runtime) ModelMenuP
         .selected_index = cache.menu.selected_index,
         .window_start = cache.menu.window_start,
         .query = cache.menu.query(),
+        .assign_role = cache.menu.assign_role,
     };
 }
 

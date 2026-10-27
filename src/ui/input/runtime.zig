@@ -4881,6 +4881,23 @@ test "input escape parser handles cmd+r as all-session resume picker" {
     try std.testing.expectEqual(@as(u8, 0), stage);
 }
 
+test "input escape parser maps Alt+P and Alt+Shift+P to role cycling" {
+    for ([_]struct { bytes: []const u8, action: InputEscapeAction }{
+        .{ .bytes = "p", .action = .cycle_role_model_forward },
+        .{ .bytes = "P", .action = .cycle_role_model_backward },
+        .{ .bytes = "[112;3u", .action = .cycle_role_model_forward },
+        .{ .bytes = "[112;4u", .action = .cycle_role_model_backward },
+    }) |case| {
+        var stage: u8 = 1;
+        var param: u16 = 0;
+        var param2: u16 = 0;
+        var result: ?InputEscapeAction = null;
+        for (case.bytes) |byte| result = consumeInputEscapeByte(&stage, &param, &param2, byte);
+        try std.testing.expectEqual(@as(?InputEscapeAction, case.action), result);
+        try std.testing.expectEqual(@as(u8, 0), stage);
+    }
+}
+
 test "input escape parser handles ctrl+a/ctrl+e via kitty protocol" {
     // ESC[97;5u is Kitty's Ctrl+A encoding.
     var stage: u8 = 1;

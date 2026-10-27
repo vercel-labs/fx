@@ -251,6 +251,9 @@ fn kittyUnicodeKeyAction(keycode: u16, modifiers: u16, meta_prefixed: bool) Inpu
     if ((keycode == 'd' or keycode == 'D') and (meta_prefixed or (mods & 0x02) != 0)) return .delete_word_right;
     if (keycode == 'o' or keycode == 'O') return ctrlOKeyAction(meta_prefixed, mods);
     if ((keycode == 'r' or keycode == 'R') and (mods & 0x08) != 0) return .open_all_sessions;
+    if ((keycode == 'p' or keycode == 'P') and (mods & alt_modifier) != 0 and (mods & ctrl_modifier) == 0) {
+        return if (keycode == 'P' or (mods & shift_modifier) != 0) .cycle_role_model_backward else .cycle_role_model_forward;
+    }
     if (keycode == 9 and (mods & 0x01) != 0) return .toggle_permission_mode;
     if ((mods & 0x04) != 0) {
         if (keycode == '_') return .{ .remapped_byte = 31 };
@@ -536,6 +539,13 @@ pub fn consumeInputEscapeByteWithMouse(
                 param.* = 0;
                 param2.* = 0;
                 return .word_right;
+            }
+            if (byte == 'p' or byte == 'P') {
+                stage.* = 0;
+                param.* = 0;
+                param2.* = 0;
+                // Alt+P and Alt+Shift+P cycle role models (D170).
+                return if (byte == 'p') .cycle_role_model_forward else .cycle_role_model_backward;
             }
             if (byte == 'd') {
                 stage.* = 0;

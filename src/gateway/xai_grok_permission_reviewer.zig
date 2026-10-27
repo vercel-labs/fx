@@ -21,7 +21,7 @@ fn reviewGrok(
 ) anyerror!permission_auto_classifier.ParseOutcome {
     return responses_reviewer.review(alloc, input, request, .{
         .source = .grok_subscription,
-        .model = reviewer_model,
+        .model = if (input.reviewer_model.len > 0) input.reviewer_model else reviewer_model,
         .require_account = true,
         .validate_fn = validateCredential,
         .build_fn = xai_grok.buildRequest,

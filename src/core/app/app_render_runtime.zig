@@ -1,4 +1,6 @@
 const std = @import("std");
+const model_roles = @import("../config/model_roles.zig");
+const model_role_runtime = @import("model_role_runtime.zig");
 const question_prompt = @import("../agent/question_prompt.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const app_commands = @import("app_commands.zig");
@@ -420,6 +422,17 @@ noinline fn approvalScreenNeedsClear(
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        fn modelMenuProjection(app: *const App) render_input.ModelMenuProjection {
+            var projection = render_input.modelMenuProjection(&app.model_cache);
+            if (comptime @hasField(App, "model_roles")) projection.role_tags = .{ .context = app, .tags_fn = modelRoleTags };
+            return projection;
+        }
+
+        fn modelRoleTags(context: ?*const anyopaque, model: []const u8, out: *[model_roles.role_count]model_roles.Role) usize {
+            const app: *const App = @ptrCast(@alignCast(context.?));
+            return model_role_runtime.rolesFor(app, model, out);
+        }
+
         fn appendDeferredHistoryForVisualEpoch(
             ctx: *anyopaque,
             finished: *const types.FinishedPrompt,
@@ -803,12 +816,12 @@ pub fn Runtime(comptime App: type) type {
                         app.input_runtime.edit_state.input.items,
                     );
                     if (comptime @hasField(App, "model_cache")) {
-                        projection.models = render_input.modelMenuProjection(&app.model_cache);
+                        projection.models = modelMenuProjection(app);
                     }
                     break :blk projection;
                 },
                 .model_menu = if (comptime @hasField(App, "model_cache"))
-                    render_input.modelMenuProjection(&app.model_cache)
+                    modelMenuProjection(app)
                 else
                     .{},
                 .session_browser = if (app.input_runtime.session_browser.active) &app.input_runtime.session_browser else null,

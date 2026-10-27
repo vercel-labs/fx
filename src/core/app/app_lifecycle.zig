@@ -1,4 +1,5 @@
 const std = @import("std");
+const model_roles = @import("../config/model_roles.zig");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const agent_steps = @import("../config/agent_steps.zig");
@@ -169,6 +170,8 @@ pub const StartupState = struct {
     /// Resolved review-model override for automatic permission review. Owned;
     /// empty keeps the reviewer's compiled default.
     review_model: []u8 = &.{},
+    /// Profile model roles (D170). Owned.
+    model_roles: model_roles.Table = .{},
     first_call_tool_choice: types.ToolChoice = .auto,
     statusline_context: bool = false,
     statusline_session: bool = false,
@@ -188,6 +191,7 @@ pub const StartupState = struct {
         if (self.selected_model.len > 0) alloc.free(self.selected_model);
         if (self.configured_model.len > 0) alloc.free(self.configured_model);
         if (self.review_model.len > 0) alloc.free(self.review_model);
+        self.model_roles.deinit(alloc);
         if (self.provider_order.len > 0) {
             for (self.provider_order) |slug| alloc.free(@constCast(slug));
             alloc.free(self.provider_order);
@@ -304,6 +308,36 @@ pub const StartupState = struct {
     pub fn takePermissionRules(self: *StartupState) types.PermissionRuleSet {
         const value = self.permission_rules;
         self.permission_rules = .{};
+        return value;
+    }
+
+    /// The model `role` picks on the startup provider, borrowed from this
+    /// state or `builtin_smol`; null keeps the consumer's default (D170).
+    pub fn roleModel(self: *const StartupState, role: model_roles.Role, builtin_smol: ?[]const u8) ?[]const u8 {
+        var provider = self.provider;
+        const label = provider.label();
+        const ref = model_roles.resolve(&self.model_roles, role, .{
+            .provider = label,
+            .default_model = self.configured_model,
+            .builtin_smol = builtin_smol,
+            // `review_model` was a gateway setting; other providers ignored it.
+            .legacy_review = if (self.provider == .gateway and self.review_model.len > 0) self.review_model else null,
+            .configured = self.configured_providers.definitions,
+        }) orelse return null;
+        return ref.on(label);
+    }
+
+    /// The permission reviewer's model; FX_REVIEW_MODEL, a gateway
+    /// override, outranks the profile's `review` role.
+    pub fn reviewModel(self: *const StartupState) []const u8 {
+        if (self.provider == .gateway and self.review_model.len > 0 and io_mod.getenv("FX_REVIEW_MODEL") != null) return self.review_model;
+        return self.roleModel(.review, null) orelse "";
+    }
+
+    /// Moves the owned model-role table out; caller owns it.
+    pub fn takeModelRoles(self: *StartupState) model_roles.Table {
+        const value = self.model_roles;
+        self.model_roles = .{};
         return value;
     }
 
@@ -797,6 +831,7 @@ fn loadStartupStateWithKeychainRead(
     state.theme = if (settings.theme) |value| try alloc.dupe(u8, value) else null;
     state.effort = settings.effort orelse .auto;
     state.review_model = try alloc.dupe(u8, settings.review_model orelse "");
+    state.model_roles = try settings.model_roles.dupe(alloc);
     state.first_call_tool_choice = settings.first_call_tool_choice orelse .auto;
     state.provider_strict = settings.provider_strict orelse false;
     if (settings.provider_order) |order| {

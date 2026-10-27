@@ -557,6 +557,10 @@ pub fn Runtime(comptime App: type) type {
             app.upgrader.configure_channel(startup.update_channel);
             app.effort = startup.effort;
             if (comptime @hasField(App, "review_model")) app.review_model = startup.takeReviewModel();
+            if (comptime @hasField(App, "model_roles")) {
+                var startup_provider = startup.provider;
+                try app.model_roles.init(app.alloc, startup.takeModelRoles(), startup_provider.label(), startup.configured_model);
+            }
             app.shell.setCommandOutputRenderPolicy(
                 app_render_runtime.Runtime(App).shellStyles(),
             );

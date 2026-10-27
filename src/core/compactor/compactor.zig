@@ -198,21 +198,24 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
     const turns = try turnsFrom(out, chosen.older, request.append_messages);
     if (turns.len == 0) return error.NothingToCompact;
     var summarizer: model.Summarizer = .{ .caller = caller, .cancel_flag = request.cancel_flag, .trace_ctx = trace_ctx };
-    trace.info(trace_ctx, .provider_start, "model={s} turns={d} earlier={} store={}", .{ caller.model, turns.len, chosen.earlier != null, request.records != null });
+    const summary_model = model.summaryModel(caller);
+    // Only the conversation's own model can read the request it cached.
+    const own_model = std.mem.eql(u8, summary_model, caller.model);
+    trace.info(trace_ctx, .provider_start, "model={s} turns={d} earlier={} store={}", .{ summary_model, turns.len, chosen.earlier != null, request.records != null });
     // The caller's allocator, so the summary gives its working memory back
     // when it is done instead of keeping it in this result.
     var summary = try summarize.compact(alloc, .{
-        .model = caller.model,
+        .model = summary_model,
         .earlier = earlier,
         .turns = turns,
         .last_turn_open = chosen.splitsLastTurn(),
         .kept = try turnsFrom(out, chosen.kept, request.append_messages),
         .max_prompt_tokens = request.size.summaryRequestTokens(),
-        .conversation_room = if (caller.sends_after_conversation) request.size.roomAfterConversation() else null,
+        .conversation_room = if (caller.sends_after_conversation and own_model) request.size.roomAfterConversation() else null,
         .max_text_tokens = request.size.compactedTokens(chosen.kept_used),
     }, summarizer.model(), request.records);
     defer summary.deinit();
-    trace.info(trace_ctx, .provider_completed, "model={s} summaries={d} shown_turns={d} turns={d} tools={d} entries={d} used={d} text_bytes={d} fallback={s}", .{ caller.model, summarizer.summaries, summary.compacted.turns.len, summary.compacted.turn_count, summary.compacted.tool_count, summary.compacted.entries.len, summary.compacted.used.len, summary.text.len, summarizer.fallback_used orelse "none" });
+    trace.info(trace_ctx, .provider_completed, "model={s} summaries={d} shown_turns={d} turns={d} tools={d} entries={d} used={d} text_bytes={d} fallback={s}", .{ summary_model, summarizer.summaries, summary.compacted.turns.len, summary.compacted.turn_count, summary.compacted.tool_count, summary.compacted.entries.len, summary.compacted.used.len, summary.text.len, summarizer.fallback_used orelse "none" });
 
     return .{
         .arena = arena,

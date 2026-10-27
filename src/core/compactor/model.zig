@@ -26,6 +26,9 @@ pub const ModelCaller = struct {
     vtable: *const VTable,
     /// The conversation's model.
     model: []const u8,
+    /// The model that writes the summary when it is not the conversation's
+    /// own: the `compact` model role (D172). Empty uses `model`.
+    summary_model: []const u8 = "",
     provider: model_provider.ProviderId,
     credential_source: ?types.CredentialSource,
     /// The caller can send a request right after the conversation, exactly
@@ -89,6 +92,11 @@ fn lowestReasoningEffort(capabilities: model_capabilities.Capabilities) ?types.R
 
 /// The model the summary step calls, remembering how many summaries it
 /// wrote and whether it fell back.
+/// The model that writes the summary.
+pub fn summaryModel(caller: ModelCaller) []const u8 {
+    return if (caller.summary_model.len > 0) caller.summary_model else caller.model;
+}
+
 pub const Summarizer = struct {
     caller: ModelCaller,
     cancel_flag: *std.atomic.Value(bool),
@@ -245,4 +253,11 @@ test "a request after the conversation goes to its own model only, with the agen
     try std.testing.expect(scripted.calls.items[0].after_conversation);
     try std.testing.expect(scripted.calls.items[0].reasoning == null);
     try std.testing.expect(summarizer.fallback_used == null);
+}
+
+test "the compact role's model writes the summary when one is set" {
+    var caller: ModelCaller = .{ .context = undefined, .vtable = undefined, .model = "conversation/model", .provider = .gateway, .credential_source = null };
+    try std.testing.expectEqualStrings("conversation/model", summaryModel(caller));
+    caller.summary_model = "cheap/summarizer";
+    try std.testing.expectEqualStrings("cheap/summarizer", summaryModel(caller));
 }

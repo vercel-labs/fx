@@ -65,7 +65,7 @@ fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []cons
 
 fn review(raw: ?*anyopaque, alloc: Allocator, input: classifier.ProviderInput, request: classifier.ReviewRequest) anyerror!classifier.ParseOutcome {
     const definition: *const definitions.Definition = @ptrCast(@alignCast(raw.?));
-    const model = definition.reviewer_model orelse request.review_turn.model;
+    const model = chat_completions.reviewerModel(definition, input, request);
     return switch (definition.protocolFor(model)) {
         .@"openai-chat-completions" => chat_completions.review(raw, alloc, input, request),
         .@"anthropic-messages" => anthropic_messages.review(raw, alloc, input, request),

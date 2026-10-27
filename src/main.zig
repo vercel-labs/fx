@@ -10,6 +10,7 @@ pub const version = "0.0.14";
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
+const model_role_runtime = @import("core/app/model_role_runtime.zig");
 const auth_runtime = @import("core/auth/auth_runtime.zig");
 const api_key_validator = @import("core/auth/api_key_validator.zig");
 const oauth_transport = @import("core/auth/oauth_transport.zig");
@@ -518,9 +519,7 @@ const App = struct {
     /// Fixed low-cost model the active provider uses for session title
     /// generation; null when the provider does not support generated titles.
     pub fn sessionTitleModel(self: *const Self) ?[]const u8 {
-        return self.providerSet()
-            .select(self.provider_selection.selection().provider)
-            .title_model;
+        return model_role_runtime.titleModel(self);
     }
 
     pub fn providerCatalog(self: *Self, provider: model_provider.ProviderId) ?model_catalog.Provider {
@@ -633,6 +632,8 @@ const App = struct {
     /// (`review_model` setting or FX_REVIEW_MODEL). Owned; empty keeps the
     /// reviewer's compiled default.
     review_model: []u8 = &.{},
+    /// Profile model roles (D170).
+    model_roles: model_role_runtime.State = .{},
     diff_entries: std.ArrayList(@import("core/output/diff.zig").DiffEntry) = .empty,
     next_diff_id: u32 = 1,
 
@@ -1091,6 +1092,7 @@ const App = struct {
         self.workspace_identity.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
         if (self.review_model.len > 0) self.alloc.free(self.review_model);
+        self.model_roles.deinit(self.alloc);
         shutdown_trace.mark("complete");
         if (was_interactive) app_lifecycle.writeLastShutdownReport(self.alloc, &shutdown_trace);
     }
@@ -4931,6 +4933,8 @@ test {
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");
+    _ = @import("core/config/model_roles.zig");
+    _ = @import("core/app/model_role_runtime.zig");
     _ = @import("core/config/provider_registry.zig");
     _ = @import("core/config/secret_command.zig");
     _ = @import("core/auth/provider_keys.zig");
