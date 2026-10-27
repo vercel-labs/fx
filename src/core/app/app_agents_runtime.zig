@@ -1893,7 +1893,9 @@ test "the switch order holds for random hosts" {
 }
 
 test "the switch order holds for fuzzed hosts" {
-    try std.testing.fuzz({}, fuzzSwitchOrder, .{});
+    try std.testing.fuzz({}, fuzzSwitchOrder, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").switch_order.*),
+    });
 }
 
 fn fuzzSwitchOrder(_: void, smith: *std.testing.Smith) !void {
