@@ -1781,6 +1781,35 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   follows see the same state. **Alternative:** checking from a connection
   thread, which a request queued between the check and the stop defeats.
 
+- **D101 Decision:** the `subagent` tool becomes the `fleet` tool, one tool
+  with the ops `run`, `spawn`, `send`, `list`, `inspect` and `terminate`.
+  `run` waits for its one turn, as `subagent` did, and with a label runs it
+  on that named worker (the old `message`). `spawn` and `send` answer at
+  once with a receipt (accepted, queued, steered, rejected or terminal)
+  naming the turn job `<worker id>-t<turn>`, the turn number reserved at
+  acceptance and saved on the work's `child_spawned` or `child_queued`
+  line. The node's host keeps each job in a ledger (`turn_jobs.zig`) that
+  the jobs tool reads; a settled result reaches the parent once, by a
+  claim or by the parent's next step, and the parent's step waits while a
+  job's result is outstanding. `Fleet.tla` checks `ExactlyOnceDelivery`.
+  **Why:** proto's workers run beside their parent and report as they
+  settle. **Alternative:** keeping `message` for peers, which fx has no
+  bus for; it stays `run` with a label.
+
+- **D102 Decision:** a worker's queued turns and its tombstone live in its
+  parent's log. Two manager line kinds: `child_queued {child, work_id,
+  data}` appends to the child's queue, which its next `child_spawned`
+  takes from the front and a cancelled `child_finished` drops from;
+  `child_terminated {child, data}` is allowed only between the child's
+  work items and makes it terminal: it takes no more work, its queue is
+  gone, and it stays listed and readable. The end of a turn and the start
+  of the queue's front are one save, unless the turn was cancelled. A
+  terminate cancels and joins the running turn before its line.
+  `Fleet.tla` checks `QueueInOrder` and `NoWorkAfterTerminate`. **Why:**
+  a send queued behind a busy worker must survive a restart, and a
+  terminated worker must never run again. **Alternative:** a queue kept
+  only in memory, which a restart loses.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a
