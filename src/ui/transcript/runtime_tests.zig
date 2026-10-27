@@ -13544,13 +13544,15 @@ test "current compact projection groups tool rows without mutating entries" {
     const entry_count = runtime.entries.items.len;
     var compact = try runtime.prepareTranscriptSource(alloc, null);
     defer compact.deinit(alloc);
-    try std.testing.expect(std.mem.find(
-        u8,
-        compact.bytes,
-        "\x1b[38;5;255m●\x1b[0m \x1b[38;5;245m2 tool calls · 1 read · 1 edit · 1 failed\x1b[0m\n" ++
-            "\x1b[38;5;245m├ Read file\x1b[0m\n" ++
-            "\x1b[38;5;245m└ Edit failed\x1b[0m",
-    ) != null);
+    // Plain words in the header with the failure in the status color; the
+    // routine read dim, the failed edit in the status color.
+    const header = try std.mem.concat(alloc, u8, &.{ "\x1b[38;5;255m●\x1b[0m Read 1 file, edited 1 file", ui_render.red_style, " · 1 failed\x1b[0m\n" });
+    defer alloc.free(header);
+    const failed_row = try std.mem.concat(alloc, u8, &.{ ui_render.red_style, "└ Edit failed\x1b[0m" });
+    defer alloc.free(failed_row);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, header) != null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "\x1b[38;5;245m├ Read file\x1b[0m\n") != null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, failed_row) != null);
     try std.testing.expectEqual(entry_count, runtime.entries.items.len);
 }
 
@@ -13564,8 +13566,8 @@ test "current compact projection finalizes tool groups from turn finished fallba
         fallback_disposition: ?transcript_blocks.ToolFallbackDisposition,
         summary_text: []const u8,
     }{
-        .{ .call_id = "unreported", .provisional = false, .turn_outcome = .completed, .detail_outcome = .completed, .fallback_disposition = .completion_unreported, .summary_text = "1 tool call · 1 read · 1 unreported" },
-        .{ .call_id = "not-executed", .provisional = true, .turn_outcome = .completed, .detail_outcome = .completed, .fallback_disposition = .not_executed, .summary_text = "1 tool call · 1 read · 1 not executed" },
+        .{ .call_id = "unreported", .provisional = false, .turn_outcome = .completed, .detail_outcome = .completed, .fallback_disposition = .completion_unreported, .summary_text = " · 1 unreported" },
+        .{ .call_id = "not-executed", .provisional = true, .turn_outcome = .completed, .detail_outcome = .completed, .fallback_disposition = .not_executed, .summary_text = " · 1 not executed" },
         .{ .call_id = "interrupted", .provisional = false, .turn_outcome = .interrupted, .detail_outcome = .cancelled, .fallback_disposition = null, .summary_text = "1 cancelled" },
         .{ .call_id = "failed", .provisional = false, .turn_outcome = .failed, .detail_outcome = .failed, .fallback_disposition = null, .summary_text = "Tool failed" },
     };
@@ -13645,11 +13647,8 @@ fn checkCompactParallelFallbackAllocationFailuresImpl(alloc: Allocator) !void {
 
     var rendered = try runtime.prepareTranscriptSource(alloc, null);
     defer rendered.deinit(alloc);
-    try std.testing.expect(std.mem.find(
-        u8,
-        rendered.bytes,
-        "2 tool calls · 2 read · 2 not executed",
-    ) != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "Read 2 files") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, " · 2 not executed") != null);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "running") == null);
     for (entry_ids) |entry_id| {
         try std.testing.expectEqual(
@@ -15323,7 +15322,7 @@ test "late zero-output command settlement reserves distinct presentation entries
         );
         try std.testing.expectEqual(
             @as(usize, 1),
-            std.mem.count(u8, rendered.bytes, "Ran \x1b[38;5;245m\x1b[38;5;252mtrue\x1b[39m"),
+            std.mem.count(u8, rendered.bytes, "Ran \x1b[38;5;252mtrue\x1b[39m"),
         );
         const detail = runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?;
         try std.testing.expectEqual(types.ToolOutcomeKind.completed, detail.outcome.?);
@@ -16138,9 +16137,11 @@ test "finality floor holds unfenced tool turn across quiet ticks and settles aft
             .tool_name = "read_file",
             .activity_kind = .read,
         } });
+        // Failed reads need attention, so each keeps a row and the turn's
+        // group stays taller than the viewport.
         _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
             .id = id,
-            .outcome = .{ .kind = .completed, .summary = "Read one file" },
+            .outcome = .{ .kind = .failed, .summary = "Failed: Reading one file" },
         } });
     }
     try runtime.finishLifecycleBatch(alloc);
@@ -16690,8 +16691,8 @@ test "finality candidates anchor a fully grouped turn at its newest rendered gro
     try std.testing.expect(source.finality.mutation_pin_start == null);
 
     const group_a_header = try alloc.print(
-        "{s}●\x1b[0m {s}3 tool calls · 3 read\x1b[0m",
-        .{ user_message_card.promptMarkerStyle(), ui_render.statusline_style },
+        "{s}●\x1b[0m Read 3 files",
+        .{user_message_card.promptMarkerStyle()},
     );
     defer alloc.free(group_a_header);
     const group_a_start = std.mem.find(u8, source.bytes, group_a_header) orelse
@@ -16786,11 +16787,10 @@ test "grouped completed command rows shell-highlight quoted strings over the row
     var source = try runtime.prepareTranscriptSource(alloc, null);
     defer source.deinit(alloc);
 
-    // The action label keeps the row's ambient style; the command verb and
-    // quoted string pick up syntax palette colors and return to the row base
-    // after their closes.
-    try std.testing.expect(std.mem.find(u8, source.bytes, "Ran \x1b[38;5;245m\x1b[38;5;252mprintf\x1b[39m\x1b[38;5;245m") != null);
-    try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;250m'hello world'\x1b[39m\x1b[38;5;245m") != null);
+    // An outcome row is plain text: the command verb and quoted string pick
+    // up syntax palette colors over the terminal's own foreground.
+    try std.testing.expect(std.mem.find(u8, source.bytes, "Ran \x1b[38;5;252mprintf\x1b[39m ") != null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;250m'hello world'\x1b[39m") != null);
 }
 
 test "multi-word command labels stay intact when a syntax token follows" {
@@ -16818,9 +16818,9 @@ test "multi-word command labels stay intact when a syntax token follows" {
     var source = try runtime.prepareTranscriptSource(alloc, null);
     defer source.deinit(alloc);
 
-    // A first-space split would open the base style between "Timed" and
-    // "out"; the recorded label keeps both words ahead of the base open.
-    try std.testing.expect(std.mem.find(u8, source.bytes, "Timed out \x1b[38;5;245m") != null);
+    // A first-space split would color "out" as the command; the recorded
+    // label keeps both words ahead of the command's first token.
+    try std.testing.expect(std.mem.find(u8, source.bytes, "Timed out \x1b[38;5;252msleep") != null);
     // The command word colors; the bare number argument stays plain.
     try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;252msleep\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;250m5\x1b[39m") == null);

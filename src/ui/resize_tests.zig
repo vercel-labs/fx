@@ -3850,6 +3850,16 @@ fn applyCompletedReadForGroupFinalityResizeTest(
     call_id: []const u8,
     group_id: types.ToolPresentationGroupId,
 ) !void {
+    return applyReadForGroupFinalityResizeTest(h, turn_id, call_id, group_id, .failed);
+}
+
+fn applyReadForGroupFinalityResizeTest(
+    h: *Harness,
+    turn_id: u64,
+    call_id: []const u8,
+    group_id: types.ToolPresentationGroupId,
+    outcome: types.ToolOutcomeKind,
+) !void {
     const id = types.ToolLifecycleId{ .turn_id = turn_id, .call_id = call_id };
     _ = try h.shell.applyToolLifecycle(h.alloc, .{ .authoritative_started = .{
         .id = id,
@@ -3858,9 +3868,11 @@ fn applyCompletedReadForGroupFinalityResizeTest(
         .tool_name = "read_file",
         .activity_kind = .read,
     } });
+    // Failed reads need attention, so every row of the group stays visible
+    // and the group stays taller than the viewport; completed reads fold.
     _ = try h.shell.applyToolLifecycle(h.alloc, .{ .terminal = .{
         .id = id,
-        .outcome = .{ .kind = .completed, .summary = "Read fixed-point fixture" },
+        .outcome = .{ .kind = outcome, .summary = if (outcome == .failed) "Failed: Reading fixed-point fixture" else "Read fixed-point fixture" },
     } });
 }
 
@@ -3925,7 +3937,9 @@ test "closed tool group finality flows through fixed point resolution and sealin
 
 test "completed tool group lets streamed assistant hard lines enter history" {
     const alloc = std.testing.allocator;
-    var h = try Harness.init(alloc, 80, 14, 3);
+    // A live group shows only its newest rows; a short viewport keeps it
+    // taller than the room above the footer, so it holds what follows.
+    var h = try Harness.init(alloc, 80, 8, 3);
     defer h.deinit();
 
     var input = InputRuntime{};
@@ -3950,7 +3964,7 @@ test "completed tool group lets streamed assistant hard lines enter history" {
             "answer-a-{d:0>2}",
             .{index},
         );
-        try applyCompletedReadForGroupFinalityResizeTest(&h, 93, call_id, group);
+        try applyReadForGroupFinalityResizeTest(&h, 93, call_id, group, .completed);
     }
     const active_call_id = try std.mem.print(
         &call_ids[call_ids.len - 1],
@@ -3995,6 +4009,11 @@ test "completed tool group lets streamed assistant hard lines enter history" {
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
+    // The settled group folds to fewer rows than the live one; the next
+    // frame commits what it released.
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
     try std.testing.expect(h.last_frame.planned_scroll_rows > 0);
     try std.testing.expect(h.last_frame.committed_scroll_rows > 0);
     try std.testing.expect(h.last_frame.document_append_bytes > 0);

@@ -5768,7 +5768,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const nextFinalText = "INSTRUCTION_REFRESH_NEXT_TURN_FINAL";
       const currentInstruction = "NESTED_CURRENT_INSTRUCTION_SENTINEL";
       const refreshLabel = "Reading project instructions before continuing:";
-      const header = "● 2 tool calls · 2 commands";
+      const header = "● Ran 2 commands";
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(nested, { recursive: true });
       writeFileSync(join(home, ".fx", "settings.json"), "{}");
@@ -5937,7 +5937,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the supported call after the unknown call.");
       await session.waitForText(finalText, TIMEOUT);
-      const header = "● 2 tool calls · 2 commands · 1 failed";
+      const header = "● Ran 2 commands · 1 failed";
       const failedRow = `├ Failed ${unsupportedToolName}`;
       const completedRow = `└ Ran ${supportedCommand}`;
       const compact = await session.captureFullScrollback();
@@ -6273,21 +6273,21 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         await session.waitForComposer(TIMEOUT);
         await session.sendText(rootPrompt);
         await waitForCondition(() => started.size === 2, "both sibling subagents started");
-        await session.waitForText(`Subagent working · ${firstTask}`, TIMEOUT);
-        await session.waitForText(`Subagent working · ${secondTask}`, TIMEOUT);
+        await session.waitForText(`Running worker · ${firstTask}`, TIMEOUT);
+        await session.waitForText(`Running worker · ${secondTask}`, TIMEOUT);
 
         releaseFirst(fakeGatewayFinalText("PARALLEL_FIRST_DONE"));
-        await session.waitForText(`Subagent finished · ${firstTask}`, TIMEOUT);
+        await session.waitForText(`Ran worker · ${firstTask}`, TIMEOUT);
         const partial = await session.captureFullScrollback();
-        expect(partial).toContain(`Subagent working · ${secondTask}`);
-        expect(partial).not.toContain(`Subagent finished · ${secondTask}`);
+        expect(partial).toContain(`Running worker · ${secondTask}`);
+        expect(partial).not.toContain(`Ran worker · ${secondTask}`);
         expect(parentContinuations).toBe(0);
 
         releaseSecond(fakeGatewayFinalText("PARALLEL_SECOND_DONE"));
         await session.waitForText("PARALLEL_SUBAGENT_ROWS_FINISHED", TIMEOUT);
         const completed = await session.captureFullScrollback();
-        expect(countOccurrences(completed, `Subagent finished · ${firstTask}`)).toBe(1);
-        expect(countOccurrences(completed, `Subagent finished · ${secondTask}`)).toBe(1);
+        expect(countOccurrences(completed, `Ran worker · ${firstTask}`)).toBe(1);
+        expect(countOccurrences(completed, `Ran worker · ${secondTask}`)).toBe(1);
         expect(parentContinuations).toBe(1);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         await session.sendText("/quit");
@@ -6361,19 +6361,19 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         await session.waitForComposer(TIMEOUT);
         await session.sendText(rootPrompt);
         for (let index = 0; index < tasks.length; index += 1) {
-          await session.waitForText(`${index === 0 ? "Subagent" : "reviewer"} working`, TIMEOUT);
+          await session.waitForText(`${index === 0 ? "Running worker" : "reviewer working"}`, TIMEOUT);
           const active = await session.captureFullScrollback();
           expect(active).toContain(tasks[index]);
           releases[index]();
-          await session.waitForText(`${index === 0 ? "Subagent finished" : "reviewer replied"} · ${tasks[index]}`, TIMEOUT);
+          await session.waitForText(`${index === 0 ? "Ran worker" : "reviewer replied"} · ${tasks[index]}`, TIMEOUT);
         }
         await session.waitForText(finalText, TIMEOUT);
         const compact = await session.captureFullScrollback();
-        expect(compact).toContain("● 5 tool calls · 4 subagent · 1 read");
+        expect(compact).toContain("● Started 4 workers, read 1 file");
         expect(compact).toContain("Invalid Agent failed · Check failure visibility");
         expect(compact).not.toContain("Invalid Agent replied");
         for (let index = 0; index < tasks.length; index += 1) {
-          expect(countOccurrences(compact, `${index === 0 ? "Subagent finished" : "reviewer replied"} · ${tasks[index]}`)).toBe(1);
+          expect(countOccurrences(compact, `${index === 0 ? "Ran worker" : "reviewer replied"} · ${tasks[index]}`)).toBe(1);
         }
         expect(compact).not.toContain("Managed subagent");
         await session.resizeWindow(45, 30);
@@ -6400,9 +6400,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         session = await TmuxSession.create({ cmd: `${FX_BIN} --resume-last`, cwd: workspace, env, width: 110, height: 35, stderrPath: join(root, "resumed-stderr.log") });
         await session.waitForText(finalText, TIMEOUT);
         const resumed = await session.captureFullScrollback();
-        expect(resumed).toContain("● 5 tool calls · 4 subagent · 1 read");
+        expect(resumed).toContain("● Started 4 workers, read 1 file");
         expect(resumed).toContain("Invalid Agent failed · Check failure visibility");
-        expect(resumed).toContain("Subagent finished · Check one-off cleanup");
+        expect(resumed).toContain("Ran worker · Check one-off cleanup");
         expect(resumed).toContain("reviewer replied · Check replay again");
         expect(rowGateway.requests.length).toBe(requestCount);
         expect(readFileSync(join(root, "resumed-stderr.log"), "utf8")).toBe("");
@@ -6515,7 +6515,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText(finalText, TIMEOUT);
 
       const compact = await session.captureFullScrollback();
-      expect(compact).toContain("● 3 tool calls · 3 commands");
+      expect(compact).toContain("● Ran 3 commands");
       expect(compact).toContain(
         "Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink && pwd",
       );
@@ -6525,7 +6525,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(countOccurrences(compact, `Ran ${thirdCommand}`)).toBe(1);
 
       await session.resizeWindow(80, 24);
-      await session.waitForText("● 3 tool calls · 3 commands", TIMEOUT);
+      await session.waitForText("● Ran 3 commands", TIMEOUT);
       await session.sendKeys("C-o");
       const fullAtTail = await session.waitForText(finalText, TIMEOUT);
       let fullAtNested = fullAtTail;
@@ -6572,7 +6572,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await session.sendKeys("C-o");
-      await session.waitForText("● 3 tool calls · 3 commands", TIMEOUT);
+      await session.waitForText("● Ran 3 commands", TIMEOUT);
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       await session.kill();
@@ -6588,7 +6588,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       });
       await session.waitForText(finalText, TIMEOUT);
       const resumed = await session.captureFullScrollback();
-      expect(resumed).toContain("● 3 tool calls · 3 commands");
+      expect(resumed).toContain("● Ran 3 commands");
       expect(resumed).toContain(
         "Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink && pwd",
       );

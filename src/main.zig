@@ -1387,7 +1387,7 @@ const App = struct {
     }
 
     /// A notice of settled background jobs shows as one status row per job,
-    /// not as the person's prompt: "✓ Background job completed · bg_3 · …".
+    /// not as the person's prompt: "✓ npm test finished · 1m2s".
     fn writeJobNoticeRows(self: *App, text: []const u8) !bool {
         var arena_state = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_state.deinit();
@@ -5024,6 +5024,8 @@ test {
     _ = @import("core/recall/recall.zig");
     _ = @import("tools/session/recall.zig");
     _ = @import("core/tooling/recall_presentation.zig");
+    _ = @import("core/tooling/fleet_presentation.zig");
+    _ = @import("core/shared/human_text.zig");
     _ = @import("tools/skills/install_skill.zig");
     _ = @import("tools/skills/skill.zig");
     _ = @import("core/upgrade/upgrade_helpers.zig");
@@ -5048,6 +5050,8 @@ test {
     _ = @import("ui/render_engine/terminal_diff.zig");
     _ = @import("ui/transcript/runtime.zig");
     _ = @import("ui/transcript/runtime_tests.zig");
+    _ = @import("ui/transcript/tool_group_tiers.zig");
+    _ = @import("ui/transcript/python_outline.zig");
     _ = @import("core/agent/worker_runtime.zig");
     _ = @import("gateway/client.zig");
     _ = @import("gateway/host_stream_provider.zig");

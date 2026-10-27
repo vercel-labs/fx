@@ -2276,8 +2276,8 @@ test "auto permission notice is retained without changing compact transcript geo
     var compact = try runtime.prepareTranscriptSource(alloc, null);
     defer compact.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, compact.bytes, "Auto agent approved") == null);
-    try std.testing.expect(std.mem.find(u8, compact.bytes, "1 tool call") != null);
     try std.testing.expect(std.mem.find(u8, compact.bytes, "Ran printf done") != null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "tool call") == null);
 
     var projection = try runtime.buildFullTranscriptProjection(alloc, null);
     defer projection.deinit(alloc);
@@ -2623,7 +2623,7 @@ test "provisional lifecycle owns semantic detail before authoritative reconcilia
     try std.testing.expectEqual(@as(usize, 1), runtime.tool_details.items.len);
 }
 
-test "nonzero command remains Ran in the current compact projection" {
+test "nonzero command reads its exit status in the current compact projection" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{ .layout = .{
         .rows = 24,
@@ -2653,7 +2653,8 @@ test "nonzero command remains Ran in the current compact projection" {
 
     var source = try runtime.prepareTranscriptSource(alloc, null);
     defer source.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, source.bytes, "Ran \x1b[38;5;245m\x1b[38;5;252mfalse\x1b[39m") != null);
+    // The row says how the command ended, not that it ran, and names it.
+    try std.testing.expect(std.mem.find(u8, source.bytes, "Exited 7 · false") != null);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, source.bytes, "│ exit code 7"));
     try std.testing.expect(std.mem.find(u8, source.bytes, "Failed") == null);
 }
@@ -2769,9 +2770,9 @@ test "nonzero streamed command reuses its active output block" {
 
     var source = try runtime.prepareTranscriptSource(alloc, null);
     defer source.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;252mprintf\x1b[39m") != null);
-    try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;252m;\x1b[39m") != null);
-    try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;252mexit\x1b[39m") != null);
+    // A failed command reads in the status color with how it ended; its
+    // command is not syntax-colored over that.
+    try std.testing.expect(std.mem.find(u8, source.bytes, "Exited 7") != null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;250m7\x1b[39m") == null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "Failed") == null);
 }
@@ -3333,7 +3334,7 @@ test "historical nonzero command keeps replay ownership outside compact sideband
     var source = try runtime.prepareTranscriptSource(alloc, null);
     defer source.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, source.bytes, "│ "));
-    try std.testing.expect(std.mem.find(u8, source.bytes, "Ran \x1b[38;5;245m\x1b[38;5;252mfalse\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "Exited 7") != null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "│ exit code 7") == null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "│ … 2 lines more") == null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "│ five") == null);
@@ -3625,7 +3626,7 @@ test "command output consolidation preserves current compact ownership" {
     var compact = try runtime.prepareTranscriptSource(alloc, null);
     defer compact.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, compact.bytes, "STREAM 001") == null);
-    try std.testing.expect(std.mem.find(u8, compact.bytes, "1 tool call") != null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "1 running") != null);
 
     _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
         .id = id,

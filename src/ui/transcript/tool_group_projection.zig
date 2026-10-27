@@ -12,6 +12,7 @@ const code_highlight = @import("../../core/agent/presentation/code_highlight.zig
 const code_highlight_languages = @import("../../core/agent/presentation/code_highlight_languages.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
+const tiers = @import("tool_group_tiers.zig");
 
 const TranscriptEntry = transcript_blocks.TranscriptEntry;
 const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
@@ -134,6 +135,8 @@ pub const SummaryStyle = struct {
     marker_style: []const u8 = "",
     text_style: []const u8 = "",
     reset_style: []const u8 = "",
+    /// Rows and counts that need attention: failures and denials.
+    attention_style: []const u8 = "",
 };
 
 const BuildStats = struct {
@@ -148,9 +151,10 @@ const category_labels = [_][]const u8{
     "edit",
     "open",
     "command",
-    "subagent",
+    "worker",
 };
 const command_category_index = 4;
+const worker_category_index = 5;
 
 const Summary = struct {
     total: usize = 0,
@@ -294,6 +298,50 @@ test "a rewind's divider spans the row with its label centered" {
     defer std.testing.allocator.free(block.lines);
     try std.testing.expectEqualStrings("────── branch · ctrl+o ───────", block.bytes);
     try std.testing.expectEqual(@as(usize, 30), display_width.visibleWidth(block.bytes));
+}
+
+const SegmentKey = struct {
+    group: types.ToolPresentationGroupId,
+    /// Counts the reasoning headings that opened a block of this group.
+    segment: u32,
+};
+
+fn isReasoningHeading(entry: TranscriptEntry) bool {
+    return switch (entry) {
+        .semantic_notice => |notice| !notice.inline_hidden and transcript_blocks.reasoningTitle(notice) != null,
+        else => false,
+    };
+}
+
+/// The tool row a reasoning heading belongs before: the row just above it,
+/// past hidden and attached entries. Null when prose or another heading
+/// comes first, so the heading stays where it is.
+fn headingOwner(entries: []const TranscriptEntry, heading_index: usize) ?usize {
+    var index = heading_index;
+    while (index > 0) {
+        index -= 1;
+        const entry = entries[index];
+        if (toolStatusEntryId(entry) != null) return index;
+        if (isAttachedEntry(entry) or !transcript_blocks.isEntryVisibleInCompactPresentation(entry)) continue;
+        return null;
+    }
+    return null;
+}
+
+/// `group` with the step's reasoning heading and a blank line above it.
+fn prependHeading(alloc: std.mem.Allocator, group: GroupBlock, heading: TranscriptEntry, cols: u16) !GroupBlock {
+    defer alloc.free(group.bytes);
+    defer alloc.free(group.lines);
+    const rendered = try transcript_blocks.renderEntryToBlock(alloc, heading, cols, .{});
+    defer rendered.deinit(alloc);
+    const text = std.mem.trimEnd(u8, rendered.bytes, "\n");
+    const lines = try alloc.alloc(transcript_blocks.LineProvenance, group.lines.len + 2);
+    errdefer alloc.free(lines);
+    lines[0] = .{ .entry = .{ .entry_id = heading.id(), .entry_class = transcript_blocks.entryClassForEntry(heading) } };
+    lines[1] = .block_separator;
+    @memcpy(lines[2..], group.lines);
+    const bytes = try alloc.print("{s}\n\n{s}", .{ text, group.bytes });
+    return .{ .bytes = bytes, .lines = lines };
 }
 
 fn isAttachedEntry(entry: TranscriptEntry) bool {
@@ -610,6 +658,8 @@ fn formatGroupSummary(alloc: std.mem.Allocator, summary: Summary) ![]u8 {
         const count = summary.categories[index];
         const label = if (index == command_category_index and count != 1)
             "commands"
+        else if (index == worker_category_index and count != 1)
+            "workers"
         else
             category_labels[index];
         try appendSegment(&out.writer, count, label);
@@ -621,110 +671,6 @@ fn formatGroupSummary(alloc: std.mem.Allocator, summary: Summary) ![]u8 {
 }
 
 const GroupBlock = struct { bytes: []u8, lines: []const transcript_blocks.LineProvenance };
-
-const SingleEntry = struct {
-    entry: TranscriptEntry,
-    entry_id: u32,
-    detail: *const ToolDetailRecord,
-};
-
-/// The group's only entry when it is a clean, completed, unfocused tool row.
-/// Failures, cancellations, timeouts, and live or focused rows keep the summary
-/// header so their state stays explicit.
-fn cleanSingleEntry(
-    entries: []const TranscriptEntry,
-    status_indices: []const usize,
-    details: []const ToolDetailRecord,
-    detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
-    summary: Summary,
-    focused_entry_id: ?u32,
-) ?SingleEntry {
-    if (status_indices.len != 1 or !summary.isClean()) return null;
-    const entry = entries[status_indices[0]];
-    const entry_id = toolStatusEntryId(entry) orelse return null;
-    if (focused_entry_id == entry_id) return null;
-    const detail = detailForEntry(details, detail_indices, entry_id, null) orelse return null;
-    if (detail.outcome != .completed or statusNamesAsk(entry, detail)) return null;
-    return .{ .entry = entry, .entry_id = entry_id, .detail = detail };
-}
-
-/// The row text for one tool entry: its canonical status phrase, with a
-/// truncated command reprojected and highlighted. Allocated in `scratch`.
-fn statusRowPhrase(
-    scratch: std.mem.Allocator,
-    entry: TranscriptEntry,
-    detail: ?*const ToolDetailRecord,
-    style: SummaryStyle,
-) ![]const u8 {
-    const raw_phrase = switch (entry) {
-        .raw_bytes => |raw| try normalizeCanonicalStatus(scratch, raw.bytes),
-        else => null,
-    } orelse if (detail) |record| record.tool_name else "tool activity";
-    const phrase = try reprojectTruncatedCommandPhrase(
-        scratch,
-        raw_phrase,
-        detail,
-    ) orelse raw_phrase;
-    return try highlightCommandPhrase(scratch, phrase, detail, style.text_style) orelse phrase;
-}
-
-/// Writes one clipped, styled row, preceded by a newline unless it is the
-/// block's first row, and records its provenance.
-fn appendStatusRow(
-    alloc: std.mem.Allocator,
-    scratch: std.mem.Allocator,
-    out: *std.Io.Writer,
-    lines: *std.ArrayList(transcript_blocks.LineProvenance),
-    entry_id: u32,
-    detail: ?*const ToolDetailRecord,
-    row: []const u8,
-    first_row: bool,
-    cols: u16,
-    style: SummaryStyle,
-) !void {
-    const clipped = try clipSummary(scratch, row, cols);
-    const accented = if (entryShowsDiffStats(detail))
-        try accentTrailingDiffStats(scratch, clipped, style.text_style)
-    else
-        clipped;
-    try lines.append(alloc, .{ .entry = .{ .entry_id = entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
-    if (!first_row) try out.writeByte('\n');
-    if (style.text_style.len > 0) try out.writeAll(style.text_style);
-    try out.writeAll(accented);
-    if (style.text_style.len > 0) try out.writeAll(style.reset_style);
-}
-
-/// A lone completed tool renders as its own "● Read README.md" row, without
-/// a one-item summary header or tree connector.
-fn formatSingleToolRow(
-    alloc: std.mem.Allocator,
-    single: SingleEntry,
-    cols: u16,
-    style: SummaryStyle,
-) !GroupBlock {
-    var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer mem_utils.deinit_arena(scratch_state);
-    const scratch = scratch_state.allocator();
-
-    var lines: std.ArrayList(transcript_blocks.LineProvenance) = .empty;
-    errdefer lines.deinit(alloc);
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-
-    const phrase = try statusRowPhrase(scratch, single.entry, single.detail, style);
-    const row = try scratch.print("● {s}", .{phrase});
-    try appendStatusRow(alloc, scratch, &out.writer, &lines, single.entry_id, single.detail, row, true, cols, style);
-    if (statusContinuation(single.entry, single.detail)) |continuation| {
-        var rows = continuationRows(continuation);
-        while (rows.next()) |text| {
-            const continuation_row = try scratch.print("  {s}", .{text});
-            try appendStatusRow(alloc, scratch, &out.writer, &lines, single.entry_id, null, continuation_row, false, cols, style);
-        }
-    }
-    const bytes = try out.toOwnedSlice();
-    errdefer alloc.free(bytes);
-    return .{ .bytes = bytes, .lines = try lines.toOwnedSlice(alloc) };
-}
 
 fn formatGroupBlock(
     alloc: std.mem.Allocator,
@@ -739,69 +685,101 @@ fn formatGroupBlock(
     style: SummaryStyle,
     styles: transcript_blocks.Styles,
 ) !GroupBlock {
-    if (!collapse_tool_calls) {
-        if (cleanSingleEntry(entries, status_indices, details, detail_indices, summary, focused_entry_id)) |single| {
-            return formatSingleToolRow(alloc, single, cols, style);
-        }
-    }
+    _ = summary;
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer mem_utils.deinit_arena(scratch_state);
+    const scratch = scratch_state.allocator();
 
-    const header = try formatGroupHeader(alloc, summary, cols, style);
-    defer alloc.free(header);
-
-    var lines: std.ArrayList(transcript_blocks.LineProvenance) = .empty;
-    errdefer lines.deinit(alloc);
-    try lines.append(alloc, .{ .entry = .{ .entry_id = entries[status_indices[0]].id(), .entry_class = .tool_status, .projection_part = .group_header } });
-    if (collapse_tool_calls) {
-        const bytes = try alloc.dupe(u8, header);
-        errdefer alloc.free(bytes);
-        return .{ .bytes = bytes, .lines = try lines.toOwnedSlice(alloc) };
-    }
-
-    var focused_in_group = false;
-    var static_count: usize = 0;
+    // Every row of the group, the focused one included for the header's
+    // counts; the focused row itself is drawn by the live activity line.
+    var all_items: std.ArrayList(tiers.Item) = .empty;
+    var row_items: std.ArrayList(tiers.Item) = .empty;
+    var live = false;
     for (status_indices) |status_index| {
         const entry = entries[status_index];
         const entry_id = toolStatusEntryId(entry) orelse continue;
         const detail = detailForEntry(details, detail_indices, entry_id, null);
         if (statusNamesAsk(entry, detail)) continue;
+        const item: tiers.Item = .{
+            .entry_id = entry_id,
+            .detail = detail,
+            .phrase = try plainStatusPhrase(scratch, entry, detail),
+            .continuation = statusContinuation(entry, detail),
+        };
+        try all_items.append(scratch, item);
+        if (tiers.isLive(detail)) live = true;
         if (focused_entry_id == entry_id) {
-            focused_in_group = true;
-        } else {
-            static_count += 1;
+            live = true;
+            continue;
         }
+        try row_items.append(scratch, item);
     }
 
-    var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer mem_utils.deinit_arena(scratch_state);
-    const scratch = scratch_state.allocator();
-
+    var lines: std.ArrayList(transcript_blocks.LineProvenance) = .empty;
+    errdefer lines.deinit(alloc);
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    try out.writer.writeAll(header);
+    const first_id = entries[status_indices[0]].id();
 
-    var static_index: usize = 0;
-    for (status_indices) |status_index| {
-        const entry = entries[status_index];
-        const entry_id = toolStatusEntryId(entry) orelse continue;
-        const detail = detailForEntry(details, detail_indices, entry_id, null);
-        if (statusNamesAsk(entry, detail) or focused_entry_id == entry_id) continue;
-
-        const display_phrase = try statusRowPhrase(scratch, entry, detail, style);
-        static_index += 1;
-        const last_static_row = !focused_in_group and static_index == static_count;
-        const connector = if (last_static_row) "└" else "├";
-        const child = try scratch.print("{s} {s}", .{ connector, display_phrase });
-        try appendStatusRow(alloc, scratch, &out.writer, &lines, entry_id, detail, child, false, cols, style);
-        if (statusContinuation(entry, detail)) |continuation| {
-            var rows = continuationRows(continuation);
-            while (rows.next()) |text| {
-                const continuation_row = try scratch.print(
-                    "{s}{s}",
-                    .{ if (last_static_row) "  " else "│ ", text },
-                );
-                try appendStatusRow(alloc, scratch, &out.writer, &lines, entry_id, null, continuation_row, false, cols, style);
-            }
+    // A cancelled or unreported row keeps its header, which names that.
+    const needs_header = for (row_items.items) |item| {
+        if (item.detail) |record| if (record.outcome == .cancelled or record.fallback_disposition != null) break true;
+    } else false;
+    if (!collapse_tool_calls and !live and !needs_header and all_items.items.len == 1 and row_items.items.len == 1) {
+        // A group of one reads as its own row: "● Ran ls", with what it carries.
+        const rows = try tiers.single(scratch, row_items.items[0]);
+        const failed = rows[0].style == .attention;
+        try lines.append(alloc, .{ .entry = .{ .entry_id = rows[0].entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
+        try writeStyled(&out.writer, if (failed) style.attention_style else style.marker_style, "●");
+        try out.writer.writeByte(' ');
+        try writeTierRow(scratch, &out.writer, "", rows[0], cols -| 2, style);
+        for (rows[1..]) |row| {
+            try lines.append(alloc, .{ .entry = .{ .entry_id = row.entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
+            try out.writer.writeByte('\n');
+            try writeTierRow(scratch, &out.writer, "    ", row, cols, style);
         }
+        const bytes = try out.toOwnedSlice();
+        errdefer alloc.free(bytes);
+        return .{ .bytes = bytes, .lines = try lines.toOwnedSlice(alloc) };
+    }
+
+    // The header: what was done in plain words, then what needs attention
+    // in the status color.
+    const summary_words = try tiers.header(scratch, all_items.items);
+    try lines.append(alloc, .{ .entry = .{ .entry_id = first_id, .entry_class = .tool_status, .projection_part = .group_header } });
+    const header_plain = try scratch.print("● {s}{s}", .{ summary_words.words, summary_words.attention });
+    const header_clipped = try clipSummary(scratch, header_plain, cols);
+    if (!std.mem.startsWith(u8, header_clipped, "●")) {
+        // Too narrow for the marker: the clip is all there is.
+        try out.writer.writeAll(header_clipped);
+        const bytes = try out.toOwnedSlice();
+        errdefer alloc.free(bytes);
+        return .{ .bytes = bytes, .lines = try lines.toOwnedSlice(alloc) };
+    }
+    try writeStyled(&out.writer, style.marker_style, "●");
+    const header_body = header_clipped["●".len..];
+    const words_end = @min(header_body.len, 1 + summary_words.words.len);
+    try out.writer.writeAll(header_body[0..words_end]);
+    if (words_end < header_body.len) try writeStyled(&out.writer, style.attention_style, header_body[words_end..]);
+    if (collapse_tool_calls) {
+        const bytes = try out.toOwnedSlice();
+        errdefer alloc.free(bytes);
+        return .{ .bytes = bytes, .lines = try lines.toOwnedSlice(alloc) };
+    }
+
+    const rows = try tiers.plan(scratch, row_items.items, live);
+    var last_top: usize = 0;
+    for (rows, 0..) |row, index| {
+        if (row.kind != .body) last_top = index;
+    }
+    for (rows, 0..) |row, index| {
+        try lines.append(alloc, .{ .entry = .{ .entry_id = row.entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
+        try out.writer.writeByte('\n');
+        const prefix = switch (row.kind) {
+            .item, .fold => if (index == last_top) "└ " else "├ ",
+            .body => if (index > last_top) "    " else "│   ",
+        };
+        try writeTierRow(scratch, &out.writer, prefix, row, cols, style);
     }
 
     for (status_indices) |status_index| {
@@ -823,6 +801,61 @@ fn formatGroupBlock(
     const bytes = try out.toOwnedSlice();
     errdefer alloc.free(bytes);
     return .{ .bytes = bytes, .lines = try lines.toOwnedSlice(alloc) };
+}
+
+/// `text` in `sgr`, closed with a full reset; plain when `sgr` is empty.
+fn writeStyled(writer: *std.Io.Writer, sgr: []const u8, text: []const u8) !void {
+    if (sgr.len == 0) return writer.writeAll(text);
+    try writer.writeAll(sgr);
+    try writer.writeAll(text);
+    try writer.writeAll("\x1b[0m");
+}
+
+/// A row's phrase without marker or styling, with a truncated command
+/// restored from its record. Allocated in `scratch`.
+fn plainStatusPhrase(
+    scratch: std.mem.Allocator,
+    entry: TranscriptEntry,
+    detail: ?*const ToolDetailRecord,
+) ![]const u8 {
+    const raw_phrase = switch (entry) {
+        .raw_bytes => |raw| try normalizeCanonicalStatus(scratch, raw.bytes),
+        else => null,
+    } orelse if (detail) |record| record.tool_name else "tool activity";
+    return try reprojectTruncatedCommandPhrase(scratch, raw_phrase, detail) orelse raw_phrase;
+}
+
+/// One planned row, clipped to `cols` and drawn in its tier's voice:
+/// attention in the status color, outcomes plain with their command
+/// highlighted, routine rows and output dim.
+fn writeTierRow(
+    scratch: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    prefix: []const u8,
+    row: tiers.Row,
+    cols: u16,
+    style: SummaryStyle,
+) !void {
+    switch (row.style) {
+        // A styled row carries its tree prefix in the same span.
+        .attention => try writeStyled(writer, style.attention_style, try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ prefix, row.text }), cols)),
+        .dim => try writeStyled(writer, style.text_style, try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ prefix, row.text }), cols)),
+        .normal => {
+            try writer.writeAll(prefix);
+            const room = cols -| @as(u16, @intCast(display_width.visibleWidth(prefix)));
+            // Style the whole row, then clip it: the clip closes any style
+            // it cuts through.
+            const highlighted = if (row.kind == .item)
+                try highlightCommandPhrase(scratch, row.text, row.detail, "") orelse row.text
+            else
+                row.text;
+            const accented = if (row.kind == .item and entryShowsDiffStats(row.detail))
+                try accentTrailingDiffStats(scratch, highlighted, "")
+            else
+                highlighted;
+            try writer.writeAll(try clipSummary(scratch, accented, room));
+        },
+    }
 }
 
 /// The minimum tail length accepted as an identity match in
@@ -1070,6 +1103,8 @@ pub fn incrementalRebuildStart(
 ) ?usize {
     if (dirty_entry_index >= entries.len) return null;
     var first = dirty_entry_index;
+    // A reasoning heading is drawn with the tool row above it.
+    if (isReasoningHeading(entries[first])) first = headingOwner(entries, first) orelse first;
     const dirty_entry_id = entries[first].id();
 
     const dirty_group = presentationGroupId(sortedDetailForEntry(details, dirty_entry_id));
@@ -1367,10 +1402,26 @@ fn buildWithStyleAndStats(
         presentation_groups.deinit(alloc);
     }
     var presentation_group_by_id: std.AutoHashMapUnmanaged(
-        types.ToolPresentationGroupId,
+        SegmentKey,
         usize,
     ) = .empty;
     defer presentation_group_by_id.deinit(alloc);
+    var segment_by_group: std.AutoHashMapUnmanaged(types.ToolPresentationGroupId, u32) = .empty;
+    defer segment_by_group.deinit(alloc);
+
+    // A step's reasoning heading arrives just after the step's first tool
+    // row. In the compact view it opens that step's block, so the block
+    // starts a new segment of its presentation group.
+    const heading_for_status = try alloc.alloc(?usize, if (mode == .compact) entries.len else 0);
+    defer alloc.free(heading_for_status);
+    @memset(heading_for_status, null);
+    if (mode == .compact) {
+        for (entries, 0..) |entry, entry_index| {
+            if (!isReasoningHeading(entry)) continue;
+            const owner = headingOwner(entries, entry_index) orelse continue;
+            heading_for_status[owner] = entry_index;
+        }
+    }
 
     for (entries, 0..) |entry, entry_index| {
         try build_checkpoint.tick(checkpoint);
@@ -1379,8 +1430,11 @@ fn buildWithStyleAndStats(
         const detail = detailForEntry(details, &detail_indices, entry_id, stats);
         if (statusNamesAsk(entry, detail) or (mode == .compact and isRewind(detail))) continue;
         const group_id = presentationGroupId(detail) orelse continue;
+        const segment = try segment_by_group.getOrPut(alloc, group_id);
+        if (!segment.found_existing) segment.value_ptr.* = 0;
+        if (mode == .compact and heading_for_status[entry_index] != null) segment.value_ptr.* += 1;
 
-        const result = try presentation_group_by_id.getOrPut(alloc, group_id);
+        const result = try presentation_group_by_id.getOrPut(alloc, .{ .group = group_id, .segment = segment.value_ptr.* });
         if (!result.found_existing) {
             result.value_ptr.* = presentation_groups.items.len;
             try presentation_groups.append(alloc, .{ .anchor_index = entry_index });
@@ -1495,7 +1549,7 @@ fn buildWithStyleAndStats(
                 );
             }
 
-            const bytes = try formatGroupBlock(
+            var bytes = try formatGroupBlock(
                 alloc,
                 entries,
                 group.status_indices.items,
@@ -1508,6 +1562,10 @@ fn buildWithStyleAndStats(
                 style,
                 styles,
             );
+            if (heading_for_status[group.anchor_index]) |heading_index| {
+                projection.entry_actions.items[heading_index] = .hide;
+                bytes = try prependHeading(alloc, bytes, entries[heading_index], cols);
+            }
             try projection.setOwnedGroup(alloc, index, bytes);
             index += 1;
             continue;
@@ -1581,7 +1639,7 @@ test "collapsed tool groups render only the summary header" {
     var projection = try buildStyledFocused(alloc, &entries, &details, 120, null, true, .{}, .{});
     defer projection.deinit(alloc);
     const block = projection.entry_actions.items[0].override.bytes;
-    try std.testing.expect(std.mem.find(u8, block, "2 tool calls") != null);
+    try std.testing.expect(std.mem.find(u8, block, "Read 1 file, edited 1 file") != null);
     try std.testing.expect(std.mem.find(u8, block, "Read file") == null);
     try std.testing.expect(projection.entry_actions.items[1] == .hide);
 }
@@ -1633,7 +1691,7 @@ test "minimal tool group summary uses semantic category order and outcomes" {
 
     try std.testing.expect(projection.entry_actions.items[0] == .override);
     try std.testing.expectEqualStrings(
-        "● 3 tool calls · 1 read · 1 edit · 1 command · 1 failed\n" ++
+        "● Read 1 file, edited 1 file, ran 1 command · 1 failed\n" ++
             "├ Read runtime.zig\n" ++
             "├ Edited main.zig\n" ++
             "└ Ran \x1b[38;5;252mzig\x1b[39m build",
@@ -1663,11 +1721,11 @@ test "grouped subagent status keeps the vertical continuation for middle rows" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 4 tool calls · 4 subagent\n" ++
-            "├ Subagent working · inspect auth\n│ glm-5.3-flash · max\n" ++
-            "├ Subagent working · inspect auth\n│ glm-5.3-flash · max\n" ++
-            "├ Subagent working · inspect auth\n│ glm-5.3-flash · max\n" ++
-            "└ Subagent working · inspect auth\n  glm-5.3-flash · max",
+        "● Started 4 workers · 4 running\n" ++
+            "├ … 1 earlier\n" ++
+            "├ Subagent working · inspect auth\n" ++
+            "├ Subagent working · inspect auth\n" ++
+            "└ Subagent working · inspect auth",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -1689,7 +1747,7 @@ test "small minimal tool groups surface canonical action targets" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 3 tool calls · 2 read · 1 edit\n" ++
+        "● Read 2 files, edited 1 file · 1 running\n" ++
             "├ Read runtime.zig\n" ++
             "├ Searched snapshot\n" ++
             "└ Editing store.zig",
@@ -1757,7 +1815,7 @@ test "collapsed tool group keeps diff count accents" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 3 tool calls · 1 read · 1 write · 1 edit\n" ++
+        "● Read 1 file, wrote 1 file, edited 1 file\n" ++
             "├ Read runtime.zig\n" ++
             "├ Wrote note.txt [G]+143\x1b[0m\n" ++
             "└ Edited main.zig [G]+12\x1b[0m / [R]-3\x1b[0m",
@@ -1790,7 +1848,7 @@ test "grouped command lines shell-highlight verbs and numeric flags" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 3 tool calls · 1 write · 1 command\n" ++
+        "● Ran 1 command, wrote 1 file and 1 other call\n" ++
             "├ Ran \x1b[38;5;252mcat\x1b[39m log.txt \x1b[38;5;252m|\x1b[39m \x1b[38;5;252mhead\x1b[39m \x1b[38;5;250m-80\x1b[39m\n" ++
             "├ Wrote note.txt [G]+2\x1b[0m\n" ++
             "└ Wrote detached.txt +7",
@@ -1854,9 +1912,9 @@ test "minimal tool groups keep instruction refresh neutral and denials visible" 
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 2 tool calls · 1 read · 1 command · 1 denied\n" ++
-            "├ Denied by auto agent \x1b[38;5;252mzig\x1b[39m build\n" ++
-            "└ Reading project instructions before continuing: runtime.zig",
+        "● Ran 1 command, read 1 file · 1 denied\n" ++
+            "├ Reading project instructions before continuing: runtime.zig\n" ++
+            "└ Denied by auto agent zig build",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -1893,7 +1951,8 @@ test "focused tool remains counted but is omitted from stable child rows" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 2 tool calls · 1 read · 1 command\n├ Read runtime.zig",
+        "● Read 1 file, ran 1 command · 1 running\n" ++
+            "└ Read runtime.zig",
         projection.entry_actions.items[0].override.bytes,
     );
     try std.testing.expect(projection.entry_actions.items[1] == .hide);
@@ -1916,10 +1975,10 @@ test "minimal command details expose running completed and failed process states
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 3 tool calls · 3 commands · 1 failed\n" ++
+        "● Ran 3 commands · 1 failed · 1 running\n" ++
             "├ Running \x1b[38;5;252mrg\x1b[39m snapshot\n" ++
             "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
-            "└ Ran \x1b[38;5;252mzig\x1b[39m build test",
+            "└ Exited 7 · zig build test",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -2116,22 +2175,23 @@ test "completed session and tty command rows reproject stored commands at the cu
     const narrow_rows = narrow.entry_actions.items[0].override.bytes;
     var narrow_lines = std.mem.splitScalar(u8, narrow_rows, '\n');
     _ = narrow_lines.next(); // group header
-    const narrow_tty = narrow_lines.next().?;
+    // Watching a session is routine: it folds above what ran, unstyled.
     const narrow_observe = narrow_lines.next().?;
-    try std.testing.expect(std.mem.startsWith(u8, narrow_tty, "├ Ran \x1b[38;5;252mbun\x1b[39m run pipeline-stage-"));
+    const narrow_tty = narrow_lines.next().?;
+    try std.testing.expect(std.mem.startsWith(u8, narrow_tty, "└ Ran \x1b[38;5;252mbun\x1b[39m run pipeline-stage-"));
     try std.testing.expect(std.mem.endsWith(u8, narrow_tty, "…\x1b[0m"));
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(narrow_tty) <= 80);
-    try std.testing.expect(std.mem.startsWith(u8, narrow_observe, "└ Observed \x1b[38;5;252mnpm\x1b[39m run dev-server-"));
-    try std.testing.expect(std.mem.endsWith(u8, narrow_observe, "…\x1b[0m"));
+    try std.testing.expect(std.mem.startsWith(u8, narrow_observe, "├ Observed npm run dev-server-"));
+    try std.testing.expect(std.mem.endsWith(u8, narrow_observe, "…"));
     // Reprojection replaces the frozen ASCII marker before reclipping.
     try std.testing.expect(std.mem.find(u8, narrow_rows, "...") == null);
 
     var wide = try build(alloc, &entries, &details, 400);
     defer wide.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 2 tool calls · 2 commands\n" ++
-            "├ Ran \x1b[38;5;252mbun\x1b[39m run " ++ text_utils.repeat("pipeline-stage-", 10) ++ "\n" ++
-            "└ Observed \x1b[38;5;252mnpm\x1b[39m run " ++ text_utils.repeat("dev-server-", 12),
+        "● Ran 1 command and 1 other call\n" ++
+            "├ Observed npm run " ++ text_utils.repeat("dev-server-", 12) ++ "\n" ++
+            "└ Ran \x1b[38;5;252mbun\x1b[39m run " ++ text_utils.repeat("pipeline-stage-", 10),
         wide.entry_actions.items[0].override.bytes,
     );
 }
@@ -2432,7 +2492,8 @@ test "command reprojection keeps the row's own label across lifecycle states" {
         // row keeps its own label rather than the stored prediction.
         try std.testing.expect(std.mem.find(u8, row, "...") == null);
         try std.testing.expect(std.mem.find(u8, row, "alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta-alpha-beta-gamma-delta") != null);
-        const expected_prefix = if (case.outcome == .completed)
+        // A settled row stands alone; a live one sits under its group header.
+        const expected_prefix = if (case.outcome != null)
             try alloc.print("● {s} ", .{case.label})
         else
             try alloc.print("\n└ {s} ", .{case.label});
@@ -2467,13 +2528,12 @@ test "minimal command timeout uses its typed cause in the row and group" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command · 1 timed out\n" ++
-            "└ Timed out \x1b[38;5;252msleep\x1b[39m 5",
+        "● Timed out sleep 5",
         projection.entry_actions.items[0].override.bytes,
     );
 }
 
-test "tool-heavy groups render every canonical action" {
+test "tool-heavy groups stay calm: live tail, then folds and a row cap" {
     const alloc = std.testing.allocator;
     const tool_count = 20;
     var entries: [tool_count]TranscriptEntry = undefined;
@@ -2515,17 +2575,15 @@ test "tool-heavy groups render every canonical action" {
     defer projection.deinit(alloc);
     const summary = projection.entry_actions.items[0].override.bytes;
 
-    try std.testing.expect(std.mem.find(u8, summary, "20 tool calls") != null);
-    try std.testing.expect(std.mem.find(u8, summary, "10 read") != null);
-    try std.testing.expect(std.mem.find(u8, summary, "8 commands") != null);
-    try std.testing.expect(std.mem.find(u8, summary, "1 failed") != null);
-    try std.testing.expect(std.mem.find(u8, summary, "Ran \x1b[38;5;252mrg\x1b[39m snapshot") != null);
-    try std.testing.expect(std.mem.find(u8, summary, "Editing runtime.zig") != null);
-    try std.testing.expectEqual(@as(usize, tool_count), std.mem.count(u8, summary, "\n"));
-    var lines = std.mem.splitScalar(u8, summary, '\n');
-    while (lines.next()) |line| {
-        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 100);
-    }
+    // Live: the header counts everything, the rows show only the newest.
+    try std.testing.expectEqualStrings(
+        "● Read 10 files, ran 8 commands, edited 2 files · 1 failed · 1 running\n" ++
+            "├ … 17 earlier\n" ++
+            "├ Exited 1 · rg snapshot\n" ++
+            "├ Edited store.zig\n" ++
+            "└ Editing runtime.zig",
+        summary,
+    );
 
     entries[19].raw_bytes.bytes = @constCast("● Edited\x1b[0m \x1b[38;5;245mruntime.zig\x1b[0m\n");
     details[19].outcome = .completed;
@@ -2533,8 +2591,23 @@ test "tool-heavy groups render every canonical action" {
     defer completed_projection.deinit(alloc);
     const completed_summary = completed_projection.entry_actions.items[0].override.bytes;
 
-    try std.testing.expect(std.mem.find(u8, completed_summary, "Edited runtime.zig") != null);
-    try std.testing.expectEqual(@as(usize, tool_count), std.mem.count(u8, completed_summary, "\n"));
+    // Settled: routine reads and older commands fold, the failure and the
+    // newest changes stay.
+    try std.testing.expectEqualStrings(
+        "● Read 10 files, ran 8 commands, edited 2 files · 1 failed\n" ++
+            "├ Read 10 files · file.zig\n" ++
+            "├ Ran 5 more commands · zig build\n" ++
+            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├ Exited 1 · rg snapshot\n" ++
+            "├ Edited store.zig\n" ++
+            "└ Edited runtime.zig",
+        completed_summary,
+    );
+    var lines = std.mem.splitScalar(u8, completed_summary, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 100);
+    }
 }
 
 test "minimal tool group keeps cancellation in the header and child row" {
@@ -2550,8 +2623,9 @@ test "minimal tool group keeps cancellation in the header and child row" {
 
     try std.testing.expect(projection.entry_actions.items[0] == .override);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command · 1 cancelled\n" ++
-            "└ Cancelled \x1b[38;5;252msleep\x1b[39m 30\n\n" ++
+        "● Ran 1 command · 1 cancelled\n" ++
+            "└ Cancelled sleep 30\n" ++
+            "\n" ++
             "■ Cancelled sleep 30 · What should change?",
         projection.entry_actions.items[0].override.bytes,
     );
@@ -2627,8 +2701,8 @@ test "cancelled actions remain inside the message-delimited block" {
     defer projection.deinit(alloc);
 
     try std.testing.expect(projection.entry_actions.items[0] == .override);
-    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "├ Cancelled \x1b[38;5;252mfirst\x1b[39m") != null);
-    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "├ Cancelled \x1b[38;5;252msecond\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "├ Cancelled first") != null);
+    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "└ Cancelled second") != null);
     try std.testing.expect(projection.entry_actions.items[1] == .hide);
     try std.testing.expect(projection.entry_actions.items[2] == .hide);
     try std.testing.expect(projection.entry_actions.items[3] == .hide);
@@ -2713,7 +2787,7 @@ test "one presentation group keeps sibling tools in creation order across assist
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 2 tool calls · 2 commands\n" ++
+        "● Ran 2 commands · 2 running\n" ++
             "├ Running \x1b[38;5;252mfirst\x1b[39m\n" ++
             "└ Running \x1b[38;5;252msecond\x1b[39m",
         projection.entry_actions.items[0].override.bytes,
@@ -2794,7 +2868,8 @@ test "legacy lifecycle records without group identity respect transcript boundar
     );
     try std.testing.expect(projection.entry_actions.items[1] == .keep);
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Running \x1b[38;5;252msecond\x1b[39m",
+        "● Ran 1 command · 1 running\n" ++
+            "└ Running \x1b[38;5;252msecond\x1b[39m",
         projection.entry_actions.items[2].override.bytes,
     );
 }
@@ -2831,7 +2906,7 @@ fn checkPresentationGroupingAllocationFailures(alloc: std.mem.Allocator) !void {
     };
     defer projection.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● 2 tool calls · 2 commands\n" ++
+        "● Ran 2 commands · 1 running\n" ++
             "├ Running \x1b[38;5;252mfirst\x1b[39m\n" ++
             "└ Running \x1b[38;5;252msecond\x1b[39m",
         projection.entry_actions.items[0].override.bytes,
@@ -2870,7 +2945,7 @@ test "entries hidden by compact presentation do not split tool groups" {
 
     try std.testing.expect(projection.entry_actions.items[0] == .override);
     try std.testing.expectEqualStrings(
-        "● 2 tool calls · 1 read · 1 edit\n" ++
+        "● Read 1 file, edited 1 file\n" ++
             "├ read_file\n" ++
             "└ edit_file",
         projection.entry_actions.items[0].override.bytes,
@@ -2960,8 +3035,8 @@ test "visible assistant messages split groups while silent entries do not" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 5 tool calls · 5 read\n" ++
-            "├ read_file\n├ read_file\n├ read_file\n├ read_file\n└ read_file",
+        "● Read 5 files\n" ++
+            "└ Read 5 files · read_file",
         projection.entry_actions.items[0].override.bytes,
     );
     for (projection.entry_actions.items[1..5]) |action| {
@@ -2971,8 +3046,9 @@ test "visible assistant messages split groups while silent entries do not" {
     try std.testing.expect(projection.entry_actions.items[6] == .override);
     try std.testing.expect(projection.entry_actions.items[7] == .keep);
     try std.testing.expectEqualStrings(
-        "● 4 tool calls · 3 read · 1 command\n" ++
-            "├ read_file\n├ read_file\n├ read_file\n└ run_command",
+        "● Read 3 files, ran 1 command\n" ++
+            "├ Read 3 files · read_file\n" ++
+            "└ run_command",
         projection.entry_actions.items[8].override.bytes,
     );
     for (projection.entry_actions.items[9..12]) |action| {
@@ -3055,7 +3131,7 @@ test "ask activity remains outside tool groups without complete detail metadata"
     try std.testing.expect(projection.entry_actions.items[2] == .override);
     try std.testing.expect(projection.entry_actions.items[3] == .keep);
     try std.testing.expectEqualStrings(
-        "● 1 tool call\n└ Reading /tmp/ask_user_question",
+        "● Reading /tmp/ask_user_question",
         projection.entry_actions.items[0].override.bytes,
     );
     try std.testing.expectEqualStrings(
@@ -3110,12 +3186,8 @@ test "mixed group keeps the count header before every action" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 6 tool calls · 5 read · 1 command\n" ++
-            "├ Read one.zig\n" ++
-            "├ Read two.zig\n" ++
-            "├ Read three.zig\n" ++
-            "├ Read four.zig\n" ++
-            "├ Read five.zig\n" ++
+        "● Read 5 files, ran 1 command\n" ++
+            "├ Read 5 files · one.zig, two.zig, +3\n" ++
             "└ Ran \x1b[38;5;252mgit\x1b[39m \x1b[38;5;250m-C\x1b[39m /workspace status \x1b[38;5;250m--short\x1b[39m",
         projection.entry_actions.items[0].override.bytes,
     );

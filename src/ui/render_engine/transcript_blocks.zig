@@ -233,9 +233,36 @@ fn blockKindForEntry(entry: TranscriptEntry) TranscriptBlockKind {
 
 pub fn isEntryVisibleInCompactPresentation(entry: TranscriptEntry) bool {
     return switch (entry) {
-        .semantic_notice => |notice| !notice.inline_hidden and notice.visibility == .compact_and_full,
+        .semantic_notice => |notice| !notice.inline_hidden and (notice.visibility == .compact_and_full or reasoningTitle(notice) != null),
         inline else => |payload| !payload.inline_hidden,
     };
+}
+
+/// The widest reasoning heading, in display columns, before it ends in "…".
+const max_reasoning_title_cols = 72;
+
+/// A step's reasoning shows inline as one heading: its title, the first
+/// line with markdown emphasis and heading marks removed. The full trace
+/// stays in the full transcript. Null for every other notice.
+pub fn reasoningTitle(notice: anytype) ?[]const u8 {
+    if (notice.visibility != .full_only or !std.mem.eql(u8, notice.topic, "thinking")) return null;
+    var lines = std.mem.splitScalar(u8, notice.body, '\n');
+    while (lines.next()) |raw| {
+        var line = std.mem.trim(u8, raw, " \t\r");
+        line = std.mem.trimStart(u8, line, "#");
+        line = std.mem.trim(u8, line, " *_");
+        if (line.len > 0) return line;
+    }
+    return null;
+}
+
+fn renderReasoningHeading(alloc: Allocator, title: []const u8, cols: u16) ![]u8 {
+    const safe = try text_utils.encodeTerminalSafeInline(alloc, title, 512);
+    defer alloc.free(safe.bytes);
+    const room = @min(@as(usize, cols) -| 2, max_reasoning_title_cols);
+    const fits = display_width.visibleWidth(safe.bytes) <= room;
+    const shown = if (fits) safe.bytes else display_width.prefixByWidth(safe.bytes, room -| 1);
+    return alloc.print("  \x1b[1m{s}{s}\x1b[0m", .{ shown, if (fits) "" else "…" });
 }
 
 pub fn entryClassForEntry(entry: TranscriptEntry) TranscriptEntryClass {
@@ -1928,6 +1955,11 @@ fn renderEntryToBlockForPresentationInterruptible(
             .bytes = "",
             .stored_tail_newlines = 0,
         };
+    }
+    if (presentation == .compact and entry == .semantic_notice) {
+        if (reasoningTitle(entry.semantic_notice)) |title| {
+            return normalizeOwnedRenderedBlock(alloc, kind, try renderReasoningHeading(alloc, title, cols));
+        }
     }
     return switch (entry) {
         .raw_bytes => |e| if (e.class == .tool_status and presentation == .full) blk: {

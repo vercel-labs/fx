@@ -513,8 +513,8 @@ describe("fx ask presentation", () => {
       const scrollback = await session.captureFullScrollback();
       const escaped = await session.captureFullScrollbackEscapes();
       expect(scrollback).toContain("Inspect fixture.txt and render the response.");
-      // The completed read collapses to its own row; the failed read keeps its header.
-      expect(pane.match(/1 tool call · 1 read/g)).toHaveLength(1);
+      // Each read collapses to its own row; the failed one says why in its row.
+      expect(pane.match(/1 tool call · 1 read/g)).toBeNull();
       expect(pane).toContain("Reading fixture.txt");
       expect(pane).toContain("Between groups.");
       expect(pane).toContain("Reading missing.txt");
