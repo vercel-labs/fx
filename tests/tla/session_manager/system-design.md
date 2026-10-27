@@ -2058,7 +2058,9 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   `url`, a worker's `label` and `message`, a job's `text`) in one pass,
   keeps a bounded body tail with a count of earlier lines, and sends a
   display-only `tool_input_preview` at most every 50 ms, plus once when
-  the call is superseded or the step ends. Detached views get it as a
+  the call is superseded or the step ends. Every fragment still counts
+  toward the turn's token estimate, but that estimate is published at
+  most every 100 ms while arguments stream. Detached views get it as a
   presentation event; older viewers ignore unknown events, so the
   supervisor protocol is unchanged. **Why:** the cost per fragment is the
   fragment's own bytes, never a reparse of the whole argument string.
