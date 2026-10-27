@@ -292,9 +292,19 @@ pub fn CompletionRuntime(comptime App: type) type {
                     &app.input_runtime.entities,
                     &app.input_runtime.vertical_navigation,
                 );
+            } else if (downOpensAgentList(app)) {
+                if (comptime @hasDecl(App, "openAgentsMenu")) try app.openAgentsMenu();
             } else {
                 try navigatePromptHistory(app, agent, 1);
             }
+        }
+
+        /// ↓ in an idle composer, which history has nothing past, opens the
+        /// agent list when there is another agent to switch to.
+        fn downOpensAgentList(app: *App) bool {
+            if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
+            const runtime = app_agents_runtime.Runtime(App);
+            return runtime.composerIdle(app) and runtime.hasAnotherAgent(app);
         }
 
         /// Pulls the newest queued steering prompt that still waits for a
@@ -510,12 +520,13 @@ pub fn CompletionRuntime(comptime App: type) type {
             return true;
         }
 
-        /// Moves the instance list's selection, keeping it in view.
+        /// Moves the agent list's selection, keeping it in view, and shows
+        /// the agent it lands on.
         pub fn routeAgentsMenuMove(app: *App, agent: *AppAgent, delta: i32) !bool {
             if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
             const runtime = app_agents_runtime.Runtime(App);
             if (!runtime.menuActive(app)) return false;
-            return runtime.moveMenu(app, delta, try inlineMenuRowBudget(app, agent, agents_menu_presentation.max_inline_rows));
+            return try runtime.moveMenu(app, delta, try inlineMenuRowBudget(app, agent, agents_menu_presentation.max_inline_rows));
         }
 
         fn routeForkMenuMove(app: *App, agent: *AppAgent, delta: i32) !bool {

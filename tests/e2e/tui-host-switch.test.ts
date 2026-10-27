@@ -11,12 +11,26 @@ import {
   tmuxAvailable,
 } from "./tmux-helpers";
 
-// Switching between main and its subagents with Alt+Left and Alt+Right, in
-// one fx process: each agent keeps its own conversation, a message typed on
-// a subagent's screen goes to that subagent, and a subagent's approval can be
-// answered on its own screen or on main's, once.
+// Switching between main and its subagents through the agent list, in one fx
+// process: ↓ on an empty composer or Ctrl+X opens it, moving through it shows
+// each agent, Enter keeps the one shown, and Esc goes back. Each agent keeps
+// its own conversation and draft, a message typed on a subagent's screen goes
+// to that subagent, and a subagent's approval can be answered on its own
+// screen or on main's, once. Option+arrows only move text.
 
 const TIMEOUT = 90_000;
+const LIST_HINT = "enter switch";
+
+// Shows the agent `rows` rows below the one on screen, or above it when
+// negative, through the agent list: Ctrl+X opens it whatever the composer
+// holds, each arrow shows the next row, and Enter keeps it.
+async function moveAgent(session: TmuxSession, rows: number) {
+  await session.sendKeys("C-x");
+  await session.waitForText(LIST_HINT, 10_000);
+  for (let step = 0; step < Math.abs(rows); step += 1) await session.sendKeys(rows > 0 ? "Down" : "Up");
+  await session.sendKeys("Enter");
+  await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
+}
 
 function text(id: string, delta: string): Response {
   return fakeGatewaySse([
@@ -112,7 +126,7 @@ async function withFx(
 
 describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   test(
-    "Alt+Right shows a subagent's conversation and takes messages typed there",
+    "the agent list shows a subagent's conversation, which takes messages typed there",
     async () => {
       let mainCalls = 0;
       const bodies = await withFx((body) => {
@@ -133,7 +147,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.waitForComposer(15_000);
 
         // The subagent's conversation replaces main's, and the footer names it.
-        await session.sendKeys("M-Right");
+        await moveAgent(session, 1);
         const subagent = await session.waitForPane((pane) =>
           pane.includes("SWITCH_CHILD_ANSWER") && pane.includes("reviewer \u00b7 "), 15_000);
         expect(subagent).toContain("SWITCH_TASK look for nothing");
@@ -154,8 +168,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         }
         expect(await session.capturePane()).toContain("SWITCH_CHILD_REPLY");
 
-        // With one subagent, Alt+Right wraps back to main, as it was.
-        await session.sendKeys("M-Right");
+        // Main's row is above it, and main is as it was.
+        await moveAgent(session, -1);
         const main = await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_FINAL"), 15_000);
         expect(main).toContain("SWITCH_USER");
         expect(main).not.toContain("SWITCH_CHILD_REPLY");
@@ -198,9 +212,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_DRAFT") && pane.includes("Image 1"), 15_000);
         const beforeSwitches = statSync(tape).size;
 
-        // The subagent's screen has its own composer, and a draft typed
-        // there stays there.
-        await session.sendKeys("M-Right");
+        // Ctrl+X opens the list over the draft. The subagent's screen has its
+        // own composer, and a draft typed there stays there.
+        await moveAgent(session, 1);
         const child = await session.waitForPane((pane) => pane.includes("reviewer \u00b7 "), 15_000);
         expect(child).not.toContain("SWITCH_MAIN_DRAFT");
         expect(child).not.toContain("Image 1");
@@ -208,13 +222,13 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.waitForText("SWITCH_CHILD_DRAFT", 15_000);
 
         // Back on main, its draft and image are as it left them.
-        await session.sendKeys("M-Right");
+        await moveAgent(session, -1);
         const main = await session.waitForPane(
           (pane) => pane.includes("SWITCH_MAIN_DRAFT") && pane.includes("Image 1"), 15_000);
         expect(main).not.toContain("SWITCH_CHILD_DRAFT");
 
         // So is the subagent's.
-        await session.sendKeys("M-Right");
+        await moveAgent(session, 1);
         const again = await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_DRAFT"), 15_000);
         expect(again).not.toContain("SWITCH_MAIN_DRAFT");
 
@@ -246,7 +260,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendText("SWITCH_USER");
         await session.waitForText("SWITCH_MAIN_FINAL", 30_000);
         await session.waitForComposer(15_000);
-        await session.sendKeys("M-Right");
+        await moveAgent(session, 1);
         await session.waitForPane((pane) => pane.includes("reviewer \u00b7 "), 15_000);
         // Shutdown is main's own: quitting here used to stop the subagent in
         // main's place and then wait forever for main's worker.
@@ -281,15 +295,27 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendText("SWITCH_USER");
         await session.waitForText("Subagent writer needs permission", 30_000);
 
-        await session.sendKeys("M-Right");
+        // The open list takes the footer from the prompt, which keys can't
+        // answer while it is open, and Esc brings the prompt back unanswered.
+        await session.sendKeys("C-x");
+        const over = await session.waitForText(LIST_HINT, 10_000);
+        expect(over).not.toContain("Apply this change?");
+        await session.sendKeys("1");
+        await session.sendKeys("Escape");
+        const back = await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("Apply this change?"), 10_000);
+        expect(back).toContain("Subagent writer needs permission");
+        expect(existsSync(join(workspace, "switch-child.txt"))).toBe(false);
+
+        // Ctrl+X opens the list while main shows the lent prompt.
+        await moveAgent(session, 1);
         await session.waitForPane((pane) =>
           pane.includes("SWITCH_WRITE_TASK") && pane.includes("Subagent writer needs permission"), 15_000);
         await session.sendKeys("1");
         await session.waitForText("SWITCH_WRITER_DONE", 30_000);
         expect(readFileSync(join(workspace, "switch-child.txt"), "utf8")).toBe("SWITCH_WROTE\n");
 
-        // Alt+Left from the only subagent is main again, its prompt gone.
-        await session.sendKeys("M-Left");
+        // Main's row is above the only subagent's, its prompt gone.
+        await moveAgent(session, -1);
         const main = await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_DONE"), 30_000);
         expect(main).not.toContain("needs permission");
       }, (home) => {
@@ -338,7 +364,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(answer).toContain("SWITCH_ALPHA");
 
         // The question and its answer belong to the subagent's conversation.
-        await session.sendKeys("M-Right");
+        await moveAgent(session, 1);
         await session.waitForPane((pane) => pane.includes("SWITCH_ASKER_DONE"), 15_000);
       });
     },
@@ -346,7 +372,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
-    "after a restart, Alt+Right shows a subagent's saved conversation before it runs again",
+    "after a restart, the agent list shows a subagent's saved conversation before it runs again",
     async () => {
       let mainCalls = 0;
       await withFx((body) => {
@@ -375,13 +401,13 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         const parent = readdirSync(sessions).find((id) => !id.startsWith(".") && statSync(join(sessions, id)).isDirectory() && holds(join(sessions, id)));
         expect(parent).toBeDefined();
         const resumed = await launch(`--resume ${parent}`);
-        await resumed.sendKeys("M-Right");
+        await moveAgent(resumed, 1);
         const subagent = await resumed.waitForPane((pane) =>
           pane.includes("SWITCH_SAVED_ANSWER") && pane.includes("reviewer \u00b7 done"), 15_000);
         expect(subagent).toContain("SWITCH_SAVED_TASK");
         // One with a saved conversation shows it instead, as a resumed fx does.
         expect(subagent).not.toContain("Run /help for commands");
-        await resumed.sendKeys("M-Right");
+        await moveAgent(resumed, -1);
         await resumed.waitForPane((pane) => pane.includes("SWITCH_MAIN_FINAL"), 15_000);
       });
     },
@@ -389,7 +415,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
-    "with no subagent, Alt+Right keeps jumping by word",
+    "with no subagent, Option+Right jumps by word",
     async () => {
       await withFx(() => text("unused", "unused"), async (session) => {
         await session.sendLiteral("alpha beta");
@@ -404,45 +430,126 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     TIMEOUT,
   );
 
-  test(
-    "with a subagent, Alt+Left jumps by word inside a draft and switches only where no word is left",
-    async () => {
-      let mainCalls = 0;
-      await withFx((body) => {
-        if (!isMainRequest(body)) return text("child_answer", "EDGE_CHILD_ANSWER");
-        mainCalls += 1;
-        if (mainCalls === 1) {
-          return toolCall("main_sub", "subagent", {
-            request: { action: "message", agent: "reviewer", message: "EDGE_TASK look for nothing" },
-          });
-        }
-        return text("main_final", "EDGE_MAIN_FINAL");
-      }, async (session) => {
-        await session.sendText("SWITCH_USER_EDGE");
-        await session.waitForText("EDGE_MAIN_FINAL", 30_000);
-        await session.waitForComposer(15_000);
+  // Main has started one subagent, `reviewer`, which answered EDGE_CHILD_ANSWER.
+  const withReviewer = (run: (session: TmuxSession) => Promise<void>) => {
+    let mainCalls = 0;
+    return withFx((body) => {
+      if (!isMainRequest(body)) return text("child_answer", "EDGE_CHILD_ANSWER");
+      mainCalls += 1;
+      if (mainCalls === 1) {
+        return toolCall("main_sub", "subagent", {
+          request: { action: "message", agent: "reviewer", message: "EDGE_TASK look for nothing" },
+        });
+      }
+      return text("main_final", "EDGE_MAIN_FINAL");
+    }, async (session) => {
+      await session.sendText("SWITCH_USER_EDGE");
+      await session.waitForText("EDGE_MAIN_FINAL", 30_000);
+      await session.waitForComposer(15_000);
+      await run(session);
+    });
+  };
 
-        // Inside a draft, Alt+Left moves by word as it does with no subagent.
+  test(
+    "with a subagent, Option+arrows only move text and never switch",
+    async () => {
+      await withReviewer(async (session) => {
+        // Inside a draft, Option+Left moves by word.
         await session.sendLiteral("hello world");
         await session.waitForText("hello world", 10_000);
         await session.sendKeys("M-Left");
         await session.sendLiteral("Z");
-        const moved = await session.waitForPane((pane) => pane.includes("hello Zworld"), 10_000);
-        expect(moved).not.toContain("reviewer \u00b7 ");
+        await session.waitForPane((pane) => pane.includes("hello Zworld"), 10_000);
 
-        // At the draft's start no word is left to jump over, so it switches,
-        // and the draft stays on main.
+        // At the draft's start, and with Terminal.app's ESC b, it stays on
+        // main; so does Option+Up.
         await session.sendKeys("C-a");
         await session.sendKeys("M-Left");
-        const child = await session.waitForPane((pane) => pane.includes("reviewer \u00b7 "), 15_000);
-        expect(child).not.toContain("hello Zworld");
-
-        // Terminal.app sends ESC b for Option+Left. In the subagent's empty
-        // composer it switches too, back to main and its draft.
         await session.sendKeys("M-b");
-        const main = await session.waitForPane(
-          (pane) => pane.includes("hello Zworld") && !pane.includes("reviewer \u00b7 "), 15_000);
-        expect(main).toContain("EDGE_MAIN_FINAL");
+        await session.sendKeys("M-Up");
+        await session.sendLiteral("Y");
+        const stayed = await session.waitForPane((pane) => pane.includes("Yhello Zworld"), 10_000);
+        expect(stayed).toContain("main \u00b7 ctrl+x");
+        expect(stayed).not.toContain("EDGE_CHILD_ANSWER");
+        expect(stayed).not.toContain(LIST_HINT);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "down on an empty composer opens the agent list, which previews, and Esc goes back",
+    async () => {
+      await withReviewer(async (session) => {
+        // The indicator on the right names main and the key that opens the list.
+        expect(await session.capturePane()).toContain("main \u2193");
+
+        // Browsing prompt history, down goes forward through it first: the
+        // recalled prompt makes the indicator offer Ctrl+X, and down puts
+        // back the empty draft instead of opening the list.
+        await session.sendKeys("Up");
+        await session.waitForPane((pane) => pane.includes("main \u00b7 ctrl+x"), 10_000);
+        await session.sendKeys("Down");
+        await session.waitForPane((pane) => pane.includes("main \u2193"), 10_000);
+        expect(await session.capturePane()).not.toContain(LIST_HINT);
+
+        // From the idle composer it opens the list on main's row.
+        await session.sendKeys("Down");
+        const list = await session.waitForText(LIST_HINT, 10_000);
+        expect(list).toContain("fx 1 (on screen) \u00b7 ");
+        expect(list).toContain("  reviewer \u00b7 ");
+
+        // Down again shows the subagent above the list, and the list stays.
+        await session.sendKeys("Down");
+        const preview = await session.waitForPane((pane) => pane.includes("EDGE_CHILD_ANSWER") && pane.includes(LIST_HINT), 10_000);
+        expect(preview).not.toContain("EDGE_MAIN_FINAL");
+
+        // Esc goes back to main.
+        await session.sendKeys("Escape");
+        const back = await session.waitForPane((pane) => pane.includes("EDGE_MAIN_FINAL") && !pane.includes(LIST_HINT), 10_000);
+        expect(back).toContain("main \u2193");
+
+        // Enter keeps the agent shown.
+        await session.sendKeys("Down");
+        await session.waitForText(LIST_HINT, 10_000);
+        await session.sendKeys("Down");
+        await session.waitForText("EDGE_CHILD_ANSWER", 10_000);
+        await session.sendKeys("Enter");
+        const kept = await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("reviewer \u00b7 done \u2193"), 10_000);
+        expect(kept).toContain("EDGE_CHILD_ANSWER");
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "with a draft, down stays in the composer, Ctrl+X opens the list, and the draft stays where it was typed",
+    async () => {
+      await withReviewer(async (session) => {
+        await session.sendLiteral("EDGE_KEEP_ME");
+        await session.waitForPane((pane) => pane.includes("main \u00b7 ctrl+x"), 10_000);
+        await session.sendKeys("Down");
+        expect(await session.capturePane()).not.toContain(LIST_HINT);
+
+        // Ctrl+X opens the list; typing there does nothing.
+        await session.sendKeys("C-x");
+        await session.waitForText(LIST_HINT, 10_000);
+        await session.sendLiteral("q");
+        await session.sendKeys("BSpace");
+        await session.sendKeys("Down");
+        const preview = await session.waitForPane((pane) => pane.includes("EDGE_CHILD_ANSWER"), 10_000);
+        expect(preview).not.toContain("EDGE_KEEP_ME");
+        await session.sendKeys("Enter");
+
+        // The subagent's composer is its own and empty.
+        const child = await session.waitForPane((pane) => pane.includes("reviewer \u00b7 done \u2193"), 10_000);
+        expect(child).not.toContain("EDGE_KEEP_ME");
+
+        // Back on main, the draft is as it was typed.
+        await moveAgent(session, -1);
+        const main = await session.waitForPane((pane) => pane.includes("\u2503 EDGE_KEEP_ME"), 10_000);
+        expect(main).not.toContain("EDGE_KEEP_MEq");
+        expect(main).toContain("main \u00b7 ctrl+x");
       });
     },
     TIMEOUT,

@@ -135,8 +135,8 @@ pub const State = struct {
     launched: usize = 0,
     /// How many instances startup opens: `--instances`, the test hook, or 1.
     startup_count: usize = 1,
-    /// Backs the footer's instance label.
-    label_buf: [32]u8 = undefined,
+    /// Backs the footer's agent indicator, which can hold a subagent's label.
+    label_buf: [192]u8 = undefined,
     /// Whether the first instance, kept in `App.main_agent`, still runs. It
     /// closes like any other and stays closed.
     first_open: bool = true,
