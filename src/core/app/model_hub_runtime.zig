@@ -498,7 +498,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// The roles whose assignment names `id` on `provider`, plus the
-        /// default role when it falls back to the session's model.
+        /// default role on the model it falls back to, the one Alt+P picks.
         fn rolesFor(app: *App, arena: Allocator, provider: []const u8, id: []const u8) ![]const Role {
             const host = model_role_runtime.host(app);
             const active_key = host.provider.label();
@@ -507,7 +507,7 @@ pub fn Runtime(comptime App: type) type {
             for (catalog.role_order) |role| {
                 const ref = model_roles.resolve(&app.model_roles.table, role, .{
                     .provider = active_key,
-                    .default_model = host.current_model,
+                    .default_model = host.defaultModel(),
                     .configured = host.set.definitions,
                 }) orelse continue;
                 if (role != .default and app.model_roles.table.get(role) == null) continue;
@@ -552,7 +552,7 @@ pub fn Runtime(comptime App: type) type {
         fn roleContext(host: model_role_runtime.Host, active_key: []const u8) model_roles.Context {
             return .{
                 .provider = active_key,
-                .default_model = host.current_model,
+                .default_model = host.defaultModel(),
                 .configured = host.set.definitions,
                 .known = host.known,
             };

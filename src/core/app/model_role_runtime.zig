@@ -163,16 +163,29 @@ pub const Host = struct {
         return if (self.pick(role)) |picked| picked.model else null;
     }
 
+    /// The model the default role falls back to when it is unset: the
+    /// profile's model on its own provider, else the session's.
+    pub fn defaultModel(self: Host) []const u8 {
+        var provider = self.provider;
+        self.state.mutex.lockUncancelable(io_mod.getIo());
+        defer self.state.mutex.unlock(io_mod.getIo());
+        return self.defaultModelLocked(provider.label());
+    }
+
+    fn defaultModelLocked(self: Host, label: []const u8) []const u8 {
+        return if (self.state.default_model.len > 0 and std.mem.eql(u8, self.state.default_provider, label))
+            self.state.default_model
+        else
+            self.current_model;
+    }
+
     /// `resolve` with the thinking level the role's entry names.
     pub fn pick(self: Host, role: Role) ?Picked {
         var provider = self.provider;
         const label = provider.label();
         self.state.mutex.lockUncancelable(io_mod.getIo());
         defer self.state.mutex.unlock(io_mod.getIo());
-        const default_model = if (self.state.default_model.len > 0 and std.mem.eql(u8, self.state.default_provider, label))
-            self.state.default_model
-        else
-            self.current_model;
+        const default_model = self.defaultModelLocked(label);
         const ref = model_roles.resolve(&self.state.table, role, .{
             .provider = label,
             .default_model = default_model,
@@ -513,6 +526,23 @@ test "cycling reaches the default role when the deep role differs only in thinki
     view.current_effort = null;
     try std.testing.expectEqual(Role.default, cycleStep(view, false).?.role);
     try std.testing.expectEqual(Role.small, cycleStep(view, true).?.role);
+}
+
+test "the default role stays on the profile's model after the session switches" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    try state.init(alloc, .{}, "gateway", "main");
+    try state.assign(alloc, .small, "fast");
+    // Alt+P moved the session to the small role's model.
+    var view: Host = .{ .state = &state, .provider = .gateway, .current_model = "fast", .set = .{ .gateway = .{}, .codex = .{}, .grok = .{} } };
+    try std.testing.expectEqualStrings("main", view.defaultModel());
+    var roles: [model_roles.role_count]Role = undefined;
+    try std.testing.expectEqualSlices(Role, &.{.small}, roles[0..view.rolesFor("fast", &roles)]);
+    try std.testing.expectEqualSlices(Role, &.{.default}, roles[0..view.rolesFor("main", &roles)]);
+    // On another provider the default follows the session.
+    view.provider = .codex;
+    try std.testing.expectEqualStrings("fast", view.defaultModel());
 }
 
 test "review falls back to the legacy gateway setting and titles to the bundle" {
