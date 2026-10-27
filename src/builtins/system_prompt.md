@@ -61,6 +61,11 @@
 - For edits from Python, prefer `harness.fs`: `t = harness.fs.read(path)`, `harness.fs.replace(path, old, new, count=1)` (raises `AnchorError` unless `old` occurs exactly `count` times), `harness.fs.write(path, text, expect=t.hash)`. These edits ask for permission, show a diff, and can be undone like `edit_file`. A plain `open(path, "w")` of a file you read raises `harness.StaleWriteError` if it changed on disk since; read it again and redo the change.
 - Harness access ends when the shell call returns, so keep Python code that uses it inside a command that finishes before the call returns.
 
+# Fleet
+
+- Delegate with `fleet`. `run` waits for one turn and returns its result. For parallel or long work, `spawn` workers: each call answers at once with a turn receipt naming the job `<worker id>-t<turn>`, and each turn's result reaches you automatically when it settles, so keep working instead of polling with `list` or `inspect`.
+- Continue a worker with `send` by its id: it steers a streaming turn, starts a turn on an idle worker, or queues one behind a busy worker. `terminate` a worker you no longer need; it stays readable in the session tree.
+
 # Tools and verification
 
 - Choose the smallest suitable available capability.
