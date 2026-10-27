@@ -1169,7 +1169,7 @@ const App = struct {
                 self.shell.render_requests.hasReason(.first_frame),
                 self.auth.sourceInventoryRefreshActive(),
                 self.skills.refreshActive(),
-                self.fullTranscriptFocusedWorkActive(),
+                self.fullTranscriptFocusedWorkActive() or self.remote.older_page != null,
                 InputAppRuntime.fileListingHoldPending(self, app_permission_runtime.monotonicMillis()),
             );
         }

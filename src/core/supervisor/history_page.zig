@@ -128,24 +128,6 @@ pub fn build(arena: Allocator, turns: []const types.HistoryTurn, before: ?Cursor
     };
 }
 
-/// The whole turns from `after_turn` to the end, which a viewer that paged
-/// back appends after the window it already holds. Incomplete when they do
-/// not fit `max_bytes`; the viewer then reloads the newest page instead.
-pub const Newer = struct { fragments: []Fragment = &.{}, bytes: usize = 0, complete: bool = true };
-
-pub fn newer(arena: Allocator, turns: []const types.HistoryTurn, after_turn: usize, max_bytes: usize) !Newer {
-    if (after_turn > turns.len) return .{ .fragments = &.{}, .bytes = 0, .complete = false };
-    const fragments = try arena.alloc(Fragment, turns.len - after_turn);
-    var used: usize = 0;
-    for (turns[after_turn..], fragments, after_turn..) |turn, *out, index| {
-        used +|= wholeTurnBytes(turn);
-        if (used > max_bytes) return .{ .fragments = &.{}, .bytes = 0, .complete = false };
-        out.* = .whole(turn);
-        out.turn_index = index;
-    }
-    return .{ .fragments = fragments, .bytes = used, .complete = true };
-}
-
 /// The saved turns a session serves pages from, and the generation that
 /// tells a viewer whether its cursor still points into the same history.
 pub const Saved = struct {
@@ -187,7 +169,6 @@ pub fn encodeReply(
     var budget = std.math.clamp(request.max_bytes, min_page_bytes, max_page_bytes);
     while (true) {
         const page = try build(arena, saved.turns, request.before, budget);
-        const later: Newer = if (request.after_turn) |after| try newer(arena, saved.turns, after, budget *| 2) else .{};
         const bytes = try protocol.encode(arena, protocol.HistoryPage([]const Fragment){
             .session_id = session_id,
             .generation = saved.generation,
@@ -197,9 +178,6 @@ pub fn encodeReply(
             .has_older = page.has_older,
             .page_bytes = page.bytes,
             .fragments = page.fragments,
-            .newer = later.fragments,
-            .newer_bytes = later.bytes,
-            .newer_complete = later.complete,
         });
         if (bytes.len <= max_frame_bytes) return bytes;
         if (budget <= min_page_bytes) return error.HistoryPageTooLarge;
@@ -397,12 +375,6 @@ pub fn fragmentBytes(fragment: Fragment) usize {
     if (fragment.has_tail) total +|= tailBytes(fragment.turn);
     if (fragment.has_user) total +|= userBytes(turnUser(fragment.turn));
     for (turnSteps(fragment.turn)) |step| total +|= stepBytes(step);
-    return total;
-}
-
-fn wholeTurnBytes(turn: types.HistoryTurn) usize {
-    var total = tailBytes(turn) +| steeringBytes(turnSteering(turn)) +| userBytes(turnUser(turn));
-    for (turnSteps(turn)) |step| total +|= stepBytes(step);
     return total;
 }
 

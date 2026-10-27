@@ -2101,7 +2101,9 @@ pub fn cloneDetachedPresentationState(self: anytype, alloc: Allocator) !@TypeOf(
     return cloneRecordedMutationState(self, alloc);
 }
 
-fn cloneMutationState(self: anytype, alloc: Allocator) !@TypeOf(self.*) {
+/// A runtime with `self`'s presentation policy and layout but no
+/// conversation content. It owns nothing until content is added.
+pub fn emptyPresentationState(self: anytype) @TypeOf(self.*) {
     const Runtime = @TypeOf(self.*);
     var shadow: Runtime = .{
         .layout = self.layout,
@@ -2128,11 +2130,15 @@ fn cloneMutationState(self: anytype, alloc: Allocator) !@TypeOf(self.*) {
         .replaceable_start = self.replaceable_start,
         .transcript_band_dirty = self.transcript_band_dirty,
     };
-    errdefer shadow.deinit(alloc);
     if (comptime @hasField(Runtime, "retention_prefix_trims")) {
         shadow.retention_prefix_trims = self.retention_prefix_trims;
     }
+    return shadow;
+}
 
+fn cloneMutationState(self: anytype, alloc: Allocator) !@TypeOf(self.*) {
+    var shadow = emptyPresentationState(self);
+    errdefer shadow.deinit(alloc);
     shadow.entries = try cloneEntries(alloc, self.entries.items);
     shadow.tool_details = try cloneToolDetails(alloc, self.tool_details);
     shadow.folded_command_blocks = try cloneFoldedCommandBlocks(

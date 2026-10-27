@@ -7198,9 +7198,13 @@ pub const TranscriptRuntime = struct {
                 );
             }
         } else if (direction == .up and before == 0 and
-            self.full_transcript.scroll_rows == 0)
+            self.full_transcript.scroll_rows == 0 and
+            self.full_transcript_installed_page != null and
+            self.full_transcript_installed_page.?.source.request.content_revision ==
+                self.full_transcript_content_revision)
         {
             // The loaded page is the oldest one; the app may fetch another.
+            // A page laid out before older entries arrived is not the top.
             self.full_transcript_history_request = true;
         }
         debug_trace.logf(
@@ -7221,29 +7225,6 @@ pub const TranscriptRuntime = struct {
         const requested = self.full_transcript_history_request;
         self.full_transcript_history_request = false;
         return requested;
-    }
-
-    /// The open full-transcript screen, captured before a remote client
-    /// rebuilds the entries under it; null when the screen is closed.
-    pub fn fullTranscriptReader(self: *const TranscriptRuntime) ?transcript_presentation.State {
-        return if (self.fullTranscriptActive()) self.full_transcript else null;
-    }
-
-    /// Reopens a captured full-transcript screen at the oldest entry, where
-    /// an older saved page was just added, instead of jumping to the tail.
-    pub fn reopenFullTranscriptAtOldest(self: *TranscriptRuntime, reader: transcript_presentation.State) void {
-        self.full_transcript = reader;
-        if (self.full_transcript.depth != .full or self.entries.items.len == 0) return;
-        self.full_transcript_page_anchor = .{ .entry_index = 0 };
-        self.full_transcript_open_request = null;
-        self.full_transcript_restore_open_pending = false;
-        self.full_transcript_failed_request = null;
-        self.full_transcript_failure_pending = false;
-        self.full_transcript_page_load.cancelActive();
-        self.full_transcript = self.full_transcript.select_page_boundary(
-            self.entries.items[0].id(),
-        );
-        self.full_transcript_prepared_page_visible = false;
     }
 
     pub const FullTranscriptScrollUnit = enum {
@@ -14313,6 +14294,7 @@ test "notification bell writes standalone BEL bytes" {
 
 test {
     _ = @import("runtime_tests.zig");
+    _ = @import("history_prepend.zig");
 }
 
 test "changed stored result retires stale full transcript geometry" {

@@ -22,7 +22,7 @@ const Allocator = std.mem.Allocator;
 
 /// Bumped whenever a request or response changes shape. A client refuses a
 /// supervisor that answers `ping` with another version.
-pub const version: u32 = 11;
+pub const version: u32 = 12;
 
 pub const Heartbeat = struct {
     prompt: []const u8 = "",
@@ -119,9 +119,6 @@ pub const HistoryPageRequest = struct {
     /// Where the history the viewer holds begins; null asks for the newest
     /// page.
     before: ?history_page.Cursor = null,
-    /// How many turns the viewer's window ends with. The reply then also
-    /// carries the turns committed since, so the window stays contiguous.
-    after_turn: ?usize = null,
     max_bytes: usize = history_page.default_page_bytes,
 };
 
@@ -141,12 +138,6 @@ pub fn HistoryPage(comptime Fragments: type) type {
         /// The page's fragments, oldest first, and their estimated bytes.
         fragments: Fragments,
         page_bytes: usize,
-        /// The whole turns after `after_turn`, when the request named it.
-        newer: Fragments,
-        newer_bytes: usize,
-        /// False when those turns did not fit; the viewer reloads the newest
-        /// page instead.
-        newer_complete: bool,
     };
 }
 
@@ -438,7 +429,7 @@ test "requests round trip with their command beside the fields" {
         .{ .command = .{ .session_id = "s", .node_id = "child", .name = "last_reply" } },
         .{ .cancel = .{ .session_id = "s", .node_id = "child" } },
         .{ .history = .{ .session_id = "s", .child_id = "grandchild", .parent_id = "child" } },
-        .{ .history_page = .{ .session_id = "s", .before = .{ .turn = 3, .step = 7 }, .after_turn = 9 } },
+        .{ .history_page = .{ .session_id = "s", .before = .{ .turn = 3, .step = 7 } } },
     };
     for (requests) |request| {
         const bytes = try encode(arena, request);

@@ -112,7 +112,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{ .topic = "session", .tone = .warning, .body = "Supervisor stopped. Relaunch proto-fx to reconnect." }, true);
                 return null;
             }
-            if (app.remote.history_load.active) {
+            if (app.remote.history_load.active and app.remote.history_load.initial) {
                 try app.writeDomainNotice(.{ .topic = "session", .tone = .neutral, .body = "The saved transcript is still loading. Please send again when it is ready." }, true);
                 return null;
             }
@@ -197,7 +197,7 @@ pub fn Runtime(comptime App: type) type {
                 return notice(app, "session", "Older entries page at the root session only.");
             }
             if (remote.link != .ready or !remote.history_loaded or
-                remote.history_load.active or remote.current_id.len == 0) return;
+                remote.history_load.active or remote.older_page != null or remote.current_id.len == 0) return;
             const window = &remote.history_window;
             window.dropPruned(app.alloc, oldestEntryFrom(app, window.first_entry_ids.items));
             if (!window.has_older) return;
@@ -205,6 +205,7 @@ pub fn Runtime(comptime App: type) type {
                 return notice(app, "session", "The transcript holds as much saved history as it can; older entries stay in the saved session.");
             }
             try remote.requestHistoryPage(false);
+            try Transport.showLoadingRow(app);
         }
 
         /// The oldest transcript entry at or after the window's first, which

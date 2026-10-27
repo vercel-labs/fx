@@ -1328,6 +1328,69 @@ test "persistence in-place initialization preserves empty ownership" {
     try std.testing.expect(persistence.resume_handoff_intent == .none);
 }
 
+/// Maps historical shell session ids to their launch-command label so a
+/// resumed transcript can render the same `Observed <command>` text the
+/// live session showed, after the in-memory execution registry is gone.
+/// Session ids restart per process, so a session resumed across epochs
+/// can contain two runs that both produced `shell-1`; the later record
+/// wins, matching the most recent epoch's live rendering.
+pub const HistoricalSessionLabels = struct {
+    const Label = struct {
+        /// Compact-bound text baked into frozen status lines.
+        label: []const u8,
+        /// Reflow-bound command stored as tool detail metadata so group
+        /// projection can reclip resumed rows to the live terminal width.
+        reflow: ?[]const u8,
+    };
+
+    workspace_root: []const u8,
+    map: std.StringHashMapUnmanaged(Label) = .empty,
+    /// Calls whose saved output later `read_tool_result` rows read, so
+    /// those rows name them as the live session did.
+    saved_output_sources: tool_presentation.ReplayedSavedOutputSources = .{},
+
+    pub fn deinit(self: *HistoricalSessionLabels, alloc: Allocator) void {
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            alloc.free(entry.value_ptr.label);
+            if (entry.value_ptr.reflow) |value| alloc.free(value);
+        }
+        self.map.deinit(alloc);
+        self.saved_output_sources.deinit(alloc);
+    }
+};
+
+/// An older saved-history page being projected a few fragments per frame,
+/// so laying it out never holds the UI for long. Its entries are numbered
+/// below the transcript's, and it owns its copy of the fragments.
+pub const OlderHistoryProjection = struct {
+    alloc: Allocator,
+    fragments: std.ArrayList(history_page.Fragment) = .empty,
+    projection: resume_projection.ResumeProjection,
+    labels: HistoricalSessionLabels,
+    has_prior_turns: bool,
+    /// The next fragment to project.
+    next: usize = 0,
+    /// One per projected fragment: the id of its first entry.
+    first_entry_ids: std.ArrayList(u32) = .empty,
+    /// The id of the older-entries notice the page starts with, if any.
+    notice_entry_id: ?u32 = null,
+
+    pub fn done(self: *const OlderHistoryProjection) bool {
+        return self.next == self.fragments.items.len;
+    }
+
+    pub fn deinit(self: *OlderHistoryProjection) void {
+        for (self.fragments.items) |fragment| types.freeHistoryTurn(self.alloc, fragment.turn);
+        self.fragments.deinit(self.alloc);
+        self.projection.deinit();
+        self.labels.deinit(self.alloc);
+        self.first_entry_ids.deinit(self.alloc);
+        self.* = undefined;
+    }
+};
+
 pub fn Runtime(comptime App: type) type {
     return struct {
         pub fn captureImageAttachment(
@@ -3731,39 +3794,6 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
-        /// Maps historical shell session ids to their launch-command label so a
-        /// resumed transcript can render the same `Observed <command>` text the
-        /// live session showed, after the in-memory execution registry is gone.
-        /// Session ids restart per process, so a session resumed across epochs
-        /// can contain two runs that both produced `shell-1`; the later record
-        /// wins, matching the most recent epoch's live rendering.
-        const HistoricalSessionLabels = struct {
-            const Label = struct {
-                /// Compact-bound text baked into frozen status lines.
-                label: []const u8,
-                /// Reflow-bound command stored as tool detail metadata so group
-                /// projection can reclip resumed rows to the live terminal width.
-                reflow: ?[]const u8,
-            };
-
-            workspace_root: []const u8,
-            map: std.StringHashMapUnmanaged(Label) = .empty,
-            /// Calls whose saved output later `read_tool_result` rows read, so
-            /// those rows name them as the live session did.
-            saved_output_sources: tool_presentation.ReplayedSavedOutputSources = .{},
-
-            fn deinit(self: *HistoricalSessionLabels, alloc: Allocator) void {
-                var it = self.map.iterator();
-                while (it.next()) |entry| {
-                    alloc.free(entry.key_ptr.*);
-                    alloc.free(entry.value_ptr.label);
-                    if (entry.value_ptr.reflow) |value| alloc.free(value);
-                }
-                self.map.deinit(alloc);
-                self.saved_output_sources.deinit(alloc);
-            }
-        };
-
         /// Returns the recorded launch-command label for a session-scoped call
         /// (borrowed from `labels`), or null when the session is unknown.
         fn historicalSessionTarget(
@@ -3984,7 +4014,83 @@ pub fn Runtime(comptime App: type) type {
             /// When set, one per fragment: receives the id of the first
             /// transcript entry the fragment may produce.
             first_entry_ids: ?[]u32 = null,
+            /// When set, receives the id of the older-entries notice.
+            notice_entry_id: ?*?u32 = null,
         };
+
+        /// The transcript retention a remote window of `window_bytes` saved
+        /// bytes needs.
+        pub fn remoteRetentionCap(window_bytes: usize) usize {
+            return remote_history_retention_floor +| window_bytes *| 2;
+        }
+
+        /// Starts projecting older saved-history `fragments` with entry ids
+        /// from `first_entry_id`, after `older_notice` when more precedes
+        /// them. `continueOlderHistory` projects them a few at a time.
+        pub fn beginOlderHistory(
+            app: *App,
+            fragments: []const history_page.Fragment,
+            first_entry_id: u32,
+            older_notice: ?[]const u8,
+        ) !OlderHistoryProjection {
+            var older = OlderHistoryProjection{
+                .alloc = app.alloc,
+                .projection = resume_projection.ResumeProjection.initOlder(
+                    app.alloc,
+                    &app.shell,
+                    io_mod.milliTimestamp(),
+                    app.next_diff_id,
+                    first_entry_id,
+                ),
+                .labels = .{ .workspace_root = app.workspace_root },
+                .has_prior_turns = older_notice != null,
+            };
+            errdefer older.deinit();
+            try older.fragments.ensureTotalCapacity(app.alloc, fragments.len);
+            try older.first_entry_ids.ensureTotalCapacity(app.alloc, fragments.len);
+            for (fragments) |fragment| {
+                var copy = fragment;
+                copy.turn = try types.dupeHistoryTurn(app.alloc, fragment.turn);
+                older.fragments.appendAssumeCapacity(copy);
+            }
+            if (older_notice) |body| {
+                older.notice_entry_id = older.projection.runtime.next_entry_id;
+                var sink = olderSink(app, &older);
+                try sink.appendNotice(.{ .topic = "session resumed", .tone = .neutral, .body = body });
+            }
+            return older;
+        }
+
+        /// Projects the next fragments of `older` until `deadline_ns`,
+        /// at least one.
+        pub fn continueOlderHistory(app: *App, older: *OlderHistoryProjection, deadline_ns: i128) !void {
+            var sink = olderSink(app, older);
+            while (!older.done()) {
+                older.first_entry_ids.appendAssumeCapacity(older.projection.runtime.next_entry_id);
+                const fragment = older.fragments.items[older.next];
+                older.next += 1;
+                try replayFragmentToSink(app, &sink, fragment, &older.has_prior_turns, &older.labels);
+                if (io_mod.nanoTimestamp() >= deadline_ns) return;
+            }
+        }
+
+        fn olderSink(app: *App, older: *OlderHistoryProjection) DetachedHistorySink(resume_projection.ResumeProjection) {
+            return .{ .app = app, .projection = &older.projection, .labels = &older.labels, .suppress_diffs = true };
+        }
+
+        /// Moves a fully projected older page into the transcript before the
+        /// entry at `insert_at`. The entries already there are not laid out
+        /// again and nothing is written to the inline scrollback.
+        pub fn prependOlderHistory(app: *App, older: *OlderHistoryProjection, insert_at: usize) !void {
+            std.debug.assert(older.done());
+            const projection = &older.projection;
+            const c_alloc = std.heap.c_allocator;
+            try app.diff_entries.ensureUnusedCapacity(c_alloc, projection.pending_diffs.items.len);
+            try projection.prependInto(&app.shell, insert_at);
+            app.diff_entries.appendSliceAssumeCapacity(projection.pending_diffs.items);
+            projection.pending_diffs.clearRetainingCapacity();
+            app.next_diff_id = projection.next_diff_id;
+        }
 
         /// Projects saved-history fragments into the transcript without
         /// taking persistence ownership. The fragments build a detached
@@ -4000,7 +4106,7 @@ pub fn Runtime(comptime App: type) type {
             const started_ns = io_mod.nanoTimestamp();
             var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
             defer labels.deinit(app.alloc);
-            app.shell.max_retained_transcript_bytes = remote_history_retention_floor +| options.window_bytes *| 2;
+            app.shell.max_retained_transcript_bytes = remoteRetentionCap(options.window_bytes);
             var projection = try app.beginResumeProjection();
             defer projection.deinit();
             var sink = DetachedHistorySink(@TypeOf(projection)){
@@ -4010,6 +4116,7 @@ pub fn Runtime(comptime App: type) type {
                 .suppress_diffs = true,
             };
             if (options.older_notice) |body| {
+                if (options.notice_entry_id) |id| id.* = projection.runtime.next_entry_id;
                 try sink.appendNotice(.{ .topic = "session resumed", .tone = .neutral, .body = body });
             }
             var has_prior_turns = options.older_notice != null;
@@ -7276,7 +7383,7 @@ test "resume projection stores reflow metadata for session action rows" {
     defer source_runtime.deinit(alloc);
     var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &source_runtime, 0, 1);
     defer projection.deinit();
-    var labels = Runtime(TestApp).HistoricalSessionLabels{ .workspace_root = app.workspace_root };
+    var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
     defer labels.deinit(app.alloc);
     var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
         .app = &app,
@@ -7370,7 +7477,7 @@ test "resume projection restores session action rows with labels seeded from the
     defer projection.deinit();
     // Resume always seeds the labels root from the app's live workspace root;
     // the origin root only records where the session was created.
-    var labels = Runtime(TestApp).HistoricalSessionLabels{ .workspace_root = app.workspace_root };
+    var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
     defer labels.deinit(app.alloc);
     var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
         .app = &app,
@@ -7447,7 +7554,7 @@ test "resume projection stores reflow metadata after the session moved workspace
     // the sink labels root is empty: the replayed status phrases are
     // generated with that same root, and withholding the metadata would
     // freeze every absolute-path command row at the compact activity bound.
-    var labels = Runtime(TestApp).HistoricalSessionLabels{ .workspace_root = "" };
+    var labels = HistoricalSessionLabels{ .workspace_root = "" };
     defer labels.deinit(app.alloc);
     var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
         .app = &app,

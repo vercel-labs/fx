@@ -8,6 +8,7 @@ const command_output_runtime = @import("command_output_runtime.zig");
 const source_preparation = @import("source_preparation.zig");
 const transcript_runtime = @import("runtime.zig");
 const transcript_store = @import("store.zig");
+const history_prepend = @import("history_prepend.zig");
 
 const Allocator = std.mem.Allocator;
 const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
@@ -55,6 +56,41 @@ pub const ResumeProjection = struct {
         projection.runtime.clearTranscript(alloc);
         projection.runtime.next_entry_id = 1;
         return projection;
+    }
+
+    /// Start an empty projection for older history that goes above the
+    /// source's entries, numbering its entries from `first_entry_id`. Unlike
+    /// `initEmpty`, it copies none of the source's content.
+    pub fn initOlder(
+        alloc: Allocator,
+        source: *TranscriptRuntime,
+        created_at_ms: i64,
+        next_diff_id: u32,
+        first_entry_id: u32,
+    ) ResumeProjection {
+        var runtime = transcript_store.emptyPresentationState(source);
+        runtime.retention_prefix_trims = null;
+        runtime.command_output_display = .{};
+        runtime.next_entry_id = first_entry_id;
+        return .{
+            .runtime = runtime,
+            .alloc = alloc,
+            .created_at_ms = created_at_ms,
+            .retention_cap = std.math.maxInt(usize),
+            .next_diff_id = next_diff_id,
+        };
+    }
+
+    /// Moves the projected entries into `target` before its entry at
+    /// `insert_at`, for the full transcript only. Nothing is laid out and
+    /// no existing entry changes; see `history_prepend.prepend`.
+    pub fn prependInto(self: *ResumeProjection, target: *TranscriptRuntime, insert_at: usize) !void {
+        std.debug.assert(!self.finalized);
+        std.debug.assert(!self.consumed);
+        _ = try command_output_runtime.syncCommandOutputBlockEntries(&self.runtime, self.alloc);
+        for (self.runtime.folded_command_blocks.items) |*block| block.deinit(self.alloc);
+        self.runtime.folded_command_blocks.clearRetainingCapacity();
+        try history_prepend.prepend(target, self.alloc, insert_at, &self.runtime);
     }
 
     pub fn deinit(self: *ResumeProjection) void {

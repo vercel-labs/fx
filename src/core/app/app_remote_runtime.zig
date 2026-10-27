@@ -14,6 +14,7 @@ const history_page = @import("../supervisor/history_page.zig");
 const remote_view = @import("remote_view.zig");
 const remote_backend = @import("remote_backend.zig");
 const sessions = @import("app_session_runtime.zig");
+const history_prepend = @import("../../ui/transcript/history_prepend.zig");
 const Allocator = std.mem.Allocator;
 const SnapshotView = remote_view.SnapshotView;
 /// What a reply answers. `poll` is a pushed session update, and `resync` the
@@ -81,6 +82,11 @@ pub const HistoryWindow = struct {
     turn_count: usize = 0,
     generation: u64 = 0,
     has_older: bool = false,
+    /// The lowest entry id the window's entries use. An older page numbers
+    /// its entries below it, so ids keep the transcript's order.
+    id_floor: u32 = 0,
+    /// The older-entries notice above the fragments, if shown.
+    notice_entry_id: ?u32 = null,
 
     pub fn deinit(self: *HistoryWindow, alloc: Allocator) void {
         for (self.fragments.items) |fragment| types.freeHistoryTurn(alloc, fragment.turn);
@@ -131,6 +137,24 @@ pub const HistoryWindow = struct {
     }
 };
 
+/// The first entry id of a remote transcript's newest window. The ids below
+/// it number the older pages added above it, each within its own block.
+const history_entry_id_base: u32 = 1 << 30;
+const older_page_entry_ids: u32 = 1 << 20;
+/// How long one loop pass may spend projecting an older page.
+const older_page_slice_ns: i128 = 4 * std.time.ns_per_ms;
+
+const older_notice_text = "Older transcript entries load when you page up in the full transcript.";
+
+/// A received older page and where it goes in the window.
+pub const OlderPage = struct {
+    projection: sessions.OlderHistoryProjection,
+    start: history_page.Cursor,
+    has_older: bool,
+    bytes: usize,
+    id_floor: u32,
+};
+
 pub const State = struct {
     allocator: ?Allocator = null,
     connection: ?*client_mod.Connection = null,
@@ -148,6 +172,11 @@ pub const State = struct {
     history_loaded: bool = false,
     history_load: HistoryLoad = .{},
     history_window: HistoryWindow = .{},
+    /// A received older page still being projected.
+    older_page: ?OlderPage = null,
+    /// The "Loading earlier history" row the full transcript shows while an
+    /// older page loads.
+    loading_entry_id: ?u32 = null,
     /// The node below the root that the composer shows, empty at the root.
     /// A prompt typed there is a message to that node.
     child_id: []u8 = &.{},
@@ -264,6 +293,13 @@ pub const State = struct {
     /// rebuilding is no longer the one the person sees.
     pub fn cancelHistoryLoad(self: *State) void {
         self.history_load.reset();
+        if (self.older_page) |*older| older.projection.deinit();
+        self.older_page = null;
+    }
+
+    /// Whether an older page is loading or being projected.
+    pub fn olderHistoryPending(self: *const State) bool {
+        return (self.history_load.active and !self.history_load.initial) or self.older_page != null;
     }
 
     /// Clears the saved-history window when the attached session or node
@@ -272,6 +308,7 @@ pub const State = struct {
         self.cancelHistoryLoad();
         self.history_window.deinit(alloc);
         self.history_loaded = false;
+        self.loading_entry_id = null;
     }
 
     /// Asks for the newest saved-history page, which replaces the window, or
@@ -285,7 +322,6 @@ pub const State = struct {
         } else .{
             .session_id = self.current_id,
             .before = window.start,
-            .after_turn = window.turn_count,
         } });
         self.history_load = .{ .active = true, .generation = self.generation, .initial = initial };
         if (initial) self.history_loaded = false;
@@ -423,6 +459,9 @@ pub fn Runtime(comptime App: type) type {
                     }
                 },
             };
+            try continueOlderPage(app);
+            // However an older load ended, its loading row goes with it.
+            if (remote.loading_entry_id != null and !remote.olderHistoryPending()) removeLoadingRow(app);
             if (app.shell.takeFullTranscriptHistoryRequest()) try Backend.loadOlderHistory(app);
             try unwatchClosedViews(app);
             try remote.flush();
@@ -628,11 +667,14 @@ pub fn Runtime(comptime App: type) type {
             if (initial) try resync(app, remote.sequence);
         }
 
-        /// Adds one saved-history page to the window and rebuilds the
-        /// transcript from it. The newest page replaces the window; an older
-        /// page goes before it, with the turns committed since after it, so
-        /// no live turn is lost. Events after the page's checkpoint follow.
+        /// Applies one saved-history page. The newest page replaces the
+        /// window and rebuilds the transcript, then the live events after
+        /// its checkpoint follow. An older page is projected a few fragments
+        /// per loop pass and then added above the window; the live turns
+        /// already shown stay as they are.
         fn applyHistoryPage(app: *App, value: std.json.Value) !void {
+            const started_ns = io_mod.nanoTimestamp();
+            defer debug_trace.logf("session", "history page applied us={d}", .{@divTrunc(io_mod.nanoTimestamp() - started_ns, std.time.ns_per_us)});
             var parsed = try decode(client_protocol.HistoryPage([]const history_page.Fragment), app, value);
             defer parsed.deinit();
             const page = parsed.value;
@@ -643,66 +685,149 @@ pub fn Runtime(comptime App: type) type {
             remote.history_load.reset();
             debug_trace.logf(
                 "session",
-                "history page fragments={d} newer={d} start={d}:{d} bytes={d} older={} initial={}",
-                .{ page.fragments.len, page.newer.len, page.start.turn, page.start.step, page.page_bytes, page.has_older, initial },
+                "history page fragments={d} start={d}:{d} bytes={d} older={} initial={}",
+                .{ page.fragments.len, page.start.turn, page.start.step, page.page_bytes, page.has_older, initial },
             );
-            const old = &remote.history_window;
-            if (!initial) {
-                if (page.generation != old.generation or !page.newer_complete) {
-                    // The saved history was rewritten, or too much happened
-                    // since the window loaded. Start again from the newest.
-                    return remote.requestHistoryPage(true);
-                }
-                if (page.fragments.len == 0) {
-                    old.has_older = false;
-                    return View.notice(app, "session", "No older transcript entries remain.");
-                }
-            }
+            if (!initial) return beginOlderPage(app, page) catch |err| failOlderPage(app, err);
 
-            const window = try extendWindow(app.alloc, old, page, initial);
-            old.deinit(app.alloc);
-            remote.history_window = window;
-            try rebuildTranscript(app, initial);
-            remote.sequence = page.history_sequence;
-            try resync(app, page.history_sequence);
-        }
-
-        /// The window after `page`: the page alone when it is the newest,
-        /// otherwise the page, then `old`, whose fragments move, then the
-        /// turns committed since.
-        fn extendWindow(
-            alloc: Allocator,
-            old: *HistoryWindow,
-            page: client_protocol.HistoryPage([]const history_page.Fragment),
-            initial: bool,
-        ) !HistoryWindow {
             var window: HistoryWindow = .{
-                .fragments = try HistoryWindow.copies(alloc, page.fragments),
+                .fragments = try HistoryWindow.copies(app.alloc, page.fragments),
                 .bytes = page.page_bytes,
                 .start = page.start,
                 .turn_count = page.turn_count,
                 .generation = page.generation,
                 .has_older = page.has_older,
             };
-            if (initial) return window;
-            errdefer window.deinit(alloc);
-            var later = try HistoryWindow.copies(alloc, page.newer);
-            defer later.deinit(alloc);
-            errdefer for (later.items) |fragment| types.freeHistoryTurn(alloc, fragment.turn);
-            try window.fragments.ensureUnusedCapacity(alloc, old.fragments.items.len + later.items.len);
-            window.fragments.appendSliceAssumeCapacity(old.fragments.items);
-            window.fragments.appendSliceAssumeCapacity(later.items);
-            window.bytes +|= old.bytes +| page.newer_bytes;
-            old.fragments.clearRetainingCapacity();
-            later.clearRetainingCapacity();
-            return window;
+            errdefer window.deinit(app.alloc);
+            try window.first_entry_ids.resize(app.alloc, window.fragments.items.len);
+            remote.history_window.deinit(app.alloc);
+            remote.history_window = window;
+            try rebuildTranscript(app);
+            remote.sequence = page.history_sequence;
+            try resync(app, page.history_sequence);
         }
 
-        /// Replays the window into a cleared transcript. A full-transcript
-        /// screen reading older history stays open at the oldest entry.
-        fn rebuildTranscript(app: *App, initial: bool) !void {
+        fn beginOlderPage(app: *App, page: client_protocol.HistoryPage([]const history_page.Fragment)) !void {
             const remote = &app.remote;
-            const reader = if (initial) null else app.shell.fullTranscriptReader();
+            const window = &remote.history_window;
+            if (page.generation != window.generation) {
+                // The saved history was rewritten. Start again from the newest.
+                return remote.requestHistoryPage(true);
+            }
+            if (page.fragments.len == 0) {
+                window.has_older = false;
+                return View.notice(app, "session", "No older transcript entries remain.");
+            }
+            // One id below the window is the loading row's.
+            if (window.id_floor <= older_page_entry_ids + 1) return remote.requestHistoryPage(true);
+            const id_floor = window.id_floor - older_page_entry_ids - 1;
+            remote.older_page = .{
+                .projection = try sessions.Runtime(App).beginOlderHistory(
+                    app,
+                    page.fragments,
+                    id_floor,
+                    if (page.has_older) older_notice_text else null,
+                ),
+                .start = page.start,
+                .has_older = page.has_older,
+                .bytes = page.page_bytes,
+                .id_floor = id_floor,
+            };
+        }
+
+        /// Projects the received older page for one slice of this loop pass,
+        /// and adds it above the window once it is complete.
+        fn continueOlderPage(app: *App) !void {
+            const remote = &app.remote;
+            const older = if (remote.older_page) |*value| value else return;
+            const started_ns = io_mod.nanoTimestamp();
+            const projected = sessions.Runtime(App).continueOlderHistory(app, &older.projection, started_ns + older_page_slice_ns);
+            debug_trace.logf("session", "older page slice fragments={d}/{d} us={d}", .{
+                older.projection.next,
+                older.projection.fragments.items.len,
+                @divTrunc(io_mod.nanoTimestamp() - started_ns, std.time.ns_per_us),
+            });
+            projected catch |err| return failOlderPage(app, err);
+            if (!older.projection.done()) return;
+            var taken = older.*;
+            remote.older_page = null;
+            defer taken.projection.deinit();
+            prependOlderPage(app, &taken) catch |err| return failOlderPage(app, err);
+            debug_trace.logf("session", "older page prepended entries={d} us={d}", .{
+                app.shell.entries.items.len,
+                @divTrunc(io_mod.nanoTimestamp() - started_ns, std.time.ns_per_us),
+            });
+        }
+
+        fn failOlderPage(app: *App, err: anyerror) !void {
+            if (app.remote.older_page) |*older| older.projection.deinit();
+            app.remote.older_page = null;
+            var message_buf: [128]u8 = undefined;
+            const message = std.mem.print(&message_buf, "The older transcript entries could not be shown ({s}).", .{@errorName(err)}) catch "The older transcript entries could not be shown.";
+            try View.notice(app, "session", message);
+        }
+
+        /// Adds a projected older page above the window. The reader stays on
+        /// the entry they were reading; one at the top sees it with the new
+        /// entries above it.
+        fn prependOlderPage(app: *App, older: *OlderPage) !void {
+            const remote = &app.remote;
+            const window = &remote.history_window;
+            const shell = &app.shell;
+            const projected = &older.projection;
+            const at_top = history_prepend.readerAtTop(shell);
+            try window.fragments.ensureUnusedCapacity(app.alloc, projected.fragments.items.len);
+            try window.first_entry_ids.ensureUnusedCapacity(app.alloc, projected.first_entry_ids.items.len);
+            removeLoadingRow(app);
+            if (window.notice_entry_id) |id| history_prepend.removeEntry(shell, app.alloc, id);
+            window.notice_entry_id = null;
+            const insert_at = history_prepend.firstIndexFrom(shell, window.id_floor);
+            const old_top: ?u32 = if (insert_at < shell.entries.items.len) shell.entries.items[insert_at].id() else null;
+            sessions.Runtime(App).prependOlderHistory(app, projected, insert_at) catch |err| switch (err) {
+                // Ids no longer fit below the window: start again from the newest.
+                error.EntryIdsOutOfOrder => return remote.requestHistoryPage(true),
+                else => return err,
+            };
+            window.fragments.replaceRangeAssumeCapacity(0, 0, projected.fragments.items);
+            projected.fragments.clearRetainingCapacity();
+            window.first_entry_ids.replaceRangeAssumeCapacity(0, 0, projected.first_entry_ids.items);
+            window.bytes +|= older.bytes;
+            window.start = older.start;
+            window.has_older = older.has_older;
+            window.id_floor = older.id_floor;
+            window.notice_entry_id = projected.notice_entry_id;
+            shell.max_retained_transcript_bytes = sessions.Runtime(App).remoteRetentionCap(window.bytes);
+            if (at_top) if (old_top) |id| history_prepend.revealEntry(shell, id);
+            shell.render_requests.request(.modal);
+        }
+
+        /// Shows "Loading earlier history" above the window while an older
+        /// page loads, in view when the reader is at the top.
+        pub fn showLoadingRow(app: *App) !void {
+            const remote = &app.remote;
+            const floor = remote.history_window.id_floor;
+            if (remote.loading_entry_id != null or floor == 0) return;
+            const shell = &app.shell;
+            const at_top = history_prepend.readerAtTop(shell);
+            try history_prepend.insertNotice(shell, app.alloc, history_prepend.firstIndexFrom(shell, floor), floor - 1, .{
+                .topic = "session",
+                .tone = .neutral,
+                .body = "Loading earlier history…",
+            });
+            remote.loading_entry_id = floor - 1;
+            if (at_top) history_prepend.revealEntry(shell, floor - 1);
+        }
+
+        fn removeLoadingRow(app: *App) void {
+            const id = app.remote.loading_entry_id orelse return;
+            app.remote.loading_entry_id = null;
+            history_prepend.removeEntry(&app.shell, app.alloc, id);
+        }
+
+        /// Replays the newest window into a cleared transcript, numbering its
+        /// entries from `history_entry_id_base` so older pages fit below.
+        fn rebuildTranscript(app: *App) !void {
+            const remote = &app.remote;
             // Clearing the shown transcript resets the history state too;
             // the window is the content being rebuilt, so it stays.
             const window = remote.history_window;
@@ -710,15 +835,16 @@ pub fn Runtime(comptime App: type) type {
             View.resetTranscriptContents(app);
             remote.history_window = window;
             remote.history_loaded = true;
-            const ids = &remote.history_window.first_entry_ids;
-            ids.clearRetainingCapacity();
-            try ids.resize(app.alloc, window.fragments.items.len);
-            sessions.Runtime(App).replayRemoteHistory(app, window.fragments.items, .{
-                .window_bytes = window.bytes,
-                .older_notice = if (window.has_older) "Older transcript entries load when you page up in the full transcript." else null,
-                .first_entry_ids = ids.items,
+            app.shell.next_entry_id = @max(app.shell.next_entry_id, history_entry_id_base);
+            const shown = &remote.history_window;
+            shown.id_floor = app.shell.next_entry_id;
+            sessions.Runtime(App).replayRemoteHistory(app, shown.fragments.items, .{
+                .window_bytes = shown.bytes,
+                .older_notice = if (shown.has_older) older_notice_text else null,
+                .first_entry_ids = shown.first_entry_ids.items,
+                .notice_entry_id = &shown.notice_entry_id,
             }) catch |err| {
-                ids.clearRetainingCapacity();
+                shown.first_entry_ids.clearRetainingCapacity();
                 var message_buf: [128]u8 = undefined;
                 const message = std.mem.print(
                     &message_buf,
@@ -728,7 +854,6 @@ pub fn Runtime(comptime App: type) type {
                 try View.notice(app, "session", message);
             };
             remote.native_turn_offset = app.shell.finalizedToolTurnWatermark() + 1;
-            if (reader) |state| app.shell.reopenFullTranscriptAtOldest(state);
             app.shell.render_requests.request(.transcript);
             app.shell.render_requests.request(.modal);
         }
