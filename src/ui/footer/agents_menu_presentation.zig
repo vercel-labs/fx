@@ -1,4 +1,5 @@
-//! The instance list `/agents` and Alt+↑ open: one row per open instance,
+//! The agent list ↓, Ctrl+X, and `/agents` open: one row per open agent, the
+//! instances in launch order, each followed by the subagents it started,
 //! such as "fx 3 · Fix the login bug · reviewer · needs approval".
 
 const std = @import("std");
@@ -37,13 +38,17 @@ pub fn windowStart(projection: AgentsMenuProjection, row_budget: u16) usize {
 /// The text of `row`, before it is clipped to the footer's width. The caller
 /// owns it.
 pub fn rowText(alloc: Allocator, row: render_input.AgentsMenuRow) ![]u8 {
-    return alloc.print("fx {d}{s} · {s} · {s} · {s}", .{
-        row.number,
-        if (row.on_screen) " (on screen)" else "",
-        if (row.title.len > 0) row.title else untitled,
+    const tag = if (row.on_screen) " (on screen)" else "";
+    const title = if (row.title.len > 0) row.title else untitled;
+    // A subagent's row sits under its instance's, indented one step.
+    if (row.subagent_name.len > 0) return alloc.print("  {s}{s} · {s} · {s} · {s}", .{
+        row.subagent_name,
+        tag,
+        title,
         row.profile,
         row.state,
     });
+    return alloc.print("fx {d}{s} · {s} · {s} · {s}", .{ row.number, tag, title, row.profile, row.state });
 }
 
 pub fn composeAgentsMenuRow(
@@ -69,10 +74,10 @@ pub fn composeAgentsMenuRow(
 }
 
 pub const hint_variants = [_][]const u8{
-    "↑↓ navigate     enter show     esc close",
-    "↑↓ navigate  enter show  esc close",
-    "↑↓ move  enter  esc",
-    "enter show  esc close",
+    "↑↓ preview     enter switch     esc back",
+    "↑↓ preview  enter switch  esc back",
+    "↑↓ preview  enter  esc",
+    "enter switch  esc back",
 };
 
 /// The visible text of row `row_index`, and whether it is selected. Caller owns the text.
@@ -95,16 +100,18 @@ fn testRow(projection: AgentsMenuProjection, row_index: u16, width: u16, row_bud
     return .{ .text = try text.toOwnedSlice(alloc), .selected = selected };
 }
 
-test "the instance list shows each instance's number, title, profile, and state" {
+test "the agent list shows each agent's number or name, title, profile, and state" {
     const rows = [_]render_input.AgentsMenuRow{
         .{ .number = 1, .title = "Fix the login bug", .profile = "main", .state = "working", .on_screen = true },
-        .{ .number = 2, .title = "", .profile = "reviewer", .state = "needs approval", .on_screen = false },
+        .{ .number = 0, .subagent_name = "tester", .title = "Run the auth tests", .profile = "tester", .state = "needs approval", .on_screen = false },
+        .{ .number = 2, .title = "", .profile = "reviewer", .state = "idle", .on_screen = false },
     };
     const projection: AgentsMenuProjection = .{ .rows = &rows, .selected = 1 };
-    try std.testing.expectEqual(@as(u16, 2), menuRowCount(projection, max_inline_rows));
+    try std.testing.expectEqual(@as(u16, 3), menuRowCount(projection, max_inline_rows));
     const expected = [_][]const u8{
         "  fx 1 (on screen) · Fix the login bug · main · working",
-        "  fx 2 · new session · reviewer · needs approval",
+        "    tester · Run the auth tests · tester · needs approval",
+        "  fx 2 · new session · reviewer · idle",
     };
     for (expected, 0..) |text, row_index| {
         const row = try testRow(projection, @intCast(row_index), 80, max_inline_rows);
@@ -114,7 +121,7 @@ test "the instance list shows each instance's number, title, profile, and state"
     }
 }
 
-test "the instance list scrolls to keep the selected instance in view" {
+test "the agent list scrolls to keep the selected agent in view" {
     var rows: [5]render_input.AgentsMenuRow = undefined;
     for (&rows, 1..) |*row, number| row.* = .{ .number = number, .title = "t", .profile = "main", .state = "idle", .on_screen = false };
     var projection: AgentsMenuProjection = .{ .rows = &rows, .selected = 0 };

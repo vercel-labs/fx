@@ -627,6 +627,12 @@ pub fn Runtime(comptime App: type) type {
                 );
             }
 
+            // The open agent list takes every key first: the agent it shows
+            // is a preview.
+            if (ingress.event) |event| {
+                if (try routeAgentsMenuInput(app, event)) return ingress.replay_byte_after_routing;
+            }
+
             var replay_byte = ingress.replay_byte_after_routing;
             if (ingress.event) |event| {
                 switch (event) {
@@ -905,22 +911,6 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
-        fn canSwitchAgents(app: *App) bool {
-            if (comptime !@hasField(App, "agent_on_screen")) return false;
-            return app_agents_runtime.Runtime(App).canSwitch(app);
-        }
-
-        /// Alt+←/→ switch agents only where their word jump would not move
-        /// the cursor: with another agent to switch to, nothing selected,
-        /// and the cursor at the draft's start for ← or its end for →. An
-        /// empty draft is both. Everywhere else they jump by word, as on
-        /// main, so switching never costs a word move.
-        fn switchesAgents(app: *App, direction: input_action.SwitchDirection) bool {
-            if (!canSwitchAgents(app)) return false;
-            if (comptime !@hasField(App, "input_runtime")) return true;
-            return app.input_runtime.edit_state.staysForWordJump(direction == .previous);
-        }
-
         fn routeResolvedEscapeAction(
             app: *App,
             decoded: input_action.Action,
@@ -930,17 +920,7 @@ pub fn Runtime(comptime App: type) type {
             was_cancel_pending: bool,
             max_input_len: usize,
         ) !ResolvedEscapeRoute {
-            // Where Alt+←/→ don't switch, they keep the word jump their
-            // composer shortcut carries, and where Alt+↑ doesn't list the
-            // instances, it keeps its paragraph move.
-            const resolved: input_action.Action = switch (decoded) {
-                .switch_agent => |direction| if (switchesAgents(app, direction))
-                    decoded
-                else
-                    composerMoveOf(composer_shortcut),
-                .open_agent_list => if (listsInstances(app)) decoded else composerMoveOf(composer_shortcut),
-                else => decoded,
-            };
+            const resolved = decoded;
             switch (resolved) {
                 .remapped_byte, .paste_start, .paste_end, .ignore => {},
                 else => disarmCtrlCExit(app, "semantic_action"),
@@ -968,25 +948,14 @@ pub fn Runtime(comptime App: type) type {
 
             if (try full_transcript_rt.routeAction(app, agents.screenAgentOf(app), resolved)) return .done;
 
-            // Switching works while a prompt is open: the prompt belongs to
-            // the agent, and comes back with it.
-            if (resolved == .switch_agent) {
-                if (comptime @hasField(App, "agent_on_screen")) {
-                    if (app.shell.fullTranscriptActive()) return .done;
-                    dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
-                    try app_agents_runtime.Runtime(App).switchAgent(app, resolved.switch_agent);
-                }
-                return .done;
-            }
-
-            // Alt+↑ opens the instance list, and moves up in it once open.
+            // Ctrl+X opens the agent list whatever the composer holds. It
+            // works while a prompt is open: the prompt belongs to the agent
+            // on screen, and comes back with it. The open list takes the key
+            // first, as Esc, in `routeAgentsMenuInput`.
             if (resolved == .open_agent_list) {
                 if (comptime @hasDecl(App, "openAgentsMenu")) {
                     if (app.shell.fullTranscriptActive()) return .done;
-                    if (app_agents_runtime.Runtime(App).menuActive(app)) {
-                        _ = try completion_rt.routeAgentsMenuMove(app, agents.screenAgentOf(app), -1);
-                        return .done;
-                    }
+                    if (!app_agents_runtime.Runtime(App).hasAnotherAgent(app)) return .done;
                     dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
                     try app.openAgentsMenu();
                 }
@@ -1099,7 +1068,6 @@ pub fn Runtime(comptime App: type) type {
                 .insert_newline,
                 .composer_shortcut,
                 .toggle_full_transcript,
-                .switch_agent,
                 .open_agent_list,
                 => unreachable,
                 .page_up,
@@ -1763,27 +1731,59 @@ pub fn Runtime(comptime App: type) type {
             return app_agents_runtime.Runtime(App).menuActive(app);
         }
 
+        /// Closes the agent list, keeping the agent it shows.
         fn cancelAgentsMenu(app: *App) bool {
             if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
             return app_agents_runtime.Runtime(App).closeMenu(app);
         }
 
-        /// Whether the instance list has more than one instance to show.
-        fn canListInstances(app: *App) bool {
+        /// Closes the agent list and puts back the agent it opened on.
+        fn backAgentsMenu(app: *App) !bool {
             if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
-            return app_agents_runtime.Runtime(App).openInstanceCount(app) > 1;
+            return app_agents_runtime.Runtime(App).backMenu(app);
         }
 
-        /// Alt+↑ lists the instances while more than one is open, unless the
-        /// draft has several lines, where it moves up a paragraph as on main.
-        fn listsInstances(app: *App) bool {
-            if (!canListInstances(app)) return false;
-            if (comptime !@hasField(App, "input_runtime")) return true;
-            return std.mem.findScalar(u8, app.input_runtime.edit_state.input.items, '\n') == null;
-        }
-
-        fn composerMoveOf(composer_shortcut: ?input_action.ShortcutAction) input_action.Action {
-            return if (composer_shortcut) |shortcut| .{ .composer_shortcut = shortcut } else .ignore;
+        /// While the agent list is open it takes every key, ahead of the
+        /// prompts and composer of the agent it shows, which is a preview:
+        /// ↑ and ↓ move and preview, Enter keeps the agent shown, and Esc,
+        /// Ctrl+X, and Ctrl+C go back to the one it opened on. A paste keeps
+        /// the agent shown and lands in its composer, and mouse input passes
+        /// through. Any other key does nothing, so none edits the previewed
+        /// agent's draft or answers its prompt. Returns whether the list
+        /// took `event`.
+        fn routeAgentsMenuInput(app: *App, event: input_action.TerminalInputEvent) !bool {
+            if (!agentsMenuActive(app)) return false;
+            const agent = agents.screenAgentOf(app);
+            switch (event) {
+                // A paste closes the list before its bytes arrive.
+                .paste_byte => return false,
+                .raw => |raw| switch (raw.byte) {
+                    '\r' => _ = try submitAgentsMenuSelection(app),
+                    3, 24 => _ = try backAgentsMenu(app),
+                    10 => _ = try completion_rt.routeAgentsMenuMove(app, agent, 1),
+                    11 => _ = try completion_rt.routeAgentsMenuMove(app, agent, -1),
+                    else => if (raw.byte >= 0x80) input_reset.resetPendingTextScalarWithTrace(
+                        &app.input_runtime.text_scalar,
+                        "agents_menu_active",
+                    ),
+                },
+                .action => |decoded| switch (decoded.action) {
+                    .cursor_up, .history_up => _ = try completion_rt.routeAgentsMenuMove(app, agent, -1),
+                    .cursor_down, .history_down => _ = try completion_rt.routeAgentsMenuMove(app, agent, 1),
+                    .escape, .open_agent_list => {
+                        _ = try backAgentsMenu(app);
+                        _ = disarmEscapeClear(app);
+                    },
+                    .paste_start => {
+                        _ = try submitAgentsMenuSelection(app);
+                        return false;
+                    },
+                    // Replayed as the byte it stands for, which comes back here.
+                    .remapped_byte, .mouse_wheel, .mouse_pointer => return false,
+                    else => {},
+                },
+            }
+            return true;
         }
 
         /// Forks before the selected prompt and puts its text in the composer.
@@ -2820,6 +2820,13 @@ pub fn Runtime(comptime App: type) type {
 
         fn resolveEscape(app: *App, agent: *AppAgent, was_cancel_pending: bool, now: i64) !void {
             if (try full_transcript_rt.routeAction(app, agent, .escape)) return;
+            // Ahead of the prompts: the open agent list shows `agent` only as
+            // a preview, and Esc goes back from it.
+            if (try backAgentsMenu(app)) {
+                _ = disarmEscapeClear(app);
+                _ = disarmEscapeInterrupt(app, "menu");
+                return;
+            }
             if (was_cancel_pending) {
                 if (agent.question_prompt.isActive()) {
                     // Freeform answers mirror the composer's Esc contract:
@@ -2849,7 +2856,7 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeInterrupt(app, "approval_prompt");
                     return;
                 }
-                if (cancelAgentsMenu(app) or cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app, agent) or cancelForkMenu(app, agent) or cancelEffortMenu(app)) {
+                if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app, agent) or cancelForkMenu(app, agent) or cancelEffortMenu(app)) {
                     _ = disarmEscapeClear(app);
                     _ = disarmEscapeInterrupt(app, "menu");
                     app.shell.render_requests.request(.footer);
@@ -2903,7 +2910,7 @@ pub fn Runtime(comptime App: type) type {
                 _ = disarmEscapeClear(app);
                 return;
             }
-            if (cancelAgentsMenu(app) or cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app, agent) or cancelForkMenu(app, agent) or cancelEffortMenu(app)) {
+            if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app, agent) or cancelForkMenu(app, agent) or cancelEffortMenu(app)) {
                 _ = disarmEscapeClear(app);
                 app.shell.render_requests.request(.footer);
                 return;
@@ -12629,17 +12636,16 @@ test "typed composer byte replaces a semantic selection and remains undoable" {
     try std.testing.expectEqualStrings("(alpha beta)", app.input_runtime.edit_state.input.items);
 }
 
-test "Alt+arrow keeps its word jump when there is no other agent to switch to" {
+test "Ctrl+X with no other agent to switch to leaves the draft as it is" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     try app.input_runtime.edit_state.setText(alloc, "one two");
-    app.input_runtime.edit_state.cursor = 0;
+    app.input_runtime.edit_state.cursor = 3;
 
-    const word_right: input_action.ShortcutAction = .{ .move = .{ .kind = .word_right, .extend_selection = false } };
-    _ = try Runtime(RoutingFakeApp).routeResolvedEscapeAction(&app, .{ .switch_agent = .next }, word_right, null, null, false, 4096);
-    try std.testing.expect(app.input_runtime.edit_state.cursor > 0);
-    try std.testing.expect(app.input_runtime.edit_state.cursor <= "one".len + 1);
+    _ = try Runtime(RoutingFakeApp).routeResolvedEscapeAction(&app, .open_agent_list, null, null, null, false, 4096);
+    try std.testing.expectEqualStrings("one two", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 3), app.input_runtime.edit_state.cursor);
 }
 
 test "composer shortcut line delete preserves no-op picker redraw and metadata state" {

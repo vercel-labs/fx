@@ -166,20 +166,25 @@ pub fn effortMenuProjection(menu: *const effort_menu.State) EffortMenuProjection
     };
 }
 
-/// One row of the instance list: an open instance and how it is doing.
+/// One row of the agent list: an open instance or one of its subagents, and
+/// how it is doing.
 pub const AgentsMenuRow = struct {
-    /// Its place among the open instances, from 1, as in "fx 3".
+    /// An instance's place among the open instances, from 1, as in "fx 3".
+    /// Unused for a subagent.
     number: usize,
+    /// A subagent's name, such as "reviewer"; empty for an instance.
+    subagent_name: []const u8 = "",
     /// Its session's title, or empty before it has one.
     title: []const u8,
     /// The agent profile it runs in.
     profile: []const u8,
     /// What it is doing, such as "needs approval".
     state: []const u8,
+    /// The agent the list opened on, where Esc goes back to.
     on_screen: bool,
 };
 
-/// The instance list `/agents` and Alt+↑ open: every open instance in order.
+/// The agent list ↓ and Ctrl+X open: every open agent in switch order.
 pub const AgentsMenuProjection = struct {
     rows: []const AgentsMenuRow = &.{},
     selected: usize = 0,
@@ -439,8 +444,9 @@ pub const RenderContext = struct {
     usage_menu: UsageMenuProjection = .{},
     workspace_menu: WorkspaceMenuProjection = .{},
     upgrade_status: []const u8 = "",
-    /// The subagent on screen, named before the status line; empty on main's
-    /// screen.
+    /// The agent indicator on the footer's right, such as "fx 2/3 ↓": the
+    /// agent on screen and the key that opens the agent list. Empty with a
+    /// single agent.
     agent_label: []const u8 = "",
     /// A hidden agent waiting on an answer, shown on the right.
     waiting_note: []const u8 = "",

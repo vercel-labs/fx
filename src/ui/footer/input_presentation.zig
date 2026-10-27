@@ -512,11 +512,6 @@ pub fn composeHintRow(
         width,
         &hint_buf,
     );
-    var labeled_buf: [max_status_line_len + 128]u8 = undefined;
-    const labeled_hint_line = if (ctx.agent_label.len > 0)
-        std.mem.print(&labeled_buf, "{s} · {s}", .{ ctx.agent_label, base_hint_line }) catch base_hint_line
-    else
-        base_hint_line;
     var hint_line = if (question_hint) |hint|
         hint
     else if (ctx.ctrl_c_pending)
@@ -524,7 +519,7 @@ pub fn composeHintRow(
     else if (auth_hint) |hint|
         hint
     else
-        labeled_hint_line;
+        base_hint_line;
 
     const width_usize: usize = width;
     const danger_text = dangerStatusText(approval_active, ctx, width);
@@ -547,6 +542,21 @@ pub fn composeHintRow(
         }
         if (esc_interrupt_hint.len == 0) hint_line = "esc esc to interrupt";
     }
+    // The agent indicator, such as "fx 2/3 ↓", follows whatever status
+    // shows on the right, as in "fx 3 finished · fx 1/3 ↓".
+    const status_text = if (ctx.waiting_note.len > 0)
+        ctx.waiting_note
+    else if (ctx.upgrade_status.len > 0)
+        ctx.upgrade_status
+    else
+        ctx.mcp_status;
+    var indicated_buf: [max_status_line_len + 192]u8 = undefined;
+    const indicated_text = if (ctx.agent_label.len == 0)
+        status_text
+    else if (status_text.len == 0)
+        ctx.agent_label
+    else
+        std.mem.print(&indicated_buf, "{s} · {s}", .{ status_text, ctx.agent_label }) catch ctx.agent_label;
     // The armed clear indicator outranks the question suppression: a
     // freeform draft mid-question uses the same double-Esc contract as the
     // composer and needs the same cue. The armed interrupt indicator outranks
@@ -559,12 +569,8 @@ pub fn composeHintRow(
         ""
     else if (danger_text.len > 0)
         danger_text
-    else if (ctx.waiting_note.len > 0)
-        ctx.waiting_note
-    else if (ctx.upgrade_status.len > 0)
-        ctx.upgrade_status
     else
-        ctx.mcp_status;
+        indicated_text;
     const right_width = display_width.visibleWidth(right_text);
     const danger_visible = danger_text.len > 0 and right_text.ptr == danger_text.ptr;
     const left_width: u16 = if (!danger_visible and right_width > 0 and width_usize > right_width)

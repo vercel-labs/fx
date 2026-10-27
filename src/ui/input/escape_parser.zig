@@ -80,20 +80,13 @@ fn modifiedArrowAction(byte: u8, modifiers: u16, meta_prefixed: bool) ?InputEsca
         'F' => composerMove(.draft_end, modifiers),
         else => null,
     };
-    if (meta_prefixed or (modifiers & alt_modifier) != 0) {
-        // Alt+←/→ may switch agents and Alt+↑ may list the instances (see
-        // `switchesAgents` and `listsInstances` in app_input_runtime.zig);
-        // with Shift or Ctrl they keep the word jump, paragraph move, and
-        // selection.
-        const switches = (modifiers & (shift_modifier | ctrl_modifier)) == 0;
-        return switch (byte) {
-            'A' => if (switches) .open_agent_list else composerMove(.paragraph_up, modifiers),
-            'B' => composerMove(.paragraph_down, modifiers),
-            'C' => if (switches) .{ .switch_agent = .next } else composerMove(.word_right, modifiers),
-            'D' => if (switches) .{ .switch_agent = .previous } else composerMove(.word_left, modifiers),
-            else => null,
-        };
-    }
+    if (meta_prefixed or (modifiers & alt_modifier) != 0) return switch (byte) {
+        'A' => composerMove(.paragraph_up, modifiers),
+        'B' => composerMove(.paragraph_down, modifiers),
+        'C' => composerMove(.word_right, modifiers),
+        'D' => composerMove(.word_left, modifiers),
+        else => null,
+    };
     if ((modifiers & ctrl_modifier) != 0) return switch (byte) {
         'C' => composerMove(.word_right, modifiers),
         'D' => composerMove(.word_left, modifiers),
@@ -276,6 +269,7 @@ pub fn controlByteFeatureAction(byte: u8) ?InputEscapeAction {
     return switch (byte) {
         15 => .toggle_full_transcript,
         16 => .open_model_catalog,
+        24 => .open_agent_list,
         else => null,
     };
 }
@@ -532,20 +526,17 @@ pub fn consumeInputEscapeByteWithMouse(
                 // ESC o is Meta-O, not a Ctrl-O terminal report.
                 return .ignore;
             }
-            // ESC b and ESC f are what Terminal.app sends for Option+←/→,
-            // so they switch agents where Alt+←/→ would; their composer
-            // shortcut keeps the word jump everywhere else.
             if (byte == 'b') {
                 stage.* = 0;
                 param.* = 0;
                 param2.* = 0;
-                return .{ .switch_agent = .previous };
+                return .word_left;
             }
             if (byte == 'f') {
                 stage.* = 0;
                 param.* = 0;
                 param2.* = 0;
-                return .{ .switch_agent = .next };
+                return .word_right;
             }
             if (byte == 'd') {
                 stage.* = 0;

@@ -354,7 +354,7 @@ pub const top_level_flags = [_]TopLevelFlag{
     },
     .{
         .usage = "--instances <n>",
-        .description = "Start n fx instances in one interactive session, each with its own conversation; Alt+Left and Alt+Right switch between them when no word is left to jump, and /agents or Alt+Up lists them",
+        .description = "Start n fx instances in one interactive session, each with its own conversation; Down on an empty composer, Ctrl+X, or /agents lists them to switch",
     },
     .{
         .usage = "--fast, --no-fast",
@@ -455,7 +455,7 @@ pub const slash_specs = [_]SlashSpec{
 
     .{ .kind = .launch_instance, .command = "/launch", .help_entry = "/launch [profile]", .completion_description = "start another fx instance on this host", .presentation_category = .session, .has_args = true, .accepts_payload = true },
     .{ .kind = .close_instance, .command = "/close", .help_entry = "/close", .completion_description = "close the fx instance on screen", .presentation_category = .session },
-    .{ .kind = .show_agents, .command = "/agents", .help_entry = "/agents", .completion_description = "list the open fx instances and switch to one", .presentation_category = .session },
+    .{ .kind = .show_agents, .command = "/agents", .help_entry = "/agents", .completion_description = "list the open agents and switch to one", .presentation_category = .session },
     .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .accepts_payload = true },
     .{ .kind = .fork_session, .command = "/fork", .help_entry = "/fork", .completion_description = "fork the session before a prompt", .presentation_category = .session },
     .{ .kind = .login, .command = "/login", .help_entry = "/login", .completion_description = "choose the model provider and how it signs in", .presentation_category = .account, .has_args = true },
