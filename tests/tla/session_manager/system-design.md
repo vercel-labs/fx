@@ -2779,6 +2779,15 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   person denied. **Alternative:** checking only `tab.goto`, which a
   redirect or a link would get around.
 
+- **D236 Decision:** the approval of a `jobs watch` with `command`
+  (D210) says that it repeats: its label is `shell.watch every 5
+  minutes: <command>`, and the prompt asks "Would you like to run this
+  command every 5 minutes while the watch lasts?" under the kind
+  "Repeating command", with the interval in whole hours, minutes or
+  seconds. The authority it grants is unchanged. **Why:** the prompt
+  read like a one-off shell run for a command that may run for an hour.
+  **Alternative:** the interval in milliseconds as the model wrote it.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

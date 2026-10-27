@@ -1512,12 +1512,14 @@ fn buildApprovalPanelLineWithLabel(
     const target = approvalTarget(label);
     const explanation = approval.request.explanation;
     const dynamic_mcp = approval.request.tool_arguments_preview != null;
+    var question_buf: [160]u8 = undefined;
+    const question = approvalQuestionText(&question_buf, label, dynamic_mcp);
 
     if (row_count >= interaction_state.approval_panel_rows_spacious) {
         return switch (row_index) {
             0 => "  Permission needed · Choose one",
             1 => "",
-            2 => std.mem.print(buf, "  {s}{s}{s}", .{ b, approvalQuestion(label, dynamic_mcp), r }) catch "  Permission request",
+            2 => std.mem.print(buf, "  {s}{s}{s}", .{ b, question, r }) catch "  Permission request",
             3 => approvalReasonLine(buf, label, target, explanation, dynamic_mcp),
             4 => approvalActionLine(buf, label, target),
             5 => "",
@@ -1532,7 +1534,7 @@ fn buildApprovalPanelLineWithLabel(
 
     return switch (row_index) {
         0 => "  Permission needed · Choose one",
-        1 => std.mem.print(buf, "  {s}{s}{s}", .{ b, approvalQuestion(label, dynamic_mcp), r }) catch "  Permission request",
+        1 => std.mem.print(buf, "  {s}{s}{s}", .{ b, question, r }) catch "  Permission request",
         2 => approvalReasonLine(buf, label, target, explanation, dynamic_mcp),
         3 => approvalActionLine(buf, label, target),
         4 => approvalChoiceLine(buf, approval.choice_index == 0, approvalChoiceLabel(approval, 0)),
@@ -1862,6 +1864,7 @@ fn approvalKind(label: []const u8, dynamic_mcp: bool) []const u8 {
     if (std.mem.startsWith(u8, label, "Remember ") or
         std.mem.startsWith(u8, label, "Revoke saved-session")) return "Permission rule";
     if (dynamic_mcp) return "MCP tool";
+    if (watchInterval(label) != null) return "Repeating command";
     if (commandLabelPrefix(label) != null) return "Command";
     if (std.mem.startsWith(u8, label, "write_file ")) return "Write file";
     if (std.mem.startsWith(u8, label, "edit_file ")) return "Edit file";
@@ -1889,7 +1892,25 @@ fn approvalQuestion(label: []const u8, dynamic_mcp: bool) []const u8 {
     return "Would you like to allow this action?";
 }
 
+/// The question, which for a watched command says how often it runs (D236).
+fn approvalQuestionText(buf: []u8, label: []const u8, dynamic_mcp: bool) []const u8 {
+    if (watchInterval(label)) |interval| {
+        return std.mem.print(buf, "Would you like to run this command {s} while the watch lasts?", .{interval}) catch "Would you like to run this command repeatedly?";
+    }
+    return approvalQuestion(label, dynamic_mcp);
+}
+
+/// "every 5 minutes" from "shell.watch every 5 minutes: date".
+fn watchInterval(label: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, label, watch_prefix)) return null;
+    const end = std.mem.find(u8, label, ": ") orelse return null;
+    return label[watch_prefix.len..end];
+}
+
+const watch_prefix = "shell.watch ";
+
 fn approvalTarget(label: []const u8) []const u8 {
+    if (watchInterval(label) != null) return label[commandLabelPrefix(label).?.len..];
     const prefixes = [_][]const u8{
         "shell.run ",
         "write_file ",
@@ -1924,6 +1945,9 @@ fn approvalReasonLine(
             "  {s}Reason:{s} This MCP tool needs approval before fx can send the request.",
             .{ dim, r },
         ) catch "  Reason: MCP tool approval required";
+    }
+    if (watchInterval(label)) |interval| {
+        return std.mem.print(buf, "  {s}Reason:{s} A watch runs this command {s} until the watch ends or is cancelled.", .{ dim, r, interval }) catch "  Reason: a watch repeats this command";
     }
     if (commandLabelPrefix(label) != null) {
         if (firstUrlHost(target)) |host| {
@@ -1995,6 +2019,10 @@ fn approvalAlwaysChoice(approval: ApprovalProjection, label: []const u8) []const
 
 fn commandLabelPrefix(label: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, label, "shell.run ")) return "shell.run ";
+    if (std.mem.startsWith(u8, label, watch_prefix)) {
+        const end = std.mem.find(u8, label, ": ") orelse return null;
+        return label[0 .. end + 2];
+    }
     return null;
 }
 
@@ -3066,4 +3094,15 @@ test "permission hints use compact ask modal language" {
     ) != null);
     try std.testing.expect(std.mem.find(u8, file.text.items, "wheel scroll") != null);
     try std.testing.expect(std.mem.find(u8, file.text.items, "tab amend") != null);
+}
+
+test "a watched command's approval says it repeats and how often (D236)" {
+    const label = "shell.watch every 5 minutes: date +%H:%M";
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("Would you like to run this command every 5 minutes while the watch lasts?", approvalQuestionText(&buf, label, false));
+    try std.testing.expectEqualStrings("Repeating command", approvalKind(label, false));
+    try std.testing.expectEqualStrings("date +%H:%M", commandTarget(label).?);
+    try std.testing.expectEqualStrings("  $ date +%H:%M", approvalActionLine(&buf, label, approvalTarget(label)));
+    try std.testing.expect(std.mem.find(u8, approvalReasonLine(&buf, label, approvalTarget(label), null, false), "runs this command every 5 minutes until the watch ends") != null);
+    try std.testing.expectEqualStrings("Would you like to run the following command?", approvalQuestionText(&buf, "shell.run date", false));
 }

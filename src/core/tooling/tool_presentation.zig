@@ -452,6 +452,50 @@ pub fn formatRunCommandPermissionLabel(
     return alloc.print("shell.run {s}{s}", .{ encoded.bytes, suffix });
 }
 
+/// The approval label of a `jobs watch` that polls `command` every
+/// `every_ms` (D236): "shell.watch every 5 minutes: date". A watch repeats
+/// its command, so the person sees how often. Caller owns it.
+pub fn formatCommandWatchPermissionLabel(alloc: Allocator, command: []const u8, every_ms: u64) ![]const u8 {
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer mem_utils.deinit_arena(scratch_state);
+    const scratch = scratch_state.allocator();
+    const encoded = try text_utils.encodeTerminalSafe(scratch, command, max_run_command_activity_bytes);
+    const suffix = try commandApprovalLabelSuffix(scratch, "shell", command);
+    var interval_buf: [48]u8 = undefined;
+    return alloc.print("shell.watch {s}: {s}{s}", .{ humanInterval(&interval_buf, every_ms), encoded.bytes, suffix });
+}
+
+/// "every 5 minutes", "every second", "every 90 seconds", "every hour".
+pub fn humanInterval(buf: []u8, every_ms: u64) []const u8 {
+    const units = [_]struct { ms: u64, one: []const u8 }{
+        .{ .ms = 3_600_000, .one = "hour" },
+        .{ .ms = 60_000, .one = "minute" },
+        .{ .ms = 1_000, .one = "second" },
+    };
+    for (units) |unit| {
+        if (every_ms < unit.ms or every_ms % unit.ms != 0) continue;
+        const count = every_ms / unit.ms;
+        if (count == 1) return std.mem.print(buf, "every {s}", .{unit.one}) catch "repeatedly";
+        return std.mem.print(buf, "every {d} {s}s", .{ count, unit.one }) catch "repeatedly";
+    }
+    const seconds = @max(1, (every_ms + 500) / 1000);
+    return std.mem.print(buf, "about every {d} seconds", .{seconds}) catch "repeatedly";
+}
+
+test "a watched command's approval label says how often it runs" {
+    const testing = std.testing;
+    var buf: [48]u8 = undefined;
+    try testing.expectEqualStrings("every 5 minutes", humanInterval(&buf, 300_000));
+    try testing.expectEqualStrings("every second", humanInterval(&buf, 1_000));
+    try testing.expectEqualStrings("every 90 seconds", humanInterval(&buf, 90_000));
+    try testing.expectEqualStrings("every hour", humanInterval(&buf, 3_600_000));
+    try testing.expectEqualStrings("every 90 minutes", humanInterval(&buf, 5_400_000));
+    try testing.expectEqualStrings("about every 2 seconds", humanInterval(&buf, 1_500));
+    const label = try formatCommandWatchPermissionLabel(testing.allocator, "date +%H:%M", 300_000);
+    defer testing.allocator.free(label);
+    try testing.expectEqualStrings("shell.watch every 5 minutes: date +%H:%M", label);
+}
+
 pub fn isAdvertisedDynamicMcpName(registry: tool_dispatch.Registry, name: []const u8, advertised: []const []const u8) bool {
     if (registry.lookup(name) != null) return false;
     for (advertised) |advertised_name| {

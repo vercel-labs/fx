@@ -2518,6 +2518,19 @@ test "a harness approval names the asking command, never its pid" {
     try std.testing.expectEqualStrings("", harnessCallerCommand("python pid 42: /opt/homebrew/Cellar/python@3.13/3.13.16/Frameworks/Python.framework/Versions/3.13/Resour"));
 }
 
+/// How often a `jobs watch` call runs its command, or null for any other
+/// call (D236).
+fn commandWatchEvery(input: Input, arena: Allocator, call: ToolCall) !?u64 {
+    const tool = registeredTool(input, call.name) orelse return null;
+    if (!try tool_dispatch.isCommandWatchCall(arena, tool, call.arguments_json)) return null;
+    const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch return null;
+    const value = args.get("every_ms") orelse return null;
+    return switch (value) {
+        .integer => |n| if (n > 0) @intCast(n) else null,
+        else => null,
+    };
+}
+
 fn interactivePermissionRequestUnmarked(
     input: Input,
     arena: Allocator,
@@ -2533,10 +2546,13 @@ fn interactivePermissionRequestUnmarked(
             };
         }
         return .{
-            .label = try tool_presentation.formatRunCommandPermissionLabel(
-                arena,
-                context.command,
-            ),
+            .label = if (try commandWatchEvery(input, arena, call)) |every_ms|
+                try tool_presentation.formatCommandWatchPermissionLabel(arena, context.command, every_ms)
+            else
+                try tool_presentation.formatRunCommandPermissionLabel(
+                    arena,
+                    context.command,
+                ),
             .command = try command_environment.formatApprovalCommand(
                 arena,
                 context.environment,
