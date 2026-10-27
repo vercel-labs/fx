@@ -5,7 +5,7 @@
 //! only as untrusted evidence. Its second line is a summary the transcript
 //! reads back to show "w1 → you" rows, and that recovery searches for the
 //! ids a model already received (`tests/tla/jobs/Mailbox.tla`
-//! RecoverDelivered).
+//! Recover).
 const std = @import("std");
 const session_adapter = @import("../session/session_adapter.zig");
 const Allocator = std.mem.Allocator;
@@ -89,6 +89,11 @@ fn writeSafe(w: *std.Io.Writer, body: []const u8) !void {
         rest = rest[at + "</system-notice".len ..];
     }
     try w.writeAll(rest);
+}
+
+/// A body's first line, shortened, as rows show it.
+pub fn preview(body: []const u8) []const u8 {
+    return firstLine(body);
 }
 
 fn firstLine(body: []const u8) []const u8 {

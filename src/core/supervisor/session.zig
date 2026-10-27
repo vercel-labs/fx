@@ -78,13 +78,11 @@ pub const Session = struct {
     pending: std.ArrayList(Pending) = .empty,
     commands: std.ArrayList(PendingCommand) = .empty,
     heartbeat_request: ?i64 = null,
-    /// Job notices sent to the host and not answered yet.
-    notice_requests: std.ArrayList(i64) = .empty,
+    /// Job notices, and notices of messages from other agents (D188), sent
+    /// to the host and not answered yet.
+    notice_requests: std.ArrayList(NoticeRequest) = .empty,
     /// Their answers, for the executor to settle: whether the model got it.
     notice_answers: std.ArrayList(NoticeAnswer) = .empty,
-    /// Notices of messages from other agents (D188), tracked the same way.
-    mail_requests: std.ArrayList(i64) = .empty,
-    mail_answers: std.ArrayList(NoticeAnswer) = .empty,
     capture: ?Capture = null,
     /// Counts every change a watcher sees: events, pending requests, and
     /// the record.
@@ -95,7 +93,8 @@ pub const Session = struct {
     views: child_views.Cache,
 
     const Capture = struct { id: i64, frame: ?[]u8 = null };
-    const NoticeAnswer = struct { id: i64, delivered: bool };
+    const NoticeRequest = struct { id: i64, mail: bool };
+    pub const NoticeAnswer = struct { id: i64, delivered: bool, mail: bool = false };
 
     pub fn create(daemon: *Daemon, id: []const u8, cwd: []const u8, name: []const u8) !*Session {
         const alloc = daemon.alloc;
@@ -121,8 +120,6 @@ pub const Session = struct {
         self.commands.deinit(alloc);
         self.notice_requests.deinit(alloc);
         self.notice_answers.deinit(alloc);
-        self.mail_requests.deinit(alloc);
-        self.mail_answers.deinit(alloc);
         self.watchers.deinit(alloc);
         self.views.deinit();
         self.jobs.deinit(alloc);
@@ -434,9 +431,9 @@ pub const Session = struct {
         /// Keep the response the host writes before dispatchFrame returns.
         capture,
         heartbeat,
-        /// A job notice: its answer says whether the model got it.
+        /// A job notice, or messages from other agents (D188): its answer
+        /// says whether the model got it.
         job_notice,
-        /// Messages from other agents, answered the same way (D188).
         peer_message,
         /// Turn the answer, whenever it comes, into a command result event.
         command: []const u8,
@@ -462,15 +459,10 @@ pub const Session = struct {
                 defer self.events_mutex.unlock(io_mod.getIo());
                 self.heartbeat_request = id;
             },
-            .job_notice => {
+            .job_notice, .peer_message => {
                 self.events_mutex.lockUncancelable(io_mod.getIo());
                 defer self.events_mutex.unlock(io_mod.getIo());
-                try self.notice_requests.append(alloc, id);
-            },
-            .peer_message => {
-                self.events_mutex.lockUncancelable(io_mod.getIo());
-                defer self.events_mutex.unlock(io_mod.getIo());
-                try self.mail_requests.append(alloc, id);
+                try self.notice_requests.append(alloc, .{ .id = id, .mail = track == .peer_message });
             },
             .command => |name| {
                 const owned = try alloc.dupe(u8, name);
@@ -915,7 +907,7 @@ pub const Session = struct {
     /// Receives every frame the host writes, from any host thread. Answers
     /// the supervisor waits for are routed to it; requests and notifications
     /// join the replay log, and requests stay pending until answered.
-    fn publish(raw: ?*anyopaque, frame: []const u8) !void {
+    pub fn publish(raw: ?*anyopaque, frame: []const u8) !void {
         const self: *Session = @ptrCast(@alignCast(raw.?));
         const trimmed = std.mem.trim(u8, frame, "\r\n");
         var arena_state = std.heap.ArenaAllocator.init(self.daemon.alloc);
@@ -958,14 +950,9 @@ pub const Session = struct {
                 return .silent;
             };
             if (self.heartbeat_request == response_id) self.heartbeat_request = null;
-            for (self.notice_requests.items, 0..) |notice_id, index| if (notice_id == response_id) {
+            for (self.notice_requests.items, 0..) |notice, index| if (notice.id == response_id) {
                 _ = self.notice_requests.swapRemove(index);
-                try self.notice_answers.append(alloc, .{ .id = response_id, .delivered = noticeDelivered(head) });
-                return .silent;
-            };
-            for (self.mail_requests.items, 0..) |notice_id, index| if (notice_id == response_id) {
-                _ = self.mail_requests.swapRemove(index);
-                try self.mail_answers.append(alloc, .{ .id = response_id, .delivered = noticeDelivered(head) });
+                try self.notice_answers.append(alloc, .{ .id = response_id, .delivered = noticeDelivered(head), .mail = notice.mail });
                 return .silent;
             };
             for (self.commands.items, 0..) |command, index| {

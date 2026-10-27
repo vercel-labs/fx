@@ -66,6 +66,9 @@ const Feedback = struct {
     fingerprint: [32]u8,
     receipt: worker_runtime.SteeringReceipt = .{},
     reported: types.SteeringDelivery = .queued,
+    /// Kept past its report until `unpinFeedback`: a mailbox delivery
+    /// reads its outcome later (D188).
+    pinned: bool = false,
 
     fn create(alloc: Allocator, child_id: []const u8, operation_id: []const u8, fingerprint: [32]u8) !*Feedback {
         const item = try alloc.create(Feedback);
@@ -192,6 +195,15 @@ pub const Owner = struct {
         return .{ .receipt = .queued };
     }
 
+    /// Keeps steer `operation_id`'s outcome readable until `unpinFeedback`.
+    pub fn pinFeedback(self: *Owner, operation_id: []const u8, pinned: bool) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.feedback.items) |item| {
+            if (std.mem.eql(u8, item.operation_id, operation_id)) item.pinned = pinned;
+        }
+    }
+
     pub fn feedbackUpdates(self: *Owner, arena: Allocator) ![]FeedbackUpdate {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -257,7 +269,7 @@ pub const Owner = struct {
                 var feedback_index: usize = 0;
                 while (feedback_index < self.feedback.items.len) {
                     const item = self.feedback.items[feedback_index];
-                    if (std.mem.eql(u8, item.child_id, child_id) and item.receipt.state.load(.seq_cst) != .queued and item.reported == item.receipt.state.load(.seq_cst)) {
+                    if (std.mem.eql(u8, item.child_id, child_id) and !item.pinned and item.receipt.state.load(.seq_cst) != .queued and item.reported == item.receipt.state.load(.seq_cst)) {
                         _ = self.feedback.swapRemove(feedback_index);
                         item.deinit(self.alloc);
                     } else feedback_index += 1;

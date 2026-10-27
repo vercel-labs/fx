@@ -112,7 +112,7 @@ fn countAt(state: *const State, earlier: []const Event) usize {
 }
 
 /// A `mail` line names a message not waiting already, and a full mailbox
-/// takes one only after a drop earlier in the batch (`Mailbox.tla`
+/// takes one only after a drop earlier in the batch (`tests/tla/jobs/Mailbox.tla`
 /// Bounded). Any time, inside a turn or between turns.
 pub fn planMail(state: *const State, earlier: []const Event, body: schema.Body.Mail) fold.TransitionError!void {
     if (pendingAt(state, earlier, body.id)) return error.InvalidTransition;

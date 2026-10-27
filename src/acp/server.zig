@@ -1065,6 +1065,12 @@ pub const PersistentHost = struct {
         return out;
     }
 
+    /// Rows for messages between workers since the last call (D187).
+    pub fn takeMailRelays(self: *PersistentHost, arena: Allocator) ![]const []const u8 {
+        const root = self.state.subagent_host orelse return &.{};
+        return subagent_mailbox.takeRelays(root, arena);
+    }
+
     /// The notice of the root's waiting messages from other agents.
     pub fn takeMailNotice(self: *PersistentHost, arena: Allocator) !?subagent_mailbox.RootNotice {
         const root = self.state.subagent_host orelse return null;
@@ -1074,6 +1080,11 @@ pub const PersistentHost = struct {
     pub fn mailNoticeAdmitted(self: *PersistentHost, notice: subagent_mailbox.RootNotice, request_id: i64) void {
         const root = self.state.subagent_host orelse return;
         subagent_mailbox.rootAdmitted(root, notice, request_id);
+    }
+
+    pub fn mailNoticeRefused(self: *PersistentHost) void {
+        const root = self.state.subagent_host orelse return;
+        subagent_mailbox.rootRefused(root);
     }
 
     pub fn mailNoticeAnswered(self: *PersistentHost, request_id: i64, delivered: bool) void {

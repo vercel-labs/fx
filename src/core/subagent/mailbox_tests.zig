@@ -31,9 +31,14 @@ const Mailroom = struct {
     /// and takes steering at its boundaries.
     hold: std.atomic.Value(bool) = .init(false),
     held: std.atomic.Value(u32) = .init(0),
+    /// A turn whose message starts with "broadcast" sends one message to
+    /// every other agent.
+    broadcasts: std.atomic.Value(u32) = .init(0),
+    /// A broadcasting turn waits for this, so every agent exists first.
+    gate: std.atomic.Value(bool) = .init(true),
     process: slot_pool.Pool = .{ .capacity = 64 },
 
-    const Seen = struct { node: []u8, text: []u8 };
+    const Seen = struct { node: []u8, text: []u8, steered: bool = false, at: i64 = 0 };
 
     fn deinit(self: *Mailroom) void {
         for (self.seen.items) |item| {
@@ -44,6 +49,10 @@ const Mailroom = struct {
     }
 
     fn note(self: *Mailroom, node: []const u8, text: []const u8) void {
+        self.noteKind(node, text, false);
+    }
+
+    fn noteKind(self: *Mailroom, node: []const u8, text: []const u8, steered: bool) void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         const owned_node = testing.allocator.dupe(u8, node) catch return;
@@ -51,7 +60,7 @@ const Mailroom = struct {
             testing.allocator.free(owned_node);
             return;
         };
-        self.seen.append(testing.allocator, .{ .node = owned_node, .text = owned_text }) catch {
+        self.seen.append(testing.allocator, .{ .node = owned_node, .text = owned_text, .steered = steered, .at = io_mod.milliTimestamp() }) catch {
             testing.allocator.free(owned_node);
             testing.allocator.free(owned_text);
         };
@@ -78,6 +87,15 @@ const Mailroom = struct {
         if (!turn.worker.beginDirectProcessing(1)) return error.ProviderFailed;
         turn.beginTurn() catch return error.ProviderFailed;
         self.note(node, message.content);
+        if (std.mem.startsWith(u8, message.content, "broadcast")) if (turn.node_host) |own| {
+            while (!self.gate.load(.seq_cst) and !cancel.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
+            var scratch = std.heap.ArenaAllocator.init(turn.alloc);
+            defer scratch.deinit();
+            const body = scratch.allocator().print("hello from {s}", .{node}) catch return error.OutOfMemory;
+            const receipts = mailbox.send(own, scratch.allocator(), .{ .to = "all", .body = body }) catch return error.ProviderFailed;
+            for (receipts) |r| if (r.outcome == .rejected) std.debug.print("rejected {s} -> {s}: {s}\n", .{ node, r.to, r.@"error" orelse "" });
+            _ = self.broadcasts.fetchAdd(1, .seq_cst);
+        };
         var steering: std.ArrayList(types.PersistedSteering) = .empty;
         defer steering.deinit(turn.alloc);
         var arena_state = std.heap.ArenaAllocator.init(turn.alloc);
@@ -98,7 +116,7 @@ const Mailroom = struct {
         // The last boundary: steering that arrived as the turn ended.
         switch (turn.worker.takeSteeringBoundaryInto(turn.alloc, arena_state.allocator(), 1, .finalizing) catch return error.OutOfMemory) {
             .continue_turn => |texts| for (texts) |text| {
-                self.note(node, text);
+                self.noteKind(node, text, true);
                 steering.append(turn.alloc, .{ .text = text, .after_tool_step_count = 0 }) catch return error.OutOfMemory;
             },
             else => {},
@@ -364,4 +382,111 @@ test "a wait on the root's mailbox takes a message and holds automatic delivery 
     thread.join();
     try testing.expectEqual(@as(usize, 1), waiter.got);
     try testing.expectEqual(@as(usize, 0), (try root.children.parent.mailbox(arena)).len);
+}
+
+/// Every envelope id that reached `node`, counted.
+fn idsSeen(room: *Mailroom, arena: Allocator, node: []const u8) !std.array_hash_map.String(usize) {
+    room.mutex.lockUncancelable(io_mod.getIo());
+    defer room.mutex.unlock(io_mod.getIo());
+    var seen: std.array_hash_map.String(usize) = .empty;
+    for (room.seen.items) |item| {
+        if (!std.mem.eql(u8, item.node, node)) continue;
+        const parsed = agent_message.parse(arena, item.text) orelse continue;
+        for (parsed.messages) |row| {
+            const entry = try seen.getOrPut(arena, try arena.dupe(u8, row.id));
+            if (!entry.found_existing) entry.value_ptr.* = 0;
+            entry.value_ptr.* += 1;
+        }
+    }
+    return seen;
+}
+
+fn maxRssBytes() usize {
+    const usage = std.posix.getrusage(0);
+    const raw: usize = @intCast(usage.maxrss);
+    // Linux reports kilobytes, macOS bytes.
+    return if (@import("builtin").target.os.tag == .linux) raw * 1024 else raw;
+}
+
+test "twenty workers in one tree broadcast to each other: every message once, no deadlock, bounded hosts" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(testing.allocator);
+    defer parent.deinit();
+    var room: Mailroom = .{};
+    defer room.deinit();
+    // The default policy: eight run slots for twenty workers.
+    const root = try tool_host.Runtime.createWithPolicy(testing.allocator, &parent.children, .{ .resolve_fn = Mailroom.resolve }, .{ .context = &room, .run_fn = Mailroom.run }, .{});
+    defer root.deinit();
+    root.tree.process_slots = &room.process;
+    const workers = 20;
+    const started = io_mod.milliTimestamp();
+    const rss_before = maxRssBytes();
+    mailbox.pump(root);
+    room.gate.store(false, .seq_cst);
+    var ids: [workers][]const u8 = undefined;
+    for (&ids, 0..) |*id, index| id.* = try spawn(arena, root, try arena.print("w{d}", .{index}), "broadcast once");
+    // Twelve of them wait for a run slot, with no log yet: messages to them
+    // are held until they start.
+    room.gate.store(true, .seq_cst);
+
+    var root_seen: std.array_hash_map.String(usize) = .empty;
+    var request: i64 = 1;
+    var max_open: usize = 0;
+    var rounds: usize = 0;
+    while (rounds < 3000) : (rounds += 1) {
+        mailbox.pump(root);
+        max_open = @max(max_open, root.tree.nodes.openCount());
+        // The supervisor's part: the root's notices, answered as delivered.
+        if (try mailbox.takeRootNotice(root, arena)) |notice| {
+            for (notice.ids) |id| {
+                const entry = try root_seen.getOrPut(arena, try arena.dupe(u8, id));
+                if (!entry.found_existing) entry.value_ptr.* = 0;
+                entry.value_ptr.* += 1;
+            }
+            mailbox.rootAdmitted(root, notice, request);
+            mailbox.rootAnswered(root, request, true);
+            request += 1;
+        }
+        var waiting: usize = 0;
+        for (try mailbox.directory.list(arena, root)) |node| waiting += node.waiting;
+        var busy = root.managed.anyRunning();
+        for (try root.fleet.snapshot(arena)) |job| {
+            if (!job.state.settled()) busy = true;
+        }
+        if (room.broadcasts.load(.seq_cst) == workers and waiting == 0 and !busy) break;
+        io_mod.sleep(5 * std.time.ns_per_ms);
+    }
+    const elapsed = io_mod.milliTimestamp() - started;
+    const rss_after = maxRssBytes();
+    std.debug.print("\nmailbox scale: {d} workers, {d} turns, {d} ms, max open hosts {d}, peak RSS growth {d} KiB\n", .{ workers, room.turns, elapsed, max_open, (rss_after -| rss_before) / 1024 });
+    try testing.expectEqual(@as(u32, workers), room.broadcasts.load(.seq_cst));
+    // The root got one message from each worker, each once.
+    try testing.expectEqual(@as(usize, workers), root_seen.count());
+    for (root_seen.keys(), root_seen.values()) |key, count| if (count != 1) std.debug.print("root dup {s} x{d}\n", .{ key, count });
+    for (ids) |id| {
+        const seen = try idsSeen(&room, arena, id);
+        for (seen.keys(), seen.values()) |key, count| if (count != 1) {
+            std.debug.print("worker {s} dup {s} x{d}\n", .{ id, key, count });
+            room.mutex.lockUncancelable(io_mod.getIo());
+            defer room.mutex.unlock(io_mod.getIo());
+            for (room.seen.items) |item| if (std.mem.eql(u8, item.node, id) and agent_message.carries(item.text, key)) std.debug.print("  seen steered={} at={d} as {s}\n", .{ item.steered, item.at, item.text[0..@min(item.text.len, 200)] });
+        };
+    }
+    for (root_seen.values()) |count| try testing.expectEqual(@as(usize, 1), count);
+    // Each worker got one from each of the others, each once.
+    for (ids) |id| {
+        const seen = try idsSeen(&room, arena, id);
+        if (seen.count() != workers - 1) std.debug.print("worker {s} saw {d}\n", .{ id, seen.count() });
+    }
+    for (ids) |id| {
+        const seen = try idsSeen(&room, arena, id);
+        try testing.expectEqual(@as(usize, workers - 1), seen.count());
+        for (seen.values()) |count| try testing.expectEqual(@as(usize, 1), count);
+        try testing.expectEqual(@as(usize, 0), (try parent.store.peekMailbox(arena, id)).len);
+    }
+    // Hosts stay near the tree's cap while every worker runs.
+    try testing.expect(max_open <= root.tree.nodes.limits.max_open + root.tree.policy.tree_slots + workers);
 }

@@ -4207,7 +4207,7 @@ pub fn Runtime(comptime App: type) type {
                     if (entry.execution.turn_summary) |summary| {
                         sink.setCreatedAtMs(summary.started_at_ms);
                     }
-                    if (fragment.has_user) try sink.appendUserTurn(entry.user, has_prior_turns.*);
+                    if (fragment.has_user) try writeUserToSink(app, sink, entry.user, has_prior_turns.*);
                     has_prior_turns.* = true;
                     try writeExecutionHistoryToSink(app, sink, entry.execution, labels);
                     if (!fragment.has_tail) return;
@@ -4225,7 +4225,7 @@ pub fn Runtime(comptime App: type) type {
                     if (entry.execution.turn_summary) |summary| {
                         sink.setCreatedAtMs(summary.started_at_ms);
                     }
-                    if (fragment.has_user) try sink.appendUserTurn(entry.user, has_prior_turns.*);
+                    if (fragment.has_user) try writeUserToSink(app, sink, entry.user, has_prior_turns.*);
                     has_prior_turns.* = true;
                     try writeExecutionHistoryToSink(app, sink, entry.execution, labels);
                     if (!fragment.has_tail) return;
@@ -4368,7 +4368,18 @@ pub fn Runtime(comptime App: type) type {
                 defer app.alloc.free(body);
                 return sink.appendNotice(.{ .topic = "rule", .tone = .warning, .body = body });
             }
-            try sink.appendUserTurn(.{ .text = text }, true);
+            try writeUserToSink(app, sink, .{ .text = text }, true);
+        }
+
+        /// fx's notices replay as the rows the live turn showed (D187).
+        fn writeUserToSink(app: *App, sink: anytype, user: types.UserTurn, has_prior_turns: bool) !void {
+            var arena_state = std.heap.ArenaAllocator.init(app.alloc);
+            defer arena_state.deinit();
+            if (try @import("notice_rows.zig").rows(arena_state.allocator(), user.text)) |shown| {
+                for (shown) |notice| try sink.appendNotice(notice);
+                return;
+            }
+            try sink.appendUserTurn(user, has_prior_turns);
         }
 
         fn writePersistedSteeringAtBoundary(

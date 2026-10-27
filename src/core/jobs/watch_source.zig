@@ -13,7 +13,8 @@
 const std = @import("std");
 const jobs = @import("jobs.zig");
 const io_mod = @import("../shared/io.zig");
-const watch_pattern = @import("watch_pattern.zig");
+// The stream rules engine reads the same JavaScript dialect as proto.
+const watch_pattern = @import("../ttsr/regex.zig");
 const Allocator = std.mem.Allocator;
 
 const job_prefix = "watch_";
@@ -178,8 +179,12 @@ pub const Source = struct {
         const number = self.next_number;
         const id = try self.alloc.print(job_prefix ++ "{d}", .{number});
         errdefer self.alloc.free(id);
-        const default_label = spec.source orelse spec.command.?;
-        const label = try self.alloc.dupe(u8, spec.label orelse default_label[0..@min(default_label.len, 80)]);
+        const label = if (spec.label) |value|
+            try self.alloc.dupe(u8, value)
+        else if (spec.source) |job_id|
+            try self.alloc.print("watch on {s}", .{job_id})
+        else
+            try self.alloc.print("watch on {s}", .{spec.command.?[0..@min(spec.command.?.len, 64)]});
         errdefer self.alloc.free(label);
         watch.* = .{
             .id = id,
@@ -251,7 +256,8 @@ pub const Source = struct {
         defer self.unlock();
         if (watch.stop_reason != null) return;
         const clipped = clip(body, max_event_bytes);
-        const text = self.alloc.print("Watch {s} ({s}) matched, event {d} of at most {d}:\n{s}", .{ watch.id, watch.label, watch.events + 1, watch.max_events, clipped }) catch return;
+        // The match leads, so a row's first line is what the watch saw.
+        const text = self.alloc.print("{s}\n(watch {s} event {d} of at most {d})", .{ clipped, watch.id, watch.events + 1, watch.max_events }) catch return;
         const from_id = self.alloc.dupe(u8, watch.id) catch {
             self.alloc.free(text);
             return;

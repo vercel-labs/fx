@@ -27,21 +27,19 @@ pub fn tick(self: *Session, now: i64) void {
 /// notice (`tests/tla/jobs/Mailbox.tla`).
 fn deliverMail(self: *Session) void {
     const host = self.host orelse return;
-    {
-        self.events_mutex.lockUncancelable(io_mod.getIo());
-        const answers = self.mail_answers.toOwnedSlice(self.daemon.alloc) catch &.{};
-        self.events_mutex.unlock(io_mod.getIo());
-        defer self.daemon.alloc.free(answers);
-        for (answers) |answer| host.mailNoticeAnswered(answer.id, answer.delivered);
-    }
     host.pumpMail();
     var arena_state = std.heap.ArenaAllocator.init(self.daemon.alloc);
     defer arena_state.deinit();
+    // Messages between workers show in the root's transcript, as proto
+    // relays them to its main view.
+    const relays = host.takeMailRelays(arena_state.allocator()) catch &.{};
+    for (relays) |row| publishNotice(self, row);
     const notice = (host.takeMailNotice(arena_state.allocator()) catch |err| {
         std.debug.print("proto-fx: message delivery failed: {s}\n", .{@errorName(err)});
         return;
     }) orelse return;
     const request_id = self.prompt(notice.text, .peer_message) catch |err| {
+        host.mailNoticeRefused();
         if (err != error.SessionBusy) std.debug.print("proto-fx: message admission failed: {s}\n", .{@errorName(err)});
         return;
     };
@@ -88,5 +86,18 @@ fn settleJobNotices(self: *Session, host: anytype) void {
     const answers = self.notice_answers.toOwnedSlice(self.daemon.alloc) catch &.{};
     self.events_mutex.unlock(io_mod.getIo());
     defer self.daemon.alloc.free(answers);
-    for (answers) |answer| host.jobNoticeAnswered(answer.id, answer.delivered);
+    for (answers) |answer| {
+        if (answer.mail) host.mailNoticeAnswered(answer.id, answer.delivered) else host.jobNoticeAnswered(answer.id, answer.delivered);
+    }
+}
+
+/// A row every viewer's transcript shows, outside any turn.
+fn publishNotice(self: *Session, title: []const u8) void {
+    const frame = std.json.Stringify.valueAlloc(self.daemon.alloc, .{
+        .jsonrpc = "2.0",
+        .method = "session/update",
+        .params = .{ .sessionId = self.id, .update = .{ .sessionUpdate = "notice", .title = title } },
+    }, .{}) catch return;
+    defer self.daemon.alloc.free(frame);
+    Session.publish(self, frame) catch |err| std.debug.print("proto-fx: notice not published: {s}\n", .{@errorName(err)});
 }

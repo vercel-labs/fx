@@ -1,7 +1,6 @@
 const std = @import("std");
 const claude_tool_stub = @import("gateway/claude_tool_stub.zig");
-const job_notice = @import("core/jobs/notice.zig");
-const agent_message = @import("core/subagent/agent_message.zig");
+const notice_rows = @import("core/app/notice_rows.zig");
 const text_utils = @import("core/shared/text_utils.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -1478,8 +1477,7 @@ const App = struct {
         has_prior_turns: bool,
         skill_tokens: []const registered_entities.SkillTokenSpan,
     ) !void {
-        if (try self.writeJobNoticeRows(user.text)) return;
-        if (try self.writeAgentMessageRows(user.text)) return;
+        if (try self.writeNoticeRows(user.text)) return;
         _ = try self.shell.writeUserPromptCard(
             self.alloc,
             &self.metrics,
@@ -1489,35 +1487,12 @@ const App = struct {
         );
     }
 
-    /// A notice of settled background jobs shows as one status row per job,
-    /// not as the person's prompt: "✓ npm test finished · 1m2s".
-    fn writeJobNoticeRows(self: *App, text: []const u8) !bool {
+    /// fx's notices show as rows, never as the person's prompt (D111, D187).
+    fn writeNoticeRows(self: *App, text: []const u8) !bool {
         var arena_state = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_state.deinit();
-        const arena = arena_state.allocator();
-        const rows = job_notice.parse(arena, text) orelse return false;
-        for (rows) |row| {
-            var buf: [512]u8 = undefined;
-            const safe = try text_utils.encodeTerminalSafeInline(arena, job_notice.rowText(&buf, row), 480);
-            const tone: types.NoticeTone = if (job_notice.rowFailed(row)) .@"error" else if (std.mem.eql(u8, row.state, "cancelled")) .cancelled else .success;
-            try self.writeDomainNotice(.{ .topic = "", .tone = tone, .body = safe.bytes }, true);
-        }
-        return true;
-    }
-
-    /// Messages from other agents of the tree show as one row each, who to
-    /// whom and the first line, never ids: "alpha → you · status?" (D187).
-    /// The turn they started reads as theirs, not the person's prompt.
-    fn writeAgentMessageRows(self: *App, text: []const u8) !bool {
-        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-        const parsed = agent_message.parse(arena, text) orelse return false;
-        for (parsed.messages) |row| {
-            const line = try agent_message.rowText(arena, row, "");
-            const safe = try text_utils.encodeTerminalSafeInline(arena, line, 480);
-            try self.writeDomainNotice(.{ .topic = "", .tone = .information, .body = safe.bytes }, true);
-        }
+        const shown = (try notice_rows.rows(arena_state.allocator(), text)) orelse return false;
+        for (shown) |notice| try self.writeDomainNotice(notice, true);
         return true;
     }
 
@@ -5184,6 +5159,7 @@ test {
     _ = @import("tools/session/recall.zig");
     _ = @import("core/tooling/recall_presentation.zig");
     _ = @import("core/tooling/fleet_presentation.zig");
+    _ = @import("core/app/notice_rows.zig");
     _ = @import("core/shared/human_text.zig");
     _ = @import("tools/skills/install_skill.zig");
     _ = @import("tools/skills/skill.zig");

@@ -259,7 +259,11 @@ pub fn deliverMail(self: *Runtime, child_id: []const u8, text: []const u8, opera
     };
     if (target.phase == .running and target.queued == 0) if (target.active_work) |work_id| {
         switch (try self.managed.steer(target.id, work_id, operation_id, fingerprint, text)) {
-            .receipt => return .{ .steered = fingerprint },
+            .receipt => {
+                // The mailbox reads this steer's outcome on a later tick.
+                self.managed.pinFeedback(operation_id, true);
+                return .{ .steered = fingerprint };
+            },
             .capacity => return .later,
             .waiting, .cancelled, .unavailable, .conflict => {},
         }

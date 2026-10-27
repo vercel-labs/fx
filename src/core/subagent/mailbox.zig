@@ -78,6 +78,17 @@ pub const Bus = struct {
     /// Waits on the root's mailbox; automatic delivery leaves it to them.
     root_waits: usize = 0,
     root_retry_after_ms: i64 = 0,
+    /// Nodes whose mailbox one thread is handing to their model now. Only
+    /// one delivery or inbox read runs per node, so no message is carried
+    /// twice or settled by another's delivery (`tests/tla/jobs/Mailbox.tla` ExactlyOnce, mutation two_carriers).
+    delivering: std.array_hash_map.String(void) = .empty,
+    /// Messages for workers admitted but not started yet, which have no
+    /// log to keep them: each moves into its worker's mailbox once the
+    /// worker's first turn saves its log.
+    early: std.ArrayList(Early) = .empty,
+    /// Rows for the root's transcript of messages between workers, as
+    /// proto relays them to its main view: "alpha → beta · first line".
+    relays: std.ArrayList([]u8) = .empty,
     /// Whether the root's own turn ran at the supervisor's last tick, so a
     /// receipt can say whether a message joins it or wakes it.
     root_busy: std.atomic.Value(bool) = .init(false),
@@ -94,6 +105,29 @@ pub const Bus = struct {
             alloc.free(steer.parent_id);
             alloc.free(steer.operation_id);
             freeIds(alloc, steer.ids);
+        }
+    };
+
+    const Early = struct {
+        node_id: []u8,
+        id: []u8,
+        from: []u8,
+        label: []u8,
+        body: []u8,
+        reply_to: ?[]u8,
+        broadcast: bool,
+
+        fn free(early: Early, alloc: Allocator) void {
+            alloc.free(early.node_id);
+            alloc.free(early.id);
+            alloc.free(early.from);
+            alloc.free(early.label);
+            alloc.free(early.body);
+            if (early.reply_to) |value| alloc.free(value);
+        }
+
+        fn line(early: Early) session_adapter.MailLine {
+            return .{ .mail = .{ .id = early.id, .from = early.from, .label = early.label, .body = early.body, .reply_to = early.reply_to, .broadcast = early.broadcast } };
         }
     };
 
@@ -115,6 +149,12 @@ pub const Bus = struct {
         self.steers.deinit(self.alloc);
         for (self.root_notices.items) |notice| freeIds(self.alloc, notice.ids);
         self.root_notices.deinit(self.alloc);
+        for (self.delivering.keys()) |key| self.alloc.free(key);
+        self.delivering.deinit(self.alloc);
+        for (self.early.items) |early| early.free(self.alloc);
+        self.early.deinit(self.alloc);
+        for (self.relays.items) |row| self.alloc.free(row);
+        self.relays.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -131,6 +171,38 @@ pub const Bus = struct {
         self.lock();
         defer self.unlock();
         return self.root_waits;
+    }
+
+    /// Claims node `node_id`'s mailbox for one delivery or read; false
+    /// while another holds it.
+    fn claim(self: *Bus, node_id: []const u8) bool {
+        self.lock();
+        defer self.unlock();
+        if (self.delivering.contains(node_id)) return false;
+        const owned = self.alloc.dupe(u8, node_id) catch return false;
+        self.delivering.put(self.alloc, owned, {}) catch {
+            self.alloc.free(owned);
+            return false;
+        };
+        return true;
+    }
+
+    fn unclaim(self: *Bus, node_id: []const u8) void {
+        self.lock();
+        defer self.unlock();
+        const index = self.delivering.getIndex(node_id) orelse return;
+        self.alloc.free(self.delivering.keys()[index]);
+        self.delivering.swapRemoveAt(index);
+    }
+
+    /// `claim`, waiting a little for another holder to finish.
+    fn claimWaiting(self: *Bus, node_id: []const u8) bool {
+        var tries: usize = 0;
+        while (tries < 2000) : (tries += 1) {
+            if (self.claim(node_id)) return true;
+            io_mod.sleep(std.time.ns_per_ms);
+        }
+        return false;
     }
 
     fn changed(self: *Bus) void {
@@ -251,9 +323,35 @@ pub fn send(sender: *Runtime, arena: Allocator, input: SendInput) ![]Receipt {
             .@"error" = try arena.print("Agent `{s}` is terminal and takes no more messages. Its transcript stays readable at history://{s}.", .{ target.id, target.id }),
         });
         try receipts.append(arena, try sendOne(root, arena, me, target, input, false));
+        if (me.depth > 0 and target.depth > 0) relay(root, arena, me.label, target.label, input.body);
     }
     bus(root).changed();
     return receipts.items;
+}
+
+const max_relays = 64;
+
+/// Queues the root transcript's row for a message between workers.
+fn relay(root: *Runtime, arena: Allocator, from: []const u8, to: []const u8, body: []const u8) void {
+    const b = bus(root);
+    const row = agent_message.rowText(arena, .{ .id = "", .from = from, .label = from, .preview = agent_message.preview(body) }, to) catch return;
+    const owned = b.alloc.dupe(u8, row) catch return;
+    b.lock();
+    defer b.unlock();
+    if (b.relays.items.len >= max_relays) b.alloc.free(b.relays.orderedRemove(0));
+    b.relays.append(b.alloc, owned) catch b.alloc.free(owned);
+}
+
+/// The relayed rows since the last call, oldest first. Owned by `arena`.
+pub fn takeRelays(root: *Runtime, arena: Allocator) ![]const []const u8 {
+    const b = bus(root);
+    b.lock();
+    defer b.unlock();
+    const out = try arena.alloc([]const u8, b.relays.items.len);
+    for (b.relays.items, out) |row, *copy| copy.* = try arena.dupe(u8, row);
+    for (b.relays.items) |row| b.alloc.free(row);
+    b.relays.clearRetainingCapacity();
+    return out;
 }
 
 fn receiptsOf(arena: Allocator, receipt: Receipt) ![]Receipt {
@@ -279,8 +377,13 @@ fn sendOne(root: *Runtime, arena: Allocator, me: Node, target: Node, input: Send
         return .{ .to = target.id, .label = target.label, .id = id, .outcome = .delivered, .effect = if (busy) .injected else .wake_requested, .dropped_oldest = dropped };
     }
     const revived = !root.tree.nodes.isOpen(target.id);
-    const entry = node_ops.lease(root, target.path) catch |err| return failed(arena, target, err);
+    const entry = node_ops.lease(root, target.path) catch |err| switch (err) {
+        // Admitted, still waiting for a run slot: no log yet.
+        error.NodeUnavailable => return holdEarly(root, arena, target, line),
+        else => return failed(arena, target, err),
+    };
     defer node_ops.release(root, entry);
+    if (!entry.session.saved()) return holdEarly(root, arena, target, line);
     const dropped = post(root, arena, entry.session, target.id, line) catch |err| return failed(arena, target, err);
     bus(root).changed();
     const effect: ?Effect = switch (try deliverWorker(root, arena, entry, target)) {
@@ -299,6 +402,93 @@ fn sendOne(root: *Runtime, arena: Allocator, me: Node, target: Node, input: Send
         .dropped_oldest = dropped,
         .@"error" = if (effect == null) "The agent cannot take it now; it waits in its mailbox and is delivered when the agent can." else null,
     };
+}
+
+/// Keeps a message for a worker that has not started, until its log exists
+/// (`flushEarly`). Bounded like a mailbox: the oldest goes first.
+fn holdEarly(root: *Runtime, arena: Allocator, target: Node, line: session_adapter.MailLine) !Receipt {
+    const b = bus(root);
+    const mail = line.mail;
+    var early: Bus.Early = .{
+        .node_id = try b.alloc.dupe(u8, target.id),
+        .id = undefined,
+        .from = undefined,
+        .label = undefined,
+        .body = undefined,
+        .reply_to = null,
+        .broadcast = mail.broadcast,
+    };
+    errdefer b.alloc.free(early.node_id);
+    early.id = try b.alloc.dupe(u8, mail.id);
+    errdefer b.alloc.free(early.id);
+    early.from = try b.alloc.dupe(u8, mail.from);
+    errdefer b.alloc.free(early.from);
+    early.label = try b.alloc.dupe(u8, mail.label);
+    errdefer b.alloc.free(early.label);
+    early.body = try b.alloc.dupe(u8, mail.body);
+    errdefer b.alloc.free(early.body);
+    early.reply_to = if (mail.reply_to) |value| try b.alloc.dupe(u8, value) else null;
+    var dropped: ?[]const u8 = null;
+    b.lock();
+    defer b.unlock();
+    var held: usize = 0;
+    var oldest: ?usize = null;
+    for (b.early.items, 0..) |item, index| if (std.mem.eql(u8, item.node_id, target.id)) {
+        held += 1;
+        if (oldest == null) oldest = index;
+    };
+    if (held >= session_adapter.max_mailbox) {
+        const gone = b.early.orderedRemove(oldest.?);
+        dropped = try arena.dupe(u8, gone.id);
+        gone.free(b.alloc);
+    }
+    try b.early.append(b.alloc, early);
+    return .{
+        .to = target.id,
+        .label = target.label,
+        .id = mail.id,
+        .outcome = .queued,
+        .dropped_oldest = dropped,
+        .@"error" = "The agent has not started yet; the message reaches it once it starts.",
+    };
+}
+
+/// Moves held messages into the mailboxes of workers whose log now exists.
+fn flushEarly(root: *Runtime, arena: Allocator) void {
+    const b = bus(root);
+    const nodes = blk: {
+        b.lock();
+        defer b.unlock();
+        if (b.early.items.len == 0) return;
+        var ids: std.ArrayList([]const u8) = .empty;
+        for (b.early.items) |item| {
+            if (!contains(ids.items, item.node_id)) ids.append(arena, arena.dupe(u8, item.node_id) catch return) catch return;
+        }
+        break :blk ids.items;
+    };
+    const tree_nodes = directory.list(arena, root) catch return;
+    for (nodes) |node_id| {
+        const node = directory.find(tree_nodes, node_id) orelse continue;
+        const entry = node_ops.lease(root, node.path) catch continue;
+        defer node_ops.release(root, entry);
+        if (!entry.session.saved()) continue;
+        while (true) {
+            const next: ?Bus.Early = take: {
+                b.lock();
+                defer b.unlock();
+                for (b.early.items, 0..) |item, index| {
+                    if (std.mem.eql(u8, item.node_id, node_id)) break :take b.early.orderedRemove(index);
+                }
+                break :take null;
+            };
+            const early = next orelse break;
+            defer early.free(b.alloc);
+            _ = post(root, arena, entry.session, node_id, early.line()) catch |err| {
+                debug_trace.logf("subagent", "early mail not posted node_id={s} err={s}", .{ node_id, @errorName(err) });
+            };
+        }
+        b.changed();
+    }
 }
 
 fn failed(arena: Allocator, target: Node, err: anyerror) !Receipt {
@@ -370,17 +560,31 @@ const WorkerDelivery = enum { none, steered, turn, later, terminal };
 /// Hands worker `node`'s waiting messages to it through its parent's host.
 fn deliverWorker(root: *Runtime, arena: Allocator, entry: *@import("node_hosts.zig").Entry, node: Node) !WorkerDelivery {
     const b = bus(root);
+    // Another thread carries this node's messages now; it, or the next
+    // pump, takes these too.
+    if (!b.claim(node.id)) return .later;
+    defer b.unclaim(node.id);
     const ready = blk: {
         b.lock();
         defer b.unlock();
-        const inflight = try b.inflightLocked(arena, node.id, false);
-        break :blk try waiting(arena, try entry.session.mailbox(arena), inflight, null);
+        // One batch at a time keeps the mailbox's order: a steer that is
+        // not applied puts its messages back in front (`tests/tla/jobs/Mailbox.tla`
+        // InOrder).
+        if ((try b.inflightLocked(arena, node.id, false)).len > 0) return .later;
+        break :blk try waiting(arena, try entry.session.mailbox(arena), &.{}, null);
     };
     if (ready.len == 0) return .none;
     const built = (try agent_message.build(arena, node.label, ready)).?;
     const carried = ready[0..built.used];
     const parent = if (entry.parent) |above| above.runtime else root;
-    const operation_id = try arena.print("mail-{s}", .{carried[0].id});
+    // Names exactly these messages, so the same delivery again after a
+    // restart finds its turn, and a different one never does.
+    var hasher = std.hash.Wyhash.init(0);
+    for (carried) |mail| {
+        hasher.update(mail.id);
+        hasher.update("\x00");
+    }
+    const operation_id = try arena.print("mail-{s}-{x}", .{ carried[0].id, hasher.final() });
     const delivery = fleet_host.deliverMail(parent, node.id, built.text, operation_id) catch |err| {
         debug_trace.logf("subagent", "mail delivery failed node_id={s} err={s}", .{ node.id, @errorName(err) });
         return .later;
@@ -404,7 +608,7 @@ fn deliverWorker(root: *Runtime, arena: Allocator, entry: *@import("node_hosts.z
         },
         .turn => {
             // The turn's admission is durable in the parent's log, so the
-            // messages leave the mailbox now (`Mailbox.tla` AdmitTurn).
+            // messages leave the mailbox now (`tests/tla/jobs/Mailbox.tla` AdmitTurn).
             const ids = try arena.alloc([]const u8, carried.len);
             for (carried, ids) |mail, *id| id.* = mail.id;
             finishMail(root, arena, entry.session, ids, .delivered);
@@ -441,6 +645,18 @@ fn settleSteers(root: *Runtime, arena: Allocator) void {
     };
     for (open) |view| {
         const state = steerState(root, view) orelse continue;
+        // Hold the node's mailbox while its messages settle, so no delivery
+        // reads them between leaving flight and leaving the mailbox.
+        if (!b.claimWaiting(view.node_id)) continue;
+        defer b.unclaim(view.node_id);
+        if (state == .applied) {
+            if (directory.pathOf(arena, root, view.node_id) catch null) |hops| {
+                if (node_ops.lease(root, hops)) |entry| {
+                    defer node_ops.release(root, entry);
+                    finishMail(root, arena, entry.session, @ptrCast(view.ids), .delivered);
+                } else |_| {}
+            }
+        }
         const steer = blk: {
             b.lock();
             defer b.unlock();
@@ -449,18 +665,9 @@ fn settleSteers(root: *Runtime, arena: Allocator) void {
             }
             continue;
         };
-        defer steer.free(b.alloc);
-        if (state == .applied) {
-            if (directory.pathOf(arena, root, steer.node_id) catch null) |hops| {
-                if (node_ops.lease(root, hops)) |entry| {
-                    defer node_ops.release(root, entry);
-                    const ids: []const []const u8 = @ptrCast(steer.ids);
-                    finishMail(root, arena, entry.session, ids, .delivered);
-                } else |_| {}
-            }
-        }
-        b.markPending(steer.node_id);
-        debug_trace.logf("subagent", "mail steer settled node_id={s} applied={}", .{ steer.node_id, state == .applied });
+        steer.free(b.alloc);
+        b.markPending(view.node_id);
+        debug_trace.logf("subagent", "mail steer settled node_id={s} applied={}", .{ view.node_id, state == .applied });
     }
 }
 
@@ -469,13 +676,16 @@ fn steerState(root: *Runtime, steer: Bus.Steer) ?types.SteeringDelivery {
     const Visit = struct {
         steer: Bus.Steer,
         fn visit(self: @This(), host: *Runtime) ?types.SteeringDelivery {
+            // The delivery pinned its steer, so the outcome stays readable.
             const replay = host.managed.feedbackReplay(self.steer.operation_id, self.steer.fingerprint) orelse return .not_applied;
             const delivery = switch (replay) {
                 .receipt => |delivery| delivery,
                 else => return .not_applied,
             };
-            if (delivery != .queued) host.managed.acknowledgeFeedback(self.steer.node_id, self.steer.operation_id, delivery);
-            return if (delivery == .queued) null else delivery;
+            if (delivery == .queued) return null;
+            host.managed.acknowledgeFeedback(self.steer.node_id, self.steer.operation_id, delivery);
+            host.managed.pinFeedback(self.steer.operation_id, false);
+            return delivery;
         }
     };
     // A parent whose host closed took the steer with it.
@@ -494,6 +704,7 @@ pub fn pump(root: *Runtime) void {
         debug_trace.logf("subagent", "mail recovery failed err={s}", .{@errorName(err)});
         return;
     };
+    flushEarly(root, arena);
     settleSteers(root, arena);
     const ids = blk: {
         b.lock();
@@ -522,7 +733,7 @@ pub fn pump(root: *Runtime) void {
 
 /// Reads every mailbox of the tree once: a waiting message the node's
 /// history already holds reached its model before a restart and leaves as
-/// delivered (`Mailbox.tla` RecoverDelivered); the rest wait.
+/// delivered (`tests/tla/jobs/Mailbox.tla` Recover, ExactlyOnce); the rest wait.
 fn recover(root: *Runtime, arena: Allocator) !void {
     const b = bus(root);
     const nodes = try directory.list(arena, root);
@@ -605,40 +816,60 @@ pub const RootNotice = struct {
 pub fn takeRootNotice(root: *Runtime, arena: Allocator) !?RootNotice {
     const b = bus(root);
     if (io_mod.milliTimestamp() < b.root_retry_after_ms) return null;
+    // An inbox read of the root's mailbox finishes first.
+    if (!b.claim(root.node_id)) return null;
+    defer b.unclaim(root.node_id);
     const ready = blk: {
         b.lock();
         defer b.unlock();
         if (b.root_waits > 0) return null;
         if (b.pending) |pending| if (!pending.contains(root.node_id)) return null;
-        const inflight = try b.inflightLocked(arena, root.node_id, true);
-        break :blk try waiting(arena, try root.children.parent.mailbox(arena), inflight, null);
+        // One notice at a time keeps the mailbox's order (`tests/tla/jobs/Mailbox.tla` InOrder).
+        if (b.root_notices.items.len > 0) return null;
+        break :blk try waiting(arena, try root.children.parent.mailbox(arena), &.{}, null);
     };
     if (ready.len == 0) {
-        bus(root).clearPending(root.node_id);
+        b.clearPending(root.node_id);
         return null;
     }
     const built = (try agent_message.build(arena, "root", ready)).?;
-    const ids = try arena.alloc([]const u8, built.used);
-    for (ready[0..built.used], ids) |mail, *id| id.* = mail.id;
+    const carried = ready[0..built.used];
+    const ids = try arena.alloc([]const u8, carried.len);
+    for (carried, ids) |mail, *id| id.* = mail.id;
+    // In flight from now, under request 0 until the loop admits it.
+    const owned = try dupeIds(b.alloc, carried);
+    b.lock();
+    defer b.unlock();
+    b.root_notices.append(b.alloc, .{ .request_id = 0, .ids = owned }) catch |err| {
+        freeIds(b.alloc, owned);
+        return err;
+    };
     return .{ .text = built.text, .ids = ids };
 }
 
-/// The loop admitted `notice` as request `request_id`: its messages stay
-/// on their way until `rootAnswered`.
+/// The loop admitted the taken notice as request `request_id`: its
+/// messages stay on their way until `rootAnswered`.
 pub fn rootAdmitted(root: *Runtime, notice: RootNotice, request_id: i64) void {
+    _ = notice;
     const b = bus(root);
-    const ids = b.alloc.alloc([]u8, notice.ids.len) catch return;
-    var filled: usize = 0;
-    for (notice.ids, ids) |id, *slot| {
-        slot.* = b.alloc.dupe(u8, id) catch {
-            freeIds(b.alloc, ids[0..filled]);
-            return;
-        };
-        filled += 1;
-    }
     b.lock();
     defer b.unlock();
-    b.root_notices.append(b.alloc, .{ .request_id = request_id, .ids = ids }) catch freeIds(b.alloc, ids);
+    for (b.root_notices.items) |*inflight| {
+        if (inflight.request_id == 0) inflight.request_id = request_id;
+    }
+}
+
+/// The loop refused the taken notice: its messages wait again.
+pub fn rootRefused(root: *Runtime) void {
+    const b = bus(root);
+    b.lock();
+    defer b.unlock();
+    var index: usize = 0;
+    while (index < b.root_notices.items.len) {
+        if (b.root_notices.items[index].request_id == 0) {
+            freeIds(b.alloc, b.root_notices.orderedRemove(index).ids);
+        } else index += 1;
+    }
 }
 
 /// The loop answered root notice `request_id`: `delivered` when the model
@@ -696,11 +927,15 @@ pub fn inbox(node: *Runtime, arena: Allocator, peek: bool, from: ?[]const u8) ![
     const root = rootHost(node);
     const b = bus(root);
     const is_root = node == root;
+    if (!b.claimWaiting(node.node_id)) return &.{};
+    defer b.unclaim(node.node_id);
     const ready = blk: {
         b.lock();
         defer b.unlock();
-        const inflight = try b.inflightLocked(arena, node.node_id, is_root);
-        break :blk try waiting(arena, try node.children.parent.mailbox(arena), inflight, from);
+        // Messages on their way to the model now reach it first; the rest
+        // wait behind them, in order.
+        if ((try b.inflightLocked(arena, node.node_id, is_root)).len > 0) return &.{};
+        break :blk try waiting(arena, try node.children.parent.mailbox(arena), &.{}, from);
     };
     if (!peek and ready.len > 0) {
         const ids = try arena.alloc([]const u8, ready.len);
@@ -712,7 +947,7 @@ pub fn inbox(node: *Runtime, arena: Allocator, peek: bool, from: ?[]const u8) ![
 
 /// Waits up to `timeout_ms` for a message in the root's mailbox, from
 /// `from` when given, and takes what waits as read. Automatic delivery
-/// leaves the root's mail to the wait while it waits (`Mailbox.tla`
+/// leaves the root's mail to the wait while it waits (`tests/tla/jobs/Mailbox.tla`
 /// NoDeliveryUnderWait). Empty when the window passed.
 pub fn waitRoot(root: *Runtime, arena: Allocator, from: ?[]const u8, timeout_ms: u64, cancel: ?*const std.atomic.Value(bool)) ![]Mail {
     const b = bus(root);

@@ -600,7 +600,9 @@ pub fn Runtime(comptime App: type) type {
                 };
                 try app.writeUserPromptCard(.{ .text = @constCast(text) });
             } else if (std.mem.eql(u8, kind, "notice")) {
-                try app.writeDomainNotice(.{ .topic = "session", .tone = .neutral, .body = string(update, "title") orelse "" }, true);
+                // A row outside any turn, such as a message between two
+                // workers the supervisor relays (D187).
+                try app.writeDomainNotice(.{ .topic = "", .tone = .information, .body = string(update, "title") orelse "" }, true);
             }
         }
 
