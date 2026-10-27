@@ -828,6 +828,7 @@ test "built-in tools register exact active local order" {
         "web_fetch",
         "web_search",
         "shell",
+        "jobs",
         "capability_search",
         "skill",
         "install_skill",
