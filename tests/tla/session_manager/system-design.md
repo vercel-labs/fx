@@ -2446,6 +2446,97 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   thought. **Alternative:** truncating the first line, which reads as a
   broken sentence.
 
+- **D185 Decision:** every node of a tree has a mailbox in its own log:
+  a `mail` line (`id`, `from`, `label`, `body`, optional `reply_to`,
+  `broadcast`) adds a message and a `mail_done` line (`id`, `how`:
+  `delivered`, `read` or `dropped`) takes it out (`fold_mail.zig`). Lines
+  are allowed inside and between turns, sync like child lines, and a fork
+  starts empty. A mailbox holds at most 100 messages, as proto's bus: a
+  sender to a full one drops the oldest message not on its way to the
+  model, in the same batch, and its receipt names the dropped id. A body
+  holds at most 16 KiB. A worker admitted but not started has no log yet;
+  its messages wait in memory until its first turn saves the log. **Why:**
+  a message survives detach, restart and resume exactly as the log has
+  it. **Alternative:** proto's in-memory bus, which loses queued messages
+  on restart.
+
+- **D186 Decision:** fleet op `message` sends to another agent of the
+  tree by id, `parent`, `root`, or `all` (every other live agent); labels
+  never route. Op `inbox` takes or, with `peek`, reads waiting messages,
+  and `list` scope `visible` names every other agent with lifecycle, turn
+  state and unread count; `owned`, the default, keeps the worker list. A
+  message answers with proto's receipts per recipient: `delivered`
+  (effect `injected` into a running turn, or `wake_requested`),
+  `queued`, `rejected` or `dropped`, with `revived` when a parked host
+  reopened. The fleet and jobs schemas changed, so the pinned
+  tool-contract hash did too. **Why:** proto's fleet `message` and
+  `inbox`. **Alternative:** a separate tool, which would split the fleet.
+
+- **D187 Decision:** the model receives messages as a system notice,
+  `<system-notice kind="agent-message">` with a JSON summary line (ids,
+  senders, first lines), never the user's words: steering and parent
+  steering pass it through without their envelopes, a turn it starts
+  carries `UserOrigin.peer_message` (root) or is read as one (worker),
+  and the reviewer sees it only as untrusted evidence
+  (`turn_started_by_agent_message_untrusted`), as job notices are. A body
+  cannot close the envelope. Transcripts show one row per message, who
+  to whom and the first line, without ids ("alpha → you · status?"),
+  live and on every replay, and the supervisor relays messages between
+  two workers to the root's viewers as rows. **Why:** another agent is
+  never user authority. **Alternative:** user messages with a prefix,
+  which the reviewer would read as intent.
+
+- **D188 Decision:** delivery is exactly once and in order
+  (`tests/tla/jobs/Mailbox.tla`). A worker's messages reach it from its
+  parent's host as `send` would: a steer into its streaming turn, or a
+  turn of its own, accepted or queued, which its parent owns and lists as
+  a job, as proto's wake turns are. A turn's admission is durable, so its
+  messages leave the mailbox at once; a steer's leave when the steer is
+  applied, which the delivery pins in the owner until read, and wait
+  again when it is not. The root's messages go through the supervisor's
+  tick like job notices: a notice that steers the running turn or starts
+  one, settled by the host's answer. One batch per node is in flight at a
+  time, and one carrier (a delivery or an inbox read) holds a node's
+  mailbox at a time. On the first tick after a start, a waiting message
+  that the node's saved turns already carry leaves as delivered. **Why:**
+  no loss or duplicate across crashes, restarts and parked hosts.
+  **Alternative:** marking a message delivered when it is sent, which
+  loses it when the turn never takes it.
+
+- **D189 Decision:** `jobs wait` takes a `mailbox` selector, `{}` or
+  `{"from": "<agent or watch id>"}`, instead of `ids`: it waits for a
+  message in the root's mailbox and takes it as read. While it waits,
+  automatic delivery leaves the root's mail to it. **Why:** proto's
+  mailbox wait. **Alternative:** polling `inbox`.
+
+- **D190 Decision:** `jobs watch` starts job `watch_N`, proto's monitor:
+  it follows a shell job's output (`source`) or re-runs a short command
+  every `every_ms` (`command`, at least 1000 ms), reports each matching
+  line, or changed matching output, until `max_events` (default 10),
+  `timeout_ms` or the end of its source, and is listed as kind `watch`.
+  `match` is a JavaScript-dialect regular expression read by the stream
+  rules engine. Each event is a message in the root's mailbox from
+  `watch_N`, so it wakes the root or joins its running turn exactly once;
+  the watch's own result, why it stopped, is delivered once like any
+  job's. Watch threads never touch the session: the supervisor's tick
+  moves their events into the mailbox. At most 8 watches run. A command
+  watch runs `/bin/sh -c` in the workspace after the call's permission
+  review. **Why:** proto's monitors without a second notice path.
+  **Alternative:** one job notice per event, which the registry's
+  single-delivery jobs cannot carry.
+
+- **D191 Decision:** messaging adds no blocking wait between agents: a
+  send leases the recipient's host briefly and never waits for its turn,
+  so the run-slot pool and permit lending (D92) are unchanged. Twenty
+  workers broadcasting to each other in one tree under the default eight
+  run slots and sixteen open hosts deliver all 400 messages exactly once
+  in about a second with about 14 MiB more peak memory
+  (`mailbox_tests.zig`). That test found a node host freed while a
+  concurrent sweep still read it; a closing host's entry is now freed
+  only after it leaves the registry's list. **Why:** many workers must
+  not deadlock or grow without bound. **Alternative:** a separate
+  messaging slot pool.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a
