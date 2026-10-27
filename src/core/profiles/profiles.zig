@@ -178,7 +178,7 @@ pub fn builtin(name: []const u8) ?Profile {
     };
     if (std.mem.eql(u8, name, agent_name)) return .{
         .name = agent_name,
-        .description = "A general subagent with every tool",
+        .description = "A copy of the agent that starts it",
         .source = .builtin,
     };
     return null;

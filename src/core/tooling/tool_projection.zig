@@ -597,7 +597,7 @@ fn appendBuiltinTool(
 /// `profile`. A repository's descriptions are its own text, so each is cut to
 /// one bounded line and marked as the repository's.
 fn writeProfileGuidance(writer: *std.Io.Writer, entries: []const profiles.Entry) !void {
-    try writer.writeAll("Agent profiles for the subagent tool's profile, a child's tools, permission mode, model, and prompt. Pick the one that fits the task; agent is the default:");
+    try writer.writeAll("Agent profiles for the subagent tool's profile, a child's tools, permission mode, model, and prompt. Name one only when the task needs it; without a profile the child gets your own tools and settings:");
     for (entries) |entry| {
         if (std.mem.eql(u8, entry.name, profiles.main_name)) continue;
         try writer.print("\n- {s}", .{entry.name});
