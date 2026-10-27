@@ -2734,6 +2734,17 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   resumed, had to repeat; after the turn it only extends the prefix.
   **Alternative:** dropping the evidence, which loses the stale-path
   reminder after a resume.
+- **D243 Decision:** read_file opens `local://`, after proto's local
+  protocol: `local://` lists the session tree's scratch folder,
+  `~/.proto-fx/local/<root session id>/`, and `local://<path>` reads a file
+  or folder in it with the usual selectors, archives and documents. The
+  folder is private and shared by the session and its subagents. A path
+  with `..` or a symlink that resolves outside the folder is refused, so
+  the read needs no file permission, like the other internal URLs. A run
+  without a saved session has no folder. **Why:** proto agents keep large
+  intermediate data and handoffs there across turns. **Alternative:** a
+  folder inside the session's own directory, which the session log's
+  layout checks own.
 
 - **D230 Decision:** the `checklist` tool keeps proto's contract: phases
   of tasks named by their exact content, never by ids; one operation per

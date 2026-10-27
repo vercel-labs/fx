@@ -1,9 +1,10 @@
 //! The internal URL schemes read_file opens instead of a file: nodes of the
-//! session tree and, with `skill://`, an installed skill's files. Kept free
+//! session tree, with `skill://` an installed skill's files and with
+//! `local://` the tree's scratch folder. Kept free
 //! of imports so permission checks can tell such a path from a file path.
 const std = @import("std");
 
-const schemes = [_][]const u8{ "history://", "agent://", "artifact://", "skill://" };
+const schemes = [_][]const u8{ "history://", "agent://", "artifact://", "skill://", "local://" };
 
 /// Whether `path` names an internal resource rather than a file.
 pub fn isInternalUrl(path: []const u8) bool {

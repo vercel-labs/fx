@@ -11,6 +11,7 @@ const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 const recall = @import("../../core/recall/recall.zig");
 const read_target = @import("../../core/workspace/read_target.zig");
 const router = @import("../read/router.zig");
+const local = @import("../read/local.zig");
 const summary = @import("../read/summary.zig");
 
 const Allocator = std.mem.Allocator;
@@ -143,6 +144,7 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
         .url => return router.readUrl(ctx, input, parsed),
         .internal => {
             if (std.mem.startsWith(u8, parsed.base, "skill://")) return router.readSkill(ctx, input, parsed);
+            if (std.mem.startsWith(u8, parsed.base, local.prefix)) return local.read(ctx, input, parsed);
             return readInternalUrl(ctx, input, parsed.base);
         },
         .file => {},
@@ -1363,4 +1365,5 @@ test {
     _ = @import("../read/directory.zig");
     _ = @import("../read/convert.zig");
     _ = @import("../read/read_tests.zig");
+    _ = @import("../read/local.zig");
 }
