@@ -3441,6 +3441,8 @@ pub fn Runtime(comptime App: type) type {
                 app: *App,
                 projection: *Projection,
                 labels: *const HistoricalSessionLabels,
+                /// See `LiveHistorySink.suppress_diffs`.
+                suppress_diffs: bool = false,
 
                 const Self = @This();
 
@@ -3698,6 +3700,10 @@ pub fn Runtime(comptime App: type) type {
                 }
 
                 fn appendDiff(self: *Self, payload: diff.DiffEntryPayload) !void {
+                    if (self.suppress_diffs) {
+                        diff.freeDiffEntryPayload(std.heap.c_allocator, payload);
+                        return;
+                    }
                     try self.projection.appendDiff(payload);
                 }
 
@@ -3975,38 +3981,55 @@ pub fn Runtime(comptime App: type) type {
             /// Shown first when older saved history precedes the fragments,
             /// saying where it is.
             older_notice: ?[]const u8 = null,
+            /// When set, one per fragment: receives the id of the first
+            /// transcript entry the fragment may produce.
+            first_entry_ids: ?[]u32 = null,
         };
 
-        /// Projects saved-history fragments into the live transcript without
-        /// taking persistence ownership. Retention waits until every fragment
-        /// is in place, then trims once to a cap derived from this window:
-        /// enforcing it per append would prune the replies and tool calls
-        /// being built, and the cap follows the window instead of ratcheting.
+        /// Projects saved-history fragments into the transcript without
+        /// taking persistence ownership. The fragments build a detached
+        /// projection, as a local resume does, which lays out and retains
+        /// once when it is installed: projecting them into the live
+        /// transcript re-rendered every entry for each command, quadratic in
+        /// the window. Retention then caps the transcript to this window.
         pub fn replayRemoteHistory(
             app: *App,
             fragments: []const history_page.Fragment,
             options: RemoteReplay,
         ) !void {
+            const started_ns = io_mod.nanoTimestamp();
             var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
             defer labels.deinit(app.alloc);
-            var sink = LiveHistorySink(App){ .app = app, .suppress_diffs = true };
-            debug_trace.logf(
-                "session",
-                "remote history replay fragments={d} bytes={d} older={}",
-                .{ fragments.len, options.window_bytes, options.older_notice != null },
-            );
-            const cap = remote_history_retention_floor +| options.window_bytes *| 2;
-            app.shell.max_retained_transcript_bytes = std.math.maxInt(usize);
-            defer app.shell.max_retained_transcript_bytes = cap;
+            app.shell.max_retained_transcript_bytes = remote_history_retention_floor +| options.window_bytes *| 2;
+            var projection = try app.beginResumeProjection();
+            defer projection.deinit();
+            var sink = DetachedHistorySink(@TypeOf(projection)){
+                .app = app,
+                .projection = &projection,
+                .labels = &labels,
+                .suppress_diffs = true,
+            };
             if (options.older_notice) |body| {
                 try sink.appendNotice(.{ .topic = "session resumed", .tone = .neutral, .body = body });
             }
             var has_prior_turns = options.older_notice != null;
-            for (fragments) |fragment| {
+            for (fragments, 0..) |fragment, index| {
+                if (options.first_entry_ids) |ids| ids[index] = projection.runtime.next_entry_id;
                 try replayFragmentToSink(app, &sink, fragment, &has_prior_turns, &labels);
             }
-            app.shell.max_retained_transcript_bytes = cap;
-            _ = try app.shell.enforceStructuredRetentionAndReport(app.alloc, null);
+            try projection.finalize();
+            try app.installResumeProjection(&projection);
+            debug_trace.logf(
+                "session",
+                "remote history replay fragments={d} bytes={d} older={} entries={d} us={d}",
+                .{
+                    fragments.len,
+                    options.window_bytes,
+                    options.older_notice != null,
+                    app.shell.entries.items.len,
+                    @divTrunc(io_mod.nanoTimestamp() - started_ns, std.time.ns_per_us),
+                },
+            );
         }
 
         fn replayHistoryToSink(
