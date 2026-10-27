@@ -5281,39 +5281,6 @@ test "processQueuedPrompt omits an empty custom tool guidance message" {
     try expectGatewayPromptStringEntry(&gateway, 0, 0, "system");
 }
 
-test "processQueuedPrompt refreshes runtime overlay each step and preserves turn suffix" {
-    const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
-    const completions = [_]FakeCompletion{
-        .{ .content = "Checking.", .tool_calls = &calls },
-        .{ .content = "Final" },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    const overlays = [_][]const u8{ "runtime overlay step one", "runtime overlay step two" };
-    hooks.runtime_context_texts = &overlays;
-    var fixture = PromptFixture{};
-
-    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
-
-    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
-    try expectBodyContains(&gateway, 0, "runtime overlay step one");
-    try expectBodyNotContains(&gateway, 0, "runtime overlay step two");
-    try expectBodyContains(&gateway, 1, "runtime overlay step two");
-    try expectBodyNotContains(&gateway, 1, "runtime overlay step one");
-    try expectBodyContains(&gateway, 1, "Checking.");
-    try expectBodyContains(&gateway, 1, "\"toolName\":\"read_file\"");
-    try expectBodyContains(&gateway, 1, "\"value\":\"ok\"");
-    const first_request_roles = [_]types.ChatRole{ .system, .system, .system, .user };
-    const second_request_roles = [_]types.ChatRole{ .system, .system, .system, .user, .assistant, .tool };
-    try expectGatewayPromptRoles(&gateway, 0, &first_request_roles);
-    try expectGatewayPromptRoles(&gateway, 1, &second_request_roles);
-    const second_request_order = [_][]const u8{ "runtime overlay step two", "user prompt", "Checking.", "\"value\":\"ok\"" };
-    try expectBodyContainsInOrder(&gateway, 1, &second_request_order);
-}
-
 test "processQueuedPrompt refreshes and acknowledges parent deliveries for each tool step" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};

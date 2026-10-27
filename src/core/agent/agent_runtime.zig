@@ -53,6 +53,7 @@ test {
     _ = @import("../compactor/compactor.zig");
     _ = @import("runtime/parallel_execution.zig");
     _ = @import("runtime/tests/gateway_flow.zig");
+    _ = @import("runtime/tests/cache_flow.zig");
     _ = @import("runtime/tests/tool_flow.zig");
     _ = @import("runtime/tests/interruption_flow.zig");
     _ = @import("runtime/tests/finalization_flow.zig");

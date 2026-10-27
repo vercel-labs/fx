@@ -142,6 +142,22 @@ pub const QueuedPrompt = struct {
     /// Worker begin publishes only its identity so the UI can consume the
     /// pending owner without painting a duplicate card.
     user_prompt_already_presented: bool = false,
+    /// The turn's frozen runtime and skill context (D130). Set only by the
+    /// orchestrator on its own copy, borrowed from the turn arena; the
+    /// worker never sets or frees them.
+    turn_context: ?[]const u8 = null,
+    skill_context: ?[]const u8 = null,
+
+    /// The user turn this prompt saves as. Borrows every field.
+    pub fn userTurn(self: QueuedPrompt) types.UserTurn {
+        return .{
+            .text = self.prompt,
+            .images = self.images,
+            .origin = self.prompt_origin,
+            .turn_context = if (self.turn_context) |text| @constCast(text) else null,
+            .skill_context = if (self.skill_context) |text| @constCast(text) else null,
+        };
+    }
 };
 
 pub const ContextCompactionTask = struct {

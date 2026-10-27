@@ -1258,6 +1258,8 @@ pub const ConversationTurnBuilder = struct {
             .images = @constCast(value.images),
             .work_id = if (value.work_id) |work_id| @constCast(work_id) else null,
             .origin = value.origin,
+            .turn_context = if (value.turn_context) |text| @constCast(text) else null,
+            .skill_context = if (value.skill_context) |text| @constCast(text) else null,
         });
     }
 

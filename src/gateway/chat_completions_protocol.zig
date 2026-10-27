@@ -167,7 +167,7 @@ fn validate_request(request: stream_provider.RequestData) Error!void {
     try request.validatePrompt();
     configured_provider.validate_model_id(request.model) catch return error.InvalidModel;
     const options = request.provider_options;
-    if (options.reasoning != null or options.fast or options.prompt_caching) return error.UnsupportedProviderOption;
+    if (options.reasoning != null or options.fast) return error.UnsupportedProviderOption;
     if (options.provider_order.len != 0) return error.UnsupportedProviderOption;
     if (request.response_format != null) return error.UnsupportedResponseFormat;
     // The vision tool runs through a separate provider request; inline image
@@ -459,14 +459,13 @@ fn write_user_content_parts(
     writer: *std.Io.Writer,
     alloc: Allocator,
     message: types.ChatMessage,
+    cache_breakpoint: bool,
 ) !void {
     try writer.writeByte('[');
     var wrote_part = false;
     if (message.content) |content| {
         if (content.len > 0) {
-            try writer.writeAll("{\"type\":\"text\",\"text\":");
-            try std.json.Stringify.value(content, .{}, writer);
-            try writer.writeByte('}');
+            try write_text_part(writer, content, cache_breakpoint);
             wrote_part = true;
         }
     }
@@ -478,6 +477,51 @@ fn write_user_content_parts(
         wrote_part = true;
     }
     try writer.writeByte(']');
+}
+
+fn write_text_part(writer: *std.Io.Writer, text: []const u8, cache_breakpoint: bool) !void {
+    try writer.writeAll("{\"type\":\"text\",\"text\":");
+    try std.json.Stringify.value(text, .{}, writer);
+    if (cache_breakpoint) try writer.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}");
+    try writer.writeByte('}');
+}
+
+/// Where Anthropic-style `cache_control` breakpoints go (D134): the last
+/// instruction, which caches the stable head, and the last user or
+/// assistant text, which caches the conversation so far as proto's
+/// completions provider does. Null when the route ignores them.
+const CacheBreakpoints = struct {
+    instruction: ?usize = null,
+    message: ?usize = null,
+
+    fn of(request: stream_provider.RequestData) CacheBreakpoints {
+        if (!request.provider_options.prompt_caching and !honorsCacheControl(request.model)) return .{};
+        return .{
+            .instruction = lastCacheableText(request.instructions, .system),
+            .message = lastCacheableText(request.messages, null),
+        };
+    }
+
+    fn lastCacheableText(messages: []const types.ChatMessage, only: ?types.ChatRole) ?usize {
+        var index = messages.len;
+        while (index > 0) {
+            index -= 1;
+            const message = messages[index];
+            if (only) |role| {
+                if (message.role != role) continue;
+            } else if (message.role != .user and message.role != .assistant) continue;
+            const content = message.content orelse continue;
+            if (std.mem.trim(u8, content, " \t\r\n").len == 0) continue;
+            return index;
+        }
+        return null;
+    }
+};
+
+/// Anthropic models behind OpenAI-compatible routers, such as OpenRouter,
+/// cache only at explicit breakpoints.
+fn honorsCacheControl(model: []const u8) bool {
+    return std.ascii.startsWithIgnoreCase(model, "anthropic/");
 }
 
 /// Emits retained tool-result images as one user message after a contiguous
@@ -528,8 +572,10 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
     var pending_images: std.ArrayList(types.ToolImage) = .empty;
     defer pending_images.deinit(alloc);
     const lanes = [_][]const types.ChatMessage{ request.instructions, request.messages };
-    for (lanes) |lane| {
-        for (lane) |message| {
+    const breakpoints = CacheBreakpoints.of(request);
+    for (lanes, [_]?usize{ breakpoints.instruction, breakpoints.message }) |lane, breakpoint| {
+        for (lane, 0..) |message, message_index| {
+            const cache_breakpoint = breakpoint != null and breakpoint.? == message_index;
             // Source validation rejects empty assistants; only stripped replay can leave one here.
             if (message.role == .assistant and message.content == null and message.tool_calls.len == 0 and message.provider_replay == null) continue;
             if (message.role != .tool) try flush_tool_image_follow_up(writer, alloc, &count, &pending_names, &pending_images);
@@ -539,7 +585,11 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
             try std.json.Stringify.value(@tagName(message.role), .{}, writer);
             try writer.writeAll(",\"content\":");
             if (message.role == .user and message.images.len != 0) {
-                try write_user_content_parts(writer, alloc, message);
+                try write_user_content_parts(writer, alloc, message, cache_breakpoint);
+            } else if (cache_breakpoint) {
+                try writer.writeByte('[');
+                try write_text_part(writer, message.content.?, true);
+                try writer.writeByte(']');
             } else {
                 try std.json.Stringify.value(message.content, .{}, writer);
             }
@@ -882,9 +932,12 @@ pub const Reducer = struct {
             .output_tokens = try token_count(fields, "completion_tokens"),
         };
         const incoming_total = try token_count(fields, "total_tokens");
+        const cache = cacheUsage(fields);
         const usage = types.Usage{
             .input_tokens = incoming.input_tokens orelse self.usage.input_tokens,
             .output_tokens = incoming.output_tokens orelse self.usage.output_tokens,
+            .cache_read_tokens = cache.read orelse self.usage.cache_read_tokens,
+            .cache_write_tokens = cache.write orelse self.usage.cache_write_tokens,
         };
         const total = incoming_total orelse self.usage_total;
         var final_fields = self.usage_final_fields;
@@ -1006,6 +1059,25 @@ fn integer(value: std.json.Value) Error!i64 {
 
 fn index_value(value: std.json.Value) Error!usize {
     return std.math.cast(usize, try integer(value)) orelse error.InvalidChunk;
+}
+
+/// Prompt cache counts as OpenAI (`prompt_tokens_details.cached_tokens`),
+/// OpenRouter (`cache_write_tokens`) and DeepSeek (`prompt_cache_hit_tokens`)
+/// report them. They only describe the bill, so a malformed one is dropped
+/// rather than failing the stream.
+fn cacheUsage(fields: std.json.ObjectMap) struct { read: ?u64 = null, write: ?u64 = null } {
+    const details: ?std.json.ObjectMap = if (non_null(fields, "prompt_tokens_details")) |value| switch (value) {
+        .object => |map| map,
+        else => null,
+    } else null;
+    const read = (if (details) |map| optionalCount(map, "cached_tokens") else null) orelse
+        optionalCount(fields, "prompt_cache_hit_tokens");
+    const write = if (details) |map| optionalCount(map, "cache_write_tokens") else null;
+    return .{ .read = read, .write = write };
+}
+
+fn optionalCount(fields: std.json.ObjectMap, key: []const u8) ?u64 {
+    return token_count(fields, key) catch null;
 }
 
 fn token_count(fields: std.json.ObjectMap, key: []const u8) Error!?u64 {
@@ -2003,14 +2075,59 @@ test "chat completions serializes user message images as content parts" {
     try std.testing.expect(std.mem.startsWith(u8, image_part.get("image_url").?.object.get("url").?.string, "data:image/png;base64,"));
 }
 
+test "chat completions marks Anthropic cache breakpoints on the head and the latest text" {
+    const alloc = std.testing.allocator;
+    var request = test_request();
+    request.model = "anthropic/claude-sonnet-4.5";
+    request.messages = &.{
+        .{ .role = .user, .content = "first question" },
+        .{ .role = .assistant, .content = "answer" },
+        .{ .role = .user, .content = "follow up" },
+    };
+    const body = try build_request(alloc, request, .{});
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings(
+        "{\"model\":\"anthropic/claude-sonnet-4.5\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[" ++
+            "{\"role\":\"system\",\"content\":\"first\"}," ++
+            "{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":\"second\",\"cache_control\":{\"type\":\"ephemeral\"}}]}," ++
+            "{\"role\":\"user\",\"content\":\"first question\"}," ++
+            "{\"role\":\"assistant\",\"content\":\"answer\"}," ++
+            "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"follow up\",\"cache_control\":{\"type\":\"ephemeral\"}}]}]}",
+        body,
+    );
+
+    // Other models keep plain string content.
+    request.model = "opaque/local-model:8b";
+    const plain = try build_request(alloc, request, .{});
+    defer alloc.free(plain);
+    try std.testing.expect(std.mem.find(u8, plain, "cache_control") == null);
+
+    // The explicit option asks for breakpoints on any model.
+    request.provider_options = .{ .prompt_caching = true };
+    const forced = try build_request(alloc, request, .{});
+    defer alloc.free(forced);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, forced, "cache_control"));
+}
+
+test "chat completions reads prompt cache usage" {
+    const alloc = std.testing.allocator;
+    var reducer = try Reducer.init(alloc, test_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, test_text);
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5533,\"completion_tokens\":3,\"total_tokens\":5536,\"prompt_tokens_details\":{\"cached_tokens\":5121,\"cache_write_tokens\":12}}}");
+    try test_accept(&reducer, "[DONE]");
+    var result = try reducer.finish(false);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 5121), result.completed.completion.usage.cache_read_tokens);
+    try std.testing.expectEqual(@as(?u64, 12), result.completed.completion.usage.cache_write_tokens);
+}
+
 test "chat completions rejects unsupported requests and ambiguous selection" {
     const alloc = std.testing.allocator;
     var request = test_request();
     request.provider_options.reasoning = .auto;
     try std.testing.expectError(error.UnsupportedProviderOption, build_request(alloc, request, .{}));
     request.provider_options = .{ .fast = true };
-    try std.testing.expectError(error.UnsupportedProviderOption, build_request(alloc, request, .{}));
-    request.provider_options = .{ .prompt_caching = true };
     try std.testing.expectError(error.UnsupportedProviderOption, build_request(alloc, request, .{}));
     request = test_request();
     request.vision_mode = .optional;

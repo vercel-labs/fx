@@ -174,6 +174,9 @@ test "host-managed credential lease exposes no secret or account metadata" {
 /// Pure provider input used by request serializers and permission reviewers.
 /// Every slice and JSON value is borrowed for the call.
 pub const RequestData = struct {
+    /// The session the request belongs to, which providers that route by a
+    /// cache key send as that key (D133).
+    session_id: ?[]const u8 = null,
     model: []const u8,
     instructions: []const types.ChatMessage = &.{},
     messages: []const types.ChatMessage,
@@ -253,6 +256,7 @@ pub const ModelRequest = struct {
 
     pub fn data(self: ModelRequest) RequestData {
         return .{
+            .session_id = self.session_id,
             .model = self.model,
             .instructions = self.instructions,
             .messages = self.messages,

@@ -261,6 +261,9 @@ fn turnsFrom(arena: Allocator, history: []const types.HistoryTurn, append_messag
         messages.clearRetainingCapacity();
         try append_messages(arena, &messages, history[index .. index + 1]);
         var projected = messages.items;
+        // The context fx sent with a turn is restated after compaction, so
+        // a summary never carries it (D130).
+        while (projected.len > 0 and isTurnContext(projected[0])) projected = projected[1..];
         var user: []const u8 = "";
         if (projected.len > 0 and projected[0].role == .user and projected[0].context_origin == .user_turn and !projected[0].restored_steering) {
             user = projected[0].content orelse "";
@@ -282,7 +285,12 @@ fn legacyEarlier(arena: Allocator, store: ?Store, summary: []const u8) !?summari
     return checkpoint.parseLegacyState(arena, ref, bytes);
 }
 
+fn isTurnContext(message: types.ChatMessage) bool {
+    return message.context_origin == .turn_context or message.context_origin == .skill_context;
+}
+
 fn appendItems(arena: Allocator, items: *std.ArrayList(summarize.Item), message: types.ChatMessage) !void {
+    if (isTurnContext(message)) return;
     const content = message.content orelse "";
     switch (message.role) {
         .system => {},

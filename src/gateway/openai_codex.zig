@@ -77,7 +77,14 @@ pub fn buildRequest(
     const writer = &out.writer;
     try writer.writeAll("{\"model\":");
     try std.json.Stringify.value(request.model, .{}, writer);
-    try writer.writeAll(",\"store\":false,\"stream\":true,\"instructions\":");
+    try writer.writeAll(",\"store\":false,\"stream\":true");
+    // The Codex CLI keys its prompt cache by conversation, so requests in one
+    // session reach the server that holds their prefix (D133).
+    if (request.session_id) |session_id| if (session_id.len > 0) {
+        try writer.writeAll(",\"prompt_cache_key\":");
+        try std.json.Stringify.value(session_id, .{}, writer);
+    };
+    try writer.writeAll(",\"instructions\":");
     try std.json.Stringify.value(instructions.written(), .{}, writer);
     try writer.writeAll(",\"input\":[");
     try writeResponsesInput(writer, std.heap.c_allocator, projected orelse request.messages, request.verified_images, budget);
@@ -637,6 +644,28 @@ test "OpenAI Codex standard requests omit the priority service tier" {
     defer std.testing.allocator.free(body);
 
     try std.testing.expect(std.mem.find(u8, body, "\"service_tier\"") == null);
+}
+
+test "OpenAI Codex keys its prompt cache by session" {
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "Hello." }};
+    const keyed = try buildRequest(std.testing.allocator, .{
+        .session_id = "session-7",
+        .model = "gpt-5.6-sol",
+        .messages = &messages,
+        .tool_choice = .none,
+        .provider_options = .{},
+    });
+    defer std.testing.allocator.free(keyed);
+    try std.testing.expect(std.mem.find(u8, keyed, "\"stream\":true,\"prompt_cache_key\":\"session-7\",\"instructions\":") != null);
+
+    const unkeyed = try buildRequest(std.testing.allocator, .{
+        .model = "gpt-5.6-sol",
+        .messages = &messages,
+        .tool_choice = .none,
+        .provider_options = .{},
+    });
+    defer std.testing.allocator.free(unkeyed);
+    try std.testing.expect(std.mem.find(u8, unkeyed, "prompt_cache_key") == null);
 }
 
 test "OpenAI Codex serializes each verified image directly once" {

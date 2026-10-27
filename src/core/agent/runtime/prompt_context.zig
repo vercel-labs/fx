@@ -224,11 +224,17 @@ pub const ProviderPrompt = struct {
     }
 };
 
+/// Builds the two prompt lanes. `instructions` holds only text that stays
+/// the same for the whole session, so the cached head never changes;
+/// `turn_context` is the context fx captured once for this turn, sent as
+/// user messages just before the person's text and saved with the turn, so
+/// later steps and turns resend the same bytes (D130).
 pub fn buildProviderPrompt(
     alloc: Allocator,
     stable_prefix: []const ChatMessage,
-    ephemeral_overlay: []const ChatMessage,
+    trailing_instructions: []const ChatMessage,
     durable_history: []const ChatMessage,
+    turn_context: []const ChatMessage,
     current_user_message: ChatMessage,
     within_turn_suffix: []const ChatMessage,
 ) !ProviderPrompt {
@@ -238,8 +244,9 @@ pub fn buildProviderPrompt(
     errdefer messages.deinit(alloc);
 
     try instructions.appendSlice(alloc, stable_prefix);
-    try instructions.appendSlice(alloc, ephemeral_overlay);
+    try instructions.appendSlice(alloc, trailing_instructions);
     try messages.appendSlice(alloc, durable_history);
+    try messages.appendSlice(alloc, turn_context);
     try messages.append(alloc, current_user_message);
     try messages.appendSlice(alloc, within_turn_suffix);
     return .{
@@ -266,7 +273,7 @@ test "buildProviderPrompt separates instructions from chronological messages" {
         .{ .role = .assistant, .content = "within turn assistant" },
     };
 
-    var prompt = try buildProviderPrompt(alloc, &stable_prefix, &overlay, &history, current, &suffix);
+    var prompt = try buildProviderPrompt(alloc, &stable_prefix, &overlay, &history, &.{}, current, &suffix);
     defer prompt.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 3), prompt.instructions.items.len);
@@ -355,6 +362,7 @@ test "buildProviderPrompt keeps compacted session context out of instructions" {
         &stable_prefix,
         &overlay,
         projected_history.items,
+        &.{},
         current,
         &suffix,
     );

@@ -2746,6 +2746,49 @@ const ParentTurnDeliveryState = struct {
     }
 };
 
+const CapturedTurnContext = struct {
+    turn_context: ?[]const u8 = null,
+    skill_context: ?[]const u8 = null,
+};
+
+/// Captures the runtime and explicit skill context for one turn (D130,
+/// D131). The runtime context is left out when it matches the latest one
+/// `window` already carries, so an unchanged workspace adds nothing. Every
+/// slice is owned by `arena` or borrowed from `explicit_skill`.
+fn captureTurnContext(
+    arena: Allocator,
+    deps: *const AgentRuntimeDeps,
+    explicit_skill: ?[]const u8,
+    window: []const ChatMessage,
+) !CapturedTurnContext {
+    var runtime: std.ArrayList(ChatMessage) = .empty;
+    try deps.append_runtime_context(deps.ctx, arena, &runtime);
+    var joined: std.Io.Writer.Allocating = .init(arena);
+    for (runtime.items) |message| {
+        const text = message.content orelse continue;
+        if (text.len == 0) continue;
+        if (joined.written().len != 0) try joined.writer.writeAll("\n\n");
+        try joined.writer.writeAll(text);
+    }
+    const runtime_text = joined.written();
+    const skill_text = explicit_skill orelse "";
+    return .{
+        .turn_context = if (runtime_text.len == 0 or latestTurnContextMatches(window, runtime_text)) null else runtime_text,
+        .skill_context = if (skill_text.len == 0) null else skill_text,
+    };
+}
+
+fn latestTurnContextMatches(window: []const ChatMessage, text: []const u8) bool {
+    var index = window.len;
+    while (index > 0) {
+        index -= 1;
+        const message = window[index];
+        if (message.context_origin != .turn_context) continue;
+        return std.mem.eql(u8, message.content orelse "", text);
+    }
+    return false;
+}
+
 fn appendPreparedParentTurnContext(
     deps: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -2755,9 +2798,12 @@ fn appendPreparedParentTurnContext(
     const prepared = try prepare(deps.ctx, arena) orelse return .{};
     if (prepared.content.len == 0) return .{};
     try messages.ensureUnusedCapacity(arena, 1);
+    // Untrusted child output, so it rides as a labelled user message and
+    // never as an instruction.
     messages.appendAssumeCapacity(.{
-        .role = .system,
+        .role = .user,
         .content = prepared.content,
+        .context_origin = .turn_context,
     });
     return .{ .acknowledgements = prepared.acknowledgements };
 }
@@ -3482,7 +3528,7 @@ const ProviderPromptProjection = struct {
 fn build_provider_prompt_with_response_language_control(
     alloc: Allocator,
     stable_prefix: []const ChatMessage,
-    ephemeral_overlay: []const ChatMessage,
+    turn_context: []const ChatMessage,
     durable_history: []const ChatMessage,
     current_user_message: ChatMessage,
     within_turn_suffix: []const ChatMessage,
@@ -3493,20 +3539,19 @@ fn build_provider_prompt_with_response_language_control(
     compaction_history_tail: []const ChatMessage,
     compacted_suffix_len: usize,
 ) !ProviderPromptProjection {
-    const effective_overlay = if (enforce_response_language and origin == .root) blk: {
-        const projected = try alloc.alloc(ChatMessage, ephemeral_overlay.len + 1);
-        @memcpy(projected[0..ephemeral_overlay.len], ephemeral_overlay);
-        projected[ephemeral_overlay.len] = .{
-            .role = .system,
-            .content = response_language_control,
-        };
-        break :blk projected;
-    } else ephemeral_overlay;
+    // The control is the same text on every request, so it stays in the
+    // cached head.
+    const language_control = [_]ChatMessage{.{ .role = .system, .content = response_language_control }};
+    const trailing_instructions: []const ChatMessage = if (enforce_response_language and origin == .root)
+        &language_control
+    else
+        &.{};
     var prompt = try buildProviderPromptForCompactionWindow(
         alloc,
         stable_prefix,
-        effective_overlay,
+        trailing_instructions,
         durable_history,
+        turn_context,
         current_user_message,
         within_turn_suffix,
         compaction_handoff,
@@ -3523,7 +3568,7 @@ fn build_provider_prompt_with_response_language_control(
     return .{
         .instructions = prompt.instructions,
         .messages = prompt.messages,
-        .current_user_index = if (compaction_handoff == null)
+        .current_user_index = turn_context.len + if (compaction_handoff == null)
             durable_history.len
         else
             1 + compaction_history_tail.len,
@@ -3534,7 +3579,7 @@ test "compacted request keeps the pending user prompt after the handoff" {
     var projected = try build_provider_prompt_with_response_language_control(
         std.testing.allocator,
         &.{.{ .role = .system, .content = "stable" }},
-        &.{.{ .role = .system, .content = "overlay" }},
+        &.{.{ .role = .user, .content = "turn context", .context_origin = .turn_context }},
         &.{.{ .role = .user, .content = "removed history" }},
         .{ .role = .user, .content = "pending prompt" },
         &.{
@@ -3551,12 +3596,12 @@ test "compacted request keeps the pending user prompt after the handoff" {
     defer projected.instructions.deinit(std.testing.allocator);
     defer projected.messages.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), projected.instructions.items.len);
+    try std.testing.expectEqual(@as(usize, 1), projected.instructions.items.len);
     try std.testing.expectEqualStrings("stable", projected.instructions.items[0].content.?);
-    try std.testing.expectEqualStrings("overlay", projected.instructions.items[1].content.?);
     const expected = [_][]const u8{
         "handoff",
         "retained tail",
+        "turn context",
         "pending prompt",
         "new suffix",
     };
@@ -3564,7 +3609,7 @@ test "compacted request keeps the pending user prompt after the handoff" {
     for (expected, projected.messages.items) |content, message| {
         try std.testing.expectEqualStrings(content, message.content.?);
     }
-    try std.testing.expectEqual(@as(usize, 2), projected.current_user_index);
+    try std.testing.expectEqual(@as(usize, 3), projected.current_user_index);
     try agent_stream_provider.validate_prompt_lanes(projected.instructions.items, projected.messages.items);
 }
 
@@ -3574,7 +3619,11 @@ fn response_language_context_conflicts(
 ) bool {
     const expected_script = expected orelse return false;
     for (messages) |message| {
-        if (message.role == .user) continue;
+        // The person's own words never count; the context fx sends as user
+        // messages (D130) does, as it did when it was an instruction.
+        if (message.role == .user and
+            message.context_origin != .turn_context and
+            message.context_origin != .skill_context) continue;
         const content = message.content orelse continue;
         const probe = content[0..@min(content.len, 4096)];
         const actual = response_language.evidence(probe).script orelse continue;
@@ -3867,7 +3916,7 @@ fn appendRunningToolCalls(
     const issuing = current_turn_messages[current_turn_messages.len - 1];
     std.debug.assert(issuing.role == .assistant and issuing.tool_calls.len == calls.len);
     try append(deps.ctx, .{
-        .user = .{ .text = @constCast(job.prompt), .images = job.images, .origin = job.prompt_origin },
+        .user = job.userTurn(),
         .execution = try finalization.compacted_execution.project(arena, execution),
         .running_calls = running,
         .running_assistant = issuing.content,
@@ -3966,7 +4015,7 @@ fn persistRecoveryCheckpointWithAction(
         current_turn_messages,
     );
     const projected = try finalization.compacted_execution.project(arena, execution);
-    const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images, .origin = job.prompt_origin };
+    const user: types.UserTurn = job.userTurn();
     // Every completed piece reaches the session before the next request.
     if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = projected });
     const effect = deps.recovery_checkpoint orelse return;
@@ -4089,7 +4138,7 @@ const CompactionSource = struct {
         const execution = try runtime_execution_memory.buildExecutionMemory(self.arena, self.current_turn_messages);
         try effect.set(deps.ctx, .{
             .turn_id = job.turn_id,
-            .user = .{ .text = @constCast(job.prompt), .images = job.images, .origin = job.prompt_origin },
+            .user = job.userTurn(),
             .assistant_source = @constCast(""),
             .execution = try self.finalization.compacted_execution.project(self.arena, execution),
             .cause = .compaction_prepared,
@@ -5866,6 +5915,19 @@ fn processQueuedPromptInner(
         "history_turns={d} gateway_messages={d} added_gateway_messages={d} interrupted_turns={d} history_turn_kinds={s} projected_message_roles={s} partial_interrupted_closures={d}",
         .{ active_history.len, stable_prefix.items.len + history_messages.items.len, history_messages.items.len, interrupted_turns, history_turn_kinds, projected_roles, partial_interrupted_closures },
     );
+    // The turn's runtime and skill context, captured once and saved with
+    // the turn, so every later step and turn resends the same bytes (D130,
+    // D131).
+    const captured_context = try captureTurnContext(
+        arena,
+        deps,
+        if (explicit_section) |section| section.text else null,
+        history_messages.items,
+    );
+    job.turn_context = captured_context.turn_context;
+    job.skill_context = captured_context.skill_context;
+    prepared_job.turn_context = captured_context.turn_context;
+    prepared_job.skill_context = captured_context.skill_context;
     for (job.grants) |grant| {
         try local_grants.append(arena, .{ .tool_name = grant.tool_name, .target_path = grant.target_path });
     }
@@ -6209,8 +6271,9 @@ test "requestHasToolImages ignores images the session dropped" {
 fn buildProviderPromptForCompactionWindow(
     alloc: Allocator,
     stable_prefix: []const ChatMessage,
-    ephemeral_overlay: []const ChatMessage,
+    trailing_instructions: []const ChatMessage,
     durable_history: []const ChatMessage,
+    turn_context: []const ChatMessage,
     current_user_message: ChatMessage,
     within_turn_suffix: []const ChatMessage,
     handoff: ?[]const u8,
@@ -6220,8 +6283,9 @@ fn buildProviderPromptForCompactionWindow(
     if (handoff == null) return runtime_prompt_context.buildProviderPrompt(
         alloc,
         stable_prefix,
-        ephemeral_overlay,
+        trailing_instructions,
         durable_history,
+        turn_context,
         current_user_message,
         within_turn_suffix,
     );
@@ -6235,8 +6299,9 @@ fn buildProviderPromptForCompactionWindow(
     return runtime_prompt_context.buildProviderPrompt(
         alloc,
         stable_prefix,
-        ephemeral_overlay,
+        trailing_instructions,
         compacted_history.items,
+        turn_context,
         current_user_message,
         within_turn_suffix[@min(compacted_suffix_len, within_turn_suffix.len)..],
     );
@@ -7097,20 +7162,21 @@ fn processQueuedPromptLoop(
             );
             return;
         }
-        var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
-        if (skills.explicit) |section| {
-            if (section.text.len > 0) try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = section.text });
-        }
-        try deps.append_runtime_context(deps.ctx, overlay_arena, &ephemeral_overlay);
+        // The turn's context was captured once when it began (D130, D131).
+        var turn_context: std.ArrayList(ChatMessage) = .empty;
+        try session_runtime.appendTurnContextChatMessages(overlay_arena, &turn_context, job.turn_context, job.skill_context);
+        // Results that settle mid-turn ride at the tail of this step's
+        // request, after everything the cache already holds (D132).
+        var parent_turn_context: std.ArrayList(ChatMessage) = .empty;
         var parent_turn_delivery = try appendPreparedParentTurnContext(
             deps,
             overlay_arena,
-            &ephemeral_overlay,
+            &parent_turn_context,
         );
         var provider_prompt = try build_provider_prompt_with_response_language_control(
             overlay_arena,
             stable_prefix.items,
-            ephemeral_overlay.items,
+            turn_context.items,
             history_messages.items,
             current_user_effective,
             within_turn_suffix.items,
@@ -7121,6 +7187,7 @@ fn processQueuedPromptLoop(
             active_compaction_history_tail,
             compacted_suffix_len,
         );
+        try provider_prompt.messages.appendSlice(overlay_arena, parent_turn_context.items);
         var gateway_instructions = provider_prompt.instructions;
         var gateway_messages = provider_prompt.messages;
         const initial_decision_pending = recovery_strategy == .continue_after_confirmed_tool;
@@ -7129,7 +7196,8 @@ fn processQueuedPromptLoop(
         var current_user_message_index = provider_prompt.current_user_index;
         const response_language_hold_until_completion =
             response_language_context_conflicts(response_language_expectation, stable_prefix.items) or
-            response_language_context_conflicts(response_language_expectation, ephemeral_overlay.items) or
+            response_language_context_conflicts(response_language_expectation, turn_context.items) or
+            response_language_context_conflicts(response_language_expectation, parent_turn_context.items) or
             response_language_context_conflicts(response_language_expectation, history_messages.items) or
             response_language_context_conflicts(response_language_expectation, within_turn_suffix.items);
 
@@ -7286,7 +7354,7 @@ fn processQueuedPromptLoop(
             provider_prompt = try build_provider_prompt_with_response_language_control(
                 overlay_arena,
                 stable_prefix.items,
-                ephemeral_overlay.items,
+                turn_context.items,
                 history_messages.items,
                 current_user_effective,
                 within_turn_suffix.items,
@@ -7297,6 +7365,7 @@ fn processQueuedPromptLoop(
                 active_compaction_history_tail,
                 compacted_suffix_len,
             );
+            try provider_prompt.messages.appendSlice(overlay_arena, parent_turn_context.items);
             gateway_instructions = provider_prompt.instructions;
             gateway_messages = provider_prompt.messages;
             current_user_message_index = provider_prompt.current_user_index;
@@ -7501,6 +7570,7 @@ fn processQueuedPromptLoop(
             else
                 .auto;
             var request_data = agent_stream_provider.RequestData{
+                .session_id = lifecycle.scope.session_id,
                 .model = gateway_model,
                 .instructions = gateway_instructions.items,
                 .messages = request_messages,
@@ -7614,7 +7684,7 @@ fn processQueuedPromptLoop(
                 } else {
                     // The pending user is source too, even before the first tool.
                     const active_prefix: types.AssistantHistoryTurn = .{
-                        .user = .{ .text = job.prompt, .images = job.images, .origin = job.prompt_origin },
+                        .user = job.userTurn(),
                         .assistant = @constCast(""),
                         .execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items[compacted_suffix_len..]),
                     };
@@ -9541,7 +9611,7 @@ fn processQueuedPromptLoop(
             const finish_execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items);
             const completed_summary = summary_accumulator.finish();
             var turn: HistoryTurn = .{ .assistant = .{
-                .user = .{ .text = job.prompt, .images = job.images, .origin = job.prompt_origin },
+                .user = job.userTurn(),
                 .assistant = @constCast(assistant_text),
                 .execution = try finalization.compacted_execution.project(arena, finish_execution),
             } };
@@ -12694,7 +12764,7 @@ fn finishFailedTurnWithNotice(
     );
     const completed_summary = summary_accumulator.finish();
     var turn: HistoryTurn = .{ .assistant = .{
-        .user = .{ .text = job.prompt, .images = job.images, .origin = job.prompt_origin },
+        .user = job.userTurn(),
         .assistant = @constCast(notice),
         .execution = try finalization.compacted_execution.project(arena, execution_memory),
     } };

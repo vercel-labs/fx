@@ -1673,6 +1673,13 @@ pub const UserTurn = struct {
     /// model projections continue to use `text` and `images` exclusively.
     work_id: ?[]u8 = null,
     origin: UserOrigin = .user,
+    /// Runtime context fx sent with this turn (D130): workspace, date, git
+    /// and permission facts. Null when it matched the context an earlier
+    /// turn in the window already carried. Projected before `text`, so the
+    /// bytes a later request resends match the ones this turn sent.
+    turn_context: ?[]u8 = null,
+    /// Explicitly invoked skill instructions sent with this turn (D130).
+    skill_context: ?[]u8 = null,
 };
 
 /// Borrows both strings; use dupeProviderReplay/freeProviderReplay for ownership.
@@ -1715,7 +1722,7 @@ pub const ChatMessage = struct {
     /// Checkpoint steering text has already had its envelope removed.
     restored_steering: bool = false,
     // Source provenance for compaction, never permission authority.
-    context_origin: enum { ordinary, user_turn, handoff } = .ordinary,
+    context_origin: enum { ordinary, user_turn, handoff, turn_context, skill_context } = .ordinary,
     standalone_response: bool = false,
 };
 
@@ -3426,6 +3433,8 @@ pub fn freeUserTurn(alloc: std.mem.Allocator, user: UserTurn) void {
     alloc.free(user.text);
     freeImageAttachmentSlice(alloc, user.images);
     if (user.work_id) |work_id| alloc.free(work_id);
+    if (user.turn_context) |text| alloc.free(text);
+    if (user.skill_context) |text| alloc.free(text);
 }
 
 pub fn dupeUserTurn(alloc: std.mem.Allocator, user: UserTurn) !UserTurn {
@@ -3436,12 +3445,18 @@ pub fn dupeUserTurn(alloc: std.mem.Allocator, user: UserTurn) !UserTurn {
     errdefer freeImageAttachmentSlice(alloc, images);
 
     const work_id = if (user.work_id) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (work_id) |value| alloc.free(value);
+    const turn_context = if (user.turn_context) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (turn_context) |value| alloc.free(value);
+    const skill_context = if (user.skill_context) |value| try alloc.dupe(u8, value) else null;
 
     return .{
         .text = text,
         .images = images,
         .work_id = work_id,
         .origin = user.origin,
+        .turn_context = turn_context,
+        .skill_context = skill_context,
     };
 }
 

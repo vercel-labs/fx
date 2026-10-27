@@ -2000,7 +2000,7 @@ pub const Session = struct {
             };
             image.blob_path = self.prompt_blobs.get(digest);
         }
-        return encodePiece(a, .{ .user = .{ .text = user.text, .images = images, .work_id = user.work_id, .origin = user.origin } });
+        return encodePiece(a, .{ .user = .{ .text = user.text, .images = images, .work_id = user.work_id, .origin = user.origin, .turn_context = user.turn_context, .skill_context = user.skill_context } });
     }
 
     /// Streams the turn so far (`AgentRuntimeDeps.append_turn_piece`): the
@@ -2023,7 +2023,7 @@ pub const Session = struct {
         defer arena.deinit();
         const a = arena.allocator();
         var events: std.ArrayList(Event) = .empty;
-        try events.append(a, .{ .user = .{ .text = user.text, .images = user.images, .work_id = user.work_id, .origin = user.origin } });
+        try events.append(a, .{ .user = .{ .text = user.text, .images = user.images, .work_id = user.work_id, .origin = user.origin, .turn_context = user.turn_context, .skill_context = user.skill_context } });
         // A result's blob needs the turn on disk first (D44).
         if (storesBodies(execution)) try self.openTurnLocked();
         // On a missing handle the list keeps the pieces before it.
@@ -3235,7 +3235,7 @@ const Source = struct {
             images.?[index].blob_path = blob_path;
         }
         const list = images orelse return user;
-        return .{ .text = user.text, .images = list, .work_id = user.work_id, .origin = user.origin };
+        return .{ .text = user.text, .images = list, .work_id = user.work_id, .origin = user.origin, .turn_context = user.turn_context, .skill_context = user.skill_context };
     }
 
     /// A `user` item, each image saved as its own blob given only that
@@ -3248,7 +3248,7 @@ const Source = struct {
             const hash = image.blob orelse continue;
             out.blob_path = src.store.manager.blobPath(pa, src.id, hash) catch |err| return imageBlobFailed(src, image.id, err);
         }
-        return .{ .text = wire.text, .images = images, .work_id = wire.work_id, .origin = wire.origin orelse .user };
+        return .{ .text = wire.text, .images = images, .work_id = wire.work_id, .origin = wire.origin orelse .user, .turn_context = wire.turn_context, .skill_context = wire.skill_context };
     }
 
     /// An image blob the log names that is gone or misnamed damages the
@@ -5237,6 +5237,8 @@ const WireUser = struct {
     images: []const WireImage = &.{},
     work_id: ?[]const u8 = null,
     origin: ?types.UserOrigin = null,
+    turn_context: ?[]const u8 = null,
+    skill_context: ?[]const u8 = null,
 
     /// `types.ImageAttachment` field for field, with `inline_data` in base64,
     /// or the image's own blob (D89): `blob` names it by its digest, and the
@@ -5307,11 +5309,13 @@ const WireUser = struct {
             .images = images,
             .work_id = user.work_id,
             .origin = if (user.origin == .user) null else user.origin,
+            .turn_context = user.turn_context,
+            .skill_context = user.skill_context,
         };
     }
 
     fn toUser(wire: WireUser, a: Allocator) !session_event.ConversationUser {
-        return .{ .text = wire.text, .images = try wire.toImages(a), .work_id = wire.work_id, .origin = wire.origin orelse .user };
+        return .{ .text = wire.text, .images = try wire.toImages(a), .work_id = wire.work_id, .origin = wire.origin orelse .user, .turn_context = wire.turn_context, .skill_context = wire.skill_context };
     }
 
     /// Writes `origin` only for fx's own messages, so a person's prompt
@@ -5327,6 +5331,16 @@ const WireUser = struct {
         if (self.origin) |origin| {
             try writer.objectField("origin");
             try writer.write(@tagName(origin));
+        }
+        // Written only when a turn carried context (D130), so a prompt
+        // without it encodes as it did before.
+        if (self.turn_context) |text| {
+            try writer.objectField("turn_context");
+            try writer.write(text);
+        }
+        if (self.skill_context) |text| {
+            try writer.objectField("skill_context");
+            try writer.write(text);
         }
         try writer.endObject();
     }

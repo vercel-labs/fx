@@ -138,8 +138,9 @@ fn decodeAny(comptime T: type, alloc: Allocator, cur: *ByteCursor) DecodeError!T
             var value: T = undefined;
             inline for (info.field_names, info.field_types) |field_name, field_type| {
                 if (comptime notInCache(T, field_name)) {
-                    // Every v1 prompt was the person's own.
-                    @field(value, field_name) = .user;
+                    // Every v1 prompt was the person's own and carried no
+                    // saved turn context.
+                    @field(value, field_name) = @field(@as(session_event.ConversationUser, .{ .text = "" }), field_name);
                 } else {
                     @field(value, field_name) = try decodeAny(field_type, alloc, cur);
                 }
@@ -172,9 +173,12 @@ fn decodeAny(comptime T: type, alloc: Allocator, cur: *ByteCursor) DecodeError!T
 }
 
 /// Fields added to the log's events after this frozen format, which caches
-/// never carry: a user message's origin (D111) postdates every v1 cache.
+/// never carry: a user message's origin (D111) and its turn and skill
+/// context (D130) postdate every v1 cache.
 fn notInCache(comptime T: type, comptime field_name: []const u8) bool {
-    return T == session_event.ConversationUser and std.mem.eql(u8, field_name, "origin");
+    return T == session_event.ConversationUser and (std.mem.eql(u8, field_name, "origin") or
+        std.mem.eql(u8, field_name, "turn_context") or
+        std.mem.eql(u8, field_name, "skill_context"));
 }
 
 /// Frees a decoded value tree. Only needed when decoding without an arena.

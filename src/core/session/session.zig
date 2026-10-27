@@ -2368,6 +2368,29 @@ fn toolResultMemory(result: core_types.PersistedToolResult) core_types.ToolResul
     };
 }
 
+/// A user turn as the model saw it: the context fx sent with it, then the
+/// person's text (D130). Borrows `user`.
+fn appendUserTurnChatMessages(
+    alloc: Allocator,
+    messages: *std.ArrayList(core_types.ChatMessage),
+    user: UserTurn,
+) Allocator.Error!void {
+    try appendTurnContextChatMessages(alloc, messages, user.turn_context, user.skill_context);
+    try messages.append(alloc, .{ .role = .user, .content = user.text, .images = user.images, .context_origin = .user_turn });
+}
+
+/// The context messages that open a turn, in the order fx sends them.
+/// Borrows both strings.
+pub fn appendTurnContextChatMessages(
+    alloc: Allocator,
+    messages: *std.ArrayList(core_types.ChatMessage),
+    turn_context: ?[]const u8,
+    skill_context: ?[]const u8,
+) Allocator.Error!void {
+    if (turn_context) |text| try messages.append(alloc, .{ .role = .user, .content = text, .context_origin = .turn_context });
+    if (skill_context) |text| try messages.append(alloc, .{ .role = .user, .content = text, .context_origin = .skill_context });
+}
+
 fn appendHistoryChatMessagesImpl(
     alloc: Allocator,
     messages: *std.ArrayList(core_types.ChatMessage),
@@ -2386,14 +2409,14 @@ fn appendHistoryChatMessagesImpl(
                 });
             },
             .assistant => |entry| {
-                try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images, .context_origin = .user_turn });
+                try appendUserTurnChatMessages(alloc, messages, entry.user);
                 try appendExecutionMemoryChatMessages(alloc, messages, entry.execution);
                 if (entry.assistant.len > 0 or entry.provider_replay != null) {
                     try messages.append(alloc, .{ .role = .assistant, .content = entry.assistant, .provider_replay = entry.provider_replay });
                 }
             },
             .interrupted => |entry| {
-                try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images, .context_origin = .user_turn });
+                try appendUserTurnChatMessages(alloc, messages, entry.user);
                 try appendExecutionMemoryChatMessages(alloc, messages, entry.execution);
                 if (entry.tool_call) |tool_call| {
                     const assistant_content = try formatInterruptedAssistantToolContent(alloc, entry);
