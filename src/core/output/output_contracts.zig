@@ -1700,6 +1700,9 @@ pub const SessionConvertSnapshot = struct {
 };
 
 /// `proto-fx daemon`: what the supervisor holds, or that it is stopping.
+/// `proto-fx update` (D140, D141).
+pub const UpdateSnapshot = @import("../upgrade/update_snapshot.zig").UpdateSnapshot;
+
 pub const DaemonSnapshot = struct {
     action: Action,
     sessions: []const supervisor_protocol.SessionSummary = &.{},

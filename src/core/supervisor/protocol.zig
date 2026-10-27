@@ -280,9 +280,17 @@ pub const Failure = struct {
 
 pub const Ack = struct { ok: bool = true };
 
+/// Every field after `version` is optional: older supervisors leave them
+/// out, which `proto-fx update` reads as unknown (D142).
 pub const Pong = struct {
     ok: bool = true,
     version: u32 = version,
+    executable: []const u8 = "",
+    executable_inode: ?u64 = null,
+    /// A session has running work or an armed heartbeat.
+    busy: ?bool = null,
+    /// Open connections, the asking one included.
+    clients: ?u32 = null,
 };
 
 pub const Status = enum { saved, idle, running, awaiting_approval, stopped, @"error" };

@@ -53,6 +53,10 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "git_commit", git_commit);
     build_options.addOption([]const u8, "app_version", app_version);
     build_options.addOption([]const u8, "update_channel", @tagName(update_channel));
+    // `proto-fx update` rebuilds the checkout this binary came from with the
+    // same compiler (D140).
+    build_options.addOption([]const u8, "source_checkout", readGitToplevel(b));
+    build_options.addOption([]const u8, "zig_exe", b.graph.zig_exe);
     build_options.addOption(WasmSurface, "wasm_surface", .none);
     // Whether this is a libfx artifact, which leaves out what only the fx
     // binary uses, such as its E2E test controls.
@@ -370,6 +374,8 @@ fn addWasmArtifact(
     wasm_options.addOption([]const u8, "git_commit", git_commit);
     wasm_options.addOption([]const u8, "app_version", app_version);
     wasm_options.addOption([]const u8, "update_channel", @tagName(update_channel));
+    wasm_options.addOption([]const u8, "source_checkout", "");
+    wasm_options.addOption([]const u8, "zig_exe", "");
     wasm_options.addOption(WasmSurface, "wasm_surface", surface);
     wasm_options.addOption(bool, "libfx", true);
 
@@ -416,6 +422,8 @@ fn addNapiArtifact(
     napi_options.addOption([]const u8, "git_commit", git_commit);
     napi_options.addOption([]const u8, "app_version", app_version);
     napi_options.addOption([]const u8, "update_channel", @tagName(update_channel));
+    napi_options.addOption([]const u8, "source_checkout", "");
+    napi_options.addOption([]const u8, "zig_exe", "");
     napi_options.addOption(NapiSurface, "napi_surface", surface);
     napi_options.addOption(bool, "libfx", true);
 
@@ -467,6 +475,19 @@ fn discoverNodeIncludeDir(b: *std.Build) []const u8 {
     };
     const trimmed = std.mem.trim(u8, out, " \t\r\n");
     return b.allocator.dupe(u8, trimmed) catch std.process.fatal("could not allocate Node include path", .{});
+}
+
+/// The absolute checkout this build runs in, or "" outside git.
+fn readGitToplevel(b: *std.Build) []const u8 {
+    const out = switch (b.runFallible(
+        &.{ "git", "rev-parse", "--show-toplevel" },
+        .{ .stderr_behavior = .ignore },
+    )) {
+        .success => |stdout| stdout,
+        .spawn_failed, .bad_exit_code, .crashed => return "",
+    };
+    const trimmed = std.mem.trim(u8, out, " \t\r\n");
+    return b.allocator.dupe(u8, trimmed) catch "";
 }
 
 fn readGitCommit(b: *std.Build) []const u8 {

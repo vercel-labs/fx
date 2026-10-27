@@ -68,6 +68,9 @@ const GracefulExitSigintGuard = if (host_target.is_wasm) struct {
 pub const Config = struct {
     version: []const u8 = "",
     revision: []const u8 = "",
+    /// The checkout and compiler this binary was built with (D140).
+    source_checkout: []const u8 = "",
+    zig_exe: []const u8 = "",
     build_channel: update_target.Channel = .stable,
     auth_mode: credentials.AuthMode = .local,
     command_catalog: command_specs.TopLevelRegistry,
@@ -392,14 +395,23 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         return .{ .exit = 1 };
     }
     if (relaunch_request) |request| {
-        if (handoff_value) |value| {
-            var handoff = value;
-            defer handoff.deinit(alloc);
+        var handoff_storage = handoff_value;
+        defer if (handoff_storage) |*handoff| handoff.deinit(alloc);
+        // A detached session lives in the supervisor, so the request names
+        // it; an in-process one is named by its validated handoff.
+        const session_id: ?[]const u8 = if (handoff_storage) |handoff| handoff.session_id else request.sessionId();
+        // `/update` installs only now, with the terminal back in cooked
+        // mode, so the build's output reaches the user (D144).
+        if (request.run_update) {
+            if (comptime @hasDecl(App, "runUpdateBeforeRelaunch")) App.runUpdateBeforeRelaunch(alloc, request.executablePath());
+        }
+        if (session_id) |id| {
+            if (request.run_update) writeStderr(deps, "Restarting to resume this session…\n");
             var argv: [5][]const u8 = undefined;
             var argc: usize = 0;
             argv[argc] = request.executablePath();
             argc += 1;
-            for ([_][]const u8{ "resume", handoff.session_id, cli_surface.upgrade_relaunch_arg }) |arg| {
+            for ([_][]const u8{ "resume", id, cli_surface.upgrade_relaunch_arg }) |arg| {
                 argv[argc] = arg;
                 argc += 1;
             }
@@ -413,7 +425,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
                 io_mod.getIo(),
                 .{ .argv = argv_slice },
             );
-            writeUpgradeRelaunchFailure(deps, replace_err, handoff.session_id);
+            writeUpgradeRelaunchFailure(deps, replace_err, id);
         } else {
             writeStderr(
                 deps,
@@ -472,6 +484,8 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
     return .{
         .version = cfg.version,
         .revision = cfg.revision,
+        .source_checkout = cfg.source_checkout,
+        .zig_exe = cfg.zig_exe,
         .build_channel = cfg.build_channel,
         .auth_mode = cfg.auth_mode,
         .command_catalog = cfg.command_catalog,

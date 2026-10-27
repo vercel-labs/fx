@@ -100,6 +100,8 @@ const agent_runtime = @import("core/agent/agent_runtime.zig");
 const assistant_presentation = @import("core/agent/assistant_presentation.zig");
 const auto_upgrade = @import("core/upgrade/auto_upgrade.zig");
 const update_target = @import("core/upgrade/update_target.zig");
+const update_command = @import("core/upgrade/update_command.zig");
+const daemon_refresh = @import("core/upgrade/daemon_refresh.zig");
 
 const compiled_update_channel = update_target.Channel.parse(build_options.update_channel) orelse
     @compileError("invalid compiled update channel");
@@ -387,6 +389,39 @@ else
 const wasm_skill_root_policy: @import("core/skills/skill_contract.zig").RootPolicy = .{
     .managed_root_source = null,
 };
+fn updateBuild() update_command.Build {
+    return .{
+        .version = version,
+        .revision = build_options.git_commit,
+        .checkout = build_options.source_checkout,
+        .zig_exe = build_options.zig_exe,
+    };
+}
+
+/// Static text for what became of the supervisor after `/update`.
+fn updateSupervisorNotice(outcome: daemon_refresh.Supervisor) ?[]u8 {
+    const text: []const u8 = switch (outcome) {
+        .restarted => "The idle supervisor restarted on the new binary.",
+        .deferred => "The supervisor keeps the previous binary while sessions are working or attached. It switches after its next idle exit.",
+        .unknown => "The running supervisor keeps the previous binary until its next idle exit. Run proto-fx daemon stop when no turns are running to switch now.",
+        .none, .current => return null,
+    };
+    return @constCast(text);
+}
+
+/// The last background check's result, and the next check when one is due
+/// (D143). Reads one small file; never touches the network itself.
+fn startupUpdateNotice(alloc: std.mem.Allocator, executable: []const u8) ?[]u8 {
+    const home = io_mod.homeDir() orelse return null;
+    const build = updateBuild();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const settings = update_command.loadSettings(arena_state.allocator(), home);
+    if (!settings.check_on_startup) return null;
+    if (update_command.backgroundCheckDue(alloc, home, build, settings, executable)) update_command.startBackgroundCheck(executable);
+    return update_command.startupNotice(alloc, home, build) catch null;
+}
+
 fn currentBuild() update_target.CurrentBuild {
     return .{
         .channel = compiled_update_channel,
@@ -748,7 +783,17 @@ const App = struct {
                 .id => |id| id,
                 else => null,
             } else null;
+            // After `/update`, move an idle supervisor onto the new binary
+            // before connecting (D142); otherwise report the startup check.
+            const startup_notice: ?[]u8 = if (launch.upgrade_relaunch != null)
+                updateSupervisorNotice(daemon_refresh.refresh(alloc))
+            else
+                startupUpdateNotice(alloc, executable);
             try RemoteRuntime.init(&app, executable, resume_id);
+            if (startup_notice) |body| {
+                defer if (launch.upgrade_relaunch == null) alloc.free(body);
+                app.writeDomainNotice(.{ .topic = "update", .tone = .neutral, .body = body }, true) catch {};
+            }
         };
         SessionAppRuntime.syncTerminalTitle(&app);
         return app;
@@ -862,6 +907,20 @@ const App = struct {
 
     pub fn requestResumeHandoffForUpgrade(self: *App) void {
         SessionAppRuntime.requestUpgradeResumeHandoff(self);
+    }
+
+    /// `/update` (D144).
+    pub fn requestUpdateRelaunch(self: *App) !void {
+        const session_id = if (self.backend == .detached) self.remote.current_id else "";
+        if (self.backend == .detached and session_id.len == 0) {
+            return self.writeDomainNotice(.{ .topic = "update", .tone = .neutral, .body = "The session is still starting. Try /update again in a moment." }, true);
+        }
+        _ = try UpgradeAppRuntime.requestUpdateRelaunch(self, session_id, build_options.git_commit);
+    }
+
+    /// Runs after the terminal is released, before the relaunch.
+    pub fn runUpdateBeforeRelaunch(alloc: std.mem.Allocator, executable: []const u8) void {
+        _ = update_command.runBeforeRelaunch(alloc, updateBuild(), io_mod.homeDir(), executable) catch {};
     }
 
     pub fn takeUpgradeRelaunchRequest(
@@ -3942,6 +4001,8 @@ fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
+        .source_checkout = build_options.source_checkout,
+        .zig_exe = build_options.zig_exe,
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
@@ -3980,6 +4041,8 @@ fn localEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
+        .source_checkout = build_options.source_checkout,
+        .zig_exe = build_options.zig_exe,
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
@@ -4018,6 +4081,8 @@ fn emptyEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
+        .source_checkout = build_options.source_checkout,
+        .zig_exe = build_options.zig_exe,
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
@@ -5033,6 +5098,11 @@ test {
     _ = @import("tools/skills/skill.zig");
     _ = @import("core/upgrade/upgrade_helpers.zig");
     _ = @import("core/upgrade/upgrade_runtime.zig");
+    _ = @import("core/upgrade/source_update.zig");
+    _ = @import("core/upgrade/release_update.zig");
+    _ = @import("core/upgrade/update_snapshot.zig");
+    _ = @import("core/upgrade/update_command.zig");
+    _ = @import("core/upgrade/daemon_refresh.zig");
     _ = @import("core/shared/types.zig");
     _ = @import("core/input/composer_history.zig");
     _ = @import("core/input/kill_ring.zig");

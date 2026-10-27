@@ -273,6 +273,7 @@ pub fn Handlers(comptime App: type) type {
                 .handle_workspace = commandHandleWorkspace,
                 .handle_shell = commandHandleShell,
                 .show_version = commandShowVersion,
+                .run_update = commandRunUpdate,
                 .show_context = commandNeedsDetachedSession,
                 .browse_subagents = commandNeedsDetachedSession,
                 .handle_heartbeat = commandNeedsDetachedSessionWithArgs,
@@ -1331,6 +1332,16 @@ pub fn Handlers(comptime App: type) type {
                 .topic = "version",
                 .tone = .neutral,
                 .body = App.app_version,
+            }, true);
+        }
+
+        fn commandRunUpdate(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasDecl(App, "requestUpdateRelaunch")) return app.requestUpdateRelaunch();
+            try app.writeDomainNotice(.{
+                .topic = "update",
+                .tone = .neutral,
+                .body = "Run proto-fx update in a shell to update this build.",
             }, true);
         }
 

@@ -31,6 +31,17 @@ pub const RelaunchRequest = struct {
     executable_path_len: usize = 0,
     previous_revision_buf: [update_target.max_revision_bytes]u8 = undefined,
     previous_revision_len: u8 = 0,
+    /// `/update`: install before relaunching (D144).
+    run_update: bool = false,
+    /// The session to resume when no in-process handoff names one, as for a
+    /// detached session.
+    session_id_buf: [128]u8 = undefined,
+    session_id_len: u8 = 0,
+
+    pub fn sessionId(self: *const RelaunchRequest) ?[]const u8 {
+        if (self.session_id_len == 0) return null;
+        return self.session_id_buf[0..self.session_id_len];
+    }
 
     pub fn executablePath(self: *const RelaunchRequest) []const u8 {
         return self.executable_path_buf[0..self.executable_path_len];
@@ -135,6 +146,25 @@ pub const AutoUpgrade = struct {
             .cancel = &self.should_stop,
             .interrupt = &self.transfer_interrupt,
         };
+    }
+
+    /// `/update`: end the terminal, install, then relaunch `executable_path`
+    /// on `session_id` (empty for an in-process handoff). `revision` is the
+    /// running build, which the relaunched one reports as its predecessor.
+    pub fn requestUpdateRelaunch(self: *AutoUpgrade, executable_path: []const u8, session_id: []const u8, revision: []const u8) !void {
+        if (executable_path.len > std.Io.Dir.max_path_bytes) return error.NameTooLong;
+        var request = RelaunchRequest{ .executable_path_len = executable_path.len, .run_update = true };
+        @memcpy(request.executable_path_buf[0..executable_path.len], executable_path);
+        if (session_id.len > request.session_id_buf.len) return error.NameTooLong;
+        @memcpy(request.session_id_buf[0..session_id.len], session_id);
+        request.session_id_len = @intCast(session_id.len);
+        if (update_target.isValidRevision(revision)) {
+            @memcpy(request.previous_revision_buf[0..revision.len], revision);
+            request.previous_revision_len = @intCast(revision.len);
+        }
+        self.version_mutex.lockUncancelable(io_mod.getIo());
+        defer self.version_mutex.unlock(io_mod.getIo());
+        self.relaunch_request = request;
     }
 
     pub fn requestRelaunch(self: *AutoUpgrade, executable_path: []const u8) !void {

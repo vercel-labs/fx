@@ -1078,12 +1078,12 @@ describe("cli: status", () => {
   );
 
   test(
-    "fx upgrade help documents release channels",
+    "fx update help documents check, force and the upgrade alias",
     async () => {
       const result = await runFx(["upgrade", "--help"]);
       expect(result.code).toBe(0);
-      expect(result.stdout).toContain("--channel <stable|dev>");
-      expect(result.stdout).toContain("Select and remember the release channel");
+      expect(result.stdout).toContain("update [--check] [--force] [--json]");
+      expect(result.stdout).toContain("Report whether an update is available without installing it");
     },
     TIMEOUT,
   );

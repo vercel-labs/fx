@@ -215,6 +215,12 @@ pub const Daemon = struct {
     /// Bumped whenever a listed session may look different.
     list_version: std.atomic.Value(u64) = .init(0),
     list_pushed: struct { version: u64 = 0, at_ms: i64 = 0, digest: u64 = 0 } = .{},
+    /// Open connections, the asking one included, for `ping` (D142).
+    clients: std.atomic.Value(u32) = .init(0),
+    /// The binary this supervisor runs and its inode at startup. `proto-fx
+    /// update` compares them with the file now at that path (D142).
+    executable: []const u8 = "",
+    executable_inode: ?u64 = null,
 
     fn deinit(self: *Daemon) void {
         // Stop every executor before freeing any session: a running one may
@@ -237,6 +243,19 @@ pub const Daemon = struct {
         if (self.connections.items.len > 0) return true;
         for (self.sessions.items) |session| if (session.holds_daemon.load(.acquire)) return true;
         return false;
+    }
+
+    /// Answers `ping` with what `proto-fx update` needs to decide whether
+    /// this supervisor may restart on a new binary. Holds `route_mutex`.
+    fn pong(self: *Daemon) protocol.Pong {
+        var busy = false;
+        for (self.sessions.items) |session| busy = busy or session.holds_daemon.load(.acquire);
+        return .{
+            .executable = self.executable,
+            .executable_inode = self.executable_inode,
+            .busy = busy,
+            .clients = self.clients.load(.acquire),
+        };
     }
 
     pub fn noteListChange(self: *Daemon) void {
@@ -454,6 +473,7 @@ pub const Daemon = struct {
         try self.connections.ensureUnusedCapacity(self.alloc, 1);
         conn.thread = try std.Thread.spawn(.{}, Conn.main, .{conn});
         self.connections.appendAssumeCapacity(conn);
+        _ = self.clients.fetchAdd(1, .release);
     }
 
     /// Tells every client the stop is intentional, then closes the
@@ -484,6 +504,7 @@ pub const Daemon = struct {
             }
             conn.thread.?.join();
             _ = self.connections.swapRemove(index);
+            _ = self.clients.fetchSub(1, .release);
             conn.release();
         }
     }
@@ -554,7 +575,7 @@ pub const Daemon = struct {
         self.route_mutex.lockUncancelable(io_mod.getIo());
         defer self.route_mutex.unlock(io_mod.getIo());
         switch (job.request) {
-            .ping => return try protocol.encode(arena, protocol.Pong{}),
+            .ping => return try protocol.encode(arena, self.pong()),
             .shutdown => {
                 self.stopping.store(true, .release);
                 return try protocol.encode(arena, protocol.Ack{});
@@ -628,6 +649,12 @@ pub fn run(alloc: Allocator, cfg: acp_config.Config) !void {
     var daemon = Daemon{ .alloc = alloc, .cfg = cfg, .home = io_mod.homeDir() orelse return error.HomeUnavailable, .state_path = state_path, .incarnation = incarnation };
     // Executors close their hosts as the registry is freed.
     defer daemon.deinit();
+    const executable = std.process.executablePathAlloc(io, alloc) catch null;
+    defer if (executable) |path| alloc.free(path);
+    if (executable) |path| {
+        daemon.executable = path;
+        if (std.Io.Dir.cwd().statFile(io, path, .{})) |stat| daemon.executable_inode = @intCast(stat.inode) else |_| {}
+    }
     try daemon.restore();
     try daemon.discoverSaved();
     const idle_limit_ms = idleLimitMs(io_mod.getenv(idle_env));

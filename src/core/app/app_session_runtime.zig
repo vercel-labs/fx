@@ -306,6 +306,15 @@ const ResumeNotice = union(enum) {
 };
 
 fn writeUpgradeNoticeBody(writer: *std.Io.Writer, upgrade: UpgradeNotice) !void {
+    // A source update (`/update`, D144) names the commits it moved between;
+    // the upstream release notes do not describe this fork.
+    if (upgrade.channel == .stable and update_target.isValidRevision(upgrade.previous_revision) and update_target.isValidRevision(upgrade.revision)) {
+        const revision = upgrade.revision[0..@min(upgrade.revision.len, 12)];
+        if (update_target.revisionsEqual(upgrade.previous_revision, upgrade.revision)) {
+            return writer.print("proto-fx restarted on {s}; the installed binary did not change", .{revision});
+        }
+        return writer.print("proto-fx has been updated to {s} (was {s})", .{ revision, upgrade.previous_revision[0..@min(upgrade.previous_revision.len, 12)] });
+    }
     try writer.writeAll("proto-fx has been updated to ");
     if (upgrade.channel == .dev and update_target.isValidRevision(upgrade.revision)) {
         try writer.print("dev {s} (v{s})", .{
@@ -8279,6 +8288,14 @@ test "upgrade notice body identifies stable notes and dev changes" {
                 .revision = "abcdef0123456789abcdef0123456789abcdef01",
             },
             .expected = "proto-fx has been updated to dev abcdef012345 (v9.9.9) (\x1b]8;;https://github.com/vercel-labs/fx/commit/abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
+        },
+        .{
+            .upgrade = .{ .version = "9.9.9", .channel = .stable, .previous_revision = "111111111111", .revision = "abcdef012345" },
+            .expected = "proto-fx has been updated to abcdef012345 (was 111111111111)",
+        },
+        .{
+            .upgrade = .{ .version = "9.9.9", .channel = .stable, .previous_revision = "abcdef012345", .revision = "abcdef012345" },
+            .expected = "proto-fx restarted on abcdef012345; the installed binary did not change",
         },
     };
 

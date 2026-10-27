@@ -37,6 +37,7 @@ const session_adapter = @import("../session/session_adapter.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const types = @import("../shared/types.zig");
 const update_target = @import("../upgrade/update_target.zig");
+const update_command = @import("../upgrade/update_command.zig");
 const test_builtin_gateway = if (builtin.is_test)
     @import("../../builtins/gateway.zig")
 else
@@ -86,7 +87,7 @@ pub const Command = union(enum) {
     resume_session: ResumeInvocation,
     credits: []const [:0]const u8,
     usage: []const [:0]const u8,
-    upgrade: []const [:0]const u8,
+    update: []const [:0]const u8,
     replay: []const [:0]const u8,
     workspace: []const [:0]const u8,
     unknown: []const u8,
@@ -212,6 +213,9 @@ const version_usage = "usage: proto-fx --version\n";
 pub const Config = struct {
     version: []const u8 = "",
     revision: []const u8 = "",
+    /// The checkout and compiler this binary was built with (D140).
+    source_checkout: []const u8 = "",
+    zig_exe: []const u8 = "",
     build_channel: update_target.Channel = .stable,
     auth_mode: credentials.AuthMode = .local,
     command_catalog: CommandCatalog,
@@ -269,11 +273,6 @@ fn selectCatalogModel(
     }
     return if (entries.len > 0) entries[0].id else null;
 }
-
-const UpgradeOptions = struct {
-    format: output_contracts.OutputFormat = .text,
-    channel: ?update_target.Channel = null,
-};
 
 const SessionListOptions = struct {
     format: output_contracts.OutputFormat = .text,
@@ -621,7 +620,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
         },
         'u' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .usage)) return .{ .usage = args[1..] };
-            if (command_specs.matchesTopLevel(command_catalog, command, .upgrade)) return .{ .upgrade = args[1..] };
+            if (command_specs.matchesTopLevel(command_catalog, command, .update)) return .{ .update = args[1..] };
         },
         'w' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .workspace)) return .{ .workspace = args[1..] };
@@ -1629,10 +1628,7 @@ fn runNonInteractiveWithDeps(
             try writeStdout(deps, "Usage and billing are managed by your configured endpoint.\n");
             return .handled_success;
         },
-        .upgrade => {
-            try writeStdout(deps, "Upstream binary upgrades are disabled for this fork. Rebuild proto-fx from your checkout.\n");
-            return .handled_success;
-        },
+        .update => |rest| return runUpdateCommand(alloc, cfg, rest, deps),
         .replay => |rest| {
             const exit_code = try cli_replay.run(alloc, rest);
             return if (exit_code == 0) .handled_success else .handled_failure;
@@ -3059,6 +3055,35 @@ fn acpRunnerConfig(cfg: Config, modifiers: LaunchModifiers, opts: AcpOptions) ac
     };
 }
 
+/// `update [--check] [--force] [--json]`, rendered from one snapshot
+/// (D140, D141). The hidden `--background` run records the startup check.
+fn runUpdateCommand(alloc: Allocator, cfg: Config, rest: []const [:0]const u8, deps: RunDeps) !RunResult {
+    const options = update_command.parseArgs(rest) catch {
+        try writeTopLevelUsage(cfg.command_catalog, deps, .update);
+        return .handled_failure;
+    };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const home = io_mod.homeDir();
+    const build: update_command.Build = .{
+        .version = cfg.version,
+        .revision = cfg.revision,
+        .checkout = cfg.source_checkout,
+        .zig_exe = cfg.zig_exe,
+    };
+    const snapshot = update_command.run(arena, build, update_command.loadSettings(arena, home), options, .{ .stream = !options.json and !options.background });
+    if (options.background) {
+        if (home) |dir| update_command.recordCheck(alloc, dir, snapshot) catch {};
+        return .handled_success;
+    }
+    const rendered = try output_contracts.UpdateSnapshot.render(snapshot, alloc, options.json);
+    defer alloc.free(rendered);
+    try writeStdout(deps, rendered);
+    if (options.json) try writeStdout(deps, "\n");
+    return if (snapshot.ok()) .handled_success else .handled_failure;
+}
+
 /// `daemon [status|stop] [--json]`, rendered from one snapshot.
 fn runDaemonCommand(alloc: Allocator, cfg: Config, rest: []const [:0]const u8, deps: RunDeps) !RunResult {
     var action: output_contracts.DaemonSnapshot.Action = .status;
@@ -3152,39 +3177,6 @@ fn parseLocalSurfaceArgs(args: []const [:0]const u8) !LocalSurfaceOptions {
             continue;
         }
         return error.InvalidLocalSurfaceArgs;
-    }
-    return options;
-}
-
-fn parseUpgradeArgs(args: []const [:0]const u8) !UpgradeOptions {
-    var options = UpgradeOptions{};
-    var format_seen = false;
-    var channel_seen = false;
-    var index: usize = 0;
-    while (index < args.len) : (index += 1) {
-        const arg = args[index];
-        if (std.mem.eql(u8, arg, "--json")) {
-            if (format_seen) return error.InvalidUpgradeArgs;
-            format_seen = true;
-            options.format = .json;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--channel")) {
-            if (channel_seen or index + 1 >= args.len) return error.InvalidUpgradeArgs;
-            channel_seen = true;
-            index += 1;
-            options.channel = update_target.Channel.parse(args[index]) orelse
-                return error.InvalidUpgradeArgs;
-            continue;
-        }
-        if (std.mem.startsWith(u8, arg, "--channel=")) {
-            if (channel_seen) return error.InvalidUpgradeArgs;
-            channel_seen = true;
-            options.channel = update_target.Channel.parse(arg["--channel=".len..]) orelse
-                return error.InvalidUpgradeArgs;
-            continue;
-        }
-        return error.InvalidUpgradeArgs;
     }
     return options;
 }
@@ -3558,7 +3550,7 @@ test "parse recognizes every top-level command and preserves unknown commands" {
         else => return error.TestExpectedEqual,
     }
     switch (parse(command_catalog, &.{@constCast("upgrade")})) {
-        .upgrade => |rest| try std.testing.expectEqual(@as(usize, 0), rest.len),
+        .update => |rest| try std.testing.expectEqual(@as(usize, 0), rest.len),
         else => return error.TestExpectedEqual,
     }
     switch (parse(command_catalog, &.{ @constCast("replay"), @constCast("tape") })) {
@@ -3936,32 +3928,6 @@ test "parse local surface args accepts only json" {
     try std.testing.expectEqual(output_contracts.OutputFormat.json, opts.format);
 
     try std.testing.expectError(error.InvalidLocalSurfaceArgs, parseLocalSurfaceArgs(&.{@constCast("--wat")}));
-}
-
-test "parse upgrade args accepts a remembered release channel" {
-    const defaults = try parseUpgradeArgs(&.{});
-    try std.testing.expectEqual(output_contracts.OutputFormat.text, defaults.format);
-    try std.testing.expect(defaults.channel == null);
-
-    const selected = try parseUpgradeArgs(&.{
-        @constCast("--channel"),
-        @constCast("dev"),
-        @constCast("--json"),
-    });
-    try std.testing.expectEqual(output_contracts.OutputFormat.json, selected.format);
-    try std.testing.expectEqual(update_target.Channel.dev, selected.channel.?);
-
-    const stable = try parseUpgradeArgs(&.{@constCast("--channel=stable")});
-    try std.testing.expectEqual(update_target.Channel.stable, stable.channel.?);
-
-    try std.testing.expectError(
-        error.InvalidUpgradeArgs,
-        parseUpgradeArgs(&.{ @constCast("--channel"), @constCast("nightly") }),
-    );
-    try std.testing.expectError(
-        error.InvalidUpgradeArgs,
-        parseUpgradeArgs(&.{ @constCast("--channel=dev"), @constCast("--channel=stable") }),
-    );
 }
 
 test "parse session list args supports bounded canonical pagination" {

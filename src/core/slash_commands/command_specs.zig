@@ -31,7 +31,7 @@ pub const TopLevelKind = enum {
     @"resume",
     credits,
     usage,
-    upgrade,
+    update,
     replay,
     workspace,
 };
@@ -75,6 +75,7 @@ pub const SlashKind = enum {
     workspace,
     shell,
     version,
+    update,
     context,
     subagents,
     heartbeat,
@@ -1840,9 +1841,9 @@ test "slash completion categories follow canonical entries" {
 test "help catalog groups visible commands and searches all command metadata" {
     const registry = testSlashRegistry();
 
-    try std.testing.expectEqual(@as(usize, 42), helpCatalogCount(registry, ""));
+    try std.testing.expectEqual(@as(usize, 43), helpCatalogCount(registry, ""));
     try std.testing.expectEqualStrings("/help", helpCatalogSpecAt(registry, "", 0).?.command);
-    try std.testing.expectEqual(@as(usize, 5), helpCatalogCategoryCount(registry, "", .general));
+    try std.testing.expectEqual(@as(usize, 6), helpCatalogCategoryCount(registry, "", .general));
     try std.testing.expectEqual(@as(usize, 3), helpCatalogCount(registry, "appearance"));
     try std.testing.expectEqualStrings("/paste", helpCatalogSpecAt(registry, "clipboard", 0).?.command);
 }

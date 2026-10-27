@@ -96,6 +96,45 @@ pub fn Runtime(comptime App: type) type {
             return .relaunch_requested;
         }
 
+        /// `/update`: ends the terminal like `/quit`, then the entry runtime
+        /// installs and relaunches on the same session (D144). A detached
+        /// session names itself through `session_id`; an in-process one
+        /// hands off through its persistence, as an upgrade does.
+        pub fn requestUpdateRelaunch(app: *App, session_id: []const u8, revision: []const u8) !ApplyOutcome {
+            return requestUpdateRelaunchWithDeps(app, session_id, revision, .{});
+        }
+
+        pub fn requestUpdateRelaunchWithDeps(app: *App, session_id: []const u8, revision: []const u8, deps: Deps) !ApplyOutcome {
+            if (upgradeUnavailableNotice(app)) |notice| {
+                try writeUpgradeNotice(app, .neutral, notice);
+                return .unavailable;
+            }
+            if (session_id.len == 0) {
+                app.prepareResumeHandoffForUpgrade() catch |err| {
+                    const notice = try app.alloc.print("update paused because this conversation is not safely resumable: {s}", .{@errorName(err)});
+                    defer app.alloc.free(notice);
+                    try writeUpgradeNotice(app, .@"error", notice);
+                    return .unavailable;
+                };
+            }
+            var executable_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const executable_path = deps.current_executable_path(deps.ctx, &executable_buf) catch |err| {
+                const notice = try app.alloc.print("update unavailable: the executable path could not be resolved: {s}", .{@errorName(err)});
+                defer app.alloc.free(notice);
+                try writeUpgradeNotice(app, .@"error", notice);
+                return .unavailable;
+            };
+            app.upgrader.requestUpdateRelaunch(executable_path, session_id, revision) catch |err| {
+                const notice = try app.alloc.print("update unavailable: {s}", .{@errorName(err)});
+                defer app.alloc.free(notice);
+                try writeUpgradeNotice(app, .@"error", notice);
+                return .unavailable;
+            };
+            if (session_id.len == 0) app.requestResumeHandoffForUpgrade();
+            if (comptime @hasField(App, "should_exit")) app.should_exit = true;
+            return .relaunch_requested;
+        }
+
         fn upgradeUnavailableNotice(app: *App) ?[]const u8 {
             if (comptime @hasField(App, "stream")) {
                 if (app.stream.active) return "upgrade is unavailable until the response finishes";

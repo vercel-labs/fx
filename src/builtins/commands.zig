@@ -263,13 +263,22 @@ pub const top_level_specs = [_]TopLevelSpec{
         },
     },
     .{
-        .kind = .upgrade,
-        .token = "upgrade",
-        .usage = "upgrade [--channel <stable|dev>] [--json]",
-        .summary = "Show local rebuild guidance (upstream upgrades disabled)",
+        .kind = .update,
+        .token = "update",
+        .aliases = &.{"upgrade"},
+        .usage = "update [--check] [--force] [--json]",
+        .summary = "Update proto-fx from its source checkout or releases",
         .options = &.{
-            .{ .flag = "--channel <stable|dev>", .description = "Select and remember the release channel" },
+            .{ .flag = "--check", .description = "Report whether an update is available without installing it" },
+            .{ .flag = "--force", .description = "Rebuild or reinstall even when already up to date" },
             json_option,
+        },
+        .details = &.{
+            "By default proto-fx updates from the git checkout it was built from: it fetches, fast-forwards the current branch, rebuilds with the same optimize mode, and swaps the new binary over the running one.",
+            "It refuses a checkout with uncommitted changes or local commits that are not on its upstream.",
+            "Set \"update\": {\"method\": \"release\", \"repo\": \"owner/name\"} in ~/.proto-fx/settings.json to install GitHub releases instead; each download is checked against its sha256.",
+            "An idle supervisor restarts on the new binary. One with running turns keeps the old binary until its next idle exit.",
+            "In a session, /update updates and relaunches proto-fx on the same session.",
         },
     },
     .{
@@ -338,7 +347,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .slack, .usage = "slack <install|status|refresh>" },
         .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },
-        .{ .kind = .upgrade, .usage = "upgrade", .summary = "Show local rebuild guidance (upstream upgrades disabled)" },
+        .{ .kind = .update, .usage = "update" },
         .{ .kind = .acp, .usage = "acp" },
         .{ .kind = .help, .usage = "help" },
     } },
@@ -498,6 +507,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .kernel, .command = "/kernel", .help_entry = "/kernel [status|prewarm|interrupt|stop|restart]", .completion_description = "manage the session's Python kernel", .presentation_category = .workspace, .has_args = true, .accepts_payload = true },
     .{ .kind = .heartbeat, .command = "/heartbeat", .help_entry = "/heartbeat [status|start <seconds> <prompt>|pause|resume|stop]", .completion_description = "send this session a prompt on a schedule", .presentation_category = .session, .has_args = true, .accepts_payload = true, .scope = .root },
     .{ .kind = .subagents, .command = "/subagents", .help_entry = "/subagents", .completion_description = "browse this session's subagents", .presentation_category = .agents },
+    .{ .kind = .update, .command = "/update", .help_entry = "/update", .completion_description = "update proto-fx and relaunch on this session", .presentation_category = .general },
     .{ .kind = .version, .command = "/version", .help_entry = "/version", .completion_description = "show the proto-fx version", .presentation_category = .general },
     .{ .kind = .quit, .command = "/quit", .aliases = &.{"/exit"}, .help_entry = "/quit", .completion_description = "exit the interactive shell", .presentation_category = .general, .show_in_welcome = true },
 };
@@ -592,6 +602,7 @@ test "built-in slash commands register exact active order" {
         "/kernel",
         "/heartbeat",
         "/subagents",
+        "/update",
         "/version",
         "/quit",
     };
