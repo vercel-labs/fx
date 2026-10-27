@@ -19,7 +19,7 @@ pub fn write(writer: *std.Io.Writer, provider: []const u8, surface: Surface) !vo
     }
     switch (preset.login) {
         .claude_or_key => try writer.writeAll(" to use your Claude Code login (sign it in again with `claude auth login`), or a new token or API key."),
-        .browser_or_key, .key => try writer.writeAll(" to sign in again or save a new key."),
+        .browser_or_key, .key, .cursor => try writer.writeAll(" to sign in again or save a new key."),
     }
 }
 

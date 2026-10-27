@@ -4936,6 +4936,7 @@ test {
     _ = @import("gateway/openai_responses.zig");
     _ = @import("gateway/routed_provider.zig");
     _ = @import("gateway/claude_agent.zig");
+    _ = @import("gateway/cursor.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");

@@ -16,6 +16,7 @@ const provider_picker_catalog = @import("provider_picker_catalog.zig");
 const provider_keys = @import("provider_keys.zig");
 const provider_auth_hint = @import("provider_auth_hint.zig");
 const openrouter_oauth = @import("openrouter_oauth.zig");
+const cursor_oauth = @import("cursor_oauth.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -2412,11 +2413,16 @@ pub const Runtime = struct {
         return self.api_key_provider;
     }
 
-    /// Starts OpenRouter's browser sign-in for the inline picker.
-    pub fn openOpenRouterSignIn(self: *Self, alloc: Allocator) !bool {
+    /// Starts a preset's browser sign-in for the inline picker: Cursor's
+    /// polled login (D202) or OpenRouter's callback login.
+    pub fn openPresetSignIn(self: *Self, alloc: Allocator, preset: []const u8) !bool {
         if (comptime host_target.is_wasm) return error.OpenRouterOAuthUnavailable;
         self.exitSignInStage(alloc);
-        if (!try openrouter_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport)) return false;
+        const started = if (std.mem.eql(u8, preset, cursor_oauth.provider_id))
+            try cursor_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport)
+        else
+            try openrouter_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport);
+        if (!started) return false;
         self.exitApiKeyStage(alloc, .screen_replacement);
         self.clearTeamSelection(alloc);
         self.picker_active = true;

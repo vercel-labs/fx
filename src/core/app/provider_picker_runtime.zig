@@ -317,7 +317,7 @@ pub fn Runtime(comptime App: type) type {
                         }
                         app.input_runtime.picker.clearProviderPickerFlow();
                         app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                        try app_auth_runtime.Runtime(App).beginOpenRouterSignInForProviderPicker(app);
+                        try app_auth_runtime.Runtime(App).beginPresetSignInForProviderPicker(app, provider.label());
                         app.shell.render_requests.request(.footer);
                         return true;
                     }

@@ -11,12 +11,15 @@ const anthropic_messages = @import("../gateway/anthropic_messages.zig");
 const openai_responses = @import("../gateway/openai_responses.zig");
 const routed_provider = @import("../gateway/routed_provider.zig");
 const claude_agent = @import("../gateway/claude_agent.zig");
+const cursor = @import("../gateway/cursor.zig");
 const configured_provider = @import("../core/config/configured_provider.zig");
 const web_search_bank = @import("web_search_bank.zig");
 
 fn configuredBundle(_: ?*anyopaque, definition: *const configured_provider.Definition) provider_set.Bundle {
     // The built-in anthropic provider runs Claude Code or Messages (D165).
     if (claude_agent.owns(definition)) return claude_agent.bundle(definition);
+    // The built-in cursor provider runs Cursor's agent service (D200).
+    if (cursor.owns(definition)) return cursor.bundle(definition);
     // Models that speak different protocols route per request (D146).
     if (definition.mixed()) return routed_provider.bundle(definition);
     return switch (definition.protocol) {

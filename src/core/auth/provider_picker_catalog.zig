@@ -148,7 +148,7 @@ pub fn providerMethods(id: model_provider.ProviderId) []const Method {
         // Presets sign in by browser or a pasted key; other connections
         // authenticate from their definition.
         .configured => if (provider_registry.presetFor(id.label())) |preset| switch (preset.login) {
-            .browser_or_key => &.{ .oauth, .api_key },
+            .browser_or_key, .cursor => &.{ .oauth, .api_key },
             .key => &.{.api_key},
             .claude_or_key => &.{ .claude_code, .claude_token, .api_key },
         } else &.{},

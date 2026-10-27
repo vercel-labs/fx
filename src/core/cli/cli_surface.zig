@@ -1143,7 +1143,7 @@ fn runNonInteractiveWithDeps(
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: proto-fx login [codex|grok|openrouter|opencode-zen|opencode-go]\nFor a direct endpoint, use proto-fx setup --base-url URL.\n");
+                try writeStderr(deps, "usage: proto-fx login [codex|grok|anthropic|cursor|openrouter|opencode-zen|opencode-go]\nFor a direct endpoint, use proto-fx setup --base-url URL.\n");
                 return .handled_failure;
             };
             if (maybe_login_provider == null or maybe_login_provider.? == .gateway) {

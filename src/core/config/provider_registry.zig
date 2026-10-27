@@ -8,6 +8,7 @@
 const std = @import("std");
 const configured = @import("configured_provider.zig");
 const preset_models = @import("provider_preset_models.zig");
+const cursor_models = @import("../../gateway/cursor_models.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const Allocator = std.mem.Allocator;
@@ -24,6 +25,9 @@ pub const Login = enum {
     /// subscription token from `claude setup-token`, or a pasted Anthropic
     /// API key (D166).
     claude_or_key,
+    /// Cursor's browser sign-in, polled until it completes, or a pasted
+    /// Cursor API key (D202).
+    cursor,
 };
 
 pub const Preset = struct {
@@ -55,6 +59,19 @@ pub const presets = [_]Preset{
         \\{"protocol":"anthropic-messages","base_url":"https://api.anthropic.com/v1","auth":{"type":"none"},"default_model":"claude-opus-5-5","reviewer_model":"claude-haiku-5-5"}
         ,
         .models = &preset_models.anthropic,
+    },
+    .{
+        .id = "cursor",
+        .name = "Cursor",
+        .description = "Cursor account: browser sign-in or a Cursor API key",
+        .key_url = "https://cursor.com/dashboard?tab=integrations",
+        .login = .cursor,
+        // Cursor's agent service over Connect; the protocol field is unused
+        // because the cursor transport owns the preset (D200).
+        .json =
+        \\{"protocol":"openai-chat-completions","base_url":"https://api2.cursor.sh","auth":{"type":"none"},"default_model":"composer-2.5","reviewer_model":"composer-2.5-fast"}
+        ,
+        .models = &cursor_models.metadata,
     },
     .{
         .id = "openrouter",
@@ -210,6 +227,10 @@ test "presets join the registry with their built-in models and routes" {
     try std.testing.expectEqual(configured.Protocol.@"openai-chat-completions", zen.protocolFor("kimi-k3"));
     try std.testing.expect(zen.model("gemini-3-pro") == null);
     try std.testing.expect(zen.model(zen.default_model.?) != null);
+    const cursor = value.get("cursor").?;
+    try std.testing.expect(cursor.preset);
+    try std.testing.expectEqualStrings("composer-2.5", cursor.default_model.?);
+    try std.testing.expect(cursor.model("claude-opus-5-high") != null);
     const go = value.get("opencode-go").?;
     try std.testing.expect(go.model(go.default_model.?) != null);
 }

@@ -7,6 +7,7 @@ const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const openrouter_oauth = @import("openrouter_oauth.zig");
+const cursor_oauth = @import("cursor_oauth.zig");
 const provider_keys = @import("provider_keys.zig");
 const provider_registry = @import("../config/provider_registry.zig");
 const claude_login = @import("../../gateway/claude_login.zig");
@@ -17,6 +18,7 @@ pub fn run(alloc: Allocator, id: []const u8, transport: oauth_transport.Provider
     const preset = provider_registry.presetFor(id) orelse return error.ConfiguredProviderUsesEnvironmentAuth;
     switch (preset.login) {
         .browser_or_key => return openrouter_oauth.runLogin(alloc, transport, url_opener),
+        .cursor => return cursor_oauth.runLogin(alloc, transport, url_opener),
         .key, .claude_or_key => {},
     }
     const stdout = std.Io.File.stdout();

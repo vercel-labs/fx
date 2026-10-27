@@ -1735,12 +1735,13 @@ pub fn Runtime(comptime App: type) type {
             try beginSignIn(app, false);
         }
 
-        /// OpenRouter's browser sign-in from `/login openrouter oauth` (D147).
-        pub fn beginOpenRouterSignInForProviderPicker(app: *App) !void {
+        /// A preset's browser sign-in from `/login openrouter oauth` (D147)
+        /// or `/login cursor oauth` (D202).
+        pub fn beginPresetSignInForProviderPicker(app: *App, preset: []const u8) !void {
             try app.flushBeforeBlockingExternalWork();
-            const started = app.auth.openOpenRouterSignIn(app.alloc) catch |err| {
+            const started = app.auth.openPresetSignIn(app.alloc, preset) catch |err| {
                 cancelPromptRetryAfterAuth(app);
-                debug_trace.logf("auth", "OpenRouter login failed err={s}", .{@errorName(err)});
+                debug_trace.logf("auth", "{s} login failed err={s}", .{ preset, @errorName(err) });
                 try writeLoginError(app, .configured, err);
                 return;
             };

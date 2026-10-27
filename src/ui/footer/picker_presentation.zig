@@ -552,8 +552,9 @@ fn composeSignInPickerRow(
         else if (source == .grok_subscription)
             "   Sign in with Grok"
         else if (source == .configured)
-            // Only OpenRouter signs a configured provider in by browser (D147).
-            "   Sign in with OpenRouter"
+            // OpenRouter (D147) and Cursor (D202) sign presets in by browser;
+            // Cursor's page is its loginDeepControl URL.
+            if (std.mem.find(u8, snapshot.verification_uri, "/loginDeepControl?") != null) "   Sign in with Cursor" else "   Sign in with OpenRouter"
         else
             "   Sign in with Vercel",
         1, 4 => "",
