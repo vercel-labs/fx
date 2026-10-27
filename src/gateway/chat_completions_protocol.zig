@@ -69,7 +69,7 @@ const max_name_bytes = 128;
 const max_history_arguments_bytes = 1024 * 1024;
 const max_json_depth = 64;
 
-const Function = struct {
+pub const Function = struct {
     name: []const u8,
     description: []const u8,
     schema: union(enum) {
@@ -99,7 +99,7 @@ fn append_function(alloc: Allocator, functions: *std.ArrayList(Function), functi
 
 // Provider-native advertisements are not Chat Completions function tools.
 // Omit only registered provider-executed tools; missing ordinary schemas fail.
-fn select_functions(alloc: Allocator, tools: stream_provider.ToolSelection, choice: types.ToolChoice) Error!std.ArrayList(Function) {
+pub fn select_functions(alloc: Allocator, tools: stream_provider.ToolSelection, choice: types.ToolChoice) Error!std.ArrayList(Function) {
     var functions: std.ArrayList(Function) = .empty;
     errdefer functions.deinit(alloc);
     if (choice == .none) return functions;
@@ -187,7 +187,7 @@ fn validate_request(request: stream_provider.RequestData) Error!void {
     }
 }
 
-fn check_json_depth(text: []const u8) Error!void {
+pub fn check_json_depth(text: []const u8) Error!void {
     var depth: usize = 0;
     var quoted = false;
     var escaped = false;
@@ -290,7 +290,7 @@ fn validate_arguments(alloc: Allocator, text: []const u8) Error!void {
     if (try types.ToolArgumentIntegrity.classifyFunctionInput(alloc, text) != .valid) return error.InvalidToolArguments;
 }
 
-fn validate_history(alloc: Allocator, messages: []const types.ChatMessage) Error!void {
+pub fn validate_history(alloc: Allocator, messages: []const types.ChatMessage) Error!void {
     var pending: std.StringHashMapUnmanaged([]const u8) = .empty;
     defer pending.deinit(alloc);
     for (messages) |message| {

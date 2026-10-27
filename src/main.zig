@@ -4918,6 +4918,9 @@ test {
     _ = @import("core/gateway/provider_set.zig");
     _ = @import("core/gateway/model_catalog.zig");
     _ = @import("gateway/chat_completions.zig");
+    _ = @import("gateway/anthropic_messages.zig");
+    _ = @import("gateway/anthropic_messages_protocol.zig");
+    _ = @import("gateway/anthropic_messages_stream.zig");
     _ = @import("core/github/git_context.zig");
     _ = @import("core/github/github_publish.zig");
     _ = @import("core/github/github_workflows.zig");

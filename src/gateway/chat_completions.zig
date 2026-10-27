@@ -248,15 +248,18 @@ fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry
         .has_file_input = vision,
         .context_window = metadata.context_window orelse 0,
         .max_tokens = metadata.max_output_tokens orelse 0,
+        // Only Messages definitions declare efforts; the list stays borrowed.
+        .has_reasoning = metadata.reasoning_efforts.len != 0,
+        .reasoning_efforts = .fromOwnedSlice(@constCast(metadata.reasoning_efforts)),
     };
 }
 
-fn lookup_capabilities(raw: ?*anyopaque, model: []const u8) model_capabilities.Capabilities {
+pub fn lookup_capabilities(raw: ?*anyopaque, model: []const u8) model_capabilities.Capabilities {
     const metadata = definition_at(raw).model(model) orelse return .{};
     return model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(metadata_entry(metadata.*)));
 }
 
-fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) Allocator.Error!catalog.ProviderResult {
+pub fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) Allocator.Error!catalog.ProviderResult {
     if (input.cancel_flag) |flag| if (flag.load(.seq_cst)) return .{ .failure = .{ .category = .cancellation } };
     const definition = definition_at(raw);
     var entries: std.ArrayList(catalog.ModelCatalogEntry) = .empty;
@@ -267,6 +270,8 @@ fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) 
         errdefer alloc.free(entry.id);
         entry.model_type = try alloc.dupe(u8, entry.model_type);
         errdefer alloc.free(entry.model_type);
+        entry.reasoning_efforts = .fromOwnedSlice(try alloc.dupe(types.ReasoningEffort, metadata.reasoning_efforts));
+        errdefer entry.reasoning_efforts.deinit(alloc);
         try entries.append(alloc, entry);
     }
     return .{ .catalog = entries };
@@ -298,7 +303,7 @@ test "configured capability lookup matches catalog projection and preserves unkn
     try std.testing.expectEqualDeep(model_capabilities.Capabilities{}, provider.lookupCapabilities("missing-fast").?);
 }
 
-fn fetch_cli_catalog(raw: ?*anyopaque, alloc: Allocator, input: gateway_provider.CliModelCatalogInput) gateway_provider.CliModelCatalogResult {
+pub fn fetch_cli_catalog(raw: ?*anyopaque, alloc: Allocator, input: gateway_provider.CliModelCatalogInput) gateway_provider.CliModelCatalogResult {
     const provenance = catalog.Provenance{ .access = catalog.AccessMetadata.init(input.access) };
     const result = fetch_catalog(raw, alloc, .{ .access = input.access, .endpoint = input.endpoint, .cancel_flag = input.cancel_flag }) catch
         return .{ .failure = .{ .access = provenance.access, .anonymous_fallback_used = false, .failure = .{ .category = .resource_exhausted } } };

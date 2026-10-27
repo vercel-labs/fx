@@ -21,7 +21,7 @@ pub const Context = struct {
     pub fn init(alloc: Allocator, transport: host_stream.Transport, json: []const u8) !Context {
         var registry = try definitions.Registry.parse_json(alloc, json);
         errdefer registry.deinit(alloc);
-        if (registry.definitions.len != 1 or registry.definitions[0].auth != .none) {
+        if (registry.definitions.len != 1 or registry.definitions[0].auth != .none or registry.definitions[0].protocol != .@"openai-chat-completions") {
             return error.InvalidConfiguredProvider;
         }
         return .{ .transport = transport, .registry = registry };
