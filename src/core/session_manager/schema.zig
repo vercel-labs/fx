@@ -207,7 +207,10 @@ pub const Body = union(Kind) {
     pub const Terminated = struct { child: []const u8, data: ?[]const u8 = null };
     /// A message another agent of the tree sent this node (D185): it waits
     /// in the node's mailbox until a `mail_done` with its id. `from` is the
-    /// sender's node id or a watch's job id, `label` its name.
+    /// sender's node id or a watch's job id, `label` its name. With `for`,
+    /// the message is held in this log for worker `for`, which has no log
+    /// yet, and is not this node's (D212): it moves to that worker's
+    /// mailbox once the worker's log exists.
     pub const Mail = struct {
         id: []const u8,
         from: []const u8,
@@ -215,6 +218,7 @@ pub const Body = union(Kind) {
         body: []const u8,
         reply_to: ?[]const u8 = null,
         broadcast: bool = false,
+        hold_for: ?[]const u8 = null,
     };
     pub const MailDone = struct { id: []const u8, how: MailEnd };
     pub const Snapshot = struct { covers_seq: u64, state: []const u8, compaction_offset: ?u64 };
@@ -311,6 +315,7 @@ pub fn appendBody(gpa: std.mem.Allocator, out: *std.ArrayList(u8), body: Body) e
             try w.string("body", m.body);
             if (m.reply_to) |reply_to| try w.string("reply_to", reply_to);
             if (m.broadcast) try w.raw("broadcast", "true");
+            if (m.hold_for) |node| try w.string("for", node);
         },
         .mail_done => |d| {
             try w.string("id", d.id);
@@ -421,6 +426,7 @@ fn bodyOf(kind: Kind, f: Fields) BodyError!Body {
             .body = try f.req([]const u8, "body"),
             .reply_to = try f.opt([]const u8, "reply_to"),
             .broadcast = try f.opt(bool, "broadcast") orelse false,
+            .hold_for = try f.opt([]const u8, "for"),
         } },
         .mail_done => .{ .mail_done = .{
             .id = try f.req([]const u8, "id"),

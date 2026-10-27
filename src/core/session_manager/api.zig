@@ -808,6 +808,7 @@ fn checkEvents(gpa: std.mem.Allocator, events: []const Event, import: bool) Appe
             try checkName(m.from, max_store_key_bytes);
             if (m.label.len > 0) try checkName(m.label, max_store_key_bytes);
             if (m.reply_to) |reply_to| try checkName(reply_to, max_store_key_bytes);
+            if (m.hold_for) |node| try checkId(node);
             if (m.body.len > fold.fold_mail.max_body_bytes) return error.TooLarge;
             if (!std.unicode.utf8ValidateSlice(m.body)) return error.InvalidArgument;
         },

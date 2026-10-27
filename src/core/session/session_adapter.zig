@@ -141,14 +141,21 @@ pub fn freeMailbox(alloc: Allocator, mailbox: []Mail) void {
     alloc.free(mailbox);
 }
 
-fn copyMailbox(alloc: Allocator, mailbox: []const Mail) ![]Mail {
-    const out = try alloc.alloc(Mail, mailbox.len);
+const MailKind = enum { own, held };
+
+fn copyMailbox(alloc: Allocator, mailbox: []const Mail, kind: MailKind) ![]Mail {
+    var len: usize = 0;
+    for (mailbox) |mail| {
+        if (mail.own() == (kind == .own)) len += 1;
+    }
+    const out = try alloc.alloc(Mail, len);
     var built: usize = 0;
     errdefer {
         for (out[0..built]) |mail| mail.deinit(alloc);
         alloc.free(out);
     }
     for (mailbox) |mail| {
+        if (mail.own() != (kind == .own)) continue;
         out[built] = try mail.clone(alloc);
         built += 1;
     }
@@ -461,7 +468,7 @@ pub const Store = struct {
     pub fn peekMailbox(store: *Store, alloc: Allocator, id: []const u8) ![]Mail {
         var peeked = try store.manager.peek(alloc, id);
         defer peeked.deinit(alloc);
-        return copyMailbox(alloc, peeked.state.mailbox.items);
+        return copyMailbox(alloc, peeked.state.mailbox.items, .own);
     }
 
     pub fn freeIds(alloc: Allocator, ids: [][]u8) void {
@@ -2621,7 +2628,16 @@ pub const Session = struct {
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         const state = try self.handle.state(scratch.allocator());
-        return copyMailbox(alloc, state.mailbox.items);
+        return copyMailbox(alloc, state.mailbox.items, .own);
+    }
+
+    /// The messages this log holds for workers that have no log yet,
+    /// oldest first (D212). Free with `freeMailbox`.
+    pub fn heldMail(self: *Session, alloc: Allocator) ![]Mail {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const state = try self.handle.state(scratch.allocator());
+        return copyMailbox(alloc, state.mailbox.items, .held);
     }
 
     /// Appends mailbox lines as one durable batch. The manager refuses a

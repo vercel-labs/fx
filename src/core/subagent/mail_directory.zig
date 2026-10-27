@@ -33,6 +33,8 @@ pub fn list(arena: Allocator, root: *tool_host.Runtime) ![]Node {
     const max_depth = root.tree.policy.max_depth;
     var nodes: std.ArrayList(Node) = .empty;
     try nodes.append(arena, .{ .id = root.node_id, .label = root_label });
+    // Workers the root's log holds mail for, one entry per message (D212).
+    var held_for: std.ArrayList([]const u8) = .empty;
     var index: usize = 0;
     while (index < nodes.items.len) : (index += 1) {
         const node = nodes.items[index];
@@ -41,7 +43,10 @@ pub fn list(arena: Allocator, root: *tool_host.Runtime) ![]Node {
             // A node with no log yet has no mailbox and no children.
             else => continue,
         };
-        nodes.items[index].waiting = peeked.state.mailbox.items.len;
+        // Mail this log holds for a worker that has not started is not its own (D212).
+        for (peeked.state.mailbox.items) |mail| {
+            if (mail.own()) nodes.items[index].waiting += 1 else try held_for.append(arena, try arena.dupe(u8, mail.hold_for.?));
+        }
         if (node.depth >= max_depth) continue;
         for (peeked.state.children.items) |child| {
             const raw = child.spawn_data orelse continue;
@@ -60,6 +65,12 @@ pub fn list(arena: Allocator, root: *tool_host.Runtime) ![]Node {
                 .path = path,
             });
         }
+    }
+    // A worker that has not started counts the messages held for it.
+    for (held_for.items) |id| {
+        for (nodes.items) |*node| if (std.mem.eql(u8, node.id, id)) {
+            node.waiting += 1;
+        };
     }
     return nodes.items;
 }

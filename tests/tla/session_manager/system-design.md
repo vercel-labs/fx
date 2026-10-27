@@ -2559,6 +2559,22 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   prompt of every request, which counts a cached prefix again at every
   step and grows with the square of the turn's length.
 
+- **D212 Decision:** a message to a worker admitted but not started,
+  which has no log yet, is a `mail` line in the root's log with `for`
+  naming the worker: it is not the root's own mail, counts against its
+  own bound of 100, survives a snapshot, and adds to the worker's waiting
+  count. Once the worker's log exists, the root's tick, a send to it, or
+  any carrier of its mail moves what is held into its mailbox in order,
+  under the worker's claim, skipping a message the mailbox or history
+  already has, and then writes `mail_done` for it in the root's log; no
+  carrier takes a worker's mail before its held mail is moved. A held
+  message for a worker that is gone or terminal is dropped.
+  `tests/tla/jobs/Mailbox.tla` models the hold and the move with the
+  mutations held_in_memory, flush_no_dedupe and take_unsettled. **Why:**
+  the held messages lived only in memory, so a crash before the worker
+  started lost them. **Alternative:** a side file beside the session,
+  which the session manager's log and snapshots would not order.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

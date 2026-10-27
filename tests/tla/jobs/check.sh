@@ -8,7 +8,8 @@
 #
 # Mailbox: a message between the agents of a tree reaches the recipient's
 # model exactly once and in order, across a crash and a restart, and none
-# is lost but by a full mailbox's drop (D185 to D189).
+# is lost but by a full mailbox's drop (D185 to D189), including one sent
+# before the recipient's log exists, which the root's log holds (D212).
 #
 # The design config must pass every invariant and liveness property. Each
 # Jobs-<mutation>.cfg enables one broken rule and must be rejected by the
@@ -35,4 +36,7 @@ Mailbox Mailbox-overtake InOrder -deadlock
 Mailbox Mailbox-release_absorbed ExactlyOnce -deadlock
 Mailbox Mailbox-ignore_wait NoDeliveryUnderWait -deadlock
 Mailbox Mailbox-two_carriers ExactlyOnce -deadlock
+Mailbox Mailbox-held_in_memory NoLossAcrossRestart -deadlock
+Mailbox Mailbox-flush_no_dedupe ExactlyOnce -deadlock
+Mailbox Mailbox-take_unsettled ExactlyOnce -deadlock
 EOF

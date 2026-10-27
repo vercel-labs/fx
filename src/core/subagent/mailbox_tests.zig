@@ -490,3 +490,53 @@ test "twenty workers in one tree broadcast to each other: every message once, no
     // Hosts stay near the tree's cap while every worker runs.
     try testing.expect(max_open <= root.tree.nodes.limits.max_open + root.tree.policy.tree_slots + workers);
 }
+
+test "a message to a worker that has not started is kept in the root's log and reaches it once after a restart" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(testing.allocator);
+    defer parent.deinit();
+    var room: Mailroom = .{};
+    defer room.deinit();
+    const root = try rootHost(&parent, &room);
+    defer root.deinit();
+
+    // Four running turns fill the tree's four run slots, so a fifth worker
+    // is admitted but cannot start: it has no log yet.
+    room.hold.store(true, .seq_cst);
+    for (0..4) |index| _ = try spawn(arena, root, try arena.print("busy{d}", .{index}), "hold until told");
+    while (room.held.load(.seq_cst) < 4) io_mod.sleep(std.time.ns_per_ms);
+    const late = try spawn(arena, root, "late", "start");
+    const receipt = one(try mailbox.send(root, arena, .{ .to = late, .body = "for when you start" }));
+    try testing.expectEqual(mailbox.Outcome.queued, receipt.outcome);
+    const held = try root.children.parent.heldMail(arena);
+    try testing.expectEqual(@as(usize, 1), held.len);
+    try testing.expectEqualStrings(late, held[0].hold_for.?);
+    // Held mail is not the root's own.
+    try testing.expectEqual(@as(usize, 0), (try root.children.parent.mailbox(arena)).len);
+
+    // A crash loses the process's memory of it; the log keeps it.
+    root.tree.mail.deinit();
+    root.tree.mail = mailbox.Bus.init(testing.allocator);
+    room.hold.store(false, .seq_cst);
+    var waited: usize = 0;
+    while (room.received(late, receipt.id.?) == 0 and waited < 4000) : (waited += 1) {
+        mailbox.pump(root);
+        io_mod.sleep(2 * std.time.ns_per_ms);
+    }
+    try settle(root);
+    try testing.expectEqual(@as(usize, 1), room.received(late, receipt.id.?));
+    try testing.expectEqual(@as(usize, 0), (try root.children.parent.heldMail(arena)).len);
+
+    // A crash after the move but before the root's log let go of it leaves
+    // it held again; the next move sees the worker already has it.
+    try root.children.parent.appendMail(&.{.{ .mail = .{ .id = receipt.id.?, .from = root.node_id, .label = "root", .body = "for when you start", .hold_for = late } }});
+    root.tree.mail.held_maybe.store(true, .seq_cst);
+    mailbox.pump(root);
+    try settle(root);
+    mailbox.pump(root);
+    try testing.expectEqual(@as(usize, 0), (try root.children.parent.heldMail(arena)).len);
+    try testing.expectEqual(@as(usize, 1), room.received(late, receipt.id.?));
+}

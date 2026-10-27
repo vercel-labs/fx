@@ -82,10 +82,11 @@ pub const Bus = struct {
     /// one delivery or inbox read runs per node, so no message is carried
     /// twice or settled by another's delivery (`tests/tla/jobs/Mailbox.tla` ExactlyOnce, mutation two_carriers).
     delivering: std.array_hash_map.String(void) = .empty,
-    /// Messages for workers admitted but not started yet, which have no
-    /// log to keep them: each moves into its worker's mailbox once the
-    /// worker's first turn saves its log.
-    early: std.ArrayList(Early) = .empty,
+    /// Whether the root's log may hold messages for workers admitted but
+    /// not started, which have no log to keep them (D212): each moves into
+    /// its worker's mailbox once the worker's first turn saves its log.
+    /// True at start, so the first pump looks after a restart.
+    held_maybe: std.atomic.Value(bool) = .init(true),
     /// Rows for the root's transcript of messages between workers, as
     /// proto relays them to its main view: "alpha → beta · first line".
     relays: std.ArrayList([]u8) = .empty,
@@ -105,29 +106,6 @@ pub const Bus = struct {
             alloc.free(steer.parent_id);
             alloc.free(steer.operation_id);
             freeIds(alloc, steer.ids);
-        }
-    };
-
-    const Early = struct {
-        node_id: []u8,
-        id: []u8,
-        from: []u8,
-        label: []u8,
-        body: []u8,
-        reply_to: ?[]u8,
-        broadcast: bool,
-
-        fn free(early: Early, alloc: Allocator) void {
-            alloc.free(early.node_id);
-            alloc.free(early.id);
-            alloc.free(early.from);
-            alloc.free(early.label);
-            alloc.free(early.body);
-            if (early.reply_to) |value| alloc.free(value);
-        }
-
-        fn line(early: Early) session_adapter.MailLine {
-            return .{ .mail = .{ .id = early.id, .from = early.from, .label = early.label, .body = early.body, .reply_to = early.reply_to, .broadcast = early.broadcast } };
         }
     };
 
@@ -151,8 +129,6 @@ pub const Bus = struct {
         self.root_notices.deinit(self.alloc);
         for (self.delivering.keys()) |key| self.alloc.free(key);
         self.delivering.deinit(self.alloc);
-        for (self.early.items) |early| early.free(self.alloc);
-        self.early.deinit(self.alloc);
         for (self.relays.items) |row| self.alloc.free(row);
         self.relays.deinit(self.alloc);
         self.* = undefined;
@@ -379,11 +355,13 @@ fn sendOne(root: *Runtime, arena: Allocator, me: Node, target: Node, input: Send
     const revived = !root.tree.nodes.isOpen(target.id);
     const entry = node_ops.lease(root, target.path) catch |err| switch (err) {
         // Admitted, still waiting for a run slot: no log yet.
-        error.NodeUnavailable => return holdEarly(root, arena, target, line),
+        error.NodeUnavailable => return holdEarly(root, arena, target, line) catch |hold_err| failed(arena, target, hold_err),
         else => return failed(arena, target, err),
     };
     defer node_ops.release(root, entry);
-    if (!entry.session.saved()) return holdEarly(root, arena, target, line);
+    if (!entry.session.saved()) return holdEarly(root, arena, target, line) catch |err| failed(arena, target, err);
+    // Messages held for it before it started go first, in order.
+    flushHeldFor(root, arena, entry, target.id) catch |err| return failed(arena, target, err);
     const dropped = post(root, arena, entry.session, target.id, line) catch |err| return failed(arena, target, err);
     bus(root).changed();
     const effect: ?Effect = switch (try deliverWorker(root, arena, entry, target)) {
@@ -404,45 +382,39 @@ fn sendOne(root: *Runtime, arena: Allocator, me: Node, target: Node, input: Send
     };
 }
 
-/// Keeps a message for a worker that has not started, until its log exists
-/// (`flushEarly`). Bounded like a mailbox: the oldest goes first.
+/// Keeps a message for a worker that has not started in the root's log,
+/// held for it, until the worker's log exists (D212, `flushHeld`): a crash
+/// cannot lose it. Bounded like a mailbox: the oldest held for that worker
+/// goes first.
 fn holdEarly(root: *Runtime, arena: Allocator, target: Node, line: session_adapter.MailLine) !Receipt {
     const b = bus(root);
-    const mail = line.mail;
-    var early: Bus.Early = .{
-        .node_id = try b.alloc.dupe(u8, target.id),
-        .id = undefined,
-        .from = undefined,
-        .label = undefined,
-        .body = undefined,
-        .reply_to = null,
-        .broadcast = mail.broadcast,
-    };
-    errdefer b.alloc.free(early.node_id);
-    early.id = try b.alloc.dupe(u8, mail.id);
-    errdefer b.alloc.free(early.id);
-    early.from = try b.alloc.dupe(u8, mail.from);
-    errdefer b.alloc.free(early.from);
-    early.label = try b.alloc.dupe(u8, mail.label);
-    errdefer b.alloc.free(early.label);
-    early.body = try b.alloc.dupe(u8, mail.body);
-    errdefer b.alloc.free(early.body);
-    early.reply_to = if (mail.reply_to) |value| try b.alloc.dupe(u8, value) else null;
+    var mail = line.mail;
+    mail.hold_for = target.id;
     var dropped: ?[]const u8 = null;
-    b.lock();
-    defer b.unlock();
-    var held: usize = 0;
-    var oldest: ?usize = null;
-    for (b.early.items, 0..) |item, index| if (std.mem.eql(u8, item.node_id, target.id)) {
-        held += 1;
-        if (oldest == null) oldest = index;
-    };
-    if (held >= session_adapter.max_mailbox) {
-        const gone = b.early.orderedRemove(oldest.?);
-        dropped = try arena.dupe(u8, gone.id);
-        gone.free(b.alloc);
+    {
+        b.lock();
+        defer b.unlock();
+        const session = root.children.parent;
+        const held = try session.heldMail(arena);
+        var count: usize = 0;
+        var oldest: ?[]const u8 = null;
+        for (held) |item| if (std.mem.eql(u8, item.hold_for.?, target.id)) {
+            count += 1;
+            if (oldest == null) oldest = item.id;
+        };
+        var lines: [2]session_adapter.MailLine = undefined;
+        var len: usize = 0;
+        if (count >= session_adapter.max_mailbox) {
+            dropped = oldest;
+            lines[len] = .{ .done = .{ .id = oldest.?, .how = .dropped } };
+            len += 1;
+        }
+        lines[len] = .{ .mail = mail };
+        len += 1;
+        try session.appendMail(lines[0..len]);
+        b.held_maybe.store(true, .seq_cst);
     }
-    try b.early.append(b.alloc, early);
+    b.changed();
     return .{
         .to = target.id,
         .label = target.label,
@@ -453,42 +425,119 @@ fn holdEarly(root: *Runtime, arena: Allocator, target: Node, line: session_adapt
     };
 }
 
-/// Moves held messages into the mailboxes of workers whose log now exists.
-fn flushEarly(root: *Runtime, arena: Allocator) void {
+/// Moves held messages into the mailboxes of workers whose log now exists,
+/// and drops those held for a worker that is gone or terminal.
+fn flushHeld(root: *Runtime, arena: Allocator) void {
     const b = bus(root);
-    const nodes = blk: {
+    if (!b.held_maybe.load(.seq_cst)) return;
+    const held = blk: {
         b.lock();
         defer b.unlock();
-        if (b.early.items.len == 0) return;
-        var ids: std.ArrayList([]const u8) = .empty;
-        for (b.early.items) |item| {
-            if (!contains(ids.items, item.node_id)) ids.append(arena, arena.dupe(u8, item.node_id) catch return) catch return;
-        }
-        break :blk ids.items;
+        const held = root.children.parent.heldMail(arena) catch return;
+        if (held.len == 0) b.held_maybe.store(false, .seq_cst);
+        break :blk held;
     };
+    if (held.len == 0) return;
+    var targets: std.ArrayList([]const u8) = .empty;
+    for (held) |mail| {
+        if (!contains(targets.items, mail.hold_for.?)) targets.append(arena, mail.hold_for.?) catch return;
+    }
     const tree_nodes = directory.list(arena, root) catch return;
-    for (nodes) |node_id| {
-        const node = directory.find(tree_nodes, node_id) orelse continue;
+    for (targets.items) |node_id| {
+        const node = directory.find(tree_nodes, node_id) orelse {
+            finishHeld(root, arena, node_id, null, .dropped);
+            continue;
+        };
+        if (node.terminated) {
+            finishHeld(root, arena, node_id, null, .dropped);
+            continue;
+        }
         const entry = node_ops.lease(root, node.path) catch continue;
         defer node_ops.release(root, entry);
         if (!entry.session.saved()) continue;
-        while (true) {
-            const next: ?Bus.Early = take: {
-                b.lock();
-                defer b.unlock();
-                for (b.early.items, 0..) |item, index| {
-                    if (std.mem.eql(u8, item.node_id, node_id)) break :take b.early.orderedRemove(index);
-                }
-                break :take null;
-            };
-            const early = next orelse break;
-            defer early.free(b.alloc);
-            _ = post(root, arena, entry.session, node_id, early.line()) catch |err| {
-                debug_trace.logf("subagent", "early mail not posted node_id={s} err={s}", .{ node_id, @errorName(err) });
-            };
-        }
-        b.changed();
+        flushHeldFor(root, arena, entry, node_id) catch |err| {
+            debug_trace.logf("subagent", "held mail not moved node_id={s} err={s}", .{ node_id, @errorName(err) });
+        };
     }
+}
+
+/// Moves the messages the root's log holds for worker `node_id`, whose log
+/// exists, into its mailbox in order, then takes them out of the root's
+/// log, claiming the worker's mailbox meanwhile (`moveHeld`).
+fn flushHeldFor(root: *Runtime, arena: Allocator, entry: *@import("node_hosts.zig").Entry, node_id: []const u8) !void {
+    const b = bus(root);
+    if (!b.held_maybe.load(.seq_cst)) return;
+    if (!b.claimWaiting(node_id)) return error.MailboxBusy;
+    defer b.unclaim(node_id);
+    try moveHeld(root, arena, entry.session, node_id);
+}
+
+/// `flushHeldFor` for a caller that holds the worker's claim. Every carrier
+/// of a worker's mail moves its held mail first, so none takes a message
+/// that the root's log still holds: a crash between the move and the root
+/// letting go leaves the message in both, and the next move skips one the
+/// worker's mailbox or history already has (`tests/tla/jobs/Mailbox.tla`
+/// ExactlyOnce, mutations take_unsettled and flush_no_dedupe).
+fn moveHeld(root: *Runtime, arena: Allocator, session: *session_adapter.Session, node_id: []const u8) !void {
+    const b = bus(root);
+    if (!b.held_maybe.load(.seq_cst)) return;
+    const held = blk: {
+        b.lock();
+        defer b.unlock();
+        const all = try root.children.parent.heldMail(arena);
+        var mine: std.ArrayList(Mail) = .empty;
+        for (all) |mail| if (std.mem.eql(u8, mail.hold_for.?, node_id)) try mine.append(arena, mail);
+        break :blk mine.items;
+    };
+    if (held.len == 0) return;
+    const present_mail = try session.mailbox(arena);
+    const received = try receivedIds(arena, root.tree.store, node_id, held);
+    for (held) |mail| {
+        if (contains(received, mail.id)) continue;
+        var present = false;
+        for (present_mail) |other| if (std.mem.eql(u8, other.id, mail.id)) {
+            present = true;
+        };
+        if (present) continue;
+        _ = try post(root, arena, session, node_id, .{ .mail = .{
+            .id = mail.id,
+            .from = mail.from,
+            .label = mail.label,
+            .body = mail.body,
+            .reply_to = mail.reply_to,
+            .broadcast = mail.broadcast,
+        } });
+    }
+    finishHeld(root, arena, node_id, held, .delivered);
+    b.markPending(node_id);
+    b.changed();
+}
+
+/// Takes the messages held for `node_id` out of the root's log: `only`
+/// those, or every one held for it.
+fn finishHeld(root: *Runtime, arena: Allocator, node_id: []const u8, only: ?[]const Mail, how: session_adapter.MailEnd) void {
+    const b = bus(root);
+    b.lock();
+    defer b.unlock();
+    const session = root.children.parent;
+    const held = session.heldMail(arena) catch return;
+    var lines: std.ArrayList(session_adapter.MailLine) = .empty;
+    for (held) |mail| {
+        if (!std.mem.eql(u8, mail.hold_for.?, node_id)) continue;
+        if (only) |subset| {
+            var listed = false;
+            for (subset) |item| if (std.mem.eql(u8, item.id, mail.id)) {
+                listed = true;
+            };
+            if (!listed) continue;
+        }
+        lines.append(arena, .{ .done = .{ .id = mail.id, .how = how } }) catch return;
+    }
+    session.appendMail(lines.items) catch |err| {
+        debug_trace.logf("subagent", "held mail settle not saved node_id={s} err={s}", .{ node_id, @errorName(err) });
+        return;
+    };
+    b.changed();
 }
 
 fn failed(arena: Allocator, target: Node, err: anyerror) !Receipt {
@@ -564,6 +613,10 @@ fn deliverWorker(root: *Runtime, arena: Allocator, entry: *@import("node_hosts.z
     // pump, takes these too.
     if (!b.claim(node.id)) return .later;
     defer b.unclaim(node.id);
+    moveHeld(root, arena, entry.session, node.id) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .later;
+    };
     const ready = blk: {
         b.lock();
         defer b.unlock();
@@ -704,7 +757,7 @@ pub fn pump(root: *Runtime) void {
         debug_trace.logf("subagent", "mail recovery failed err={s}", .{@errorName(err)});
         return;
     };
-    flushEarly(root, arena);
+    flushHeld(root, arena);
     settleSteers(root, arena);
     const ids = blk: {
         b.lock();
@@ -745,7 +798,11 @@ fn recover(root: *Runtime, arena: Allocator) !void {
     for (nodes) |node| {
         if (node.waiting == 0) continue;
         const store = root.tree.store;
-        const mailbox = try store.peekMailbox(arena, node.id);
+        // A worker with no log yet counts only mail held for it (D212).
+        const mailbox = store.peekMailbox(arena, node.id) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
         const received = try receivedIds(arena, store, node.id, mailbox);
         if (received.len > 0) {
             if (node.depth == 0) {
@@ -929,6 +986,7 @@ pub fn inbox(node: *Runtime, arena: Allocator, peek: bool, from: ?[]const u8) ![
     const is_root = node == root;
     if (!b.claimWaiting(node.node_id)) return &.{};
     defer b.unclaim(node.node_id);
+    if (!is_root) try moveHeld(root, arena, node.children.parent, node.node_id);
     const ready = blk: {
         b.lock();
         defer b.unlock();

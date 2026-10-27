@@ -21,8 +21,16 @@
 (* message that the history already holds out of the mailbox as delivered *)
 (* (RecoverDelivered). A mailbox wait holds automatic delivery off.        *)
 (*                                                                         *)
+(* A recipient admitted but not started has no log (D212): a message to   *)
+(* it is held in the root's log, a second durable log, until it starts.   *)
+(* Then the held messages move to its mailbox in order (MovePost) and the *)
+(* root's log lets them go (MoveDone); a move skips a message the mailbox *)
+(* or history already has, and no carrier takes mail the root's log still *)
+(* holds, so a crash between the two steps neither loses nor repeats one. *)
+(*                                                                         *)
 (* Code: src/core/subagent/mailbox.zig (send, post, deliverWorker,         *)
-(* settleSteers, recover, takeRootNotice, rootAnswered, inbox, waitRoot),  *)
+(* settleSteers, recover, takeRootNotice, rootAnswered, inbox, waitRoot,   *)
+(* holdEarly, flushHeld, moveHeld, finishHeld),                            *)
 (* src/core/session_manager/fold_mail.zig, src/core/supervisor/wake.zig.   *)
 (*                                                                         *)
 (* `Mutation` enables one broken rule so TLC shows each property bites:    *)
@@ -33,13 +41,17 @@
 (*   release_absorbed  a steer the model took goes back to the mailbox     *)
 (*   ignore_wait       automatic delivery takes mail a wait holds          *)
 (*   two_carriers      an inbox read runs beside a delivery                *)
+(*   held_in_memory    held messages live in memory, not the root's log    *)
+(*   flush_no_dedupe   a move posts a message the mailbox already has      *)
+(*   take_unsettled    a carrier takes mail the root's log still holds     *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS N, Cap, MaxCrashes, MaxWaits, MaxReleases, Mutation
 
 ASSUME Mutation \in {"none", "no_recover", "commit_early", "overtake",
-                     "release_absorbed", "ignore_wait", "two_carriers"}
+                     "release_absorbed", "ignore_wait", "two_carriers",
+                     "held_in_memory", "flush_no_dedupe", "take_unsettled"}
 
 Msgs == 1..N
 
@@ -59,9 +71,12 @@ VARIABLES
     parked,     \* the recipient's host is closed
     crashes,    \* budgets that keep the model finite and fair
     waits,
-    releases
+    releases,
+    started,    \* the recipient's log exists
+    held,       \* messages the root's log holds for it, oldest first
+    moving      \* the held message a move posted, or 0
 
-vars == <<next, box, dropped, history, flight, absorbed, turnq, carrier, waiting, stolen, up, recovered, parked, crashes, waits, releases>>
+vars == <<next, box, dropped, history, flight, absorbed, turnq, carrier, waiting, stolen, up, recovered, parked, crashes, waits, releases, started, held, moving>>
 
 SetOf(s) == {s[i] : i \in DOMAIN s}
 Remove(s, set) == SelectSeq(s, LAMBDA m : m \notin set)
@@ -84,6 +99,9 @@ TypeOK ==
     /\ crashes \in 0..MaxCrashes
     /\ waits \in 0..MaxWaits
     /\ releases \in 0..MaxReleases
+    /\ started \in BOOLEAN
+    /\ held \in Seq(Msgs)
+    /\ moving \in 0..N
 
 Init ==
     /\ next = 1
@@ -102,11 +120,14 @@ Init ==
     /\ crashes = 0
     /\ waits = 0
     /\ releases = 0
+    /\ started = FALSE
+    /\ held = <<>>
+    /\ moving = 0
 
 \* post: a full mailbox drops its oldest message not in flight, else its
 \* oldest. A message to a parked host reopens it (revive).
 Send ==
-    /\ up /\ next <= N
+    /\ up /\ next <= N /\ started /\ held = <<>>
     /\ IF Len(box) < Cap
        THEN /\ box' = Append(box, next)
             /\ UNCHANGED dropped
@@ -116,12 +137,61 @@ Send ==
                /\ dropped' = dropped \cup {victim}
     /\ next' = next + 1
     /\ parked' = FALSE
-    /\ UNCHANGED <<history, flight, absorbed, turnq, carrier, waiting, stolen, up, recovered, crashes, waits, releases>>
+    /\ UNCHANGED <<history, flight, absorbed, turnq, carrier, waiting, stolen, up, recovered, crashes, waits, releases, started, held, moving>>
+
+\* holdEarly: the recipient has no log, so the root's log holds the message;
+\* a full hold drops its oldest. sendOne moves what is held before it posts
+\* to a started recipient, so a send waits behind held mail (MovePost).
+Hold ==
+    /\ up /\ next <= N /\ ~started
+    /\ IF Len(held) < Cap
+       THEN /\ held' = Append(held, next)
+            /\ UNCHANGED dropped
+       ELSE /\ held' = Append(Tail(held), next)
+            /\ dropped' = dropped \cup {Head(held)}
+    /\ next' = next + 1
+    /\ UNCHANGED <<box, history, flight, absorbed, turnq, carrier, waiting, stolen, up, recovered, parked, crashes, waits, releases, started, moving>>
+
+\* The recipient's first turn saves its log.
+Start ==
+    /\ up /\ ~started
+    /\ started' = TRUE
+    /\ UNCHANGED <<next, box, dropped, history, flight, absorbed, turnq, carrier, waiting, stolen, up, recovered, parked, crashes, waits, releases, held, moving>>
+
+\* moveHeld, under the recipient's claim: post the oldest held message to
+\* its mailbox unless the mailbox or history has it already.
+MovePost ==
+    /\ up /\ recovered /\ started /\ held /= <<>> /\ moving = 0
+    /\ carrier = "none"
+    /\ LET h == Head(held) IN
+       /\ IF h \in SetOf(box) \cup SetOf(history) /\ Mutation /= "flush_no_dedupe"
+          THEN UNCHANGED <<box, dropped>>
+          ELSE IF Len(box) < Cap
+               THEN /\ box' = Append(box, h)
+                    /\ UNCHANGED dropped
+               ELSE LET free == {i \in DOMAIN box : box[i] \notin flight}
+                        victim == IF free = {} THEN box[1] ELSE box[CHOOSE i \in free : \A j \in free : i <= j]
+                    IN /\ box' = Append(Remove(box, {victim}), h)
+                       /\ dropped' = dropped \cup {victim}
+       /\ moving' = h
+    /\ UNCHANGED <<next, history, flight, absorbed, turnq, carrier, waiting, stolen, up, recovered, parked, crashes, waits, releases, started, held>>
+
+\* finishHeld: the root's log lets the moved message go.
+MoveDone ==
+    /\ up /\ moving /= 0
+    /\ held' = Remove(held, {moving})
+    /\ moving' = 0
+    /\ UNCHANGED <<next, box, dropped, history, flight, absorbed, turnq, carrier, waiting, stolen, up, recovered, parked, crashes, waits, releases, started>>
 
 \* deliverWorker and takeRootNotice: one batch at a time, never past an
 \* inbox read, a wait, or an admitted turn that has not run.
+Settled ==
+    /\ moving = 0
+    /\ SetOf(held) \cap SetOf(box) = {}
+
 CanTake ==
     /\ up /\ recovered /\ Remove(box, flight) /= <<>>
+    /\ (Settled \/ Mutation = "take_unsettled")
     /\ (flight = {} \/ Mutation = "overtake")
     /\ (turnq = <<>> \/ Mutation = "overtake")
     /\ carrier = "none"
@@ -134,7 +204,7 @@ TakeSteer ==
        /\ flight' = flight \cup b
        /\ box' = IF Mutation = "commit_early" THEN Remove(box, b) ELSE box
     /\ stolen' = (stolen \/ waiting)
-    /\ UNCHANGED <<next, dropped, history, absorbed, turnq, carrier, waiting, up, recovered, parked, crashes, waits, releases>>
+    /\ UNCHANGED <<next, dropped, history, absorbed, turnq, carrier, waiting, up, recovered, parked, crashes, waits, releases, started, held, moving>>
 
 \* The turn takes the steer, or runs the notice's turn: the model gets the
 \* oldest message of the batch it has not got.
@@ -144,14 +214,14 @@ Absorb ==
            first == CHOOSE m \in pending : \A k \in pending : m <= k
        IN /\ history' = Append(history, first)
           /\ absorbed' = absorbed \cup {first}
-    /\ UNCHANGED <<next, box, dropped, flight, turnq, carrier, waiting, stolen, up, recovered, parked, crashes, waits, releases>>
+    /\ UNCHANGED <<next, box, dropped, flight, turnq, carrier, waiting, stolen, up, recovered, parked, crashes, waits, releases, started, held, moving>>
 
 \* settleSteers, or rootAnswered(delivered): the absorbed batch leaves.
 Commit ==
     /\ up /\ flight /= {} /\ absorbed = flight
     /\ box' = Remove(box, flight)
     /\ flight' = {} /\ absorbed' = {}
-    /\ UNCHANGED <<next, dropped, history, turnq, carrier, waiting, stolen, up, recovered, parked, crashes, waits, releases>>
+    /\ UNCHANGED <<next, dropped, history, turnq, carrier, waiting, stolen, up, recovered, parked, crashes, waits, releases, started, held, moving>>
 
 \* The turn ended before it took the steer: the batch waits again, in front.
 Release ==
@@ -159,7 +229,7 @@ Release ==
     /\ (absorbed = {} \/ Mutation = "release_absorbed")
     /\ flight' = {} /\ absorbed' = {}
     /\ releases' = releases + 1
-    /\ UNCHANGED <<next, box, dropped, history, turnq, carrier, waiting, stolen, up, recovered, parked, crashes, waits>>
+    /\ UNCHANGED <<next, box, dropped, history, turnq, carrier, waiting, stolen, up, recovered, parked, crashes, waits, started, held, moving>>
 
 \* deliverWorker's own turn: admitted durably in the parent's log, so the
 \* batch leaves the mailbox at once.
@@ -168,21 +238,22 @@ AdmitTurn ==
     /\ turnq' = turnq \o Remove(box, flight)
     /\ box' = Keep(box, flight)
     /\ stolen' = (stolen \/ waiting)
-    /\ UNCHANGED <<next, dropped, history, flight, absorbed, carrier, waiting, up, recovered, parked, crashes, waits, releases>>
+    /\ UNCHANGED <<next, dropped, history, flight, absorbed, carrier, waiting, up, recovered, parked, crashes, waits, releases, started, held, moving>>
 
 \* The admitted turn runs, after a restart too: the model gets its batch.
 RunTurn ==
     /\ up /\ turnq /= <<>>
     /\ history' = history \o turnq
     /\ turnq' = <<>>
-    /\ UNCHANGED <<next, box, dropped, flight, absorbed, carrier, waiting, stolen, up, recovered, parked, crashes, waits, releases>>
+    /\ UNCHANGED <<next, box, dropped, flight, absorbed, carrier, waiting, stolen, up, recovered, parked, crashes, waits, releases, started, held, moving>>
 
 \* inbox, or one poll of a mailbox wait: it holds the mailbox and takes
 \* what waits, unless a batch is in flight, which reaches the model first.
 ReadStart ==
     /\ up /\ recovered /\ carrier = "none"
+    /\ (Settled \/ Mutation = "take_unsettled")
     /\ carrier' = "read"
-    /\ UNCHANGED <<next, box, dropped, history, flight, absorbed, turnq, waiting, stolen, up, recovered, parked, crashes, waits, releases>>
+    /\ UNCHANGED <<next, box, dropped, history, flight, absorbed, turnq, waiting, stolen, up, recovered, parked, crashes, waits, releases, started, held, moving>>
 
 Read ==
     /\ up /\ carrier = "read" /\ box /= <<>>
@@ -190,12 +261,12 @@ Read ==
     /\ turnq = <<>>
     /\ history' = history \o box
     /\ box' = <<>>
-    /\ UNCHANGED <<next, dropped, flight, absorbed, turnq, carrier, waiting, stolen, up, recovered, parked, crashes, waits, releases>>
+    /\ UNCHANGED <<next, dropped, flight, absorbed, turnq, carrier, waiting, stolen, up, recovered, parked, crashes, waits, releases, started, held, moving>>
 
 ReadEnd ==
     /\ carrier = "read"
     /\ carrier' = "none"
-    /\ UNCHANGED <<next, box, dropped, history, flight, absorbed, turnq, waiting, stolen, up, recovered, parked, crashes, waits, releases>>
+    /\ UNCHANGED <<next, box, dropped, history, flight, absorbed, turnq, waiting, stolen, up, recovered, parked, crashes, waits, releases, started, held, moving>>
 
 \* waitRoot holds automatic delivery off while it waits; it reads with
 \* ReadStart and Read as it polls.
@@ -203,25 +274,25 @@ WaitStart ==
     /\ up /\ ~waiting /\ waits < MaxWaits
     /\ waiting' = TRUE
     /\ waits' = waits + 1
-    /\ UNCHANGED <<next, box, dropped, history, flight, absorbed, turnq, carrier, stolen, up, recovered, parked, crashes, releases>>
+    /\ UNCHANGED <<next, box, dropped, history, flight, absorbed, turnq, carrier, stolen, up, recovered, parked, crashes, releases, started, held, moving>>
 
 WaitEnd ==
     /\ waiting
     /\ waiting' = FALSE
-    /\ UNCHANGED <<next, box, dropped, history, flight, absorbed, turnq, carrier, stolen, up, recovered, parked, crashes, waits, releases>>
+    /\ UNCHANGED <<next, box, dropped, history, flight, absorbed, turnq, carrier, stolen, up, recovered, parked, crashes, waits, releases, started, held, moving>>
 
 \* A wrongly concurrent delivery beside a read (`two_carriers`).
 TakeBesideRead ==
     /\ Mutation = "two_carriers"
     /\ up /\ recovered /\ carrier = "read" /\ flight = {} /\ turnq = <<>> /\ box /= <<>>
     /\ flight' = SetOf(box)
-    /\ UNCHANGED <<next, box, dropped, history, absorbed, turnq, carrier, waiting, stolen, up, recovered, parked, crashes, waits, releases>>
+    /\ UNCHANGED <<next, box, dropped, history, absorbed, turnq, carrier, waiting, stolen, up, recovered, parked, crashes, waits, releases, started, held, moving>>
 
 \* An idle host closes; a host with work in flight stays open.
 Park ==
     /\ up /\ ~parked /\ flight = {} /\ carrier = "none"
     /\ parked' = TRUE
-    /\ UNCHANGED <<next, box, dropped, history, flight, absorbed, turnq, carrier, waiting, stolen, up, recovered, crashes, waits, releases>>
+    /\ UNCHANGED <<next, box, dropped, history, flight, absorbed, turnq, carrier, waiting, stolen, up, recovered, crashes, waits, releases, started, held, moving>>
 
 \* Memory goes; the logs stay.
 Crash ==
@@ -231,34 +302,37 @@ Crash ==
     /\ carrier' = "none" /\ waiting' = FALSE
     /\ recovered' = FALSE
     /\ crashes' = crashes + 1
-    /\ UNCHANGED <<next, box, dropped, history, turnq, stolen, parked, waits, releases>>
+    /\ moving' = 0
+    /\ held' = IF Mutation = "held_in_memory" THEN <<>> ELSE held
+    /\ UNCHANGED <<next, box, dropped, history, turnq, stolen, parked, waits, releases, started>>
 
 Restart ==
     /\ ~up
     /\ up' = TRUE
-    /\ UNCHANGED <<next, box, dropped, history, flight, absorbed, turnq, carrier, waiting, stolen, recovered, parked, crashes, waits, releases>>
+    /\ UNCHANGED <<next, box, dropped, history, flight, absorbed, turnq, carrier, waiting, stolen, recovered, parked, crashes, waits, releases, started, held, moving>>
 
 \* recover: a waiting message the history holds leaves as delivered.
 Recover ==
     /\ up /\ ~recovered
     /\ box' = IF Mutation = "no_recover" THEN box ELSE Remove(box, SetOf(history))
     /\ recovered' = TRUE
-    /\ UNCHANGED <<next, dropped, history, flight, absorbed, turnq, carrier, waiting, stolen, up, parked, crashes, waits, releases>>
+    /\ UNCHANGED <<next, dropped, history, flight, absorbed, turnq, carrier, waiting, stolen, up, parked, crashes, waits, releases, started, held, moving>>
 
 Next ==
-    \/ Send \/ TakeSteer \/ Absorb \/ Commit \/ Release \/ AdmitTurn \/ RunTurn
+    \/ Send \/ Hold \/ Start \/ MovePost \/ MoveDone \/ TakeSteer \/ Absorb \/ Commit \/ Release \/ AdmitTurn \/ RunTurn
     \/ ReadStart \/ Read \/ ReadEnd \/ WaitStart \/ WaitEnd \/ TakeBesideRead
     \/ Park \/ Crash \/ Restart \/ Recover
 
 Done ==
-    /\ next > N /\ box = <<>> /\ turnq = <<>> /\ flight = {}
+    /\ next > N /\ box = <<>> /\ turnq = <<>> /\ flight = {} /\ held = <<>>
     /\ carrier = "none" /\ ~waiting /\ up /\ recovered
 
 SafetySpec == Init /\ [][Next \/ (Done /\ UNCHANGED vars)]_vars
 
 Spec ==
     /\ SafetySpec
-    /\ WF_vars(Send) /\ WF_vars(Restart) /\ WF_vars(Recover)
+    /\ WF_vars(Send) /\ WF_vars(Hold) /\ WF_vars(Start) /\ WF_vars(Restart) /\ WF_vars(Recover)
+    /\ SF_vars(MovePost) /\ WF_vars(MoveDone)
     /\ SF_vars(TakeSteer \/ AdmitTurn) /\ WF_vars(Absorb) /\ WF_vars(Commit)
     /\ WF_vars(RunTurn) /\ WF_vars(ReadEnd) /\ WF_vars(WaitEnd)
 
@@ -275,12 +349,13 @@ ExactlyOnce == \A m \in Msgs : Count(history, m) <= 1
 InOrder == \A i, j \in DOMAIN history : i < j => history[i] < history[j]
 
 \* The mailbox never holds more than its cap.
-Bounded == Len(box) <= Cap
+Bounded == Len(box) <= Cap /\ Len(held) <= Cap
 
 \* A sent message is waiting, admitted, received, or dropped: none is lost.
 NoLossAcrossRestart ==
     \A m \in 1..(next - 1) :
         \/ m \in SetOf(box) \/ m \in SetOf(history) \/ m \in SetOf(turnq) \/ m \in dropped
+        \/ m \in SetOf(held)
 
 \* Automatic delivery never takes mail while a wait holds the mailbox.
 NoDeliveryUnderWait == ~stolen
