@@ -12,11 +12,15 @@ const model_provider = @import("../core/config/model_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 
+const model_capabilities = @import("../core/config/model_capabilities.zig");
 const Allocator = std.mem.Allocator;
 
 pub const ToolChoiceMode = configured_provider.ToolChoiceMode;
+pub const ReasoningFormat = configured_provider.ReasoningFormat;
 pub const Options = struct {
     tool_choice_mode: ToolChoiceMode = .omit,
+    /// How a reasoning effort is sent; `none` rejects one (D146).
+    reasoning_format: ReasoningFormat = .none,
     /// Borrowed only during serialization; includes the configured authority binding.
     provider: ?*const model_provider.ProviderId = null,
 };
@@ -163,12 +167,14 @@ fn validate_dynamic_schema(value: std.json.Value, depth: usize, budget: *SchemaB
     }
 }
 
-fn validate_request(request: stream_provider.RequestData) Error!void {
+fn validate_request(request: stream_provider.RequestData, format: ReasoningFormat) Error!void {
     try request.validatePrompt();
     configured_provider.validate_model_id(request.model) catch return error.InvalidModel;
     const options = request.provider_options;
-    if (options.reasoning != null or options.fast) return error.UnsupportedProviderOption;
-    if (options.provider_order.len != 0) return error.UnsupportedProviderOption;
+    if (options.fast) return error.UnsupportedProviderOption;
+    if (options.reasoning != null and format == .none) return error.UnsupportedProviderOption;
+    // Only OpenRouter routes between upstream providers.
+    if (options.provider_order.len != 0 and format != .openrouter) return error.UnsupportedProviderOption;
     if (request.response_format != null) return error.UnsupportedResponseFormat;
     // The vision tool runs through a separate provider request; inline image
     // content on user and tool-result messages serializes natively below.
@@ -394,7 +400,7 @@ fn write_replay(writer: *std.Io.Writer, alloc: Allocator, message: types.ChatMes
 /// max_output_tokens deliberately maps to max_tokens, not max_completion_tokens.
 /// Deadline enforcement and prepared-body reuse belong to the transport owner.
 pub fn build_request(alloc: Allocator, input: stream_provider.RequestData, options: Options) Error![]u8 {
-    try validate_request(input);
+    try validate_request(input, options.reasoning_format);
     var projected: ?[]types.ChatMessage = null;
     if (options.provider) |provider| {
         projected = try types.projectProviderReplay(alloc, input.messages, .{ .provider = provider.*, .model = input.model });
@@ -653,7 +659,31 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
         }
     }
     if (request.max_output_tokens) |limit| try writer.print(",\"max_tokens\":{d}", .{limit});
+    try write_reasoning(writer, request.provider_options, options.reasoning_format);
     try writer.writeByte('}');
+}
+
+/// OpenRouter takes `reasoning.effort` up to `xhigh` and a `provider` route;
+/// OpenAI-style endpoints take `reasoning_effort` as the catalog names it.
+fn write_reasoning(writer: *std.Io.Writer, options: model_capabilities.ResolvedProviderOptions, format: ReasoningFormat) !void {
+    if (options.reasoning) |effort| if (effort.gatewayValue()) |name| switch (format) {
+        .none => {},
+        .openrouter => {
+            try writer.writeAll(",\"reasoning\":{\"effort\":");
+            try std.json.Stringify.value(if (std.mem.eql(u8, name, "max")) "xhigh" else name, .{}, writer);
+            try writer.writeByte('}');
+        },
+        .openai => {
+            try writer.writeAll(",\"reasoning_effort\":");
+            try std.json.Stringify.value(name, .{}, writer);
+        },
+    };
+    if (format == .openrouter and options.provider_order.len != 0) {
+        try writer.writeAll(",\"provider\":{");
+        try writer.writeAll(if (options.provider_strict) "\"only\":" else "\"order\":");
+        try std.json.Stringify.value(options.provider_order, .{}, writer);
+        try writer.writeByte('}');
+    }
 }
 
 pub const Limits = struct {
@@ -718,7 +748,8 @@ pub const Reducer = struct {
     json_bytes: usize = 0,
 
     pub fn init(alloc: Allocator, request: stream_provider.RequestData, limits: Limits) Error!Reducer {
-        try validate_request(request);
+        // The request was already sent; any accepted reasoning format applies.
+        try validate_request(request, .openrouter);
         return .{ .alloc = alloc, .limits = limits, .choice = request.tool_choice };
     }
 

@@ -10,6 +10,7 @@ const host_target = @import("../hosts/target.zig");
 const model_provider = @import("../config/model_provider.zig");
 const provider_catalog = @import("provider_catalog.zig");
 const types = @import("../shared/types.zig");
+const provider_registry = @import("../config/provider_registry.zig");
 
 /// How a provider is authenticated. Subscription providers expose no methods;
 /// choosing one acts directly instead of opening the method column.
@@ -20,7 +21,7 @@ pub const Method = enum {
     api_key,
 };
 
-pub const max_provider_options = provider_catalog.entries.len;
+pub const max_provider_options = provider_catalog.entries.len + provider_catalog.preset_entries.len;
 const max_method_options = 2;
 /// The team column lists at most this many teams; accounts beyond it see the
 /// first 128 and can still change teams through the sign-in flow.
@@ -123,13 +124,24 @@ pub fn providerOptions(out: *[max_provider_options][]const u8) usize {
         out[count] = entry.slug;
         count += 1;
     }
+    if (comptime host_target.is_wasm) return count;
+    for (&provider_catalog.preset_entries) |*entry| {
+        out[count] = entry.slug;
+        count += 1;
+    }
     return count;
 }
 
 pub fn providerMethods(id: model_provider.ProviderId) []const Method {
     return switch (id) {
         .gateway => &.{ .oauth, .api_key },
-        .codex, .grok, .configured => &.{},
+        .codex, .grok => &.{},
+        // Presets sign in by browser or a pasted key; other connections
+        // authenticate from their definition.
+        .configured => if (provider_registry.presetFor(id.label())) |preset| switch (preset.login) {
+            .browser_or_key => &.{ .oauth, .api_key },
+            .key => &.{.api_key},
+        } else &.{},
     };
 }
 
@@ -154,8 +166,11 @@ test "provider options expose the catalog slugs the composer accepts" {
     }
 }
 
-test "only the gateway offers a method column" {
+test "only the gateway and presets offer a method column" {
     try std.testing.expectEqual(@as(usize, 2), providerMethods(.gateway).len);
+    try std.testing.expectEqual(@as(usize, 2), providerMethods(provider_catalog.parse("openrouter").?).len);
+    try std.testing.expectEqual(Method.api_key, providerMethods(provider_catalog.parse("opencode-zen").?)[0]);
+    try std.testing.expectEqual(@as(usize, 0), providerMethods(model_provider.parse("local").?).len);
     try std.testing.expectEqual(@as(usize, 0), providerMethods(.codex).len);
     try std.testing.expectEqual(@as(usize, 0), providerMethods(.grok).len);
 }

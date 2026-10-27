@@ -17,6 +17,8 @@ const types = @import("../core/shared/types.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const sse = @import("sse.zig");
+const configured_request = @import("configured_request.zig");
+const openrouter_catalog = @import("openrouter_catalog.zig");
 const Allocator = std.mem.Allocator;
 
 /// Every callback borrows the immutable definition from the owning profile runtime.
@@ -41,13 +43,13 @@ fn definition_at(raw: ?*anyopaque) *const definitions.Definition {
     return @ptrCast(@alignCast(raw.?));
 }
 
-fn bound_identity(definition: *const definitions.Definition) model_provider.ProviderId {
+pub fn bound_identity(definition: *const definitions.Definition) model_provider.ProviderId {
     var identity = model_provider.parse(definition.id).?;
     identity.configured.binding = definition.binding_identity();
     return identity;
 }
 
-fn build(raw: ?*anyopaque, alloc: Allocator, request: streams.RequestData) ![]u8 {
+pub fn build(raw: ?*anyopaque, alloc: Allocator, request: streams.RequestData) ![]u8 {
     return build_for(definition_at(raw), alloc, request);
 }
 
@@ -61,7 +63,7 @@ pub fn build_for(definition: *const definitions.Definition, alloc: Allocator, re
             break;
         }
     };
-    return codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity });
+    return codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .reasoning_format = definition.reasoning_format, .provider = &identity });
 }
 
 pub fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
@@ -106,19 +108,12 @@ test "chat completions adapter binds replay to endpoint authority and wires proj
     try std.testing.expect(request.messages[0].provider_replay.?.parts_json.ptr == replay.parts_json.ptr);
 }
 
-fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest) !streams.Result {
+pub fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest) !streams.Result {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     const definition = definition_at(raw);
     if (request.credential.credentialSource() != .configured) return error.ConfiguredProviderCredentialRequired;
     const token = request.credential.secret();
-    if (token) |value| {
-        if (value.len > 16 * 1024) return error.InvalidConfiguredProviderCredential;
-        for (value) |byte| if (byte <= 0x20 or byte >= 0x7f) return error.InvalidConfiguredProviderCredential;
-    }
-    switch (definition.auth) {
-        .none => if (token != null) return error.UnexpectedConfiguredProviderCredential,
-        .bearer => if (token == null) return error.MissingConfiguredProviderCredential,
-    }
+    try configured_request.checkToken(definition, token);
     const payload = request.prepared_request_body orelse try build(raw, alloc, request.data());
     defer if (request.prepared_request_body == null) alloc.free(payload);
     return post(alloc, definition, request, token, payload) catch |err| {
@@ -142,8 +137,23 @@ fn phase_deadline(milliseconds: i64, caller: ?std.Io.Clock.Timestamp) std.Io.Clo
 fn post(alloc: Allocator, definition: *const definitions.Definition, request: streams.ModelRequest, token: ?[]const u8, payload: []const u8) !streams.Result {
     const url = try definition.chat_url(alloc);
     defer alloc.free(url);
-    const authorization = if (token) |value| try alloc.print("Bearer {s}", .{value}) else null;
+    return post_url(alloc, definition, url, request, token, payload, consume);
+}
+
+pub const ConsumeFn = *const fn (Allocator, *std.Io.Reader, streams.ModelRequest, ?sse.Progress) anyerror!streams.Result;
+
+/// Posts `payload` to `url` with the definition's bearer key and headers and
+/// parses the streamed reply with `consume_fn`. Shared with the Responses
+/// transport for configured providers.
+pub fn post_url(alloc: Allocator, definition: *const definitions.Definition, url: []const u8, request: streams.ModelRequest, token: ?[]const u8, payload: []const u8, consume_fn: ConsumeFn) !streams.Result {
+    const authorization = if (token) |value| if (value.len != 0) try alloc.print("Bearer {s}", .{value}) else null else null;
     defer if (authorization) |value| secret.zeroAndFree(alloc, value);
+    var extra = try configured_request.resolveHeaders(alloc, definition);
+    defer extra.deinit(alloc);
+    var headers: std.ArrayList(std.http.Header) = .empty;
+    defer headers.deinit(alloc);
+    try headers.append(alloc, .{ .name = "accept", .value = "text/event-stream" });
+    try headers.appendSlice(alloc, extra.items);
     var client: std.http.Client = .{ .allocator = alloc, .io = io.getIo() };
     defer client.deinit();
     var uri = try std.Uri.parse(url);
@@ -152,7 +162,7 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
         .client = &client,
         .uri = uri,
         .authorization = authorization,
-        .extra_headers = &.{.{ .name = "accept", .value = "text/event-stream" }},
+        .extra_headers = headers.items,
     };
     try request.admission.admit();
     var opened = try client_mod.openBoundedPost(alloc, request.cancel_flag, phase_deadline(30_000, request.deadline), &operation);
@@ -183,8 +193,8 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
         if (http.connection) |connection| try watch.start(request.cancel_flag, phase_deadline(30_000, request.deadline), connection.stream_writer.stream);
     }
     var retry_after: ?u64 = null;
-    var headers = response.head.iterateHeaders();
-    while (headers.next()) |header| if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {
+    var response_headers = response.head.iterateHeaders();
+    while (response_headers.next()) |header| if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {
         retry_after = std.fmt.parseUnsigned(u64, std.mem.trim(u8, header.value, " \t"), 10) catch null;
         break;
     };
@@ -204,7 +214,7 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
 
         return .{ .failed = .{ .kind = failure_kind(response.head.status), .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
     }
-    var result = consume(alloc, reader, request, watch.progress()) catch |err| return watch.failure(err);
+    var result = consume_fn(alloc, reader, request, watch.progress()) catch |err| return watch.failure(err);
     if (watch.finish()) |err| {
         result.deinit(alloc);
         return err;
@@ -229,7 +239,7 @@ pub fn failure_kind(status: std.http.Status) streams.FailureKind {
 
 /// Parses a successful streamed reply from `reader`, telling `progress` about
 /// each event when it is set.
-pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest, progress: ?sse.Progress) !streams.Result {
+pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest, progress: ?sse.Progress) anyerror!streams.Result {
     var limits: codec.Limits = .{};
     if (request.content_capture_limit) |limit| limits.content_bytes = @min(limit, limits.content_bytes);
     return codec.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag, progress);
@@ -255,7 +265,13 @@ fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry
 }
 
 pub fn lookup_capabilities(raw: ?*anyopaque, model: []const u8) model_capabilities.Capabilities {
-    const metadata = definition_at(raw).model(model) orelse return .{};
+    const definition = definition_at(raw);
+    const metadata = definition.model(model) orelse {
+        if (definition.catalog == .openrouter) if (openrouter_catalog.lookup(model)) |entry| {
+            return model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(metadata_entry(entry)));
+        };
+        return .{};
+    };
     return model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(metadata_entry(metadata.*)));
 }
 
@@ -264,7 +280,12 @@ pub fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInp
     const definition = definition_at(raw);
     var entries: std.ArrayList(catalog.ModelCatalogEntry) = .empty;
     errdefer catalog.freeModelCatalog(alloc, &entries);
-    for (definition.model_metadata) |metadata| {
+    // Declared models first; a preset's built-in ones fill in, then the live
+    // OpenRouter catalog when the definition uses it.
+    var live = if (definition.catalog == .openrouter) openrouter_catalog.fetch(alloc, definition.base_url, input.cancel_flag) else openrouter_catalog.Fetched{};
+    defer live.deinit(alloc);
+    for ([_][]const definitions.ModelMetadata{ definition.model_metadata, definition.builtin_models, live.models }) |list| for (list) |metadata| {
+        if (listed(entries.items, metadata.id)) continue;
         var entry = metadata_entry(metadata);
         entry.id = try alloc.dupe(u8, entry.id);
         errdefer alloc.free(entry.id);
@@ -273,8 +294,13 @@ pub fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInp
         entry.reasoning_efforts = .fromOwnedSlice(try alloc.dupe(types.ReasoningEffort, metadata.reasoning_efforts));
         errdefer entry.reasoning_efforts.deinit(alloc);
         try entries.append(alloc, entry);
-    }
+    };
     return .{ .catalog = entries };
+}
+
+fn listed(entries: []const catalog.ModelCatalogEntry, id: []const u8) bool {
+    for (entries) |entry| if (std.mem.eql(u8, entry.id, id)) return true;
+    return false;
 }
 
 test "configured capability lookup matches catalog projection and preserves unknowns" {
@@ -318,9 +344,20 @@ pub fn fetch_cli_catalog(raw: ?*anyopaque, alloc: Allocator, input: gateway_prov
     }
 }
 
-const Review = struct { definition: *const definitions.Definition, input: classifier.ProviderInput };
-fn review(raw: ?*anyopaque, alloc: Allocator, input: classifier.ProviderInput, request: classifier.ReviewRequest) !classifier.ParseOutcome {
-    var state = Review{ .definition = definition_at(raw), .input = input };
+/// The build and stream callbacks a review sends through; both take the
+/// definition as context.
+pub const ReviewTransport = struct {
+    build_fn: *const fn (?*anyopaque, Allocator, streams.RequestData) anyerror![]u8 = build,
+    stream_fn: *const fn (?*anyopaque, Allocator, streams.ModelRequest) anyerror!streams.Result = stream,
+};
+const Review = struct { definition: *const definitions.Definition, input: classifier.ProviderInput, transport: ReviewTransport };
+pub fn review(raw: ?*anyopaque, alloc: Allocator, input: classifier.ProviderInput, request: classifier.ReviewRequest) !classifier.ParseOutcome {
+    return review_with(raw, alloc, input, request, .{});
+}
+
+/// A permission review sent through `transport` to the reviewer model.
+pub fn review_with(raw: ?*anyopaque, alloc: Allocator, input: classifier.ProviderInput, request: classifier.ReviewRequest, transport: ReviewTransport) !classifier.ParseOutcome {
+    var state = Review{ .definition = definition_at(raw), .input = input, .transport = transport };
     return classifier.Reviewer.withTransportModel(.{ .context = &state, .build_fn = build_review, .send_fn = send_review }, input.cancel_flag, classifier.Reviewer.default_timeout_ms, state.definition.reviewer_model orelse request.review_turn.model).review(alloc, request);
 }
 fn build_review(raw: *anyopaque, alloc: Allocator, model: []const u8, _: []const u8, instructions: []const types.ChatMessage, messages: []const types.ChatMessage, target_id: []const u8, deadline: std.Io.Clock.Timestamp, cancel: *std.atomic.Value(bool)) ![]u8 {
@@ -328,7 +365,7 @@ fn build_review(raw: *anyopaque, alloc: Allocator, model: []const u8, _: []const
     const expanded = try review_messages.expandPendingToolReviewMessages(alloc, messages, target_id, deadline, cancel);
     defer alloc.free(expanded);
     const output_limit = if (state.definition.model(model)) |metadata| @min(metadata.max_output_tokens orelse 2048, 2048) else 2048;
-    return build(@ptrCast(@constCast(state.definition)), alloc, .{ .model = model, .instructions = instructions, .messages = expanded, .tools = .{ .additional_functions = &.{classifier.function_schema} }, .tool_choice = .required, .provider_options = .{}, .max_output_tokens = output_limit });
+    return state.transport.build_fn(@ptrCast(@constCast(state.definition)), alloc, .{ .model = model, .instructions = instructions, .messages = expanded, .tools = .{ .additional_functions = &.{classifier.function_schema} }, .tool_choice = .required, .provider_options = .{}, .max_output_tokens = output_limit });
 }
 fn ignore_event(_: *anyopaque, _: streams.Event) void {}
 fn free_result(raw: *anyopaque, alloc: Allocator) void {
@@ -341,7 +378,8 @@ fn send_review(raw: *anyopaque, alloc: Allocator, model: []const u8, payload: []
     var delivery: streams.DeliveryCertainty = .init();
     var evidence: streams.AttemptEvidence = .{};
     var event_context: u8 = 0;
-    var result = gateway_step.streamModelCompletion(bundle(state.definition).agent_stream.?, alloc, .{
+    const provider: streams.Provider = .{ .context = @ptrCast(@constCast(state.definition)), .stream_fn = state.transport.stream_fn };
+    var result = gateway_step.streamModelCompletion(provider, alloc, .{
         .credential = .{ .direct = .{ .secret_bytes = state.input.credential, .source = state.input.credential_source } },
         .model = model,
         .retry_count = 1,

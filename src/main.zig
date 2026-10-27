@@ -1206,8 +1206,33 @@ const App = struct {
         try InputSubmitRuntime.resumePromptAfterAuth(self, max_prompt_history);
     }
 
+    /// `/login` signs in to the built-in API providers (D147); gateway login
+    /// stays unsupported in proto-fx.
     pub fn runLoginCommand(self: *App) !void {
-        try self.writeDomainNotice(.{ .topic = "provider", .tone = .neutral, .body = "Use proto-fx setup --base-url URL to discover models and configure a direct provider. Gateway login is not supported." }, true);
+        try AuthAppRuntime.runLoginCommand(self);
+    }
+
+    /// Only the built-in API providers sign in through `/login`.
+    pub fn presetLoginOnly(_: *const App) bool {
+        return true;
+    }
+
+    /// Applies a provider a login just saved a key for. A detached session's
+    /// host switches; the in-process runtime switches itself (returns false).
+    pub fn selectProviderAfterLogin(self: *App, provider: model_provider.ProviderId) !bool {
+        switch (self.backend) {
+            .in_process => return false,
+            .detached => {
+                try DetachedBackend.selectProvider(self, provider.label());
+                // The picker lists the new provider's models from here on.
+                const definition = self.provider_selection.definitions.get(provider.label());
+                const model = if (definition) |value| value.default_model orelse "" else "";
+                try self.provider_selection.replaceSelection(provider, model);
+                self.model_cache.resetForProviderChange();
+                self.startModelCacheWarmup();
+                return true;
+            },
+        }
     }
 
     pub fn runLogoutCommand(self: *App, target: []const u8) !void {
@@ -4893,6 +4918,13 @@ test {
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");
+    _ = @import("core/config/provider_registry.zig");
+    _ = @import("core/config/secret_command.zig");
+    _ = @import("core/auth/provider_keys.zig");
+    _ = @import("gateway/configured_request.zig");
+    _ = @import("gateway/openrouter_catalog.zig");
+    _ = @import("gateway/openai_responses.zig");
+    _ = @import("gateway/routed_provider.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");

@@ -12,14 +12,13 @@ const definitions = @import("../core/config/configured_provider.zig");
 const streams = @import("../core/agent/stream_provider.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
 const classifier = @import("../core/permissions/auto_classifier.zig");
-const gateway_step = @import("../core/agent/runtime/gateway_step.zig");
-const review_messages = @import("vercel_protocol.zig");
 const io = @import("../core/shared/io.zig");
 const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const sse = @import("sse.zig");
+const configured_request = @import("configured_request.zig");
 const Allocator = std.mem.Allocator;
 
 pub const api_version = "2023-06-01";
@@ -74,7 +73,7 @@ fn definition_options(definition: *const definitions.Definition, model: []const 
     return options;
 }
 
-fn build(raw: ?*anyopaque, alloc: Allocator, request: streams.RequestData) ![]u8 {
+pub fn build(raw: ?*anyopaque, alloc: Allocator, request: streams.RequestData) ![]u8 {
     const definition = definition_at(raw);
     const identity = bound_identity(definition);
     return codec.build_request(alloc, request, definition_options(definition, request.model, &identity));
@@ -86,25 +85,25 @@ pub fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []
     return selected;
 }
 
-fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest) !streams.Result {
+pub fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest) !streams.Result {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     const definition = definition_at(raw);
     if (request.credential.credentialSource() != .configured) return error.ConfiguredProviderCredentialRequired;
     const token = request.credential.secret();
-    switch (definition.auth) {
-        .none => if (token != null and token.?.len != 0) return error.UnexpectedConfiguredProviderCredential,
-        .bearer => if (token == null) return error.MissingConfiguredProviderCredential,
-    }
+    try configured_request.checkToken(definition, token);
     const url = try definition.messages_url(alloc);
     defer alloc.free(url);
     const identity = bound_identity(definition);
     const style: KeyStyle = switch (definition.auth) {
         .none => .none,
-        .bearer => if (definition.key_header == .x_api_key) .x_api_key else .bearer,
+        .bearer, .command, .login => if (definition.key_header == .x_api_key) .x_api_key else .bearer,
     };
+    var headers = try configured_request.resolveHeaders(alloc, definition);
+    defer headers.deinit(alloc);
     return stream_endpoint(alloc, .{
         .messages_url = url,
         .key_style = style,
+        .extra_headers = headers.items,
         .options = definition_options(definition, request.model, &identity),
     }, if (style == .none) null else token, request);
 }
@@ -255,60 +254,9 @@ pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelR
     return reducer.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag, progress);
 }
 
-const Review = struct { definition: *const definitions.Definition, input: classifier.ProviderInput };
-fn review(raw: ?*anyopaque, alloc: Allocator, input: classifier.ProviderInput, request: classifier.ReviewRequest) !classifier.ParseOutcome {
-    var state = Review{ .definition = definition_at(raw), .input = input };
-    return classifier.Reviewer.withTransportModel(.{ .context = &state, .build_fn = build_review, .send_fn = send_review }, input.cancel_flag, classifier.Reviewer.default_timeout_ms, state.definition.reviewer_model orelse request.review_turn.model).review(alloc, request);
-}
-fn build_review(raw: *anyopaque, alloc: Allocator, model: []const u8, _: []const u8, instructions: []const types.ChatMessage, messages: []const types.ChatMessage, target_id: []const u8, deadline: std.Io.Clock.Timestamp, cancel: *std.atomic.Value(bool)) ![]u8 {
-    const state: *Review = @ptrCast(@alignCast(raw));
-    const expanded = try review_messages.expandPendingToolReviewMessages(alloc, messages, target_id, deadline, cancel);
-    defer alloc.free(expanded);
-    const output_limit = if (state.definition.model(model)) |metadata| @min(metadata.max_output_tokens orelse 2048, 2048) else 2048;
-    return build(@ptrCast(@constCast(state.definition)), alloc, .{ .model = model, .instructions = instructions, .messages = expanded, .tools = .{ .additional_functions = &.{classifier.function_schema} }, .tool_choice = .required, .provider_options = .{}, .max_output_tokens = output_limit });
-}
-fn ignore_event(_: *anyopaque, _: streams.Event) void {}
-fn free_result(raw: *anyopaque, alloc: Allocator) void {
-    const result: *streams.Result = @ptrCast(@alignCast(raw));
-    result.deinit(alloc);
-    alloc.destroy(result);
-}
-fn send_review(raw: *anyopaque, alloc: Allocator, model: []const u8, payload: []const u8, deadline: std.Io.Clock.Timestamp, cancel: *std.atomic.Value(bool)) !classifier.TransportOutcome {
-    const state: *Review = @ptrCast(@alignCast(raw));
-    var delivery: streams.DeliveryCertainty = .init();
-    var evidence: streams.AttemptEvidence = .{};
-    var event_context: u8 = 0;
-    var result = gateway_step.streamModelCompletion(bundle(state.definition).agent_stream.?, alloc, .{
-        .credential = .{ .direct = .{ .secret_bytes = state.input.credential, .source = state.input.credential_source } },
-        .model = model,
-        .retry_count = 1,
-        .messages = &.{},
-        .tools = .{ .additional_functions = &.{classifier.function_schema} },
-        .tool_choice = .required,
-        .provider_options = .{},
-        .prepared_request_body = payload,
-        .trace_ctx = .{},
-        .content_capture_limit = 16 * 1024,
-        .deadline = deadline,
-        .delivery = &delivery,
-        .attempt_evidence = &evidence,
-        .events = .{ .context = &event_context, .emit_fn = ignore_event },
-        .cancel_flag = cancel,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Cancelled => return .cancelled,
-        error.Timeout => return .timed_out,
-        error.RequiredToolMissing => return .{ .completion = .{ .completion = .{} } },
-        else => return .permanent_failure,
-    };
-    errdefer result.deinit(alloc);
-    if (result == .failed) {
-        result.deinit(alloc);
-        return .permanent_failure;
-    }
-    const owned = try alloc.create(streams.Result);
-    owned.* = result;
-    return .{ .completion = .{ .completion = owned.completed.completion, .context = owned, .deinit_fn = free_result } };
+/// The chat review flow, sent through this transport.
+pub fn review(raw: ?*anyopaque, alloc: Allocator, input: classifier.ProviderInput, request: classifier.ReviewRequest) !classifier.ParseOutcome {
+    return chat_completions.review_with(raw, alloc, input, request, .{ .build_fn = build, .stream_fn = stream });
 }
 
 test "signature rejection patterns match proto" {

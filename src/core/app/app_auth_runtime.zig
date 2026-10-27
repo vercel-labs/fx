@@ -14,6 +14,8 @@ const grok_oauth = @import("../auth/grok_oauth.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const auth_transition = @import("../auth/auth_transition.zig");
 const model_provider = @import("../config/model_provider.zig");
+const provider_registry = @import("../config/provider_registry.zig");
+const provider_keys = @import("../auth/provider_keys.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const picker_state = @import("../input/picker_state.zig");
@@ -276,6 +278,14 @@ pub fn Runtime(comptime App: type) type {
                     });
                     return;
                 };
+            if (requested_provider) |requested| if (requested == .configured) {
+                const removed = provider_keys.delete(app.alloc, requested.label()) catch {
+                    try writeAuthNotice(app, .{ .topic = "auth", .tone = .@"error", .body = "Could not remove the saved key." });
+                    return;
+                };
+                try writeAuthNotice(app, .{ .topic = "auth", .tone = .neutral, .body = if (removed) "Removed the saved key." else "No saved key found." });
+                return;
+            };
             try app.flushBeforeBlockingExternalWork();
             const selected_provider: model_provider.ProviderId = if (comptime provider_runtime.supported(App))
                 provider_runtime.provider(app)
@@ -797,8 +807,35 @@ pub fn Runtime(comptime App: type) type {
                             try finishSubscriptionSignIn(app, .grok);
                             return;
                         },
+                        .provider_key => |value| {
+                            app.auth.closePicker(app.alloc);
+                            try finishProviderKey(app, value.provider);
+                            return;
+                        },
                     }
                 },
+            }
+        }
+
+        /// A configured provider's key was saved by /login: say where it went
+        /// and switch to the provider, which resolves the key itself.
+        fn finishProviderKey(app: *App, provider: model_provider.NameKey) !void {
+            const name = provider.label();
+            const display = if (provider_registry.presetFor(name)) |preset| preset.name else name;
+            const body = try app.alloc.print("Saved the {s} key to the profile.", .{display});
+            defer app.alloc.free(body);
+            try writeAuthNotice(app, .{ .topic = "auth", .tone = .neutral, .body = body });
+            const target = model_provider.parse(name) orelse return;
+            if (comptime @hasDecl(App, "selectProviderAfterLogin")) {
+                if (try app.selectProviderAfterLogin(target)) return;
+            }
+            if (comptime provider_runtime.supported(App)) {
+                if (provider_runtime.provider(app).eql(target)) {
+                    // Already selected: the next request resolves the new key.
+                    try resumePromptAfterAuth(app);
+                    return;
+                }
+                try switchProvider(app, target, false, .manual);
             }
         }
 
@@ -876,6 +913,7 @@ pub fn Runtime(comptime App: type) type {
         fn applyApiKeySaveResult(app: *App, result: auth_runtime.ApiKeySaveResult) !void {
             switch (result) {
                 .empty => return,
+                .provider_saved => |provider| try finishProviderKey(app, provider),
                 .saved => |changed| {
                     applyCredentialChange(app, changed);
                     rememberCredentialSource(app, .stored_key);
@@ -1195,7 +1233,8 @@ pub fn Runtime(comptime App: type) type {
                 .models_path = app.model_cache.models_path,
                 .preferred_source = if (target == .gateway) settings.credential_source else null,
                 .primary_model = if (intent == .post_oauth and provider_runtime.provider(app).eql(target)) provider_runtime.model(app) else null,
-                .preferred_model = if (intent == .post_oauth) settings.models.get(target) else io_mod.getenv("FX_MODEL") orelse settings.models.get(target),
+                .preferred_model = (if (intent == .post_oauth) settings.models.get(target) else io_mod.getenv("FX_MODEL") orelse settings.models.get(target)) orelse
+                    config_runtime.configuredDefaultModel(&settings, target),
             });
         }
 
@@ -1690,6 +1729,20 @@ pub fn Runtime(comptime App: type) type {
             try beginSignIn(app, false);
         }
 
+        /// OpenRouter's browser sign-in from `/login openrouter oauth` (D147).
+        pub fn beginOpenRouterSignInForProviderPicker(app: *App) !void {
+            try app.flushBeforeBlockingExternalWork();
+            const started = app.auth.openOpenRouterSignIn(app.alloc) catch |err| {
+                cancelPromptRetryAfterAuth(app);
+                debug_trace.logf("auth", "OpenRouter login failed err={s}", .{@errorName(err)});
+                try writeLoginError(app, .configured, err);
+                return;
+            };
+            if (!started) return;
+            app.shell.render_requests.request(.footer);
+            if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
+        }
+
         fn validateTeamCredential(
             app: *App,
             candidate: credentials.Credential,
@@ -2037,6 +2090,12 @@ pub fn Runtime(comptime App: type) type {
                     error.ChatGptAuthorizationFailed => .{ .topic = "auth", .tone = .@"error", .body = "Codex sign-in was denied. The current credential is unchanged." },
                     error.ChatGptLoginTimedOut, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "Codex sign-in expired. The current credential is unchanged; run /login to try again." },
                     else => .{ .topic = "auth", .tone = .@"error", .body = "Codex sign-in failed. The current credential is unchanged." },
+                }
+            else if (source == .configured)
+                switch (err) {
+                    error.OpenRouterAuthorizationFailed => .{ .topic = "auth", .tone = .@"error", .body = "OpenRouter sign-in was denied. The current credential is unchanged." },
+                    error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "OpenRouter sign-in expired. The current credential is unchanged; run /login to try again." },
+                    else => .{ .topic = "auth", .tone = .@"error", .body = "OpenRouter sign-in failed. The current credential is unchanged." },
                 }
             else if (source == .grok_subscription)
                 switch (err) {

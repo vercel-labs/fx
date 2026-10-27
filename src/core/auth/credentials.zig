@@ -9,6 +9,8 @@ const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
 const model_provider = @import("../config/model_provider.zig");
 const provider_catalog = @import("provider_catalog.zig");
+const provider_keys = @import("provider_keys.zig");
+const secret_command = @import("../config/secret_command.zig");
 const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
@@ -388,6 +390,18 @@ pub fn resolveForProvider(
         return switch (definition.auth) {
             .none => .{ .credential = .{ .token = try alloc.dupe(u8, ""), .source = .configured } },
             .bearer => |env| .{ .credential = try loadEnvCredential(alloc, env, .configured) },
+            .command => |text| .{ .credential = .{ .token = secret_command.resolve(alloc, text) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                debug_trace.logf("auth", "configured key command failed provider={s}", .{definition.id});
+                return .{ .failure = .{ .source = .configured, .err = err } };
+            }, .source = .configured } },
+            // The key /login saved wins over the environment fallback.
+            .login => |env| if (try provider_keys.load(alloc, definition.id)) |key|
+                .{ .credential = .{ .token = key, .source = .configured } }
+            else if (env.len != 0)
+                .{ .credential = try loadEnvCredential(alloc, env, .configured) }
+            else
+                .{},
         };
     }
     if (provider != .gateway) {

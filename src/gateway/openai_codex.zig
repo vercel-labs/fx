@@ -10,6 +10,7 @@ const gateway_client = @import("client.zig");
 const responses_protocol = @import("responses_protocol.zig");
 const sse_stream = @import("sse.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
+const model_provider = @import("../core/config/model_provider.zig");
 
 const Allocator = std.mem.Allocator;
 const endpoint = "https://chatgpt.com/backend-api/codex/responses";
@@ -47,9 +48,28 @@ fn validateModel(model: []const u8) !void {
     }
 }
 
+/// What a Responses endpoint other than ChatGPT's Codex one needs changed.
+pub const BuildOptions = struct {
+    /// The replay authority: Codex, or a configured provider's bound identity.
+    provider: model_provider.ProviderId = .codex,
+    /// Codex's `text.verbosity`, which other endpoints may refuse.
+    verbosity: bool = true,
+    /// The public API's `max_output_tokens`, which Codex rejects.
+    max_output_tokens: bool = false,
+};
+
 pub fn buildRequest(
     alloc: Allocator,
     request: stream_provider.RequestData,
+) ![]u8 {
+    return buildRequestWith(alloc, request, .{});
+}
+
+/// The Responses body for `request`. Caller owns it.
+pub fn buildRequestWith(
+    alloc: Allocator,
+    request: stream_provider.RequestData,
+    options: BuildOptions,
 ) ![]u8 {
     try request.validatePrompt();
     try validateModel(request.model);
@@ -58,7 +78,7 @@ pub fn buildRequest(
     else
         .{};
     try budget.check();
-    const projected = try types.projectProviderReplay(alloc, request.messages, .{ .provider = .codex, .model = request.model });
+    const projected = try types.projectProviderReplay(alloc, request.messages, .{ .provider = options.provider, .model = request.model });
     defer if (projected) |messages| alloc.free(messages);
     if (projected != null) debug_trace.logf("gateway", "provider_replay_omitted provider=codex reason=source_mismatch", .{});
 
@@ -98,10 +118,12 @@ pub fn buildRequest(
     // ChatGPT subscription models.
     if (request.provider_options.fast) try writer.writeAll(",\"service_tier\":\"priority\"");
 
-    try writer.writeAll(",\"text\":{\"verbosity\":\"low\"");
+    try writer.writeAll(",\"text\":{");
+    if (options.verbosity) try writer.writeAll("\"verbosity\":\"low\"");
     if (request.response_format) |format| {
         if (format.schema != .object) return error.InvalidStructuredResponseSchema;
-        try writer.writeAll(",\"format\":{\"type\":\"json_schema\",\"name\":");
+        if (options.verbosity) try writer.writeByte(',');
+        try writer.writeAll("\"format\":{\"type\":\"json_schema\",\"name\":");
         try std.json.Stringify.value(format.name, .{}, writer);
         try writer.writeAll(",\"description\":");
         try std.json.Stringify.value(format.description, .{}, writer);
@@ -119,6 +141,7 @@ pub fn buildRequest(
     }
     // The ChatGPT Codex endpoint chooses the model's output limit and rejects
     // the public Responses API max_output_tokens parameter.
+    if (options.max_output_tokens) if (request.max_output_tokens) |limit| try writer.print(",\"max_output_tokens\":{d}", .{limit});
     try writer.writeByte('}');
     return out.toOwnedSlice();
 }

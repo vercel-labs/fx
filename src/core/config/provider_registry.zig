@@ -1,0 +1,220 @@
+//! Built-in provider presets and the profile model-override file.
+//!
+//! OpenRouter, OpenCode Zen and OpenCode Go are configured providers that ship
+//! with fx (D145): each is a definition like one a user writes, marked
+//! `preset`, with a built-in model table. `models.json` in the profile (D148)
+//! patches a preset by key, or adds or replaces a whole definition, in the
+//! same schema as settings.json `providers`.
+const std = @import("std");
+const configured = @import("configured_provider.zig");
+const preset_models = @import("provider_preset_models.zig");
+const io_mod = @import("../shared/io.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
+const Allocator = std.mem.Allocator;
+
+pub const models_file_name = "models.json";
+const max_models_file_bytes = 1024 * 1024;
+
+pub const Login = enum {
+    /// Browser PKCE sign-in, or a pasted key.
+    browser_or_key,
+    /// A pasted key only.
+    key,
+};
+
+pub const Preset = struct {
+    id: []const u8,
+    name: []const u8,
+    description: []const u8,
+    /// Where to get a key by hand.
+    key_url: []const u8,
+    /// Keys from this provider start with this, when it is known.
+    key_prefix: []const u8 = "",
+    login: Login,
+    /// The definition, in the settings.json `providers` schema.
+    json: []const u8,
+    models: []const configured.ModelMetadata,
+    catalog: configured.CatalogSource = .declared,
+};
+
+pub const presets = [_]Preset{
+    .{
+        .id = "openrouter",
+        .name = "OpenRouter",
+        .description = "OpenRouter account: browser sign-in or an sk-or- key",
+        .key_url = "https://openrouter.ai/settings/keys",
+        .key_prefix = "sk-or-",
+        .login = .browser_or_key,
+        // Chat Completions for every model: OpenRouter applies `cache_control`
+        // for anthropic/* there and returns reasoning details (D146).
+        .json =
+        \\{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"login","env":"OPENROUTER_API_KEY"},"tool_choice_mode":"send","reasoning_format":"openrouter","default_model":"anthropic/claude-sonnet-5.5","headers":{"HTTP-Referer":"https://github.com/vercel-labs/fx","X-Title":"proto-fx"}}
+        ,
+        .models = &preset_models.openrouter,
+        .catalog = .openrouter,
+    },
+    .{
+        .id = "opencode-zen",
+        .name = "OpenCode Zen",
+        .description = "OpenCode Zen API key from opencode.ai/auth",
+        .key_url = "https://opencode.ai/auth",
+        .login = .key,
+        .json =
+        \\{"protocol":"openai-chat-completions","base_url":"https://opencode.ai/zen/v1","auth":{"type":"login","env":"OPENCODE_API_KEY","header":"x-api-key"},"tool_choice_mode":"send","reasoning_format":"openai","default_model":"claude-sonnet-5-5"}
+        ,
+        .models = &preset_models.opencode_zen,
+    },
+    .{
+        .id = "opencode-go",
+        .name = "OpenCode Go",
+        .description = "OpenCode Go API key from opencode.ai/auth",
+        .key_url = "https://opencode.ai/auth",
+        .login = .key,
+        .json =
+        \\{"protocol":"openai-chat-completions","base_url":"https://opencode.ai/zen/go/v1","auth":{"type":"login","env":"OPENCODE_API_KEY","header":"x-api-key"},"tool_choice_mode":"send","reasoning_format":"openai","default_model":"glm-5.3"}
+        ,
+        .models = &preset_models.opencode_go,
+    },
+};
+
+pub fn presetFor(id: []const u8) ?*const Preset {
+    for (&presets) |*preset| if (std.mem.eql(u8, preset.id, id)) return preset;
+    return null;
+}
+
+pub const ExtendError = configured.ParseError || error{ InvalidModelsFile, StreamTooLong };
+
+/// Adds the presets to `registry`, then applies `<fx_dir>/models.json` when
+/// `fx_dir` is set. A user definition in settings.json with a preset's id
+/// keeps priority over the preset; models.json wins over both.
+pub fn extend(alloc: Allocator, registry: *?configured.Registry, fx_dir: ?[]const u8) !void {
+    if (registry.* == null) registry.* = .{};
+    const target = &registry.*.?;
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const overrides = if (fx_dir) |dir| try loadOverrides(arena, dir) else null;
+    for (&presets) |*preset| {
+        const patch = if (overrides) |object| object.get(preset.id) else null;
+        // A user's own definition with this id replaces the preset entirely.
+        if (patch == null and target.get(preset.id) != null) continue;
+        try target.put(alloc, try buildPreset(alloc, arena, preset, patch));
+    }
+    const object = overrides orelse return;
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        if (presetFor(entry.key_ptr.*) != null) continue;
+        try target.put(alloc, try configured.parse_definition(alloc, entry.key_ptr.*, entry.value_ptr.*));
+    }
+}
+
+/// The definition for `preset` with `patch` laid over it: top-level keys
+/// replace, `headers` and `model_metadata` merge by key. Caller owns it.
+pub fn buildPreset(alloc: Allocator, arena: Allocator, preset: *const Preset, patch: ?std.json.Value) !configured.Definition {
+    var base = try std.json.parseFromSliceLeaky(std.json.Value, arena, preset.json, .{});
+    if (patch) |overlay| {
+        if (overlay != .object) return error.InvalidModelsFile;
+        var iterator = overlay.object.iterator();
+        while (iterator.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const merge = std.mem.eql(u8, key, "headers") or std.mem.eql(u8, key, "model_metadata");
+            const existing = base.object.getPtr(key);
+            if (merge and existing != null and existing.?.* == .object and entry.value_ptr.* == .object) {
+                var fields = entry.value_ptr.object.iterator();
+                while (fields.next()) |field| try existing.?.object.put(arena, field.key_ptr.*, field.value_ptr.*);
+            } else try base.object.put(arena, key, entry.value_ptr.*);
+        }
+    }
+    var definition = try configured.parse_definition(alloc, preset.id, base);
+    definition.builtin_models = preset.models;
+    definition.catalog = preset.catalog;
+    definition.preset = true;
+    return definition;
+}
+
+/// The `providers` object of models.json, or null when the file is absent.
+/// Borrows from `arena`.
+fn loadOverrides(arena: Allocator, fx_dir: []const u8) !?std.json.ObjectMap {
+    const path = try std.Io.Dir.path.join(arena, &.{ fx_dir, models_file_name });
+    var file = io_mod.openExistingRegularFile(std.Io.Dir.cwd(), path, .read_only) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.close(io_mod.getIo());
+    const bytes = try io_mod.readFileToEnd(arena, &file, max_models_file_bytes);
+    return try parseOverrides(arena, bytes);
+}
+
+pub fn parseOverrides(arena: Allocator, bytes: []const u8) !std.json.ObjectMap {
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{
+        .duplicate_field_behavior = .@"error",
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DuplicateField => return error.DuplicateField,
+        else => return error.InvalidModelsFile,
+    };
+    if (root != .object) return error.InvalidModelsFile;
+    for (root.object.keys()) |key| if (!std.mem.eql(u8, key, "providers")) return error.InvalidModelsFile;
+    const providers = root.object.get("providers") orelse return .empty;
+    if (providers != .object) return error.InvalidModelsFile;
+    return providers.object;
+}
+
+/// The profile directory under `home`. Caller owns it.
+pub fn fxDir(alloc: Allocator, home: []const u8) ![]u8 {
+    return profile_paths.rootDir(alloc, home);
+}
+
+test "presets join the registry with their built-in models and routes" {
+    const alloc = std.testing.allocator;
+    var registry: ?configured.Registry = null;
+    defer if (registry) |*value| value.deinit(alloc);
+    try extend(alloc, &registry, null);
+    const value = registry.?;
+    try std.testing.expectEqual(@as(usize, 0), value.userCount());
+    const router = value.get("openrouter").?;
+    try std.testing.expect(router.preset);
+    try std.testing.expectEqual(configured.CatalogSource.openrouter, router.catalog);
+    try std.testing.expectEqual(configured.ReasoningFormat.openrouter, router.reasoning_format);
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-5.5", router.default_model.?);
+    try std.testing.expect(router.model(router.default_model.?) != null);
+    const zen = value.get("opencode-zen").?;
+    try std.testing.expect(zen.mixed());
+    try std.testing.expectEqual(configured.KeyHeader.x_api_key, zen.key_header);
+    try std.testing.expectEqualStrings("OPENCODE_API_KEY", zen.keyEnv().?);
+    try std.testing.expectEqual(configured.Protocol.@"anthropic-messages", zen.protocolFor("claude-sonnet-5-5"));
+    try std.testing.expectEqual(configured.Protocol.@"openai-responses", zen.protocolFor("gpt-5.5"));
+    try std.testing.expectEqual(configured.Protocol.@"openai-chat-completions", zen.protocolFor("kimi-k3"));
+    try std.testing.expect(zen.model("gemini-3-pro") == null);
+    try std.testing.expect(zen.model(zen.default_model.?) != null);
+    const go = value.get("opencode-go").?;
+    try std.testing.expect(go.model(go.default_model.?) != null);
+}
+
+test "models.json patches presets by key and adds whole definitions" {
+    const alloc = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const overrides = try parseOverrides(arena_state.allocator(),
+        \\{"providers":{"openrouter":{"base_url":"http://127.0.0.1:8394/v1","headers":{"X-Title":"mine"},"model_metadata":{"local/claude":{"protocol":"anthropic-messages","context_window":200000}}},
+        \\"cento":{"protocol":"anthropic-messages","base_url":"http://127.0.0.1:8394/v1","auth":{"type":"bearer","command":"!printf dummy"},"model_metadata":{"claude-cento":{}}}}}
+    );
+    var registry: configured.Registry = try .parse_json(alloc,
+        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1/v1","auth":{"type":"none"}}}
+    );
+    defer registry.deinit(alloc);
+    const router = try buildPreset(alloc, arena_state.allocator(), presetFor("openrouter").?, overrides.get("openrouter"));
+    try registry.put(alloc, router);
+    try registry.put(alloc, try configured.parse_definition(alloc, "cento", overrides.get("cento").?));
+    const patched = registry.get("openrouter").?;
+    try std.testing.expectEqualStrings("http://127.0.0.1:8394/v1", patched.base_url);
+    try std.testing.expectEqual(@as(usize, 2), patched.headers.len);
+    for (patched.headers) |header| if (std.mem.eql(u8, header.name, "X-Title")) try std.testing.expectEqualStrings("mine", header.value);
+    try std.testing.expectEqual(configured.Protocol.@"anthropic-messages", patched.protocolFor("local/claude"));
+    try std.testing.expect(patched.model("anthropic/claude-sonnet-5.5") != null);
+    try std.testing.expectEqualStrings("!printf dummy", registry.get("cento").?.auth.command);
+    try std.testing.expectEqual(@as(usize, 2), registry.userCount());
+    for ([_][]const u8{ "[]", "{\"models\":{}}", "{\"providers\":[]}", "{\"providers\":{},\"providers\":{}}" }) |bad| {
+        if (parseOverrides(arena_state.allocator(), bad)) |_| return error.TestUnexpectedResult else |_| {}
+    }
+}

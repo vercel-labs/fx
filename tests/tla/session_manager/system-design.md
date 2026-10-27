@@ -1991,6 +1991,56 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   revisions. **Why:** a build is long and noisy, and the session lives in
   the supervisor, not the terminal. **Alternative:** building on a
   background thread inside the running terminal.
+- **D145 Decision:** OpenRouter, OpenCode Zen and OpenCode Go ship as
+  built-in configured providers (`provider_registry.zig`), not new
+  `ProviderId` tags. Each is a definition in the settings.json `providers`
+  schema, marked `preset`, with a built-in model table; it joins every
+  loaded registry, never selects itself when it is the only one, and a
+  user definition with its id replaces it. **Why:** configured providers
+  already carry binding identity, replay authority and bundles, while a
+  new tag touches every provider switch. **Alternative:** tags beside
+  `codex` and `grok`, as proto's registry has ids.
+
+- **D146 Decision:** a model may name its own wire protocol
+  (`model_metadata.<id>.protocol`); a provider whose models differ routes
+  each request by model (`routed_provider.zig`), and replay projection,
+  which has no model, reads the replay's shape. OpenRouter sends every
+  model through Chat Completions with `cache_control` for `anthropic/*`,
+  `reasoning.effort` and its `provider` route; OpenCode follows proto's
+  catalog: Messages, Responses or Chat Completions per model, and its
+  Gemini models are left out. OpenRouter's catalog is fetched from
+  `<base>/models`, filtered to tool models and cached in the profile.
+  **Why:** OpenRouter applies Anthropic breakpoints and returns reasoning
+  details on Chat Completions, so its Messages endpoint adds nothing proto
+  uses. **Alternative:** a provider per protocol, which splits one key and
+  one catalog into three.
+
+- **D147 Decision:** `/login` and `fx login` sign in to the presets:
+  OpenRouter by PKCE S256 on loopback port 54549 or a pasted `sk-or-`
+  key, OpenCode by a pasted key. Keys go to `provider-keys.json`, 0600 in
+  the profile beside the Codex and Grok sessions; an environment variable
+  is the fallback. A detached session switches through its host's
+  `provider` option. Configured Responses models reuse the Codex body and
+  reducer with the public API's `max_output_tokens`. **Why:** proto's
+  login flows, without a second credential store. **Alternative:** the
+  keychain, which the gateway key uses and which the session host may not
+  reach.
+
+- **D148 Decision:** the profile's `models.json` overrides providers as
+  proto's `models.yml` does: a preset is patched by key (`headers` and
+  `model_metadata` merge), any other id is a whole definition that wins
+  over settings.json. Keys and header values may be `!command`, split into
+  words with quotes and run without a shell, for 10 seconds, once per
+  process. JSON keeps one parser and the duplicate-key checks every
+  profile file has. **Why:** parity with proto while a repository's
+  `.fx.json` still cannot name a provider or a command. **Alternative:**
+  YAML, which needs a parser outside the standard library.
+
+- **D149 Decision:** `fx setup --base-url` takes `--protocol
+  chat-completions|anthropic-messages`; a Messages key goes in
+  `x-api-key`. **Why:** a direct Messages endpoint needed hand-written
+  settings. **Alternative:** probing both protocols, which costs a request
+  and guesses wrong on gateways that serve both.
 
 ## Design Risks And Failure Behavior
 

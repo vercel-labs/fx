@@ -13,6 +13,8 @@ const model_provider = @import("../config/model_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const provider_catalog = @import("provider_catalog.zig");
 const provider_picker_catalog = @import("provider_picker_catalog.zig");
+const provider_keys = @import("provider_keys.zig");
+const openrouter_oauth = @import("openrouter_oauth.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -537,6 +539,8 @@ pub const ApiKeySaveStart = enum {
 pub const ApiKeySaveResult = union(enum) {
     empty,
     saved: bool,
+    /// A configured provider's key landed in the provider key file (D147).
+    provider_saved: model_provider.NameKey,
     gateway_refused,
     gateway_unavailable,
     store_failed,
@@ -553,6 +557,7 @@ pub const ApiKeySaveOutcome = union(enum) {
     store_failed,
     reload_failed,
     loaded: credentials.Credential,
+    provider_saved: model_provider.NameKey,
 
     pub fn deinit(self: *ApiKeySaveOutcome, alloc: Allocator) void {
         switch (self.*) {
@@ -568,11 +573,22 @@ const ApiKeySaveDeps = struct {
     validator: api_key_validator.Provider = api_key_validator.unavailable_provider,
     store: StoredKeyStoreFn = storeUnavailableSecret,
     loader: CredentialLoaderFn = loadCredentialSource,
+    /// Saves the key for this configured provider instead of the gateway.
+    provider: ?model_provider.NameKey = null,
 };
 
 /// The whole save sequence with no runtime state, so outcome behaviour can be
 /// tested synchronously while the worker owns only threading.
 fn performApiKeySave(alloc: Allocator, key: []const u8, deps: ApiKeySaveDeps) ApiKeySaveOutcome {
+    if (deps.provider) |provider| {
+        const trimmed = std.mem.trim(u8, key, " \t\r\n");
+        if (!provider_keys.validKey(trimmed)) return .gateway_refused;
+        provider_keys.save(alloc, provider.label(), trimmed) catch |err| {
+            debug_trace.logf("auth", "provider key save failed provider={s} err={s}", .{ provider.label(), @errorName(err) });
+            return .store_failed;
+        };
+        return .{ .provider_saved = provider };
+    }
     switch (deps.validator.validate(alloc, key)) {
         .accepted => {},
         .refused => return .gateway_refused,
@@ -1754,6 +1770,9 @@ pub const Runtime = struct {
     /// panel, so the composer keeps showing which path the user walked.
     api_key_inline: bool = false,
     api_key_returns_to_root: bool = false,
+    /// The configured provider the open key field saves for, or null for the
+    /// gateway's key.
+    api_key_provider: ?model_provider.NameKey = null,
     api_key_save: ApiKeySaveRuntime = .{},
     inventory_refresh_task: ?*InventoryRefreshTask = null,
     prompt_credential_refresh_task: ?*PromptCredentialRefreshTask = null,
@@ -1803,7 +1822,7 @@ pub const Runtime = struct {
         auth_mode: credentials.AuthMode,
     ) void {
         comptime {
-            if (@typeInfo(Self).@"struct".field_names.len != 33) {
+            if (@typeInfo(Self).@"struct".field_names.len != 34) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -1835,6 +1854,7 @@ pub const Runtime = struct {
         storage.api_key_input = .empty;
         storage.api_key_inline = false;
         storage.api_key_returns_to_root = false;
+        storage.api_key_provider = null;
         storage.api_key_save = .{};
         storage.inventory_refresh_task = null;
         storage.prompt_credential_refresh_task = null;
@@ -2371,6 +2391,33 @@ pub const Runtime = struct {
         self.api_key_inline = true;
     }
 
+    /// Opens the inline key field for a configured provider such as OpenRouter.
+    pub fn openProviderKeyPickerInline(self: *Self, alloc: Allocator, provider: model_provider.ProviderId) void {
+        self.openApiKeyPickerInline(alloc);
+        self.api_key_provider = .fromProvider(provider);
+    }
+
+    /// The configured provider the open key field saves for.
+    pub fn apiKeyProvider(self: *const Self) ?model_provider.NameKey {
+        return self.api_key_provider;
+    }
+
+    /// Starts OpenRouter's browser sign-in for the inline picker.
+    pub fn openOpenRouterSignIn(self: *Self, alloc: Allocator) !bool {
+        if (comptime host_target.is_wasm) return error.OpenRouterOAuthUnavailable;
+        self.exitSignInStage(alloc);
+        if (!try openrouter_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport)) return false;
+        self.exitApiKeyStage(alloc, .screen_replacement);
+        self.clearTeamSelection(alloc);
+        self.picker_active = true;
+        self.picker_stage = .sign_in;
+        self.picker_selection = null;
+        self.sign_in_source = .configured;
+        self.sign_in_returns_to_root = false;
+        self.sign_in_code_visible = false;
+        return true;
+    }
+
     pub fn apiKeyInlineActive(self: *const Self) bool {
         return self.apiKeyEntryActive() and self.api_key_inline;
     }
@@ -2555,6 +2602,8 @@ pub const Runtime = struct {
         // Ownership moves to the worker, so the stage exit below has nothing to zero.
         const key = self.api_key_input;
         self.api_key_input = .empty;
+        var save_deps = deps;
+        save_deps.provider = self.api_key_provider;
 
         const returns_to_root = self.api_key_returns_to_root;
         self.exitApiKeyStage(alloc, .saved);
@@ -2567,7 +2616,7 @@ pub const Runtime = struct {
             self.picker_selection = .{ .action = .setup };
         }
 
-        return if (self.api_key_save.start(alloc, key, deps)) .started else .busy;
+        return if (self.api_key_save.start(alloc, key, save_deps)) .started else .busy;
     }
 
     pub fn apiKeySaveInFlight(self: *const Self) bool {
@@ -2583,6 +2632,7 @@ pub const Runtime = struct {
             .gateway_unavailable => .gateway_unavailable,
             .store_failed => .store_failed,
             .reload_failed => .reload_failed,
+            .provider_saved => |provider| .{ .provider_saved = provider },
             .loaded => |*credential| blk: {
                 var owned = credential.*;
                 outcome = .reload_failed;
@@ -3066,6 +3116,7 @@ pub const Runtime = struct {
 
     fn exitApiKeyStage(self: *Self, alloc: Allocator, reason: ApiKeyExitReason) void {
         self.api_key_inline = false;
+        self.api_key_provider = null;
         const byte_count = self.api_key_input.items.len;
         if (self.api_key_input.capacity > 0) {
             const allocated = self.api_key_input.allocatedSlice();
@@ -4938,6 +4989,7 @@ test "api key stage zeroes its allocation on every exit path" {
         runtime.exitApiKeyStage(alloc, .saved);
         const result: ApiKeySaveResult = switch (outcome) {
             .loaded => .{ .saved = true },
+            .provider_saved => |provider| .{ .provider_saved = provider },
             .gateway_refused => .gateway_refused,
             .gateway_unavailable => .gateway_unavailable,
             .store_failed => .store_failed,
@@ -4967,6 +5019,7 @@ test "api key stage zeroes its allocation on every exit path" {
         runtime.exitApiKeyStage(alloc, .saved);
         const result: ApiKeySaveResult = switch (outcome) {
             .loaded => .{ .saved = true },
+            .provider_saved => |provider| .{ .provider_saved = provider },
             .gateway_refused => .gateway_refused,
             .gateway_unavailable => .gateway_unavailable,
             .store_failed => .store_failed,
@@ -4996,6 +5049,7 @@ test "api key stage zeroes its allocation on every exit path" {
         runtime.exitApiKeyStage(alloc, .saved);
         const result: ApiKeySaveResult = switch (outcome) {
             .loaded => .{ .saved = true },
+            .provider_saved => |provider| .{ .provider_saved = provider },
             .gateway_refused => .gateway_refused,
             .gateway_unavailable => .gateway_unavailable,
             .store_failed => .store_failed,
@@ -5025,6 +5079,7 @@ test "api key stage zeroes its allocation on every exit path" {
         runtime.exitApiKeyStage(alloc, .saved);
         const result: ApiKeySaveResult = switch (outcome) {
             .loaded => .{ .saved = true },
+            .provider_saved => |provider| .{ .provider_saved = provider },
             .gateway_refused => .gateway_refused,
             .gateway_unavailable => .gateway_unavailable,
             .store_failed => .store_failed,
@@ -5054,6 +5109,7 @@ test "api key stage zeroes its allocation on every exit path" {
         runtime.exitApiKeyStage(alloc, .saved);
         const result: ApiKeySaveResult = switch (outcome) {
             .loaded => .{ .saved = true },
+            .provider_saved => |provider| .{ .provider_saved = provider },
             .gateway_refused => .gateway_refused,
             .gateway_unavailable => .gateway_unavailable,
             .store_failed => .store_failed,

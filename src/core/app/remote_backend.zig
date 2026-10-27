@@ -24,6 +24,8 @@ const command_router = @import("../slash_commands/command_router.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const browser_mod = @import("../input/session_browser.zig");
 const app_commands = @import("app_commands.zig");
+const app_auth_runtime = @import("app_auth_runtime.zig");
+const provider_registry = @import("../config/provider_registry.zig");
 const remote_runtime = @import("app_remote_runtime.zig");
 const remote_view = @import("remote_view.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
@@ -407,8 +409,8 @@ pub fn Runtime(comptime App: type) type {
             handlers.browse_subagents = commandSubagents;
             handlers.handle_heartbeat = commandHeartbeat;
             handlers.handle_kernel = commandKernel;
-            handlers.login = commandGatewayAccount;
-            handlers.logout = commandGatewayAccountWithArgs;
+            handlers.login = commandLogin;
+            handlers.logout = commandLogout;
             handlers.provider = commandGatewayAccount;
             handlers.show_credits = commandGatewayAccount;
             handlers.show_usage = commandGatewayAccount;
@@ -452,6 +454,23 @@ pub fn Runtime(comptime App: type) type {
 
         fn commandGatewayAccountWithArgs(ctx: *anyopaque, _: []const u8) !void {
             try commandGatewayAccount(ctx);
+        }
+
+        /// `/login` opens the provider picker for the built-in API providers;
+        /// the key it saves is the profile's, which the host reads (D147).
+        fn commandLogin(ctx: *anyopaque) !void {
+            try app_auth_runtime.Runtime(App).runLoginCommand(appFrom(ctx));
+        }
+
+        fn commandLogout(ctx: *anyopaque, rest: []const u8) !void {
+            const name = std.mem.trim(u8, rest, " \t\r\n");
+            if (provider_registry.presetFor(name) == null) return commandGatewayAccount(ctx);
+            try app_auth_runtime.Runtime(App).runLogoutCommand(appFrom(ctx), name);
+        }
+
+        /// Switches the attached root session to `provider` after a login.
+        pub fn selectProvider(app: *App, provider: []const u8) !void {
+            try setOption(app, root(app), "provider", provider);
         }
 
         fn commandStatus(ctx: *anyopaque) !void {

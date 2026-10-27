@@ -13,6 +13,7 @@ const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
+const model_provider = @import("../config/model_provider.zig");
 const test_builtin_gateway = if (builtin.is_test)
     @import("../../builtins/gateway.zig")
 else
@@ -199,16 +200,30 @@ pub const SignInSnapshot = struct {
 
 pub const max_manual_code_bytes: usize = 4096;
 
+/// A key a browser sign-in minted for a configured provider, such as an
+/// OpenRouter PKCE exchange. Owns `key`.
+pub const ProviderKey = struct {
+    provider: model_provider.NameKey,
+    key: []u8,
+
+    pub fn deinit(self: *ProviderKey, alloc: Allocator) void {
+        secret.zeroAndFree(alloc, self.key);
+        self.key = &.{};
+    }
+};
+
 pub const SignInCompletion = union(enum) {
     vercel: TeamSelection,
     chatgpt: chatgpt_session.Session,
     grok: grok_session.Session,
+    provider_key: ProviderKey,
 
     pub fn deinit(self: *SignInCompletion, alloc: Allocator) void {
         switch (self.*) {
             .vercel => |*selection| selection.deinit(alloc),
             .chatgpt => |*session| session.deinit(alloc),
             .grok => |*session| session.deinit(alloc),
+            .provider_key => |*value| value.deinit(alloc),
         }
         self.* = .{ .vercel = .{} };
     }
@@ -680,7 +695,7 @@ fn completeSignIn(
 fn saveSignIn(_: ?*anyopaque, alloc: Allocator, completion: SignInCompletion) !void {
     const session = switch (completion) {
         .vercel => |selection| selection.session orelse return LoginError.NoSession,
-        .chatgpt, .grok => return error.InvalidSignInCompletion,
+        .chatgpt, .grok, .provider_key => return error.InvalidSignInCompletion,
     };
     try oauth_session.saveNewSession(alloc, session);
 }

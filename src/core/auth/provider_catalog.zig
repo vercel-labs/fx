@@ -1,6 +1,7 @@
 const std = @import("std");
 const model_provider = @import("../config/model_provider.zig");
 const types = @import("../shared/types.zig");
+const provider_registry = @import("../config/provider_registry.zig");
 
 pub const Entry = struct {
     id: model_provider.ProviderId,
@@ -44,11 +45,28 @@ pub const entries = [_]Entry{
     },
 };
 
+/// Built-in configured providers that `/login` signs in to (D145).
+pub const preset_entries = blk: {
+    @setEvalBranchQuota(20_000);
+    var list: [provider_registry.presets.len]Entry = undefined;
+    for (provider_registry.presets, &list) |preset, *entry| entry.* = .{
+        .id = model_provider.parse(preset.id).?,
+        .slug = preset.id,
+        .name = preset.name,
+        .route_name = preset.name,
+        .description = preset.description,
+        .subscription = false,
+        .login_source = .configured,
+    };
+    break :blk list;
+};
+
 pub fn parse(value: []const u8) ?model_provider.ProviderId {
     for (&entries) |*entry| {
         if (std.ascii.eqlIgnoreCase(value, entry.slug)) return entry.id;
         for (entry.aliases) |alias| if (std.ascii.eqlIgnoreCase(value, alias)) return entry.id;
     }
+    for (&preset_entries) |*entry| if (std.ascii.eqlIgnoreCase(value, entry.slug)) return entry.id;
     return null;
 }
 
@@ -63,7 +81,10 @@ const configured_entry = Entry{
 };
 
 pub fn find(id: model_provider.ProviderId) *const Entry {
-    if (id == .configured) return &configured_entry;
+    if (id == .configured) {
+        for (&preset_entries) |*entry| if (std.mem.eql(u8, entry.slug, id.label())) return entry;
+        return &configured_entry;
+    }
     for (&entries) |*entry| if (entry.id.eql(id)) return entry;
     unreachable;
 }
@@ -81,5 +102,10 @@ test "auth provider catalog uses the model provider identity and explicit aliase
     try std.testing.expect(parse("chatgpt") == null);
     try std.testing.expect(parse("unknown") == null);
     try std.testing.expect(find(.codex).subscription);
+    const router = parse("OpenRouter").?;
+    try std.testing.expectEqualStrings("openrouter", router.label());
+    try std.testing.expectEqualStrings("OpenRouter", find(router).name);
+    try std.testing.expectEqualStrings("OpenCode Zen", label(parse("opencode-zen").?));
+    try std.testing.expectEqualStrings("Configured provider", label(model_provider.parse("local").?));
     try std.testing.expect(find(.grok).subscription);
 }

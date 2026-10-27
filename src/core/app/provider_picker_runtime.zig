@@ -14,6 +14,7 @@ const std = @import("std");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
+const provider_registry = @import("../config/provider_registry.zig");
 const provider_picker_catalog = @import("../auth/provider_picker_catalog.zig");
 const model_provider = @import("../config/model_provider.zig");
 const picker_state = @import("../input/picker_state.zig");
@@ -74,11 +75,17 @@ pub fn Runtime(comptime App: type) type {
                 .provider => {
                     var slugs: [provider_picker_catalog.max_provider_options][]const u8 = undefined;
                     count = provider_picker_catalog.providerOptions(&slugs);
-                    for (slugs[0..count], 0..) |slug, i| {
-                        column.labels[i] = slug;
+                    const listed = count;
+                    count = 0;
+                    for (slugs[0..listed]) |slug| {
                         const id = provider_catalog.parse(slug) orelse .gateway;
-                        column.annotations[i] = if (id.eql(active_provider) and
+                        if (comptime @hasDecl(App, "presetLoginOnly")) {
+                            if (app.presetLoginOnly() and id != .configured) continue;
+                        }
+                        column.labels[count] = slug;
+                        column.annotations[count] = if (id.eql(active_provider) and
                             model_provider.authorizesCredential(id, app.auth.credentialSource())) "current" else "";
+                        count += 1;
                     }
                 },
                 .method => {
@@ -280,6 +287,25 @@ pub fn Runtime(comptime App: type) type {
                     const provider = provider_catalog.parse(
                         app.input_runtime.picker.provider_picker_pending_provider.items,
                     ) orelse .gateway;
+                    // A preset saves its own key or signs in with OpenRouter;
+                    // the gateway's key inventory does not apply (D147).
+                    if (provider == .configured) {
+                        if (method == .api_key) {
+                            try openKeyStage(app, query.prefix, .api_key);
+                            app.auth.openProviderKeyPickerInline(app.alloc, provider);
+                            if (provider_registry.presetFor(provider.label())) |preset| {
+                                const body = try app.alloc.print("Paste your {s} key. Get one at {s}.", .{ preset.name, preset.key_url });
+                                defer app.alloc.free(body);
+                                try app.writeDomainNotice(.{ .topic = "auth", .tone = .neutral, .body = body }, true);
+                            }
+                            return true;
+                        }
+                        app.input_runtime.picker.clearProviderPickerFlow();
+                        app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                        try app_auth_runtime.Runtime(App).beginOpenRouterSignInForProviderPicker(app);
+                        app.shell.render_requests.request(.footer);
+                        return true;
+                    }
                     if (method == .api_key) {
                         // With detected keys the next column asks which to use
                         // (or `new` to paste one); with none there is nothing
@@ -734,10 +760,12 @@ test "provider picker loading preserves query and selection instead of exposing 
 
     app.auth.inventory_refresh_active = false;
     const ready = columnFor(&app, .provider, "co");
-    try std.testing.expectEqual(@as(usize, 1), ready.count);
+    // codex, then the opencode presets.
+    try std.testing.expectEqual(@as(usize, 3), ready.count);
     try std.testing.expectEqualStrings("codex", ready.labels[0]);
+    // The preserved third row is the one the ready column completes.
     try Runtime(ColumnTestApp).autocomplete(&app);
-    try std.testing.expectEqualStrings("/provider codex", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("/provider opencode-go", app.input_runtime.edit_state.input.items);
 }
 
 test "method column marks the credential the active provider is using" {

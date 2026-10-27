@@ -5,6 +5,8 @@ const app_lifecycle = @import("../app/app_lifecycle.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
+const preset_login = @import("../auth/preset_login.zig");
+const provider_keys = @import("../auth/provider_keys.zig");
 const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
 const cli_replay = @import("cli_replay.zig");
@@ -823,7 +825,7 @@ fn runProviderLogin(alloc: Allocator, cfg: Config, provider: model_provider.Prov
         .gateway => try login_flow.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
         .codex => try chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
         .grok => try grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
-        .configured => return error.ConfiguredProviderUsesEnvironmentAuth,
+        .configured => try preset_login.run(alloc, provider.label(), cfg.gateway_provider.oauth_transport, cfg.url_opener),
     }
 }
 
@@ -863,7 +865,7 @@ fn activateProviderSelectionFallible(
 
     if (target == .configured) {
         const bound = try target.bind(settings.providers orelse .{});
-        const selected_model = settings.models.get(bound) orelse return error.ConfiguredModelNotSelected;
+        const selected_model = settings.models.get(bound) orelse config_runtime.configuredDefaultModel(&settings, bound) orelse return error.ConfiguredModelNotSelected;
         var attempt = config_runtime.attemptUserPreferences(alloc, .{
             .provider = bound,
             .model_preference = .{ .provider = bound, .model = selected_model },
@@ -1125,7 +1127,7 @@ fn runNonInteractiveWithDeps(
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: proto-fx login [codex|grok]\nFor a direct endpoint, use proto-fx setup --base-url URL.\n");
+                try writeStderr(deps, "usage: proto-fx login [codex|grok|openrouter|opencode-zen|opencode-go]\nFor a direct endpoint, use proto-fx setup --base-url URL.\n");
                 return .handled_failure;
             };
             if (maybe_login_provider == null or maybe_login_provider.? == .gateway) {
@@ -1154,7 +1156,7 @@ fn runNonInteractiveWithDeps(
                 .gateway => "Signed in to Vercel.\nAI Gateway access may still require billing or API setup for the selected account.\n",
                 .codex => "Signed in with Codex.\n",
                 .grok => "Signed in with Grok.\n",
-                .configured => "Configured providers use settings.json authentication.\n",
+                .configured => "Saved the key to the profile.\n",
             });
             return .handled_success;
         },
@@ -1173,6 +1175,14 @@ fn runNonInteractiveWithDeps(
             }
             // Preserve the original `fx logout` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
+            if (login_provider == .configured) {
+                const removed = provider_keys.delete(alloc, login_provider.label()) catch {
+                    try writeStderr(deps, "proto-fx logout: failed to remove the saved key\n");
+                    return .handled_failure;
+                };
+                try writeStdout(deps, if (removed) "Removed the saved key.\n" else "No saved key found.\n");
+                return .handled_success;
+            }
             if (login_provider == .codex) {
                 const outcome = chatgpt_oauth.logout() catch {
                     try writeStderr(deps, "proto-fx logout: failed to durably remove saved Codex login\n");

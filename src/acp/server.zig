@@ -3755,7 +3755,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             defer settings.deinit(alloc);
             const saved_model = settings.models.get(target);
             var selected_model = if (target == .configured)
-                saved_model orelse return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_request, .message = "Configure a model for the selected provider" })
+                saved_model orelse (if (state.configured_providers.get(target.label())) |definition| definition.default_model else null) orelse return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_request, .message = "Configure a model for the selected provider" })
             else
                 catalog.items[0].id;
             if (target != .configured) if (saved_model) |saved| {

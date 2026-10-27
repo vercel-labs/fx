@@ -1,5 +1,6 @@
-//! Configure a direct Chat Completions connection, discovering its model catalog
-//! when the user did not select a model. This runs on the setup command, not paint.
+//! Configure a direct Chat Completions or Anthropic Messages connection,
+//! discovering its model catalog when the user did not select a model (D149).
+//! This runs on the setup command, not paint.
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const configured = @import("configured_provider.zig");
@@ -9,7 +10,14 @@ const profile_paths = @import("../shared/profile_paths.zig");
 const http = @import("../../gateway/client.zig");
 const Allocator = std.mem.Allocator;
 
-pub const usage = "proto-fx setup --base-url URL [--model MODEL] [--api-key-env NAME] [--name NAME]";
+pub const usage = "proto-fx setup --base-url URL [--protocol chat-completions|anthropic-messages] [--model MODEL] [--api-key-env NAME] [--name NAME]";
+
+/// The `--protocol` value as a settings protocol name, or null when unknown.
+pub fn protocolName(value: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, value, "chat-completions") or std.mem.eql(u8, value, "openai-chat-completions")) return "openai-chat-completions";
+    if (std.mem.eql(u8, value, "anthropic-messages") or std.mem.eql(u8, value, "messages")) return "anthropic-messages";
+    return null;
+}
 
 /// Whether `err` means the arguments were malformed, so the usage helps.
 pub fn isUsageError(err: anyerror) bool {
@@ -29,6 +37,7 @@ pub fn run(alloc: Allocator, args: []const [:0]const u8, failure: *?[]u8) ![]u8 
     var selected: ?[]const u8 = null;
     var key_env: ?[]const u8 = null;
     var name: []const u8 = "local";
+    var protocol: []const u8 = "openai-chat-completions";
     var index: usize = 0;
     while (index < args.len) : (index += 2) {
         if (index + 1 >= args.len) return error.InvalidSetupArguments;
@@ -42,16 +51,20 @@ pub fn run(alloc: Allocator, args: []const [:0]const u8, failure: *?[]u8) ![]u8 
             key_env = value;
         } else if (std.mem.eql(u8, option, "--name")) {
             name = value;
+        } else if (std.mem.eql(u8, option, "--protocol")) {
+            protocol = protocolName(value) orelse return error.InvalidSetupArguments;
         } else return error.InvalidSetupArguments;
     }
     const raw_base = base orelse return error.BaseUrlRequired;
     try configured.validate_id(name);
     var prefix = std.mem.trimEnd(u8, raw_base, "/");
     var definition: std.json.Value = .{ .object = .empty };
-    try definition.object.put(a, "protocol", .{ .string = "openai-chat-completions" });
+    try definition.object.put(a, "protocol", .{ .string = protocol });
     try definition.object.put(a, "base_url", .{ .string = prefix });
     var auth: std.json.Value = .{ .object = .empty };
-    try auth.object.put(a, "type", .{ .string = if (key_env != null) "bearer" else "none" });
+    // Messages endpoints take the key in Anthropic's `x-api-key` header.
+    const messages = std.mem.eql(u8, protocol, "anthropic-messages");
+    try auth.object.put(a, "type", .{ .string = if (key_env == null) "none" else if (messages) "x-api-key" else "bearer" });
     if (key_env) |env| try auth.object.put(a, "env", .{ .string = env });
     try definition.object.put(a, "auth", auth);
     var providers: std.json.Value = .{ .object = .empty };
@@ -181,4 +194,8 @@ test "setup names a missing home instead of printing usage" {
     try std.testing.expect(isUsageError(error.BaseUrlRequired));
     try std.testing.expect(failure == null);
     try std.testing.expect(!isUsageError(error.FileNotFound));
+    const bad = [_][:0]const u8{ "--base-url", "http://127.0.0.1:1/v1", "--protocol", "grpc" };
+    try std.testing.expectError(error.InvalidSetupArguments, run(alloc, &bad, &failure));
+    try std.testing.expectEqualStrings("anthropic-messages", protocolName("anthropic-messages").?);
+    try std.testing.expectEqualStrings("openai-chat-completions", protocolName("chat-completions").?);
 }

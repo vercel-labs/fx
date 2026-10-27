@@ -12,6 +12,7 @@ const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
 const model_preferences = @import("model_preferences.zig");
 const configured_provider = @import("configured_provider.zig");
+const provider_registry = @import("provider_registry.zig");
 const update_target = @import("../upgrade/update_target.zig");
 pub const context_limits = @import("context_limits.zig");
 
@@ -334,9 +335,17 @@ pub fn selectProviderModel(
         .gateway => default_model,
         .codex => run_model orelse return error.CodexModelNotSelected,
         .grok => run_model orelse return error.GrokModelNotSelected,
-        .configured => run_model orelse return error.ConfiguredModelNotSelected,
+        .configured => run_model orelse configuredDefaultModel(settings, provider) orelse return error.ConfiguredModelNotSelected,
     };
     return .{ .provider = provider, .model = model };
+}
+
+/// The model a configured provider's definition names as its default, such
+/// as a preset's. Borrows from `settings`.
+pub fn configuredDefaultModel(settings: *const Settings, provider: model_provider.ProviderId) ?[]const u8 {
+    const registry = settings.providers orelse return null;
+    const definition = registry.get(provider.label()) orelse return null;
+    return definition.default_model;
 }
 
 /// User-facing guidance for a `ModelSelectionError`, or null for any other error.
@@ -357,8 +366,11 @@ fn resolve_provider_selection(settings: *Settings) !void {
         settings.provider = model_provider.parse(raw) orelse return error.InvalidProviderValue;
     }
     if (settings.provider == null) {
+        // Built-in presets never select themselves; one user connection does.
         const registry: configured_provider.Registry = settings.providers orelse .{};
-        if (registry.definitions.len == 1) settings.provider = model_provider.parse(registry.definitions[0].id);
+        if (registry.userCount() == 1) for (registry.definitions) |definition| {
+            if (!definition.preset) settings.provider = model_provider.parse(definition.id);
+        };
     }
     if (settings.provider) |provider| settings.provider = try provider.bind(settings.providers orelse .{});
 }
@@ -367,13 +379,17 @@ fn resolve_provider_selection(settings: *Settings) !void {
 pub fn loadConfiguredProviders(alloc: Allocator) !configured_provider.Registry {
     var paths = try discoverPaths(alloc, ".");
     defer paths.deinit(alloc);
-    const bytes = (try readOptionalUserSettingsFile(alloc, paths)) orelse return .{};
-    defer alloc.free(bytes);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{ .duplicate_field_behavior = .@"error" });
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidSettingsShape;
-    const definitions = parsed.value.object.get("providers") orelse return .{};
-    return configured_provider.Registry.parse(alloc, definitions);
+    var registry: ?configured_provider.Registry = null;
+    errdefer if (registry) |*value| value.deinit(alloc);
+    if (try readOptionalUserSettingsFile(alloc, paths)) |bytes| {
+        defer alloc.free(bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{ .duplicate_field_behavior = .@"error" });
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidSettingsShape;
+        if (parsed.value.object.get("providers")) |definitions| registry = try configured_provider.Registry.parse(alloc, definitions);
+    }
+    try provider_registry.extend(alloc, &registry, paths.home_fx_dir);
+    return registry.?;
 }
 
 pub fn loadMergedSettings(alloc: Allocator, workspace_root: []const u8) !Settings {
@@ -638,6 +654,11 @@ fn loadMergedSettingsDetailedWithOptionalHome(
         }
     }
 
+    {
+        const fx_dir = if (home_dir) |home| try profile_paths.rootDir(alloc, home) else null;
+        defer if (fx_dir) |dir| alloc.free(dir);
+        try provider_registry.extend(alloc, &settings.providers, fx_dir);
+    }
     try resolve_provider_selection(&settings);
     if (providerEnvOverride() != null) sources.provider = .process_override;
     if (modelEnvOverride() != null) {
@@ -1309,11 +1330,13 @@ pub fn loadMergedSettingsFromPaths(alloc: Allocator, paths: Paths) !Settings {
         try mergeSettings(&settings, &user_settings, alloc);
 
         try mergeWorkspaceOverridesFromValue(&settings, alloc, parsed.value, paths.workspace_root);
+        try provider_registry.extend(alloc, &settings.providers, paths.home_fx_dir);
         try resolve_provider_selection(&settings);
         return settings;
     }
 
     try mergeSettingsFile(&settings, alloc, paths.workspace_settings);
+    try provider_registry.extend(alloc, &settings.providers, paths.home_fx_dir);
     try resolve_provider_selection(&settings);
     return settings;
 }

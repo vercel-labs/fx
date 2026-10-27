@@ -29,9 +29,20 @@ pub const ParseError = Allocator.Error || error{
     InvalidToolChoiceMode,
     InvalidModelId,
     InvalidModelMetadata,
+    InvalidHeader,
+    InvalidCommand,
 };
 
-pub const Protocol = enum { @"openai-chat-completions", @"anthropic-messages" };
+pub const Protocol = enum { @"openai-chat-completions", @"anthropic-messages", @"openai-responses" };
+/// How a Chat Completions endpoint takes a reasoning effort: not at all,
+/// OpenRouter's `reasoning` object, or OpenAI's `reasoning_effort` (D146).
+pub const ReasoningFormat = enum { none, openrouter, openai };
+/// Where a definition's model list comes from: only what it declares, or
+/// also OpenRouter's public catalog, fetched and cached (D146).
+pub const CatalogSource = enum { declared, openrouter };
+/// An extra request header. A value starting with `!` is a command whose
+/// trimmed output is the value; `!!` escapes a literal `!` (D148).
+pub const Header = struct { name: []const u8, value: []const u8 };
 /// Where the credential goes: `Authorization: Bearer` or Anthropic's
 /// `x-api-key`, which only the Messages protocol accepts.
 pub const KeyHeader = enum { authorization, x_api_key };
@@ -44,7 +55,12 @@ pub const ToolChoiceMode = enum { omit, send };
 /// the effectful edge; `none` must omit Authorization rather than supply a token.
 pub const Auth = union(enum) {
     none,
+    /// The environment variable holding the key.
     bearer: []const u8,
+    /// A `!command` whose trimmed output is the key; run without a shell.
+    command: []const u8,
+    /// The key `/login` saved for this provider, else this environment variable.
+    login: []const u8,
 };
 
 pub const ModelMetadata = struct {
@@ -56,6 +72,8 @@ pub const ModelMetadata = struct {
     /// Owned. Empty means the model takes no reasoning effort.
     reasoning_efforts: []const types.ReasoningEffort = &.{},
     thinking: ?ThinkingMode = null,
+    /// The wire protocol for this model when it differs from the provider's.
+    protocol: ?Protocol = null,
 };
 
 /// Registry owns all slices. Treat definitions as immutable while borrowed by
@@ -69,6 +87,16 @@ pub const Definition = struct {
     tool_choice_mode: ToolChoiceMode = .omit,
     reviewer_model: ?[]const u8 = null,
     model_metadata: []const ModelMetadata = &.{},
+    headers: []const Header = &.{},
+    reasoning_format: ReasoningFormat = .none,
+    /// The model a first switch to this provider selects.
+    default_model: ?[]const u8 = null,
+    catalog: CatalogSource = .declared,
+    /// Static models a built-in preset ships; borrowed, never freed, and
+    /// shadowed by `model_metadata` entries with the same id.
+    builtin_models: []const ModelMetadata = &.{},
+    /// Built in rather than written by the user (D145).
+    preset: bool = false,
 
     /// Caller owns the returned URL. base_url is already a validated API prefix.
     pub fn chat_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
@@ -80,13 +108,43 @@ pub const Definition = struct {
         return std.mem.concat(alloc, u8, &.{ self.base_url, "/messages" });
     }
 
+    /// Caller owns the returned URL.
+    pub fn responses_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
+        return std.mem.concat(alloc, u8, &.{ self.base_url, "/responses" });
+    }
+
     /// Borrowed metadata; absence and unspecified fields remain unknown.
     pub fn model(self: Definition, id: []const u8) ?*const ModelMetadata {
         if (id.len > max_model_bytes) return null;
         for (self.model_metadata) |*metadata| {
             if (std.mem.eql(u8, metadata.id, id)) return metadata;
         }
+        for (self.builtin_models) |*metadata| {
+            if (std.mem.eql(u8, metadata.id, id)) return metadata;
+        }
         return null;
+    }
+
+    /// The wire protocol `id` is sent with.
+    pub fn protocolFor(self: Definition, id: []const u8) Protocol {
+        const metadata = self.model(id) orelse return self.protocol;
+        return metadata.protocol orelse self.protocol;
+    }
+
+    /// Whether any model is sent with a protocol other than the provider's.
+    pub fn mixed(self: Definition) bool {
+        for ([_][]const ModelMetadata{ self.model_metadata, self.builtin_models }) |list| {
+            for (list) |metadata| if (metadata.protocol) |protocol| if (protocol != self.protocol) return true;
+        }
+        return false;
+    }
+
+    /// The credential slot's environment variable, if it has one.
+    pub fn keyEnv(self: Definition) ?[]const u8 {
+        return switch (self.auth) {
+            .bearer, .login => |env| if (env.len == 0) null else env,
+            .none, .command => null,
+        };
     }
 
     /// Non-secret route provenance, stable across credential rotation in the
@@ -101,21 +159,28 @@ pub const Definition = struct {
         hash_part(&hash, @tagName(self.auth));
         switch (self.auth) {
             .none => {},
-            .bearer => |env| hash_part(&hash, env),
+            .bearer, .command, .login => |text| hash_part(&hash, text),
         }
         // Hashed only when set, so existing bearer bindings keep their identity.
         if (self.key_header == .x_api_key) hash_part(&hash, "x-api-key");
+        for (self.headers) |header| hash_part(&hash, header.name);
         return hash.finalResult();
     }
 
-    fn deinit(self: Definition, alloc: Allocator) void {
+    pub fn deinit(self: Definition, alloc: Allocator) void {
         alloc.free(self.id);
         alloc.free(self.base_url);
         switch (self.auth) {
             .none => {},
-            .bearer => |env| alloc.free(env),
+            .bearer, .command, .login => |text| alloc.free(text),
         }
         if (self.reviewer_model) |id| alloc.free(id);
+        if (self.default_model) |id| alloc.free(id);
+        for (self.headers) |header| {
+            alloc.free(header.name);
+            alloc.free(header.value);
+        }
+        alloc.free(self.headers);
         for (self.model_metadata) |metadata| {
             alloc.free(metadata.id);
             alloc.free(metadata.reasoning_efforts);
@@ -174,6 +239,32 @@ pub const Registry = struct {
         self.* = .{};
     }
 
+    /// Adds `definition`, replacing one with the same id. Takes ownership of
+    /// `definition` on success and on failure.
+    pub fn put(self: *Registry, alloc: Allocator, definition: Definition) Allocator.Error!void {
+        for (self.definitions, 0..) |existing, index| {
+            if (!std.mem.eql(u8, existing.id, definition.id)) continue;
+            existing.deinit(alloc);
+            @constCast(self.definitions)[index] = definition;
+            return;
+        }
+        const grown = alloc.alloc(Definition, self.definitions.len + 1) catch |err| {
+            definition.deinit(alloc);
+            return err;
+        };
+        @memcpy(grown[0..self.definitions.len], self.definitions);
+        grown[self.definitions.len] = definition;
+        alloc.free(self.definitions);
+        self.definitions = grown;
+    }
+
+    /// How many definitions the user wrote, leaving out built-in presets.
+    pub fn userCount(self: Registry) usize {
+        var count: usize = 0;
+        for (self.definitions) |definition| count += @intFromBool(!definition.preset);
+        return count;
+    }
+
     /// Returns a borrow valid until registry teardown. IDs are case-sensitive.
     pub fn get(self: Registry, id: []const u8) ?*const Definition {
         if (id.len > max_id_bytes) return null;
@@ -184,9 +275,10 @@ pub const Registry = struct {
     }
 };
 
-fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
+/// Parses one definition. All returned storage is owned by `alloc`.
+pub fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata" });
+    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata", "headers", "reasoning_format", "default_model" });
     const protocol = try required(value, "protocol");
     if (protocol != .string) return error.InvalidProtocol;
     const kind = std.meta.stringToEnum(Protocol, protocol.string) orelse return error.InvalidProtocol;
@@ -195,69 +287,134 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
     const normalized = try validate_url(url.string);
     const auth_value = try required(value, "auth");
     const auth = try parse_auth(auth_value);
-    var key_header: KeyHeader = .authorization;
-    if (auth_value.object.get("type").?.string[0] == 'x') {
-        if (kind != .@"anthropic-messages") return error.InvalidAuth;
-        key_header = .x_api_key;
-    }
+    // A login key names its Messages header explicitly; `x-api-key` implies it.
+    const header_value = auth_value.object.get("header");
+    const key_header: KeyHeader = if (auth_value.object.get("type").?.string[0] == 'x' or
+        (header_value != null and std.mem.eql(u8, header_value.?.string, "x-api-key"))) .x_api_key else .authorization;
     var mode: ToolChoiceMode = .omit;
     if (value.object.get("tool_choice_mode")) |choice| {
         if (choice != .string) return error.InvalidToolChoiceMode;
         mode = if (std.mem.eql(u8, choice.string, "omit")) .omit else if (std.mem.eql(u8, choice.string, "send")) .send else return error.InvalidToolChoiceMode;
     }
-    var reviewer: ?[]const u8 = null;
-    if (value.object.get("reviewer_model")) |model_value| {
-        if (model_value != .string) return error.InvalidModelId;
-        try validate_model_id(model_value.string);
-        reviewer = model_value.string;
+    var reasoning_format: ReasoningFormat = .none;
+    if (value.object.get("reasoning_format")) |format| {
+        if (format != .string) return error.InvalidObject;
+        reasoning_format = std.meta.stringToEnum(ReasoningFormat, format.string) orelse return error.InvalidObject;
     }
+    const reviewer = try optional_model(value.object.get("reviewer_model"));
+    const default_model = try optional_model(value.object.get("default_model"));
 
-    const owned_id = try alloc.dupe(u8, id);
-    errdefer alloc.free(owned_id);
-    const owned_url = try alloc.dupe(u8, normalized);
-    errdefer alloc.free(owned_url);
-    const owned_auth: Auth = switch (auth) {
-        .none => .none,
-        .bearer => |env| .{ .bearer = try alloc.dupe(u8, env) },
-    };
-    errdefer switch (owned_auth) {
-        .none => {},
-        .bearer => |env| alloc.free(env),
-    };
-    const owned_reviewer = if (reviewer) |model_id| try alloc.dupe(u8, model_id) else null;
-    errdefer if (owned_reviewer) |model_id| alloc.free(model_id);
-    return .{
-        .id = owned_id,
+    var definition: Definition = .{
+        .id = try alloc.dupe(u8, id),
         .protocol = kind,
         .key_header = key_header,
-        .base_url = owned_url,
-        .auth = owned_auth,
+        .base_url = &.{},
+        .auth = .none,
         .tool_choice_mode = mode,
-        .reviewer_model = owned_reviewer,
-        .model_metadata = if (value.object.get("model_metadata")) |metadata| try parse_metadata(alloc, metadata, kind) else &.{},
+        .reasoning_format = reasoning_format,
     };
+    errdefer definition.deinit(alloc);
+    definition.base_url = try alloc.dupe(u8, normalized);
+    definition.auth = switch (auth) {
+        .none => .none,
+        .bearer => |text| .{ .bearer = try alloc.dupe(u8, text) },
+        .command => |text| .{ .command = try alloc.dupe(u8, text) },
+        .login => |text| .{ .login = try alloc.dupe(u8, text) },
+    };
+    if (reviewer) |model_id| definition.reviewer_model = try alloc.dupe(u8, model_id);
+    if (default_model) |model_id| definition.default_model = try alloc.dupe(u8, model_id);
+    if (value.object.get("headers")) |headers| definition.headers = try parse_headers(alloc, headers);
+    if (value.object.get("model_metadata")) |metadata| definition.model_metadata = try parse_metadata(alloc, metadata, kind, reasoning_format);
+    // Only the Messages transport has a separate key header.
+    if (auth_value.object.get("type").?.string[0] == 'x' and kind != .@"anthropic-messages" and !definition.mixed()) return error.InvalidAuth;
+    return definition;
+}
+
+fn optional_model(value: ?std.json.Value) ParseError!?[]const u8 {
+    const present = value orelse return null;
+    if (present != .string) return error.InvalidModelId;
+    try validate_model_id(present.string);
+    return present.string;
 }
 
 fn parse_auth(value: std.json.Value) ParseError!Auth {
-    try check_fields(value, &.{ "type", "env" });
+    try check_fields(value, &.{ "type", "env", "command", "header" });
     const kind = try required(value, "type");
     if (kind != .string) return error.InvalidAuth;
     if (std.mem.eql(u8, kind.string, "none")) {
-        if (value.object.contains("env")) return error.InvalidAuth;
+        if (value.object.count() != 1) return error.InvalidAuth;
         return .none;
     }
-    if (!std.mem.eql(u8, kind.string, "bearer") and !std.mem.eql(u8, kind.string, "x-api-key")) return error.InvalidAuth;
+    const login = std.mem.eql(u8, kind.string, "login");
+    if (value.object.get("header")) |header| {
+        if (!login or header != .string) return error.InvalidAuth;
+        if (!std.mem.eql(u8, header.string, "x-api-key") and !std.mem.eql(u8, header.string, "authorization")) return error.InvalidAuth;
+    }
+    if (!login and !std.mem.eql(u8, kind.string, "bearer") and !std.mem.eql(u8, kind.string, "x-api-key")) return error.InvalidAuth;
+    if (value.object.get("command")) |command| {
+        if (login or value.object.contains("env")) return error.InvalidAuth;
+        if (command != .string) return error.InvalidCommand;
+        try validate_command(command.string);
+        return .{ .command = command.string };
+    }
+    if (login and !value.object.contains("env")) return .{ .login = "" };
+
     const env = try required(value, "env");
     if (env != .string) return error.InvalidEnvironmentName;
-    if (env.string.len > max_env_bytes) return error.LimitExceeded;
-    if (env.string.len == 0 or (!std.ascii.isAlphabetic(env.string[0]) and env.string[0] != '_')) return error.InvalidEnvironmentName;
-    for (env.string) |byte| {
-        if (!std.ascii.isAlphanumeric(byte) and byte != '_') return error.InvalidEnvironmentName;
-    }
-    return .{ .bearer = env.string };
+    try validate_env(env.string);
+    return if (login) .{ .login = env.string } else .{ .bearer = env.string };
 }
 
-fn parse_metadata(alloc: Allocator, value: std.json.Value, protocol: Protocol) ParseError![]const ModelMetadata {
+fn validate_env(env: []const u8) ParseError!void {
+    if (env.len > max_env_bytes) return error.LimitExceeded;
+    if (env.len == 0 or (!std.ascii.isAlphabetic(env[0]) and env[0] != '_')) return error.InvalidEnvironmentName;
+    for (env) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '_') return error.InvalidEnvironmentName;
+    }
+}
+
+/// A `!command` is printable ASCII after the bang and names a program.
+pub fn validate_command(text: []const u8) error{ InvalidCommand, LimitExceeded }!void {
+    if (text.len > max_url_bytes) return error.LimitExceeded;
+    if (text.len < 2 or text[0] != '!' or text[1] == '!') return error.InvalidCommand;
+    if (std.mem.trim(u8, text[1..], " ").len == 0) return error.InvalidCommand;
+    for (text) |byte| if (byte < 0x20 or byte == 0x7f) return error.InvalidCommand;
+}
+
+fn parse_headers(alloc: Allocator, value: std.json.Value) ParseError![]const Header {
+    if (value != .object) return error.InvalidObject;
+    if (value.object.count() > 16) return error.LimitExceeded;
+    const headers = try alloc.alloc(Header, value.object.count());
+    var initialized: usize = 0;
+    errdefer {
+        for (headers[0..initialized]) |header| {
+            alloc.free(header.name);
+            alloc.free(header.value);
+        }
+        alloc.free(headers);
+    }
+    var iterator = value.object.iterator();
+    while (iterator.next()) |entry| {
+        const name = entry.key_ptr.*;
+        if (name.len == 0 or name.len > 128) return error.InvalidHeader;
+        for (name) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_') return error.InvalidHeader;
+        // Credentials belong in `auth`, where they are redacted and bound.
+        for ([_][]const u8{ "authorization", "x-api-key", "content-type", "content-length", "host" }) |reserved| {
+            if (std.ascii.eqlIgnoreCase(name, reserved)) return error.InvalidHeader;
+        }
+        const text = entry.value_ptr.*;
+        if (text != .string or text.string.len > max_url_bytes) return error.InvalidHeader;
+        for (text.string) |byte| if (byte < 0x20 or byte == 0x7f) return error.InvalidHeader;
+        if (text.string.len != 0 and text.string[0] == '!' and !std.mem.startsWith(u8, text.string, "!!")) try validate_command(text.string);
+        const owned_name = try alloc.dupe(u8, name);
+        errdefer alloc.free(owned_name);
+        headers[initialized] = .{ .name = owned_name, .value = try alloc.dupe(u8, text.string) };
+        initialized += 1;
+    }
+    return headers;
+}
+
+fn parse_metadata(alloc: Allocator, value: std.json.Value, protocol: Protocol, reasoning_format: ReasoningFormat) ParseError![]const ModelMetadata {
     if (value != .object) return error.InvalidObject;
     if (value.object.count() > max_models) return error.LimitExceeded;
     const models = try alloc.alloc(ModelMetadata, value.object.count());
@@ -273,9 +430,16 @@ fn parse_metadata(alloc: Allocator, value: std.json.Value, protocol: Protocol) P
     while (iterator.next()) |entry| {
         try validate_model_id(entry.key_ptr.*);
         const metadata = entry.value_ptr.*;
-        try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision", "reasoning_efforts", "thinking" });
-        // Only the Messages transport sends reasoning settings.
-        if (protocol != .@"anthropic-messages" and (metadata.object.contains("reasoning_efforts") or metadata.object.contains("thinking"))) return error.UnknownField;
+        try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision", "reasoning_efforts", "thinking", "protocol" });
+        var model_protocol: ?Protocol = null;
+        if (metadata.object.get("protocol")) |kind| {
+            if (kind != .string) return error.InvalidProtocol;
+            model_protocol = std.meta.stringToEnum(Protocol, kind.string) orelse return error.InvalidProtocol;
+        }
+        // Chat Completions sends reasoning settings only in a declared format.
+        const effective = model_protocol orelse protocol;
+        if (effective == .@"openai-chat-completions" and reasoning_format == .none and metadata.object.contains("reasoning_efforts")) return error.UnknownField;
+        if (effective != .@"anthropic-messages" and metadata.object.contains("thinking")) return error.UnknownField;
         var thinking: ?ThinkingMode = null;
         if (metadata.object.get("thinking")) |mode| {
             if (mode != .string) return error.InvalidModelMetadata;
@@ -291,6 +455,7 @@ fn parse_metadata(alloc: Allocator, value: std.json.Value, protocol: Protocol) P
         models[initialized] = .{
             .reasoning_efforts = efforts,
             .thinking = thinking,
+            .protocol = model_protocol,
             .id = try alloc.dupe(u8, entry.key_ptr.*),
             .context_window = context,
             .max_output_tokens = output,
@@ -592,7 +757,9 @@ test "configured provider auth admits only explicit none or a portable environme
         .{ .json = "{\"type\":\"bearer\",\"env\":\"KEY=secret\"}", .err = error.InvalidEnvironmentName },
         .{ .json = "{\"type\":\"bearer\",\"env\":\"KEY\\n\"}", .err = error.InvalidEnvironmentName },
         .{ .json = "{\"type\":\"bearer\",\"env\":\"KEY\",\"token\":\"literal\"}", .err = error.UnknownField },
-        .{ .json = "{\"type\":\"bearer\",\"command\":\"get-key\"}", .err = error.UnknownField },
+        .{ .json = "{\"type\":\"bearer\",\"command\":\"get-key\"}", .err = error.InvalidCommand },
+        .{ .json = "{\"type\":\"bearer\",\"command\":\"!get-key\",\"env\":\"K\"}", .err = error.InvalidAuth },
+        .{ .json = "{\"type\":\"login\",\"command\":\"!get-key\"}", .err = error.InvalidAuth },
     };
     for (cases) |case| {
         const json = try alloc.print("{{\"local\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com\",\"auth\":{s}}}}}", .{case.json});
@@ -722,6 +889,57 @@ test "configured anthropic messages provider takes an x-api-key slot and thinkin
         \\{"x":{"protocol":"anthropic-messages","base_url":"https://e.com","auth":{"type":"none"},"model_metadata":{"m":{"reasoning_efforts":["auto"]}}}}
         ,
         \\{"x":{"protocol":"anthropic-messages","base_url":"https://e.com","auth":{"type":"none"},"model_metadata":{"m":{"thinking":"always"}}}}
+        ,
+    }) |json| {
+        if (Registry.parse_json(alloc, json)) |parsed| {
+            var owned = parsed;
+            owned.deinit(alloc);
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+}
+
+test "configured provider routes per model and parses headers, login and command keys" {
+    const alloc = std.testing.allocator;
+    var registry = try Registry.parse_json(alloc,
+        \\{"zen":{"protocol":"openai-chat-completions","base_url":"https://opencode.ai/zen/v1","auth":{"type":"x-api-key","command":"!op read op://vault/zen"},
+        \\"reasoning_format":"openai","default_model":"claude-x","headers":{"X-Title":"fx","X-Key":"!pass show zen","X-Bang":"!!literal"},
+        \\"model_metadata":{"claude-x":{"protocol":"anthropic-messages","thinking":"adaptive","reasoning_efforts":["low","high"]},"gpt-x":{"protocol":"openai-responses","reasoning_efforts":["low"]},"glm":{"reasoning_efforts":["high"]}}},
+        \\"router":{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"login","env":"OPENROUTER_API_KEY"}}}
+    );
+    defer registry.deinit(alloc);
+    const zen = registry.get("zen").?;
+    try std.testing.expect(zen.mixed());
+    try std.testing.expectEqual(Protocol.@"anthropic-messages", zen.protocolFor("claude-x"));
+    try std.testing.expectEqual(Protocol.@"openai-responses", zen.protocolFor("gpt-x"));
+    try std.testing.expectEqual(Protocol.@"openai-chat-completions", zen.protocolFor("glm"));
+    try std.testing.expectEqual(Protocol.@"openai-chat-completions", zen.protocolFor("unknown"));
+    try std.testing.expectEqualStrings("!op read op://vault/zen", zen.auth.command);
+    try std.testing.expectEqual(KeyHeader.x_api_key, zen.key_header);
+    try std.testing.expectEqual(ReasoningFormat.openai, zen.reasoning_format);
+    try std.testing.expectEqualStrings("claude-x", zen.default_model.?);
+    try std.testing.expectEqual(@as(usize, 3), zen.headers.len);
+    const router = registry.get("router").?;
+    try std.testing.expectEqualStrings("OPENROUTER_API_KEY", router.keyEnv().?);
+    try std.testing.expect(!router.mixed());
+    try std.testing.expectEqual(@as(usize, 2), registry.userCount());
+    var with_builtin = router.*;
+    const builtin = [_]ModelMetadata{.{ .id = "anthropic/claude", .protocol = .@"anthropic-messages" }};
+    with_builtin.builtin_models = &builtin;
+    try std.testing.expect(with_builtin.mixed());
+    try std.testing.expectEqual(Protocol.@"anthropic-messages", with_builtin.protocolFor("anthropic/claude"));
+    for ([_][]const u8{
+        \\{"x":{"protocol":"openai-chat-completions","base_url":"https://e.com","auth":{"type":"none"},"headers":{"Authorization":"Bearer k"}}}
+        ,
+        \\{"x":{"protocol":"openai-chat-completions","base_url":"https://e.com","auth":{"type":"none"},"headers":{"X-A":"!"}}}
+        ,
+        \\{"x":{"protocol":"openai-chat-completions","base_url":"https://e.com","auth":{"type":"none"},"headers":{"bad header":"v"}}}
+        ,
+        \\{"x":{"protocol":"openai-chat-completions","base_url":"https://e.com","auth":{"type":"none"},"reasoning_format":"other"}}
+        ,
+        \\{"x":{"protocol":"openai-chat-completions","base_url":"https://e.com","auth":{"type":"none"},"model_metadata":{"m":{"protocol":"grpc"}}}}
+        ,
+        \\{"x":{"protocol":"openai-responses","base_url":"https://e.com","auth":{"type":"none"},"model_metadata":{"m":{"thinking":"adaptive"}}}}
         ,
     }) |json| {
         if (Registry.parse_json(alloc, json)) |parsed| {

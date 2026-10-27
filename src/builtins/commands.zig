@@ -128,8 +128,9 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .login,
         .token = "login",
-        .usage = "login [codex|grok]",
-        .summary = "Sign in to an optional subscription provider",
+        .usage = "login [PROVIDER]",
+        .summary = "Sign in to a subscription or a built-in API provider",
+        .details = &.{"PROVIDER is codex, grok, openrouter, opencode-zen or opencode-go."},
     },
     .{
         .kind = .logout,
@@ -140,8 +141,9 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .setup,
         .token = "setup",
-        .usage = "setup --base-url URL [--model MODEL] [--api-key-env NAME] [--name NAME]",
-        .summary = "Discover models and configure an OpenAI-compatible endpoint",
+        .usage = "setup --base-url URL [--protocol PROTOCOL] [--model MODEL] [--api-key-env NAME] [--name NAME]",
+        .details = &.{"PROTOCOL is chat-completions (the default) or anthropic-messages."},
+        .summary = "Discover models and configure an OpenAI-compatible or Anthropic Messages endpoint",
     },
     .{
         .kind = .status,
@@ -332,7 +334,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .usage = "session recover <id>", .summary = "Copy a recoverable corrupt session" },
     } },
     .{ .entries = &.{
-        .{ .kind = .login, .usage = "login [codex|grok]", .summary = "Sign in to a model provider" },
+        .{ .kind = .login, .usage = "login [PROVIDER]", .summary = "Sign in to a model provider" },
         .{ .kind = .logout, .usage = "logout [codex|grok]", .summary = "Sign out of a model provider" },
         .{ .kind = .provider, .usage = "provider <name>", .summary = "Choose the active model provider" },
         .{ .kind = .models, .usage = "models" },

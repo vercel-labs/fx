@@ -8,12 +8,17 @@ const xai_grok_permission_reviewer = @import("../gateway/xai_grok_permission_rev
 const provider_catalog = @import("../core/auth/provider_catalog.zig");
 const chat_completions = @import("../gateway/chat_completions.zig");
 const anthropic_messages = @import("../gateway/anthropic_messages.zig");
+const openai_responses = @import("../gateway/openai_responses.zig");
+const routed_provider = @import("../gateway/routed_provider.zig");
 const configured_provider = @import("../core/config/configured_provider.zig");
 
 fn configuredBundle(_: ?*anyopaque, definition: *const configured_provider.Definition) provider_set.Bundle {
+    // Models that speak different protocols route per request (D146).
+    if (definition.mixed()) return routed_provider.bundle(definition);
     return switch (definition.protocol) {
         .@"openai-chat-completions" => chat_completions.bundle(definition),
         .@"anthropic-messages" => anthropic_messages.bundle(definition),
+        .@"openai-responses" => openai_responses.bundle(definition),
     };
 }
 

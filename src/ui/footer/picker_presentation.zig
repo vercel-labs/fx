@@ -551,6 +551,9 @@ fn composeSignInPickerRow(
             "   Sign in with Codex"
         else if (source == .grok_subscription)
             "   Sign in with Grok"
+        else if (source == .configured)
+            // Only OpenRouter signs a configured provider in by browser (D147).
+            "   Sign in with OpenRouter"
         else
             "   Sign in with Vercel",
         1, 4 => "",
