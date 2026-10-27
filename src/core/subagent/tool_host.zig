@@ -610,7 +610,7 @@ pub const Runtime = struct {
                 .unknown_role => return .{ .rejected = .{
                     .ok = false,
                     .error_code = "unknown_model_role",
-                    .result = try alloc.print("unknown model role '{s}'. Roles: @default, @smol, @slow, @worker, @tiny, @review, @title, @compact, @designer, @commit, @advisor.", .{raw_model}),
+                    .result = try alloc.print("unknown model role '{s}'. Roles: @default, @small, @deep, @worker, @tiny, @review, @title, @compact, @designer, @commit, @advisor.", .{raw_model}),
                 } },
                 .unavailable => {
                     debug_trace.logf("subagent", "model role unset raw={s}; inheriting model={s}", .{ raw_model, options.defaults.model });
@@ -1880,7 +1880,7 @@ test "model override passes through for non-gateway providers" {
 const RoleResolverFixture = struct {
     fn resolve(_: ?*anyopaque, name: []const u8) ModelRoleResolver.Lookup {
         if (std.mem.eql(u8, name, "worker")) return .{ .model = "cento-worker" };
-        if (std.mem.eql(u8, name, "smol")) return .unavailable;
+        if (std.mem.eql(u8, name, "small")) return .unavailable;
         return .unknown_role;
     }
 };
@@ -1912,13 +1912,13 @@ test "a fleet @role model resolves before the child exists" {
     try std.testing.expectEqualStrings("cento-worker", fixture.observed_model.?);
 
     // A role without a model on this provider inherits the parent's.
-    var smol = try model_contract.validateRequest(alloc, .{ .run = .{ .task = "probe", .model = "@smol" } });
-    defer smol.deinit(alloc);
+    var small = try model_contract.validateRequest(alloc, .{ .run = .{ .task = "probe", .model = "@small" } });
+    defer small.deinit(alloc);
     alloc.free(fixture.observed_model.?);
     fixture.observed_model = null;
-    var smol_options = options;
-    smol_options.invocation_id = "role-inherit";
-    try std.testing.expect((try runtime.executeManaged(arena, &smol, smol_options)).success);
+    var small_options = options;
+    small_options.invocation_id = "role-inherit";
+    try std.testing.expect((try runtime.executeManaged(arena, &small, small_options)).success);
     try std.testing.expectEqualStrings("parent-model", fixture.observed_model.?);
 
     var unknown = try model_contract.validateRequest(alloc, .{ .run = .{ .task = "probe", .model = "@nobody" } });

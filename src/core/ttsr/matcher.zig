@@ -21,7 +21,7 @@ pub const cost_regex: u8 = 1;
 pub const cost_ast: u8 = 2;
 pub const cost_judge: u8 = 3;
 
-pub const default_judge_roles = [_][]const u8{ "tiny", "smol" };
+pub const default_judge_roles = [_][]const u8{ "tiny", "small" };
 
 pub const PathPredicate = struct {
     globs: []const []const u8 = &.{},

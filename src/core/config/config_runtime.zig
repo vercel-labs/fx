@@ -2989,20 +2989,20 @@ test "first_call_tool_choice ignores unknown strings and rejects invalid types" 
 }
 
 test "model_roles parse from the profile, merge per role, and stay out of project defaults" {
-    var base = try parseSettingsJson(std.testing.allocator, "{\"model_roles\":{\"smol\":\"a\",\"worker\":\"@smol\"},\"review_model\":\"legacy\"}");
+    var base = try parseSettingsJson(std.testing.allocator, "{\"model_roles\":{\"small\":\"a\",\"worker\":\"@small\"},\"review_model\":\"legacy\"}");
     defer base.deinit(std.testing.allocator);
-    var over = try parseSettingsJson(std.testing.allocator, "{\"model_roles\":{\"smol\":\"b\"},\"cycle_order\":[\"smol\",\"default\"]}");
+    var over = try parseSettingsJson(std.testing.allocator, "{\"model_roles\":{\"small\":\"b\"},\"cycle_order\":[\"small\",\"default\"]}");
     defer over.deinit(std.testing.allocator);
     try mergeSettings(&base, &over, std.testing.allocator);
-    try std.testing.expectEqualStrings("b", base.model_roles.get(.smol).?);
-    try std.testing.expectEqualStrings("@smol", base.model_roles.get(.worker).?);
+    try std.testing.expectEqualStrings("b", base.model_roles.get(.small).?);
+    try std.testing.expectEqualStrings("@small", base.model_roles.get(.worker).?);
     try std.testing.expectEqual(@as(usize, 2), base.model_roles.cycleOrder().len);
     try std.testing.expectEqualStrings("legacy", base.review_model.?);
     try std.testing.expectError(error.InvalidModelRolesType, parseSettingsJson(std.testing.allocator, "{\"model_roles\":\"x\"}"));
 
-    var project = try parseSettingsJsonForLayer(std.testing.allocator, "{\"model_roles\":{\"smol\":\"repo\"}}", .project);
+    var project = try parseSettingsJsonForLayer(std.testing.allocator, "{\"model_roles\":{\"small\":\"repo\"}}", .project);
     defer project.deinit(std.testing.allocator);
-    try std.testing.expect(project.model_roles.get(.smol) == null);
+    try std.testing.expect(project.model_roles.get(.small) == null);
 }
 
 test "review_model parses, merges, and yields to FX_REVIEW_MODEL" {

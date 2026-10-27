@@ -999,11 +999,11 @@ const AskContext = struct {
         self.v2_children = children;
     }
 
-    /// The web search side worker's model: the profile's smol role, else
+    /// The web search side worker's model: the profile's small role, else
     /// the session's model (D213).
     fn searchWorkerModel(self: *AskContext) []const u8 {
         const startup = self.role_startup orelse return self.model;
-        return startup.roleModel(.smol, null) orelse self.model;
+        return startup.roleModel(.small, null) orelse self.model;
     }
 
     /// The credentials a bank web search may use; borrowed from `self`.

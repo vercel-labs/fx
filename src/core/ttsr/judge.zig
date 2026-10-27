@@ -164,7 +164,7 @@ test "judge parses the last verdict word, caches and budgets" {
     var judge = Judge.init(std.testing.allocator, .{ .ctx = &model, .complete = FakeModel.complete });
     defer judge.deinit();
     const j = judge.asJudge();
-    const request: evaluate.JudgeRequest = .{ .question = "Real cast?", .roles = &.{"smol"}, .text = "x as any", .source = .tool, .lang = "ts", .tool_name = "write_file", .file_paths = &.{"a.ts"} };
+    const request: evaluate.JudgeRequest = .{ .question = "Real cast?", .roles = &.{"small"}, .text = "x as any", .source = .tool, .lang = "ts", .tool_name = "write_file", .file_paths = &.{"a.ts"} };
     try std.testing.expectEqual(true, j.ask(j.ctx, request).?);
     try std.testing.expectEqual(true, j.ask(j.ctx, request).?);
     try std.testing.expectEqual(@as(usize, 1), model.calls);

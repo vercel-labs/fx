@@ -2862,22 +2862,22 @@ test "model list explains public-only and rejected-credential catalogs" {
 test "model list shows role assignments in text and json" {
     const alloc = std.testing.allocator;
     const roles = [_]ModelListSnapshot.RoleAssignment{
-        .{ .role = "smol", .model = "fast" },
-        .{ .role = "worker", .model = "fast", .configured = "@smol" },
-        .{ .role = "slow", .model = null },
+        .{ .role = "small", .model = "fast" },
+        .{ .role = "worker", .model = "fast", .configured = "@small" },
+        .{ .role = "deep", .model = null },
     };
     const snapshot: ModelListSnapshot = .{ .ids = &.{ "fast", "main" }, .roles = &roles };
     const text = try snapshot.render(alloc, .text);
     defer alloc.free(text);
-    try std.testing.expect(std.mem.find(u8, text, "[models] roles\n - smol: fast\n - worker: fast (@smol)\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "slow") == null);
+    try std.testing.expect(std.mem.find(u8, text, "[models] roles\n - small: fast\n - worker: fast (@small)\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "deep") == null);
     const json = try snapshot.render(alloc, .json);
     defer alloc.free(json);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
     defer parsed.deinit();
     const listed = parsed.value.object.get("roles").?.array.items;
     try std.testing.expectEqual(@as(usize, 3), listed.len);
-    try std.testing.expectEqualStrings("@smol", listed[1].object.get("configured").?.string);
+    try std.testing.expectEqualStrings("@small", listed[1].object.get("configured").?.string);
     try std.testing.expect(listed[2].object.get("model").? == .null);
 }
 

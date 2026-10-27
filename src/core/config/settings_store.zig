@@ -980,22 +980,27 @@ test "model role patch sets and clears one model_roles entry" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), "{\"model_roles\":{\"slow\":\"deep\"}}", .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), "{\"model_roles\":{\"slow\":\"deep\",\"smol\":\"quick\"}}", .{});
     defer parsed.deinit();
     var root = parsed.value;
 
-    var application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .model_role = .{ .role = .worker, .value = "@smol" } });
+    var application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .model_role = .{ .role = .worker, .value = "@small" } });
     try std.testing.expect(application.changed);
     const roles = root.object.get("model_roles").?.object;
-    try std.testing.expectEqualStrings("@smol", roles.get("worker").?.string);
+    try std.testing.expectEqualStrings("@small", roles.get("worker").?.string);
     try std.testing.expectEqualStrings("deep", roles.get("slow").?.string);
-    application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .model_role = .{ .role = .slow, .value = null } });
+    application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .model_role = .{ .role = .deep, .value = null } });
     try std.testing.expect(application.changed);
+    try std.testing.expect(root.object.get("model_roles").?.object.get("deep") == null);
+    // Clearing a role also drops proto's older name for it.
     try std.testing.expect(root.object.get("model_roles").?.object.get("slow") == null);
-    application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .model_role = .{ .role = .slow, .value = null } });
+    application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .model_role = .{ .role = .small, .value = "fast" } });
+    try std.testing.expectEqualStrings("fast", root.object.get("model_roles").?.object.get("small").?.string);
+    try std.testing.expect(root.object.get("model_roles").?.object.get("smol") == null);
+    application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .model_role = .{ .role = .deep, .value = null } });
     try std.testing.expect(!application.changed);
     try validateKnownSettingsObject(root.object, false);
-    try std.testing.expectError(error.InvalidDurableField, validateUserPatch(.{ .model_role = .{ .role = .smol, .value = "bad\nref" } }));
+    try std.testing.expectError(error.InvalidDurableField, validateUserPatch(.{ .model_role = .{ .role = .small, .value = "bad\nref" } }));
 }
 
 test "collapse tool calls user patch writes the profile preference" {
@@ -1103,6 +1108,10 @@ fn applyUserPatchToRoot(
         if (!root.object.contains("model_roles")) try root.object.put(arena, "model_roles", .{ .object = .empty });
         const roles = root.object.getPtr("model_roles").?;
         if (roles.* != .object) return error.InvalidSettingsFormat;
+        // proto's older name for the role goes; the new name is written.
+        if (role_patch.role.legacyName()) |legacy| {
+            if (roles.object.orderedRemove(legacy)) application.changed = true;
+        }
         if (role_patch.value) |value| {
             application.changed = try putString(arena, &roles.object, role_patch.role.label(), value) or application.changed;
         } else if (roles.object.orderedRemove(role_patch.role.label())) {

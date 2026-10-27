@@ -121,7 +121,7 @@ pub const Host = struct {
         const ref = model_roles.resolve(&self.state.table, role, .{
             .provider = label,
             .default_model = default_model,
-            .builtin_smol = self.set.select(provider).title_model,
+            .builtin_small = self.set.select(provider).title_model,
             // `review_model` was a gateway setting; other providers ignored it.
             .legacy_review = if (self.review_model.len > 0 and provider == .gateway) self.review_model else null,
             .configured = self.set.definitions,
@@ -140,17 +140,17 @@ pub const Host = struct {
         return self.current_model;
     }
 
-    /// The web search side worker's model: the profile's smol role when
+    /// The web search side worker's model: the profile's small role when
     /// it sets one on this provider, else the session's model, as before
     /// roles (D213).
     pub fn searchWorkerModel(self: Host) []const u8 {
         const configured = blk: {
             self.state.mutex.lockUncancelable(io_mod.getIo());
             defer self.state.mutex.unlock(io_mod.getIo());
-            break :blk self.state.table.get(.smol) != null;
+            break :blk self.state.table.get(.small) != null;
         };
         if (!configured) return self.current_model;
-        return self.resolve(.smol) orelse self.current_model;
+        return self.resolve(.small) orelse self.current_model;
     }
 
     /// The permission reviewer's model; empty keeps the reviewer's default.
@@ -166,7 +166,7 @@ pub const Host = struct {
     }
 
     /// A stream rule judge's model: the first of `roles` (proto's `tiny`,
-    /// `smol` by default) that resolves on this provider (D207). Null leaves
+    /// `small` by default) that resolves on this provider (D207). Null leaves
     /// the session's model to answer.
     pub fn judgeModel(self: Host, roles: []const []const u8) ?[]const u8 {
         for (roles) |name| {
@@ -324,7 +324,7 @@ pub fn Runtime(comptime App: type) type {
                     if (!std.mem.eql(u8, raw, model)) try out.writer.print("  {s}", .{raw});
                 } else switch (role) {
                     .default => {},
-                    .title, .tiny => try out.writer.writeAll("  follows smol"),
+                    .title, .tiny => try out.writer.writeAll("  follows small"),
                     else => try out.writer.writeAll("  built in"),
                 }
             }
@@ -343,14 +343,14 @@ test "state assignment keeps replaced tables alive" {
     var state: State = .{};
     defer state.deinit(alloc);
     try state.init(alloc, .{}, "gateway", "main");
-    try state.assign(alloc, .smol, "fast");
-    const borrowed = state.table.get(.smol).?;
-    try state.assign(alloc, .smol, "faster");
+    try state.assign(alloc, .small, "fast");
+    const borrowed = state.table.get(.small).?;
+    try state.assign(alloc, .small, "faster");
     // The first assignment's bytes stay valid for borrowers.
     try std.testing.expectEqualStrings("fast", borrowed);
-    try std.testing.expectEqualStrings("faster", state.table.get(.smol).?);
-    try state.assign(alloc, .smol, null);
-    try std.testing.expect(state.table.get(.smol) == null);
+    try std.testing.expectEqualStrings("faster", state.table.get(.small).?);
+    try state.assign(alloc, .small, null);
+    try std.testing.expect(state.table.get(.small) == null);
 }
 
 test "cycling steps through roles with distinct models and tags list roles" {
@@ -358,25 +358,25 @@ test "cycling steps through roles with distinct models and tags list roles" {
     var state: State = .{};
     defer state.deinit(alloc);
     try state.init(alloc, .{}, "gateway", "main");
-    try state.assign(alloc, .smol, "fast");
-    try state.assign(alloc, .slow, "deep");
-    try state.assign(alloc, .worker, "@smol");
+    try state.assign(alloc, .small, "fast");
+    try state.assign(alloc, .deep, "careful");
+    try state.assign(alloc, .worker, "@small");
     var view: Host = .{ .state = &state, .provider = .gateway, .current_model = "main", .set = .{ .gateway = .{}, .codex = .{}, .grok = .{} } };
-    // Default order: slow, default, smol.
+    // Default order: deep, default, small.
     try std.testing.expectEqualStrings("fast", cycleStep(view, false).?.model);
     view.current_model = "fast";
-    try std.testing.expectEqualStrings("deep", cycleStep(view, false).?.model);
-    view.current_model = "deep";
+    try std.testing.expectEqualStrings("careful", cycleStep(view, false).?.model);
+    view.current_model = "careful";
     try std.testing.expectEqualStrings("main", cycleStep(view, false).?.model);
     view.current_model = "main";
-    try std.testing.expectEqualStrings("deep", cycleStep(view, true).?.model);
+    try std.testing.expectEqualStrings("careful", cycleStep(view, true).?.model);
     // A model outside the order starts from the first role.
     view.current_model = "other";
-    try std.testing.expectEqual(Role.slow, cycleStep(view, false).?.role);
+    try std.testing.expectEqual(Role.deep, cycleStep(view, false).?.role);
 
     var roles: [model_roles.role_count]Role = undefined;
     const count = view.rolesFor("fast", &roles);
-    try std.testing.expectEqualSlices(Role, &.{ .smol, .worker }, roles[0..count]);
+    try std.testing.expectEqualSlices(Role, &.{ .small, .worker }, roles[0..count]);
     try std.testing.expectEqual(@as(usize, 1), view.rolesFor("main", &roles));
     try std.testing.expectEqualStrings("fast", view.lookup("worker").model);
     try std.testing.expect(view.lookup("nobody") == .unknown_role);
@@ -403,8 +403,8 @@ test "review falls back to the legacy gateway setting and titles to the bundle" 
     try std.testing.expectEqualStrings("", view.reviewModel());
     try state.assign(alloc, .review, "codex/strict");
     try std.testing.expectEqualStrings("strict", view.reviewModel());
-    try state.assign(alloc, .compact, "@smol");
-    try state.assign(alloc, .smol, "codex-mini");
+    try state.assign(alloc, .compact, "@small");
+    try state.assign(alloc, .small, "codex-mini");
     try std.testing.expectEqualStrings("codex-mini", view.compactModel());
     try std.testing.expectEqualStrings("codex-mini", view.titleModel().?);
 }
@@ -427,28 +427,28 @@ test "a judge takes the first of its roles that resolves" {
     try state.init(alloc, .{}, "codex", "main");
     const view: Host = .{ .state = &state, .provider = .codex, .current_model = "gpt-main", .set = .{ .gateway = .{}, .codex = .{}, .grok = .{} } };
     // No role set and no low-cost model: the session's model answers.
-    try std.testing.expect(view.judgeModel(&.{ "tiny", "smol" }) == null);
-    try state.assign(alloc, .smol, "codex-mini");
-    try std.testing.expectEqualStrings("codex-mini", view.judgeModel(&.{ "tiny", "smol" }).?);
+    try std.testing.expect(view.judgeModel(&.{ "tiny", "small" }) == null);
+    try state.assign(alloc, .small, "codex-mini");
+    try std.testing.expectEqualStrings("codex-mini", view.judgeModel(&.{ "tiny", "small" }).?);
     try state.assign(alloc, .review, "codex-strict");
-    try std.testing.expectEqualStrings("codex-strict", view.judgeModel(&.{ "nope", "review", "smol" }).?);
+    try std.testing.expectEqualStrings("codex-strict", view.judgeModel(&.{ "nope", "review", "small" }).?);
 }
 
-test "the web search worker takes the profile's smol role, else the session's model" {
+test "the web search worker takes the profile's small role, else the session's model" {
     const alloc = std.testing.allocator;
     var state: State = .{};
     defer state.deinit(alloc);
     try state.init(alloc, .{}, "gateway", "main");
     var view: Host = .{ .state = &state, .provider = .gateway, .current_model = "main", .set = .{ .gateway = .{ .title_model = "luna" }, .codex = .{}, .grok = .{} } };
-    // Without a smol entry the session's model stays, not the bundle's.
+    // Without a small entry the session's model stays, not the bundle's.
     try std.testing.expectEqualStrings("main", view.searchWorkerModel());
-    try state.assign(alloc, .smol, "swift");
+    try state.assign(alloc, .small, "swift");
     try std.testing.expectEqualStrings("swift", view.searchWorkerModel());
-    // A smol model on another provider leaves the session's model.
-    try state.assign(alloc, .smol, "codex/mini");
+    // A small model on another provider leaves the session's model.
+    try state.assign(alloc, .small, "codex/mini");
     try std.testing.expectEqualStrings("main", view.searchWorkerModel());
     view.provider = .codex;
     try std.testing.expectEqualStrings("mini", view.searchWorkerModel());
-    try state.assign(alloc, .smol, null);
+    try state.assign(alloc, .small, null);
     try std.testing.expectEqualStrings("main", view.searchWorkerModel());
 }

@@ -230,7 +230,7 @@ test "descriptions and literal prefilters" {
     var f = Fixture.init();
     defer f.deinit();
     const program = try f.program("match: { if: { lang: [rs] }, then: { regex: 'Box::leak', in: code }, else: { all: [ { regex: 'Box::leak' }, { llm: 'Real?' } ] } }");
-    try std.testing.expectEqualStrings("if lang rs then regex /Box::leak/ in code else all(regex /Box::leak/, llm \"Real?\" (tiny→smol))", program.description);
+    try std.testing.expectEqualStrings("if lang rs then regex /Box::leak/ in code else all(regex /Box::leak/, llm \"Real?\" (tiny→small))", program.description);
     try std.testing.expect(program.needs_judge);
     try std.testing.expect(matcher.mayMatch(program, "let b = Box::leak(x)"));
     try std.testing.expect(!matcher.mayMatch(program, "nothing here"));

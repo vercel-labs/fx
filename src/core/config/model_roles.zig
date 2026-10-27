@@ -12,7 +12,7 @@
 //!   falls back to `default` (D171).
 //!
 //! A role without an entry follows its built-in fallback: `title` and
-//! `tiny` follow `smol`, `smol` uses the provider's own low-cost model, and
+//! `tiny` follow `small`, `small` uses the provider's own low-cost model, and
 //! every other role leaves the choice to its consumer (the conversation's
 //! model, or the reviewer's compiled default). The legacy `review_model`
 //! setting fills `review` when the table has no entry for it (D172).
@@ -27,8 +27,8 @@ pub const max_ref_bytes: usize = 1024;
 
 pub const Role = enum {
     default,
-    smol,
-    slow,
+    small,
+    deep,
     worker,
     tiny,
     review,
@@ -38,9 +38,23 @@ pub const Role = enum {
     commit,
     advisor,
 
+    /// Accepts each role's name and proto's older names, `smol` for
+    /// `small` and `slow` for `deep`, so proto-style settings keep working.
     pub fn parse(name: []const u8) ?Role {
-        return std.meta.stringToEnum(Role, name);
+        if (std.meta.stringToEnum(Role, name)) |role| return role;
+        for (legacy_names) |legacy| if (std.mem.eql(u8, legacy.name, name)) return legacy.role;
+        return null;
     }
+
+    /// proto's name for this role when it differs, so a settings writer
+    /// can drop the old key.
+    pub fn legacyName(self: Role) ?[]const u8 {
+        for (legacy_names) |legacy| if (legacy.role == self) return legacy.name;
+        return null;
+    }
+
+    const LegacyName = struct { name: []const u8, role: Role };
+    const legacy_names = [_]LegacyName{ .{ .name = "smol", .role = .small }, .{ .name = "slow", .role = .deep } };
 
     pub fn label(self: Role) []const u8 {
         return @tagName(self);
@@ -50,8 +64,8 @@ pub const Role = enum {
     pub fn summary(self: Role) []const u8 {
         return switch (self) {
             .default => "the profile's default model",
-            .smol => "fast, low-cost work",
-            .slow => "careful, high-reasoning work",
+            .small => "fast, low-cost work",
+            .deep => "careful, high-reasoning work",
             .worker => "fleet workers that ask for @worker",
             .tiny => "the smallest side calls",
             .review => "automatic permission review",
@@ -68,7 +82,7 @@ pub const role_count = @typeInfo(Role).@"enum".field_names.len;
 pub const all_roles = std.enums.values(Role);
 
 /// proto's default cycle order.
-pub const default_cycle_order = [_]Role{ .slow, .default, .smol };
+pub const default_cycle_order = [_]Role{ .deep, .default, .small };
 
 pub const Error = error{ InvalidModelRolesType, InvalidModelRoleValue, InvalidCycleOrderType, InvalidCycleOrderValue, OutOfMemory };
 
@@ -135,6 +149,8 @@ pub const Table = struct {
                     debug_trace.logf("config", "ignoring unknown model role={s}", .{entry.key_ptr.*});
                     continue;
                 };
+                // The role's own name wins over proto's older one.
+                if (!std.mem.eql(u8, entry.key_ptr.*, role.label()) and value.object.contains(role.label())) continue;
                 if (entry.value_ptr.* == .null) continue;
                 if (entry.value_ptr.* != .string) return error.InvalidModelRoleValue;
                 const trimmed = std.mem.trim(u8, entry.value_ptr.string, " \t\r\n");
@@ -206,8 +222,8 @@ pub const Context = struct {
     provider: []const u8,
     /// The profile's default model on the active provider; `@default`.
     default_model: []const u8,
-    /// The provider's built-in low-cost model, used for `smol` when unset.
-    builtin_smol: ?[]const u8 = null,
+    /// The provider's built-in low-cost model, used for `small` when unset.
+    builtin_small: ?[]const u8 = null,
     /// The legacy `review_model` setting, used for `review` when unset.
     legacy_review: ?[]const u8 = null,
     /// Configured providers, whose names may qualify a reference alongside
@@ -227,8 +243,8 @@ pub fn resolve(table: *const Table, role: Role, ctx: Context) ?Ref {
         visited.insert(current);
         const raw = table.get(current) orelse switch (current) {
             .review => ctx.legacy_review orelse return null,
-            .title, .tiny => "@smol",
-            .smol => return if (ctx.builtin_smol) |model| .{ .model = model, .source = .smol } else null,
+            .title, .tiny => "@small",
+            .small => return if (ctx.builtin_small) |model| .{ .model = model, .source = .small } else null,
             .default => return defaultRef(ctx),
             else => return null,
         };
@@ -267,7 +283,7 @@ fn parseFixture(alloc: Allocator, json: []const u8) !Table {
     return Table.parse(alloc, parsed.value.object.get("model_roles"), parsed.value.object.get("cycle_order"));
 }
 
-test "roles resolve bare, provider-qualified, and aliased references" {
+test "roles resolve bare, provider-qualified, and aliased references, under proto's older names too" {
     const alloc = std.testing.allocator;
     var table = try parseFixture(alloc,
         \\{"model_roles":{"smol":"cheap","worker":"@smol","slow":"codex/gpt-5.5","review":"openai/gpt-5","custom":"x"}}
@@ -277,18 +293,18 @@ test "roles resolve bare, provider-qualified, and aliased references" {
 
     const worker = resolve(&table, .worker, ctx).?;
     try std.testing.expectEqualStrings("cheap", worker.model);
-    try std.testing.expectEqual(Role.smol, worker.source);
+    try std.testing.expectEqual(Role.small, worker.source);
     try std.testing.expectEqualStrings("cheap", worker.on("gateway").?);
 
-    const slow = resolve(&table, .slow, ctx).?;
-    try std.testing.expectEqualStrings("codex", slow.provider.?);
-    try std.testing.expectEqualStrings("gpt-5.5", slow.model);
-    try std.testing.expect(slow.on("gateway") == null);
+    const deep = resolve(&table, .deep, ctx).?;
+    try std.testing.expectEqualStrings("codex", deep.provider.?);
+    try std.testing.expectEqualStrings("gpt-5.5", deep.model);
+    try std.testing.expect(deep.on("gateway") == null);
 
     // A gateway model ID whose prefix is not a provider stays whole.
     try std.testing.expectEqualStrings("openai/gpt-5", resolve(&table, .review, ctx).?.model);
     try std.testing.expectEqualStrings("main", resolve(&table, .default, ctx).?.model);
-    // title and tiny follow smol; compact keeps the conversation's model.
+    // title and tiny follow small; compact keeps the conversation's model.
     try std.testing.expectEqualStrings("cheap", resolve(&table, .title, ctx).?.model);
     try std.testing.expectEqualStrings("cheap", resolve(&table, .tiny, ctx).?.model);
     try std.testing.expect(resolve(&table, .compact, ctx) == null);
@@ -297,13 +313,13 @@ test "roles resolve bare, provider-qualified, and aliased references" {
 test "alias cycles and unknown aliases fall back to default" {
     const alloc = std.testing.allocator;
     var table = try parseFixture(alloc,
-        \\{"model_roles":{"smol":"@tiny","tiny":"@smol","worker":"@nobody","default":"@worker"}}
+        \\{"model_roles":{"small":"@tiny","tiny":"@small","worker":"@nobody","default":"@worker"}}
     );
     defer table.deinit(alloc);
     const ctx: Context = .{ .provider = "gateway", .default_model = "main" };
-    const smol = resolve(&table, .smol, ctx).?;
-    try std.testing.expectEqualStrings("main", smol.model);
-    try std.testing.expectEqual(Role.default, smol.source);
+    const small = resolve(&table, .small, ctx).?;
+    try std.testing.expectEqualStrings("main", small.model);
+    try std.testing.expectEqual(Role.default, small.source);
     try std.testing.expectEqualStrings("main", resolve(&table, .worker, ctx).?.model);
     // default aliasing itself through worker ends at the profile model.
     try std.testing.expectEqualStrings("main", resolve(&table, .default, ctx).?.model);
@@ -312,7 +328,7 @@ test "alias cycles and unknown aliases fall back to default" {
 
 test "unset roles use built-in and legacy fallbacks" {
     var table: Table = .{};
-    const ctx: Context = .{ .provider = "codex", .default_model = "gpt-5.5", .builtin_smol = "gpt-5.6-luna", .legacy_review = "legacy-review" };
+    const ctx: Context = .{ .provider = "codex", .default_model = "gpt-5.5", .builtin_small = "gpt-5.6-luna", .legacy_review = "legacy-review" };
     try std.testing.expectEqualStrings("gpt-5.6-luna", resolve(&table, .title, ctx).?.model);
     try std.testing.expectEqualStrings("legacy-review", resolve(&table, .review, ctx).?.model);
     try std.testing.expect(resolve(&table, .worker, ctx) == null);
@@ -324,33 +340,46 @@ test "unset roles use built-in and legacy fallbacks" {
 test "configured provider labels qualify references" {
     const alloc = std.testing.allocator;
     var table = try parseFixture(alloc,
-        \\{"model_roles":{"worker":"cento/cento-worker","smol":"cento/"}}
+        \\{"model_roles":{"worker":"cento/cento-worker","small":"cento/"}}
     );
     defer table.deinit(alloc);
     const definitions = [_]configured_provider.Definition{.{ .id = "cento", .protocol = .@"openai-chat-completions", .base_url = "http://127.0.0.1:8394/v1", .auth = .none }};
     const ctx: Context = .{ .provider = "cento", .default_model = "claude-cento", .configured = &definitions };
     try std.testing.expectEqualStrings("cento-worker", resolve(&table, .worker, ctx).?.on("cento").?);
     // A trailing slash names no model, so it is a bare ID.
-    try std.testing.expectEqualStrings("cento/", resolve(&table, .smol, ctx).?.model);
+    try std.testing.expectEqualStrings("cento/", resolve(&table, .small, ctx).?.model);
 }
 
 test "parse rejects bad types and overlay replaces per role" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.InvalidModelRolesType, parseFixture(alloc, "{\"model_roles\":[]}"));
-    try std.testing.expectError(error.InvalidModelRoleValue, parseFixture(alloc, "{\"model_roles\":{\"smol\":1}}"));
-    try std.testing.expectError(error.InvalidModelRoleValue, parseFixture(alloc, "{\"model_roles\":{\"smol\":\"@\"}}"));
-    try std.testing.expectError(error.InvalidCycleOrderType, parseFixture(alloc, "{\"cycle_order\":\"smol\"}"));
+    try std.testing.expectError(error.InvalidModelRoleValue, parseFixture(alloc, "{\"model_roles\":{\"small\":1}}"));
+    try std.testing.expectError(error.InvalidModelRoleValue, parseFixture(alloc, "{\"model_roles\":{\"small\":\"@\"}}"));
+    try std.testing.expectError(error.InvalidCycleOrderType, parseFixture(alloc, "{\"cycle_order\":\"small\"}"));
 
-    var base = try parseFixture(alloc, "{\"model_roles\":{\"smol\":\"a\",\"slow\":\"b\"}}");
+    var base = try parseFixture(alloc, "{\"model_roles\":{\"small\":\"a\",\"deep\":\"b\"}}");
     defer base.deinit(alloc);
-    var layer = try parseFixture(alloc, "{\"model_roles\":{\"smol\":\"c\"},\"cycle_order\":[\"smol\",\"bogus\",\"slow\",\"smol\"]}");
+    var layer = try parseFixture(alloc, "{\"model_roles\":{\"small\":\"c\"},\"cycle_order\":[\"smol\",\"bogus\",\"deep\",\"small\"]}");
     defer layer.deinit(alloc);
     base.overlay(alloc, &layer);
-    try std.testing.expectEqualStrings("c", base.get(.smol).?);
-    try std.testing.expectEqualStrings("b", base.get(.slow).?);
-    try std.testing.expectEqualSlices(Role, &.{ .smol, .slow }, base.cycleOrder());
+    try std.testing.expectEqualStrings("c", base.get(.small).?);
+    try std.testing.expectEqualStrings("b", base.get(.deep).?);
+    try std.testing.expectEqualSlices(Role, &.{ .small, .deep }, base.cycleOrder());
 
     var copy = try base.dupe(alloc);
     defer copy.deinit(alloc);
-    try std.testing.expectEqualStrings("c", copy.get(.smol).?);
+    try std.testing.expectEqualStrings("c", copy.get(.small).?);
+}
+
+test "a role's own name wins over proto's older name for it" {
+    const alloc = std.testing.allocator;
+    var table = try parseFixture(alloc,
+        \\{"model_roles":{"smol":"old","small":"new","slow":"careful"}}
+    );
+    defer table.deinit(alloc);
+    try std.testing.expectEqualStrings("new", table.get(.small).?);
+    try std.testing.expectEqualStrings("careful", table.get(.deep).?);
+    try std.testing.expectEqual(Role.small, Role.parse("smol").?);
+    try std.testing.expectEqualStrings("smol", Role.small.legacyName().?);
+    try std.testing.expect(Role.worker.legacyName() == null);
 }

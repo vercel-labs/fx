@@ -598,13 +598,13 @@ test "model menu keeps shared-prefix model ids distinguishable when narrow" {
 
 test "model menu rows tag role models and the header shows the role Enter assigns" {
     const alloc = std.testing.allocator;
-    const item: model_cache_runtime.ModelMenuItem = .{ .id = @constCast("cento-smol"), .provider = "cento", .capabilities = .{} };
-    var row = try composeTitleRow(alloc, item, &.{ .smol, .worker }, false, null, 60);
+    const item: model_cache_runtime.ModelMenuItem = .{ .id = @constCast("cento-small"), .provider = "cento", .capabilities = .{} };
+    var row = try composeTitleRow(alloc, item, &.{ .small, .worker }, false, null, 60);
     defer row.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, row.items, "cento-smol") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, " smol worker") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "cento-small") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, " small worker") != null);
     // Tags drop rather than squeeze the ID.
-    var narrow = try composeTitleRow(alloc, item, &.{ .smol, .worker }, false, null, 16);
+    var narrow = try composeTitleRow(alloc, item, &.{ .small, .worker }, false, null, 16);
     defer narrow.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, narrow.items, "worker") == null);
 

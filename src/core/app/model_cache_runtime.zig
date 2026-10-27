@@ -199,7 +199,7 @@ pub const ModelMenu = struct {
 
     /// Steps `assign_role` through the roles and back to none.
     pub fn stepAssignRole(self: *ModelMenu) void {
-        const order = [_]model_roles.Role{ .smol, .slow, .worker, .tiny, .review, .title, .compact, .default, .designer, .commit, .advisor };
+        const order = [_]model_roles.Role{ .small, .deep, .worker, .tiny, .review, .title, .compact, .default, .designer, .commit, .advisor };
         const current = self.assign_role orelse {
             self.assign_role = order[0];
             return;

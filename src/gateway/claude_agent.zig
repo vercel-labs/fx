@@ -35,7 +35,7 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const Allocator = std.mem.Allocator;
 
 pub const provider_id = "anthropic";
-/// The cheap model for titles and permission reviews, as proto's smol role.
+/// The cheap model for titles and permission reviews, as proto's small role (proto calls it smol).
 pub const small_model = "claude-haiku-5-5";
 /// Prefix of Claude subscription tokens from `claude setup-token`.
 pub const subscription_token_prefix = "sk-ant-oat";

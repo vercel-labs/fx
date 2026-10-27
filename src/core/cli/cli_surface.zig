@@ -2516,7 +2516,7 @@ fn modelRoleAssignments(
     const ctx: model_roles.Context = .{
         .provider = label,
         .default_model = startup.configured_model,
-        .builtin_smol = bundle.title_model,
+        .builtin_small = bundle.title_model,
         .legacy_review = if (startup.provider == .gateway and startup.review_model.len > 0) startup.review_model else null,
         .configured = startup.configured_providers.definitions,
     };
@@ -5101,7 +5101,7 @@ test "runIfRequested models passes startup team to fetch seam" {
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expect(probe.called);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"models\",\"count\":1,\"shown_count\":1,\"more_count\":0,\"private_models_hidden\":false,\"ids\":[\"private/blue-hornbill\"],\"roles\":[{\"role\":\"default\",\"model\":null,\"configured\":null},{\"role\":\"smol\",\"model\":\"openai/gpt-5.6-luna\",\"configured\":null},{\"role\":\"slow\",\"model\":null,\"configured\":null},{\"role\":\"worker\",\"model\":null,\"configured\":null},{\"role\":\"tiny\",\"model\":\"openai/gpt-5.6-luna\",\"configured\":null},{\"role\":\"review\",\"model\":null,\"configured\":null},{\"role\":\"title\",\"model\":\"openai/gpt-5.6-luna\",\"configured\":null},{\"role\":\"compact\",\"model\":null,\"configured\":null},{\"role\":\"designer\",\"model\":null,\"configured\":null},{\"role\":\"commit\",\"model\":null,\"configured\":null},{\"role\":\"advisor\",\"model\":null,\"configured\":null}]}\n",
+        "{\"kind\":\"models\",\"count\":1,\"shown_count\":1,\"more_count\":0,\"private_models_hidden\":false,\"ids\":[\"private/blue-hornbill\"],\"roles\":[{\"role\":\"default\",\"model\":null,\"configured\":null},{\"role\":\"small\",\"model\":\"openai/gpt-5.6-luna\",\"configured\":null},{\"role\":\"deep\",\"model\":null,\"configured\":null},{\"role\":\"worker\",\"model\":null,\"configured\":null},{\"role\":\"tiny\",\"model\":\"openai/gpt-5.6-luna\",\"configured\":null},{\"role\":\"review\",\"model\":null,\"configured\":null},{\"role\":\"title\",\"model\":\"openai/gpt-5.6-luna\",\"configured\":null},{\"role\":\"compact\",\"model\":null,\"configured\":null},{\"role\":\"designer\",\"model\":null,\"configured\":null},{\"role\":\"commit\",\"model\":null,\"configured\":null},{\"role\":\"advisor\",\"model\":null,\"configured\":null}]}\n",
         capture.stdout.written(),
     );
 }
@@ -5121,7 +5121,7 @@ test "runIfRequested models json describes each model from its catalog entry" {
     try std.testing.expectEqualStrings(
         "{\"kind\":\"models\",\"count\":1,\"shown_count\":1,\"more_count\":0,\"private_models_hidden\":false," ++
             "\"ids\":[\"private/blue-hornbill\"],\"models\":[{\"id\":\"private/blue-hornbill\",\"name\":\"Blue Hornbill\"," ++
-            "\"efforts\":[\"low\",\"high\"],\"fast\":true,\"ultrafast\":true}],\"roles\":[{\"role\":\"default\",\"model\":null,\"configured\":null},{\"role\":\"smol\",\"model\":\"openai/gpt-5.6-luna\",\"configured\":null},{\"role\":\"slow\",\"model\":null,\"configured\":null},{\"role\":\"worker\",\"model\":null,\"configured\":null},{\"role\":\"tiny\",\"model\":\"openai/gpt-5.6-luna\",\"configured\":null},{\"role\":\"review\",\"model\":null,\"configured\":null},{\"role\":\"title\",\"model\":\"openai/gpt-5.6-luna\",\"configured\":null},{\"role\":\"compact\",\"model\":null,\"configured\":null},{\"role\":\"designer\",\"model\":null,\"configured\":null},{\"role\":\"commit\",\"model\":null,\"configured\":null},{\"role\":\"advisor\",\"model\":null,\"configured\":null}]}\n",
+            "\"efforts\":[\"low\",\"high\"],\"fast\":true,\"ultrafast\":true}],\"roles\":[{\"role\":\"default\",\"model\":null,\"configured\":null},{\"role\":\"small\",\"model\":\"openai/gpt-5.6-luna\",\"configured\":null},{\"role\":\"deep\",\"model\":null,\"configured\":null},{\"role\":\"worker\",\"model\":null,\"configured\":null},{\"role\":\"tiny\",\"model\":\"openai/gpt-5.6-luna\",\"configured\":null},{\"role\":\"review\",\"model\":null,\"configured\":null},{\"role\":\"title\",\"model\":\"openai/gpt-5.6-luna\",\"configured\":null},{\"role\":\"compact\",\"model\":null,\"configured\":null},{\"role\":\"designer\",\"model\":null,\"configured\":null},{\"role\":\"commit\",\"model\":null,\"configured\":null},{\"role\":\"advisor\",\"model\":null,\"configured\":null}]}\n",
         capture.stdout.written(),
     );
 }

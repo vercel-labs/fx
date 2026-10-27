@@ -2195,7 +2195,7 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
 - **D168 Decision:** the catalog is proto's Anthropic list with the
   current models first (Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku
   5.5); the default is `claude-opus-5-5` and the reviewer and title model
-  is `claude-haiku-5-5`, proto's smol choice, both patchable in
+  is `claude-haiku-5-5`, proto's small choice, both patchable in
   models.json. `proto-fx ask` generates titles for a configured provider
   that names a title model, since its transport resolves its own
   credential. **Why:** proto's defaults. **Alternative:** the gateway's
@@ -2213,11 +2213,11 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   Claude Code history. **Alternative:** the user's own config directory,
   which would leak seeded sessions into it.
 - **D170 Decision:** model roles follow proto's `model-roles.ts`. The
-  profile's `model_roles` maps `default`, `smol`, `slow`, `worker`,
+  profile's `model_roles` maps `default`, `small`, `deep`, `worker`,
   `tiny`, `review`, `title` and `compact` (and proto's `designer`,
   `commit` and `advisor`, stored for compatibility) to a reference, and
   `cycle_order` lists the roles Alt+P, Alt+Shift+P and `/role next|prev`
-  step through, `slow`, `default`, `smol` by default. `/role` lists,
+  step through, `deep`, `default`, `small` by default (D220). `/role` lists,
   assigns and cycles; Ctrl+R in the `/model` catalog chooses the role
   Enter assigns to, and each catalog row is tagged with the roles that pick
   it. `proto-fx models [--json]` lists what each role picks. Both are
@@ -2239,7 +2239,7 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
 
 - **D172 Decision:** consumers ask a role first and keep their old
   default when it picks nothing: session titles ask `title`, which
-  follows `smol`, which falls back to the provider's built-in low-cost
+  follows `small`, which falls back to the provider's built-in low-cost
   model; the permission reviewer asks `review` (codex, grok and
   configured providers now honour it), and the legacy `review_model`
   fills `review` on the gateway only, as before, with `FX_REVIEW_MODEL`
@@ -2364,7 +2364,7 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   judge uses proto's prompt, takes the last yes or no in the answer,
   caches by question, roles and buffer, and spends at most 64 calls a
   turn. The model comes from `AgentRuntimeDeps.resolve_judge_model`, given
-  the rule's roles (`tiny`, `smol` by default); unset, or answering null,
+  the rule's roles (`tiny`, `small` by default); unset, or answering null,
   the request's own model and connection answer. `proto-fx ttsr test` and
   `scan` never call a model, so a judged condition does not match there.
   **Why:** model roles bind this seam without touching the rule engine.
@@ -2427,9 +2427,9 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
 
 - **D207 Decision:** the terminal, `ask` and ACP bind
   `resolve_judge_model` (D182) to model roles: a judge takes the first of
-  the rule's roles (`tiny`, `smol` by default, as proto's
+  the rule's roles (`tiny`, `small` by default, as proto's
   `ttsr-judge.ts`) that resolves on the session's provider, following
-  each role's fallback, so an unset `tiny` reaches `smol` and then the
+  each role's fallback, so an unset `tiny` reaches `small` and then the
   provider's own low-cost model; with none, the session's model answers.
   A role naming another provider does not resolve. `proto-fx ttsr test`
   still never calls a model: `--llm` would need `ask`'s credential and
@@ -2576,11 +2576,11 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   which the session manager's log and snapshots would not order.
 
 - **D213 Decision:** the web search side worker's model is the profile's
-  smol role when it names a model on the session's provider, else the
+  small role when it names a model on the session's provider, else the
   session's model as before, in the interactive app, the ACP server and
   `ask`. The role's built-in fallback to the provider's low-cost model
-  does not apply here. **Why:** proto runs side work on its smol model;
-  without a smol entry the search keeps the model it used. **Alternative:**
+  does not apply here. **Why:** proto runs side work on its small model;
+  without a small entry the search keeps the model it used. **Alternative:**
   the built-in low-cost model, which would change every gateway search
   for people who set no roles.
 
@@ -2666,6 +2666,13 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   under it like a command. **Why:** proto's screenshots and browser
   cells in proto-fx's row style. **Alternative:** returning only paths,
   which a vision model cannot see.
+- **D220 Decision:** the roles proto calls `smol` and `slow` are named
+  `small` and `deep` in proto-fx. Settings, `@role` references and
+  `cycle_order` still accept the old names, and the role's own name wins
+  when both are set. Every writer and display uses the new name, and
+  writing a role drops its old key. **Why:** the names say what the role
+  is for in plain English. **Alternative:** keeping proto's names, which
+  read as slang and as a speed rather than a kind of work.
 
 ## Design Risks And Failure Behavior
 
