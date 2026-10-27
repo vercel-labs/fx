@@ -434,11 +434,11 @@ describe("fx ask presentation", () => {
     expect(firstPrompt).toContain(
       "Before the first tool call in a tool-driven task, always send one brief user-visible update",
     );
-    expect(firstPrompt).toContain("Never start the first tool silently.");
+    expect(firstPrompt).toContain("Do not begin the first tool call without that update.");
     expect(firstPrompt).toContain(
       "If another tool call will follow, always first tell the user what failed",
     );
-    expect(firstPrompt).toContain("Do not narrate each routine tool call.");
+    expect(firstPrompt).toContain("Do not describe each routine tool call.");
 
     const output = JSON.parse(result.stdout) as {
       output: string;

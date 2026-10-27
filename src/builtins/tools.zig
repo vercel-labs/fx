@@ -848,12 +848,12 @@ test "shell advertises only run interact and stop" {
     try std.testing.expect(std.mem.find(
         u8,
         schema_json,
-        "output_delta is always terminal-safe",
+        "output_delta is terminal-safe",
     ) != null);
     try std.testing.expect(std.mem.find(
         u8,
         schema_json,
-        "Empty observations wait 5000-300000 ms",
+        "An empty observation waits 5000-300000 ms",
     ) != null);
     try std.testing.expect(registry.lookup("terminal") == null);
     try std.testing.expect(registry.lookup("shell") != null);
