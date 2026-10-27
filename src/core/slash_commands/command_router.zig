@@ -13,9 +13,9 @@ pub const ParsedCommand = union(enum) {
     rename_session: []const u8,
     fork_session,
     help,
-    login,
+    login: []const u8,
     logout: []const u8,
-    provider,
+    provider: []const u8,
     status,
     image: []const u8,
     images: []const u8,
@@ -61,9 +61,9 @@ pub const CommandHandlers = struct {
     resume_session: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     fork_session: *const fn (ctx: *anyopaque) anyerror!void,
     show_help: *const fn (ctx: *anyopaque) anyerror!void,
-    login: *const fn (ctx: *anyopaque) anyerror!void,
+    login: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     logout: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
-    provider: *const fn (ctx: *anyopaque) anyerror!void,
+    provider: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_status: *const fn (ctx: *anyopaque) anyerror!void,
     attach_image: *const fn (ctx: *anyopaque, path: []const u8) anyerror!void,
     manage_images: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
@@ -116,9 +116,9 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .rename_session => .{ .rename_session = payload },
         .fork_session => .fork_session,
         .help => .help,
-        .login => .login,
+        .login => .{ .login = payload },
         .logout => .{ .logout = payload },
-        .provider => .provider,
+        .provider => .{ .provider = payload },
         .status => .status,
         .images => .{ .images = payload },
         .image => .{ .image = payload },
@@ -189,9 +189,9 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .rename_session => |rest| try handlers.rename_session(handlers.ctx, rest),
         .fork_session => try handlers.fork_session(handlers.ctx),
         .help => try handlers.show_help(handlers.ctx),
-        .login => try handlers.login(handlers.ctx),
+        .login => |rest| try handlers.login(handlers.ctx, rest),
         .logout => |rest| try handlers.logout(handlers.ctx, rest),
-        .provider => try handlers.provider(handlers.ctx),
+        .provider => |rest| try handlers.provider(handlers.ctx, rest),
         .status => try handlers.show_status(handlers.ctx),
         .image => |path| try handlers.attach_image(handlers.ctx, path),
         .images => |rest| try handlers.manage_images(handlers.ctx, rest),
@@ -253,8 +253,19 @@ test "parse rejects removed plural model command" {
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/models"));
 }
 
-test "provider arguments belong to the inline picker, not the router" {
-    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/provider codex"));
+test "login and provider arguments reach their handlers when typed whole (D224)" {
+    switch (parse(testSlashRegistry(), "/provider codex")) {
+        .provider => |rest| try std.testing.expectEqualStrings("codex", rest),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (parse(testSlashRegistry(), "/login openrouter api-key")) {
+        .login => |rest| try std.testing.expectEqualStrings("openrouter api-key", rest),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (parse(testSlashRegistry(), "/login")) {
+        .login => |rest| try std.testing.expectEqualStrings("", rest),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "parse extracts allowlist command payload" {
@@ -564,9 +575,9 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .resume_session = unexpectedPayload,
         .fork_session = unexpectedNoPayload,
         .show_help = unexpectedNoPayload,
-        .login = unexpectedNoPayload,
+        .login = unexpectedPayload,
         .logout = unexpectedPayload,
-        .provider = unexpectedNoPayload,
+        .provider = unexpectedPayload,
         .show_status = unexpectedNoPayload,
         .attach_image = unexpectedPayload,
         .manage_images = unexpectedPayload,

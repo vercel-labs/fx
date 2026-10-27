@@ -2673,6 +2673,39 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   writing a role drops its old key. **Why:** the names say what the role
   is for in plain English. **Alternative:** keeping proto's names, which
   read as slang and as a speed rather than a kind of work.
+- **D221 Decision:** `/model`, Ctrl+P and `/provider` open one model hub,
+  after proto's `model-hub.ts`: a sidebar of Roles, All models, each
+  provider (signed in first) and Web search beside the scope's list, on
+  the catalog-menu alternate screen. All models lists the active
+  provider's catalog with every other signed-in provider's declared
+  models; typing searches them fuzzily, Enter uses the highlighted model
+  (switching provider first when it belongs to another), Ctrl+R assigns
+  it to a role and Ctrl+T picks a thinking level with it. Roles shows
+  each role's assignment or its fallback; Enter picks a model for it, x
+  clears it, c and [ ] edit `cycle_order`. A provider shows its sign-in
+  state; Enter on a signed-out one runs `/login` for it and Backspace
+  signs out of a saved key. Names are shown, never settings keys. Hub
+  state and its snapshot live in `src/core/model_hub/`; the screen in
+  `src/ui/model_hub/` only reads them. `/login` keeps its columns;
+  `/provider` no longer opens them. **Why:** proto's hub is one place for
+  models, roles and providers, and proto-fx's `/provider` only printed a
+  notice in a detached session. **Alternative:** extending the inline
+  `/model` menu, which has no room for a sidebar or a role table.
+- **D222 Decision:** the hub saves `cycle_order` whole when a role joins,
+  leaves or moves in the Alt+P cycle, and swaps the role table in memory
+  as `/role` does (D173). **Why:** the cycle is one ordered list.
+  **Alternative:** a per-role flag, which loses the order.
+- **D223 Decision:** an edit to the web search list saves `web_search.order`
+  as every provider in the order the hub shows and `web_search.exclude`
+  as the ones turned off, keeping the object's other keys. **Why:** the
+  saved order is then exactly what the hub showed. **Alternative:** saving
+  only the moved provider, which reorders the rest on the next load.
+- **D224 Decision:** `/login <provider> [method]` and `/provider <provider>`
+  reach their handlers when typed whole, pasted or recalled: `/login`
+  walks the same columns Enter would, and `/provider` opens the hub on
+  that provider. **Why:** the columns only follow keystrokes, so pasted
+  text fell through to "Unknown command". **Alternative:** keeping the
+  router blind to arguments, which leaves pasting broken.
 
 ## Design Risks And Failure Behavior
 

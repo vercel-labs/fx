@@ -4,6 +4,7 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
 const question_prompt = @import("../agent/question_prompt.zig");
 const app_auth_runtime = @import("app_auth_runtime.zig");
+const model_hub_runtime = @import("model_hub_runtime.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_workspace_runtime = @import("app_workspace_runtime.zig");
@@ -868,6 +869,9 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
 
+            if (comptime model_hub_runtime.supported(App)) {
+                if (try model_hub_runtime.Runtime(App).routeByte(app, byte)) return;
+            }
             if (comptime runtime_profile.allows(App, .native_auth)) {
                 if (try app_auth_runtime.Runtime(App).routeAuthPickerByte(app, byte)) return;
             }
@@ -934,6 +938,10 @@ pub fn Runtime(comptime App: type) type {
             switch (resolved) {
                 .remapped_byte, .paste_start, .paste_end, .ignore, .escape => {},
                 else => _ = disarmEscapeInterrupt(app, "semantic_action"),
+            }
+
+            if (comptime model_hub_runtime.supported(App)) {
+                if (try model_hub_runtime.Runtime(App).routeAction(app, resolved)) return .done;
             }
 
             if (resolved == .escape) {
@@ -2021,6 +2029,12 @@ pub fn Runtime(comptime App: type) type {
         fn openModelBrowseCatalog(app: *App) !void {
             if (comptime !@hasField(App, "model_cache")) return;
             if (comptime @hasField(App, "skills")) app.skills.closeMenu();
+            if (comptime model_hub_runtime.supported(App)) {
+                // Bare `/model` opens the model hub (D221).
+                app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+                return model_hub_runtime.Runtime(App).open(app, .models, "");
+            }
             try openModelMenu(app);
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
@@ -2032,6 +2046,8 @@ pub fn Runtime(comptime App: type) type {
         /// verbatim when the picker closes, whether a model was picked or not.
         fn openModelPickerShortcut(app: *App) !void {
             if (comptime !@hasField(App, "model_cache")) return;
+            // The hub leaves the composer alone, so no draft needs keeping.
+            if (comptime model_hub_runtime.supported(App)) return model_hub_runtime.Runtime(App).open(app, .models, "");
             if (app.input_runtime.model_picker_draft != null) {
                 // Unreachable through the keyboard (Ctrl+P backs out of an
                 // active flow first); recover a stranded draft rather than

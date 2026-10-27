@@ -1,0 +1,324 @@
+//! What the model hub shows (D221): every provider fx knows with its
+//! sign-in state, the models of each signed-in provider, the role table and
+//! the web search bank, copied into one arena when the hub opens or after a
+//! change. The hub's state and its renderer read this snapshot; nothing in
+//! it is borrowed from the live app.
+
+const std = @import("std");
+const model_roles = @import("../config/model_roles.zig");
+const types = @import("../shared/types.zig");
+
+const Allocator = std.mem.Allocator;
+const Role = model_roles.Role;
+
+/// How a provider signs in, which picks what the hub offers for it.
+pub const SignIn = enum {
+    /// The `/login` flow for the provider: a browser, a key, or both.
+    login,
+    /// Nothing to sign in to: settings describe the endpoint and its key.
+    settings,
+    /// Signed in outside fx, as Codex and Grok subscriptions are.
+    external,
+};
+
+pub const Provider = struct {
+    /// The provider's settings key. Used to act on it, never shown.
+    key: []const u8,
+    /// The name shown.
+    name: []const u8,
+    /// One line on how it is signed in, or how to sign in.
+    detail: []const u8,
+    signed_in: bool,
+    /// The session's provider.
+    active: bool,
+    sign_in: SignIn,
+    /// A saved key or login that sign out removes.
+    can_sign_out: bool,
+    /// False for a provider whose catalog only loads once it is active.
+    models_known: bool = true,
+    model_count: usize = 0,
+};
+
+pub const Model = struct {
+    provider: u16,
+    /// The model's ID, used to select it; shown only when it has no name.
+    id: []const u8,
+    /// The name shown: the catalog's name, else the ID.
+    name: []const u8,
+    context_window: ?u32 = null,
+    /// `auto` is always offered; these follow it.
+    efforts: []const types.ReasoningEffort = &.{},
+    current: bool = false,
+    /// Roles that pick this model, in table order.
+    roles: []const Role = &.{},
+};
+
+pub const RoleRow = struct {
+    role: Role,
+    /// The model the profile assigns, as shown; null when unset.
+    assigned: ?[]const u8 = null,
+    /// What the role resolves to now, through its fallbacks.
+    resolved: ?[]const u8 = null,
+    /// The fallback chain when nothing is assigned, as shown.
+    chain: []const u8 = "",
+    /// Position in `cycle_order`, from 1.
+    cycle_position: ?usize = null,
+};
+
+pub const WebSearchRow = struct {
+    /// The provider's settings ID, used to save the order, never shown.
+    id: []const u8,
+    name: []const u8,
+    excluded: bool,
+    ready: bool,
+};
+
+pub const Snapshot = struct {
+    arena: std.heap.ArenaAllocator,
+    providers: []Provider = &.{},
+    models: []Model = &.{},
+    roles: []RoleRow = &.{},
+    cycle: []Role = &.{},
+    web_search: []WebSearchRow = &.{},
+    /// The session's reasoning effort; null when the session does not
+    /// report it, as a detached one does not.
+    effort: ?types.ReasoningEffort = null,
+    /// The active provider's catalog is still loading.
+    loading: bool = false,
+
+    pub fn init(alloc: Allocator) Snapshot {
+        return .{ .arena = .init(alloc) };
+    }
+
+    pub fn deinit(self: *Snapshot) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    pub fn providerName(self: *const Snapshot, index: u16) []const u8 {
+        return if (index < self.providers.len) self.providers[index].name else "";
+    }
+
+    pub fn currentModel(self: *const Snapshot) ?usize {
+        for (self.models, 0..) |model, index| if (model.current) return index;
+        return null;
+    }
+
+    pub fn roleRow(self: *const Snapshot, role: Role) ?*const RoleRow {
+        for (self.roles) |*row| if (row.role == role) return row;
+        return null;
+    }
+};
+
+/// The role's name for people.
+pub fn roleName(role: Role) []const u8 {
+    return switch (role) {
+        .default => "Default",
+        .small => "Small",
+        .deep => "Deep",
+        .worker => "Worker",
+        .tiny => "Tiny",
+        .review => "Review",
+        .title => "Title",
+        .compact => "Compact",
+        .designer => "Designer",
+        .commit => "Commit",
+        .advisor => "Advisor",
+    };
+}
+
+/// The order roles are listed in, as proto lists its built-in roles first.
+pub const role_order = [_]Role{ .default, .small, .deep, .worker, .tiny, .review, .title, .compact, .designer, .commit, .advisor };
+
+/// Builds a snapshot. Every string is copied into the snapshot's arena.
+pub const Builder = struct {
+    snapshot: Snapshot,
+    providers: std.ArrayList(Provider) = .empty,
+    models: std.ArrayList(Model) = .empty,
+    roles: std.ArrayList(RoleRow) = .empty,
+    web_search: std.ArrayList(WebSearchRow) = .empty,
+
+    pub fn init(alloc: Allocator) Builder {
+        return .{ .snapshot = .init(alloc) };
+    }
+
+    pub fn deinit(self: *Builder) void {
+        self.snapshot.deinit();
+    }
+
+    pub fn arena(self: *Builder) Allocator {
+        return self.snapshot.arena.allocator();
+    }
+
+    pub fn dupe(self: *Builder, text: []const u8) ![]const u8 {
+        return self.arena().dupe(u8, text);
+    }
+
+    /// Adds a provider; returns its index for its models.
+    pub fn addProvider(self: *Builder, provider: Provider) !u16 {
+        var copy = provider;
+        copy.key = try self.dupe(provider.key);
+        copy.name = try self.dupe(provider.name);
+        copy.detail = try self.dupe(provider.detail);
+        try self.providers.append(self.arena(), copy);
+        return @intCast(self.providers.items.len - 1);
+    }
+
+    /// Adds a model unless its provider already lists that ID.
+    pub fn addModel(self: *Builder, model: Model) !void {
+        for (self.models.items) |existing| {
+            if (existing.provider == model.provider and std.mem.eql(u8, existing.id, model.id)) return;
+        }
+        var copy = model;
+        copy.id = try self.dupe(model.id);
+        copy.name = try self.dupe(if (model.name.len > 0) model.name else model.id);
+        copy.efforts = try self.arena().dupe(types.ReasoningEffort, model.efforts);
+        copy.roles = try self.arena().dupe(Role, model.roles);
+        try self.models.append(self.arena(), copy);
+        self.providers.items[model.provider].model_count += 1;
+    }
+
+    pub fn addRole(self: *Builder, row: RoleRow) !void {
+        var copy = row;
+        if (row.assigned) |text| copy.assigned = try self.dupe(text);
+        if (row.resolved) |text| copy.resolved = try self.dupe(text);
+        copy.chain = try self.dupe(row.chain);
+        try self.roles.append(self.arena(), copy);
+    }
+
+    pub fn addWebSearch(self: *Builder, row: WebSearchRow) !void {
+        var copy = row;
+        copy.id = try self.dupe(row.id);
+        copy.name = try self.dupe(row.name);
+        try self.web_search.append(self.arena(), copy);
+    }
+
+    /// Orders providers signed in first, then by name, and models by
+    /// provider and name, then hands the snapshot over.
+    pub fn finish(self: *Builder, cycle: []const Role) !Snapshot {
+        const a = self.arena();
+        const count = self.providers.items.len;
+        const order = try a.alloc(u16, count);
+        for (order, 0..) |*slot, index| slot.* = @intCast(index);
+        std.mem.sort(u16, order, self.providers.items, providerBefore);
+        // Remap model provider indices to the sorted order.
+        const remap = try a.alloc(u16, count);
+        const sorted = try a.alloc(Provider, count);
+        for (order, 0..) |old, new| {
+            remap[old] = @intCast(new);
+            sorted[new] = self.providers.items[old];
+        }
+        for (self.models.items) |*model| model.provider = remap[model.provider];
+        self.snapshot.providers = sorted;
+        std.mem.sort(Model, self.models.items, self.snapshot.providers, modelBefore);
+        self.snapshot.models = self.models.items;
+        self.snapshot.roles = self.roles.items;
+        self.snapshot.web_search = self.web_search.items;
+        self.snapshot.cycle = try a.dupe(Role, cycle);
+        const result = self.snapshot;
+        self.* = .{ .snapshot = .init(result.arena.child_allocator) };
+        return result;
+    }
+};
+
+fn providerBefore(providers: []const Provider, a: u16, b: u16) bool {
+    const left = providers[a];
+    const right = providers[b];
+    if (left.signed_in != right.signed_in) return left.signed_in;
+    return std.ascii.lessThanIgnoreCase(left.name, right.name);
+}
+
+fn modelBefore(providers: []const Provider, a: Model, b: Model) bool {
+    // Models holding a role lead, as in proto's browser.
+    const a_roles = a.roles.len > 0;
+    const b_roles = b.roles.len > 0;
+    if (a_roles != b_roles) return a_roles;
+    if (a.provider != b.provider) return std.ascii.lessThanIgnoreCase(providers[a.provider].name, providers[b.provider].name);
+    return std.ascii.lessThanIgnoreCase(a.name, b.name);
+}
+
+/// A fuzzy match score for `query` against `text`, or null when the query's
+/// characters do not all appear in order. Higher is better: consecutive
+/// characters and matches at word starts score more.
+pub fn fuzzyScore(text: []const u8, query: []const u8) ?u32 {
+    if (query.len == 0) return 0;
+    var score: u32 = 0;
+    var position: usize = 0;
+    var previous: ?usize = null;
+    for (query) |raw| {
+        if (raw == ' ') continue;
+        const needle = std.ascii.toLower(raw);
+        var found: ?usize = null;
+        while (position < text.len) : (position += 1) {
+            if (std.ascii.toLower(text[position]) == needle) {
+                found = position;
+                break;
+            }
+        }
+        const at = found orelse return null;
+        score += 1;
+        if (previous != null and previous.? + 1 == at) score += 4;
+        if (at == 0 or !std.ascii.isAlphanumeric(text[at - 1])) score += 3;
+        previous = at;
+        position = at + 1;
+    }
+    // The query as one piece beats scattered letters, more so at a word start.
+    if (findIgnoreCase(text, query)) |at| {
+        score += 64;
+        if (at == 0 or !std.ascii.isAlphanumeric(text[at - 1])) score += 32;
+    }
+    // Shorter texts rank above longer ones with the same matches.
+    return score * 64 -| @as(u32, @intCast(@min(text.len, 63)));
+}
+
+fn findIgnoreCase(text: []const u8, query: []const u8) ?usize {
+    if (query.len == 0 or query.len > text.len) return null;
+    var index: usize = 0;
+    while (index + query.len <= text.len) : (index += 1) {
+        if (std.ascii.eqlIgnoreCase(text[index..][0..query.len], query)) return index;
+    }
+    return null;
+}
+
+/// The text a model matches against: provider, name and ID.
+pub fn modelSearchScore(snapshot: *const Snapshot, model: Model, query: []const u8) ?u32 {
+    const trimmed = std.mem.trim(u8, query, " \t");
+    if (trimmed.len == 0) return 0;
+    var best: ?u32 = null;
+    for ([_][]const u8{ model.name, model.id }) |text| {
+        if (fuzzyScore(text, trimmed)) |score| best = @max(best orelse 0, score + 16);
+    }
+    var buf: [256]u8 = undefined;
+    const joined = std.mem.print(&buf, "{s} {s}", .{ snapshot.providerName(model.provider), model.name }) catch model.name;
+    if (fuzzyScore(joined, trimmed)) |score| best = @max(best orelse 0, score);
+    return best;
+}
+
+test "fuzzy scores prefer consecutive and word-start matches" {
+    try std.testing.expect(fuzzyScore("claude-cento", "cc") != null);
+    try std.testing.expect(fuzzyScore("claude-cento", "xz") == null);
+    try std.testing.expect(fuzzyScore("claude-cento", "cento").? > fuzzyScore("claude-cento", "cdeno").?);
+    try std.testing.expect(fuzzyScore("gpt-5", "gpt").? > fuzzyScore("a-long-gpt-model-name", "gpt").?);
+    // A whole-word match beats letters scattered through a shorter name.
+    try std.testing.expect(fuzzyScore("claude-cento-lite", "lite").? > fuzzyScore("ling-3.0-tiny-free", "lite").?);
+}
+
+test "the builder orders signed-in providers first and remaps their models" {
+    var builder: Builder = .init(std.testing.allocator);
+    defer builder.deinit();
+    const zen = try builder.addProvider(.{ .key = "opencode-zen", .name = "OpenCode Zen", .detail = "", .signed_in = false, .active = false, .sign_in = .login, .can_sign_out = false });
+    const cento = try builder.addProvider(.{ .key = "cento", .name = "cento", .detail = "", .signed_in = true, .active = true, .sign_in = .settings, .can_sign_out = false });
+    try builder.addModel(.{ .provider = zen, .id = "glm", .name = "" });
+    try builder.addModel(.{ .provider = cento, .id = "claude-cento", .name = "Claude Cento", .roles = &.{.default} });
+    try builder.addModel(.{ .provider = cento, .id = "claude-cento", .name = "dupe" });
+    var snapshot = try builder.finish(&.{ .deep, .default });
+    defer snapshot.deinit();
+    try std.testing.expectEqualStrings("cento", snapshot.providers[0].name);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.providers[0].model_count);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.models.len);
+    try std.testing.expectEqualStrings("Claude Cento", snapshot.models[0].name);
+    try std.testing.expectEqual(@as(u16, 0), snapshot.models[0].provider);
+    try std.testing.expectEqualStrings("glm", snapshot.models[1].name);
+    try std.testing.expectEqual(@as(u16, 1), snapshot.models[1].provider);
+    try std.testing.expectEqualSlices(Role, &.{ .deep, .default }, snapshot.cycle);
+}

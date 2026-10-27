@@ -121,10 +121,17 @@ pub const UserSettingsPatch = struct {
     notification_max: ?bool = null,
     /// Sets or clears one `model_roles` entry (D170).
     model_role: ?ModelRolePatch = null,
+    /// Replaces `cycle_order` (D222).
+    cycle_order: ?[]const model_roles.Role = null,
+    /// Replaces `web_search.order` and `web_search.exclude`, keeping the
+    /// object's other keys (D223).
+    web_search: ?WebSearchPatch = null,
 
     fn isEmpty(self: UserSettingsPatch) bool {
         return self.connections_json == null and self.model_preference == null and
             self.model_role == null and
+            self.cycle_order == null and
+            self.web_search == null and
             self.provider == null and
             self.permission_mode == null and
             self.credential_source == null and
@@ -144,6 +151,11 @@ pub const UserSettingsPatch = struct {
             self.notification_attention_required == null and
             self.notification_max == null;
     }
+};
+
+pub const WebSearchPatch = struct {
+    order: []const []const u8,
+    exclude: []const []const u8,
 };
 
 /// `value` null removes the role's entry.
@@ -935,6 +947,11 @@ fn validateUserPatch(patch: UserSettingsPatch) !void {
     if (patch.model_role) |role_patch| if (role_patch.value) |value| {
         model_roles.validateRef(value) catch return error.InvalidDurableField;
     };
+    if (patch.cycle_order) |order| if (order.len > model_roles.role_count) return error.InvalidDurableField;
+    if (patch.web_search) |web_search| for ([_][]const []const u8{ web_search.order, web_search.exclude }) |list| {
+        if (list.len > 32) return error.InvalidDurableField;
+        for (list) |id| if (!validateProviderSlug(id)) return error.InvalidDurableField;
+    };
 }
 
 fn validAdditionalDirectoryPath(path: []const u8) bool {
@@ -1001,6 +1018,28 @@ test "model role patch sets and clears one model_roles entry" {
     try std.testing.expect(!application.changed);
     try validateKnownSettingsObject(root.object, false);
     try std.testing.expectError(error.InvalidDurableField, validateUserPatch(.{ .model_role = .{ .role = .small, .value = "bad\nref" } }));
+}
+
+test "cycle order and web search patches replace their lists and keep other keys" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), "{\"web_search\":{\"searxng_url\":\"http://s\",\"order\":[\"exa\"]}}", .{});
+    defer parsed.deinit();
+    var root = parsed.value;
+    var application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .cycle_order = &.{ .small, .deep } });
+    try std.testing.expect(application.changed);
+    const cycle = root.object.get("cycle_order").?.array.items;
+    try std.testing.expectEqualStrings("small", cycle[0].string);
+    try std.testing.expectEqualStrings("deep", cycle[1].string);
+    application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .web_search = .{ .order = &.{ "duckduckgo", "exa" }, .exclude = &.{"brave"} } });
+    try std.testing.expect(application.changed);
+    const web_search = root.object.get("web_search").?.object;
+    try std.testing.expectEqualStrings("http://s", web_search.get("searxng_url").?.string);
+    try std.testing.expectEqualStrings("duckduckgo", web_search.get("order").?.array.items[0].string);
+    try std.testing.expectEqualStrings("brave", web_search.get("exclude").?.array.items[0].string);
+    try validateKnownSettingsObject(root.object, false);
+    try std.testing.expectError(error.InvalidDurableField, validateUserPatch(.{ .web_search = .{ .order = &.{"bad id"}, .exclude = &.{} } }));
 }
 
 test "collapse tool calls user patch writes the profile preference" {
@@ -1117,6 +1156,18 @@ fn applyUserPatchToRoot(
         } else if (roles.object.orderedRemove(role_patch.role.label())) {
             application.changed = true;
         }
+    }
+    if (patch.cycle_order) |order| {
+        var names: [model_roles.role_count][]const u8 = undefined;
+        for (order, 0..) |role, index| names[index] = role.label();
+        application.changed = try putStringArray(arena, &root.object, "cycle_order", names[0..order.len]) or application.changed;
+    }
+    if (patch.web_search) |web_search| {
+        if (!root.object.contains("web_search")) try root.object.put(arena, "web_search", .{ .object = .empty });
+        const object = root.object.getPtr("web_search").?;
+        if (object.* != .object) return error.InvalidSettingsFormat;
+        application.changed = try putStringArray(arena, &object.object, "order", web_search.order) or application.changed;
+        application.changed = try putStringArray(arena, &object.object, "exclude", web_search.exclude) or application.changed;
     }
     if (patch.provider) |value| application.changed = try putString(arena, &root.object, "provider", value.label()) or application.changed;
     if (patch.permission_mode) |value| application.changed = try putString(arena, &root.object, "permission_mode", @tagName(value)) or application.changed;

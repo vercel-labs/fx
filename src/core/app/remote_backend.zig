@@ -411,7 +411,7 @@ pub fn Runtime(comptime App: type) type {
             handlers.handle_kernel = commandKernel;
             handlers.login = commandLogin;
             handlers.logout = commandLogout;
-            handlers.provider = commandGatewayAccount;
+            handlers.provider = commandProvider;
             handlers.show_credits = commandGatewayAccount;
             handlers.show_usage = commandGatewayAccount;
             handlers.submit_feedback = commandGatewayAccount;
@@ -458,8 +458,19 @@ pub fn Runtime(comptime App: type) type {
 
         /// `/login` opens the provider picker for the built-in API providers;
         /// the key it saves is the profile's, which the host reads (D147).
-        fn commandLogin(ctx: *anyopaque) !void {
-            try app_auth_runtime.Runtime(App).runLoginCommand(appFrom(ctx));
+        fn commandLogin(ctx: *anyopaque, rest: []const u8) !void {
+            const app = appFrom(ctx);
+            if (comptime @hasDecl(App, "runLoginWithArgs")) {
+                if (std.mem.trim(u8, rest, " \t").len > 0) return app.runLoginWithArgs(rest);
+            }
+            try app_auth_runtime.Runtime(App).runLoginCommand(app);
+        }
+
+        /// `/provider` opens the model hub on the providers (D221).
+        fn commandProvider(ctx: *anyopaque, rest: []const u8) !void {
+            const app = appFrom(ctx);
+            if (comptime @hasDecl(App, "openModelHub")) return app.openModelHub(.providers, rest);
+            try commandGatewayAccount(ctx);
         }
 
         fn commandLogout(ctx: *anyopaque, rest: []const u8) !void {

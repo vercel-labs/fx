@@ -528,9 +528,9 @@ pub const slash_specs = [_]SlashSpec{
 
     .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .accepts_payload = true },
     .{ .kind = .fork_session, .command = "/fork", .help_entry = "/fork", .completion_description = "fork the session before a prompt", .presentation_category = .session },
-    .{ .kind = .login, .command = "/login", .help_entry = "/login", .completion_description = "choose the model provider and how it signs in", .presentation_category = .account, .has_args = true },
+    .{ .kind = .login, .command = "/login", .help_entry = "/login [provider [method]]", .completion_description = "sign in to a provider", .presentation_category = .account, .has_args = true, .accepts_payload = true },
     .{ .kind = .logout, .command = "/logout", .help_entry = "/logout [codex|grok]", .completion_description = "sign out of a provider session", .presentation_category = .account, .has_args = true, .accepts_payload = true },
-    .{ .kind = .provider, .command = "/provider", .aliases = &.{"/setup"}, .help_entry = "/provider (/setup)", .completion_description = "choose the model provider and how it signs in", .presentation_category = .account, .has_args = true },
+    .{ .kind = .provider, .command = "/provider", .aliases = &.{"/setup"}, .help_entry = "/provider [provider] (/setup)", .completion_description = "providers, sign-in and web search in the model hub", .presentation_category = .account, .has_args = true, .accepts_payload = true },
     .{ .kind = .stats, .command = "/stats", .help_entry = "/stats", .completion_description = "show token and turn statistics", .presentation_category = .account },
     .{ .kind = .usage, .command = "/usage", .aliases = &.{}, .help_entry = "/usage", .completion_description = "show your provider's usage and spend", .presentation_category = .account },
     .{ .kind = .status, .command = "/status", .help_entry = "/status", .completion_description = "show runtime configuration and the session ID", .presentation_category = .general, .show_in_welcome = true },

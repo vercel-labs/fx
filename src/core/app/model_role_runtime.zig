@@ -94,6 +94,21 @@ pub const State = struct {
         self.retired.appendAssumeCapacity(self.table);
         self.table = next;
     }
+
+    /// Replaces `cycle_order` (D222).
+    pub fn setCycle(self: *State, alloc: Allocator, order: []const Role) !void {
+        if (order.len > model_roles.role_count) return error.InvalidCycleOrderValue;
+        var next = try self.table.dupe(alloc);
+        errdefer next.deinit(alloc);
+        @memcpy(next.cycle[0..order.len], order);
+        next.cycle_len = order.len;
+        next.has_cycle = true;
+        try self.retired.ensureUnusedCapacity(alloc, 1);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.retired.appendAssumeCapacity(self.table);
+        self.table = next;
+    }
 };
 
 /// What role resolution needs from its host: the TUI app, `fx ask`, or
@@ -268,20 +283,33 @@ pub fn Runtime(comptime App: type) type {
             return assign(app, role, value_text);
         }
 
-        /// Saves `role` in the profile and applies it.
-        pub fn assign(app: *App, role: Role, value: ?[]const u8) !void {
+        /// Saves `role` in the profile and applies it, without a notice.
+        /// False when the reference was refused or the save failed; the
+        /// notice saying why is written.
+        pub fn save(app: *App, role: Role, value: ?[]const u8) !bool {
             if (value) |text| model_roles.validateRef(text) catch {
-                return app.writeDomainNotice(.{ .topic = "role", .tone = .@"error", .body = "That is not a model reference." }, true);
+                try app.writeDomainNotice(.{ .topic = "role", .tone = .@"error", .body = "That is not a model reference." }, true);
+                return false;
             };
             const owned = if (value) |text| try app.alloc.dupe(u8, text) else null;
             defer if (owned) |bytes| app.alloc.free(bytes);
             var attempt = config_runtime.attemptUserPreferences(app.alloc, .{ .model_role = .{ .role = role, .value = owned } });
             defer attempt.deinit(app.alloc);
             switch (attempt) {
-                .failure => |failure| return session_commands.reportUserSettingsFailure(app, "role", failure.err, failure.cleanup, false),
+                .failure => |failure| {
+                    try session_commands.reportUserSettingsFailure(app, "role", failure.err, failure.cleanup, false);
+                    return false;
+                },
                 .outcome => {},
             }
             try app.model_roles.assign(app.alloc, role, owned);
+            return true;
+        }
+
+        /// Saves `role` in the profile and applies it.
+        pub fn assign(app: *App, role: Role, value: ?[]const u8) !void {
+            if (!try save(app, role, value)) return;
+            const owned = value;
             const body = if (owned) |text|
                 try app.alloc.print("{s} → {s}", .{ role.label(), text })
             else

@@ -44,6 +44,7 @@ const ui_input = @import("../../ui/input/runtime.zig");
 const input_visual_layout = @import("../../ui/input/visual_layout.zig");
 const registered_entities = @import("../input/registered_entities.zig");
 const approval_screen = @import("../../ui/approval_screen.zig");
+const model_hub_screen = @import("../../ui/model_hub/screen.zig");
 const full_transcript_screen = @import("../../ui/full_transcript_screen.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const render_engine = @import("../../ui/render_engine.zig");
@@ -136,6 +137,8 @@ const SurfaceFrameShell = struct {
 const RenderReconciliation = union(enum) {
     inline_render: InlineRenderReconciliation,
     file_approval_screen,
+    /// The model hub owns the catalog-menu alternate screen (D221).
+    model_hub_screen,
     frame_result: FrameAttemptResult,
 };
 
@@ -1227,6 +1230,18 @@ pub fn Runtime(comptime App: type) type {
                 },
             }
 
+            if (!question_active and approval == null and modelHubActive(app)) {
+                if (try app_lifecycle.closeFullTranscriptIfActive(
+                    app.alloc,
+                    &app.terminal,
+                    &app.shell,
+                    &app.metrics,
+                )) {
+                    try requestNormalViewportRecovery(app);
+                }
+                return .model_hub_screen;
+            }
+
             if (!question_active and approval == null and (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(app) or forkMenuActive(app) or effortMenuActive(app))) {
                 if (try app_lifecycle.closeFullTranscriptIfActive(
                     app.alloc,
@@ -1278,6 +1293,7 @@ pub fn Runtime(comptime App: type) type {
             const render_reconciliation = switch (try reconcileBeforeFrameRender(app, render_input.steeringBannerRows(footer_ctx, app.shell.layout.cols))) {
                 .inline_render => |inline_render| inline_render,
                 .file_approval_screen => return renderApprovalScreen(app),
+                .model_hub_screen => return renderModelHubScreen(app),
                 .frame_result => |result| return result,
             };
             const presentation_commits_transcript = !render_reconciliation.alternate_screen_owns_rendering;
@@ -2025,6 +2041,38 @@ pub fn Runtime(comptime App: type) type {
         fn skillsMenuActive(app: *const App) bool {
             if (comptime @hasField(App, "skills")) return app.skills.menuVisible();
             return false;
+        }
+
+        fn modelHubActive(app: *const App) bool {
+            if (comptime @hasField(App, "model_hub") and @hasField(App, "terminal")) return app.model_hub.active;
+            return false;
+        }
+
+        /// Paints the model hub on the catalog-menu alternate screen. Every
+        /// frame rewrites each row; a size change clears the screen first.
+        /// Closing the hub leaves the screen on the next frame, which
+        /// restores the main grid and composer (AGENTS.md catalog menus).
+        fn renderModelHubScreen(app: *App) !FrameAttemptResult {
+            if (comptime !@hasField(App, "model_hub") or !@hasField(App, "terminal")) unreachable;
+            const entering = !app.terminal.catalogMenuScreenActive();
+            app_lifecycle.enterCatalogMenuScreen(&app.terminal, &app.shell, &app.metrics) catch |err| {
+                debug_trace.logf("model_hub", "screen_enter_failed err={s}", .{@errorName(err)});
+                app.model_hub.close(app.alloc);
+                return err;
+            };
+            const layout = app.shell.layout;
+            if (app.shell.shadow_vt) |grid| {
+                if (grid.cols != layout.cols or grid.rows != layout.rows) try grid.resize(layout.cols, layout.rows);
+            }
+            const resized = app.model_hub.painted_rows != layout.rows or app.model_hub.painted_cols != layout.cols;
+            var painted = try model_hub_screen.paint(app.alloc, &app.model_hub, layout.rows, layout.cols, entering or resized);
+            defer painted.deinit(app.alloc);
+            try app_lifecycle.writeLifecycleTerminalBytes(&app.shell, &app.metrics, painted.bytes);
+            app.model_hub.painted_rows = layout.rows;
+            app.model_hub.painted_cols = layout.cols;
+            app.model_hub.window_start = painted.window_start;
+            if (painted.visible_rows > 0) app.model_hub.visible_rows = painted.visible_rows;
+            return .{ .shadow_state = .committed, .animation_visible = false };
         }
 
         fn modelMenuActive(app: *const App) bool {

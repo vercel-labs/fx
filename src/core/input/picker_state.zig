@@ -141,6 +141,9 @@ const FileListingWait = struct {
 /// Owns layout-independent composer picker state. Call `deinit` with the
 /// allocator used by `beginModelPickerFlow`.
 pub const State = struct {
+    /// Set by a host where `/provider` opens the model hub (D221): only
+    /// `/login ` then opens the provider columns.
+    provider_command_opens_hub: bool = false,
     slash_completion_index: usize = 0,
     slash_completion_window_start: usize = 0,
     inline_picker_suppression: ?InlinePickerSuppression = null,
@@ -242,7 +245,7 @@ pub const State = struct {
         if (self.provider_picker_stage == .provider) return;
         if (self.rawProviderPickerQuery(editor) != null) return;
         const trimmed = editor.input.items[leadingWhitespaceLen(editor.input.items)..];
-        if (providerPickerPrefixLen(trimmed) == null) return;
+        if (providerPickerPrefixLen(trimmed, self.provider_command_opens_hub) == null) return;
         self.clearProviderPickerFlow();
     }
 
@@ -337,7 +340,7 @@ pub const State = struct {
         const items = editor.input.items;
         const trim_start = leadingWhitespaceLen(items);
         const trimmed = items[trim_start..];
-        const prefix_len = providerPickerPrefixLen(trimmed) orelse return null;
+        const prefix_len = providerPickerPrefixLen(trimmed, self.provider_command_opens_hub) orelse return null;
 
         const stage = self.provider_picker_stage;
         if (stage == .provider) return .{
@@ -642,8 +645,23 @@ fn modelPickerTokenStart(trimmed: []const u8, model: []const u8, stage: ModelPic
     return skipPickerSpaces(trimmed, effort_end);
 }
 
-fn providerPickerPrefixLen(trimmed: []const u8) ?usize {
+test "a host whose /provider opens the model hub keeps the columns for /login only" {
+    const alloc = std.testing.allocator;
+    var editor: editor_state.State = .{};
+    defer editor.deinit(alloc);
+    var state: State = .{ .provider_command_opens_hub = true };
+    defer state.deinit(alloc);
+    try editor.setText(alloc, "/provider open");
+    try std.testing.expect(state.activeProviderPickerQuery(&editor) == null);
+    try editor.setText(alloc, "/setup open");
+    try std.testing.expect(state.activeProviderPickerQuery(&editor) == null);
+    try editor.setText(alloc, "/login open");
+    try std.testing.expect(state.activeProviderPickerQuery(&editor) != null);
+}
+
+fn providerPickerPrefixLen(trimmed: []const u8, login_only: bool) ?usize {
     for (provider_picker_prefixes) |prefix| {
+        if (login_only and !std.mem.eql(u8, prefix, login_prefix)) continue;
         if (trimmed.len < prefix.len) continue;
         if (std.ascii.eqlIgnoreCase(trimmed[0..prefix.len], prefix)) return prefix.len;
     }

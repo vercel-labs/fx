@@ -443,8 +443,11 @@ pub fn Handlers(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        fn commandLogin(ctx: *anyopaque) !void {
+        fn commandLogin(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasDecl(App, "runLoginWithArgs")) {
+                if (std.mem.trim(u8, rest, " \t").len > 0) return app.runLoginWithArgs(rest);
+            }
             if (comptime @hasDecl(App, "runLoginCommand")) {
                 try app.runLoginCommand();
             } else {
@@ -469,8 +472,9 @@ pub fn Handlers(comptime App: type) type {
             }
         }
 
-        fn commandProvider(ctx: *anyopaque) !void {
+        fn commandProvider(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasDecl(App, "openModelHub")) return app.openModelHub(.providers, rest);
             if (comptime @hasDecl(App, "runProviderCommand")) {
                 try app.runProviderCommand();
             } else {

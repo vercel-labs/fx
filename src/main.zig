@@ -11,6 +11,9 @@ pub const version = "0.0.14";
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
 const model_role_runtime = @import("core/app/model_role_runtime.zig");
+const model_hub = @import("core/model_hub/hub.zig");
+const model_hub_runtime = @import("core/app/model_hub_runtime.zig");
+const provider_picker_runtime = @import("core/app/provider_picker_runtime.zig");
 const auth_runtime = @import("core/auth/auth_runtime.zig");
 const api_key_validator = @import("core/auth/api_key_validator.zig");
 const oauth_transport = @import("core/auth/oauth_transport.zig");
@@ -634,6 +637,8 @@ const App = struct {
     review_model: []u8 = &.{},
     /// Profile model roles (D170).
     model_roles: model_role_runtime.State = .{},
+    /// The model hub `/model` and `/provider` open (D221).
+    model_hub: model_hub.State = .{},
     diff_entries: std.ArrayList(@import("core/output/diff.zig").DiffEntry) = .empty,
     next_diff_id: u32 = 1,
 
@@ -709,6 +714,8 @@ const App = struct {
         // The native binary always drives a supervisor session; the libfx
         // terminal runs its agent in process.
         if (comptime !host_target.is_wasm) app.backend = .detached;
+        // `/provider` opens the model hub; `/login` keeps the columns (D221).
+        app.input_runtime.picker.provider_command_opens_hub = comptime model_hub_runtime.supported(App);
         try BootstrapAppRuntime.bootstrap(
             &app,
             footer_rows,
@@ -1053,6 +1060,7 @@ const App = struct {
         };
         self.terminal_client.deinit();
         self.managed_executions.deinit();
+        self.model_hub.deinit(self.alloc);
         self.model_cache.deinit();
         self.usage_dashboard.deinit();
         InputSubmitRuntime.clearPendingSubmission(self, "shutdown");
@@ -1239,6 +1247,16 @@ const App = struct {
                 return true;
             },
         }
+    }
+
+    /// Opens the model hub (D221) at its models or its providers.
+    pub fn openModelHub(self: *App, start: model_hub.Start, args: []const u8) !void {
+        try model_hub_runtime.Runtime(App).open(self, start, args);
+    }
+
+    /// `/login <provider> [method]` typed whole (D224).
+    pub fn runLoginWithArgs(self: *App, args: []const u8) !void {
+        try provider_picker_runtime.Runtime(App).openLogin(self, args);
     }
 
     pub fn runLogoutCommand(self: *App, target: []const u8) !void {
@@ -3121,6 +3139,7 @@ const App = struct {
         );
 
         if (try self.model_cache.pollLoadTransition()) {
+            try model_hub_runtime.Runtime(App).refresh(self);
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
         if (try app_commands.Handlers(App).collectUsageDashboardFacts(self)) {
@@ -5160,6 +5179,8 @@ test {
     _ = @import("builtins/web_search_bank.zig");
     _ = @import("core/cli/cli_search.zig");
     _ = @import("core/ttsr/ttsr.zig");
+    _ = @import("core/model_hub/hub.zig");
+    _ = @import("ui/model_hub/screen.zig");
     _ = @import("core/cli/cli_ttsr.zig");
     _ = @import("core/output/ttsr_snapshot.zig");
     _ = @import("core/output/web_search_snapshot.zig");

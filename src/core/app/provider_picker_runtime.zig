@@ -402,6 +402,48 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// `/login <provider> [method]` typed whole, pasted or recalled from
+        /// history: walks the columns Enter would, so the outcome matches
+        /// picking each one (D224). The model hub's sign-in uses it too.
+        /// Writes a notice and returns when the words name nothing.
+        pub fn openLogin(app: *App, args: []const u8) !void {
+            if (comptime !supported(App)) return;
+            var words = std.mem.tokenizeAny(u8, args, " \t");
+            const provider_word = words.next() orelse return;
+            const provider = provider_catalog.parse(provider_word) orelse
+                return unknownLoginWord(app, "provider", provider_word);
+            if (comptime @hasDecl(App, "presetLoginOnly")) {
+                if (app.presetLoginOnly() and provider != .configured) return unknownLoginWord(app, "provider", provider_word);
+            }
+            const slug = provider_catalog.find(provider).slug;
+            const methods = provider_picker_catalog.providerMethods(provider);
+            const method_word = words.next();
+            if (method_word) |word| {
+                const method = provider_picker_catalog.parseMethod(word) orelse return unknownLoginWord(app, "sign-in method", word);
+                if (std.mem.findScalar(provider_picker_catalog.Method, methods, method) == null) return unknownLoginWord(app, "sign-in method", word);
+            }
+            if (methods.len == 0) {
+                try commit(app, .{ .provider = provider });
+                return;
+            }
+            const prefix = picker_state.login_prefix;
+            if (method_word) |word| {
+                try setComposerText(app, "{s}{s} {s}", .{ prefix, slug, word });
+                try app.input_runtime.picker.beginProviderPickerFlow(app.alloc, slug, "", .method);
+                _ = try submit(app);
+                return;
+            }
+            try setComposerText(app, "{s}{s} ", .{ prefix, slug });
+            try app.input_runtime.picker.beginProviderPickerFlow(app.alloc, slug, "", .method);
+            app.shell.render_requests.request(.footer);
+        }
+
+        fn unknownLoginWord(app: *App, what: []const u8, word: []const u8) !void {
+            const body = try app.alloc.print("No {s} named {s}. Type /login to pick one.", .{ what, word });
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{ .topic = "auth", .tone = .@"error", .body = body }, true);
+        }
+
         /// Opens one of the api-key stages under the `api-key` argument: the
         /// which-key list, or the masked entry field (whose bytes the auth
         /// runtime owns; the composer only carries the breadcrumb).

@@ -660,6 +660,31 @@ pub const Runtime = struct {
         return try model_catalog.projectModelIds(alloc, self.catalog.items);
     }
 
+    /// One catalog model for the model hub (D221).
+    pub const HubEntry = struct {
+        id: []const u8,
+        name: []const u8,
+        context_window: ?u32,
+        efforts: []const types.ReasoningEffort,
+    };
+
+    /// The ready catalog copied into `arena`, or null while it loads or
+    /// after it failed.
+    pub fn snapshotForHub(self: *Self, arena: Allocator) !?[]HubEntry {
+        self.finishThreadIfDone();
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.state != .ready) return null;
+        const entries = try arena.alloc(HubEntry, self.catalog.items.len);
+        for (self.catalog.items, entries) |entry, *out| out.* = .{
+            .id = try arena.dupe(u8, entry.id),
+            .name = try arena.dupe(u8, entry.name orelse ""),
+            .context_window = if (entry.context_window > 0) entry.context_window else null,
+            .efforts = try arena.dupe(types.ReasoningEffort, entry.reasoning_efforts.items),
+        };
+        return entries;
+    }
+
     pub fn metadataForModel(self: *Self, model: []const u8) ?model_capabilities.GatewayMetadata {
         self.finishThreadIfDone();
         self.mutex.lockUncancelable(io_mod.getIo());
