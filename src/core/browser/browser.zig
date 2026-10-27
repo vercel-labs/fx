@@ -11,6 +11,7 @@ const io_mod = @import("../shared/io.zig");
 const cdp = @import("cdp.zig");
 const launch = @import("launch.zig");
 const websocket = @import("websocket.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
@@ -100,16 +101,22 @@ pub const Browser = struct {
     pub fn close(self: *Browser) void {
         const alloc = self.alloc;
         self.conn.cancel = null;
-        if (!self.conn.closed) {
-            for (self.tabs.items) |tab| {
-                if (tab.owned) self.closeTarget(tab.target_id);
-            }
-            self.dropController();
-            if (self.backend == .launched) {
-                // A graceful close lets the browser flush its profile first.
-                self.conn.sendIgnored(null, "Browser.close", "") catch {};
-                _ = self.conn.waitEvent(null, "Never.happens", 300) catch {};
-            }
+        if (!self.conn.closed) switch (self.backend) {
+            // The whole browser stops; asking it to close lets it flush its
+            // profile first, and its process group goes down after.
+            .launched => self.conn.sendIgnored(null, "Browser.close", "") catch {},
+            // Someone else's browser keeps running: close only fx's tabs.
+            .connected => {
+                for (self.tabs.items) |tab| {
+                    if (tab.owned) self.closeTarget(tab.target_id);
+                }
+                self.dropController();
+            },
+        };
+        if (self.controller) |controller| {
+            alloc.free(controller.target_id);
+            alloc.free(controller.session_id);
+            self.controller = null;
         }
         for (self.tabs.items) |tab| {
             tab.deinit(alloc);

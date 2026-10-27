@@ -2599,6 +2599,73 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   before changing its configuration", which no command could do.
   **Alternative:** opening the session with the provider named in the
   create request, which the supervisor protocol does not carry.
+- **D195 Decision:** the browser tool speaks the Chrome DevTools Protocol
+  natively: a small RFC 6455 WebSocket client and a CDP connection that
+  matches answers by id and counts each tab's navigations and loads as
+  events arrive (`src/core/browser/`). `run` executes the model's
+  JavaScript in a hidden controller page of the same browser, not in the
+  driven page and not in Node; each `tab` call reaches proto-fx through a
+  `Runtime.addBinding` binding, and proto-fx answers it after doing the
+  work with trusted input events, `Runtime.callFunctionOn` on resolved
+  elements, the accessibility tree, or a screenshot. A script keeps running
+  across the page's navigations; `waitForNavigation` and `waitForUrl` are
+  deferred waits the run loop settles, so starting one before a click
+  works. A run past its timeout, or cancelled, closes the controller,
+  which ends the script. The tab API keeps proto's names; `page` and
+  `browser` puppeteer objects do not exist and `tab.evaluate` runs in the
+  page's main world. **Why:** proto-fx has no Node runtime, and a browser
+  page is a JavaScript engine already. **Alternative:** evaluating the
+  script inside the driven page, which a form submit would destroy
+  mid-script.
+
+- **D196 Decision:** the backend is, in order, `app.cdp_url` on `open`,
+  the profile's `browser.cdp_url` or `FX_BROWSER_CDP_URL` (an
+  `http://host:port` endpoint asked for `/json/version`, or a `ws://`
+  URL), then a local Chromium-family browser launched headless:
+  `browser.executable` or `FX_BROWSER_EXECUTABLE`, installed Chrome,
+  Chromium, Brave or Edge, then the newest Playwright or Puppeteer cache,
+  a full browser before a headless shell. The tool is advertised only
+  when one of these exists, checked once per process. proto's relay
+  extension, cmux surfaces and Electron `app.path` attach are not ported;
+  `app.path` is refused with that reason. **Why:** the endpoints proto-fx
+  can reach without Node or an extension. **Alternative:** downloading
+  Chrome for Testing on first use as proto does, which needs a network
+  installer.
+
+- **D197 Decision:** a session node's browser lives in its session
+  runtime beside the Python kernel (`browser_slot.Slot`): attach and
+  detach never change it, and the session closing or resetting closes
+  fx's tabs, the controller, the connection, and a launched browser's
+  process group, then deletes its temporary profile. A launched browser
+  leads its own process group and is recorded in the profile's
+  `browser/` folder with its and its owner's start tokens; the next launch
+  kills the group and deletes the profile of a record whose owner is gone.
+  Closing the last tab of a launched browser stops it; a connected browser
+  is only detached and its own tabs are never closed. A worker's host that
+  closes past its idle TTL (D96) closes its browser with it, as it releases
+  its kernel; the browser is a leaf resource of the host, so
+  `NodeHosts.tla` is unchanged. **Why:** no orphaned browsers, even after
+  a crash. **Alternative:** one browser shared by the
+  process, which would outlive the session that opened it.
+
+- **D198 Decision:** `open` with an http(s) URL answers to web_fetch's
+  domain rules and grants (`domain:<host>`), as read_file URLs do (D161),
+  and like `close` runs without approval; other schemes are refused.
+  `run` executes code that can submit forms and navigate, so it needs
+  approval in `ask` mode and one security review in `auto` mode, which
+  sees the exact arguments including the script. **Why:** opening a page
+  reads like a fetch; a script acts. **Alternative:** reviewing every
+  open, which adds a review to every page read.
+
+- **D199 Decision:** `tab.screenshot()` captures JPEG at most 1024 pixels
+  on its longest side, saves it to `browser.screenshot_dir` or the
+  temporary folder, returns the path, and attaches up to three images per
+  run to the tool result for the model. Transcript rows read "Opened
+  example.com", and a settled run by what its script did ("Filled
+  #email, clicked Register +2") with its first lines and output tail
+  under it like a command. **Why:** proto's screenshots and browser
+  cells in proto-fx's row style. **Alternative:** returning only paths,
+  which a vision model cannot see.
 
 ## Design Risks And Failure Behavior
 

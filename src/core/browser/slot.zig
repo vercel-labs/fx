@@ -5,6 +5,7 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const browser_mod = @import("browser.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 
 pub const Browser = browser_mod.Browser;
 
@@ -32,7 +33,10 @@ pub const Slot = struct {
 
     /// Closes the browser while the caller holds the lock.
     pub fn closeLocked(self: *Slot) void {
-        if (self.browser) |browser| browser.close();
+        if (self.browser) |browser| {
+            debug_trace.logf("browser", "event=close label={s} tabs={d}", .{ browser.label, browser.tabs.items.len });
+            browser.close();
+        }
         self.browser = null;
     }
 };

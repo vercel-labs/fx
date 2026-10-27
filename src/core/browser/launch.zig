@@ -11,6 +11,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const memory = @import("../kernel/memory.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -205,21 +206,37 @@ pub const Process = struct {
     ws_url: []u8,
     record_path: ?[]u8 = null,
     exe: []u8,
+    /// Stops the browser if fx dies without closing it.
+    sentinel: ?std.process.Child = null,
+
+    /// Waits up to `timeout_ms` for the browser and every helper in its
+    /// group to exit, reaping the browser when it does.
+    fn awaitGone(self: *Process, timeout_ms: i64) bool {
+        const deadline = io_mod.monotonicMilliTimestamp() + timeout_ms;
+        while (true) {
+            if (self.child.id) |pid| {
+                var status: c_int = 0;
+                if (std.c.waitpid(pid, &status, std.c.W.NOHANG) == pid) self.child.id = null;
+            }
+            if (self.child.id == null and !groupAlive(self.pid)) return true;
+            if (io_mod.monotonicMilliTimestamp() >= deadline) return false;
+            io_mod.sleep(10 * std.time.ns_per_ms);
+        }
+    }
 
     /// Stops the browser and its helpers, reaps it, and removes its profile
     /// and record. Safe to call once.
     pub fn stop(self: *Process, alloc: Allocator) void {
         const io = io_mod.getIo();
-        // The browser leads its own process group; signal the group so no
-        // renderer or GPU helper outlives it.
-        std.posix.kill(-self.pid, .TERM) catch {};
-        const deadline = io_mod.monotonicMilliTimestamp() + 2000;
-        while (io_mod.monotonicMilliTimestamp() < deadline) {
-            if (!groupAlive(self.pid)) break;
-            io_mod.sleep(20 * std.time.ns_per_ms);
+        if (self.sentinel) |*sentinel| sentinel.kill(io);
+        // A browser asked to close gets a moment; then the group it leads is
+        // signalled, so no renderer or GPU helper outlives it.
+        if (!self.awaitGone(1000)) {
+            std.posix.kill(-self.pid, .TERM) catch {};
+            if (!self.awaitGone(1000)) std.posix.kill(-self.pid, .KILL) catch {};
         }
-        std.posix.kill(-self.pid, .KILL) catch {};
-        self.child.kill(io);
+        if (self.child.id != null) self.child.kill(io);
+        debug_trace.logf("browser", "event=stopped pid={d}", .{self.pid});
         removeTree(self.profile_dir);
         if (self.record_path) |path| {
             std.Io.Dir.cwd().deleteFile(io, path) catch {};
@@ -300,8 +317,35 @@ pub fn launch(alloc: Allocator, options: LaunchOptions) LaunchError!Process {
     const exe = alloc.dupe(u8, options.exe) catch return error.OutOfMemory;
     var process: Process = .{ .child = child, .pid = pid, .profile_dir = profile, .ws_url = ws_url, .exe = exe };
     stopped = true;
+    process.sentinel = spawnSentinel(@intCast(std.c.getpid()), pid, profile);
     if (options.registry_dir) |dir| process.record_path = writeRecord(alloc, dir, pid, profile) catch null;
     return process;
+}
+
+/// The sentinel's script: while the owner lives it waits; then it stops the
+/// browser's process group and deletes its profile. Arguments: owner pid,
+/// browser process group, profile folder.
+const sentinel_script =
+    \\while kill -0 "$1" 2>/dev/null; do sleep 1; done
+    \\kill -TERM -"$2" 2>/dev/null; sleep 2; kill -KILL -"$2" 2>/dev/null
+    \\case "$3" in *proto-fx-browser-*) rm -rf "$3";; esac
+;
+
+/// Starts a small `/bin/sh` that stops the browser when `owner` exits, so a
+/// killed fx leaves no browser behind (D197). Null when it cannot start;
+/// the record still lets the next launch reap the browser.
+pub fn spawnSentinel(owner: std.posix.pid_t, pgid: std.posix.pid_t, profile: []const u8) ?std.process.Child {
+    var owner_buf: [16]u8 = undefined;
+    var group_buf: [16]u8 = undefined;
+    const owner_text = std.mem.print(&owner_buf, "{d}", .{owner}) catch return null;
+    const group_text = std.mem.print(&group_buf, "{d}", .{pgid}) catch return null;
+    return std.process.spawn(io_mod.getIo(), .{
+        .argv = &.{ "/bin/sh", "-c", sentinel_script, "proto-fx-browser-sentinel", owner_text, group_text, profile },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = 0,
+    }) catch null;
 }
 
 /// What a record says: the browser, its owner, and its profile.
@@ -459,6 +503,18 @@ test "browser DevToolsActivePort names the browser websocket" {
     try std.testing.expectEqualStrings("ws://127.0.0.1:53211/devtools/browser/0b1c", url);
     try std.testing.expect((try parseActivePort(alloc, "53211\n")) == null);
     try std.testing.expect((try parseActivePort(alloc, "x\n/devtools\n")) == null);
+}
+
+test "a browser sentinel stops the browser's group once its owner exits" {
+    const io = std.testing.io;
+    var owner = try std.process.spawn(io, .{ .argv = &.{ "/bin/sleep", "1" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+    var group = try std.process.spawn(io, .{ .argv = &.{ "/bin/sleep", "30" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .pgid = 0 });
+    var sentinel = spawnSentinel(owner.id.?, group.id.?, "/nonexistent/proto-fx-browser-test").?;
+    _ = try owner.wait(io);
+    // The group's leader exits on TERM within the sentinel's poll interval.
+    const term = try group.wait(io);
+    try std.testing.expect(term == .signal);
+    _ = try sentinel.wait(io);
 }
 
 test "browser orphan records of a dead owner are reaped and live owners are kept" {

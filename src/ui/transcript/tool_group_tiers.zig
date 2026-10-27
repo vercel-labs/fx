@@ -534,6 +534,8 @@ fn appendBrowserBody(arena: Allocator, rows: *std.ArrayList(Row), entry_id: u32,
     var out_split = std.mem.splitScalar(u8, output, '\n');
     while (out_split.next()) |raw| {
         const line = visibleLine(raw);
+        // The saved-images notice is for the model, not the person.
+        if (std.mem.startsWith(u8, line, "Saved images: ")) continue;
         if (std.mem.trim(u8, line, " \t").len > 0) try tail.append(arena, line);
     }
     if (tail.items.len == 0) return;

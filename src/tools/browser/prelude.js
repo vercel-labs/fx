@@ -68,7 +68,11 @@
       extract: (format) => t("extract", { format: format || "markdown" }),
       text: (selector) => (selector === undefined ? t("extract", { format: "text" }) : onTarget("text", selector)),
       html: (selector) => (selector === undefined ? t("html") : onTarget("html", selector)),
-      screenshot: (o) => t("screenshot", optionsOf(o)),
+      screenshot: (o) => {
+        if (optionsOf(o).path !== undefined)
+          throw new Error("tab.screenshot() takes no path; it saves the image itself and returns the saved path, which you can copy");
+        return t("screenshot", optionsOf(o));
+      },
       click: (selector, o) => onTarget("click", selector, optionsOf(o)),
       dblclick: (selector, o) => onTarget("click", selector, Object.assign({ count: 2 }, optionsOf(o))),
       hover: (selector, o) => onTarget("hover", selector, optionsOf(o)),

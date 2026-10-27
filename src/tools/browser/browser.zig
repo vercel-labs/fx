@@ -219,7 +219,9 @@ fn open(ctx: DispatchContext, slot: *slot_mod.Slot, input: *Input, settings: *br
             if (!same) return .{ .failure = try alloc.print("this session's browser is {s}; close it with {{\"action\":\"close\",\"all\":true}} before connecting to {s}", .{ b.label, wanted }) };
         }
     } else {
-        slot.browser = startBrowser(alloc, requested_cdp, settings, ctx.cancel_flag) catch |err| return .{ .failure = try startFailure(alloc, err, requested_cdp) };
+        // The browser outlives this call, so it takes the session's allocator,
+        // never the call's arena.
+        slot.browser = startBrowser(ctx.lifecycle_allocator, requested_cdp, settings, ctx.cancel_flag) catch |err| return .{ .failure = try startFailure(alloc, err, requested_cdp) };
         slot.browser.?.conn.cancel = ctx.cancel_flag;
     }
     const browser = slot.browser.?;

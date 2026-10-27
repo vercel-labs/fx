@@ -980,6 +980,9 @@ const App = struct {
         // The worker mutates session state, so it stops before persistence.
         if (self.worker_thread) |thread| thread.join();
         shutdown_trace.mark("worker_thread_joined");
+        // A browser the session launched is a child process: stop it (D197).
+        self.session.browser.deinit();
+        shutdown_trace.mark("browser_closed");
         WorkerAppRuntime.settleFinishedPromptsForShutdown(self) catch |err| {
             SessionAppRuntime.recordShutdownFailure(self, err);
         };
