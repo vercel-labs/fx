@@ -310,7 +310,8 @@ pub const AgentRuntimeDeps = struct {
     /// run real sessions turn it on; tests and embedders stay without rules.
     ttsr_enabled: bool = false,
     /// Resolves the model roles an `llm:` rule condition names, in order, to
-    /// a model id. Null, or a null answer, uses the session's own model.
+    /// a model id. Null, or a null answer, uses the session's own model. The
+    /// terminal, `ask` and ACP resolve them through model roles (D207).
     resolve_judge_model: ?*const fn (ctx: *anyopaque, roles: []const []const u8) ?[]const u8 = null,
     report_inner_tool_usage: ?*const fn (ctx: *anyopaque, tool_name: []const u8, usage: types.ToolUsage) void = null,
     // Accent for the +N / -N counts in a committed file's status line.

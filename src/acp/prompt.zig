@@ -2011,6 +2011,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .agent_stream_provider = server.streamProviderFor(ctx.state, ctx.state.active_session.?.provider),
         .report_usage = reportUsage,
         .ttsr_enabled = !std_builtin.is_test,
+        .resolve_judge_model = resolveJudgeModel,
         .flush_assistant_stream_per_content_chunk = host_target.is_wasm,
         .render_assistant_text = false,
         .tool_registry = ctx.toolRegistry(),
@@ -2280,6 +2281,14 @@ fn resolveModelCapabilities(
 /// Subagent model overrides resolve against the same catalog the capability
 /// path uses. The resolve loads the catalog on first use; only cancellation
 /// or an unavailable catalog falls back to raw passthrough.
+/// A stream rule judge's model: the first of the rule's roles that resolves
+/// (D207). Null keeps the session's model.
+fn resolveJudgeModel(raw_ctx: *anyopaque, roles: []const []const u8) ?[]const u8 {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*active| active else return null;
+    return server.roleHost(ctx.state, session).judgeModel(roles);
+}
+
 fn resolveModelRole(raw_ctx: ?*anyopaque, name: []const u8) @import("../core/subagent/tool_host.zig").ModelRoleResolver.Lookup {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx.?));
     const session = if (ctx.state.active_session) |*active| active else return .unavailable;

@@ -6,8 +6,8 @@
 //! a judge spends at most `max_judgements` model calls, so a pathological
 //! rule cannot turn every step into a model call. The host supplies the
 //! model call through `Completer`, which resolves the rule's roles to a
-//! model; until model roles exist the host answers with the session's own
-//! model.
+//! model through the profile's model roles, or answers with the session's
+//! own model when none of them resolves (D207).
 const std = @import("std");
 const evaluate = @import("evaluate.zig");
 

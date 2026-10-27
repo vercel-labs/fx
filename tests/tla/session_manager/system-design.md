@@ -2425,6 +2425,17 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   title. **Alternative:** requiring `reviewer_model`, which few
   definitions set.
 
+- **D207 Decision:** the terminal, `ask` and ACP bind
+  `resolve_judge_model` (D182) to model roles: a judge takes the first of
+  the rule's roles (`tiny`, `smol` by default, as proto's
+  `ttsr-judge.ts`) that resolves on the session's provider, following
+  each role's fallback, so an unset `tiny` reaches `smol` and then the
+  provider's own low-cost model; with none, the session's model answers.
+  A role naming another provider does not resolve. `proto-fx ttsr test`
+  still never calls a model: `--llm` would need `ask`'s credential and
+  provider startup. **Why:** proto's judge selection. **Alternative:**
+  always the session's model, which spends the large model on yes or no.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

@@ -15,6 +15,7 @@ const input_completion_runtime = @import("input_completion_runtime.zig");
 const composer_stash = @import("../input/composer_stash.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
+const model_role_runtime = @import("model_role_runtime.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
@@ -376,6 +377,7 @@ pub fn Bindings(comptime App: type) type {
                 .report_usage = agentReportUsage,
                 // Stream rules run for real sessions; unit tests stay hermetic.
                 .ttsr_enabled = !@import("builtin").is_test,
+                .resolve_judge_model = if (comptime @hasField(App, "model_roles")) agentResolveJudgeModel else null,
                 .report_inner_tool_usage = agentReportInnerToolUsage,
                 .diff_marker_styles = .{
                     .added = ui_render.diff_added_marker_style,
@@ -1287,6 +1289,13 @@ pub fn Bindings(comptime App: type) type {
         fn agentPushCommandOutputComplete(ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app_worker_runtime.Runtime(App).pushCommandOutputComplete(app, lifecycle_id);
+        }
+
+        /// A stream rule judge's model: the first of the rule's roles that
+        /// resolves (D207). Null keeps the session's model.
+        fn agentResolveJudgeModel(ctx: *anyopaque, roles: []const []const u8) ?[]const u8 {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            return model_role_runtime.host(app).judgeModel(roles);
         }
 
         fn agentPushHttpError(ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {

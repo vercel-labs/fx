@@ -1889,7 +1889,8 @@ fn maybeStartAskTitleTask(
     const session_id = ctx.activeSessionId() orelse return null;
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
     const role_title = if (ctx.role_startup) |startup| startup.roleModel(.title, bundle.title_model) else null;
-    const title_model = role_title orelse bundle.title_model orelse return null;
+    // As in the daemon, the session's model titles when nothing cheaper is set (D206).
+    const title_model = role_title orelse bundle.title_model orelse if (ctx.model.len != 0) ctx.model else return null;
     const agent_stream = bundle.agent_stream orelse return null;
     const excerpt = session_title_generation.promptExcerpt(prompt) orelse return null;
     // A configured provider resolves its own credential (D168) or, without
@@ -2012,6 +2013,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .context_registry = ctx.deps.context_registry,
         .context_enabled = ctx.context_enabled,
         .ttsr_enabled = !@import("builtin").is_test,
+        .resolve_judge_model = resolveJudgeModel,
         .finalize_turn = finalizeTurn,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .append_runtime_context = appendRuntimeContext,
@@ -2155,6 +2157,19 @@ fn availableModelCapabilities(raw_ctx: *anyopaque, model: []const u8) model_capa
 /// Subagent model overrides resolve against the same catalog the capability
 /// path uses. The resolve loads the catalog on first use; only cancellation
 /// or an unavailable catalog falls back to raw passthrough.
+/// A stream rule judge's model: the first of the rule's roles that resolves
+/// (D207). Null keeps the session's model.
+fn resolveJudgeModel(raw_ctx: *anyopaque, roles: []const []const u8) ?[]const u8 {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    const startup = ctx.role_startup orelse return null;
+    const bundle = ctx.cfg.provider_set.select(ctx.provider);
+    for (roles) |name| {
+        const role = model_roles.Role.parse(name) orelse continue;
+        if (startup.roleModel(role, bundle.title_model)) |model| return model;
+    }
+    return null;
+}
+
 fn resolveModelRole(raw_ctx: ?*anyopaque, name: []const u8) subagent_tool_host.ModelRoleResolver.Lookup {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx.?));
     const role = model_roles.Role.parse(name) orelse return .unknown_role;

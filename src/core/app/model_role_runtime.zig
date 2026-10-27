@@ -152,6 +152,17 @@ pub const Host = struct {
         return self.resolve(.compact) orelse "";
     }
 
+    /// A stream rule judge's model: the first of `roles` (proto's `tiny`,
+    /// `smol` by default) that resolves on this provider (D207). Null leaves
+    /// the session's model to answer.
+    pub fn judgeModel(self: Host, roles: []const []const u8) ?[]const u8 {
+        for (roles) |name| {
+            const role = Role.parse(name) orelse continue;
+            if (self.resolve(role)) |model| return model;
+        }
+        return null;
+    }
+
     /// Resolves a fleet worker's `@role` model request.
     pub fn lookup(self: Host, name: []const u8) Lookup {
         const role = Role.parse(name) orelse return .unknown_role;
@@ -390,4 +401,18 @@ test "a provider without a low-cost model titles with the session's model" {
     try std.testing.expectEqualStrings("gpt-main", view.titleModel().?);
     view.current_model = "@default";
     try std.testing.expect(view.titleModel() == null);
+}
+
+test "a judge takes the first of its roles that resolves" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    try state.init(alloc, .{}, "codex", "main");
+    const view: Host = .{ .state = &state, .provider = .codex, .current_model = "gpt-main", .set = .{ .gateway = .{}, .codex = .{}, .grok = .{} } };
+    // No role set and no low-cost model: the session's model answers.
+    try std.testing.expect(view.judgeModel(&.{ "tiny", "smol" }) == null);
+    try state.assign(alloc, .smol, "codex-mini");
+    try std.testing.expectEqualStrings("codex-mini", view.judgeModel(&.{ "tiny", "smol" }).?);
+    try state.assign(alloc, .review, "codex-strict");
+    try std.testing.expectEqualStrings("codex-strict", view.judgeModel(&.{ "nope", "review", "smol" }).?);
 }
