@@ -25,6 +25,7 @@ const result_store = @import("../session/result_store.zig");
 const slot_pool = @import("slot_pool.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tree_mod = @import("tree.zig");
+const turn_jobs = @import("turn_jobs.zig");
 const node_hosts = @import("node_hosts.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
@@ -73,6 +74,7 @@ test {
     _ = @import("node_ops.zig");
     _ = @import("slot_pool.zig");
     _ = @import("tree.zig");
+    _ = @import("turn_jobs.zig");
 }
 
 test "managed execution receipts retain the pending contract" {
@@ -189,6 +191,8 @@ pub const Runtime = struct {
     admission_mutex: std.Io.Mutex = .init,
     yielded_mutex: std.Io.Mutex = .init,
     yielded: std.ArrayList(YieldedWork) = .empty,
+    /// The turn jobs of this node's workers (D101).
+    fleet: turn_jobs.Ledger,
 
     const YieldedWork = struct { child_id: []u8, work_id: []u8, max_result_bytes: usize, result: ?ManagedExecutionResult = null, delivered: bool = false };
     pub const YieldedResult = struct { child_id: []const u8, work_id: []const u8, body: []const u8, max_result_bytes: usize, delivered: bool, receipt_sequence: u64 = 0 };
@@ -260,6 +264,7 @@ pub const Runtime = struct {
             .approvals = &options.tree.approvals,
             .authority_resolver = undefined,
             .managed = undefined,
+            .fleet = turn_jobs.Ledger.init(alloc),
         };
         runtime.node_path = options.node_path orelse (&runtime.tree.root_id)[0..1];
         runtime.authority_resolver = .{
@@ -309,6 +314,7 @@ pub const Runtime = struct {
         self.cancelYielded();
         self.yielded.deinit(self.alloc);
         self.managed.deinit();
+        self.fleet.deinit();
         if (self.owns_tree) self.tree.destroy();
         self.alloc.free(self.node_id);
         const alloc = self.alloc;
