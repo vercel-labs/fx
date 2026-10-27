@@ -37,7 +37,7 @@ const Allocator = std.mem.Allocator;
 pub const ToolSpec = tool_specs.ToolSpec;
 
 const read_file_description =
-    "Read one file with bounded line-numbered output and optional start_line/line_count range. UTF-8 text returns as numbered lines; image files (PNG, JPEG, GIF, WebP up to 3.9MB) attach to the result for inspection. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. Use when: inspect an exact known path before editing or explaining code, or view an image file. Do not use when: list directories or search many files (use the shell tool instead), or read non-image binary data.";
+    "Read a file, directory, archive, database, document, notebook, image, web page or internal resource at path, with bounded line-numbered output. Append a selector to path: :N-M, :N+K, :N-, comma lists such as :5-9,40-60, or :raw for unnumbered text (start_line/line_count also work). Code files longer than the read cap return a structural summary when no range is given; read folded ranges with path:N-M and never guess them. A directory lists two levels with ignore rules applied. archive.zip:member reads a zip, tar or tar.gz member; .gz decompresses. db.sqlite lists tables; db.sqlite:table, :table:key, ?where=, ?limit= and ?q=SELECT read rows read-only. PDF, docx, pptx, xlsx and epub convert to text; .ipynb shows cells with outputs; PNG, JPEG, GIF and WebP up to 3.9MB attach for inspection. http(s) URLs return reader-mode text as untrusted content under web_fetch policy. history://, agent:// and skill://<name>[/file] open internal resources. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. Use when: inspect known paths, pages or data before editing or explaining. Do not use when: searching many files (use the shell tool instead).";
 const write_file_description =
     "Create or overwrite a file using complete contents. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. Use when: add a new file or intentionally replace an entire file that is generated or small. Do not use when: targeted edits to existing files, partial replacements, deleting files, or unapproved external paths.";
 const edit_file_description =
@@ -158,7 +158,7 @@ pub const read_file = ToolSpec{
         .description = read_file_description,
         .input_schema = .{
             .properties = &.{
-                .{ .name = "path", .json_type = .string, .description = "File path relative to the workspace root, or an external path using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy." },
+                .{ .name = "path", .json_type = .string, .description = "Path relative to the workspace root, an external path (absolute, ~/..., or ../...), an http(s) URL, or an internal URL, with an optional selector suffix such as :10-40 or :raw; external access is subject to permission policy." },
                 .{ .name = "start_line", .json_type = .integer, .description = "Optional 1-based first line to return. Defaults to 1." },
                 .{ .name = "line_count", .json_type = .integer, .description = "Optional positive number of lines to return. Defaults to the normal read cap and is bounded." },
             },
@@ -889,7 +889,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "b55470fd5cf8e2ee8a815d02e58849d18bff9157fc8e93564b17f83f98a78199",
+        "21d7156ac6a73c705e942da5465df8f21f5cb6d384af8bf999dc9a631d3b1f22",
         &actual_hex,
     );
 }

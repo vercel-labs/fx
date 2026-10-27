@@ -358,10 +358,11 @@ fn prepareRegisteredApplicableTargets(
         };
     };
     defer permission_targets.deinit(alloc);
-    // `history://` and `agent://` are nodes of the session tree: no folder
-    // holds project instructions for them.
+    // Internal resources and web domains (a read_file URL's target) are not
+    // files: no folder holds project instructions for them.
     for (permission_targets.items) |target| {
-        if (@import("../recall/scheme.zig").isInternalUrl(target.path)) return .{ .prepared = @constCast(&.{}) };
+        if (@import("../recall/scheme.zig").isInternalUrl(target.path) or
+            std.mem.startsWith(u8, target.path, "domain:")) return .{ .prepared = @constCast(&.{}) };
     }
 
     const target_kind = filesystemTargetKind(tool.executor_kind);

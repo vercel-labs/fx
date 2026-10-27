@@ -1,5 +1,5 @@
 const std = @import("std");
-const internal_url = @import("../recall/scheme.zig");
+const read_paths = @import("../workspace/read_target.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const command_environment = @import("../execution/command_environment.zig");
@@ -204,9 +204,19 @@ pub fn permissionTargetForCall(
         },
         .path_existing => blk: {
             const path_arg = try tool_args.requiredStringArg(args, "path");
-            // `history://` and `agent://` name a node of this session tree,
-            // which read_file renders; there is no file to resolve.
-            if (std.mem.eql(u8, call.name, "read_file") and internal_url.isInternalUrl(path_arg)) break :blk arena.dupe(u8, path_arg);
+            if (std.mem.eql(u8, call.name, "read_file")) {
+                // `history://`, `agent://` and `skill://` name internal
+                // resources, which read_file renders; there is no file to
+                // resolve. A web URL answers to the web_fetch rules for its
+                // domain. Otherwise the file is the path before any selector,
+                // archive member or SQLite table (D161).
+                const target = read_paths.parse(std.mem.trim(u8, path_arg, " \t\r\n"));
+                switch (target.kind) {
+                    .internal => break :blk arena.dupe(u8, path_arg),
+                    .url => break :blk webFetchDomainTargetForUrl(arena, target.base),
+                    .file => break :blk try resolveFileToolPath(arena, workspace_root, call.name, target.base, .existing),
+                }
+            }
             break :blk try resolveFileToolPath(arena, workspace_root, call.name, path_arg, .existing);
         },
         .none => try arena.dupe(u8, call.name),
@@ -330,7 +340,8 @@ pub fn missingPathTargetForCallInScope(
     call: types.ToolCall,
 ) ![]const u8 {
     const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
-    const path_arg = try tool_args.requiredStringArg(args, "path");
+    const raw_path = try tool_args.requiredStringArg(args, "path");
+    const path_arg = if (std.mem.eql(u8, call.name, "read_file")) read_paths.filesystemPath(raw_path) else raw_path;
     return resolveFileToolPath(
         arena,
         scope.primary_directory,

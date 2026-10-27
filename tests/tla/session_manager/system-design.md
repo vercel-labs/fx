@@ -2095,6 +2095,60 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   does. **Why:** the person sees what ran around the code.
   **Alternative:** outlining only commands that are a single interpreter
   call.
+- **D160 Decision:** the read tool keeps the name `read_file` and grows
+  into proto's `read`: one entry point for files, directories, archives,
+  SQLite, documents, notebooks, images, web URLs and internal URLs. Each
+  kind becomes text that passes through the same numbered line window.
+  **Why:** saved sessions, permission rules (`read`), hooks, mods, the
+  Python harness and the transcript fold all name `read_file`; a rename
+  would break them for no change in behavior. **Alternative:** rename to
+  `read` with an alias, which would show two names in old and new
+  transcripts.
+
+- **D161 Decision:** `path` carries proto's suffixes: `:N`, `:N-`, `:N-M`,
+  `:N+K`, comma lists and `:raw`; `archive.zip:member` or
+  `archive.zip/member`; `db.sqlite:table[:key]` and `?q=`, `?where=`,
+  `?limit=`. One parser (`core/workspace/read_target.zig`) serves the
+  tool, the permission target and the row label, so the permission check
+  resolves exactly the file the tool opens. An http(s) path is decided by
+  the `web_fetch` rules and grants for its domain and fetched through
+  web_fetch, so its URL policy, cache and artifacts apply. A colon in a
+  URL's authority is a port, and a SQLite target takes no line selector,
+  since `:42` there names a row. **Why:** one meaning per string at every
+  layer. **Alternative:** extra schema fields per kind, which models fill
+  less reliably than proto's path forms.
+
+- **D162 Decision:** a code file longer than the read cap (400 lines by
+  default) read without a range returns a structural summary: bodies of
+  four or more lines and comments of six or more fold, a folded brace
+  body collapses onto one row, and the footer names the folded ranges.
+  Folding works from indentation, not a parser. Shorter files still come
+  back whole. **Why:** the old behavior showed only the first 400 lines,
+  and proto's summary shows the whole shape for the same budget.
+  **Alternative:** proto's 100-line threshold, which would replace whole
+  reads that fit the cap today.
+
+- **D163 Decision:** PDF, docx, pptx, xlsx, epub and SQLite convert
+  through one Python script. With a kernel slot it runs in the node's
+  pooled `fx-read` kernel, unsaved and apart from the user's namespace;
+  otherwise once as `python3 -I`, and SQLite falls back to
+  `sqlite3 -readonly`. Office formats and SQLite need only the standard
+  library; PDF uses pypdf or markitdown when installed and a rough
+  built-in extractor otherwise, with a clear message when it finds no
+  text. SQLite opens `mode=ro` with `query_only`, and `?q=` runs only
+  SELECT, WITH, PRAGMA and EXPLAIN. **Why:** a warm kernel answers later
+  reads fast, and no read can write. **Alternative:** converters in Zig,
+  which would duplicate what Python's standard library already parses.
+
+- **D164 Decision:** zip, tar and tar.gz read natively through `std.zip`,
+  `std.tar` and `std.compress.flate`, in memory, with members capped at
+  10 MiB; directories list two levels through the workspace indexer, so
+  git's ignore rules apply. `skill://<name>[/file]` reads through the
+  skill tool's loader. `proto-fx read <target> [--json]` runs the same
+  tool once with the person at the terminal as the authority. `local://`
+  is not offered: proto-fx has no session scratch store that write_file
+  could fill. **Why:** no extraction to disk and no new process for
+  listings. **Alternative:** shelling out to `unzip` and `tar`.
 
 ## Design Risks And Failure Behavior
 

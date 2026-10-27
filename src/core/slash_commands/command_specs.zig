@@ -35,6 +35,7 @@ pub const TopLevelKind = enum {
     replay,
     workspace,
     search,
+    read,
 };
 
 pub const SlashKind = enum {

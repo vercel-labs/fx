@@ -5131,6 +5131,8 @@ test {
     _ = @import("builtins/web_search_bank.zig");
     _ = @import("core/cli/cli_search.zig");
     _ = @import("core/output/web_search_snapshot.zig");
+    _ = @import("core/cli/cli_read.zig");
+    _ = @import("core/output/read_snapshot.zig");
     _ = @import("gateway/web_search.zig");
     _ = @import("gateway/web_search_types.zig");
     _ = @import("tools/web/content.zig");

@@ -314,6 +314,16 @@ pub const top_level_specs = [_]TopLevelSpec{
         },
     },
     .{
+        .kind = .read,
+        .token = "read",
+        .usage = "read <target> [--json]",
+        .summary = "Read a file, directory, archive, database, document or URL as the agent sees it",
+        .options = &.{json_option},
+        .details = &.{
+            "The target takes the same forms as the read_file tool: a path with an optional :N-M, :N+K or :raw selector, a directory, archive.zip:member, db.sqlite:table, a PDF or office document, a notebook, an http(s) URL, or history:// and agent:// inside a session.",
+        },
+    },
+    .{
         .kind = .workspace,
         .token = "workspace",
         .usage = "workspace [list|add PATH|remove PATH|clear] [--json]",
@@ -368,6 +378,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .workspace, .usage = "workspace" },
         .{ .kind = .update, .usage = "update" },
         .{ .kind = .search, .usage = "search <query>" },
+        .{ .kind = .read, .usage = "read <target>" },
         .{ .kind = .acp, .usage = "acp" },
         .{ .kind = .help, .usage = "help" },
     } },

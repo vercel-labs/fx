@@ -24,6 +24,7 @@ const permission_request = @import("../permissions/permission_request.zig");
 const permissions = @import("../permissions/permissions.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
 const tool_args = @import("tool_args.zig");
+const read_target = @import("../workspace/read_target.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
 const tool_presentation = @import("tool_presentation.zig");
@@ -162,6 +163,7 @@ fn isRunCommandCall(input: Input, arena: Allocator, call: ToolCall) !bool {
 fn permissionNameForCall(input: Input, arena: Allocator, call: ToolCall) ![]const u8 {
     const command_call = try isRunCommandCall(input, arena, call);
     if (command_call) return "run_command";
+    if (try isReadFileUrlCall(input, arena, call)) return permissions.web_fetch_permission;
     return if (std.mem.eql(u8, call.name, "shell")) "terminal" else call.name;
 }
 
@@ -170,10 +172,24 @@ fn permissionTargetKindForCall(
     arena: Allocator,
     call: ToolCall,
 ) !permissions.PermissionTargetKind {
+    if (try isReadFileUrlCall(input, arena, call)) return .none;
     return if (try isRunCommandCall(input, arena, call))
         .command_cwd
     else
         permissionTargetKind(input.tool_registry, call.name);
+}
+
+/// A built-in read_file call whose path is a web URL fetches like web_fetch,
+/// so web_fetch's permission rules and grants decide it (D161).
+fn isReadFileUrlCall(input: Input, arena: Allocator, call: ToolCall) !bool {
+    const tool = registeredTool(input, call.name) orelse return false;
+    if (tool.executor_kind != .read_file) return false;
+    const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    const path = tool_args.optionalStringArg(args, "path") orelse return false;
+    return read_target.isWebUrl(std.mem.trim(u8, path, " \t\r\n"));
 }
 
 fn registeredWebSearchTarget(input: Input, name: []const u8) ?[]const u8 {
@@ -5025,6 +5041,48 @@ test "permission rule display follows supplied registry metadata" {
         .arguments_json = "{\"path\":\"notes.txt\"}",
     }, .ask, &.{});
     try std.testing.expectEqual(ToolPermissionDecision.policy_denied, outcome.decision);
+}
+
+test "read_file URLs answer to web_fetch domain rules and selectors to the file's rules" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = "notes.txt", .data = "notes" });
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.workspace_root = workspace;
+    const tools = [_]tool_dispatch.Tool{test_builtin_tools.read_file};
+    input.tool_registry = .{ .tools = tools[0..] };
+    var rules = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("domain:blocked.example"), .action = .deny },
+        .{ .permission = @constCast("read"), .pattern = @constCast("notes.txt"), .action = .deny },
+    };
+    input.permission_rules = .{ .rules = rules[0..] };
+
+    const url = try requestPermissionOutcome(input, arena_state.allocator(), .{
+        .id = "url",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"https://blocked.example/page:1-20\"}",
+    }, .ask, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, url.decision);
+    const ranged = try requestPermissionOutcome(input, arena_state.allocator(), .{
+        .id = "ranged",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"notes.txt:1-2\"}",
+    }, .ask, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, ranged.decision);
+    const other = try requestPermissionOutcome(input, arena_state.allocator(), .{
+        .id = "other",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"https://open.example/\"}",
+    }, .ask, &.{});
+    try std.testing.expect(other.decision != ToolPermissionDecision.policy_denied);
 }
 
 test "automatic review receives exact command and mints matching one-call authority" {

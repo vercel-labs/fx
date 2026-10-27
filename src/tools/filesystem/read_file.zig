@@ -9,6 +9,9 @@ const core_types = @import("../../core/shared/types.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 const recall = @import("../../core/recall/recall.zig");
+const read_target = @import("../../core/workspace/read_target.zig");
+const router = @import("../read/router.zig");
+const summary = @import("../read/summary.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -27,6 +30,10 @@ pub const Input = struct {
     path: []u8,
     start_line: usize = 1,
     line_count: usize = tool_dispatch.default_max_read_file_lines,
+    /// Lines and raw mode picked by a `:N-M` or `:raw` suffix on `path`.
+    selector: read_target.Selector = .{},
+    /// start_line or line_count was given, so no structural summary applies.
+    explicit_range: bool = false,
 
     /// Frees the owned normalized path.
     pub fn deinit(self: *Input, alloc: Allocator) void {
@@ -62,12 +69,18 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
 
     switch (try parseOptionalPositive(ctx.allocator, parsed.value.object, "start_line")) {
         .missing => {},
-        .value => |value| input.start_line = value,
+        .value => |value| {
+            input.start_line = value;
+            input.explicit_range = true;
+        },
         .failure => |body| return .{ .failure = body },
     }
     switch (try parseOptionalPositive(ctx.allocator, parsed.value.object, "line_count")) {
         .missing => {},
-        .value => |value| input.line_count = @min(value, max_line_count),
+        .value => |value| {
+            input.line_count = @min(value, max_line_count);
+            input.explicit_range = true;
+        },
         .failure => |body| return .{ .failure = body },
     }
 
@@ -103,6 +116,11 @@ pub fn validate(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolIn
     if (input.path.len == 0) {
         return try ctx.allocator.dupe(u8, "read_file field \"path\" must not be empty");
     }
+    input.selector = read_target.parse(input.path).selector;
+    if (input.selector.range_count > 0) {
+        input.start_line = input.selector.ranges[0].start;
+        input.explicit_range = true;
+    }
     return null;
 }
 
@@ -120,19 +138,35 @@ fn replaceOwnedPath(alloc: Allocator, input: *Input, owned: []u8) void {
 /// Reads the validated file and returns an owned tool result body.
 pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const input = erased.as(Input);
-    if (recall.isInternalUrl(input.path)) return readInternalUrl(ctx, input);
+    const parsed = read_target.parse(input.path);
+    switch (parsed.kind) {
+        .url => return router.readUrl(ctx, input, parsed),
+        .internal => {
+            if (std.mem.startsWith(u8, parsed.base, "skill://")) return router.readSkill(ctx, input, parsed);
+            return readInternalUrl(ctx, input, parsed.base);
+        },
+        .file => {},
+    }
 
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const target = pathing.resolveWorkspaceOrExternalPath(arena, ctx.workspace_root, input.path) catch |err| {
+    const target = pathing.resolveWorkspaceOrExternalPath(arena, ctx.workspace_root, parsed.base) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        return readFileFailure(ctx.allocator, err, input.path);
+        return readFileFailure(ctx.allocator, err, parsed.base);
     };
+    const display = pathing.workspaceRelativePath(arena, ctx.workspace_root, target) catch target;
+    if (parsed.container != .none and !(parsed.container == .gzip and input.selector.raw)) {
+        return router.readContainer(ctx, input, parsed, target, display);
+    }
+    if (!input.selector.raw) {
+        if (@import("../read/convert.zig").documentKind(target)) |kind| return router.readDocument(ctx, input, kind, target, display);
+    }
 
     const zio = io_mod.getIo();
     var file = io_mod.openExistingReadOnlyRegularFile(std.Io.Dir.cwd(), target, .no_follow) catch |err| {
+        if (router.isDirectory(target)) return router.readDirectory(ctx, input, target, display);
         return readFileFailure(
             ctx.allocator,
             if (err == error.DurablePathUnsafe) error.NotRegularFile else err,
@@ -166,37 +200,71 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
         ) };
     }
 
+    if (!input.selector.raw and @import("../read/notebook.zig").isNotebookPath(target)) {
+        return router.readNotebook(ctx, input, text, rel);
+    }
+
     var selected = input.*;
     selected.line_count = @min(selected.line_count, ctx.max_read_file_lines);
+    const snapshot_complete = !truncated_by_size and actual_len == stat.size;
+    if (!input.explicit_range and !input.selector.raw and summary.isCodePath(target) and
+        std.mem.count(u8, text, "\n") >= selected.line_count)
+    {
+        const folded_or_null = summary.summarize(ctx.allocator, text, selected.line_count) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
+        if (folded_or_null) |folded| {
+            defer folded.deinit(ctx.allocator);
+            var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+            hasher.update(text);
+            try recordSuccessfulRead(ctx, target, stat, hasher.finalResult(), false, snapshot_complete);
+            tool_dispatch.reportToolResultMemory(ctx, .{ .model_view_covers_full_file = false });
+            return .{ .success = try ctx.allocator.print("<path>{s}</path>\n<content>\n{s}</content>", .{ rel, folded.text }) };
+        }
+    }
 
     var records: std.ArrayList(LineRecord) = .empty;
     defer freeLineRecords(arena, &records);
     const scan = try selectLinesFromContent(arena, text, &selected, ctx.max_read_file_line_len, &records);
-    const snapshot_covers_full_file = !truncated_by_size and actual_len == stat.size;
+    const snapshot_covers_full_file = snapshot_complete;
     const model_view_covers_full_file = snapshot_covers_full_file and modelViewCoversFullFile(&selected, scan, records.items.len);
     try recordSuccessfulRead(ctx, target, stat, scan.content_hash, model_view_covers_full_file, snapshot_covers_full_file);
     tool_dispatch.reportToolResultMemory(ctx, .{
         .model_view_covers_full_file = model_view_covers_full_file,
     });
 
-    return .{ .success = try formatReadOutput(ctx.allocator, rel, &selected, records.items, scan, snapshot_covers_full_file) };
+    return .{ .success = try formatReadOutput(ctx.allocator, rel, "", &selected, records.items, scan, snapshot_covers_full_file) };
 }
 
 /// `history://` and `agent://` render a node of this session tree as text,
 /// read in the same numbered line windows as a file.
-fn readInternalUrl(ctx: tool_dispatch.DispatchContext, input: *Input) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+fn readInternalUrl(ctx: tool_dispatch.DispatchContext, input: *Input, url: []const u8) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const view = ctx.node_view orelse return .{
-        .failure = try ctx.allocator.print("{s} is unavailable: this run has no saved session tree.", .{input.path}),
+        .failure = try ctx.allocator.print("{s} is unavailable: this run has no saved session tree.", .{url}),
     };
-    const resource = recall.readUrl(ctx.allocator, view, input.path) catch |err| switch (err) {
+    const resource = recall.readUrl(ctx.allocator, view, url) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return .{ .failure = try ctx.allocator.print("Reading {s} failed: {s}", .{ input.path, @errorName(err) }) },
+        else => return .{ .failure = try ctx.allocator.print("Reading {s} failed: {s}", .{ url, @errorName(err) }) },
     };
     const text = switch (resource) {
         .failure => |failure| return .{ .failure = failure },
         .text => |text| text,
     };
     defer ctx.allocator.free(text);
+    return windowedText(ctx, input, input.path, "", text);
+}
+
+/// Text from a converter, an archive member, a URL or an internal resource,
+/// read in the same numbered line windows as a file. `preamble` goes before
+/// the content. Caller owns the result.
+pub fn windowedText(
+    ctx: tool_dispatch.DispatchContext,
+    input: *const Input,
+    label: []const u8,
+    preamble: []const u8,
+    text: []const u8,
+) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena_state.deinit();
     var selected = input.*;
@@ -204,7 +272,7 @@ fn readInternalUrl(ctx: tool_dispatch.DispatchContext, input: *Input) tool_dispa
     var records: std.ArrayList(LineRecord) = .empty;
     defer freeLineRecords(arena_state.allocator(), &records);
     const scan = try selectLinesFromContent(arena_state.allocator(), text, &selected, ctx.max_read_file_line_len, &records);
-    return .{ .success = try formatReadOutput(ctx.allocator, input.path, &selected, records.items, scan, true) };
+    return .{ .success = try formatReadOutput(ctx.allocator, label, preamble, &selected, records.items, scan, true) };
 }
 
 fn readFileFailure(alloc: Allocator, err: anyerror, path: []const u8) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
@@ -329,7 +397,12 @@ const LineSelectionState = struct {
 
     fn keepLine(self: *LineSelectionState, line_number: usize, text: []const u8) !void {
         if (self.stop_display) return;
-        if (line_number < self.input.start_line) return;
+        const ranges = self.input.selector.lines();
+        if (ranges.len > 0) {
+            for (ranges) |range| {
+                if (range.contains(line_number)) break;
+            } else return;
+        } else if (line_number < self.input.start_line) return;
         if (self.records.items.len >= self.input.line_count) {
             self.display_truncated = true;
             self.stop_display = true;
@@ -424,6 +497,7 @@ fn recordSuccessfulRead(
 fn formatReadOutput(
     alloc: Allocator,
     rel: []const u8,
+    preamble: []const u8,
     input: *const Input,
     records: []const LineRecord,
     scan: ReadScan,
@@ -432,8 +506,10 @@ fn formatReadOutput(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
-    out.writer.print("<path>{s}</path>\n<content>\n", .{rel}) catch return error.OutOfMemory;
-    if (records.len > 0) {
+    out.writer.print("<path>{s}</path>\n{s}<content>\n", .{ rel, preamble }) catch return error.OutOfMemory;
+    if (records.len > 0 and input.selector.raw) {
+        for (records) |record| out.writer.print("{s}\n", .{record.text}) catch return error.OutOfMemory;
+    } else if (records.len > 0) {
         writeRecords(&out.writer, records) catch return error.OutOfMemory;
     } else if (scan.total_lines > 0 and input.start_line > scan.total_lines) {
         out.writer.print("... [start_line {d} is beyond end of file; total lines {d}]\n", .{ input.start_line, scan.total_lines }) catch return error.OutOfMemory;
@@ -1276,4 +1352,15 @@ test "read_file records empty and beyond-end successes" {
     const beyond_record = tracker.lookup(file_path).?;
     try std.testing.expect(!beyond_record.model_view_covers_full_file);
     try std.testing.expect(beyond_record.snapshot_covers_full_file);
+}
+
+test {
+    _ = read_target;
+    _ = router;
+    _ = summary;
+    _ = @import("../read/archive.zig");
+    _ = @import("../read/notebook.zig");
+    _ = @import("../read/directory.zig");
+    _ = @import("../read/convert.zig");
+    _ = @import("../read/read_tests.zig");
 }

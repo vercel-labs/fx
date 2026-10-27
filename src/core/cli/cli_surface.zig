@@ -11,6 +11,7 @@ const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
 const cli_replay = @import("cli_replay.zig");
 const cli_search = @import("cli_search.zig");
+const cli_read = @import("cli_read.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -94,6 +95,7 @@ pub const Command = union(enum) {
     replay: []const [:0]const u8,
     workspace: []const [:0]const u8,
     search: []const [:0]const u8,
+    read: []const [:0]const u8,
     unknown: []const u8,
 };
 
@@ -606,6 +608,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
         'r' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .@"resume")) return .{ .resume_session = .{ .args = args[1..] } };
             if (command_specs.matchesTopLevel(command_catalog, command, .replay)) return .{ .replay = args[1..] };
+            if (command_specs.matchesTopLevel(command_catalog, command, .read)) return .{ .read = args[1..] };
         },
         's' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .setup)) return .{ .setup = args[1..] };
@@ -1663,6 +1666,22 @@ fn runNonInteractiveWithDeps(
                 .transport = cfg.gateway_provider.oauth_transport,
                 .secret_store = cfg.secret_store,
             });
+            defer alloc.free(result.output);
+            if (result.succeeded or result.format == .json) {
+                try writeFormattedOutput(deps, result.output, result.format);
+            } else {
+                try writeStderr(deps, result.output);
+            }
+            return if (result.succeeded) .handled_success else .handled_failure;
+        },
+        .read => |rest| {
+            const options = cli_read.parseArgs(rest) catch {
+                try writeTopLevelUsage(cfg.command_catalog, deps, .read);
+                return .handled_failure;
+            };
+            const workspace = try cli_read.currentWorkspace(alloc);
+            defer alloc.free(workspace);
+            const result = try cli_read.run(alloc, options, workspace);
             defer alloc.free(result.output);
             if (result.succeeded or result.format == .json) {
                 try writeFormattedOutput(deps, result.output, result.format);

@@ -14,6 +14,7 @@ const terminal_ui_projection = @import("../terminal/ui_projection.zig");
 const types = @import("../shared/types.zig");
 const fleet_presentation = @import("fleet_presentation.zig");
 const recall_presentation = @import("recall_presentation.zig");
+const read_target = @import("../workspace/read_target.zig");
 const io_mod = @import("../shared/io.zig");
 const test_builtin_tools = if (builtin.is_test)
     @import("../../builtins/tools.zig")
@@ -801,12 +802,22 @@ fn formatPlainActionPhase(alloc: Allocator, input: ToolActionInput, phase: Actio
     if (spec.executor_kind == .web_search) {
         return alloc.print("{s} {s}", .{ phase.label(presentation), try formatWebSearchActionDetail(scratch, args) });
     }
+    var read_label_buf: [160]u8 = undefined;
     const value = input.display_target orelse
         call.resolved_display_target orelse
         resolvedSkillName(call, presentation) orelse
+        readTargetLabel(&read_label_buf, spec.*, args) orelse
         tool_dispatch.presentationLabelValue(presentation, args) orelse
         presentation.label_arg_default;
     return alloc.print("{s} {s}", .{ phase.label(presentation), value });
+}
+
+/// A read_file row names a URL by host and path, an archive member as
+/// `archive › member` and a SQLite table as `db › table` (D161).
+fn readTargetLabel(buf: []u8, spec: tool_dispatch.Tool, args: std.json.ObjectMap) ?[]const u8 {
+    if (spec.executor_kind != .read_file) return null;
+    const path = tool_args.optionalStringArg(args, "path") orelse return null;
+    return read_target.displayLabel(buf, std.mem.trim(u8, path, " \t\r\n"));
 }
 
 /// Names an earlier call in the row of a later call that reads its saved
@@ -1400,6 +1411,9 @@ test "tool presentation preserves plain action fallbacks" {
         expected: []const u8,
     }{
         .{ .call = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"src/main.zig\"}" }, .expected = "Reading src/main.zig" },
+        .{ .call = .{ .id = "url", .name = "read_file", .arguments_json = "{\"path\":\"https://ziglang.org/learn/?x=1\"}" }, .expected = "Reading ziglang.org/learn" },
+        .{ .call = .{ .id = "member", .name = "read_file", .arguments_json = "{\"path\":\"dist/app.zip:src/a.ts\"}" }, .expected = "Reading app.zip › src/a.ts" },
+        .{ .call = .{ .id = "table", .name = "read_file", .arguments_json = "{\"path\":\"data/shop.db:orders\"}" }, .expected = "Reading shop.db › orders" },
         .{ .call = .{ .id = "command", .name = "run_command", .arguments_json = "{\"command\":\"zig build\"}" }, .expected = "Running zig build" },
         .{ .call = .{ .id = "ask", .name = "ask_user_question", .arguments_json = "{}" }, .expected = "Asking " },
         .{ .call = .{ .id = "skill", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" }, .expected = "Loading skill workflow" },

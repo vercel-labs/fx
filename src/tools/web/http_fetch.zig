@@ -369,9 +369,13 @@ fn resolveWithDeadline(alloc: Allocator, host_name: std.Io.net.HostName, port: u
     var select_buffer: [2]ResolveSelect = undefined;
     var select: std.Io.Select(ResolveSelect) = .init(zio, &select_buffer);
 
-    try select.concurrent(.watch, ResolveWatch.run, .{ &watch, zio, ResolveCondition{ .deadline = deadline } });
+    // A single-threaded Io, as in `proto-fx read`, cannot watch the deadline
+    // beside the lookup; resolve directly and rely on the resolver's timeouts.
+    select.concurrent(.watch, ResolveWatch.run, .{ &watch, zio, ResolveCondition{ .deadline = deadline } }) catch
+        return collectLookup(alloc, host_name, port, options);
     select.concurrent(.lookup, collectLookup, .{ alloc, host_name, port, options }) catch |err| {
         watch.finish(&select);
+        if (err == error.ConcurrencyUnavailable) return collectLookup(alloc, host_name, port, options);
         return err;
     };
 
