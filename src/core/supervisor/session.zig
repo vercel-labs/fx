@@ -82,6 +82,9 @@ pub const Session = struct {
     notice_requests: std.ArrayList(i64) = .empty,
     /// Their answers, for the executor to settle: whether the model got it.
     notice_answers: std.ArrayList(NoticeAnswer) = .empty,
+    /// Notices of messages from other agents (D188), tracked the same way.
+    mail_requests: std.ArrayList(i64) = .empty,
+    mail_answers: std.ArrayList(NoticeAnswer) = .empty,
     capture: ?Capture = null,
     /// Counts every change a watcher sees: events, pending requests, and
     /// the record.
@@ -118,6 +121,8 @@ pub const Session = struct {
         self.commands.deinit(alloc);
         self.notice_requests.deinit(alloc);
         self.notice_answers.deinit(alloc);
+        self.mail_requests.deinit(alloc);
+        self.mail_answers.deinit(alloc);
         self.watchers.deinit(alloc);
         self.views.deinit();
         self.jobs.deinit(alloc);
@@ -431,6 +436,8 @@ pub const Session = struct {
         heartbeat,
         /// A job notice: its answer says whether the model got it.
         job_notice,
+        /// Messages from other agents, answered the same way (D188).
+        peer_message,
         /// Turn the answer, whenever it comes, into a command result event.
         command: []const u8,
     };
@@ -459,6 +466,11 @@ pub const Session = struct {
                 self.events_mutex.lockUncancelable(io_mod.getIo());
                 defer self.events_mutex.unlock(io_mod.getIo());
                 try self.notice_requests.append(alloc, id);
+            },
+            .peer_message => {
+                self.events_mutex.lockUncancelable(io_mod.getIo());
+                defer self.events_mutex.unlock(io_mod.getIo());
+                try self.mail_requests.append(alloc, id);
             },
             .command => |name| {
                 const owned = try alloc.dupe(u8, name);
@@ -549,7 +561,7 @@ pub const Session = struct {
         return protocol.encode(arena, protocol.PromptAdmitted{ .request_id = 0 });
     }
 
-    pub const PromptOrigin = enum { user, heartbeat, job_notice };
+    pub const PromptOrigin = enum { user, heartbeat, job_notice, peer_message };
 
     pub fn prompt(self: *Session, text: []const u8, origin: PromptOrigin) !i64 {
         if (text.len == 0 or text.len > max_prompt_bytes) return error.InvalidPrompt;
@@ -568,10 +580,11 @@ pub const Session = struct {
         return self.dispatch("session/prompt", .{
             .sessionId = self.id,
             .prompt = &blocks,
-            ._meta = .{ .fx = .{ .steer = true, .notice = origin == .job_notice } },
+            ._meta = .{ .fx = .{ .steer = true, .notice = origin == .job_notice or origin == .peer_message, .peer = origin == .peer_message } },
         }, switch (origin) {
             .heartbeat => .heartbeat,
             .job_notice => .job_notice,
+            .peer_message => .peer_message,
             .user => .none,
         });
     }
@@ -948,6 +961,11 @@ pub const Session = struct {
             for (self.notice_requests.items, 0..) |notice_id, index| if (notice_id == response_id) {
                 _ = self.notice_requests.swapRemove(index);
                 try self.notice_answers.append(alloc, .{ .id = response_id, .delivered = noticeDelivered(head) });
+                return .silent;
+            };
+            for (self.mail_requests.items, 0..) |notice_id, index| if (notice_id == response_id) {
+                _ = self.mail_requests.swapRemove(index);
+                try self.mail_answers.append(alloc, .{ .id = response_id, .delivered = noticeDelivered(head) });
                 return .silent;
             };
             for (self.commands.items, 0..) |command, index| {

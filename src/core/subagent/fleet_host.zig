@@ -33,7 +33,7 @@ pub fn execute(self: *Runtime, alloc: Allocator, request: *model_contract.Reques
         .list => list(self, alloc, null),
         .inspect => |id| list(self, alloc, id),
         .terminate => |id| terminate(self, alloc, id),
-        .run, .message => unreachable,
+        .run, .message, .peer_message, .inbox, .peers => unreachable,
     };
 }
 
@@ -199,6 +199,75 @@ fn send(self: *Runtime, alloc: Allocator, request: model_contract.Request, id: [
         }
     };
     return admitTurn(self, alloc, arena, request, fingerprint, target, ctx);
+}
+
+/// What became of messages handed to one of this node's workers (D186).
+pub const MailDelivery = union(enum) {
+    /// Steered into its running turn; settled when the steer is.
+    steered: [32]u8,
+    /// A turn of its own, accepted or queued, owned by this node like any
+    /// `send`: its job is listed here and its result reaches this node.
+    turn: model_contract.Receipt,
+    /// Not now, such as a full queue; the messages wait for the next try.
+    later,
+    /// The worker takes no more input.
+    terminal,
+};
+
+/// Hands `text`, a notice of messages for worker `child_id`, to the
+/// worker as `send` would: a steer into its running turn, or a turn of its
+/// own. `operation_id` names the delivery, so the same delivery again,
+/// after a restart, gets the same turn.
+pub fn deliverMail(self: *Runtime, child_id: []const u8, text: []const u8, operation_id: []const u8) !MailDelivery {
+    var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const request: model_contract.Request = .{ .send = .{ .id = try arena.dupe(u8, child_id), .message = try arena.dupe(u8, text) } };
+    const fingerprint = model_contract.requestFingerprint(request);
+    const ctx: Context = .{
+        .operation_id = operation_id,
+        .options = .{
+            .invocation_id = operation_id,
+            .defaults = .{ .provider = .gateway, .model = "", .effort = .auto, .conversation_language = @import("../session/session.zig").ConversationLanguage.default() },
+            .max_result_bytes = 0,
+            .timestamp_ms = io_mod.milliTimestamp(),
+            .lend_turn_slots = false,
+        },
+        // A message adds no authority: the worker keeps this node's mode.
+        .child_mode = self.permission_ceiling,
+        .resolved_model = null,
+    };
+    self.admission_mutex.lockUncancelable(io_mod.getIo());
+    defer self.admission_mutex.unlock(io_mod.getIo());
+    const target: Target = blk: {
+        var lock = self.managed.state_store.acquireLock();
+        defer lock.release();
+        var registry = try self.managed.state_store.load(arena);
+        const child = switch (try findWorker(arena, &registry, child_id)) {
+            .found => |child| child,
+            .refused => |refused| return if (refused.receipt == .terminal) .terminal else .later,
+        };
+        if (replayedTurn(child.*, operation_id)) |replayed| return .{ .turn = replayed.receipt };
+        break :blk .{
+            .id = child.id,
+            .label = child.agentName().?,
+            .phase = child.phase,
+            .active_work = if (child.active) |active| active.id else null,
+            .active_turn = if (child.active) |active| active.turn else 0,
+            .queued = child.queue.len,
+        };
+    };
+    if (target.phase == .running and target.queued == 0) if (target.active_work) |work_id| {
+        switch (try self.managed.steer(target.id, work_id, operation_id, fingerprint, text)) {
+            .receipt => return .{ .steered = fingerprint },
+            .capacity => return .later,
+            .waiting, .cancelled, .unavailable, .conflict => {},
+        }
+    };
+    const admitted = try admitTurn(self, arena, arena, request, fingerprint, target, ctx);
+    if (admitted.success) return .{ .turn = if (std.mem.find(u8, admitted.body, "\"receipt\":\"queued\"") != null) .queued else .accepted };
+    if (std.mem.find(u8, admitted.body, "\"receipt\":\"terminal\"") != null) return .terminal;
+    return .later;
 }
 
 fn replayedTurn(child: Child, operation_id: []const u8) ?struct { receipt: model_contract.Receipt, turn: u32 } {

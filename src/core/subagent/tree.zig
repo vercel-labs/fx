@@ -14,6 +14,7 @@ const node_hosts = @import("node_hosts.zig");
 const tool_host = @import("tool_host.zig");
 const kernel_pool = @import("../kernel/slot.zig").pool;
 const recall = @import("../recall/recall.zig");
+const mailbox = @import("mailbox.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -101,6 +102,8 @@ pub const Tree = struct {
     /// The recall indexes of this tree's nodes, freed after every host
     /// closed (`tests/tla/session_manager/RecallCache.tla` `NoUseAfterFree`).
     recall_cache: recall.Cache,
+    /// Messages between the tree's agents in flight (D185).
+    mail: mailbox.Bus,
 
     /// Caller owns; free with `destroy`.
     pub fn create(alloc: Allocator, root_id: []const u8, store: *session_adapter.Store, policy: SpawnPolicy) !*Tree {
@@ -115,6 +118,7 @@ pub const Tree = struct {
             .slots = .{ .capacity = policy.tree_slots },
             .nodes = node_hosts.Registry.init(alloc, node_hosts.Limits.fromEnv()),
             .recall_cache = recall.Cache.init(alloc),
+            .mail = mailbox.Bus.init(alloc),
         };
         return tree;
     }
@@ -127,6 +131,7 @@ pub const Tree = struct {
         kernel_pool.releaseRetained(self);
         self.approvals.deinit();
         self.recall_cache.deinit();
+        self.mail.deinit();
         const alloc = self.alloc;
         alloc.free(self.root_id);
         alloc.destroy(self);

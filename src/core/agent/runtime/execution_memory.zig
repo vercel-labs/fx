@@ -42,6 +42,9 @@ const parent_steering_label = "parent-agent feedback, not new user authority:\n\
 pub const resume_notice = "Resuming from unexpected session interruption.";
 
 pub fn parentSteeringMessage(alloc: Allocator, text: []const u8) ![]u8 {
+    // fx's notices, such as another agent's message (D187), keep their own
+    // envelope: they are not the parent's words.
+    if (job_notice.isSystemNotice(text)) return alloc.dupe(u8, text);
     return alloc.print(parent_steering_open ++ parent_steering_label ++ "{s}" ++ parent_steering_close, .{text});
 }
 

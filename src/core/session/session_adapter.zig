@@ -124,6 +124,36 @@ pub const Child = struct {
 
 pub const QueuedWork = struct { work_id: []u8, data: ?[]u8 };
 
+/// One waiting message of a node's mailbox (D185). Owns its slices.
+pub const Mail = sm.fold_mail.Mail;
+pub const max_mailbox = sm.fold_mail.max_mailbox;
+pub const max_mail_body_bytes = sm.fold_mail.max_body_bytes;
+
+/// A line of a node's mailbox: a message in, or one out.
+pub const MailLine = union(enum) {
+    mail: sm.Body.Mail,
+    done: sm.Body.MailDone,
+};
+
+pub fn freeMailbox(alloc: Allocator, mailbox: []Mail) void {
+    for (mailbox) |mail| mail.deinit(alloc);
+    alloc.free(mailbox);
+}
+
+fn copyMailbox(alloc: Allocator, mailbox: []const Mail) ![]Mail {
+    const out = try alloc.alloc(Mail, mailbox.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |mail| mail.deinit(alloc);
+        alloc.free(out);
+    }
+    for (mailbox) |mail| {
+        out[built] = try mail.clone(alloc);
+        built += 1;
+    }
+    return out;
+}
+
 pub fn freeChildren(alloc: Allocator, children: []Child) void {
     for (children) |child| freeChild(alloc, child);
     alloc.free(children);
@@ -423,6 +453,14 @@ pub const Store = struct {
             built += 1;
         }
         return out;
+    }
+
+    /// Node `id`'s mailbox, read without its lock from its folded state.
+    /// Free with `freeMailbox`.
+    pub fn peekMailbox(store: *Store, alloc: Allocator, id: []const u8) ![]Mail {
+        var peeked = try store.manager.peek(alloc, id);
+        defer peeked.deinit(alloc);
+        return copyMailbox(alloc, peeked.state.mailbox.items);
     }
 
     pub fn freeIds(alloc: Allocator, ids: [][]u8) void {
@@ -2571,6 +2609,31 @@ pub const Session = struct {
         const events = try self.alloc.alloc(sm.Event, lines.len);
         defer self.alloc.free(events);
         for (lines, events) |line, *event| event.* = line.event();
+        _ = try self.write(events);
+    }
+
+    // -- mailbox (D185) ------------------------------------------------------
+
+    /// The messages waiting in this node's mailbox, oldest first. Free
+    /// with `freeMailbox`.
+    pub fn mailbox(self: *Session, alloc: Allocator) ![]Mail {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const state = try self.handle.state(scratch.allocator());
+        return copyMailbox(alloc, state.mailbox.items);
+    }
+
+    /// Appends mailbox lines as one durable batch. The manager refuses a
+    /// message already waiting, one past a full mailbox, and a done line
+    /// for a message that does not wait.
+    pub fn appendMail(self: *Session, lines: []const MailLine) !void {
+        if (lines.len == 0) return;
+        const events = try self.alloc.alloc(sm.Event, lines.len);
+        defer self.alloc.free(events);
+        for (lines, events) |line, *event| event.* = switch (line) {
+            .mail => |m| .{ .mail = m },
+            .done => |d| .{ .mail_done = d },
+        };
         _ = try self.write(events);
     }
 
@@ -4747,7 +4810,7 @@ noinline fn replay(
                     if (keptTurn(alloc, dropped, turn, ended.turn)) try sink.turn(try presentStoredResults(src, alloc, turn), ended.turn);
                 },
                 .compacted => |line| try sink.summary(line.data),
-                .session_created, .turn_committed, .set, .child_spawned, .child_finished, .child_queued, .child_terminated, .snapshot, .closed, .rewound, .store_set, .store_del, .kernel_snapshot => {},
+                .session_created, .turn_committed, .set, .child_spawned, .child_finished, .child_queued, .child_terminated, .mail, .mail_done, .snapshot, .closed, .rewound, .store_set, .store_del, .kernel_snapshot => {},
             }
         }
         from = .{ .at = page.next orelse break };

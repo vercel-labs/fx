@@ -106,7 +106,7 @@ fn collectScoredMatches(
 /// `message` is `run` on a named worker, which it spawns when new. `spawn`
 /// and `send` return a turn receipt at once and the turn's result arrives
 /// when it settles.
-pub const Action = enum { run, message, spawn, send, list, inspect, terminate };
+pub const Action = enum { run, message, spawn, send, list, inspect, terminate, peer_message, inbox, peers };
 
 pub const RunInput = struct {
     task: []const u8,
@@ -128,6 +128,8 @@ pub const SpawnInput = struct {
     effort: ?[]const u8 = null,
 };
 pub const SendInput = struct { id: []const u8, message: []const u8 };
+/// fleet op `message` (D186): to a node id, `parent`, `root` or `all`.
+pub const PeerInput = struct { to: []const u8, message: []const u8, reply_to: ?[]const u8 = null };
 pub const RequestInput = union(Action) {
     run: RunInput,
     message: MessageInput,
@@ -136,6 +138,9 @@ pub const RequestInput = union(Action) {
     list,
     inspect: []const u8,
     terminate: []const u8,
+    peer_message: PeerInput,
+    inbox: bool,
+    peers,
 };
 
 /// Creation-time routing overrides carried by a request. Both default to the
@@ -175,6 +180,12 @@ pub const Request = union(Action) {
     list,
     inspect: []u8,
     terminate: []u8,
+    /// A message to another agent of the tree (D186).
+    peer_message: struct { to: []u8, message: []u8, reply_to: ?[]u8 = null },
+    /// This node's mailbox; `true` peeks without taking (D186).
+    inbox: bool,
+    /// Every other agent of the tree (`list` scope `visible`).
+    peers,
 
     pub fn deinit(self: *Request, alloc: Allocator) void {
         switch (self.*) {
@@ -198,8 +209,13 @@ pub const Request = union(Action) {
                 alloc.free(value.id);
                 alloc.free(value.message);
             },
-            .list => {},
+            .list, .inbox, .peers => {},
             .inspect, .terminate => |id| alloc.free(id),
+            .peer_message => |value| {
+                alloc.free(value.to);
+                alloc.free(value.message);
+                if (value.reply_to) |reply_to| alloc.free(reply_to);
+            },
         }
         self.* = undefined;
     }
@@ -233,7 +249,7 @@ pub const Request = union(Action) {
             .message => |value| value.message,
             .spawn => |value| value.message,
             .send => |value| value.message,
-            .list, .inspect, .terminate => null,
+            .list, .inspect, .terminate, .peer_message, .inbox, .peers => null,
         };
     }
 };
@@ -294,6 +310,18 @@ pub fn validateRequest(
             break :blk .{ .send = .{ .id = id, .message = try alloc.dupe(u8, value.message) } };
         },
         .list => .list,
+        .peers => .peers,
+        .inbox => |peek| .{ .inbox = peek },
+        .peer_message => |value| blk: {
+            try validateWorkerId(value.to);
+            try validateText(value.message, max_peer_message_bytes, error.InvalidMessage);
+            if (value.reply_to) |reply_to| try validateWorkerId(reply_to);
+            const to = try alloc.dupe(u8, value.to);
+            errdefer alloc.free(to);
+            const message = try alloc.dupe(u8, value.message);
+            errdefer alloc.free(message);
+            break :blk .{ .peer_message = .{ .to = to, .message = message, .reply_to = try dupeOptional(alloc, value.reply_to) } };
+        },
         .inspect => |id| blk: {
             try validateWorkerId(id);
             break :blk .{ .inspect = try alloc.dupe(u8, id) };
@@ -332,6 +360,9 @@ pub fn validateRequest(
         },
     };
 }
+
+/// The longest message one agent sends another, as a mailbox line keeps it.
+pub const max_peer_message_bytes: usize = 16 * 1024;
 
 fn validateWorkerId(id: []const u8) ValidationError!void {
     if (id.len == 0 or id.len > 128 or !std.unicode.utf8ValidateSlice(id) or std.mem.findScalar(u8, id, 0) != null) return error.InvalidId;
@@ -390,7 +421,7 @@ pub const Plan = union(enum) {
 
 pub fn plan(request: Request, snapshot: ?Snapshot) Plan {
     return switch (request) {
-        .run, .spawn, .send, .list, .inspect, .terminate => .create_one_off,
+        .run, .spawn, .send, .list, .inspect, .terminate, .peer_message, .inbox, .peers => .create_one_off,
         .message => if (snapshot) |child| switch (child.kind) {
             .one_off => .{ .reject = .child_not_persistent },
             .persistent => switch (child.phase) {
@@ -424,8 +455,16 @@ pub fn requestFingerprint(request: Request) [32]u8 {
             hash.update("\x00");
             hash.update(value.message);
         },
-        .list => {},
+        .list, .peers => {},
+        .inbox => |peek| hash.update(if (peek) "peek" else "take"),
         .inspect, .terminate => |id| hash.update(id),
+        .peer_message => |value| {
+            hash.update(value.to);
+            hash.update("\x00");
+            hash.update(value.reply_to orelse "");
+            hash.update("\x00");
+            hash.update(value.message);
+        },
         .message => |value| {
             hash.update(value.agent);
             hash.update("\x00");
@@ -489,6 +528,11 @@ pub const Result = struct {
     job: ?[]const u8 = null,
     /// Raw JSON array of worker rows, for `list` and `inspect`.
     workers: ?[]const u8 = null,
+    /// Raw JSON: delivery receipts for `message`, waiting messages for
+    /// `inbox`, and agent rows for `list` scope `visible` (D186).
+    receipts: ?[]const u8 = null,
+    messages: ?[]const u8 = null,
+    peers: ?[]const u8 = null,
 };
 
 pub fn feedbackResult(delivery: types.SteeringDelivery) Result {
@@ -526,7 +570,9 @@ pub fn encodeResultAlloc(alloc: Allocator, result: Result) ![]u8 {
         }
     }
     if (result.turn) |turn| try out.writer.print(",\"turn\":{d}", .{turn});
-    if (result.workers) |workers| try out.writer.print(",\"workers\":{s}", .{workers});
+    inline for (.{ "workers", "receipts", "messages", "peers" }) |name| {
+        if (@field(result, name)) |raw| try out.writer.print(",\"" ++ name ++ "\":{s}", .{raw});
+    }
     try out.writer.writeByte('}');
     return out.toOwnedSlice();
 }
@@ -541,7 +587,7 @@ fn writeOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
 
 test "minimal request validation owns one-off and persistent intent" {
     const alloc = std.testing.allocator;
-    try std.testing.expectEqual(@as(usize, 7), @typeInfo(Action).@"enum".field_names.len);
+    try std.testing.expectEqual(@as(usize, 10), @typeInfo(Action).@"enum".field_names.len);
     var run = try validateRequest(alloc, .{ .run = .{ .task = "review this" } });
     defer run.deinit(alloc);
     try std.testing.expectEqual(Action.run, run.action());

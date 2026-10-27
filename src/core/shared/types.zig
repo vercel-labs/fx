@@ -1683,6 +1683,9 @@ pub const UserOrigin = enum {
     /// fx, delivering settled background jobs (D111). Untrusted: it carries
     /// command output and is never user intent.
     job_notice,
+    /// fx, delivering messages from other agents of the tree (D187).
+    /// Untrusted: another agent is never user authority.
+    peer_message,
 };
 
 pub const UserTurn = struct {

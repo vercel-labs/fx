@@ -16,6 +16,7 @@ const Allocator = std.mem.Allocator;
 
 pub const shell_source = @import("shell_source.zig");
 pub const turn_source = @import("turn_source.zig");
+pub const watch_source = @import("watch_source.zig");
 pub const notice = @import("notice.zig");
 pub const card = @import("card.zig");
 pub const host = @import("host.zig");
@@ -23,11 +24,14 @@ pub const host = @import("host.zig");
 pub const Kind = enum {
     shell,
     turn,
+    /// A watch over a job's output or a polled command (D190).
+    watch,
 
     pub fn label(self: Kind) []const u8 {
         return switch (self) {
             .shell => "shell",
             .turn => "worker",
+            .watch => "watch",
         };
     }
 };
@@ -133,10 +137,32 @@ pub const Registry = struct {
     /// Takes back a queued notice that holds a job's result, so a wait gets
     /// it instead (`host.zig`).
     reclaimer: ?Reclaimer = null,
+    /// Starts watches (D190); null where the host keeps none.
+    watches: ?*watch_source.Source = null,
+    /// Waits on the session's mailbox for `jobs wait` (D189); null where
+    /// the session has no agents to message it.
+    mailbox: ?MailboxPort = null,
 
     pub const Reclaimer = struct {
         ctx: *anyopaque,
         func: *const fn (ctx: *anyopaque, job_id: []const u8) bool,
+    };
+
+    /// One message a mailbox wait took. Strings borrow the caller's arena.
+    pub const MailMessage = struct {
+        id: []const u8,
+        from: []const u8,
+        label: []const u8,
+        body: []const u8,
+        reply_to: ?[]const u8 = null,
+        broadcast: bool = false,
+    };
+
+    pub const MailboxPort = struct {
+        ctx: *anyopaque,
+        /// Waits up to `timeout_ms` for messages, from `from` when given,
+        /// and takes them as read; empty when the window passed.
+        wait: *const fn (ctx: *anyopaque, arena: Allocator, from: ?[]const u8, timeout_ms: u64, cancel: ?*const std.atomic.Value(bool)) anyerror![]MailMessage,
     };
 
     pub fn init(alloc: Allocator) Registry {

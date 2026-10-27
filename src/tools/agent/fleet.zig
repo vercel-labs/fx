@@ -28,9 +28,11 @@ const DecodeError = error{
 pub const run_fields = [_][]const u8{ "op", "message", "label", "model", "effort", "schema" };
 pub const spawn_fields = [_][]const u8{ "op", "message", "label", "instructions", "model", "effort", "schema" };
 pub const send_fields = [_][]const u8{ "op", "id", "message" };
-pub const list_fields = [_][]const u8{"op"};
+pub const list_fields = [_][]const u8{ "op", "scope" };
 pub const id_fields = [_][]const u8{ "op", "id" };
-pub const ops = [_][]const u8{ "run", "spawn", "send", "list", "inspect", "terminate" };
+pub const message_fields = [_][]const u8{ "op", "to", "message", "reply_to" };
+pub const inbox_fields = [_][]const u8{ "op", "peek" };
+pub const ops = [_][]const u8{ "run", "spawn", "send", "message", "list", "inspect", "inbox", "terminate" };
 
 /// Where a rejected call went wrong, so the correction can name it.
 const Problem = struct {
@@ -91,15 +93,19 @@ fn decodeFailure(
     }) };
 }
 
-const op_fields_text = "run takes message, label, model, effort and schema; spawn takes message, label, instructions, model, effort and schema; send takes id and message; inspect and terminate take id; list takes nothing.";
+const op_fields_text = "run takes message, label, model, effort and schema; spawn takes message, label, instructions, model, effort and schema; send takes id and message; message takes to, message and reply_to; inspect and terminate take id; list takes scope; inbox takes peek.";
+const ops_text = "run, spawn, send, message, list, inspect, inbox, terminate";
 
 /// Pure: the correction a model sees for a call that failed to decode.
 fn problemText(arena: Allocator, err: DecodeError, problem: Problem) Allocator.Error![]const u8 {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        error.InvalidEnum => "op must be one of run, spawn, send, list, inspect, terminate.",
+        error.InvalidEnum => if (std.mem.eql(u8, problem.field, "scope"))
+            "scope must be owned or visible."
+        else
+            "op must be one of " ++ ops_text ++ ".",
         error.MissingField => if (std.mem.eql(u8, problem.field, "op"))
-            "op is required: one of run, spawn, send, list, inspect, terminate."
+            "op is required: one of " ++ ops_text ++ "."
         else
             try arena.print("op \"{s}\" requires {s}.", .{ problem.op, problem.field }),
         error.UnknownField => try arena.print("op \"{s}\" does not accept {s}. " ++ op_fields_text, .{ problem.op, problem.field }),
@@ -107,6 +113,8 @@ fn problemText(arena: Allocator, err: DecodeError, problem: Problem) Allocator.E
             "fleet arguments must be a JSON object."
         else if (std.mem.eql(u8, problem.field, "schema"))
             "schema must be a JSON Schema object."
+        else if (std.mem.eql(u8, problem.field, "peek"))
+            "peek must be true or false."
         else
             try arena.print("{s} must be a string.", .{problem.field}),
     };
@@ -115,7 +123,7 @@ fn problemText(arena: Allocator, err: DecodeError, problem: Problem) Allocator.E
 fn validationText(err: model_contract.ValidationError) ?[]const u8 {
     return switch (err) {
         error.InvalidAgent => "label must be 1 to 48 ASCII letters, digits, underscores or hyphens.",
-        error.InvalidId => "id must name a worker, as fleet op \"list\" shows it.",
+        error.InvalidId => "id must name a worker, as fleet op \"list\" shows it; to must name an agent, as fleet op \"list\" scope \"visible\" shows it, or be parent, root or all.",
         else => null,
     };
 }
@@ -180,7 +188,28 @@ fn parseRoot(arena: Allocator, value: std.json.Value, problem: *Problem) DecodeE
     }
     if (std.mem.eql(u8, op, "list")) {
         try rejectUnknown(root, &list_fields, problem);
+        const scope = (try optionalString(root, "scope", problem)) orelse "owned";
+        if (std.mem.eql(u8, scope, "visible")) return .peers;
+        if (!std.mem.eql(u8, scope, "owned")) return error.InvalidEnum;
         return .list;
+    }
+    if (std.mem.eql(u8, op, "message")) {
+        try rejectUnknown(root, &message_fields, problem);
+        return .{ .peer_message = .{
+            .to = try requiredString(root, "to", problem),
+            .message = try requiredString(root, "message", problem),
+            .reply_to = try optionalString(root, "reply_to", problem),
+        } };
+    }
+    if (std.mem.eql(u8, op, "inbox")) {
+        try rejectUnknown(root, &inbox_fields, problem);
+        problem.field = "peek";
+        const peek = root.get("peek") orelse return .{ .inbox = false };
+        return switch (peek) {
+            .bool => |flag| .{ .inbox = flag },
+            .null => .{ .inbox = false },
+            else => error.InvalidFieldType,
+        };
     }
     if (std.mem.eql(u8, op, "inspect")) {
         try rejectUnknown(root, &id_fields, problem);
@@ -294,7 +323,8 @@ pub fn call(
 
 pub fn readsOnly(erased: tool_dispatch.ToolInput) bool {
     return switch (erased.as(Input).request) {
-        .list, .inspect => true,
+        .list, .inspect, .peers => true,
+        .inbox => |peek| peek,
         else => false,
     };
 }
@@ -362,6 +392,13 @@ test "fleet decodes every op and names what a rejected call got wrong" {
     try expectRequestTag("{\"op\":\"list\"}", .list);
     try expectRequestTag("{\"op\":\"inspect\",\"id\":\"w\"}", .inspect);
     try expectRequestTag("{\"op\":\"terminate\",\"id\":\"w\"}", .terminate);
+    try expectRequestTag("{\"op\":\"message\",\"to\":\"all\",\"message\":\"status?\",\"reply_to\":\"m1\"}", .peer_message);
+    try expectRequestTag("{\"op\":\"inbox\",\"peek\":true}", .inbox);
+    try expectRequestTag("{\"op\":\"list\",\"scope\":\"visible\"}", .peers);
+    try expectRequestTag("{\"op\":\"list\",\"scope\":\"owned\"}", .list);
+    try expectCorrection("{\"op\":\"list\",\"scope\":\"everyone\"}", "invalid_enum", "scope must be owned or visible.");
+    try expectCorrection("{\"op\":\"message\",\"message\":\"x\"}", "missing_field", "op \"message\" requires to.");
+    try expectCorrection("{\"op\":\"inbox\",\"peek\":\"yes\"}", "invalid_field_type", "peek must be true or false.");
     try expectCorrection("{\"op\":\"send\",\"id\":\"w\",\"message\":\"x\",\"label\":\"p\"}", "unknown_field", "op \"send\" does not accept label.");
     try expectCorrection("{\"op\":\"spawn\"}", "missing_field", "op \"spawn\" requires message.");
     try expectCorrection("{\"message\":\"x\"}", "missing_field", "op is required");

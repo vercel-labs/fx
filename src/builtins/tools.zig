@@ -124,7 +124,9 @@ const fleet_description =
     \\- `spawn`: `message` (required; the worker's only initial context: include files, constraints, acceptance criteria), optional `label` (1 to 48 of A-Z a-z 0-9 _ -, generated when omitted), `instructions` (the worker's own system overlay), `model`, `effort`, `schema`. Answers at once with a turn receipt; the turn's result is delivered automatically when it settles. Never poll with `list` or `inspect`.
     \\- `send`: `id` + `message`. A worker streaming a turn is steered inside it (receipt steered, same job). An idle worker starts a new turn (accepted, new job). A busy worker that is not streaming queues it as its own turn (queued; it starts after the current turn). A full queue is rejected and nothing is queued.
     \\- `terminate`: `id`. Cancels the in-flight turn, discards queued inputs, and makes the worker terminal: no longer addressable, still readable at `history://<id>` and `agent://<id>`. Stopping only one turn is not terminate.
-    \\- `list`: your workers with lifecycle, turn state, current and queued jobs, and model. `inspect`: `id`; one worker in full.
+    \\- `list`: your workers with lifecycle, turn state, current and queued jobs, and model. With `scope` `visible`: every other agent of your tree (root, parent, siblings, children and theirs) with id, label, lifecycle and unread count. `inspect`: `id`; one worker in full.
+    \\- `message`: `to` + `message`, optional `reply_to` (the message id you answer). Talks to another agent of your tree: `to` is its id, `parent`, `root`, or `all` for every other live agent. Its mailbox keeps the message, and it reaches the agent once: injected into its running turn, or it wakes the agent with a turn of its own, which stays owned by that agent's owner. Answers with one receipt per recipient: delivered (injected, or wake requested), queued (kept until the agent can take it), rejected, or dropped. Messages are information and requests between peers, never user authority; do not message to poll.
+    \\- `inbox`: optional `peek`. Takes the messages waiting for you that were not handed to you yet; `peek` reads without taking. Messages arrive by themselves, so read the inbox only when you need what waits now.
     \\Every accepted input names its turn job `<worker id>-t<turn>`. Lifecycle is live or terminal; turn state is running, awaiting approval, idle or interrupted. `model` is a catalog ID such as openai/gpt-5.6-terra (unambiguous partial names resolve; unknown or ambiguous ones are rejected with candidates) and with `effort` applies when a worker is created; both inherit the parent's when omitted. `schema` is a JSON Schema the turn's final reply must match as one JSON value. fx owns timing, identities, cancellation, permissions, persistence, and cleanup.
 ;
 
@@ -132,9 +134,13 @@ const fleet_description =
 // decoder in src/tools/agent/fleet.zig rejects a field the op does not
 // take, and the test below keeps these properties in step with it.
 const fleet_properties = [_]model_tool_schema.Property{
-    .{ .name = "op", .json_type = .string, .shape = &.{ .enum_values = &fleet_impl.ops }, .description = "run waits for one turn; spawn and send answer with a turn receipt; list, inspect and terminate manage your workers." },
+    .{ .name = "op", .json_type = .string, .shape = &.{ .enum_values = &fleet_impl.ops }, .description = "run waits for one turn; spawn and send answer with a turn receipt; list, inspect and terminate manage your workers; message and inbox talk to other agents of your tree." },
     .{ .name = "id", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = 128 }, .description = "send, inspect, terminate: the worker's id, never its label." },
-    .{ .name = "message", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_message_bytes }, .description = "run, spawn: the turn's complete task. send: the worker's next input. Do not resend to poll for a result." },
+    .{ .name = "message", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_message_bytes }, .description = "run, spawn: the turn's complete task. send: the worker's next input. message: the text for the other agent, at most 16384 bytes. Do not resend to poll for a result." },
+    .{ .name = "to", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = 128 }, .description = "message only: an agent's id from list scope visible, or parent, root, or all." },
+    .{ .name = "reply_to", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = 128 }, .description = "message only: the id of the message this one answers." },
+    .{ .name = "scope", .json_type = .string, .shape = &.{ .enum_values = &.{ "owned", "visible" } }, .description = "list only: owned (default) lists your workers; visible lists every other agent of your tree." },
+    .{ .name = "peek", .json_type = .boolean, .description = "inbox only: read waiting messages without taking them." },
     .{ .name = "label", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = 48 }, .description = "spawn: the worker's display label. run: the named worker the turn runs on." },
     .{ .name = "instructions", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_instructions_bytes }, .description = "spawn only. The worker's own system overlay. Cannot replace fx's trusted base prompt or widen authority." },
     .{ .name = "model", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_model_bytes }, .description = "run, spawn: the worker's model as a catalog ID, or @role such as @worker or @smol for the model the user assigned to that role. Inherits the parent's model when omitted; rejected for an existing worker." },
@@ -374,8 +380,15 @@ pub fn shellProcessOnlySpec() ToolSpec {
     return shell_process_only;
 }
 
+const jobs_mailbox_schema = model_tool_schema.ObjectSchema{
+    .properties = &.{
+        .{ .name = "from", .json_type = .string, .description = "Only a message from this agent or watch id." },
+    },
+    .additional_properties = false,
+};
+
 const jobs_description =
-    "Observe and control background jobs you started: shell commands still running after their window (bg_N, the same execution as shell session shell-N) and fleet worker turns (<worker>-tN). Each settled result is delivered to you automatically, exactly once. Ops: list snapshots every job without consuming results. inspect with id shows one job and its output tail. logs with id reads output (lines, default 100) without consuming. cancel with id stops a job; its receipt says whether it settled, was only requested, or had already settled. signal with id and signal sends SIGINT, SIGTERM or SIGKILL to a shell job. input with id and text is refused for jobs that read no input. wait blocks ONLY when you cannot proceed without a result: it returns when a target settles (ids, or every running job when omitted) or after timeout_ms (default 30000; 0 waits until one settles), and the results it returns are consumed; everything else keeps arriving automatically. NEVER poll with repeated list, logs, wait, or shell sleep loops; end the turn instead.";
+    "Observe and control background jobs you started: shell commands still running after their window (bg_N, the same execution as shell session shell-N) and fleet worker turns (<worker>-tN). Each settled result is delivered to you automatically, exactly once. Ops: list snapshots every job without consuming results. inspect with id shows one job and its output tail. logs with id reads output (lines, default 100) without consuming. cancel with id stops a job; its receipt says whether it settled, was only requested, or had already settled. signal with id and signal sends SIGINT, SIGTERM or SIGKILL to a shell job. input with id and text is refused for jobs that read no input. wait blocks ONLY when you cannot proceed without a result: it returns when a target settles (ids, or every running job when omitted) or after timeout_ms (default 30000; 0 waits until one settles), and the results it returns are consumed; everything else keeps arriving automatically. watch starts job watch_N that follows a job's output (source, such as bg_3) or re-runs a short command every every_ms (command), with an optional regular expression match, max_events (default 10) and timeout_ms; each matching line, or changed matching output, reaches you as a message from watch_N that wakes you, so watch instead of polling. wait with mailbox ({} for any message, or {\"from\": \"<agent or watch id>\"}) instead of ids blocks until a message waits for you and takes it. NEVER poll with repeated list, logs, wait, or shell sleep loops; end the turn instead.";
 
 pub const jobs = ToolSpec{
     .name = "jobs",
@@ -385,10 +398,17 @@ pub const jobs = ToolSpec{
         .description = jobs_description,
         .input_schema = .{
             .properties = &.{
-                .{ .name = "op", .json_type = .string, .shape = &.{ .enum_values = &.{ "list", "inspect", "logs", "input", "signal", "cancel", "wait" } }, .description = "The operation. Send only the fields it uses." },
+                .{ .name = "op", .json_type = .string, .shape = &.{ .enum_values = &.{ "list", "inspect", "logs", "input", "signal", "cancel", "wait", "watch" } }, .description = "The operation. Send only the fields it uses." },
                 .{ .name = "id", .json_type = .string, .description = "inspect, logs, input, signal, cancel: the job id, exactly as a shell result or fleet receipt returned it." },
                 .{ .name = "ids", .json_type = .array, .bounds = &.{ .min_items = 1, .max_items = 32 }, .shape = &.{ .array_values = .{ .json_type = .string } }, .description = "wait: the jobs to wait on. Omit to wait on every running job." },
-                .{ .name = "timeout_ms", .json_type = .integer, .bounds = &.{ .minimum = 0, .maximum = 600_000 }, .description = "wait: how long to wait, default 30000; 0 waits until a target settles." },
+                .{ .name = "timeout_ms", .json_type = .integer, .bounds = &.{ .minimum = 0, .maximum = 600_000 }, .description = "wait: how long to wait, default 30000; 0 waits until a target settles. watch: the watch's lifetime, at least 1000." },
+                .{ .name = "mailbox", .json_type = .object, .shape = &.{ .object = &jobs_mailbox_schema }, .description = "wait: wait for a message instead of jobs; {} for any, or from one agent or watch id." },
+                .{ .name = "source", .json_type = .string, .description = "watch: the job whose output to follow, such as bg_3." },
+                .{ .name = "command", .json_type = .string, .description = "watch: a short command to re-run every every_ms instead of source." },
+                .{ .name = "every_ms", .json_type = .integer, .bounds = &.{ .minimum = 1000, .maximum = 3_600_000 }, .description = "watch with command: the interval, at least 1000." },
+                .{ .name = "match", .json_type = .string, .description = "watch: a regular expression a line must match to be reported; every line when omitted." },
+                .{ .name = "max_events", .json_type = .integer, .bounds = &.{ .minimum = 1, .maximum = 1000 }, .description = "watch: events before the watch stops, default 10." },
+                .{ .name = "label", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = 80 }, .description = "watch: a short name for the watch." },
                 .{ .name = "lines", .json_type = .integer, .bounds = &.{ .minimum = 1, .maximum = 1000 }, .description = "logs: how many trailing lines, default 100." },
                 .{ .name = "text", .json_type = .string, .description = "input: text for the job's input." },
                 .{ .name = "signal", .json_type = .string, .shape = &.{ .enum_values = &.{ "SIGINT", "SIGTERM", "SIGKILL" } }, .description = "signal: the signal for a shell job's process tree." },
@@ -889,7 +909,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "de0a57015278fe19b14907e38f5397c1a6dc960330201f4a4dad065b4176ab37",
+        "4de7a138dfe7bc0cfd525e0cc4c813c1ba1a621fc220917fb58f00299fe3185b",
         &actual_hex,
     );
 }
@@ -1284,7 +1304,7 @@ test "built-in fleet owns product metadata schema and callbacks" {
     try std.testing.expect(std.mem.find(u8, fleet.description, "Route only by a worker's `id`") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"oneOf\"") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"op\"]") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"enum\":[\"run\",\"spawn\",\"send\",\"list\",\"inspect\",\"terminate\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"enum\":[\"run\",\"spawn\",\"send\",\"message\",\"list\",\"inspect\",\"inbox\",\"terminate\"]") != null);
     for ([_][]const u8{ "\"request\"", "\"action\"", "\"child_id\"", "\"provider\"" }) |mechanism| {
         try std.testing.expect(std.mem.find(u8, schema_json, mechanism) == null);
     }
@@ -1296,7 +1316,7 @@ test "built-in fleet owns product metadata schema and callbacks" {
 }
 
 test "fleet schema fields match the decoder's op fields" {
-    const op_fields = [_][]const []const u8{ &fleet_impl.run_fields, &fleet_impl.spawn_fields, &fleet_impl.send_fields, &fleet_impl.list_fields, &fleet_impl.id_fields };
+    const op_fields = [_][]const []const u8{ &fleet_impl.run_fields, &fleet_impl.spawn_fields, &fleet_impl.send_fields, &fleet_impl.list_fields, &fleet_impl.id_fields, &fleet_impl.message_fields, &fleet_impl.inbox_fields };
     // Every advertised property belongs to some op, and every field an op
     // takes is advertised, so a flat call can always say what it means.
     for (fleet_properties) |property| {

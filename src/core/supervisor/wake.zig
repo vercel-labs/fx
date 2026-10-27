@@ -15,7 +15,37 @@ pub fn tick(self: *Session, now: i64) void {
         self.events_mutex.unlock(io_mod.getIo());
         if (!waiting) fireHeartbeat(self, now);
     }
-    if (!self.record.stopped) deliverJobNotice(self);
+    if (!self.record.stopped) {
+        deliverJobNotice(self);
+        deliverMail(self);
+    }
+}
+
+/// Delivers messages from other agents (D188): every worker's waiting
+/// messages through its parent's host, then the root's own as a notice
+/// that steers the running turn or starts one, exactly once like a job
+/// notice (`tests/tla/jobs/Mailbox.tla`).
+fn deliverMail(self: *Session) void {
+    const host = self.host orelse return;
+    {
+        self.events_mutex.lockUncancelable(io_mod.getIo());
+        const answers = self.mail_answers.toOwnedSlice(self.daemon.alloc) catch &.{};
+        self.events_mutex.unlock(io_mod.getIo());
+        defer self.daemon.alloc.free(answers);
+        for (answers) |answer| host.mailNoticeAnswered(answer.id, answer.delivered);
+    }
+    host.pumpMail();
+    var arena_state = std.heap.ArenaAllocator.init(self.daemon.alloc);
+    defer arena_state.deinit();
+    const notice = (host.takeMailNotice(arena_state.allocator()) catch |err| {
+        std.debug.print("proto-fx: message delivery failed: {s}\n", .{@errorName(err)});
+        return;
+    }) orelse return;
+    const request_id = self.prompt(notice.text, .peer_message) catch |err| {
+        if (err != error.SessionBusy) std.debug.print("proto-fx: message admission failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    host.mailNoticeAdmitted(notice, request_id);
 }
 
 fn fireHeartbeat(self: *Session, now: i64) void {

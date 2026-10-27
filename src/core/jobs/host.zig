@@ -21,6 +21,7 @@ pub const Host = struct {
     registry: jobs.Registry,
     shell: jobs.shell_source.Source,
     turns: jobs.turn_source.Source,
+    watches: jobs.watch_source.Source,
     mutex: std.Io.Mutex = .init,
     /// Notices the agent loop admitted and has not yet answered. Their
     /// results stay reserved until the answer says whether the model got
@@ -61,15 +62,21 @@ pub const Host = struct {
             .registry = jobs.Registry.init(alloc),
             .shell = .{ .runtime = executions },
             .turns = jobs.turn_source.Source.init(alloc, turn_runtime),
+            .watches = undefined,
         };
+        self.watches = jobs.watch_source.Source.init(alloc, &self.registry);
         self.registry.addSource(self.shell.source());
         self.registry.addSource(self.turns.source());
+        self.registry.addSource(self.watches.source());
+        self.registry.watches = &self.watches;
         self.registry.reclaimer = .{ .ctx = self, .func = reclaim };
     }
 
     /// Frees the bookkeeping only: the sources' runtimes may already be gone.
     pub fn deinit(self: *Host) void {
         const alloc = self.registry.alloc;
+        // Watch threads read the registry: stop them first.
+        self.watches.deinit();
         for (self.queued.items) |queued| queued.free(alloc);
         self.queued.deinit(alloc);
         self.registry.deinit();
@@ -255,8 +262,10 @@ fn testHost(host: *Host, source: *TestSource, steer: *TestSteer) void {
         .registry = jobs.Registry.init(std.testing.allocator),
         .shell = undefined,
         .turns = jobs.turn_source.Source.init(std.testing.allocator, null),
+        .watches = undefined,
         .withdraw = .{ .ctx = steer, .func = TestSteer.withdraw },
     };
+    host.watches = jobs.watch_source.Source.init(std.testing.allocator, &host.registry);
     host.registry.addSource(.{ .ctx = source, .vtable = &TestSource.vtable });
     host.registry.reclaimer = .{ .ctx = host, .func = Host.reclaim };
 }

@@ -1,0 +1,747 @@
+//! Messages between the agents of one tree (D185 to D189), proto's IRC bus
+//! in proto-fx form. Each node keeps a mailbox in its own log
+//! (`fold_mail.zig`); this file routes a message there and then to the
+//! node's model, exactly once:
+//!
+//! - A worker gets its waiting messages as `send` would give them, from
+//!   its parent's host: a steer into its running turn, or a turn of its
+//!   own that its parent owns and lists as a job, as proto's wake turns
+//!   are. A turn is admitted durably, so its messages leave the mailbox at
+//!   once; a steer's messages leave it when the steer is applied, and wait
+//!   again when it is not.
+//! - The root gets its messages from the supervisor's tick, as job notices
+//!   are (`supervisor/wake.zig`): a steer of the running turn or a turn of
+//!   its own, settled by the host's answer.
+//!
+//! After a restart, a waiting message the node's history already holds was
+//! received before the crash and leaves the mailbox as delivered
+//! (`tests/tla/jobs/Mailbox.tla` ExactlyOnce, NoLossAcrossRestart).
+const std = @import("std");
+const agent_message = @import("agent_message.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
+const fleet_host = @import("fleet_host.zig");
+const io_mod = @import("../shared/io.zig");
+const node_ops = @import("node_ops.zig");
+const session_adapter = @import("../session/session_adapter.zig");
+const session_store = @import("../session/session_store.zig");
+const tool_host = @import("tool_host.zig");
+const types = @import("../shared/types.zig");
+pub const directory = @import("mail_directory.zig");
+
+const Allocator = std.mem.Allocator;
+const Runtime = tool_host.Runtime;
+const Mail = session_adapter.Mail;
+const Node = directory.Node;
+
+/// After the loop answered a root notice without delivering it, the next
+/// waits this long.
+const undelivered_retry_ms = 5_000;
+
+pub const Outcome = enum { delivered, queued, rejected, dropped };
+pub const Effect = enum { injected, wake_requested };
+
+/// What became of one message, as proto's bus answers a sender.
+pub const Receipt = struct {
+    to: []const u8,
+    label: []const u8 = "",
+    id: ?[]const u8 = null,
+    outcome: Outcome,
+    effect: ?Effect = null,
+    /// The recipient's host was closed and opened again for it.
+    revived: bool = false,
+    /// The oldest waiting message a full mailbox dropped for this one.
+    dropped_oldest: ?[]const u8 = null,
+    @"error": ?[]const u8 = null,
+};
+
+pub const SendInput = struct {
+    to: []const u8,
+    body: []const u8,
+    reply_to: ?[]const u8 = null,
+};
+
+/// One tree's mail state in this process. Durable state is the mailboxes;
+/// this holds only what is in flight.
+pub const Bus = struct {
+    alloc: Allocator,
+    mutex: std.Io.Mutex = .init,
+    /// Bumped whenever a mailbox changes, for waits.
+    generation: std.atomic.Value(u64) = .init(0),
+    /// Nodes that may have waiting messages; null until the first pump
+    /// reads every mailbox of the tree.
+    pending: ?std.array_hash_map.String(void) = null,
+    /// Messages steered into a worker's running turn, until the steer is
+    /// settled.
+    steers: std.ArrayList(Steer) = .empty,
+    /// Root messages the supervisor handed to the loop and not answered.
+    root_notices: std.ArrayList(InflightNotice) = .empty,
+    /// Waits on the root's mailbox; automatic delivery leaves it to them.
+    root_waits: usize = 0,
+    root_retry_after_ms: i64 = 0,
+    /// Whether the root's own turn ran at the supervisor's last tick, so a
+    /// receipt can say whether a message joins it or wakes it.
+    root_busy: std.atomic.Value(bool) = .init(false),
+
+    const Steer = struct {
+        node_id: []u8,
+        parent_id: []u8,
+        operation_id: []u8,
+        fingerprint: [32]u8,
+        ids: [][]u8,
+
+        fn free(steer: Steer, alloc: Allocator) void {
+            alloc.free(steer.node_id);
+            alloc.free(steer.parent_id);
+            alloc.free(steer.operation_id);
+            freeIds(alloc, steer.ids);
+        }
+    };
+
+    const InflightNotice = struct {
+        request_id: i64,
+        ids: [][]u8,
+    };
+
+    pub fn init(alloc: Allocator) Bus {
+        return .{ .alloc = alloc };
+    }
+
+    pub fn deinit(self: *Bus) void {
+        if (self.pending) |*pending| {
+            for (pending.keys()) |key| self.alloc.free(key);
+            pending.deinit(self.alloc);
+        }
+        for (self.steers.items) |steer| steer.free(self.alloc);
+        self.steers.deinit(self.alloc);
+        for (self.root_notices.items) |notice| freeIds(self.alloc, notice.ids);
+        self.root_notices.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn lock(self: *Bus) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+    }
+
+    fn unlock(self: *Bus) void {
+        self.mutex.unlock(io_mod.getIo());
+    }
+
+    /// Waits on the root's mailbox now.
+    pub fn rootWaits(self: *Bus) usize {
+        self.lock();
+        defer self.unlock();
+        return self.root_waits;
+    }
+
+    fn changed(self: *Bus) void {
+        _ = self.generation.fetchAdd(1, .seq_cst);
+    }
+
+    /// Ids of `node_id`'s messages on their way to its model. Owned by
+    /// `arena`. Holds `mutex`.
+    fn inflightLocked(self: *Bus, arena: Allocator, node_id: []const u8, root: bool) ![]const []const u8 {
+        var ids: std.ArrayList([]const u8) = .empty;
+        if (root) {
+            for (self.root_notices.items) |notice| for (notice.ids) |id| try ids.append(arena, try arena.dupe(u8, id));
+        } else for (self.steers.items) |steer| {
+            if (!std.mem.eql(u8, steer.node_id, node_id)) continue;
+            for (steer.ids) |id| try ids.append(arena, try arena.dupe(u8, id));
+        }
+        return ids.items;
+    }
+
+    fn markPending(self: *Bus, node_id: []const u8) void {
+        self.lock();
+        defer self.unlock();
+        const pending = if (self.pending) |*pending| pending else return;
+        if (pending.contains(node_id)) return;
+        const owned = self.alloc.dupe(u8, node_id) catch return;
+        pending.put(self.alloc, owned, {}) catch self.alloc.free(owned);
+    }
+
+    fn clearPending(self: *Bus, node_id: []const u8) void {
+        self.lock();
+        defer self.unlock();
+        const pending = if (self.pending) |*pending| pending else return;
+        const index = pending.getIndex(node_id) orelse return;
+        self.alloc.free(pending.keys()[index]);
+        pending.swapRemoveAt(index);
+    }
+};
+
+fn freeIds(alloc: Allocator, ids: []const []u8) void {
+    for (ids) |id| alloc.free(id);
+    alloc.free(ids);
+}
+
+fn dupeIds(alloc: Allocator, mails: []const Mail) ![][]u8 {
+    const ids = try alloc.alloc([]u8, mails.len);
+    var filled: usize = 0;
+    errdefer {
+        for (ids[0..filled]) |id| alloc.free(id);
+        alloc.free(ids);
+    }
+    for (mails, ids) |mail, *id| {
+        id.* = try alloc.dupe(u8, mail.id);
+        filled += 1;
+    }
+    return ids;
+}
+
+fn contains(ids: []const []const u8, id: []const u8) bool {
+    for (ids) |candidate| if (std.mem.eql(u8, candidate, id)) return true;
+    return false;
+}
+
+/// `mailbox` without the messages in `inflight` and, with `from`, only
+/// those from that sender. Owned by `arena`.
+fn waiting(arena: Allocator, mailbox: []const Mail, inflight: []const []const u8, from: ?[]const u8) ![]Mail {
+    var out: std.ArrayList(Mail) = .empty;
+    for (mailbox) |mail| {
+        if (contains(inflight, mail.id)) continue;
+        if (from) |sender| if (!std.mem.eql(u8, mail.from, sender)) continue;
+        try out.append(arena, mail);
+    }
+    return out.items;
+}
+
+fn rootHost(bus_owner: *Runtime) *Runtime {
+    return bus_owner.tree.root_host.?;
+}
+
+fn bus(host: *Runtime) *Bus {
+    return &host.tree.mail;
+}
+
+// ---------------------------------------------------------------------------
+// Sending
+
+/// Sends `input` from `sender`'s node to one agent of its tree, its parent
+/// or root by name, or every other live agent with `all` (D186). Receipts
+/// are owned by `arena`.
+pub fn send(sender: *Runtime, arena: Allocator, input: SendInput) ![]Receipt {
+    const root = rootHost(sender);
+    const nodes = try directory.list(arena, root);
+    const me = directory.find(nodes, sender.node_id) orelse return error.NodeUnavailable;
+    var receipts: std.ArrayList(Receipt) = .empty;
+    if (std.mem.eql(u8, input.to, "all")) {
+        for (nodes) |node| {
+            if (std.mem.eql(u8, node.id, me.id) or node.terminated) continue;
+            try receipts.append(arena, try sendOne(root, arena, me, node, input, true));
+        }
+    } else {
+        const target_id: []const u8 = if (std.mem.eql(u8, input.to, "parent"))
+            me.parent orelse return receiptsOf(arena, .{ .to = input.to, .outcome = .rejected, .@"error" = "The root agent has no parent." })
+        else if (std.mem.eql(u8, input.to, "root"))
+            root.node_id
+        else
+            input.to;
+        if (std.mem.eql(u8, target_id, me.id)) return receiptsOf(arena, .{ .to = input.to, .outcome = .rejected, .@"error" = "Cannot send a message to yourself." });
+        const target = directory.find(nodes, target_id) orelse {
+            const hint = if (directory.findLabel(nodes, target_id)) |named|
+                try arena.print("`{s}` is a label, and labels never route. Address agent `{s}` by its id.", .{ target_id, named.id })
+            else
+                try arena.print("Unknown agent `{s}`. fleet op \"list\" scope \"visible\" names every agent of this tree.", .{target_id});
+            return receiptsOf(arena, .{ .to = input.to, .outcome = .rejected, .@"error" = hint });
+        };
+        if (target.terminated) return receiptsOf(arena, .{
+            .to = target.id,
+            .label = target.label,
+            .outcome = .rejected,
+            .@"error" = try arena.print("Agent `{s}` is terminal and takes no more messages. Its transcript stays readable at history://{s}.", .{ target.id, target.id }),
+        });
+        try receipts.append(arena, try sendOne(root, arena, me, target, input, false));
+    }
+    bus(root).changed();
+    return receipts.items;
+}
+
+fn receiptsOf(arena: Allocator, receipt: Receipt) ![]Receipt {
+    const out = try arena.alloc(Receipt, 1);
+    out[0] = receipt;
+    return out;
+}
+
+fn sendOne(root: *Runtime, arena: Allocator, me: Node, target: Node, input: SendInput, broadcast: bool) !Receipt {
+    const id = try session_store.generateSessionId(arena);
+    const line: session_adapter.MailLine = .{ .mail = .{
+        .id = id,
+        .from = me.id,
+        .label = me.label,
+        .body = input.body,
+        .reply_to = input.reply_to,
+        .broadcast = broadcast,
+    } };
+    if (target.depth == 0) {
+        const dropped = post(root, arena, root.children.parent, root.node_id, line) catch |err| return failed(arena, target, err);
+        bus(root).changed();
+        const busy = bus(root).root_busy.load(.seq_cst);
+        return .{ .to = target.id, .label = target.label, .id = id, .outcome = .delivered, .effect = if (busy) .injected else .wake_requested, .dropped_oldest = dropped };
+    }
+    const revived = !root.tree.nodes.isOpen(target.id);
+    const entry = node_ops.lease(root, target.path) catch |err| return failed(arena, target, err);
+    defer node_ops.release(root, entry);
+    const dropped = post(root, arena, entry.session, target.id, line) catch |err| return failed(arena, target, err);
+    bus(root).changed();
+    const effect: ?Effect = switch (try deliverWorker(root, arena, entry, target)) {
+        .steered => .injected,
+        .turn => .wake_requested,
+        .none, .later => null,
+        .terminal => return .{ .to = target.id, .label = target.label, .id = id, .outcome = .rejected, .@"error" = "The agent became terminal before the message reached it." },
+    };
+    return .{
+        .to = target.id,
+        .label = target.label,
+        .id = id,
+        .outcome = if (effect != null) .delivered else .queued,
+        .effect = effect,
+        .revived = revived,
+        .dropped_oldest = dropped,
+        .@"error" = if (effect == null) "The agent cannot take it now; it waits in its mailbox and is delivered when the agent can." else null,
+    };
+}
+
+fn failed(arena: Allocator, target: Node, err: anyerror) !Receipt {
+    if (err == error.OutOfMemory) return error.OutOfMemory;
+    debug_trace.logf("subagent", "mail not posted node_id={s} err={s}", .{ target.id, @errorName(err) });
+    return .{ .to = target.id, .label = target.label, .outcome = .rejected, .@"error" = try arena.print("The message could not be kept: {s}.", .{@errorName(err)}) };
+}
+
+/// Appends `line` to node `node_id`'s mailbox in `session`, dropping its
+/// oldest waiting message when it is full (D185). Returns the dropped id.
+fn post(root: *Runtime, arena: Allocator, session: *session_adapter.Session, node_id: []const u8, line: session_adapter.MailLine) !?[]const u8 {
+    const b = bus(root);
+    b.lock();
+    defer b.unlock();
+    const mailbox = try session.mailbox(arena);
+    var dropped: ?[]const u8 = null;
+    var lines: [2]session_adapter.MailLine = undefined;
+    var count: usize = 0;
+    if (mailbox.len >= session_adapter.max_mailbox) {
+        const inflight = try b.inflightLocked(arena, node_id, std.mem.eql(u8, node_id, root.node_id));
+        // The oldest that is not on its way to the model, or the oldest.
+        var victim = mailbox[0];
+        for (mailbox) |mail| if (!contains(inflight, mail.id)) {
+            victim = mail;
+            break;
+        };
+        dropped = victim.id;
+        lines[count] = .{ .done = .{ .id = victim.id, .how = .dropped } };
+        count += 1;
+    }
+    lines[count] = line;
+    count += 1;
+    try session.appendMail(lines[0..count]);
+    if (b.pending) |*pending| if (!pending.contains(node_id)) {
+        const owned = try b.alloc.dupe(u8, node_id);
+        pending.put(b.alloc, owned, {}) catch |err| {
+            b.alloc.free(owned);
+            return err;
+        };
+    };
+    return dropped;
+}
+
+/// Writes `how` for each of `ids` that still waits in `session`'s mailbox.
+fn finishMail(root: *Runtime, arena: Allocator, session: *session_adapter.Session, ids: []const []const u8, how: @import("session_manager").MailEnd) void {
+    const b = bus(root);
+    b.lock();
+    defer b.unlock();
+    const mailbox = session.mailbox(arena) catch return;
+    var lines: std.ArrayList(session_adapter.MailLine) = .empty;
+    for (ids) |id| {
+        for (mailbox) |mail| if (std.mem.eql(u8, mail.id, id)) {
+            lines.append(arena, .{ .done = .{ .id = id, .how = how } }) catch return;
+            break;
+        };
+    }
+    session.appendMail(lines.items) catch |err| {
+        debug_trace.logf("subagent", "mail settle not saved count={d} err={s}", .{ lines.items.len, @errorName(err) });
+        return;
+    };
+    b.changed();
+}
+
+// ---------------------------------------------------------------------------
+// Delivering to workers
+
+const WorkerDelivery = enum { none, steered, turn, later, terminal };
+
+/// Hands worker `node`'s waiting messages to it through its parent's host.
+fn deliverWorker(root: *Runtime, arena: Allocator, entry: *@import("node_hosts.zig").Entry, node: Node) !WorkerDelivery {
+    const b = bus(root);
+    const ready = blk: {
+        b.lock();
+        defer b.unlock();
+        const inflight = try b.inflightLocked(arena, node.id, false);
+        break :blk try waiting(arena, try entry.session.mailbox(arena), inflight, null);
+    };
+    if (ready.len == 0) return .none;
+    const built = (try agent_message.build(arena, node.label, ready)).?;
+    const carried = ready[0..built.used];
+    const parent = if (entry.parent) |above| above.runtime else root;
+    const operation_id = try arena.print("mail-{s}", .{carried[0].id});
+    const delivery = fleet_host.deliverMail(parent, node.id, built.text, operation_id) catch |err| {
+        debug_trace.logf("subagent", "mail delivery failed node_id={s} err={s}", .{ node.id, @errorName(err) });
+        return .later;
+    };
+    switch (delivery) {
+        .steered => |fingerprint| {
+            const steer: Bus.Steer = .{
+                .node_id = try b.alloc.dupe(u8, node.id),
+                .parent_id = try b.alloc.dupe(u8, parent.node_id),
+                .operation_id = try b.alloc.dupe(u8, operation_id),
+                .fingerprint = fingerprint,
+                .ids = try dupeIds(b.alloc, carried),
+            };
+            b.lock();
+            defer b.unlock();
+            b.steers.append(b.alloc, steer) catch |err| {
+                steer.free(b.alloc);
+                return err;
+            };
+            return .steered;
+        },
+        .turn => {
+            // The turn's admission is durable in the parent's log, so the
+            // messages leave the mailbox now (`Mailbox.tla` AdmitTurn).
+            const ids = try arena.alloc([]const u8, carried.len);
+            for (carried, ids) |mail, *id| id.* = mail.id;
+            finishMail(root, arena, entry.session, ids, .delivered);
+            return .turn;
+        },
+        .later => return .later,
+        .terminal => {
+            const ids = try arena.alloc([]const u8, ready.len);
+            for (ready, ids) |mail, *id| id.* = mail.id;
+            finishMail(root, arena, entry.session, ids, .dropped);
+            return .terminal;
+        },
+    }
+}
+
+/// Settles steers whose outcome is known: applied messages leave their
+/// mailbox, the rest wait again.
+fn settleSteers(root: *Runtime, arena: Allocator) void {
+    const b = bus(root);
+    // Read each steer's outcome without the bus lock: the parent's host
+    // has locks of its own.
+    const open = blk: {
+        b.lock();
+        defer b.unlock();
+        var copy: std.ArrayList(Bus.Steer) = .empty;
+        for (b.steers.items) |steer| copy.append(arena, .{
+            .node_id = arena.dupe(u8, steer.node_id) catch return,
+            .parent_id = arena.dupe(u8, steer.parent_id) catch return,
+            .operation_id = arena.dupe(u8, steer.operation_id) catch return,
+            .fingerprint = steer.fingerprint,
+            .ids = steer.ids,
+        }) catch return;
+        break :blk copy.items;
+    };
+    for (open) |view| {
+        const state = steerState(root, view) orelse continue;
+        const steer = blk: {
+            b.lock();
+            defer b.unlock();
+            for (b.steers.items, 0..) |candidate, index| {
+                if (std.mem.eql(u8, candidate.operation_id, view.operation_id)) break :blk b.steers.orderedRemove(index);
+            }
+            continue;
+        };
+        defer steer.free(b.alloc);
+        if (state == .applied) {
+            if (directory.pathOf(arena, root, steer.node_id) catch null) |hops| {
+                if (node_ops.lease(root, hops)) |entry| {
+                    defer node_ops.release(root, entry);
+                    const ids: []const []const u8 = @ptrCast(steer.ids);
+                    finishMail(root, arena, entry.session, ids, .delivered);
+                } else |_| {}
+            }
+        }
+        b.markPending(steer.node_id);
+        debug_trace.logf("subagent", "mail steer settled node_id={s} applied={}", .{ steer.node_id, state == .applied });
+    }
+}
+
+/// The steer's outcome once it is known; null while it is queued.
+fn steerState(root: *Runtime, steer: Bus.Steer) ?types.SteeringDelivery {
+    const Visit = struct {
+        steer: Bus.Steer,
+        fn visit(self: @This(), host: *Runtime) ?types.SteeringDelivery {
+            const replay = host.managed.feedbackReplay(self.steer.operation_id, self.steer.fingerprint) orelse return .not_applied;
+            const delivery = switch (replay) {
+                .receipt => |delivery| delivery,
+                else => return .not_applied,
+            };
+            if (delivery != .queued) host.managed.acknowledgeFeedback(self.steer.node_id, self.steer.operation_id, delivery);
+            return if (delivery == .queued) null else delivery;
+        }
+    };
+    // A parent whose host closed took the steer with it.
+    return root.tree.withHost(steer.parent_id, ?types.SteeringDelivery, Visit{ .steer = steer }, Visit.visit) orelse .not_applied;
+}
+
+/// Delivers every waiting worker message it can: the supervisor's tick
+/// calls it, and so does every send. The first call reads every mailbox of
+/// the tree and settles what a crash left (D188).
+pub fn pump(root: *Runtime) void {
+    var arena_state = std.heap.ArenaAllocator.init(root.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const b = bus(root);
+    if (b.pending == null) recover(root, arena) catch |err| {
+        debug_trace.logf("subagent", "mail recovery failed err={s}", .{@errorName(err)});
+        return;
+    };
+    settleSteers(root, arena);
+    const ids = blk: {
+        b.lock();
+        defer b.unlock();
+        const pending = b.pending orelse return;
+        var copy: std.ArrayList([]const u8) = .empty;
+        for (pending.keys()) |id| {
+            if (std.mem.eql(u8, id, root.node_id)) continue;
+            copy.append(arena, arena.dupe(u8, id) catch return) catch return;
+        }
+        break :blk copy.items;
+    };
+    if (ids.len == 0) return;
+    const nodes = directory.list(arena, root) catch return;
+    for (ids) |id| {
+        const node = directory.find(nodes, id) orelse {
+            b.clearPending(id);
+            continue;
+        };
+        const entry = node_ops.lease(root, node.path) catch continue;
+        defer node_ops.release(root, entry);
+        const outcome = deliverWorker(root, arena, entry, node) catch continue;
+        if (outcome == .none) b.clearPending(id);
+    }
+}
+
+/// Reads every mailbox of the tree once: a waiting message the node's
+/// history already holds reached its model before a restart and leaves as
+/// delivered (`Mailbox.tla` RecoverDelivered); the rest wait.
+fn recover(root: *Runtime, arena: Allocator) !void {
+    const b = bus(root);
+    const nodes = try directory.list(arena, root);
+    var pending: std.array_hash_map.String(void) = .empty;
+    errdefer {
+        for (pending.keys()) |key| b.alloc.free(key);
+        pending.deinit(b.alloc);
+    }
+    for (nodes) |node| {
+        if (node.waiting == 0) continue;
+        const store = root.tree.store;
+        const mailbox = try store.peekMailbox(arena, node.id);
+        const received = try receivedIds(arena, store, node.id, mailbox);
+        if (received.len > 0) {
+            if (node.depth == 0) {
+                finishMail(root, arena, root.children.parent, received, .delivered);
+            } else if (node_ops.lease(root, node.path)) |entry| {
+                defer node_ops.release(root, entry);
+                finishMail(root, arena, entry.session, received, .delivered);
+            } else |_| {}
+        }
+        if (received.len < mailbox.len) {
+            const owned = try b.alloc.dupe(u8, node.id);
+            try pending.put(b.alloc, owned, {});
+        }
+    }
+    b.lock();
+    defer b.unlock();
+    if (b.pending == null) b.pending = pending else {
+        for (pending.keys()) |key| b.alloc.free(key);
+        pending.deinit(b.alloc);
+    }
+}
+
+/// The ids of `mailbox` that node `id`'s saved turns carry, as a prompt or
+/// a steer. Owned by `arena`.
+fn receivedIds(arena: Allocator, store: *session_adapter.Store, id: []const u8, mailbox: []const Mail) ![]const []const u8 {
+    if (mailbox.len == 0) return &.{};
+    const Visitor = struct {
+        arena: Allocator,
+        mailbox: []const Mail,
+        found: std.ArrayList([]const u8) = .empty,
+
+        fn note(self: *@This(), text: []const u8) !void {
+            const at = std.mem.find(u8, text, agent_message.open_tag) orelse return;
+            for (self.mailbox) |mail| {
+                if (contains(self.found.items, mail.id)) continue;
+                if (agent_message.carries(text[at..], mail.id)) try self.found.append(self.arena, mail.id);
+            }
+        }
+
+        pub fn turn(self: *@This(), value: types.HistoryTurn, _: u64) !void {
+            const user, const execution = switch (value) {
+                .assistant => |entry| .{ entry.user, entry.execution },
+                .interrupted => |entry| .{ entry.user, entry.execution },
+                .compacted_summary => return,
+            };
+            try self.note(user.text);
+            for (execution.steering) |steering| try self.note(steering.text);
+        }
+    };
+    var visitor: Visitor = .{ .arena = arena, .mailbox = mailbox };
+    store.visitTurns(arena, id, &visitor) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return visitor.found.items,
+    };
+    return visitor.found.items;
+}
+
+// ---------------------------------------------------------------------------
+// The root's mail, delivered by the supervisor
+
+pub const RootNotice = struct {
+    text: []const u8,
+    ids: []const []const u8,
+};
+
+/// The notice of the root's waiting messages, or null. The caller hands
+/// `text` to the agent loop, then calls `rootAdmitted` with its request id.
+pub fn takeRootNotice(root: *Runtime, arena: Allocator) !?RootNotice {
+    const b = bus(root);
+    if (io_mod.milliTimestamp() < b.root_retry_after_ms) return null;
+    const ready = blk: {
+        b.lock();
+        defer b.unlock();
+        if (b.root_waits > 0) return null;
+        if (b.pending) |pending| if (!pending.contains(root.node_id)) return null;
+        const inflight = try b.inflightLocked(arena, root.node_id, true);
+        break :blk try waiting(arena, try root.children.parent.mailbox(arena), inflight, null);
+    };
+    if (ready.len == 0) {
+        bus(root).clearPending(root.node_id);
+        return null;
+    }
+    const built = (try agent_message.build(arena, "root", ready)).?;
+    const ids = try arena.alloc([]const u8, built.used);
+    for (ready[0..built.used], ids) |mail, *id| id.* = mail.id;
+    return .{ .text = built.text, .ids = ids };
+}
+
+/// The loop admitted `notice` as request `request_id`: its messages stay
+/// on their way until `rootAnswered`.
+pub fn rootAdmitted(root: *Runtime, notice: RootNotice, request_id: i64) void {
+    const b = bus(root);
+    const ids = b.alloc.alloc([]u8, notice.ids.len) catch return;
+    var filled: usize = 0;
+    for (notice.ids, ids) |id, *slot| {
+        slot.* = b.alloc.dupe(u8, id) catch {
+            freeIds(b.alloc, ids[0..filled]);
+            return;
+        };
+        filled += 1;
+    }
+    b.lock();
+    defer b.unlock();
+    b.root_notices.append(b.alloc, .{ .request_id = request_id, .ids = ids }) catch freeIds(b.alloc, ids);
+}
+
+/// The loop answered root notice `request_id`: `delivered` when the model
+/// got it, as a steer the turn took or the prompt of a turn it ran.
+pub fn rootAnswered(root: *Runtime, request_id: i64, delivered: bool) void {
+    const b = bus(root);
+    const ids = blk: {
+        b.lock();
+        defer b.unlock();
+        for (b.root_notices.items, 0..) |notice, index| {
+            if (notice.request_id == request_id) break :blk b.root_notices.orderedRemove(index).ids;
+        }
+        return;
+    };
+    defer freeIds(b.alloc, ids);
+    var arena_state = std.heap.ArenaAllocator.init(root.alloc);
+    defer arena_state.deinit();
+    if (delivered) {
+        const borrowed: []const []const u8 = @ptrCast(ids);
+        finishMail(root, arena_state.allocator(), root.children.parent, borrowed, .delivered);
+    } else {
+        b.root_retry_after_ms = io_mod.milliTimestamp() + undelivered_retry_ms;
+        b.markPending(root.node_id);
+    }
+}
+
+/// Whether the root has waiting messages no notice carries yet.
+pub fn rootHasMail(root: *Runtime) bool {
+    const b = bus(root);
+    b.lock();
+    defer b.unlock();
+    const pending = b.pending orelse return false;
+    return pending.contains(root.node_id);
+}
+
+/// Posts a message to the root's mailbox from something that is not an
+/// agent: a watch reporting a match (D190). `from` is the watch's job id.
+pub fn postToRoot(root: *Runtime, from: []const u8, label: []const u8, body: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(root.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const clipped = body[0..@min(body.len, session_adapter.max_mail_body_bytes)];
+    const id = try session_store.generateSessionId(arena);
+    _ = try post(root, arena, root.children.parent, root.node_id, .{ .mail = .{ .id = id, .from = from, .label = label, .body = clipped } });
+    bus(root).changed();
+}
+
+// ---------------------------------------------------------------------------
+// Reading a mailbox
+
+/// `node`'s waiting messages, oldest first, without those on their way to
+/// its model. Unless `peek`, they leave the mailbox as read. With `from`,
+/// only that sender's. Owned by `arena`.
+pub fn inbox(node: *Runtime, arena: Allocator, peek: bool, from: ?[]const u8) ![]Mail {
+    const root = rootHost(node);
+    const b = bus(root);
+    const is_root = node == root;
+    const ready = blk: {
+        b.lock();
+        defer b.unlock();
+        const inflight = try b.inflightLocked(arena, node.node_id, is_root);
+        break :blk try waiting(arena, try node.children.parent.mailbox(arena), inflight, from);
+    };
+    if (!peek and ready.len > 0) {
+        const ids = try arena.alloc([]const u8, ready.len);
+        for (ready, ids) |mail, *id| id.* = mail.id;
+        finishMail(root, arena, node.children.parent, ids, .read);
+    }
+    return ready;
+}
+
+/// Waits up to `timeout_ms` for a message in the root's mailbox, from
+/// `from` when given, and takes what waits as read. Automatic delivery
+/// leaves the root's mail to the wait while it waits (`Mailbox.tla`
+/// NoDeliveryUnderWait). Empty when the window passed.
+pub fn waitRoot(root: *Runtime, arena: Allocator, from: ?[]const u8, timeout_ms: u64, cancel: ?*const std.atomic.Value(bool)) ![]Mail {
+    const b = bus(root);
+    {
+        b.lock();
+        defer b.unlock();
+        b.root_waits += 1;
+    }
+    defer {
+        b.lock();
+        b.root_waits -= 1;
+        b.unlock();
+    }
+    const deadline = io_mod.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (true) {
+        const seen = b.generation.load(.seq_cst);
+        const taken = try inbox(root, arena, false, from);
+        if (taken.len > 0) return taken;
+        if (cancel) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
+        if (io_mod.milliTimestamp() >= deadline) return &.{};
+        while (b.generation.load(.seq_cst) == seen and io_mod.milliTimestamp() < deadline) {
+            if (cancel) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
+            io_mod.sleep(25 * std.time.ns_per_ms);
+        }
+    }
+}
+
+test {
+    _ = agent_message;
+    _ = directory;
+    _ = @import("mailbox_tests.zig");
+}

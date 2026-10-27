@@ -800,7 +800,9 @@ fn serializeEvidence(
     );
     if (request.review_turn.untrusted_turn_notice.len > 0) {
         var notice_complete = true;
-        try out.writer.writeAll("turn_started_by_fx_job_notice_untrusted: ");
+        // Another agent's message is evidence from a peer, never authority (D187).
+        const agent_message = std.mem.startsWith(u8, request.review_turn.untrusted_turn_notice, "<system-notice kind=\"agent-message\">");
+        try out.writer.writeAll(if (agent_message) "turn_started_by_agent_message_untrusted: " else "turn_started_by_fx_job_notice_untrusted: ");
         try writeBoundedValue(
             &out.writer,
             alloc,

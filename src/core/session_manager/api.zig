@@ -35,6 +35,9 @@ pub const Body = schema.Body;
 pub const Event = fold.Event;
 pub const Piece = fold.Piece;
 pub const State = fold.State;
+/// A node's mailbox (D185).
+pub const fold_mail = fold.fold_mail;
+pub const MailEnd = schema.MailEnd;
 /// Turns a rewind dropped from a session's history (D97).
 pub const Dropped = fold.Dropped;
 pub const Rewind = fold.Rewind;
@@ -800,6 +803,15 @@ fn checkEvents(gpa: std.mem.Allocator, events: []const Event, import: bool) Appe
             try checkId(c.child);
             if (c.data) |data| try checkChildData(gpa, data);
         },
+        .mail => |m| {
+            try checkName(m.id, max_store_key_bytes);
+            try checkName(m.from, max_store_key_bytes);
+            if (m.label.len > 0) try checkName(m.label, max_store_key_bytes);
+            if (m.reply_to) |reply_to| try checkName(reply_to, max_store_key_bytes);
+            if (m.body.len > fold.fold_mail.max_body_bytes) return error.TooLarge;
+            if (!std.unicode.utf8ValidateSlice(m.body)) return error.InvalidArgument;
+        },
+        .mail_done => |d| try checkName(d.id, max_store_key_bytes),
         .rewound => |r| for (r.abandoned) |id| try checkId(id),
         .store_set => |v| {
             try checkName(v.key, max_store_key_bytes);
@@ -846,6 +858,7 @@ test {
     _ = @import("log.zig");
     _ = @import("fold.zig");
     _ = @import("fold_queue.zig");
+    _ = @import("fold_mail.zig");
     _ = @import("session.zig");
     _ = @import("catalog.zig");
     _ = @import("python_fold.zig");

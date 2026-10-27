@@ -10,7 +10,7 @@ const tool_args = @import("tool_args.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const Op = enum { run, spawn, send, list, inspect, terminate };
+pub const Op = enum { run, spawn, send, message, list, inspect, inbox, terminate };
 
 pub const Call = struct {
     op: Op,
@@ -19,18 +19,34 @@ pub const Call = struct {
     /// Whether `target` is a label a person reads, not a worker id.
     target_is_label: bool = true,
     message: ?[]const u8 = null,
+    /// `list` scope `visible`: every other agent of the tree (D186).
+    visible: bool = false,
 };
 
 /// The fleet call `args` describe; null for the older `subagent` shapes.
 pub fn parseCall(args: std.json.ObjectMap) ?Call {
     const op = std.meta.stringToEnum(Op, tool_args.optionalStringArg(args, "op") orelse return null) orelse return null;
     const label = tool_args.optionalStringArg(args, "label");
+    if (op == .message) {
+        // `to` is an id unless it names a relation a person reads.
+        const to = tool_args.optionalStringArg(args, "to");
+        const named = if (to) |value| relationName(value) else null;
+        return .{ .op = op, .target = named orelse to, .target_is_label = named != null, .message = tool_args.optionalStringArg(args, "message") };
+    }
     return .{
         .op = op,
         .target = label orelse tool_args.optionalStringArg(args, "id"),
         .target_is_label = label != null,
         .message = tool_args.optionalStringArg(args, "message"),
+        .visible = std.mem.eql(u8, tool_args.optionalStringArg(args, "scope") orelse "", "visible"),
     };
+}
+
+fn relationName(to: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, to, "all")) return "all";
+    if (std.mem.eql(u8, to, "parent")) return "parent";
+    if (std.mem.eql(u8, to, "root")) return "root";
+    return null;
 }
 
 /// A run's worker as a person names it: its label, or the task's first words.
@@ -46,7 +62,11 @@ pub fn activeRow(alloc: Allocator, scratch: Allocator, call: Call, completed: bo
         .run => try alloc.print("{s} worker {s}", .{ if (completed) "Ran" else "Running", try runName(scratch, call) }),
         .spawn => try alloc.print("{s} {s}", .{ if (completed) "Spawned" else "Spawning", target }),
         .send => try alloc.print("{s} {s}", .{ if (completed) "Sent to" else "Sending to", target }),
-        .list => try alloc.dupe(u8, if (completed) "Listed workers" else "Listing workers"),
+        .message => try alloc.print("{s} {s}", .{ if (completed) "Messaged" else "Messaging", if (call.target_is_label) target else "agent" }),
+        .inbox => try alloc.dupe(u8, if (completed) "Read inbox" else "Reading inbox"),
+        .list => try alloc.dupe(u8, if (call.visible)
+            (if (completed) "Listed agents" else "Listing agents")
+        else if (completed) "Listed workers" else "Listing workers"),
         .inspect => try alloc.print("{s} {s}", .{ if (completed) "Inspected" else "Inspecting", target }),
         .terminate => try alloc.print("{s} {s}", .{ if (completed) "Terminated" else "Terminating", target }),
     };
@@ -80,6 +100,33 @@ const Body = struct {
     turn: ?u32 = null,
     job: ?[]const u8 = null,
     workers: ?[]const Worker = null,
+    receipts: ?[]const Receipt = null,
+    messages: ?[]const Message = null,
+    peers: ?[]const Peer = null,
+};
+
+/// The mailbox's shapes (`subagent/mailbox.zig`, `mail_ops.zig`).
+const Receipt = struct {
+    to: []const u8,
+    label: []const u8 = "",
+    outcome: []const u8,
+    effect: ?[]const u8 = null,
+    revived: bool = false,
+    dropped_oldest: ?[]const u8 = null,
+};
+const Message = struct {
+    from: []const u8,
+    label: []const u8 = "",
+    body: []const u8 = "",
+    reply_to: ?[]const u8 = null,
+    broadcast: bool = false,
+};
+const Peer = struct {
+    label: []const u8,
+    lifecycle: []const u8,
+    turn: []const u8,
+    unread: usize = 0,
+    depth: u8 = 0,
 };
 
 /// The settled row for a fleet result, with its continuation rows; null
@@ -126,33 +173,80 @@ fn settledRowWriting(alloc: Allocator, call: Call, output: []const u8, now_ms: i
             }
             if (call.message) |message| try w.print(" · {s}", .{try preview_line(arena, message, 80)});
         },
+        .message => try writeMessaged(w, arena, call, body.receipts orelse &.{}),
+        .inbox => {
+            const messages = body.messages orelse &.{};
+            if (messages.len == 0) {
+                try w.writeAll("Read inbox · empty");
+                return try out.toOwnedSlice();
+            }
+            try w.print("Read inbox · {d} message{s}", .{ messages.len, if (messages.len == 1) "" else "s" });
+            for (messages) |message| {
+                const from = if (message.label.len > 0) message.label else "agent";
+                try w.print("\n{s} → {s} · {s}", .{ try safe(arena, from, 48), if (message.broadcast) "all" else "you", try preview_line(arena, firstLine(std.mem.trim(u8, message.body, " \t\r\n")), 100) });
+            }
+        },
+        .list => if (call.visible) {
+            const peers = body.peers orelse &.{};
+            if (peers.len == 0) {
+                try w.writeAll("Listed agents · none");
+                return try out.toOwnedSlice();
+            }
+            try w.print("Listed agents · {d}", .{peers.len});
+            for (peers) |peer| {
+                try w.print("\n{s} · {s}/{s}", .{ try safe(arena, peer.label, 48), try safe(arena, peer.lifecycle, 16), try safe(arena, peer.turn, 16) });
+                if (peer.unread > 0) try w.print(" · {d} unread", .{peer.unread});
+            }
+        } else try writeWorkers(w, arena, call, body.workers orelse &.{}, now_ms),
         .terminate => {
             try w.print("Terminated {s}", .{name});
             if (std.mem.eql(u8, body.error_code orelse "", "turn_cancelled")) try w.writeAll(" · in-flight turn cancelled");
         },
-        .list, .inspect => {
-            const workers = body.workers orelse &.{};
-            if (workers.len == 0) {
-                try w.writeAll(if (call.op == .inspect) "Inspected worker · not found" else "Listed workers · none");
-                return try out.toOwnedSlice();
-            }
-            if (call.op == .inspect) {
-                // One worker: its state fits on the phrase, and only its
-                // last activity earns a row.
-                try w.print("Inspected {s} · ", .{try safe(arena, workers[0].label, 64)});
-                try writeWorker(w, arena, workers[0], now_ms, false);
-                try writeInspectRows(w, arena, workers[0]);
-                return try out.toOwnedSlice();
-            }
-            try w.writeAll("Listed workers");
-            try writeStateCounts(w, arena, workers);
-            for (workers) |worker| {
-                try w.writeAll("\n");
-                try writeWorker(w, arena, worker, now_ms, true);
-            }
-        },
+        .inspect => try writeWorkers(w, arena, call, body.workers orelse &.{}, now_ms),
     }
     return try out.toOwnedSlice();
+}
+
+fn writeWorkers(w: *std.Io.Writer, arena: Allocator, call: Call, workers: []const Worker, now_ms: i64) !void {
+    if (workers.len == 0) return w.writeAll(if (call.op == .inspect) "Inspected worker · not found" else "Listed workers · none");
+    if (call.op == .inspect) {
+        // One worker: its state fits on the phrase, and only its last
+        // activity earns a row.
+        try w.print("Inspected {s} · ", .{try safe(arena, workers[0].label, 64)});
+        try writeWorker(w, arena, workers[0], now_ms, false);
+        return writeInspectRows(w, arena, workers[0]);
+    }
+    try w.writeAll("Listed workers");
+    try writeStateCounts(w, arena, workers);
+    for (workers) |worker| {
+        try w.writeAll("\n");
+        try writeWorker(w, arena, worker, now_ms, true);
+    }
+}
+
+/// "Message → beta · first line", then one row per recipient when it was
+/// a broadcast or a message did not simply arrive. Labels, never ids.
+fn writeMessaged(w: *std.Io.Writer, arena: Allocator, call: Call, receipts: []const Receipt) !void {
+    const preview = try preview_line(arena, firstLine(std.mem.trim(u8, call.message orelse "", " \t\r\n")), 100);
+    const target = if (call.target_is_label) call.target orelse "agent" else if (receipts.len == 1) receipts[0].label else "agent";
+    try w.print("Message → {s}", .{try safe(arena, if (target.len > 0) target else "agent", 48)});
+    if (preview.len > 0) try w.print(" · {s}", .{preview});
+    const broadcast = receipts.len != 1;
+    for (receipts) |receipt| {
+        const plain = std.mem.eql(u8, receipt.outcome, "delivered") and !receipt.revived and receipt.dropped_oldest == null;
+        if (!broadcast and plain) continue;
+        try w.print("\n{s} · {s}", .{ try safe(arena, if (receipt.label.len > 0) receipt.label else "agent", 48), receiptWords(receipt) });
+        if (receipt.revived) try w.writeAll(" · reopened");
+        if (receipt.dropped_oldest != null) try w.writeAll(" · mailbox full, oldest dropped");
+    }
+}
+
+fn receiptWords(receipt: Receipt) []const u8 {
+    if (std.mem.eql(u8, receipt.outcome, "delivered")) {
+        return if (std.mem.eql(u8, receipt.effect orelse "", "injected")) "joined its turn" else "woke it";
+    }
+    if (std.mem.eql(u8, receipt.outcome, "queued")) return "waiting in its mailbox";
+    return "not delivered";
 }
 
 /// "1 running · 2 idle": how many workers are in each state, in first-seen order.
@@ -270,4 +364,20 @@ test "fleet receipts and worker lists become rows" {
     const rejected = (try settledRow(alloc, .{ .op = .send, .target = "W9", .target_is_label = false, .message = "x" }, "{\"ok\":false,\"result\":\"Unknown worker `W9`.\",\"error_code\":\"unknown_worker\",\"receipt\":\"rejected\"}", 0)).?;
     defer alloc.free(rejected);
     try std.testing.expectEqualStrings("Fleet send rejected\nUnknown worker `W9`.", rejected);
+}
+
+test "messages, inboxes and the tree's agents become rows without ids" {
+    const alloc = std.testing.allocator;
+    const one = (try settledRow(alloc, .{ .op = .message, .target = "01JX", .target_is_label = false, .message = "Take the parser\nthen report" }, "{\"ok\":true,\"receipts\":[{\"to\":\"01JX\",\"label\":\"beta\",\"id\":\"M1\",\"outcome\":\"delivered\",\"effect\":\"wake_requested\"}]}", 0)).?;
+    defer alloc.free(one);
+    try std.testing.expectEqualStrings("Message → beta · Take the parser", one);
+    const all = (try settledRow(alloc, .{ .op = .message, .target = "all", .message = "done" }, "{\"ok\":true,\"receipts\":[{\"to\":\"R\",\"label\":\"root\",\"outcome\":\"delivered\",\"effect\":\"injected\"},{\"to\":\"B\",\"label\":\"beta\",\"outcome\":\"queued\",\"revived\":true}]}", 0)).?;
+    defer alloc.free(all);
+    try std.testing.expectEqualStrings("Message → all · done\nroot · joined its turn\nbeta · waiting in its mailbox · reopened", all);
+    const read = (try settledRow(alloc, .{ .op = .inbox }, "{\"ok\":true,\"messages\":[{\"id\":\"M2\",\"from\":\"A\",\"label\":\"alpha\",\"body\":\"status?\\nmore\"}]}", 0)).?;
+    defer alloc.free(read);
+    try std.testing.expectEqualStrings("Read inbox · 1 message\nalpha → you · status?", read);
+    const peers = (try settledRow(alloc, .{ .op = .list, .visible = true }, "{\"ok\":true,\"peers\":[{\"id\":\"R\",\"label\":\"root\",\"lifecycle\":\"live\",\"turn\":\"idle\",\"unread\":2}]}", 0)).?;
+    defer alloc.free(peers);
+    try std.testing.expectEqualStrings("Listed agents · 1\nroot · live/idle · 2 unread", peers);
 }

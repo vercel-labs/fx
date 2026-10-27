@@ -941,11 +941,14 @@ fn appendMarkdownLinkClose(alloc: Allocator, out: *std.ArrayList(u8), uri: []con
 /// Runs a prompt turn under the mode and permission policy captured at
 /// dispatch. Mid-turn session/set_mode changes only affect later prompts.
 /// Whether `params` carry the supervisor's job-notice marker.
-fn promptIsJobNotice(alloc: Allocator, params: []const u8) bool {
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch return false;
+/// Who wrote a prompt the supervisor marked a notice: fx for settled jobs,
+/// or another agent of the tree (`_meta.fx.peer`, D187).
+fn promptNoticeOrigin(alloc: Allocator, params: []const u8) types.UserOrigin {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch return .user;
     defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    return acp_types.fxMetaBool(parsed.value.object, "notice") orelse false;
+    if (parsed.value != .object) return .user;
+    if (!(acp_types.fxMetaBool(parsed.value.object, "notice") orelse false)) return .user;
+    return if (acp_types.fxMetaBool(parsed.value.object, "peer") orelse false) .peer_message else .job_notice;
 }
 
 pub fn handlePrompt(
@@ -1004,7 +1007,7 @@ pub fn handlePrompt(
     ) catch |err| return promptInputFailure(err);
     // Only the supervisor sets `_meta.fx.notice`, on a job notice it wrote.
     // Marking a prompt a notice only ever takes authority away.
-    const prompt_origin: types.UserOrigin = if (promptIsJobNotice(alloc, params)) .job_notice else .user;
+    const prompt_origin: types.UserOrigin = promptNoticeOrigin(alloc, params);
     defer prompt_input.deinit(alloc);
     if (prompt_input.pending_images.len > 0) {
         if (session.wasm_state == null and session.v2 == null) {

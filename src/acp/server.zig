@@ -47,6 +47,7 @@ const session_title_generation = @import("../core/session/session_title_generati
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
 const terminal_client_runtime = @import("../core/terminal/client.zig");
 const subagent_tool_host = @import("../core/subagent/tool_host.zig");
+const subagent_mailbox = @import("../core/subagent/mailbox.zig");
 const subagent_child_state = @import("../core/subagent/child_state.zig");
 const subagent_authority = @import("../core/subagent/authority.zig");
 const types = @import("../core/shared/types.zig");
@@ -970,6 +971,7 @@ pub const PersistentHost = struct {
         self.jobs.init(alloc, &self.state.managed_executions, &self.state.subagent_host);
         errdefer self.jobs.deinit();
         self.jobs.withdraw = .{ .ctx = self, .func = withdrawNoticeSteer };
+        self.jobs.registry.mailbox = .{ .ctx = self, .wait = waitMailbox };
         self.state.jobs = &self.jobs.registry;
         self.state.sessions_v2 = if (cfg.home_override) |home|
             try session_adapter.Store.open(alloc, home)
@@ -1032,6 +1034,53 @@ pub const PersistentHost = struct {
         return self.node_messages.busy();
     }
 
+    /// Delivers the tree's waiting worker messages and notes whether the
+    /// root's turn runs (D188). The supervisor's tick calls it.
+    pub fn pumpMail(self: *PersistentHost) void {
+        const root = self.state.subagent_host orelse return;
+        root.tree.mail.root_busy.store(self.busy(), .seq_cst);
+        self.postWatchEvents(root);
+        subagent_mailbox.pump(root);
+    }
+
+    /// Moves what watches matched into the root's mailbox, from each
+    /// watch's job id (D190).
+    fn postWatchEvents(self: *PersistentHost, root: *subagent_tool_host.Runtime) void {
+        var arena_state = std.heap.ArenaAllocator.init(self.state.alloc);
+        defer arena_state.deinit();
+        const events = self.jobs.watches.takeEvents(arena_state.allocator()) catch return;
+        for (events) |event| subagent_mailbox.postToRoot(root, event.from, event.label, event.body) catch |err| {
+            debug_trace.logf("jobs", "watch event not posted from={s} err={s}", .{ event.from, @errorName(err) });
+        };
+    }
+
+    /// A `jobs wait` on the root's mailbox (D189), on the prompt's thread
+    /// while the root's turn runs.
+    fn waitMailbox(raw: *anyopaque, arena: Allocator, from: ?[]const u8, timeout_ms: u64, cancel: ?*const std.atomic.Value(bool)) anyerror![]jobs_mod.Registry.MailMessage {
+        const self: *PersistentHost = @ptrCast(@alignCast(raw));
+        const root = self.state.subagent_host orelse return error.MailboxUnavailable;
+        const mails = try subagent_mailbox.waitRoot(root, arena, from, timeout_ms, cancel);
+        const out = try arena.alloc(jobs_mod.Registry.MailMessage, mails.len);
+        for (mails, out) |mail, *row| row.* = .{ .id = mail.id, .from = mail.from, .label = mail.label, .body = mail.body, .reply_to = mail.reply_to, .broadcast = mail.broadcast };
+        return out;
+    }
+
+    /// The notice of the root's waiting messages from other agents.
+    pub fn takeMailNotice(self: *PersistentHost, arena: Allocator) !?subagent_mailbox.RootNotice {
+        const root = self.state.subagent_host orelse return null;
+        return subagent_mailbox.takeRootNotice(root, arena);
+    }
+
+    pub fn mailNoticeAdmitted(self: *PersistentHost, notice: subagent_mailbox.RootNotice, request_id: i64) void {
+        const root = self.state.subagent_host orelse return;
+        subagent_mailbox.rootAdmitted(root, notice, request_id);
+    }
+
+    pub fn mailNoticeAnswered(self: *PersistentHost, request_id: i64, delivered: bool) void {
+        const root = self.state.subagent_host orelse return;
+        subagent_mailbox.rootAnswered(root, request_id, delivered);
+    }
+
     /// The async-result notice for jobs that settled with nobody waiting.
     pub fn takeJobNotice(self: *PersistentHost, arena: Allocator) !?jobs_mod.host.Notice {
         return self.jobs.takeNotice(arena);
@@ -1080,6 +1129,8 @@ pub const PersistentHost = struct {
     pub fn deinit(self: *PersistentHost) void {
         const alloc = self.state.alloc;
         handleCancel(&self.state, false);
+        // Watches read the shell jobs they follow: stop them first (D190).
+        self.jobs.watches.stopAll(.session);
         self.node_messages.deinit();
         self.child_approvals.deinit(&self.state);
         self.state.deinit();

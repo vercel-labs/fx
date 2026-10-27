@@ -71,6 +71,8 @@ fn unavailableChildRun(
 
 test {
     _ = @import("nested_tests.zig");
+    _ = @import("mailbox.zig");
+    _ = @import("mail_ops.zig");
     _ = @import("node_hosts.zig");
     _ = @import("node_ops.zig");
     _ = @import("slot_pool.zig");
@@ -449,6 +451,7 @@ pub const Runtime = struct {
         defer alloc.free(operation_id);
 
         return switch (request.*) {
+            .peer_message, .inbox, .peers => @import("mail_ops.zig").execute(self, alloc, request),
             .list, .inspect, .terminate => fleet_host.execute(self, alloc, request, .{
                 .operation_id = operation_id,
                 .options = options,
@@ -926,7 +929,7 @@ pub const Runtime = struct {
                     registry.children[registry.children.len - 1].id,
                 );
             },
-            .spawn, .send, .list, .inspect, .terminate => unreachable,
+            .spawn, .send, .list, .inspect, .terminate, .peer_message, .inbox, .peers => unreachable,
         }
     }
 

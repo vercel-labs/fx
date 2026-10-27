@@ -32,6 +32,8 @@ pub const Kind = enum {
     kernel_snapshot,
     child_queued,
     child_terminated,
+    mail,
+    mail_done,
 };
 
 pub const Header = struct {
@@ -105,6 +107,9 @@ pub const Host = enum { app, ask, acp, sdk, child };
 pub const Reason = enum { cancel, failed, closed, crash };
 /// How a child's work item ended (D22). Hosts never write `lost`.
 pub const Outcome = enum { ok, failed, cancelled, interrupted, lost };
+/// How a message left a mailbox (D185): handed to the node's model, read
+/// through `inbox` or a wait, or dropped as the oldest of a full mailbox.
+pub const MailEnd = enum { delivered, read, dropped };
 /// `language` is the conversation language fx keeps per session, a JSON
 /// string such as `"es"` or `"und-Latn"` (D18); the index lists it.
 /// `client_prompt` (a JSON string) and `tool_identities` are an ACP
@@ -142,6 +147,8 @@ pub const Body = union(Kind) {
     kernel_snapshot: KernelSnapshot,
     child_queued: WorkItem,
     child_terminated: Terminated,
+    mail: Mail,
+    mail_done: MailDone,
 
     pub const Created = struct {
         id: []const u8,
@@ -198,6 +205,18 @@ pub const Body = union(Kind) {
     /// The child is terminal after `child_terminated` (D113): it takes no
     /// more work and its queue is gone. `data` is fx's raw JSON.
     pub const Terminated = struct { child: []const u8, data: ?[]const u8 = null };
+    /// A message another agent of the tree sent this node (D185): it waits
+    /// in the node's mailbox until a `mail_done` with its id. `from` is the
+    /// sender's node id or a watch's job id, `label` its name.
+    pub const Mail = struct {
+        id: []const u8,
+        from: []const u8,
+        label: []const u8 = "",
+        body: []const u8,
+        reply_to: ?[]const u8 = null,
+        broadcast: bool = false,
+    };
+    pub const MailDone = struct { id: []const u8, how: MailEnd };
     pub const Snapshot = struct { covers_seq: u64, state: []const u8, compaction_offset: ?u64 };
     /// The session's history drops turns `turn` through `through`, the
     /// newest turn when it was written, and every child first spawned
@@ -284,6 +303,18 @@ pub fn appendBody(gpa: std.mem.Allocator, out: *std.ArrayList(u8), body: Body) e
         .child_terminated => |c| {
             try w.string("child", c.child);
             if (c.data) |data| try w.raw("data", data);
+        },
+        .mail => |m| {
+            try w.string("id", m.id);
+            try w.string("from", m.from);
+            if (m.label.len > 0) try w.string("label", m.label);
+            try w.string("body", m.body);
+            if (m.reply_to) |reply_to| try w.string("reply_to", reply_to);
+            if (m.broadcast) try w.raw("broadcast", "true");
+        },
+        .mail_done => |d| {
+            try w.string("id", d.id);
+            try w.string("how", @tagName(d.how));
         },
         .snapshot => |s| {
             try w.number("covers_seq", s.covers_seq);
@@ -382,6 +413,18 @@ fn bodyOf(kind: Kind, f: Fields) BodyError!Body {
         .child_terminated => .{ .child_terminated = .{
             .child = try f.req([]const u8, "child"),
             .data = f.raw("data"),
+        } },
+        .mail => .{ .mail = .{
+            .id = try f.req([]const u8, "id"),
+            .from = try f.req([]const u8, "from"),
+            .label = try f.opt([]const u8, "label") orelse "",
+            .body = try f.req([]const u8, "body"),
+            .reply_to = try f.opt([]const u8, "reply_to"),
+            .broadcast = try f.opt(bool, "broadcast") orelse false,
+        } },
+        .mail_done => .{ .mail_done = .{
+            .id = try f.req([]const u8, "id"),
+            .how = try f.req(MailEnd, "how"),
         } },
         .snapshot => .{ .snapshot = .{
             .covers_seq = try f.req(u64, "covers_seq"),

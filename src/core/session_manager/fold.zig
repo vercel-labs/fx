@@ -9,6 +9,7 @@
 const std = @import("std");
 const schema = @import("schema.zig");
 const fold_queue = @import("fold_queue.zig");
+pub const fold_mail = @import("fold_mail.zig");
 const queueAt = fold_queue.queueAt;
 
 pub const Interruption = struct { turn: u64, reason: schema.Reason };
@@ -146,6 +147,8 @@ pub const State = struct {
     children: std.ArrayList(Child) = .empty,
     /// The turns rewinds dropped, oldest rewind first (D97).
     dropped: std.ArrayList(Dropped) = .empty,
+    /// Messages other agents sent this node that wait, oldest first (D185).
+    mailbox: std.ArrayList(fold_mail.Mail) = .empty,
     last_compaction_seq: ?u64 = null,
     /// Byte offset of the newest `compacted` line. fx's `data` there may
     /// keep a tail of earlier lines, which the adapter reads back to.
@@ -166,6 +169,8 @@ pub const State = struct {
         for (state.children.items) |child| child.deinit(gpa);
         state.children.deinit(gpa);
         state.dropped.deinit(gpa);
+        for (state.mailbox.items) |mail| mail.deinit(gpa);
+        state.mailbox.deinit(gpa);
         state.* = undefined;
     }
 
@@ -185,6 +190,7 @@ pub const State = struct {
         var copy: State = state.*;
         copy.children = .empty;
         copy.dropped = .empty;
+        copy.mailbox = .empty;
         inline for (setting_fields) |name| @field(copy, name) = null;
         errdefer copy.deinit(gpa);
         inline for (setting_fields) |name| {
@@ -193,6 +199,8 @@ pub const State = struct {
         try copy.children.ensureTotalCapacity(gpa, state.children.items.len);
         for (state.children.items) |child| copy.children.appendAssumeCapacity(try child.clone(gpa));
         try copy.dropped.appendSlice(gpa, state.dropped.items);
+        try copy.mailbox.ensureTotalCapacity(gpa, state.mailbox.items.len);
+        for (state.mailbox.items) |mail| copy.mailbox.appendAssumeCapacity(try mail.clone(gpa));
         return copy;
     }
 
@@ -282,6 +290,7 @@ pub const State = struct {
         for (a.dropped.items, b.dropped.items) |x, y| {
             if (!std.meta.eql(x, y)) return false;
         }
+        if (!fold_mail.eql(a.mailbox.items, b.mailbox.items)) return false;
         return a.last_compaction_seq == b.last_compaction_seq and
             a.compaction_offset == b.compaction_offset and
             a.clean_exit == b.clean_exit and
@@ -351,6 +360,9 @@ pub fn apply(gpa: std.mem.Allocator, state: *State, fork_seq: u64, line: Line) e
         .child_finished => |c| if (line.seq > fork_seq) try state.finishChild(gpa, line.seq, c),
         .child_queued => |c| if (line.seq > fork_seq) if (state.findChild(c.child)) |i| try fold_queue.enqueue(gpa, &state.children.items[i], line.seq, c),
         .child_terminated => |c| if (line.seq > fork_seq) if (state.findChild(c.child)) |i| try fold_queue.terminate(gpa, &state.children.items[i], line.seq, c),
+        // A fork starts with an empty mailbox, as with children (D185).
+        .mail => |m| if (line.seq > fork_seq) try fold_mail.receive(gpa, state, line.seq, m),
+        .mail_done => |d| if (line.seq > fork_seq) fold_mail.finish(gpa, state, d.id),
         .rewound => |r| {
             try state.dropped.append(gpa, .{ .turn = r.turn, .through = r.through, .from = r.from, .at = if (r.from != null) line.seq else 0 });
             for (r.abandoned) |id| {
@@ -391,6 +403,9 @@ pub const Event = union(enum) {
     /// (D113).
     child_queued: schema.Body.WorkItem,
     child_terminated: schema.Body.Terminated,
+    /// A message into this node's mailbox, and one leaving it (D185).
+    mail: schema.Body.Mail,
+    mail_done: schema.Body.MailDone,
 };
 
 pub const StoreSet = struct { key: []const u8, blob: *const [1][]const u8 };
@@ -484,6 +499,14 @@ pub fn plan(state: *const State, events: []const Event, out: []schema.Body) Tran
                 if (abandonedAt(state, events[0..i], c.child)) return error.InvalidTransition;
                 if (openWorkAt(state, events[0..i], c.child) != null) return error.InvalidTransition;
                 break :blk .{ .child_terminated = c };
+            },
+            .mail => |m| blk: {
+                try fold_mail.planMail(state, events[0..i], m);
+                break :blk .{ .mail = m };
+            },
+            .mail_done => |d| blk: {
+                try fold_mail.planDone(state, events[0..i], d);
+                break :blk .{ .mail_done = d };
             },
             // Between turns, over turns that exist, and never over a child
             // whose work runs (`tests/tla/session_manager/Rewind.tla`
@@ -615,6 +638,7 @@ pub fn encodeState(gpa: std.mem.Allocator, out: *std.ArrayList(u8), state: *cons
         }
         try out.append(gpa, ']');
     }
+    try fold_mail.encode(gpa, out, state.mailbox.items);
     try out.appendSlice(gpa, ",\"last_compaction_seq\":");
     try printOptional(gpa, out, state.last_compaction_seq);
     try out.appendSlice(gpa, ",\"compaction_offset\":");
@@ -686,6 +710,7 @@ pub fn decodeState(gpa: std.mem.Allocator, arena: std.mem.Allocator, raw: []cons
             .terminated = terminated,
         });
     }
+    if (f.raw("mailbox")) |raw_mailbox| try fold_mail.decode(gpa, arena, &state, raw_mailbox);
     if (f.raw("dropped")) |raw_dropped| {
         for (try schema.rawElements(arena, raw_dropped)) |raw_range| {
             const r = try schema.Fields.parseObject(arena, raw_range);
@@ -787,7 +812,7 @@ fn specValid(open: bool, event: Event) ?bool {
         .turn_started => !open,
         .item, .turn_committed, .turn_interrupted, .store_set, .store_del, .kernel_snapshot => open,
         .compacted, .set => true,
-        .child_spawned, .child_finished, .child_queued, .child_terminated, .rewound => null, // not in TurnLifecycle
+        .child_spawned, .child_finished, .child_queued, .child_terminated, .mail, .mail_done, .rewound => null, // not in TurnLifecycle
     };
 }
 

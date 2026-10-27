@@ -6109,7 +6109,7 @@ fn buildReviewTurnContext(
 /// The job notice that started this turn, which the reviewer sees only as
 /// untrusted evidence (D111); empty for a person's prompt.
 fn untrustedTurnNotice(job: QueuedPrompt) []const u8 {
-    return if (job.prompt_origin == .job_notice) job.prompt else "";
+    return if (job.prompt_origin != .user) job.prompt else "";
 }
 
 pub fn permissionDeniedModelOutput(

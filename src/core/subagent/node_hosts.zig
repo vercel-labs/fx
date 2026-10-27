@@ -99,10 +99,16 @@ pub const Entry = struct {
         return false;
     }
 
-    fn destroy(entry: *Entry, alloc: Allocator) void {
+    /// Closes the host, its children and its log. The entry itself, its id
+    /// and path stay readable until `free`: other threads read a closing
+    /// entry under the registry's lock until it leaves the list.
+    fn shut(entry: *Entry) void {
         entry.runtime.deinit();
         entry.children.deinit();
         entry.session.close();
+    }
+
+    fn free(entry: *Entry, alloc: Allocator) void {
         for (entry.path) |hop| alloc.free(hop);
         alloc.free(entry.path);
         alloc.free(entry.id);
@@ -263,6 +269,14 @@ pub const Registry = struct {
     /// Whether node `id`, or any node below it, runs a turn or has work of
     /// its children running, as far as open hosts show. Every running turn
     /// holds its node's host, so a closed host means none runs.
+    /// Whether node `id` has an open host now.
+    pub fn isOpen(self: *Registry, id: []const u8) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const entry = self.findLocked(id) orelse return false;
+        return !entry.closing;
+    }
+
     pub fn subtreeBusy(self: *Registry, id: []const u8) bool {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -320,7 +334,7 @@ pub const Registry = struct {
     pub fn rebind(self: *Registry, child_runner_context: ?*anyopaque, host_authority: @import("authority.zig").HostResolver) void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        for (self.entries.items) |entry| entry.runtime.rebindHost(child_runner_context, host_authority);
+        for (self.entries.items) |entry| if (!entry.closing) entry.runtime.rebindHost(child_runner_context, host_authority);
     }
 
     fn findLocked(self: *Registry, id: []const u8) ?*Entry {
@@ -375,13 +389,16 @@ pub const Registry = struct {
         debug_trace.logf("subagent", "node host closed node_id={s} depth={d}", .{ entry.id, entry.depth });
         const parent = entry.parent;
         // The host joins whatever its children left; none runs.
-        entry.destroy(self.alloc);
+        entry.shut();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         for (self.entries.items, 0..) |candidate, index| if (candidate == entry) {
             _ = self.entries.swapRemove(index);
             break;
         };
+        // Freed only once no reader can reach it: a concurrent sweep reads
+        // `closing` of every listed entry.
+        entry.free(self.alloc);
         if (parent) |above| {
             above.leases -= 1;
             above.last_used = io_mod.monotonicMilliTimestamp();

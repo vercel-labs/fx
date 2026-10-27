@@ -229,6 +229,9 @@ pub fn run(
     const prompt = worker_runtime.QueuedPrompt{
         .turn_id = trace_context.turn_id,
         .prompt = arena.dupe(u8, message.content) catch return error.OutOfMemory,
+        // A turn woken by another agent's message is never the parent's
+        // instruction (D187).
+        .prompt_origin = if (@import("agent_message.zig").isEnvelope(message.content)) .peer_message else .user,
         .images = &.{},
         .model = arena.dupe(u8, admission.model) catch return error.OutOfMemory,
         .provider = admission.provider,
