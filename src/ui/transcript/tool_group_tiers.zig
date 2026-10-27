@@ -33,8 +33,11 @@ pub const live_row_count = 3;
 const tail_lines = 4;
 /// Commands, newest first, that keep their output tail in a settled group.
 const tail_blocks = 3;
-/// Statements a Python outline shows before "… N more".
-const outline_rows = 6;
+/// Rows a Python outline shows, `Module · N nodes` included, before
+/// "… N more".
+const outline_rows = 9;
+/// Shell lines kept on each side of an embedded Python cell.
+const shell_chunk_lines = 2;
 /// Names a fold lists before "+N".
 const fold_names = 2;
 /// The widest command name a fold lists.
@@ -463,16 +466,7 @@ fn appendCommandBody(arena: Allocator, rows: *std.ArrayList(Row), item: Item) !v
         const shown = if (script) |found| try arena.print("{s} {s}", .{ found.interpreter, found.form }) else firstLineOf(command);
         try appendBody(arena, rows, item.entry_id, try arena.print("$ {s}", .{shown}));
     }
-    if (script) |found| {
-        const statements = try python_outline.outline(arena, found.code);
-        const limit = if (statements.len > outline_rows) outline_rows - 1 else statements.len;
-        for (statements[0..limit]) |statement| {
-            const indent = try arena.alloc(u8, statement.depth * 2);
-            @memset(indent, ' ');
-            try appendBody(arena, rows, item.entry_id, try arena.print("{s}{s}", .{ indent, statement.text }));
-        }
-        if (limit < statements.len) try appendBody(arena, rows, item.entry_id, try arena.print("… {d} more statements", .{statements.len - limit}));
-    }
+    if (script) |found| try appendScriptBody(arena, rows, item.entry_id, found);
     const output = commandOutput(record);
     var lines: std.ArrayList([]const u8) = .empty;
     var split = std.mem.splitScalar(u8, output, '\n');
@@ -495,6 +489,47 @@ fn appendCommandBody(arena: Allocator, rows: *std.ArrayList(Row), item: Item) !v
         const safe = try text_utils.encodeTerminalSafe(arena, plain, 400);
         try appendBody(arena, rows, item.entry_id, safe.bytes);
     }
+}
+
+/// A Python cell as proto shows it: the shell around it when the command
+/// does more than run it, and between, the cell's outline, or its first
+/// lines when the outline cannot read it.
+fn appendScriptBody(arena: Allocator, rows: *std.ArrayList(Row), entry_id: u32, found: python_outline.Script) !void {
+    const mixed = found.mixed();
+    if (mixed) {
+        var before: std.ArrayList([]const u8) = .empty;
+        var split = std.mem.splitScalar(u8, found.before, '\n');
+        while (split.next()) |line| if (std.mem.trim(u8, line, " \t\r").len > 0) try before.append(arena, line);
+        for (before.items[before.items.len -| shell_chunk_lines..]) |line| try appendBody(arena, rows, entry_id, try safeLine(arena, line));
+    }
+    if (try python_outline.parse(arena, found.code)) |outline| {
+        for (try python_outline.rows(arena, outline, outline_rows)) |row| try appendBody(arena, rows, entry_id, try safeLine(arena, row));
+    } else {
+        var lines: std.ArrayList([]const u8) = .empty;
+        var split = std.mem.splitScalar(u8, std.mem.trimEnd(u8, found.code, " \t\r\n"), '\n');
+        while (split.next()) |line| if (std.mem.trim(u8, line, " \t\r").len > 0) try lines.append(arena, line);
+        const limit = if (lines.items.len > outline_rows) outline_rows - 1 else lines.items.len;
+        for (lines.items[0..limit]) |line| try appendBody(arena, rows, entry_id, try safeLine(arena, line));
+        if (limit < lines.items.len) try appendBody(arena, rows, entry_id, try arena.print("… {d} more lines", .{lines.items.len - limit}));
+    }
+    if (mixed) {
+        var shown: usize = 0;
+        var split = std.mem.splitScalar(u8, found.after, '\n');
+        while (split.next()) |line| {
+            if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
+            if (shown == shell_chunk_lines) {
+                try appendBody(arena, rows, entry_id, "…");
+                break;
+            }
+            try appendBody(arena, rows, entry_id, try safeLine(arena, line));
+            shown += 1;
+        }
+    }
+}
+
+fn safeLine(arena: Allocator, line: []const u8) ![]const u8 {
+    const plain = try std.mem.replaceOwned(u8, arena, std.mem.trimEnd(u8, line, " \t\r"), "\t", "    ");
+    return (try text_utils.encodeTerminalSafe(arena, plain, 400)).bytes;
 }
 
 fn appendBody(arena: Allocator, rows: *std.ArrayList(Row), entry_id: u32, text: []const u8) !void {
@@ -736,12 +771,45 @@ test "a Python run outlines its code and keeps the end of its output" {
     const expected = [_][]const u8{
         "Exited 1 · AttributeError: module 'os' has no attribute 'nope'",
         "$ python3 heredoc",
-        "import os",
-        "os.nope()",
+        "Module · 2 nodes",
+        "├─ import os",
+        "└─ os.nope()",
         "Output",
         "Traceback (most recent call last):",
         "  File \"<stdin>\", line 2, in <module>",
     };
     try std.testing.expectEqual(expected.len, rows.len);
     for (expected, rows) |want, row| try std.testing.expectEqualStrings(want, row.text);
+}
+
+test "a Python cell inside other shell keeps its shell chunks, and unparsed code shows its lines" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var record = testRecord(1, "shell", .command, "{\"action\":\"run\"}");
+    record.command_display = @constCast("proto models --help && python3.13 <<'PY'\nfor x in range(3):\n    print(x)\nPY\necho done");
+    record.command_process_presentation = .{ .exit_code = 0 };
+    record.result = @constCast("0\n1\n2\ndone\n");
+    const items = [_]Item{.{ .entry_id = 1, .detail = &record, .phrase = "Ran proto models --help && python3.13" }};
+    const rows = try plan(arena, &items, false);
+    const expected = [_][]const u8{
+        "Ran python3.13",
+        "proto models --help && python3.13 <<'PY'",
+        "Module · 2 nodes",
+        "└─ for x range(3) ·L1",
+        "   └─ print(x)",
+        "PY",
+        "echo done",
+        "Output",
+        "0",
+        "1",
+        "2",
+        "done",
+    };
+    try std.testing.expectEqual(expected.len, rows.len);
+    for (expected, rows) |want, row| try std.testing.expectEqualStrings(want, row.text);
+
+    record.command_display = @constCast("python3 - <<'PY'\nprint((1,\nPY");
+    const broken = try plan(arena, &items, false);
+    try std.testing.expectEqualStrings("print((1,", broken[1].text);
 }
