@@ -398,15 +398,14 @@ fn updateBuild() update_command.Build {
     };
 }
 
-/// Static text for what became of the supervisor after `/update`.
-fn updateSupervisorNotice(outcome: daemon_refresh.Supervisor) ?[]u8 {
-    const text: []const u8 = switch (outcome) {
+/// What became of the supervisor after `/update`.
+fn updateSupervisorNotice(outcome: daemon_refresh.Supervisor) []const u8 {
+    return switch (outcome) {
         .restarted => "The idle supervisor restarted on the new binary.",
         .deferred => "The supervisor keeps the previous binary while sessions are working or attached. It switches after its next idle exit.",
         .unknown => "The running supervisor keeps the previous binary until its next idle exit. Run proto-fx daemon stop when no turns are running to switch now.",
-        .none, .current => return null,
+        .none, .current => "",
     };
-    return @constCast(text);
 }
 
 /// The last background check's result, and the next check when one is due
@@ -744,6 +743,8 @@ const App = struct {
             }
         }
         app.context_limits.applyCommandLine(launch.modifiers.context_limit_overrides);
+        var relaunch_notice: ?[]u8 = null;
+        errdefer if (relaunch_notice) |text| alloc.free(text);
         if (comptime host_profile.durable_sessions or host_profile.js_host_sessions) {
             if (app.backend == .in_process and app.requested_resume != null) {
                 const resumed = if (launch.upgrade_relaunch != null)
@@ -763,7 +764,16 @@ const App = struct {
                 };
                 SessionAppRuntime.syncTerminalTitle(&app);
             } else if (launch.upgrade_relaunch) |relaunch| {
-                SessionAppRuntime.writeUpgradeNotice(&app, app_version, build_update_channel, relaunch.previous_revision orelse "", build_revision) catch |err|
+                // A detached session rebuilds its transcript once attached,
+                // so the notice waits for that (D144).
+                if (app.backend == .detached) {
+                    relaunch_notice = app_session_runtime.upgradeNoticeText(alloc, .{
+                        .version = app_version,
+                        .channel = build_update_channel,
+                        .previous_revision = relaunch.previous_revision orelse "",
+                        .revision = build_revision,
+                    }) catch null;
+                } else SessionAppRuntime.writeUpgradeNotice(&app, app_version, build_update_channel, relaunch.previous_revision orelse "", build_revision) catch |err|
                     debug_trace.logf("session", "event=upgrade_notice_unavailable err={s}", .{@errorName(err)});
             }
         }
@@ -785,16 +795,20 @@ const App = struct {
             } else null;
             // After `/update`, move an idle supervisor onto the new binary
             // before connecting (D142); otherwise report the startup check.
-            const startup_notice: ?[]u8 = if (launch.upgrade_relaunch != null)
-                updateSupervisorNotice(daemon_refresh.refresh(alloc))
-            else
-                startupUpdateNotice(alloc, executable);
+            if (launch.upgrade_relaunch != null) {
+                const supervisor = updateSupervisorNotice(daemon_refresh.refresh(alloc));
+                const updated = relaunch_notice orelse "";
+                const sep: []const u8 = if (updated.len > 0 and supervisor.len > 0) "\n" else "";
+                if (updated.len + supervisor.len > 0) {
+                    app.remote.pending_notice = std.mem.concat(alloc, u8, &.{ updated, sep, supervisor }) catch null;
+                    app.remote.pending_notice_tone = .success;
+                    app.remote.pending_notice_topic = "";
+                }
+            } else app.remote.pending_notice = startupUpdateNotice(alloc, executable);
             try RemoteRuntime.init(&app, executable, resume_id);
-            if (startup_notice) |body| {
-                defer if (launch.upgrade_relaunch == null) alloc.free(body);
-                app.writeDomainNotice(.{ .topic = "update", .tone = .neutral, .body = body }, true) catch {};
-            }
         };
+        if (relaunch_notice) |text| alloc.free(text);
+        relaunch_notice = null;
         SessionAppRuntime.syncTerminalTitle(&app);
         return app;
     }

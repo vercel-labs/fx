@@ -291,7 +291,7 @@ pub const ResumeHandoffIntent = enum {
     upgrade_requested,
 };
 
-const UpgradeNotice = struct {
+pub const UpgradeNotice = struct {
     version: []const u8,
     channel: update_target.Channel,
     previous_revision: []const u8,
@@ -304,6 +304,15 @@ const ResumeNotice = union(enum) {
     /// The id of the session this one was forked from.
     fork: []const u8,
 };
+
+/// The post-update notice as text, for a detached session that shows it once
+/// its transcript is rebuilt (D144). The caller owns it.
+pub fn upgradeNoticeText(alloc: Allocator, upgrade: UpgradeNotice) ![]u8 {
+    var body: std.Io.Writer.Allocating = .init(alloc);
+    defer body.deinit();
+    try writeUpgradeNoticeBody(&body.writer, upgrade);
+    return body.toOwnedSlice();
+}
 
 fn writeUpgradeNoticeBody(writer: *std.Io.Writer, upgrade: UpgradeNotice) !void {
     // A source update (`/update`, D144) names the commits it moved between;

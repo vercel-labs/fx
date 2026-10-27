@@ -168,6 +168,12 @@ pub const State = struct {
     watching: struct { list: bool = false, children: bool = false, child: bool = false } = .{},
     /// The attached root session.
     current_id: []u8 = &.{},
+    /// A notice from startup, such as an available update, shown once the
+    /// first session transcript is rebuilt, which would clear it (D143).
+    /// Owned.
+    pending_notice: ?[]u8 = null,
+    pending_notice_tone: types.NoticeTone = .neutral,
+    pending_notice_topic: []const u8 = "update",
     /// Whether the saved transcript for `current_id` has finished loading.
     history_loaded: bool = false,
     history_load: HistoryLoad = .{},
@@ -215,6 +221,8 @@ pub const State = struct {
 
     pub fn deinit(self: *State, alloc: Allocator) void {
         if (self.connection) |connection| connection.stop();
+        if (self.pending_notice) |notice| alloc.free(notice);
+        self.pending_notice = null;
         dropRequests(alloc, &self.queue);
         self.queue.deinit(alloc);
         dropRequests(alloc, &self.sent);
@@ -865,6 +873,11 @@ pub fn Runtime(comptime App: type) type {
                 try View.notice(app, "session", message);
             };
             remote.native_turn_offset = app.shell.finalizedToolTurnWatermark() + 1;
+            if (remote.pending_notice) |body| {
+                remote.pending_notice = null;
+                defer app.alloc.free(body);
+                try app.writeDomainNotice(.{ .topic = remote.pending_notice_topic, .tone = remote.pending_notice_tone, .body = body }, true);
+            }
             app.shell.render_requests.request(.transcript);
             app.shell.render_requests.request(.modal);
         }
