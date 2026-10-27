@@ -14,8 +14,28 @@ const queueAt = fold_queue.queueAt;
 pub const Interruption = struct { turn: u64, reason: schema.Reason };
 
 /// Turns `turn` through `through` that a rewind dropped from the history
-/// (D97). Turn numbers only grow, so ranges never reuse a number.
-pub const Dropped = struct { turn: u64, through: u64 };
+/// (D97). Turn numbers only grow, so ranges never reuse a number. A rewind
+/// to a checkpoint (D120) drops only part of turn `turn`: its items from
+/// line seq `from` up to the rewind's own line, seq `at`. The turn itself
+/// stays.
+pub const Dropped = struct {
+    turn: u64,
+    through: u64,
+    from: ?u64 = null,
+    at: u64 = 0,
+
+    /// Whether this rewind drops the whole turn `turn`.
+    pub fn dropsTurn(range: Dropped, turn: u64) bool {
+        return range.from == null and turn >= range.turn and turn <= range.through;
+    }
+
+    /// Whether this rewind drops the item of turn `turn` at line `seq`
+    /// without dropping the whole turn.
+    pub fn dropsItem(range: Dropped, turn: u64, seq: u64) bool {
+        const from = range.from orelse return false;
+        return turn == range.turn and seq >= from and seq < range.at;
+    }
+};
 
 /// The most rewinds one session keeps; a later one is refused.
 pub const max_rewinds = 64;
@@ -271,7 +291,7 @@ pub const State = struct {
 
 /// Whether any of `ranges` holds `turn`.
 pub fn isDropped(ranges: []const Dropped, turn: u64) bool {
-    for (ranges) |range| if (turn >= range.turn and turn <= range.through) return true;
+    for (ranges) |range| if (range.dropsTurn(turn)) return true;
     return false;
 }
 
@@ -332,7 +352,7 @@ pub fn apply(gpa: std.mem.Allocator, state: *State, fork_seq: u64, line: Line) e
         .child_queued => |c| if (line.seq > fork_seq) if (state.findChild(c.child)) |i| try fold_queue.enqueue(gpa, &state.children.items[i], line.seq, c),
         .child_terminated => |c| if (line.seq > fork_seq) if (state.findChild(c.child)) |i| try fold_queue.terminate(gpa, &state.children.items[i], line.seq, c),
         .rewound => |r| {
-            try state.dropped.append(gpa, .{ .turn = r.turn, .through = r.through });
+            try state.dropped.append(gpa, .{ .turn = r.turn, .through = r.through, .from = r.from, .at = if (r.from != null) line.seq else 0 });
             for (r.abandoned) |id| {
                 const index = state.findChild(id) orelse continue;
                 state.children.items[index].abandoned = true;
@@ -358,7 +378,8 @@ pub const Event = union(enum) {
     child_spawned: schema.Body.WorkItem,
     child_finished: schema.Body.Finished,
     /// Drops turns `turn` through the newest from the history and abandons
-    /// the named children (D97). The manager fills in `through`.
+    /// the named children (D97); with `from`, only the open turn's items
+    /// from that line seq (D120). The manager fills in `through`.
     rewound: Rewind,
     /// A value of the node's store, or its removal (D99). Inside a turn;
     /// the manager fills in the turn.
@@ -380,7 +401,7 @@ pub const KernelSnapshot = struct {
     failed: []const u8 = "[]",
 };
 
-pub const Rewind = struct { turn: u64, abandoned: []const []const u8 = &.{} };
+pub const Rewind = struct { turn: u64, abandoned: []const []const u8 = &.{}, from: ?u64 = null };
 
 /// One completed piece of a turn: fx's data, and the blobs it refers to.
 pub const Piece = struct {
@@ -467,15 +488,19 @@ pub fn plan(state: *const State, events: []const Event, out: []schema.Body) Tran
             // Between turns, over turns that exist, and never over a child
             // whose work runs (`tests/tla/session_manager/Rewind.tla`
             // NoRewindWhileBusy).
+            // A rewind to a checkpoint drops part of the open turn and only
+            // that (`tests/tla/session_manager/Checkpoint.tla` DropsOnlySinceCheckpoint).
             .rewound => |r| blk: {
-                if (open_turn != null) return error.InvalidTransition;
+                if (r.from) |from| {
+                    if (open_turn != r.turn or from > state.last_seq + 1) return error.InvalidTransition;
+                } else if (open_turn != null) return error.InvalidTransition;
                 if (r.turn == 0 or r.turn > last_turn) return error.InvalidTransition;
                 if (rewindsAt(state, events[0..i]) >= max_rewinds) return error.InvalidTransition;
                 for (r.abandoned) |id| {
                     if (state.findChild(id) == null) return error.InvalidTransition;
                     if (openWorkAt(state, events[0..i], id) != null) return error.InvalidTransition;
                 }
-                break :blk .{ .rewound = .{ .turn = r.turn, .through = last_turn, .abandoned = r.abandoned } };
+                break :blk .{ .rewound = .{ .turn = r.turn, .through = last_turn, .abandoned = r.abandoned, .from = r.from } };
             },
             // Python state belongs to the turn that made it, so a rewind
             // drops it with the turn (`tests/tla/session_manager/PythonState.tla`).
@@ -584,7 +609,9 @@ pub fn encodeState(gpa: std.mem.Allocator, out: *std.ArrayList(u8), state: *cons
         try out.appendSlice(gpa, ",\"dropped\":[");
         for (state.dropped.items, 0..) |range, i| {
             if (i > 0) try out.append(gpa, ',');
-            try out.print(gpa, "{{\"turn\":{d},\"through\":{d}}}", .{ range.turn, range.through });
+            try out.print(gpa, "{{\"turn\":{d},\"through\":{d}", .{ range.turn, range.through });
+            if (range.from) |from| try out.print(gpa, ",\"from\":{d},\"at\":{d}", .{ from, range.at });
+            try out.append(gpa, '}');
         }
         try out.append(gpa, ']');
     }
@@ -662,7 +689,12 @@ pub fn decodeState(gpa: std.mem.Allocator, arena: std.mem.Allocator, raw: []cons
     if (f.raw("dropped")) |raw_dropped| {
         for (try schema.rawElements(arena, raw_dropped)) |raw_range| {
             const r = try schema.Fields.parseObject(arena, raw_range);
-            try state.dropped.append(gpa, .{ .turn = try r.req(u64, "turn"), .through = try r.req(u64, "through") });
+            try state.dropped.append(gpa, .{
+                .turn = try r.req(u64, "turn"),
+                .through = try r.req(u64, "through"),
+                .from = try r.opt(u64, "from"),
+                .at = try r.opt(u64, "at") orelse 0,
+            });
         }
     }
     return state;
@@ -932,6 +964,7 @@ test "snapshot state round trips" {
         .abandoned = true,
     });
     try state.dropped.append(testing.allocator, .{ .turn = 2, .through = 3 });
+    try state.dropped.append(testing.allocator, .{ .turn = 4, .through = 4, .from = 3, .at = 40 });
     var out: std.ArrayList(u8) = .empty;
     try encodeState(arena.allocator(), &out, &state);
     var decoded = try decodeState(testing.allocator, arena.allocator(), out.items);
@@ -984,4 +1017,40 @@ test "a rewind drops turns between turns and abandons only idle children" {
     try testing.expectEqual(@as(u64, 3), one[0].turn_started.turn);
     try testing.expectError(error.InvalidTransition, plan(&state, &.{.{ .child_spawned = .{ .child = "late", .work_id = "w3" } }}, &one));
     try plan(&state, &.{.{ .child_spawned = .{ .child = "early", .work_id = "w3" } }}, &one);
+}
+
+test "a rewind to a checkpoint drops part of the open turn only" {
+    var state: State = .{};
+    defer state.deinit(testing.allocator);
+    var one: [1]schema.Body = undefined;
+    var seq: u64 = 0;
+    const steps = [_]Event{
+        .turn_started,
+        .{ .item = .{ .type = "user", .data = "{}" } },
+        .{ .child_spawned = .{ .child = "scout", .work_id = "w1" } },
+        .{ .child_finished = .{ .child = "scout", .work_id = "w1", .outcome = .ok } },
+    };
+    for (steps) |event| {
+        try plan(&state, &.{event}, &one);
+        seq += 1;
+        try apply(testing.allocator, &state, 0, .{ .seq = seq, .offset = 0, .body = one[0] });
+    }
+    // Only inside the turn it names, and a whole-turn rewind is still
+    // refused inside a turn.
+    try testing.expectError(error.InvalidTransition, plan(&state, &.{.{ .rewound = .{ .turn = 2, .from = 3 } }}, &one));
+    try testing.expectError(error.InvalidTransition, plan(&state, &.{.{ .rewound = .{ .turn = 1 } }}, &one));
+    try plan(&state, &.{.{ .rewound = .{ .turn = 1, .from = 3, .abandoned = &.{"scout"} } }}, &one);
+    try testing.expectEqual(@as(u64, 1), one[0].rewound.through);
+    seq += 1;
+    try apply(testing.allocator, &state, 0, .{ .seq = seq, .offset = 0, .body = one[0] });
+    // The turn stays, its later items too, and the child is abandoned.
+    try testing.expect(!state.droppedTurn(1));
+    const range = state.dropped.items[0];
+    try testing.expect(range.dropsItem(1, 3));
+    try testing.expect(!range.dropsItem(1, 2));
+    try testing.expect(!range.dropsItem(2, 3));
+    try testing.expect(!range.dropsItem(1, seq + 1));
+    try testing.expect(state.children.items[0].abandoned);
+    try plan(&state, &.{.{ .item = .{ .type = "assistant", .data = "{}" } }}, &one);
+    try testing.expectEqual(@as(u64, 1), one[0].item.turn);
 }

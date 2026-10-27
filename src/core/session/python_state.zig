@@ -383,6 +383,6 @@ pub fn usage(alloc: Allocator, blob_dir: []const u8, node_id: []const u8, name: 
 }
 
 fn droppedTurn(ranges: []const sm.Dropped, turn: u64) bool {
-    for (ranges) |range| if (turn >= range.turn and turn <= range.through) return true;
+    for (ranges) |range| if (range.dropsTurn(turn)) return true;
     return false;
 }

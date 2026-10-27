@@ -202,7 +202,11 @@ pub const Body = union(Kind) {
     /// The session's history drops turns `turn` through `through`, the
     /// newest turn when it was written, and every child first spawned
     /// after `turn` started is abandoned (D97). Written between turns.
-    pub const Rewound = struct { turn: u64, through: u64, abandoned: []const []const u8 = &.{} };
+    /// With `from`, a model's rewind to its checkpoint (D120): written
+    /// inside the open turn `turn`, it drops only that turn's items from
+    /// line seq `from` through the newest one written before it, and
+    /// abandons the children first spawned after `from`.
+    pub const Rewound = struct { turn: u64, through: u64, abandoned: []const []const u8 = &.{}, from: ?u64 = null };
     /// One value of the node's `proto_fx` store, kept as blob `blob[0]`
     /// (D99). Written inside a turn; a rewind of that turn drops it.
     pub const StoreSet = struct { turn: u64, key: []const u8, blob: *const [1][]const u8 };
@@ -291,6 +295,7 @@ pub fn appendBody(gpa: std.mem.Allocator, out: *std.ArrayList(u8), body: Body) e
             try w.number("turn", r.turn);
             try w.number("through", r.through);
             try w.stringList("abandoned", r.abandoned);
+            if (r.from) |from| try w.number("from", from);
         },
         .store_set => |v| {
             try w.number("turn", v.turn);
@@ -388,6 +393,7 @@ fn bodyOf(kind: Kind, f: Fields) BodyError!Body {
             .turn = try f.req(u64, "turn"),
             .through = try f.req(u64, "through"),
             .abandoned = try f.opt([]const []const u8, "abandoned") orelse &.{},
+            .from = try f.opt(u64, "from"),
         } },
         .store_set => blk: {
             const blob = try f.arena.create([1][]const u8);
@@ -914,6 +920,9 @@ test "every kind's fields round trip, raw values byte for byte" {
     try testing.expectEqualStrings("c2", rewound.abandoned[1]);
     const bare = (try roundTrip(arena, .{ .rewound = .{ .turn = 1, .through = 1 } })).rewound;
     try testing.expectEqual(@as(usize, 0), bare.abandoned.len);
+    try testing.expectEqual(@as(?u64, null), bare.from);
+    const partial = (try roundTrip(arena, .{ .rewound = .{ .turn = 4, .through = 4, .from = 6 } })).rewound;
+    try testing.expectEqual(@as(?u64, 6), partial.from);
 }
 
 test "a body missing a required field is rejected" {

@@ -2367,8 +2367,87 @@ pub const Session = struct {
         const sa = scratch.allocator();
         const state = try self.handle.state(sa);
         if (turn == 0 or turn > state.last_turn or state.droppedTurn(turn)) return error.InvalidRewindPoint;
-        var start_seq: ?u64 = null;
+        const point = try self.scanRewind(sa, &state, .{ .turn_start = turn });
+        const abandoned = try abandonedAfter(alloc, &state, &point);
+        errdefer freeAbandoned(alloc, abandoned);
+        _ = try self.write(&.{.{ .rewound = .{ .turn = turn, .abandoned = @ptrCast(abandoned) } }});
+        var kept: usize = 0;
+        for (self.turn_numbers.items) |number| {
+            if (number) |value| if (value >= turn) continue;
+            self.turn_numbers.items[kept] = number;
+            kept += 1;
+        }
+        self.turn_numbers.shrinkRetainingCapacity(kept);
+        if (self.trim.turn) |value| if (value >= turn) {
+            self.trim = .{};
+        };
+        debug_trace.logf("session", "event=sessions_v2_rewound session={s} turn={d} through={d} abandoned={d}", .{ self.id(), turn, state.last_turn, abandoned.len });
+        // The node's kernels go back to the newest snapshot the rewind kept.
+        python_state.afterRewind(self.id());
+        return .{ .abandoned = abandoned };
+    }
+
+    /// Drops from the open turn what it saved since the model's checkpoint
+    /// (D120): every item after the pieces `kept` encodes, by one `rewound`
+    /// line inside the turn, and abandons the children first spawned after
+    /// them. The turn goes on, and the node's kernels and store stay as
+    /// they are. Refused when a compaction came after the checkpoint, or
+    /// when the saved pieces are not `kept`'s. Nothing is written when
+    /// nothing after them was saved.
+    pub fn rewindToCheckpoint(self: *Session, alloc: Allocator, user: types.UserTurn, kept: types.ExecutionMemory) !Rewound {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (!self.turn_open) return .{ .abandoned = &.{} };
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        var events: std.ArrayList(Event) = .empty;
+        try events.append(sa, .{ .user = .{ .text = user.text, .images = user.images, .work_id = user.work_id } });
+        // As a stream does, it keeps the pieces before a missing handle.
+        session_event.appendExecutionConversationEvents(sa, &events, try self.withResultFiles(sa, kept)) catch |err| switch (err) {
+            error.ConversationArtifactRequired => {},
+            else => return err,
+        };
+        const pieces = @min(events.items.len, self.streamed.items.len);
+        for (events.items[0..pieces], self.streamed.items[0..pieces]) |event, streamed| {
+            if (!samePiece(sa, streamed, try self.encodeEvent(sa, event))) return error.RewindMismatch;
+        }
+        const state = try self.handle.state(sa);
+        const point = try self.scanRewind(sa, &state, .{ .pieces = .{ .turn = self.last_turn, .kept = pieces } });
+        if (!point.drops) return .{ .abandoned = &.{} };
+        const abandoned = try abandonedAfter(alloc, &state, &point);
+        errdefer freeAbandoned(alloc, abandoned);
+        _ = try self.write(&.{.{ .rewound = .{ .turn = self.last_turn, .from = point.after + 1, .abandoned = @ptrCast(abandoned) } }});
+        for (self.streamed.items[pieces..]) |bytes| self.alloc.free(bytes);
+        self.streamed.shrinkRetainingCapacity(pieces);
+        debug_trace.logf("session", "event=sessions_v2_checkpoint_rewound session={s} turn={d} from={d} abandoned={d}", .{ self.id(), self.last_turn, point.after + 1, abandoned.len });
+        return .{ .abandoned = abandoned };
+    }
+
+    const RewindPoint = union(enum) {
+        /// A turn's start: `/undo` drops it and every later turn (D97).
+        turn_start: u64,
+        /// The open turn after its first `kept` pieces: a rewind to a
+        /// checkpoint drops what follows (D120).
+        pieces: struct { turn: u64, kept: usize },
+    };
+
+    const RewindScan = struct {
+        /// The last line the rewind keeps.
+        after: u64,
+        /// Whether any item comes after it.
+        drops: bool,
+        /// Each child's first `child_spawned` line.
+        first_spawn: std.array_hash_map.String(u64),
+    };
+
+    /// Reads the whole log once for a rewind: where `point` falls, refused
+    /// past a compaction, and each child's first spawn.
+    fn scanRewind(self: *Session, sa: Allocator, state: *const sm.State, point: RewindPoint) !RewindScan {
+        var after: ?u64 = null;
+        var drops = false;
         var first_spawn: std.array_hash_map.String(u64) = .empty;
+        var pieces: usize = 0;
         var from: sm.From = .start;
         while (true) {
             var page = try self.handle.read(sa, from, .forward, replay_page_lines);
@@ -2376,10 +2455,25 @@ pub const Session = struct {
             for (page.entries) |entry| {
                 const body = entry.body orelse continue;
                 switch (body) {
-                    .turn_started => |t| if (t.turn == turn) {
-                        start_seq = entry.seq;
+                    .turn_started => |t| {
+                        switch (point) {
+                            .turn_start => |wanted| if (t.turn == wanted) {
+                                after = entry.seq;
+                            },
+                            .pieces => |p| if (t.turn == p.turn and p.kept == 0) {
+                                after = entry.seq;
+                            },
+                        }
                     },
-                    .compacted => if (start_seq != null) return error.RewindPastCompaction,
+                    .item => |piece| if (point == .pieces and piece.turn == point.pieces.turn) {
+                        if (after != null) {
+                            drops = true;
+                        } else if (pieceKind(piece.type) != null and !droppedItem(state.dropped.items, piece.turn, entry.seq)) {
+                            pieces += 1;
+                            if (pieces == point.pieces.kept) after = entry.seq;
+                        }
+                    },
+                    .compacted => if (after != null) return error.RewindPastCompaction,
                     .child_spawned => |c| {
                         const slot = try first_spawn.getOrPut(sa, c.child);
                         if (!slot.found_existing) {
@@ -2392,32 +2486,31 @@ pub const Session = struct {
             }
             from = .{ .at = page.next orelse break };
         }
-        const after = start_seq orelse return error.InvalidRewindPoint;
+        return .{
+            .after = after orelse return error.InvalidRewindPoint,
+            .drops = drops or point == .turn_start,
+            .first_spawn = first_spawn,
+        };
+    }
+
+    /// The children first spawned after `point`, not yet abandoned; owned.
+    fn abandonedAfter(alloc: Allocator, state: *const sm.State, point: *const RewindScan) ![][]u8 {
         var abandoned: std.ArrayList([]u8) = .empty;
         errdefer {
             for (abandoned.items) |child| alloc.free(child);
             abandoned.deinit(alloc);
         }
         for (state.children.items) |child| {
-            const spawned = first_spawn.get(child.id) orelse continue;
-            if (spawned <= after or child.abandoned) continue;
+            const spawned = point.first_spawn.get(child.id) orelse continue;
+            if (spawned <= point.after or child.abandoned) continue;
             try abandoned.append(alloc, try alloc.dupe(u8, child.id));
         }
-        _ = try self.write(&.{.{ .rewound = .{ .turn = turn, .abandoned = @ptrCast(abandoned.items) } }});
-        var kept: usize = 0;
-        for (self.turn_numbers.items) |number| {
-            if (number) |value| if (value >= turn) continue;
-            self.turn_numbers.items[kept] = number;
-            kept += 1;
-        }
-        self.turn_numbers.shrinkRetainingCapacity(kept);
-        if (self.trim.turn) |value| if (value >= turn) {
-            self.trim = .{};
-        };
-        debug_trace.logf("session", "event=sessions_v2_rewound session={s} turn={d} through={d} abandoned={d}", .{ self.id(), turn, state.last_turn, abandoned.items.len });
-        // The node's kernels go back to the newest snapshot the rewind kept.
-        python_state.afterRewind(self.id());
-        return .{ .abandoned = try abandoned.toOwnedSlice(alloc) };
+        return abandoned.toOwnedSlice(alloc);
+    }
+
+    fn freeAbandoned(alloc: Allocator, abandoned: [][]u8) void {
+        for (abandoned) |child| alloc.free(child);
+        alloc.free(abandoned);
     }
 
     // -- children (D22) ------------------------------------------------------
@@ -4576,6 +4669,8 @@ noinline fn replay(
                     running_text = null;
                 },
                 .item => |piece| {
+                    // What a rewind to a checkpoint dropped (D120).
+                    if (droppedItem(dropped, piece.turn, entry.seq)) continue;
                     if (std.mem.eql(u8, piece.type, superseded_type)) {
                         superseded = true;
                         continue;
@@ -4664,11 +4759,18 @@ noinline fn replay(
 /// when a rewind dropped its number (D97).
 fn keptTurn(alloc: Allocator, dropped: []const sm.Dropped, turn: types.HistoryTurn, number: ?u64) bool {
     const value = number orelse return true;
-    for (dropped) |range| if (value >= range.turn and value <= range.through) {
+    for (dropped) |range| if (range.dropsTurn(value)) {
         types.freeHistoryTurn(alloc, turn);
         return false;
     };
     return true;
+}
+
+/// Whether a rewind to a checkpoint dropped the item of turn `turn` at line
+/// `seq` (D120).
+fn droppedItem(dropped: []const sm.Dropped, turn: u64, seq: u64) bool {
+    for (dropped) |range| if (range.dropsItem(turn, seq)) return true;
+    return false;
 }
 
 /// `turn` with each stored result shown as v1 showed it: one the model saw
@@ -5798,6 +5900,67 @@ test "streamed pieces are written once, and the commit adds only the rest" {
     defer restored.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), restored.history.len);
     try testing.expectEqualStrings("streamed answer", restored.history[0].assistant.assistant);
+}
+
+fn checkpointTestStep(calls: []types.ToolCall, results: []types.PersistedToolResult, id: []const u8, name: []const u8, output: []const u8) types.ToolExecutionStep {
+    calls[0] = .{ .id = id, .name = name, .arguments_json = "{}" };
+    results[0] = .{
+        .tool_call_id = @constCast(id),
+        .tool_name = @constCast(name),
+        .status = .success,
+        .output = @constCast(output),
+        .output_bytes = output.len,
+        .stored_output_bytes = 0,
+    };
+    return .{ .tool_calls = calls, .tool_results = results };
+}
+
+test "a rewind to a checkpoint drops the open turn's exploration and keeps the turn (D120)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("explore") };
+    var calls: [4][1]types.ToolCall = undefined;
+    var results: [4][1]types.PersistedToolResult = undefined;
+    const opened = checkpointTestStep(&calls[0], &results[0], "c0", "checkpoint", "Checkpoint: map it");
+    const first = checkpointTestStep(&calls[1], &results[1], "r1", "read_file", "one");
+    const second = checkpointTestStep(&calls[2], &results[2], "r2", "read_file", "two");
+    const rewound = checkpointTestStep(&calls[3], &results[3], "w3", "rewind", "Report:\nit is small");
+    var explored = [_]types.ToolExecutionStep{ opened, first, second };
+    try s.appendProgress(user, .{ .tool_steps = &explored }, .{ .calls = &calls[3] });
+    var kept_steps = [_]types.ToolExecutionStep{opened};
+    var dropped = try s.rewindToCheckpoint(testing.allocator, user, .{ .tool_steps = &kept_steps });
+    dropped.deinit(testing.allocator);
+    var after = [_]types.ToolExecutionStep{ opened, rewound };
+    try s.appendProgress(user, .{ .tool_steps = &after }, .{});
+    // The same rewind again finds nothing left to drop.
+    var again = try s.rewindToCheckpoint(testing.allocator, user, .{ .tool_steps = &kept_steps });
+    again.deinit(testing.allocator);
+    var turn: types.HistoryTurn = .{ .assistant = .{ .user = user, .assistant = @constCast("small"), .execution = .{ .tool_steps = &after } } };
+    try s.prepareTurn(&turn);
+    defer for (after) |step| {
+        testing.allocator.free(step.tool_results[0].output_handle.?);
+        testing.allocator.free(step.tool_results[0].preview.?);
+    };
+    try s.commitTurn(turn, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    try testing.expectEqual(@as(usize, 0), try countItems(t.store.manager, id, superseded_type));
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, "user"));
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), restored.history.len);
+    const steps = restored.history[0].assistant.execution.tool_steps;
+    try testing.expectEqual(@as(usize, 2), steps.len);
+    try testing.expectEqualStrings("checkpoint", steps[0].tool_calls[0].name);
+    try testing.expectEqualStrings("rewind", steps[1].tool_calls[0].name);
+    try testing.expectEqualStrings("small", restored.history[0].assistant.assistant);
 }
 
 test "any I/O fault may have left a write in the log" {

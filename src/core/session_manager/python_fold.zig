@@ -5,7 +5,9 @@
 //! Every `store_set`, `store_del` and `kernel_snapshot` line names the turn
 //! it was written in, and turn numbers never repeat, so a line belongs to a
 //! turn a rewind dropped exactly when its turn is in `State.dropped`. Both
-//! folds skip those lines; nothing else is needed for a rewind. A fork copies
+//! folds skip those lines; nothing else is needed for a rewind. A rewind to
+//! a checkpoint (D120) drops no whole turn, so it keeps the Python state as
+//! it is. A fork copies
 //! the lines through its point with its source's rewinds, so the same folds
 //! over the fork's own log give the state at the fork point
 //! (`tests/tla/session_manager/PythonState.tla` `RestoreExact`).
