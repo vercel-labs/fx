@@ -1931,6 +1931,9 @@ fn approvalReasonLine(
         }
         return "";
     }
+    if (std.mem.startsWith(u8, label, "install_skill ")) {
+        return std.mem.print(buf, "  {s}Reason:{s} This installs a skill: instructions every later session can load. Approve only a source you trust.", .{ dim, r }) catch "  Reason: skill installation requires approval";
+    }
     if (std.mem.startsWith(u8, label, "write_file ") or
         std.mem.startsWith(u8, label, "edit_file "))
     {
@@ -2431,6 +2434,24 @@ test "ordinary command approval leaves the reason row blank" {
     );
 
     try std.testing.expectEqualStrings("", reason);
+}
+
+test "skill installation approval says what installing a skill does" {
+    var prompt = ApprovalPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+    try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{
+        .label = "install_skill vercel-labs/agent-skills",
+    }));
+    var reason_buf: [512]u8 = undefined;
+    const reason = buildApprovalPanelLine(
+        &reason_buf,
+        prompt.projection().?,
+        3,
+        interaction_state.approval_panel_rows_spacious,
+        120,
+    );
+    try std.testing.expect(std.mem.find(u8, reason, "installs a skill") != null);
+    try std.testing.expect(std.mem.find(u8, reason, "source you trust") != null);
 }
 
 test "inline command panel wraps the complete target before its controls" {
