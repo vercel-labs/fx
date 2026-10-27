@@ -199,11 +199,25 @@ pub fn Runtime(comptime App: type) type {
             if (remote.link != .ready or !remote.history_loaded or
                 remote.history_load.active or remote.current_id.len == 0) return;
             const window = &remote.history_window;
+            window.dropPruned(app.alloc, oldestEntryFrom(app, window.first_entry_ids.items));
             if (!window.has_older) return;
             if (window.bytes >= remote_runtime.history_window_max_bytes) {
                 return notice(app, "session", "The transcript holds as much saved history as it can; older entries stay in the saved session.");
             }
             try remote.requestHistoryPage(false);
+        }
+
+        /// The oldest transcript entry at or after the window's first, which
+        /// retention has not pruned. Entries before the window, such as the
+        /// welcome, are not history.
+        fn oldestEntryFrom(app: *App, first_entry_ids: []const u32) ?u32 {
+            const floor = if (first_entry_ids.len > 0) first_entry_ids[0] else return null;
+            var oldest: ?u32 = null;
+            for (app.shell.entries.items) |entry| {
+                const id = entry.id();
+                if (id >= floor and id < (oldest orelse std.math.maxInt(u32))) oldest = id;
+            }
+            return oldest;
         }
 
         /// Opens saved session `id`, which the supervisor may not hold yet,

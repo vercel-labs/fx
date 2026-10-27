@@ -42,6 +42,9 @@ pub const Cursor = struct {
 /// outcome; the turn's other fragments show them instead.
 pub const Fragment = struct {
     turn: types.HistoryTurn,
+    /// The saved turn's index, so the fragment's cursor is
+    /// `{ turn_index, first_step }`.
+    turn_index: usize = 0,
     first_step: usize = 0,
     has_user: bool = true,
     has_tail: bool = true,
@@ -103,6 +106,7 @@ pub fn build(arena: Allocator, turns: []const types.HistoryTurn, before: ?Cursor
         const has_user = first == 0;
         if (has_user) spent +|= userBytes(turnUser(turn));
         var fragment = try narrow(arena, turn, first, end, has_user, has_tail, budget);
+        fragment.turn_index = index;
         if (forced) {
             const step = try boundStep(arena, steps[first], budget -| spent);
             const owned = try arena.dupe(types.ToolExecutionStep, turnSteps(fragment.turn));
@@ -133,10 +137,11 @@ pub fn newer(arena: Allocator, turns: []const types.HistoryTurn, after_turn: usi
     if (after_turn > turns.len) return .{ .fragments = &.{}, .bytes = 0, .complete = false };
     const fragments = try arena.alloc(Fragment, turns.len - after_turn);
     var used: usize = 0;
-    for (turns[after_turn..], fragments) |turn, *out| {
+    for (turns[after_turn..], fragments, after_turn..) |turn, *out, index| {
         used +|= wholeTurnBytes(turn);
         if (used > max_bytes) return .{ .fragments = &.{}, .bytes = 0, .complete = false };
         out.* = .whole(turn);
+        out.turn_index = index;
     }
     return .{ .fragments = fragments, .bytes = used, .complete = true };
 }
@@ -383,6 +388,15 @@ fn steeringBytes(steering: []const types.PersistedSteering) usize {
         total +|= item.text.len +| 32;
         if (item.assistant_prefix) |prefix| total +|= prefix.len;
     }
+    return total;
+}
+
+/// The estimated saved bytes of `fragment`, as a page counts them.
+pub fn fragmentBytes(fragment: Fragment) usize {
+    var total = steeringBytes(turnSteering(fragment.turn));
+    if (fragment.has_tail) total +|= tailBytes(fragment.turn);
+    if (fragment.has_user) total +|= userBytes(turnUser(fragment.turn));
+    for (turnSteps(fragment.turn)) |step| total +|= stepBytes(step);
     return total;
 }
 

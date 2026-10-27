@@ -73,6 +73,9 @@ pub const history_window_max_bytes: usize = 8 * 1024 * 1024;
 /// after the checkpoint it was loaded at follow it.
 pub const HistoryWindow = struct {
     fragments: std.ArrayList(history_page.Fragment) = .empty,
+    /// One per fragment once the transcript is built from them: the id of
+    /// the first entry the fragment produced.
+    first_entry_ids: std.ArrayList(u32) = .empty,
     bytes: usize = 0,
     start: history_page.Cursor = .{},
     turn_count: usize = 0,
@@ -82,7 +85,33 @@ pub const HistoryWindow = struct {
     pub fn deinit(self: *HistoryWindow, alloc: Allocator) void {
         for (self.fragments.items) |fragment| types.freeHistoryTurn(alloc, fragment.turn);
         self.fragments.deinit(alloc);
+        self.first_entry_ids.deinit(alloc);
         self.* = .{};
+    }
+
+    /// Drops the fragments whose oldest entries retention pruned from the
+    /// transcript, whose oldest remaining entry at or after the window's is
+    /// `oldest_entry_id` (null when none remains). The window then starts
+    /// at the oldest fragment still shown, so the next older page fetches
+    /// exactly what was pruned, and its bytes count only what is shown.
+    pub fn dropPruned(self: *HistoryWindow, alloc: Allocator, oldest_entry_id: ?u32) void {
+        const ids = self.first_entry_ids.items;
+        if (ids.len != self.fragments.items.len) return;
+        const pruned = if (oldest_entry_id) |oldest| for (ids, 0..) |id, index| {
+            if (id >= oldest) break index;
+        } else ids.len else ids.len;
+        if (pruned == 0) return;
+        for (self.fragments.items[0..pruned]) |fragment| {
+            self.bytes -|= history_page.fragmentBytes(fragment);
+            types.freeHistoryTurn(alloc, fragment.turn);
+        }
+        self.fragments.replaceRangeAssumeCapacity(0, pruned, &.{});
+        self.first_entry_ids.replaceRangeAssumeCapacity(0, pruned, &.{});
+        self.start = if (self.fragments.items.len > 0) .{
+            .turn = self.fragments.items[0].turn_index,
+            .step = self.fragments.items[0].first_step,
+        } else .{ .turn = self.turn_count };
+        self.has_older = true;
     }
 
     /// Owned copies of `fragments`. The caller frees each turn and the list.
@@ -681,10 +710,15 @@ pub fn Runtime(comptime App: type) type {
             View.resetTranscriptContents(app);
             remote.history_window = window;
             remote.history_loaded = true;
+            const ids = &remote.history_window.first_entry_ids;
+            ids.clearRetainingCapacity();
+            try ids.resize(app.alloc, window.fragments.items.len);
             sessions.Runtime(App).replayRemoteHistory(app, window.fragments.items, .{
                 .window_bytes = window.bytes,
                 .older_notice = if (window.has_older) "Older transcript entries load when you page up in the full transcript." else null,
+                .first_entry_ids = ids.items,
             }) catch |err| {
+                ids.clearRetainingCapacity();
                 var message_buf: [128]u8 = undefined;
                 const message = std.mem.print(
                     &message_buf,
@@ -728,4 +762,43 @@ pub fn boolean(value: std.json.Value, key: []const u8) bool {
 }
 pub fn itemsOf(value: std.json.Value) []const std.json.Value {
     return if (value == .array) value.array.items else &.{};
+}
+
+test "a window drops the fragments retention pruned and restarts at the oldest shown" {
+    const alloc = std.testing.allocator;
+    const turn: types.HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("question") },
+        .assistant = @constCast("answer"),
+        .execution = .{ .turn_summary = .{} },
+    } };
+    var window: HistoryWindow = .{ .turn_count = 7, .start = .{ .turn = 4 } };
+    defer window.deinit(alloc);
+    const shape = [_]history_page.Fragment{
+        .{ .turn = turn, .turn_index = 4 },
+        .{ .turn = turn, .turn_index = 5, .has_tail = false },
+        .{ .turn = turn, .turn_index = 5, .first_step = 2, .has_user = false },
+        .{ .turn = turn, .turn_index = 6 },
+    };
+    window.fragments = try HistoryWindow.copies(alloc, &shape);
+    for (shape) |fragment| window.bytes += history_page.fragmentBytes(fragment);
+    try window.first_entry_ids.appendSlice(alloc, &.{ 10, 20, 30, 40 });
+
+    // Nothing pruned: the window is unchanged.
+    window.dropPruned(alloc, 10);
+    try std.testing.expectEqual(@as(usize, 4), window.fragments.items.len);
+
+    // Retention pruned into the second fragment: the first two leave, and
+    // the next older page ends where the shown history begins.
+    window.dropPruned(alloc, 25);
+    try std.testing.expectEqual(@as(usize, 2), window.fragments.items.len);
+    try std.testing.expectEqualSlices(u32, &.{ 30, 40 }, window.first_entry_ids.items);
+    try std.testing.expectEqual(history_page.Cursor{ .turn = 5, .step = 2 }, window.start);
+    try std.testing.expectEqual(history_page.fragmentBytes(shape[2]) + history_page.fragmentBytes(shape[3]), window.bytes);
+    try std.testing.expect(window.has_older);
+
+    // Everything pruned: the window is empty and starts after its turns.
+    window.dropPruned(alloc, null);
+    try std.testing.expectEqual(@as(usize, 0), window.fragments.items.len);
+    try std.testing.expectEqual(history_page.Cursor{ .turn = 7 }, window.start);
+    try std.testing.expectEqual(@as(usize, 0), window.bytes);
 }
