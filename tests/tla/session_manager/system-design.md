@@ -2436,6 +2436,16 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   provider startup. **Why:** proto's judge selection. **Alternative:**
   always the session's model, which spends the large model on yes or no.
 
+- **D208 Decision:** a step's reasoning heading shows only for a real
+  title: a summary's `#` or whole-line bold title, or a first line on its
+  own of at most 60 bytes and 8 words that starts with a capital and does
+  not end in `:`, `.`, `,`, `;`, `!`, `?` or an ellipsis. A trace that
+  opens with prose, such as "The user wants three things:", shows no
+  heading; the full transcript keeps the whole trace either way. **Why:**
+  proto shows a heading for a title, not for the first words of a
+  thought. **Alternative:** truncating the first line, which reads as a
+  broken sentence.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

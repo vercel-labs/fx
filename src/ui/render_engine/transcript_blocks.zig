@@ -241,19 +241,68 @@ pub fn isEntryVisibleInCompactPresentation(entry: TranscriptEntry) bool {
 /// The widest reasoning heading, in display columns, before it ends in "…".
 const max_reasoning_title_cols = 72;
 
-/// A step's reasoning shows inline as one heading: its title, the first
-/// line with markdown emphasis and heading marks removed. The full trace
-/// stays in the full transcript. Null for every other notice.
+/// A step's reasoning shows inline as one heading when it has a title; the
+/// full trace stays in the full transcript. Null for every other notice.
 pub fn reasoningTitle(notice: anytype) ?[]const u8 {
     if (notice.visibility != .full_only or !std.mem.eql(u8, notice.topic, "thinking")) return null;
-    var lines = std.mem.splitScalar(u8, notice.body, '\n');
+    return stepTitle(notice.body);
+}
+
+/// The widest plain first line that still reads as a title.
+const max_plain_title_bytes = 60;
+const max_plain_title_words = 8;
+
+/// A reasoning trace's title, as proto shows one (D208): a summary's `#` or
+/// bold title line, or a first line short enough to read as a title, on
+/// its own, starting with a capital and ending without sentence or list
+/// punctuation. A trace that opens with prose ("The user wants three
+/// things:") has none, and no heading shows.
+pub fn stepTitle(body: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, body, '\n');
     while (lines.next()) |raw| {
-        var line = std.mem.trim(u8, raw, " \t\r");
-        line = std.mem.trimStart(u8, line, "#");
-        line = std.mem.trim(u8, line, " *_");
-        if (line.len > 0) return line;
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        if (line[0] == '#') return titleText(std.mem.trim(u8, std.mem.trimStart(u8, line, "#"), " *_"));
+        if (line.len > 4 and std.mem.startsWith(u8, line, "**") and std.mem.endsWith(u8, line, "**")) {
+            const inner = std.mem.trim(u8, line[2 .. line.len - 2], " ");
+            if (std.mem.find(u8, inner, "**") != null) return null;
+            return titleText(inner);
+        }
+        // A plain line is a title only on its own, not the start of a paragraph.
+        if (lines.peek()) |next| if (std.mem.trim(u8, next, " \t\r").len != 0) return null;
+        const plain = titleText(line) orelse return null;
+        if (plain.len > max_plain_title_bytes or !std.ascii.isUpper(plain[0])) return null;
+        if (std.mem.find(u8, plain, ". ") != null) return null;
+        if (std.mem.countScalar(u8, plain, ' ') + 1 > max_plain_title_words) return null;
+        return plain;
     }
     return null;
+}
+
+/// `text` when it can stand as a title: not empty and not ending in the
+/// punctuation that ends a sentence or opens a list.
+fn titleText(text: []const u8) ?[]const u8 {
+    if (text.len == 0) return null;
+    if (std.mem.endsWith(u8, text, "\u{2026}")) return null;
+    return switch (text[text.len - 1]) {
+        ':', '.', ',', ';', '!', '?' => null,
+        else => text,
+    };
+}
+
+test "a step heading shows only for a real title" {
+    try std.testing.expectEqualStrings("Planning the count", stepTitle("**Planning the count**\n\nI will run one shell command.").?);
+    try std.testing.expectEqualStrings("Reading the notes", stepTitle("## Reading the notes\nThen more.").?);
+    try std.testing.expectEqualStrings("Counting Python files", stepTitle("Counting Python files\n\nThe tree has three folders.").?);
+    // Prose openings, list lead-ins and long or wrapped lines show nothing.
+    try std.testing.expect(stepTitle("The user wants three things:\n\n1. count\n2. write") == null);
+    try std.testing.expect(stepTitle("**The user wants three things:**\n\n1. count") == null);
+    try std.testing.expect(stepTitle("I'll count the .py files under the workspace with a single shell invocation.") == null);
+    try std.testing.expect(stepTitle("Let me check\nthe folder layout first") == null);
+    try std.testing.expect(stepTitle("lowercase start of a thought") == null);
+    try std.testing.expect(stepTitle("Okay so now I need to think about how to count the files here") == null);
+    try std.testing.expect(stepTitle("Done. Next the plan") == null);
+    try std.testing.expect(stepTitle("\n  \n") == null);
 }
 
 fn renderReasoningHeading(alloc: Allocator, title: []const u8, cols: u16) ![]u8 {
