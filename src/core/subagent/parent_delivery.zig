@@ -14,6 +14,9 @@ const Allocator = std.mem.Allocator;
 /// The context for the parent's next step, or null when nothing settled.
 /// Owned by `arena`.
 pub fn prepare(host: *tool_host.Runtime, arena: Allocator) !?deps.PreparedParentTurnContext {
+    // Workers whose queue a cancelled turn left waiting start at the
+    // parent's next step (D113).
+    @import("fleet_host.zig").pumpQueues(host);
     const completed = try host.prepareYielded(arena);
     if (completed.len == 0) return null;
     const capability = host.children.parent.childCapability() catch null;

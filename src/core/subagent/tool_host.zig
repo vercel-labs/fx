@@ -1064,10 +1064,6 @@ pub const Runtime = struct {
                 .delivered = item.delivered,
             });
         }
-        // Workers whose queue a cancel left waiting start at the parent's
-        // next step (D113). Their results reach the parent through the jobs
-        // registry, never here (D112).
-        fleet_host.pumpQueues(self);
         for (try self.managed.feedbackUpdates(arena)) |update| {
             try results.append(arena, .{
                 .child_id = update.child_id,

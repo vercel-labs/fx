@@ -696,7 +696,7 @@ test "a subagent group holds at most max_parallel_subagent_calls calls" {
     const builtin_tools = @import("../../../builtins/tools.zig");
     const registry = tool_dispatch.Registry{ .tools = &.{builtin_tools.fleet} };
     var calls: [max_parallel_subagent_calls + 3]ToolCall = undefined;
-    for (&calls) |*call| call.* = toolCall("child", "subagent", "{\"action\":\"run\",\"task\":\"t\"}");
+    for (&calls) |*call| call.* = toolCall("child", "fleet", "{\"op\":\"run\",\"message\":\"t\"}");
     try std.testing.expectEqual(LeadingGroup{ .kind = .subagent, .len = max_parallel_subagent_calls }, leadingParallelGroup(registry, &calls));
     try std.testing.expectEqual(LeadingGroup{ .kind = .subagent, .len = 3 }, leadingParallelGroup(registry, calls[max_parallel_subagent_calls..]));
 }
@@ -727,8 +727,8 @@ test "parallel classifier keeps one leading registered subagent group" {
     };
     const registry = tool_dispatch.Registry{ .tools = &tools };
     const calls = [_]ToolCall{
-        toolCall("child_1", "subagent", "{\"request\":{\"action\":\"run\",\"task\":\"first\"}}"),
-        toolCall("child_2", "subagent", "{\"request\":{\"action\":\"run\",\"task\":\"second\"}}"),
+        toolCall("child_1", "fleet", "{\"op\":\"run\",\"message\":\"first\"}"),
+        toolCall("child_2", "fleet", "{\"op\":\"spawn\",\"message\":\"second\"}"),
         toolCall("read_1", "read_file", "{\"path\":\"README.md\"}"),
     };
 
