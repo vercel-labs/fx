@@ -125,7 +125,8 @@ pub const RequestInput = union(Action) {
 };
 
 /// Creation-time overrides carried by a request. Model and effort default to
-/// the profile's, then the parent's; the profile defaults to fx's `agent`.
+/// the profile's, then the parent's; without a profile the child gets the
+/// parent's tools and settings.
 /// Overrides apply only when a child session is created.
 pub const Override = struct {
     model: ?[]const u8 = null,
