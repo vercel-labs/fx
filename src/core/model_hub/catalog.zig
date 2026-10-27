@@ -53,10 +53,40 @@ pub const Model = struct {
     roles: []const Role = &.{},
 };
 
+/// Whether a role's chain entry can be used now (D250).
+pub const EntryState = enum {
+    ready,
+    /// On the active provider, but its catalog does not list the model.
+    unknown_model,
+    /// On a signed-in provider that is not the session's.
+    other_provider,
+    /// On a provider that is not signed in.
+    signed_out,
+    /// `@role`: follows another role.
+    alias,
+};
+
+/// One reference of a role's chain: the first is the assignment, the rest
+/// its fallbacks, in order.
+pub const EntryRow = struct {
+    /// The reference as saved, without its level. Used to save, not shown.
+    ref: []const u8,
+    /// The reference as people read it, such as `cento · claude-cento`.
+    shown: []const u8,
+    effort: ?types.ReasoningEffort = null,
+    /// The levels the entry's model offers, for its thinking strip.
+    efforts: []const types.ReasoningEffort = &.{},
+    state: EntryState = .ready,
+};
+
 pub const RoleRow = struct {
     role: Role,
     /// The model the profile assigns, as shown; null when unset.
     assigned: ?[]const u8 = null,
+    /// The role's chain; empty when unset.
+    entries: []const EntryRow = &.{},
+    /// The entry the role resolves to now.
+    in_use: ?usize = null,
     /// What the role resolves to now, through its fallbacks.
     resolved: ?[]const u8 = null,
     /// The fallback chain when nothing is assigned, as shown.
@@ -183,6 +213,14 @@ pub const Builder = struct {
         if (row.assigned) |text| copy.assigned = try self.dupe(text);
         if (row.resolved) |text| copy.resolved = try self.dupe(text);
         copy.chain = try self.dupe(row.chain);
+        const entries = try self.arena().alloc(EntryRow, row.entries.len);
+        for (row.entries, entries) |entry, *out| {
+            out.* = entry;
+            out.ref = try self.dupe(entry.ref);
+            out.shown = try self.dupe(entry.shown);
+            out.efforts = try self.arena().dupe(types.ReasoningEffort, entry.efforts);
+        }
+        copy.entries = entries;
         try self.roles.append(self.arena(), copy);
     }
 

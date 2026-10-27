@@ -6,6 +6,11 @@ const types = @import("../shared/types.zig");
 const alloc = std.testing.allocator;
 
 fn fixture() !catalog.Snapshot {
+    return fixtureWith(&.{});
+}
+
+/// The fixture with Small set to `small_chain`.
+fn fixtureWith(small_chain: []const catalog.EntryRow) !catalog.Snapshot {
     var builder: catalog.Builder = .init(alloc);
     errdefer builder.deinit();
     const cento = try builder.addProvider(.{ .key = "cento", .name = "cento", .detail = "No sign-in needed", .signed_in = true, .active = true, .sign_in = .settings, .can_sign_out = false });
@@ -16,7 +21,14 @@ fn fixture() !catalog.Snapshot {
     try builder.addModel(.{ .provider = cento, .id = "claude-cento-lite", .name = "" });
     try builder.addModel(.{ .provider = router, .id = "anthropic/claude-sonnet-5.5", .name = "Claude Sonnet 5.5" });
     try builder.addModel(.{ .provider = zen, .id = "glm-5.3", .name = "" });
-    for (catalog.role_order) |role| try builder.addRole(.{ .role = role, .chain = "the session's model", .cycle_position = if (role == .default) 1 else null });
+    for (catalog.role_order) |role| try builder.addRole(.{
+        .role = role,
+        .chain = "the session's model",
+        .cycle_position = if (role == .default) 1 else null,
+        .entries = if (role == .small) small_chain else &.{},
+        .assigned = if (role == .small and small_chain.len > 0) small_chain[0].shown else null,
+        .in_use = if (role == .small and small_chain.len > 1) 1 else null,
+    });
     try builder.addWebSearch(.{ .id = "exa", .name = "Exa", .excluded = false, .ready = false });
     try builder.addWebSearch(.{ .id = "duckduckgo", .name = "DuckDuckGo", .excluded = false, .ready = true });
     return builder.finish(&.{.default});
@@ -95,14 +107,14 @@ test "assigning from the Roles list picks a model and returns to the role" {
     try std.testing.expectEqualDeep(hub.Effect{ .toggle_cycle = .small }, try state.handle(alloc, .{ .char = 'c' }));
     try std.testing.expectEqualDeep(hub.Effect{ .clear_role = .small }, try state.handle(alloc, .{ .char = 'x' }));
     _ = try state.handle(alloc, .enter);
-    try std.testing.expectEqual(hub.Role.small, state.assigning.?);
+    try std.testing.expectEqualDeep(hub.Assigning{ .role = .small, .entry = null }, state.assigning.?);
     try std.testing.expectEqual(hub.ScopeKind.all_models, state.scope.kind);
     try typeText(&state, "lite");
     const effect = try state.handle(alloc, .enter);
-    try std.testing.expectEqual(hub.Role.small, effect.assign_role.role);
-    try std.testing.expectEqualStrings("claude-cento-lite", state.snapshot.?.models[effect.assign_role.model].id);
+    try std.testing.expectEqual(hub.Role.small, effect.edit_role.role);
+    try std.testing.expectEqualStrings("claude-cento-lite", state.snapshot.?.models[effect.edit_role.edit.put.model].id);
     try std.testing.expectEqual(hub.ScopeKind.roles, state.scope.kind);
-    try std.testing.expectEqual(hub.Role.small, state.snapshot.?.roles[state.rows.items[state.selected]].role);
+    try std.testing.expectEqual(hub.Role.small, state.snapshot.?.roles[state.roleCursor().?.role_index].role);
     // Moving a role in the cycle needs it to be in the cycle.
     try std.testing.expectEqual(hub.Effect.none, try state.handle(alloc, .{ .char = ']' }));
     _ = try state.handle(alloc, .up);
@@ -119,7 +131,8 @@ test "the role and thinking strips act on the highlighted model" {
     _ = try state.handle(alloc, .role_strip);
     _ = try state.handle(alloc, .right);
     const assigned = try state.handle(alloc, .enter);
-    try std.testing.expectEqual(hub.Role.small, assigned.assign_role.role);
+    try std.testing.expectEqual(hub.Role.small, assigned.edit_role.role);
+    try std.testing.expectEqual(@as(?usize, 0), assigned.edit_role.edit.put.entry);
     _ = try state.handle(alloc, .thinking_strip);
     try std.testing.expectEqual(@as(usize, 3), state.stripCount());
     _ = try state.handle(alloc, .left);
@@ -153,4 +166,54 @@ test "a fresher snapshot keeps the scope and the highlighted model" {
     @memcpy(buf[0..id.len], id);
     try state.replaceSnapshot(alloc, try fixture());
     try std.testing.expectEqualStrings(buf[0..id.len], state.snapshot.?.models[state.selectedModel().?].id);
+}
+
+test "a role's fallbacks list under it and edit by entry" {
+    const efforts = [_]types.ReasoningEffort{ types.ReasoningEffort.literal("low"), types.ReasoningEffort.literal("high") };
+    const chain = [_]catalog.EntryRow{
+        .{ .ref = "codex/gpt-5.6-luna", .shown = "Codex · gpt-5.6-luna", .state = .signed_out },
+        .{ .ref = "cento/claude-cento", .shown = "cento · claude-cento", .efforts = &efforts, .effort = types.ReasoningEffort.literal("high") },
+    };
+    var state: hub.State = .{};
+    defer state.deinit(alloc);
+    try state.open(alloc, try fixtureWith(&chain), .models);
+    _ = try state.handle(alloc, .left);
+    _ = try state.handle(alloc, .home);
+    _ = try state.handle(alloc, .right);
+    // Default, Small, Small's fallback, then the other roles.
+    try std.testing.expectEqual(catalog.role_order.len + 1, state.rows.items.len);
+    _ = try state.handle(alloc, .down);
+    _ = try state.handle(alloc, .down);
+    try std.testing.expectEqualDeep(hub.RoleCursor{ .role_index = 1, .entry = 1 }, state.roleCursor().?);
+    // t opens the fallback's thinking strip on its level; auto saves it bare.
+    _ = try state.handle(alloc, .{ .char = 't' });
+    try std.testing.expect(state.strip == .entry_thinking);
+    try std.testing.expectEqual(@as(usize, 2), state.strip.entry_thinking);
+    _ = try state.handle(alloc, .left);
+    const low = try state.handle(alloc, .enter);
+    try std.testing.expectEqualStrings("low", low.edit_role.edit.thinking.effort.?.label());
+    _ = try state.handle(alloc, .{ .char = 't' });
+    _ = try state.handle(alloc, .right);
+    const bare = try state.handle(alloc, .enter);
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, null), bare.edit_role.edit.thinking.effort);
+    try std.testing.expectEqual(@as(usize, 1), bare.edit_role.edit.thinking.entry);
+    // [ moves the fallback ahead of the assignment, and the highlight follows.
+    const moved = try state.handle(alloc, .{ .char = '[' });
+    try std.testing.expectEqualDeep(hub.RoleEdit{ .move = .{ .entry = 1, .later = false } }, moved.edit_role.edit);
+    try std.testing.expectEqual(@as(usize, 1), state.selected);
+    // A signed-out model has no levels to offer.
+    try std.testing.expectEqual(hub.Effect.redraw, try state.handle(alloc, .{ .char = 't' }));
+    try std.testing.expect(state.strip == .none);
+    // x on a fallback removes only it; on the role it clears the role.
+    _ = try state.handle(alloc, .down);
+    try std.testing.expectEqualDeep(hub.RoleEdit{ .remove = 1 }, (try state.handle(alloc, .{ .char = 'x' })).edit_role.edit);
+    try std.testing.expectEqualDeep(hub.Effect{ .clear_role = .small }, try state.handle(alloc, .{ .char = 'x' }));
+    // f adds a fallback through the model list; Enter on a fallback replaces it.
+    _ = try state.handle(alloc, .{ .char = 'f' });
+    try std.testing.expectEqualDeep(hub.Assigning{ .role = .small, .entry = null }, state.assigning.?);
+    _ = try state.handle(alloc, .escape);
+    try std.testing.expectEqual(hub.ScopeKind.roles, state.scope.kind);
+    _ = try state.handle(alloc, .down);
+    _ = try state.handle(alloc, .enter);
+    try std.testing.expectEqualDeep(hub.Assigning{ .role = .small, .entry = 1 }, state.assigning.?);
 }

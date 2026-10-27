@@ -685,6 +685,17 @@ pub const Runtime = struct {
         return entries;
     }
 
+    /// Whether the ready catalog lists `model`; true while no catalog is
+    /// ready, so a role's fallback chain does not skip a model only because
+    /// nothing is known yet (D250). Takes only the mutex, so the worker
+    /// thread may ask while it resolves a role.
+    pub fn knowsModel(self: *Self, model: []const u8) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.state != .ready or self.catalog.items.len == 0) return true;
+        return findCatalogModel(self.catalog.items, model) != null;
+    }
+
     pub fn metadataForModel(self: *Self, model: []const u8) ?model_capabilities.GatewayMetadata {
         self.finishThreadIfDone();
         self.mutex.lockUncancelable(io_mod.getIo());

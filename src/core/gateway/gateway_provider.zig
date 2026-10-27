@@ -246,6 +246,15 @@ pub const CapabilityResolver = struct {
         return fallback;
     }
 
+    /// Whether the ready catalog lists `model`; true while none is ready,
+    /// so a role's fallback chain does not skip a model only because
+    /// nothing is known yet (D250). Reads like `available`.
+    pub fn knows(self: *const CapabilityResolver, model: []const u8) bool {
+        if (self.state != .ready or self.catalog.items.len == 0) return true;
+        for (self.catalog.items) |entry| if (std.mem.eql(u8, entry.id, model)) return true;
+        return false;
+    }
+
     pub fn available(
         self: *const CapabilityResolver,
         model: []const u8,

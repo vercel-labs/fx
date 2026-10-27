@@ -124,7 +124,8 @@ pub const ModelOverrideResolver = struct {
 /// on the parent's provider (D174). The model must outlive `executeManaged`.
 pub const ModelRoleResolver = struct {
     pub const Lookup = union(enum) {
-        model: []const u8,
+        /// The role's model and the thinking level its entry names (D251).
+        model: struct { id: []const u8, effort: ?types.ReasoningEffort = null },
         unknown_role,
         /// The role picks no model on this provider; the worker inherits.
         unavailable,
@@ -456,15 +457,15 @@ pub const Runtime = struct {
                 .operation_id = operation_id,
                 .options = options,
                 .child_mode = .ask,
-                .resolved_model = null,
+                .resolved_model = .{},
             }),
             .run, .message, .spawn, .send => blk: {
                 // A child is never wider than the node that asks for it.
                 const child_mode = authority.admitChildPermission(self.permission_ceiling, options.parent_permission_mode) catch
                     break :blk self.encodeManaged(alloc, .{ .ok = false, .error_code = @tagName(tree_mod.SpawnRefusal.permission_escalation) });
-                const resolved_model: ?[]const u8 = switch (try resolveOverrideModel(alloc, request.override(), options)) {
+                const resolved_model: Resolved = switch (try resolveOverrideModel(alloc, request.override(), options)) {
                     .rejected => |failure| break :blk try self.encodeManaged(alloc, failure),
-                    .accepted => |model| model,
+                    .accepted => |resolved| resolved,
                 };
                 if (request.* == .spawn or request.* == .send) break :blk fleet_host.execute(self, alloc, request, .{
                     .operation_id = operation_id,
@@ -578,8 +579,9 @@ pub const Runtime = struct {
     }
 
     const OverrideModelResolution = union(enum) {
-        /// Resolved canonical catalog ID, or null to keep the raw override.
-        accepted: ?[]const u8,
+        /// Resolved canonical catalog ID, or null to keep the raw override,
+        /// and a role's thinking level.
+        accepted: Resolved,
         rejected: model_contract.Result,
     };
 
@@ -593,8 +595,9 @@ pub const Runtime = struct {
         override: model_contract.Override,
         options: ExecuteOptions,
     ) !OverrideModelResolution {
-        var raw_model = override.model orelse return .{ .accepted = null };
+        var raw_model = override.model orelse return .{ .accepted = .{} };
         var from_role = false;
+        var role_effort: ?types.ReasoningEffort = null;
         if (raw_model[0] == '@') {
             const roles = options.model_role_resolver orelse return .{ .rejected = .{
                 .ok = false,
@@ -602,9 +605,10 @@ pub const Runtime = struct {
                 .result = try alloc.dupe(u8, "This host has no model roles; pass a catalog model ID."),
             } };
             switch (roles.resolve_fn(roles.context, raw_model[1..])) {
-                .model => |model| {
-                    debug_trace.logf("subagent", "model role resolved raw={s} model={s}", .{ raw_model, model });
-                    raw_model = model;
+                .model => |picked| {
+                    debug_trace.logf("subagent", "model role resolved raw={s} model={s}", .{ raw_model, picked.id });
+                    raw_model = picked.id;
+                    role_effort = picked.effort;
                     from_role = true;
                 },
                 .unknown_role => return .{ .rejected = .{
@@ -614,7 +618,7 @@ pub const Runtime = struct {
                 } },
                 .unavailable => {
                     debug_trace.logf("subagent", "model role unset raw={s}; inheriting model={s}", .{ raw_model, options.defaults.model });
-                    return .{ .accepted = options.defaults.model };
+                    return .{ .accepted = .{ .model = options.defaults.model } };
                 },
             }
         }
@@ -625,16 +629,16 @@ pub const Runtime = struct {
         // so overrides for those children pass through to the provider.
         if (options.defaults.provider != .gateway) {
             debug_trace.logf("subagent", "model override resolution skipped raw={s} reason=non_gateway_provider", .{raw_model});
-            return .{ .accepted = passthrough };
+            return .{ .accepted = .{ .model = passthrough, .effort = role_effort } };
         }
         const resolver = options.model_override_resolver orelse {
             debug_trace.logf("subagent", "model override resolution skipped raw={s} reason=no_resolver", .{raw_model});
-            return .{ .accepted = passthrough };
+            return .{ .accepted = .{ .model = passthrough, .effort = role_effort } };
         };
         switch (try resolver.resolve(alloc, raw_model)) {
             .no_catalog => {
                 debug_trace.logf("subagent", "model override resolution skipped raw={s} reason=no_catalog", .{raw_model});
-                return .{ .accepted = passthrough };
+                return .{ .accepted = .{ .model = passthrough, .effort = role_effort } };
             },
             .matched => |id| {
                 if (!std.mem.eql(u8, id, raw_model)) {
@@ -644,7 +648,7 @@ pub const Runtime = struct {
                         .{ raw_model, id },
                     );
                 }
-                return .{ .accepted = id };
+                return .{ .accepted = .{ .model = id, .effort = role_effort } };
             },
             .ambiguous => |candidates| {
                 debug_trace.logf(
@@ -767,7 +771,7 @@ pub const Runtime = struct {
         operation_id: []const u8,
         options: ExecuteOptions,
         child_mode: types.PermissionMode,
-        resolved_model: ?[]const u8,
+        resolved_model: Resolved,
     ) !ManagedAdmission {
         // A running registry entry must not be exposed before its Slot exists.
         // Release the registry lock before taking the managed-owner lock.
@@ -795,7 +799,7 @@ pub const Runtime = struct {
         operation_id: []const u8,
         options: ExecuteOptions,
         child_mode: types.PermissionMode,
-        resolved_model: ?[]const u8,
+        resolved_model: Resolved,
     ) !ManagedAdmission {
         const fingerprint = model_contract.requestFingerprint(request);
         const defaults = effectiveDefaults(options.defaults, request.override(), resolved_model);
@@ -1713,26 +1717,32 @@ test "creation defaults keep parent values unless the request overrides them" {
         .effort = .auto,
         .conversation_language = session.ConversationLanguage.default(),
     };
-    const inherited = effectiveDefaults(parent, .{}, null);
+    const inherited = effectiveDefaults(parent, .{}, .{});
     try std.testing.expectEqualStrings("parent-model", inherited.model);
     try std.testing.expect(inherited.effort.isDefault());
     const overridden = effectiveDefaults(parent, .{
         .model = "gpt-5.6-sol-fast",
         .effort = types.ReasoningEffort.parse("medium"),
-    }, null);
+    }, .{});
     try std.testing.expectEqualStrings("gpt-5.6-sol-fast", overridden.model);
     try std.testing.expectEqualStrings("medium", overridden.effort.label());
     try std.testing.expectEqual(parent.provider, overridden.provider);
     // Model-only and effort-only overrides leave the other value inherited.
-    const model_only = effectiveDefaults(parent, .{ .model = "other-model" }, null);
+    const model_only = effectiveDefaults(parent, .{ .model = "other-model" }, .{});
     try std.testing.expectEqualStrings("other-model", model_only.model);
     try std.testing.expect(model_only.effort.isDefault());
     // A catalog-resolved model wins over the raw override text.
-    const resolved = effectiveDefaults(parent, .{ .model = "terra-fast" }, "openai/gpt-5.6-terra-fast");
+    const resolved = effectiveDefaults(parent, .{ .model = "terra-fast" }, .{ .model = "openai/gpt-5.6-terra-fast" });
     try std.testing.expectEqualStrings("openai/gpt-5.6-terra-fast", resolved.model);
     // Without an override there is nothing to resolve.
-    const no_override = effectiveDefaults(parent, .{}, "openai/gpt-5.6-terra-fast");
+    const no_override = effectiveDefaults(parent, .{}, .{ .model = "openai/gpt-5.6-terra-fast" });
     try std.testing.expectEqualStrings("parent-model", no_override.model);
+    // A role's thinking level applies unless the request names one.
+    const high = types.ReasoningEffort.literal("high");
+    const from_role = effectiveDefaults(parent, .{ .model = "@small" }, .{ .model = "cento-mini", .effort = high });
+    try std.testing.expectEqualStrings("high", from_role.effort.label());
+    const named = effectiveDefaults(parent, .{ .model = "@small", .effort = types.ReasoningEffort.literal("low") }, .{ .model = "cento-mini", .effort = high });
+    try std.testing.expectEqualStrings("low", named.effort.label());
 }
 
 const OverrideResolverFixture = struct {
@@ -1879,7 +1889,7 @@ test "model override passes through for non-gateway providers" {
 
 const RoleResolverFixture = struct {
     fn resolve(_: ?*anyopaque, name: []const u8) ModelRoleResolver.Lookup {
-        if (std.mem.eql(u8, name, "worker")) return .{ .model = "cento-worker" };
+        if (std.mem.eql(u8, name, "worker")) return .{ .model = .{ .id = "cento-worker" } };
         if (std.mem.eql(u8, name, "small")) return .unavailable;
         return .unknown_role;
     }
@@ -2149,13 +2159,22 @@ fn modelOverrideFailureMessage(
 pub fn effectiveDefaults(
     defaults: Defaults,
     override: model_contract.Override,
-    resolved_model: ?[]const u8,
+    resolved_model: Resolved,
 ) Defaults {
     var resolved = defaults;
-    if (override.model) |model| resolved.model = resolved_model orelse model;
-    if (override.effort) |effort| resolved.effort = effort;
+    if (override.model) |model| resolved.model = resolved_model.model orelse model;
+    // An effort the request names outranks the one its role names.
+    if (override.effort orelse resolved_model.effort) |effort| resolved.effort = effort;
     return resolved;
 }
+
+/// What a creation-time model override resolved to: the canonical model,
+/// or null to keep the raw override, and the thinking level of the `@role`
+/// it named, if any (D251).
+pub const Resolved = struct {
+    model: ?[]const u8 = null,
+    effort: ?types.ReasoningEffort = null,
+};
 
 fn captureAdmission(
     raw: ?*anyopaque,

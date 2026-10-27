@@ -8,6 +8,10 @@ const alloc = std.testing.allocator;
 const catalog = hub.catalog;
 
 fn fixture() !catalog.Snapshot {
+    return fixtureWith(&.{});
+}
+
+fn fixtureWith(small_chain: []const catalog.EntryRow) !catalog.Snapshot {
     var builder: catalog.Builder = .init(alloc);
     errdefer builder.deinit();
     const cento = try builder.addProvider(.{ .key = "cento", .name = "cento", .detail = "No sign-in needed", .signed_in = true, .active = true, .sign_in = .settings, .can_sign_out = false });
@@ -18,7 +22,15 @@ fn fixture() !catalog.Snapshot {
     try builder.addModel(.{ .provider = cento, .id = "claude-cento-lite", .name = "", .context_window = 200_000 });
     try builder.addModel(.{ .provider = zen, .id = "claude-sonnet-5-5", .name = "Claude Sonnet 5.5 with a very long catalog name that must clip" });
     try builder.addModel(.{ .provider = go, .id = "glm-5.3", .name = "" });
-    for (catalog.role_order) |role| try builder.addRole(.{ .role = role, .assigned = if (role == .small) "cento · claude-cento" else null, .resolved = "cento · claude-cento", .chain = "the session's model", .cycle_position = if (role == .default) 1 else null });
+    for (catalog.role_order) |role| try builder.addRole(.{
+        .role = role,
+        .assigned = if (role == .small) "cento · claude-cento" else null,
+        .entries = if (role == .small) small_chain else &.{},
+        .in_use = if (role == .small and small_chain.len > 1) 1 else null,
+        .resolved = "cento · claude-cento",
+        .chain = "the session's model",
+        .cycle_position = if (role == .default) 1 else null,
+    });
     try builder.addWebSearch(.{ .id = "exa", .name = "Exa", .excluded = true, .ready = false });
     try builder.addWebSearch(.{ .id = "duckduckgo", .name = "DuckDuckGo", .excluded = false, .ready = true });
     return builder.finish(&.{ .deep, .default, .small });
@@ -128,4 +140,38 @@ test "the roles, web search and locked views and the strips render" {
     defer alloc.free(locked);
     try std.testing.expect(std.mem.find(u8, locked, "Enter signs in") != null);
     try std.testing.expect(std.mem.find(u8, locked, "glm-5.3") != null);
+}
+
+test "a role's chain shows its fallbacks, the one in use and levels, at any width" {
+    const efforts = [_]types.ReasoningEffort{ types.ReasoningEffort.literal("low"), types.ReasoningEffort.literal("high") };
+    const chain = [_]catalog.EntryRow{
+        .{ .ref = "codex/gpt-5.6-luna", .shown = "Codex · gpt-5.6-luna", .state = .signed_out, .effort = types.ReasoningEffort.literal("low") },
+        .{ .ref = "cento/claude-cento-lite", .shown = "cento · claude-cento-lite", .efforts = &efforts, .effort = types.ReasoningEffort.literal("high") },
+    };
+    var state: hub.State = .{};
+    defer state.deinit(alloc);
+    try state.open(alloc, try fixtureWith(&chain), .models);
+    _ = try state.handle(alloc, .left);
+    _ = try state.handle(alloc, .home);
+    _ = try state.handle(alloc, .right);
+    const wide = try render(&state, 24, 120);
+    defer alloc.free(wide);
+    for ([_][]const u8{ "Codex · gpt-5.6-luna · low · not signed in", "then 1", "cento · claude-cento-lite · high · in use", "f add fallback" }) |needle| {
+        if (std.mem.find(u8, wide, needle) == null) {
+            std.debug.print("missing {s} in\n{s}\n", .{ needle, wide });
+            return error.TestExpectedEqual;
+        }
+    }
+    _ = try state.handle(alloc, .down);
+    _ = try state.handle(alloc, .down);
+    _ = try state.handle(alloc, .{ .char = 't' });
+    const strip = try render(&state, 24, 120);
+    defer alloc.free(strip);
+    try std.testing.expect(std.mem.find(u8, strip, "Thinking with cento · claude-cento-lite") != null);
+    try std.testing.expect(std.mem.find(u8, strip, "[high ✓]") != null);
+    // Narrow terminals clip rows instead of overflowing; rowsOf checks every width.
+    for ([_]u16{ 40, 52, 70 }) |cols| {
+        const narrow = try render(&state, 16, cols);
+        alloc.free(narrow);
+    }
 }

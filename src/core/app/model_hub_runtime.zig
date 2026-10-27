@@ -164,19 +164,7 @@ pub fn Runtime(comptime App: type) type {
                 .none, .redraw => {},
                 .close => close(app),
                 .select_model => |choice| try selectModel(app, choice.model, choice.effort),
-                .assign_role => |assign| {
-                    const snapshot = &app.model_hub.snapshot.?;
-                    const model = snapshot.models[assign.model];
-                    const provider = snapshot.providers[model.provider];
-                    const ref = try app.alloc.print("{s}/{s}", .{ provider.key, model.id });
-                    defer app.alloc.free(ref);
-                    const notice = try app.alloc.print("{s} now uses {s} on {s}", .{ catalog.roleName(assign.role), model.name, provider.name });
-                    defer app.alloc.free(notice);
-                    if (!try model_role_runtime.Runtime(App).save(app, assign.role, ref)) return;
-                    try app.writeDomainNotice(.{ .topic = "role", .tone = .neutral, .body = notice }, true);
-                    app.model_hub.setNotice(notice);
-                    try refresh(app);
-                },
+                .edit_role => |change| try editRole(app, change.role, change.edit),
                 .clear_role => |role| {
                     if (!try model_role_runtime.Runtime(App).save(app, role, null)) return;
                     var notice_buf: [96]u8 = undefined;
@@ -218,6 +206,49 @@ pub fn Runtime(comptime App: type) type {
                     try refresh(app);
                 },
             }
+        }
+
+        /// Saves one role's changed chain (D250) and says what it does now.
+        fn editRole(app: *App, role: Role, edit: hub.RoleEdit) !void {
+            const snapshot = &app.model_hub.snapshot.?;
+            const row = snapshot.roleRow(role) orelse return;
+            var ref: ?[]u8 = null;
+            defer if (ref) |bytes| app.alloc.free(bytes);
+            var notice_buf: [160]u8 = undefined;
+            const name = catalog.roleName(role);
+            var notice: []const u8 = "";
+            const chain_edit: edits.ChainEdit = switch (edit) {
+                .put => |put| blk: {
+                    const model = snapshot.models[put.model];
+                    const provider = snapshot.providers[model.provider];
+                    ref = try app.alloc.print("{s}/{s}", .{ provider.key, model.id });
+                    const fallback = put.entry == null or put.entry.? > 0;
+                    notice = std.mem.print(&notice_buf, "{s} {s} {s} on {s}", .{ name, if (fallback) "falls back to" else "now uses", model.name, provider.name }) catch "";
+                    break :blk .{ .put = .{ .entry = put.entry, .ref = ref.? } };
+                },
+                .remove => |at| blk: {
+                    notice = std.mem.print(&notice_buf, "Removed a fallback from {s}", .{name}) catch "";
+                    break :blk .{ .remove = at };
+                },
+                .move => |move| blk: {
+                    notice = std.mem.print(&notice_buf, "Reordered {s}'s models", .{name}) catch "";
+                    break :blk .{ .move = .{ .entry = move.entry, .later = move.later } };
+                },
+                .thinking => |thinking| blk: {
+                    notice = if (thinking.effort) |effort|
+                        std.mem.print(&notice_buf, "{s} thinks at {s} with that model", .{ name, effort.label() }) catch ""
+                    else
+                        std.mem.print(&notice_buf, "{s} keeps the session's thinking with that model", .{name}) catch "";
+                    break :blk .{ .thinking = .{ .entry = thinking.entry, .effort = thinking.effort } };
+                },
+            };
+            const value = try edits.editRoleChain(app.alloc, row.entries, chain_edit);
+            defer if (value) |bytes| app.alloc.free(bytes);
+            debug_trace.logf("model_hub", "role={s} chain={s}", .{ role.label(), value orelse "" });
+            if (!try model_role_runtime.Runtime(App).save(app, role, value)) return;
+            try app.writeDomainNotice(.{ .topic = "role", .tone = .neutral, .body = notice }, true);
+            app.model_hub.setNotice(notice);
+            try refresh(app);
         }
 
         /// Runs a slash command through the app's own router, so the hub
@@ -492,17 +523,74 @@ pub fn Runtime(comptime App: type) type {
             const arena = builder.arena();
             const table = &app.model_roles.table;
             const cycle = table.cycleOrder();
+            const host = model_role_runtime.host(app);
+            const active_id = provider_runtime.provider(app);
+            const active_key = active_id.label();
             for (catalog.role_order) |role| {
                 const raw = table.get(role);
                 const resolved = model_role_runtime.resolveModel(app, role);
+                var entries: std.ArrayList(catalog.EntryRow) = .empty;
+                if (raw) |text| {
+                    const chain = model_roles.Chain.parse(text);
+                    for (chain.entries()) |entry| try entries.append(arena, try entryRow(app, builder, entry, definitions, host));
+                }
                 try builder.addRole(.{
                     .role = role,
-                    .assigned = if (raw) |text| try describeRef(app, arena, text, definitions) else null,
-                    .resolved = if (resolved) |model| try describeModel(app, arena, provider_runtime.provider(app).label(), model, definitions) else null,
+                    .assigned = if (entries.items.len > 0) entries.items[0].shown else null,
+                    .entries = entries.items,
+                    .in_use = model_roles.chosenEntry(table, role, roleContext(host, active_key)),
+                    .resolved = if (resolved) |model| try describeModel(app, arena, active_key, model, definitions) else null,
                     .chain = fallbackChain(role),
                     .cycle_position = if (std.mem.findScalar(Role, cycle, role)) |position| position + 1 else null,
                 });
             }
+        }
+
+        /// `active_key` must be the provider's label from a value that
+        /// outlives the context: a configured provider's label points into
+        /// the ID it is called on.
+        fn roleContext(host: model_role_runtime.Host, active_key: []const u8) model_roles.Context {
+            return .{
+                .provider = active_key,
+                .default_model = host.current_model,
+                .configured = host.set.definitions,
+                .known = host.known,
+            };
+        }
+
+        /// One chain entry as the hub shows it, with whether it can be used
+        /// now and the thinking levels its model offers.
+        fn entryRow(
+            app: *App,
+            builder: *catalog.Builder,
+            entry: model_roles.Entry,
+            definitions: []const configured_provider.Definition,
+            host: model_role_runtime.Host,
+        ) !catalog.EntryRow {
+            const arena = builder.arena();
+            var row: catalog.EntryRow = .{ .ref = entry.ref, .shown = try describeRef(app, arena, entry.ref, definitions), .effort = entry.effort };
+            if (entry.ref[0] == '@') {
+                row.state = .alias;
+                return row;
+            }
+            var provider = host.provider;
+            const active_key = provider.label();
+            const ref = model_roles.parseRef(entry.ref, .default, definitions);
+            const key = ref.provider orelse active_key;
+            for (builder.models.items) |model| {
+                if (!std.mem.eql(u8, builder.providers.items[model.provider].key, key)) continue;
+                if (std.mem.eql(u8, model.id, ref.model)) row.efforts = model.efforts;
+            }
+            if (std.mem.eql(u8, key, active_key)) {
+                const known = if (host.known) |check| check.known_fn(check.context, ref.model) else true;
+                row.state = if (known) .ready else .unknown_model;
+                return row;
+            }
+            row.state = .signed_out;
+            for (builder.providers.items) |listed| {
+                if (std.mem.eql(u8, listed.key, key) and listed.signed_in) row.state = .other_provider;
+            }
+            return row;
         }
 
         /// A role reference as people read it: `@small` follows Small, and

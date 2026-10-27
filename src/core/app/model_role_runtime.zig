@@ -21,8 +21,11 @@ const Role = model_roles.Role;
 const model_provider = @import("../config/model_provider.zig");
 const provider_set = @import("../gateway/provider_set.zig");
 
-/// The next role in `cycle_order` whose model differs from the session's.
-pub const Step = struct { role: Role, model: []const u8 };
+const types = @import("../shared/types.zig");
+
+/// The next role in `cycle_order` whose model differs from the session's,
+/// with the thinking level the role names (D251).
+pub const Step = struct { role: Role, model: []const u8, effort: ?types.ReasoningEffort = null };
 
 fn cycleStep(view: Host, backward: bool) ?Step {
     const order = view.state.table.cycleOrder();
@@ -38,9 +41,9 @@ fn cycleStep(view: Host, backward: bool) ?Step {
     var offset: usize = 1;
     while (offset <= order.len) : (offset += 1) {
         const index = if (backward) (start + order.len * 2 - offset) % order.len else (start + offset) % order.len;
-        const model = view.resolve(order[index]) orelse continue;
-        if (std.mem.eql(u8, model, view.current_model)) continue;
-        return .{ .role = order[index], .model = model };
+        const picked = view.pick(order[index]) orelse continue;
+        if (std.mem.eql(u8, picked.model, view.current_model)) continue;
+        return .{ .role = order[index], .model = picked.model, .effort = picked.effort };
     }
     return null;
 }
@@ -121,10 +124,17 @@ pub const Host = struct {
     set: provider_set.Set,
     /// The legacy `review_model` setting or FX_REVIEW_MODEL; empty for none.
     review_model: []const u8 = "",
+    /// The active provider's catalog, which a fallback chain checks (D250).
+    known: ?model_roles.Known = null,
 
     /// Resolves `role` on the host's provider. The model borrows the role
     /// table, the profile default, the host's model or a bundle string.
     pub fn resolve(self: Host, role: Role) ?[]const u8 {
+        return if (self.pick(role)) |picked| picked.model else null;
+    }
+
+    /// `resolve` with the thinking level the role's entry names.
+    pub fn pick(self: Host, role: Role) ?Picked {
         var provider = self.provider;
         const label = provider.label();
         self.state.mutex.lockUncancelable(io_mod.getIo());
@@ -140,10 +150,13 @@ pub const Host = struct {
             // `review_model` was a gateway setting; other providers ignored it.
             .legacy_review = if (self.review_model.len > 0 and provider == .gateway) self.review_model else null,
             .configured = self.set.definitions,
+            .known = self.known,
         }) orelse return null;
-        const model = ref.on(label);
-        if (model == null) debug_trace.logf("config", "model role={s} names provider={s} active={s}; using the consumer default", .{ role.label(), ref.provider.?, label });
-        return model;
+        const model = ref.on(label) orelse {
+            debug_trace.logf("config", "model role={s} names provider={s} active={s}; using the consumer default", .{ role.label(), ref.provider.?, label });
+            return null;
+        };
+        return .{ .model = model, .effort = ref.effort };
     }
 
     /// The model for session titles: the title role, the provider's own
@@ -194,7 +207,7 @@ pub const Host = struct {
     /// Resolves a fleet worker's `@role` model request.
     pub fn lookup(self: Host, name: []const u8) Lookup {
         const role = Role.parse(name) orelse return .unknown_role;
-        return if (self.resolve(role)) |model| .{ .model = model } else .unavailable;
+        return if (self.pick(role)) |picked| .{ .model = picked } else .unavailable;
     }
 
     /// Roles that pick `model`, for the `/model` tags.
@@ -211,8 +224,10 @@ pub const Host = struct {
     }
 };
 
+pub const Picked = model_roles.Picked;
+
 pub const Lookup = union(enum) {
-    model: []const u8,
+    model: Picked,
     unknown_role,
     /// The role resolves to nothing, or to another provider.
     unavailable,
@@ -232,7 +247,17 @@ pub fn host(app: anytype) Host {
         .current_model = view_model orelse provider_runtime.model(app),
         .set = app.providerSet(),
         .review_model = app.review_model,
+        .known = if (comptime @hasField(App, "model_cache")) .{ .context = @ptrCast(@constCast(&app.model_cache)), .known_fn = knownInCache(@TypeOf(app.model_cache)) } else null,
     };
+}
+
+fn knownInCache(comptime Cache: type) *const fn (?*anyopaque, []const u8) bool {
+    return struct {
+        fn known(raw: ?*anyopaque, model: []const u8) bool {
+            const cache: *Cache = @ptrCast(@alignCast(raw.?));
+            return cache.knowsModel(model);
+        }
+    }.known;
 }
 
 pub fn resolveModel(app: anytype, role: Role) ?[]const u8 {
@@ -265,7 +290,7 @@ pub fn rolesFor(app: anytype, model: []const u8, out: *[model_roles.role_count]R
 
 pub fn Runtime(comptime App: type) type {
     return struct {
-        const usage = "usage: /role [next|prev|<role> [model|@role|clear]]";
+        const usage = "usage: /role [next|prev|<role> [model[:level], fallback…|@role|clear]]";
 
         /// `/role`: lists roles, assigns one, or cycles.
         pub fn handle(app: *App, rest: []const u8) !void {
@@ -287,7 +312,7 @@ pub fn Runtime(comptime App: type) type {
         /// False when the reference was refused or the save failed; the
         /// notice saying why is written.
         pub fn save(app: *App, role: Role, value: ?[]const u8) !bool {
-            if (value) |text| model_roles.validateRef(text) catch {
+            if (value) |text| model_roles.validateChain(text) catch {
                 try app.writeDomainNotice(.{ .topic = "role", .tone = .@"error", .body = "That is not a model reference." }, true);
                 return false;
             };
@@ -328,11 +353,14 @@ pub fn Runtime(comptime App: type) type {
             defer app.alloc.free(model);
             try session_backend.Ops(App).selectModel(app, .{
                 .model = model,
-                .effort = app.effort,
+                .effort = step.effort orelse app.effort,
                 .fast_mode = app.fast_mode,
                 .ultrafast_mode = app.worker.agent_turn_settings.ultrafast_mode,
             });
-            const body = try app.alloc.print("{s} · {s}", .{ step.role.label(), model });
+            const body = if (step.effort) |effort|
+                try app.alloc.print("{s} · {s} · {s}", .{ step.role.label(), model, effort.label() })
+            else
+                try app.alloc.print("{s} · {s}", .{ step.role.label(), model });
             defer app.alloc.free(body);
             try app.writeDomainNotice(.{ .topic = "role", .tone = .neutral, .body = body }, true);
         }
@@ -406,7 +434,7 @@ test "cycling steps through roles with distinct models and tags list roles" {
     const count = view.rolesFor("fast", &roles);
     try std.testing.expectEqualSlices(Role, &.{ .small, .worker }, roles[0..count]);
     try std.testing.expectEqual(@as(usize, 1), view.rolesFor("main", &roles));
-    try std.testing.expectEqualStrings("fast", view.lookup("worker").model);
+    try std.testing.expectEqualStrings("fast", view.lookup("worker").model.model);
     try std.testing.expect(view.lookup("nobody") == .unknown_role);
     try std.testing.expect(view.lookup("compact") == .unavailable);
 

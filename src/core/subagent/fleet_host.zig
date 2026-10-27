@@ -22,7 +22,7 @@ pub const Context = struct {
     operation_id: []const u8,
     options: tool_host.ExecuteOptions,
     child_mode: @import("../shared/types.zig").PermissionMode,
-    resolved_model: ?[]const u8,
+    resolved_model: tool_host.Resolved,
 };
 
 pub fn execute(self: *Runtime, alloc: Allocator, request: *model_contract.Request, ctx: Context) !Result {
@@ -235,7 +235,7 @@ pub fn deliverMail(self: *Runtime, child_id: []const u8, text: []const u8, opera
         },
         // A message adds no authority: the worker keeps this node's mode.
         .child_mode = self.permission_ceiling,
-        .resolved_model = null,
+        .resolved_model = .{},
     };
     self.admission_mutex.lockUncancelable(io_mod.getIo());
     defer self.admission_mutex.unlock(io_mod.getIo());

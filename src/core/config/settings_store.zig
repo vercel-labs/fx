@@ -945,7 +945,7 @@ pub fn validateProviderSlug(slug: []const u8) bool {
 fn validateUserPatch(patch: UserSettingsPatch) !void {
     if (patch.model_preference) |preference| try validateModel(preference.model);
     if (patch.model_role) |role_patch| if (role_patch.value) |value| {
-        model_roles.validateRef(value) catch return error.InvalidDurableField;
+        model_roles.validateChain(value) catch return error.InvalidDurableField;
     };
     if (patch.cycle_order) |order| if (order.len > model_roles.role_count) return error.InvalidDurableField;
     if (patch.web_search) |web_search| for ([_][]const []const u8{ web_search.order, web_search.exclude }) |list| {

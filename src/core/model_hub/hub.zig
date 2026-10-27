@@ -40,6 +40,8 @@ pub const Strip = union(enum) {
     roles: usize,
     /// Reasoning efforts to use the highlighted model with: `auto` first.
     thinking: usize,
+    /// The thinking level of the highlighted role entry: `auto` first (D251).
+    entry_thinking: usize,
     /// Confirms signing out of a provider.
     sign_out: u16,
 };
@@ -71,7 +73,8 @@ pub const Effect = union(enum) {
     close,
     /// Use this model for the session, with this effort when given.
     select_model: struct { model: usize, effort: ?types.ReasoningEffort = null },
-    assign_role: struct { role: Role, model: usize },
+    /// Changes one role's chain (D250).
+    edit_role: struct { role: Role, edit: RoleEdit },
     clear_role: Role,
     toggle_cycle: Role,
     move_cycle: struct { role: Role, later: bool },
@@ -82,6 +85,44 @@ pub const Effect = union(enum) {
     /// Move a web search provider earlier or later.
     move_web_search: struct { index: usize, later: bool },
     toggle_web_search: usize,
+};
+
+/// A change to one role's chain, by entry: 0 is the assignment, later
+/// entries its fallbacks.
+pub const RoleEdit = union(enum) {
+    /// Puts the snapshot's model at `entry`, or appends it when null.
+    put: struct { entry: ?usize, model: usize },
+    remove: usize,
+    move: struct { entry: usize, later: bool },
+    /// Null saves the entry without a level, so it keeps the session's.
+    thinking: struct { entry: usize, effort: ?types.ReasoningEffort },
+};
+
+/// What Enter on a model does while a role waits for one.
+pub const Assigning = struct {
+    role: Role,
+    /// The entry the model replaces; null appends a fallback.
+    entry: ?usize,
+};
+
+/// A Roles list row: the role's own row (entry 0) or one of its fallbacks.
+pub const RoleCursor = struct {
+    role_index: usize,
+    entry: usize,
+
+    const entry_bits = 4;
+
+    pub fn decode(row: usize) RoleCursor {
+        return .{ .role_index = row >> entry_bits, .entry = row & ((1 << entry_bits) - 1) };
+    }
+
+    fn encode(self: RoleCursor) usize {
+        return (self.role_index << entry_bits) | self.entry;
+    }
+
+    comptime {
+        std.debug.assert(model_roles.max_chain < (1 << entry_bits));
+    }
 };
 
 const max_query_bytes = 128;
@@ -96,7 +137,7 @@ pub const State = struct {
     query_len: usize = 0,
     strip: Strip = .none,
     /// The role Enter on a model assigns, from the Roles list.
-    assigning: ?Role = null,
+    assigning: ?Assigning = null,
     /// The highlighted row of the scope's list.
     selected: usize = 0,
     /// The first visible row, kept by the renderer's last frame.
@@ -248,7 +289,10 @@ pub const State = struct {
         self.rows.clearRetainingCapacity();
         const snapshot = &(self.snapshot orelse return);
         switch (self.scope.kind) {
-            .roles => for (snapshot.roles, 0..) |_, index| try self.rows.append(alloc, index),
+            .roles => for (snapshot.roles, 0..) |role_row, index| {
+                try self.rows.append(alloc, (RoleCursor{ .role_index = index, .entry = 0 }).encode());
+                for (1..@max(role_row.entries.len, 1)) |entry| try self.rows.append(alloc, (RoleCursor{ .role_index = index, .entry = entry }).encode());
+            },
             .web_search => for (snapshot.web_search, 0..) |_, index| try self.rows.append(alloc, index),
             .all_models, .provider => if (self.listsModels()) try self.collectModels(alloc, snapshot),
         }
@@ -315,10 +359,10 @@ pub const State = struct {
     }
 
     fn escape(self: *State, alloc: Allocator) !Effect {
-        if (self.assigning) |role| {
+        if (self.assigning) |assigning| {
             self.assigning = null;
             try self.setScope(alloc, .{ .kind = .roles });
-            self.selectRole(role);
+            self.selectRole(assigning.role, assigning.entry orelse 0);
             self.focus = .list;
             return .redraw;
         }
@@ -339,11 +383,31 @@ pub const State = struct {
         if (self.listsModels()) self.selectCurrentModel();
     }
 
-    fn selectRole(self: *State, role: Role) void {
+    /// Highlights `role`'s row for `entry`, else the role's own row.
+    fn selectRole(self: *State, role: Role, entry: usize) void {
         const snapshot = self.snapshot orelse return;
-        for (self.rows.items, 0..) |index, row| if (snapshot.roles[index].role == role) {
-            self.selected = row;
-        };
+        for (self.rows.items, 0..) |id, row| {
+            const cursor = RoleCursor.decode(id);
+            if (snapshot.roles[cursor.role_index].role != role) continue;
+            if (cursor.entry == 0) self.selected = row;
+            if (cursor.entry == entry) {
+                self.selected = row;
+                return;
+            }
+        }
+    }
+
+    /// The Roles row under the highlight.
+    pub fn roleCursor(self: *const State) ?RoleCursor {
+        if (self.scope.kind != .roles or self.selected >= self.rows.items.len) return null;
+        return RoleCursor.decode(self.rows.items[self.selected]);
+    }
+
+    /// The chain entry under the highlight in the Roles list.
+    pub fn selectedEntry(self: *const State) ?catalog.EntryRow {
+        const cursor = self.roleCursor() orelse return null;
+        const entries = self.snapshot.?.roles[cursor.role_index].entries;
+        return if (cursor.entry < entries.len) entries[cursor.entry] else null;
     }
 
     fn handleScope(self: *State, alloc: Allocator, key: Key) !Effect {
@@ -436,11 +500,14 @@ pub const State = struct {
         switch (key) {
             .enter => {
                 const model = self.selectedModel() orelse return .none;
-                if (self.assigning) |role| {
+                if (self.assigning) |assigning| {
                     self.assigning = null;
                     try self.setScope(alloc, .{ .kind = .roles });
-                    self.selectRole(role);
-                    return .{ .assign_role = .{ .role = role, .model = model } };
+                    const entries = self.snapshot.?.roleRow(assigning.role).?.entries.len;
+                    // The highlight lands where the model goes; the refresh keeps it.
+                    self.selectRole(assigning.role, 0);
+                    self.selected += assigning.entry orelse entries;
+                    return .{ .edit_role = .{ .role = assigning.role, .edit = .{ .put = .{ .entry = assigning.entry, .model = model } } } };
                 }
                 return .{ .select_model = .{ .model = model } };
             },
@@ -493,28 +560,67 @@ pub const State = struct {
 
     fn handleRoles(self: *State, alloc: Allocator, key: Key) !Effect {
         const snapshot = self.snapshot.?;
-        if (self.selected >= self.rows.items.len) return .none;
-        const role = snapshot.roles[self.rows.items[self.selected]].role;
+        const cursor = self.roleCursor() orelse return .none;
+        const role_row = snapshot.roles[cursor.role_index];
+        const role = role_row.role;
+        const own_row = cursor.entry == 0;
         switch (key) {
-            .enter, .right => {
-                self.assigning = role;
-                self.query_len = 0;
-                try self.setScope(alloc, .{ .kind = .all_models });
-                self.focus = .list;
-                return .redraw;
-            },
-            .backspace, .delete => return .{ .clear_role = role },
+            .enter, .right => return self.startAssign(alloc, role, if (role_row.entries.len == 0) null else cursor.entry),
+            .backspace, .delete => return self.removeEntry(role, own_row, cursor.entry),
             .char => |byte| switch (byte) {
-                'x' => return .{ .clear_role = role },
+                'x' => return self.removeEntry(role, own_row, cursor.entry),
+                'f' => {
+                    if (role_row.entries.len >= model_roles.max_chain) {
+                        self.setNotice("A role keeps at most 8 models");
+                        return .redraw;
+                    }
+                    return self.startAssign(alloc, role, null);
+                },
+                't' => {
+                    const entry = self.selectedEntry() orelse return .none;
+                    if (entry.state == .alias or entry.efforts.len == 0) {
+                        self.setNotice("No thinking levels are known for this model");
+                        return .redraw;
+                    }
+                    var current: usize = 0;
+                    if (entry.effort) |effort| for (entry.efforts, 1..) |level, index| {
+                        if (level.eql(effort)) current = index;
+                    };
+                    self.strip = .{ .entry_thinking = current };
+                    return .redraw;
+                },
                 'c' => return .{ .toggle_cycle = role },
                 '[', ']' => {
-                    if (snapshot.roleRow(role).?.cycle_position == null) return .none;
-                    return .{ .move_cycle = .{ .role = role, .later = byte == ']' } };
+                    const later = byte == ']';
+                    if (own_row and role_row.entries.len < 2) {
+                        if (role_row.cycle_position == null) return .none;
+                        return .{ .move_cycle = .{ .role = role, .later = later } };
+                    }
+                    // In a chain, [ and ] reorder the models; the first is the assignment.
+                    if (!later and cursor.entry == 0) return .none;
+                    if (later and cursor.entry + 1 >= role_row.entries.len) return .none;
+                    self.selected = if (later) self.selected + 1 else self.selected - 1;
+                    return .{ .edit_role = .{ .role = role, .edit = .{ .move = .{ .entry = cursor.entry, .later = later } } } };
                 },
                 else => return self.handleScope(alloc, key),
             },
             else => return .none,
         }
+    }
+
+    fn startAssign(self: *State, alloc: Allocator, role: Role, entry: ?usize) !Effect {
+        self.assigning = .{ .role = role, .entry = entry };
+        self.query_len = 0;
+        try self.setScope(alloc, .{ .kind = .all_models });
+        self.focus = .list;
+        return .redraw;
+    }
+
+    /// x on a role clears it; on a fallback, removes that model.
+    fn removeEntry(self: *State, role: Role, own_row: bool, entry: usize) Effect {
+        if (own_row) return .{ .clear_role = role };
+        self.selected -|= 1;
+        return .{ .edit_role = .{ .role = role, .edit = .{ .remove = entry } } };
     }
 
     fn handleWebSearch(self: *State, key: Key) Effect {
@@ -544,6 +650,7 @@ pub const State = struct {
             .none => 0,
             .roles => catalog.role_order.len,
             .thinking => if (self.selectedModel()) |model| self.snapshot.?.models[model].efforts.len + 1 else 1,
+            .entry_thinking => if (self.selectedEntry()) |entry| entry.efforts.len + 1 else 1,
             .sign_out => 2,
         };
     }
@@ -551,6 +658,10 @@ pub const State = struct {
     /// The effort chip at `index`: 0 is `auto`.
     pub fn stripEffort(self: *const State, index: usize) types.ReasoningEffort {
         if (index == 0) return .auto;
+        if (self.strip == .entry_thinking) {
+            const entry = self.selectedEntry() orelse return .auto;
+            return if (index - 1 < entry.efforts.len) entry.efforts[index - 1] else .auto;
+        }
         const model = self.selectedModel() orelse return .auto;
         const efforts = self.snapshot.?.models[model].efforts;
         return if (index - 1 < efforts.len) efforts[index - 1] else .auto;
@@ -561,6 +672,7 @@ pub const State = struct {
         const selected: *usize = switch (self.strip) {
             .roles => |*value| value,
             .thinking => |*value| value,
+            .entry_thinking => |*value| value,
             .sign_out => {
                 switch (key) {
                     .enter => {
@@ -590,6 +702,14 @@ pub const State = struct {
                 return .redraw;
             },
             .enter => {
+                if (self.strip == .entry_thinking) {
+                    const index = selected.*;
+                    const effort: ?types.ReasoningEffort = if (index == 0) null else self.stripEffort(index);
+                    self.strip = .none;
+                    const cursor = self.roleCursor() orelse return .redraw;
+                    const role = self.snapshot.?.roles[cursor.role_index].role;
+                    return .{ .edit_role = .{ .role = role, .edit = .{ .thinking = .{ .entry = cursor.entry, .effort = effort } } } };
+                }
                 const model = self.selectedModel() orelse {
                     self.strip = .none;
                     return .redraw;
@@ -601,7 +721,7 @@ pub const State = struct {
                     .roles => blk: {
                         const role = catalog.role_order[index];
                         const holds = std.mem.findScalar(Role, self.snapshot.?.models[model].roles, role) != null;
-                        break :blk if (holds) .{ .clear_role = role } else .{ .assign_role = .{ .role = role, .model = model } };
+                        break :blk if (holds) .{ .clear_role = role } else .{ .edit_role = .{ .role = role, .edit = .{ .put = .{ .entry = 0, .model = model } } } };
                     },
                     .thinking => .{ .select_model = .{ .model = model, .effort = self.stripEffort(index) } },
                     else => .redraw,

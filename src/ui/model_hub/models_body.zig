@@ -11,10 +11,16 @@ const catalog = hub.catalog;
 
 pub fn status(line: *Line, state: *const hub.State) !void {
     const snapshot = &state.snapshot.?;
-    if (state.assigning) |role| {
-        try line.put(ui_render.warning_style, "Assigning ");
-        try line.put(ui_render.bold_style, catalog.roleName(role));
-        try line.put(ui_render.dim_style, " · enter assigns the highlighted model, esc cancels");
+    if (state.assigning) |assigning| {
+        const entry = assigning.entry orelse {
+            try line.put(ui_render.warning_style, "Adding a fallback to ");
+            try line.put(ui_render.bold_style, catalog.roleName(assigning.role));
+            try line.put(ui_render.dim_style, " · enter adds the highlighted model, esc cancels");
+            return;
+        };
+        try line.put(ui_render.warning_style, if (entry == 0) "Assigning " else "Replacing a fallback of ");
+        try line.put(ui_render.bold_style, catalog.roleName(assigning.role));
+        try line.put(ui_render.dim_style, " · enter picks the highlighted model, esc cancels");
         return;
     }
     if (state.scope.kind == .provider) {

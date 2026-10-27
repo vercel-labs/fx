@@ -2835,6 +2835,34 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   read like a one-off shell run for a command that may run for an hour.
   **Alternative:** the interval in milliseconds as the model wrote it.
 
+- **D250 Decision:** a role's `model_roles` entry may list several
+  references separated by commas, as proto's `modelRoles` does. The role
+  resolves to the first one that is usable now, on the active provider
+  and listed in its catalog (a catalog that has not loaded counts as
+  listing it); else to the first one on the active provider; else to the
+  first one, as a single reference always did. An `@role` reference
+  resolves through that role's own chain. The hub's Roles view lists a
+  role's later references under it as fallbacks, marks the one in use
+  and says why the others are passed over (another provider, not signed
+  in, not in the catalog). Enter replaces a reference, f appends one, x
+  removes it, and [ ] reorder them, the first being the assignment; a
+  chain keeps at most 8. **Why:** one role can then name a model on each
+  provider the person uses, or a cheaper model when the first is gone.
+  **Alternative:** proto's separate `retry.fallbackChains`, which only
+  switches after a failed request, a retry path proto-fx does not have.
+
+- **D251 Decision:** any reference in a chain may end in a thinking level,
+  `cento/claude-cento:high`, as proto's selectors do; a suffix that is
+  not a level (`llama3:8b`) stays part of the ID. The level applies when
+  the role's model is used for the session (Alt+P, `/role next`) and for
+  fleet workers that ask for `@role`, unless the request names its own
+  effort; an `@role:level` reference replaces the level of the role it
+  follows. Side calls (titles, review, compaction, judges) keep their own
+  efforts. The hub's t sets the level of the highlighted reference, or
+  saves it bare to keep the session's. **Why:** proto's per-role
+  thinking, in the same setting. **Alternative:** a second
+  `model_role_thinking` table that could disagree with the chain.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

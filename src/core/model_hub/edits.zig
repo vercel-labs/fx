@@ -1,9 +1,11 @@
-//! The lists a hub action saves: `cycle_order` (D222) and the web search
-//! order and exclusions (D223). Pure, so the hub's runtime only persists.
+//! The lists a hub action saves: `cycle_order` (D222), the web search
+//! order and exclusions (D223), and a role's chain (D250). Pure, so the
+//! hub's runtime only persists.
 
 const std = @import("std");
 const model_roles = @import("../config/model_roles.zig");
 const catalog = @import("catalog.zig");
+const types = @import("../shared/types.zig");
 
 const Role = model_roles.Role;
 
@@ -34,6 +36,64 @@ pub fn moveCycle(cycle: []const Role, role: Role, later: bool, out: *[model_role
     if (later and index + 1 < items.len) std.mem.swap(Role, &items[index], &items[index + 1]);
     if (!later and index > 0) std.mem.swap(Role, &items[index], &items[index - 1]);
     return items;
+}
+
+/// A role chain change with the new model's reference spelled out.
+pub const ChainEdit = union(enum) {
+    put: struct { entry: ?usize, ref: []const u8 },
+    remove: usize,
+    move: struct { entry: usize, later: bool },
+    thinking: struct { entry: usize, effort: ?types.ReasoningEffort },
+};
+
+/// The role's settings value after `edit`: its references joined by `, `,
+/// each with its level, or null when the chain is now empty. A model put
+/// into the chain drops any other copy of it, and is saved without a
+/// level, as proto saves new picks. Caller owns the bytes.
+pub fn editRoleChain(alloc: std.mem.Allocator, entries: []const catalog.EntryRow, edit: ChainEdit) !?[]u8 {
+    var chain: model_roles.Chain = .{};
+    for (entries[0..@min(entries.len, model_roles.max_chain)]) |entry| {
+        chain.items[chain.len] = .{ .ref = entry.ref, .effort = entry.effort };
+        chain.len += 1;
+    }
+    switch (edit) {
+        .put => |put| put: {
+            // Adding a model the chain already has changes nothing, as in proto.
+            if (put.entry == null) for (chain.entries()) |entry| {
+                if (std.mem.eql(u8, entry.ref, put.ref)) break :put;
+            };
+            const at = put.entry orelse chain.len;
+            const fresh: model_roles.Entry = .{ .ref = put.ref };
+            if (at < chain.len) {
+                chain.items[at] = fresh;
+            } else if (chain.len < model_roles.max_chain) {
+                chain.items[chain.len] = fresh;
+                chain.len += 1;
+            }
+            const kept = @min(at, chain.len - 1);
+            var index = chain.len;
+            while (index > 0) {
+                index -= 1;
+                if (index != kept and std.mem.eql(u8, chain.items[index].ref, put.ref)) removeAt(&chain, index);
+            }
+        },
+        .remove => |at| if (at < chain.len) removeAt(&chain, at),
+        .move => |move| if (move.entry < chain.len) {
+            if (move.later and move.entry + 1 < chain.len) std.mem.swap(model_roles.Entry, &chain.items[move.entry], &chain.items[move.entry + 1]);
+            if (!move.later and move.entry > 0) std.mem.swap(model_roles.Entry, &chain.items[move.entry], &chain.items[move.entry - 1]);
+        },
+        .thinking => |thinking| if (thinking.entry < chain.len) {
+            chain.items[thinking.entry].effort = thinking.effort;
+        },
+    }
+    if (chain.len == 0) return null;
+    return try chain.joinAlloc(alloc);
+}
+
+fn removeAt(chain: *model_roles.Chain, at: usize) void {
+    var index = at;
+    while (index + 1 < chain.len) : (index += 1) chain.items[index] = chain.items[index + 1];
+    chain.len -= 1;
 }
 
 pub const max_web_search = 32;
@@ -110,4 +170,33 @@ test "web search edits save the shown order and the exclusions" {
     try std.testing.expectEqual(@as(usize, 0), toggled.exclude().len);
     const off = editWebSearch(&rows, .{ .toggle = 0 });
     try std.testing.expectEqual(@as(usize, 2), off.exclude().len);
+}
+
+test "role chain edits put, dedupe, reorder, set levels and empty out" {
+    const alloc = std.testing.allocator;
+    const entries = [_]catalog.EntryRow{
+        .{ .ref = "codex/gpt-5.6-luna", .shown = "", .effort = types.ReasoningEffort.literal("low") },
+        .{ .ref = "cento/claude-cento-lite", .shown = "" },
+    };
+    const Case = struct { edit: ChainEdit, want: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .edit = .{ .put = .{ .entry = null, .ref = "cento/claude-cento" } }, .want = "codex/gpt-5.6-luna:low, cento/claude-cento-lite, cento/claude-cento" },
+        // Putting a model already in the chain moves it there.
+        .{ .edit = .{ .put = .{ .entry = 0, .ref = "cento/claude-cento-lite" } }, .want = "cento/claude-cento-lite" },
+        .{ .edit = .{ .put = .{ .entry = null, .ref = "codex/gpt-5.6-luna" } }, .want = "codex/gpt-5.6-luna:low, cento/claude-cento-lite" },
+        .{ .edit = .{ .move = .{ .entry = 1, .later = false } }, .want = "cento/claude-cento-lite, codex/gpt-5.6-luna:low" },
+        .{ .edit = .{ .move = .{ .entry = 1, .later = true } }, .want = "codex/gpt-5.6-luna:low, cento/claude-cento-lite" },
+        .{ .edit = .{ .remove = 0 }, .want = "cento/claude-cento-lite" },
+        .{ .edit = .{ .thinking = .{ .entry = 1, .effort = types.ReasoningEffort.literal("high") } }, .want = "codex/gpt-5.6-luna:low, cento/claude-cento-lite:high" },
+        .{ .edit = .{ .thinking = .{ .entry = 0, .effort = null } }, .want = "codex/gpt-5.6-luna, cento/claude-cento-lite" },
+    };
+    for (cases) |case| {
+        const got = try editRoleChain(alloc, &entries, case.edit);
+        defer if (got) |bytes| alloc.free(bytes);
+        try std.testing.expectEqualStrings(case.want.?, got.?);
+    }
+    try std.testing.expect(try editRoleChain(alloc, entries[0..1], .{ .remove = 0 }) == null);
+    const fresh = (try editRoleChain(alloc, &.{}, .{ .put = .{ .entry = null, .ref = "cento/x" } })).?;
+    defer alloc.free(fresh);
+    try std.testing.expectEqualStrings("cento/x", fresh);
 }

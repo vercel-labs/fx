@@ -160,6 +160,7 @@ pub fn hints(line: *Line, state: *const hub.State, compact: bool) !void {
         .none => {},
         .roles => |selected| return roleStrip(line, state, selected),
         .thinking => |selected| return thinkingStrip(line, state, selected),
+        .entry_thinking => |selected| return entryThinkingStrip(line, state, selected),
         .sign_out => |provider| {
             try line.put("", "Sign out of ");
             try line.putUntrusted(ui_render.bold_style, state.snapshot.?.providerName(provider), 32);
@@ -172,7 +173,7 @@ pub fn hints(line: *Line, state: *const hub.State, compact: bool) !void {
         .provider => if (compact) "↑↓ · enter open · esc close" else "↑↓ scopes · enter open · → list · ⌫ sign out · type to search · esc close",
         else => if (compact) "↑↓ · enter open · esc close" else "↑↓ scopes · enter or → list · type to search · esc close",
     } else switch (state.scope.kind) {
-        .roles => if (compact) "enter pick · x clear · c cycle · [ ] move" else "↑↓ roles · enter pick a model · x clear · c cycle · [ ] reorder · ← sidebar · esc close",
+        .roles => if (compact) "enter pick · f fallback · t think · x clear" else "↑↓ roles · enter pick · f add fallback · t thinking · x clear · c cycle · [ ] reorder · esc close",
         .web_search => if (compact) "space on/off · [ ] move · ← back" else "↑↓ providers · space on or off · [ ] reorder · ← sidebar · esc close",
         .all_models, .provider => if (state.assigning != null)
             (if (compact) "enter assigns · esc cancels" else "↑↓ models · type to search · enter assigns · esc cancels")
@@ -214,6 +215,21 @@ fn thinkingStrip(line: *Line, state: *const hub.State, selected: usize) !void {
         const effort = state.stripEffort(index);
         labels[index] = if (index == 0) "auto" else model.efforts[index - 1].displayLabel();
         holds[index] = state.snapshot.?.effort != null and effort.eql(state.snapshot.?.effort.?) and model.current;
+    }
+    try chips(line, labels[0..count], holds[0..count], selected);
+}
+
+fn entryThinkingStrip(line: *Line, state: *const hub.State, selected: usize) !void {
+    const entry = state.selectedEntry() orelse return;
+    try line.put(ui_render.hint_style, "Thinking with ");
+    try line.putUntrusted(ui_render.bold_style, entry.shown, 28);
+    try line.put(ui_render.hint_style, "  ");
+    var labels: [17][]const u8 = undefined;
+    var holds: [17]bool = @splat(false);
+    const count = @min(state.stripCount(), labels.len);
+    for (0..count) |index| {
+        labels[index] = if (index == 0) "session's" else entry.efforts[index - 1].displayLabel();
+        holds[index] = if (index == 0) entry.effort == null else entry.effort != null and entry.effort.?.eql(entry.efforts[index - 1]);
     }
     try chips(line, labels[0..count], holds[0..count], selected);
 }

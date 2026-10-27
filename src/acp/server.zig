@@ -486,7 +486,14 @@ pub fn roleHost(state: *ServerState, session: *const ActiveSessionState) model_r
         .current_model = session.model,
         .set = state.cfg.provider_set,
         .review_model = state.review_model,
+        // A prompt reads the catalog; refreshes run only between prompts.
+        .known = .{ .context = @ptrCast(&state.capability_resolver), .known_fn = catalogKnows },
     };
+}
+
+fn catalogKnows(raw: ?*anyopaque, model: []const u8) bool {
+    const resolver: *const gateway_provider.CapabilityResolver = @ptrCast(@alignCast(raw.?));
+    return resolver.knows(model);
 }
 
 /// Rereads the profile's model roles; a failure keeps the current ones.

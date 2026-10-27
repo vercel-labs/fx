@@ -2314,7 +2314,7 @@ fn resolveModelRole(raw_ctx: ?*anyopaque, name: []const u8) @import("../core/sub
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx.?));
     const session = if (ctx.state.active_session) |*active| active else return .unavailable;
     return switch (server.roleHost(ctx.state, session).lookup(name)) {
-        .model => |model| .{ .model = model },
+        .model => |picked| .{ .model = .{ .id = picked.model, .effort = picked.effort } },
         .unknown_role => .unknown_role,
         .unavailable => .unavailable,
     };

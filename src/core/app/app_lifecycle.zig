@@ -314,6 +314,11 @@ pub const StartupState = struct {
     /// The model `role` picks on the startup provider, borrowed from this
     /// state or `builtin_small`; null keeps the consumer's default (D170).
     pub fn roleModel(self: *const StartupState, role: model_roles.Role, builtin_small: ?[]const u8) ?[]const u8 {
+        return if (self.rolePick(role, builtin_small)) |picked| picked.model else null;
+    }
+
+    /// `roleModel` with the thinking level the role's entry names (D251).
+    pub fn rolePick(self: *const StartupState, role: model_roles.Role, builtin_small: ?[]const u8) ?model_roles.Picked {
         var provider = self.provider;
         const label = provider.label();
         const ref = model_roles.resolve(&self.model_roles, role, .{
@@ -324,7 +329,7 @@ pub const StartupState = struct {
             .legacy_review = if (self.provider == .gateway and self.review_model.len > 0) self.review_model else null,
             .configured = self.configured_providers.definitions,
         }) orelse return null;
-        return ref.on(label);
+        return .{ .model = ref.on(label) orelse return null, .effort = ref.effort };
     }
 
     /// The permission reviewer's model; FX_REVIEW_MODEL, a gateway

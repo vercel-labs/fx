@@ -368,7 +368,7 @@ pub fn Runtime(comptime App: type) type {
         fn resolveModelRole(raw: ?*anyopaque, name: []const u8) subagent_tool_host.ModelRoleResolver.Lookup {
             const app: *App = @ptrCast(@alignCast(raw.?));
             return switch (model_role_runtime.lookup(app, name)) {
-                .model => |model| .{ .model = model },
+                .model => |picked| .{ .model = .{ .id = picked.model, .effort = picked.effort } },
                 .unknown_role => .unknown_role,
                 .unavailable => .unavailable,
             };
