@@ -252,6 +252,7 @@ pub const State = struct {
         const window = &self.history_window;
         try self.enqueue(.history_page, .{ .history_page = if (initial) .{
             .session_id = self.current_id,
+            .max_bytes = history_page.resume_page_bytes,
         } else .{
             .session_id = self.current_id,
             .before = window.start,

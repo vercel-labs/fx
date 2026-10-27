@@ -18,7 +18,12 @@ const Allocator = std.mem.Allocator;
 pub const default_page_bytes: usize = 512 * 1024;
 /// The most one page may ask for. Encoding escapes text, so the session
 /// still shrinks a page whose encoded reply would exceed one frame.
-pub const max_page_bytes: usize = 2 * 1024 * 1024;
+pub const max_page_bytes: usize = 4 * 1024 * 1024;
+/// The first page a resume asks for. The client prints it into the
+/// terminal's own scrollback, which the app cannot page, so it is as large
+/// as one page may be. Saved bytes are mostly tool output a collapsed row
+/// shows little of; a few hundred turns replay in well under a second.
+pub const resume_page_bytes: usize = max_page_bytes;
 /// The smallest budget a shrinking reply retries with.
 const min_page_bytes: usize = 16 * 1024;
 
