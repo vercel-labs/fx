@@ -2774,17 +2774,20 @@ const CapturedTurnContext = struct {
 };
 
 /// Captures the runtime and explicit skill context for one turn (D130,
-/// D131). The runtime context is left out when it matches the latest one
+/// D131), with the project context earlier turns' tool calls reached
+/// (D261). The runtime context is left out when it matches the latest one
 /// `window` already carries, so an unchanged workspace adds nothing. Every
 /// slice is owned by `arena` or borrowed from `explicit_skill`.
 fn captureTurnContext(
     arena: Allocator,
     deps: *const AgentRuntimeDeps,
     explicit_skill: ?[]const u8,
+    project_tail: ?[]const u8,
     window: []const ChatMessage,
 ) !CapturedTurnContext {
     var runtime: std.ArrayList(ChatMessage) = .empty;
     try deps.append_runtime_context(deps.ctx, arena, &runtime);
+    if (project_tail) |text| try runtime.append(arena, .{ .role = .user, .content = text });
     var joined: std.Io.Writer.Allocating = .init(arena);
     for (runtime.items) |message| {
         const text = message.content orelse continue;
@@ -5897,10 +5900,12 @@ fn processQueuedPromptInner(
         };
         break :reconstruct snapshot;
     };
-    defer if (reconstructed_context) |*snapshot| snapshot.deinit(arena);
+    defer if (reconstructed_context) |*reconstructed| reconstructed.snapshot.deinit(arena);
     var prepared_job = job;
-    if (reconstructed_context) |snapshot| prepared_job.context_snapshot = snapshot;
-    try appendStablePromptContext(arena, deps, config, if (skill_section) |section| section.text else null, if (reconstructed_context) |snapshot| snapshot.modelVisibleBytes() else null, &stable_prefix);
+    if (reconstructed_context) |reconstructed| prepared_job.context_snapshot = reconstructed.snapshot;
+    // The instructions carry the session's own project context, read again;
+    // what earlier turns' tool calls reached rides in the turn context (D261).
+    try appendStablePromptContext(arena, deps, config, if (skill_section) |section| section.text else null, if (reconstructed_context) |reconstructed| reconstructed.head else null, &stable_prefix);
     const active_history = job.history;
     const history_messages_before = stable_prefix.items.len;
     const interrupted_turns = runtime_interruption.countInterruptedHistory(active_history);
@@ -5944,6 +5949,7 @@ fn processQueuedPromptInner(
         arena,
         deps,
         if (explicit_section) |section| section.text else null,
+        if (reconstructed_context) |reconstructed| reconstructed.tail else null,
         history_messages.items,
     );
     job.turn_context = captured_context.turn_context;
@@ -6342,12 +6348,25 @@ fn commitContextCompaction(
     return deps.propagate_history_turn(deps.ctx, .{ .compacted_summary = summary });
 }
 
+const ReconstructedContext = struct {
+    /// Everything the turn has delivered, for the turn's delivery state.
+    snapshot: context_contract.GatheredContextSnapshot,
+    /// The queued prompt's own project context read again, when a rule
+    /// file changed since it was queued; null keeps the queued bytes.
+    head: ?[]const u8 = null,
+    /// What the retained targets add to the session's own project context.
+    tail: ?[]const u8 = null,
+};
+
+/// Gathers the project context earlier turns' tool calls reached. Its new
+/// part rides in the turn context, never the instructions, so the head of
+/// every request stays as the session's first turn sent it (D261).
 fn reconstructProjectContext(
     alloc: Allocator,
     deps: *const AgentRuntimeDeps,
     config: Config,
     job: QueuedPrompt,
-) !?context_contract.GatheredContextSnapshot {
+) !?ReconstructedContext {
     if (!deps.context_enabled) return null;
     var retained = try tool_preparation.retainedContextTargets(
         alloc,
@@ -6381,8 +6400,34 @@ fn reconstructProjectContext(
     errdefer snapshot.deinit(alloc);
     if (config.cancel_flag.load(.seq_cst)) return error.Cancelled;
     for (snapshot.notices) |notice| try deps.pushContextNotice(notice);
-    debug_trace.logf("context", "reconstructed retained_targets={d} delivered_sources={d} bytes={d}", .{ retained.items.len, snapshot.delivered_sources.len, snapshot.modelVisibleBytes().len });
-    return snapshot;
+    const prior_count = @min(prior.len, 128);
+    var base = try registry.gatherDefaultSnapshot(alloc, .{
+        .workspace_root = config.workspace_root,
+        .access_scope = config.access_scope,
+        .targets = targets.items[0..prior_count],
+        .bounded_reconstruction = true,
+        .context_limits = config.context_limits,
+    });
+    defer base.deinit(alloc);
+    if (config.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    var added = try registry.selectDefaultApplicableContext(alloc, .{
+        .workspace_root = config.workspace_root,
+        .access_scope = config.access_scope,
+        .targets = targets.items[prior_count..],
+        .delivered_sources = base.delivered_sources,
+        .evaluated_endpoints = base.evaluated_endpoints,
+        .context_limits = config.context_limits,
+    });
+    defer added.deinit(alloc);
+    const tail: ?[]const u8 = if (added.content) |content| if (content.len > 0) try alloc.dupe(u8, content) else null else null;
+    if (config.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    debug_trace.logf("context", "reconstructed retained_targets={d} delivered_sources={d} bytes={d} tail_bytes={d}", .{ retained.items.len, snapshot.delivered_sources.len, snapshot.modelVisibleBytes().len, if (tail) |text| text.len else 0 });
+    const queued = job.context_snapshot.modelVisibleBytes();
+    const head: ?[]const u8 = if (queued.len == 0 or std.mem.eql(u8, queued, base.modelVisibleBytes()))
+        null
+    else
+        try alloc.dupe(u8, base.modelVisibleBytes());
+    return .{ .snapshot = snapshot, .head = head, .tail = tail };
 }
 
 fn appendStablePromptContext(

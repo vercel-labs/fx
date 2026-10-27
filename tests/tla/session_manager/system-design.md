@@ -2743,6 +2743,17 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   tools change, not on use. **Alternative:** dropping server state from
   the instructions, which hides a server that needs a login until a search
   fails.
+- **D261 Decision:** project context that earlier turns' tool calls reached,
+  such as a nested `AGENTS.md`, rides in the next turn's context rather
+  than the instructions. The instructions keep the queued prompt's own
+  project context, read again so a rule file changed since the prompt was
+  queued is current. The added part is saved with the turn context and
+  repeats only when it changes (D130), so a resume finds it in the log.
+  **Why:** D241 kept it out of the instructions within its turn, but the
+  next turn rebuilt it into them and missed the cache from the first byte.
+  **Alternative:** saving D241's mid-turn message with the turn, which
+  would let the next turn repeat the turn byte for byte, but rewrites what
+  the session log keeps for a step.
 - **D242 Decision:** a saved turn's "Session file evidence" message is
   projected after the turn's last message, not between its tool results
   and its final answer. **Why:** the turn's own requests never carried it,
