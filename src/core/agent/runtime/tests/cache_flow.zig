@@ -290,3 +290,48 @@ test "project context found mid-turn rides at the tail and leaves the instructio
     try test_support.expectBodyContainsInOrder(&gateway, 1, &.{ "nested_read", "NESTED_SCOPE_RULE" });
     try std.testing.expectEqual(@as(usize, 1), test_support.countNeedle(gateway.request_bodies.items[2], "NESTED_SCOPE_RULE"));
 }
+
+test "a later turn adds the earlier turn's file evidence after it, never inside it" {
+    const alloc = std.testing.allocator;
+    const calls = [_]types.ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a.txt\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .content = "Checking.", .tool_calls = &calls },
+        .{ .content = "First answer" },
+        .{ .content = "Second answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    try std.testing.expect(hooks.history_turns.items[0].assistant.execution.files.len > 0);
+
+    var second = fixture.job();
+    second.prompt = @constCast("second prompt");
+    second.history = hooks.history_turns.items;
+    try runFakePrompt(&gateway, &hooks, fixture.config(), second);
+    try expectExtends(&gateway, 1, 2);
+    try test_support.expectBodyContainsInOrder(&gateway, 2, &.{ "First answer", "Session file evidence", "second prompt" });
+}
+
+/// Every prompt entry of request `earlier` reappears unchanged, in order,
+/// at the start of request `later`'s prompt.
+fn expectExtends(gateway: *const FakeGateway, earlier: usize, later: usize) !void {
+    const alloc = std.testing.allocator;
+    var first = try std.json.parseFromSlice(std.json.Value, alloc, gateway.request_bodies.items[earlier], .{});
+    defer first.deinit();
+    var second = try std.json.parseFromSlice(std.json.Value, alloc, gateway.request_bodies.items[later], .{});
+    defer second.deinit();
+    const a = first.value.object.get("prompt").?.array.items;
+    const b = second.value.object.get("prompt").?.array.items;
+    try std.testing.expect(b.len > a.len);
+    for (a, b[0..a.len]) |x, y| {
+        const xs = try std.json.Stringify.valueAlloc(alloc, x, .{});
+        defer alloc.free(xs);
+        const ys = try std.json.Stringify.valueAlloc(alloc, y, .{});
+        defer alloc.free(ys);
+        try std.testing.expectEqualStrings(xs, ys);
+    }
+}

@@ -2157,6 +2157,24 @@ fn appendHistoryChatMessagesWithTrailingProjection(
     );
 }
 
+/// The turn's file evidence, after everything the turn sent (D242): the
+/// turn's own requests never carried it, so a later request adds it after
+/// the turn's last message and repeats every earlier byte.
+fn appendFileEvidenceMessage(alloc: Allocator, messages: *std.ArrayList(message.Message), execution: core_types.ExecutionMemory) !void {
+    if (execution.files.len == 0) return;
+    const text = try formatExecutionFileContext(alloc, execution.files);
+    errdefer alloc.free(text);
+    try messages.append(alloc, message.Message.userOwned(text));
+}
+
+/// `appendFileEvidenceMessage` for chat messages.
+fn appendFileEvidenceChatMessage(alloc: Allocator, messages: *std.ArrayList(core_types.ChatMessage), execution: core_types.ExecutionMemory) !void {
+    if (execution.files.len == 0) return;
+    const text = try formatExecutionFileContext(alloc, execution.files);
+    errdefer alloc.free(text);
+    try messages.append(alloc, .{ .role = .user, .content = text });
+}
+
 fn appendHistoryMessagesImpl(
     alloc: Allocator,
     messages: *std.ArrayList(message.Message),
@@ -2179,6 +2197,7 @@ fn appendHistoryMessagesImpl(
                 if (entry.assistant.len > 0) {
                     try messages.append(alloc, message.Message.assistantBorrowed(entry.assistant, &.{}));
                 }
+                try appendFileEvidenceMessage(alloc, messages, entry.execution);
             },
             .interrupted => |entry| {
                 try messages.append(alloc, .{
@@ -2233,6 +2252,7 @@ fn appendHistoryMessagesImpl(
                 const text = try formatInterruptedHistoryContext(alloc, entry);
                 errdefer alloc.free(text);
                 try messages.append(alloc, message.Message.userOwned(text));
+                try appendFileEvidenceMessage(alloc, messages, entry.execution);
             },
         }
     }
@@ -2279,11 +2299,6 @@ fn appendExecutionMemoryMessages(
                 try messages.append(alloc, message.Message.userText(feedback));
             }
         }
-    }
-    if (execution.files.len > 0) {
-        const text = try formatExecutionFileContext(alloc, execution.files);
-        errdefer alloc.free(text);
-        try messages.append(alloc, message.Message.userOwned(text));
     }
     while (steering_index < execution.steering.len) : (steering_index += 1) {
         const steering = execution.steering[steering_index];
@@ -2343,11 +2358,6 @@ pub fn appendExecutionMemoryChatMessages(
                 });
             }
         }
-    }
-    if (execution.files.len > 0) {
-        const text = try formatExecutionFileContext(alloc, execution.files);
-        errdefer alloc.free(text);
-        try messages.append(alloc, .{ .role = .user, .content = text });
     }
     while (steering_index < execution.steering.len) : (steering_index += 1) {
         const steering = execution.steering[steering_index];
@@ -2435,6 +2445,7 @@ fn appendHistoryChatMessagesImpl(
                 if (entry.assistant.len > 0 or entry.provider_replay != null) {
                     try messages.append(alloc, .{ .role = .assistant, .content = entry.assistant, .provider_replay = entry.provider_replay });
                 }
+                try appendFileEvidenceChatMessage(alloc, messages, entry.execution);
             },
             .interrupted => |entry| {
                 try appendUserTurnChatMessages(alloc, messages, entry.user);
@@ -2467,10 +2478,14 @@ fn appendHistoryChatMessagesImpl(
                     const assistant_content = try formatInterruptedAssistantClosedContent(alloc, entry);
                     try messages.append(alloc, .{ .role = .assistant, .content = assistant_content });
                 }
-                if (interrupted_projection == .steering_continuation) continue;
+                if (interrupted_projection == .steering_continuation) {
+                    try appendFileEvidenceChatMessage(alloc, messages, entry.execution);
+                    continue;
+                }
                 const text = try formatInterruptedHistoryContext(alloc, entry);
                 errdefer alloc.free(text);
                 try messages.append(alloc, .{ .role = .user, .content = text });
+                try appendFileEvidenceChatMessage(alloc, messages, entry.execution);
             },
         }
     }
@@ -2766,7 +2781,7 @@ test "resume history preserves steering between tool episodes" {
     try std.testing.expectEqualStrings("after second", messages.items[6].content.?.asText());
 }
 
-test "resume projection replays assistant tool execution memory before final answer" {
+test "resume projection replays assistant tool execution memory before final answer and its file evidence after it" {
     const alloc = std.testing.allocator;
     var calls = [_]ToolCall{.{
         .id = "call_read",
@@ -2810,10 +2825,11 @@ test "resume projection replays assistant tool execution memory before final ans
     try std.testing.expectEqualStrings("call_read", messages.items[1].tool_calls[0].id);
     try std.testing.expectEqual(.tool, messages.items[2].role);
     try std.testing.expectEqualStrings("file contents", messages.items[2].content.?.asText());
-    try std.testing.expectEqual(.user, messages.items[3].role);
-    try std.testing.expect(std.mem.find(u8, messages.items[3].content.?.asText(), "model_view=full") != null);
-    try std.testing.expectEqual(.assistant, messages.items[4].role);
-    try std.testing.expectEqualStrings("main wires the app", messages.items[4].content.?.asText());
+    // The file evidence follows the turn's last message (D242).
+    try std.testing.expectEqual(.assistant, messages.items[3].role);
+    try std.testing.expectEqualStrings("main wires the app", messages.items[3].content.?.asText());
+    try std.testing.expectEqual(.user, messages.items[4].role);
+    try std.testing.expect(std.mem.find(u8, messages.items[4].content.?.asText(), "model_view=full") != null);
 }
 
 test "resume projections omit empty terminal assistant after completed execution" {
@@ -4032,9 +4048,14 @@ fn checkPromptHistoryMessageProjectionAllocationFailures(
         PersistedToolStatus.failure,
         messages.items[messages.items.len - 3].tool_result_status.?,
     );
+    // The file evidence follows the turn's last message (D242).
+    try std.testing.expectEqualStrings(
+        "latest assistant",
+        messages.items[messages.items.len - 2].content.?.asText(),
+    );
     try std.testing.expect(std.mem.find(
         u8,
-        messages.items[messages.items.len - 2].content.?.asText(),
+        messages.items[messages.items.len - 1].content.?.asText(),
         "src/latest.zig",
     ) != null);
 }

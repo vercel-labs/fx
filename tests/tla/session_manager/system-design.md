@@ -2727,6 +2727,13 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   first byte. **Alternative:** appending it to the tool result that found
   it, which saves it with the turn but rewrites a result the session has
   already streamed, and freezes a rule file that later changes.
+- **D242 Decision:** a saved turn's "Session file evidence" message is
+  projected after the turn's last message, not between its tool results
+  and its final answer. **Why:** the turn's own requests never carried it,
+  so placing it inside the turn rewrote bytes every later request, live or
+  resumed, had to repeat; after the turn it only extends the prefix.
+  **Alternative:** dropping the evidence, which loses the stale-path
+  reminder after a resume.
 
 - **D230 Decision:** the `checklist` tool keeps proto's contract: phases
   of tasks named by their exact content, never by ids; one operation per
