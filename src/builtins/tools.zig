@@ -23,6 +23,7 @@ const read_file_impl = @import("../tools/filesystem/read_file.zig");
 const write_file_impl = @import("../tools/filesystem/write_file.zig");
 const read_tool_result_impl = @import("../tools/session/read_tool_result.zig");
 const recall_impl = @import("../tools/session/recall.zig");
+const checkpoint_impl = @import("../tools/session/checkpoint.zig");
 const shell_impl = @import("../tools/shell/shell.zig");
 const jobs_impl = @import("../tools/jobs/jobs.zig");
 const install_skill_impl = @import("../tools/skills/install_skill.zig");
@@ -144,6 +145,10 @@ const vision_description =
     "Inspect authorized images attached by the user or local image paths supplied in the conversation, and return structured factual evidence. Pass exactly one source: image_ids for attached images, or paths for local images. Use when: read visible text, UI state, objects, layout, or other visual details needed for the task. Do not use when: inspect paths the user did not supply, infer details not visible in an image, or repeat evidence already available in the conversation.";
 const read_tool_result_description =
     "Read a stored tool result or captured command output by opaque handle from the active session or process. Pass handle with query to find a known literal line, or with an optional byte range. Turns, tool calls, and earlier compactions saved by compaction open by their ID as the handle, such as M12, T12, or L2, and search finds them by text without a handle. Use when: inspect more after a tool-result preview or command-output handle indicates that retained output is available, or recover details of a compacted turn, tool call, or earlier compaction. Do not use when: read arbitrary files, search the workspace, recover secrets, or inspect results from another session or process.";
+const checkpoint_description =
+    "Context checkpoint: start before exploratory work; a later `rewind` keeps only your concise report, which minimizes context cost for investigations with many intermediate calls. MUST `rewind` before replying after starting a checkpoint; NEVER checkpoint while one is active. A checkpoint lasts for the current turn.";
+const rewind_description =
+    "End the active checkpoint: rewind context to it, replacing the intermediate exploration with your report. Only the report stays in context, so give the findings, paths and names you still need, and the Python variables that hold computed results. Python variables, the proto_fx store and files keep what the exploration left: rewind does not undo file edits. Refused while a worker or child node you started still runs.";
 
 pub const read_file = ToolSpec{
     .name = "read_file",
@@ -715,6 +720,64 @@ pub const recall = ToolSpec{
     .irreversible_fn = recall_impl.isIrreversible,
 };
 
+const checkpoint_properties = [_]model_tool_schema.Property{
+    .{ .name = "goal", .json_type = .string, .bounds = &.{ .min_length = 1 }, .description = "investigation goal" },
+};
+
+pub const checkpoint = ToolSpec{
+    .name = "checkpoint",
+    .description = checkpoint_description,
+    .model_schema = .{
+        .name = "checkpoint",
+        .description = checkpoint_description,
+        .input_schema = .{
+            .properties = &checkpoint_properties,
+            .required = &.{"goal"},
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .checkpoint,
+    .activity_kind = .read,
+    .requires_approval = false,
+    .action_label = "Opening checkpoint",
+    .completed_action_label = "Checkpoint",
+    .label_arg_kind = .goal,
+    .permission_target_kind = .none,
+    .decode = checkpoint_impl.decodeCheckpoint,
+    .call = checkpoint_impl.callCheckpoint,
+    .reads_only_fn = checkpoint_impl.readsOnly,
+    .irreversible_fn = checkpoint_impl.isIrreversible,
+};
+
+const rewind_properties = [_]model_tool_schema.Property{
+    .{ .name = "report", .json_type = .string, .bounds = &.{ .min_length = 1 }, .description = "investigation findings" },
+};
+
+pub const rewind = ToolSpec{
+    .name = "rewind",
+    .description = rewind_description,
+    .model_schema = .{
+        .name = "rewind",
+        .description = rewind_description,
+        .input_schema = .{
+            .properties = &rewind_properties,
+            .required = &.{"report"},
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .checkpoint,
+    .activity_kind = .read,
+    .requires_approval = false,
+    .action_label = "Rewinding",
+    .completed_action_label = "Rewound",
+    .label_arg_default = "to checkpoint",
+    .permission_target_kind = .none,
+    .decode = checkpoint_impl.decodeRewind,
+    .call = checkpoint_impl.callRewind,
+    .reads_only_fn = checkpoint_impl.readsOnly,
+    .irreversible_fn = checkpoint_impl.isIrreversible,
+};
+
 pub const all = [_]tool_dispatch.Tool{
     read_file,
     write_file,
@@ -732,6 +795,8 @@ pub const all = [_]tool_dispatch.Tool{
     vision,
     read_tool_result,
     recall,
+    checkpoint,
+    rewind,
 };
 
 pub const registry = tool_dispatch.Registry{ .tools = all[0..] };
@@ -751,6 +816,8 @@ pub const advertisement_order = [_][]const u8{
     "web_fetch",
     "web_search",
     "recall",
+    "checkpoint",
+    "rewind",
 };
 
 pub const read_only_tool_names = [_][]const u8{
@@ -820,7 +887,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "0cb745d9f5e5ece6338d81dabc77aebfc22c8522dd93d5298f71eeb51ea2665c",
+        "1d9c2705177a481f1c94216197d3149cb97532648c0316edd753adb955f4c177",
         &actual_hex,
     );
 }
@@ -875,6 +942,8 @@ test "built-in tools register exact active local order" {
         "vision",
         "read_tool_result",
         "recall",
+        "checkpoint",
+        "rewind",
     };
 
     try std.testing.expectEqual(expected_names.len, all.len);

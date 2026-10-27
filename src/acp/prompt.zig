@@ -2001,6 +2001,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         else
             null,
         .save_prompt_images = if (session.v2 != null) savePromptImages else null,
+        .rewind_to_checkpoint = if (session.v2 != null) rewindToCheckpoint else null,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .recovery_checkpoint = if (session.journal != null)
             .{
@@ -2896,6 +2897,19 @@ fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !v
     v2.appendProgress(progress.user, progress.execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant }) catch |err| {
         debug_trace.logf("session", "event=sessions_v2_stream_failed session={s} err={s} deferred=commit", .{ v2.id(), @errorName(err) });
     };
+}
+
+/// `AgentRuntimeDeps.rewind_to_checkpoint` on v2 (D120). The children the
+/// rewind abandoned leave the registry (D97).
+fn rewindToCheckpoint(raw_ctx: *anyopaque, user: types.UserTurn, kept: types.ExecutionMemory) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*value| value else return;
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const v2 = session.v2 orelse return;
+    var rewound = try v2.rewindToCheckpoint(std.heap.c_allocator, user, kept);
+    defer rewound.deinit(std.heap.c_allocator);
+    if (rewound.abandoned.len > 0) if (ctx.state.subagent_host) |children_host| children_host.children.forget();
 }
 
 /// `AgentRuntimeDeps.save_prompt_images` on v2: the prompt's images become

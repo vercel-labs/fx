@@ -250,9 +250,20 @@ pub const RunCommandBackend = struct {
     }
 };
 
+/// Asks whether a worker or child node of the calling session runs.
+pub const SubtreeBusy = struct {
+    ctx: *anyopaque,
+    busy_fn: *const fn (*anyopaque) bool,
+};
+
 /// Context shared by core tool dispatch, validation, and execution.
 pub const DispatchContext = struct {
     allocator: Allocator,
+    /// The running turn's messages so far, which the checkpoint tools read
+    /// (D120). Borrowed for the call.
+    current_turn_messages: []const core_types.ChatMessage = &.{},
+    /// Null in hosts without children; `rewind` waits for none (D120).
+    subtree_busy: ?SubtreeBusy = null,
     /// The session's Python kernel slot; null in hosts without a session runtime.
     kernel: ?*@import("../kernel/slot.zig").Slot = null,
     /// The running turn's services for `proto_fx` in agent shell commands.
@@ -406,6 +417,7 @@ pub const LabelArgKind = enum {
     server,
     selector,
     session_id,
+    goal,
 };
 
 pub const PermissionTargetKind = core_permissions.PermissionTargetKind;
@@ -428,6 +440,8 @@ pub const ExecutorKind = enum {
     vision,
     host,
     jobs,
+    /// The model's checkpoint and rewind (D120).
+    checkpoint,
 };
 
 pub const ApprovalPolicy = enum {
@@ -646,6 +660,7 @@ fn labelValueForKind(kind: LabelArgKind, args: std.json.ObjectMap) ?[]const u8 {
         .server => optionalStringArg(args, "server"),
         .selector => optionalStringArg(args, "selector"),
         .session_id => optionalStringArg(args, "session_id"),
+        .goal => optionalStringArg(args, "goal"),
     };
 }
 

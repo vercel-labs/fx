@@ -61,6 +61,7 @@ const image_data = @import("../../images/image_data.zig");
 const runtime_assistant_stream = @import("assistant_stream.zig");
 const runtime_tool_presentation = @import("tool_presentation.zig");
 const runtime_execution_memory = @import("execution_memory.zig");
+const checkpoint_rewind = @import("checkpoint_rewind.zig");
 const request_image_budget = @import("request_image_budget.zig");
 const execution_memory_helpers = @import("../execution_memory.zig");
 const runtime_agent = @import("agent.zig");
@@ -7043,6 +7044,8 @@ fn processQueuedPromptLoop(
         .none;
     var restore_recovery_source = job.recovery_checkpoint != null;
     var step: usize = 0;
+    // Hidden reminders this turn spent on an open checkpoint (D120).
+    var checkpoint_reminders: usize = 0;
     agent_steps_loop: while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
         current_step_index = step + 1;
         if (deps.observer) |observer| observer.beginStep(current_step_index);
@@ -7054,6 +7057,7 @@ fn processQueuedPromptLoop(
             step_ctx.step_id,
         );
         last_step_ctx = step_ctx;
+        try checkpoint_rewind.applyPending(deps, &within_turn_suffix, compacted_suffix_len, .{ .text = @constCast(job.prompt), .images = job.images }, &finalization.compacted_execution);
         if (config.cancel_flag.load(.seq_cst)) {
             if (try append_immediate_steering_after_cancel(
                 deps,
@@ -9603,6 +9607,8 @@ fn processQueuedPromptLoop(
 
             if (disposition == .completed and agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                 try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, history_text, history_replay)) continue;
+            if (disposition == .completed and agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+                try checkpoint_rewind.remind(deps, arena, &within_turn_suffix, &checkpoint_reminders, history_text, history_replay)) continue;
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 if (!has_content) {
@@ -12485,6 +12491,8 @@ fn processQueuedPromptLoop(
 
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                 try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, raw_final, final_provider_replay)) continue;
+            if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+                try checkpoint_rewind.remind(deps, arena, &within_turn_suffix, &checkpoint_reminders, raw_final, final_provider_replay)) continue;
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });

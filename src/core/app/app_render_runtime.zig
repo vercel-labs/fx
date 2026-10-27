@@ -863,6 +863,7 @@ pub fn Runtime(comptime App: type) type {
                 .statusline = statusline,
                 .breadcrumb = session_backend.Ops(App).view(app).breadcrumb,
                 .running_jobs = session_backend.Ops(App).view(app).running_jobs,
+                .checkpoint = if (comptime @hasField(App, "checkpoint_indicator")) app.checkpoint_indicator.openGoal() orelse "" else "",
                 .activity = activityProjection(app),
                 .input = &app.input_runtime,
             };

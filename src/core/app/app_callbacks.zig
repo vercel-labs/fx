@@ -343,6 +343,10 @@ pub fn Bindings(comptime App: type) type {
                     if (app.session_persistence.v2 != null) agentSavePromptImages else null
                 else
                     null,
+                .rewind_to_checkpoint = if (comptime @hasField(App, "session_persistence"))
+                    if (app.session_persistence.v2 != null) agentRewindToCheckpoint else null
+                else
+                    null,
                 .propagate_grant = agentPropagateGrant,
                 .push_event = agentPushEvent,
                 .push_text = agentPushText,
@@ -516,6 +520,9 @@ pub fn Bindings(comptime App: type) type {
                 try app.shell.applyToolLifecyclePreservingNormalBufferAnchor(alloc, event)
             else
                 try app.shell.applyToolLifecycle(alloc, event);
+            if (comptime @hasField(App, "checkpoint_indicator")) {
+                if (app.checkpoint_indicator.observe(event)) app.shell.render_requests.request(.footer);
+            }
             if (comptime @hasField(App, "workspace_root")) switch (event) {
                 .authoritative_started => |started| if (started.arguments_json) |arguments_json| {
                     var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch |err| {
@@ -1159,6 +1166,11 @@ pub fn Bindings(comptime App: type) type {
         fn agentAppendTurnPiece(ctx: *anyopaque, progress: agent_runtime.TurnProgress) anyerror!void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app_session_runtime.Runtime(App).appendTurnPiece(app, progress);
+        }
+
+        fn agentRewindToCheckpoint(ctx: *anyopaque, user: types.UserTurn, kept: types.ExecutionMemory) anyerror!void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try app_session_runtime.Runtime(App).rewindToCheckpoint(app, user, kept);
         }
 
         fn agentSavePromptImages(ctx: *anyopaque, alloc: std.mem.Allocator, images: []types.ImageAttachment) anyerror!void {

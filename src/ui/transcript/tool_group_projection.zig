@@ -260,6 +260,42 @@ fn statusNamesAsk(entry: TranscriptEntry, detail: ?*const ToolDetailRecord) bool
     };
 }
 
+/// A completed `rewind` (D120). Its exploration is gone from the model's
+/// context, so the compact transcript shows the rewind as one dim divider;
+/// the full transcript (ctrl+o) keeps its row and its report.
+fn isRewind(detail: ?*const ToolDetailRecord) bool {
+    const record = detail orelse return false;
+    return record.outcome == .completed and std.mem.eql(u8, record.tool_name, "rewind");
+}
+
+const branch_label = " branch · ctrl+o ";
+
+/// `──── branch · ctrl+o ────` across the row, dim.
+fn formatBranchDivider(alloc: std.mem.Allocator, entry_id: u32, cols: u16, styles: transcript_blocks.Styles) !GroupBlock {
+    const label_width = display_width.visibleWidth(branch_label);
+    const width = @max(@as(usize, cols), label_width);
+    const left = (width - label_width) / 2;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.writeAll(styles.dim_style);
+    for (0..left) |_| try out.writer.writeAll("─");
+    try out.writer.writeAll(branch_label);
+    for (0..width - label_width - left) |_| try out.writer.writeAll("─");
+    try out.writer.writeAll(styles.reset_style);
+    const lines = try alloc.alloc(transcript_blocks.LineProvenance, 1);
+    errdefer alloc.free(lines);
+    lines[0] = .{ .entry = .{ .entry_id = entry_id, .entry_class = .tool_status, .projection_part = .group_child } };
+    return .{ .bytes = try out.toOwnedSlice(), .lines = lines };
+}
+
+test "a rewind's divider spans the row with its label centered" {
+    const block = try formatBranchDivider(std.testing.allocator, 7, 30, .{});
+    defer std.testing.allocator.free(block.bytes);
+    defer std.testing.allocator.free(block.lines);
+    try std.testing.expectEqualStrings("────── branch · ctrl+o ───────", block.bytes);
+    try std.testing.expectEqual(@as(usize, 30), display_width.visibleWidth(block.bytes));
+}
+
 fn isAttachedEntry(entry: TranscriptEntry) bool {
     return switch (entry) {
         .raw_bytes => |raw| raw.class == .command_output or raw.class == .diff_block,
@@ -1341,7 +1377,7 @@ fn buildWithStyleAndStats(
         if (mode == .compact and !transcript_blocks.isEntryVisibleInCompactPresentation(entry)) continue;
         const entry_id = toolStatusEntryId(entry) orelse continue;
         const detail = detailForEntry(details, &detail_indices, entry_id, stats);
-        if (statusNamesAsk(entry, detail)) continue;
+        if (statusNamesAsk(entry, detail) or (mode == .compact and isRewind(detail))) continue;
         const group_id = presentationGroupId(detail) orelse continue;
 
         const result = try presentation_group_by_id.getOrPut(alloc, group_id);
@@ -1478,6 +1514,11 @@ fn buildWithStyleAndStats(
         }
 
         const detail = detailForEntry(details, &detail_indices, entry_id, stats);
+        if (isRewind(detail)) {
+            try projection.setOwnedGroup(alloc, index, try formatBranchDivider(alloc, entry_id, cols, styles));
+            index += 1;
+            continue;
+        }
         if (statusNamesAsk(entries[index], detail)) {
             index += 1;
             continue;
@@ -1494,7 +1535,7 @@ fn buildWithStyleAndStats(
             if (presentation_group_indices[index] != null) break;
             if (toolStatusEntryId(entries[index])) |group_entry_id| {
                 const group_detail = detailForEntry(details, &detail_indices, group_entry_id, stats);
-                if (statusNamesAsk(entries[index], group_detail)) break;
+                if (statusNamesAsk(entries[index], group_detail) or isRewind(group_detail)) break;
                 observeTool(&summary, group_detail);
                 try status_indices.append(alloc, index);
                 projection.entry_actions.items[index] = .hide;

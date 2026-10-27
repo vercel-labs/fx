@@ -257,6 +257,10 @@ pub const AgentRuntimeDeps = struct {
     /// Called at every model-request boundary with the turn so far, so each
     /// completed piece is saved as it happens rather than at the turn's end.
     append_turn_piece: ?*const fn (ctx: *anyopaque, progress: TurnProgress) anyerror!void = null,
+    /// Drops from the saved open turn what came after the model's
+    /// checkpoint (D120): `kept` is the turn through the checkpoint's step.
+    /// An error leaves the saved turn as it was.
+    rewind_to_checkpoint: ?*const fn (ctx: *anyopaque, user: types.UserTurn, kept: types.ExecutionMemory) anyerror!void = null,
     /// Saves the turn's prompt images in the session before its first
     /// request is built, so the note naming each saved file is true when
     /// that request is sent (D89). It sets `blob_path`, allocated with

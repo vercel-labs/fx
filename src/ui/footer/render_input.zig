@@ -362,6 +362,9 @@ pub const RenderContext = struct {
     /// The path to the focused node of a session tree, as labels joined by
     /// ` › `; empty at the root.
     breadcrumb: []const u8 = "",
+    /// The goal of the running turn's open checkpoint (D120); empty when
+    /// none is open.
+    checkpoint: []const u8 = "",
     pending_images: []const types.ImageAttachment = &.{},
     composer_visible: bool = true,
     permission_mode: types.PermissionMode = .ask,

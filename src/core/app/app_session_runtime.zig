@@ -2902,6 +2902,17 @@ pub fn Runtime(comptime App: type) type {
             try v2.appendProgress(progress.user, progress.execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant });
         }
 
+        /// `AgentRuntimeDeps.rewind_to_checkpoint` on v2 (D120). The
+        /// children the rewind abandoned leave the registry (D97).
+        pub fn rewindToCheckpoint(app: *App, user: types.UserTurn, kept: types.ExecutionMemory) !void {
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const v2 = app.session_persistence.v2 orelse return;
+            var rewound = try v2.rewindToCheckpoint(std.heap.c_allocator, user, kept);
+            defer rewound.deinit(std.heap.c_allocator);
+            if (rewound.abandoned.len > 0) if (app.session_persistence.subagent_host) |children_host| children_host.children.forget();
+        }
+
         /// `AgentRuntimeDeps.save_prompt_images` on v2: the prompt's images
         /// become the session's blobs before its first request (D89).
         pub fn savePromptImages(app: *App, alloc: std.mem.Allocator, images: []types.ImageAttachment) !void {

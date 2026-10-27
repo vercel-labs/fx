@@ -141,6 +141,7 @@ const shell_runtime = @import("ui/shell_runtime.zig");
 const ui_terminal = @import("ui/terminal/terminal.zig");
 const cursor_probe = @import("ui/terminal/cursor_probe.zig");
 const ui_program_status = @import("ui/terminal/program_status.zig");
+const checkpoint_indicator = @import("core/output/checkpoint_indicator.zig");
 const transcript_runtime = @import("ui/transcript/runtime.zig");
 const resume_projection = @import("ui/transcript/resume_projection.zig");
 const assistant_pacer = @import("ui/assistant/pacer.zig");
@@ -555,6 +556,7 @@ const App = struct {
     notifications: builtin_hooks.notifications.State = .{},
     herdr: builtin_hooks.Client = .{},
     program_status: ui_program_status.Reporter = .{},
+    checkpoint_indicator: checkpoint_indicator.Indicator = .{},
 
     /// Who runs this frontend's session, chosen once in `init`. The
     /// detached backend keeps its connection and view state in `remote`.
@@ -4804,6 +4806,7 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
 
 test {
     _ = @import("core/agent/runtime/journal.zig");
+    _ = checkpoint_indicator;
     _ = @import("acp/libfx_journal.zig");
     _ = @import("mcp/mcp.zig");
     _ = @import("core/mcp_host/runtime.zig");

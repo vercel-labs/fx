@@ -1983,6 +1983,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .append_turn_piece = if (ctx.v2 != null) appendTurnPiece else null,
         .save_prompt_images = if (ctx.v2 != null) savePromptImages else null,
+        .rewind_to_checkpoint = if (ctx.v2 != null) rewindToCheckpoint else null,
         .propagate_grant = propagateGrant,
         .push_event = pushEvent,
         .push_text = pushText,
@@ -2913,6 +2914,18 @@ fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !v
     };
     // The log now refers to this prompt's images.
     ctx.prompt_snapshot_committed = true;
+}
+
+/// `AgentRuntimeDeps.rewind_to_checkpoint` on v2 (D120). The children the
+/// rewind abandoned leave the registry (D97).
+fn rewindToCheckpoint(raw_ctx: *anyopaque, user: types.UserTurn, kept: types.ExecutionMemory) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    const v2 = ctx.v2 orelse return;
+    var rewound = try v2.rewindToCheckpoint(std.heap.c_allocator, user, kept);
+    defer rewound.deinit(std.heap.c_allocator);
+    if (rewound.abandoned.len > 0) if (ctx.subagent_host) |children_host| children_host.children.forget();
 }
 
 /// The prompt's images become the session's blobs before its first request

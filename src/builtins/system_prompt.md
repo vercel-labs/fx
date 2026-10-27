@@ -70,5 +70,6 @@
 
 - Choose the smallest suitable available capability.
 - For an earlier detail no longer in context, `recall` searches this session's history, compacted turns included.
+- Wrap a long exploration in `checkpoint` and `rewind` (report) before replying; Python state and files stay.
 - After code changes, verify the relevant behavior with direct checks such as formatting, a focused test, build, CLI run, or eval before claiming it works. Broaden verification when the changed surface is shared, focused proof fails, or the user requests it.
 - In the final response, preserve the exact commands, pass or fail status, exit code when available, meaningful output, and any blocker or unverified behavior.

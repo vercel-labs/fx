@@ -1185,6 +1185,8 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         ctx.web_search_runtime_ready and ctx.web_search_backend != null;
     return .{
         .allocator = arena,
+        .current_turn_messages = ctx.current_turn_messages,
+        .subtree_busy = if (ctx.subagent_host) |host| .{ .ctx = host, .busy_fn = subtreeBusy } else null,
         .kernel = &ctx.session.kernel,
         .harness = ctx.harness,
         .observer = ctx.observer,
@@ -2210,6 +2212,12 @@ fn subagentProviderFailure(
         .error_code = error_code,
     }) catch return error.OutOfMemory;
     return .{ .status = .failure, .body = body };
+}
+
+/// A child node's turn or a fleet worker's turn still runs (D97, D120).
+fn subtreeBusy(raw: *anyopaque) bool {
+    const host: *subagent_tool_host.Runtime = @ptrCast(@alignCast(raw));
+    return host.subtreeBusy() or host.fleet.active();
 }
 
 fn executeSubagentProvider(

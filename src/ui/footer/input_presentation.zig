@@ -503,6 +503,8 @@ pub fn composeHintRow(
         width,
         &hint_buf,
     );
+    var checkpoint_buf: [max_status_line_len]u8 = undefined;
+    const lead_hint_line = withCheckpoint(ctx.checkpoint, base_hint_line, &checkpoint_buf);
     var crumb_buf: [max_status_line_len]u8 = undefined;
     var hint_line = if (question_hint) |hint|
         hint
@@ -511,9 +513,9 @@ pub fn composeHintRow(
     else if (auth_hint) |hint|
         hint
     else if (ctx.breadcrumb.len > 0)
-        withBreadcrumb(ctx.breadcrumb, base_hint_line, width, &crumb_buf)
+        withBreadcrumb(ctx.breadcrumb, lead_hint_line, width, &crumb_buf)
     else
-        base_hint_line;
+        lead_hint_line;
 
     const width_usize: usize = width;
     var jobs_buf: [max_status_line_len]u8 = undefined;
@@ -616,6 +618,27 @@ fn withBreadcrumb(path: []const u8, hint: []const u8, width: u16, out: []u8) []c
 }
 
 const statusline_gap = " · ";
+
+/// `checkpoint · <goal>` ahead of the hint line while a checkpoint is open
+/// (D120), so a rewind still owed is never invisible.
+fn withCheckpoint(goal: []const u8, hint: []const u8, out: []u8) []const u8 {
+    if (goal.len == 0) return hint;
+    const clipped = display_width.prefixByWidth(goal, 40);
+    return std.mem.print(out, "checkpoint · {s}{s}{s}{s}", .{
+        clipped,
+        if (clipped.len < goal.len) "…" else "",
+        statusline_gap,
+        hint,
+    }) catch hint;
+}
+
+test "an open checkpoint leads the hint line, its goal clipped" {
+    var buf: [max_status_line_len]u8 = undefined;
+    try std.testing.expectEqualStrings("hint", withCheckpoint("", "hint", &buf));
+    try std.testing.expectEqualStrings("checkpoint · map geom · hint", withCheckpoint("map geom", "hint", &buf));
+    const long = text_utils.repeat("a", 50);
+    try std.testing.expectEqualStrings("checkpoint · " ++ text_utils.repeat("a", 40) ++ "… · hint", withCheckpoint(long, "hint", &buf));
+}
 
 pub fn dangerStatusText(
     approval_active: bool,
