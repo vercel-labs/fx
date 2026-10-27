@@ -116,7 +116,13 @@ pub const Child = struct {
     seq: u64,
     /// A rewind of the parent dropped the turn that first spawned it (D97).
     abandoned: bool = false,
+    /// Work waiting behind the open item, oldest first (D102).
+    queue: []QueuedWork = &.{},
+    /// fx's data on `child_terminated`; set once the child is terminal (D102).
+    terminated: ?[]u8 = null,
 };
+
+pub const QueuedWork = struct { work_id: []u8, data: ?[]u8 };
 
 pub fn freeChildren(alloc: Allocator, children: []Child) void {
     for (children) |child| freeChild(alloc, child);
@@ -128,12 +134,33 @@ fn freeChild(alloc: Allocator, child: Child) void {
     alloc.free(child.work_id);
     if (child.spawn_data) |data| alloc.free(data);
     if (child.finish_data) |data| alloc.free(data);
+    freeQueue(alloc, child.queue);
+    if (child.terminated) |data| alloc.free(data);
+}
+
+fn freeQueue(alloc: Allocator, queue: []QueuedWork) void {
+    for (queue) |item| {
+        alloc.free(item.work_id);
+        if (item.data) |data| alloc.free(data);
+    }
+    if (queue.len > 0) alloc.free(queue);
 }
 
 /// A line about a child, appended through its parent.
 pub const ChildLine = union(enum) {
     spawned: struct { child: []const u8, work_id: []const u8, data: ?[]const u8 = null },
     finished: struct { child: []const u8, work_id: []const u8, outcome: ChildOutcome, data: ?[]const u8 = null },
+    queued: struct { child: []const u8, work_id: []const u8, data: ?[]const u8 = null },
+    terminated: struct { child: []const u8, data: ?[]const u8 = null },
+
+    fn event(line: ChildLine) sm.Event {
+        return switch (line) {
+            .spawned => |spawned| .{ .child_spawned = .{ .child = spawned.child, .work_id = spawned.work_id, .data = spawned.data } },
+            .finished => |finished| .{ .child_finished = .{ .child = finished.child, .work_id = finished.work_id, .outcome = finished.outcome, .data = finished.data } },
+            .queued => |queued| .{ .child_queued = .{ .child = queued.child, .work_id = queued.work_id, .data = queued.data } },
+            .terminated => |terminated| .{ .child_terminated = .{ .child = terminated.child, .data = terminated.data } },
+        };
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -2367,15 +2394,30 @@ pub const Session = struct {
             errdefer alloc.free(work_copy);
             const spawn_copy = if (child.spawn_data) |data| try alloc.dupe(u8, data) else null;
             errdefer if (spawn_copy) |data| alloc.free(data);
+            const finish_copy = if (child.finish_data) |data| try alloc.dupe(u8, data) else null;
+            errdefer if (finish_copy) |data| alloc.free(data);
+            const terminated_copy = if (child.terminated) |data| try alloc.dupe(u8, data) else null;
+            errdefer if (terminated_copy) |data| alloc.free(data);
+            const queue_copy = try alloc.alloc(QueuedWork, child.queue.items.len);
+            var queued: usize = 0;
+            errdefer freeQueue(alloc, queue_copy[0..queued]);
+            for (child.queue.items) |waiting| {
+                const item_id = try alloc.dupe(u8, waiting.work_id);
+                errdefer alloc.free(item_id);
+                queue_copy[queued] = .{ .work_id = item_id, .data = if (waiting.data) |data| try alloc.dupe(u8, data) else null };
+                queued += 1;
+            }
             out[built] = .{
                 .id = id_copy,
                 .work_id = work_copy,
                 .open = child.open,
                 .outcome = child.outcome,
                 .spawn_data = spawn_copy,
-                .finish_data = if (child.finish_data) |data| try alloc.dupe(u8, data) else null,
+                .finish_data = finish_copy,
                 .seq = child.seq,
                 .abandoned = child.abandoned,
+                .queue = queue_copy,
+                .terminated = terminated_copy,
             };
             built += 1;
         }
@@ -2388,10 +2430,7 @@ pub const Session = struct {
         if (lines.len == 0) return;
         const events = try self.alloc.alloc(sm.Event, lines.len);
         defer self.alloc.free(events);
-        for (lines, events) |line, *event| event.* = switch (line) {
-            .spawned => |spawned| .{ .child_spawned = .{ .child = spawned.child, .work_id = spawned.work_id, .data = spawned.data } },
-            .finished => |finished| .{ .child_finished = .{ .child = finished.child, .work_id = finished.work_id, .outcome = finished.outcome, .data = finished.data } },
-        };
+        for (lines, events) |line, *event| event.* = line.event();
         _ = try self.write(events);
     }
 
@@ -3737,10 +3776,7 @@ const Conversion = struct {
         const source: V1Source = .{ .fingerprint = if (left_out_total > 0) "" else &member.fingerprint, .left_out = records, .left_out_total = left_out_total };
         try settings.append(a, .{ .set = .{ .key = .v1_source, .value = try jsonValue(a, source) } });
         if (role == .root) {
-            for (try child_state.v1ImportLines(a, role.root.registry.*, role.root.has_log)) |line| try settings.append(a, switch (line) {
-                .spawned => |spawned| .{ .child_spawned = .{ .child = spawned.child, .work_id = spawned.work_id, .data = spawned.data } },
-                .finished => |finished| .{ .child_finished = .{ .child = finished.child, .work_id = finished.work_id, .outcome = finished.outcome, .data = finished.data } },
-            });
+            for (try child_state.v1ImportLines(a, role.root.registry.*, role.root.has_log)) |line| try settings.append(a, line.event());
         }
         session.import_ts = @max(newest, member.listed_ms);
         _ = try session.write(settings.items);
@@ -4569,7 +4605,7 @@ noinline fn replay(
                     if (keptTurn(alloc, dropped, turn, ended.turn)) try sink.turn(try presentStoredResults(src, alloc, turn), ended.turn);
                 },
                 .compacted => |line| try sink.summary(line.data),
-                .session_created, .turn_committed, .set, .child_spawned, .child_finished, .snapshot, .closed, .rewound, .store_set, .store_del, .kernel_snapshot => {},
+                .session_created, .turn_committed, .set, .child_spawned, .child_finished, .child_queued, .child_terminated, .snapshot, .closed, .rewound, .store_set, .store_del, .kernel_snapshot => {},
             }
         }
         from = .{ .at = page.next orelse break };

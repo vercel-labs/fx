@@ -8,6 +8,8 @@
 
 const std = @import("std");
 const schema = @import("schema.zig");
+const fold_queue = @import("fold_queue.zig");
+const queueAt = fold_queue.queueAt;
 
 pub const Interruption = struct { turn: u64, reason: schema.Reason };
 
@@ -35,16 +37,27 @@ pub const Child = struct {
     /// A rewind of this session dropped the turn that first spawned it
     /// (D97): it stays listed, read-only, and takes no more work.
     abandoned: bool = false,
+    /// Work waiting behind the open item, oldest first (D102).
+    queue: std.ArrayList(Queued) = .empty,
+    /// fx's `data` from `child_terminated`; set once the child is
+    /// terminal (D102): listed, read-only, and taking no more work.
+    terminated: ?[]u8 = null,
 
     fn deinit(child: Child, gpa: std.mem.Allocator) void {
         gpa.free(child.id);
         gpa.free(child.work_id);
         if (child.spawn_data) |data| gpa.free(data);
         if (child.finish_data) |data| gpa.free(data);
+        for (child.queue.items) |item| item.deinit(gpa);
+        var queue = child.queue;
+        queue.deinit(gpa);
+        if (child.terminated) |data| gpa.free(data);
     }
 
     fn clone(child: Child, gpa: std.mem.Allocator) error{OutOfMemory}!Child {
         var copy = child;
+        copy.queue = .empty;
+        copy.terminated = null;
         copy.id = try gpa.dupe(u8, child.id);
         errdefer gpa.free(copy.id);
         copy.work_id = try gpa.dupe(u8, child.work_id);
@@ -52,18 +65,40 @@ pub const Child = struct {
         copy.spawn_data = try dupeOptional(gpa, child.spawn_data);
         errdefer if (copy.spawn_data) |data| gpa.free(data);
         copy.finish_data = try dupeOptional(gpa, child.finish_data);
+        errdefer if (copy.finish_data) |data| gpa.free(data);
+        copy.terminated = try dupeOptional(gpa, child.terminated);
+        errdefer if (copy.terminated) |data| gpa.free(data);
+        errdefer {
+            for (copy.queue.items) |item| item.deinit(gpa);
+            copy.queue.deinit(gpa);
+        }
+        try copy.queue.ensureTotalCapacity(gpa, child.queue.items.len);
+        for (child.queue.items) |item| copy.queue.appendAssumeCapacity(try item.clone(gpa));
         return copy;
     }
 
     fn eql(a: Child, b: Child) bool {
+        if (a.queue.items.len != b.queue.items.len) return false;
+        for (a.queue.items, b.queue.items) |x, y| {
+            if (!std.mem.eql(u8, x.work_id, y.work_id) or !optionalEql(x.data, y.data)) return false;
+        }
         return std.mem.eql(u8, a.id, b.id) and
             std.mem.eql(u8, a.work_id, b.work_id) and
             a.open == b.open and a.outcome == b.outcome and a.seq == b.seq and
             a.abandoned == b.abandoned and
             optionalEql(a.spawn_data, b.spawn_data) and
-            optionalEql(a.finish_data, b.finish_data);
+            optionalEql(a.finish_data, b.finish_data) and
+            optionalEql(a.terminated, b.terminated);
+    }
+
+    /// Whether the child may take work: not abandoned (D97) or terminal (D102).
+    pub fn closed(child: Child) bool {
+        return child.abandoned or child.terminated != null;
     }
 };
+
+pub const Queued = fold_queue.Queued;
+pub const max_queued_work = fold_queue.max_queued_work;
 
 /// Everything the log implies about a session except its identity, which
 /// is line 1. Owns every slice; free with `deinit`.
@@ -153,7 +188,7 @@ pub const State = struct {
         };
     }
 
-    fn findChild(state: *const State, id: []const u8) ?usize {
+    pub fn findChild(state: *const State, id: []const u8) ?usize {
         for (state.children.items, 0..) |child, i| {
             if (std.mem.eql(u8, child.id, id)) return i;
         }
@@ -173,6 +208,10 @@ pub const State = struct {
         errdefer if (data) |d| gpa.free(d);
         if (state.findChild(spawned.child)) |i| {
             const known = &state.children.items[i];
+            // A queued item starts from the front of the queue (D102).
+            if (known.queue.items.len > 0 and std.mem.eql(u8, known.queue.items[0].work_id, spawned.work_id)) {
+                known.queue.orderedRemove(0).deinit(gpa);
+            }
             gpa.free(known.work_id);
             if (known.spawn_data) |d| gpa.free(d);
             known.work_id = work_id;
@@ -190,6 +229,13 @@ pub const State = struct {
     /// not a line the manager writes, and changes nothing.
     fn finishChild(state: *State, gpa: std.mem.Allocator, seq: u64, finished: schema.Body.Finished) error{OutOfMemory}!void {
         const known = &state.children.items[state.findChild(finished.child) orelse return];
+        // A cancelled queued item leaves the queue and never ran (D102).
+        for (known.queue.items, 0..) |item, index| {
+            if (!std.mem.eql(u8, item.work_id, finished.work_id)) continue;
+            known.queue.orderedRemove(index).deinit(gpa);
+            known.seq = seq;
+            return;
+        }
         if (!known.open or !std.mem.eql(u8, known.work_id, finished.work_id)) return;
         const data = try dupeOptional(gpa, finished.data);
         if (known.finish_data) |d| gpa.free(d);
@@ -283,6 +329,8 @@ pub fn apply(gpa: std.mem.Allocator, state: *State, fork_seq: u64, line: Line) e
         },
         .child_spawned => |c| if (line.seq > fork_seq) try state.spawnChild(gpa, line.seq, c),
         .child_finished => |c| if (line.seq > fork_seq) try state.finishChild(gpa, line.seq, c),
+        .child_queued => |c| if (line.seq > fork_seq) if (state.findChild(c.child)) |i| try fold_queue.enqueue(gpa, &state.children.items[i], line.seq, c),
+        .child_terminated => |c| if (line.seq > fork_seq) if (state.findChild(c.child)) |i| try fold_queue.terminate(gpa, &state.children.items[i], line.seq, c),
         .rewound => |r| {
             try state.dropped.append(gpa, .{ .turn = r.turn, .through = r.through });
             for (r.abandoned) |id| {
@@ -318,6 +366,10 @@ pub const Event = union(enum) {
     store_del: []const u8,
     /// The kernel's globals at this turn's end (D99). Inside a turn.
     kernel_snapshot: KernelSnapshot,
+    /// Work waiting behind a child's open item, and a child made terminal
+    /// (D102).
+    child_queued: schema.Body.WorkItem,
+    child_terminated: schema.Body.Terminated,
 };
 
 pub const StoreSet = struct { key: []const u8, blob: *const [1][]const u8 };
@@ -377,14 +429,40 @@ pub fn plan(state: *const State, events: []const Event, out: []schema.Body) Tran
             // OneOpenWork); a finish names exactly that one.
             .child_spawned => |c| blk: {
                 if (openWorkAt(state, events[0..i], c.child) != null) return error.InvalidTransition;
-                // An abandoned child takes no more work (D97).
+                // An abandoned or terminal child takes no more work (D97, D102).
                 if (abandonedAt(state, events[0..i], c.child)) return error.InvalidTransition;
+                // Queued work starts in order (`tests/tla/session_manager/Fleet.tla`
+                // QueueInOrder).
+                var queue = queueAt(state, events[0..i], c.child);
+                if (queue.len() > 0 and !std.mem.eql(u8, queue.front().?, c.work_id)) return error.InvalidTransition;
                 break :blk .{ .child_spawned = c };
             },
             .child_finished => |c| blk: {
+                var queue = queueAt(state, events[0..i], c.child);
+                if (queue.contains(c.work_id)) {
+                    if (c.outcome != .cancelled) return error.InvalidTransition;
+                    break :blk .{ .child_finished = c };
+                }
                 const open = openWorkAt(state, events[0..i], c.child) orelse return error.InvalidTransition;
                 if (!std.mem.eql(u8, open, c.work_id)) return error.InvalidTransition;
                 break :blk .{ .child_finished = c };
+            },
+            .child_queued => |c| blk: {
+                if (state.findChild(c.child) == null) return error.InvalidTransition;
+                if (abandonedAt(state, events[0..i], c.child)) return error.InvalidTransition;
+                var queue = queueAt(state, events[0..i], c.child);
+                if (queue.len() >= max_queued_work or queue.contains(c.work_id)) return error.InvalidTransition;
+                if (openWorkAt(state, events[0..i], c.child)) |open| if (std.mem.eql(u8, open, c.work_id)) return error.InvalidTransition;
+                break :blk .{ .child_queued = c };
+            },
+            // Terminal only between work items, so the in-flight turn is
+            // finished first (`tests/tla/session_manager/Fleet.tla`
+            // NoWorkAfterTerminate).
+            .child_terminated => |c| blk: {
+                if (state.findChild(c.child) == null) return error.InvalidTransition;
+                if (abandonedAt(state, events[0..i], c.child)) return error.InvalidTransition;
+                if (openWorkAt(state, events[0..i], c.child) != null) return error.InvalidTransition;
+                break :blk .{ .child_terminated = c };
             },
             // Between turns, over turns that exist, and never over a child
             // whose work runs (`tests/tla/session_manager/Rewind.tla`
@@ -417,11 +495,13 @@ pub fn plan(state: *const State, events: []const Event, out: []schema.Body) Tran
     }
 }
 
-/// Whether `child` is abandoned after `earlier` events of the batch.
+/// Whether `child` is abandoned or terminal after `earlier` events of the
+/// batch.
 fn abandonedAt(state: *const State, earlier: []const Event, child: []const u8) bool {
-    if (state.findChild(child)) |index| if (state.children.items[index].abandoned) return true;
+    if (state.findChild(child)) |index| if (state.children.items[index].closed()) return true;
     for (earlier) |event| switch (event) {
         .rewound => |r| for (r.abandoned) |id| if (std.mem.eql(u8, id, child)) return true,
+        .child_terminated => |c| if (std.mem.eql(u8, c.child, child)) return true,
         else => {},
     };
     return false;
@@ -482,6 +562,20 @@ pub fn encodeState(gpa: std.mem.Allocator, out: *std.ArrayList(u8), state: *cons
         if (child.spawn_data) |data| try appendRawField(gpa, out, "spawn_data", data);
         if (child.finish_data) |data| try appendRawField(gpa, out, "finish_data", data);
         if (child.abandoned) try out.appendSlice(gpa, ",\"abandoned\":true");
+        // Written only for workers that have them, so older snapshots read
+        // the same (D102).
+        if (child.queue.items.len > 0) {
+            try out.appendSlice(gpa, ",\"queue\":[");
+            for (child.queue.items, 0..) |item, q| {
+                if (q > 0) try out.append(gpa, ',');
+                try out.appendSlice(gpa, "{\"work_id\":");
+                try schema.appendJsonString(gpa, out, item.work_id);
+                if (item.data) |data| try appendRawField(gpa, out, "data", data);
+                try out.append(gpa, '}');
+            }
+            try out.append(gpa, ']');
+        }
+        if (child.terminated) |data| try appendRawField(gpa, out, "terminated", data);
         try out.append(gpa, '}');
     }
     try out.append(gpa, ']');
@@ -537,6 +631,21 @@ pub fn decodeState(gpa: std.mem.Allocator, arena: std.mem.Allocator, raw: []cons
         errdefer if (spawn_data) |data| gpa.free(data);
         const finish_data = try dupeOptional(gpa, c.raw("finish_data"));
         errdefer if (finish_data) |data| gpa.free(data);
+        const terminated = try dupeOptional(gpa, c.raw("terminated"));
+        errdefer if (terminated) |data| gpa.free(data);
+        var queue: std.ArrayList(Queued) = .empty;
+        errdefer {
+            for (queue.items) |item| item.deinit(gpa);
+            queue.deinit(gpa);
+        }
+        if (c.raw("queue")) |raw_queue| for (try schema.rawElements(arena, raw_queue)) |raw_item| {
+            const q = try schema.Fields.parseObject(arena, raw_item);
+            const item_id = try gpa.dupe(u8, try q.req([]const u8, "work_id"));
+            errdefer gpa.free(item_id);
+            const item_data = try dupeOptional(gpa, q.raw("data"));
+            errdefer if (item_data) |data| gpa.free(data);
+            try queue.append(gpa, .{ .work_id = item_id, .data = item_data });
+        };
         try state.children.append(gpa, .{
             .id = id,
             .work_id = work_id,
@@ -546,6 +655,8 @@ pub fn decodeState(gpa: std.mem.Allocator, arena: std.mem.Allocator, raw: []cons
             .finish_data = finish_data,
             .seq = try c.req(u64, "seq"),
             .abandoned = try c.opt(bool, "abandoned") orelse false,
+            .queue = queue,
+            .terminated = terminated,
         });
     }
     if (f.raw("dropped")) |raw_dropped| {
@@ -644,7 +755,7 @@ fn specValid(open: bool, event: Event) ?bool {
         .turn_started => !open,
         .item, .turn_committed, .turn_interrupted, .store_set, .store_del, .kernel_snapshot => open,
         .compacted, .set => true,
-        .child_spawned, .child_finished, .rewound => null, // not in TurnLifecycle
+        .child_spawned, .child_finished, .child_queued, .child_terminated, .rewound => null, // not in TurnLifecycle
     };
 }
 

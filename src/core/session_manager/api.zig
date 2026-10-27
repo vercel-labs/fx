@@ -787,6 +787,15 @@ fn checkEvents(gpa: std.mem.Allocator, events: []const Event, import: bool) Appe
             if (c.outcome == .lost and !import) return error.InvalidArgument;
             if (c.data) |data| try checkChildData(gpa, data);
         },
+        .child_queued => |c| {
+            try checkId(c.child);
+            try checkWorkId(c.work_id);
+            if (c.data) |data| try checkChildData(gpa, data);
+        },
+        .child_terminated => |c| {
+            try checkId(c.child);
+            if (c.data) |data| try checkChildData(gpa, data);
+        },
         .rewound => |r| for (r.abandoned) |id| try checkId(id),
         .store_set => |v| {
             try checkName(v.key, max_store_key_bytes);
@@ -831,6 +840,7 @@ test {
     _ = @import("schema.zig");
     _ = @import("log.zig");
     _ = @import("fold.zig");
+    _ = @import("fold_queue.zig");
     _ = @import("session.zig");
     _ = @import("catalog.zig");
     _ = @import("python_fold.zig");

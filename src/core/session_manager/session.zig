@@ -1121,7 +1121,7 @@ fn hasTurnStart(bodies: []const schema.Body) bool {
 /// Durability points (`tests/tla/session_manager/system-design.md` "Durable State And Schema").
 fn needsSync(bodies: []const schema.Body) bool {
     for (bodies) |body| switch (body) {
-        .turn_committed, .turn_interrupted, .child_spawned, .child_finished, .rewound => return true,
+        .turn_committed, .turn_interrupted, .child_spawned, .child_finished, .child_queued, .child_terminated, .rewound => return true,
         // Usage is durable before fx clears its usage-recovery marker
         // (`tests/tla/session_manager/Wiring.tla` UsageNeverSilent).
         // fx removes the side folder only once the move is durable (D47).

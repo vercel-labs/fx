@@ -30,6 +30,8 @@ pub const Kind = enum {
     store_set,
     store_del,
     kernel_snapshot,
+    child_queued,
+    child_terminated,
 };
 
 pub const Header = struct {
@@ -138,6 +140,8 @@ pub const Body = union(Kind) {
     store_set: StoreSet,
     store_del: StoreDel,
     kernel_snapshot: KernelSnapshot,
+    child_queued: WorkItem,
+    child_terminated: Terminated,
 
     pub const Created = struct {
         id: []const u8,
@@ -188,6 +192,12 @@ pub const Body = union(Kind) {
     /// `data` is fx's raw JSON about the child or the work (D22).
     pub const WorkItem = struct { child: []const u8, work_id: []const u8, data: ?[]const u8 = null };
     pub const Finished = struct { child: []const u8, work_id: []const u8, outcome: Outcome, data: ?[]const u8 = null };
+    /// A worker's turn waits behind its running one (D102): `child_queued`
+    /// adds `work_id` to the end of the child's queue, its `child_spawned`
+    /// takes it from the front, and a cancelled `child_finished` drops it.
+    /// The child is terminal after `child_terminated` (D102): it takes no
+    /// more work and its queue is gone. `data` is fx's raw JSON.
+    pub const Terminated = struct { child: []const u8, data: ?[]const u8 = null };
     pub const Snapshot = struct { covers_seq: u64, state: []const u8, compaction_offset: ?u64 };
     /// The session's history drops turns `turn` through `through`, the
     /// newest turn when it was written, and every child first spawned
@@ -256,7 +266,7 @@ pub fn appendBody(gpa: std.mem.Allocator, out: *std.ArrayList(u8), body: Body) e
             try w.raw("value", s.value);
             try w.blobList(s.blobs);
         },
-        .child_spawned => |c| {
+        .child_spawned, .child_queued => |c| {
             try w.string("child", c.child);
             try w.string("work_id", c.work_id);
             if (c.data) |data| try w.raw("data", data);
@@ -265,6 +275,10 @@ pub fn appendBody(gpa: std.mem.Allocator, out: *std.ArrayList(u8), body: Body) e
             try w.string("child", c.child);
             try w.string("work_id", c.work_id);
             try w.string("outcome", @tagName(c.outcome));
+            if (c.data) |data| try w.raw("data", data);
+        },
+        .child_terminated => |c| {
+            try w.string("child", c.child);
             if (c.data) |data| try w.raw("data", data);
         },
         .snapshot => |s| {
@@ -353,6 +367,15 @@ fn bodyOf(kind: Kind, f: Fields) BodyError!Body {
             .child = try f.req([]const u8, "child"),
             .work_id = try f.req([]const u8, "work_id"),
             .outcome = try f.req(Outcome, "outcome"),
+            .data = f.raw("data"),
+        } },
+        .child_queued => .{ .child_queued = .{
+            .child = try f.req([]const u8, "child"),
+            .work_id = try f.req([]const u8, "work_id"),
+            .data = f.raw("data"),
+        } },
+        .child_terminated => .{ .child_terminated = .{
+            .child = try f.req([]const u8, "child"),
             .data = f.raw("data"),
         } },
         .snapshot => .{ .snapshot = .{
