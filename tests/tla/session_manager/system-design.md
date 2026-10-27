@@ -2880,6 +2880,19 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   keeps the plan in view while it works. **Alternative:** a slash command
   that prints the list, which goes stale as soon as it scrolls away.
 
+- **D253 Decision:** `proto-fx ttsr test --llm` judges `llm:` conditions
+  with a model, as proto's `ttsr test --llm` does: the first of the
+  rule's roles (`tiny`, then `small`) that resolves on the profile's
+  provider, through its fallback chain with the provider's catalog
+  (D250), else the profile's own model, with the credential `ask` would
+  use. Each question is one bounded call. The report names the model,
+  the role that picked it and how many questions it answered, or why it
+  answered none, in text and in JSON's `judge`; without `--llm` a rule
+  set with `llm:` conditions gets a note saying they were not judged.
+  `scan` never calls a model. **Why:** an `llm:` rule could only be
+  tried in a live session. **Alternative:** judging with the profile's
+  model only, which tests a different model than the session uses.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

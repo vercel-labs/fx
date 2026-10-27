@@ -3,14 +3,15 @@
 //! `ttsr-cli.ts` does.
 //!
 //! `test` and `scan` evaluate settled buffers: `ast:` conditions settle,
-//! and `llm:` conditions settle as no match, since neither command calls a
-//! model.
+//! and `llm:` conditions settle as no match unless `test --llm` asks the
+//! model the rule's roles pick (D253); `scan` never calls a model.
 const std = @import("std");
 const ttsr = @import("../ttsr/ttsr.zig");
 const indexer = @import("../indexer/indexer.zig");
 const io_mod = @import("../shared/io.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const snapshot = @import("../output/ttsr_snapshot.zig");
+const cli_ttsr_judge = @import("cli_ttsr_judge.zig");
 
 const Allocator = std.mem.Allocator;
 const Manager = ttsr.manager.Manager;
@@ -36,6 +37,8 @@ pub const Options = struct {
     path: ?[]const u8 = null,
     directory: ?[]const u8 = null,
     max_bytes: usize = default_max_scan_bytes,
+    /// `test`: judge `llm:` conditions with a model (D253).
+    llm: bool = false,
 };
 
 pub const ParseError = error{ InvalidTtsrArguments, OutOfMemory };
@@ -58,6 +61,10 @@ pub fn parseArgs(args: []const [:0]const u8) ParseError!Options {
             }
             if (std.mem.eql(u8, arg, "--verbose")) {
                 options.verbose = true;
+                continue;
+            }
+            if (options.action == .@"test" and std.mem.eql(u8, arg, "--llm")) {
+                options.llm = true;
                 continue;
             }
             index += 1;
@@ -144,7 +151,9 @@ fn hitFor(arena: Allocator, entry: *const ttsr.manager.Entry, evidence: ?ttsr.ev
 }
 
 /// Runs one subcommand in `workspace_root`. The caller owns `output`.
-pub fn run(alloc: Allocator, options: Options, workspace_root: []const u8, home: ?[]const u8) !Result {
+/// `judge` answers `llm:` conditions for `test --llm`; null leaves them
+/// unjudged.
+pub fn run(alloc: Allocator, options: Options, workspace_root: []const u8, home: ?[]const u8, judge: ?*cli_ttsr_judge.Binding) !Result {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -158,7 +167,7 @@ pub fn run(alloc: Allocator, options: Options, workspace_root: []const u8, home:
     defer loaded.manager.deinit();
     return switch (options.action) {
         .list => list(alloc, arena, options, &loaded),
-        .@"test" => runTest(alloc, arena, options, &loaded, workspace_root),
+        .@"test" => runTest(alloc, arena, options, &loaded, workspace_root, judge),
         .scan => scan(alloc, arena, options, &loaded, workspace_root),
     };
 }
@@ -214,7 +223,7 @@ fn readSnippet(arena: Allocator, options: Options) ![]const u8 {
     return io_mod.readFileToEnd(arena, &handle, max_snippet_bytes);
 }
 
-fn runTest(alloc: Allocator, arena: Allocator, options: Options, loaded: *Loaded, workspace_root: []const u8) !Result {
+fn runTest(alloc: Allocator, arena: Allocator, options: Options, loaded: *Loaded, workspace_root: []const u8, binding: ?*cli_ttsr_judge.Binding) !Result {
     const snippet = readSnippet(arena, options) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return fail(alloc, options.format, "the snippet file could not be read"),
@@ -236,7 +245,13 @@ fn runTest(alloc: Allocator, arena: Allocator, options: Options, loaded: *Loaded
         break :blk one;
     } else &.{};
     const shell_without_path = tool != null and std.mem.eql(u8, tool.?, "shell") and file_path == null;
+    var judge: ?ttsr.judge.Judge = if (binding) |value| ttsr.judge.Judge.init(alloc, value.completer()) else null;
+    defer if (judge) |*value| value.deinit();
+    if (judge == null and options.llm == false and loaded.manager.hasJudgeRules() and note == null) {
+        note = "llm: conditions are not judged without --llm";
+    }
     const matches = try loaded.manager.checkSnapshot(snippet, .{
+        .judge = if (judge) |*value| value.asJudge() else null,
         .source = source,
         .key = "ttsr-test",
         .tool_name = tool,
@@ -272,6 +287,7 @@ fn runTest(alloc: Allocator, arena: Allocator, options: Options, loaded: *Loaded
         .not_triggered = not_triggered.items,
         .errors = try errorsFor(arena, &loaded.manager),
         .note = note,
+        .judge = if (binding) |value| value.report else if (options.llm) .{ .unavailable = "no model could be reached for this profile" } else null,
         .verbose = options.verbose,
     };
     const output = try result.render(alloc, options.format);
@@ -390,15 +406,15 @@ test "ttsr test and scan evaluate the workspace rules" {
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(home);
 
-    const tested = try run(alloc, try parseArgs(&.{ "test", "git push --force", "--source", "tool" }), root, home);
+    const tested = try run(alloc, try parseArgs(&.{ "test", "git push --force", "--source", "tool" }), root, home, null);
     defer alloc.free(tested.output);
     try std.testing.expect(std.mem.find(u8, tested.output, "✓ no-force [project]") != null);
 
-    const listed = try run(alloc, try parseArgs(&.{ "list", "--json" }), root, home);
+    const listed = try run(alloc, try parseArgs(&.{ "list", "--json" }), root, home, null);
     defer alloc.free(listed.output);
     try std.testing.expect(std.mem.find(u8, listed.output, "\"name\":\"no-force\"") != null);
 
-    const scanned = try run(alloc, try parseArgs(&.{ "scan", "--verbose" }), root, home);
+    const scanned = try run(alloc, try parseArgs(&.{ "scan", "--verbose" }), root, home, null);
     defer alloc.free(scanned.output);
     try std.testing.expect(std.mem.find(u8, scanned.output, "src/deploy.sh\n  ✓ no-force") != null);
     try std.testing.expect(std.mem.find(u8, scanned.output, "src/clean.sh") == null);

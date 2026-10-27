@@ -13,6 +13,7 @@ const cli_ask = @import("cli_ask.zig");
 const cli_replay = @import("cli_replay.zig");
 const cli_search = @import("cli_search.zig");
 const cli_ttsr = @import("cli_ttsr.zig");
+const cli_ttsr_judge = @import("cli_ttsr_judge.zig");
 const cli_read = @import("cli_read.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const collections = @import("../shared/collections.zig");
@@ -1716,7 +1717,58 @@ fn runNonInteractiveWithDeps(
             };
             const workspace_root = try io_mod.realpathAlloc(alloc, ".");
             defer alloc.free(workspace_root);
-            const result = try cli_ttsr.run(alloc, options, workspace_root, io_mod.homeDir());
+            // `--llm` asks the model the profile's roles pick (D253), with
+            // the credential `ask` would use.
+            var judge_startup: ?app_lifecycle.StartupState = null;
+            defer if (judge_startup) |*startup| startup.deinit(alloc);
+            var judge_credential: ?credentials.Credential = null;
+            defer if (judge_credential) |*credential| credential.deinit(alloc);
+            var judge_binding: ?cli_ttsr_judge.Binding = null;
+            var judge_roles: TtsrJudgeRoles = .{ .startup = undefined, .builtin_small = null };
+            defer collections.freeStringList(alloc, &judge_roles.ids);
+            if (options.llm) {
+                judge_startup = if (cfg.auth_mode == .host_managed)
+                    try deps.load_catalog_startup_state_with_auth_mode(alloc, cfg.secret_store, cfg.default_model, cfg.default_agent_step_limit, cfg.auth_mode, null, null)
+                else
+                    try deps.load_startup_state(alloc, cfg.gateway_provider.oauth_transport, cfg.secret_store, cfg.default_model, cfg.default_agent_step_limit);
+                const startup = &judge_startup.?;
+                var providers = cfg.provider_set;
+                providers.definitions = startup.configured_providers.definitions;
+                const bundle = providers.select(startup.provider);
+                judge_roles = .{ .startup = startup, .builtin_small = bundle.title_model };
+                // The catalog lets a role's fallback chain skip models the
+                // provider does not list, as the terminal's does.
+                if (bundle.cli_model_catalog) |catalog_provider| switch (catalog_provider.fetch(alloc, .{
+                    .access = startup.modelCatalogAccess(),
+                    .endpoint = cfg.models_path,
+                })) {
+                    .loaded => |loaded| {
+                        var entries = loaded.entries;
+                        model_catalog.freeModelCatalog(alloc, &entries);
+                        judge_roles.ids = loaded.ids;
+                    },
+                    .failure => {},
+                };
+                const lease: ?@import("../agent/stream_provider.zig").CredentialLease = if (cfg.auth_mode == .host_managed) .host_managed else lease: {
+                    judge_credential = auth_runtime.prepareCredential(alloc, cfg.gateway_provider.oauth_transport, cfg.secret_store, startup.provider, null) catch null;
+                    const credential = judge_credential orelse break :lease null;
+                    break :lease .{ .direct = .{
+                        .secret_bytes = credential.token,
+                        .source = credential.source,
+                        .account_id = credential.accountId(),
+                        .tenant_context = credential.gatewayTeam(),
+                    } };
+                };
+                if (bundle.agent_stream) |stream| if (lease) |credential| {
+                    judge_binding = .{
+                        .stream = stream,
+                        .credential = credential,
+                        .session_model = if (startup.configured_model.len > 0) startup.configured_model else cfg.default_model,
+                        .roles = .{ .ctx = &judge_roles, .pick = TtsrJudgeRoles.pick },
+                    };
+                };
+            }
+            const result = try cli_ttsr.run(alloc, options, workspace_root, io_mod.homeDir(), if (judge_binding) |*binding| binding else null);
             defer alloc.free(result.output);
             if (result.succeeded or result.format == .json) {
                 try writeFormattedOutput(deps, result.output, result.format);
@@ -2528,6 +2580,28 @@ fn modelRoleAssignments(
     }
     return out[0..model_roles.role_count];
 }
+
+/// The profile's model roles for `ttsr test --llm`.
+const TtsrJudgeRoles = struct {
+    startup: *const app_lifecycle.StartupState,
+    builtin_small: ?[]const u8,
+    /// The provider's catalog; empty when it did not load.
+    ids: std.ArrayList([]u8) = .empty,
+
+    fn pick(raw: *const anyopaque, role: model_roles.Role) ?[]const u8 {
+        const self: *const TtsrJudgeRoles = @ptrCast(@alignCast(raw));
+        const known: model_roles.Known = .{ .context = @ptrCast(@constCast(self)), .known_fn = knows };
+        const picked = self.startup.rolePick(role, self.builtin_small, known) orelse return null;
+        return picked.model;
+    }
+
+    fn knows(raw: ?*anyopaque, model: []const u8) bool {
+        const self: *const TtsrJudgeRoles = @ptrCast(@alignCast(raw.?));
+        if (self.ids.items.len == 0) return true;
+        for (self.ids.items) |id| if (std.mem.eql(u8, id, model)) return true;
+        return false;
+    }
+};
 
 fn catalogFailureDetail(failure: model_catalog.Failure) []const u8 {
     return switch (failure.category) {

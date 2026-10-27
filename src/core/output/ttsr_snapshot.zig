@@ -61,6 +61,18 @@ pub const ListSnapshot = struct {
     }
 };
 
+/// What `ttsr test --llm` asked a model (D253).
+pub const JudgeReport = struct {
+    /// The model that answered last, and the role that picked it; null
+    /// role for the profile's own model.
+    model: ?[]const u8 = null,
+    role: ?[]const u8 = null,
+    calls: usize = 0,
+    answered: usize = 0,
+    /// Why a question went unanswered, when one did.
+    unavailable: ?[]const u8 = null,
+};
+
 pub const TestSnapshot = struct {
     source: []const u8,
     tool: ?[]const u8 = null,
@@ -72,6 +84,8 @@ pub const TestSnapshot = struct {
     not_triggered: []const Hit,
     errors: []const RuleError = &.{},
     note: ?[]const u8 = null,
+    /// Set with `--llm`.
+    judge: ?JudgeReport = null,
     /// Only `--verbose` text lists the rules that did not fire.
     verbose: bool = false,
 
@@ -92,6 +106,7 @@ pub const TestSnapshot = struct {
                     .not_triggered = self.not_triggered,
                     .errors = self.errors,
                     .note = self.note,
+                    .judge = self.judge,
                 }, .{}, w);
                 try w.writeByte('\n');
             },
@@ -101,6 +116,7 @@ pub const TestSnapshot = struct {
                 if (self.file_path) |path| try w.print(" · path {s}", .{path});
                 try w.print(" · {d} bytes\n  \"{s}\"\n", .{ self.snippet_bytes, self.snippet_preview });
                 if (self.note) |note| try w.print("note: {s}\n", .{note});
+                if (self.judge) |judge| try writeJudge(w, judge);
                 for (self.errors) |failure| try w.print("error: {s}: {s}\n", .{ failure.name, failure.message });
                 if (self.triggered.len == 0) {
                     try w.print("No rules triggered ({d} evaluated).\n", .{self.evaluated});
@@ -117,6 +133,18 @@ pub const TestSnapshot = struct {
         return out.toOwnedSlice();
     }
 };
+
+fn writeJudge(w: *std.Io.Writer, judge: JudgeReport) !void {
+    if (judge.calls == 0) {
+        try w.print("judge: {s}\n", .{judge.unavailable orelse "no llm: condition needed a verdict"});
+        return;
+    }
+    try w.print("judge: {s}", .{judge.model orelse "?"});
+    if (judge.role) |role| try w.print(" via @{s}", .{role}) else try w.writeAll(" (the profile's model)");
+    try w.print(" · {d} of {d} question{s} answered", .{ judge.answered, judge.calls, if (judge.calls == 1) "" else "s" });
+    if (judge.unavailable) |reason| try w.print(" · {s}", .{reason});
+    try w.writeByte('\n');
+}
 
 pub const RuleError = struct { name: []const u8, message: []const u8 };
 

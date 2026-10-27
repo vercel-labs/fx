@@ -2186,7 +2186,7 @@ fn resolveModelRole(raw_ctx: ?*anyopaque, name: []const u8) subagent_tool_host.M
     const role = model_roles.Role.parse(name) orelse return .unknown_role;
     const startup = ctx.role_startup orelse return .unavailable;
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
-    return if (startup.rolePick(role, bundle.title_model)) |picked| .{ .model = .{ .id = picked.model, .effort = picked.effort } } else .unavailable;
+    return if (startup.rolePick(role, bundle.title_model, null)) |picked| .{ .model = .{ .id = picked.model, .effort = picked.effort } } else .unavailable;
 }
 
 fn resolveModelOverride(raw_ctx: ?*anyopaque, alloc: Allocator, raw_model: []const u8) Allocator.Error!subagent_model_contract.ModelCatalogMatch {

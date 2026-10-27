@@ -3815,7 +3815,17 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
         std.mem.eql(u8, command, "models") or
         std.mem.eql(u8, command, "credits") or
         // Reads AI Gateway usage reports over HTTP with a deadline.
-        std.mem.eql(u8, command, "usage");
+        std.mem.eql(u8, command, "usage") or
+        // `ttsr test --llm` asks a model (D253).
+        (std.mem.eql(u8, command, "ttsr") and hasArg(effective_args, "--llm"));
+}
+
+fn hasArg(args: []const [:0]const u8, wanted: []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--")) return false;
+        if (std.mem.eql(u8, arg, wanted)) return true;
+    }
+    return false;
 }
 
 test "the supervisor runs as a hidden command with the full entry config" {
@@ -3833,6 +3843,8 @@ test "auth and upgrade commands use early threaded io without full entry config"
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "logout")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "teams")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "provider")}));
+    try std.testing.expect(needsEarlyThreadedIo(&.{ @as([:0]const u8, "ttsr"), "test", "--llm", "x" }));
+    try std.testing.expect(!needsEarlyThreadedIo(&.{ @as([:0]const u8, "ttsr"), "test", "x" }));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "usage")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "setup")}));
 }
@@ -5195,6 +5207,7 @@ test {
     _ = @import("core/model_hub/hub.zig");
     _ = @import("ui/model_hub/screen.zig");
     _ = @import("core/cli/cli_ttsr.zig");
+    _ = @import("core/cli/cli_ttsr_judge.zig");
     _ = @import("core/output/ttsr_snapshot.zig");
     _ = @import("core/output/web_search_snapshot.zig");
     _ = @import("core/cli/cli_read.zig");

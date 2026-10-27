@@ -326,7 +326,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .ttsr,
         .token = "ttsr",
-        .usage = "ttsr <list|test|scan> [<snippet>|<folder>] [--rule <file>] [--file <path>|-] [--source <text|thinking|tool>] [--tool <name>] [--path <file>] [--max-bytes <n>] [--verbose] [--json]",
+        .usage = "ttsr <list|test|scan> [<snippet>|<folder>] [--rule <file>] [--file <path>|-] [--source <text|thinking|tool>] [--tool <name>] [--path <file>] [--llm] [--max-bytes <n>] [--verbose] [--json]",
         .summary = "List, test, and scan with the workspace's stream rules",
         .options = &.{
             .{ .flag = "--rule <file>", .description = "Evaluate this one rule file alone instead of the workspace's rules" },
@@ -334,6 +334,7 @@ pub const top_level_specs = [_]TopLevelSpec{
             .{ .flag = "--source <kind>", .description = "test: match as assistant text, thinking, or a tool call (default: inferred from the file)" },
             .{ .flag = "--tool <name>", .description = "test: the tool call the snippet stands for (default: shell)" },
             .{ .flag = "--path <file>", .description = "test: the file the snippet is written to, which sets its language" },
+            .{ .flag = "--llm", .description = "test: judge llm: conditions with the model the rule's roles pick (tiny, then small), or the profile's model" },
             .{ .flag = "--max-bytes <n>", .description = "scan: skip files larger than this (default: 5242880; 0 for no limit)" },
             .{ .flag = "--verbose", .description = "test: also list rules that did not fire. scan: list matched files and lines" },
             json_option,
@@ -342,7 +343,7 @@ pub const top_level_specs = [_]TopLevelSpec{
             "Stream rules watch the model's text, reasoning and tool calls as they stream. When one matches, proto-fx stops the response and retries with the rule, or adds it to the tool result or after the reply, as the rule's interruptMode says.",
             "Rules are Markdown with a match: condition in their frontmatter, read from .proto-fx/rules and ~/.proto-fx/rules, Cursor's .cursor/rules/*.mdc, Windsurf's .windsurf/rules, and the built-in rules.",
             "In ~/.proto-fx/settings.json, \"ttsr\": {\"enabled\", \"context_mode\": \"discard\"|\"keep\", \"interrupt_mode\", \"repeat_mode\": \"once\"|\"after-gap\", \"repeat_gap\", \"builtin_rules\", \"disabled_rules\": [...]} configures them; PROTO_FX_TTSR=0 turns them off.",
-            "test and scan never call a model, so a condition that asks one (llm:) does not match there.",
+            "scan never calls a model, and test calls one only with --llm, so without it a condition that asks one (llm:) does not match.",
         },
     },
     .{
