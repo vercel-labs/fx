@@ -53,6 +53,7 @@ pub const ConversationUser = struct {
     text: []const u8,
     images: []const types.ImageAttachment = &.{},
     work_id: ?[]const u8 = null,
+    origin: types.UserOrigin = .user,
 };
 
 pub const ConversationToolCall = struct {
@@ -493,6 +494,7 @@ pub fn appendHistoryTurnConversationEvents(
                 .text = entry.user.text,
                 .images = entry.user.images,
                 .work_id = entry.user.work_id,
+                .origin = entry.user.origin,
             } });
             try appendExecutionConversationEvents(alloc, events, entry.execution);
             const follows_standalone = entry.execution.tool_steps.len > 0 and
@@ -510,6 +512,7 @@ pub fn appendHistoryTurnConversationEvents(
                 .text = entry.user.text,
                 .images = entry.user.images,
                 .work_id = entry.user.work_id,
+                .origin = entry.user.origin,
             } });
             try appendExecutionConversationEvents(alloc, events, entry.execution);
             if (entry.tool_call) |call| {

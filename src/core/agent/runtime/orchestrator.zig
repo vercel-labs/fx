@@ -3866,7 +3866,7 @@ fn appendRunningToolCalls(
     const issuing = current_turn_messages[current_turn_messages.len - 1];
     std.debug.assert(issuing.role == .assistant and issuing.tool_calls.len == calls.len);
     try append(deps.ctx, .{
-        .user = .{ .text = @constCast(job.prompt), .images = job.images },
+        .user = .{ .text = @constCast(job.prompt), .images = job.images, .origin = job.prompt_origin },
         .execution = try finalization.compacted_execution.project(arena, execution),
         .running_calls = running,
         .running_assistant = issuing.content,
@@ -3965,7 +3965,7 @@ fn persistRecoveryCheckpointWithAction(
         current_turn_messages,
     );
     const projected = try finalization.compacted_execution.project(arena, execution);
-    const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images };
+    const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images, .origin = job.prompt_origin };
     // Every completed piece reaches the session before the next request.
     if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = projected });
     const effect = deps.recovery_checkpoint orelse return;
@@ -4088,7 +4088,7 @@ const CompactionSource = struct {
         const execution = try runtime_execution_memory.buildExecutionMemory(self.arena, self.current_turn_messages);
         try effect.set(deps.ctx, .{
             .turn_id = job.turn_id,
-            .user = .{ .text = @constCast(job.prompt), .images = job.images },
+            .user = .{ .text = @constCast(job.prompt), .images = job.images, .origin = job.prompt_origin },
             .assistant_source = @constCast(""),
             .execution = try self.finalization.compacted_execution.project(self.arena, execution),
             .cause = .compaction_prepared,
@@ -5319,6 +5319,8 @@ fn restorePromptAfterTerminalFailure(
 ) void {
     if (config.origin != .root) return;
     if (job.recovery_checkpoint != null) return;
+    // fx wrote a job notice; the person's composer never gets it back.
+    if (job.prompt_origin != .user) return;
     const restore = deps.restore_failed_prompt orelse return;
     const prompt = std.mem.trim(u8, job.prompt, " \t\r\n");
     if (prompt.len == 0) return;
@@ -5761,7 +5763,8 @@ fn processQueuedPromptInner(
     defer if (skill_section) |*section| section.deinit(arena);
     var explicit_section: ?skill_invocation.ExplicitPromptSection = null;
     defer if (explicit_section) |*section| section.deinit(arena);
-    if (skill_section != null or config.skill_bindings.len > 0) {
+    // A skill named in a job notice is job output, never the person asking.
+    if (job.prompt_origin == .user and (skill_section != null or config.skill_bindings.len > 0)) {
         explicit_section = load_explicit: while (true) {
             const prepared = skill_invocation.buildExplicitPromptSection(arena, config.skill_catalog, job.prompt, config.skill_bindings, config.context_limits, config.cancel_flag) catch |err| {
                 if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
@@ -6018,6 +6021,7 @@ fn buildReviewTurnContext(
     credential: types.CredentialLease,
     target_call_id: []const u8,
     review_attempt_available: bool,
+    turn_notice: []const u8,
 ) permission_auto_classifier.ReviewTurnContext {
     const trusted_root_context = auto_classifier_context.rootUserRequestContext(
         root_user_intent_context,
@@ -6034,7 +6038,14 @@ fn buildReviewTurnContext(
         },
         .trusted_root_context = trusted_root_context,
         .current_turn_untrusted_messages = current_turn_messages,
+        .untrusted_turn_notice = turn_notice,
     };
+}
+
+/// The job notice that started this turn, which the reviewer sees only as
+/// untrusted evidence (D111); empty for a person's prompt.
+fn untrustedTurnNotice(job: QueuedPrompt) []const u8 {
+    return if (job.prompt_origin == .job_notice) job.prompt else "";
 }
 
 pub fn permissionDeniedModelOutput(
@@ -6914,9 +6925,10 @@ fn processQueuedPromptLoop(
         .root => if (job.root_user_intent_context.len > 0)
             job.root_user_intent_context
         else
-            try auto_classifier_context.buildCanonicalRootUserContext(
+            try auto_classifier_context.buildCanonicalRootUserContextForOrigin(
                 arena,
                 job.prompt,
+                job.prompt_origin,
                 job.history,
             ),
     };
@@ -7598,7 +7610,7 @@ fn processQueuedPromptLoop(
                 } else {
                     // The pending user is source too, even before the first tool.
                     const active_prefix: types.AssistantHistoryTurn = .{
-                        .user = .{ .text = job.prompt, .images = job.images },
+                        .user = .{ .text = job.prompt, .images = job.images, .origin = job.prompt_origin },
                         .assistant = @constCast(""),
                         .execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items[compacted_suffix_len..]),
                     };
@@ -9525,7 +9537,7 @@ fn processQueuedPromptLoop(
             const finish_execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items);
             const completed_summary = summary_accumulator.finish();
             var turn: HistoryTurn = .{ .assistant = .{
-                .user = .{ .text = job.prompt, .images = job.images },
+                .user = .{ .text = job.prompt, .images = job.images, .origin = job.prompt_origin },
                 .assistant = @constCast(assistant_text),
                 .execution = try finalization.compacted_execution.project(arena, finish_execution),
             } };
@@ -10343,6 +10355,7 @@ fn processQueuedPromptLoop(
                         activeCredentialLease(active_api_key, job),
                         parallel_call.id,
                         parallel_review_attempt_available,
+                        untrustedTurnNotice(job),
                     );
                     if (parallel_preserved_review_hold != null) {
                         debug_trace.eventf(
@@ -11365,6 +11378,7 @@ fn processQueuedPromptLoop(
                 activeCredentialLease(active_api_key, job),
                 execution_call.id,
                 review_attempt_available,
+                untrustedTurnNotice(job),
             );
             const tool_execution_root_user_context = try buildToolExecutionRootUserContext(
                 call_allocator,
@@ -12672,7 +12686,7 @@ fn finishFailedTurnWithNotice(
     );
     const completed_summary = summary_accumulator.finish();
     var turn: HistoryTurn = .{ .assistant = .{
-        .user = .{ .text = job.prompt, .images = job.images },
+        .user = .{ .text = job.prompt, .images = job.images, .origin = job.prompt_origin },
         .assistant = @constCast(notice),
         .execution = try finalization.compacted_execution.project(arena, execution_memory),
     } };

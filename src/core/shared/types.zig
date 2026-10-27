@@ -1656,12 +1656,23 @@ pub const ImageAttachment = struct {
     }
 };
 
+/// Who wrote a turn's user message. Saved with the turn, never inferred from
+/// its text.
+pub const UserOrigin = enum {
+    /// The person, or a client acting for them.
+    user,
+    /// fx, delivering settled background jobs (D111). Untrusted: it carries
+    /// command output and is never user intent.
+    job_notice,
+};
+
 pub const UserTurn = struct {
     text: []u8,
     images: []ImageAttachment = &.{},
     /// Durable join key for manager-owned child work. This is metadata only;
     /// model projections continue to use `text` and `images` exclusively.
     work_id: ?[]u8 = null,
+    origin: UserOrigin = .user,
 };
 
 /// Borrows both strings; use dupeProviderReplay/freeProviderReplay for ownership.
@@ -3430,6 +3441,7 @@ pub fn dupeUserTurn(alloc: std.mem.Allocator, user: UserTurn) !UserTurn {
         .text = text,
         .images = images,
         .work_id = work_id,
+        .origin = user.origin,
     };
 }
 

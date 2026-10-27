@@ -1953,7 +1953,7 @@ pub const Session = struct {
             };
             image.blob_path = self.prompt_blobs.get(digest);
         }
-        return encodePiece(a, .{ .user = .{ .text = user.text, .images = images, .work_id = user.work_id } });
+        return encodePiece(a, .{ .user = .{ .text = user.text, .images = images, .work_id = user.work_id, .origin = user.origin } });
     }
 
     /// Streams the turn so far (`AgentRuntimeDeps.append_turn_piece`): the
@@ -1976,7 +1976,7 @@ pub const Session = struct {
         defer arena.deinit();
         const a = arena.allocator();
         var events: std.ArrayList(Event) = .empty;
-        try events.append(a, .{ .user = .{ .text = user.text, .images = user.images, .work_id = user.work_id } });
+        try events.append(a, .{ .user = .{ .text = user.text, .images = user.images, .work_id = user.work_id, .origin = user.origin } });
         // A result's blob needs the turn on disk first (D44).
         if (storesBodies(execution)) try self.openTurnLocked();
         // On a missing handle the list keeps the pieces before it.
@@ -3095,7 +3095,7 @@ const Source = struct {
             images.?[index].blob_path = blob_path;
         }
         const list = images orelse return user;
-        return .{ .text = user.text, .images = list, .work_id = user.work_id };
+        return .{ .text = user.text, .images = list, .work_id = user.work_id, .origin = user.origin };
     }
 
     /// A `user` item, each image saved as its own blob given only that
@@ -3108,7 +3108,7 @@ const Source = struct {
             const hash = image.blob orelse continue;
             out.blob_path = src.store.manager.blobPath(pa, src.id, hash) catch |err| return imageBlobFailed(src, image.id, err);
         }
-        return .{ .text = wire.text, .images = images, .work_id = wire.work_id };
+        return .{ .text = wire.text, .images = images, .work_id = wire.work_id, .origin = wire.origin orelse .user };
     }
 
     /// An image blob the log names that is gone or misnamed damages the
@@ -5087,6 +5087,7 @@ const WireUser = struct {
     text: []const u8,
     images: []const WireImage = &.{},
     work_id: ?[]const u8 = null,
+    origin: ?types.UserOrigin = null,
 
     /// `types.ImageAttachment` field for field, with `inline_data` in base64,
     /// or the image's own blob (D89): `blob` names it by its digest, and the
@@ -5152,11 +5153,33 @@ const WireUser = struct {
                 .source_ref = image.source_ref,
             };
         }
-        return .{ .text = user.text, .images = images, .work_id = user.work_id };
+        return .{
+            .text = user.text,
+            .images = images,
+            .work_id = user.work_id,
+            .origin = if (user.origin == .user) null else user.origin,
+        };
     }
 
     fn toUser(wire: WireUser, a: Allocator) !session_event.ConversationUser {
-        return .{ .text = wire.text, .images = try wire.toImages(a), .work_id = wire.work_id };
+        return .{ .text = wire.text, .images = try wire.toImages(a), .work_id = wire.work_id, .origin = wire.origin orelse .user };
+    }
+
+    /// Writes `origin` only for fx's own messages, so a person's prompt
+    /// encodes as it did before origins existed.
+    pub fn jsonStringify(self: WireUser, writer: *std.json.Stringify) !void {
+        try writer.beginObject();
+        try writer.objectField("text");
+        try writer.write(self.text);
+        try writer.objectField("images");
+        try writer.write(self.images);
+        try writer.objectField("work_id");
+        try writer.write(self.work_id);
+        if (self.origin) |origin| {
+            try writer.objectField("origin");
+            try writer.write(@tagName(origin));
+        }
+        try writer.endObject();
     }
 
     /// The images, without the bytes of those in blobs: `Source.decodeUser`
@@ -9534,4 +9557,18 @@ test "only the adapter imports the session manager" {
         checked += 1;
     }
     try testing.expect(checked > 100);
+}
+
+test "a job notice turn keeps its origin through the saved user piece" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const encoded = try encodePiece(a, .{ .user = .{ .text = "notice", .origin = .job_notice } });
+    try testing.expect(std.mem.find(u8, encoded, "\"origin\":\"job_notice\"") != null);
+    const decoded = try decodePiece(a, .user, encoded, .alloc_always);
+    try testing.expectEqual(types.UserOrigin.job_notice, decoded.user.origin);
+    // A person's prompt encodes as it did before origins existed.
+    const plain = try encodePiece(a, .{ .user = .{ .text = "hi" } });
+    try testing.expect(std.mem.find(u8, plain, "origin") == null);
+    try testing.expectEqual(types.UserOrigin.user, (try decodePiece(a, .user, plain, .alloc_always)).user.origin);
 }

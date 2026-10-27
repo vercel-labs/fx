@@ -1257,6 +1257,7 @@ pub const ConversationTurnBuilder = struct {
             .text = @constCast(value.text),
             .images = @constCast(value.images),
             .work_id = if (value.work_id) |work_id| @constCast(work_id) else null,
+            .origin = value.origin,
         });
     }
 

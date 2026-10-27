@@ -901,6 +901,14 @@ fn appendMarkdownLinkClose(alloc: Allocator, out: *std.ArrayList(u8), uri: []con
 
 /// Runs a prompt turn under the mode and permission policy captured at
 /// dispatch. Mid-turn session/set_mode changes only affect later prompts.
+/// Whether `params` carry the supervisor's job-notice marker.
+fn promptIsJobNotice(alloc: Allocator, params: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    return acp_types.fxMetaBool(parsed.value.object, "notice") orelse false;
+}
+
 pub fn handlePrompt(
     state: *server.ServerState,
     alloc: Allocator,
@@ -953,6 +961,9 @@ pub fn handlePrompt(
         next_image_id,
         state.cfg.host_attachments,
     ) catch |err| return promptInputFailure(err);
+    // Only the supervisor sets `_meta.fx.notice`, on a job notice it wrote.
+    // Marking a prompt a notice only ever takes authority away.
+    const prompt_origin: types.UserOrigin = if (promptIsJobNotice(alloc, params)) .job_notice else .user;
     defer prompt_input.deinit(alloc);
     if (prompt_input.pending_images.len > 0) {
         if (session.wasm_state == null and session.v2 == null) {
@@ -1151,9 +1162,10 @@ pub fn handlePrompt(
     defer types.freeHistoryTurnSlice(alloc, context_history);
     var context_snapshot = try state.context_snapshot.dupe(alloc);
     defer context_snapshot.deinit(alloc);
-    const root_user_intent_context = try auto_classifier_context.buildCanonicalRootUserContext(
+    const root_user_intent_context = try auto_classifier_context.buildCanonicalRootUserContextForOrigin(
         alloc,
         owned_prompt,
+        prompt_origin,
         session.session_rt.agent.history.items,
     );
     defer alloc.free(root_user_intent_context);
@@ -1168,6 +1180,7 @@ pub fn handlePrompt(
     const job: worker_runtime.QueuedPrompt = .{
         .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0,
         .prompt = @constCast(owned_prompt),
+        .prompt_origin = prompt_origin,
         .images = @constCast(current_images),
         .authorized_image_catalog = authorized_image_catalog,
         .model = session.model,
