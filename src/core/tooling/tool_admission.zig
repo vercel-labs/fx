@@ -113,8 +113,17 @@ fn registeredTerminalCallReadsOnly(
     arena: Allocator,
     call: ToolCall,
 ) !bool {
+    return registeredCallReadsOnly(input, arena, call, .terminal);
+}
+
+fn registeredCallReadsOnly(
+    input: Input,
+    arena: Allocator,
+    call: ToolCall,
+    kind: tool_dispatch.ExecutorKind,
+) !bool {
     const tool = registeredTool(input, call.name) orelse return false;
-    if (tool.executor_kind != .terminal) return false;
+    if (tool.executor_kind != kind) return false;
     const decode_ctx = tool_dispatch.DispatchContext{
         .allocator = arena,
         .workspace_root = input.workspace_root,
@@ -165,6 +174,7 @@ fn permissionNameForCall(input: Input, arena: Allocator, call: ToolCall) ![]cons
     const command_call = try isRunCommandCall(input, arena, call);
     if (command_call) return "run_command";
     if (try isReadFileUrlCall(input, arena, call)) return permissions.web_fetch_permission;
+    if ((try browserOpenUrl(input, arena, call)) != null) return permissions.web_fetch_permission;
     return if (std.mem.eql(u8, call.name, "shell")) "terminal" else call.name;
 }
 
@@ -178,6 +188,29 @@ fn permissionTargetKindForCall(
         .command_cwd
     else
         permissionTargetKind(input.tool_registry, call.name);
+}
+
+/// The URL a browser open loads, when it is a web URL: web_fetch's domain
+/// rules and grants decide it (D198).
+fn browserOpenUrl(input: Input, arena: Allocator, call: ToolCall) !?[]const u8 {
+    const tool = registeredTool(input, call.name) orelse return null;
+    if (tool.executor_kind != .browser) return null;
+    const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    const action = tool_args.optionalStringArg(args, "action") orelse return null;
+    if (!std.mem.eql(u8, action, "open")) return null;
+    const url = std.mem.trim(u8, tool_args.optionalStringArg(args, "url") orelse return null, " \t\r\n");
+    return if (read_target.isWebUrl(url)) url else null;
+}
+
+fn browserOpenTarget(input: Input, arena: Allocator, call: ToolCall) !?[]u8 {
+    const url = (try browserOpenUrl(input, arena, call)) orelse return null;
+    return permissions.webFetchDomainTargetForUrl(arena, url) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidToolArguments,
+    };
 }
 
 /// A built-in read_file call whose path is a web URL fetches like web_fetch,
@@ -1137,6 +1170,11 @@ fn resolveOrdinaryPermissionOutcome(
         return ordinaryPermissionOutcome(.once);
     }
     if (!command_call and !toolRequiresApproval(input, call.name) and !is_dynamic_tool) {
+        return ordinaryPermissionOutcome(.once);
+    }
+    // Opening and closing browser tabs answer only to rules, as web_fetch
+    // does; a browser run executes code and asks or is reviewed (D198).
+    if (!command_call and !is_dynamic_tool and try registeredCallReadsOnly(input, arena, call, .browser)) {
         return ordinaryPermissionOutcome(.once);
     }
 
@@ -2630,6 +2668,11 @@ fn permissionTargetsForCall(input: Input, arena: Allocator, call: ToolCall) !per
         return .{ .items = items };
     }
     const tool = registeredTool(input, call.name) orelse return error.UnsupportedTool;
+    if (try browserOpenTarget(input, arena, call)) |target| {
+        const items = try arena.alloc(permissions.PermissionCallTarget, 1);
+        items[0] = .{ .role = "target", .path = target };
+        return .{ .items = items };
+    }
     if (try isRunCommandCall(input, arena, call)) {
         const items = try arena.alloc(permissions.PermissionCallTarget, 1);
         errdefer arena.free(items);
@@ -2686,6 +2729,7 @@ pub fn permissionTargetForCall(input: Input, arena: Allocator, call: ToolCall) !
     if (isAvailableDynamicTool(input, call.name)) return arena.dupe(u8, call.name);
     if (registeredWebSearchTarget(input, call.name)) |target_name| return arena.dupe(u8, target_name);
     const tool = registeredTool(input, call.name) orelse return error.UnsupportedTool;
+    if (try browserOpenTarget(input, arena, call)) |target| return target;
     if (try isRunCommandCall(input, arena, call)) {
         return commandPermissionTarget(input, arena, call);
     }
@@ -5084,6 +5128,32 @@ test "read_file URLs answer to web_fetch domain rules and selectors to the file'
         .arguments_json = "{\"path\":\"https://open.example/\"}",
     }, .ask, &.{});
     try std.testing.expect(other.decision != ToolPermissionDecision.policy_denied);
+}
+
+test "browser opens answer to web_fetch domain rules without approval while runs ask (D198)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    const tools = [_]tool_dispatch.Tool{test_builtin_tools.browser};
+    input.tool_registry = .{ .tools = tools[0..] };
+    var rules = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("domain:blocked.example"), .action = .deny },
+    };
+    input.permission_rules = .{ .rules = rules[0..] };
+
+    const blocked = try requestPermissionOutcome(input, arena, .{ .id = "b", .name = "browser", .arguments_json = "{\"action\":\"open\",\"url\":\"https://blocked.example/login\"}" }, .ask, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, blocked.decision);
+    const open = try requestPermissionOutcome(input, arena, .{ .id = "o", .name = "browser", .arguments_json = "{\"action\":\"open\",\"url\":\"https://example.com/\"}" }, .ask, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.once, open.decision);
+    try std.testing.expectEqualStrings("domain:example.com", try permissionTargetForCall(input, arena, .{ .id = "o", .name = "browser", .arguments_json = "{\"action\":\"open\",\"url\":\"https://example.com/\"}" }));
+    const close = try requestPermissionOutcome(input, arena, .{ .id = "c", .name = "browser", .arguments_json = "{\"action\":\"close\",\"all\":true}" }, .ask, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.once, close.decision);
+    const run = try requestPermissionOutcome(input, arena, .{ .id = "r", .name = "browser", .arguments_json = "{\"action\":\"run\",\"code\":\"await tab.click('#buy')\"}" }, .ask, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.permission_required, run.decision);
+    try std.testing.expectEqualStrings("browser", try permissionTargetForCall(input, arena, .{ .id = "r", .name = "browser", .arguments_json = "{\"action\":\"run\",\"code\":\"1\"}" }));
 }
 
 test "automatic review receives exact command and mints matching one-call authority" {

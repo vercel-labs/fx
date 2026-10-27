@@ -21,6 +21,7 @@ const human_text = @import("../../core/shared/human_text.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const tool_args = @import("../../core/tooling/tool_args.zig");
 const python_outline = @import("python_outline.zig");
+const browser_summary = @import("../../core/browser/script_summary.zig");
 
 const Allocator = std.mem.Allocator;
 const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
@@ -36,6 +37,8 @@ const tail_blocks = 3;
 /// Rows a Python outline shows, `Module · N nodes` included, before
 /// "… N more".
 const outline_rows = 9;
+/// Script lines a browser run shows, "… N more lines" included.
+const browser_code_rows = 6;
 /// Shell lines kept on each side of an embedded Python cell.
 const shell_chunk_lines = 2;
 /// Names a fold lists before "+N".
@@ -119,6 +122,8 @@ pub fn tierOf(arena: Allocator, item: Item) Tier {
         return if (std.mem.eql(u8, op, "interact") or watched) .routine else .outcome;
     }
     if (std.mem.eql(u8, name, "jobs")) return if (isOneOf(op, &.{"cancel"})) .outcome else .routine;
+    // Opening a page and running a script are what happened; closing is routine.
+    if (std.mem.eql(u8, name, "browser")) return if (isOneOf(op, &.{"close"})) .routine else .outcome;
     if (std.mem.eql(u8, name, "fleet")) return if (isOneOf(op, &.{ "spawn", "run", "terminate" })) .outcome else .routine;
     const kind = record.activity_kind orelse return .outcome;
     return switch (kind) {
@@ -400,6 +405,7 @@ fn firstRow(text: []const u8) ?[]const u8 {
 /// outcome and a failed one says why: "Exited 1 · AttributeError: …".
 fn itemText(arena: Allocator, item: Item) ![]const u8 {
     const record = item.detail orelse return item.phrase;
+    if (std.mem.eql(u8, record.tool_name, "browser")) return browserText(arena, item, record);
     if (!isCommandRun(arena, record)) return item.phrase;
     if (commandFailed(record)) {
         const label = switch (record.command_process_presentation.?) {
@@ -431,12 +437,35 @@ fn itemText(arena: Allocator, item: Item) ![]const u8 {
     return item.phrase;
 }
 
+/// A browser row in proto-fx's voice: "Opened example.com", and a settled
+/// run by what its script did, "Filled #email, clicked Sign in".
+fn browserText(arena: Allocator, item: Item, record: *const ToolDetailRecord) ![]const u8 {
+    const json = record.arguments_json orelse return item.phrase;
+    const args = tool_args.parseToolArgsObject(arena, json) catch return item.phrase;
+    const action = tool_args.optionalStringArg(args, "action") orelse return item.phrase;
+    if (std.mem.eql(u8, action, "open")) {
+        const url = tool_args.optionalStringArg(args, "url") orelse return item.phrase;
+        const verb = for ([_][]const u8{ "Opened", "Opening" }) |candidate| {
+            if (std.mem.startsWith(u8, item.phrase, candidate)) break candidate;
+        } else return item.phrase;
+        return arena.print("{s} {s}", .{ verb, browser_summary.shortUrl(url) });
+    }
+    if (!std.mem.eql(u8, action, "run") or isLive(record)) return item.phrase;
+    const code = tool_args.optionalStringArg(args, "code") orelse return item.phrase;
+    const summary = (try browser_summary.summarize(arena, code)) orelse return item.phrase;
+    if (isFailure(record)) {
+        if (try human_text.failureReason(arena, record.result orelse "")) |reason| return arena.print("Failed · {s}", .{reason});
+    }
+    return summary;
+}
+
 /// The command as the model wrote it, newlines intact, which a heredoc's
 /// outline needs; the display text folds them away.
 fn commandText(arena: Allocator, record: *const ToolDetailRecord) ?[]const u8 {
     if (record.arguments_json) |json| {
         if (tool_args.parseToolArgsObject(arena, json)) |args| {
             if (tool_args.optionalStringArg(args, "command")) |command| return command;
+            if (std.mem.eql(u8, record.tool_name, "browser")) if (tool_args.optionalStringArg(args, "code")) |code| return code;
         } else |_| {}
     }
     return record.command_display;
@@ -446,7 +475,7 @@ fn commandText(arena: Allocator, record: *const ToolDetailRecord) ?[]const u8 {
 /// its visible output. Other command tools keep an envelope for the model,
 /// so their output stays in the full transcript.
 fn commandOutput(record: *const ToolDetailRecord) []const u8 {
-    if (!std.mem.eql(u8, record.tool_name, "shell")) return "";
+    if (!std.mem.eql(u8, record.tool_name, "shell") and !std.mem.eql(u8, record.tool_name, "browser")) return "";
     return record.result orelse "";
 }
 
@@ -461,6 +490,7 @@ fn appendCommandBody(arena: Allocator, rows: *std.ArrayList(Row), item: Item) !v
     const command = commandText(arena, record) orelse "";
     const failed = commandFailed(record);
     const reason = if (failed) try human_text.failureReason(arena, commandOutput(record)) else null;
+    if (std.mem.eql(u8, record.tool_name, "browser")) return appendBrowserBody(arena, rows, item.entry_id, command, commandOutput(record));
     const script = python_outline.script(command);
     if (failed and reason != null and command.len > 0) {
         const shown = if (script) |found| try arena.print("{s} {s}", .{ found.interpreter, found.form }) else firstLineOf(command);
@@ -489,6 +519,28 @@ fn appendCommandBody(arena: Allocator, rows: *std.ArrayList(Row), item: Item) !v
         const safe = try text_utils.encodeTerminalSafe(arena, plain, 400);
         try appendBody(arena, rows, item.entry_id, safe.bytes);
     }
+}
+
+/// A browser run as a code block: the script's first lines, then the end
+/// of what it displayed and returned.
+fn appendBrowserBody(arena: Allocator, rows: *std.ArrayList(Row), entry_id: u32, code: []const u8, output: []const u8) !void {
+    var lines: std.ArrayList([]const u8) = .empty;
+    var split = std.mem.splitScalar(u8, std.mem.trimEnd(u8, code, " \t\r\n"), '\n');
+    while (split.next()) |line| if (std.mem.trim(u8, line, " \t\r").len > 0) try lines.append(arena, line);
+    const limit = if (lines.items.len > browser_code_rows) browser_code_rows - 1 else lines.items.len;
+    for (lines.items[0..limit]) |line| try appendBody(arena, rows, entry_id, try safeLine(arena, line));
+    if (limit < lines.items.len) try appendBody(arena, rows, entry_id, try arena.print("… {d} more lines", .{lines.items.len - limit}));
+    var tail: std.ArrayList([]const u8) = .empty;
+    var out_split = std.mem.splitScalar(u8, output, '\n');
+    while (out_split.next()) |raw| {
+        const line = visibleLine(raw);
+        if (std.mem.trim(u8, line, " \t").len > 0) try tail.append(arena, line);
+    }
+    if (tail.items.len == 0) return;
+    try appendBody(arena, rows, entry_id, "Output");
+    const start = tail.items.len -| tail_lines;
+    if (start > 0) try appendBody(arena, rows, entry_id, try arena.print("… {d} earlier line{s}", .{ start, if (start == 1) "" else "s" }));
+    for (tail.items[start..]) |line| try appendBody(arena, rows, entry_id, try safeLine(arena, line));
 }
 
 /// A Python cell as proto shows it: the shell around it when the command
@@ -812,4 +864,23 @@ test "a Python cell inside other shell keeps its shell chunks, and unparsed code
     record.command_display = @constCast("python3 - <<'PY'\nprint((1,\nPY");
     const broken = try plan(arena, &items, false);
     try std.testing.expectEqualStrings("print((1,", broken[1].text);
+}
+
+test "browser rows read by what they opened and did, with the script and its output tail" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var opened = testRecord(1, "browser", .open, "{\"action\":\"open\",\"url\":\"https://example.com/\"}");
+    var ran = testRecord(2, "browser", .command, "{\"action\":\"run\",\"code\":\"await tab.fill('#name', 'Ada');\\nawait tab.click('text/Sign in');\\nreturn await tab.text('#out');\"}");
+    ran.result = @constCast("Hello Ada");
+    const items = [_]Item{
+        .{ .entry_id = 1, .detail = &opened, .phrase = "Opened https://example.com/" },
+        .{ .entry_id = 2, .detail = &ran, .phrase = "Ran browser script on main" },
+    };
+    const rows = try plan(arena, &items, false);
+    var texts: std.ArrayList([]const u8) = .empty;
+    for (rows) |row| try texts.append(arena, row.text);
+    const joined = try std.mem.join(arena, "\n", texts.items);
+    try std.testing.expect(std.mem.find(u8, joined, "Opened example.com") != null);
+    try std.testing.expect(std.mem.find(u8, joined, "Filled #name, clicked Sign in +1\nawait tab.fill('#name', 'Ada');\nawait tab.click('text/Sign in');\nreturn await tab.text('#out');\nOutput\nHello Ada") != null);
 }

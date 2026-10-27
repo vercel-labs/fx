@@ -266,6 +266,8 @@ pub const DispatchContext = struct {
     subtree_busy: ?SubtreeBusy = null,
     /// The session's Python kernel slot; null in hosts without a session runtime.
     kernel: ?*@import("../kernel/slot.zig").Slot = null,
+    /// The session node's browser, which the browser tool opens (D197).
+    browser: ?*@import("../browser/slot.zig").Slot = null,
     /// The running turn's services for `proto_fx` in agent shell commands.
     harness: ?@import("../harness/services.zig").Services = null,
     permission_mode: permission_gate.PermissionMode = .ask,
@@ -442,6 +444,8 @@ pub const ExecutorKind = enum {
     jobs,
     /// The model's checkpoint and rewind (D120).
     checkpoint,
+    /// Real Chromium tabs over the DevTools protocol (D195).
+    browser,
 };
 
 pub const ApprovalPolicy = enum {

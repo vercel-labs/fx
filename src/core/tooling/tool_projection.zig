@@ -18,6 +18,9 @@ pub const Options = struct {
     permission_rules: types.PermissionRuleSet = .{},
     subagent_available: bool = false,
     web_search: WebSearchExposure = .provider_native,
+    /// Whether a browser can be had: a configured endpoint or a local
+    /// Chromium. Without one the browser tool is not advertised (D196).
+    browser_available: bool = false,
 };
 
 const BuildKind = enum { full, read_only };
@@ -535,6 +538,7 @@ fn appendBuiltinTool(
     if (!includeBuiltinForKind(tool.name, kind, tool_set)) return;
     if (std.mem.eql(u8, tool.name, "fleet") and !options.subagent_available) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
+    if (tool.executor_kind == .browser and !options.browser_available) return;
     if (tool.executor_kind == .web_search) switch (options.web_search) {
         .provider_native => {},
         .hidden => return,

@@ -276,6 +276,7 @@ fn runAskChild(
             .permission_mode = admission.permission_mode,
             .permission_rules = admission.rules,
             .subagent_available = true,
+            .browser_available = builtin_tools.browserAvailable(),
             .web_search = ctx.webSearchExposure(),
         },
     ) catch return error.OutOfMemory;
@@ -1775,6 +1776,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .permission_mode = ctx.permission_mode,
         .permission_rules = ctx.permission_rules,
         .subagent_available = ctx.subagent_host != null,
+        .browser_available = builtin_tools.browserAvailable(),
         .web_search = ctx.webSearchExposure(),
     }, session_child_capability != null);
     defer tool_projection.deinit(alloc);

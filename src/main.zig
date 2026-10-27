@@ -2003,6 +2003,7 @@ const App = struct {
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
             .subagent_available = self.session_persistence.subagent_host != null,
+            .browser_available = builtin_tools.browserAvailable(),
             .web_search = AgentAppRuntime.webSearchExposure(self, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl()),
         });
     }
@@ -4918,6 +4919,20 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
 
 test {
     _ = @import("core/agent/runtime/journal.zig");
+    _ = @import("core/browser/websocket.zig");
+    _ = @import("core/browser/cdp.zig");
+    _ = @import("core/browser/launch.zig");
+    _ = @import("core/browser/browser.zig");
+    _ = @import("core/browser/slot.zig");
+    _ = @import("core/browser/endpoint.zig");
+    _ = @import("core/browser/settings.zig");
+    _ = @import("core/browser/script_summary.zig");
+    _ = @import("tools/browser/browser.zig");
+    _ = @import("tools/browser/page.zig");
+    _ = @import("tools/browser/observe.zig");
+    _ = @import("tools/browser/output.zig");
+    _ = @import("tools/browser/run.zig");
+    _ = @import("tools/browser/live_tests.zig");
     _ = checkpoint_indicator;
     _ = @import("acp/libfx_journal.zig");
     _ = @import("mcp/mcp.zig");

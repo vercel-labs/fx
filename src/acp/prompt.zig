@@ -1170,6 +1170,7 @@ pub fn handlePrompt(
         .permission_mode = captured_permission_mode,
         .permission_rules = session.permission_rules,
         .subagent_available = state.subagent_host != null,
+        .browser_available = builtin_tools.browserAvailable(),
         .web_search = webSearchExposure(state, session),
     });
     defer tool_projection.deinit(alloc);
@@ -1422,6 +1423,7 @@ pub fn runSubagentChild(
             .permission_mode = admission.permission_mode,
             .permission_rules = admission.rules,
             .subagent_available = true,
+            .browser_available = builtin_tools.browserAvailable(),
             .web_search = webSearchExposure(state, active),
         },
     ) catch return error.OutOfMemory;
