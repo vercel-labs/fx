@@ -64,6 +64,8 @@ pub const View = struct {
     child_transcript: bool = false,
     /// The path to the focused node, `root › a › b`; empty at the root.
     breadcrumb: []const u8 = "",
+    /// Background jobs still running in the session.
+    running_jobs: u32 = 0,
     /// Left and Right open the session and subagent browser.
     session_browser: bool = false,
     /// Model pickers can offer effort and speed stages, because this
@@ -98,6 +100,7 @@ pub fn Ops(comptime App: type) type {
                     .workspace_label = remote.workspace_label,
                     .child_transcript = remote.child_id.len > 0,
                     .breadcrumb = remote.breadcrumb,
+                    .running_jobs = remote.running_jobs,
                     .session_browser = true,
                     .model_options = false,
                     .session_controls = false,

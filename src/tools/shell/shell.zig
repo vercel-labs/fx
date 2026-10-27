@@ -171,6 +171,9 @@ test "inferAction names the one action a call's fields fit" {
 const OwnedInput = struct {
     arena_state: std.heap.ArenaAllocator.State,
     value: Input,
+    /// A run without yield_time_ms: it waits up to the auto-background
+    /// threshold and then becomes a background job.
+    auto_background: bool = false,
 
     fn deinit(self: *OwnedInput, alloc: Allocator) void {
         self.arena_state.promote(alloc).deinit();
@@ -228,6 +231,7 @@ fn decode_input(
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
+    const auto_background = raw.object.get("yield_time_ms") == null and action == .run and !input.tty;
     if (raw.object.get("yield_time_ms") == null) {
         input.yield_time_ms = defaultYieldTime(action);
     }
@@ -236,6 +240,7 @@ fn decode_input(
     owned.* = .{
         .arena_state = arena_state.state,
         .value = input,
+        .auto_background = auto_background,
     };
     arena_state.state = .init;
     return .{
@@ -592,9 +597,10 @@ pub fn call(
     ctx: tool_dispatch.DispatchContext,
     erased: tool_dispatch.ToolInput,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    const input = erased.as(OwnedInput).value;
+    const owned = erased.as(OwnedInput);
+    const input = owned.value;
     return switch (input.action) {
-        .run => callRun(ctx, input),
+        .run => callRun(ctx, input, owned.auto_background),
         .interact => callInteract(ctx, input),
         .stop => callStop(ctx, input),
     };
@@ -603,6 +609,7 @@ pub fn call(
 fn callRun(
     ctx: tool_dispatch.DispatchContext,
     input: Input,
+    auto_background: bool,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     if (input.tty) {
         return callTtyRun(ctx, input);
@@ -669,6 +676,9 @@ fn callRun(
         .output_chunk_ctx = ctx.output_chunk_ctx,
         .on_output_chunk = ctx.on_output_chunk,
         .yield_time_ms = input.yield_time_ms,
+        // Without a job registry nothing would deliver a backgrounded
+        // result, so the command keeps the ordinary window.
+        .auto_background_ms = if (auto_background and ctx.jobs != null) ctx.auto_background_ms else null,
         .cancel_flag = ctx.cancel_flag,
     }) catch |err| {
         if (err == error.Cancelled and
@@ -680,10 +690,61 @@ fn callRun(
         return runtimeFailure(ctx, err);
     };
     defer prepared.deinit(ctx.allocator);
-    const result = try finishPrepared(ctx, runtime, &prepared, .command);
+    const running = prepared.snapshot.state == .running and ctx.jobs != null;
+    var job_id_buffer: [64]u8 = undefined;
+    const job_id = if (running) jobIdFor(&job_id_buffer, prepared.snapshot.execution_id) else null;
+    const finished = try finishPrepared(ctx, runtime, &prepared, .command);
+    const result = if (job_id) |id|
+        attachJobNotice(ctx.allocator, finished, id, auto_background) catch |err| {
+            finished.deinit(ctx.allocator);
+            return err;
+        }
+    else
+        finished;
     return attachSnapshotNotice(ctx.allocator, result) catch |err| {
         result.deinit(ctx.allocator);
         return err;
+    };
+}
+
+/// `shell-3` runs as background job `bg_3`.
+fn jobIdFor(buffer: []u8, execution_id: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, execution_id, "shell-")) return null;
+    return std.mem.print(buffer, "bg_{s}", .{execution_id["shell-".len..]}) catch null;
+}
+
+/// Names the background job a still-running command became, and how its
+/// result arrives, in a JSON run result.
+fn attachJobNotice(
+    alloc: Allocator,
+    result: tool_dispatch.ToolResult,
+    job_id: []const u8,
+    auto_background: bool,
+) Allocator.Error!tool_dispatch.ToolResult {
+    const body = switch (result) {
+        .success, .failure => |value| value,
+        .rich => return result,
+    };
+    if (body.len == 0 or body[body.len - 1] != '}') return result;
+    var notice_buffer: [256]u8 = undefined;
+    const notice = if (auto_background)
+        std.mem.print(&notice_buffer, "Backgrounded as job {s}; result will be delivered automatically.", .{job_id}) catch unreachable
+    else
+        std.mem.print(&notice_buffer, "Running as job {s}; its result will be delivered automatically unless shell interact or jobs wait collects it first.", .{job_id}) catch unreachable;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    out.writer.writeAll(body[0 .. body.len - 1]) catch return error.OutOfMemory;
+    out.writer.writeAll(",\"job_id\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(job_id, .{}, &out.writer) catch return error.OutOfMemory;
+    out.writer.writeAll(",\"job_notice\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(notice, .{}, &out.writer) catch return error.OutOfMemory;
+    out.writer.writeByte('}') catch return error.OutOfMemory;
+    const updated = try out.toOwnedSlice();
+    alloc.free(body);
+    return switch (result) {
+        .success => .{ .success = updated },
+        .failure => .{ .failure = updated },
+        .rich => unreachable,
     };
 }
 

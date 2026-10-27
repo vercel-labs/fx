@@ -200,6 +200,8 @@ pub const State = struct {
     native_turn_offset: u64 = 1,
     native_source_turn_id: ?u64 = null,
     model: []u8 = &.{},
+    /// The attached session's running background jobs, for the footer.
+    running_jobs: u32 = 0,
     cwd: []u8 = &.{},
     workspace_label: []u8 = &.{},
     incarnation: []u8 = &.{},

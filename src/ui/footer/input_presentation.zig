@@ -516,6 +516,7 @@ pub fn composeHintRow(
         base_hint_line;
 
     const width_usize: usize = width;
+    var jobs_buf: [max_status_line_len]u8 = undefined;
     const danger_text = dangerStatusText(approval_active, ctx, width);
     // The armed interrupt hint shrinks through compact variants so narrow
     // terminals still show the confirming-press cue; when no variant fits
@@ -550,6 +551,8 @@ pub fn composeHintRow(
         danger_text
     else if (ctx.upgrade_status.len > 0)
         ctx.upgrade_status
+    else if (ctx.running_jobs > 0)
+        runningJobsText(ctx.running_jobs, ctx.mcp_status, &jobs_buf)
     else
         ctx.mcp_status;
     const right_width = display_width.visibleWidth(right_text);
@@ -580,6 +583,20 @@ pub fn composeHintRow(
     }
 
     return row;
+}
+
+/// The running background-job count, ahead of any MCP status: "2 jobs
+/// running · <mcp>".
+fn runningJobsText(count: u32, mcp_status: []const u8, out: []u8) []const u8 {
+    const noun = if (count == 1) "job" else "jobs";
+    if (mcp_status.len == 0) return std.mem.print(out, "{d} {s} running", .{ count, noun }) catch "";
+    return std.mem.print(out, "{d} {s} running" ++ statusline_gap ++ "{s}", .{ count, noun, mcp_status }) catch "";
+}
+
+test "the footer counts running background jobs" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("1 job running", runningJobsText(1, "", &buf));
+    try std.testing.expectEqualStrings("3 jobs running" ++ statusline_gap ++ "mcp: 2", runningJobsText(3, "mcp: 2", &buf));
 }
 
 /// The focused node's path ahead of the hint line. It takes up to half the

@@ -1,4 +1,5 @@
 const std = @import("std");
+const jobs_card = @import("../jobs/card.zig");
 const builtin = @import("builtin");
 const command_policy = @import("command_policy.zig");
 const managed_execution = @import("../execution/managed_execution.zig");
@@ -179,6 +180,25 @@ pub fn subagentStatusLine(alloc: Allocator, call: ToolCall, output: []const u8) 
     const ok = parsed.value.object.get("ok") orelse return null;
     if (ok != .bool or !ok.bool) return null;
     return formatSubagentPlainAction(alloc, call, .pending);
+}
+
+/// The card of a `jobs` call, or the row of a shell run that went to the
+/// background. Null for every other call.
+pub fn jobsStatusLine(alloc: Allocator, call: ToolCall, output: []const u8) Allocator.Error!?[]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const text = (if (std.mem.eql(u8, call.name, "jobs"))
+        jobs_card.statusText(arena, output)
+    else if (std.mem.eql(u8, call.name, "shell"))
+        jobs_card.backgroundedShellText(arena, call.arguments_json, output)
+    else
+        null) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // A card that cannot be drawn falls back to the plain row.
+        else => null,
+    };
+    return if (text) |value| try alloc.dupe(u8, value) else null;
 }
 
 /// Only structured child terminal failures change the failure label.

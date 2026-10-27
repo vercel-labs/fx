@@ -21,6 +21,7 @@ const Allocator = std.mem.Allocator;
 comptime {
     std.debug.assert(command_replay_store.model_handle_notice_reserve_bytes < tool_result_limits.min_configured_tool_result_bytes);
 }
+const job_notice = @import("../../jobs/notice.zig");
 const ChatMessage = types.ChatMessage;
 const ToolCall = types.ToolCall;
 const Config = runtime_config.Config;
@@ -44,7 +45,21 @@ pub fn parentSteeringMessage(alloc: Allocator, text: []const u8) ![]u8 {
 }
 
 pub fn steeringMessage(alloc: Allocator, text: []const u8) ![]u8 {
+    // fx's own notices, such as settled background jobs, carry their own
+    // envelope and never read as the user's live update.
+    if (job_notice.isSystemNotice(text)) return alloc.dupe(u8, text);
     return alloc.print(steering_open ++ "{s}" ++ steering_close, .{text});
+}
+
+test "a job notice steers in its own envelope and survives a restore" {
+    const alloc = std.testing.allocator;
+    const text = job_notice.open_tag ++ "{\"jobs\":[]}\nBackground job bg_1 has completed." ++ job_notice.close_tag;
+    const message = try steeringMessage(alloc, text);
+    defer alloc.free(message);
+    try std.testing.expectEqualStrings(text, message);
+    try std.testing.expectEqualStrings(text, steeringText(message).?);
+    const restored = [_]ChatMessage{.{ .role = .user, .content = text, .restored_steering = true }};
+    try std.testing.expect((try rewrapRestoredSteering(alloc, &restored)).ptr == (&restored).ptr);
 }
 
 test "steering message tells the model to apply the update and continue" {
@@ -311,7 +326,7 @@ pub fn rewrapRestoredSteering(arena: Allocator, messages: []const ChatMessage) A
     for (messages, 0..) |message, index| {
         if (!message.restored_steering) continue;
         const text = message.content orelse continue;
-        if (text.len == 0 or steeringText(text) != null or std.mem.eql(u8, text, resume_notice)) continue;
+        if (text.len == 0 or steeringText(text) != null or std.mem.eql(u8, text, resume_notice) or job_notice.isSystemNotice(text)) continue;
         const projected = result orelse try arena.dupe(ChatMessage, messages);
         result = projected;
         projected[index].content = if (std.mem.startsWith(u8, text, parent_steering_label))
@@ -367,6 +382,8 @@ fn isSteering(message: ChatMessage) bool {
 }
 
 fn steeringText(content: []const u8) ?[]const u8 {
+    // A system notice is its own envelope; persisted text keeps it whole.
+    if (job_notice.isSystemNotice(content)) return content;
     if (std.mem.startsWith(u8, content, parent_steering_open) and std.mem.endsWith(u8, content, parent_steering_close)) {
         // Keep the sender label in persisted text and ordinary history replay.
         return content[parent_steering_open.len .. content.len - parent_steering_close.len];

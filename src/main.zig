@@ -1,4 +1,6 @@
 const std = @import("std");
+const job_notice = @import("core/jobs/notice.zig");
+const text_utils = @import("core/shared/text_utils.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
@@ -1372,6 +1374,7 @@ const App = struct {
         has_prior_turns: bool,
         skill_tokens: []const registered_entities.SkillTokenSpan,
     ) !void {
+        if (try self.writeJobNoticeRows(user.text)) return;
         _ = try self.shell.writeUserPromptCard(
             self.alloc,
             &self.metrics,
@@ -1379,6 +1382,22 @@ const App = struct {
             has_prior_turns,
             skill_tokens,
         );
+    }
+
+    /// A notice of settled background jobs shows as one status row per job,
+    /// not as the person's prompt: "✓ Background job completed · bg_3 · …".
+    fn writeJobNoticeRows(self: *App, text: []const u8) !bool {
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const rows = job_notice.parse(arena, text) orelse return false;
+        for (rows) |row| {
+            var buf: [512]u8 = undefined;
+            const safe = try text_utils.encodeTerminalSafeInline(arena, job_notice.rowText(&buf, row), 480);
+            const tone: types.NoticeTone = if (job_notice.rowFailed(row)) .@"error" else if (std.mem.eql(u8, row.state, "cancelled")) .cancelled else .success;
+            try self.writeDomainNotice(.{ .topic = "", .tone = tone, .body = safe.bytes }, true);
+        }
+        return true;
     }
 
     /// The session browser exists only for detached sessions; the input
@@ -4996,6 +5015,9 @@ test {
     _ = @import("tools/web/html_to_markdown.zig");
     _ = @import("tools/filesystem/read_file.zig");
     _ = @import("tools/session/read_tool_result.zig");
+    _ = @import("tools/jobs/jobs.zig");
+    _ = @import("core/jobs/jobs.zig");
+    _ = @import("core/subagent/turn_jobs.zig");
     _ = @import("tools/skills/install_skill.zig");
     _ = @import("tools/skills/skill.zig");
     _ = @import("core/upgrade/upgrade_helpers.zig");

@@ -478,6 +478,7 @@ pub fn Runtime(comptime App: type) type {
                 remote.model = owned;
             }
             remote.permission_mode = types.PermissionMode.parse(summary.mode) orelse remote.permission_mode;
+            remote.running_jobs = summary.running_jobs;
             // The inactive local engine mirrors the attached projection for settings panels.
             app.permission_engine.mode = remote.permission_mode;
             const running = summary.status == .running or summary.status == .awaiting_approval;

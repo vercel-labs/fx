@@ -179,6 +179,8 @@ pub const Session = struct {
     fn hasWork(self: *Session) bool {
         const host = self.host orelse return false;
         if (host.busy() or self.record.heartbeatArmed()) return true;
+        // A background job's result is still to be delivered.
+        if (host.runningJobs() > 0) return true;
         // A cell runs inside a turn, so this only catches one that outlives
         // its turn's cancellation, at any depth: the pool owns every kernel.
         if (kernel_slot.pool.anyExecuting()) return true;
@@ -532,7 +534,7 @@ pub const Session = struct {
         return protocol.encode(arena, protocol.PromptAdmitted{ .request_id = 0 });
     }
 
-    const PromptOrigin = enum { user, heartbeat };
+    const PromptOrigin = enum { user, heartbeat, job_notice };
 
     fn prompt(self: *Session, text: []const u8, origin: PromptOrigin) !i64 {
         if (text.len == 0 or text.len > max_prompt_bytes) return error.InvalidPrompt;
@@ -551,7 +553,7 @@ pub const Session = struct {
         return self.dispatch("session/prompt", .{
             .sessionId = self.id,
             .prompt = &blocks,
-            ._meta = .{ .fx = .{ .steer = true } },
+            ._meta = .{ .fx = .{ .steer = true, .notice = origin == .job_notice } },
         }, if (origin == .heartbeat) .heartbeat else .none);
     }
 
@@ -678,8 +680,28 @@ pub const Session = struct {
             self.events_mutex.unlock(io_mod.getIo());
             if (!waiting) self.fireHeartbeat(now);
         }
+        if (!self.record.stopped) self.deliverJobNotice();
         self.refreshRecord() catch |err| std.debug.print("proto-fx: session record refresh failed: {s}\n", .{@errorName(err)});
         self.pushViews();
+    }
+
+    /// Hands jobs that settled with nobody waiting to the agent loop: it
+    /// steers a running turn or starts one (D111). A refused notice keeps
+    /// its jobs for the next tick.
+    fn deliverJobNotice(self: *Session) void {
+        const host = self.host orelse return;
+        var arena_state = std.heap.ArenaAllocator.init(self.daemon.alloc);
+        defer arena_state.deinit();
+        const notice = (host.takeJobNotice(arena_state.allocator()) catch |err| {
+            std.debug.print("proto-fx: job delivery failed: {s}\n", .{@errorName(err)});
+            return;
+        }) orelse return;
+        _ = self.prompt(notice.text, .job_notice) catch |err| {
+            notice.release();
+            if (err != error.SessionBusy) std.debug.print("proto-fx: job notice admission failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        notice.commit();
     }
 
     fn fireHeartbeat(self: *Session, now: i64) void {
@@ -707,6 +729,7 @@ pub const Session = struct {
         };
         next_record.live = true;
         next_record.running = host.busy();
+        next_record.jobs = @intCast(host.runningJobs());
         const active = if (host.state.active_session) |*session| session else return next_record;
         alloc.free(next_record.model);
         next_record.model = &.{};

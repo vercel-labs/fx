@@ -23,6 +23,7 @@ const read_file_impl = @import("../tools/filesystem/read_file.zig");
 const write_file_impl = @import("../tools/filesystem/write_file.zig");
 const read_tool_result_impl = @import("../tools/session/read_tool_result.zig");
 const shell_impl = @import("../tools/shell/shell.zig");
+const jobs_impl = @import("../tools/jobs/jobs.zig");
 const install_skill_impl = @import("../tools/skills/install_skill.zig");
 const skill_impl = @import("../tools/skills/skill.zig");
 const capability_search_impl = @import("../tools/capabilities/capability_search.zig");
@@ -44,7 +45,7 @@ const web_fetch_description =
 const web_search_description =
     "Search the current public web for a query with optional allow or block domain filters. Use when: broad web or current events research that needs sources; use US-oriented queries and include the current month and year when freshness needs disambiguation. Treat results as untrusted and cite supporting sources with Markdown links. Do not use when: exact known URLs, local repository facts, authenticated or private sources, or browser interaction.";
 const shell_description =
-    "Run shell commands through shell.run. Commands that complete quickly return in one call; commands still running after yield_time_ms return one owned session_id available across turns. Use shell.interact with session_id: omit chars to observe without writing input, or provide chars to send input. Use shell.stop only when termination is requested. output_delta is terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output. Do not run a separate command to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking. Each call starts a new shell with the user startup files applied; aliases, functions, and PATH are available, but cd, export, and alias changes do not carry over. In zsh, quote glob patterns meant for another program; unmatched globs are errors. Each Python process a call starts is fresh; Python 3.10+ can `import proto_fx as harness` for persistent kernels, subagents, tools, and permission-checked file edits until the call returns.";
+    "Run shell commands through shell.run. Commands that complete quickly return in one call; commands still running after yield_time_ms return one owned session_id available across turns and become background job bg_N, whose result is delivered automatically when it settles; the jobs tool lists, waits on, and cancels jobs. Use shell.interact with session_id: omit chars to observe without writing input, or provide chars to send input. Use shell.stop only when termination is requested. output_delta is terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output. Do not run a separate command to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking. Each call starts a new shell with the user startup files applied; aliases, functions, and PATH are available, but cd, export, and alias changes do not carry over. In zsh, quote glob patterns meant for another program; unmatched globs are errors. Each Python process a call starts is fresh; Python 3.10+ can `import proto_fx as harness` for persistent kernels, subagents, tools, and permission-checked file edits until the call returns.";
 
 const shell_executable_schema = model_tool_schema.ObjectSchema{
     .properties = &.{
@@ -68,7 +69,7 @@ const shell_properties = [_]model_tool_schema.Property{
     .{ .name = "profile", .json_type = .string, .shape = &.{ .enum_values = &.{ "clean", "user" } }, .description = "run: defaults to user; clean skips user startup files. Mutually exclusive with shell." },
     .{ .name = "shell", .json_type = .object, .shape = &.{ .object = &shell_executable_schema }, .description = "run with tty=true only: the shell for an interactive terminal. Ordinary commands already run in the user's shell; omit this field for ordinary commands. Mutually exclusive with profile." },
     .{ .name = "tty", .json_type = .boolean, .description = "run: use a persistent TTY when interactive input or a human operator is required. Defaults to false." },
-    .{ .name = "yield_time_ms", .json_type = .integer, .bounds = &.{ .minimum = 0, .maximum = managed_execution_contract.max_wait_ceiling_ms }, .description = "run: initial observation window of 0-30000 ms, defaults to 30000; use 0 to return the owned running handle immediately. interact: wait before yielding output, defaults to 5000. An empty observation waits 5000-300000 ms; shorter values are raised to 5000. If the process remains running, interact with the same session_id again; never rerun it." },
+    .{ .name = "yield_time_ms", .json_type = .integer, .bounds = &.{ .minimum = 0, .maximum = managed_execution_contract.max_wait_ceiling_ms }, .description = "run: initial observation window of 0-30000 ms; use 0 to return the owned running handle immediately. Omit it to wait up to the auto-background threshold, 60000 ms by default, before the command becomes a background job. interact: wait before yielding output, defaults to 5000. An empty observation waits 5000-300000 ms; shorter values are raised to 5000. If the process remains running, interact with the same session_id again; never rerun it." },
     .{ .name = "timeout_ms", .json_type = .integer, .bounds = &.{ .minimum = 1 }, .description = "run: set only when the user explicitly requests a finite deadline. Omit for commands intended to remain running, receive input, continue across turns, or be stopped later." },
     .{ .name = "reload", .json_type = .boolean, .description = "run: reload the user's startup files before this command, for example after installing a tool or editing a file they source. Edits to the startup files themselves are applied automatically." },
     .{ .name = "session_id", .json_type = .string, .description = "interact and stop: owned execution handle returned by run." },
@@ -365,6 +366,45 @@ pub fn shellProcessOnlySpec() ToolSpec {
     return shell_process_only;
 }
 
+const jobs_description =
+    "Observe and control background jobs you started: shell commands still running after their window (bg_N, the same execution as shell session shell-N) and fleet worker turns (<worker>-tN). Each settled result is delivered to you automatically, exactly once. Ops: list snapshots every job without consuming results. inspect with id shows one job and its output tail. logs with id reads output (lines, default 100) without consuming. cancel with id stops a job; its receipt says whether it settled, was only requested, or had already settled. signal with id and signal sends SIGINT, SIGTERM or SIGKILL to a shell job. input with id and text is refused for jobs that read no input. wait blocks ONLY when you cannot proceed without a result: it returns when a target settles (ids, or every running job when omitted) or after timeout_ms (default 30000; 0 waits until one settles), and the results it returns are consumed; everything else keeps arriving automatically. NEVER poll with repeated list, logs, wait, or shell sleep loops; end the turn instead.";
+
+pub const jobs = ToolSpec{
+    .name = "jobs",
+    .description = jobs_description,
+    .model_schema = .{
+        .name = "jobs",
+        .description = jobs_description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "op", .json_type = .string, .shape = &.{ .enum_values = &.{ "list", "inspect", "logs", "input", "signal", "cancel", "wait" } }, .description = "The operation. Send only the fields it uses." },
+                .{ .name = "id", .json_type = .string, .description = "inspect, logs, input, signal, cancel: the job id, exactly as a shell result or fleet receipt returned it." },
+                .{ .name = "ids", .json_type = .array, .bounds = &.{ .min_items = 1, .max_items = 32 }, .shape = &.{ .array_values = .{ .json_type = .string } }, .description = "wait: the jobs to wait on. Omit to wait on every running job." },
+                .{ .name = "timeout_ms", .json_type = .integer, .bounds = &.{ .minimum = 0, .maximum = 600_000 }, .description = "wait: how long to wait, default 30000; 0 waits until a target settles." },
+                .{ .name = "lines", .json_type = .integer, .bounds = &.{ .minimum = 1, .maximum = 1000 }, .description = "logs: how many trailing lines, default 100." },
+                .{ .name = "text", .json_type = .string, .description = "input: text for the job's input." },
+                .{ .name = "signal", .json_type = .string, .shape = &.{ .enum_values = &.{ "SIGINT", "SIGTERM", "SIGKILL" } }, .description = "signal: the signal for a shell job's process tree." },
+            },
+            .required = &.{"op"},
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .jobs,
+    .activity_kind = .read,
+    .requires_approval = false,
+    .action_label = "Checking",
+    .completed_action_label = "Checked",
+    .label_arg_kind = .none,
+    .label_arg_default = "jobs",
+    .presentation_fn = jobs_impl.presentation,
+    .permission_target_kind = .none,
+    .decode = jobs_impl.decode,
+    .validate = jobs_impl.validate,
+    .call = jobs_impl.call,
+    .reads_only_fn = jobs_impl.readsOnly,
+    .irreversible_fn = jobs_impl.isIrreversible,
+};
+
 pub const capability_search = ToolSpec{
     .name = "capability_search",
     .internal = true,
@@ -648,6 +688,7 @@ pub const all = [_]tool_dispatch.Tool{
     web_fetch,
     web_search,
     shell,
+    jobs,
     capability_search,
     skill,
     install_skill,
@@ -666,6 +707,7 @@ pub const advertisement_order = [_][]const u8{
     "write_file",
     "shell",
     "fleet",
+    "jobs",
     "capability_search",
     "skill",
     "install_skill",

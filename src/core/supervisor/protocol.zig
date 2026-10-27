@@ -297,6 +297,8 @@ pub const SessionSummary = struct {
     heartbeat: Heartbeat = .{},
     error_message: ?[]const u8 = null,
     updated_at_ms: i64 = 0,
+    /// Background jobs still running in the live host.
+    running_jobs: u32 = 0,
 };
 
 pub const SessionList = struct {

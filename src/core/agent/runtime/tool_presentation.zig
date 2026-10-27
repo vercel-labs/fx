@@ -1224,6 +1224,8 @@ pub fn finishExecutedToolStatus(
     const outcome_decision = command_decision orelse terminal_action_decision;
     const base_line = if (try tooling_presentation.subagentStatusLine(arena, call, result.model_output)) |line|
         line
+    else if (try tooling_presentation.jobsStatusLine(arena, call, result.model_output)) |line|
+        line
     else if (outcome_decision) |decision| blk: {
         const base = try hooks.describe_tool_action_denied(
             hooks.ctx,

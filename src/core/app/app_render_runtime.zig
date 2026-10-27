@@ -862,6 +862,7 @@ pub fn Runtime(comptime App: type) type {
                 .question = app.question_prompt.projection(),
                 .statusline = statusline,
                 .breadcrumb = session_backend.Ops(App).view(app).breadcrumb,
+                .running_jobs = session_backend.Ops(App).view(app).running_jobs,
                 .activity = activityProjection(app),
                 .input = &app.input_runtime,
             };

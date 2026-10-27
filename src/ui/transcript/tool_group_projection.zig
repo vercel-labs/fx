@@ -382,12 +382,14 @@ fn normalizeStatusPhrase(
     return if (phrase.len == 0) null else phrase;
 }
 
-fn subagentStatusContinuation(
+/// The rows below a status phrase: a subagent's model line, or a jobs
+/// card's job rows.
+fn statusContinuation(
     entry: TranscriptEntry,
     detail: ?*const ToolDetailRecord,
 ) ?[]const u8 {
     const record = detail orelse return null;
-    if (record.activity_kind != .subagent) return null;
+    if (record.activity_kind != .subagent and !std.mem.eql(u8, record.tool_name, "jobs")) return null;
     const text = switch (entry) {
         .raw_bytes => |raw| raw.bytes,
         else => return null,
@@ -675,7 +677,7 @@ fn formatSingleToolRow(
     const phrase = try statusRowPhrase(scratch, single.entry, single.detail, style);
     const row = try scratch.print("● {s}", .{phrase});
     try appendStatusRow(alloc, scratch, &out.writer, &lines, single.entry_id, single.detail, row, true, cols, style);
-    if (subagentStatusContinuation(single.entry, single.detail)) |continuation| {
+    if (statusContinuation(single.entry, single.detail)) |continuation| {
         var rows = continuationRows(continuation);
         while (rows.next()) |text| {
             const continuation_row = try scratch.print("  {s}", .{text});
@@ -753,7 +755,7 @@ fn formatGroupBlock(
         const connector = if (last_static_row) "└" else "├";
         const child = try scratch.print("{s} {s}", .{ connector, display_phrase });
         try appendStatusRow(alloc, scratch, &out.writer, &lines, entry_id, detail, child, false, cols, style);
-        if (subagentStatusContinuation(entry, detail)) |continuation| {
+        if (statusContinuation(entry, detail)) |continuation| {
             var rows = continuationRows(continuation);
             while (rows.next()) |text| {
                 const continuation_row = try scratch.print(
@@ -930,7 +932,7 @@ fn formatExpandedChild(
         try accentTrailingDiffStats(scratch, child, "")
     else
         child;
-    const continuation = subagentStatusContinuation(entry, detail) orelse return alloc.dupe(u8, accented);
+    const continuation = statusContinuation(entry, detail) orelse return alloc.dupe(u8, accented);
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     try out.writer.writeAll(accented);

@@ -62,6 +62,7 @@ const agent_checkpoint = @import("../core/agent/runtime/checkpoint.zig");
 const host_attachments = @import("../core/hosts/host_attachments.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const libfx_steering = @import("libfx_steering.zig");
+const jobs_mod = @import("../core/jobs/jobs.zig");
 const journal_events = @import("../core/agent/runtime/journal.zig");
 const libfx_journal = @import("libfx_journal.zig");
 const tool_call_identities = @import("tool_call_identities.zig");
@@ -397,6 +398,8 @@ pub const ServerState = struct {
     worker: worker_runtime.WorkerRuntime = .{},
     terminal_client: terminal_client_runtime.Runtime = .{},
     managed_executions: managed_execution.Runtime = managed_execution.Runtime.init(std.heap.c_allocator),
+    /// The background jobs of a persistent host; other hosts keep none.
+    jobs: ?*jobs_mod.Registry = null,
     /// A v2 session's children (D22), borrowed by `subagent_host`.
     subagent_v2_children: ?*subagent_child_state.V2Children = null,
     subagent_host: ?*subagent_tool_host.Runtime = null,
@@ -912,6 +915,7 @@ pub const PersistentHost = struct {
     child_approvals: node_host.Approvals = .{},
     /// A person's message running on a child of the root.
     node_messages: node_host.Messages = .{},
+    jobs: jobs_mod.host.Host = undefined,
 
     pub fn init(alloc: Allocator, cfg: Config, context: ?*anyopaque, write: jsonrpc.Writer.WriteFn) !*PersistentHost {
         const self = try alloc.create(PersistentHost);
@@ -930,6 +934,9 @@ pub const PersistentHost = struct {
             .lifecycle_view = lifecycle_view,
         } };
         errdefer self.state.deinit();
+        self.jobs.init(alloc, &self.state.managed_executions, &self.state.subagent_host);
+        errdefer self.jobs.deinit();
+        self.state.jobs = &self.jobs.registry;
         self.state.sessions_v2 = if (cfg.home_override) |home|
             try session_adapter.Store.open(alloc, home)
         else
@@ -991,6 +998,15 @@ pub const PersistentHost = struct {
         return self.node_messages.busy();
     }
 
+    /// The async-result notice for jobs that settled with nobody waiting.
+    pub fn takeJobNotice(self: *PersistentHost, arena: Allocator) !?jobs_mod.host.Notice {
+        return self.jobs.takeNotice(arena);
+    }
+
+    pub fn runningJobs(self: *PersistentHost) usize {
+        return self.jobs.runningCount();
+    }
+
     pub fn withdrawSteeringRequest(self: *PersistentHost, id: i64) bool {
         const active = if (self.state.active_session) |*session| session else return false;
         return active.steering.withdrawRequest(self.state.alloc, id);
@@ -1018,6 +1034,7 @@ pub const PersistentHost = struct {
         self.node_messages.deinit();
         self.child_approvals.deinit(&self.state);
         self.state.deinit();
+        self.jobs.deinit();
         alloc.destroy(self);
     }
 };
@@ -1844,7 +1861,10 @@ fn handleSteeringPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonr
             .message = "Steering queue is full",
         }),
     };
-    if (state.presentation == .native) _ = session.steering.claimInterrupt(&session.cancel_flag);
+    // A job notice waits for the next safe boundary instead of cutting the
+    // reply short (D111).
+    const notice = acp_types.fxMetaBool(parsed.value.object, "notice") orelse false;
+    if (state.presentation == .native and !notice) _ = session.steering.claimInterrupt(&session.cancel_flag);
     debug_trace.logf("acp", "queued steering prompt bytes={d}", .{text.len});
 }
 

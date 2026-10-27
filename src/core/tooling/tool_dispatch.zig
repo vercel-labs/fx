@@ -281,6 +281,9 @@ pub const DispatchContext = struct {
     on_output_chunk: ?command_runner.CommandOutputCallback = null,
     command_artifact_dir: ?[]const u8 = null,
     managed_executions: ?*managed_execution.Runtime = null,
+    /// The session's background jobs; null where the host keeps none.
+    jobs: ?*@import("../jobs/jobs.zig").Registry = null,
+    auto_background_ms: u32 = @import("../execution/managed_execution_contract.zig").default_auto_background_ms,
     tool_result_dir: ?[]const u8 = null,
     session_child_capability: ?*session_child_store.SessionChildCapability = null,
     ephemeral_command_replay: ?*command_replay_store.EphemeralStore = null,
@@ -421,6 +424,7 @@ pub const ExecutorKind = enum {
     ask_user_question,
     vision,
     host,
+    jobs,
 };
 
 pub const ApprovalPolicy = enum {

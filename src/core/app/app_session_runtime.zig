@@ -4466,6 +4466,8 @@ pub fn Runtime(comptime App: type) type {
                 )
             else if (try tooling_presentation.subagentStatusLine(action_arena.allocator(), call, result.output)) |line|
                 line
+            else if (try tooling_presentation.jobsStatusLine(action_arena.allocator(), call, result.output)) |line|
+                line
             else if (shell_correction) |correction| correction: {
                 const action = try tooling_presentation.formatPlainAction(action_arena.allocator(), .{
                     .tool_registry = app.toolAdvertisementSet().registry,

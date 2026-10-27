@@ -34,6 +34,10 @@ pub const StartCapturedInput = struct {
     output_chunk_ctx: ?*anyopaque = null,
     on_output_chunk: ?command_runner.CommandOutputCallback = null,
     yield_time_ms: u32 = contract.default_yield_time_ms,
+    /// Replaces `yield_time_ms` when set: how long a command the model did
+    /// not give a window to runs in the foreground before it becomes a
+    /// background job.
+    auto_background_ms: ?u32 = null,
     cancel_flag: ?*std.atomic.Value(bool) = null,
     /// Extra variables for the command, copied into the execution.
     environment_extension: ?command_runner.EnvironmentExtension = null,
@@ -135,6 +139,39 @@ pub fn modelOutputDelta(
     return try alloc.dupe(u8, output_delta);
 }
 
+/// A captured execution the model was handed while it ran: a background job.
+pub const JobItem = struct {
+    execution_id: []u8,
+    command: []u8,
+    state: SnapshotState,
+    started_ms: i64,
+    ended_ms: ?i64,
+    /// A stop was requested and the process has not settled yet.
+    stopping: bool,
+    /// Its final result reached the model.
+    delivered: bool,
+
+    pub fn deinit(self: *JobItem, alloc: Allocator) void {
+        alloc.free(self.execution_id);
+        alloc.free(self.command);
+        self.* = undefined;
+    }
+};
+
+/// Output a job has not delivered yet, read without consuming it.
+pub const OutputPeek = struct {
+    tail: []u8,
+    retained_bytes: usize,
+    total_bytes: usize,
+    handle: ?[]u8,
+
+    pub fn deinit(self: *OutputPeek, alloc: Allocator) void {
+        alloc.free(self.tail);
+        if (self.handle) |handle| alloc.free(handle);
+        self.* = undefined;
+    }
+};
+
 pub const ListItem = struct {
     execution_id: []u8,
     command: []u8,
@@ -205,6 +242,8 @@ const Entry = struct {
     /// Serializes joins of `thread`; see `Runtime.joinEntry`.
     join_mutex: std.Io.Mutex = .init,
     published_running: bool = false,
+    started_ms: i64 = 0,
+    ended_ms: ?i64 = null,
     tombstone_sequence: std.atomic.Value(u32) = .init(0),
     active_operations: usize = 0,
     pending_delete: bool = false,
@@ -279,6 +318,7 @@ const Entry = struct {
             .output_chunk_lifecycle_id = output_chunk_lifecycle_id,
             .output_chunk_ctx = input.output_chunk_ctx,
             .on_output_chunk = input.on_output_chunk,
+            .started_ms = io_mod.milliTimestamp(),
         };
         return entry;
     }
@@ -460,6 +500,7 @@ const Entry = struct {
             );
             self.state = state_for_worker_error(err);
             self.barrier.output_drained = true;
+            self.ended_ms = io_mod.milliTimestamp();
             self.mutex.unlock(zio);
             return;
         };
@@ -477,6 +518,7 @@ const Entry = struct {
         next = contract.transition(next.state, next.barrier, .output_drained);
         self.state = next.state;
         self.barrier = next.barrier;
+        self.ended_ms = io_mod.milliTimestamp();
         self.mutex.unlock(zio);
     }
 
@@ -556,6 +598,10 @@ pub const Runtime = struct {
         if (input.yield_time_ms > contract.max_yield_time_ms) {
             return error.InvalidYieldTime;
         }
+        if ((input.auto_background_ms orelse 0) > contract.max_auto_background_ms) {
+            return error.InvalidYieldTime;
+        }
+        const window_ms = input.auto_background_ms orelse input.yield_time_ms;
         const admission = try self.admitCaptured(input);
         const entry = admission.entry;
         var published = false;
@@ -568,7 +614,7 @@ pub const Runtime = struct {
             return self.prepareSnapshot(alloc, entry.execution_id);
         }
 
-        if (input.yield_time_ms == 0) {
+        if (window_ms == 0) {
             const prepared = try self.prepareSnapshot(alloc, entry.execution_id);
             const zio = io_mod.getIo();
             entry.mutex.lockUncancelable(zio);
@@ -601,7 +647,7 @@ pub const Runtime = struct {
                 }
             }
             const elapsed = io_mod.milliTimestamp() - started_ms;
-            if (elapsed >= input.yield_time_ms) break;
+            if (elapsed >= window_ms) break;
             io_mod.sleep(10 * std.time.ns_per_ms);
         }
 
@@ -1003,6 +1049,61 @@ pub const Runtime = struct {
             });
         }
         return result.toOwnedSlice(alloc);
+    }
+
+    /// Every captured execution published while it ran, with whether its
+    /// final result reached the model. Caller owns the items.
+    pub fn jobList(self: *Runtime, alloc: Allocator) ![]JobItem {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        var result: std.ArrayList(JobItem) = .empty;
+        errdefer {
+            for (result.items) |*item| item.deinit(alloc);
+            result.deinit(alloc);
+        }
+        for (self.entries) |candidate| {
+            const entry = candidate orelse continue;
+            entry.mutex.lockUncancelable(zio);
+            defer entry.mutex.unlock(zio);
+            if (entry.backend() != .captured or !entry.published_running) continue;
+            const execution_id = try alloc.dupe(u8, entry.execution_id);
+            errdefer alloc.free(execution_id);
+            try result.append(alloc, .{
+                .execution_id = execution_id,
+                .command = try alloc.dupe(u8, entry.command),
+                .state = entry.statusSnapshot(),
+                .started_ms = entry.started_ms,
+                .ended_ms = entry.ended_ms,
+                .stopping = entry.state == .stopping,
+                .delivered = entry.backend_state == .tombstone,
+            });
+        }
+        return result.toOwnedSlice(alloc);
+    }
+
+    /// The last `max_tail` bytes of output not yet delivered, read without
+    /// reserving or consuming it. Caller owns the result.
+    pub fn peekOutput(
+        self: *Runtime,
+        alloc: Allocator,
+        execution_id: []const u8,
+        max_tail: usize,
+    ) !OutputPeek {
+        const entry = self.acquireEntry(execution_id) orelse return error.ExecutionNotFound;
+        defer self.releaseEntry(entry);
+        const zio = io_mod.getIo();
+        entry.mutex.lockUncancelable(zio);
+        defer entry.mutex.unlock(zio);
+        const output = entry.output.items;
+        const tail = try alloc.dupe(u8, output[output.len - @min(output.len, max_tail) ..]);
+        errdefer alloc.free(tail);
+        return .{
+            .tail = tail,
+            .retained_bytes = output.len,
+            .total_bytes = entry.stdout_bytes +| entry.stderr_bytes,
+            .handle = if (entry.output_handle) |handle| try alloc.dupe(u8, handle) else null,
+        };
     }
 
     pub fn commitDelivery(

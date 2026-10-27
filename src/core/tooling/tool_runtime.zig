@@ -192,6 +192,9 @@ pub const Context = struct {
     ephemeral_command_replay: ?*command_replay_store.EphemeralStore = null,
     terminal_client: ?*terminal_client_runtime.Runtime = null,
     managed_executions: ?*managed_execution.Runtime = null,
+    jobs: ?*@import("../jobs/jobs.zig").Registry = null,
+    /// How long a shell command runs before it becomes a background job.
+    auto_background_ms: u32 = @import("../execution/managed_execution_contract.zig").default_auto_background_ms,
     command_timeout_ms: ?usize = null,
     command_timeout_started_ms: ?i64 = null,
     command_replay_capture: ?*command_replay_store.Capture = null,
@@ -1203,6 +1206,8 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .ephemeral_command_replay = ctx.ephemeral_command_replay,
         .terminal_client = ctx.terminal_client,
         .managed_executions = ctx.managed_executions,
+        .jobs = ctx.jobs,
+        .auto_background_ms = ctx.auto_background_ms,
         .command_artifact_dir = ctx.command_artifact_dir,
         .terminal_owner_session_id = ctx.lifecycle_scope.session_id,
         .terminal_transport_role = switch (ctx.lifecycle_scope.kind) {

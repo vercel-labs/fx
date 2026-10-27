@@ -5,6 +5,11 @@ pub const max_live_entries: usize = 64;
 pub const max_tombstones: usize = 32;
 pub const default_yield_time_ms: u32 = 30_000;
 pub const max_yield_time_ms: u32 = 30_000;
+/// The longest a command runs in the foreground before it is backgrounded
+/// automatically, whatever the configured threshold.
+pub const max_auto_background_ms: u32 = 600_000;
+/// proto's threshold: a command still running after a minute becomes a job.
+pub const default_auto_background_ms: u32 = 60_000;
 pub const default_wait_ceiling_ms: u32 = 5_000;
 pub const max_wait_ceiling_ms: u32 = 300_000;
 

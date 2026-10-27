@@ -19,6 +19,8 @@ pub const Record = struct {
     /// The live host's conversation is on disk.
     saved: bool = false,
     running: bool = false,
+    /// Background jobs still running in the live host. Not saved.
+    jobs: u32 = 0,
     model: []u8 = &.{},
     mode: []u8 = &.{},
 
@@ -34,6 +36,7 @@ pub const Record = struct {
         copy.live = self.live;
         copy.saved = self.saved;
         copy.running = self.running;
+        copy.jobs = self.jobs;
         if (self.failure) |failure| copy.failure = try alloc.dupe(u8, failure);
         copy.heartbeat = self.heartbeat;
         copy.heartbeat.prompt = "";
@@ -67,6 +70,7 @@ pub const Record = struct {
             .heartbeat = heartbeat_copy,
             .error_message = if (record.failure) |failure| try arena.dupe(u8, failure) else null,
             .updated_at_ms = record.updated_at_ms,
+            .running_jobs = record.jobs,
         };
     }
 
@@ -90,7 +94,7 @@ pub const Record = struct {
         const b = other.heartbeat;
         return same_failure and eql(u8, self.name, other.name) and eql(u8, self.model, other.model) and
             eql(u8, self.mode, other.mode) and self.stopped == other.stopped and self.live == other.live and
-            self.saved == other.saved and self.running == other.running and self.updated_at_ms == other.updated_at_ms and
+            self.saved == other.saved and self.running == other.running and self.jobs == other.jobs and self.updated_at_ms == other.updated_at_ms and
             eql(u8, a.prompt, b.prompt) and a.interval_ms == b.interval_ms and a.next_run_ms == b.next_run_ms and
             a.paused == b.paused and a.run_count == b.run_count;
     }
