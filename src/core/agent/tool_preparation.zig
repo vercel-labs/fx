@@ -358,6 +358,11 @@ fn prepareRegisteredApplicableTargets(
         };
     };
     defer permission_targets.deinit(alloc);
+    // `history://` and `agent://` are nodes of the session tree: no folder
+    // holds project instructions for them.
+    for (permission_targets.items) |target| {
+        if (@import("../recall/scheme.zig").isInternalUrl(target.path)) return .{ .prepared = @constCast(&.{}) };
+    }
 
     const target_kind = filesystemTargetKind(tool.executor_kind);
     const applicable_targets: []context_contract.ApplicableTarget = if (target_kind) |kind|

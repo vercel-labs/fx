@@ -30,12 +30,7 @@ const last_reply_bytes = 4000;
 const max_listed_nodes = 200;
 const max_listed_depth = 4;
 
-const schemes = [_][]const u8{ "history://", "agent://", "artifact://" };
-
-pub fn isInternalUrl(path: []const u8) bool {
-    for (schemes) |scheme| if (std.mem.startsWith(u8, path, scheme)) return true;
-    return false;
-}
+pub const isInternalUrl = @import("scheme.zig").isInternalUrl;
 
 pub const Url = union(enum) {
     tree,
@@ -196,11 +191,12 @@ const TurnTexts = struct {
                 .user, .assistant => try writer.print("[{s}] {s}\n", .{ @tagName(value.role), value.text }),
                 .tool => {
                     try writer.print("[{s}] {s}\n", .{ value.tool, corpus.clip(value.text, 2000) });
-                    const shown = corpus.clip(value.output, parts.self.output_bytes);
+                    const readable = corpus.readableOutput(parts.self.arena, value.output);
+                    const shown = corpus.clip(readable, parts.self.output_bytes);
                     var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, shown, "\n"), '\n');
                     while (lines.next()) |line| try writer.print("  {s}\n", .{line});
-                    if (shown.len < value.output.len) {
-                        try writer.print("  … {d} more bytes; whole turn: history://{s}/turn/{d}\n", .{ value.output.len - shown.len, parts.self.id, parts.number });
+                    if (shown.len < readable.len) {
+                        try writer.print("  … {d} more bytes; whole turn: history://{s}/turn/{d}\n", .{ readable.len - shown.len, parts.self.id, parts.number });
                     }
                     if (value.handle) |handle| {
                         if (std.mem.eql(u8, parts.self.id, parts.self.view.node_id))

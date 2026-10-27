@@ -1,4 +1,5 @@
 const std = @import("std");
+const internal_url = @import("../recall/scheme.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const command_environment = @import("../execution/command_environment.zig");
@@ -203,6 +204,9 @@ pub fn permissionTargetForCall(
         },
         .path_existing => blk: {
             const path_arg = try tool_args.requiredStringArg(args, "path");
+            // `history://` and `agent://` name a node of this session tree,
+            // which read_file renders; there is no file to resolve.
+            if (std.mem.eql(u8, call.name, "read_file") and internal_url.isInternalUrl(path_arg)) break :blk arena.dupe(u8, path_arg);
             break :blk try resolveFileToolPath(arena, workspace_root, call.name, path_arg, .existing);
         },
         .none => try arena.dupe(u8, call.name),
@@ -3339,4 +3343,12 @@ test "a shell refresh resets remembered command grants only" {
     shell_snapshot.processOwner().recordShellGrant(command);
     try std.testing.expect(sessionGrantAllowed(&grants, "run_command", command));
     try std.testing.expectEqual(@as(usize, 2), liveSessionGrantCount(&grants));
+}
+
+test "read_file of an internal URL targets the URL, not a file" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const call: types.ToolCall = .{ .id = "r", .name = "read_file", .arguments_json = "{\"path\":\"history://abc/turn/2\"}" };
+    const target = try permissionTargetForCall(arena_state.allocator(), "/tmp/no-such-workspace", call, .path_existing);
+    try std.testing.expectEqualStrings("history://abc/turn/2", target);
 }

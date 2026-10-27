@@ -374,6 +374,7 @@ test "recall finds a detail in proto's shapes, pages, expands, and rebuilds only
 }
 
 test {
+    _ = @import("scheme.zig");
     _ = corpus;
     _ = rank;
     _ = urls;

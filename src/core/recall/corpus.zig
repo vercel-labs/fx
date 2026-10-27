@@ -81,6 +81,20 @@ pub fn forEachPart(turn: types.HistoryTurn, visitor: anytype) !void {
     if (reply) |text| if (text.len > 0) try visitor.part(.{ .role = .assistant, .text = text });
 }
 
+/// A tool output as a person reads it: a command result's captured text
+/// instead of the JSON envelope the model saw it in; any other output as it
+/// is. Allocated in `arena` when decoded.
+pub fn readableOutput(arena: Allocator, output: []const u8) []const u8 {
+    if (output.len < 2 or output[0] != '{') return output;
+    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, output, .{}) catch return output;
+    if (value != .object) return output;
+    for ([_][]const u8{ "output_delta", "output" }) |field| {
+        const text = value.object.get(field) orelse continue;
+        if (text == .string) return text.string;
+    }
+    return output;
+}
+
 fn steeringAfter(steering: []const types.PersistedSteering, steps: usize, visitor: anytype) !void {
     for (steering) |item| if (item.after_tool_step_count == steps) try visitor.part(.{ .role = .user, .text = item.text });
 }
@@ -170,8 +184,9 @@ pub const Index = struct {
                 const reader = self.stored orelse break :whole value.output;
                 break :whole reader.read(scratch.allocator(), handle, max_entry_bytes) orelse value.output;
             };
+            const readable = readableOutput(scratch.allocator(), output);
             const joined = if (value.role == .tool)
-                try scratch.allocator().print("{s}\n{s}", .{ value.text, output })
+                try scratch.allocator().print("{s}\n{s}", .{ value.text, readable })
             else
                 value.text;
             const text = try alloc.dupe(u8, clip(joined, max_entry_bytes));
@@ -268,6 +283,14 @@ test "a turn's parts come in the order the model saw them, with steering after i
     try testing.expectEqualStrings("src/a.zig", tool.path.?);
     try testing.expectEqualStrings("h1", tool.handle.?);
     try testing.expect(std.mem.endsWith(u8, tool.text, "whole output of h1"));
+}
+
+test "a command result reads as its captured text" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqualStrings("build id: Z\n1", readableOutput(arena.allocator(), "{\"exit_code\":0,\"output_delta\":\"build id: Z\\n1\"}"));
+    try testing.expectEqualStrings("{\"rows\":3}", readableOutput(arena.allocator(), "{\"rows\":3}"));
+    try testing.expectEqualStrings("plain", readableOutput(arena.allocator(), "plain"));
 }
 
 test "the index keeps the newest entries within its byte bound" {
