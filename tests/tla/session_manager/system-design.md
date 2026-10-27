@@ -2042,6 +2042,58 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   settings. **Alternative:** probing both protocols, which costs a request
   and guesses wrong on gateways that serve both.
 
+- **D155 Decision:** a provider event `tool_input_delta` carries the call
+  id, its index among the response's calls, and the argument fragment,
+  from every reducer: Vercel, Responses (Codex, Grok, configured
+  Responses), Chat Completions and Anthropic Messages. The last two now
+  also send `tool_started` once a call's id and name arrive, as the
+  others already did. Usage and cache accounting do not change.
+  **Why:** a live preview needs to know which call a fragment belongs
+  to, and proto renders arguments while they stream. **Alternative:** a
+  bare chunk keyed by arrival order, which interleaved calls break.
+
+- **D156 Decision:** the runtime follows only the newest call. An
+  incremental reader decodes the top-level string fields a preview shows
+  (`command`, `path`, `content`, `old_string` and `new_string`, `query`,
+  `url`, a worker's `label` and `message`, a job's `text`) in one pass,
+  keeps a bounded body tail with a count of earlier lines, and sends a
+  display-only `tool_input_preview` at most every 50 ms, plus once when
+  the call is superseded or the step ends. Detached views get it as a
+  presentation event; older viewers ignore unknown events, so the
+  supervisor protocol is unchanged. **Why:** the cost per fragment is the
+  fragment's own bytes, never a reparse of the whole argument string.
+  **Alternative:** proto's throttled reparse of the whole partial JSON.
+
+- **D157 Decision:** the streaming call is drawn under the activity row as
+  a block: a `●` header (`Running`, `Writing <path>`, `Editing <path>`,
+  `Searching <query>`), then the newest eight rows of its body, syntax
+  highlighted by the command's shell or Python, the file's extension, or
+  as `-`/`+` diff lines. Only this live block is highlighted; when the call
+  starts, the preview is cleared and the settled transcript block stays
+  plain, as proto's committed cards are. Rows are rendered once per
+  preview version and width. **Why:** the footer already owns live,
+  replaceable rows, and the transcript stays append-only. **Alternative:**
+  a provisional transcript row, which shell and file tools do not get.
+
+- **D158 Decision:** Python outlines follow proto's `pi-ast` outline
+  without tree-sitter: a line and indentation reader produces `Module · N
+  nodes` and a tree whose block nodes (def, class, if, elif, else, for,
+  while, with, try, except, finally, match, case) carry `·L<line>`,
+  assignments read `x ← expr`, augmented ones `x += expr`, and text caps
+  match proto's. Three or more imports in a row fold into one `imports`
+  row, and a long tree ends in `… N more`. Code whose brackets, strings
+  or indentation do not close is shown as its first lines instead.
+  **Why:** proto's shape at a glance without a parser dependency.
+  **Alternative:** a Zig port of the tree-sitter Python grammar.
+
+- **D159 Decision:** an embedded cell is the first Python interpreter on
+  any line of a shell command, fed by a heredoc or `-c`. When the command
+  does more than run it, the block shows up to two shell lines before the
+  outline and up to two after it, as proto's `renderShellWithCellOutlines`
+  does. **Why:** the person sees what ran around the code.
+  **Alternative:** outlining only commands that are a single interpreter
+  call.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a
