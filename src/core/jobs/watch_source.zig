@@ -15,6 +15,10 @@ const jobs = @import("jobs.zig");
 const io_mod = @import("../shared/io.zig");
 // The stream rules engine reads the same JavaScript dialect as proto.
 const watch_pattern = @import("../ttsr/regex.zig");
+const command_admission = @import("../permissions/command_admission.zig");
+const command_environment = @import("../execution/command_environment.zig");
+const command_runner = @import("../execution/command_runner.zig");
+const execution_router = @import("../execution/router.zig");
 const Allocator = std.mem.Allocator;
 
 const job_prefix = "watch_";
@@ -38,10 +42,67 @@ pub const Spec = struct {
     max_events: ?u32 = null,
     timeout_ms: ?u64 = null,
     label: ?[]const u8 = null,
-    cwd: []const u8 = ".",
+    /// What admitted `command`: the authority shell run would get for it
+    /// (D210). A watch polls only the exact command, directory, and
+    /// environment that authority names, on the shell tool's route.
+    authority: ?command_admission.CommandExecutionAuthority = null,
 };
 
-pub const StartError = error{ OutOfMemory, InvalidWatch, TooManyWatches, UnknownJob };
+pub const StartError = error{ OutOfMemory, InvalidWatch, TooManyWatches, UnknownJob, CommandNotApproved };
+
+/// What a command watch was approved to run, owned by the watch.
+const ApprovedCommand = struct {
+    context: command_admission.CommandContext,
+    source: ?command_admission.ShellAuthorizationSource,
+    grant_epoch: ?u64,
+
+    fn init(alloc: Allocator, command: []const u8, authority: command_admission.CommandExecutionAuthority) StartError!ApprovedCommand {
+        const fingerprint, const source: ?command_admission.ShellAuthorizationSource, const grant_epoch: ?u64 = switch (authority) {
+            .direct_only => |value| .{ value, null, null },
+            .shell_allowed => |value| .{ value.fingerprint, value.source, value.grant_epoch },
+        };
+        // The command the model asked to watch must be the one approved.
+        if (!std.mem.eql(u8, fingerprint.command, command) or fingerprint.execution_mode != .captured) return error.CommandNotApproved;
+        const owned_command = try alloc.dupe(u8, fingerprint.command);
+        errdefer alloc.free(owned_command);
+        const cwd = try alloc.dupe(u8, fingerprint.resolved_cwd);
+        errdefer alloc.free(cwd);
+        const environment: command_environment.Environment = switch (fingerprint.environment) {
+            .legacy => .legacy,
+            .workspace_clean => .workspace_clean,
+            .clean => |path| .{ .clean = try alloc.dupe(u8, path) },
+            .user => |path| .{ .user = try alloc.dupe(u8, path) },
+        };
+        return .{
+            .context = .{
+                .command = owned_command,
+                .resolved_cwd = cwd,
+                .target_os = fingerprint.target_os,
+                .environment = environment,
+                .execution_mode = .captured,
+            },
+            .source = source,
+            .grant_epoch = grant_epoch,
+        };
+    }
+
+    fn deinit(self: ApprovedCommand, alloc: Allocator) void {
+        alloc.free(self.context.command);
+        alloc.free(self.context.resolved_cwd);
+        switch (self.context.environment) {
+            .clean, .user => |path| alloc.free(path),
+            .legacy, .workspace_clean => {},
+        }
+    }
+
+    fn executionAuthority(self: *const ApprovedCommand) command_admission.CommandExecutionAuthority {
+        const fingerprint = command_admission.AdmissionFingerprint.init(self.context);
+        return if (self.source) |source|
+            .{ .shell_allowed = .{ .fingerprint = fingerprint, .source = source, .grant_epoch = self.grant_epoch } }
+        else
+            .{ .direct_only = fingerprint };
+    }
+};
 
 pub const Mode = enum { source, poll };
 pub const StopReason = enum { limit, exit, timeout, manual, @"error", session };
@@ -56,7 +117,7 @@ const Watch = struct {
     label: []u8,
     mode: Mode,
     source_id: ?[]u8,
-    command: ?[]u8,
+    command: ?ApprovedCommand,
     every_ms: u64,
     pattern: ?[]u8,
     matcher: ?watch_pattern.Regex,
@@ -76,7 +137,7 @@ const Watch = struct {
         alloc.free(watch.id);
         alloc.free(watch.label);
         if (watch.source_id) |value| alloc.free(value);
-        if (watch.command) |value| alloc.free(value);
+        if (watch.command) |value| value.deinit(alloc);
         if (watch.pattern) |value| alloc.free(value);
         if (watch.matcher) |*matcher| matcher.deinit();
         if (watch.failure) |value| alloc.free(value);
@@ -155,6 +216,7 @@ pub const Source = struct {
         if (mode == .poll and (spec.every_ms orelse 0) < min_interval_ms) return error.InvalidWatch;
         if (mode == .source and spec.every_ms != null) return error.InvalidWatch;
         if (spec.timeout_ms) |timeout| if (timeout < min_interval_ms) return error.InvalidWatch;
+        if (spec.command != null and spec.authority == null) return error.CommandNotApproved;
         const max_events = spec.max_events orelse default_max_events;
         if (max_events == 0 or max_events > max_max_events) return error.InvalidWatch;
         if (spec.source) |id| {
@@ -166,6 +228,8 @@ pub const Source = struct {
             error.InvalidPattern => return error.InvalidWatch,
         } else null;
         errdefer if (matcher) |*value| value.deinit();
+        var approved: ?ApprovedCommand = if (spec.command) |command| try ApprovedCommand.init(self.alloc, command, spec.authority.?) else null;
+        errdefer if (approved) |value| value.deinit(self.alloc);
         const watch = try self.alloc.create(Watch);
         errdefer self.alloc.destroy(watch);
         const now = io_mod.milliTimestamp();
@@ -191,7 +255,7 @@ pub const Source = struct {
             .label = label,
             .mode = mode,
             .source_id = if (spec.source) |value| try self.alloc.dupe(u8, value) else null,
-            .command = if (spec.command) |value| try self.alloc.dupe(u8, value) else null,
+            .command = approved,
             .every_ms = spec.every_ms orelse source_poll_ms,
             .pattern = if (spec.match) |value| try self.alloc.dupe(u8, value) else null,
             .matcher = matcher,
@@ -200,15 +264,13 @@ pub const Source = struct {
             .started_ms = now,
         };
         matcher = null;
-        const cwd = try self.alloc.dupe(u8, spec.cwd);
-        errdefer self.alloc.free(cwd);
+        approved = null;
         const out_id = try arena.dupe(u8, id);
         try self.watches.append(self.alloc, watch);
         self.next_number += 1;
         // From here the watch is listed: a thread that cannot start leaves
         // it failed rather than missing.
-        watch.thread = std.Thread.spawn(.{}, run, .{ self, watch, cwd }) catch blk: {
-            self.alloc.free(cwd);
+        watch.thread = std.Thread.spawn(.{}, run, .{ self, watch }) catch blk: {
             finishLocked(watch, .@"error");
             break :blk null;
         };
@@ -403,7 +465,7 @@ fn jobOf(arena: Allocator, watch: *const Watch) !jobs.Job {
 fn resultText(arena: Allocator, watch: *const Watch) ![]const u8 {
     const what = switch (watch.mode) {
         .source => try arena.print("following {s}", .{watch.source_id.?}),
-        .poll => try arena.print("polling `{s}` every {d} ms", .{ watch.command.?, watch.every_ms }),
+        .poll => try arena.print("polling `{s}` every {d} ms", .{ watch.command.?.context.command, watch.every_ms }),
     };
     const match_text = if (watch.pattern) |pattern| try arena.print(" for /{s}/", .{pattern}) else "";
     const reason = if (watch.stop_reason) |stop| switch (stop) {
@@ -419,6 +481,23 @@ fn resultText(arena: Allocator, watch: *const Watch) ![]const u8 {
         watch.id, watch.label, what, match_text, reason, failure, watch.events, watch.id,
     });
 }
+
+/// One poll's raw output, bounded like the shell tool's.
+const Captured = struct {
+    arena: Allocator,
+    stdout: std.ArrayList(u8) = .empty,
+    stderr: std.ArrayList(u8) = .empty,
+
+    fn append(raw: *anyopaque, _: ?@import("../shared/types.zig").ToolLifecycleId, stream: command_runner.CommandOutputStream, chunk: []const u8) anyerror!void {
+        const self: *Captured = @ptrCast(@alignCast(raw));
+        const list = switch (stream) {
+            .stdout => &self.stdout,
+            .stderr => &self.stderr,
+        };
+        const room = max_capture_bytes -| list.items.len;
+        try list.appendSlice(self.arena, chunk[0..@min(chunk.len, room)]);
+    }
+};
 
 fn freeEvent(alloc: Allocator, event: QueuedEvent) void {
     alloc.free(event.from);
@@ -443,11 +522,10 @@ fn sleepWhile(self: *Source, watch: *Watch, ms: u64) void {
     _ = self;
 }
 
-fn run(self: *Source, watch: *Watch, cwd: []u8) void {
-    defer self.alloc.free(cwd);
+fn run(self: *Source, watch: *Watch) void {
     switch (watch.mode) {
         .source => follow(self, watch),
-        .poll => poll(self, watch, cwd),
+        .poll => poll(self, watch),
     }
 }
 
@@ -493,24 +571,29 @@ fn follow(self: *Source, watch: *Watch) void {
 
 /// Re-runs a command: matching output that changed since the last report
 /// is an event.
-fn poll(self: *Source, watch: *Watch, cwd: []const u8) void {
+fn poll(self: *Source, watch: *Watch) void {
+    const approved = &watch.command.?;
     var last: ?u64 = null;
     while (self.running(watch)) {
         var arena_state = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        const result = std.process.run(arena, io_mod.getIo(), .{
-            .argv = &.{ "/bin/sh", "-c", watch.command.? },
-            .cwd = .{ .path = cwd },
-            .stdout_limit = .limited(max_capture_bytes),
-            .stderr_limit = .limited(max_capture_bytes),
-            .timeout = .{ .duration = .{ .raw = .fromMilliseconds(poll_timeout_ms), .clock = .awake } },
-        }) catch |err| {
+        var captured: Captured = .{ .arena = arena };
+        // The shell tool's route: the approved command only, re-planned and
+        // checked against its approval on every poll.
+        _ = execution_router.executePlannedCommand(.{
+            .max_command_output_bytes = max_capture_bytes,
+            .cancel_flag = &watch.stop,
+            .accepted_output_chunk_ctx = &captured,
+            .on_accepted_output_chunk = Captured.append,
+            .callback_projection = .raw,
+            .timeout_ms = poll_timeout_ms,
+        }, arena, approved.context, approved.executionAuthority()) catch |err| {
             self.finish(watch, .@"error", @errorName(err));
             return;
         };
         var text: std.ArrayList(u8) = .empty;
-        var lines = std.mem.splitScalar(u8, if (result.stdout.len > 0) result.stdout else result.stderr, '\n');
+        var lines = std.mem.splitScalar(u8, if (captured.stdout.items.len > 0) captured.stdout.items else captured.stderr.items, '\n');
         while (lines.next()) |raw_line| {
             const line = std.mem.trimEnd(u8, raw_line, "\r");
             if (line.len == 0 or !watch.matches(line)) continue;
@@ -536,10 +619,11 @@ test "a poll watch reports changed matching output and stops at its limit" {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    try std.testing.expectError(error.InvalidWatch, watches.start(arena, .{ .command = "true" }));
-    try std.testing.expectError(error.InvalidWatch, watches.start(arena, .{ .command = "true", .every_ms = 1000, .match = "(bad" }));
+    try std.testing.expectError(error.InvalidWatch, watches.start(arena, .{ .command = "true", .authority = testApproval("true") }));
+    try std.testing.expectError(error.InvalidWatch, watches.start(arena, .{ .command = "true", .every_ms = 1000, .match = "(bad", .authority = testApproval("true") }));
     try std.testing.expectError(error.UnknownJob, watches.start(arena, .{ .source = "bg_9" }));
-    const id = try watches.start(arena, .{ .command = "od -An -N4 -tu4 /dev/urandom | tr -d ' '; echo ready", .every_ms = 1000, .match = "^\\d+$", .max_events = 2, .label = "clock" });
+    const command = "od -An -N4 -tu4 /dev/urandom | tr -d ' '; echo ready";
+    const id = try watches.start(arena, .{ .command = command, .every_ms = 1000, .match = "^\\d+$", .max_events = 2, .label = "clock", .authority = testApproval(command) });
     try std.testing.expectEqualStrings("watch_1", id);
     var events: usize = 0;
     var waited: usize = 0;
@@ -556,4 +640,44 @@ test "a poll watch reports changed matching output and stops at its limit" {
     try std.testing.expect(std.mem.find(u8, settled[0].text, "reached max_events") != null);
     try settled[0].token.commit();
     try std.testing.expectEqual(@as(usize, 0), (try registry.takeDeliveries(arena)).len);
+}
+
+fn testApproval(command: []const u8) command_admission.CommandExecutionAuthority {
+    return .{ .shell_allowed = .{
+        .fingerprint = .init(.{ .command = command, .resolved_cwd = ".", .target_os = @import("builtin").target.os.tag }),
+        .source = .interactive_once,
+    } };
+}
+
+test "a command watch runs only the command its approval names" {
+    const alloc = std.testing.allocator;
+    var registry = jobs.Registry.init(alloc);
+    defer registry.deinit();
+    var watches = Source.init(alloc, &registry);
+    defer watches.deinit();
+    registry.addSource(watches.source());
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // No approval, or an approval of another command, starts nothing.
+    try std.testing.expectError(error.CommandNotApproved, watches.start(arena, .{ .command = "echo hi", .every_ms = 1000 }));
+    try std.testing.expectError(error.CommandNotApproved, watches.start(arena, .{ .command = "rm -rf build", .every_ms = 1000, .authority = testApproval("echo hi") }));
+    var tty_approval = testApproval("echo hi");
+    tty_approval.shell_allowed.fingerprint.execution_mode = .tty;
+    try std.testing.expectError(error.CommandNotApproved, watches.start(arena, .{ .command = "echo hi", .every_ms = 1000, .authority = tty_approval }));
+    try std.testing.expectEqual(@as(usize, 0), (try registry.list(arena)).len);
+    // A read-only approval that does not cover what the command does fails
+    // the watch on its first poll instead of widening it.
+    const direct: command_admission.CommandExecutionAuthority = .{ .direct_only = .init(.{ .command = "touch watched.txt", .resolved_cwd = ".", .target_os = @import("builtin").target.os.tag }) };
+    const id = try watches.start(arena, .{ .command = "touch watched.txt", .every_ms = 1000, .authority = direct });
+    var waited: usize = 0;
+    while (waited < 100) : (waited += 1) {
+        const job = (try registry.find(arena, id)).?;
+        if (job.state.settled()) break;
+        io_mod.sleep(20 * std.time.ns_per_ms);
+    }
+    const job = (try registry.find(arena, id)).?;
+    try std.testing.expectEqual(jobs.State.failed, job.state);
+    const logs = try registry.logs(arena, id, 4096);
+    try std.testing.expect(std.mem.find(u8, logs.text, "CommandAdmissionChanged") != null);
 }

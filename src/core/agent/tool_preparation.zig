@@ -380,6 +380,7 @@ fn isCapturedCommandCall(
     tool: tool_dispatch.Tool,
 ) Allocator.Error!bool {
     if (tool.executor_kind == .run_command) return true;
+    if (try tool_dispatch.isCommandWatchCall(alloc, &tool, call.arguments_json)) return true;
     const expected_action = tool.captured_command_action orelse return false;
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, call.arguments_json, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,

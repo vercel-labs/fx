@@ -190,6 +190,7 @@ fn failureText(alloc: Allocator, input: Input, err: anyerror) ![]u8 {
         error.TooManyWatches => alloc.dupe(u8, "Too many watches are running; cancel one with jobs cancel before starting another."),
         error.InvalidWatch => alloc.dupe(u8, "jobs watch could not start: match must be a valid regular expression, and source must be a shell job, not a watch."),
         error.WatchesUnavailable => alloc.dupe(u8, "Watches are unavailable in this host."),
+        error.CommandNotApproved => alloc.dupe(u8, "jobs watch did not start: its command was not approved to run as shell run would run it. Permission rules and review decide a watched command exactly as they decide shell run."),
         error.MailboxUnavailable => alloc.dupe(u8, "This session has no mailbox: messages come from fleet workers of an interactive session."),
         else => alloc.print("jobs {s} failed: {s}", .{ @tagName(input.op), @errorName(err) }),
     };
@@ -280,7 +281,12 @@ fn run(ctx: tool_dispatch.DispatchContext, registry: *jobs.Registry, arena: Allo
                 .max_events = input.max_events,
                 .timeout_ms = input.timeout_ms,
                 .label = input.label,
-                .cwd = if (ctx.workspace_root.len > 0) ctx.workspace_root else ".",
+                // Admission gave a command watch the authority shell run
+                // would get for the same command (D210).
+                .authority = if (ctx.execution_authority) |authority| switch (authority) {
+                    .run_command => |value| value,
+                    else => null,
+                } else null,
             });
             try field(&json, "id", id);
             if (try registry.find(arena, id)) |job| {

@@ -2520,8 +2520,7 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   the watch's own result, why it stopped, is delivered once like any
   job's. Watch threads never touch the session: the supervisor's tick
   moves their events into the mailbox. At most 8 watches run. A command
-  watch runs `/bin/sh -c` in the workspace after the call's permission
-  review. **Why:** proto's monitors without a second notice path.
+  watch is admitted and run as shell run of its command (D210). **Why:** proto's monitors without a second notice path.
   **Alternative:** one job notice per event, which the registry's
   single-delivery jobs cannot carry.
 
@@ -2536,6 +2535,20 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   only after it leaves the registry's list. **Why:** many workers must
   not deadlock or grow without bound. **Alternative:** a separate
   messaging slot pool.
+
+- **D210 Decision:** a `jobs watch` with `command` is a captured command
+  like shell run: admission gives it command authority through the same
+  configured and saved-session rules, auto-mode routine plan or review of
+  the exact command, and the user's shell environment policy, and the
+  watch refuses to start unless that authority names exactly its command
+  as a captured run. Each poll runs the approved command, directory and
+  environment through the shell tool's execution router, which re-plans
+  and checks the approval every time, so a direct-only approval cannot
+  widen and a different command can never run. **Why:** a watch re-runs
+  its command for as long as an hour, so it must not be a path around
+  the shell tool's permissions. **Alternative:** reviewing the jobs call
+  as a whole and running `/bin/sh -c`, which let a watch run a command
+  shell run would deny.
 
 ## Design Risks And Failure Behavior
 

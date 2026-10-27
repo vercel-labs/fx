@@ -531,6 +531,31 @@ pub const Tool = struct {
 
 pub const Registry = mod_registry.ToolRegistry(Tool);
 
+/// A `jobs` watch with `command` re-runs that command, so it is a captured
+/// command like shell run: command authority admits it, through the same
+/// rules, review, and environment, and each poll runs only the command that
+/// was approved (D210).
+pub fn isCommandWatchArgs(tool: *const Tool, args: std.json.ObjectMap) bool {
+    if (tool.executor_kind != .jobs) return false;
+    const op = args.get("op") orelse return false;
+    if (op != .string or !std.mem.eql(u8, op.string, "watch")) return false;
+    const command = args.get("command") orelse return false;
+    return command == .string;
+}
+
+/// `isCommandWatchArgs` for raw call arguments; malformed arguments are not
+/// a command watch (decode rejects them).
+pub fn isCommandWatchCall(alloc: Allocator, tool: *const Tool, arguments_json: []const u8) error{OutOfMemory}!bool {
+    if (tool.executor_kind != .jobs) return false;
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const args = tool_args.parseToolArgsObject(scratch.allocator(), arguments_json) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    return isCommandWatchArgs(tool, args);
+}
+
 pub const ProgressLabelKind = enum {
     none,
     started,
@@ -778,10 +803,11 @@ pub fn admitToolCall(ctx: DispatchContext, registry: Registry, call: message.Too
             }
 
             const captured_command = input.tool.executor_kind == .run_command or
-                if (input.tool.captured_command_fn) |classify|
+                (if (input.tool.captured_command_fn) |classify|
                     classify(input.value)
                 else
-                    false;
+                    false) or
+                try isCommandWatchCall(call_ctx.allocator, input.tool, call.arguments_json);
             if (captured_command) {
                 const authority = decision.execution_authority orelse {
                     return .{ .failure = try call_ctx.allocator.dupe(u8, "captured command permission allowed without execution authority") };
