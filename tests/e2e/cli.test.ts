@@ -990,18 +990,23 @@ describe("cli: status", () => {
   test(
     "fx status --json returns valid status JSON",
     async () => {
-      const r = await runFx(["status", "--json"]);
-      expect(r.code).toBe(0);
-      const json = JSON.parse(r.stdout.trim());
-      expect(json.kind).toBe("status");
-      expect(json).toHaveProperty("model");
-      expect(json).toHaveProperty("workspace");
-      expect(json).toHaveProperty("permission_mode");
-      expect(json).toHaveProperty("history_turns");
-      expect(json).toHaveProperty("agent_step_limit");
-      expect(json.update_channel).toBe("stable");
-      expect(json.build_channel).toBe("stable");
-      expect(json.build_revision).toMatch(/^[0-9a-f]{12}$/);
+      const home = createIsolatedTestHome();
+      try {
+        const r = await runFx(["status", "--json"], { env: { HOME: home } });
+        expect(r.code).toBe(0);
+        const json = JSON.parse(r.stdout.trim());
+        expect(json.kind).toBe("status");
+        expect(json).toHaveProperty("model");
+        expect(json).toHaveProperty("workspace");
+        expect(json).toHaveProperty("permission_mode");
+        expect(json).toHaveProperty("history_turns");
+        expect(json).toHaveProperty("agent_step_limit");
+        expect(json.update_channel).toBe("stable");
+        expect(json.build_channel).toBe("stable");
+        expect(json.build_revision).toMatch(/^[0-9a-f]{12}$/);
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
     },
     TIMEOUT,
   );
