@@ -302,6 +302,7 @@ pub const MarkdownProcessor = struct {
                 try self.pipe_buf.appendSlice(alloc, line);
                 try self.pipe_buf.append(alloc, '\n');
                 self.pipe_last_line_has_lf = line_has_lf;
+                if (line_has_lf) try self.previewPipeBlock(alloc, out, completions.table_preview);
                 return;
             }
             try self.finalizePipeBlock(alloc, out, completions.table);
@@ -478,6 +479,25 @@ pub const MarkdownProcessor = struct {
         if (try block_render.writeListLine(alloc, line, line_has_lf, out, &fs, &link_id_counter)) return;
 
         try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(line, line_has_lf), out, false, &fs, &link_id_counter);
+    }
+
+    /// Shows a streaming table's ended rows once its delimiter row has
+    /// arrived, so a long table appears row by row instead of all at once.
+    fn previewPipeBlock(
+        self: *MarkdownProcessor,
+        alloc: Allocator,
+        out: *std.ArrayList(u8),
+        completion: ?*const payload.TableCompletion,
+    ) !void {
+        const sink = completion orelse return;
+        if (!bp.isValidTable(self.pipe_buf.items)) return;
+        const fs = self.footnoteSink();
+        var table = try block_render.parseTablePayloadWithFootnotes(alloc, self.pipe_buf.items, &fs, &link_id_counter);
+        table.partial = true;
+        var delivered = false;
+        errdefer if (!delivered) table.deinit(alloc);
+        try sink.deliver(sink.ctx, table, out);
+        delivered = true;
     }
 
     fn finalizePipeBlock(

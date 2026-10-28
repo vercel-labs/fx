@@ -2402,6 +2402,7 @@ pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !Transcri
             .created_at_ms = assistant.created_at_ms,
             .inline_hidden = assistant.inline_hidden,
             .table = try assistant.table.clone(alloc),
+            .frozen_widths = assistant.frozen_widths,
         } },
         .assistant_code_block => |assistant| .{ .assistant_code_block = .{
             .id = assistant.id,
@@ -2958,12 +2959,16 @@ pub fn appendAssistantTurnEntry(self: anytype, alloc: Allocator) !u32 {
     return entry_id;
 }
 
-/// Takes ownership of `table` only when it returns successfully.
+/// Takes ownership of `table` only when it returns successfully. A table that
+/// follows a still-streaming table replaces it in place, so the rows already
+/// shown stay where they are and only the new rows, or the closing border,
+/// are added.
 pub fn appendAssistantTableOwned(
     self: anytype,
     alloc: Allocator,
     table: assistant_presentation.TablePayload,
 ) !u32 {
+    if (trailingPartialTableIndex(self) != null) return replaceTrailingPartialTableOwned(self, alloc, table);
     if (hasCommittedRetentionSource(self)) {
         var shadow = try cloneRecordedMutationState(self, alloc);
         defer shadow.deinit(alloc);
@@ -2999,6 +3004,88 @@ pub fn appendAssistantTableOwned(
     try enforceStructuredRetention(self, alloc, entry_id);
     requestTranscriptPaint(self);
     self.next_entry_id +%= 1;
+    return entry_id;
+}
+
+/// A streaming table keeps its column widths once it no longer fits the
+/// viewport: its first rows are then in scrollback, where a wider layout
+/// could not reach them.
+fn streamingTableWidthsToKeep(
+    self: anytype,
+    alloc: Allocator,
+    shown: assistant_presentation.TablePayload,
+) !transcript_blocks.FrozenTableWidths {
+    const cols = self.layout.cols -| assistant_wrap.gutterWidth(self.layout.cols);
+    const rendered = try transcript_blocks.renderTableForTranscript(alloc, shown, cols);
+    defer alloc.free(rendered);
+    const height = std.mem.count(u8, rendered, "\n");
+    if (height < self.layout.content_bottom) return .{};
+    return transcript_blocks.tableColumnWidths(alloc, shown, cols);
+}
+
+fn trailingPartialTableIndex(self: anytype) ?usize {
+    const len = self.entries.items.len;
+    if (len == 0) return null;
+    return switch (self.entries.items[len - 1]) {
+        .assistant_table => |e| if (e.table.partial) len - 1 else null,
+        else => null,
+    };
+}
+
+/// Takes ownership of `table` only when it returns successfully.
+fn replaceTrailingPartialTableOwned(
+    self: anytype,
+    alloc: Allocator,
+    table: assistant_presentation.TablePayload,
+) !u32 {
+    if (hasCommittedRetentionSource(self)) {
+        var shadow = try cloneRecordedMutationState(self, alloc);
+        defer shadow.deinit(alloc);
+        var trims: std.ArrayList(RetentionPrefixTrim) = .empty;
+        defer trims.deinit(alloc);
+        if (comptime @hasField(@TypeOf(shadow), "retention_prefix_trims")) shadow.retention_prefix_trims = &trims;
+        const id = try replaceTrailingPartialTableOwned(&shadow, alloc, table);
+        errdefer {
+            // The caller keeps `table`, so the shadow must not free it.
+            for (shadow.entries.items, 0..) |entry, index| {
+                if (entry.id() == id) {
+                    _ = shadow.entries.orderedRemove(index);
+                    break;
+                }
+            }
+        }
+        try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, "assistant_table_replace", .preserve_same_epoch);
+        return id;
+    }
+    const index = trailingPartialTableIndex(self).?;
+    const entry = &self.entries.items[index].assistant_table;
+    const entry_id = entry.id;
+    const previous = entry.table;
+    const previous_widths = entry.frozen_widths;
+    if (previous_widths.len == 0) entry.frozen_widths = try streamingTableWidthsToKeep(self, alloc, previous);
+    entry.table = table;
+    errdefer for (self.entries.items) |*candidate| switch (candidate.*) {
+        .assistant_table => |*e| if (e.id == entry_id) {
+            e.table = previous;
+            e.frozen_widths = previous_widths;
+            break;
+        },
+        else => {},
+    };
+
+    const rendered = try transcript_blocks.renderEntriesToBytes(
+        alloc,
+        self.entries.items,
+        self.layout.cols,
+        self.command_output_render.styles,
+    );
+    defer alloc.free(rendered);
+    try ensurePaintReservation(self, alloc);
+    try rebuildTranscriptFromRendered(self, alloc, rendered, "replace_assistant_table");
+    try enforceStructuredRetention(self, alloc, entry_id);
+    requestTranscriptPaint(self);
+    var retired = previous;
+    retired.deinit(alloc);
     return entry_id;
 }
 

@@ -440,6 +440,9 @@ pub const TranscriptEntry = union(enum) {
         created_at_ms: i64 = 0,
         inline_hidden: bool = false,
         table: assistant_presentation.TablePayload,
+        /// Column widths kept once a streaming table grew past the viewport,
+        /// so rows already in scrollback still line up with the rows after.
+        frozen_widths: FrozenTableWidths = .{},
     };
 
     pub const AssistantCodeBlockEntry = struct {
@@ -1077,6 +1080,58 @@ pub fn renderTableForTranscript(
     return rendered.toOwnedSlice(alloc);
 }
 
+/// Small enough that a table entry stays within the largest transcript entry.
+pub const max_frozen_table_columns = 24;
+
+/// Content widths of a table's columns, fixed while it streams. Empty means
+/// the table lays itself out at every render.
+pub const FrozenTableWidths = struct {
+    len: u8 = 0,
+    widths: [max_frozen_table_columns]u16 = @splat(0),
+};
+
+/// The content widths `renderTableForTranscript` gives `table` at `cols`, or
+/// an empty value when it would not draw a grid.
+pub fn tableColumnWidths(alloc: Allocator, table: assistant_presentation.TablePayload, cols: u16) !FrozenTableWidths {
+    if (cols <= 2 or table.column_count == 0 or table.column_count > max_frozen_table_columns) return .{};
+    const measures = try alloc.alloc(TableColumnMeasure, table.column_count);
+    defer alloc.free(measures);
+    const widths = try alloc.alloc(usize, table.column_count);
+    defer alloc.free(widths);
+    measureTableColumns(table, measures);
+    if (!fitTableColumnWidths(measures, cols, widths)) return .{};
+    var frozen: FrozenTableWidths = .{ .len = @intCast(table.column_count) };
+    for (widths, 0..) |width, index| frozen.widths[index] = @intCast(@min(width, std.math.maxInt(u16)));
+    return frozen;
+}
+
+/// Renders `table` in the frozen column widths when they still fit `cols`,
+/// widening only a one-cell column that must hold a two-cell rune. Otherwise
+/// the table lays itself out as `renderTableForTranscript` does.
+pub fn renderTableForTranscriptFrozen(
+    alloc: Allocator,
+    table: assistant_presentation.TablePayload,
+    cols: u16,
+    frozen: FrozenTableWidths,
+) ![]u8 {
+    if (frozen.len == 0 or frozen.len != table.column_count) return renderTableForTranscript(alloc, table, cols);
+    const measures = try alloc.alloc(TableColumnMeasure, table.column_count);
+    defer alloc.free(measures);
+    const widths = try alloc.alloc(usize, table.column_count);
+    defer alloc.free(widths);
+    measureTableColumns(table, measures);
+    var total: usize = table.column_count * 3 + 1;
+    for (widths, measures, frozen.widths[0..frozen.len]) |*width, measure, kept| {
+        width.* = if (measure.natural >= 2) @max(kept, 2) else @max(kept, 1);
+        total += width.*;
+    }
+    if (total > cols) return renderTableForTranscript(alloc, table, cols);
+    var rendered: std.ArrayList(u8) = .empty;
+    errdefer rendered.deinit(alloc);
+    try renderBoxedGrid(alloc, table, widths, &rendered);
+    return rendered.toOwnedSlice(alloc);
+}
+
 /// A wrapped column keeps at least this many cells, or its natural width when
 /// narrower, so its text stays legible and every two-cell rune still fits.
 const table_min_column_width: usize = 3;
@@ -1167,8 +1222,19 @@ fn fitTableColumnWidths(measures: []const TableColumnMeasure, cols: usize, width
     }
 
     var word_total = settled_total;
+    var all_words_total: usize = 0;
     for (measures, widths) |measure, width| {
-        if (width == table_column_open) word_total += wrappedColumnSpan(measure, false).base;
+        const word = wrappedColumnSpan(measure, false).base;
+        all_words_total += word;
+        if (width == table_column_open) word_total += word;
+    }
+    // A settled column must not cost another column its whole words: when
+    // every column's longest word fits but the settled ones crowd them out,
+    // every column wraps instead.
+    if (word_total > available and all_words_total <= available) {
+        @memset(widths, table_column_open);
+        settled_total = 0;
+        word_total = all_words_total;
     }
     const break_words = word_total > available;
 
@@ -1553,7 +1619,8 @@ fn renderBoxedGrid(alloc: Allocator, table: assistant_presentation.TablePayload,
                 if (line_index < lines.items.len) {
                     const line = lines.items[line_index];
                     const pad = width -| line.width;
-                    const alignment: assistant_presentation.TableColumnAlign = if (row_index == 0) .left else table.alignments[col];
+                    // A header sits over its column the way the column's cells do.
+                    const alignment = table.alignments[col];
                     const left_pad = switch (alignment) {
                         .left => 0,
                         .right => pad,
@@ -1572,7 +1639,8 @@ fn renderBoxedGrid(alloc: Allocator, table: assistant_presentation.TablePayload,
         if (row_index == 0 and table.rows.len > 1) try appendTableBorder(alloc, out, "├", "┼", "┤", widths);
         if (row_index > 0 and row_index + 1 < table.rows.len) try appendTableBorder(alloc, out, "├", "┼", "┤", widths);
     }
-    try appendTableBorder(alloc, out, "└", "┴", "┘", widths);
+    // A table still streaming stays open below its last ended row.
+    if (!table.partial) try appendTableBorder(alloc, out, "└", "┴", "┘", widths);
 }
 
 /// One physical line of a wrapped cell. `text` borrows the cell bytes; the
@@ -2067,7 +2135,7 @@ fn renderEntryToBlockForPresentationInterruptible(
         },
         .assistant_table => |e| blk: {
             const gutter = assistant_wrap.gutterWidth(cols);
-            const rendered = try renderTableForTranscript(alloc, e.table, cols -| gutter);
+            const rendered = try renderTableForTranscriptFrozen(alloc, e.table, cols -| gutter, e.frozen_widths);
             defer alloc.free(rendered);
             const prefixed = try assistant_wrap.prefixStructuralRows(alloc, rendered, gutter);
             break :blk try normalizeOwnedRenderedBlock(alloc, kind, prefixed);
@@ -5090,6 +5158,20 @@ test "fitTableColumnWidths keeps short columns whole and gives longer text more 
     try std.testing.expect(fitTableColumnWidths(&measures, 17, &widths));
     try std.testing.expectEqualSlices(usize, &.{ 1, 3, 3 }, &widths);
     try std.testing.expect(!fitTableColumnWidths(&measures, 16, &widths));
+}
+
+test "fitTableColumnWidths wraps a short column before it breaks another column's words" {
+    // The first column fits an even share on one line, but settling it there
+    // would leave the second column narrower than its 14-cell word.
+    const measures = [_]TableColumnMeasure{
+        .{ .natural = 8, .word = 3 },
+        .{ .natural = 40, .word = 14 },
+    };
+    var widths: [2]usize = undefined;
+    try std.testing.expect(fitTableColumnWidths(&measures, 27, &widths));
+    try std.testing.expect(widths[1] >= 14);
+    try std.testing.expect(widths[0] >= 3);
+    try std.testing.expectEqual(@as(usize, 20), widths[0] + widths[1]);
 }
 
 test "renderTableForTranscript keeps a grid at every width that fits minimum columns" {

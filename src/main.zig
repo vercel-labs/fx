@@ -5056,6 +5056,7 @@ test {
     _ = @import("core/app/app_worker_runtime.zig");
     _ = @import("ui/event_loop.zig");
     _ = @import("ui/resize_tests.zig");
+    _ = @import("ui/markdown_table_tests.zig");
     _ = @import("ui/transcript/resume_projection.zig");
     _ = @import("ui/render_engine/assistant_wrap.zig");
     _ = @import("ui/render_engine/transcript_blocks.zig");

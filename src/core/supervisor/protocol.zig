@@ -22,7 +22,7 @@ const Allocator = std.mem.Allocator;
 
 /// Bumped whenever a request or response changes shape. A client refuses a
 /// supervisor that answers `ping` with another version.
-pub const version: u32 = 13;
+pub const version: u32 = 14;
 
 pub const Heartbeat = struct {
     prompt: []const u8 = "",

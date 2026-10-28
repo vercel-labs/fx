@@ -673,12 +673,14 @@ fn publishAssistantChunkResolved(stream_ctx: *StreamChunkContext, chunk: []const
     if (initial_prefix_to_emit) |prefix| {
         try stream_ctx.markdown.pushWithCompletions(alloc, prefix, &out, .{
             .table = table_completion,
+            .table_preview = table_completion,
             .code = semantic_code_completion,
             .thematic_rule = semantic_thematic_rule_completion,
         });
     }
     try stream_ctx.markdown.pushWithCompletions(alloc, chunk[start..], &out, .{
         .table = table_completion,
+        .table_preview = table_completion,
         .code = semantic_code_completion,
         .thematic_rule = semantic_thematic_rule_completion,
     });
@@ -996,6 +998,8 @@ const StreamCapture = struct {
     source_spans: std.ArrayList([]u8) = .empty,
     text_spans: std.ArrayList([]u8) = .empty,
     tables: std.ArrayList(TablePayload) = .empty,
+    /// Streaming tables received before their finished table replaced them.
+    preview_count: usize = 0,
     code_blocks: std.ArrayList(assistant_presentation.CodeBlockPayload) = .empty,
     thematic_rule_count: usize = 0,
     token_progress_updates: std.ArrayList(types.TurnTokenProgress) = .empty,
@@ -1183,6 +1187,15 @@ const StreamCapture = struct {
 
     fn captureTable(raw: *anyopaque, table: TablePayload) !void {
         const self: *StreamCapture = @ptrCast(@alignCast(raw));
+        self.preview_count += @intFromBool(table.partial);
+        // As the transcript does, a table replaces the streaming table before it.
+        const order = self.presentation_order.items;
+        if (order.len > 0 and order[order.len - 1] == .table and self.tables.items[self.tables.items.len - 1].partial) {
+            const last = &self.tables.items[self.tables.items.len - 1];
+            last.deinit(self.capture_alloc);
+            last.* = table;
+            return;
+        }
         try self.tables.ensureUnusedCapacity(self.capture_alloc, 1);
         try self.presentation_order.ensureUnusedCapacity(self.capture_alloc, 1);
         self.tables.appendAssumeCapacity(table);

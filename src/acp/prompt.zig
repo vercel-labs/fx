@@ -35,6 +35,7 @@ const sessions = @import("sessions.zig");
 const client_instructions = @import("client_instructions.zig");
 const tool_call_identities = @import("tool_call_identities.zig");
 const agent_runtime = @import("../core/agent/agent_runtime.zig");
+const assistant_presentation = @import("../core/agent/assistant_presentation.zig");
 const agent_execution_memory = @import("../core/agent/execution_memory.zig");
 const diff_mod = @import("../core/output/diff.zig");
 const file_mutation = @import("../core/tooling/file_mutation.zig");
@@ -1278,7 +1279,10 @@ pub fn handlePrompt(
     agent_config.session_child_capability = sessionChildCapability(session);
     maybeStartAcpTitleTask(state, session, owned_prompt, recovery_checkpoint != null, ctx.observer);
     defer if (session.title_task != null) completeAcpTitleTask(state, session);
-    agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, null, .{
+    // The native frontend lays tables, code blocks, and rules out at its own
+    // width, so they cross as payloads rather than as text rendered here.
+    const semantic_presentation = if (ctx.native()) native_lane.semanticSink(&ctx) else null;
+    agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, semantic_presentation, .{
         .view = state.lifecycle_view,
         .scope = .{
             .kind = .acp,
@@ -3607,6 +3611,36 @@ const native_lane = struct {
         noteSteeringEvent(ctx, event);
     }
 
+    fn semanticSink(ctx: *AcpContext) agent_runtime.SemanticPresentationSink {
+        return .{
+            .ctx = @ptrCast(ctx),
+            .table = pushTableNative,
+            .code_block = pushCodeBlockNative,
+            .thematic_rule = pushThematicRuleNative,
+        };
+    }
+
+    /// Consumes its owned table, as the native app's sink does.
+    fn pushTableNative(raw_ctx: *anyopaque, table: assistant_presentation.TablePayload) !void {
+        const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+        var owned = table;
+        defer owned.deinit(std.heap.c_allocator);
+        ctx.sendNativeEvent(.{ .assistant_presentation = .{ .table = table } }) catch {};
+    }
+
+    /// Consumes its owned block, as the native app's sink does.
+    fn pushCodeBlockNative(raw_ctx: *anyopaque, block: assistant_presentation.CodeBlockPayload) !void {
+        const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+        var owned = block;
+        defer owned.deinit(std.heap.c_allocator);
+        ctx.sendNativeEvent(.{ .assistant_presentation = .{ .code_block = block } }) catch {};
+    }
+
+    fn pushThematicRuleNative(raw_ctx: *anyopaque) !void {
+        const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+        ctx.sendNativeEvent(.{ .assistant_presentation = .thematic_rule }) catch {};
+    }
+
     /// The frontend renders the reply itself, so only rendered text crosses.
     fn pushTextNative(raw_ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
         const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
@@ -4915,6 +4949,55 @@ test "native root presentation selects one lane and retains typed tool progress"
     // A consumed owned event never returns a delivery error to callers whose
     // errdefer otherwise releases it again.
     try deps.push_event(deps.ctx, .{ .append_user_feedback = try std.heap.c_allocator.dupe(u8, "failed publication") });
+}
+
+test "native lane sends tables, code blocks, and rules as payloads the frontend lays out" {
+    const alloc = std.testing.allocator;
+    const Capture = struct {
+        frames: std.ArrayList([]u8) = .empty,
+
+        fn write(raw: ?*anyopaque, frame: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const owned = try std.testing.allocator.dupe(u8, frame);
+            errdefer std.testing.allocator.free(owned);
+            try self.frames.append(std.testing.allocator, owned);
+        }
+    };
+    var capture: Capture = .{};
+    defer {
+        for (capture.frames.items) |frame| alloc.free(frame);
+        capture.frames.deinit(alloc);
+    }
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = jsonrpc.Writer.initCallback(&capture, Capture.write);
+    state.presentation = .native;
+    var ctx: AcpContext = .{ .alloc = alloc, .state = &state, .session_id = "session_1" };
+    defer ctx.deinitPublishedToolCalls();
+
+    const sink = native_lane.semanticSink(&ctx);
+    var table = try assistant_presentation.parseTablePayload(std.heap.c_allocator, "| a | b |\n|---|--:|\n| 1 | 2 |\n");
+    table.partial = true;
+    try sink.table(sink.ctx, table);
+    const language = try std.heap.c_allocator.dupe(u8, "zig");
+    const code = try std.heap.c_allocator.dupe(u8, "const x = 1;\n");
+    try sink.code_block(sink.ctx, .{ .language = language, .code = code });
+    try sink.thematic_rule(sink.ctx);
+
+    try std.testing.expectEqual(@as(usize, 3), capture.frames.items.len);
+    const expected = [_][]const u8{ "table", "code_block", "thematic_rule" };
+    for (capture.frames.items, expected) |frame, kind| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, frame, .{});
+        defer parsed.deinit();
+        const params = parsed.value.object.get("params").?.object;
+        const presentation = params.get("event").?.object.get("assistant_presentation").?;
+        switch (presentation) {
+            .object => |object| try std.testing.expect(object.get(kind) != null),
+            .string => |name| try std.testing.expectEqualStrings(kind, name),
+            else => return error.TestUnexpectedPresentation,
+        }
+    }
+    try std.testing.expect(std.mem.find(u8, capture.frames.items[0], "\"partial\":true") != null);
 }
 
 test "ACP auth failure emits a valid detail-free JSON-RPC notification" {

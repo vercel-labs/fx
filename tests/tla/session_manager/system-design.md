@@ -3036,6 +3036,33 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   still tries it again. **Why:** every start printed `SessionOpenFailed`
   with no reason for a session log that could not load.
 
+- **D285 Decision:** the supervisor's native presentation lane carries an
+  assistant table, fenced code block, or thematic rule as a payload, as the
+  in-process frontend receives it, instead of text the host laid out. The
+  frontend lays them out at its own width and again on resize. Supervisor
+  protocol 14 marks the change. **Why:** the host laid tables out with no
+  width, so a detached frontend showed rows that wrapped through their
+  borders and code blocks without their header. **Alternative:** sending the
+  terminal width to the host, which cannot reflow text already sent.
+
+- **D286 Decision:** a table that is still streaming arrives as a payload
+  marked `partial` each time one of its rows ends, once its delimiter row
+  has arrived. The frontend replaces a trailing partial table in place, and
+  the finished table replaces it last; a partial table draws no bottom
+  border. A row still streaming is not shown. **Why:** a table appeared only
+  when its last row ended, leaving a long table blank while it streamed.
+  **Alternative:** streaming the raw pipe text, which jumps to a grid at the
+  end.
+
+- **D287 Decision:** once a streaming table no longer fits the viewport, it
+  keeps the column widths its rows were drawn with, and later rows wrap
+  inside them. Frozen widths apply while they fit the terminal; at a width
+  they do not fit, the table lays itself out again. **Why:** rows that have
+  scrolled into the terminal's scrollback cannot be redrawn, so a wider
+  layout would leave them misaligned with the rows below. **Alternative:**
+  clearing the scrollback to redraw the table, which the inline transcript
+  never does.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

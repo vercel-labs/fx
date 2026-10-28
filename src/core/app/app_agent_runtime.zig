@@ -2944,6 +2944,8 @@ test "app direct ask delivers semantic presentation through the runtime sink" {
     for (events.items) |event| switch (event) {
         .assistant_presentation => |presentation| switch (presentation) {
             .table => |table| {
+                // Rows of the streaming table precede the finished one.
+                if (table.partial) continue;
                 table_count += 1;
                 semantic_events[semantic_event_count] = .table;
                 semantic_event_count += 1;

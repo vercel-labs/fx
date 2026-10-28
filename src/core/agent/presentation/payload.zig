@@ -11,6 +11,9 @@ pub const TablePayload = struct {
     rows: []TableRow,
     alignments: []TableColumnAlign,
     column_count: usize,
+    /// Set while the table is still streaming: it holds only the rows that
+    /// have ended so far, and the next payload for it replaces it.
+    partial: bool = false,
 
     pub fn deinit(self: *TablePayload, alloc: Allocator) void {
         deinitTableRows(alloc, self.rows);
@@ -48,6 +51,7 @@ pub const TablePayload = struct {
             .rows = rows,
             .alignments = alignments,
             .column_count = self.column_count,
+            .partial = self.partial,
         };
     }
 };
@@ -91,6 +95,9 @@ pub const ThematicRuleCompletion = struct {
 
 pub const MarkdownCompletions = struct {
     table: ?*const TableCompletion = null,
+    /// Receives the rows of a table that is still streaming, marked partial,
+    /// each time a row ends. The finished table still goes to `table`.
+    table_preview: ?*const TableCompletion = null,
     code: ?*const CodeBlockCompletion = null,
     thematic_rule: ?*const ThematicRuleCompletion = null,
 };
