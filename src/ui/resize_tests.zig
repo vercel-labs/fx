@@ -3935,10 +3935,10 @@ test "closed tool group finality flows through fixed point resolution and sealin
     try expectGridContains(&h, "SECOND_GROUP_INTRO");
 }
 
-test "completed tool group lets streamed assistant hard lines enter history" {
+test "a live tool group holds no rows, so streamed assistant hard lines enter history at once" {
     const alloc = std.testing.allocator;
-    // A live group shows only its newest rows; a short viewport keeps it
-    // taller than the room above the footer, so it holds what follows.
+    // A live group has its settled layout (D291): it is never taller than
+    // the group it settles into, so it holds nothing back from history.
     var h = try Harness.init(alloc, 80, 8, 3);
     defer h.deinit();
 
@@ -3987,7 +3987,7 @@ test "completed tool group lets streamed assistant hard lines enter history" {
     defer held_source.deinit(alloc);
     const held = h.shell.stableTranscriptProjectionForFlow(held_source.bytes) orelse
         return error.TestExpectedStableTranscript;
-    try std.testing.expect(held.visual_offset > held.history_visual_offset);
+    try std.testing.expectEqual(held.history_visual_offset, held.visual_offset);
 
     _ = try h.shell.streamAssistantChunk(
         alloc,
@@ -3997,34 +3997,21 @@ test "completed tool group lets streamed assistant hard lines enter history" {
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
-
-    try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
-    try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
+    try std.testing.expect(h.last_frame.transcript_history_floor_respected);
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
+    try expectGridContains(&h, "partial tail");
 
     _ = try h.shell.applyToolLifecycle(alloc, .{ .terminal = .{
         .id = active_id,
         .outcome = .{ .kind = .completed, .summary = "Read fixed-point fixture" },
     } });
-    h.frame_redraw = true;
-    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
-    try h.flush();
-
-    // The settled group folds to fewer rows than the live one; the next
-    // frame commits what it released.
-    h.frame_redraw = true;
-    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
-    try h.flush();
-    try std.testing.expect(h.last_frame.planned_scroll_rows > 0);
-    try std.testing.expect(h.last_frame.committed_scroll_rows > 0);
-    try std.testing.expect(h.last_frame.document_append_bytes > 0);
-    try std.testing.expect(h.last_frame.transcript_history_floor_respected);
-    try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
-
-    var released_source = try h.shell.prepareTranscriptSource(alloc, null);
-    defer released_source.deinit(alloc);
-    const released = h.shell.stableTranscriptProjectionForFlow(released_source.bytes) orelse
-        return error.TestExpectedStableTranscript;
-    try std.testing.expect(released.history_visual_offset > held.visual_offset);
+    for (0..2) |_| {
+        h.frame_redraw = true;
+        try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+        try h.flush();
+        try std.testing.expect(h.last_frame.transcript_history_floor_respected);
+        try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
+    }
     try expectGridContains(&h, "partial tail");
 }
 

@@ -3077,6 +3077,18 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   **Alternative:** reusing the permission lexer, which would tie what a
   row says to what is allowed to run.
 
+- **D291 Decision:** a live tool group uses the settled layout: folds,
+  then attention rows and the newest outcomes in the order they ran, each
+  with what it carries under it. A running call is an attention row and
+  the newest, so it comes last; when it settles nothing above it moves,
+  and when the next call starts the settled rows stay as they were. A
+  read that settles joins the Explored row in place. **Why:** the live
+  view showed only the last three rows without output and the settled
+  view showed folds and output, so the tree switched shape on every call
+  and earlier calls' output appeared and vanished under later rows.
+  **Alternative:** keeping the short live view and freezing it between
+  calls, which still jumps once the turn settles.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

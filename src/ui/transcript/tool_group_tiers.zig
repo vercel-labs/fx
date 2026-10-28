@@ -16,7 +16,9 @@
 //! without opening the full transcript. A shell command that only reads,
 //! lists or searches files is routine and reads as what it did (D290);
 //! those fold into one "Explored · Read a, b · Searched x" row. A live group
-//! shows only its last few rows. Ctrl+O keeps every row.
+//! has the same layout with its running rows last, so each call's row and
+//! output stay where they are as later calls arrive (D291). Ctrl+O keeps
+//! every row.
 const std = @import("std");
 const transcript_blocks = @import("../render_engine/transcript_blocks.zig");
 const human_text = @import("../../core/shared/human_text.zig");
@@ -36,8 +38,6 @@ pub const settled_row_cap = 5;
 const tail_blocks = 3;
 /// Names a fold lists before "+N".
 const fold_names = 2;
-/// Rows a live group shows: the newest, so it does not grow while it runs.
-pub const live_row_count = 3;
 /// Names one verb of an Explored row lists before "+N".
 const explore_names = 3;
 /// The widest command name a fold lists.
@@ -293,26 +293,11 @@ fn anomalyOf(detail: ?*const ToolDetailRecord) ?Anomaly {
 
 // ---- rows ------------------------------------------------------------------
 
-/// The rows under the header. `live` shows only the newest rows.
-pub fn plan(arena: Allocator, items: []const Item, live: bool) ![]Row {
+/// The rows under the header. A live group has the layout a settled one
+/// has: a running row is an attention row and the newest, so it comes
+/// last, and when it settles the rows above it stay where they are (D291).
+pub fn plan(arena: Allocator, items: []const Item) ![]Row {
     var rows: std.ArrayList(Row) = .empty;
-    if (live) {
-        const start = items.len -| live_row_count;
-        if (start > 0) try rows.append(arena, .{
-            .entry_id = items[0].entry_id,
-            .kind = .fold,
-            .style = .dim,
-            .text = try arena.print("… {d} earlier", .{start}),
-        });
-        for (items[start..]) |item| try rows.append(arena, .{
-            .entry_id = item.entry_id,
-            .kind = .item,
-            .style = styleOf(arena, item),
-            .text = try itemText(arena, item),
-            .detail = item.detail,
-        });
-        return rows.items;
-    }
 
     const tiers = try arena.alloc(Tier, items.len);
     var attention: usize = 0;
@@ -708,7 +693,7 @@ test "routine rows fold, outcomes stay, failures say why" {
     const summary = try header(arena, &items);
     try std.testing.expectEqualStrings("Read 3 files, wrote 1 file, ran 1 command and 2 other calls", summary.words);
     try std.testing.expectEqualStrings(" · 1 failed", summary.attention);
-    const rows = try plan(arena, &items, false);
+    const rows = try plan(arena, &items);
     var texts: std.ArrayList([]const u8) = .empty;
     for (rows) |row| try texts.append(arena, try arena.print("{s}:{s}", .{ @tagName(row.style), row.text }));
     const joined = try std.mem.join(arena, "\n", texts.items);
@@ -735,7 +720,7 @@ test "a settled group caps its rows and folds older commands" {
         record.result = @constCast(try arena.print("{d}\n", .{index}));
         item.* = .{ .entry_id = @intCast(index + 1), .detail = record, .phrase = try arena.print("Ran {s}", .{command}) };
     }
-    const rows = try plan(arena, &items, false);
+    const rows = try plan(arena, &items);
     var item_rows: usize = 0;
     var body_rows: usize = 0;
     for (rows) |row| switch (row.kind) {
@@ -749,16 +734,36 @@ test "a settled group caps its rows and folds older commands" {
     try std.testing.expectEqualStrings("8", rows[rows.len - 1].text);
 }
 
-test "a live group shows only its newest rows" {
+test "a running row comes last and settling it moves nothing above it" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var items: [6]Item = undefined;
-    for (&items, 0..) |*item, index| item.* = .{ .entry_id = @intCast(index + 1), .detail = null, .phrase = try arena.print("Read f{d}", .{index}) };
-    const rows = try plan(arena, &items, true);
-    try std.testing.expectEqual(@as(usize, 4), rows.len);
-    try std.testing.expectEqualStrings("… 3 earlier", rows[0].text);
-    try std.testing.expectEqualStrings("Read f5", rows[3].text);
+    var records: [4]ToolDetailRecord = undefined;
+    var items: [4]Item = undefined;
+    for (&records, &items, 0..) |*record, *item, index| {
+        const command = try arena.print("make step{d}", .{index});
+        record.* = testRecord(@intCast(index + 1), "shell", .command, "{\"action\":\"run\"}");
+        record.command_display = @constCast(command);
+        record.command_process_presentation = .{ .exit_code = 0 };
+        record.result = @constCast(try arena.print("built {d}\n", .{index}));
+        item.* = .{ .entry_id = @intCast(index + 1), .detail = record, .phrase = try arena.print("Ran {s}", .{command}) };
+    }
+    records[3].outcome = null;
+    records[3].command_process_presentation = null;
+    records[3].result = null;
+    items[3].phrase = "Running make step3";
+    const live = try plan(arena, &items);
+    try std.testing.expectEqualStrings("Running make step3", live[live.len - 1].text);
+    records[3].outcome = .completed;
+    records[3].command_process_presentation = .{ .exit_code = 0 };
+    records[3].result = @constCast("built 3\n");
+    items[3].phrase = "Ran make step3";
+    const settled = try plan(arena, &items);
+    // Every row before the running one is unchanged; the settled row and
+    // its output follow.
+    for (live[0 .. live.len - 1], 0..) |row, index| try std.testing.expectEqualStrings(row.text, settled[index].text);
+    try std.testing.expectEqualStrings("Ran make step3", settled[live.len - 1].text);
+    try std.testing.expectEqualStrings("built 3", settled[settled.len - 1].text);
 }
 
 test "a Python run outlines its code and keeps the end of its output" {
@@ -770,7 +775,7 @@ test "a Python run outlines its code and keeps the end of its output" {
     record.command_process_presentation = .{ .exit_code = 1 };
     record.result = @constCast("Traceback (most recent call last):\n  File \"<stdin>\", line 2, in <module>\nAttributeError: module 'os' has no attribute 'nope'\n");
     const items = [_]Item{.{ .entry_id = 1, .detail = &record, .phrase = "Exited 1: Running python3 - <<'PY' import os os.nope() PY" }};
-    const rows = try plan(arena, &items, false);
+    const rows = try plan(arena, &items);
     const expected = [_][]const u8{
         "Exited 1 · AttributeError: module 'os' has no attribute 'nope'",
         "$ python3 heredoc",
@@ -794,7 +799,7 @@ test "a Python cell inside other shell keeps its shell chunks, and unparsed code
     record.command_process_presentation = .{ .exit_code = 0 };
     record.result = @constCast("0\n1\n2\ndone\n");
     const items = [_]Item{.{ .entry_id = 1, .detail = &record, .phrase = "Ran proto models --help && python3.13" }};
-    const rows = try plan(arena, &items, false);
+    const rows = try plan(arena, &items);
     const expected = [_][]const u8{
         "Ran python3.13",
         "proto models --help && python3.13 <<'PY'",
@@ -813,7 +818,7 @@ test "a Python cell inside other shell keeps its shell chunks, and unparsed code
     for (expected, rows) |want, row| try std.testing.expectEqualStrings(want, row.text);
 
     record.command_display = @constCast("python3 - <<'PY'\nprint((1,\nPY");
-    const broken = try plan(arena, &items, false);
+    const broken = try plan(arena, &items);
     try std.testing.expectEqualStrings("print((1,", broken[1].text);
 }
 
@@ -828,7 +833,7 @@ test "browser rows read by what they opened and did, with the script and its out
         .{ .entry_id = 1, .detail = &opened, .phrase = "Opened https://example.com/" },
         .{ .entry_id = 2, .detail = &ran, .phrase = "Ran browser script on main" },
     };
-    const rows = try plan(arena, &items, false);
+    const rows = try plan(arena, &items);
     var texts: std.ArrayList([]const u8) = .empty;
     for (rows) |row| try texts.append(arena, row.text);
     const joined = try std.mem.join(arena, "\n", texts.items);
@@ -837,7 +842,7 @@ test "browser rows read by what they opened and did, with the script and its out
 
     var blocked = testRecord(3, "browser", .command, "{\"action\":\"run\",\"code\":\"await tab.click('#go');\"}");
     blocked.result = @constCast("[main: navigation blocked: http://localhost/ is denied by the web_fetch rule for domain:localhost]");
-    const blocked_rows = try plan(arena, &.{.{ .entry_id = 3, .detail = &blocked, .phrase = "Ran browser script on main" }}, false);
+    const blocked_rows = try plan(arena, &.{.{ .entry_id = 3, .detail = &blocked, .phrase = "Ran browser script on main" }});
     try std.testing.expectEqualStrings("Clicked #go · navigation blocked", blocked_rows[0].text);
 }
 
@@ -853,7 +858,7 @@ test "checklist rows read by what changed, with the list or the progress under t
         .{ .entry_id = 1, .detail = &planned, .phrase = "Updated checklist" },
         .{ .entry_id = 2, .detail = &done, .phrase = "Updated checklist" },
     };
-    const rows = try plan(arena, &items, false);
+    const rows = try plan(arena, &items);
     var texts: std.ArrayList([]const u8) = .empty;
     for (rows) |row| try texts.append(arena, row.text);
     const joined = try std.mem.join(arena, "\n", texts.items);
@@ -885,7 +890,7 @@ test "reading commands fold into one Explored row and only other commands keep t
     const summary = try header(arena, &items);
     try std.testing.expectEqualStrings("Read 2 files, searched 2 patterns, listed 1 directory and 1 other call", summary.words);
     try std.testing.expectEqualStrings("", summary.attention);
-    const rows = try plan(arena, &items, false);
+    const rows = try plan(arena, &items);
     var texts: std.ArrayList([]const u8) = .empty;
     for (rows) |row| try texts.append(arena, try arena.print("{s}:{s}", .{ @tagName(row.style), row.text }));
     try std.testing.expectEqualStrings(

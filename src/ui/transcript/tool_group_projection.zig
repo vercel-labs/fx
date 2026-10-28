@@ -767,7 +767,7 @@ fn formatGroupBlock(
         return .{ .bytes = bytes, .lines = try lines.toOwnedSlice(alloc) };
     }
 
-    const rows = try tiers.plan(scratch, row_items.items, live);
+    const rows = try tiers.plan(scratch, row_items.items);
     var last_top: usize = 0;
     for (rows, 0..) |row, index| {
         if (row.kind != .body) last_top = index;
@@ -1722,10 +1722,14 @@ test "grouped subagent status keeps the vertical continuation for middle rows" {
 
     try std.testing.expectEqualStrings(
         "● Started 4 workers · 4 running\n" ++
-            "├ … 1 earlier\n" ++
             "├ Subagent working · inspect auth\n" ++
+            "│   glm-5.3-flash · max\n" ++
             "├ Subagent working · inspect auth\n" ++
-            "└ Subagent working · inspect auth",
+            "│   glm-5.3-flash · max\n" ++
+            "├ Subagent working · inspect auth\n" ++
+            "│   glm-5.3-flash · max\n" ++
+            "└ Subagent working · inspect auth\n" ++
+            "    glm-5.3-flash · max",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -2533,7 +2537,7 @@ test "minimal command timeout uses its typed cause in the row and group" {
     );
 }
 
-test "tool-heavy groups stay calm: live tail, then folds and a row cap" {
+test "tool-heavy groups stay calm: folds and a row cap, live or settled" {
     const alloc = std.testing.allocator;
     const tool_count = 20;
     var entries: [tool_count]TranscriptEntry = undefined;
@@ -2575,10 +2579,14 @@ test "tool-heavy groups stay calm: live tail, then folds and a row cap" {
     defer projection.deinit(alloc);
     const summary = projection.entry_actions.items[0].override.bytes;
 
-    // Live: the header counts everything, the rows show only the newest.
+    // Live: the settled layout with the running row last, so settling it
+    // moves nothing above it (D291).
     try std.testing.expectEqualStrings(
         "● Read 10 files, ran 8 commands, edited 2 files · 1 failed · 1 running\n" ++
-            "├ … 17 earlier\n" ++
+            "├ Read 10 files · file.zig\n" ++
+            "├ Ran 5 more commands · zig build\n" ++
+            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
             "├ Exited 1 · rg snapshot\n" ++
             "├ Edited store.zig\n" ++
             "└ Editing runtime.zig",
