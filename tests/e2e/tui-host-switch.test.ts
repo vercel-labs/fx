@@ -415,6 +415,86 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
+    "/compact on a subagent's screen saves to its own session, and its next turns use it, after a restart too",
+    async () => {
+      const summary = "Facts:\nF1: SWITCH_COMPACT_SUMMARY: the subagent read notes.txt for main.";
+      const history = "history alpha beta gamma delta sample line\n".repeat(1600);
+      let mainCalls = 0;
+      const bodies = await withFx((body) => {
+        // The compactor asks for its summary with no tools.
+        const request = JSON.parse(body) as { toolChoice?: { type?: string }; tools?: unknown[] };
+        if (request.toolChoice?.type === "none" && request.tools?.length === 0) return text("summary", summary);
+        if (!isMainRequest(body)) {
+          const latest = latestUserText(body);
+          if (latest.includes("SWITCH_AFTER_COMPACT")) return text("child_after", "SWITCH_CHILD_AFTER");
+          if (latest.includes("SWITCH_AFTER_RESUME")) return text("child_resumed", "SWITCH_CHILD_RESUMED");
+          // The subagent reads a file and answers at length, which leaves work to compact.
+          if (!body.includes('"child_read"')) return toolCall("child_read", "read_file", { path: "notes.txt" });
+          return text("child_answer", `SWITCH_CHILD_ANSWER\n${history}`);
+        }
+        mainCalls += 1;
+        if (mainCalls === 1) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "reader", message: "SWITCH_TASK read notes.txt" },
+          });
+        }
+        return text("main_final", "SWITCH_MAIN_FINAL");
+      }, async (session, { home, workspace, launch }) => {
+        writeFileSync(join(workspace, "notes.txt"), "SWITCH_NOTES\n");
+        const sessions = join(home, ".fx", "sessions", "v2");
+        const holds = (path: string, marker: string): boolean => readdirSync(path).some((entry) => {
+          const full = join(path, entry);
+          return statSync(full).isDirectory() ? holds(full, marker) : readFileSync(full, "latin1").includes(marker);
+        });
+        // The saved sessions whose files hold `marker`.
+        const holding = (marker: string) => readdirSync(sessions).filter((id) =>
+          !id.startsWith(".") && statSync(join(sessions, id)).isDirectory() && holds(join(sessions, id), marker));
+
+        await session.sendText("SWITCH_USER");
+        await session.waitForText("SWITCH_MAIN_FINAL", 30_000);
+        await session.waitForComposer(15_000);
+        await moveAgent(session, 1);
+        await session.waitForPane((pane) => pane.includes("reader \u00b7 "), 15_000);
+        await session.sendText("/compact");
+        const deadline = Date.now() + 30_000;
+        while (holding("SWITCH_COMPACT_SUMMARY").length === 0 && Date.now() < deadline) await Bun.sleep(100);
+        await session.waitForComposer(15_000);
+        await session.sendText("SWITCH_AFTER_COMPACT");
+        await session.waitForText("SWITCH_CHILD_AFTER", 30_000);
+        await session.waitForComposer(15_000);
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(15_000)).toBe(true);
+
+        // The summary is saved in the subagent's own session, not main's.
+        const parents = holding("SWITCH_MAIN_FINAL");
+        expect(parents.length).toBe(1);
+        const compacted = holding("SWITCH_COMPACT_SUMMARY");
+        expect(compacted.length).toBe(1);
+        expect(compacted[0]).not.toBe(parents[0]);
+        expect(holding("SWITCH_TASK")).toContain(compacted[0]!);
+
+        // A restart restores the subagent's compacted conversation.
+        const resumed = await launch(`--resume ${parents[0]}`);
+        await moveAgent(resumed, 1);
+        await resumed.waitForPane((pane) => pane.includes("reader \u00b7 "), 15_000);
+        await resumed.sendText("SWITCH_AFTER_RESUME");
+        await resumed.waitForText("SWITCH_CHILD_RESUMED", 30_000);
+      });
+
+      const childTurn = (marker: string) => bodies.find((body) => !isMainRequest(body) && latestUserText(body).includes(marker));
+      for (const marker of ["SWITCH_AFTER_COMPACT", "SWITCH_AFTER_RESUME"]) {
+        const body = childTurn(marker);
+        expect(body).toBeDefined();
+        expect(body).toContain("compacted_conversation");
+        expect(body).toContain("SWITCH_COMPACT_SUMMARY");
+      }
+      // Main's model never sees the subagent's summary.
+      for (const body of bodies.filter(isMainRequest)) expect(body).not.toContain("SWITCH_COMPACT_SUMMARY");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "with no subagent, Option+Right jumps by word",
     async () => {
       await withFx(() => text("unused", "unused"), async (session) => {
