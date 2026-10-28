@@ -32,7 +32,7 @@ const Source = @import("regions.zig").Source;
 
 const max_history_args = 4096;
 
-pub const NoticeKind = enum { interrupt, reminder, deferred };
+pub const NoticeKind = envelope.NoticeKind;
 
 pub const Injection = struct {
     /// Envelopes for the model.
@@ -401,21 +401,10 @@ pub const Coordinator = struct {
 
 /// The transcript row's body, in proto-fx's notice voice; no ids.
 fn noticeText(alloc: Allocator, pending: []const Pending, kind: NoticeKind) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    for (pending, 0..) |item, index| {
-        if (index > 0) try out.appendSlice(alloc, ", ");
-        try out.appendSlice(alloc, item.name);
-    }
-    if (pending.len == 1) if (pending[0].description) |description| {
-        const first_line = std.mem.sliceTo(description, '\n');
-        if (first_line.len > 0) try out.print(alloc, " · {s}", .{first_line[0..@min(first_line.len, 160)]});
-    };
-    try out.appendSlice(alloc, switch (kind) {
-        .interrupt => " · response restarted",
-        .reminder => " · added to the tool result",
-        .deferred => " · added after the reply",
-    });
-    return out.items;
+    const names = try alloc.alloc([]const u8, pending.len);
+    defer alloc.free(names);
+    for (pending, names) |item, *name| name.* = item.name;
+    return envelope.noticeBody(alloc, names, if (pending.len == 1) pending[0].description else null, kind);
 }
 
 /// A rule's path as a person reads it.

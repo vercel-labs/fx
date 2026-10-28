@@ -4361,14 +4361,26 @@ pub fn Runtime(comptime App: type) type {
                     if (prefix.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, prefix);
                 }
                 if (steering.text.len == 0) continue;
-                try writeSteeringToSink(app, sink, steering.text);
+                try writeSteeringToSink(app, sink, steering.text, afterReply(steering));
             }
         }
 
         /// A stream rule's saved injection reads as the rule row the live
         /// turn showed; other steering is the person's own update.
-        fn writeSteeringToSink(app: *App, sink: anytype, text: []u8) !void {
-            if (try ttsr.envelope.restoredNotice(app.alloc, text)) |body| {
+        fn afterReply(steering: types.PersistedSteering) bool {
+            const prefix = steering.assistant_prefix orelse return false;
+            return prefix.len > 0;
+        }
+
+        fn writeSteeringToSink(app: *App, sink: anytype, text: []u8, after_reply: bool) !void {
+            var arena_state = std.heap.ArenaAllocator.init(app.alloc);
+            defer arena_state.deinit();
+            // The single rule's description, as the live row gave it.
+            const description = if (try ttsr.envelope.singleRulePath(arena_state.allocator(), text)) |path|
+                ttsr.discovery.describe(arena_state.allocator(), path, app.workspace_root, io_mod.getenv("HOME"))
+            else
+                null;
+            if (try ttsr.envelope.restoredNotice(app.alloc, text, after_reply, description)) |body| {
                 defer app.alloc.free(body);
                 return sink.appendNotice(.{ .topic = "rule", .tone = .warning, .body = body });
             }
@@ -4400,7 +4412,7 @@ pub fn Runtime(comptime App: type) type {
                 if (item.assistant_prefix) |prefix| {
                     if (prefix.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, prefix);
                 }
-                if (item.text.len > 0) try writeSteeringToSink(app, sink, item.text);
+                if (item.text.len > 0) try writeSteeringToSink(app, sink, item.text, afterReply(item));
                 index.* += 1;
             }
         }

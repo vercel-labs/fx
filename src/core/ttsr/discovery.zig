@@ -67,6 +67,29 @@ pub fn loadFile(arena: Allocator, path: []const u8) !Rule {
     return try rule_mod.parseMarkdown(arena, name, content, path, .file) orelse error.RuleDisabled;
 }
 
+/// The description of the rule an injection names by `path` as its row
+/// shows it (workspace-relative, `~/...`, or `builtin://`), when the rule
+/// can still be read. Memory comes from `arena`.
+pub fn describe(arena: Allocator, path: []const u8, workspace_root: []const u8, home: ?[]const u8) ?[]const u8 {
+    const builtin_prefix = "builtin://";
+    if (std.mem.startsWith(u8, path, builtin_prefix)) {
+        const name = stripExtension(path[builtin_prefix.len..]);
+        for (builtin_rules.sources) |source| if (std.mem.eql(u8, source.name, name)) {
+            const parsed = rule_mod.parseMarkdown(arena, name, source.content, path, .builtin) catch return null;
+            return (parsed orelse return null).description;
+        };
+        return null;
+    }
+    const full = if (std.mem.startsWith(u8, path, "~/"))
+        join(arena, &.{ home orelse return null, path[2..] }) catch return null
+    else if (std.Io.Dir.path.isAbsolute(path))
+        path
+    else
+        join(arena, &.{ workspace_root, path }) catch return null;
+    const parsed = loadFile(arena, full) catch return null;
+    return parsed.description;
+}
+
 fn join(arena: Allocator, parts: []const []const u8) ![]const u8 {
     return std.Io.Dir.path.join(arena, parts);
 }
