@@ -517,15 +517,18 @@ pub fn Runtime(comptime App: type) type {
         /// it shows until its own request comes, and the subagent that lent
         /// it lets it be while its worker still asks the same thing.
         /// Otherwise the approval goes back first, and the caller syncs the
-        /// prompt from the worker's `pending`.
+        /// prompt from the worker's `pending`. That includes an approval
+        /// answered on the instance's screen, whose prompt is already
+        /// cleared, so the next one of the tree can be lent.
         pub fn keepLentApproval(app: *App, agent: *AppAgent, pending: ?permission_request.PermissionRequest) bool {
             const lender = app.approval_lender orelse return false;
             const borrower = rootInstance(app, lender);
             if (agent == borrower) {
                 if (pending == null) return true;
             } else if (agent == &lender.agent) {
-                const lent = borrower.approval_prompt.request orelse return false;
-                if (pending) |request| if (request.id == lent.id) return true;
+                if (borrower.approval_prompt.request) |lent| {
+                    if (pending) |request| if (request.id == lent.id) return true;
+                }
             } else return false;
             _ = returnApproval(app);
             return false;
