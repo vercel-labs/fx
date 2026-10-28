@@ -26,6 +26,7 @@ const scripts = [
   "test-native-core-http-cleanup.mjs",
   "test-native-core-fetch-failure.mjs",
   "test-native-core-image-framing.mjs",
+  "test-native-core-large-request.mjs",
   "test-native-host-tool-frame-limit.mjs",
   "test-native-core-cancel-before-fetch.mjs",
   "test-native-core-cancel.mjs",

@@ -62,7 +62,7 @@ shared createFxAgent() logic in sdk/fx-sdk.js
 - `exited` settles when the native runtime exits.
 - `abort()` aborts Node fetch and closes native input.
 
-Each core has one nonblocking Unix socketpair for readiness. The adapter takes ownership of the reader with `takeCoreReadyFd()` and watches it through `node:net`; Bun adopts the descriptor through `connect()`. The native writer signals when a fetch request becomes pending, output changes from empty to non-empty, semantic consumption completes, or the core exits. Wake bytes carry no state: JavaScript drains the bounded fetch and output queues to quiescence and then checks exit state. ACP output is accumulated to newline boundaries and parsed as JSON. Gateway requests are transferred to Node as a bounded JSON metadata record plus the raw request body; Node runs the configured `fetch`, streams bounded response chunks back to Zig, and owns the `AbortController`. This matches the WebAssembly host-fetch boundary and ensures the N-API core never uses the native `std.http` Gateway transport.
+Each core has one nonblocking Unix socketpair for readiness. The adapter takes ownership of the reader with `takeCoreReadyFd()` and watches it through `node:net`; Bun adopts the descriptor through `connect()`. The native writer signals when a fetch request becomes pending, output changes from empty to non-empty, semantic consumption completes, or the core exits. Wake bytes carry no state: JavaScript drains the bounded fetch and output queues to quiescence and then checks exit state. ACP output is accumulated to newline boundaries and parsed as JSON. Gateway requests are transferred to Node as a JSON metadata record plus the raw request body; Node runs the configured `fetch`, streams bounded response chunks back to Zig, and owns the `AbortController`. This matches the WebAssembly host-fetch boundary and ensures the N-API core never uses the native `std.http` Gateway transport.
 
 The body pump observes the matching fetch through `coreFetchDisposition()` under one bridge lock. Separate consumption and active queries can produce a torn observation if the native worker completes between them. Explicit semantic consumption takes precedence over active or retired state and survives normal close and shutdown; HTTP EOF alone does not grant it. JavaScript stops forwarding consumed bytes and drains the remaining HTTP body within 100 ms and 64 KiB without delaying text or result delivery. Cancellation, failure, or an exceeded cleanup bound aborts the body. Runtime destruction waits for owned cleanup to settle. Older compatible addons without the disposition export retain the active-only conservative abort behavior.
 
@@ -87,7 +87,7 @@ The native kernel installs host-stream and host model-catalog providers. It does
 | `writeCoreAttachment(handle, id, buffer)` | Copies one raw inbound payload, a prompt image or a restore checkpoint, into the bounded attachment table under a positive `uint32` id. |
 | `takeCoreAttachment(handle, id)` | Removes and returns one outbound payload, a checkpoint, as a Node Buffer, or `null`. |
 | `discardCoreAttachments(handle)` | Drops inbound payloads that no frame consumed. |
-| `takeCoreFetch(runtime)` | Takes the pending bounded Gateway request as `{ request, body }`: a JSON metadata Buffer with the positive `fetchHandle`, method, URL, and headers, and the raw request body Buffer. |
+| `takeCoreFetch(runtime)` | Takes the pending Gateway request as `{ request, body }`: a JSON metadata Buffer with the positive `fetchHandle`, method, URL, and headers, and the raw request body Buffer. |
 | `coreFetchActive(runtime, fetchHandle)` | Reports whether that request may still receive host response operations. |
 | `coreFetchDisposition(runtime, fetchHandle)` | Atomically reports retired (`0`), active (`1`), or explicitly consumed (`2`) for the exact handle. Matching consumption takes precedence. This additive export is optional for version 4 addons. |
 | `startCoreFetchResponse(runtime, fetchHandle, status)` | Publishes the matching fetch response status. |
@@ -115,7 +115,7 @@ Creating a core performs these steps:
 1. Atomically reserve one of 64 process-wide runtime slots.
 2. Read and copy bounded configuration strings from the JavaScript options object.
 3. Validate the Gateway endpoint.
-4. Allocate a `Runtime` and bounded fetch bridge using Zig's C allocator.
+4. Allocate a `Runtime` and fetch bridge using Zig's C allocator.
 5. Spawn one native thread.
 6. Run `acp_server.runWithTransport()` on that thread using callback-backed ACP queues and the shared host-stream provider.
 
@@ -184,7 +184,6 @@ All untrusted values crossing the native boundary are bounded before allocation 
 | Input queue | 8 MiB |
 | Output queue | 8 MiB |
 | Encoded output message | 64 MiB |
-| Fetch request body and serialized metadata | 8 MiB |
 | One attachment | 4 MiB |
 | Pending inbound attachments | 8, totaling at most 8 MiB |
 | Pending outbound attachments | 4, totaling at most 8 MiB |
@@ -196,7 +195,7 @@ All untrusted values crossing the native boundary are bounded before allocation 
 | ACP history | 100 turns |
 | Agent steps | 64 |
 
-The fetch request budget covers the full model request, including retained history and metadata. The body crosses to Node unencoded beside its metadata, so the transfer adds no separate bound; accepting one tool result does not reserve space for later requests.
+A model request is not bounded at the native boundary. The core builds it, including the retained history, and the body crosses to Node unencoded beside its metadata, so a long conversation sends the same request on the native and WebAssembly backends. The addon frees each body once Node has taken it. The provider bounds the request instead. Automatic compaction keeps it within the model's context window when that window is known, and when a provider refuses a request as too large, the agent leaves out the oldest images, or compacts the conversation at most once for that request, then retries.
 
 Prompt images and kernel checkpoints also cross the boundary unencoded. JavaScript writes each inbound payload with `writeCoreAttachment()` and then sends the ACP frame that references its id, an image block's `_meta.fx.attachment` or `libfx/restore`'s `checkpointAttachment`; the core thread takes the payload once while handling that frame. `libfx/checkpoint` answers with `checkpointAttachment`, and JavaScript takes those bytes with `takeCoreAttachment()`. The attachment table has its own mutex and stores C-allocator copies, so the core thread never touches JavaScript memory. JavaScript discards unconsumed inbound payloads before attaching new ones.
 
