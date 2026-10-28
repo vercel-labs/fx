@@ -135,6 +135,12 @@ pub const HostResolver = struct {
     /// It wins over the child's profile and the work's mode, as main's
     /// choice wins over its launch profile.
     child_permission_mode_fn: ?*const fn (?*anyopaque, []const u8) ?types.PermissionMode = null,
+    /// The permission mode agent `parent_id` works in now: an instance's
+    /// own, or a subagent's as the host that started it resolves it. A
+    /// child with no mode of its own or from its profile follows it on each
+    /// tool call. Without it, or when it returns null, a child keeps the mode
+    /// its work was sent under.
+    parent_permission_mode_fn: ?*const fn (?*anyopaque, Allocator, []const u8) ?types.PermissionMode = null,
     /// fx's own tools, MCP integrations, and MCP view for root `root_id`,
     /// before any profile: what a profile that sets tools or MCP servers
     /// chooses from, even past its parent's. Without it, such a profile
@@ -149,6 +155,11 @@ pub const HostResolver = struct {
     fn childPermissionMode(self: HostResolver, child_id: []const u8) ?types.PermissionMode {
         const mode_fn = self.child_permission_mode_fn orelse return null;
         return mode_fn(self.context, child_id);
+    }
+
+    fn parentPermissionMode(self: HostResolver, alloc: Allocator, parent_id: []const u8) ?types.PermissionMode {
+        const mode_fn = self.parent_permission_mode_fn orelse return null;
+        return mode_fn(self.context, alloc, parent_id);
     }
 
     fn resolve(
@@ -296,8 +307,9 @@ pub const Resolver = struct {
 
     /// The authority of a turn on child `child_id` that no work of main's
     /// started, such as one the user typed on its screen: the same as
-    /// a run's, with `permission_mode` in place of the work's. The child's
-    /// profile still narrows its tools, and its own mode still wins.
+    /// a run's, with `permission_mode` in place of the work's where the host
+    /// can't say the parent's current mode. The child's profile still
+    /// narrows its tools, and its own mode still wins.
     pub fn resolveForUser(
         self: *Resolver,
         alloc: Allocator,
@@ -308,6 +320,50 @@ pub const Resolver = struct {
     }
 
     const Basis = union(enum) { work, user: types.PermissionMode };
+
+    /// The permission mode child `child_id` works in now, whatever its work
+    /// was sent under: the mode chosen on its own screen, else its
+    /// profile's, else the one its parent works in now. Its tool calls are
+    /// decided in this mode, and the host that started it asks here for
+    /// the mode its own subagents follow. Reads the registry without the
+    /// store lock, so the main loop can call it while a save runs.
+    pub fn currentMode(self: *Resolver, alloc: Allocator, child_id: []const u8) Error!types.PermissionMode {
+        domain.validateId(child_id) catch return error.ChildNotAttached;
+        domain.validateId(self.root_id) catch return error.ChildNotAttached;
+        const parent_mode = self.host.parentPermissionMode(alloc, self.root_id);
+        const store = child_state.Store{ .children = self.children, .parent_id = self.root_id };
+        var registry = store.load(alloc) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.StoreUnavailable,
+        };
+        defer registry.deinit(alloc);
+        const child = registry.findById(child_id) orelse return error.ChildNotAttached;
+        // Without its parent's mode it keeps the one its work was sent
+        // under, or ask with no work.
+        const sent: types.PermissionMode = if (child.active) |work| work.permission_mode else .ask;
+        return self.modeFor(child_id, try self.profileOf(child_id, child.profile), parent_mode orelse sent);
+    }
+
+    /// The profile child `child_id` runs in, loaded the first time. A
+    /// child with a profile and no cache gets no authority.
+    fn profileOf(self: *Resolver, child_id: []const u8, name: ?[]const u8) Error!?*const profiles.Profile {
+        const value = name orelse return null;
+        const cache = self.profiles orelse return error.HostAuthorityUnavailable;
+        return try cache.get(child_id, value);
+    }
+
+    /// Child `child_id`'s mode, given the one it would otherwise follow:
+    /// the mode chosen on its own screen, else its profile's, which wins
+    /// even when looser than `inherited`, else `inherited`.
+    fn modeFor(
+        self: *Resolver,
+        child_id: []const u8,
+        profile: ?*const profiles.Profile,
+        inherited: types.PermissionMode,
+    ) types.PermissionMode {
+        if (self.host.childPermissionMode(child_id)) |own| return own;
+        return if (profile) |value| profiles.permissionMode(value, inherited) else inherited;
+    }
 
     fn resolveWith(
         self: *Resolver,
@@ -334,6 +390,10 @@ pub const Resolver = struct {
         // Host resolution may connect MCP servers; parent state observation must remain available.
         var host = try self.host.resolve(alloc, self.root_id);
         defer host.deinit(alloc);
+        // The parent's current mode, resolved outside the store lock: the
+        // host's hook takes the authority lock, and a subagent parent's
+        // reads its own parent's registry.
+        const parent_mode = self.host.parentPermissionMode(alloc, self.root_id);
 
         const current = blk: {
             var lock = store.acquireLock();
@@ -344,24 +404,19 @@ pub const Resolver = struct {
             };
             defer registry.deinit(alloc);
             const child = registry.findById(child_id) orelse return error.ChildNotAttached;
-            const mode = switch (basis) {
+            const sent = switch (basis) {
                 .work => (child.active orelse return error.ChildNotAttached).permission_mode,
                 .user => |value| value,
             };
             // Work replaced since the first read is no longer this run's. A
             // user's turn belongs to no work.
             if (basis == .work and child.work_generation != work_generation) return error.ChildNotAttached;
-            const profile: ?*const profiles.Profile = if (child.profile) |name| profile: {
-                const cache = self.profiles orelse return error.HostAuthorityUnavailable;
-                break :profile try cache.get(child_id, name);
-            } else null;
+            const profile = try self.profileOf(child_id, child.profile);
             break :blk .{
                 .generation = registry.generation,
-                // The profile's own mode wins, even looser than main's.
-                .permission_mode = self.host.childPermissionMode(child_id) orelse if (profile) |value|
-                    profiles.permissionMode(value, mode)
-                else
-                    mode,
+                // It follows its parent's current mode, and keeps the one its
+                // work was sent under only where the host can't say it.
+                .permission_mode = self.modeFor(child_id, profile, parent_mode orelse sent),
                 .profile = profile,
             };
         };
@@ -1113,4 +1168,102 @@ test "a turn no work started is limited by the child's profile and the user's mo
     var unchanged = try resolver.resolveForUser(alloc, "plain-child", .ask);
     defer unchanged.deinit(alloc);
     try std.testing.expectEqual(types.PermissionMode.ask, unchanged.permission_mode);
+}
+
+test "a child with no mode of its own follows its parent's current mode, under its profile's and its own screen's" {
+    const Host = struct {
+        fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) HostResolveError!HostAuthority {
+            return HostAuthority.capture(alloc, &.{ "read_file", "write_file" }, &.{}, .{}, &.{}) catch
+                return error.OutOfMemory;
+        }
+        fn parentMode(context: ?*anyopaque, _: Allocator, _: []const u8) ?types.PermissionMode {
+            const mode: *const ?types.PermissionMode = @ptrCast(@alignCast(context.?));
+            return mode.*;
+        }
+        fn ownMode(_: ?*anyopaque, child_id: []const u8) ?types.PermissionMode {
+            return if (std.mem.eql(u8, child_id, "plain-child")) .auto else null;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "fxhome/.fx/agents/reviewer");
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "fxhome/.fx/agents/reviewer/profile.json", .{});
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), "{\"description\": \"Reviewer\", \"permission_mode\": \"auto\"}");
+    }
+    const fx_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "fxhome");
+    defer alloc.free(fx_home);
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    const store = parent.stateStore();
+    var registry = try child_state.Registry.init(alloc, parent.parent.id());
+    defer registry.deinit(alloc);
+    // Both children's work was sent while the parent was in ask.
+    var work = child_state.ActiveWork{ .id = try alloc.dupe(u8, "work-1"), .message = try alloc.dupe(u8, "build"), .permission_mode = .ask, .created_at_ms = 1 };
+    defer work.deinit(alloc);
+    try registry.appendOneOff(alloc, "plain-child", work);
+    try registry.appendOneOff(alloc, "profiled-child", work);
+    try registry.setProfile(alloc, "profiled-child", "reviewer");
+    try store.save(alloc, registry);
+
+    var cache: ProfileCache = .{ .alloc = alloc, .roots = .{ .home = fx_home, .workspace_root = null } };
+    defer cache.deinit();
+    var parent_mode: ?types.PermissionMode = .yolo;
+    var resolver = Resolver{
+        .children = &parent.children,
+        .root_id = parent.parent.id(),
+        .host = .{ .context = &parent_mode, .resolve_fn = Host.resolve, .parent_permission_mode_fn = Host.parentMode },
+        .profiles = &cache,
+    };
+
+    // The parent loosened after the work was sent, and the child's next call
+    // follows it, as does the mode the host reads for it.
+    var loosened = try resolver.resolve(alloc, "plain-child");
+    defer loosened.deinit(alloc);
+    try std.testing.expectEqual(types.PermissionMode.yolo, loosened.permission_mode);
+    try std.testing.expectEqual(types.PermissionMode.yolo, try resolver.currentMode(alloc, "plain-child"));
+
+    // Tightening tightens it, and a turn the user typed follows the parent
+    // too, not the mode its admission copied.
+    parent_mode = .ask;
+    var tightened = try resolver.resolve(alloc, "plain-child");
+    defer tightened.deinit(alloc);
+    try std.testing.expectEqual(types.PermissionMode.ask, tightened.permission_mode);
+    var typed = try resolver.resolveForUser(alloc, "plain-child", .yolo);
+    defer typed.deinit(alloc);
+    try std.testing.expectEqual(types.PermissionMode.ask, typed.permission_mode);
+
+    // A profile's mode wins over the parent's either way.
+    var profiled = try resolver.resolve(alloc, "profiled-child");
+    defer profiled.deinit(alloc);
+    try std.testing.expectEqual(types.PermissionMode.auto, profiled.permission_mode);
+    parent_mode = .yolo;
+    try std.testing.expectEqual(types.PermissionMode.auto, try resolver.currentMode(alloc, "profiled-child"));
+
+    // A mode chosen on the child's own screen wins over its parent's.
+    resolver.host.child_permission_mode_fn = Host.ownMode;
+    try std.testing.expectEqual(types.PermissionMode.auto, try resolver.currentMode(alloc, "plain-child"));
+    resolver.host.child_permission_mode_fn = null;
+
+    // Where the host can't say the parent's mode, the child keeps the one
+    // its work was sent under, or the user's for a typed turn.
+    parent_mode = null;
+    var kept = try resolver.resolve(alloc, "plain-child");
+    defer kept.deinit(alloc);
+    try std.testing.expectEqual(types.PermissionMode.ask, kept.permission_mode);
+    var kept_typed = try resolver.resolveForUser(alloc, "plain-child", .auto);
+    defer kept_typed.deinit(alloc);
+    try std.testing.expectEqual(types.PermissionMode.auto, kept_typed.permission_mode);
+
+    // With no work and no parent mode, the host reads ask; an unknown child
+    // has none.
+    try registry.finish(alloc, "plain-child", "work-1", .completed, null);
+    try store.save(alloc, registry);
+    try std.testing.expectEqual(types.PermissionMode.ask, try resolver.currentMode(alloc, "plain-child"));
+    parent_mode = .auto;
+    try std.testing.expectEqual(types.PermissionMode.auto, try resolver.currentMode(alloc, "plain-child"));
+    try std.testing.expectError(error.ChildNotAttached, resolver.currentMode(alloc, "missing-child"));
 }

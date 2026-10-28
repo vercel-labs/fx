@@ -4262,8 +4262,31 @@ pub fn Runtime(comptime App: type) type {
                 .context = app,
                 .resolve_fn = resolveSubagentAuthority,
                 .child_permission_mode_fn = subagentOwnPermissionMode,
+                .parent_permission_mode_fn = subagentParentPermissionMode,
                 .base_fn = resolveSubagentBase,
             };
+        }
+
+        /// The permission mode agent `parent_id` works in now, which its
+        /// subagents follow unless their own screen or profile sets one: an
+        /// instance's own, or a subagent's as the host that started it
+        /// resolves it. A subagent parent whose mode can't be resolved gives
+        /// ask, so no child runs looser than its parent. Null for an id that
+        /// is neither, whose children's authority doesn't resolve anyway.
+        fn subagentParentPermissionMode(raw: ?*anyopaque, alloc: Allocator, parent_id: []const u8) ?types.PermissionMode {
+            const app: *App = @ptrCast(@alignCast(raw.?));
+            if (parentResolverOf(app, parent_id)) |parent| return parent.currentMode(alloc, parent_id) catch |err| {
+                debug_trace.logf("subagent", "parent permission mode unavailable parent={s} err={s}; using ask", .{ parent_id, @errorName(err) });
+                return .ask;
+            };
+            if (comptime @hasField(@TypeOf(app.permission_state), "authority_mutex")) {
+                app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+            }
+            defer if (comptime @hasField(@TypeOf(app.permission_state), "authority_mutex")) {
+                app.permission_state.authority_mutex.unlock(io_mod.getIo());
+            };
+            const instance = instanceWithSession(app, parent_id) orelse return null;
+            return app_permission_runtime.Runtime(App).modeOf(app, instance);
         }
 
         /// fx's own tools, MCP integrations, and MCP view, before any
@@ -4356,8 +4379,8 @@ pub fn Runtime(comptime App: type) type {
         /// A subagent's authority as the parent of its own subagents:
         /// its own, as the host that started it resolves it, so a nested
         /// subagent never holds what its parent lacks. The mode is not part of
-        /// it, because each of its
-        /// subagents' work carries the mode it was sent under.
+        /// it: each of its subagents reads the parent's current mode through
+        /// `subagentParentPermissionMode`.
         fn subagentRootAuthority(
             alloc: Allocator,
             parent: *subagent_authority.Resolver,
