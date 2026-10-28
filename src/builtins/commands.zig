@@ -135,8 +135,9 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .logout,
         .token = "logout",
-        .usage = "logout [codex|grok]",
-        .summary = "Sign out of a selected provider session",
+        .usage = "logout [PROVIDER]",
+        .summary = "Sign out of a subscription or remove a built-in API provider's saved key",
+        .details = &.{ "PROVIDER is codex, grok, anthropic, cursor, openrouter, opencode-zen or opencode-go.", "codex and grok end their subscription sign-in; the others remove the key or sign-in token proto-fx saved for them. Keys in environment variables stay." },
     },
     .{
         .kind = .setup,
@@ -385,7 +386,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     } },
     .{ .entries = &.{
         .{ .kind = .login, .usage = "login [PROVIDER]", .summary = "Sign in to a model provider" },
-        .{ .kind = .logout, .usage = "logout [codex|grok]", .summary = "Sign out of a model provider" },
+        .{ .kind = .logout, .usage = "logout [PROVIDER]", .summary = "Sign out of a model provider" },
         .{ .kind = .provider, .usage = "provider <name>", .summary = "Choose the active model provider" },
         .{ .kind = .models, .usage = "models" },
     } },
@@ -530,7 +531,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .accepts_payload = true },
     .{ .kind = .fork_session, .command = "/fork", .help_entry = "/fork", .completion_description = "fork the session before a prompt", .presentation_category = .session },
     .{ .kind = .login, .command = "/login", .help_entry = "/login [provider [method]]", .completion_description = "sign in to a provider", .presentation_category = .account, .has_args = true, .accepts_payload = true },
-    .{ .kind = .logout, .command = "/logout", .help_entry = "/logout [codex|grok]", .completion_description = "sign out of a provider session", .presentation_category = .account, .has_args = true, .accepts_payload = true },
+    .{ .kind = .logout, .command = "/logout", .help_entry = "/logout [provider]", .completion_description = "sign out of a provider session", .presentation_category = .account, .has_args = true, .accepts_payload = true },
     .{ .kind = .provider, .command = "/provider", .aliases = &.{"/setup"}, .help_entry = "/provider [provider] (/setup)", .completion_description = "providers, sign-in and web search in the model hub", .presentation_category = .account, .has_args = true, .accepts_payload = true },
     .{ .kind = .stats, .command = "/stats", .help_entry = "/stats", .completion_description = "show token and turn statistics", .presentation_category = .account },
     .{ .kind = .usage, .command = "/usage", .aliases = &.{}, .help_entry = "/usage", .completion_description = "show your provider's usage and spend", .presentation_category = .account },

@@ -1183,7 +1183,7 @@ fn runNonInteractiveWithDeps(
         },
         .logout => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: proto-fx logout [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: proto-fx logout [codex|grok|anthropic|cursor|openrouter|opencode-zen|opencode-go]\n");
                 return .handled_failure;
             };
             if (cfg.auth_mode == .host_managed) {

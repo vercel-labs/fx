@@ -274,7 +274,7 @@ pub fn Runtime(comptime App: type) type {
                     try writeAuthNotice(app, .{
                         .topic = "",
                         .tone = .warning,
-                        .body = "usage: /logout [vercel|codex|grok]",
+                        .body = "usage: /logout [codex|grok|anthropic|cursor|openrouter|opencode-zen|opencode-go]",
                     });
                     return;
                 };
