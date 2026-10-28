@@ -597,7 +597,7 @@ const App = struct {
     approval_lender: ?*app_agents_runtime.ChildAgent = null,
     /// Runs the subagent host hands to child agents. Owned by
     /// `app_agents_runtime`.
-    child_mailbox: app_agents_runtime.Mailbox = .{},
+    child_handoffs: app_agents_runtime.Handoffs = .{},
     shell: TranscriptRuntime = .{},
     pacer: assistant_pacer.AssistantPacer = .{},
 

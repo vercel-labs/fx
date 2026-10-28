@@ -165,20 +165,20 @@ fn turnInFlight(agent: *agents.Agent) bool {
     return agent.worker.isProcessing() or agent.worker.queuedPromptCount() > 0;
 }
 
-/// Slot threads and the main loop both use the mailbox's list.
-const mailbox_alloc = std.heap.c_allocator;
+/// Slot threads and the main loop both use the hand-off list.
+const handoff_alloc = std.heap.c_allocator;
 
 /// Hand-offs from the subagent host's slot threads to the main loop. A slot
 /// thread posts and waits; only the main loop takes, once each pass.
-pub const Mailbox = struct {
+pub const Handoffs = struct {
     mutex: std.Io.Mutex = .init,
     /// Set when the app shuts down: nothing more is posted or taken, and
     /// every slot thread waiting for a hand-off is released.
     closed: bool = false,
     posts: std.ArrayList(*Post) = .empty,
 
-    pub fn deinit(self: *Mailbox) void {
-        self.posts.deinit(mailbox_alloc);
+    pub fn deinit(self: *Handoffs) void {
+        self.posts.deinit(handoff_alloc);
         self.* = .{};
     }
 };
@@ -215,12 +215,12 @@ pub const PostError = error{ OutOfMemory, Cancelled, Failed };
 
 /// Posts `post` and waits until the main loop takes it. Fails with
 /// `Cancelled` when `cancel` is set first or the app shuts down.
-pub fn postAndWait(mailbox: *Mailbox, post: *Post, cancel: *std.atomic.Value(bool)) PostError!void {
+pub fn postAndWait(handoffs: *Handoffs, post: *Post, cancel: *std.atomic.Value(bool)) PostError!void {
     {
-        mailbox.mutex.lockUncancelable(io_mod.getIo());
-        defer mailbox.mutex.unlock(io_mod.getIo());
-        if (mailbox.closed) return error.Cancelled;
-        try mailbox.posts.append(mailbox_alloc, post);
+        handoffs.mutex.lockUncancelable(io_mod.getIo());
+        defer handoffs.mutex.unlock(io_mod.getIo());
+        if (handoffs.closed) return error.Cancelled;
+        try handoffs.posts.append(handoff_alloc, post);
     }
     while (true) {
         switch (post.state.load(.acquire)) {
@@ -229,7 +229,7 @@ pub fn postAndWait(mailbox: *Mailbox, post: *Post, cancel: *std.atomic.Value(boo
             .closed => return error.Cancelled,
             .posted => {},
         }
-        if (cancel.load(.seq_cst) and withdraw(mailbox, post)) return error.Cancelled;
+        if (cancel.load(.seq_cst) and withdraw(handoffs, post)) return error.Cancelled;
         // Settling wakes this at once; the timeout only rechecks `cancel`,
         // which its setter does not signal.
         post.settled.waitTimeout(io_mod.getIo(), wake_check) catch {};
@@ -244,11 +244,11 @@ const wake_check: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(50
 const release_timeout_ms: i64 = 5_000;
 
 /// Takes `post` back if the loop has not taken it yet.
-fn withdraw(mailbox: *Mailbox, post: *Post) bool {
-    mailbox.mutex.lockUncancelable(io_mod.getIo());
-    defer mailbox.mutex.unlock(io_mod.getIo());
-    for (mailbox.posts.items, 0..) |item, index| if (item == post) {
-        _ = mailbox.posts.orderedRemove(index);
+fn withdraw(handoffs: *Handoffs, post: *Post) bool {
+    handoffs.mutex.lockUncancelable(io_mod.getIo());
+    defer handoffs.mutex.unlock(io_mod.getIo());
+    for (handoffs.posts.items, 0..) |item, index| if (item == post) {
+        _ = handoffs.posts.orderedRemove(index);
         return true;
     };
     return false;
@@ -1194,7 +1194,7 @@ pub fn Runtime(comptime App: type) type {
         /// subagent's own subagents before it.
         pub fn shutdownChildren(app: *App) void {
             attach(app, null);
-            closeMailbox(app);
+            closeHandoffs(app);
             var index = app.child_agents.items.len;
             while (index > 0) {
                 index -= 1;
@@ -1221,7 +1221,7 @@ pub fn Runtime(comptime App: type) type {
             // Main's own shutdown writes to its transcript, so it goes back on
             // screen first.
             attach(app, null);
-            closeMailbox(app);
+            closeHandoffs(app);
             for (app.child_agents.items) |child| {
                 child.agent.worker.requestCancel();
                 child.agent.worker.requestShutdown();
@@ -1237,34 +1237,34 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        /// Closes the mailbox at shutdown, releasing every slot thread still
+        /// Closes the hand-offs at shutdown, releasing every slot thread still
         /// waiting for a hand-off.
-        fn closeMailbox(app: *App) void {
-            app.child_mailbox.mutex.lockUncancelable(io_mod.getIo());
-            defer app.child_mailbox.mutex.unlock(io_mod.getIo());
-            app.child_mailbox.closed = true;
-            for (app.child_mailbox.posts.items) |post| post.settle(.closed);
-            app.child_mailbox.posts.clearRetainingCapacity();
+        fn closeHandoffs(app: *App) void {
+            app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
+            defer app.child_handoffs.mutex.unlock(io_mod.getIo());
+            app.child_handoffs.closed = true;
+            for (app.child_handoffs.posts.items) |post| post.settle(.closed);
+            app.child_handoffs.posts.clearRetainingCapacity();
         }
 
-        /// Takes every hand-off waiting in the mailbox. Runs on the main loop
-        /// each pass, before the children's events are handled.
+        /// Takes every waiting hand-off. Runs on the main loop each pass,
+        /// before the children's events are handled.
         pub fn takePosts(app: *App) void {
             var posts: std.ArrayList(*Post) = .empty;
             {
-                app.child_mailbox.mutex.lockUncancelable(io_mod.getIo());
-                defer app.child_mailbox.mutex.unlock(io_mod.getIo());
-                if (app.child_mailbox.closed) return;
-                std.mem.swap(std.ArrayList(*Post), &posts, &app.child_mailbox.posts);
+                app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
+                defer app.child_handoffs.mutex.unlock(io_mod.getIo());
+                if (app.child_handoffs.closed) return;
+                std.mem.swap(std.ArrayList(*Post), &posts, &app.child_handoffs.posts);
             }
-            defer posts.deinit(mailbox_alloc);
+            defer posts.deinit(handoff_alloc);
             var held: std.ArrayList(*Post) = .empty;
-            defer held.deinit(mailbox_alloc);
+            defer held.deinit(handoff_alloc);
             for (posts.items) |post| {
                 // A run waits while a turn of its child's is going: the run
                 // replaces the child's installed run, which that turn reads.
                 if (post.run != null) if (findChild(app, post.turn.child_id orelse "")) |child| if (turnGoing(app, child)) {
-                    held.append(mailbox_alloc, post) catch {
+                    held.append(handoff_alloc, post) catch {
                         debug_trace.eventf("host", "child_handoff_failed", .{}, "agent={s} kind=run reason=OutOfMemory", .{child.id});
                         post.settle(.failed);
                         continue;
@@ -1284,11 +1284,11 @@ pub fn Runtime(comptime App: type) type {
             }
             if (held.items.len == 0) return;
             // Back at the front, in order, to be offered again next pass.
-            app.child_mailbox.mutex.lockUncancelable(io_mod.getIo());
-            defer app.child_mailbox.mutex.unlock(io_mod.getIo());
-            if (app.child_mailbox.closed) {
+            app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
+            defer app.child_handoffs.mutex.unlock(io_mod.getIo());
+            if (app.child_handoffs.closed) {
                 for (held.items) |post| post.settle(.closed);
-            } else app.child_mailbox.posts.insertSlice(mailbox_alloc, 0, held.items) catch {
+            } else app.child_handoffs.posts.insertSlice(handoff_alloc, 0, held.items) catch {
                 for (held.items) |post| post.settle(.failed);
             };
         }
@@ -1751,19 +1751,19 @@ pub fn Runtime(comptime App: type) type {
             app.child_agents = .empty;
             app.main_screen.deinit(app.alloc);
             app.main_screen = .{};
-            app.child_mailbox.deinit();
+            app.child_handoffs.deinit();
         }
     };
 }
 
 test "a slot thread's hand-off returns once the main loop takes it" {
-    var mailbox: Mailbox = .{};
-    defer mailbox.deinit();
+    var handoffs: Handoffs = .{};
+    defer handoffs.deinit();
     var cancel = std.atomic.Value(bool).init(false);
     // The loop side never runs here, so the turn is never read.
     var post = Post{ .turn = undefined };
     const Loop = struct {
-        fn take(box: *Mailbox) void {
+        fn take(box: *Handoffs) void {
             while (true) {
                 box.mutex.lockUncancelable(io_mod.getIo());
                 if (box.posts.pop()) |taken| {
@@ -1776,24 +1776,24 @@ test "a slot thread's hand-off returns once the main loop takes it" {
             }
         }
     };
-    const thread = try std.Thread.spawn(.{}, Loop.take, .{&mailbox});
-    try postAndWait(&mailbox, &post, &cancel);
+    const thread = try std.Thread.spawn(.{}, Loop.take, .{&handoffs});
+    try postAndWait(&handoffs, &post, &cancel);
     thread.join();
     try std.testing.expectEqual(Post.State.taken, post.state.load(.acquire));
 }
 
 test "a hand-off withdrawn on cancel, or posted after shutdown, never reaches the main loop" {
-    var mailbox: Mailbox = .{};
-    defer mailbox.deinit();
+    var handoffs: Handoffs = .{};
+    defer handoffs.deinit();
     var cancel = std.atomic.Value(bool).init(true);
     var post = Post{ .turn = undefined };
-    try std.testing.expectError(error.Cancelled, postAndWait(&mailbox, &post, &cancel));
-    try std.testing.expectEqual(@as(usize, 0), mailbox.posts.items.len);
+    try std.testing.expectError(error.Cancelled, postAndWait(&handoffs, &post, &cancel));
+    try std.testing.expectEqual(@as(usize, 0), handoffs.posts.items.len);
 
-    mailbox.closed = true;
+    handoffs.closed = true;
     cancel.store(false, .seq_cst);
-    try std.testing.expectError(error.Cancelled, postAndWait(&mailbox, &post, &cancel));
-    try std.testing.expectEqual(@as(usize, 0), mailbox.posts.items.len);
+    try std.testing.expectError(error.Cancelled, postAndWait(&handoffs, &post, &cancel));
+    try std.testing.expectEqual(@as(usize, 0), handoffs.posts.items.len);
 }
 
 test "the switch list follows the registry's start order, with an unlisted agent kept after it" {
