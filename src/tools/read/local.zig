@@ -12,6 +12,7 @@ const profile_paths = @import("../../core/shared/profile_paths.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const read_target = @import("../../core/workspace/read_target.zig");
 const read_file = @import("../filesystem/read_file.zig");
+const local_folder = @import("../../core/session/local_folder.zig");
 
 const Allocator = std.mem.Allocator;
 const ToolResult = tool_dispatch.ToolResult;
@@ -19,7 +20,6 @@ const DispatchError = tool_dispatch.DispatchError;
 const Ctx = tool_dispatch.DispatchContext;
 
 pub const prefix = "local://";
-const local_dir_name = "local";
 const max_listed_files: usize = 500;
 
 pub fn read(ctx: Ctx, input: *read_file.Input, target: read_target.Target) DispatchError!ToolResult {
@@ -65,16 +65,7 @@ fn noopDeinit(_: *anyopaque, _: Allocator) void {}
 /// Creates `<home>/.proto-fx/local/<root_id>` as a private folder and
 /// returns its real path, owned by `arena`.
 fn openRoot(arena: Allocator, home: []const u8, root_id: []const u8) ![]const u8 {
-    const io = io_mod.getIo();
-    var home_dir = try std.Io.Dir.openDirAbsolute(io, home, .{});
-    defer home_dir.close(io);
-    var profile = try io_mod.openOrCreateVerifiedPrivateDirFromDir(home_dir, profile_paths.root_dir_name);
-    defer profile.close();
-    var local = try io_mod.openOrCreateVerifiedPrivateDir(&profile, local_dir_name);
-    defer local.close();
-    var session = try io_mod.openOrCreateVerifiedPrivateDir(&local, root_id);
-    defer session.close();
-    return io_mod.realpathAlloc(arena, try std.Io.Dir.path.join(arena, &.{ home, profile_paths.root_dir_name, local_dir_name, root_id }));
+    return local_folder.open(arena, home, root_id);
 }
 
 fn validRelative(relative: []const u8) bool {

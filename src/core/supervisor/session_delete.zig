@@ -10,6 +10,7 @@ const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const kernel_slot = @import("../kernel/slot.zig");
+const local_folder = @import("../session/local_folder.zig");
 const protocol = @import("protocol.zig");
 const child_views = @import("child_views.zig");
 const Session = @import("session.zig").Session;
@@ -60,6 +61,10 @@ pub fn run(session: *Session, arena: Allocator) ![]const u8 {
     };
     for (family) |member| if (!kernel_slot.removeSaved(alloc, session.daemon.home, member)) {
         debug_trace.logf("supervisor", "event=kernel_files_kept session={s}", .{member});
+    };
+    // The tree's local:// folder, with its browser screenshots (D274).
+    for (family) |member| if (!local_folder.remove(alloc, session.daemon.home, member)) {
+        debug_trace.logf("supervisor", "event=local_folder_kept session={s}", .{member});
     };
     session.retired.store(true, .release);
     return protocol.encode(arena, protocol.Ack{});

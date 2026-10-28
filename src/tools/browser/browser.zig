@@ -12,6 +12,7 @@ const launch = @import("../../core/browser/launch.zig");
 const slot_mod = @import("../../core/browser/slot.zig");
 const profile_paths = @import("../../core/shared/profile_paths.zig");
 const output_mod = @import("output.zig");
+const local_folder = @import("../../core/session/local_folder.zig");
 const page_mod = @import("page.zig");
 const run_mod = @import("run.zig");
 const navigation_policy = @import("navigation_policy.zig");
@@ -294,10 +295,21 @@ fn runAction(ctx: DispatchContext, slot: *slot_mod.Slot, input: *Input, settings
     const alloc = ctx.allocator;
     const browser = slot.browser orelse return .{ .failure = try alloc.print("No tab named \"{s}\"; open it first with {{\"action\":\"open\",\"name\":\"{s}\",\"url\":\"...\"}}", .{ input.name, input.name }) };
     if (browser.findTab(input.name) == null) return .{ .failure = try alloc.print("No tab named \"{s}\"; open it first with {{\"action\":\"open\",\"name\":\"{s}\",\"url\":\"...\"}}", .{ input.name, input.name }) };
+    // Screenshots stay with the session, in its local:// folder, unless the
+    // profile names a folder (D274).
+    var dir_arena = std.heap.ArenaAllocator.init(alloc);
+    defer dir_arena.deinit();
+    const session_shots: ?[]const u8 = if (ctx.node_view) |view| if (io_mod.homeDir()) |home|
+        if (local_folder.open(dir_arena.allocator(), home, view.root_id)) |local|
+            try std.Io.Dir.path.join(dir_arena.allocator(), &.{ local, "screenshots" })
+        else |_|
+            null
+    else
+        null else null;
     var output: output_mod.Output = .{
         .gpa = alloc,
         .max_text_bytes = @max(4096, ctx.max_tool_result_bytes -| 1024),
-        .screenshot_dir = settings.screenshot_dir,
+        .screenshot_dir = settings.screenshot_dir orelse session_shots,
     };
     defer output.deinit();
     const outcome = run_mod.run(alloc, browser, input.name, input.code.?, input.timeout_s * 1000, &output) catch |err| switch (err) {

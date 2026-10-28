@@ -2983,6 +2983,16 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   `SessionOpenFailed`. **Alternative:** resolving in the frontend, which
   would read the store a second time.
 
+- **D274 Decision:** a browser screenshot from a saved session goes to
+  `screenshots/` in the session tree's `local://` folder (D243), so the
+  agent can read it back without a file permission, and deleting the
+  session removes that folder with each member's. A profile's
+  `browser.screenshot_dir` still wins, and a run with no saved session
+  still uses the temporary folder. **Why:** the integration pass found
+  screenshots left in the system temporary folder after their session.
+  **Alternative:** deleting each screenshot after its run, which loses
+  the file the run's result names.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a
