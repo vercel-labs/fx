@@ -194,14 +194,14 @@ pub const ScanSnapshot = struct {
                 try w.writeByte('\n');
             },
             .text => {
-                try w.print("Rule scan · {s} · {d} files · {d} scanned · {d} rules\n", .{ self.directory, self.total_files, self.scanned_files, self.evaluated_rules });
+                try w.print("Rule scan · {s} · {d} file{s} · {d} scanned · {d} rule{s}\n", .{ self.directory, self.total_files, plural(self.total_files), self.scanned_files, self.evaluated_rules, plural(self.evaluated_rules) });
                 for (self.errors) |failure| try w.print("error: {s}: {s}\n", .{ failure.name, failure.message });
                 const skipped = self.skipped_binary + self.skipped_large + self.skipped_unreadable + self.skipped_no_relevant_rules;
                 if (skipped > 0) try w.print("  skipped: binary {d} · large {d} · unreadable {d} · no relevant rules {d}\n", .{ self.skipped_binary, self.skipped_large, self.skipped_unreadable, self.skipped_no_relevant_rules });
                 if (self.matched_files == 0) {
                     try w.writeAll("No rule matches.\n");
                 } else {
-                    try w.print("{d} matches across {d} files\n", .{ self.total_matches, self.matched_files });
+                    try w.print("{d} match{s} across {d} file{s}\n", .{ self.total_matches, if (self.total_matches == 1) "" else "es", self.matched_files, plural(self.matched_files) });
                     if (!self.verbose) {
                         try w.writeAll("  rerun with --verbose to list the files, conditions and lines\n");
                     } else for (self.files) |file| {
@@ -214,6 +214,10 @@ pub const ScanSnapshot = struct {
         return out.toOwnedSlice();
     }
 };
+
+fn plural(count: usize) []const u8 {
+    return if (count == 1) "" else "s";
+}
 
 fn writeHit(w: *std.Io.Writer, hit: Hit, mark: []const u8) !void {
     try w.print("  {s} {s} [{s}] · {s}\n", .{ mark, hit.name, hit.provider, hit.condition });
@@ -251,4 +255,14 @@ test "ttsr snapshots render text and json from the same data" {
     const scan_json = try scan.render(alloc, .json);
     defer alloc.free(scan_json);
     try std.testing.expect(std.mem.find(u8, scan_json, "\"skipped\":{\"binary\":1") != null);
+    const scan_text = try scan.render(alloc, .text);
+    defer alloc.free(scan_text);
+    try std.testing.expect(std.mem.find(u8, scan_text, "Rule scan · /w · 3 files · 1 scanned · 2 rules\n") != null);
+    try std.testing.expect(std.mem.find(u8, scan_text, "\n1 match across 1 file\n") != null);
+    var several = scan;
+    several.total_matches = 3;
+    several.matched_files = 2;
+    const several_text = try several.render(alloc, .text);
+    defer alloc.free(several_text);
+    try std.testing.expect(std.mem.find(u8, several_text, "\n3 matches across 2 files\n") != null);
 }
