@@ -108,6 +108,9 @@ pub const RenderRequestState = struct {
     animation_candidate_in_flight: bool = false,
     next_animation_generation: u64 = 1,
     consecutive_input_pending_aborts: u8 = 0,
+    /// Frames whose transcript transition failed an invariant and were
+    /// recovered with a terminal reset instead of ending the process (D296).
+    transcript_recoveries: u32 = 0,
     observed_compaction_revision: u64 = 0,
 
     pub fn observeCompactionRevision(self: *RenderRequestState, revision: u64) void {

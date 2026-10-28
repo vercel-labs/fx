@@ -4081,6 +4081,50 @@ test "a long tool group with tall command output never leaves blank rows under t
     try std.testing.expect(filled);
 }
 
+test "python calls streaming into a group on a short screen keep the transcript transition valid" {
+    // The user's frontend exited with InvalidTranscriptTransition 1h16m into
+    // a turn as "● Ran python3" with its outline became "├ Ran python3,
+    // └ Running python3": the group's rows that had entered history folded
+    // away, and the history floor fell past the end of the transcript.
+    const alloc = std.testing.allocator;
+    for ([_]u16{ 8, 10, 12, 16 }) |rows| {
+        var h = try Harness.init(alloc, 72, rows, 3);
+        defer h.deinit();
+        var input = InputRuntime{};
+        defer input.deinit(alloc);
+        var approval = approval_prompt.ApprovalPrompt{};
+        defer approval.deinit(alloc);
+        try h.shell.initViewport(&h.metrics, 4);
+        _ = try h.shell.appendRawTranscriptEntry(alloc, "Checking the components again.\n");
+        try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+        try h.flush();
+        const group = types.ToolPresentationGroupId{ .turn_id = 77, .anchor_step_id = 1 };
+        var call_ids: [5][16]u8 = undefined;
+        for (0..call_ids.len) |index| {
+            const call_id = try std.mem.print(&call_ids[index], "py-{d}", .{index});
+            const id = types.ToolLifecycleId{ .turn_id = 77, .call_id = call_id };
+            _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+                .id = id,
+                .presentation_group_id = group,
+                .reconciles_provisional_call_id = null,
+                .tool_name = "shell",
+                .activity_kind = .command,
+                .arguments_json = "{\"action\":\"run\",\"command\":\"python3 - <<'PY'\\nimport os\\nfor name in os.listdir('.'):\\n    print(name)\\nprint(1)\\nPY\"}",
+            } });
+            for (0..2) |phase| {
+                if (phase == 1) _ = try h.shell.applyToolLifecycle(alloc, .{ .terminal = .{
+                    .id = id,
+                    .outcome = .{ .kind = .completed, .summary = "Ran python3 - <<'PY'" },
+                    .result = "a.ts\nb.ts\nc.ts\nd.ts\ne.ts\nf.ts\n6\n",
+                } });
+                h.frame_redraw = true;
+                try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+                try h.flush();
+            }
+        }
+    }
+}
+
 test "hidden auto approval lifecycle reposition adds no compact scroll rows" {
     var h = try Harness.init(std.testing.allocator, 80, 12, 4);
     defer h.deinit();

@@ -1002,6 +1002,10 @@ pub fn Runtime(comptime App: type) type {
                 shell_runtime.ResizeFrameCommit.none;
             const attempted = attemptRequestedFrame(app, snapshot) catch |err| {
                 attempt.restore();
+                if (err == error.InvalidTranscriptTransition) {
+                    try recoverInvalidTranscriptTransition(app, render_requests, reason_names);
+                    return;
+                }
                 if (comptime @hasField(App, "terminal")) {
                     _ = app_lifecycle.closeFullTranscriptIfActive(
                         app.alloc,
@@ -1122,6 +1126,31 @@ pub fn Runtime(comptime App: type) type {
                     render_requests.animation_next_deadline_ms,
                 },
             );
+        }
+
+        /// A painter invariant that fails must not end the process (D296):
+        /// drop the transcript anchor, reset the terminal so the next frame
+        /// repaints the whole viewport from the transcript, and go on.
+        fn recoverInvalidTranscriptTransition(
+            app: *App,
+            render_requests: *render_request.RenderRequestState,
+            reason_names: []const u8,
+        ) !void {
+            render_requests.transcript_recoveries +|= 1;
+            debug_trace.logf(
+                "frame_schedule",
+                "transcript_transition_recover err=InvalidTranscriptTransition reasons={s} recoveries={d} action=terminal_reset",
+                .{ reason_names, render_requests.transcript_recoveries },
+            );
+            if (comptime @hasDecl(@TypeOf(app.shell), "resetTranscriptAnchor")) {
+                app.shell.resetTranscriptAnchor("invalid_transcript_transition");
+            }
+            if (comptime @hasDecl(@TypeOf(app.shell), "requestTerminalReset")) {
+                try app.shell.requestTerminalReset(&app.metrics);
+            } else {
+                app.shell.terminal_reset_pending = true;
+            }
+            render_requests.request(.transcript);
         }
 
         fn attemptRequestedFrame(
@@ -3328,6 +3357,7 @@ test "core.app_render_runtime alternate presentation cannot reset primary scroll
 const CoordinatorFault = enum {
     committed,
     preparation_error,
+    invalid_transcript_transition,
     input_pending,
     terminal_partial_write,
     shadow_feed_failed,
@@ -3412,6 +3442,7 @@ const CoordinatorFaultTestApp = struct {
                 };
             },
             .preparation_error => error.TestPreparationFailure,
+            .invalid_transcript_transition => error.InvalidTranscriptTransition,
             .input_pending => error.InputPending,
             .terminal_partial_write => .{
                 .shadow_state = .terminal_partial_write,
@@ -3542,6 +3573,25 @@ test "core.app_render_runtime requested-frame flush restores preparation errors"
         @as(u8, 1),
         app.shell.render_requests.pendingInvalidations().len,
     );
+}
+
+test "core.app_render_runtime recovers an invalid transcript transition instead of failing" {
+    var app = CoordinatorFaultTestApp{ .fault = .invalid_transcript_transition };
+    app.shell.render_requests.request(.footer);
+
+    // The frame fails its invariant, yet the flush succeeds: the next frame
+    // starts over from a terminal reset (D296).
+    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.attempts);
+    try std.testing.expect(app.shell.terminal_reset_pending);
+    try std.testing.expectEqual(@as(u32, 1), app.shell.render_requests.transcript_recoveries);
+    try std.testing.expect(app.shell.render_requests.hasReason(.transcript));
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+
+    // Once the transcript repaints, frames commit again.
+    app.fault = .committed;
+    try Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app);
+    try std.testing.expectEqual(@as(usize, 2), app.attempts);
 }
 
 test "core.app_render_runtime requested-frame flush restores input-interrupted work" {

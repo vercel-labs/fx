@@ -3132,6 +3132,18 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   repaint rows from history into the freed space, which duplicates them
   in the terminal's scrollback.
 
+- **D296 Decision:** a frame whose transcript transition fails a painter
+  invariant (`InvalidTranscriptTransition`) no longer ends the frontend.
+  The frame is dropped, the transcript anchor is reset and the terminal is
+  reset, so the next frame repaints the viewport from the transcript; the
+  debug trace records `transcript_transition_recover` with a running
+  count. The likely cause in the reported 1h16m turn, a live group folding
+  away rows that had entered the terminal's history so the history floor
+  fell past the end of the transcript, no longer happens (D295).
+  **Why:** the frontend exited mid-turn printing only the error name.
+  **Alternative:** clamping each invariant in the painter, which hides
+  the state that broke and leaves the screen out of step with the record.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a
