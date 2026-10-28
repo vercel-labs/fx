@@ -10,6 +10,7 @@ const shared_theme = @import("../../core/shared/theme.zig");
 const code_highlight = @import("../../core/agent/presentation/code_highlight.zig");
 const code_highlight_languages = @import("../../core/agent/presentation/code_highlight_languages.zig");
 const python_outline = @import("../transcript/python_outline.zig");
+const command_summary = @import("../transcript/command_summary.zig");
 const ui_render = @import("../render.zig");
 
 const Allocator = std.mem.Allocator;
@@ -69,8 +70,9 @@ pub fn render(arena: Allocator, tail: *const Tail, cols: u16, body_rows: usize) 
                 code = std.mem.trimEnd(u8, found.code, "\n");
                 language = code_highlight_languages.resolve("python");
             } else if (std.mem.findScalar(u8, body, '\n') == null and tail.earlier_lines == 0) {
-                // A one-line command reads in the header itself.
-                header_value = body;
+                // A one-line command reads in the header itself, without a
+                // leading `cd` or quiet redirects (D294).
+                header_value = try command_summary.clean(arena, body);
                 code = "";
             } else {
                 language = code_highlight_languages.resolve("sh");
@@ -89,7 +91,11 @@ pub fn render(arena: Allocator, tail: *const Tail, cols: u16, body_rows: usize) 
         try arena.print("{s} {s}", .{ verb, firstLine(header_value) })
     else
         verb;
-    const head_cut = display_width.prefixByWidth(head_plain, header_room);
+    // A command ends at a word (D294); other subjects keep their clip.
+    const head_cut = if (tail.body_kind == .command and code.len == 0)
+        try command_summary.clipAtWord(arena, head_plain, header_room)
+    else
+        display_width.prefixByWidth(head_plain, header_room);
     if (tail.body_kind == .command and header_value.len > 0 and code.len == 0 and head_cut.len > verb.len + 1) {
         try out.appendSlice(arena, verb);
         try out.append(arena, ' ');
@@ -228,6 +234,8 @@ test "one-line commands sit in the header and edits read as diff lines" {
     var tail: Tail = .{};
     tail.apply(.{ .call_id = "c", .tool_name = "shell", .body = "ls -la src", .body_kind = .command });
     try std.testing.expectEqualStrings("● Running ls -la src", try plain(arena, try render(arena, &tail, 80, body_row_limit)));
+    tail.apply(.{ .call_id = "g", .tool_name = "shell", .body = "cd ~/code/proto && wc -l packages/tui/a.ts 2>/dev/null; find packages", .body_kind = .command });
+    try std.testing.expectEqualStrings("● Running wc -l packages/tui/a.ts; …", try plain(arena, try render(arena, &tail, 40, body_row_limit)));
     tail.apply(.{ .call_id = "d", .tool_name = "edit_file", .subject = "app.py", .body = "-return 1\n+return 2", .body_kind = .diff });
     try std.testing.expectEqualStrings("● Editing app.py\n    -return 1\n    +return 2", try plain(arena, try render(arena, &tail, 80, body_row_limit)));
     tail.apply(.{ .call_id = "e", .tool_name = "web_search", .subject = "zig 0.17 release notes" });

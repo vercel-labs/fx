@@ -40,8 +40,8 @@ const tail_blocks = 3;
 const fold_names = 2;
 /// Names one verb of an Explored row lists before "+N".
 const explore_names = 3;
-/// The widest command name a fold lists.
-const fold_name_bytes = 32;
+/// The widest command name a fold lists, in columns.
+const fold_name_width = 32;
 
 pub const Tier = enum { attention, outcome, routine };
 
@@ -523,7 +523,7 @@ fn itemText(arena: Allocator, item: Item) ![]const u8 {
         // the row names the command.
         if (try human_text.failureReason(arena, bodies.commandOutput(record))) |reason| return arena.print("{s} · {s}", .{ label, reason });
         const name = if (bodies.commandText(arena, record)) |command|
-            if (python_outline.script(command)) |found| found.interpreter else bodies.firstLineOf(command)
+            if (python_outline.script(command)) |found| found.interpreter else try command_summary.clean(arena, command)
         else if (std.mem.startsWith(u8, item.phrase, "Ran "))
             item.phrase["Ran ".len..]
         else
@@ -538,9 +538,12 @@ fn itemText(arena: Allocator, item: Item) ![]const u8 {
     if (exploredItem(arena, item)) |actions| return command_summary.phrase(arena, actions, isLive(record));
     const command = bodies.commandText(arena, record) orelse return item.phrase;
     if (python_outline.script(command)) |found| return arena.print("{s} {s}", .{ verb, found.interpreter });
+    // The command without a leading `cd` or quiet redirects (D294).
     const first = bodies.firstLineOf(command);
-    if (first.len < std.mem.trimEnd(u8, command, " \t\r\n").len) return arena.print("{s} {s} …", .{ verb, first });
-    return item.phrase;
+    const cleaned = try command_summary.clean(arena, command);
+    if (first.len < std.mem.trimEnd(u8, command, " \t\r\n").len) return arena.print("{s} {s} …", .{ verb, cleaned });
+    if (cleaned.ptr == first.ptr or std.mem.eql(u8, cleaned, first)) return item.phrase;
+    return arena.print("{s} {s}", .{ verb, cleaned });
 }
 
 /// A call that did not run, in plain words (D293): "Held · reviewer
@@ -684,11 +687,8 @@ fn targetOf(phrase: []const u8) []const u8 {
 fn commandName(arena: Allocator, record: *const ToolDetailRecord) ?[]const u8 {
     const command = bodies.commandText(arena, record) orelse return null;
     if (python_outline.script(command)) |found| return found.interpreter;
-    const first = bodies.firstLineOf(command);
-    if (first.len <= fold_name_bytes) return first;
-    var end: usize = fold_name_bytes;
-    while (end > 0 and (first[end] & 0xc0) == 0x80) end -= 1;
-    return first[0..end];
+    const cleaned = command_summary.clean(arena, command) catch return null;
+    return command_summary.clipAtWord(arena, cleaned, fold_name_width) catch null;
 }
 
 // ---- tests -----------------------------------------------------------------
@@ -933,7 +933,7 @@ test "reading commands fold into one Explored row and only other commands keep t
     for (rows) |row| try texts.append(arena, try arena.print("{s}:{s}", .{ @tagName(row.style), row.text }));
     try std.testing.expectEqualStrings(
         \\dim:Explored · Listed ~/code/proto · Read markdown.ts:1-120 · Searched "table" in markdown.ts · Read package.json · Searched "nothing-here" in src
-        \\normal:Ran cd ~/code/proto && git log --oneline -3
+        \\normal:Ran git log --oneline -3
         \\dim:abc first
     , try std.mem.join(arena, "\n", texts.items));
 

@@ -13,6 +13,7 @@ const code_highlight_languages = @import("../../core/agent/presentation/code_hig
 const text_utils = @import("../../core/shared/text_utils.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 const tiers = @import("tool_group_tiers.zig");
+const command_summary = @import("command_summary.zig");
 
 const TranscriptEntry = transcript_blocks.TranscriptEntry;
 const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
@@ -832,17 +833,23 @@ fn writeTierRow(
     scratch: std.mem.Allocator,
     writer: *std.Io.Writer,
     prefix: []const u8,
-    row: tiers.Row,
+    planned: tiers.Row,
     cols: u16,
     style: SummaryStyle,
 ) !void {
+    const room = cols -| @as(u16, @intCast(display_width.visibleWidth(prefix)));
+    var row = planned;
+    // A command cut to the width ends at a word, not inside one (D294).
+    if (row.kind != .body and display_width.visibleWidth(row.text) > room) {
+        const is_command = if (row.detail) |record| record.activity_kind == .command else row.kind == .fold;
+        if (is_command) row.text = try command_summary.clipAtWord(scratch, row.text, room);
+    }
     switch (row.style) {
         // A styled row carries its tree prefix in the same span.
         .attention => try writeStyled(writer, style.attention_style, try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ prefix, row.text }), cols)),
         .dim => try writeStyled(writer, style.text_style, try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ prefix, row.text }), cols)),
         .normal => {
             try writer.writeAll(prefix);
-            const room = cols -| @as(u16, @intCast(display_width.visibleWidth(prefix)));
             // Style the whole row, then clip it: the clip closes any style
             // it cuts through.
             const highlighted = if (row.kind == .item)
@@ -2052,8 +2059,8 @@ test "minimal completed command rows reproject stored arguments at the current w
     var narrow = try build(alloc, &entries, &details, 80);
     defer narrow.deinit(alloc);
     const narrow_row = narrow.entry_actions.items[0].override.bytes;
-    // The row carries styling (the command verb token), so the clip closes it.
-    try std.testing.expect(std.mem.endsWith(u8, narrow_row, "…\x1b[0m"));
+    // One long word cannot end at a word boundary, so it is cut inside it.
+    try std.testing.expect(std.mem.endsWith(u8, narrow_row, "…"));
     try std.testing.expect(std.mem.find(u8, narrow_row, "alpha-beta-gamma") != null);
 
     var wide = try build(alloc, &entries, &details, 240);
@@ -2104,7 +2111,8 @@ test "minimal completed command rows reproject stored arguments at the current w
     var relative = try build(alloc, &relative_entries, &relative_details, 240);
     defer relative.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● Ran \x1b[38;5;252mcd\x1b[39m ./packages/cli \x1b[38;5;252m&&\x1b[39m \x1b[38;5;252mprintf\x1b[39m" ++ text_utils.repeat(" relative-path printf", 5) ++ " relative-path ",
+        // A leading `cd` says nothing about the command (D294).
+        "● Ran \x1b[38;5;252mprintf\x1b[39m" ++ text_utils.repeat(" relative-path printf", 5) ++ " relative-path",
         relative.entry_actions.items[0].override.bytes,
     );
 
@@ -2183,7 +2191,7 @@ test "completed session and tty command rows reproject stored commands at the cu
     const narrow_observe = narrow_lines.next().?;
     const narrow_tty = narrow_lines.next().?;
     try std.testing.expect(std.mem.startsWith(u8, narrow_tty, "└ Ran \x1b[38;5;252mbun\x1b[39m run pipeline-stage-"));
-    try std.testing.expect(std.mem.endsWith(u8, narrow_tty, "…\x1b[0m"));
+    try std.testing.expect(std.mem.endsWith(u8, narrow_tty, "…"));
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(narrow_tty) <= 80);
     try std.testing.expect(std.mem.startsWith(u8, narrow_observe, "├ Observed npm run dev-server-"));
     try std.testing.expect(std.mem.endsWith(u8, narrow_observe, "…"));

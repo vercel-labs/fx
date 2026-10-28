@@ -196,7 +196,7 @@ test "reads fold into the Explored row while other commands and Python keep thei
     try std.testing.expectEqualStrings(
         \\● Ran 3 commands, listed 1 directory, read 1 file and 1 other call
         \\├ Explored · Listed ~/code/proto · Read assistant-message.ts:1-120 · Searched "table" in markdown.ts
-        \\├ Ran cd ~/code/proto 2>/dev/null && git log --oneline -3 && du -sh packages
+        \\├ Ran git log --oneline -3 && du -sh packages
         \\│   abc1 one
         \\│   abc2 two
         \\│   abc3 three
@@ -211,7 +211,45 @@ test "reads fold into the Explored row while other commands and Python keep thei
         \\│   Output
         \\│   README.md
         \\│   packages
-        \\└ Ran cd ~/code/proto && make check
+        \\└ Ran make check
         \\    ok
+    , try std.mem.join(arena, "\n", texts.items));
+}
+
+test "long commands drop their cd and quiet redirects and end at a word" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const commands = [_][]const u8{
+        "cd ~/code/proto 2>/dev/null && npm run build -- --filter packages/tui 2>/dev/null; npm test -- --runInBand",
+        "cd ~/code/proto && make lint 2>&1",
+    };
+    var entries: [commands.len]TranscriptEntry = undefined;
+    var details: [commands.len]ToolDetailRecord = undefined;
+    for (commands, &entries, &details, 0..) |command, *entry, *detail, index| {
+        const entry_id: u32 = @intCast(index + 1);
+        entry.* = .{ .raw_bytes = .{ .id = entry_id, .bytes = try arena.print("● Ran {s}\n", .{command}), .class = .tool_status } };
+        detail.* = .{
+            .entry_id = entry_id,
+            .tool_name = @constCast("shell"),
+            .activity_kind = .command,
+            .arguments_json = try arena.print("{f}", .{std.json.fmt(.{ .action = "run", .command = command }, .{})}),
+            .command_display = @constCast(command),
+            .outcome = .completed,
+            .command_process_presentation = .{ .exit_code = 0 },
+            .result = @constCast("done\n"),
+        };
+    }
+    var projection = try projection_mod.buildStyled(arena, &entries, &details, 60, .{}, .{});
+    defer projection.deinit(arena);
+    var texts: std.ArrayList([]const u8) = .empty;
+    var split = std.mem.splitScalar(u8, projection.entry_actions.items[0].override.bytes, '\n');
+    while (split.next()) |line| try texts.append(arena, try plain(arena, line));
+    try std.testing.expectEqualStrings(
+        \\● Ran 2 commands
+        \\├ Ran npm run build -- --filter packages/tui; npm test -- …
+        \\│   done
+        \\└ Ran make lint
+        \\    done
     , try std.mem.join(arena, "\n", texts.items));
 }

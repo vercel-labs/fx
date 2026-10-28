@@ -3109,6 +3109,15 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   said "1 denied" while the only matching row said "Review unavailable"
   and, in the live view, could sit folded under "… N earlier".
 
+- **D294 Decision:** a command's row and the names in a "Ran N more
+  commands" fold drop what says nothing about the command: a leading
+  `cd X &&` or `cd X;`, `2>/dev/null` and other quiet redirects, a
+  trailing `|| true`. A command too wide for its row ends at a word with
+  " …", and only a first word wider than half the row is cut inside it.
+  The full command stays in the record, Ctrl+O and the permission paths.
+  **Why:** rows read "cd ~/code/proto 2>/dev/null && g", cut mid-word,
+  after spending most of their width on the `cd`.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a
