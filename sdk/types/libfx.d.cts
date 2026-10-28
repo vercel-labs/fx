@@ -322,7 +322,7 @@ export type FxSessionEvent = FxEventBase & (
   | { type: "session.forwarded"; sessionId: string; agent: string }
   /** A queue delivery named an input the session's log does not hold, or none at all, so it ran nothing. */
   | { type: "session.refused"; sessionId?: string; messageId?: string; reason: "unknown message" | "malformed message" }
-  /** `cutoffs`: the times in a row the deadline cut off the same step, this one included. */
+  /** `cutoffs`: the times in a row the same step was cut off, this one included, by the deadline or by a worker that stopped partway. */
   | { type: "session.deadline"; sessionId: string; epoch: number; cutoffs: number }
   | { type: "ui.error"; sessionId: string; error: string }
 );
