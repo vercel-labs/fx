@@ -3230,7 +3230,7 @@ test("ACP refuses a damaged or read-only session and leaves its log as it was", 
 
     flipMiddleByte(log);
     const damaged = readFileSync(log);
-    expect((await load()).error.message).toBe("Session could not be loaded");
+    expect((await load()).error.message).toMatch(/^Session could not be loaded \(\w+\)$/);
     expect(readFileSync(log)).toEqual(damaged);
     writeFileSync(log, good);
 
@@ -3268,7 +3268,7 @@ test.skipIf(!tmuxAvailable())("the app and ACP refuse a session whose blob went 
     expect(app.stderr).not.toContain("NotFound");
     client = await AcpRpc.start(fixture, gateway);
     const load = await client.request("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
-    expect(load.error.message).toBe("Session could not be loaded");
+    expect(load.error.message).toMatch(/^Session could not be loaded \(\w+\)$/);
     expect(await client.close()).toBe(0);
     client = undefined;
     expect(gateway.requests).toHaveLength(1);

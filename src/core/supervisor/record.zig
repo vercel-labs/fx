@@ -223,3 +223,18 @@ test "a running record carries its turn's start to the summary" {
     copy.running = false;
     try std.testing.expectEqual(@as(i64, 0), (try copy.summary(arena.allocator(), "id", "/Users/example/ws", 0)).turn_started_at_ms);
 }
+
+/// A failed open as one line: the error, then the host's reason if any.
+pub fn failureText(buf: []u8, err: anyerror, reason: []const u8) []const u8 {
+    if (reason.len == 0) return @errorName(err);
+    return std.mem.print(buf, "{s} ({s})", .{ @errorName(err), reason }) catch @errorName(err);
+}
+
+test "a failed restore names the host's reason after the error" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "SessionOpenFailed (Session could not be loaded (InvalidSessionFormat))",
+        failureText(&buf, error.SessionOpenFailed, "Session could not be loaded (InvalidSessionFormat)"),
+    );
+    try std.testing.expectEqualStrings("SessionOpenFailed", failureText(&buf, error.SessionOpenFailed, ""));
+}

@@ -50,6 +50,9 @@ const SavedRow = struct {
     heartbeat: protocol.Heartbeat = .{},
     updated_at_ms: i64 = 0,
     owned: bool = true,
+    /// Why its restore failed. A start skips such a session rather than
+    /// fail on it again (D284).
+    failure: ?[]const u8 = null,
 
     fn of(id: []const u8, cwd: []const u8, record: *const Record) SavedRow {
         return .{
@@ -60,6 +63,7 @@ const SavedRow = struct {
             .heartbeat = record.heartbeat,
             .updated_at_ms = record.updated_at_ms,
             .owned = record.reopens(),
+            .failure = record.failure,
         };
     }
 };
@@ -326,6 +330,7 @@ pub const Daemon = struct {
         copy.name = try arena.dupe(u8, row.name);
         copy.cwd = try arena.dupe(u8, row.cwd);
         copy.heartbeat.prompt = try arena.dupe(u8, row.heartbeat.prompt);
+        if (row.failure) |failure| copy.failure = try arena.dupe(u8, failure);
         return copy;
     }
 
@@ -542,6 +547,12 @@ pub const Daemon = struct {
             session.record.stopped = row.stopped;
             session.record.heartbeat = row.heartbeat;
             session.record.heartbeat.prompt = if (row.heartbeat.prompt.len > 0) try self.alloc.dupe(u8, row.heartbeat.prompt) else "";
+            if (row.failure) |failure| {
+                // Recorded once when it failed; skipped quietly since. An
+                // attach still tries it again.
+                session.record.failure = try self.alloc.dupe(u8, failure);
+                continue;
+            }
             if (!row.stopped and row.owned) {
                 const job = try newJob(self.alloc);
                 job.request = .{ .create = .{ .cwd = session.cwd, .@"resume" = session.id } };
@@ -846,6 +857,33 @@ test "a delete runs on the executor: refused while in use or busy, else saved st
     const saved = try tmp.dir.readFileAlloc(io, "sessions.json", alloc, .limited(1 << 16));
     defer alloc.free(saved);
     try std.testing.expect(std.mem.find(u8, saved, "S1") == null);
+}
+
+test "a session whose restore failed is saved with its reason and skipped on the next start" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const state_path = try std.Io.Dir.path.join(alloc, &.{ home, "sessions.json" });
+    defer alloc.free(state_path);
+    {
+        var daemon = Daemon{ .alloc = alloc, .cfg = undefined, .home = home, .state_path = state_path, .incarnation = "first" };
+        defer daemon.deinit();
+        const broken = try daemon.register("S1", "/w", "broken");
+        broken.record.failure = try alloc.dupe(u8, "SessionOpenFailed (Session could not be loaded (InvalidSessionFormat))");
+        const other = try daemon.register("S2", "/w", "other");
+        other.record.stopped = true;
+        try daemon.persist();
+    }
+    var daemon = Daemon{ .alloc = alloc, .cfg = undefined, .home = home, .state_path = state_path, .incarnation = "second" };
+    defer daemon.deinit();
+    try daemon.restore();
+    // No reopen is queued for it, and the other session still restores.
+    const broken = daemon.find("S1").?;
+    try std.testing.expect(!broken.hasExecutor());
+    try std.testing.expectEqualStrings("SessionOpenFailed (Session could not be loaded (InvalidSessionFormat))", broken.record.failure.?);
+    try std.testing.expect(daemon.find("S2") != null);
 }
 
 test "an anchor tells a removed socket from a removed state directory" {

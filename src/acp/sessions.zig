@@ -1395,10 +1395,11 @@ fn handleLoadFailure(
             defer alloc.free(message);
             return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = message });
         };
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.internal_error,
-            .message = "Session could not be loaded",
-        });
+        // The reason travels with the message, so a supervisor that cannot
+        // restore the session can say why (D284).
+        const message = try alloc.print("Session could not be loaded ({s})", .{@errorName(err)});
+        defer alloc.free(message);
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = message });
     }
     return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,

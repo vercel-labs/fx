@@ -73,6 +73,10 @@ pub const Session = struct {
     history: history_page.Saved = .{},
     history_dirty: bool = true,
     next_tick_ms: i64 = 0,
+    /// The host's words for why the last open failed, for the restore
+    /// line and the recorded failure (D284).
+    open_reason: [200]u8 = undefined,
+    open_reason_len: usize = 0,
 
     // Guarded by `events_mutex`; `publish` runs on host threads.
     events_mutex: std.Io.Mutex = .init,
@@ -348,15 +352,21 @@ pub const Session = struct {
     /// last attached, and answers with a full snapshot.
     fn open(self: *Session, arena: Allocator, resume_id: ?[]const u8, record_failure: bool) !Snap {
         if (self.host == null) self.openHost(if (resume_id) |id| if (id.len > 0) id else null else null) catch |err| {
+            const reason = self.open_reason[0..self.open_reason_len];
             if (self.id.len == 0) {
                 self.retired.store(true, .release);
             } else if (record_failure) {
+                var text_buf: [256]u8 = undefined;
+                const text = @import("record.zig").failureText(&text_buf, err, reason);
                 var next_record = try self.record.clone(self.daemon.alloc);
                 if (next_record.failure) |old| self.daemon.alloc.free(old);
-                next_record.failure = self.daemon.alloc.dupe(u8, @errorName(err)) catch null;
+                next_record.failure = self.daemon.alloc.dupe(u8, text) catch null;
                 self.daemon.commit(self, &next_record, false) catch {};
-                std.debug.print("proto-fx: cannot restore session {s}: {s}\n", .{ self.id, @errorName(err) });
+                // Recorded, so later starts skip it quietly (server.zig `restore`).
+                std.debug.print("proto-fx: cannot restore session {s}: {s}\n", .{ self.id, text });
+                return err;
             }
+            if (reason.len > 0) std.debug.print("proto-fx: session startup: {s}\n", .{reason});
             return err;
         };
         var next_record = try self.liveRecord();
@@ -369,6 +379,7 @@ pub const Session = struct {
 
     fn openHost(self: *Session, resume_id: ?[]const u8) !void {
         const alloc = self.daemon.alloc;
+        self.open_reason_len = 0;
         var cfg = self.daemon.cfg;
         cfg.home_override = self.daemon.home;
         cfg.workspace_root_override = self.cwd;
@@ -385,7 +396,7 @@ pub const Session = struct {
             .clientInfo = .{ .name = "proto-fx", .version = "phase1" },
         });
         if (!host.state.initialized) {
-            logStartupFailure(arena, initialized);
+            self.noteStartupFailure(arena, initialized);
             return error.SessionInitializationFailed;
         }
         // The host already appends this workspace's project servers. The
@@ -398,7 +409,7 @@ pub const Session = struct {
         else
             try self.call(arena, "session/new", .{ .cwd = self.cwd, .mcpServers = no_servers, ._meta = meta });
         const active = host.state.active_session orelse {
-            logStartupFailure(arena, opened);
+            self.noteStartupFailure(arena, opened);
             return error.SessionOpenFailed;
         };
         if (self.id.len == 0) {
@@ -421,11 +432,15 @@ pub const Session = struct {
         self.history_dirty = true;
     }
 
-    fn logStartupFailure(arena: Allocator, response: ?[]const u8) void {
+    /// Keeps the host's error message from a failed startup response.
+    fn noteStartupFailure(self: *Session, arena: Allocator, response: ?[]const u8) void {
         const bytes = response orelse return;
         const Response = struct { @"error": ?struct { message: []const u8 = "unknown ACP error" } = null };
         const parsed = std.json.parseFromSliceLeaky(Response, arena, bytes, .{ .ignore_unknown_fields = true }) catch return;
-        if (parsed.@"error") |failure| std.debug.print("proto-fx: session startup: {s}\n", .{failure.message});
+        const failure = parsed.@"error" orelse return;
+        const kept = failure.message[0..@min(failure.message.len, self.open_reason.len)];
+        @memcpy(self.open_reason[0..kept.len], kept);
+        self.open_reason_len = kept.len;
     }
 
     const Track = union(enum) {
