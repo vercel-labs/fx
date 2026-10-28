@@ -1019,15 +1019,24 @@ fn automaticReviewOutcome(
         return reviewerUnavailableOutcome(call, .turn_review_budget_exhausted);
     }
 
+    // `arena` lives until the turn ends. The review request, the reviewer's
+    // HTTP exchange, and its parsing are temporary, so they use their own
+    // arena and only the small result is copied out.
+    var review_arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer review_arena_state.deinit();
+    const review_arena = review_arena_state.allocator();
     const request = try reviewRequestForCall(
         input,
-        arena,
+        review_arena,
         call,
         targets,
         is_dynamic_tool,
         file_authorization,
     );
-    const review = try runAutomaticReview(input, arena, call, request);
+    const review = try copyReviewOutcome(
+        arena,
+        try runAutomaticReview(input, review_arena, call, request),
+    );
     if (nonAllowAutoReviewOutcome(review)) |blocked| return blocked;
     var outcome = if (file_authorization) |authorization|
         command_admission.PermissionOutcome{
@@ -1046,6 +1055,20 @@ fn automaticReviewOutcome(
         );
     outcome.auto_review_result = review.valid;
     return outcome;
+}
+
+fn copyReviewOutcome(
+    alloc: Allocator,
+    review: permission_auto_classifier.ParseOutcome,
+) Allocator.Error!permission_auto_classifier.ParseOutcome {
+    return switch (review) {
+        .valid => |result| .{ .valid = .{
+            .risk = result.risk,
+            .decision = result.decision,
+            .rationale = try alloc.dupe(u8, result.rationale),
+        } },
+        .evidence_incomplete, .invalid => review,
+    };
 }
 
 fn runAutomaticReview(
