@@ -1350,7 +1350,7 @@ pub fn Runtime(comptime App: type) type {
         ) subagent_execution.ServiceError!void {
             const app: *App = @ptrCast(@alignCast(raw.?));
             var post = app_agents_runtime.Post{ .turn = turn };
-            app_agents_runtime.postAndWait(&app.child_mailbox, &post, cancel) catch |err| return switch (err) {
+            app_agents_runtime.postAndWait(&app.child_handoffs, &post, cancel) catch |err| return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.Cancelled => error.Cancelled,
                 error.Failed => error.ProviderFailed,
@@ -1380,7 +1380,7 @@ pub fn Runtime(comptime App: type) type {
                 unsent.turn = null;
                 unsent.deinit(app.alloc);
             };
-            app_agents_runtime.postAndWait(&app.child_mailbox, &post, cancel) catch |err| return switch (err) {
+            app_agents_runtime.postAndWait(&app.child_handoffs, &post, cancel) catch |err| return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.Cancelled => error.Cancelled,
                 error.Failed => error.ProviderFailed,
