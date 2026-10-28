@@ -311,6 +311,8 @@ pub const SessionSummary = struct {
     updated_at_ms: i64 = 0,
     /// Background jobs still running in the live host.
     running_jobs: u32 = 0,
+    /// When the running turn started (wall clock), 0 when none runs.
+    turn_started_at_ms: i64 = 0,
 };
 
 pub const SessionList = struct {

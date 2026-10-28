@@ -517,6 +517,13 @@ pub fn Runtime(comptime App: type) type {
             }
             if (remote.child_id.len == 0) {
                 try callbacks.Bindings(App).worker_tool_lifecycle_presenter(app).finish_batch(app.alloc);
+                // A view that attached mid-turn counts from the turn's start,
+                // once the replay that restarts its clock is applied.
+                const turn_start = summary.turn_started_at_ms;
+                if (!loading_history and running and turn_start > 0 and turn_start != remote.turn_start_adopted) {
+                    remote.turn_start_adopted = turn_start;
+                    if (app.stream.turn_started_ms == 0 or turn_start < app.stream.turn_started_ms) app.stream.turn_started_ms = turn_start;
+                }
                 if (summary.status == .awaiting_approval) {
                     if (app.stream.waiting_since_ms == 0) app.stream.waiting_since_ms = io_mod.milliTimestamp();
                 } else if (app.stream.waiting_since_ms != 0) {

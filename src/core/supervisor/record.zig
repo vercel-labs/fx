@@ -19,6 +19,8 @@ pub const Record = struct {
     /// The live host's conversation is on disk.
     saved: bool = false,
     running: bool = false,
+    /// When the running turn started; meaningful only while `running`.
+    turn_started_ms: i64 = 0,
     /// Background jobs still running in the live host. Not saved.
     jobs: u32 = 0,
     model: []u8 = &.{},
@@ -36,6 +38,7 @@ pub const Record = struct {
         copy.live = self.live;
         copy.saved = self.saved;
         copy.running = self.running;
+        copy.turn_started_ms = self.turn_started_ms;
         copy.jobs = self.jobs;
         if (self.failure) |failure| copy.failure = try alloc.dupe(u8, failure);
         copy.heartbeat = self.heartbeat;
@@ -71,6 +74,7 @@ pub const Record = struct {
             .error_message = if (record.failure) |failure| try arena.dupe(u8, failure) else null,
             .updated_at_ms = record.updated_at_ms,
             .running_jobs = record.jobs,
+            .turn_started_at_ms = if (record.running) record.turn_started_ms else 0,
         };
     }
 
@@ -94,7 +98,7 @@ pub const Record = struct {
         const b = other.heartbeat;
         return same_failure and eql(u8, self.name, other.name) and eql(u8, self.model, other.model) and
             eql(u8, self.mode, other.mode) and self.stopped == other.stopped and self.live == other.live and
-            self.saved == other.saved and self.running == other.running and self.jobs == other.jobs and self.updated_at_ms == other.updated_at_ms and
+            self.saved == other.saved and self.running == other.running and self.turn_started_ms == other.turn_started_ms and self.jobs == other.jobs and self.updated_at_ms == other.updated_at_ms and
             eql(u8, a.prompt, b.prompt) and a.interval_ms == b.interval_ms and a.next_run_ms == b.next_run_ms and
             a.paused == b.paused and a.run_count == b.run_count;
     }
@@ -197,4 +201,25 @@ test "heartbeat changes validate before they touch the record" {
     try std.testing.expectEqual(@as(i64, 5300), record.heartbeat.next_run_ms);
     try record.applyHeartbeat(alloc, .{ .session_id = "s", .action = .clear }, 400);
     try std.testing.expect(!record.heartbeatArmed() and record.heartbeat.prompt.len == 0);
+}
+
+test "a running record carries its turn's start to the summary" {
+    const alloc = std.testing.allocator;
+    var record = try Record.init(alloc, "session");
+    defer record.deinit(alloc);
+    record.live = true;
+    record.running = true;
+    record.turn_started_ms = 1_700_000_000_000;
+    var copy = try record.clone(alloc);
+    defer copy.deinit(alloc);
+    try std.testing.expect(record.sameView(&copy));
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const shown = try copy.summary(arena.allocator(), "id", "/Users/example/ws", 0);
+    try std.testing.expectEqual(@as(i64, 1_700_000_000_000), shown.turn_started_at_ms);
+    // A later turn is a different view; an idle session shows no start.
+    copy.turn_started_ms += 5;
+    try std.testing.expect(!record.sameView(&copy));
+    copy.running = false;
+    try std.testing.expectEqual(@as(i64, 0), (try copy.summary(arena.allocator(), "id", "/Users/example/ws", 0)).turn_started_at_ms);
 }

@@ -730,6 +730,7 @@ pub const Session = struct {
         };
         next_record.live = true;
         next_record.running = host.busy();
+        next_record.turn_started_ms = host.turnStartedMs();
         next_record.jobs = @intCast(host.runningJobs());
         const active = if (host.state.active_session) |*session| session else return next_record;
         alloc.free(next_record.model);

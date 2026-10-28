@@ -325,6 +325,9 @@ const ActivePrompt = struct {
     permission_mode: types.PermissionMode,
     thread: if (host_target.is_wasm) void else std.Thread = if (host_target.is_wasm) {} else undefined,
     reapable: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Wall-clock start, so a frontend that attaches mid-turn shows the
+    /// turn's elapsed time rather than its own.
+    started_ms: i64 = 0,
 };
 
 /// Who reads a host's turns. A host has exactly one reader for its life.
@@ -1106,6 +1109,12 @@ pub const PersistentHost = struct {
 
     pub fn runningJobs(self: *PersistentHost) usize {
         return self.jobs.runningCount();
+    }
+
+    /// When the running turn started, or 0 with no turn running.
+    pub fn turnStartedMs(self: *PersistentHost) i64 {
+        const active = self.state.active_prompt orelse return 0;
+        return active.started_ms;
     }
 
     /// The loop admitted `notice` as request `request_id`.
@@ -2613,6 +2622,7 @@ fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Messag
         .msg = try cloneMessage(alloc, msg),
         .mode = session.mode,
         .permission_mode = session.permission_mode,
+        .started_ms = io_mod.milliTimestamp(),
     };
     errdefer jsonrpc.freeMessage(alloc, &active.msg);
 

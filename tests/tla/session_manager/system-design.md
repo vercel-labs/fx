@@ -2966,6 +2966,15 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   reattach could replay it. **Alternative:** a larger log, which only
   moves the limit.
 
+- **D272 Decision:** the supervisor's session summary carries the
+  running turn's wall-clock start as `turn_started_at_ms`, an additive
+  field, so the protocol version stays. A detached frontend that replays a
+  running turn adopts it once per turn, after the replayed events restart
+  its own clock; a later approval pause still moves the clock as before.
+  **Why:** after a reattach the turn timer restarted from zero.
+  **Alternative:** a start time in every native turn event, which the
+  replay log may have dropped.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

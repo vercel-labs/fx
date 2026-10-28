@@ -176,6 +176,8 @@ pub const State = struct {
     pending_notice_topic: []const u8 = "update",
     /// Whether the saved transcript for `current_id` has finished loading.
     history_loaded: bool = false,
+    /// The supervisor's start of the running turn this view last adopted.
+    turn_start_adopted: i64 = 0,
     history_load: HistoryLoad = .{},
     history_window: HistoryWindow = .{},
     /// A received older page still being projected.
