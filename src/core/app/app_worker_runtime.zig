@@ -719,6 +719,7 @@ pub fn Runtime(comptime App: type) type {
             } else false;
             if (approval_changed and in_child and agent.approval_prompt.isActive()) {
                 debug_trace.eventf("host", "approval_requested", .{}, "agent={s}", .{subagentIdOf(app, agent).?});
+                if (comptime @hasDecl(App, "notePromptAsked")) app.notePromptAsked(agent, .approval);
             }
             // The approval screen shows the agent on screen, so a hidden
             // agent's change leaves it be.
@@ -1165,6 +1166,9 @@ pub fn Runtime(comptime App: type) type {
                                 return err;
                             };
                             if (!was_active and agent.question_prompt.isActive()) {
+                                if (comptime @hasDecl(App, "notePromptAsked")) {
+                                    if (isSubagent(app, agent)) app.notePromptAsked(agent, .question);
+                                }
                                 app.shell.render_requests.request(.modal);
                                 if (comptime @hasDecl(App, "dispatchAttentionRequired")) {
                                     app.dispatchAttentionRequired(
