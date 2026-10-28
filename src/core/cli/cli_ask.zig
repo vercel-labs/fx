@@ -3264,9 +3264,15 @@ fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u
     else
         try gateway_error_format.formatHttpErrorMessage(ctx.alloc, status, detail);
     defer ctx.alloc.free(message);
-    try ctx.writeStderr("fx ask: ");
-    try ctx.writeStderr(message);
-    try ctx.writeStderr("\n");
+    if (ctx.presenter) |presenter| {
+        // The terminal presentation owns the screen, with line wrap off,
+        // until it finishes; text written around it runs into the prompt.
+        try presenter.pushNotice(.{ .topic = "error", .tone = .@"error", .body = message });
+    } else {
+        try ctx.writeStderr("fx ask: ");
+        try ctx.writeStderr(message);
+        try ctx.writeStderr("\n");
+    }
     if (ctx.output_mode.capturesJson()) {
         try ctx.assistant_output.appendSlice(ctx.alloc, message);
         try ctx.assistant_output.append(ctx.alloc, '\n');
