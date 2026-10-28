@@ -59,6 +59,21 @@ function latestUserText(body: string): string {
   return userTexts(body).at(-1) ?? "";
 }
 
+async function until(what: string, done: () => boolean, ms = 30_000) {
+  const deadline = Date.now() + ms;
+  while (!done()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await Bun.sleep(50);
+  }
+}
+
+// A reply the test holds back until it calls `release`.
+function held() {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => (release = resolve));
+  return { promise, release };
+}
+
 // Main's requests carry what the test typed to main, which always starts
 // SWITCH_USER; a subagent's carry only its task and what is typed to it. The
 // subagent tool can't tell them apart, because a subagent is offered it too.
@@ -74,10 +89,11 @@ interface Run {
 }
 
 async function withFx(
-  respond: (body: string) => Response,
+  respond: (body: string) => Response | Promise<Response>,
   run: (session: TmuxSession, context: Run) => Promise<void>,
   setupHome: (home: string) => void = () => {},
   record = false,
+  env: Record<string, string> = {},
 ) {
   const gateway = startDynamicFakeGateway(respond);
   const home = createIsolatedTestHome();
@@ -102,6 +118,7 @@ async function withFx(
         FX_AUTO_UPGRADE: "0",
         FX_SOUND: "0",
         ...(record && sessions.length === 0 ? { FX_RECORD: tape } : {}),
+        ...env,
       },
       width: 120,
       height: 40,
@@ -367,6 +384,122 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await moveAgent(session, 1);
         await session.waitForPane((pane) => pane.includes("SWITCH_ASKER_DONE"), 15_000);
       });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent with no mode of its own follows main's as it changes, on its next tool call",
+    async () => {
+      let mainCalls = 0;
+      let childCalls = 0;
+      const first = held();
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          if (latestUserText(body).includes("SWITCH_TYPED")) {
+            if (body.includes('"typed_write"')) return text("typed_done", "SWITCH_TYPED_DONE");
+            return toolCall("typed_write", "write_file", { path: "typed.txt", content: "TYPED\n" });
+          }
+          childCalls += 1;
+          if (childCalls > 1) return text("child_done", "SWITCH_FOLLOWER_DONE");
+          await first.promise;
+          return toolCall("child_write", "write_file", { path: "followed.txt", content: "FOLLOWED\n" });
+        }
+        mainCalls += 1;
+        if (mainCalls === 1) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "follower", message: "SWITCH_FOLLOW_TASK write a note" },
+          });
+        }
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session, { workspace }) => {
+        // The subagent starts while main is in ask, then main moves to auto
+        // before the subagent's write, which then runs without asking.
+        await session.sendText("SWITCH_USER");
+        await until("the subagent's first request", () => childCalls === 1);
+        await session.sendKeys("BTab");
+        await session.waitForText("auto ·", 10_000);
+        first.release();
+        await session.waitForText("SWITCH_MAIN_DONE", 30_000);
+        expect(readFileSync(join(workspace, "followed.txt"), "utf8")).toBe("FOLLOWED\n");
+        expect(await session.captureFullScrollback()).not.toContain("needs permission");
+
+        // Its footer shows the mode it follows.
+        await moveAgent(session, 1);
+        await session.waitForPane((pane) => pane.includes("SWITCH_FOLLOWER_DONE") && pane.includes("auto ·"), 15_000);
+
+        // Tightening main tightens it: back in ask, a write the user asks of
+        // it on its own screen waits for an answer.
+        await moveAgent(session, -1);
+        await session.sendText("/permissions ask");
+        await session.waitForText("mode set to ask", 10_000);
+        await moveAgent(session, 1);
+        await session.waitForPane((pane) => pane.includes("ask ·"), 15_000);
+        await session.sendText("SWITCH_TYPED write again");
+        await session.waitForText("Apply this change?", 30_000);
+        expect(existsSync(join(workspace, "typed.txt"))).toBe(false);
+        await session.sendKeys("1");
+        await session.waitForText("SWITCH_TYPED_DONE", 30_000);
+        expect(readFileSync(join(workspace, "typed.txt"), "utf8")).toBe("TYPED\n");
+      }, () => {}, false, { FX_PERMISSION_MODE: "ask" });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "main's screen shows the subagent prompt asked first, whichever subagent started first",
+    async () => {
+      const gates = { first: held(), second: held() };
+      const seen = { first: 0, second: 0 };
+      const started = { first: false, second: false };
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          const who: "first" | "second" = userTexts(body).some((t) => t.includes("SWITCH_TASK_SECOND")) ? "second" : "first";
+          if (body.includes(`"write_${who}"`)) return text(`done_${who}`, `CHILD_DONE_${who.toUpperCase()}`);
+          seen[who] += 1;
+          await gates[who].promise;
+          return toolCall(`write_${who}`, "write_file", { path: `${who}.txt`, content: `${who}\n` });
+        }
+        if (body.includes("CHILD_DONE_FIRST")) return text("main_saw_first", "SWITCH_MAIN_SAW_FIRST");
+        if (body.includes("CHILD_DONE_SECOND")) return text("main_saw_second", "SWITCH_MAIN_SAW_SECOND");
+        if (latestUserText(body).includes("START_SECOND") && !started.second) {
+          started.second = true;
+          return toolCall("main_second", "subagent", {
+            request: { action: "message", agent: "second", message: "SWITCH_TASK_SECOND write second.txt" },
+          });
+        }
+        if (!started.first) {
+          started.first = true;
+          return toolCall("main_first", "subagent", {
+            request: { action: "message", agent: "first", message: "SWITCH_TASK_FIRST write first.txt" },
+          });
+        }
+        return text("main_idle", "SWITCH_MAIN_IDLE");
+      }, async (session, { workspace }) => {
+        await session.sendText("SWITCH_USER start the first");
+        await until("the first subagent's request", () => seen.first === 1);
+        await session.sendText("SWITCH_USER START_SECOND");
+        await until("the second subagent's request", () => seen.second === 1);
+
+        // On the first subagent's screen, the second asks, then the first.
+        await moveAgent(session, 1);
+        gates.second.release();
+        await session.waitForText("second needs approval", 30_000);
+        gates.first.release();
+        await session.waitForText("Subagent first needs permission", 30_000);
+
+        // Back on main, the second's prompt shows first, then the first's.
+        await moveAgent(session, -1);
+        const oldest = await session.waitForText("Subagent second needs permission", 15_000);
+        expect(oldest).not.toContain("Subagent first needs permission");
+        await session.sendKeys("1");
+        await session.waitForText("Subagent first needs permission", 15_000);
+        expect(readFileSync(join(workspace, "second.txt"), "utf8")).toBe("second\n");
+        expect(existsSync(join(workspace, "first.txt"))).toBe(false);
+        await session.sendKeys("1");
+        await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
+        expect(readFileSync(join(workspace, "first.txt"), "utf8")).toBe("first\n");
+      }, () => {}, false, { FX_PERMISSION_MODE: "ask" });
     },
     TIMEOUT,
   );

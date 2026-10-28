@@ -77,6 +77,12 @@ pub const ChildAgent = struct {
     /// The name its parent gave it, such as `reviewer`, from its first run.
     /// Empty for a one-off. Owned.
     name: []u8 = &.{},
+    /// Where its current approval and question come in the order its tree's
+    /// prompts were asked (`App.prompt_order`), so the instance's screen
+    /// shows the oldest first. Meaningful only while that prompt is active.
+    /// Main loop only.
+    approval_asked: u64 = 0,
+    question_asked: u64 = 0,
     /// Backs `footerLabel`.
     label_buf: [160]u8 = undefined,
 
@@ -482,25 +488,59 @@ pub fn Runtime(comptime App: type) type {
             return if (on_screen.agent.role == .instance) &on_screen.agent else null;
         }
 
-        /// While an instance is on screen with no question or approval
-        /// showing, a hidden question from a subagent of its tree is lent to
-        /// the instance's prompt, named for the subagent, so it shows on the
-        /// instance's screen too. It goes back before anything but the input
-        /// that edits it touches it.
-        pub fn lendQuestion(app: *App) void {
-            if (app.question_lender != null) return;
+        pub const PromptKind = enum { approval, question };
+
+        /// Notes that subagent `agent`'s approval or question just showed,
+        /// so its tree's prompts reach the instance's screen in the order
+        /// they were asked.
+        pub fn notePromptAsked(app: *App, agent: *const agents.Agent, kind: PromptKind) void {
+            const child = for (app.child_agents.items) |child| {
+                if (&child.agent == agent) break child;
+            } else return;
+            app.prompt_order += 1;
+            switch (kind) {
+                .approval => child.approval_asked = app.prompt_order,
+                .question => child.question_asked = app.prompt_order,
+            }
+        }
+
+        /// While an instance is on screen with no approval or question
+        /// showing, the oldest one waiting in its tree, approval or
+        /// question, is lent to the instance's prompt, so it shows on the
+        /// instance's screen too. One is lent at a time, so the next shows
+        /// once that one is answered or goes back. A rule a subagent's
+        /// `/permissions remember` would save is its own, so it isn't lent.
+        pub fn lendPrompt(app: *App) void {
+            if (app.approval_lender != null or app.question_lender != null) return;
             const borrower = instanceOnScreen(app) orelse return;
-            if (borrower.question_prompt.isActive() or borrower.approval_prompt.isActive()) return;
+            if (borrower.approval_prompt.isActive() or borrower.question_prompt.isActive()) return;
+            var oldest: ?struct { child: *ChildAgent, kind: PromptKind, asked: u64 } = null;
             for (app.child_agents.items) |child| {
                 if (!lendsTo(app, child, borrower)) continue;
-                if (!child.agent.question_prompt.isActive()) continue;
-                std.mem.swap(question_prompt.QuestionPrompt, &borrower.question_prompt, &child.agent.question_prompt);
-                borrower.question_prompt.asker = child.displayName();
-                app.question_lender = child;
-                debug_trace.eventf("host", "question_lent", .{}, "agent={s}", .{child.id});
-                app.shell.render_requests.request(.modal);
-                return;
+                const approval = &child.agent.approval_prompt;
+                if (approval.isActive() and approval.rule_management == null) {
+                    if (oldest == null or child.approval_asked < oldest.?.asked) oldest = .{ .child = child, .kind = .approval, .asked = child.approval_asked };
+                }
+                if (child.agent.question_prompt.isActive()) {
+                    if (oldest == null or child.question_asked < oldest.?.asked) oldest = .{ .child = child, .kind = .question, .asked = child.question_asked };
+                }
             }
+            const lent = oldest orelse return;
+            switch (lent.kind) {
+                .approval => lendApproval(app, borrower, lent.child),
+                .question => lendQuestion(app, borrower, lent.child),
+            }
+            app.shell.render_requests.request(.modal);
+        }
+
+        /// Lends `child`'s question to `borrower`'s prompt, named for the
+        /// subagent. It goes back before anything but the input that edits
+        /// it touches it.
+        fn lendQuestion(app: *App, borrower: *AppAgent, child: *ChildAgent) void {
+            std.mem.swap(question_prompt.QuestionPrompt, &borrower.question_prompt, &child.agent.question_prompt);
+            borrower.question_prompt.asker = child.displayName();
+            app.question_lender = child;
+            debug_trace.eventf("host", "question_lent", .{}, "agent={s}", .{child.id});
         }
 
         /// Gives a lent question back to the subagent that asked it, and
@@ -539,28 +579,14 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        /// While an instance is on screen with no approval or question
-        /// showing, a hidden approval from a subagent of its tree is lent to
-        /// the instance's prompt, so it shows on the instance's screen too.
-        /// Its request comes from its own worker and stays labeled with its
-        /// name. It goes back when the subagent is shown, the instance gets
-        /// its own, or the subagent stops waiting (`keepLentApproval`). A
-        /// rule a subagent's `/permissions remember` would save is its own,
-        /// so it isn't lent.
-        pub fn lendApproval(app: *App) void {
-            if (app.approval_lender != null) return;
-            const borrower = instanceOnScreen(app) orelse return;
-            if (borrower.approval_prompt.isActive() or borrower.question_prompt.isActive()) return;
-            for (app.child_agents.items) |child| {
-                if (!lendsTo(app, child, borrower)) continue;
-                const prompt = &child.agent.approval_prompt;
-                if (!prompt.isActive() or prompt.rule_management != null) continue;
-                std.mem.swap(@TypeOf(child.agent.approval_prompt), &borrower.approval_prompt, prompt);
-                app.approval_lender = child;
-                debug_trace.eventf("host", "approval_lent", .{}, "agent={s}", .{child.id});
-                app.shell.render_requests.request(.modal);
-                return;
-            }
+        /// Lends `child`'s approval to `borrower`'s prompt. Its request comes
+        /// from the subagent's own worker and stays labeled with its name.
+        /// It goes back when the subagent is shown, the instance gets its
+        /// own, or the subagent stops waiting (`keepLentApproval`).
+        fn lendApproval(app: *App, borrower: *AppAgent, child: *ChildAgent) void {
+            std.mem.swap(@TypeOf(child.agent.approval_prompt), &borrower.approval_prompt, &child.agent.approval_prompt);
+            app.approval_lender = child;
+            debug_trace.eventf("host", "approval_lent", .{}, "agent={s}", .{child.id});
         }
 
         /// Gives a lent approval back to the subagent it came from, and
