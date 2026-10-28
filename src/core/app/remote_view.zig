@@ -924,3 +924,21 @@ test "a provider chosen by /login before a session is open opens one and applies
     try std.testing.expectEqual(remote_runtime.Kind.config, app.remote.queue.items[0].kind);
     try std.testing.expect(std.mem.find(u8, app.remote.queue.items[0].json, "opencode-zen") != null);
 }
+
+test "session pushes wait for the replay a reattach asked for" {
+    const alloc = std.testing.allocator;
+    var state: remote_runtime.State = .{ .allocator = alloc, .link = .ready };
+    defer state.deinit(alloc);
+    try std.testing.expect(state.acceptsSessionPush());
+    // The newest history page is loading: its resync replays the turn.
+    state.history_load = .{ .active = true, .initial = true };
+    try std.testing.expect(!state.acceptsSessionPush());
+    // The page is in place and its resync is out.
+    state.history_load = .{};
+    try state.sent.append(alloc, .{ .kind = .resync, .json = try alloc.dupe(u8, "{}"), .generation = state.generation });
+    try std.testing.expect(!state.acceptsSessionPush());
+    alloc.free(state.sent.pop().?.json);
+    // Paging older history never holds the live turn back.
+    state.history_load = .{ .active = true, .initial = false };
+    try std.testing.expect(state.acceptsSessionPush());
+}

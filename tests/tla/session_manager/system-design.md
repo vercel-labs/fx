@@ -2945,6 +2945,17 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   cancel with a prompt for feedback. **Alternative:** a new outcome kind,
   which every frontend and the supervisor protocol would need to learn.
 
+- **D270 Decision:** a detached frontend applies no pushed session
+  snapshot from the attach that loads history until the resync after the
+  newest history page answers. The resync replays every event after the
+  page's checkpoint, so a push in that window could only move the
+  frontend's sequence past frames it still owes. **Why:** the integration
+  pass lost a running turn's prompt and first write on reattach; a push
+  for a newer event arrived between the page and its resync, and the
+  resync's older events were then skipped as seen. **Alternative:**
+  registering the attach's watcher at the checkpoint, which would push the
+  same events twice while the page loads.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

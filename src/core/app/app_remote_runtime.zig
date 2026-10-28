@@ -406,6 +406,17 @@ pub const State = struct {
         }
         return false;
     }
+
+    /// Whether a pushed session snapshot may apply now. From an attach until
+    /// the resync after the newest history page answers, the replay that
+    /// resync returns covers every event; a push could only jump the
+    /// sequence past the frames it still owes, such as the running turn's
+    /// prompt (D270).
+    pub fn acceptsSessionPush(self: *const State) bool {
+        if (self.link != .ready) return false;
+        if (self.history_load.active and self.history_load.initial) return false;
+        return !(self.inFlight(.startup) or self.inFlight(.attach) or self.inFlight(.resync));
+    }
 };
 
 pub fn Runtime(comptime App: type) type {
@@ -548,7 +559,7 @@ pub fn Runtime(comptime App: type) type {
             const remote = &app.remote;
             switch (topic) {
                 .session => {
-                    if (remote.link != .ready or remote.inFlight(.startup) or remote.inFlight(.attach)) return;
+                    if (!remote.acceptsSessionPush()) return;
                     if (!std.mem.eql(u8, string(body, "session_id") orelse "", remote.current_id)) return;
                     try applyResponse(app, .poll, body);
                 },
