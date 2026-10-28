@@ -877,8 +877,8 @@ export interface FxSession {
   stream(cursor?: number): ReadableStream<Uint8Array>;
   /**
    * Steers the running turn the way the fx CLI does: it cuts a streaming reply short, waits for a running tool, and
-   * joins a turn waiting to start. When no turn runs or waits, it starts one. A steer with images or resources cannot
-   * join a turn: the running one ends at its next safe point and the steer runs next.
+   * joins a turn waiting to start. When no turn runs or waits, it starts one. A steer with images or resources, or with
+   * more than 64 KiB of text, cannot join a turn: the running one ends at its next safe point and the steer runs next.
    */
   steer(input: FxSessionPromptInput, options?: FxSteerOptions): Promise<FxSteered>;
   /** Cancels the running turn. */
