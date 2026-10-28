@@ -2993,6 +2993,49 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   **Alternative:** deleting each screenshot after its run, which loses
   the file the run's result names.
 
+- **D280 Decision:** the startup banner belongs to process start. Once
+  the supervisor connection has dropped, a transcript rebuild (a restart's
+  reattach, or a later session switch) keeps the welcome entry only while
+  it is still whole on screen, where it repaints in place; once it has
+  scrolled, the rebuild clears it with the rest. **Why:** a supervisor restart printed the
+  whole banner a second time below the first. **Alternative:** skipping
+  the rebuild on a restart, which leaves a transcript built from another
+  supervisor's sequence numbers.
+
+- **D281 Decision:** a detached frontend counts reconnect attempts that
+  fail in a row: a connection that would not open, or one that dropped
+  within 10 seconds. The waits double from 250 ms to 4 s; after five
+  failures the connection stops and the frontend shows one line saying
+  the supervisor keeps stopping and naming its log (D283). Within a run of
+  attempts, the lost-connection, restored and lost-session notices show
+  once each. **Why:** a supervisor that crashed on every start produced an
+  endless pair of notices per attempt with no hint at the cause.
+  **Alternative:** a status row updated in place, which the inline
+  transcript cannot rewrite once it scrolls.
+
+- **D282 Decision:** a reattach after an outage that the supervisor
+  answers with `SessionNotFound` reads "This session could not be restored
+  by the supervisor" and offers `/new` and `/resume`. **Why:** the bare
+  error name gave no cause and no way forward.
+
+- **D283 Decision:** the frontend that starts the supervisor appends the
+  supervisor's stderr to `daemon.log` in the daemon state folder, where a
+  panic and its trace land. At each start a full log (256 KiB) moves to
+  `daemon.log.1`, replacing the one there, and a running supervisor starts
+  its log over when it passes the limit. A supervisor that exits before
+  it answers fails the start at once instead of after the 15 second
+  timeout. Debug builds read `PROTO_FX_DEBUG_DAEMON_PANIC_MS` and panic
+  that long after start, to reproduce a crash loop. **Why:** the detached
+  supervisor's panic output went to `/dev/null`.
+
+- **D284 Decision:** a session the supervisor cannot restore at start is
+  recorded once with the host's reason (`SessionOpenFailed (Session could
+  not be loaded (InvalidSessionFormat))`); the ACP load error names the
+  underlying error. The saved registry keeps that failure, so later
+  starts skip the session quietly and restore the others, and an attach
+  still tries it again. **Why:** every start printed `SessionOpenFailed`
+  with no reason for a session log that could not load.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a
