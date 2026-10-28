@@ -67,7 +67,7 @@ async function disablePromptHistory(
   settingsPath: string,
 ): Promise<void> {
   await session.sendText("/settings");
-  await session.waitForText("←→ change", TIMEOUT);
+  await session.waitForText(/Settings \d+/, TIMEOUT);
   await session.sendLiteral("prompt history");
   await session.waitForPane(
     (pane) => pane.includes("Prompt history") && !pane.includes("Startup scrollback"),
@@ -86,7 +86,7 @@ async function disablePromptHistory(
   if (enabled !== false) throw new Error("Timed out disabling prompt history");
   await session.sendKeys("Escape");
   await session.waitForPane(
-    (pane) => hasEmptyComposer(pane) && !pane.includes("←→ change"),
+    (pane) => hasEmptyComposer(pane) && !/Settings \d+/.test(pane),
     TIMEOUT,
   );
 }
@@ -434,14 +434,14 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         expect(startup).not.toContain("adaptive");
         expect(startup).not.toContain("⚡︎ fast");
         await session.sendText("/settings");
-        const pane = await session.waitForText("←→ change", TIMEOUT);
+        const pane = await session.waitForText(/Settings \d+/, TIMEOUT);
         expect(pane).toContain("anthropic/claude-opus-4.7");
         expect(pane).toContain("Startup scrollback");
         expect(pane).toContain("Prompt history");
         await session.sendKeys("Escape");
         await session.waitForPane(
           (current) =>
-            hasEmptyComposer(current) && !current.includes("←→ change"),
+            hasEmptyComposer(current) && !/Settings \d+/.test(current),
           TIMEOUT,
         );
         await session.sendText("/statusline");
@@ -957,7 +957,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         });
         await session.waitForText("Run /help", TIMEOUT);
         await session.sendText("/settings");
-        await session.waitForText("←→ change", TIMEOUT);
+        await session.waitForText(/Settings \d+/, TIMEOUT);
         await session.sendLiteral("reason");
         const effortSetting = await session.waitForText("Reasoning effort", TIMEOUT);
         expect(effortSetting).toContain("low");

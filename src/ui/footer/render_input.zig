@@ -413,6 +413,8 @@ pub const RenderContext = struct {
     upgrade_status: []const u8 = "",
     /// What MCP has to say, after everything else on the right.
     mcp_status: []const u8 = "",
+    /// The session's cost and tokens, shown when no notice needs the spot.
+    usage_status: []const u8 = "",
     danger_status: []const u8 = "",
     danger_status_compact: []const u8 = "",
     esc_clear_armed: bool = false,

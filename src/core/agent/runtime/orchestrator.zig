@@ -8144,6 +8144,11 @@ fn processQueuedPromptLoop(
                 gateway_delivery.load(),
             );
             stream_result_set = true;
+            // Account before recovery, validation, or cancellation can leave
+            // this attempt. A priced failure still belongs to the session.
+            if (deps.report_cost) |report_fn| {
+                if (streamCompletion(stream_result).cost_usd) |cost| report_fn(deps.ctx, cost);
+            }
             pushNetworkRecord(deps, job.provider, gateway_model, gateway_wait_started_ms, &stream_result);
             const first_failure = streamFailure(stream_result);
             const auth_replay = auth_transition.decideAuthReplay(.{
@@ -8172,6 +8177,9 @@ fn processQueuedPromptLoop(
                     model_request.attempt_evidence = &replay_evidence;
                     const replay_wait_started_ms = io_mod.milliTimestamp();
                     stream_result = try streamMainCompletion(deps, arena, model_request);
+                    if (deps.report_cost) |report_fn| {
+                        if (streamCompletion(stream_result).cost_usd) |cost| report_fn(deps.ctx, cost);
+                    }
                     pushNetworkRecord(deps, job.provider, gateway_model, replay_wait_started_ms, &stream_result);
                     parent_turn_delivery.observeGatewayDelivery(
                         deps,
@@ -9300,7 +9308,6 @@ fn processQueuedPromptLoop(
                 report_fn(deps.ctx, completion.usage);
             }
         }
-
         if (disposition == .completed and completion.tool_calls.len > 0) {
             switch (tool_admission) {
                 .admitted => reportProviderExecutedUsage(deps, completion.tool_calls),

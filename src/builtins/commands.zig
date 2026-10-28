@@ -471,7 +471,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .paste, .command = "/paste", .help_entry = "/paste", .completion_description = "attach an image from the clipboard when supported", .presentation_category = .media },
     .{ .kind = .fast, .command = "/fast", .help_entry = "/fast", .completion_description = "toggle Fast mode when supported", .presentation_category = .model },
     .{ .kind = .ultrafast, .command = "/ultrafast", .help_entry = "/ultrafast [on|off|status]", .completion_description = "request Ultra mode when supported", .presentation_category = .model, .has_args = true, .accepts_payload = true },
-    .{ .kind = .statusline, .command = "/statusline", .help_entry = "/statusline [context|session|workspace]", .completion_description = "toggle status line segments", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
+    .{ .kind = .statusline, .command = "/statusline", .help_entry = "/statusline [context|session|workspace|usage]", .completion_description = "toggle status line segments", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .notifications, .command = "/sound", .help_entry = "/sound [on|off|max]", .completion_description = "toggle sounds and terminal bells", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .workspace, .command = "/workspace", .help_entry = "/workspace [list|add PATH|remove PATH|clear]", .completion_description = "manage additional workspace directories", .presentation_category = .workspace, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .shell, .command = "/shell", .help_entry = "/shell reload", .completion_description = "reload shell startup files for commands", .presentation_category = .workspace, .has_args = true, .accepts_payload = true },
@@ -619,7 +619,7 @@ test "built-in statusline help and completion include workspace" {
     const help = try renderSlashHelp(std.testing.allocator);
     defer std.testing.allocator.free(help);
     try std.testing.expect(
-        std.mem.find(u8, help, "/statusline [context|session|workspace]") != null,
+        std.mem.find(u8, help, "/statusline [context|session|workspace|usage]") != null,
     );
 
     try std.testing.expectEqualStrings(

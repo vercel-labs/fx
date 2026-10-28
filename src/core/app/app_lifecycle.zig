@@ -173,6 +173,7 @@ pub const StartupState = struct {
     statusline_context: bool = false,
     statusline_session: bool = false,
     statusline_workspace: bool = false,
+    statusline_usage: bool = true,
     session_title_generation: bool = true,
     notification_turn_end: bool = false,
     notification_attention_required: bool = false,
@@ -813,6 +814,7 @@ fn loadStartupStateWithKeychainRead(
     state.statusline_context = settings.statusline_context orelse false;
     state.statusline_session = settings.statusline_session orelse false;
     state.statusline_workspace = settings.statusline_workspace orelse false;
+    state.statusline_usage = settings.statusline_usage orelse true;
     state.session_title_generation = settings.session_titles orelse true;
     const sound_override = soundEnvOverride();
     const sound_on_override: ?bool = if (sound_override) |level| level != .off else null;

@@ -403,19 +403,62 @@ fn appendSessionStatusSegments(
         appendStatusSegment(out, end, display_width.prefixByWidth(title, max_session_title_cells));
     }
     if (statusline.context_used > 0) {
-        if (statusline.context_total) |total| {
-            const used_k = statusline.context_used / 1000;
-            const total_k: u64 = @as(u64, total) / 1000;
-            const pct = if (total > 0) (statusline.context_used * 100) / @as(u64, total) else 0;
-            var ctx_buf: [48]u8 = undefined;
-            appendStatusSegment(out, end, std.mem.print(&ctx_buf, "{d}k/{d}k {d}%", .{ used_k, total_k, pct }) catch "");
-        } else {
-            const used_k = statusline.context_used / 1000;
-            var ctx_buf: [32]u8 = undefined;
-            appendStatusSegment(out, end, std.mem.print(&ctx_buf, "{d}k", .{used_k}) catch "");
-        }
+        var ctx_buf: [48]u8 = undefined;
+        appendStatusSegment(out, end, formatContextUsage(&ctx_buf, statusline.context_used, statusline.context_total));
     }
     appendWorkspaceIdentity(out, end, status_limit, statusline);
+}
+
+/// How full the context is, as `37k/1000k 3%`, or `37k` when the model's
+/// window is unknown.
+fn formatContextUsage(buf: []u8, used: u64, total: ?u32) []const u8 {
+    const window = total orelse return std.mem.print(buf, "{d}k", .{used / 1000}) catch "";
+    const pct = if (window > 0) (used * 100) / @as(u64, window) else 0;
+    return std.mem.print(buf, "{d}k/{d}k {d}%", .{ used / 1000, @as(u64, window) / 1000, pct }) catch "";
+}
+
+/// The status line's right side when no notice needs it: the session's cost
+/// when `show_cost` and the provider priced it, then the context once, as its
+/// window share when `show_window`, else as tokens. Empty with neither.
+pub fn buildUsageStatus(
+    buf: []u8,
+    show_cost: bool,
+    cost_usd: f64,
+    show_window: bool,
+    context_used: u64,
+    context_total: ?u32,
+) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    if (show_cost and cost_usd > 0) {
+        if (cost_usd < 0.01) w.writeAll("<$0.01") catch {} else w.print("${d:.2}", .{cost_usd}) catch {};
+    }
+    if (context_used > 0 and (show_window or show_cost)) {
+        if (w.end > 0) w.writeAll(" · ") catch {};
+        var ctx_buf: [48]u8 = undefined;
+        if (show_window) {
+            w.writeAll(formatContextUsage(&ctx_buf, context_used, context_total)) catch {};
+        } else if (context_used < 1000) {
+            w.print("{d} tokens", .{context_used}) catch {};
+        } else {
+            w.print("{d}k tokens", .{context_used / 1000}) catch {};
+        }
+    }
+    return w.buffered();
+}
+
+test "buildUsageStatus shows the cost, then the context once" {
+    var buf: [64]u8 = undefined;
+    // Both on: the context's window share, once.
+    try std.testing.expectEqualStrings("$0.90 · 37k/1000k 3%", buildUsageStatus(&buf, true, 0.9, true, 37_000, 1_000_000));
+    // Only usage: the same context, as tokens.
+    try std.testing.expectEqualStrings("$0.90 · 37k tokens", buildUsageStatus(&buf, true, 0.9, false, 37_000, 1_000_000));
+    // Only context.
+    try std.testing.expectEqualStrings("37k/1000k 3%", buildUsageStatus(&buf, false, 0.9, true, 37_000, 1_000_000));
+    // No cost reported, a fraction of a cent, nothing yet, nothing on.
+    try std.testing.expectEqualStrings("850 tokens", buildUsageStatus(&buf, true, 0, false, 850, null));
+    try std.testing.expectEqualStrings("<$0.01 · 2k tokens", buildUsageStatus(&buf, true, 0.004, false, 2_400, null));
+    try std.testing.expectEqualStrings("", buildUsageStatus(&buf, true, 0, true, 0, 1_000_000));
+    try std.testing.expectEqualStrings("", buildUsageStatus(&buf, false, 0.9, false, 37_000, 1_000_000));
 }
 
 pub const subagent_status_width: u16 = 200;

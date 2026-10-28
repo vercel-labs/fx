@@ -1184,6 +1184,10 @@ pub const Persistence = struct {
     // its checkpoint mutex first, so callers must not checkpoint while held.
     // UI compaction publication takes worker_mutex before this mutex.
     write_mutex: std.Io.Mutex = .init,
+    // Main-agent cost is in-memory only. A separate lock keeps UI snapshots
+    // independent of storage I/O and makes the infallible callback allocation-free.
+    cost_mutex: std.Io.Mutex = .init,
+    session_cost_usd: f64 = 0,
     subagent_host: ?*subagent_tool_host.Runtime = null,
     /// The v2 session's children (D22), borrowed by `subagent_host`.
     v2_children: ?*subagent_child_state.V2Children = null,
@@ -1218,12 +1222,14 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (@typeInfo(Persistence).@"struct".field_names.len != 27) {
+            if (@typeInfo(Persistence).@"struct".field_names.len != 29) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
         storage.* = undefined;
         storage.write_mutex = .init;
+        storage.cost_mutex = .init;
+        storage.session_cost_usd = 0;
         storage.subagent_host = null;
         storage.v2_children = null;
         storage.workspace_preferences = null;
@@ -1250,6 +1256,25 @@ pub const Persistence = struct {
         storage.shutdown_failure = null;
         storage.v2_store = null;
         storage.v2 = null;
+    }
+
+    pub fn recordCost(self: *Persistence, cost_usd: f64) void {
+        self.cost_mutex.lockUncancelable(io_mod.getIo());
+        defer self.cost_mutex.unlock(io_mod.getIo());
+        self.session_cost_usd += cost_usd;
+    }
+
+    pub fn sessionCost(self: *Persistence) f64 {
+        self.cost_mutex.lockUncancelable(io_mod.getIo());
+        defer self.cost_mutex.unlock(io_mod.getIo());
+        return self.session_cost_usd;
+    }
+
+    // Session transitions settle the old worker before resetting this total.
+    fn resetCost(self: *Persistence) void {
+        self.cost_mutex.lockUncancelable(io_mod.getIo());
+        defer self.cost_mutex.unlock(io_mod.getIo());
+        self.session_cost_usd = 0;
     }
 
     pub fn deinit(self: *Persistence, alloc: Allocator) void {
@@ -1325,6 +1350,34 @@ test "persistence in-place initialization preserves empty ownership" {
     try std.testing.expect(persistence.session_picker_load.task == null);
     try std.testing.expect(!persistence.session_picker_cache.ready);
     try std.testing.expect(persistence.resume_handoff_intent == .none);
+    try std.testing.expectEqual(@as(f64, 0), persistence.sessionCost());
+}
+
+test "session cost serializes worker additions and UI snapshots then resets" {
+    const Reporter = struct {
+        fn run(persistence: *Persistence) void {
+            for (0..4096) |_| persistence.recordCost(0.125);
+        }
+    };
+    var persistence: Persistence = .{};
+    defer persistence.deinit(std.testing.allocator);
+    {
+        const first = try std.Thread.spawn(.{}, Reporter.run, .{&persistence});
+        defer first.join();
+        const second = try std.Thread.spawn(.{}, Reporter.run, .{&persistence});
+        defer second.join();
+        var previous: f64 = 0;
+        for (0..4096) |_| {
+            const current = persistence.sessionCost();
+            try std.testing.expect(current >= previous and current <= 1024);
+            previous = current;
+        }
+    }
+    try std.testing.expectEqual(@as(f64, 1024), persistence.sessionCost());
+    persistence.resetCost();
+    try std.testing.expectEqual(@as(f64, 0), persistence.sessionCost());
+    persistence.recordCost(0.25);
+    try std.testing.expectEqual(@as(f64, 0.25), persistence.sessionCost());
 }
 
 pub fn Runtime(comptime App: type) type {
@@ -1469,6 +1522,7 @@ pub fn Runtime(comptime App: type) type {
             app.total_input_tokens = 0;
             app.total_output_tokens = 0;
             app.total_web_search_requests = 0;
+            app.session_persistence.resetCost();
             if (comptime runtime_profile.allows(App, .js_host_sessions)) {
                 try beginFreshJsHostSession(app);
             }
@@ -2193,6 +2247,7 @@ pub fn Runtime(comptime App: type) type {
             app.total_input_tokens = state.total_input_tokens;
             app.total_output_tokens = state.total_output_tokens;
             app.total_web_search_requests = 0;
+            app.session_persistence.resetCost();
 
             var historical_labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
             defer historical_labels.deinit(app.alloc);
@@ -6011,8 +6066,10 @@ test "js-host resume restores transcript context preferences and revision" {
     );
     app.session_persistence.js_host_store = fake.store();
     app.requested_resume = .last;
+    app.session_persistence.recordCost(0.75);
 
     try Runtime(TestApp).resumeRequestedJsHostSession(&app);
+    try std.testing.expectEqual(@as(f64, 0), app.session_persistence.sessionCost());
 
     try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
     try std.testing.expectEqual(@as(usize, 1), app.cards.items.len);
@@ -6435,6 +6492,8 @@ test "a fresh session clears usage counters without a durable store" {
     app.total_input_tokens = 43_000;
     app.total_output_tokens = 1_200;
     app.total_web_search_requests = 3;
+    app.session_persistence.recordCost(0.75);
+    try std.testing.expectEqual(@as(f64, 0.75), app.session_persistence.sessionCost());
 
     try Runtime(TestApp).beginFreshPersistedSession(&app);
 
@@ -6442,6 +6501,7 @@ test "a fresh session clears usage counters without a durable store" {
     try std.testing.expectEqual(@as(u64, 0), app.total_input_tokens);
     try std.testing.expectEqual(@as(u64, 0), app.total_output_tokens);
     try std.testing.expectEqual(@as(u64, 0), app.total_web_search_requests);
+    try std.testing.expectEqual(@as(f64, 0), app.session_persistence.sessionCost());
 }
 
 test "v2 ultrafast resume applies process overrides without persisting them" {

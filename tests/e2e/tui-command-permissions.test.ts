@@ -1583,10 +1583,10 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendText("/sound on");
       await activeSession.waitForText("* sound: on", TIMEOUT);
       await activeSession.sendText("/settings");
-      await activeSession.waitForText("←→ change", TIMEOUT);
+      await activeSession.waitForText(/Settings \d+/, TIMEOUT);
       await activeSession.sendKeys("Escape");
       await activeSession.waitForPane(
-        (pane) => !pane.includes("←→ change"),
+        (pane) => !/Settings \d+/.test(pane),
         TIMEOUT,
       );
       await activeSession.waitForText(responseRows.at(-1)!, TIMEOUT);

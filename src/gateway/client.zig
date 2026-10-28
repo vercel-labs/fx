@@ -3572,6 +3572,42 @@ fn parseSseServiceTier(root: std.json.Value) ?types.ProviderServiceTier {
     return types.ProviderServiceTier.parse(service_tier.string);
 }
 
+/// The response's cost in US dollars from Gateway's terminal metadata, which
+/// sends it as a decimal string. Anything else, negative, or not finite reads
+/// as no cost reported.
+fn parseSseGatewayCost(root: std.json.Value) ?f64 {
+    if (root != .object) return null;
+    const provider_metadata = root.object.get("providerMetadata") orelse return null;
+    if (provider_metadata != .object) return null;
+    const gateway = provider_metadata.object.get("gateway") orelse return null;
+    if (gateway != .object) return null;
+    const cost: f64 = switch (gateway.object.get("cost") orelse return null) {
+        .string => |text| std.fmt.parseFloat(f64, text) catch return null,
+        .float => |value| value,
+        .integer => |value| @floatFromInt(value),
+        else => return null,
+    };
+    if (!std.math.isFinite(cost) or cost < 0) return null;
+    return cost;
+}
+
+test "parseSseGatewayCost reads Gateway's cost and ignores anything else" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { json: []const u8, want: ?f64 }{
+        .{ .json = "{\"providerMetadata\":{\"gateway\":{\"cost\":\"0.0012\"}}}", .want = 0.0012 },
+        .{ .json = "{\"providerMetadata\":{\"gateway\":{\"cost\":0.5}}}", .want = 0.5 },
+        .{ .json = "{\"providerMetadata\":{\"gateway\":{\"cost\":\"free\"}}}", .want = null },
+        .{ .json = "{\"providerMetadata\":{\"gateway\":{\"cost\":\"-1\"}}}", .want = null },
+        .{ .json = "{\"providerMetadata\":{\"gateway\":{\"serviceTier\":\"default\"}}}", .want = null },
+        .{ .json = "{\"providerMetadata\":{\"openai\":{\"cost\":\"1\"}}}", .want = null },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.want, parseSseGatewayCost(parsed.value));
+    }
+}
+
 fn captureGenerationMetadata(
     alloc: std.mem.Allocator,
     root: std.json.Value,
@@ -3683,6 +3719,7 @@ fn consumeSseStreamTraced(
     var finish_resolved_provider: ?[]const u8 = null;
     defer if (finish_resolved_provider) |provider| alloc.free(@constCast(provider));
     var finish_service_tier: ?types.ProviderServiceTier = null;
+    var finish_cost_usd: ?f64 = null;
     var generation_id: ?[]u8 = null;
     defer if (generation_id) |id| alloc.free(id);
     var resolved_model: ?[]u8 = null;
@@ -4100,6 +4137,7 @@ fn consumeSseStreamTraced(
             finish_usage = finish_event.usage;
             finish_resolved_provider = parseSseResolvedProvider(alloc, root);
             finish_service_tier = parseSseServiceTier(root);
+            finish_cost_usd = parseSseGatewayCost(root);
             traceSseTermination(resolved_model_trace, "valid_finish", finish_reason_holder);
             break;
         }
@@ -4126,6 +4164,7 @@ fn consumeSseStreamTraced(
     completion.resolved_provider = finish_resolved_provider;
     finish_resolved_provider = null;
     completion.service_tier = finish_service_tier;
+    completion.cost_usd = finish_cost_usd;
     completion.generation_metadata_invalid = generation_metadata_invalid;
     completion.finish_reason = finish_reason_holder;
     completion.usage = finish_usage;

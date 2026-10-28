@@ -57,7 +57,7 @@ async function disablePromptHistory(
   settingsPath: string,
 ): Promise<void> {
   await session.sendText("/settings");
-  await session.waitForText("←→ change", TIMEOUT);
+  await session.waitForText(/Settings \d+/, TIMEOUT);
   await session.sendLiteral("prompt history");
   await session.waitForPane(
     (pane) => pane.includes("Prompt history") && !pane.includes("Startup scrollback"),
@@ -76,7 +76,7 @@ async function disablePromptHistory(
   if (enabled !== false) throw new Error("Timed out disabling prompt history");
   await session.sendKeys("Escape");
   await session.waitForPane(
-    (pane) => hasEmptyComposer(pane) && !pane.includes("←→ change"),
+    (pane) => hasEmptyComposer(pane) && !/Settings \d+/.test(pane),
     TIMEOUT,
   );
 }

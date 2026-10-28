@@ -145,8 +145,7 @@ async function waitForSettingsMenu(session: TmuxSession): Promise<string[]> {
     latest = await session.capturePaneGrid();
     const pane = latest.join("\n");
     if (
-      pane.includes("←→ change") &&
-      (pane.includes("Settings") || pane.includes("Status line context"))
+      (/Settings \d+/.test(pane) || pane.includes("Status line context"))
     ) return latest;
     await Bun.sleep(100);
   }
@@ -202,8 +201,7 @@ async function waitForStatuslineMenu(
     const pane = latest.join("\n");
     if (
       pane.includes("Status line") &&
-      pane.includes("↑↓ navigate") &&
-      pane.includes("←→ change") &&
+      /Usage\s+off\s+on/.test(pane) &&
       (expectedSelection === undefined || pane.includes(expectedSelection))
     ) return latest;
     await Bun.sleep(100);
@@ -1249,7 +1247,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       let grid = await waitForSettingsMenu(session);
       expect(grid.join("\n")).toContain("Slash menu categories");
 
-      for (let index = 0; index < 3; index += 1) {
+      for (let index = 0; index < 4; index += 1) {
         await session.sendKeys("Down");
       }
       await session.sendKeys("Left");
@@ -1259,7 +1257,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (pane) => hasEmptyComposer(pane) && !pane.includes("←→ change"),
+        (pane) => hasEmptyComposer(pane) && !pane.includes("Status line context"),
         5_000,
       );
       await session.sendLiteralText("/m");
@@ -1648,10 +1646,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("Settings");
       expect(pane).toContain("Interface");
       expect(pane).toContain("[All]");
-      expect(pane).toContain("↑↓ navigate");
-      expect(pane).toContain("tab category");
-      expect(pane).toContain("←→ change");
-      expect(pane).toContain("esc close");
+      // The status line takes the key hints' row, to show each change as it's made.
+      expect(pane).not.toContain("tab category");
+      expect(grid.filter((line) => line.trim() !== "").at(-1)).toContain(" · ");
       expect(pane).not.toContain("Enter Change");
 
       expect(pane).not.toContain("Input appearance");
@@ -1673,7 +1670,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           hasEmptyComposer(current) &&
           current.includes("𝒇x") &&
           current.includes("workspace-statusline-visible") &&
-          !current.includes("←→ change"),
+          !current.includes("Status line context"),
         5_000,
       );
       expect(capturePaneHistory(session, -1000)).not.toMatch(/[*✓!✗⊘i] settings:/);
@@ -1726,7 +1723,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("Status line context");
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("←→ change"),
+        (current) => hasEmptyComposer(current) && !current.includes("Status line context"),
         5_000,
       );
 
@@ -1776,8 +1773,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("off  on");
       expect(pane).not.toContain("❯");
       expect(pane).not.toContain("Choose what appears");
-      expect(pane).toContain("↑↓ navigate");
-      expect(pane).toContain("←→ change");
+      expect(pane).not.toContain("←→ change");
+      expect(grid.filter((line) => line.trim() !== "").at(-1)).toContain(" · ");
 
       await session.sendKeys("Right");
       grid = await waitForStatuslineMenu(session, "off  on");
@@ -1794,7 +1791,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("Down");
       await session.sendKeys("Right");
-      grid = await waitForStatuslineMenu(session, "Workspace");
+      // The status line below the menu shows the workspace as soon as it's on.
+      grid = await waitForStatuslineMenu(session, "compact-statusline-workspace");
       pane = grid.join("\n");
       expect(pane).not.toContain("saved to user settings");
       await waitForStatuslineValue(settingsPath, "workspace", true);
@@ -1805,7 +1803,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           hasEmptyComposer(current) &&
           current.includes("𝒇x") &&
           current.includes("compact-statusline-workspace") &&
-          !current.includes("←→ change"),
+          !/Usage\s+off\s+on/.test(current),
         5_000,
       );
       expect(session.isAlive()).toBe(true);
@@ -2189,7 +2187,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("←→ change"),
+        (current) => hasEmptyComposer(current) && !current.includes("Status line context"),
         5_000,
       );
 

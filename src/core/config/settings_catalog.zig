@@ -26,6 +26,7 @@ pub const SettingId = enum {
     statusline_context,
     statusline_session,
     statusline_workspace,
+    statusline_usage,
     slash_menu_categories,
     collapse_tool_calls,
     session_titles,
@@ -58,6 +59,7 @@ pub const Snapshot = struct {
     statusline_context: bool = false,
     statusline_session: bool = false,
     statusline_workspace: bool = false,
+    statusline_usage: bool = true,
     slash_menu_categories: bool = true,
     collapse_tool_calls: bool = false,
     session_titles: bool = true,
@@ -75,6 +77,7 @@ pub const Snapshot = struct {
             .statusline_context => onOff(self.statusline_context),
             .statusline_session => onOff(self.statusline_session),
             .statusline_workspace => onOff(self.statusline_workspace),
+            .statusline_usage => onOff(self.statusline_usage),
             .slash_menu_categories => onOff(self.slash_menu_categories),
             .collapse_tool_calls => onOff(self.collapse_tool_calls),
             .session_titles => onOff(self.session_titles),
@@ -130,6 +133,11 @@ const statusline_choices = [_]StatuslineChoice{
         .label = "Workspace",
         .description = "Show the workspace path and Git branch",
         .setting = .statusline_workspace,
+    },
+    .{
+        .label = "Usage",
+        .description = "Show the session's cost",
+        .setting = .statusline_usage,
     },
 };
 
@@ -262,6 +270,7 @@ const specs = [_]Spec{
     .{ .id = .statusline_context, .category = .interface, .label = "Status line context", .description = "Show context usage in the status line" },
     .{ .id = .statusline_session, .category = .interface, .label = "Status line session", .description = "Show the session title in the status line" },
     .{ .id = .statusline_workspace, .category = .interface, .label = "Status line workspace", .description = "Show the workspace path and Git branch in the status line" },
+    .{ .id = .statusline_usage, .category = .interface, .label = "Status line usage", .description = "Show the session's cost in the status line" },
     .{ .id = .slash_menu_categories, .category = .interface, .label = "Slash menu categories", .description = "Show categories and skill sources in slash-command results" },
     .{ .id = .collapse_tool_calls, .category = .interface, .label = "Collapse tool calls", .description = "Show only a summary for each group of tool calls" },
     .{ .id = .model, .category = .agent, .label = "Model", .description = "Choose the model used for new turns" },
@@ -365,6 +374,7 @@ fn staticOptionsFor(id: SettingId) []const []const u8 {
         .statusline_context,
         .statusline_session,
         .statusline_workspace,
+        .statusline_usage,
         .slash_menu_categories,
         .collapse_tool_calls,
         .session_titles,
@@ -426,8 +436,8 @@ test "settings catalog projects grouped searchable preferences" {
         .sound_level = "on",
     };
 
-    try std.testing.expectEqual(@as(usize, 14), filteredCount(snapshot, .all, ""));
-    try std.testing.expectEqual(@as(usize, 5), filteredCount(snapshot, .interface, ""));
+    try std.testing.expectEqual(@as(usize, 15), filteredCount(snapshot, .all, ""));
+    try std.testing.expectEqual(@as(usize, 6), filteredCount(snapshot, .interface, ""));
     try std.testing.expectEqual(@as(usize, 6), filteredCount(snapshot, .agent, ""));
     try std.testing.expectEqual(@as(usize, 1), filteredCount(snapshot, .notifications, ""));
     try std.testing.expectEqual(@as(usize, 2), filteredCount(snapshot, .advanced, ""));

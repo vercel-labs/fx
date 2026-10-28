@@ -286,10 +286,11 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
     async () => {
       session = await launchAndWait();
       await session.sendText("/settings");
-      const pane = await session.waitForText("←→ change", 5_000);
-      expect(pane).toContain("Settings");
-      expect(pane).toContain("↑↓ navigate");
-      expect(pane).not.toContain("[All]");
+      const pane = await session.waitForText(/Settings \d+/, 5_000);
+      expect(pane).toContain("Status line context");
+      // The status line takes the key hints' row, to show each change as it's made.
+      expect(pane).not.toContain("↑↓ navigate");
+      expect(pane.split("\n").filter((line) => line.trim() !== "").at(-1)).toContain(" · ");
     },
     TIMEOUT,
   );

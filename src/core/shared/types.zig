@@ -1797,6 +1797,9 @@ pub const ModelCompletion = struct {
     provider_state_json: ?[]const u8 = null,
     finish_reason: ?ProviderFinishReason = null,
     usage: Usage = .{},
+    /// What AI Gateway says this response cost, in US dollars; null when the
+    /// provider doesn't report one.
+    cost_usd: ?f64 = null,
 };
 
 pub fn validGatewayGenerationId(id: []const u8) bool {

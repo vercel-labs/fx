@@ -1063,7 +1063,7 @@ describe("ultrafast fake Gateway", () => {
           await session.waitForComposer(TIMEOUT);
           await waitForGatewayModelCatalog(gateway);
           await session.sendText("/settings");
-          await session.waitForText("←→ change", TIMEOUT);
+          await session.waitForText(/Settings \d+/, TIMEOUT);
           await session.sendLiteral("ultra");
           await session.waitForPane((pane) => /Ultra mode\s+off\s+on/.test(pane), TIMEOUT);
           expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
@@ -1077,7 +1077,7 @@ describe("ultrafast fake Gateway", () => {
           expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
             .toMatchObject({ ultrafast_mode: true });
           await session.sendKeys("Escape");
-          await session.waitForPane((pane) => hasEmptyComposer(pane) && !pane.includes("←→ change"), TIMEOUT);
+          await session.waitForPane((pane) => hasEmptyComposer(pane) && !/Settings \d+/.test(pane), TIMEOUT);
           await session.sendText("Return the Settings enabled marker.");
           await session.waitForText("Settings enabled Ultra", TIMEOUT);
           await session.waitForStableComposer(TIMEOUT);
@@ -1099,7 +1099,7 @@ describe("ultrafast fake Gateway", () => {
           expect(gateway.requests).toHaveLength(2);
           expectUltrafastRequest(gateway.requests[1]!.body);
           await session.sendText("/settings");
-          await session.waitForText("←→ change", TIMEOUT);
+          await session.waitForText(/Settings \d+/, TIMEOUT);
           await session.sendLiteral("ultra");
           await session.waitForPane((pane) => /Ultra mode\s+off\s+on/.test(pane), TIMEOUT);
           expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
@@ -1112,7 +1112,7 @@ describe("ultrafast fake Gateway", () => {
           expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
             .toMatchObject({ ultrafast_mode: false });
           await session.sendKeys("Escape");
-          await session.waitForPane((pane) => hasEmptyComposer(pane) && !pane.includes("←→ change"), TIMEOUT);
+          await session.waitForPane((pane) => hasEmptyComposer(pane) && !/Settings \d+/.test(pane), TIMEOUT);
           await session.sendText("Return the Settings disabled marker.");
           await session.waitForText("Settings disabled Ultra", TIMEOUT);
           const settled = await session.waitForStableComposer(TIMEOUT);

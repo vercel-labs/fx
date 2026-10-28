@@ -455,54 +455,6 @@ pub fn startupSettled(statuses: []const runtime.Status, since_start_ms: i64) boo
     return true;
 }
 
-/// The servers the user already saw needing attention, by name, so the
-/// status line can stop repeating them once they've sent a prompt.
-pub const Seen = struct {
-    pub const capacity = 128;
-    hashes: [capacity]u64 = undefined,
-    len: usize = 0,
-    /// More servers needed attention than fit; every one counts as seen.
-    overflowed: bool = false,
-
-    /// Remembers every server in `statuses` that needs attention now.
-    pub fn record(seen: *Seen, statuses: []const runtime.Status) void {
-        seen.* = .{};
-        for (statuses) |s| {
-            if (!needsAttention(s)) continue;
-            if (seen.len == capacity) {
-                seen.overflowed = true;
-                return;
-            }
-            seen.hashes[seen.len] = nameHash(s.name);
-            seen.len += 1;
-        }
-    }
-
-    pub fn contains(seen: *const Seen, name: []const u8) bool {
-        if (seen.overflowed) return true;
-        const h = nameHash(name);
-        for (seen.hashes[0..seen.len]) |x| if (x == h) return true;
-        return false;
-    }
-
-    fn nameHash(name: []const u8) u64 {
-        return std.hash.Wyhash.hash(0, name);
-    }
-};
-
-/// The servers in `statuses` that need attention and aren't in `seen`,
-/// copied into `out`: what the status line still has to say.
-pub fn unseen(statuses: []const runtime.Status, seen: *const Seen, out: []runtime.Status) []runtime.Status {
-    var n: usize = 0;
-    for (statuses) |s| {
-        if (n == out.len) break;
-        if (!needsAttention(s) or seen.contains(s.name)) continue;
-        out[n] = s;
-        n += 1;
-    }
-    return out[0..n];
-}
-
 /// What the status line says about MCP, written into `buf`: fresh news,
 /// else the sign-in waiting for the browser, else what needs the user until
 /// it's handled. Empty when nothing does: `/mcp` lists every server.
@@ -608,24 +560,6 @@ test "the status line waits for servers to finish starting, at most startup_quie
     try testing.expect(startupSettled(&.{ ready, login }, 100));
     // A slow server doesn't hide the count for long.
     try testing.expect(startupSettled(&.{connecting}, startup_quiet_ms));
-}
-
-test "after a prompt, the status line names only servers that newly need attention" {
-    const login: runtime.Status = .{ .name = "linear", .source = .profile, .transport = .http, .state = .idle, .needs_login = true };
-    const ready: runtime.Status = .{ .name = "notion", .source = .profile, .transport = .http, .state = .ready };
-    var seen: Seen = .{};
-    seen.record(&.{ login, ready });
-    var out: [4]runtime.Status = undefined;
-    // What the user already saw isn't repeated.
-    try testing.expectEqual(@as(usize, 0), unseen(&.{ login, ready }, &seen, &out).len);
-    // A server that newly needs attention is.
-    var broken = ready;
-    broken.state = .failed;
-    const fresh = unseen(&.{ login, broken }, &seen, &out);
-    try testing.expectEqual(@as(usize, 1), fresh.len);
-    try testing.expectEqualStrings("notion", fresh[0].name);
-    var buf: [96]u8 = undefined;
-    try testing.expectEqualStrings("notion failed · /mcp", statusLine(&buf, fresh, null, null, 0));
 }
 
 test "the status line keeps names inert and never ends inside a character" {

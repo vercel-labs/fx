@@ -1548,6 +1548,51 @@ async function launchRouteRecoveryTui(
 }
 
 describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
+  test("session cost counts priced recovery attempts once and survives Usage toggles until a new session", async () => {
+    const pricedResponse = (cost: string, text?: string) => fakeGatewaySse([
+      ...(text ? [{ type: "text-delta", id: "cost-answer", delta: text }] : [{
+        type: "error", error: { code: "provider_error", message: "priced route failure" },
+      }]),
+      {
+        type: "finish",
+        finishReason: { unified: text ? "stop" : "error", raw: text ? "stop" : "provider_error" },
+        usage: { inputTokens: { total: 37_000 }, outputTokens: { total: 10 } },
+        providerMetadata: { gateway: { cost } },
+      },
+    ]);
+    const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+      "fx-tui-priced-recovery-",
+      [
+        () => pricedResponse("0.40"),
+        () => pricedResponse("0.20", "PRICED_RECOVERY_DONE"),
+        () => pricedResponse("0.05", "FRESH_PRICED_SESSION_DONE"),
+      ],
+      { settings: { session_titles: false, statusLine: { context: false, usage: true } } },
+    );
+    await session!.sendText("Recover from the priced response.");
+    await session!.waitForText("PRICED_RECOVERY_DONE", TIMEOUT);
+    await session!.waitForText("$0.60 · 37k tokens", TIMEOUT);
+    await session!.waitForStableComposer(TIMEOUT);
+    expect(queuedGateway.requests).toHaveLength(2);
+
+    await session!.sendText("/statusline usage");
+    await session!.waitForPane(pane => pane.includes("usage: off") && !pane.includes("$0.60"), TIMEOUT);
+    await session!.sendText("/statusline usage");
+    await session!.waitForText("$0.60 · 37k tokens", TIMEOUT);
+    expect(JSON.parse(readFileSync(join(root!, "home", ".fx", "settings.json"), "utf8")))
+      .toMatchObject({ statusLine: { usage: true } });
+
+    await session!.sendText("/new");
+    await session!.waitForPane(pane => hasEmptyComposer(pane) && !pane.includes("$0.60"), TIMEOUT);
+    await session!.sendText("Start a fresh priced session.");
+    await session!.waitForText("FRESH_PRICED_SESSION_DONE", TIMEOUT);
+    await session!.waitForText("$0.05 · 37k tokens", TIMEOUT);
+    await session!.waitForStableComposer(TIMEOUT);
+    expect(queuedGateway.requests).toHaveLength(3);
+    expect(await session!.captureFullScrollback()).toContain("FRESH_PRICED_SESSION_DONE");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, TIMEOUT);
+
   test("autonomous retry settles a streamed tool start and permits a later prompt", async () => {
     const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
       "fx-tui-retry-settlement-",

@@ -967,6 +967,12 @@ pub fn composeFooterFrame(
         .empty;
     try pushFooterBandRow(alloc, &frame, plan, rows.bottom_divider, &bottom_row);
 
+    // /statusline and /settings show the status line itself in place of
+    // their key hints, so each change shows as it is made.
+    const previews_statusline = if (compact_command_menu) |menu|
+        menu == .statusline
+    else
+        input.show_picker and input.picker_kind == .settings;
     var danger_status_visible = false;
     var hint_row = if (approval_active)
         try approval_ui.composeInlineApprovalHintRow(
@@ -974,12 +980,10 @@ pub fn composeFooterFrame(
             input.approval.?,
             shell.layout.cols,
         )
-    else if (compact_command_menu) |menu|
-        try input_presentation.composeCompactCommandMenuHintRow(alloc, shell.layout.cols, menu)
+    else if (compact_command_menu != null and !previews_statusline)
+        try input_presentation.composeCompactCommandMenuHintRow(alloc, shell.layout.cols, compact_command_menu.?)
     else if (input.show_picker and input.picker_kind == .skills)
         try input_presentation.composeSkillsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
-    else if (input.show_picker and input.picker_kind == .settings)
-        try input_presentation.composeSettingsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .mcp and ctx.mcp_host_menu.active())
         try input_presentation.composeVariantHintRow(
             alloc,

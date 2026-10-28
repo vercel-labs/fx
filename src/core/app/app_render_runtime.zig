@@ -531,6 +531,7 @@ pub fn Runtime(comptime App: type) type {
         var effort_picker_values_buf: [types.ReasoningEffort.max_options + 1]types.ReasoningEffort = undefined;
         var effort_picker_labels_buf: [types.ReasoningEffort.max_options + 1][]const u8 = undefined;
         var fast_picker_labels_buf: [3][]const u8 = undefined;
+        var usage_status_buf: [48]u8 = undefined;
         var provider_picker_column: provider_picker_runtime.ColumnBuffer = .{};
         noinline fn footerContext(
             app: *App,
@@ -715,7 +716,7 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
 
-            var statusline = buildStatuslineItems(app, visible_model);
+            var statusline = buildStatuslineItems(app);
             statusline.ultrafast_indicator_active = if (pending_model != null)
                 visible_capabilities.supports_ultrafast_mode and std.mem.eql(u8, pendingPickerSpeed(model_query, app.input_runtime.picker.model_picker_fast_index), "ultrafast")
             else if (comptime @hasField(@TypeOf(app.worker), "agent_turn_settings"))
@@ -848,6 +849,7 @@ pub fn Runtime(comptime App: type) type {
                     .{},
                 .upgrade_status = upgrade_label,
                 .mcp_status = if (comptime @hasField(App, "mcp")) app.mcp.hostStatusText() else "",
+                .usage_status = sessionUsageText(app, visible_model),
                 .danger_status = if (yolo_warning_active)
                     app_permission_runtime.yolo_warning_text
                 else
@@ -878,10 +880,21 @@ pub fn Runtime(comptime App: type) type {
             return model_capabilities.reasoningEffortAtIndex(capabilities, effort_index);
         }
 
-        fn buildStatuslineItems(
-            app: *App,
-            visible_model: []const u8,
-        ) ui_render.StatuslineItems {
+        /// The status line's right side: the session's cost with Usage on,
+        /// and the context once, with either on.
+        fn sessionUsageText(app: *App, visible_model: []const u8) []const u8 {
+            if (!app.statusline_usage and !app.statusline_context) return "";
+            return ui_render.buildUsageStatus(
+                &usage_status_buf,
+                app.statusline_usage,
+                app.session_persistence.sessionCost(),
+                app.statusline_context,
+                app.total_input_tokens,
+                model_capabilities.resolveForApp(App, app, visible_model).context_window,
+            );
+        }
+
+        fn buildStatuslineItems(app: *App) ui_render.StatuslineItems {
             var items: ui_render.StatuslineItems = .{};
             if (comptime @hasField(App, "workspace_identity") and
                 @hasField(App, "workspace_root"))
@@ -893,10 +906,8 @@ pub fn Runtime(comptime App: type) type {
                 items.workspace_label = identity.workspace_label;
                 items.git_branch = identity.git_branch;
             }
-            if (app.statusline_context) {
-                items.context_used = app.total_input_tokens;
-                items.context_total = model_capabilities.resolveForApp(App, app, visible_model).context_window;
-            }
+            // The context shows on the right, with the session's cost:
+            // `sessionUsageText`.
             if (comptime @hasField(App, "statusline_session")) {
                 if (app.statusline_session) {
                     items.session_title = app_session_runtime.Runtime(App).cachedSessionTitle(app);
@@ -3838,6 +3849,7 @@ const CoordinatorTestApp = struct {
     fast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
     statusline_context: bool = false,
+    statusline_usage: bool = false,
     total_input_tokens: u64 = 0,
     intrinsic_fast_model: ?[]const u8 = null,
     gateway_metadata_model: ?[]const u8 = null,
@@ -4274,7 +4286,7 @@ test "core.app_render_runtime projects an inline slash completion suffix after t
     try std.testing.expectEqualStrings("explain /he", ctx.input.edit_state.input.items);
 }
 
-test "core.app_render_runtime projects Opus 4.8 one million token context to footer" {
+test "core.app_render_runtime shows Opus 4.8's one million token context on the right, once" {
     const alloc = std.testing.allocator;
     var app = CoordinatorTestApp{
         .alloc = alloc,
@@ -4283,28 +4295,20 @@ test "core.app_render_runtime projects Opus 4.8 one million token context to foo
         .total_input_tokens = 43_000,
     };
     defer app.deinit();
+    const model = "anthropic/claude-opus-4.8";
 
-    const statusline = Runtime(CoordinatorTestApp).buildStatuslineItems(
-        &app,
-        "anthropic/claude-opus-4.8",
-    );
-    try std.testing.expectEqual(@as(u64, 43_000), statusline.context_used);
-    try std.testing.expectEqual(@as(?u32, 1_000_000), statusline.context_total);
-
-    var buf: [128]u8 = undefined;
-    const line = ui_render.buildHintLine(
-        false,
-        true,
-        "anthropic/claude-opus-4.8",
-        .ask,
-        false,
-        .auto,
-        true,
-        statusline,
-        100,
-        &buf,
-    );
-    try std.testing.expectEqualStrings("ask · opus 4.8 · 43k/1000k 4%", line);
+    // Not on the left any more.
+    const statusline = Runtime(CoordinatorTestApp).buildStatuslineItems(&app);
+    try std.testing.expectEqual(@as(u64, 0), statusline.context_used);
+    try std.testing.expectEqualStrings("43k/1000k 4%", Runtime(CoordinatorTestApp).sessionUsageText(&app, model));
+    // With Usage on, the cost comes first and the context still shows once.
+    app.statusline_usage = true;
+    app.session_persistence.recordCost(0.9);
+    try std.testing.expectEqualStrings("$0.90 · 43k/1000k 4%", Runtime(CoordinatorTestApp).sessionUsageText(&app, model));
+    app.statusline_context = false;
+    try std.testing.expectEqualStrings("$0.90 · 43k tokens", Runtime(CoordinatorTestApp).sessionUsageText(&app, model));
+    app.statusline_usage = false;
+    try std.testing.expectEqualStrings("", Runtime(CoordinatorTestApp).sessionUsageText(&app, model));
 }
 
 test "core.app_render_runtime uses Gateway context window from resolved capabilities" {
@@ -4319,12 +4323,10 @@ test "core.app_render_runtime uses Gateway context window from resolved capabili
     };
     defer app.deinit();
 
-    const statusline = Runtime(CoordinatorTestApp).buildStatuslineItems(
-        &app,
-        "provider/new-long-context",
+    try std.testing.expectEqualStrings(
+        "12k/750k 1%",
+        Runtime(CoordinatorTestApp).sessionUsageText(&app, "provider/new-long-context"),
     );
-    try std.testing.expectEqual(@as(u64, 12_000), statusline.context_used);
-    try std.testing.expectEqual(@as(?u32, 750_000), statusline.context_total);
 }
 
 test "core.app_render_runtime request owner authorizes explicit frame causes" {

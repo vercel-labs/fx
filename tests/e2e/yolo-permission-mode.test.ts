@@ -326,12 +326,11 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
       const warningPane = await session.waitForText(WARNING, TIMEOUT);
       expect(warningPane).toContain("full access ·");
 
-      await session.sendText("/settings");
-      const settingsPane = await session.waitForText("←→ change", TIMEOUT);
-      expect(settingsPane).toContain("Permission mode");
-      expect(settingsPane).not.toContain("Command sandbox");
+      // A menu that covers the status line pauses the warning's time.
+      await session.sendText("/help");
+      await session.waitForText("enter open", TIMEOUT);
       await Bun.sleep(4_300);
-      expect(await session.capturePane()).toContain("←→ change");
+      expect(await session.capturePane()).toContain("enter open");
 
       await session.sendKeys("Escape");
       const resumedWarning = await session.waitForText(WARNING, TIMEOUT);
@@ -340,6 +339,13 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
       await Bun.sleep(1_500);
       expect(await session.capturePane()).toContain(WARNING);
       await session.waitForPane((pane) => !pane.includes(WARNING), 3_500);
+
+      await session.sendText("/settings");
+      const settingsPane = await session.waitForText(/Settings \d+/, TIMEOUT);
+      expect(settingsPane).toContain("Permission mode");
+      expect(settingsPane).not.toContain("Command sandbox");
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !/Settings \d+/.test(pane), TIMEOUT);
 
       const stored = JSON.parse(readFileSync(fixture.settingsPath, "utf8"));
       expect(stored).toMatchObject({
