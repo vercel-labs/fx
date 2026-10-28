@@ -8,6 +8,7 @@
 //! Recover).
 const std = @import("std");
 const session_adapter = @import("../session/session_adapter.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const Allocator = std.mem.Allocator;
 
 pub const open_tag = "<system-notice kind=\"agent-message\">\n";
@@ -101,7 +102,7 @@ fn firstLine(body: []const u8) []const u8 {
     const end = std.mem.findScalar(u8, trimmed, '\n') orelse trimmed.len;
     var line = trimmed[0..@min(end, preview_bytes)];
     // Never split a UTF-8 sequence.
-    while (line.len > 0 and line.len < end and (line[line.len] & 0xC0) == 0x80) line = line[0 .. line.len - 1];
+    while (line.len > 0 and line.len < end and (trimmed[line.len] & 0xC0) == 0x80) line = line[0 .. line.len - 1];
     return line;
 }
 
@@ -138,6 +139,17 @@ pub fn rowText(arena: Allocator, row: Row, to: []const u8) ![]const u8 {
     const target = if (row.broadcast) "all" else if (to.len > 0) to else "you";
     if (row.preview.len == 0) return arena.print("{s} → {s}", .{ from, target });
     return arena.print("{s} → {s} · {s}", .{ from, target, row.preview });
+}
+
+test "a long first line is cut at the preview limit without reading past it or splitting a character" {
+    const ascii = text_utils.repeat("a", preview_bytes + 40);
+    try std.testing.expectEqual(preview_bytes, preview(ascii).len);
+
+    // A two-byte character straddles the limit: the cut backs off before it.
+    const wide = text_utils.repeat("a", preview_bytes - 1) ++ "\u{e9}" ++ "tail";
+    const line = preview(wide);
+    try std.testing.expectEqual(preview_bytes - 1, line.len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(line));
 }
 
 test "a notice carries each message once, safely enveloped, and reads back" {
