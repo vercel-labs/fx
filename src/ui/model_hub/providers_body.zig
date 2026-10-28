@@ -57,7 +57,7 @@ pub fn webRow(line: *Line, state: *const hub.State, index: usize, highlighted: b
         try line.put(ui_render.dim_style, "▪ ");
     }
     const style = if (highlighted) ui_render.selected_completion_style else if (row.excluded) ui_render.dim_style else "";
-    const state_text: []const u8 = if (row.excluded) "off" else if (row.ready) "ready" else "needs a key";
+    const state_text: []const u8 = if (row.excluded) "off" else if (row.ready) "ready" else row.needs;
     try line.putUntrusted(style, row.name, line.remaining() -| (state_text.len + 2));
     _ = try line.putRight(if (row.ready and !row.excluded) ui_render.green_style else ui_render.dim_style, state_text, 2);
 }
@@ -65,5 +65,5 @@ pub fn webRow(line: *Line, state: *const hub.State, index: usize, highlighted: b
 pub fn webDetail(line: *Line, state: *const hub.State, index: usize) !void {
     const row = state.snapshot.?.web_search[index];
     try line.putUntrusted(ui_render.dim_style, row.name, 32);
-    try line.put(ui_render.dim_style, if (row.excluded) " is off; space turns it back on" else if (row.ready) " is ready to search" else " is tried once its key or sign-in is present");
+    try line.put(ui_render.dim_style, if (row.excluded) " is off; space turns it back on" else if (row.ready) " is ready to search" else row.needs_detail);
 }

@@ -152,10 +152,39 @@ fn processEnv(_: ?*anyopaque, name: []const u8) ?[]const u8 {
     return io_mod.getenv(name);
 }
 
+/// What a provider waits for before it searches, as the model hub says it.
+pub const Needs = enum {
+    key,
+    /// A subscription sign-in the session runs on: Codex.
+    sign_in,
+    sign_in_or_key,
+    url,
+
+    pub fn text(self: Needs) []const u8 {
+        return switch (self) {
+            .key => "needs a key",
+            .sign_in => "needs sign-in",
+            .sign_in_or_key => "needs sign-in or a key",
+            .url => "needs a URL",
+        };
+    }
+
+    /// The sentence after the provider's name when it is not ready.
+    pub fn detail(self: Needs) []const u8 {
+        return switch (self) {
+            .key => " is tried once its key is set",
+            .sign_in => " searches when the session runs on its sign-in",
+            .sign_in_or_key => " is tried once its key is set or the session runs on its sign-in",
+            .url => " is tried once its URL is set",
+        };
+    }
+};
+
 pub const Member = struct {
     /// Stable lowercase id used in settings, `--provider`, and output.
     id: []const u8,
     label: []const u8,
+    needs: Needs = .key,
     available_fn: *const fn (*const Env) bool,
     /// Availability when a person names this provider; defaults to `available_fn`.
     explicit_available_fn: ?*const fn (*const Env) bool = null,

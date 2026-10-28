@@ -101,6 +101,9 @@ pub const WebSearchRow = struct {
     name: []const u8,
     excluded: bool,
     ready: bool,
+    /// What the row says while it is not ready.
+    needs: []const u8 = "needs a key",
+    needs_detail: []const u8 = " is tried once its key is set",
 };
 
 pub const Snapshot = struct {

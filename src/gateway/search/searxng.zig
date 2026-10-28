@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
 pub const member = bank.Member{
     .id = "searxng",
     .label = "SearXNG",
+    .needs = .url,
     .available_fn = available,
     .search_fn = search,
 };

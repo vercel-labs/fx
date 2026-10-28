@@ -51,6 +51,7 @@ fn loadSettings(alloc: Allocator) anyerror!bank.Settings {
 const vercel_member = bank.Member{
     .id = "vercel",
     .label = "Vercel AI Gateway",
+    .needs = .sign_in_or_key,
     .available_fn = vercelAvailable,
     .search_fn = vercelSearch,
 };

@@ -21,6 +21,7 @@ const xai_api_endpoint = "https://api.x.ai/v1/responses";
 pub const codex_member = bank.Member{
     .id = "codex",
     .label = "Codex",
+    .needs = .sign_in,
     .available_fn = codexAvailable,
     .search_fn = codexSearch,
 };
@@ -28,6 +29,7 @@ pub const codex_member = bank.Member{
 pub const xai_member = bank.Member{
     .id = "xai",
     .label = "Grok",
+    .needs = .sign_in_or_key,
     .available_fn = xaiAvailable,
     .search_fn = xaiSearch,
 };

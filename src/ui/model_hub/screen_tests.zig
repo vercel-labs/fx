@@ -33,6 +33,7 @@ fn fixtureWith(small_chain: []const catalog.EntryRow) !catalog.Snapshot {
     });
     try builder.addWebSearch(.{ .id = "exa", .name = "Exa", .excluded = true, .ready = false });
     try builder.addWebSearch(.{ .id = "duckduckgo", .name = "DuckDuckGo", .excluded = false, .ready = true });
+    try builder.addWebSearch(.{ .id = "codex", .name = "Codex", .excluded = false, .ready = false, .needs = "needs sign-in" });
     return builder.finish(&.{ .deep, .default, .small });
 }
 
@@ -135,6 +136,9 @@ test "the roles, web search and locked views and the strips render" {
     try std.testing.expect(std.mem.find(u8, web, "Exa") != null);
     try std.testing.expect(std.mem.find(u8, web, "off") != null);
     try std.testing.expect(std.mem.find(u8, web, "ready") != null);
+    // Codex searches through a sign-in, never a key.
+    try std.testing.expect(std.mem.find(u8, web, "needs sign-in") != null);
+    try std.testing.expect(std.mem.find(u8, web, "needs a key") == null);
     _ = try state.handle(alloc, .up);
     const locked = try render(&state, 24, 120);
     defer alloc.free(locked);

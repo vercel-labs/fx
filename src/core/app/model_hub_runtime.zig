@@ -390,7 +390,7 @@ pub fn Runtime(comptime App: type) type {
             }
 
             try addRoles(app, &builder, definitions);
-            try addWebSearch(app, &builder, inventory);
+            try addWebSearch(app, &builder, inventory, active_id);
             // A detached session keeps its effort in the supervisor, which
             // does not report it; the hub then marks no level as in use.
             builder.snapshot.effort = if (session_backend.Ops(App).agentInProcess(app)) app.effort else null;
@@ -632,15 +632,16 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
-        fn addWebSearch(app: *App, builder: *catalog.Builder, inventory: std.EnumSet(credentials.Source)) !void {
+        fn addWebSearch(app: *App, builder: *catalog.Builder, inventory: std.EnumSet(credentials.Source), active_id: model_provider.ProviderId) !void {
             const bank = app.providerSet().web_search orelse return;
             var settings = bank.loadSettings(app.alloc);
             defer settings.deinit(app.alloc);
             var env: web_search_bank.Env = .{};
-            // Signed-in subscriptions and gateway keys make their searches
-            // ready; the token itself is not needed to say so.
-            if (inventory.contains(.chatgpt_subscription)) env.chatgpt_token = "present";
-            if (inventory.contains(.grok_subscription)) env.grok_token = "present";
+            // A subscription searches with the session's own sign-in, so it
+            // is ready while the session runs on it (`envFromInputs`); the
+            // token itself is not needed to say so.
+            if (active_id.eql(.codex) and inventory.contains(.chatgpt_subscription)) env.chatgpt_token = "present";
+            if (active_id.eql(.grok) and inventory.contains(.grok_subscription)) env.grok_token = "present";
             if (inventory.contains(.fx_login) or inventory.contains(.ai_gateway_api_key) or inventory.contains(.stored_key)) env.gateway_key = "present";
             env.searxng_url = settings.searxng_url;
             var listed: [edits.max_web_search]bool = @splat(false);
@@ -665,6 +666,8 @@ pub fn Runtime(comptime App: type) type {
                 .name = member.label,
                 .excluded = excluded,
                 .ready = member.available(env, true),
+                .needs = member.needs.text(),
+                .needs_detail = member.needs.detail(),
             });
         }
     };
