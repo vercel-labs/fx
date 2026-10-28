@@ -4,6 +4,8 @@
 //! anything; `remote_backend.zig` does, over `app_remote_runtime.zig`.
 const std = @import("std");
 const client_protocol = @import("../supervisor/protocol.zig");
+
+const replay_gap_text = "Some live output exceeded the replay buffer. Reopen this session after its turn finishes to load the complete saved transcript.";
 const history_page = @import("../supervisor/history_page.zig");
 const host_commands = @import("../../acp/commands.zig");
 const io_mod = @import("../shared/io.zig");
@@ -501,6 +503,8 @@ pub fn Runtime(comptime App: type) type {
             const running = summary.status == .running or summary.status == .awaiting_approval;
             const generation = remote.generation;
             if (!loading_history) {
+                // Frames this view never saw fell out of the replay log.
+                if (value.oldest_sequence > remote.sequence + 1) try notice(app, "session", replay_gap_text);
                 for (value.events) |event| {
                     if (event.sequence <= remote.sequence) continue;
                     // A command's result answers the node the person focuses,
@@ -546,7 +550,7 @@ pub fn Runtime(comptime App: type) type {
         fn applyFrame(app: *App, frame: std.json.Value) !void {
             const method = string(frame, "method") orelse return;
             if (std.mem.eql(u8, method, client_protocol.replay_gap_method)) {
-                try notice(app, "session", "Some live output exceeded the replay buffer. Reopen this session after its turn finishes to load the complete saved transcript.");
+                try notice(app, "session", replay_gap_text);
                 return;
             }
             if (std.mem.eql(u8, method, "fx/mcp_notice")) {

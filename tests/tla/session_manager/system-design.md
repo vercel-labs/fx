@@ -2956,6 +2956,16 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   registering the attach's watcher at the checkpoint, which would push the
   same events twice while the page loads.
 
+- **D271 Decision:** the supervisor's replay log drops tool-input
+  previews before any other frame when it is full, and `oldest_sequence`
+  names the newest sequence whose other frame fell out, plus one. A
+  frontend whose sequence is older shows the replay-gap notice instead of
+  silently resuming after the gap. **Why:** a preview repeats up to 2 KB
+  of a call's streaming arguments every 50 ms, so one long write filled
+  the 2 MB log and pushed the running turn's prompt out before a
+  reattach could replay it. **Alternative:** a larger log, which only
+  moves the limit.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a
