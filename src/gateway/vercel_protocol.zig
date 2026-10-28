@@ -337,7 +337,8 @@ fn buildGatewayRequestBodyValidated(
     try out.writer.writeAll("{\"prompt\":[");
     var i: usize = 0;
     while (i < messages.len) {
-        const message = messages[i];
+        var message = messages[i];
+        if (!options.prompt_caching) message.cache_breakpoint = false;
         if (budget) |active| try active.check();
         if (i > 0) try out.writer.writeByte(',');
         if (message.role == .tool) {
@@ -775,6 +776,9 @@ fn writeChatMessageJsonInner(
                 try std.json.Stringify.value(content, .{}, writer);
             } else {
                 try writer.writeAll("\"\"");
+            }
+            if (message.cache_breakpoint) {
+                try writer.writeAll(",\"providerOptions\":{\"anthropic\":{\"cacheControl\":{\"type\":\"ephemeral\"}}}");
             }
         },
         .user => {
@@ -1489,6 +1493,40 @@ test "Gateway request replays separated messages as their own text" {
             .parts_json = case.parts_json,
         } }};
         try std.testing.expectError(error.InvalidProviderState, buildGatewayRequestBody(alloc, "[]", &invalid));
+    }
+}
+
+test "Gateway stable cache boundary preserves live context and respects caching off" {
+    const alloc = std.testing.allocator;
+    const messages = [_]ChatMessage{
+        .{ .role = .system, .content = "stable instructions", .cache_breakpoint = true },
+        .{ .role = .system, .content = "current branch" },
+        .{ .role = .user, .content = "question", .cache_breakpoint = true },
+    };
+    for ([_]bool{ true, false }) |enabled| {
+        const body = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{ .prompt_caching = enabled }, .auto);
+        defer alloc.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer parsed.deinit();
+        const prompt = parsed.value.object.get("prompt").?.array.items;
+        try std.testing.expectEqual(@as(usize, 3), prompt.len);
+        try std.testing.expectEqualStrings("system", prompt[0].object.get("role").?.string);
+        try std.testing.expectEqualStrings("stable instructions", prompt[0].object.get("content").?.string);
+        try std.testing.expectEqualStrings("system", prompt[1].object.get("role").?.string);
+        try std.testing.expectEqualStrings("current branch", prompt[1].object.get("content").?.string);
+        try std.testing.expectEqualStrings("user", prompt[2].object.get("role").?.string);
+        try std.testing.expect(prompt[1].object.get("providerOptions") == null);
+        try std.testing.expect(prompt[2].object.get("providerOptions") == null);
+        if (enabled) {
+            const control = prompt[0].object.get("providerOptions").?.object.get("anthropic").?.object.get("cacheControl").?.object;
+            try std.testing.expectEqualStrings("ephemeral", control.get("type").?.string);
+            try std.testing.expectEqualStrings("auto", parsed.value.object.get("providerOptions").?.object.get("gateway").?.object.get("caching").?.string);
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "cacheControl"));
+        } else {
+            try std.testing.expect(prompt[0].object.get("providerOptions") == null);
+            try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, body, "cacheControl"));
+        }
+        try std.testing.expect(messages[0].cache_breakpoint);
     }
 }
 

@@ -3452,8 +3452,47 @@ fn parseSseUsage(root: std.json.Value) types.Usage {
     return .{
         .input_tokens = parseSseTokenTotal(usage_value, "inputTokens"),
         .output_tokens = parseSseTokenTotal(usage_value, "outputTokens"),
+        .cache_read_tokens = parseSseTokenDetail(usage_value, "inputTokens", "cacheRead"),
+        .cache_write_tokens = parseSseTokenDetail(usage_value, "inputTokens", "cacheWrite"),
         .reasoning_tokens = parseSseTokenDetail(usage_value, "outputTokens", "reasoning"),
     };
+}
+
+test "SSE usage preserves cache counts and rejects malformed details" {
+    const cases = [_]struct { json: []const u8, expected: types.Usage }{
+        .{
+            .json =
+            \\{"usage":{"inputTokens":{"total":100,"cacheRead":80,"cacheWrite":16},"outputTokens":{"total":10,"reasoning":5}}}
+            ,
+            .expected = .{ .input_tokens = 100, .output_tokens = 10, .cache_read_tokens = 80, .cache_write_tokens = 16, .reasoning_tokens = 5 },
+        },
+        .{
+            .json =
+            \\{"usage":{"inputTokens":{"cacheRead":0,"cacheWrite":0}}}
+            ,
+            .expected = .{ .cache_read_tokens = 0, .cache_write_tokens = 0 },
+        },
+        .{ .json = "{}", .expected = .{} },
+        .{ .json = "{\"usage\":null}", .expected = .{} },
+        .{ .json = "{\"usage\":{\"inputTokens\":17}}", .expected = .{} },
+        .{
+            .json =
+            \\{"usage":{"inputTokens":{"total":100,"cacheRead":-1,"cacheWrite":"16"}}}
+            ,
+            .expected = .{ .input_tokens = 100 },
+        },
+        .{
+            .json =
+            \\{"usage":{"inputTokens":{"cacheRead":1.5,"cacheWrite":null}}}
+            ,
+            .expected = .{},
+        },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualDeep(case.expected, parseSseUsage(parsed.value));
+    }
 }
 
 fn parseSseTokenDetail(usage_value: std.json.Value, section: []const u8, key: []const u8) ?u64 {

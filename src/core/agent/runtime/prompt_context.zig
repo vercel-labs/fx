@@ -238,6 +238,9 @@ pub fn buildProviderPrompt(
     errdefer messages.deinit(alloc);
 
     try instructions.appendSlice(alloc, stable_prefix);
+    if (instructions.items.len > 0) {
+        instructions.items[instructions.items.len - 1].cache_breakpoint = true;
+    }
     try instructions.appendSlice(alloc, ephemeral_overlay);
     try messages.appendSlice(alloc, durable_history);
     try messages.append(alloc, current_user_message);
@@ -274,10 +277,28 @@ test "buildProviderPrompt separates instructions from chronological messages" {
     try std.testing.expectEqualStrings("stable system prompt", prompt.instructions.items[0].content.?);
     try std.testing.expectEqualStrings("stable project context", prompt.instructions.items[1].content.?);
     try std.testing.expectEqualStrings("volatile runtime overlay", prompt.instructions.items[2].content.?);
+    try std.testing.expect(!prompt.instructions.items[0].cache_breakpoint);
+    try std.testing.expect(prompt.instructions.items[1].cache_breakpoint);
+    try std.testing.expect(!prompt.instructions.items[2].cache_breakpoint);
+    try std.testing.expect(!stable_prefix[1].cache_breakpoint);
+    for (prompt.messages.items) |message| try std.testing.expect(!message.cache_breakpoint);
     try std.testing.expectEqualStrings("history user prompt", prompt.messages.items[0].content.?);
     try std.testing.expectEqualStrings("history assistant answer", prompt.messages.items[1].content.?);
     try std.testing.expectEqualStrings("current user prompt", prompt.messages.items[2].content.?);
     try std.testing.expectEqualStrings("within turn assistant", prompt.messages.items[3].content.?);
+}
+
+test "buildProviderPrompt without stable instructions does not cache the overlay" {
+    const alloc = std.testing.allocator;
+    const overlay = [_]ChatMessage{.{ .role = .system, .content = "current branch" }};
+    const current = ChatMessage{ .role = .user, .content = "question" };
+    for ([_][]const ChatMessage{ &.{}, &overlay }) |ephemeral_overlay| {
+        var prompt = try buildProviderPrompt(alloc, &.{}, ephemeral_overlay, &.{}, current, &.{});
+        defer prompt.deinit(alloc);
+        try std.testing.expectEqual(ephemeral_overlay.len, prompt.instructions.items.len);
+        for (prompt.instructions.items) |message| try std.testing.expect(!message.cache_breakpoint);
+        try std.testing.expect(!prompt.messages.items[0].cache_breakpoint);
+    }
 }
 
 test "buildProviderPrompt keeps compacted session context out of instructions" {

@@ -1581,6 +1581,8 @@ pub const ChatMessage = struct {
     tool_result_status: ?PersistedToolStatus = null,
     tool_result_memory: ?ToolResultMemory = null,
     permission_feedback: bool = false,
+    /// Request-local cache boundary after stable instructions, not persisted state.
+    cache_breakpoint: bool = false,
     /// Checkpoint steering text has already had its envelope removed.
     restored_steering: bool = false,
     // Source provenance for compaction, never permission authority.
