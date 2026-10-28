@@ -15,6 +15,7 @@
 //! milliseconds, it shuts down as `daemon stop` does. It also stops when its
 //! socket is removed, and leaves without saving when its state directory is.
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const acp_config = @import("../cli/acp_runner.zig");
 const session_adapter = @import("../session/session_adapter.zig");
@@ -684,12 +685,18 @@ pub fn run(alloc: Allocator, cfg: acp_config.Config) !void {
     }
     try daemon.restore();
     try daemon.discoverSaved();
+    if (comptime builtin.optimize == .debug) armDebugPanic();
     const idle_limit_ms = idleLimitMs(io_mod.getenv(idle_env));
     var idle_since = io_mod.milliTimestamp();
+    var log_checked_ms: i64 = 0;
     const exit: Exit = while (true) {
         if (daemon.stopping.load(.acquire)) break .requested;
         daemon.reapConnections(false);
         const now = io_mod.milliTimestamp();
+        if (now - log_checked_ms >= 5_000) {
+            log_checked_ms = now;
+            client.boundOwnLog();
+        }
         {
             daemon.route_mutex.lockUncancelable(io);
             defer daemon.route_mutex.unlock(io);
@@ -720,6 +727,22 @@ pub fn run(alloc: Allocator, cfg: acp_config.Config) !void {
     // Save while the hosts are still open: each live, saved session is
     // owned and reopens on the next start.
     try daemon.persist();
+}
+
+/// Debug builds only: names a delay in milliseconds after which the
+/// supervisor panics, to reproduce a supervisor that keeps crashing.
+const debug_panic_env = "PROTO_FX_DEBUG_DAEMON_PANIC_MS";
+
+fn armDebugPanic() void {
+    const raw = io_mod.getenv(debug_panic_env) orelse return;
+    const delay_ms = std.fmt.parseInt(u32, raw, 10) catch return;
+    const thread = std.Thread.spawn(.{}, debugPanic, .{delay_ms}) catch return;
+    thread.detach();
+}
+
+fn debugPanic(delay_ms: u32) void {
+    io_mod.sleep(@as(u64, delay_ms) * std.time.ns_per_ms);
+    @panic("debug supervisor panic (" ++ debug_panic_env ++ ")");
 }
 
 /// Why the accept loop ended. Every reason but `state_removed` shuts down

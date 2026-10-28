@@ -46,23 +46,44 @@ pub const Client = struct {
     }
 
     /// Launches this executable in detached daemon mode if no daemon answers.
-    /// Startup races converge on the daemon's exclusive owner lock.
+    /// Startup races converge on the daemon's exclusive owner lock. The
+    /// daemon's stderr, where a panic and its trace go, is appended to
+    /// `log_name` in the state directory (D283). A daemon that exits before
+    /// it answers fails at once with `error.DaemonExited`.
     pub fn ensureRunning(self: *const Client, executable: []const u8) !void {
         if (self.ping()) |_| return else |err| if (err == error.DaemonVersionMismatch) return err;
-        var child = try std.process.spawn(io_mod.getIo(), .{
+        const io = io_mod.getIo();
+        const log = openLog(self.alloc) catch null;
+        defer if (log) |file| file.close(io);
+        var child = try std.process.spawn(io, .{
             .argv = &.{ executable, daemon_argument },
             .stdin = .ignore,
             .stdout = .ignore,
-            .stderr = .ignore,
+            .stderr = if (log) |file| .{ .file = file } else .ignore,
         });
-        // The daemon has a separate session and owns its lifetime, not this terminal.
-        _ = &child;
+        // The daemon has a separate session and owns its lifetime, not this
+        // terminal; this side only notices if it ends before answering.
+        var exited_at: ?i64 = null;
         const deadline = io_mod.milliTimestamp() + 15_000;
         while (io_mod.milliTimestamp() < deadline) {
             if (self.ping()) |_| return else |err| if (err == error.DaemonVersionMismatch) return err;
+            if (exited_at == null and reaped(&child)) exited_at = io_mod.milliTimestamp();
+            // A daemon that lost the owner lock to another exits too; give
+            // the winner a moment to answer.
+            if (exited_at) |at| if (io_mod.milliTimestamp() - at > 1_000) return error.DaemonExited;
             io_mod.sleep(30 * std.time.ns_per_ms);
         }
         return error.DaemonStartupTimeout;
+    }
+
+    /// True once the spawned daemon has exited; reaps it.
+    fn reaped(child: *std.process.Child) bool {
+        const pid = child.id orelse return true;
+        var status: c_int = undefined;
+        const waited = std.c.waitpid(pid, &status, std.c.W.NOHANG);
+        if (waited == 0) return false;
+        child.id = null;
+        return true;
     }
 
     /// A supervisor of another protocol version is still running: stop it
@@ -231,6 +252,57 @@ pub fn stateDir(alloc: Allocator) ![]u8 {
     return std.Io.Dir.path.join(alloc, &.{ root, "daemon" });
 }
 
+/// The file in the state directory that holds the daemon's stderr.
+pub const log_name = "daemon.log";
+/// Past this size the log moves to `daemon.log.1`, replacing the one there,
+/// so the two together stay under twice the limit (D283).
+pub const max_log_bytes: u64 = 256 * 1024;
+
+/// The daemon log's path. Caller owns it.
+pub fn logPath(alloc: Allocator) ![]u8 {
+    const root = try stateDir(alloc);
+    defer alloc.free(root);
+    return std.Io.Dir.path.join(alloc, &.{ root, log_name });
+}
+
+/// Opens the daemon log for a new daemon's stderr. Caller closes it.
+fn openLog(alloc: Allocator) !std.Io.File {
+    const io = io_mod.getIo();
+    const root = try stateDir(alloc);
+    defer alloc.free(root);
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var dir = try std.Io.Dir.openDirAbsolute(io, root, .{});
+    defer dir.close(io);
+    return openLogIn(dir, io_mod.milliTimestamp());
+}
+
+/// Rotates the log in `dir` when it is full, then opens it for appending
+/// and marks where this start begins.
+fn openLogIn(dir: std.Io.Dir, now_ms: i64) !std.Io.File {
+    const io = io_mod.getIo();
+    if (dir.statFile(io, log_name, .{})) |stat| {
+        if (stat.size >= max_log_bytes) try dir.rename(log_name, dir, log_name ++ ".1", io);
+    } else |err| if (err != error.FileNotFound) return err;
+    const file = try dir.createFile(io, log_name, .{ .truncate = false, .permissions = .fromMode(0o600) });
+    errdefer file.close(io);
+    // The daemon shares this offset: it writes after what is there.
+    if (std.c.lseek(file.handle, 0, std.c.SEEK.END) < 0) return error.Unseekable;
+    var line: [80]u8 = undefined;
+    try file.writeStreamingAll(io, try std.mem.print(&line, "proto-fx supervisor starting at {d} ms\n", .{now_ms}));
+    return file;
+}
+
+/// Keeps a running daemon's own log under the limit: when its stderr is a
+/// file past `max_log_bytes`, it starts over (D283).
+pub fn boundOwnLog() void {
+    const io = io_mod.getIo();
+    const stderr = std.Io.File.stderr();
+    const stat = stderr.stat(io) catch return;
+    if (stat.kind != .file or stat.size < max_log_bytes) return;
+    stderr.setLength(io, 0) catch return;
+    _ = std.c.lseek(stderr.handle, 0, std.c.SEEK.SET);
+}
+
 pub fn socketPath(alloc: Allocator) ![]u8 {
     const root = try stateDir(alloc);
     defer alloc.free(root);
@@ -267,4 +339,32 @@ fn readFrame(alloc: Allocator, stream: std.Io.net.Stream, timeout_ms: i32) ![]u8
         try bytes.appendSlice(alloc, buffer[0..count]);
     }
     return error.FrameTooLarge;
+}
+
+test "the daemon log appends each start and rotates once full" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    {
+        const file = try openLogIn(tmp.dir, 1);
+        defer file.close(io);
+        try file.writeStreamingAll(io, "thread 1 panic: boom\n");
+    }
+    {
+        const file = try openLogIn(tmp.dir, 2);
+        file.close(io);
+    }
+    const bytes = try tmp.dir.readFileAlloc(io, log_name, std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("proto-fx supervisor starting at 1 ms\nthread 1 panic: boom\nproto-fx supervisor starting at 2 ms\n", bytes);
+    // A full log moves aside, so the pair stays bounded.
+    {
+        const file = try tmp.dir.createFile(io, log_name, .{});
+        defer file.close(io);
+        try file.setLength(io, max_log_bytes);
+    }
+    const file = try openLogIn(tmp.dir, 3);
+    file.close(io);
+    try std.testing.expectEqual(max_log_bytes, (try tmp.dir.statFile(io, log_name ++ ".1", .{})).size);
+    try std.testing.expect((try tmp.dir.statFile(io, log_name, .{})).size < 64);
 }
