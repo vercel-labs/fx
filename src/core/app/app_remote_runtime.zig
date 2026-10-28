@@ -147,6 +147,36 @@ const older_page_slice_ns: i128 = 4 * std.time.ns_per_ms;
 const older_notice_text = "Older transcript entries load when you page up in the full transcript.";
 
 /// A received older page and where it goes in the window.
+/// The daemon log's path when the file exists. Caller owns it.
+fn existingLogPath(alloc: Allocator) ?[]u8 {
+    const path = client_mod.logPath(alloc) catch return null;
+    std.Io.Dir.cwd().access(io_mod.getIo(), path, .{}) catch {
+        alloc.free(path);
+        return null;
+    };
+    return path;
+}
+
+/// The line shown once reconnecting stops. Caller owns it.
+fn gaveUpText(alloc: Allocator, failure: anyerror, log_path: ?[]const u8) ![]u8 {
+    const where = if (log_path) |path|
+        try alloc.print(" Its output, with any crash report, is in {s}.", .{path})
+    else
+        try alloc.dupe(u8, "");
+    defer alloc.free(where);
+    return alloc.print("The supervisor keeps stopping ({s}), so proto-fx stopped reconnecting after {d} tries.{s} Relaunch proto-fx to try again.", .{ @errorName(failure), client_mod.Retry.max_failures, where });
+}
+
+test "the give-up line names the daemon log only when there is one" {
+    const alloc = std.testing.allocator;
+    const with_log = try gaveUpText(alloc, error.SupervisorDisconnected, "/Users/example/.proto-fx/daemon/daemon.log");
+    defer alloc.free(with_log);
+    try std.testing.expectEqualStrings("The supervisor keeps stopping (SupervisorDisconnected), so proto-fx stopped reconnecting after 5 tries. Its output, with any crash report, is in /Users/example/.proto-fx/daemon/daemon.log. Relaunch proto-fx to try again.", with_log);
+    const without = try gaveUpText(alloc, error.DaemonExited, null);
+    defer alloc.free(without);
+    try std.testing.expect(std.mem.find(u8, without, "is in") == null);
+}
+
 pub const OlderPage = struct {
     projection: sessions.OlderHistoryProjection,
     start: history_page.Cursor,
@@ -218,6 +248,9 @@ pub const State = struct {
     workspace_label: []u8 = &.{},
     incarnation: []u8 = &.{},
     reconnect_notice: bool = false,
+    /// Notices already shown in this run of failed reconnect attempts. A
+    /// supervisor that keeps restarting says each once per run (D281).
+    run_notices: struct { restored: bool = false } = .{},
     permission_mode: types.PermissionMode = .ask,
     pending_permission_id: ?i64 = null,
     /// The session whose host asked `pending_permission_id`.
@@ -479,7 +512,8 @@ pub fn Runtime(comptime App: type) type {
             }
             for (incoming.items) |item| switch (item) {
                 .connected => try connected(app),
-                .disconnected => |failure| try disconnected(app, failure),
+                .disconnected => |outage| try disconnected(app, outage),
+                .gave_up => |failure| try gaveUp(app, failure),
                 .stopped => {
                     remote.link = .stopped;
                     dropRequests(app.alloc, &remote.sent);
@@ -538,9 +572,11 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        fn disconnected(app: *App, failure: anyerror) !void {
+        fn disconnected(app: *App, outage: client_mod.Outage) !void {
             const remote = &app.remote;
+            const failure = outage.err;
             remote.link = .connecting;
+            if (outage.attempt == 1) remote.run_notices = .{};
             // Nothing sent before the outage will be answered.
             dropRequests(app.alloc, &remote.sent);
             remote.permission_response_queued = false;
@@ -550,8 +586,13 @@ pub fn Runtime(comptime App: type) type {
                 remote.cancelHistoryLoad();
             }
             if (app.input_runtime.session_browser.active) app.input_runtime.session_browser.fail(@errorName(failure));
+            // One notice per outage: later attempts in the same run are the
+            // same outage, and the run ends in `gaveUp` if it never heals.
+            if (outage.attempt > 1) return;
             if (!remote.connected_once) {
-                try app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = @errorName(failure) }, true);
+                const body = try app.alloc.print("Could not reach the supervisor ({s}). Retrying.", .{@errorName(failure)});
+                defer app.alloc.free(body);
+                try app.writeDomainNotice(.{ .topic = "session", .tone = .warning, .body = body }, true);
                 return;
             }
             remote.outage_seen = true;
@@ -560,7 +601,21 @@ pub fn Runtime(comptime App: type) type {
             try app.writeDomainNotice(.{ .topic = "session", .tone = .warning, .body = body }, true);
         }
 
-        /// Applies one pushed update. A session update waits for the reply
+        /// The supervisor kept stopping and the connection gave up. One
+        /// line says so and names the log that holds its crash output.
+        fn gaveUp(app: *App, failure: anyerror) !void {
+            const remote = &app.remote;
+            remote.link = .stopped;
+            dropRequests(app.alloc, &remote.sent);
+            remote.permission_response_queued = false;
+            const log_path = existingLogPath(app.alloc);
+            defer if (log_path) |path| app.alloc.free(path);
+            const body = try gaveUpText(app.alloc, failure, log_path);
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = body }, true);
+        }
+
+        /// Applies one pushed update.        /// Applies one pushed update. A session update waits for the reply
         /// that starts its watch, which carries the baseline.
         fn applyUpdate(app: *App, topic: client_protocol.Topic, body: std.json.Value) !void {
             const remote = &app.remote;

@@ -103,10 +103,13 @@ pub const Incoming = union(enum) {
     connected,
     /// The connection could not open, or closed. Every request sent before
     /// it has no reply coming.
-    disconnected: anyerror,
+    disconnected: Outage,
     /// The supervisor stopped on purpose. The connection does not reopen
     /// and nothing more arrives.
     stopped,
+    /// The supervisor kept stopping, so the connection stopped trying; it
+    /// carries the last failure. Nothing more arrives (D281).
+    gave_up: anyerror,
     /// A reply (`id` set) or a pushed update (`update` set).
     frame: std.json.Parsed(protocol.ServerFrame),
 
@@ -118,9 +121,43 @@ pub const Incoming = union(enum) {
     }
 };
 
+pub const Outage = struct {
+    err: anyerror,
+    /// Which failed attempt in a row this is, from 1. Only the first of a
+    /// run needs a notice; the rest are the same outage.
+    attempt: u32 = 1,
+};
+
+/// Counts the attempts in a row that failed: a connection that would not
+/// open, or one that dropped before it stayed up `stable_ms`. Each waits
+/// longer than the last; past `max_failures` the connection gives up
+/// rather than restart a supervisor that keeps crashing (D281).
+pub const Retry = struct {
+    failures: u32 = 0,
+
+    pub const max_failures = 5;
+    pub const stable_ms = 10_000;
+    const first_wait_ms = 250;
+    const max_wait_ms = 4_000;
+
+    /// One attempt failed. `lived_ms` is how long its connection stayed
+    /// open, null when none opened. Returns the wait before the next
+    /// attempt, or null to give up.
+    pub fn failed(self: *Retry, lived_ms: ?i64) ?i32 {
+        if (lived_ms) |ms| if (ms >= stable_ms) {
+            self.failures = 0;
+        };
+        self.failures += 1;
+        if (self.failures > max_failures) return null;
+        const shift: u5 = @intCast(@min(self.failures - 1, 8));
+        return @min(@as(i32, first_wait_ms) << shift, max_wait_ms);
+    }
+};
+
 /// One kept-open connection to the supervisor, run by one I/O thread. The
 /// thread starts the supervisor if none answers, reconnects with backoff
-/// when the connection drops, and queues what it reads for `take`. Only the
+/// when the connection drops, gives up when it keeps dropping (`Retry`),
+/// and queues what it reads for `take`. Only the
 /// owning thread calls `send`, `take`, and `stop`.
 pub const Connection = struct {
     alloc: Allocator,
@@ -134,8 +171,6 @@ pub const Connection = struct {
     next_id: u64 = 1,
     inbox_mutex: std.Io.Mutex = .init,
     inbox: std.ArrayList(Incoming) = .empty,
-
-    const max_backoff_ms = 2_000;
 
     pub fn start(alloc: Allocator, executable: []const u8) !*Connection {
         const self = try alloc.create(Connection);
@@ -208,32 +243,28 @@ pub const Connection = struct {
     }
 
     fn run(self: *Connection) void {
-        var backoff_ms: i32 = 0;
-        // One notice per outage, not one per failed attempt.
-        var reported = false;
+        var retry: Retry = .{};
+        var wait_ms: i32 = 0;
         while (true) {
-            if (backoff_ms > 0) self.channel.waitWake(backoff_ms);
+            if (wait_ms > 0) self.channel.waitWake(wait_ms);
             if (!self.channel.reset()) return;
-            backoff_ms = if (backoff_ms == 0) 250 else @min(backoff_ms * 2, max_backoff_ms);
             const stream = self.open() catch |err| {
-                if (!reported) self.deliver(.{ .disconnected = err });
-                reported = true;
+                wait_ms = retry.failed(null) orelse return self.deliver(.{ .gave_up = err });
+                self.deliver(.{ .disconnected = .{ .err = err, .attempt = retry.failures } });
                 continue;
             };
             defer stream.close(io_mod.getIo());
+            const opened_ms = io_mod.milliTimestamp();
             self.connected.store(true, .release);
             self.deliver(.connected);
-            reported = false;
-            backoff_ms = 0;
             const ended: anyerror = if (self.channel.pump(stream, self)) |_| error.SupervisorDisconnected else |err| err;
             self.connected.store(false, .release);
             // An intentional stop stays stopped; only a drop or crash
             // starts the supervisor again.
             if (self.stopped) return self.deliver(.stopped);
             if (self.channel.isClosed() and !self.channel.reset()) return;
-            self.deliver(.{ .disconnected = ended });
-            reported = true;
-            backoff_ms = 250;
+            wait_ms = retry.failed(io_mod.milliTimestamp() - opened_ms) orelse return self.deliver(.{ .gave_up = ended });
+            self.deliver(.{ .disconnected = .{ .err = ended, .attempt = retry.failures } });
         }
     }
 
@@ -367,4 +398,19 @@ test "the daemon log appends each start and rotates once full" {
     file.close(io);
     try std.testing.expectEqual(max_log_bytes, (try tmp.dir.statFile(io, log_name ++ ".1", .{})).size);
     try std.testing.expect((try tmp.dir.statFile(io, log_name, .{})).size < 64);
+}
+
+test "reconnects back off, give up after repeated quick failures, and start over once stable" {
+    var retry: Retry = .{};
+    const waits = [_]i32{ 250, 500, 1_000, 2_000, 4_000 };
+    for (waits, 1..) |wait, attempt| {
+        // A supervisor that answers and then crashes counts like one that never answers.
+        try std.testing.expectEqual(@as(?i32, wait), retry.failed(if (attempt % 2 == 0) 300 else null));
+        try std.testing.expectEqual(@as(u32, @intCast(attempt)), retry.failures);
+    }
+    try std.testing.expectEqual(@as(?i32, null), retry.failed(null));
+    // A connection that stayed up starts a new run of attempts.
+    var stable: Retry = .{ .failures = 4 };
+    try std.testing.expectEqual(@as(?i32, 250), stable.failed(Retry.stable_ms));
+    try std.testing.expectEqual(@as(u32, 1), stable.failures);
 }

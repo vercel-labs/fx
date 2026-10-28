@@ -541,7 +541,10 @@ pub fn Runtime(comptime App: type) type {
             app.stream.active = if (remote.child_id.len > 0) remote.viewedChildRunning() or submission_queued else running or submission_queued;
             if (remote.reconnect_notice) {
                 remote.reconnect_notice = false;
-                try notice(app, "session", "Supervisor restarted; restored this session. Unsent requests were not replayed.");
+                // A supervisor that keeps restarting restores the session
+                // each time; say so once per run of attempts (D281).
+                if (!remote.run_notices.restored) try notice(app, "session", "Supervisor restarted; restored this session. Unsent requests were not replayed.");
+                remote.run_notices.restored = true;
             }
             if (!remote.permission_response_queued) {
                 if (value.pending.len == 0) {
