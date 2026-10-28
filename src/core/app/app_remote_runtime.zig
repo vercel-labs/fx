@@ -147,6 +147,25 @@ const older_page_slice_ns: i128 = 4 * std.time.ns_per_ms;
 const older_notice_text = "Older transcript entries load when you page up in the full transcript.";
 
 /// A received older page and where it goes in the window.
+/// A reattach after a supervisor restart found no such session: the new
+/// supervisor has not restored it, or could not (D282).
+const lost_session_text = "This session could not be restored by the supervisor. Start a new session with /new, or resume another with /resume.";
+
+fn lostAfterRestart(state: *const State, kind: Kind, message: []const u8) bool {
+    return state.outage_seen and (kind == .resync or kind == .attach) and std.mem.eql(u8, message, "SessionNotFound");
+}
+
+test "a session the restarted supervisor lacks is named in plain words" {
+    var state: State = .{};
+    try std.testing.expect(!lostAfterRestart(&state, .resync, "SessionNotFound"));
+    state.outage_seen = true;
+    try std.testing.expect(lostAfterRestart(&state, .resync, "SessionNotFound"));
+    try std.testing.expect(lostAfterRestart(&state, .attach, "SessionNotFound"));
+    try std.testing.expect(!lostAfterRestart(&state, .delete, "SessionNotFound"));
+    try std.testing.expect(!lostAfterRestart(&state, .resync, "SessionBusy"));
+    try std.testing.expect(std.mem.find(u8, lost_session_text, "SessionNotFound") == null);
+}
+
 /// The daemon log's path when the file exists. Caller owns it.
 fn existingLogPath(alloc: Allocator) ?[]u8 {
     const path = client_mod.logPath(alloc) catch return null;
@@ -250,7 +269,7 @@ pub const State = struct {
     reconnect_notice: bool = false,
     /// Notices already shown in this run of failed reconnect attempts. A
     /// supervisor that keeps restarting says each once per run (D281).
-    run_notices: struct { restored: bool = false } = .{},
+    run_notices: struct { restored: bool = false, lost_session: bool = false } = .{},
     permission_mode: types.PermissionMode = .ask,
     pending_permission_id: ?i64 = null,
     /// The session whose host asked `pending_permission_id`.
@@ -676,7 +695,13 @@ pub fn Runtime(comptime App: type) type {
             var outcome = try decode(client_protocol.Outcome, app, value);
             defer outcome.deinit();
             if (!outcome.value.ok) {
-                const message = outcome.value.@"error" orelse "The local session request failed";
+                var message = outcome.value.@"error" orelse "The local session request failed";
+                if (lostAfterRestart(&app.remote, kind, message)) {
+                    // Said once per run of reconnect attempts (D282).
+                    if (app.remote.run_notices.lost_session) return;
+                    app.remote.run_notices.lost_session = true;
+                    message = lost_session_text;
+                }
                 if (kind == .history_page) return failHistoryPage(app, message);
                 if (kind == .list or kind == .children) app.input_runtime.session_browser.fail(message);
                 // The supervisor words a refused delete itself
