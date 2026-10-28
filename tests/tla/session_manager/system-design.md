@@ -3118,6 +3118,20 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   **Why:** rows read "cd ~/code/proto 2>/dev/null && g", cut mid-word,
   after spending most of their width on the `cd`.
 
+- **D295 Decision:** a tool group only grows. Rows come in the order the
+  calls ran; adjacent reads, lists and searches (shell or `read_file`)
+  share one "Explored · …" row, a running one joining it in the present
+  tense, and adjacent routine calls share one dim row. Every command
+  keeps its row and output tail; nothing above a new call is folded away
+  or cut, which replaces the row cap, the "Ran N more commands" fold and
+  the three-tail limit of D291. **Why:** the inline renderer cannot take
+  back rows that have scrolled into the terminal's history, so a live
+  group that folded earlier output away as a call started left that
+  height as blank rows; a 39 minute turn ended with a screen of them and
+  the footer pushed out of place. **Alternative:** letting the renderer
+  repaint rows from history into the freed space, which duplicates them
+  in the terminal's scrollback.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

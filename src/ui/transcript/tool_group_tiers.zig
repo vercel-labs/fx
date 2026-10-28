@@ -6,19 +6,21 @@
 //! - outcome: what changed: files written or edited, commands run, workers
 //!   started or stopped, jobs backgrounded or cancelled, checkpoints.
 //! - routine: reads, lists, inspects, logs, observes, fetches, recall and
-//!   sends. Routine rows never stand alone in a settled group: similar ones
-//!   fold into one dim row, "Read 6 files · notes.md, app.py, +4".
+//!   sends. Adjacent routine rows share one dim row, "Read 6 files ·
+//!   notes.md, app.py, +4".
 //!
-//! A settled group shows its folds, then at most `settled_row_cap` rows,
-//! attention first and then the newest outcomes, in the order they ran;
-//! older outcomes fold too. A command row carries a short tail of its
-//! output (and a Python run its outline) so a person sees what happened
-//! without opening the full transcript. A shell command that only reads,
-//! lists or searches files is routine and reads as what it did (D290);
-//! those fold into one "Explored · Read a, b · Searched x" row. A live group
-//! has the same layout with its running rows last, so each call's row and
-//! output stay where they are as later calls arrive (D291). Ctrl+O keeps
-//! every row.
+//! Rows come in the order the calls ran. A shell command that only reads,
+//! lists or searches files reads as what it did (D290), and adjacent ones,
+//! with file reads, share one "Explored · Read a, b · Searched x" row; a
+//! call still running joins that row in the present tense. A command row
+//! carries a short tail of its output (and a Python run its outline) so a
+//! person sees what happened without opening the full transcript.
+//!
+//! A group only ever grows (D295): a new call appends rows or joins the
+//! last shared row, a settling call fills in its own row and output, and
+//! nothing above is folded away or cut. The inline renderer cannot take
+//! back rows that have scrolled into the terminal's history, so a group
+//! that shrank left that height as blank rows. Ctrl+O keeps every row.
 const std = @import("std");
 const transcript_blocks = @import("../render_engine/transcript_blocks.zig");
 const human_text = @import("../../core/shared/human_text.zig");
@@ -32,16 +34,10 @@ const checklist_presentation = @import("../../core/checklist/presentation.zig");
 const Allocator = std.mem.Allocator;
 const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
 
-/// Rows a settled group shows besides its folds.
-pub const settled_row_cap = 5;
-/// Commands, newest first, that keep their output tail in a settled group.
-const tail_blocks = 3;
 /// Names a fold lists before "+N".
 const fold_names = 2;
 /// Names one verb of an Explored row lists before "+N".
 const explore_names = 3;
-/// The widest command name a fold lists, in columns.
-const fold_name_width = 32;
 
 pub const Tier = enum { attention, outcome, routine };
 
@@ -177,16 +173,6 @@ pub fn tierOf(arena: Allocator, item: Item) Tier {
     };
 }
 
-/// An outcome that changed something a person keeps: a file, a worker, a
-/// checkpoint. It outranks a command when rows are scarce.
-fn isChange(detail: ?*const ToolDetailRecord) bool {
-    const record = detail orelse return false;
-    const kind = record.activity_kind orelse return false;
-    if (kind == .write or kind == .edit) return true;
-    if (std.mem.eql(u8, record.tool_name, "fleet") or isOneOf(record.tool_name, &.{ "checkpoint", "rewind", "checklist" })) return true;
-    return false;
-}
-
 fn isCommandRun(arena: Allocator, record: *const ToolDetailRecord) bool {
     if (record.activity_kind != .command) return false;
     if (!std.mem.eql(u8, record.tool_name, "shell")) return true;
@@ -311,104 +297,66 @@ fn anomalyOf(item: Item) ?Anomaly {
 
 // ---- rows ------------------------------------------------------------------
 
-/// The rows under the header. A live group has the layout a settled one
-/// has: a running row is an attention row and the newest, so it comes
-/// last, and when it settles the rows above it stay where they are (D291).
+/// The rows under the header, in the order the calls ran (D295).
 pub fn plan(arena: Allocator, items: []const Item) ![]Row {
     var rows: std.ArrayList(Row) = .empty;
-
-    const tiers = try arena.alloc(Tier, items.len);
-    var attention: usize = 0;
-    for (items, tiers) |item, *tier| {
-        tier.* = tierOf(arena, item);
-        if (tier.* == .attention) attention += 1;
-    }
-    // Attention rows always show. The newest changes to files, workers and
-    // checkpoints fill what is left first, then the newest other outcomes.
-    const shown = try arena.alloc(bool, items.len);
-    @memset(shown, false);
-    var unrecorded: usize = 0;
-    for (items) |item| unrecorded += @intFromBool(item.detail == null);
-    var room = settled_row_cap -| (attention + unrecorded);
-    // A row without a record cannot be told apart from its neighbors, so it
-    // always shows, as rows did before tiers.
-    for (items, tiers, shown) |item, tier, *visible| {
-        if (tier == .attention or item.detail == null) visible.* = true;
-    }
-    for ([_]bool{ true, false }) |changes| {
-        var index = items.len;
-        while (index > 0 and room > 0) {
-            index -= 1;
-            if (tiers[index] != .outcome or shown[index]) continue;
-            if (isChange(items[index].detail) != changes) continue;
-            shown[index] = true;
-            room -= 1;
-        }
-    }
-
-    var folds: std.ArrayList(Fold) = .empty;
-    var explore_actions: std.ArrayList(command_summary.Action) = .empty;
-    var explore_count: usize = 0;
-    var explore_entry: u32 = 0;
-    var more_commands: Fold = .{ .key = "", .verb = "Ran", .entry_id = 0, .noun = .{ "more command", "more commands" } };
-    var more_other: usize = 0;
-    var more_other_entry: ?u32 = null;
-    for (items, tiers, shown) |item, tier, visible| {
-        if (visible) continue;
-        if (tier == .routine) {
-            if (exploredItem(arena, item)) |actions| {
-                if (explore_count == 0) explore_entry = item.entry_id;
-                explore_count += 1;
-                try explore_actions.appendSlice(arena, actions);
-                continue;
-            }
-            try addToFold(arena, &folds, item);
-            continue;
-        }
-        const record = item.detail orelse {
-            more_other += 1;
-            more_other_entry = more_other_entry orelse item.entry_id;
+    var index: usize = 0;
+    while (index < items.len) {
+        const kind = runKind(arena, items[index]) orelse {
+            const item = items[index];
+            const tail = if (item.detail) |record| keepsOutput(arena, item, record) else false;
+            try appendItem(arena, &rows, item, styleOf(arena, item), tail);
+            index += 1;
             continue;
         };
-        if (isCommandRun(arena, record)) {
-            if (more_commands.count == 0) more_commands.entry_id = item.entry_id;
-            try more_commands.add(arena, commandName(arena, record) orelse targetOf(item.phrase));
-        } else {
-            more_other += 1;
-            more_other_entry = more_other_entry orelse item.entry_id;
+        var end = index + 1;
+        while (end < items.len) : (end += 1) {
+            const next = runKind(arena, items[end]) orelse break;
+            if (!std.mem.eql(u8, next, kind)) break;
         }
-    }
-    if (explore_count > 0) try rows.append(arena, .{
-        .entry_id = explore_entry,
-        .kind = .fold,
-        .style = .dim,
-        .text = try exploredText(arena, explore_actions.items, explore_count),
-    });
-    for (folds.items) |*fold| try rows.append(arena, .{ .entry_id = fold.entry_id, .kind = .fold, .style = .dim, .text = try fold.text(arena) });
-    if (more_commands.count > 0) try rows.append(arena, .{ .entry_id = more_commands.entry_id, .kind = .fold, .style = .dim, .text = try more_commands.text(arena) });
-    if (more_other > 0) try rows.append(arena, .{
-        .entry_id = more_other_entry.?,
-        .kind = .fold,
-        .style = .dim,
-        .text = try arena.print("+{d} more · ctrl+o", .{more_other}),
-    });
-
-    // The newest commands keep their output; older ones keep their row.
-    var tails_left: usize = tail_blocks;
-    const keeps_tail = try arena.alloc(bool, items.len);
-    @memset(keeps_tail, false);
-    var index = items.len;
-    while (index > 0 and tails_left > 0) {
-        index -= 1;
-        const record = items[index].detail orelse continue;
-        if (!shown[index] or !keepsOutput(arena, items[index], record)) continue;
-        keeps_tail[index] = true;
-        tails_left -= 1;
-    }
-    for (items, shown, keeps_tail) |item, visible, tail| {
-        if (visible) try appendItem(arena, &rows, item, styleOf(arena, item), tail);
+        try appendRun(arena, &rows, items[index..end], kind);
+        index = end;
     }
     return rows.items;
+}
+
+const explore_run = "explore";
+
+/// The shared row an item joins with its neighbors, or null for a row of
+/// its own: reads, lists and searches share "explore"; other routine calls
+/// share by tool and verb. A call that failed or still waits on a person
+/// stands alone; one that is running joins, so settling it moves nothing.
+fn runKind(arena: Allocator, item: Item) ?[]const u8 {
+    const record = item.detail orelse return null;
+    if (isFailure(record)) return null;
+    if (isFileRead(item)) return explore_run;
+    if (exploredItem(arena, item) != null) return explore_run;
+    if (isLive(record)) return null;
+    if (tierOf(arena, item) != .routine) return null;
+    return foldKey(arena, item) catch null;
+}
+
+/// A file read whose row says so: "Read notes.md", "Reading app.py".
+fn isFileRead(item: Item) bool {
+    const record = item.detail orelse return false;
+    if (!std.mem.eql(u8, record.tool_name, "read_file")) return false;
+    return std.mem.startsWith(u8, item.phrase, "Read ") or std.mem.startsWith(u8, item.phrase, "Reading ");
+}
+
+fn appendRun(arena: Allocator, rows: *std.ArrayList(Row), run: []const Item, kind: []const u8) !void {
+    const only_file_reads = for (run) |item| {
+        if (!isFileRead(item) or isLive(item.detail)) break false;
+    } else true;
+    const text = if (run.len == 1)
+        try itemText(arena, run[0])
+    else if (std.mem.eql(u8, kind, explore_run) and !only_file_reads)
+        try exploredText(arena, run)
+    else blk: {
+        var folds: std.ArrayList(Fold) = .empty;
+        for (run) |item| try addToFold(arena, &folds, item);
+        break :blk try folds.items[0].text(arena);
+    };
+    try rows.append(arena, .{ .entry_id = run[0].entry_id, .kind = if (run.len == 1) .item else .fold, .style = .dim, .text = text, .detail = if (run.len == 1) run[0].detail else null });
 }
 
 /// A group of one: its row in its own voice, never dim, with what it
@@ -431,25 +379,40 @@ fn keepsOutput(arena: Allocator, item: Item, record: *const ToolDetailRecord) bo
     return exploredItem(arena, item) == null;
 }
 
-/// Explored commands as one row, codex's way: adjacent actions of a kind
-/// share their verb, "Explored · Read a.ts, b.ts · Searched "x" in c.ts".
-fn exploredText(arena: Allocator, actions: []const command_summary.Action, commands: usize) ![]const u8 {
+/// Adjacent reads as one row, codex's way: actions of a kind share their
+/// verb, "Explored · Read a.ts, b.ts · Searched "x" in c.ts", and a call
+/// still running reads in the present tense.
+fn exploredText(arena: Allocator, run: []const Item) ![]const u8 {
+    const Action = struct { kind: command_summary.Kind, target: []const u8, running: bool };
+    var actions: std.ArrayList(Action) = .empty;
+    for (run) |item| {
+        const running = isLive(item.detail);
+        if (exploredItem(arena, item)) |found| {
+            for (found) |action| try actions.append(arena, .{ .kind = action.kind, .target = action.target, .running = running });
+        } else {
+            // A file read names its file and lines, not its whole path.
+            const target = targetOf(item.phrase);
+            const name = std.Io.Dir.path.basename(target[0 .. std.mem.findScalar(u8, target, ':') orelse target.len]);
+            const range = if (std.mem.findScalar(u8, target, ':')) |at| target[at..] else "";
+            try actions.append(arena, .{ .kind = .read, .target = try arena.print("{s}{s}", .{ name, range }), .running = running });
+        }
+    }
     var out: std.Io.Writer.Allocating = .init(arena);
     const writer = &out.writer;
-    if (commands > 1) try writer.writeAll("Explored · ");
+    try writer.writeAll("Explored · ");
     var index: usize = 0;
-    while (index < actions.len) {
-        const kind = actions[index].kind;
+    while (index < actions.items.len) {
+        const first = actions.items[index];
         var names: std.ArrayList([]const u8) = .empty;
         var end = index;
-        while (end < actions.len and actions[end].kind == kind) : (end += 1) {
-            const target = actions[end].target;
+        while (end < actions.items.len and actions.items[end].kind == first.kind and actions.items[end].running == first.running) : (end += 1) {
+            const target = actions.items[end].target;
             for (names.items) |known| {
                 if (std.mem.eql(u8, known, target)) break;
             } else try names.append(arena, target);
         }
         if (index > 0) try writer.writeAll(" · ");
-        try writer.print("{s} ", .{kind.past()});
+        try writer.print("{s} ", .{if (first.running) first.kind.present() else first.kind.past()});
         for (names.items[0..@min(names.items.len, explore_names)], 0..) |name, position| {
             if (position > 0) try writer.writeAll(", ");
             try writer.writeAll(name);
@@ -532,7 +495,7 @@ fn itemText(arena: Allocator, item: Item) ![]const u8 {
     }
     // A run names its command by the first line, and inline Python by its
     // interpreter; the outline below shows the rest.
-    const verb = for ([_][]const u8{ "Ran", "Running" }) |candidate| {
+    const verb = for ([_][]const u8{ "Ran", "Running", "Backgrounded" }) |candidate| {
         if (std.mem.startsWith(u8, item.phrase, candidate) and item.phrase.len > candidate.len and item.phrase[candidate.len] == ' ') break candidate;
     } else return item.phrase;
     if (exploredItem(arena, item)) |actions| return command_summary.phrase(arena, actions, isLive(record));
@@ -670,6 +633,15 @@ fn addToFold(arena: Allocator, folds: *std.ArrayList(Fold), item: Item) !void {
     try fold.add(arena, if (noun != null) targetOf(item.phrase) else phraseHead(item.phrase));
 }
 
+/// The shared row a routine call joins: reads and fetches by tool and
+/// verb, every other routine call one list of what was checked.
+fn foldKey(arena: Allocator, item: Item) ![]const u8 {
+    const verb = item.phrase[0 .. std.mem.findScalar(u8, item.phrase, ' ') orelse item.phrase.len];
+    const tool = if (item.detail) |record| record.tool_name else "";
+    if (std.mem.eql(u8, tool, "web_fetch")) return arena.print("{s}\x00{s}", .{ tool, verb });
+    return "routine";
+}
+
 /// A phrase before its " · " detail: "Inspected npm test".
 fn phraseHead(phrase: []const u8) []const u8 {
     return std.mem.trim(u8, phrase[0 .. std.mem.find(u8, phrase, " · ") orelse phrase.len], " ");
@@ -681,14 +653,6 @@ fn targetOf(phrase: []const u8) []const u8 {
     const after_verb = if (std.mem.findScalar(u8, phrase, ' ')) |space| phrase[space + 1 ..] else phrase;
     const end = std.mem.find(u8, after_verb, " · ") orelse after_verb.len;
     return std.mem.trim(u8, after_verb[0..end], " ");
-}
-
-/// A command as a fold lists it: its first line, short.
-fn commandName(arena: Allocator, record: *const ToolDetailRecord) ?[]const u8 {
-    const command = bodies.commandText(arena, record) orelse return null;
-    if (python_outline.script(command)) |found| return found.interpreter;
-    const cleaned = command_summary.clean(arena, command) catch return null;
-    return command_summary.clipAtWord(arena, cleaned, fold_name_width) catch null;
 }
 
 // ---- tests -----------------------------------------------------------------
@@ -703,7 +667,7 @@ fn testRecord(entry_id: u32, tool_name: []const u8, kind: @import("../../core/sh
     };
 }
 
-test "routine rows fold, outcomes stay, failures say why" {
+test "adjacent routine rows fold, outcomes stay, failures say why" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -737,14 +701,14 @@ test "routine rows fold, outcomes stay, failures say why" {
     const joined = try std.mem.join(arena, "\n", texts.items);
     try std.testing.expectEqualStrings(
         \\dim:Read 3 files · notes.md, app.py, +1
-        \\dim:Inspected sleep 9 ×2
         \\normal:Wrote out.txt +1
         \\attention:Exited 1 · cat: nope.txt: No such file or directory
         \\dim:$ cat nope.txt
+        \\dim:Inspected sleep 9 ×2
     , joined);
 }
 
-test "a settled group caps its rows and folds older commands" {
+test "a group of commands keeps every row and its output, in order" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -759,17 +723,11 @@ test "a settled group caps its rows and folds older commands" {
         item.* = .{ .entry_id = @intCast(index + 1), .detail = record, .phrase = try arena.print("Ran {s}", .{command}) };
     }
     const rows = try plan(arena, &items);
-    var item_rows: usize = 0;
-    var body_rows: usize = 0;
-    for (rows) |row| switch (row.kind) {
-        .item => item_rows += 1,
-        .body => body_rows += 1,
-        .fold => try std.testing.expectEqualStrings("Ran 4 more commands · echo 0, echo 1, +2", row.text),
-    };
-    try std.testing.expectEqual(@as(usize, settled_row_cap), item_rows);
-    try std.testing.expectEqual(@as(usize, tail_blocks), body_rows);
-    try std.testing.expectEqualStrings("Ran echo 8", rows[rows.len - 2].text);
-    try std.testing.expectEqualStrings("8", rows[rows.len - 1].text);
+    try std.testing.expectEqual(@as(usize, 18), rows.len);
+    for (0..9) |index| {
+        try std.testing.expectEqualStrings(try arena.print("Ran echo {d}", .{index}), rows[index * 2].text);
+        try std.testing.expectEqualStrings(try arena.print("{d}", .{index}), rows[index * 2 + 1].text);
+    }
 }
 
 test "a running row comes last and settling it moves nothing above it" {
@@ -911,7 +869,7 @@ fn shellRun(arena: Allocator, entry_id: u32, command: []const u8, output: []cons
     return record;
 }
 
-test "reading commands fold into one Explored row and only other commands keep their output" {
+test "adjacent reading commands share one Explored row and only other commands keep their output" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -932,9 +890,10 @@ test "reading commands fold into one Explored row and only other commands keep t
     var texts: std.ArrayList([]const u8) = .empty;
     for (rows) |row| try texts.append(arena, try arena.print("{s}:{s}", .{ @tagName(row.style), row.text }));
     try std.testing.expectEqualStrings(
-        \\dim:Explored · Listed ~/code/proto · Read markdown.ts:1-120 · Searched "table" in markdown.ts · Read package.json · Searched "nothing-here" in src
+        \\dim:Explored · Listed ~/code/proto · Read markdown.ts:1-120 · Searched "table" in markdown.ts · Read package.json
         \\normal:Ran git log --oneline -3
         \\dim:abc first
+        \\dim:Searched "nothing-here" in src
     , try std.mem.join(arena, "\n", texts.items));
 
     // A group of one read reads as what it read, with nothing under it.
@@ -945,6 +904,10 @@ test "reading commands fold into one Explored row and only other commands keep t
     records[2].outcome = null;
     records[2].command_process_presentation = null;
     const live = try single(arena, items[2]);
+    // A job sent to the background names its Python by the interpreter.
+    var job = try shellRun(arena, 7, "sleep 4; python3 - <<'PY'\nprint(1)\nPY", "", 0);
+    const backgrounded = try single(arena, .{ .entry_id = 7, .detail = &job, .phrase = "Backgrounded sleep 4; python3 - <<'PY' print(1) PY" });
+    try std.testing.expectEqualStrings("Backgrounded python3", backgrounded[0].text);
     try std.testing.expectEqualStrings("Searching \"table\" in markdown.ts", live[0].text);
 }
 

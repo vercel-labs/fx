@@ -1924,8 +1924,8 @@ test "minimal tool groups keep instruction refresh neutral and denials visible" 
 
     try std.testing.expectEqualStrings(
         "● Ran 1 command, read 1 file · 1 denied\n" ++
-            "├ Reading project instructions before continuing: runtime.zig\n" ++
-            "└ Denied by auto agent zig build",
+            "├ Denied by auto agent zig build\n" ++
+            "└ Reading project instructions before continuing: runtime.zig",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -2187,13 +2187,14 @@ test "completed session and tty command rows reproject stored commands at the cu
     const narrow_rows = narrow.entry_actions.items[0].override.bytes;
     var narrow_lines = std.mem.splitScalar(u8, narrow_rows, '\n');
     _ = narrow_lines.next(); // group header
-    // Watching a session is routine: it folds above what ran, unstyled.
-    const narrow_observe = narrow_lines.next().?;
+    // Rows come in the order the calls ran; watching a session is
+    // routine and unstyled.
     const narrow_tty = narrow_lines.next().?;
-    try std.testing.expect(std.mem.startsWith(u8, narrow_tty, "└ Ran \x1b[38;5;252mbun\x1b[39m run pipeline-stage-"));
+    const narrow_observe = narrow_lines.next().?;
+    try std.testing.expect(std.mem.startsWith(u8, narrow_tty, "├ Ran \x1b[38;5;252mbun\x1b[39m run pipeline-stage-"));
     try std.testing.expect(std.mem.endsWith(u8, narrow_tty, "…"));
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(narrow_tty) <= 80);
-    try std.testing.expect(std.mem.startsWith(u8, narrow_observe, "├ Observed npm run dev-server-"));
+    try std.testing.expect(std.mem.startsWith(u8, narrow_observe, "└ Observed npm run dev-server-"));
     try std.testing.expect(std.mem.endsWith(u8, narrow_observe, "…"));
     // Reprojection replaces the frozen ASCII marker before reclipping.
     try std.testing.expect(std.mem.find(u8, narrow_rows, "...") == null);
@@ -2202,8 +2203,8 @@ test "completed session and tty command rows reproject stored commands at the cu
     defer wide.deinit(alloc);
     try std.testing.expectEqualStrings(
         "● Ran 1 command and 1 other call\n" ++
-            "├ Observed npm run " ++ text_utils.repeat("dev-server-", 12) ++ "\n" ++
-            "└ Ran \x1b[38;5;252mbun\x1b[39m run " ++ text_utils.repeat("pipeline-stage-", 10),
+            "├ Ran \x1b[38;5;252mbun\x1b[39m run " ++ text_utils.repeat("pipeline-stage-", 10) ++ "\n" ++
+            "└ Observed npm run " ++ text_utils.repeat("dev-server-", 12),
         wide.entry_actions.items[0].override.bytes,
     );
 }
@@ -2545,7 +2546,7 @@ test "minimal command timeout uses its typed cause in the row and group" {
     );
 }
 
-test "tool-heavy groups stay calm: folds and a row cap, live or settled" {
+test "tool-heavy groups keep every call in order, live or settled" {
     const alloc = std.testing.allocator;
     const tool_count = 20;
     var entries: [tool_count]TranscriptEntry = undefined;
@@ -2587,12 +2588,16 @@ test "tool-heavy groups stay calm: folds and a row cap, live or settled" {
     defer projection.deinit(alloc);
     const summary = projection.entry_actions.items[0].override.bytes;
 
-    // Live: the settled layout with the running row last, so settling it
-    // moves nothing above it (D291).
+    // Live: every call in the order it ran, the running one last, so
+    // settling it moves nothing above it (D291, D295).
     try std.testing.expectEqualStrings(
         "● Read 10 files, ran 8 commands, edited 2 files · 1 failed · 1 running\n" ++
             "├ Read 10 files · file.zig\n" ++
-            "├ Ran 5 more commands · zig build\n" ++
+            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
             "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
             "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
             "├ Exited 1 · rg snapshot\n" ++
@@ -2607,12 +2612,15 @@ test "tool-heavy groups stay calm: folds and a row cap, live or settled" {
     defer completed_projection.deinit(alloc);
     const completed_summary = completed_projection.entry_actions.items[0].override.bytes;
 
-    // Settled: routine reads and older commands fold, the failure and the
-    // newest changes stay.
+    // Settled: the same rows; only the running one says it finished.
     try std.testing.expectEqualStrings(
         "● Read 10 files, ran 8 commands, edited 2 files · 1 failed\n" ++
             "├ Read 10 files · file.zig\n" ++
-            "├ Ran 5 more commands · zig build\n" ++
+            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
             "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
             "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
             "├ Exited 1 · rg snapshot\n" ++
@@ -2718,7 +2726,9 @@ test "cancelled actions remain inside the message-delimited block" {
 
     try std.testing.expect(projection.entry_actions.items[0] == .override);
     try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "├ Cancelled first") != null);
-    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "└ Cancelled second") != null);
+    // Rows come in the order the calls ran (D295).
+    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "├ Cancelled second") != null);
+    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "└ read") != null);
     try std.testing.expect(projection.entry_actions.items[1] == .hide);
     try std.testing.expect(projection.entry_actions.items[2] == .hide);
     try std.testing.expect(projection.entry_actions.items[3] == .hide);

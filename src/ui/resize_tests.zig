@@ -4015,6 +4015,72 @@ test "a live tool group holds no rows, so streamed assistant hard lines enter hi
     try expectGridContains(&h, "partial tail");
 }
 
+fn trailingBlankRows(h: *Harness) !u16 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(h.alloc);
+    var blank: u16 = 0;
+    var r: u16 = h.vt.rows;
+    while (r >= 1) : (r -= 1) {
+        buf.clearRetainingCapacity();
+        try h.vt.rowTextTrimmed(r, &buf);
+        if (std.mem.trim(u8, buf.items, " ").len > 0) break;
+        blank += 1;
+    }
+    return blank;
+}
+
+test "a long tool group with tall command output never leaves blank rows under the footer" {
+    // The user's 39 minute turn ended with a screen of blank rows: a live
+    // group folded away earlier calls' output while it ran, and the inline
+    // renderer cannot take back rows that scrolled into the terminal's
+    // history. A group only grows (D295), so the footer stays at the bottom.
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 80, 16, 3);
+    defer h.deinit();
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+    try h.shell.initViewport(&h.metrics, 8);
+    _ = try h.shell.appendRawTranscriptEntry(alloc, "startup row\n");
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    const group = types.ToolPresentationGroupId{ .turn_id = 41, .anchor_step_id = 1 };
+    var call_ids: [9][16]u8 = undefined;
+    var filled = false;
+    for (0..call_ids.len) |index| {
+        const call_id = try std.mem.print(&call_ids[index], "tall-{d}", .{index});
+        const id = types.ToolLifecycleId{ .turn_id = 41, .call_id = call_id };
+        var args: [96]u8 = undefined;
+        var summary: [64]u8 = undefined;
+        const command = if (index % 3 == 1) "ls -la src" else "make report";
+        _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+            .id = id,
+            .presentation_group_id = group,
+            .reconciles_provisional_call_id = null,
+            .tool_name = "shell",
+            .activity_kind = .command,
+            .arguments_json = try std.mem.print(&args, "{{\"action\":\"run\",\"command\":\"{s}\"}}", .{command}),
+        } });
+        for (0..2) |phase| {
+            if (phase == 1) _ = try h.shell.applyToolLifecycle(alloc, .{ .terminal = .{
+                .id = id,
+                .outcome = .{ .kind = .completed, .summary = try std.mem.print(&summary, "Ran {s}", .{command}) },
+                .result = "line one\nline two\nline three\nline four\nline five\nline six\n",
+            } });
+            h.frame_redraw = true;
+            try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+            try h.flush();
+            const blank = try trailingBlankRows(&h);
+            if (blank == 0) filled = true;
+            // Once the screen is full, the footer keeps the bottom rows.
+            if (filled) try std.testing.expect(blank <= 1);
+        }
+    }
+    try std.testing.expect(filled);
+}
+
 test "hidden auto approval lifecycle reposition adds no compact scroll rows" {
     var h = try Harness.init(std.testing.allocator, 80, 12, 4);
     defer h.deinit();

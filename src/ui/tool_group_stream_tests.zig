@@ -185,7 +185,7 @@ test "a streaming tool group keeps each call's rows in place as calls arrive and
     }
 }
 
-test "reads fold into the Explored row while other commands and Python keep their output" {
+test "reads read as what they did while other commands and Python keep their output" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -195,12 +195,13 @@ test "reads fold into the Explored row while other commands and Python keep thei
     for (rows) |row| try texts.append(arena, row.text);
     try std.testing.expectEqualStrings(
         \\● Ran 3 commands, listed 1 directory, read 1 file and 1 other call
-        \\├ Explored · Listed ~/code/proto · Read assistant-message.ts:1-120 · Searched "table" in markdown.ts
+        \\├ Listed ~/code/proto
         \\├ Ran git log --oneline -3 && du -sh packages
         \\│   abc1 one
         \\│   abc2 two
         \\│   abc3 three
         \\│    41M packages
+        \\├ Read assistant-message.ts:1-120
         \\├ Ran python3
         \\│   cd ~/code/proto && python3 - <<'PY'
         \\│   Module · 3 nodes
@@ -211,6 +212,7 @@ test "reads fold into the Explored row while other commands and Python keep thei
         \\│   Output
         \\│   README.md
         \\│   packages
+        \\├ Searched "table" in markdown.ts
         \\└ Ran make check
         \\    ok
     , try std.mem.join(arena, "\n", texts.items));
