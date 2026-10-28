@@ -3062,6 +3062,20 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   layout would leave them misaligned with the rows below. **Alternative:**
   clearing the scrollback to redraw the table, which the inline transcript
   never does.
+- **D290 Decision:** a shell command that only reads, lists or searches
+  files reads as what it did, after codex's command parser: "Read
+  markdown.ts:1-120", "Searched "table" in markdown.ts", "Listed
+  ~/code/proto". A leading `cd` folds into the paths, formatting helpers
+  in a pipe (`head`, `wc`, `sort`) drop out, and a part that cannot be
+  named, writes a file, or uses a substitution keeps the command as it
+  was. Such a command shows no output; in a group they fold into one row,
+  "Explored · Read a, b · Searched x", and count as reads, searches and
+  lists in the header. Other commands and Python cells keep their output.
+  A search that exits 1 with no output found nothing; it did not fail.
+  The parse is presentation only and never feeds permissions or review.
+  **Why:** routine reads filled the tree with output nobody needed.
+  **Alternative:** reusing the permission lexer, which would tie what a
+  row says to what is allowed to run.
 
 ## Design Risks And Failure Behavior
 

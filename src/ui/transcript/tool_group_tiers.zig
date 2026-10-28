@@ -13,14 +13,17 @@
 //! attention first and then the newest outcomes, in the order they ran;
 //! older outcomes fold too. A command row carries a short tail of its
 //! output (and a Python run its outline) so a person sees what happened
-//! without opening the full transcript. A live group shows only its last
-//! few rows. Ctrl+O keeps every row.
+//! without opening the full transcript. A shell command that only reads,
+//! lists or searches files is routine and reads as what it did (D290);
+//! those fold into one "Explored · Read a, b · Searched x" row. A live group
+//! shows only its last few rows. Ctrl+O keeps every row.
 const std = @import("std");
 const transcript_blocks = @import("../render_engine/transcript_blocks.zig");
 const human_text = @import("../../core/shared/human_text.zig");
-const text_utils = @import("../../core/shared/text_utils.zig");
 const tool_args = @import("../../core/tooling/tool_args.zig");
 const python_outline = @import("python_outline.zig");
+const bodies = @import("tool_group_bodies.zig");
+const command_summary = @import("command_summary.zig");
 const browser_summary = @import("../../core/browser/script_summary.zig");
 const checklist_presentation = @import("../../core/checklist/presentation.zig");
 
@@ -29,21 +32,14 @@ const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
 
 /// Rows a settled group shows besides its folds.
 pub const settled_row_cap = 5;
-/// Rows a live group shows: the newest, so it does not grow while it runs.
-pub const live_row_count = 3;
-/// Output lines a command block keeps from the end of its output.
-const tail_lines = 4;
 /// Commands, newest first, that keep their output tail in a settled group.
 const tail_blocks = 3;
-/// Rows a Python outline shows, `Module · N nodes` included, before
-/// "… N more".
-const outline_rows = 9;
-/// Script lines a browser run shows, "… N more lines" included.
-const browser_code_rows = 6;
-/// Shell lines kept on each side of an embedded Python cell.
-const shell_chunk_lines = 2;
 /// Names a fold lists before "+N".
 const fold_names = 2;
+/// Rows a live group shows: the newest, so it does not grow while it runs.
+pub const live_row_count = 3;
+/// Names one verb of an Explored row lists before "+N".
+const explore_names = 3;
 /// The widest command name a fold lists.
 const fold_name_bytes = 32;
 
@@ -75,13 +71,41 @@ pub fn isLive(detail: ?*const ToolDetailRecord) bool {
     return record.outcome == null and record.fallback_disposition == null;
 }
 
-fn commandFailed(record: *const ToolDetailRecord) bool {
+pub fn commandFailed(record: *const ToolDetailRecord) bool {
     if (record.activity_kind != .command) return false;
     const presentation = record.command_process_presentation orelse return false;
     return switch (presentation) {
-        .exit_code => |code| code != 0,
+        // A search that finds nothing exits 1; it did not fail.
+        .exit_code => |code| code != 0 and !(code == 1 and searchFoundNothing(record)),
         .signal, .timed_out, .output_capture_failed => true,
     };
+}
+
+fn searchFoundNothing(record: *const ToolDetailRecord) bool {
+    var buffer: [32 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    const actions = explored(fixed.allocator(), record) orelse return false;
+    for (actions) |action| if (action.kind != .search) return false;
+    return std.mem.trim(u8, record.result orelse "", " \t\r\n").len == 0;
+}
+
+/// What a shell run reads, lists and searches when that is all it does,
+/// or null (D290). Presentation only: it never decides what runs.
+pub fn explored(arena: Allocator, record: *const ToolDetailRecord) ?[]const command_summary.Action {
+    if (!isCommandRun(arena, record)) return null;
+    if (!std.mem.eql(u8, record.tool_name, "shell") and !record.isCapturedCommand()) return null;
+    const command = bodies.commandText(arena, record) orelse return null;
+    if (python_outline.script(command) != null) return null;
+    return command_summary.explore(arena, command) catch null;
+}
+
+/// An item's explored actions, when its row names a command it ran or is
+/// running. A row in other words, such as the instruction refresh, keeps
+/// them.
+fn exploredItem(arena: Allocator, item: Item) ?[]const command_summary.Action {
+    const record = item.detail orelse return null;
+    if (!std.mem.startsWith(u8, item.phrase, "Ran ") and !std.mem.startsWith(u8, item.phrase, "Running ")) return null;
+    return explored(arena, record);
 }
 
 pub fn isFailure(detail: ?*const ToolDetailRecord) bool {
@@ -113,6 +137,7 @@ fn isOneOf(value: []const u8, comptime options: []const []const u8) bool {
 pub fn tierOf(arena: Allocator, item: Item) Tier {
     const record = item.detail orelse return .outcome;
     if (isLive(record) or isFailure(record)) return .attention;
+    if (exploredItem(arena, item) != null) return .routine;
     const op = operation(arena, record);
     const name = record.tool_name;
     if (std.mem.eql(u8, name, "shell")) {
@@ -159,13 +184,19 @@ fn isCommandRun(arena: Allocator, record: *const ToolDetailRecord) bool {
 
 const Family = struct { verb: []const u8, one: []const u8, many: []const u8 };
 
-fn familyOf(arena: Allocator, record: ?*const ToolDetailRecord) ?Family {
-    const value = record orelse return null;
+fn familyOf(arena: Allocator, item: Item) ?Family {
+    const value = item.detail orelse return null;
     const name = value.tool_name;
     if (std.mem.eql(u8, name, "read_file")) return .{ .verb = "read", .one = "file", .many = "files" };
     if (std.mem.eql(u8, name, "write_file")) return .{ .verb = "wrote", .one = "file", .many = "files" };
     if (std.mem.eql(u8, name, "edit_file")) return .{ .verb = "edited", .one = "file", .many = "files" };
     if (std.mem.eql(u8, name, "web_fetch")) return .{ .verb = "fetched", .one = "page", .many = "pages" };
+    // A read that failed counts as the command it was.
+    if (!isFailure(value)) if (exploredItem(arena, item)) |actions| return switch (actions[0].kind) {
+        .read => .{ .verb = "read", .one = "file", .many = "files" },
+        .list => .{ .verb = "listed", .one = "directory", .many = "directories" },
+        .search => .{ .verb = "searched", .one = "pattern", .many = "patterns" },
+    };
     if (isCommandRun(arena, value)) return .{ .verb = "ran", .one = "command", .many = "commands" };
     const starts_worker = std.mem.eql(u8, name, "subagent") or
         (std.mem.eql(u8, name, "fleet") and isOneOf(operation(arena, value), &.{ "spawn", "run" }));
@@ -191,7 +222,7 @@ pub fn header(arena: Allocator, items: []const Item) !Header {
     var counts_by_anomaly: [anomaly_labels.len]usize = @splat(0);
     for (items) |item| {
         if (anomalyOf(item.detail)) |anomaly| counts_by_anomaly[@backingInt(anomaly)] += 1;
-        const family = familyOf(arena, item.detail) orelse {
+        const family = familyOf(arena, item) orelse {
             other += 1;
             continue;
         };
@@ -313,12 +344,21 @@ pub fn plan(arena: Allocator, items: []const Item, live: bool) ![]Row {
     }
 
     var folds: std.ArrayList(Fold) = .empty;
+    var explore_actions: std.ArrayList(command_summary.Action) = .empty;
+    var explore_count: usize = 0;
+    var explore_entry: u32 = 0;
     var more_commands: Fold = .{ .key = "", .verb = "Ran", .entry_id = 0, .noun = .{ "more command", "more commands" } };
     var more_other: usize = 0;
     var more_other_entry: ?u32 = null;
     for (items, tiers, shown) |item, tier, visible| {
         if (visible) continue;
         if (tier == .routine) {
+            if (exploredItem(arena, item)) |actions| {
+                if (explore_count == 0) explore_entry = item.entry_id;
+                explore_count += 1;
+                try explore_actions.appendSlice(arena, actions);
+                continue;
+            }
             try addToFold(arena, &folds, item);
             continue;
         }
@@ -335,6 +375,12 @@ pub fn plan(arena: Allocator, items: []const Item, live: bool) ![]Row {
             more_other_entry = more_other_entry orelse item.entry_id;
         }
     }
+    if (explore_count > 0) try rows.append(arena, .{
+        .entry_id = explore_entry,
+        .kind = .fold,
+        .style = .dim,
+        .text = try exploredText(arena, explore_actions.items, explore_count),
+    });
     for (folds.items) |*fold| try rows.append(arena, .{ .entry_id = fold.entry_id, .kind = .fold, .style = .dim, .text = try fold.text(arena) });
     if (more_commands.count > 0) try rows.append(arena, .{ .entry_id = more_commands.entry_id, .kind = .fold, .style = .dim, .text = try more_commands.text(arena) });
     if (more_other > 0) try rows.append(arena, .{
@@ -352,7 +398,7 @@ pub fn plan(arena: Allocator, items: []const Item, live: bool) ![]Row {
     while (index > 0 and tails_left > 0) {
         index -= 1;
         const record = items[index].detail orelse continue;
-        if (!shown[index] or !isCommandRun(arena, record)) continue;
+        if (!shown[index] or !keepsOutput(arena, items[index], record)) continue;
         keeps_tail[index] = true;
         tails_left -= 1;
     }
@@ -367,9 +413,46 @@ pub fn plan(arena: Allocator, items: []const Item, live: bool) ![]Row {
 pub fn single(arena: Allocator, item: Item) ![]Row {
     var rows: std.ArrayList(Row) = .empty;
     const style: Style = if (isFailure(item.detail)) .attention else .normal;
-    const tail = if (item.detail) |record| isCommandRun(arena, record) else false;
+    const tail = if (item.detail) |record| keepsOutput(arena, item, record) else false;
     try appendItem(arena, &rows, item, style, tail);
     return rows.items;
+}
+
+/// A command keeps its output under its row unless it only read files and
+/// finished well: then its row says what it read (D290).
+fn keepsOutput(arena: Allocator, item: Item, record: *const ToolDetailRecord) bool {
+    if (!isCommandRun(arena, record)) return false;
+    if (isFailure(record)) return true;
+    return exploredItem(arena, item) == null;
+}
+
+/// Explored commands as one row, codex's way: adjacent actions of a kind
+/// share their verb, "Explored · Read a.ts, b.ts · Searched "x" in c.ts".
+fn exploredText(arena: Allocator, actions: []const command_summary.Action, commands: usize) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const writer = &out.writer;
+    if (commands > 1) try writer.writeAll("Explored · ");
+    var index: usize = 0;
+    while (index < actions.len) {
+        const kind = actions[index].kind;
+        var names: std.ArrayList([]const u8) = .empty;
+        var end = index;
+        while (end < actions.len and actions[end].kind == kind) : (end += 1) {
+            const target = actions[end].target;
+            for (names.items) |known| {
+                if (std.mem.eql(u8, known, target)) break;
+            } else try names.append(arena, target);
+        }
+        if (index > 0) try writer.writeAll(" · ");
+        try writer.print("{s} ", .{kind.past()});
+        for (names.items[0..@min(names.items.len, explore_names)], 0..) |name, position| {
+            if (position > 0) try writer.writeAll(", ");
+            try writer.writeAll(name);
+        }
+        if (names.items.len > explore_names) try writer.print(", +{d}", .{names.items.len - explore_names});
+        index = end;
+    }
+    return out.written();
 }
 
 fn appendItem(arena: Allocator, rows: *std.ArrayList(Row), item: Item, style: Style, tail: bool) !void {
@@ -382,11 +465,11 @@ fn appendItem(arena: Allocator, rows: *std.ArrayList(Row), item: Item, style: St
     });
     // A card keeps one row under it: the one that carries its outcome.
     if (item.continuation) |continuation| {
-        if (firstRow(continuation)) |row| try appendBody(arena, rows, item.entry_id, row);
+        if (firstRow(continuation)) |row| try bodies.appendBody(arena, rows, item.entry_id, row);
     }
-    if (tail) try appendCommandBody(arena, rows, item);
+    if (tail) try bodies.appendCommandBody(arena, rows, item);
     if (item.detail) |record| if (try checklistView(arena, record)) |view| {
-        for (view.body) |line| try appendBody(arena, rows, item.entry_id, try safeLine(arena, line));
+        for (view.body) |line| try bodies.appendBody(arena, rows, item.entry_id, try bodies.safeLine(arena, line));
     };
 }
 
@@ -432,9 +515,9 @@ fn itemText(arena: Allocator, item: Item) ![]const u8 {
         };
         // With a reason, the command moves to the row below; without one
         // the row names the command.
-        if (try human_text.failureReason(arena, commandOutput(record))) |reason| return arena.print("{s} · {s}", .{ label, reason });
-        const name = if (commandText(arena, record)) |command|
-            if (python_outline.script(command)) |found| found.interpreter else firstLineOf(command)
+        if (try human_text.failureReason(arena, bodies.commandOutput(record))) |reason| return arena.print("{s} · {s}", .{ label, reason });
+        const name = if (bodies.commandText(arena, record)) |command|
+            if (python_outline.script(command)) |found| found.interpreter else bodies.firstLineOf(command)
         else if (std.mem.startsWith(u8, item.phrase, "Ran "))
             item.phrase["Ran ".len..]
         else
@@ -446,9 +529,10 @@ fn itemText(arena: Allocator, item: Item) ![]const u8 {
     const verb = for ([_][]const u8{ "Ran", "Running" }) |candidate| {
         if (std.mem.startsWith(u8, item.phrase, candidate) and item.phrase.len > candidate.len and item.phrase[candidate.len] == ' ') break candidate;
     } else return item.phrase;
-    const command = commandText(arena, record) orelse return item.phrase;
+    if (exploredItem(arena, item)) |actions| return command_summary.phrase(arena, actions, isLive(record));
+    const command = bodies.commandText(arena, record) orelse return item.phrase;
     if (python_outline.script(command)) |found| return arena.print("{s} {s}", .{ verb, found.interpreter });
-    const first = firstLineOf(command);
+    const first = bodies.firstLineOf(command);
     if (first.len < std.mem.trimEnd(u8, command, " \t\r\n").len) return arena.print("{s} {s} …", .{ verb, first });
     return item.phrase;
 }
@@ -478,162 +562,6 @@ fn browserText(arena: Allocator, item: Item, record: *const ToolDetailRecord) ![
         return arena.print("{s} · navigation blocked", .{summary});
     }
     return summary;
-}
-
-/// The command as the model wrote it, newlines intact, which a heredoc's
-/// outline needs; the display text folds them away.
-fn commandText(arena: Allocator, record: *const ToolDetailRecord) ?[]const u8 {
-    if (record.arguments_json) |json| {
-        if (tool_args.parseToolArgsObject(arena, json)) |args| {
-            if (tool_args.optionalStringArg(args, "command")) |command| return command;
-            if (std.mem.eql(u8, record.tool_name, "browser")) if (tool_args.optionalStringArg(args, "code")) |code| return code;
-        } else |_| {}
-    }
-    return record.command_display;
-}
-
-/// The output a command printed, as people saw it: a shell call's result is
-/// its visible output. Other command tools keep an envelope for the model,
-/// so their output stays in the full transcript.
-fn commandOutput(record: *const ToolDetailRecord) []const u8 {
-    if (!std.mem.eql(u8, record.tool_name, "shell") and !std.mem.eql(u8, record.tool_name, "browser")) return "";
-    return record.result orelse "";
-}
-
-fn firstLineOf(text: []const u8) []const u8 {
-    return std.mem.trimEnd(u8, text[0 .. std.mem.findScalar(u8, text, '\n') orelse text.len], " \t\r");
-}
-
-/// The rows under a command: what ran, when the row does not say it, the
-/// outline of its Python, then the end of its output.
-fn appendCommandBody(arena: Allocator, rows: *std.ArrayList(Row), item: Item) !void {
-    const record = item.detail.?;
-    const command = commandText(arena, record) orelse "";
-    const failed = commandFailed(record);
-    const reason = if (failed) try human_text.failureReason(arena, commandOutput(record)) else null;
-    if (std.mem.eql(u8, record.tool_name, "browser")) return appendBrowserBody(arena, rows, item.entry_id, command, commandOutput(record));
-    const script = python_outline.script(command);
-    if (failed and reason != null and command.len > 0) {
-        const shown = if (script) |found| try arena.print("{s} {s}", .{ found.interpreter, found.form }) else firstLineOf(command);
-        try appendBody(arena, rows, item.entry_id, try arena.print("$ {s}", .{shown}));
-    }
-    if (script) |found| try appendScriptBody(arena, rows, item.entry_id, found);
-    const output = commandOutput(record);
-    var lines: std.ArrayList([]const u8) = .empty;
-    var split = std.mem.splitScalar(u8, output, '\n');
-    while (split.next()) |raw| {
-        const line = visibleLine(raw);
-        if (std.mem.trim(u8, line, " \t").len == 0) continue;
-        if (reason) |text| if (std.mem.eql(u8, std.mem.trim(u8, line, " \t"), text)) continue;
-        try lines.append(arena, line);
-    }
-    const start = lines.items.len -| tail_lines;
-    // An outline and the output it printed read apart.
-    if (script != null and lines.items.len > 0) try appendBody(arena, rows, item.entry_id, "Output");
-    if (start > 0) try appendBody(arena, rows, item.entry_id, try arena.print("… {d} earlier line{s}", .{ start, if (start == 1) "" else "s" }));
-    // The tail keeps its own indentation, less what all of it shares.
-    var common: usize = std.math.maxInt(usize);
-    for (lines.items[start..]) |line| common = @min(common, line.len - std.mem.trimStart(u8, line, " ").len);
-    for (lines.items[start..]) |*line| line.* = line.*[common..];
-    for (lines.items[start..]) |line| {
-        const plain = try std.mem.replaceOwned(u8, arena, try stripEscapes(arena, line), "\t", "    ");
-        const safe = try text_utils.encodeTerminalSafe(arena, plain, 400);
-        try appendBody(arena, rows, item.entry_id, safe.bytes);
-    }
-}
-
-/// A browser run as a code block: the script's first lines, then the end
-/// of what it displayed and returned.
-fn appendBrowserBody(arena: Allocator, rows: *std.ArrayList(Row), entry_id: u32, code: []const u8, output: []const u8) !void {
-    var lines: std.ArrayList([]const u8) = .empty;
-    var split = std.mem.splitScalar(u8, std.mem.trimEnd(u8, code, " \t\r\n"), '\n');
-    while (split.next()) |line| if (std.mem.trim(u8, line, " \t\r").len > 0) try lines.append(arena, line);
-    const limit = if (lines.items.len > browser_code_rows) browser_code_rows - 1 else lines.items.len;
-    for (lines.items[0..limit]) |line| try appendBody(arena, rows, entry_id, try safeLine(arena, line));
-    if (limit < lines.items.len) try appendBody(arena, rows, entry_id, try arena.print("… {d} more lines", .{lines.items.len - limit}));
-    var tail: std.ArrayList([]const u8) = .empty;
-    var out_split = std.mem.splitScalar(u8, output, '\n');
-    while (out_split.next()) |raw| {
-        const line = visibleLine(raw);
-        // The saved-images notice is for the model, not the person.
-        if (std.mem.startsWith(u8, line, "Saved images: ")) continue;
-        if (std.mem.trim(u8, line, " \t").len > 0) try tail.append(arena, line);
-    }
-    if (tail.items.len == 0) return;
-    try appendBody(arena, rows, entry_id, "Output");
-    const start = tail.items.len -| tail_lines;
-    if (start > 0) try appendBody(arena, rows, entry_id, try arena.print("… {d} earlier line{s}", .{ start, if (start == 1) "" else "s" }));
-    for (tail.items[start..]) |line| try appendBody(arena, rows, entry_id, try safeLine(arena, line));
-}
-
-/// A Python cell as proto shows it: the shell around it when the command
-/// does more than run it, and between, the cell's outline, or its first
-/// lines when the outline cannot read it.
-fn appendScriptBody(arena: Allocator, rows: *std.ArrayList(Row), entry_id: u32, found: python_outline.Script) !void {
-    const mixed = found.mixed();
-    if (mixed) {
-        var before: std.ArrayList([]const u8) = .empty;
-        var split = std.mem.splitScalar(u8, found.before, '\n');
-        while (split.next()) |line| if (std.mem.trim(u8, line, " \t\r").len > 0) try before.append(arena, line);
-        for (before.items[before.items.len -| shell_chunk_lines..]) |line| try appendBody(arena, rows, entry_id, try safeLine(arena, line));
-    }
-    if (try python_outline.parse(arena, found.code)) |outline| {
-        for (try python_outline.rows(arena, outline, outline_rows)) |row| try appendBody(arena, rows, entry_id, try safeLine(arena, row));
-    } else {
-        var lines: std.ArrayList([]const u8) = .empty;
-        var split = std.mem.splitScalar(u8, std.mem.trimEnd(u8, found.code, " \t\r\n"), '\n');
-        while (split.next()) |line| if (std.mem.trim(u8, line, " \t\r").len > 0) try lines.append(arena, line);
-        const limit = if (lines.items.len > outline_rows) outline_rows - 1 else lines.items.len;
-        for (lines.items[0..limit]) |line| try appendBody(arena, rows, entry_id, try safeLine(arena, line));
-        if (limit < lines.items.len) try appendBody(arena, rows, entry_id, try arena.print("… {d} more lines", .{lines.items.len - limit}));
-    }
-    if (mixed) {
-        var shown: usize = 0;
-        var split = std.mem.splitScalar(u8, found.after, '\n');
-        while (split.next()) |line| {
-            if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
-            if (shown == shell_chunk_lines) {
-                try appendBody(arena, rows, entry_id, "…");
-                break;
-            }
-            try appendBody(arena, rows, entry_id, try safeLine(arena, line));
-            shown += 1;
-        }
-    }
-}
-
-fn safeLine(arena: Allocator, line: []const u8) ![]const u8 {
-    const plain = try std.mem.replaceOwned(u8, arena, std.mem.trimEnd(u8, line, " \t\r"), "\t", "    ");
-    return (try text_utils.encodeTerminalSafe(arena, plain, 400)).bytes;
-}
-
-fn appendBody(arena: Allocator, rows: *std.ArrayList(Row), entry_id: u32, text: []const u8) !void {
-    try rows.append(arena, .{ .entry_id = entry_id, .kind = .body, .style = .dim, .text = text });
-}
-
-/// What a terminal shows of a line: the text after its last carriage return.
-fn visibleLine(raw: []const u8) []const u8 {
-    const line = std.mem.trimEnd(u8, raw, "\r");
-    return if (std.mem.findScalarLast(u8, line, '\r')) |at| line[at + 1 ..] else line;
-}
-
-/// The line without terminal escape sequences, so output colors never
-/// reach the transcript's own styling.
-fn stripEscapes(arena: Allocator, line: []const u8) ![]const u8 {
-    if (std.mem.findScalar(u8, line, 0x1b) == null) return line;
-    var out: std.ArrayList(u8) = .empty;
-    var index: usize = 0;
-    while (index < line.len) {
-        if (line[index] == 0x1b and index + 1 < line.len and line[index + 1] == '[') {
-            index += 2;
-            while (index < line.len and (line[index] < 0x40 or line[index] > 0x7e)) index += 1;
-            index += 1;
-            continue;
-        }
-        try out.append(arena, line[index]);
-        index += 1;
-    }
-    return out.items;
 }
 
 // ---- folds -----------------------------------------------------------------
@@ -731,9 +659,9 @@ fn targetOf(phrase: []const u8) []const u8 {
 
 /// A command as a fold lists it: its first line, short.
 fn commandName(arena: Allocator, record: *const ToolDetailRecord) ?[]const u8 {
-    const command = commandText(arena, record) orelse return null;
+    const command = bodies.commandText(arena, record) orelse return null;
     if (python_outline.script(command)) |found| return found.interpreter;
-    const first = firstLineOf(command);
+    const first = bodies.firstLineOf(command);
     if (first.len <= fold_name_bytes) return first;
     var end: usize = fold_name_bytes;
     while (end > 0 and (first[end] & 0xc0) == 0x80) end -= 1;
@@ -930,4 +858,49 @@ test "checklist rows read by what changed, with the list or the progress under t
     for (rows) |row| try texts.append(arena, row.text);
     const joined = try std.mem.join(arena, "\n", texts.items);
     try std.testing.expectEqualStrings("Planned 2 tasks\n→ Write parser\n○ Add tests\nCompleted Write parser\n1 of 2 done · next: Add tests", joined);
+}
+
+fn shellRun(arena: Allocator, entry_id: u32, command: []const u8, output: []const u8, exit_code: i32) !ToolDetailRecord {
+    var record = testRecord(entry_id, "shell", .command, try arena.print("{f}", .{std.json.fmt(.{ .action = "run", .command = command }, .{})}));
+    record.command_display = @constCast(command);
+    record.command_process_presentation = .{ .exit_code = exit_code };
+    record.result = @constCast(output);
+    return record;
+}
+
+test "reading commands fold into one Explored row and only other commands keep their output" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var records = [_]ToolDetailRecord{
+        try shellRun(arena, 1, "ls -la ~/code/proto 2>/dev/null", "a\nb\n", 0),
+        try shellRun(arena, 2, "cd ~/code/proto && sed -n '1,120p' packages/tui/src/components/markdown.ts", "line\n", 0),
+        try shellRun(arena, 3, "cd ~/code/proto && grep -n \"table\" packages/tui/src/components/markdown.ts | head -60", "12: table\n", 0),
+        try shellRun(arena, 4, "cd ~/code/proto && cat package.json", "{}\n", 0),
+        try shellRun(arena, 5, "cd ~/code/proto && git log --oneline -3", "abc first\n", 0),
+        try shellRun(arena, 6, "rg -n nothing-here src", "", 1),
+    };
+    var items: [records.len]Item = undefined;
+    for (&items, &records) |*item, *record| item.* = .{ .entry_id = record.entry_id, .detail = record, .phrase = try arena.print("Ran {s}", .{record.command_display.?}) };
+    const summary = try header(arena, &items);
+    try std.testing.expectEqualStrings("Read 2 files, searched 2 patterns, listed 1 directory and 1 other call", summary.words);
+    try std.testing.expectEqualStrings("", summary.attention);
+    const rows = try plan(arena, &items, false);
+    var texts: std.ArrayList([]const u8) = .empty;
+    for (rows) |row| try texts.append(arena, try arena.print("{s}:{s}", .{ @tagName(row.style), row.text }));
+    try std.testing.expectEqualStrings(
+        \\dim:Explored · Listed ~/code/proto · Read markdown.ts:1-120 · Searched "table" in markdown.ts · Read package.json · Searched "nothing-here" in src
+        \\normal:Ran cd ~/code/proto && git log --oneline -3
+        \\dim:abc first
+    , try std.mem.join(arena, "\n", texts.items));
+
+    // A group of one read reads as what it read, with nothing under it.
+    const one = try single(arena, items[1]);
+    try std.testing.expectEqual(@as(usize, 1), one.len);
+    try std.testing.expectEqualStrings("Read markdown.ts:1-120", one[0].text);
+    // While it runs it says so.
+    records[2].outcome = null;
+    records[2].command_process_presentation = null;
+    const live = try single(arena, items[2]);
+    try std.testing.expectEqualStrings("Searching \"table\" in markdown.ts", live[0].text);
 }

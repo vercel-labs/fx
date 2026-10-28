@@ -5262,6 +5262,8 @@ test {
     _ = @import("ui/transcript/runtime_tests.zig");
     _ = @import("ui/transcript/tool_group_tiers.zig");
     _ = @import("ui/transcript/python_outline.zig");
+    _ = @import("ui/transcript/command_summary.zig");
+    _ = @import("ui/transcript/tool_group_bodies.zig");
     _ = @import("ui/footer/tool_input_preview_view.zig");
     _ = @import("core/shared/tool_input_preview.zig");
     _ = @import("core/agent/runtime/tool_input_preview.zig");
