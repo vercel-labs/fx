@@ -165,8 +165,48 @@ pub fn toolUpdateContentText(is_failure: bool, output: []const u8) []const u8 {
     {
         return output;
     }
-    return text_utils.utf8PrefixByBytes(output, 200);
+    return text_utils.utf8PrefixByBytes(output, content_preview_bytes);
 }
+
+/// The most text a tool_call_update's content carries for tool output.
+const content_preview_bytes = 200;
+
+/// The end of a running command's output, for its live tool_call_update.
+/// ACP replaces a card's content with each update, so every progress update
+/// carries this tail of the output so far rather than only the newest chunk.
+/// Keeps the last `content_preview_bytes`; once older bytes are dropped,
+/// `text` starts at a whole line, or at a whole UTF-8 sequence when the kept
+/// bytes hold no line start.
+pub const OutputTail = struct {
+    bytes: [content_preview_bytes]u8 = undefined,
+    len: usize = 0,
+    cut: bool = false,
+
+    pub fn append(self: *OutputTail, chunk: []const u8) void {
+        if (chunk.len >= self.bytes.len) {
+            self.cut = self.cut or self.len > 0 or chunk.len > self.bytes.len;
+            @memcpy(&self.bytes, chunk[chunk.len - self.bytes.len ..]);
+            self.len = self.bytes.len;
+            return;
+        }
+        const keep = @min(self.len, self.bytes.len - chunk.len);
+        if (keep < self.len) self.cut = true;
+        @memmove(self.bytes[0..keep], self.bytes[self.len - keep .. self.len]);
+        @memcpy(self.bytes[keep..][0..chunk.len], chunk);
+        self.len = keep + chunk.len;
+    }
+
+    pub fn text(self: *const OutputTail) []const u8 {
+        const kept = self.bytes[0..self.len];
+        if (!self.cut) return kept;
+        if (std.mem.findScalar(u8, kept, '\n')) |index| {
+            if (index + 1 < kept.len) return kept[index + 1 ..];
+        }
+        var start: usize = 0;
+        while (start < kept.len and kept[start] & 0xC0 == 0x80) start += 1;
+        return kept[start..];
+    }
+};
 
 test "describeToolCall flags internal discovery and names MCP identity" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -230,6 +270,36 @@ test "toolUpdateContentText clips long output and guards unsafe bytes" {
     const denied_json = "{\"error\":{\"type\":\"tool_permission_denied\",\"tool_name\":\"run_command\",\"message\":\"Permission denied by user\",\"reason\":\"user_denied\"}}";
     const denied = toolUpdateContentText(true, denied_json);
     try std.testing.expectEqualStrings(denied_json, denied);
+}
+
+test "output tail accumulates until the preview bound" {
+    var tail: OutputTail = .{};
+    tail.append("step-1\n");
+    tail.append("step-2\n");
+    try std.testing.expectEqualStrings("step-1\nstep-2\n", tail.text());
+}
+
+test "output tail slides to the newest whole lines" {
+    var tail: OutputTail = .{};
+    var line_buf: [16]u8 = undefined;
+    for (0..100) |index| tail.append(try std.mem.print(&line_buf, "line-{d:0>3}\n", .{index}));
+    const shown = tail.text();
+    try std.testing.expect(shown.len <= content_preview_bytes);
+    try std.testing.expect(std.mem.startsWith(u8, shown, "line-"));
+    try std.testing.expect(std.mem.endsWith(u8, shown, "line-099\n"));
+}
+
+test "output tail keeps whole UTF-8 sequences without a line start" {
+    var tail: OutputTail = .{};
+    // 302 bytes, so the kept 200 begin inside a two-byte sequence.
+    tail.append("x" ++ text_utils.repeat("\u{e9}", 150) ++ "z");
+    try std.testing.expect(std.unicode.utf8ValidateSlice(tail.text()));
+    try std.testing.expectEqual(content_preview_bytes - 1, tail.text().len);
+    try std.testing.expect(std.mem.endsWith(u8, tail.text(), "z"));
+
+    var single: OutputTail = .{};
+    single.append(text_utils.repeat("y", 500) ++ "\n");
+    try std.testing.expectEqualStrings(text_utils.repeat("y", content_preview_bytes - 1) ++ "\n", single.text());
 }
 
 fn expectShellUpdateContent(expected: ?[]const u8, tool_name: []const u8, output: []const u8) !void {

@@ -247,6 +247,10 @@ const AcpContext = struct {
     /// card stands. Keys are owned copies of provider call ids so the ID
     /// stays stable from permission review through execution.
     published_tool_calls: std.StringHashMapUnmanaged(ToolCallCard) = .empty,
+    /// The card whose command output `command_output_tail` holds, borrowed
+    /// from `published_tool_calls`. One command streams at a time.
+    command_output_call: ?[]const u8 = null,
+    command_output_tail: tool_call_presentation.OutputTail = .{},
     message_id: acp_types.MessageIdBuffer = undefined,
     message_kind: ?AgentMessageKind = null,
     stop_reason: acp_types.StopReason = .end_turn,
@@ -436,6 +440,25 @@ const AcpContext = struct {
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
         try acp_types.writeToolCallUpdate(&out.writer, tool_call_id, .in_progress, plain);
+        try self.sendUpdate(out.writer.buffered());
+    }
+
+    /// Sends the tail of a running command's output so far. Output for a
+    /// call without a card goes out chunk by chunk, as before.
+    fn sendCommandOutputProgress(self: *AcpContext, tool_call_id: []const u8, chunk: []const u8) !void {
+        const call_id = self.published_tool_calls.getKey(tool_call_id) orelse
+            return self.sendToolCallProgressText(tool_call_id, chunk);
+        const same_call = if (self.command_output_call) |current| std.mem.eql(u8, current, call_id) else false;
+        if (!same_call) {
+            self.command_output_call = call_id;
+            self.command_output_tail = .{};
+        }
+        const plain = try stripAnsiAlloc(self.alloc, chunk);
+        defer if (plain.ptr != chunk.ptr) self.alloc.free(plain);
+        self.command_output_tail.append(plain);
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        defer out.deinit();
+        try acp_types.writeToolCallUpdate(&out.writer, call_id, .in_progress, self.command_output_tail.text());
         try self.sendUpdate(out.writer.buffered());
     }
 
@@ -3244,7 +3267,7 @@ fn formatToolExecutionError(_: *anyopaque, arena: Allocator, tool_name: []const 
 fn onCommandOutputChunk(raw_ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId, _: command_output_content.Stream, chunk: []const u8) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const id = lifecycle_id orelse return;
-    try ctx.sendToolCallProgressText(id.call_id, chunk);
+    try ctx.sendCommandOutputProgress(id.call_id, chunk);
 }
 
 fn onMcpProgress(raw_ctx: *anyopaque, lifecycle_id: types.ToolLifecycleId, text: []const u8) void {

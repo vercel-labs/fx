@@ -1110,6 +1110,44 @@ test("ACP shell completed and replayed updates show the command output", async (
   }
 }, 45000);
 
+for (const [command, expectEnd] of [
+  ["for i in 1 2 3; do echo step-$i; sleep 0.2; done", "step-1\nstep-2\nstep-3\n"],
+  ["seq 1 400", "398\n399\n400\n"],
+] as const) {
+  test(`ACP shell progress shows the output so far: ${command}`, async () => {
+    const fixture = createConfiguredProviderFixture(body => body.messages.some((message: any) => message.role === "tool")
+      ? configuredCompletion(body.model, "done")
+      : configuredToolCompletion(body.model, "shell", { request: { action: "run", yield_time_ms: 30_000, command } }, "call_progress"));
+    let client: AcpClient | undefined;
+    try {
+      client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+      await client.request("initialize", { protocolVersion: 1 }, 1);
+      const created = await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }, 2) as any;
+      if (created.error) throw new Error(JSON.stringify(created));
+      await client.request("session/set_mode", { modeId: "full-access" }, 3);
+      const prompt = await runPrompt(client, "Run the command.", TIMEOUT);
+      expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+      const progress = prompt.messages
+        .filter((message: any) => message.method === "session/update" && message.params?.update?.toolCallId === "call_progress" && message.params.update.status === "in_progress")
+        .map((message: any) => acpContentText(message.params.update.content))
+        .filter((text: string) => text.length > 0);
+      expect(progress.length).toBeGreaterThan(1);
+      const last = progress.at(-1)!;
+      expect(last.endsWith(expectEnd)).toBe(true);
+      expect(Buffer.byteLength(last)).toBeLessThanOrEqual(200);
+      // Each update is the output so far, starting at a whole line.
+      const full = command.startsWith("seq")
+        ? Array.from({ length: 400 }, (_, index) => `${index + 1}\n`).join("")
+        : expectEnd;
+      for (const text of progress) expect(full.startsWith(text) || full.includes(`\n${text}`)).toBe(true);
+      expect(client.stderr).toBe("");
+    } finally {
+      await client?.close();
+      fixture.close();
+    }
+  }, 45000);
+}
+
 test("ACP finishes tool calls that a cancel stopped before they ran", async () => {
   const root = createIsolatedRoot("fx-acp-cancel-cards-");
   const gateway = startFakeGateway([
