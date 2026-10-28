@@ -5536,6 +5536,45 @@ test "a hidden subagent's approval is lent to main's screen, answered on its wor
     try std.testing.expect(app.lentApproval() == null);
 }
 
+test "an approval answered on main's screen goes back, so the next one of the tree is lent" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const writer = try addTestChildAgent(&app, "writer-id");
+    writer.name = try alloc.dupe(u8, "writer");
+    const reader = try addTestChildAgent(&app, "reader-id");
+    reader.name = try alloc.dupe(u8, "reader");
+    defer for ([_]*agents.Agent{ &app.main_agent, &writer.agent, &reader.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    _ = try writer.agent.approval_prompt.syncRequest(alloc, .{ .id = 7, .label = "shell ls", .origin = .{ .subagent = "writer" } });
+    _ = try reader.agent.approval_prompt.syncRequest(alloc, .{ .id = 9, .label = "shell pwd", .origin = .{ .subagent = "reader" } });
+    App.AgentsAppRuntime.lendApproval(&app);
+    try std.testing.expect(app.approval_lender == writer);
+
+    // The user answers it on main's screen: the prompt there clears and the
+    // writer's worker stops asking. Synced in the writer's context, the
+    // answered approval goes back instead of staying lent.
+    app.main_agent.approval_prompt.clearAfterAcceptedSubmission(alloc);
+    const InWriter = struct {
+        fn run(_: void, a: *App, agent: *agents.Agent) anyerror!void {
+            try std.testing.expect(!a.keepLentApproval(agent, null));
+            try std.testing.expect(a.approval_lender == null);
+            try std.testing.expect(!agent.approval_prompt.isActive());
+        }
+    };
+    try App.AgentsAppRuntime.visit(&app, writer, {}, InWriter.run);
+
+    // The reader's approval, still waiting, shows on main's screen next.
+    App.AgentsAppRuntime.lendApproval(&app);
+    try std.testing.expect(app.approval_lender == reader);
+    try std.testing.expectEqual(@as(u64, 9), app.main_agent.approval_prompt.request.?.id);
+}
+
 test "a hidden subagent's question is lent to main's screen and goes back on a switch" {
     const alloc = std.testing.allocator;
     var app = App{ .alloc = alloc };
