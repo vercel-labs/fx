@@ -10,6 +10,7 @@ test {
     _ = @import("core/agent/assistant_presentation.zig");
     _ = @import("core/agent/runtime/execution_memory.zig");
     _ = @import("core/agent/runtime/vision_contracts.zig");
+    _ = @import("core/agent/worker_runtime.zig");
     _ = @import("core/app/app_agents_runtime.zig");
     _ = @import("core/app/host_record.zig");
     _ = @import("core/images/image_attachments.zig");

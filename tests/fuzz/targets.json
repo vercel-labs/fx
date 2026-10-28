@@ -5,6 +5,7 @@
     {"name": "host_record_decode", "module": "fx", "test": "a host record file decodes or is refused on fuzzed bytes", "iterations": 1500000},
     {"name": "host_restore", "module": "fx", "test": "restoring holds for fuzzed sets of records", "iterations": 2000000},
     {"name": "switch_order", "module": "fx", "test": "the switch order holds for fuzzed hosts", "iterations": 4000000},
+    {"name": "queue_placement", "module": "fx", "test": "queue placement delivers each message once and in order on fuzzed sequences", "iterations": 200000},
     {"name": "profile_parse", "module": "fx", "test": "profile parsing stays bounded on fuzzed settings and prompts", "iterations": 1000000},
     {"name": "image_dimensions", "module": "fx", "test": "image dimension parsing stays bounded on arbitrary bytes", "iterations": 5000000},
     {"name": "image_route", "module": "fx", "test": "the core keeps the model's laws on arbitrary event sequences", "iterations": 5000000},

@@ -569,6 +569,9 @@ pub const WorkerRuntime = struct {
     /// Guarded by `worker_mutex`; explicit cancellation clears this ownership.
     steering_cancel_turn_id: ?u64 = null,
     direct_steering_closed: bool = false,
+    /// Set by `nudgeWaiter` and cleared by `waitForPostOrNudge`, so a nudge
+    /// sent before the wait starts still ends it. Guarded by `worker_mutex`.
+    mail_nudged: bool = false,
     /// When true, queued work will not start.
     turn_start_held: bool = false,
     /// Independent of a pending submission's turn-start hold; protects queued
@@ -958,17 +961,68 @@ pub const WorkerRuntime = struct {
     }
 
     /// Takes prompt ownership only on true. Does not cancel an in-flight operation
-    /// or fall back to the ordinary FIFO of an ephemeral direct worker.
+    /// or fall back to the ordinary FIFO of an ephemeral direct worker. Refuses
+    /// while older work or a message for a later turn waits, so it never joins
+    /// the running turn past them.
     pub fn admitActiveSteering(self: *WorkerRuntime, alloc: std.mem.Allocator, prompt: QueuedPrompt) !bool {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         if (!self.worker_processing or self.active_turn_id == 0 or
             self.direct_steering_closed or self.worker_stop_requested or
-            self.worker_cancel_requested.load(.seq_cst)) return false;
+            self.worker_cancel_requested.load(.seq_cst) or self.olderMailWaitsLocked()) return false;
         var queued = prompt;
         queued.delivery = .{ .active_turn = self.active_turn_id };
         try self.enqueuePromptLocked(alloc, queued);
         return true;
+    }
+
+    /// Posts a message from another agent. It joins the running turn when
+    /// nothing older waits, and otherwise waits for the next turn, which
+    /// takes it in when it starts; an idle worker starts that turn. It never
+    /// interrupts the model. Takes ownership of `prompt` on success.
+    pub fn postMail(self: *WorkerRuntime, alloc: std.mem.Allocator, prompt: QueuedPrompt) !void {
+        var queued = prompt;
+        if (queued.turn_id == 0) queued.turn_id = debug_trace.nextTurnId();
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.finalization_failure != null) return error.TurnFinalizationDeliveryFailed;
+        if (self.worker_stop_requested) return error.WorkerStopped;
+        const joins = self.worker_processing and self.active_turn_id != 0 and
+            !self.direct_steering_closed and !self.worker_cancel_requested.load(.seq_cst) and
+            !self.olderMailWaitsLocked();
+        queued.delivery = if (joins) .{ .active_turn = self.active_turn_id } else .continuation;
+        queued.agent_settings = self.agent_turn_settings;
+        try self.enqueuePromptLocked(alloc, queued);
+    }
+
+    pub const PostWake = enum { posted, nudged, stopped };
+
+    /// Ends a `waitForPostOrNudge` without queueing anything: the host's
+    /// call when a child's turn ends with nothing to post, so a wait on that
+    /// child can return.
+    pub fn nudgeWaiter(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.mail_nudged = true;
+        self.worker_cond.broadcast(io_mod.getIo());
+    }
+
+    /// Blocks until a prompt is queued for this worker, whatever it carries,
+    /// a nudge arrives, or a stop or cancel is requested. A nudge sent
+    /// before the wait starts still ends it.
+    pub fn waitForPostOrNudge(self: *WorkerRuntime) PostWake {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        while (self.queued_prompts.items.len == 0) {
+            if (self.worker_stop_requested or self.worker_cancel_requested.load(.seq_cst)) return .stopped;
+            if (self.mail_nudged) {
+                self.mail_nudged = false;
+                return .nudged;
+            }
+            self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch return .stopped;
+        }
+        self.mail_nudged = false;
+        return .posted;
     }
 
     pub fn enqueueContextCompaction(
@@ -1046,8 +1100,10 @@ pub const WorkerRuntime = struct {
         return false;
     }
 
-    /// Transfers `prompt` to the active turn when steering is requested and the
-    /// turn still accepts guidance. Otherwise it enters the ordinary FIFO.
+    /// Transfers `prompt` to the active turn when steering is requested, the
+    /// turn still accepts guidance, and nothing older waits. Behind older
+    /// waiting work, a plain message rides into the next turn after it
+    /// instead of passing it; otherwise it enters the ordinary FIFO.
     /// A steer interrupts the model stream immediately only when no wait
     /// boundary is active; a running tool or an in-flight compaction defers
     /// delivery to the next steering boundary instead of being cancelled.
@@ -1076,11 +1132,15 @@ pub const WorkerRuntime = struct {
         var interrupt_after_admission = false;
         const explicitly_cancelled = self.worker_cancel_requested.load(.seq_cst) and
             self.steering_cancel_turn_id != self.active_turn_id;
+        const older_waits = self.olderMailWaitsLocked();
         if (steer_if_active and self.worker_processing and self.active_turn_id != 0 and
-            !explicitly_cancelled)
+            !explicitly_cancelled and !older_waits)
         {
             queued.delivery = .{ .active_turn = self.active_turn_id };
             interrupt_after_admission = !self.hasSteeringWaitBoundaryLocked();
+        } else if (steer_if_active and older_waits and sameTurnSteeringEligible(queued)) {
+            queued.delivery = .continuation;
+            debug_trace.eventf("worker", "steering_behind_waiting", .{ .turn_id = self.active_turn_id }, "queued_turn_id={d} queue_depth={d}", .{ queued.turn_id, self.queuedWorkCountLocked() });
         }
         try self.enqueuePromptLocked(alloc, queued);
         if (steer_if_active and self.worker_processing) {
@@ -1099,6 +1159,16 @@ pub const WorkerRuntime = struct {
         return prompt.images.len == 0 and
             prompt.skill_bindings.len == 0 and
             prompt.skill_display_spans.len == 0;
+    }
+
+    /// Whether a prompt waits that isn't the running turn's own: queued work,
+    /// or a message waiting for a later turn. A new message never joins the
+    /// running turn past one, so messages arrive in the order they were sent.
+    fn olderMailWaitsLocked(self: *const WorkerRuntime) bool {
+        for (self.queued_prompts.items) |prompt| {
+            if (prompt.delivery.activeTurnId() != self.active_turn_id) return true;
+        }
+        return false;
     }
 
     fn enqueuePromptLocked(self: *WorkerRuntime, alloc: std.mem.Allocator, queued_value: QueuedPrompt) !void {
@@ -1245,19 +1315,22 @@ pub const WorkerRuntime = struct {
         for (events[0..event_count]) |event| self.worker_events.appendAssumeCapacity(event);
         alloc.free(events);
 
-        var index: usize = 0;
-        while (index < self.queued_prompts.items.len) {
-            if (self.queued_prompts.items[index].delivery.activeTurnId() != turn_id) {
-                index += 1;
+        // One stable pass takes this turn's prompts and keeps the rest in
+        // order, so a boundary costs the same however many wait.
+        var kept: usize = 0;
+        for (self.queued_prompts.items) |prompt| {
+            if (prompt.delivery.activeTurnId() != turn_id) {
+                self.queued_prompts.items[kept] = prompt;
+                kept += 1;
                 continue;
             }
-            const prompt = self.queued_prompts.orderedRemove(index);
             if (prompt.steering_receipt) |receipt| {
                 receipt.state.store(.applied, .seq_cst);
                 debug_trace.eventf("subagent", "feedback_applied", .{}, "operation={s}", .{receipt.operation_id});
             }
             freeQueuedPrompt(alloc, prompt);
         }
+        self.queued_prompts.shrinkRetainingCapacity(kept);
         if (self.queued_prompts.items.len == 0) {
             types.freeHistoryTurnSlice(alloc, self.queued_history);
             self.queued_history = &.{};
@@ -1560,12 +1633,15 @@ pub const WorkerRuntime = struct {
         self.worker_processing = true;
         self.active_turn_id = job.turn_id;
         self.tool_phase_step_id = null;
-        if (job.delivery.isContinuation()) {
-            for (self.queued_prompts.items) |*prompt| {
-                if (!prompt.delivery.isContinuation() or !sameTurnSteeringEligible(prompt.*)) continue;
-                prompt.delivery = .{ .active_turn = job.turn_id };
-            }
+        // A turn takes in the messages waiting right behind it, in order, up
+        // to the first prompt that needs a turn of its own, so none passes it.
+        var absorbed: usize = 0;
+        for (self.queued_prompts.items) |*prompt| {
+            if (!prompt.delivery.isContinuation() or !sameTurnSteeringEligible(prompt.*)) break;
+            prompt.delivery = .{ .active_turn = job.turn_id };
+            absorbed += 1;
         }
+        if (absorbed > 0) debug_trace.eventf("worker", "continuations_absorbed", .{ .turn_id = job.turn_id }, "count={d}", .{absorbed});
         self.active_context_compaction = false;
         debug_trace.logf(
             "worker",
@@ -5169,6 +5245,313 @@ test "promoted steering keeps rich trailing guidance for its own turn" {
     defer freeQueuedPrompt(alloc, trailing);
     try std.testing.expect(trailing.delivery.isContinuation());
     try std.testing.expectEqualStrings("second with image", trailing.prompt);
+}
+
+test "a message behind waiting work rides into that work's turn instead of passing it" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "older work", "model"));
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "newer message", "model"));
+    // It waits for the next turn and leaves the running one alone.
+    try std.testing.expect(runtime.queued_prompts.items[1].delivery.isContinuation());
+    try std.testing.expect(!runtime.worker_cancel_requested.load(.seq_cst));
+    try std.testing.expect((try runtime.takeSteeringBoundary(alloc, 9, .model)) == .none);
+
+    runtime.finishProcessing();
+    const work = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, work);
+    try std.testing.expectEqualStrings("older work", work.prompt);
+    const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, work.turn_id, .model));
+    defer {
+        for (guidance) |text| alloc.free(text);
+        alloc.free(guidance);
+    }
+    try std.testing.expectEqual(@as(usize, 1), guidance.len);
+    try std.testing.expectEqualStrings("newer message", guidance[0]);
+    try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
+}
+
+test "a rich message behind waiting work keeps a turn of its own" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "older work", "model"));
+    try runtime.admitInteractivePrompt(alloc, try makeImagePrompt(alloc, "newer with image", "model"));
+    try std.testing.expect(runtime.queued_prompts.items[1].delivery == .ordinary);
+    try std.testing.expect(!runtime.worker_cancel_requested.load(.seq_cst));
+
+    runtime.finishProcessing();
+    const work = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, work);
+    try std.testing.expectEqualStrings("older work", work.prompt);
+    try std.testing.expect((try runtime.takeSteeringBoundary(alloc, work.turn_id, .model)) == .none);
+    runtime.finishProcessing();
+    const rich = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, rich);
+    try std.testing.expectEqualStrings("newer with image", rich.prompt);
+}
+
+test "a turn takes in only the messages right behind it, so none passes older work" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "first", "model"));
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "work", "model"));
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "third", "model"));
+    runtime.finishProcessing();
+
+    // The first message's turn stops at the work queued behind it.
+    const first = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, first);
+    try std.testing.expectEqualStrings("first", first.prompt);
+    try std.testing.expect((try runtime.takeSteeringBoundary(alloc, first.turn_id, .model)) == .none);
+    runtime.finishProcessing();
+
+    // The work's turn takes the third in.
+    const work = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, work);
+    try std.testing.expectEqualStrings("work", work.prompt);
+    const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, work.turn_id, .model));
+    defer {
+        for (guidance) |text| alloc.free(text);
+        alloc.free(guidance);
+    }
+    try std.testing.expectEqual(@as(usize, 1), guidance.len);
+    try std.testing.expectEqualStrings("third", guidance[0]);
+}
+
+test "a parent's message joins the running turn only while nothing older waits" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+
+    const early = try makePrompt(alloc, "early message", "model");
+    try std.testing.expect(try runtime.admitActiveSteering(alloc, early));
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "work", "model"));
+    const late = try makePrompt(alloc, "late message", "model");
+    try std.testing.expect(!(try runtime.admitActiveSteering(alloc, late)));
+    freeQueuedPrompt(alloc, late);
+    try std.testing.expectEqual(@as(usize, 2), runtime.queuedPromptCount());
+}
+
+test "a boundary takes the turn's messages in one pass and keeps the rest in order" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+
+    for ([_][]const u8{ "a", "x", "b", "y" }) |text| try runtime.enqueuePrompt(alloc, try makePrompt(alloc, text, "model"));
+    runtime.queued_prompts.items[0].delivery = .{ .active_turn = 9 };
+    runtime.queued_prompts.items[2].delivery = .{ .active_turn = 9 };
+    const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, 9, .model));
+    defer {
+        for (guidance) |text| alloc.free(text);
+        alloc.free(guidance);
+    }
+    try std.testing.expectEqual(@as(usize, 2), guidance.len);
+    try std.testing.expectEqualStrings("a", guidance[0]);
+    try std.testing.expectEqualStrings("b", guidance[1]);
+    try std.testing.expectEqual(@as(usize, 2), runtime.queuedPromptCount());
+    try std.testing.expectEqualStrings("x", runtime.queued_prompts.items[0].prompt);
+    try std.testing.expectEqualStrings("y", runtime.queued_prompts.items[1].prompt);
+}
+
+test "an agent's posted message joins the running turn, waits behind older work, or starts a turn" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+
+    // It joins the running turn without interrupting the model.
+    try runtime.postMail(alloc, try makePrompt(alloc, "joins", "model"));
+    try std.testing.expectEqual(@as(?u64, 9), runtime.queued_prompts.items[0].delivery.activeTurnId());
+    try std.testing.expect(!runtime.worker_cancel_requested.load(.seq_cst));
+
+    // Behind older work, it waits for the next turn.
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "work", "model"));
+    try runtime.postMail(alloc, try makePrompt(alloc, "waits", "model"));
+    try std.testing.expect(runtime.queued_prompts.items[2].delivery.isContinuation());
+
+    // To an idle worker, it starts a turn of its own.
+    var idle = WorkerRuntime{};
+    defer idle.deinit(alloc);
+    try idle.postMail(alloc, try makePrompt(alloc, "wakes", "model"));
+    const job = (try idle.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, job);
+    try std.testing.expectEqualStrings("wakes", job.prompt);
+    try std.testing.expect(job.delivery.isContinuation());
+}
+
+test "waiting for a post returns on a post, on a nudge sent before it, and on a cancel" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+
+    runtime.nudgeWaiter();
+    try std.testing.expectEqual(WorkerRuntime.PostWake.nudged, runtime.waitForPostOrNudge());
+    try std.testing.expect(!runtime.mail_nudged);
+
+    try runtime.postMail(alloc, try makePrompt(alloc, "posted", "model"));
+    try std.testing.expectEqual(WorkerRuntime.PostWake.posted, runtime.waitForPostOrNudge());
+    const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, 9, .model));
+    defer {
+        for (guidance) |text| alloc.free(text);
+        alloc.free(guidance);
+    }
+
+    runtime.requestCancel();
+    try std.testing.expectEqual(WorkerRuntime.PostWake.stopped, runtime.waitForPostOrNudge());
+}
+
+test "a blocked wait for a post wakes when another thread nudges or posts" {
+    const alloc = std.testing.allocator;
+    const Waiter = struct {
+        fn run(worker: *WorkerRuntime, woke: *WorkerRuntime.PostWake) void {
+            woke.* = worker.waitForPostOrNudge();
+        }
+    };
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+
+    var woke: WorkerRuntime.PostWake = .stopped;
+    var nudged = try std.Thread.spawn(.{}, Waiter.run, .{ &runtime, &woke });
+    io_mod.sleep(10 * std.time.ns_per_ms);
+    runtime.nudgeWaiter();
+    nudged.join();
+    try std.testing.expectEqual(WorkerRuntime.PostWake.nudged, woke);
+
+    woke = .stopped;
+    var posted = try std.Thread.spawn(.{}, Waiter.run, .{ &runtime, &woke });
+    io_mod.sleep(10 * std.time.ns_per_ms);
+    try runtime.postMail(alloc, try makePrompt(alloc, "posted", "model"));
+    posted.join();
+    try std.testing.expectEqual(WorkerRuntime.PostWake.posted, woke);
+}
+
+test "queue placement delivers each message once and in order on fuzzed sequences" {
+    try std.testing.fuzz({}, fuzzQueuePlacement, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").queue_placement.*),
+    });
+}
+
+/// Which numbered messages a fuzzed run sent and delivered: each one
+/// delivered must have been accepted, at most once, and after every message
+/// sent before it.
+const PlacementLog = struct {
+    accepted: [64]bool = @splat(false),
+    delivered: [64]bool = @splat(false),
+    last: ?u32 = null,
+
+    fn deliver(self: *PlacementLog, text: []const u8) !void {
+        const n = try std.fmt.parseInt(u32, text[1..], 10);
+        try std.testing.expect(self.accepted[n]);
+        try std.testing.expect(!self.delivered[n]);
+        if (self.last) |last| try std.testing.expect(n > last);
+        self.delivered[n] = true;
+        self.last = n;
+    }
+
+    fn expectAllDelivered(self: *const PlacementLog) !void {
+        for (self.accepted, self.delivered) |accepted, delivered| try std.testing.expect(!accepted or delivered);
+    }
+};
+
+/// Drives one worker through fuzzed steps: a message the user types, plain
+/// or with an image; work queued for a turn of its own; a parent's message to
+/// the running turn; another agent's posted message; a steering boundary; and
+/// a turn ending or the next one starting. Then it drains the queue.
+fn fuzzQueuePlacement(_: void, smith: *std.testing.Smith) !void {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    var log: PlacementLog = .{};
+    var sent: u32 = 0;
+    var steps: usize = 0;
+    while (steps < 48 and !smith.eos()) : (steps += 1) {
+        switch (smith.valueRangeAtMost(u8, 0, 6)) {
+            0, 1 => |kind| {
+                try runtime.admitInteractivePrompt(alloc, try placementPrompt(alloc, sent, kind == 1));
+                log.accepted[sent] = true;
+                sent += 1;
+            },
+            2 => {
+                try runtime.enqueuePrompt(alloc, try placementPrompt(alloc, sent, false));
+                log.accepted[sent] = true;
+                sent += 1;
+            },
+            3 => {
+                const prompt = try placementPrompt(alloc, sent, false);
+                if (try runtime.admitActiveSteering(alloc, prompt)) log.accepted[sent] = true else freeQueuedPrompt(alloc, prompt);
+                sent += 1;
+            },
+            4 => {
+                try runtime.postMail(alloc, try placementPrompt(alloc, sent, false));
+                log.accepted[sent] = true;
+                sent += 1;
+            },
+            5 => try placementBoundary(alloc, &runtime, &log),
+            else => try placementTurn(alloc, &runtime, &log),
+        }
+    }
+    var rounds: usize = 0;
+    while (runtime.worker_processing or runtime.queued_prompts.items.len > 0) : (rounds += 1) {
+        if (rounds > 400) return error.TestQueueDidNotDrain;
+        if (runtime.worker_processing) {
+            try placementBoundary(alloc, &runtime, &log);
+            if (runtime.worker_processing) runtime.finishProcessing();
+        } else try placementTurn(alloc, &runtime, &log);
+    }
+    try log.expectAllDelivered();
+}
+
+fn placementPrompt(alloc: std.mem.Allocator, n: u32, image: bool) !QueuedPrompt {
+    var buf: [16]u8 = undefined;
+    const text = try std.mem.print(&buf, "m{d}", .{n});
+    return if (image) makeImagePrompt(alloc, text, "model") else makePrompt(alloc, text, "model");
+}
+
+/// The running turn reaches a boundary, which delivers its messages, or
+/// ends it for a handoff or an interrupt.
+fn placementBoundary(alloc: std.mem.Allocator, runtime: *WorkerRuntime, log: *PlacementLog) !void {
+    if (!runtime.worker_processing) return;
+    const kind: SteeringBoundaryKind = if (runtime.worker_cancel_requested.load(.seq_cst)) .cancelled else .model;
+    switch (try runtime.takeSteeringBoundary(alloc, runtime.active_turn_id, kind)) {
+        .continue_turn => |messages| {
+            defer {
+                for (messages) |text| alloc.free(text);
+                alloc.free(messages);
+            }
+            for (messages) |text| try log.deliver(text);
+        },
+        .none => {},
+        .handoff, .interrupt => runtime.finishProcessing(),
+    }
+}
+
+/// Ends the running turn, or starts the next one, which delivers its prompt.
+fn placementTurn(alloc: std.mem.Allocator, runtime: *WorkerRuntime, log: *PlacementLog) !void {
+    if (runtime.worker_processing) return runtime.finishProcessing();
+    const job = (try runtime.tryTakeNextPrompt(alloc)) orelse return;
+    defer freeQueuedPrompt(alloc, job);
+    try log.deliver(job.prompt);
 }
 
 test "clear queued prompts also clears steering" {
