@@ -160,6 +160,10 @@ pub const State = struct {
     connection: ?*client_mod.Connection = null,
     link: Link = .connecting,
     connected_once: bool = false,
+    /// The connection dropped at least once. The startup banner then sits
+    /// in scrollback, so a transcript rebuild does not print it again
+    /// (D280).
+    outage_seen: bool = false,
     /// Requests not sent yet. They go out when the link is ready.
     queue: std.ArrayList(Request) = .empty,
     /// Sent requests awaiting their replies.
@@ -550,6 +554,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = @errorName(failure) }, true);
                 return;
             }
+            remote.outage_seen = true;
             const body = try app.alloc.print("Lost the connection to the supervisor ({s}). Reconnecting.", .{@errorName(failure)});
             defer app.alloc.free(body);
             try app.writeDomainNotice(.{ .topic = "session", .tone = .warning, .body = body }, true);

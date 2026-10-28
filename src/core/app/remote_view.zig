@@ -144,7 +144,13 @@ pub fn Runtime(comptime App: type) type {
             app.remote.native_source_turn_id = null;
             for (app.remote.submitted_text.items) |text| app.alloc.free(text);
             app.remote.submitted_text.clearRetainingCapacity();
-            app.shell.clearTranscriptPreservingWelcome(app.alloc);
+            // The banner belongs to process start only. A rebuild keeps it
+            // while it is still whole on screen, where it repaints in
+            // place; after an outage that scrolled it away, printing it
+            // again would duplicate it (D280).
+            const banner_on_screen = app.shell.last_visible_transcript_start_line == 0 and
+                app.shell.last_visible_transcript_partial_skip_rows == 0;
+            if (app.remote.outage_seen and !banner_on_screen) app.shell.clearTranscript(app.alloc) else app.shell.clearTranscriptPreservingWelcome(app.alloc);
             app.stream = .{};
             app.remote.resetHistory(app.alloc);
             _ = app.shell.worker_status_state().clear();
@@ -836,6 +842,24 @@ test "root native presentation preserves tool detail through steering and resets
     try std.testing.expectError(error.TestAppendRejected, app.apply(
         \\{"assistant_presentation":{"code_block":{"language":"zig","code":"const x = 1;"}}}
     ));
+}
+
+test "a transcript rebuild after a supervisor outage leaves the startup banner out" {
+    var app: NativePresentationTestApp = .{};
+    defer app.shell.deinit(app.alloc);
+    defer app.remote.deinit(app.alloc);
+    _ = try app.shell.appendRawTranscriptEntryClassified(app.alloc, "proto-fx · Run /help for commands\n\n", .welcome);
+    // Switching sessions at startup keeps the banner above the history.
+    Runtime(NativePresentationTestApp).resetTranscriptContents(&app);
+    try std.testing.expect(app.shell.hasOnlyWelcome());
+    // After an outage the banner repaints in place while it is on screen.
+    app.remote.outage_seen = true;
+    Runtime(NativePresentationTestApp).resetTranscriptContents(&app);
+    try std.testing.expect(app.shell.hasOnlyWelcome());
+    // Once it scrolled away, a restart's rebuild leaves it in scrollback.
+    app.shell.last_visible_transcript_start_line = 3;
+    Runtime(NativePresentationTestApp).resetTranscriptContents(&app);
+    try std.testing.expectEqual(@as(usize, 0), app.shell.entries.items.len);
 }
 
 test "own prompt echoes are skipped once while other prompts get a card" {
