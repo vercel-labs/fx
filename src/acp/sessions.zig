@@ -2046,7 +2046,7 @@ pub fn writeProviderConfigOption(
     current: model_provider.ProviderId,
     definitions: []const @import("../core/config/configured_provider.zig").Definition,
 ) !void {
-    try w.writeAll("{\"id\":\"provider\",\"name\":\"Provider\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":");
+    try w.writeAll("{\"id\":\"provider\",\"name\":\"Provider\",\"category\":\"model_config\",\"type\":\"select\",\"currentValue\":");
     try writeJsonStr(current.label(), w);
     try w.writeAll(",\"options\":[{\"value\":\"gateway\",\"name\":\"Vercel AI Gateway\"},{\"value\":\"codex\",\"name\":\"Codex subscription\"}");
     if (comptime !host_target.is_wasm) {
@@ -2134,7 +2134,7 @@ pub fn fastConfigState(state: *server.ServerState) ?bool {
 }
 
 pub fn writeFastConfigOption(w: *std.Io.Writer, current: bool) !void {
-    try w.writeAll("{\"id\":\"fast\",\"name\":\"Fast Mode\",\"description\":\"Uses the model's fast lane\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":");
+    try w.writeAll("{\"id\":\"fast\",\"name\":\"Fast Mode\",\"description\":\"Uses the model's fast lane\",\"category\":\"model_config\",\"type\":\"select\",\"currentValue\":");
     try writeJsonStr(if (current) "true" else "false", w);
     try w.writeAll(",\"options\":[{\"value\":\"false\",\"name\":\"off\"},{\"value\":\"true\",\"name\":\"on\"}]}");
 }
@@ -2170,7 +2170,7 @@ pub fn ultrafastConfigState(state: *server.ServerState) ?bool {
 }
 
 pub fn writeUltrafastConfigOption(w: *std.Io.Writer, current: bool) !void {
-    try w.writeAll("{\"id\":\"ultrafast\",\"name\":\"Ultrafast Mode\",\"description\":\"Uses the model's ultrafast Gateway lane\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":");
+    try w.writeAll("{\"id\":\"ultrafast\",\"name\":\"Ultrafast Mode\",\"description\":\"Uses the model's ultrafast Gateway lane\",\"category\":\"model_config\",\"type\":\"select\",\"currentValue\":");
     try writeJsonStr(if (current) "true" else "false", w);
     try w.writeAll(",\"options\":[{\"value\":\"false\",\"name\":\"off\"},{\"value\":\"true\",\"name\":\"on\"}]}");
 }
@@ -2272,6 +2272,35 @@ test "formatIso8601 produces known timestamp" {
     const result = try formatIso8601(alloc, 0);
     defer alloc.free(result);
     try std.testing.expectEqualStrings("1970-01-01T00:00:00Z", result);
+}
+
+test "ACP config options reserve the model category for model selection" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("[");
+    try writeProviderConfigOption(&out.writer, .gateway, &.{});
+    try out.writer.writeAll(",");
+    try writeModelConfigOption(&out.writer, "example/model", null);
+    try out.writer.writeAll(",");
+    try writeFastConfigOption(&out.writer, true);
+    try out.writer.writeAll(",");
+    try writeUltrafastConfigOption(&out.writer, false);
+    try out.writer.writeAll("]");
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
+    defer parsed.deinit();
+    var model_count: usize = 0;
+    for (parsed.value.array.items) |item| {
+        const option = item.object;
+        if (std.mem.eql(u8, option.get("category").?.string, "model")) {
+            model_count += 1;
+            try std.testing.expectEqualStrings("model", option.get("id").?.string);
+            try std.testing.expectEqualStrings("example/model", option.get("currentValue").?.string);
+        } else {
+            try std.testing.expectEqualStrings("model_config", option.get("category").?.string);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), model_count);
 }
 
 test "writeModelConfigOption produces valid json with single model fallback" {
