@@ -100,6 +100,7 @@ pub const Request = struct {
     api_key: []const u8,
     credential_source: ?types.CredentialSource = null,
     account_id: ?[]const u8 = null,
+    chatgpt_direct: bool = false,
     gateway_team: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
     prompt_excerpt: []const u8,
@@ -155,6 +156,7 @@ pub fn run(alloc: Allocator, request: Request) !Outcome {
             .secret_bytes = request.api_key,
             .source = request.credential_source,
             .account_id = request.account_id,
+            .chatgpt_direct = request.chatgpt_direct,
             .tenant_context = request.gateway_team,
         } };
     var delivery = stream_provider.DeliveryCertainty.init();
@@ -234,6 +236,7 @@ pub const Task = struct {
     api_key: ?[]u8 = null,
     gateway_team: ?[]u8 = null,
     account_id: ?[]u8 = null,
+    chatgpt_direct: bool = false,
     credential_source: ?types.CredentialSource = null,
     stream_provider: stream_provider.Provider,
     title: ?[]u8 = null,
@@ -253,6 +256,7 @@ pub const Task = struct {
         api_key: ?[]const u8 = null,
         gateway_team: ?[]const u8 = null,
         account_id: ?[]const u8 = null,
+        chatgpt_direct: bool = false,
         credential_source: ?types.CredentialSource = null,
         stream_provider: stream_provider.Provider,
     };
@@ -283,6 +287,7 @@ pub const Task = struct {
             .api_key = api_key,
             .gateway_team = gateway_team,
             .account_id = account_id,
+            .chatgpt_direct = init.chatgpt_direct,
             .credential_source = init.credential_source,
             .stream_provider = init.stream_provider,
         };
@@ -346,6 +351,7 @@ pub const Task = struct {
             .api_key = self.api_key orelse "",
             .credential_source = self.credential_source,
             .account_id = self.account_id,
+            .chatgpt_direct = self.chatgpt_direct,
             .gateway_team = self.gateway_team,
             .session_id = self.session_id,
             .prompt_excerpt = self.prompt_excerpt,
@@ -529,11 +535,12 @@ test "run reports a transport error with its error name" {
     }
 }
 
-test "run sanitizes provider content into a generated title" {
+test "run sanitizes provider content into a generated title with direct ChatGPT authority" {
     const Fake = struct {
         fn stream(_: ?*anyopaque, _: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
             try request.admission.admit();
             try std.testing.expectEqualStrings("test/title", request.model);
+            try std.testing.expect(request.credential.chatgptDirect());
             try std.testing.expectEqual(@as(usize, 1), request.instructions.len);
             try std.testing.expectEqual(@as(usize, 1), request.messages.len);
             try std.testing.expectEqualStrings("fix the renderer", request.messages[0].content.?);
@@ -553,6 +560,8 @@ test "run sanitizes provider content into a generated title" {
         .stream_provider = .{ .stream_fn = Fake.stream },
         .model = "test/title",
         .api_key = "key",
+        .credential_source = .chatgpt_subscription,
+        .chatgpt_direct = true,
         .prompt_excerpt = "fix the renderer",
         .cancel_flag = &cancelled,
     });

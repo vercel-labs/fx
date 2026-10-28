@@ -5999,6 +5999,7 @@ fn activeCredentialLease(
         .secret_bytes = secret_value,
         .source = job.credential_source,
         .account_id = job.account_id,
+        .chatgpt_direct = job.chatgpt_direct,
         .tenant_context = job.gateway_team,
     } };
 }
@@ -7433,6 +7434,7 @@ fn processQueuedPromptLoop(
                 .provider_options = provider_opts,
                 .max_output_tokens = model_capabilities.requestOutputTokens(request_capabilities) orelse length_retry_output_tokens,
                 .budget = .{ .cancel_flag = config.cancel_flag },
+                .prompt_cache_key = lifecycle.scope.session_id,
             };
             // The request re-sends every image the session keeps, and
             // building it whole would hold all of them, encoded, at once.
@@ -7559,6 +7561,7 @@ fn processQueuedPromptLoop(
                         .api_key = active_api_key,
                         .credential_source = job.credential_source,
                         .account_id = job.account_id,
+                        .chatgpt_direct = job.chatgpt_direct,
                         .gateway_team = job.gateway_team,
                         .session_id = lifecycle.scope.session_id,
                         .retry_count = config.gateway_retry_count,
@@ -7725,6 +7728,7 @@ fn processQueuedPromptLoop(
                         .secret_bytes = active_api_key,
                         .source = job.credential_source orelse .ai_gateway_api_key,
                         .account_id = job.account_id,
+                        .chatgpt_direct = job.chatgpt_direct,
                         .tenant_context = job.gateway_team,
                     } },
                 .session_id = lifecycle.scope.session_id,

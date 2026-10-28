@@ -19,9 +19,11 @@ fn reviewCodex(
     input: permission_auto_classifier.ProviderInput,
     request: permission_auto_classifier.ReviewRequest,
 ) anyerror!permission_auto_classifier.ParseOutcome {
+    // Direct sessions must receive a model selected from their live catalog.
+    if (input.chatgpt_direct and input.reviewer_model.len == 0) return .{ .invalid = .provider_context_missing };
     return responses_reviewer.review(alloc, input, request, .{
         .source = .chatgpt_subscription,
-        .model = openai_codex_models.reviewer_model,
+        .model = if (input.reviewer_model.len > 0) input.reviewer_model else openai_codex_models.reviewer_model,
         .validate_fn = validateCredential,
         .build_fn = openai_codex.buildRequest,
         .send_fn = sendPrepared,
@@ -32,6 +34,7 @@ fn validateCredential(
     alloc: Allocator,
     input: permission_auto_classifier.ProviderInput,
 ) !void {
+    if (input.chatgpt_direct) return;
     const account_id = try chatgpt_oauth.extractAccountId(alloc, input.credential);
     alloc.free(account_id);
 }

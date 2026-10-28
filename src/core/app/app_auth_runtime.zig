@@ -1354,7 +1354,8 @@ pub fn Runtime(comptime App: type) type {
             var credential = task.credential;
             task.credential = null;
             defer if (credential) |*value| value.deinit(app.alloc);
-            const access: credentials.CatalogAccess = if (hostManagesAuth(app)) .host_managed else credentials.catalogAccessForCredentialAndAccount(credential.?.source, credential.?.token, credential.?.gatewayTeam(), credential.?.accountId());
+            var access: credentials.CatalogAccess = if (hostManagesAuth(app)) .host_managed else credentials.catalogAccessForCredentialAndAccount(credential.?.source, credential.?.token, credential.?.gatewayTeam(), credential.?.accountId());
+            if (access == .authenticated) access.authenticated.chatgpt_direct = credential.?.chatgpt_direct;
             var owned_model = try app.alloc.dupe(u8, selected_model);
             defer app.alloc.free(owned_model);
 

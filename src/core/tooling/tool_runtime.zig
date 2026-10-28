@@ -129,6 +129,7 @@ pub const Context = struct {
     gateway_team: ?[]const u8 = null,
     credential_source: ?types.CredentialSource = null,
     account_id: ?[]const u8 = null,
+    chatgpt_direct: bool = false,
     provider: model_provider.ProviderId = .gateway,
     provider_capabilities: provider_set.Bundle.Capabilities = .{
         .fx_search = true,
@@ -318,9 +319,10 @@ pub const Context = struct {
             .credential = self.api_key,
             .credential_source = self.credential_source,
             .account_id = self.account_id,
+            .chatgpt_direct = self.chatgpt_direct,
             .tenant = self.gateway_team,
             .endpoint = self.gateway_chat_url,
-            .reviewer_model = self.reviewer_model,
+            .reviewer_model = if (self.chatgpt_direct and self.reviewer_model.len == 0) self.model else self.reviewer_model,
             .cancel_flag = self.cancel_flag,
         });
     }
@@ -2587,6 +2589,30 @@ const TestRuntime = struct {
         };
     }
 };
+
+test "direct ChatGPT permission review uses the selected model unless overridden" {
+    const Fake = struct {
+        fn review(_: ?*anyopaque, _: Allocator, _: permission_auto_classifier.ProviderInput, _: permission_auto_classifier.ReviewRequest) anyerror!permission_auto_classifier.ParseOutcome {
+            return .{ .invalid = .provider_failed };
+        }
+    };
+    var runtime: TestRuntime = .{ .model = "gpt-5.4", .api_key = "chatgpt-token" };
+    defer runtime.deinit(std.testing.allocator);
+    var ctx = runtime.context();
+    ctx.credential_source = .chatgpt_subscription;
+    ctx.chatgpt_direct = true;
+    ctx.permission_reviewer_provider = .{ .review_fn = Fake.review };
+    const direct = ctx.admissionAutoClassifier().provider_input;
+    try std.testing.expect(direct.chatgpt_direct);
+    try std.testing.expectEqualStrings("gpt-5.4", direct.reviewer_model);
+    try std.testing.expectEqualStrings("chatgpt-token", direct.credential);
+
+    ctx.reviewer_model = "explicit-reviewer";
+    try std.testing.expectEqualStrings("explicit-reviewer", ctx.admissionAutoClassifier().provider_input.reviewer_model);
+    ctx.chatgpt_direct = false;
+    ctx.reviewer_model = "";
+    try std.testing.expectEqualStrings("", ctx.admissionAutoClassifier().provider_input.reviewer_model);
+}
 
 const CancelTestCommandOnOutput = struct {
     flag: *std.atomic.Value(bool),

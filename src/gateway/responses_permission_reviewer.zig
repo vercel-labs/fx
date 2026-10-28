@@ -237,6 +237,7 @@ fn sendReview(
         else
             .{ .direct = .{
                 .secret_bytes = runtime.input.credential,
+                .chatgpt_direct = runtime.input.chatgpt_direct,
                 .source = runtime.adapter.source,
                 .account_id = runtime.input.account_id,
                 .tenant_context = runtime.input.tenant,

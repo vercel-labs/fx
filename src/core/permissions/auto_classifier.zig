@@ -317,6 +317,7 @@ pub const OverrideFn = *const fn (
 /// referenced slice and pointer must remain valid until `Classifier.review`
 /// returns.
 pub const ProviderInput = struct {
+    chatgpt_direct: bool = false,
     credential: []const u8 = "",
     credential_source: ?types.CredentialSource = null,
     account_id: ?[]const u8 = null,

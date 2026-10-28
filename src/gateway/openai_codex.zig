@@ -87,6 +87,12 @@ pub fn buildRequest(
     try writer.writeAll(",\"tool_choice\":");
     try std.json.Stringify.value(request.tool_choice.label(), .{}, writer);
     try writer.writeAll(",\"parallel_tool_calls\":true,\"include\":[\"reasoning.encrypted_content\"]");
+    // Routes each step of a conversation to the backend that already holds
+    // its cached prefix. Without it, consecutive steps can miss the cache.
+    if (request.prompt_cache_key) |key| if (key.len > 0) {
+        try writer.writeAll(",\"prompt_cache_key\":");
+        try std.json.Stringify.value(key, .{}, writer);
+    };
     // Codex exposes Fast mode as its priority service tier for supported
     // ChatGPT subscription models.
     if (request.provider_options.fast) try writer.writeAll(",\"service_tier\":\"priority\"");
@@ -199,9 +205,29 @@ pub fn acceptsCredential(lease: stream_provider.CredentialLease) bool {
 /// The Responses endpoint, or a loopback test endpoint from the environment.
 /// Borrowed; static or environment-owned.
 pub fn responsesEndpoint() error{InvalidE2EOpenAICodexEndpoint}![]const u8 {
-    const override = io_mod.getenv(e2e_endpoint_env) orelse return endpoint;
+    return responsesEndpointForRoute(false);
+}
+
+pub fn responsesEndpointForRoute(chatgpt_direct: bool) error{InvalidE2EOpenAICodexEndpoint}![]const u8 {
+    const override = io_mod.getenv(e2e_endpoint_env) orelse return if (chatgpt_direct) "https://api.openai.com/v1/responses" else endpoint;
     if (!gateway_client.isLoopbackHttpUrl(override)) return error.InvalidE2EOpenAICodexEndpoint;
     return override;
+}
+
+test "ChatGPT direct Responses uses opaque bearer without account introspection" {
+    var auth = try requestAuthHeaders(std.testing.allocator, .{ .direct = .{
+        .secret_bytes = "opaque-direct-token",
+        .source = .chatgpt_subscription,
+        .chatgpt_direct = true,
+        .account_id = "not a legacy account id",
+    } });
+    defer auth.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Bearer opaque-direct-token", auth.authorization.?);
+    try std.testing.expect(auth.account_id == null);
+    if (io_mod.getenv(e2e_endpoint_env) == null) {
+        try std.testing.expectEqualStrings("https://api.openai.com/v1/responses", try responsesEndpointForRoute(true));
+        try std.testing.expectEqualStrings(endpoint, try responsesEndpoint());
+    }
 }
 
 pub const max_extra_headers = 6;
@@ -252,6 +278,7 @@ pub fn requestAuthHeaders(alloc: Allocator, auth: stream_provider.CredentialLeas
         .direct => |direct| blk: {
             const authorization = try alloc.print("Bearer {s}", .{direct.secret_bytes});
             errdefer secret.zeroAndFree(alloc, authorization);
+            if (direct.chatgpt_direct) break :blk .{ .authorization = authorization };
             const account_id = if (direct.account_id) |account|
                 try alloc.dupe(u8, account)
             else
@@ -276,11 +303,11 @@ pub fn streamPrepared(
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
     var auth_headers = try requestAuthHeaders(alloc, request.credential);
     defer auth_headers.deinit(alloc);
-    const request_endpoint = responsesEndpoint() catch |err| return stream_provider.failResult(err);
+    const request_endpoint = responsesEndpointForRoute(request.credential.chatgptDirect()) catch |err| return stream_provider.failResult(err);
     const uri = try std.Uri.parse(request_endpoint);
 
     var extra_headers_buf: [max_extra_headers]std.http.Header = undefined;
-    const extra_headers = extraHeaders(&extra_headers_buf, auth_headers.account_id, request.session_id);
+    const extra_headers = if (request.credential.chatgptDirect()) extra_headers_buf[0..0] else extraHeaders(&extra_headers_buf, auth_headers.account_id, request.session_id);
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
@@ -637,6 +664,31 @@ test "OpenAI Codex standard requests omit the priority service tier" {
     defer std.testing.allocator.free(body);
 
     try std.testing.expect(std.mem.find(u8, body, "\"service_tier\"") == null);
+}
+
+test "OpenAI Codex requests carry the session as the prompt cache key" {
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "Hello." }};
+    const keyed = try buildRequest(std.testing.allocator, .{
+        .model = "gpt-5.6-sol",
+        .messages = &messages,
+        .tool_choice = .none,
+        .provider_options = .{},
+        .prompt_cache_key = "session_123",
+    });
+    defer std.testing.allocator.free(keyed);
+    try std.testing.expect(std.mem.find(u8, keyed, "\"prompt_cache_key\":\"session_123\"") != null);
+
+    inline for (.{ @as(?[]const u8, null), @as(?[]const u8, "") }) |key| {
+        const body = try buildRequest(std.testing.allocator, .{
+            .model = "gpt-5.6-sol",
+            .messages = &messages,
+            .tool_choice = .none,
+            .provider_options = .{},
+            .prompt_cache_key = key,
+        });
+        defer std.testing.allocator.free(body);
+        try std.testing.expect(std.mem.find(u8, body, "\"prompt_cache_key\"") == null);
+    }
 }
 
 test "OpenAI Codex serializes each verified image directly once" {

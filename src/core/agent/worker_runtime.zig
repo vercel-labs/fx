@@ -116,6 +116,7 @@ pub const QueuedPrompt = struct {
     gateway_team: ?[]u8 = null,
     credential_source: ?types.CredentialSource = null,
     account_id: ?[]u8 = null,
+    chatgpt_direct: bool = false,
     permission_mode: types.PermissionMode,
     history: []types.HistoryTurn,
     /// Absolute end of the leading canonical-history range loaded without
@@ -151,6 +152,7 @@ pub const ContextCompactionTask = struct {
     gateway_team: ?[]u8 = null,
     credential_source: ?types.CredentialSource = null,
     account_id: ?[]u8 = null,
+    chatgpt_direct: bool = false,
     history: []types.HistoryTurn,
     unversioned_history_count: usize = std.math.maxInt(usize),
 };

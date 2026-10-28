@@ -116,6 +116,7 @@ pub const CredentialSource = enum {
 };
 
 pub const DirectCredentialLease = struct {
+    chatgpt_direct: bool = false,
     secret_bytes: []const u8 = "",
     source: ?CredentialSource = null,
     account_id: ?[]const u8 = null,
@@ -146,6 +147,13 @@ pub const CredentialLease = union(enum) {
         return switch (self) {
             .direct => |direct| direct.account_id,
             .host_managed => null,
+        };
+    }
+
+    pub fn chatgptDirect(self: CredentialLease) bool {
+        return switch (self) {
+            .direct => |direct| direct.chatgpt_direct,
+            .host_managed => false,
         };
     }
 

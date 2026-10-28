@@ -93,6 +93,7 @@ pub const CatalogAccess = union(enum) {
         team_context: ?[]const u8,
         account_id: ?[]const u8 = null,
         authority: CatalogAuthority = .automatic,
+        chatgpt_direct: bool = false,
     },
     host_managed,
 
@@ -142,6 +143,7 @@ pub const CatalogAccess = union(enum) {
                 .team_context = access.team_context,
                 .account_id = access.account_id,
                 .authority = .explicit,
+                .chatgpt_direct = access.chatgpt_direct,
             } },
             .host_managed => .host_managed,
         };
@@ -182,12 +184,14 @@ pub fn catalogAccessAt(credential: ?Credential, now_ms: i64) CatalogAccess {
     if (sourceRefreshable(selected.source) and selected.needsRefreshAt(now_ms)) {
         return .{ .public_only = .{ .credential_refresh_required = selected.source } };
     }
-    return catalogAccessForCredentialAndAccount(
+    var access = catalogAccessForCredentialAndAccount(
         selected.source,
         selected.token,
         selected.gatewayTeam(),
         selected.accountId(),
     );
+    if (access == .authenticated) access.authenticated.chatgpt_direct = selected.chatgpt_direct;
+    return access;
 }
 
 pub fn catalogAccessAfterRefreshFailure(source: Source) CatalogAccess {
@@ -287,6 +291,7 @@ pub const Credential = struct {
     token: []u8,
     source: Source,
     account_id: ?[]u8 = null,
+    chatgpt_direct: bool = false,
     team_id: ?[]u8 = null,
     team_slug: ?[]u8 = null,
     refresh_after_ms: ?i64 = null,
@@ -303,6 +308,7 @@ pub const Credential = struct {
         return .{
             .token = token,
             .source = self.source,
+            .chatgpt_direct = self.chatgpt_direct,
             .account_id = account_id,
             .team_id = team_id,
             .team_slug = team_slug,
@@ -332,6 +338,23 @@ pub const Credential = struct {
         return refresh_after_ms <= now_ms;
     }
 };
+
+test "ChatGPT direct credential route survives cloning and catalog authority" {
+    const alloc = std.testing.allocator;
+    var credential: Credential = .{
+        .token = try alloc.dupe(u8, "opaque-direct-token"),
+        .source = .chatgpt_subscription,
+        .chatgpt_direct = true,
+    };
+    defer credential.deinit(alloc);
+    var cloned = try credential.clone(alloc);
+    defer cloned.deinit(alloc);
+    try std.testing.expect(cloned.chatgpt_direct);
+    const access = catalogAccessAt(cloned, 0).withExplicitAuthority();
+    try std.testing.expect(access.authenticated.chatgpt_direct);
+    try std.testing.expectEqual(CatalogAuthority.explicit, access.authenticated.authority);
+    try std.testing.expect(!catalogAccessForCredential(.chatgpt_subscription, "opaque", null).authenticated.chatgpt_direct);
+}
 
 pub const StoredKeyReadStatus = enum {
     not_attempted,
@@ -672,6 +695,7 @@ fn loadChatGptCredential(
     return .{
         .token = token,
         .source = .chatgpt_subscription,
+        .chatgpt_direct = access.chatgpt_direct,
         .account_id = account_id,
         .refresh_after_ms = access.refresh_after_ms,
     };

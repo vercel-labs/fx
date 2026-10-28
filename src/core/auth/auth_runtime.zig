@@ -1023,7 +1023,7 @@ pub const ProviderPreparation = struct {
             if (self.credential == null) return;
         }
         if (self.cancel_requested.load(.seq_cst)) return;
-        const access: credentials.CatalogAccess = if (self.host_managed)
+        var access: credentials.CatalogAccess = if (self.host_managed)
             .host_managed
         else
             credentials.catalogAccessForCredentialAndAccount(
@@ -1032,6 +1032,7 @@ pub const ProviderPreparation = struct {
                 self.credential.?.gatewayTeam(),
                 self.credential.?.accountId(),
             );
+        if (access == .authenticated) access.authenticated.chatgpt_direct = self.credential.?.chatgpt_direct;
         self.catalog = self.input.catalog_provider.fetch(self.alloc, .{
             .access = access,
             .endpoint = self.input.models_path,
@@ -1952,6 +1953,12 @@ pub const Runtime = struct {
         return credential.accountId();
     }
 
+    pub fn chatgptDirect(self: *const Self) bool {
+        if (self.auth_mode == .host_managed) return false;
+        const credential = self.selected_credential orelse return false;
+        return credential.chatgpt_direct;
+    }
+
     pub fn gatewayTeam(self: *const Self) ?[]const u8 {
         const credential = self.gatewayCredential() orelse return null;
         return credential.gateway_team;
@@ -2808,12 +2815,15 @@ pub const Runtime = struct {
         credential: credentials.Credential,
     ) auth_transition.CredentialChange {
         return if (self.selected_credential) |selected|
-            auth_transition.decideCredentialChange(
-                credentialAuthorityFacts(selected),
-                credentialAuthorityFacts(credential),
-                !std.mem.eql(u8, selected.token, credential.token) or
-                    selected.refresh_after_ms != credential.refresh_after_ms,
-            )
+            if (selected.chatgpt_direct != credential.chatgpt_direct)
+                .authority
+            else
+                auth_transition.decideCredentialChange(
+                    credentialAuthorityFacts(selected),
+                    credentialAuthorityFacts(credential),
+                    !std.mem.eql(u8, selected.token, credential.token) or
+                        selected.refresh_after_ms != credential.refresh_after_ms,
+                )
         else
             .authority;
     }
@@ -4498,6 +4508,33 @@ test "provider picker projects the active Vercel team" {
     const current_team = runtime.pickerView().current_team;
     try std.testing.expect(current_team != null);
     try std.testing.expectEqualStrings("team_1", current_team.?);
+}
+
+test "ChatGPT routing changes credential authority and survives token rotation" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    try std.testing.expect(!runtime.chatgptDirect());
+
+    var credential = try makeTestCredential(alloc, "chatgpt-token", .chatgpt_subscription, null, null);
+    defer credential.deinit(alloc);
+    _ = runtime.adoptCredential(alloc, &credential);
+    try std.testing.expect(!runtime.chatgptDirect());
+
+    var direct = try makeTestCredential(alloc, "chatgpt-token", .chatgpt_subscription, null, null);
+    defer direct.deinit(alloc);
+    direct.chatgpt_direct = true;
+    try std.testing.expectEqual(auth_transition.CredentialChange.authority, runtime.adoptPreparedCredential(alloc, &direct));
+    try std.testing.expect(runtime.chatgptDirect());
+    try std.testing.expect(runtime.modelCatalogAccess().authenticated.chatgpt_direct);
+
+    var rotated = try makeTestCredential(alloc, "refreshed-chatgpt-token", .chatgpt_subscription, null, null);
+    defer rotated.deinit(alloc);
+    rotated.chatgpt_direct = true;
+    try std.testing.expect(runtime.adoptPreparedCredential(alloc, &rotated) != .authority);
+    try std.testing.expect(runtime.chatgptDirect());
+    runtime.auth_mode = .host_managed;
+    try std.testing.expect(!runtime.chatgptDirect());
 }
 
 test "adopting fx login publishes Vercel session availability to setup" {

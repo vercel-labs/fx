@@ -1552,6 +1552,7 @@ const App = struct {
             .gateway_team = gateway_team_copy,
             .credential_source = gateway_credential.source,
             .account_id = account_id_copy,
+            .chatgpt_direct = self.auth.chatgptDirect(),
             .permission_mode = self.permission_engine.mode,
             .history = history_copy,
             .unversioned_history_count = self.session.unversionedHistoryEnd(),
@@ -1602,6 +1603,7 @@ const App = struct {
             .gateway_team = gateway_team,
             .credential_source = credential.source,
             .account_id = account_id,
+            .chatgpt_direct = self.auth.chatgptDirect(),
             .history = history,
             .unversioned_history_count = self.session.unversionedHistoryEnd(),
         });

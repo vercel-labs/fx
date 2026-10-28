@@ -31,6 +31,7 @@ pub const LabelBuffer = [160]u8;
 /// The sign-in `/usage` reads with, or null when fx is not signed in to AI
 /// Gateway. Borrows from `auth` and `label_buf`.
 pub fn credential(auth: *const auth_runtime.Runtime, label_buf: *LabelBuffer) ?usage.Credential {
+    if (auth.selected_credential) |selected| if (selected.chatgpt_direct) return null;
     const current = auth.gatewayCredential() orelse {
         const selected = auth.selected_credential;
         debug_trace.logf("usage", "no gateway credential: source={s} selected={} needs_refresh={}", .{
@@ -48,6 +49,7 @@ pub fn credential(auth: *const auth_runtime.Runtime, label_buf: *LabelBuffer) ?u
 /// Why `credential` found nothing: a provider token that needs renewing,
 /// another provider, or no sign-in at all.
 pub fn missingReason(auth: *const auth_runtime.Runtime) usage.Unavailable {
+    if (auth.selected_credential) |selected| if (selected.chatgpt_direct) return .unsupported_provider;
     const source = auth.credentialSource() orelse return .no_gateway_sign_in;
     return switch (source) {
         .fx_login, .stored_key, .ai_gateway_api_key => .no_gateway_sign_in,
@@ -60,6 +62,8 @@ pub fn missingReason(auth: *const auth_runtime.Runtime) usage.Unavailable {
 /// The same mapping for a credential loaded without the auth runtime, as
 /// `fx usage` does. Borrows from `c` and `label_buf`.
 pub fn fromCredential(c: credentials.Credential, label_buf: *LabelBuffer) ?usage.Credential {
+    // The direct grant authorizes the public API, not Codex's usage endpoints.
+    if (c.chatgpt_direct) return null;
     return fromParts(c.source, c.token, c.gatewayTeam(), c.team_slug, c.account_id, label_buf);
 }
 
