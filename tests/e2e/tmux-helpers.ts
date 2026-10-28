@@ -169,16 +169,53 @@ export function fakeShellRun(
   });
 }
 
+// A caution without `evidence` reaches fx as an unproven caution, which fx
+// clears. Use fakeGatewayHeldDecision for a review that must hold the action.
 export function fakeGatewayPermissionDecision(
   decision: "clear" | "caution" = "clear",
   toolCallId = "permission_decision_1",
   rationale = "test fixture",
+  evidence?: string,
+  category: "prompt_injection" | "system_harm" = "system_harm",
 ) {
   return fakeGatewayToolCall(toolCallId, "permission_decision", {
     risk: decision === "clear" ? "low" : "high",
     decision,
     rationale,
+    ...(evidence === undefined ? {} : { category, evidence }),
   });
+}
+
+// fx holds an action only when the review names a harm and quotes evidence
+// found in the pending action, so this answers with a system-harm caution
+// that quotes the action line of the review request it receives.
+export function fakeGatewayHeldDecision(
+  toolCallId = "permission_decision_1",
+  rationale = "test fixture",
+) {
+  return (body: string) =>
+    fakeGatewayPermissionDecision("caution", toolCallId, rationale, reviewedActionEvidence(body));
+}
+
+export function reviewedActionEvidence(body: string): string {
+  const texts: string[] = [];
+  const collect = (value: unknown) => {
+    if (typeof value === "string") texts.push(value);
+    else if (Array.isArray(value)) value.forEach(collect);
+    else if (value && typeof value === "object") Object.values(value).forEach(collect);
+  };
+  collect(JSON.parse(body));
+  const instruction = texts.find((text) => text.includes("<permission_review>"));
+  if (!instruction) throw new Error("review request has no permission_review instruction");
+  const action = instruction.slice(instruction.lastIndexOf("\naction: "));
+  const line = action.split("\n").find((entry) => /^(command|arguments_json|path): /.test(entry));
+  if (!line) throw new Error("review request has no reviewed action line");
+  return line
+    .slice(line.indexOf(": ") + 2)
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&amp;", "&")
+    .slice(0, 160);
 }
 
 export function fakeGatewaySerializedToolCall(
@@ -432,7 +469,9 @@ function serveFakeGateway(
         classifierRequests.push({ body, headers });
         const next = classifierResponses.shift();
         if (next) return typeof next === "function" ? await next(body) : next;
-        return fakeGatewayPermissionDecision(options.classifierDecision ?? "clear");
+        return options.classifierDecision === "caution"
+          ? fakeGatewayHeldDecision()(body)
+          : fakeGatewayPermissionDecision("clear");
       }
       if (body.includes(TITLE_GENERATION_MARKER)) {
         titleRequests.push({ body, headers });

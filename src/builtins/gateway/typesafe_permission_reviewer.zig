@@ -129,11 +129,14 @@ pub fn review(
         .gateway_team = input.tenant,
     };
     debug_trace.logf("permission", "event=auto_review_typesafe_selected endpoint={s} via_gateway={}", .{ config.endpoint, route.via_gateway });
-    return permission_auto_classifier.Reviewer.withTransportModel(.{
+    var reviewer = permission_auto_classifier.Reviewer.withTransportModel(.{
         .context = @ptrCast(&config),
         .build_fn = buildReviewBody,
         .send_fn = sendReview,
-    }, input.cancel_flag, permission_auto_classifier.Reviewer.default_timeout_ms, route.model).review(alloc, request);
+    }, input.cancel_flag, permission_auto_classifier.Reviewer.default_timeout_ms, route.model);
+    // Jev answers with a bare decision, so there is no quote to check.
+    reviewer.require_caution_proof = false;
+    return reviewer.review(alloc, request);
 }
 
 /// Composes the System One request body from the reviewer's already-composed
