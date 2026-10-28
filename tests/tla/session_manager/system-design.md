@@ -2975,6 +2975,14 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   **Alternative:** a start time in every native turn event, which the
   replay log may have dropped.
 
+- **D273 Decision:** a resume the supervisor cannot find by its exact id
+  is taken as the start of one: after refreshing its saved index, the
+  supervisor resumes the one session whose id starts with it, and answers
+  how many match when several do, or that none does. **Why:** `proto-fx
+  daemon status` shows 8-character ids, and resuming one failed with
+  `SessionOpenFailed`. **Alternative:** resolving in the frontend, which
+  would read the store a second time.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

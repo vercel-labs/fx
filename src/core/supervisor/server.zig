@@ -596,7 +596,19 @@ pub const Daemon = struct {
                 if (self.saved_index.contains(request.session_id)) return try protocol.encode(arena, protocol.Failure{ .@"error" = "The supervisor has not loaded this session, so it was not deleted." });
                 return try protocol.encode(arena, protocol.Ack{});
             },
-            .create => |request| {
+            .create => |*request| {
+                if (request.@"resume") |query| if (query.len > 0 and self.find(query) == null) {
+                    // A resume may name a unique start of a session's id.
+                    self.saved_index_stale.store(true, .release);
+                    self.discoverSaved() catch {};
+                    var ids: std.ArrayList([]const u8) = .empty;
+                    for (self.sessions.items) |session| if (session.id.len > 0) try ids.append(arena, session.id);
+                    switch (matchIdPrefix(ids.items, query)) {
+                        .found => |id| request.@"resume" = try arena.dupe(u8, id),
+                        .ambiguous => |count| return try protocol.encode(arena, protocol.Failure{ .@"error" = try arena.print("{d} saved sessions have ids that start with {s}; give more of the id.", .{ count, query }) }),
+                        .none => return try protocol.encode(arena, protocol.Failure{ .@"error" = try arena.print("No saved session has an id that starts with {s}. List them with `proto-fx sessions`.", .{query}) }),
+                    }
+                };
                 const existing = if (request.@"resume") |id| self.find(id) else null;
                 const session = existing orelse new: {
                     const root = try io_mod.realpathAlloc(arena, request.cwd);
@@ -612,6 +624,21 @@ pub const Daemon = struct {
         return null;
     }
 };
+
+const PrefixMatch = union(enum) { found: []const u8, none, ambiguous: usize };
+
+/// The one id `query` starts, or why there is none.
+fn matchIdPrefix(ids: []const []const u8, query: []const u8) PrefixMatch {
+    var found: ?[]const u8 = null;
+    var count: usize = 0;
+    for (ids) |id| if (std.mem.startsWith(u8, id, query)) {
+        if (found) |seen| if (std.mem.eql(u8, seen, id)) continue;
+        found = id;
+        count += 1;
+    };
+    if (count > 1) return .{ .ambiguous = count };
+    return if (found) |id| .{ .found = id } else .none;
+}
 
 fn newJob(alloc: Allocator) !*Job {
     const job = try alloc.create(Job);
@@ -815,4 +842,12 @@ test "an anchor tells a removed socket from a removed state directory" {
     try std.testing.expectEqual(Anchor.Check.socket_removed, anchor.check());
     try tmp.dir.deleteTree(io, "state");
     try std.testing.expectEqual(Anchor.Check.state_removed, anchor.check());
+}
+
+test "a resume id may be any unique start of a saved session's id" {
+    const ids = [_][]const u8{ "G8ln8216A_wA", "G8lnZZ00b_x1", "PZjgRexiAKt6" };
+    try std.testing.expectEqualStrings("PZjgRexiAKt6", matchIdPrefix(&ids, "PZjgRexi").found);
+    try std.testing.expectEqualStrings("G8ln8216A_wA", matchIdPrefix(&ids, "G8ln8216").found);
+    try std.testing.expectEqual(@as(usize, 2), matchIdPrefix(&ids, "G8ln").ambiguous);
+    try std.testing.expect(matchIdPrefix(&ids, "nope") == .none);
 }
