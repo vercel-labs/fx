@@ -3089,6 +3089,26 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   **Alternative:** keeping the short live view and freezing it between
   calls, which still jumps once the turn settles.
 
+- **D292 Decision:** a permission review sent through a configured
+  provider (chat completions, Anthropic Messages, Responses, Cursor, Claude
+  Code) treats a failed connection and an upstream that is busy, down or
+  overloaded (429, 5xx, a provider error) as a transient failure, so the
+  reviewer tries once more with a fresh deadline before it holds the call
+  as unavailable; a request the provider refuses (400, 401, 403, 413)
+  stays permanent. **Why:** a local proxy's brief "no healthy upstream"
+  answer held a read at once, while the Responses reviewer already retried
+  the same failures. **Alternative:** retrying every failure, which repeats
+  a request that cannot succeed.
+
+- **D293 Decision:** a call that did not run reads in plain words: a
+  review hold as "Held · reviewer unavailable · <command>" (or safety
+  caution, review evidence incomplete) and the header counts it as
+  "held", apart from "denied"; any other denial as "<label> · <command>".
+  The command drops its leading `cd` and quiet redirects. Held and denied
+  rows are attention rows, so they always show (D291). **Why:** the header
+  said "1 denied" while the only matching row said "Review unavailable"
+  and, in the live view, could sit folded under "… N earlier".
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

@@ -407,14 +407,50 @@ fn send_review(raw: *anyopaque, alloc: Allocator, model: []const u8, payload: []
         error.Cancelled => return .cancelled,
         error.Timeout => return .timed_out,
         error.RequiredToolMissing => return .{ .completion = .{ .completion = .{} } },
-        else => return .permanent_failure,
+        else => {
+            const outcome = reviewErrorOutcome(err);
+            debug_trace.logf("permission", "event=auto_review_transport result={s} reason=transport_error error={s}", .{ @tagName(outcome), @errorName(err) });
+            return outcome;
+        },
     };
     errdefer result.deinit(alloc);
     if (result == .failed) {
+        const outcome = reviewFailureOutcome(result.failed.kind);
+        debug_trace.logf("permission", "event=auto_review_transport result={s} reason=provider_failure failure_kind={s}", .{ @tagName(outcome), @tagName(result.failed.kind) });
         result.deinit(alloc);
-        return .permanent_failure;
+        return outcome;
     }
     const owned = try alloc.create(streams.Result);
     owned.* = result;
     return .{ .completion = .{ .completion = owned.completed.completion, .context = owned, .deinit_fn = free_result } };
+}
+
+/// A review whose request failed on the way is worth one more try, as the
+/// Responses reviewer does: the reviewer retries a transient failure once
+/// with a fresh deadline (D292). A refused request will be refused again.
+fn reviewErrorOutcome(err: anyerror) classifier.TransportOutcome {
+    return switch (err) {
+        error.Cancelled => .cancelled,
+        error.Timeout => .timed_out,
+        else => .transient_failure,
+    };
+}
+
+/// An upstream that is busy, down or overloaded may answer the next
+/// attempt; one that rejects the request will not (D292).
+fn reviewFailureOutcome(kind: streams.FailureKind) classifier.TransportOutcome {
+    return switch (kind) {
+        .rate_limited, .server_error, .bad_gateway, .unavailable, .gateway_timeout, .provider_error => .transient_failure,
+        .invalid_request, .unauthorized, .forbidden, .request_too_large => .permanent_failure,
+    };
+}
+
+test "a review that an upstream fails for now is tried again, a refused one is not" {
+    try std.testing.expectEqual(classifier.TransportOutcome.transient_failure, reviewFailureOutcome(.server_error));
+    try std.testing.expectEqual(classifier.TransportOutcome.transient_failure, reviewFailureOutcome(.unavailable));
+    try std.testing.expectEqual(classifier.TransportOutcome.transient_failure, reviewFailureOutcome(.rate_limited));
+    try std.testing.expectEqual(classifier.TransportOutcome.permanent_failure, reviewFailureOutcome(.unauthorized));
+    try std.testing.expectEqual(classifier.TransportOutcome.permanent_failure, reviewFailureOutcome(.invalid_request));
+    try std.testing.expectEqual(classifier.TransportOutcome.transient_failure, reviewErrorOutcome(error.ConnectionRefused));
+    try std.testing.expectEqual(classifier.TransportOutcome.timed_out, reviewErrorOutcome(error.Timeout));
 }

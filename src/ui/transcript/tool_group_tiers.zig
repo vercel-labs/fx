@@ -108,6 +108,23 @@ fn exploredItem(arena: Allocator, item: Item) ?[]const command_summary.Action {
     return explored(arena, record);
 }
 
+/// Labels of a call that a security review held, and what each means.
+const review_holds = [_][2][]const u8{
+    .{ "Review unavailable", "reviewer unavailable" },
+    .{ "Safety caution", "safety caution" },
+    .{ "Review evidence incomplete", "review evidence incomplete" },
+};
+
+/// Why a review held this call, or null when it was not held.
+fn heldReason(item: Item) ?[]const u8 {
+    const record = item.detail orelse return null;
+    if (record.outcome != .denied) return null;
+    for (review_holds) |hold| {
+        if (std.mem.startsWith(u8, item.phrase, hold[0])) return hold[1];
+    }
+    return null;
+}
+
 pub fn isFailure(detail: ?*const ToolDetailRecord) bool {
     const record = detail orelse return false;
     if (record.fallback_disposition != null) return true;
@@ -221,7 +238,7 @@ pub fn header(arena: Allocator, items: []const Item) !Header {
     var other: usize = 0;
     var counts_by_anomaly: [anomaly_labels.len]usize = @splat(0);
     for (items) |item| {
-        if (anomalyOf(item.detail)) |anomaly| counts_by_anomaly[@backingInt(anomaly)] += 1;
+        if (anomalyOf(item)) |anomaly| counts_by_anomaly[@backingInt(anomaly)] += 1;
         const family = familyOf(arena, item) orelse {
             other += 1;
             continue;
@@ -273,18 +290,19 @@ pub fn header(arena: Allocator, items: []const Item) !Header {
     return .{ .words = words, .attention = attention.written() };
 }
 
-const Anomaly = enum { unreported, not_executed, timed_out, failed, denied, cancelled, running };
-const anomaly_labels = [_][]const u8{ "unreported", "not executed", "timed out", "failed", "denied", "cancelled", "running" };
+const Anomaly = enum { unreported, not_executed, timed_out, failed, held, denied, cancelled, running };
+const anomaly_labels = [_][]const u8{ "unreported", "not executed", "timed out", "failed", "held", "denied", "cancelled", "running" };
 
 /// What about a row needs attention, in the order the header names it.
-fn anomalyOf(detail: ?*const ToolDetailRecord) ?Anomaly {
-    const record = detail orelse return null;
+fn anomalyOf(item: Item) ?Anomaly {
+    const record = item.detail orelse return null;
     if (record.fallback_disposition) |disposition| return switch (disposition) {
         .completion_unreported => .unreported,
         .not_executed => .not_executed,
     };
     if (isLive(record)) return .running;
     if (record.command_process_presentation) |presentation| if (presentation == .timed_out and record.activity_kind == .command) return .timed_out;
+    if (heldReason(item) != null) return .held;
     if (record.outcome == .denied) return .denied;
     if (record.outcome == .cancelled) return .cancelled;
     if (isFailure(record)) return .failed;
@@ -407,6 +425,8 @@ pub fn single(arena: Allocator, item: Item) ![]Row {
 /// finished well: then its row says what it read (D290).
 fn keepsOutput(arena: Allocator, item: Item, record: *const ToolDetailRecord) bool {
     if (!isCommandRun(arena, record)) return false;
+    // A call that was held or denied never ran: there is nothing under it.
+    if (record.outcome == .denied) return false;
     if (isFailure(record)) return true;
     return exploredItem(arena, item) == null;
 }
@@ -488,6 +508,7 @@ fn firstRow(text: []const u8) ?[]const u8 {
 /// outcome and a failed one says why: "Exited 1 · AttributeError: …".
 fn itemText(arena: Allocator, item: Item) ![]const u8 {
     const record = item.detail orelse return item.phrase;
+    if (record.outcome == .denied) return deniedText(arena, item, record);
     if (std.mem.eql(u8, record.tool_name, "browser")) return browserText(arena, item, record);
     if (try checklistView(arena, record)) |view| return view.headline;
     if (!isCommandRun(arena, record)) return item.phrase;
@@ -520,6 +541,23 @@ fn itemText(arena: Allocator, item: Item) ![]const u8 {
     const first = bodies.firstLineOf(command);
     if (first.len < std.mem.trimEnd(u8, command, " \t\r\n").len) return arena.print("{s} {s} …", .{ verb, first });
     return item.phrase;
+}
+
+/// A call that did not run, in plain words (D293): "Held · reviewer
+/// unavailable · grep -rn x src" for a review hold, "Denied · npm test"
+/// otherwise. The model gets the reason with the result and goes on.
+fn deniedText(arena: Allocator, item: Item, record: *const ToolDetailRecord) ![]const u8 {
+    const separator = std.mem.find(u8, item.phrase, ": ");
+    const label = if (separator) |at| item.phrase[0..at] else "Denied";
+    var action = if (separator) |at| item.phrase[at + 2 ..] else item.phrase;
+    if (record.activity_kind == .command) {
+        if (bodies.commandText(arena, record)) |command| {
+            action = if (python_outline.script(command)) |found| found.interpreter else try command_summary.clean(arena, command);
+        }
+    }
+    if (heldReason(item)) |reason| return arena.print("Held · {s} · {s}", .{ reason, action });
+    if (std.mem.eql(u8, action, item.phrase)) return item.phrase;
+    return arena.print("{s} · {s}", .{ label, action });
 }
 
 /// A browser row in proto-fx's voice: "Opened example.com", and a settled
@@ -908,4 +946,30 @@ test "reading commands fold into one Explored row and only other commands keep t
     records[2].command_process_presentation = null;
     const live = try single(arena, items[2]);
     try std.testing.expectEqualStrings("Searching \"table\" in markdown.ts", live[0].text);
+}
+
+test "a call a review held says so plainly and the header counts it as held" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var held = try shellRun(arena, 1, "cd ~/code/proto && grep -rn \"getMarkdownTheme\" packages/coding-agent/src --include=\"*.ts\" | head -20", "", 0);
+    held.outcome = .denied;
+    held.command_process_presentation = null;
+    var denied = try shellRun(arena, 2, "npm publish", "", 0);
+    denied.outcome = .denied;
+    denied.command_process_presentation = null;
+    var ran = try shellRun(arena, 3, "make", "ok\n", 0);
+    const items = [_]Item{
+        .{ .entry_id = 1, .detail = &held, .phrase = "Review unavailable: Running cd ~/code/proto && grep -rn \"getMarkdownTheme\" packages/coding-agent/src --include=\"*.ts\" | head -20" },
+        .{ .entry_id = 2, .detail = &denied, .phrase = "Denied by auto agent: Running npm publish" },
+        .{ .entry_id = 3, .detail = &ran, .phrase = "Ran make" },
+    };
+    const summary = try header(arena, &items);
+    try std.testing.expectEqualStrings(" · 1 held · 1 denied", summary.attention);
+    const rows = try plan(arena, &items);
+    try std.testing.expectEqualStrings("Held · reviewer unavailable · grep -rn \"getMarkdownTheme\" packages/coding-agent/src --include=\"*.ts\" | head -20", rows[0].text);
+    try std.testing.expectEqual(Style.attention, rows[0].style);
+    try std.testing.expectEqualStrings("Denied by auto agent · npm publish", rows[1].text);
+    // Nothing ran, so nothing sits under either row.
+    try std.testing.expectEqualStrings("Ran make", rows[2].text);
 }
