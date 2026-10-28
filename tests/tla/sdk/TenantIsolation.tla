@@ -34,7 +34,8 @@
 (* A worker that takes a message runs every input of the session its       *)
 (* store holds and no turn ran yet, as one turn each. A session belongs to *)
 (* the agent its first stored input names; a message that reached another  *)
-(* agent is sent on to that one, as AgentRouting.tla checks.               *)
+(* agent is sent on to that one, as AgentRouting.tla checks, but only by   *)
+(* the agent its input was sent through: any other refuses it.             *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
@@ -175,8 +176,12 @@ Take(m, a, rest) ==
          /\ queue' = rest
          /\ UNCHANGED <<log, owner, done, ran>>
     ELSE IF own # NameOf[a]
-    THEN \* Another agent's session: sent on to it.
-         /\ queue' = rest \cup {Ref([m EXCEPT !.n = own])}
+    THEN \* Another agent's session: sent on to it, but only by the agent
+         \* its input was sent through. A delivery that reached any other
+         \* agent was not queued there, and is refused.
+         /\ queue' = IF \E x \in held: x.n # NameOf[a]
+                      THEN rest
+                      ELSE rest \cup {Ref([m EXCEPT !.n = own])}
          /\ UNCHANGED <<log, owner, done, ran>>
     ELSE /\ log' = [log EXCEPT ![st] = logged]
          /\ owner' = [owner EXCEPT ![st][m.s] = own]
