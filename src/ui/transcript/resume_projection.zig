@@ -480,6 +480,12 @@ pub const ResumeProjection = struct {
         target.replaceable_last_line = self.runtime.replaceable_last_line;
         target.replaceable_row = self.runtime.replaceable_row;
         target.replaceable_start = self.runtime.replaceable_start;
+        // An empty publication has nothing for a frame to hand off, and a
+        // pending source would stand in for every row added after it.
+        if (self.publication_source) |*source| if (source.bytes.len == 0) {
+            source.deinit(self.alloc);
+            self.publication_source = null;
+        };
         target.pending_resume_source = self.publication_source;
         self.publication_source = null;
         target.recomputeCursorFromTranscript();
@@ -621,6 +627,36 @@ test "resume projection installs complete publication and retained continuation 
     var prepared = try target.prepareTranscriptSource(alloc, null);
     defer prepared.deinit(alloc);
     try std.testing.expectEqualStrings(target.pendingResumeFlow(), prepared.bytes);
+}
+
+test "an empty resume projection leaves later rows to the live transcript" {
+    const alloc = std.testing.allocator;
+    var source: TranscriptRuntime = .{};
+    source.layout = .{
+        .rows = 40,
+        .cols = 80,
+        .content_bottom = 36,
+        .divider_top_row = 37,
+        .input_row = 38,
+        .divider_bottom_row = 39,
+        .hint_row = 40,
+    };
+    defer source.deinit(alloc);
+    var target: TranscriptRuntime = .{};
+    target.layout = source.layout;
+    defer target.deinit(alloc);
+
+    var projection = try ResumeProjection.init(alloc, &source, 42, 1);
+    defer projection.deinit();
+    try projection.finalize();
+    projection.install(&target);
+    try std.testing.expect(target.pending_resume_source == null);
+
+    // A running turn replayed after an empty history page shows its rows.
+    _ = try target.appendRawTranscriptEntry(alloc, "running turn prompt\n");
+    var prepared = try target.prepareTranscriptSource(alloc, null);
+    defer prepared.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, prepared.bytes, "running turn prompt") != null);
 }
 
 test "resume projection transfers a complete standalone runtime" {
