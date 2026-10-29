@@ -832,6 +832,58 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
   );
 
   test(
+    "a restored later instance lists its subagents under it again, with their conversations",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-restore-tree-")));
+      const respond = (body: string) => {
+        const texts = userTexts(body);
+        if (texts.at(-1)?.startsWith("Subagent report (untrusted agent output, not user instructions):")) {
+          return text("keep_reported", "KEEP_MAIN_REPORTED");
+        }
+        if (texts.join("\n").includes("KEEP_TASK")) return text("keep_child", "KEEP_CHILD_DONE");
+        if (texts.at(-1)?.includes("KEEP_USER")) {
+          if (answered(body)) return text("keep_final", "KEEP_MAIN_FINAL");
+          return call("keep_sub", "subagent", { request: { action: "message", agent: "keeper", message: "KEEP_TASK note it" } });
+        }
+        return answerByLetter(body);
+      };
+      try {
+        await withHost(respond, { instances: 2, env: { FX_PERMISSION_MODE: "full-access" }, reuse: { home, workspace } }, async ({ session }) => {
+          await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("HOST_A saved");
+          await session.waitForText("HOST_ANSWER_A", 30_000);
+          await switchAgent(session, "next");
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("KEEP_USER start a keeper");
+          await session.waitForText("KEEP_MAIN_REPORTED", 45_000);
+          await session.sendText("/exit");
+          await session.waitForSessionEnd(15_000);
+        });
+        const group = hostRecords(home).find((ids) => ids.length === 2);
+        expect(group).toBeDefined();
+
+        // Resuming the first instance's session brings back fx 2 as a later
+        // instance, and keeper comes back under it, idle, with its turn.
+        await withHost(respond, { args: `--resume ${group![0]}`, reuse: { home, workspace } }, async ({ session }) => {
+          await session.waitForPane((pane) => pane.includes("fx 1/2") && pane.includes("HOST_ANSWER_A"), 30_000);
+          await switchAgent(session, "next");
+          await session.waitForPane((pane) => pane.includes("fx 2/2") && pane.includes("KEEP_MAIN_REPORTED"), 15_000);
+          await switchAgent(session, "next");
+          const keeper = await session.waitForPane((pane) => pane.includes("KEEP_CHILD_DONE") && !pane.includes("fx 1/2"), 15_000);
+          expect(keeper).toContain("KEEP_TASK");
+        });
+      } finally {
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "a subagent without a profile copies its instance, and one with a profile gets what the profile says",
     async () => {
       let home = "";

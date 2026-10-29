@@ -53,6 +53,7 @@ const session_summary_codec = @import("../session/session_summary_codec.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_child_state = @import("../subagent/child_state.zig");
 const subagent_reports = @import("../subagent/reports.zig");
+const agent_frame = @import("../shared/agent_frame.zig");
 const subagent_authority = @import("../subagent/authority.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const builtin_tools = @import("../../builtins/tools.zig");
@@ -3524,8 +3525,14 @@ pub fn Runtime(comptime App: type) type {
                     if (prefix.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, prefix);
                 }
                 if (steering.text.len == 0) continue;
-                try sink.appendUserTurn(.{ .text = steering.text }, true);
+                try sink.appendUserTurn(savedSteeringTurn(steering.text), true);
             }
+        }
+
+        /// A saved steering entry as the message it was: the user's update,
+        /// or a subagent's report a boundary took, which draws as its card.
+        fn savedSteeringTurn(text: []u8) types.UserTurn {
+            return .{ .text = text, .author = if (agent_frame.isFrame(text)) .child else .user };
         }
 
         fn writePersistedSteeringAtBoundary(
@@ -3543,7 +3550,7 @@ pub fn Runtime(comptime App: type) type {
                     if (prefix.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, prefix);
                 }
                 if (item.text.len > 0) {
-                    try sink.appendUserTurn(.{ .text = item.text }, true);
+                    try sink.appendUserTurn(savedSteeringTurn(item.text), true);
                 }
                 index.* += 1;
             }
@@ -4268,6 +4275,8 @@ pub fn Runtime(comptime App: type) type {
                 host.report_sink = .{ .context = app, .post_fn = App.postSubagentReport };
                 // A subagent's own host can message the subagent's parent.
                 host.owner_has_parent = agent.role == .subagent;
+                // What a restart left owed reaches this agent now.
+                host.resumeReports(v2);
             }
         }
 
