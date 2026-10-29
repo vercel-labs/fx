@@ -135,6 +135,61 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 25000);
 
+  test("resumes with equivalent reordered and recased header sets", async () => {
+    const f = fixture();
+    const env = { ...f.env, FX_TEST_HEADER_KEY: "synthetic-header-key", FX_TEST_HEADER_PROJECT: "test-project" };
+    try {
+      Object.assign(f.settings.providers.local, {
+        headers: { "X-Tenant": "one", "x-region": "two" },
+        header_env: { "X-Api-Key": "FX_TEST_HEADER_KEY", "x-project": "FX_TEST_HEADER_PROJECT" },
+      });
+      f.save();
+      const first = await runFx(["ask", "--json", "hello"], { cwd: f.workspace, env, timeoutMs: 20000 });
+      if (first.code !== 0) throw new Error(first.stdout + first.stderr);
+      const saved = JSON.parse(first.stdout);
+
+      Object.assign(f.settings.providers.local, {
+        headers: { "X-Region": "two", "x-tenant": "one" },
+        header_env: { "X-Project": "FX_TEST_HEADER_PROJECT", "x-api-key": "FX_TEST_HEADER_KEY" },
+      });
+      f.save();
+      const resumed = await runFx(["ask", "--json", "--resume", saved.session_id, "continue"], { cwd: f.workspace, env, timeoutMs: 20000 });
+      if (resumed.code !== 0) throw new Error(resumed.stdout + resumed.stderr);
+      expect(JSON.parse(resumed.stdout).session_id).toBe(saved.session_id);
+      expect(resumed.stderr).toBe("");
+      expect(f.requests).toHaveLength(2);
+      for (const request of f.requests) {
+        expect(request.headers["x-tenant"]).toBe("one");
+        expect(request.headers["x-region"]).toBe("two");
+        expect(request.headers["api-key"]).toBeUndefined();
+        expect(request.headers["x-api-key"]).toBe("synthetic-header-key");
+        expect(request.headers["x-project"]).toBe("test-project");
+      }
+    } finally { f.close(); }
+  }, 45000);
+
+  test.each(["literal", "environment"])("refuses implicit resume after changing a %s header binding", async source => {
+    const f = fixture();
+    const env = { ...f.env, FX_TEST_HEADER_KEY: "synthetic-first-key", FX_TEST_OTHER_HEADER_KEY: "synthetic-second-key" };
+    try {
+      Object.assign(f.settings.providers.local, {
+        headers: { "x-tenant": "one" },
+        header_env: { "x-api-key": "FX_TEST_HEADER_KEY" },
+      });
+      f.save();
+      const first = await runFx(["ask", "--json", "hello"], { cwd: f.workspace, env, timeoutMs: 20000 });
+      if (first.code !== 0) throw new Error(first.stdout + first.stderr);
+      const saved = JSON.parse(first.stdout);
+      Object.assign(f.settings.providers.local, source === "literal"
+        ? { headers: { "x-tenant": "two" } }
+        : { header_env: { "x-api-key": "FX_TEST_OTHER_HEADER_KEY" } });
+      f.save();
+      const resumed = await runFx(["ask", "--json", "--resume", saved.session_id, "continue"], { cwd: f.workspace, env, timeoutMs: 20000 });
+      expect(resumed.code).not.toBe(0);
+      expect(f.requests).toHaveLength(1);
+    } finally { f.close(); }
+  }, 45000);
+
   test("sends configured literal and environment-backed request headers", async () => {
     const f = fixture();
     try {
