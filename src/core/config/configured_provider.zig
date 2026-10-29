@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const sort_utils = @import("../shared/sort_utils.zig");
 const Allocator = std.mem.Allocator;
 
 const max_providers = 32;
@@ -287,13 +288,14 @@ fn parse_headers(alloc: Allocator, value: std.json.Value) ParseError![]const Hea
         for (headers[0..initialized]) |previous| {
             if (std.ascii.eqlIgnoreCase(previous.name, entry.key_ptr.*)) return error.InvalidHeader;
         }
-        const owned_name = try alloc.dupe(u8, entry.key_ptr.*);
+        const owned_name = try std.ascii.allocLowerString(alloc, entry.key_ptr.*);
         errdefer alloc.free(owned_name);
         const owned_value = try alloc.dupe(u8, entry.value_ptr.string);
         errdefer alloc.free(owned_value);
         headers[initialized] = .{ .name = owned_name, .value = owned_value };
         initialized += 1;
     }
+    sortHeaders(Header, headers);
     return headers;
 }
 
@@ -317,14 +319,23 @@ fn parse_header_env(alloc: Allocator, value: std.json.Value) ParseError![]const 
         for (refs[0..initialized]) |previous| {
             if (std.ascii.eqlIgnoreCase(previous.name, entry.key_ptr.*)) return error.InvalidHeader;
         }
-        const owned_name = try alloc.dupe(u8, entry.key_ptr.*);
+        const owned_name = try std.ascii.allocLowerString(alloc, entry.key_ptr.*);
         errdefer alloc.free(owned_name);
         const owned_env = try alloc.dupe(u8, entry.value_ptr.string);
         errdefer alloc.free(owned_env);
         refs[initialized] = .{ .name = owned_name, .env = owned_env };
         initialized += 1;
     }
+    sortHeaders(HeaderEnv, refs);
     return refs;
+}
+
+fn sortHeaders(comptime T: type, headers: []T) void {
+    sort_utils.sort(T, headers, {}, struct {
+        fn lessThan(_: void, left: T, right: T) bool {
+            return std.mem.lessThan(u8, left.name, right.name);
+        }
+    }.lessThan);
 }
 
 fn free_headers(alloc: Allocator, headers: []const Header) void {
@@ -561,7 +572,7 @@ test "configured provider owns definitions and preserves unknown metadata" {
     try std.testing.expectEqualStrings("x-opencode-session", router.headers[0].name);
     try std.testing.expectEqualStrings("fx-verify-0001", router.headers[0].value);
     try std.testing.expectEqual(@as(usize, 1), router.header_env.len);
-    try std.testing.expectEqualStrings("HTTP-Referer", router.header_env[0].name);
+    try std.testing.expectEqualStrings("http-referer", router.header_env[0].name);
     try std.testing.expectEqualStrings("FX_TEST_REFERER", router.header_env[0].env);
     const metadata = router.model("openai/gpt-4.1").?;
     try std.testing.expectEqual(@as(?u32, 8192), metadata.context_window);
@@ -630,6 +641,20 @@ test "configured provider binding identity separates name endpoint and auth slot
     changed.headers = &.{};
     changed.header_env = &.{};
     try std.testing.expect(!std.mem.eql(u8, &identity, &changed.binding_identity()));
+}
+
+test "configured provider header binding ignores order and name casing" {
+    const first_json =
+        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"},"headers":{"X-Tenant":"one","x-region":"two"},"header_env":{"X-Api-Key":"FIRST_KEY","x-project":"PROJECT_ID"}}}
+    ;
+    const reordered_json =
+        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"},"headers":{"X-Region":"two","x-tenant":"one"},"header_env":{"X-Project":"PROJECT_ID","x-api-key":"FIRST_KEY"}}}
+    ;
+    var first = try Registry.parse_json(std.testing.allocator, first_json);
+    defer first.deinit(std.testing.allocator);
+    var reordered = try Registry.parse_json(std.testing.allocator, reordered_json);
+    defer reordered.deinit(std.testing.allocator);
+    try std.testing.expectEqual(first.get("local").?.binding_identity(), reordered.get("local").?.binding_identity());
 }
 
 test "configured provider invalid request headers fail explicitly" {
