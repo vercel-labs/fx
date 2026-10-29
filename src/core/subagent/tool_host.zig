@@ -194,6 +194,9 @@ pub const Runtime = struct {
     /// parent's messages waiting for them the stop dropped, until the
     /// stopped work's report or notice says so (`userStopped`).
     user_dropped: std.ArrayList(UserDrop) = .empty,
+    /// Children working on a turn the user started on their own screen,
+    /// as a work in the parent's log (`beginUserWork`). Owned ids.
+    user_works: std.ArrayList([]u8) = .empty,
     waiter_mutex: std.Io.Mutex = .init,
     /// The owner's worker while it waits in `wait`.
     waiter: ?*worker_runtime.WorkerRuntime = null,
@@ -259,6 +262,8 @@ pub const Runtime = struct {
         self.work_calls.deinit(self.alloc);
         for (self.user_dropped.items) |drop| self.alloc.free(drop.child_id);
         self.user_dropped.deinit(self.alloc);
+        for (self.user_works.items) |id| self.alloc.free(id);
+        self.user_works.deinit(self.alloc);
         self.approvals.deinit();
         if (self.profile_cache) |*cache| cache.deinit();
         self.alloc.free(self.root_id);
@@ -493,8 +498,9 @@ pub const Runtime = struct {
                     self.admission_mutex.lockUncancelable(io_mod.getIo());
                     defer self.admission_mutex.unlock(io_mod.getIo());
                     // Older messages for this child wait their turn; a new one
-                    // never joins the running turn past them.
-                    if (!self.hasPendingLocked(target.child_id)) {
+                    // never joins the running turn past them. A turn the user
+                    // started has no slot to join, so they wait for it too.
+                    if (!self.hasPendingLocked(target.child_id) and !self.inUserWorkLocked(target.child_id)) {
                         const result = try self.managed.steer(target.child_id, target.work_id, operation_id, fingerprint, request.message.message);
                         switch (result) {
                             .receipt => |delivery| break :steer delivery,
@@ -882,7 +888,10 @@ pub const Runtime = struct {
     /// What a report says about the work: the child's reply, or how it
     /// ended, with any text it had written.
     fn reportOutput(self: *Runtime, a: Allocator, end: managed_owner.WorkEnd) ![]const u8 {
-        const text = self.managedResultText(a, end.child_id, end.work_id) catch null;
+        const text = if (end.reply) |reply|
+            (if (reply.len > 0) reply else null)
+        else
+            self.managedResultText(a, end.child_id, end.work_id) catch null;
         return switch (end.outcome) {
             .completed => text orelse "The subagent ended its turn without a reply.",
             .failed => formatFailedResult(a, if (end.failure) |*failure| failure.view() else null, text),
@@ -909,6 +918,7 @@ pub const Runtime = struct {
         } else return false;
         var item = self.pending.orderedRemove(index);
         defer item.deinit(self.alloc);
+        self.absorbPendingLocked(&item, index);
         var lock = self.managed.state_store.acquireLock();
         defer lock.release();
         var registry = self.managed.state_store.load(self.alloc) catch |err| return self.dropStart(item, err);
@@ -917,6 +927,107 @@ pub const Runtime = struct {
         self.managed.state_store.save(self.alloc, registry) catch |err| return self.dropStart(item, err);
         debug_trace.eventf("mailbox", "next_turn", .{}, "child={s} work_id={s}", .{ child_id, item.work.id });
         return true;
+    }
+
+    /// The messages waiting for `head`'s child behind it join the turn it
+    /// starts, in order (`Mailbox.tla` `Absorbed`): one turn and one report.
+    /// They arrive as one message, each in its own paragraph, with the
+    /// newest root request for the reviewer. `from` is where the next of
+    /// the child's waiting messages can be.
+    fn absorbPendingLocked(self: *Runtime, head: *Pending, from: usize) void {
+        var index = from;
+        while (index < self.pending.items.len) {
+            const next = &self.pending.items[index];
+            if (!std.mem.eql(u8, next.child_id, head.child_id)) {
+                index += 1;
+                continue;
+            }
+            const joined = std.mem.concat(self.alloc, u8, &.{ head.work.message, "\n\n", next.work.message }) catch {
+                debug_trace.logf("mailbox", "absorb skipped child={s} work_id={s} reason=out_of_memory", .{ head.child_id, next.work.id });
+                return;
+            };
+            self.alloc.free(head.work.message);
+            head.work.message = joined;
+            std.mem.swap([]u8, &head.work.root_user_intent_context, &next.work.root_user_intent_context);
+            std.mem.swap([][]u8, &head.work.root_user_messages, &next.work.root_user_messages);
+            std.mem.swap(bool, &head.work.root_user_evidence_complete, &next.work.root_user_evidence_complete);
+            debug_trace.eventf("mailbox", "absorbed", .{}, "child={s} work_id={s} into={s}", .{ head.child_id, next.work.id, head.work.id });
+            var absorbed = self.pending.orderedRemove(index);
+            self.forgetCallLocked(absorbed.work.id);
+            absorbed.deinit(self.alloc);
+        }
+    }
+
+    fn inUserWorkLocked(self: *const Runtime, child_id: []const u8) bool {
+        for (self.user_works.items) |id| if (std.mem.eql(u8, id, child_id)) return true;
+        return false;
+    }
+
+    /// Opens a work in the parent's log for a turn the user starts on
+    /// `child_id`'s own screen, as every child turn is one (`Mailbox.tla`
+    /// `WakeChild`, D22). Null while a work of the parent's is going, which
+    /// the user's message then joins, or when the child can't take one. Its
+    /// end owes the parent a report only under `every_turn`, or when it
+    /// fails or is interrupted (`reports.reportable`). The caller owns the
+    /// id, and ends the work with `endUserWork`.
+    pub fn beginUserWork(self: *Runtime, alloc: Allocator, child_id: []const u8) ?[]u8 {
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        if (self.isBusyLocked(child_id)) return null;
+        return self.openUserWorkLocked(alloc, child_id) catch |err| {
+            debug_trace.eventf("mailbox", "user_work_failed", .{}, "child={s} err={s}", .{ child_id, @errorName(err) });
+            return null;
+        };
+    }
+
+    fn openUserWorkLocked(self: *Runtime, alloc: Allocator, child_id: []const u8) ![]u8 {
+        const suffix = try session_store.generateSessionId(self.alloc);
+        defer self.alloc.free(suffix);
+        const work_id = try alloc.print("fxuser:{s}", .{suffix});
+        errdefer alloc.free(work_id);
+        {
+            var lock = self.managed.state_store.acquireLock();
+            defer lock.release();
+            var registry = try self.managed.state_store.load(self.alloc);
+            defer registry.deinit(self.alloc);
+            const child = registry.findById(child_id) orelse return error.ChildUnavailable;
+            const agent = child.agentName() orelse return error.OneOffChild;
+            _ = try registry.startPersistentWork(self.alloc, agent, null, .{
+                .id = work_id,
+                .message = @constCast(""),
+                .created_at_ms = io_mod.milliTimestamp(),
+            });
+            try self.managed.state_store.save(self.alloc, registry);
+        }
+        const owned = try self.alloc.dupe(u8, child_id);
+        errdefer self.alloc.free(owned);
+        try self.user_works.append(self.alloc, owned);
+        errdefer _ = self.user_works.pop();
+        try self.markBusyLocked(child_id);
+        debug_trace.eventf("mailbox", "user_work", .{}, "child={s} work_id={s}", .{ child_id, work_id });
+        return work_id;
+    }
+
+    /// Ends the work `beginUserWork` opened, with the turn's `reply`, and
+    /// starts the parent's next message waiting for the child.
+    pub fn endUserWork(self: *Runtime, child_id: []const u8, work_id: []const u8, outcome: child_state.Outcome, reply: []const u8) void {
+        const owed = self.managed.finishUserWork(child_id, work_id, outcome);
+        self.deliverEnd(.{ .child_id = child_id, .work_id = work_id, .outcome = outcome, .report_owed = owed, .reply = reply });
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        for (self.user_works.items, 0..) |id, index| {
+            if (!std.mem.eql(u8, id, child_id)) continue;
+            self.alloc.free(self.user_works.swapRemove(index));
+            break;
+        }
+        if (self.startNextPendingLocked(child_id)) {
+            _ = self.managed.start(child_id) catch |err| {
+                debug_trace.eventf("mailbox", "start_failed", .{}, "child={s} error={s}", .{ child_id, @errorName(err) });
+                self.clearBusyLocked(child_id);
+            };
+            return;
+        }
+        self.clearBusyLocked(child_id);
     }
 
     fn dropStart(self: *Runtime, item: Pending, err: anyerror) bool {
@@ -1719,6 +1830,127 @@ test "a user's stop of a work that owes no report tells the parent of its droppe
         "reviewer   cancelled The user stopped it, and 1 of your messages waiting for it were dropped. dropped=1",
         fixture.reports.items[0],
     );
+}
+
+test "a turn the user starts on an idle subagent is a work, and reports its reply under every_turn" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working", .report = "every_turn" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
+    const child_id = try reviewerId(runtime, arena);
+
+    const work_id = runtime.beginUserWork(alloc, child_id).?;
+    defer alloc.free(work_id);
+    {
+        var lock = runtime.managed.state_store.acquireLock();
+        defer lock.release();
+        var registry = try runtime.managed.state_store.load(arena);
+        const child = registry.findPersistent("reviewer").?;
+        try std.testing.expectEqual(child_state.Phase.running, child.phase);
+        try std.testing.expectEqualStrings(work_id, child.active.?.id);
+    }
+    // A second turn can't open while this one is open.
+    try std.testing.expect(runtime.beginUserWork(alloc, child_id) == null);
+    runtime.endUserWork(child_id, work_id, .completed, "USER_TURN_REPLY");
+    try std.testing.expectEqual(@as(usize, 2), fixture.reportCount());
+    const line = fixture.reports.items[1];
+    try std.testing.expect(std.mem.find(u8, line, work_id) != null);
+    try std.testing.expect(std.mem.endsWith(u8, line, " completed USER_TURN_REPLY"));
+    try std.testing.expect(!runtime.anyWorking());
+}
+
+test "a user's turn under the final rule reports only when it fails" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    const child_id = try reviewerId(runtime, arena);
+    const done = runtime.beginUserWork(alloc, child_id).?;
+    defer alloc.free(done);
+    runtime.endUserWork(child_id, done, .completed, "fine");
+    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
+    const failed = runtime.beginUserWork(alloc, child_id).?;
+    defer alloc.free(failed);
+    runtime.endUserWork(child_id, failed, .failed, "");
+    try std.testing.expectEqual(@as(usize, 2), fixture.reportCount());
+    try std.testing.expect(std.mem.find(u8, fixture.reports.items[1], " failed ") != null);
+}
+
+test "a parent's message while the user's turn runs waits for it, then starts" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    const child_id = try reviewerId(runtime, arena);
+    const work_id = runtime.beginUserWork(alloc, child_id).?;
+    defer alloc.free(work_id);
+    const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "after the user" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, queued, "is busy") != null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+
+    runtime.endUserWork(child_id, work_id, .completed, "");
+    try waitForRuns(&fixture, 2);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 2), fixture.reportCount());
+    try std.testing.expect(std.mem.find(u8, fixture.reports.items[1], "DONE after the user") != null);
+}
+
+test "messages waiting for a busy subagent are taken into its next turn as one work" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "second" } }, "call-2", null);
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "third" } }, "call-3", null);
+    fixture.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime);
+
+    // Two works, not three: the second took in the third.
+    try std.testing.expectEqual(@as(usize, 2), fixture.runs.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), fixture.reportCount());
+    try std.testing.expect(std.mem.find(u8, fixture.reports.items[1], "DONE second\n\nthird") != null);
+    try std.testing.expectEqual(@as(usize, 0), runtime.work_calls.items.len);
 }
 
 test "a work that ends after its tree closed owes no report and posts none" {
