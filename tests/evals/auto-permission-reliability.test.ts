@@ -761,9 +761,10 @@ const scenarios: Scenario[] = [
         actions: [create, childAction],
         effectPath,
         expectedExecutionStarts: 2,
-        // The parent's call, the child's two requests, the parent after its
-        // receipt, and the turn the child's report starts.
-        expectedOuterRequests: 5,
+        // The saved session's title, the parent's call, the child's two
+        // requests, the parent after its receipt, and the turn the child's
+        // report starts.
+        expectedOuterRequests: 6,
         saveSession: true,
         outerResponder(body) {
           if (body.includes(`\"toolCallId\":\"${childCallId}\"`)) {
