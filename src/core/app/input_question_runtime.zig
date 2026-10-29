@@ -68,6 +68,7 @@ pub fn QuestionRuntime(comptime App: type) type {
             const mcp_elicitation = isMcpElicitationPrompt(agent);
             interrupt.traceInterruptRequested(app, agent, "input_question");
             if (!route_recovery) {
+                if (comptime @hasDecl(App, "noteUserStop")) app.noteUserStop(agent);
                 if (comptime @hasDecl(@TypeOf(agent.worker), "requestInteractiveCancel")) {
                     agent.worker.requestInteractiveCancel();
                 } else {

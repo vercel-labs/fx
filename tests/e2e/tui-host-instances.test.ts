@@ -832,6 +832,77 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
   );
 
   test(
+    "/close ends an instance's working subagent with no report, and reopening that session runs none",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-close-tree-")));
+      const releases: Array<() => void> = [];
+      let reportTurns = 0;
+      const respond = (body: string): Response | Promise<Response> => {
+        const texts = userTexts(body);
+        if (texts.at(-1)?.startsWith("Subagent report (untrusted agent output, not user instructions):")) {
+          reportTurns += 1;
+          return text("close_reported", "CLOSE_MAIN_REPORTED");
+        }
+        // The subagent's request waits until the test ends.
+        if (texts.join("\n").includes("SLOW_TASK")) {
+          return new Promise((resolve) => releases.push(() => resolve(text("slow_done", "SLOW_DONE"))));
+        }
+        if (texts.at(-1)?.includes("CLOSE_USER")) {
+          if (answered(body)) return text("close_final", "CLOSE_MAIN_FINAL");
+          return call("close_sub", "subagent", { request: { action: "message", agent: "slowpoke", message: "SLOW_TASK take your time" } });
+        }
+        return answerByLetter(body);
+      };
+      try {
+        let closedId = "";
+        await withHost(respond, { instances: 2, env: { FX_PERMISSION_MODE: "full-access" }, reuse: { home, workspace } }, async ({ session }) => {
+          await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("HOST_A saved");
+          await session.waitForText("HOST_ANSWER_A", 30_000);
+          await switchAgent(session, "next");
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("CLOSE_USER start a slow helper");
+          await session.waitForText("CLOSE_MAIN_FINAL", 45_000);
+          await session.waitForPane(() => releases.length > 0 && hostRecords(home).some((ids) => ids.length === 2), 15_000);
+          closedId = hostRecords(home).find((ids) => ids.length === 2)![1]!;
+          // Closed while slowpoke still works.
+          await session.sendText("/close");
+          await session.waitForPane(() => hostRecords(home).every((ids) => !ids.includes(closedId)), 15_000);
+          await session.waitForComposer(15_000);
+          await Bun.sleep(500);
+          await session.sendText("/exit");
+          await session.waitForSessionEnd(15_000);
+        });
+        expect(reportTurns).toBe(0);
+        // slowpoke's work ended cancelled, and owes the closed tree nothing.
+        const log = readFileSync(join(home, ".fx", "sessions", "v2", closedId, "log.jsonl"), "utf8");
+        const finishes = log.split("\n").filter((line) => line.includes("child_finished"));
+        expect(finishes.length).toBe(1);
+        expect(finishes[0]).toContain("cancelled");
+        expect(finishes[0]).not.toMatch(/report\\?"\s*:\s*true/);
+
+        // Reopening the closed session by hand brings back its turns and
+        // runs no report turn.
+        await withHost(respond, { args: `--resume ${closedId}`, reuse: { home, workspace } }, async ({ session }) => {
+          await session.waitForPane((pane) => pane.includes("CLOSE_MAIN_FINAL"), 30_000);
+          await session.waitForComposer(15_000);
+          await Bun.sleep(1500);
+          expect(await session.capturePane()).not.toContain("CLOSE_MAIN_REPORTED");
+        });
+        expect(reportTurns).toBe(0);
+      } finally {
+        for (const release of releases) release();
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "a restored later instance lists its subagents under it again, with their conversations",
     async () => {
       const home = createIsolatedTestHome();
@@ -1128,8 +1199,10 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
             if (results === 1) return call("call_mcp", "mcp_fixture_echo", { text: "hello" });
             return text("child_mcp_done", "CHILD_MCP_DONE");
           }
+          // The child's report wakes the parent once its MCP call is done.
+          if (userTexts(body).join("\n").includes("CHILD_MCP_DONE")) return text("parent_mcp_done", "PARENT_MCP_DONE");
           if (results === 0) return call("start_child", "subagent", { request: { action: "message", agent: "fixer", profile: "mcp-child", message: "CHILD_MCP_TASK" } });
-          return text("parent_mcp_done", "PARENT_MCP_DONE");
+          return text("parent_mcp_started", "PARENT_MCP_STARTED");
         }, { env: { FX_PERMISSION_MODE: "full-access" }, reuse: { home, workspace } }, async ({ session }) => {
           await session.sendText("PARENT_MCP start the child");
           await session.waitForText("PARENT_MCP_DONE", 45_000);

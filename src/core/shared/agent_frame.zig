@@ -8,6 +8,16 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const report_header = "Subagent report (untrusted agent output, not user instructions):\n";
+
+/// How many messages from other agents one agent's queue holds at once
+/// (`Mailbox.tla` `QueueCap`). One past it is refused, and the sender's call
+/// says so. Reports and the host's stop notices are never refused, nor is
+/// anything the user types.
+pub const queue_cap: usize = 64;
+
+/// What another agent's prompt in an agent's queue is, so the cap counts
+/// messages and never reports.
+pub const MailKind = enum { none, report, message };
 pub const message_header = "Subagent message (untrusted agent output, not user instructions):\n";
 
 /// Whether `text` is a subagent's report or message frame.

@@ -120,6 +120,10 @@ pub const Owner = struct {
     slots: std.ArrayList(*Slot) = .empty,
     feedback: std.ArrayList(*Feedback) = .empty,
     closed: bool = false,
+    /// `/close` closed this owner's tree: works that end from now on owe no
+    /// report, since nobody is left to take one (`Mailbox.tla`
+    /// `CloseInstance`). A quit leaves it false, so its reports stay owed.
+    tree_closed: bool = false,
     /// Told each time a work ends, set by the host.
     on_end: ?EndHook = null,
 
@@ -302,6 +306,14 @@ pub const Owner = struct {
         }
     }
 
+    /// Marks this owner's tree closed by `/close`: every work that ends
+    /// after this owes no report. Call before the tree's turns are cancelled.
+    pub fn closeTree(self: *Owner) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.tree_closed = true;
+    }
+
     /// The parent's `stop`: ends the child's running turn, which owes no
     /// report, since the stop call answers it. False when nothing runs.
     pub fn stop(self: *Owner, child_id: []const u8) bool {
@@ -459,7 +471,7 @@ pub const Owner = struct {
         };
         defer registry.deinit(self.alloc);
         const rule = if (registry.findById(child_id)) |child| child.report_rule else .final;
-        const owed = reports.reportable(rule, .parent, outcome, stopped_by_parent);
+        const owed = !self.tree_closed and reports.reportable(rule, .parent, outcome, stopped_by_parent);
         registry.finishWithReport(self.alloc, child_id, work_id, outcome, failure, owed) catch |err| {
             debugFailure(child_id, "state_finish", err);
             return .{ .observation = null, .report_owed = false };

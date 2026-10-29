@@ -131,6 +131,10 @@ pub const Report = struct {
     outcome: child_state.Outcome,
     /// The child's last reply for the work, as it wrote it.
     output: []const u8,
+    /// How many of the parent's messages waiting for the child the user's
+    /// stop dropped (decision 10). A report with no `work_id` is the notice
+    /// of that drop when the stopped work owed no report.
+    dropped: usize = 0,
 };
 
 const header = agent_frame.report_header;
@@ -180,7 +184,8 @@ pub fn message(alloc: Allocator, report: Report, max_output_bytes: usize) error{
         .work_id = report.work_id,
         .outcome = @tagName(report.outcome),
         .output = output,
-    }, .{}, &out.writer) catch return error.OutOfMemory;
+        .dropped = if (report.dropped > 0) @as(?usize, report.dropped) else null,
+    }, .{ .emit_null_optional_fields = false }, &out.writer) catch return error.OutOfMemory;
     out.writer.writeByte('\n') catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
@@ -222,6 +227,15 @@ test "a report's sender is read back from its frame, and other text has none" {
     defer parsed.deinit();
     try std.testing.expectEqualStrings("c1", parsed.value.child_id);
     try std.testing.expectEqualStrings("w1", parsed.value.work_id);
+
+    try std.testing.expect(std.mem.find(u8, text, "dropped") == null);
+
+    // The notice of a user's stop: a frame, but no report to take.
+    const notice = try message(alloc, .{ .agent = "reviewer", .child_id = "c1", .work_id = "", .outcome = .cancelled, .output = "", .dropped = 2 }, 4096);
+    defer alloc.free(notice);
+    try std.testing.expect(agent_frame.isFrame(notice));
+    try std.testing.expect(std.mem.find(u8, notice, "\"dropped\":2") != null);
+    try std.testing.expect((try agent_frame.reportSender(alloc, notice)) == null);
 
     const note = try messageText(alloc, "reviewer", "c1", "a question", 4096);
     defer alloc.free(note);

@@ -1421,7 +1421,7 @@ pub fn Runtime(comptime App: type) type {
                 if (lifecycle == .turn_finished and !offScreen(app, agent)) app.program_status.noteTurnFinished(lifecycle.turn_finished.outcome);
             }
             if (comptime agents.hasAgentField(App, "child_run")) {
-                if (lifecycle == .turn_finished) app_agents_runtime.Runtime(App).noteChildTurnFinished(app, agent, lifecycle.turn_finished.outcome);
+                if (lifecycle == .turn_finished) app_agents_runtime.Runtime(App).noteChildTurnFinished(app, agent, lifecycle.turn_finished);
             }
             if (transition.applied_activity_kind) |kind| {
                 applyToolActivity(&agent.stream, kind);

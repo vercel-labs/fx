@@ -834,10 +834,15 @@ fn postAcpReport(
         .history = &.{},
         .grants = &.{},
         .author = .child,
+        .mail = if (delivery == .report) .report else .message,
     }) catch |err| {
         var dropped = state.report_calls.pop().?;
         dropped.deinit(alloc);
-        return if (err == error.OutOfMemory) error.OutOfMemory else error.AgentGone;
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.QueueFull => error.QueueFull,
+            else => error.AgentGone,
+        };
     };
     owns_text = false;
 }

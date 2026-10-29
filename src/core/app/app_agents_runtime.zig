@@ -211,6 +211,8 @@ pub const ReportPost = struct {
     outcome: subagent_child_state.Outcome = .completed,
     /// The report's output, or the message's text.
     text: []u8,
+    /// A report's count of the parent's messages a user's stop dropped.
+    dropped: usize = 0,
 
     fn create(host: *subagent_tool_host.Runtime, delivery: subagent_tool_host.Delivery) !*ReportPost {
         const post = try handoff_alloc.create(ReportPost);
@@ -234,6 +236,7 @@ pub const ReportPost = struct {
             .work_id = owned_work,
             .outcome = if (delivery == .report) delivery.report.outcome else .completed,
             .text = try handoff_alloc.dupe(u8, text),
+            .dropped = if (delivery == .report) delivery.report.dropped else 0,
         };
         return post;
     }
@@ -246,6 +249,15 @@ pub const ReportPost = struct {
         handoff_alloc.destroy(self);
     }
 };
+
+test "a report's hand-off keeps the count of messages a user's stop dropped" {
+    // Only the host's address is kept, so any will do.
+    var host: subagent_tool_host.Runtime = undefined;
+    const post = try ReportPost.create(&host, .{ .report = .{ .agent = "reviewer", .child_id = "c1", .work_id = "w1", .outcome = .cancelled, .output = "", .dropped = 2 } });
+    defer post.destroy();
+    try std.testing.expectEqual(@as(usize, 2), post.dropped);
+    try std.testing.expectEqual(subagent_child_state.Outcome.cancelled, post.outcome);
+}
 
 /// Queues a host's delivery for the main loop, without waiting.
 /// `AgentGone` once the app is shutting down; a report then stays owed.
@@ -1397,15 +1409,49 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// The agent a subagent's delivery from `host` goes to: the host's
+        /// owner, or with `from_owner` that owner's own parent. Call with
+        /// `authority_mutex` held, or on the main loop.
+        fn receiverOf(app: *App, host: *subagent_tool_host.Runtime, from_owner: bool) ?*AppAgent {
+            const owner = ownerOf(app, host) orelse return null;
+            if (!from_owner) return owner;
+            const child = hostedOf(app, owner) orelse return null;
+            return ownerOf(app, hostOf(app, child));
+        }
+
+        /// Holds a place for a subagent's message in the queue it goes to,
+        /// on the subagent's thread, so a full queue refuses it while its
+        /// call waits (`Mailbox.tla` `Refuse`). `deliverReport` uses the
+        /// place; `releaseMessagePlace` gives it back.
+        pub fn reserveMessagePlace(app: *App, host: *subagent_tool_host.Runtime, from_owner: bool) subagent_tool_host.PostReportError!void {
+            const receiver = blk: {
+                app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+                defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+                break :blk receiverOf(app, host, from_owner) orelse return error.AgentGone;
+            };
+            // The receiver outlives the sender's call: a tree closes its
+            // subagents' threads before the agents that started them.
+            if (!receiver.worker.reserveAgentMessage()) return error.QueueFull;
+        }
+
+        pub fn releaseMessagePlace(app: *App, host: *subagent_tool_host.Runtime, from_owner: bool) void {
+            const receiver = blk: {
+                app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+                defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+                break :blk receiverOf(app, host, from_owner) orelse return;
+            };
+            receiver.worker.releaseAgentMessage();
+        }
+
         fn deliverReport(app: *App, post: *ReportPost) !void {
-            const owner = ownerOf(app, post.host) orelse return error.AgentGone;
-            // A subagent's message to its parent: the owner's own parent when
-            // the owner sent it.
-            const target, const sender = if (post.kind == .message and post.from_owner) blk: {
+            const message = post.kind == .message;
+            const target = receiverOf(app, post.host, message and post.from_owner) orelse return error.AgentGone;
+            // A message sent by the owner names the owner, its own subagent.
+            const sender = if (message and post.from_owner) blk: {
+                const owner = ownerOf(app, post.host) orelse return error.AgentGone;
                 const child = hostedOf(app, owner) orelse return error.AgentGone;
-                const parent = ownerOf(app, hostOf(app, child)) orelse return error.AgentGone;
-                break :blk .{ parent, if (child.name.len > 0) child.name else child.id };
-            } else .{ owner, post.agent };
+                break :blk if (child.name.len > 0) child.name else child.id;
+            } else post.agent;
             const limit = target.worker.effectiveAgentTurnSettings().max_tool_result_bytes;
             const text = switch (post.kind) {
                 .report => try subagent_reports.message(app.alloc, .{
@@ -1414,11 +1460,15 @@ pub fn Runtime(comptime App: type) type {
                     .work_id = post.work_id,
                     .outcome = post.outcome,
                     .output = post.text,
+                    .dropped = post.dropped,
                 }, limit),
-                .message => try subagent_reports.messageText(app.alloc, sender, post.child_id, post.text, limit),
+                .message => subagent_reports.messageText(app.alloc, sender, post.child_id, post.text, limit) catch |err| {
+                    target.worker.releaseAgentMessage();
+                    return err;
+                },
             };
             defer app.alloc.free(text);
-            try app.postAgentMessage(target, text, .child);
+            try app.postAgentMessage(target, text, .child, if (message) .message else .report);
             debug_trace.eventf("host", "child_delivery_posted", .{}, "child={s} work_id={s} kind={s}", .{ post.child_id, post.work_id, @tagName(post.kind) });
         }
 
@@ -1698,6 +1748,11 @@ pub fn Runtime(comptime App: type) type {
             if (app.question_lender) |lender| if (std.mem.findScalar(*ChildAgent, tree.items, lender) != null) {
                 _ = returnQuestion(app);
             };
+            // First, so no work the close ends owes a report into the tree.
+            if (comptime agents.hasAgentField(App, "session_persistence")) {
+                if (root.session_persistence.subagent_host) |host| host.closeTree();
+                for (tree.items) |entry| if (entry.agent.session_persistence.subagent_host) |host| host.closeTree();
+            }
             for (tree.items) |entry| {
                 entry.agent.worker.requestCancel();
                 entry.agent.worker.requestShutdown();
@@ -1796,12 +1851,30 @@ pub fn Runtime(comptime App: type) type {
             endRun(run, outcome);
         }
 
+        /// The user stops a subagent's turn on its own screen (Esc, or
+        /// cancelling its approval or question) while it works for its
+        /// parent: the other agents' messages waiting in its queue are
+        /// dropped, and its parent's host drops those waiting there
+        /// (`subagent_tool_host.Runtime.userStopped`). A turn the user
+        /// started there has no parent's messages behind it.
+        pub fn noteUserStop(app: *App, agent: *AppAgent) void {
+            const run = runInFlight(app, agent) orelse return;
+            const child = hostedOf(app, agent) orelse return;
+            const host = hostOf(app, child) orelse return;
+            const drop = agent.worker.dropAgentMessages(std.heap.c_allocator);
+            host.userStopped(run.child_id, drop.from_parent);
+        }
+
         /// Records how a child's turn ended. The finished turn can still be
         /// on its way, held by the pacer or not yet drained, so the run ends
         /// when it is saved, or in `settleChildRuns` once nothing is left.
-        pub fn noteChildTurnFinished(app: *App, agent: *AppAgent, outcome: types.TurnPresentationOutcome) void {
+        pub fn noteChildTurnFinished(app: *App, agent: *AppAgent, finished: types.TurnFinished) void {
             const run = runInFlight(app, agent) orelse return;
-            run.ended_as = outcome;
+            run.ended_as = finished.outcome;
+            if (finished.outcome == .interrupted and agent.worker.handedOff(finished.turn_id)) {
+                run.handed_off = true;
+                debug_trace.eventf("host", "child_turn_handed_off", .{}, "agent={s} work_id={s} turn_id={d}", .{ run.child_id, run.work_id, finished.turn_id });
+            }
         }
 
         /// Ends each child's run whose turn has finished and left nothing to
@@ -1843,7 +1916,9 @@ pub fn Runtime(comptime App: type) type {
                     };
                     finishRun(run, .failed);
                 },
-                .interrupted, .paused => finishRun(run, .cancelled),
+                // Handed off to the user's image or `$skill`: the work is done.
+                .interrupted => finishRun(run, if (run.handed_off) .completed else .cancelled),
+                .paused => finishRun(run, .cancelled),
             }
         }
 
