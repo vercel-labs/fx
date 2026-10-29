@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const approval_registry = @import("approval_registry.zig");
+const reports = @import("reports.zig");
 const agents = @import("../agents/agents.zig");
 const authority = @import("authority.zig");
 const child_state = @import("child_state.zig");
@@ -36,6 +37,11 @@ const Slot = struct {
     metrics: live_metrics.LiveMetrics = .{},
     cancel: std.atomic.Value(bool) = .init(false),
     shutdown: std.atomic.Value(bool) = .init(false),
+    /// Set by the parent's `stop`, so the end owes no report.
+    stopped_by_parent: bool = false,
+    /// Set by the host once it has no next work for the slot, which then
+    /// finishes. A start for the child waits for that.
+    ending: bool = false,
     worker: ?*worker_runtime.WorkerRuntime = null,
     /// True when `worker` is the child agent's own, which runs its later
     /// turns too: stopping the turn cancels it instead of shutting it down.
@@ -63,7 +69,6 @@ const Feedback = struct {
     operation_id: []u8,
     fingerprint: [32]u8,
     receipt: worker_runtime.SteeringReceipt = .{},
-    reported: types.SteeringDelivery = .queued,
 
     fn create(alloc: Allocator, child_id: []const u8, operation_id: []const u8, fingerprint: [32]u8) !*Feedback {
         const item = try alloc.create(Feedback);
@@ -82,10 +87,23 @@ const Feedback = struct {
     }
 };
 
-pub const FeedbackUpdate = struct {
+/// What the owner tells its host when one of a child's works ends: the work
+/// is finished in the registry, and whether its end owes the parent a
+/// report is recorded with it.
+pub const WorkEnd = struct {
     child_id: []const u8,
-    operation_id: []const u8,
-    delivery: types.SteeringDelivery,
+    work_id: []const u8,
+    outcome: child_state.Outcome,
+    failure: ?types.ModelFailureDiagnostic = null,
+    report_owed: bool,
+};
+
+/// The host's hook for a work's end, called on the child's slot thread with
+/// no lock held. It returns true when it has installed the child's next
+/// work in the registry, which the same slot then runs.
+pub const EndHook = struct {
+    context: *anyopaque,
+    end_fn: *const fn (*anyopaque, WorkEnd) bool,
 };
 
 pub const Owner = struct {
@@ -102,6 +120,8 @@ pub const Owner = struct {
     slots: std.ArrayList(*Slot) = .empty,
     feedback: std.ArrayList(*Feedback) = .empty,
     closed: bool = false,
+    /// Told each time a work ends, set by the host.
+    on_end: ?EndHook = null,
 
     fn feedbackReplayLocked(self: *Owner, operation_id: []const u8, fingerprint: [32]u8) ?FeedbackResult {
         for (self.feedback.items) |item| {
@@ -177,33 +197,6 @@ pub const Owner = struct {
         return .{ .receipt = .queued };
     }
 
-    pub fn feedbackUpdates(self: *Owner, arena: Allocator) ![]FeedbackUpdate {
-        self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
-        var updates: std.ArrayList(FeedbackUpdate) = .empty;
-        for (self.feedback.items) |item| {
-            const delivery = item.receipt.state.load(.seq_cst);
-            if (delivery == item.reported) continue;
-            try updates.append(arena, .{
-                .child_id = try arena.dupe(u8, item.child_id),
-                .operation_id = try arena.dupe(u8, item.operation_id),
-                .delivery = delivery,
-            });
-        }
-        return updates.toOwnedSlice(arena);
-    }
-
-    pub fn acknowledgeFeedback(self: *Owner, child_id: []const u8, operation_id: []const u8, delivery: types.SteeringDelivery) void {
-        self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
-        for (self.feedback.items) |item| {
-            if (std.mem.eql(u8, item.child_id, child_id) and std.mem.eql(u8, item.operation_id, operation_id)) {
-                if (item.receipt.state.load(.seq_cst) == delivery) item.reported = delivery;
-                return;
-            }
-        }
-    }
-
     pub fn hasRunningChild(self: *Owner, child_id: []const u8) bool {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -221,6 +214,10 @@ pub const Owner = struct {
                 if (self.closed) return error.OwnerClosed;
                 for (self.slots.items, 0..) |slot, index| {
                     if (!std.mem.eql(u8, slot.child_id, child_id)) continue;
+                    if (slot.completion == .running and slot.ending) {
+                        self.waiters_changed.waitUncancelable(io_mod.getIo(), &self.mutex);
+                        continue :start_attempt;
+                    }
                     if (slot.completion == .running) return .already_running;
                     if (slot.waiters != 0) {
                         self.waiters_changed.waitUncancelable(io_mod.getIo(), &self.mutex);
@@ -231,7 +228,9 @@ pub const Owner = struct {
                 var feedback_index: usize = 0;
                 while (feedback_index < self.feedback.items.len) {
                     const item = self.feedback.items[feedback_index];
-                    if (std.mem.eql(u8, item.child_id, child_id) and item.receipt.state.load(.seq_cst) != .queued and item.reported == item.receipt.state.load(.seq_cst)) {
+                    // A settled message's tool call already answered; only
+                    // its replay needed it.
+                    if (std.mem.eql(u8, item.child_id, child_id) and item.receipt.state.load(.seq_cst) != .queued) {
                         _ = self.feedback.swapRemove(feedback_index);
                         item.deinit(self.alloc);
                     } else feedback_index += 1;
@@ -291,6 +290,32 @@ pub const Owner = struct {
         if (reaped) destroySlot(self, active);
         if (unpublished) return error.StateUnavailable;
         return observation;
+    }
+
+    /// The host has no next work for the child's slot, which is about to
+    /// finish its last one.
+    pub fn markEnding(self: *Owner, child_id: []const u8) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.slots.items) |slot| {
+            if (std.mem.eql(u8, slot.child_id, child_id) and slot.completion == .running) slot.ending = true;
+        }
+    }
+
+    /// The parent's `stop`: ends the child's running turn, which owes no
+    /// report, since the stop call answers it. False when nothing runs.
+    pub fn stop(self: *Owner, child_id: []const u8) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.slots.items) |slot| {
+            if (!std.mem.eql(u8, slot.child_id, child_id)) continue;
+            if (slot.completion != .running) return false;
+            slot.stopped_by_parent = true;
+            slot.cancel.store(true, .seq_cst);
+            stopTurn(slot, .cancel);
+            return true;
+        }
+        return false;
     }
 
     pub fn cancel(self: *Owner, child_id: []const u8) CancelError!void {
@@ -413,30 +438,38 @@ pub const Owner = struct {
         try self.state_store.save(self.alloc, registry);
     }
 
+    const Finished = struct { observation: ?Observation, report_owed: bool };
+
+    /// Finishes the work in the registry, recording whether its end owes
+    /// the parent a report: work the parent gave the child, under the
+    /// child's report rule, unless the parent stopped it.
     fn finish(
         self: *Owner,
         child_id: []const u8,
         work_id: []const u8,
         outcome: child_state.Outcome,
         failure: ?types.ModelFailureDiagnostic,
-    ) ?Observation {
+        stopped_by_parent: bool,
+    ) Finished {
         var lock = self.state_store.acquireLock();
         defer lock.release();
         var registry = self.state_store.load(self.alloc) catch |err| {
             debugFailure(child_id, "state_load", err);
-            return null;
+            return .{ .observation = null, .report_owed = false };
         };
         defer registry.deinit(self.alloc);
-        registry.finish(self.alloc, child_id, work_id, outcome, failure) catch |err| {
+        const rule = if (registry.findById(child_id)) |child| child.report_rule else .final;
+        const owed = reports.reportable(rule, .parent, outcome, stopped_by_parent);
+        registry.finishWithReport(self.alloc, child_id, work_id, outcome, failure, owed) catch |err| {
             debugFailure(child_id, "state_finish", err);
-            return null;
+            return .{ .observation = null, .report_owed = false };
         };
         self.state_store.save(self.alloc, registry) catch |err| {
             debugFailure(child_id, "state_save", err);
-            return null;
+            return .{ .observation = null, .report_owed = false };
         };
-        const child = registry.findById(child_id) orelse return null;
-        return .{ .phase = child.phase, .outcome = child.last_outcome, .failure = child.last_failure };
+        const child = registry.findById(child_id) orelse return .{ .observation = null, .report_owed = owed };
+        return .{ .observation = .{ .phase = child.phase, .outcome = child.last_outcome, .failure = child.last_failure }, .report_owed = owed };
     }
 };
 
@@ -484,11 +517,6 @@ test "child feedback deduplicates operations and bounds queued receipts" {
     // The parent wrote every one, so the child's turn never reads it as the user's.
     for (result.continue_turn) |message| try std.testing.expectEqual(worker_runtime.MessageAuthor.parent, message.author);
     try std.testing.expectEqual(types.SteeringDelivery.applied, owner.feedbackReplay("first", fingerprint).?.receipt);
-    try std.testing.expectEqual(@as(usize, 64), (try owner.feedbackUpdates(arena.allocator())).len);
-    owner.acknowledgeFeedback("other-child", "first", .applied);
-    try std.testing.expectEqual(@as(usize, 64), (try owner.feedbackUpdates(arena.allocator())).len);
-    owner.acknowledgeFeedback("child", "first", .applied);
-    try std.testing.expectEqual(@as(usize, 63), (try owner.feedbackUpdates(arena.allocator())).len);
 }
 
 fn checkFeedbackAllocation(alloc: Allocator) !void {
@@ -515,17 +543,44 @@ test "child feedback allocation failure preserves ownership" {
     try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkFeedbackAllocation, .{});
 }
 
+/// Runs the child's works one after another: each one's end is finished in
+/// the registry and handed to the host, which may install the child's next
+/// work. The slot stays running until no next work is installed, so a
+/// message that arrives meanwhile finds the child busy and waits its turn.
 fn slotMain(slot: *Slot) void {
     const owner = slot.owner;
-    const outcome = runOne(slot);
-    // Startup must not inspect the old slot between saved and in-memory completion.
-    // Take owner before registry, matching cancellation and approval lock ordering.
-    owner.mutex.lockUncancelable(io_mod.getIo());
-    const completed = owner.finish(slot.child_id, outcome.work_id, outcome.outcome, outcome.failure);
-    slot.completion = if (completed) |value| .{ .published = value } else .unpublished;
-    slot.done.set(io_mod.getIo());
-    owner.mutex.unlock(io_mod.getIo());
-    outcome.deinit(owner.alloc);
+    while (true) {
+        const outcome = runOne(slot);
+        defer outcome.deinit(owner.alloc);
+        // Startup must not inspect the old slot between saved and in-memory completion.
+        // Take owner before registry, matching cancellation and approval lock ordering.
+        owner.mutex.lockUncancelable(io_mod.getIo());
+        const finished = owner.finish(slot.child_id, outcome.work_id, outcome.outcome, outcome.failure, slot.stopped_by_parent);
+        const closing = owner.closed or slot.shutdown.load(.seq_cst);
+        owner.mutex.unlock(io_mod.getIo());
+        const next = if (owner.on_end) |hook| hook.end_fn(hook.context, .{
+            .child_id = slot.child_id,
+            .work_id = outcome.work_id,
+            .outcome = outcome.outcome,
+            .failure = outcome.failure,
+            .report_owed = finished.report_owed,
+        }) else false;
+        owner.mutex.lockUncancelable(io_mod.getIo());
+        if (next and !closing and !owner.closed and !slot.shutdown.load(.seq_cst)) {
+            // The next work starts afresh: this one's stop is spent.
+            slot.cancel.store(false, .seq_cst);
+            slot.stopped_by_parent = false;
+            slot.metrics = .{};
+            owner.mutex.unlock(io_mod.getIo());
+            continue;
+        }
+        slot.completion = if (finished.observation) |value| .{ .published = value } else .unpublished;
+        slot.done.set(io_mod.getIo());
+        // A start that waited for this slot to finish goes on.
+        owner.waiters_changed.broadcast(io_mod.getIo());
+        owner.mutex.unlock(io_mod.getIo());
+        return;
+    }
 }
 
 const OneOutcome = struct {

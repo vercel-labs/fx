@@ -753,8 +753,9 @@ const scenarios: Scenario[] = [
         toolName: "subagent",
         input: {
           request: {
-            action: "run",
-            task: childPrompt,
+            action: "message",
+            agent: "runner",
+            message: childPrompt,
           },
         },
       };
@@ -772,8 +773,9 @@ const scenarios: Scenario[] = [
         effectPath,
         expectedExecutionStarts: 2,
         // The saved session's title, the parent's call, the child's two
-        // requests, and the parent after the child's result.
-        expectedOuterRequests: 5,
+        // requests, the parent after its receipt, and the turn the child's
+        // report starts.
+        expectedOuterRequests: 6,
         saveSession: true,
         outerResponder(body) {
           if (body.includes(`\"toolCallId\":\"${childCallId}\"`)) {

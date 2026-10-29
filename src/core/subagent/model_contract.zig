@@ -2,6 +2,7 @@ const std = @import("std");
 const domain = @import("domain.zig");
 const types = @import("../shared/types.zig");
 const profiles = @import("../profiles/profiles.zig");
+const reports = @import("reports.zig");
 const session_commands = @import("../session/session_commands.zig");
 
 const Allocator = std.mem.Allocator;
@@ -103,25 +104,26 @@ fn collectScoredMatches(
     return out.toOwnedSlice(alloc);
 }
 
-pub const Action = enum { run, message };
+pub const Action = enum { message, wait, status, stop };
 
-pub const RunInput = struct {
-    task: []const u8,
-    model: ?[]const u8 = null,
-    effort: ?[]const u8 = null,
-    profile: ?[]const u8 = null,
-};
+/// The name a subagent gives its own parent in `message{agent}`. No child
+/// can be named it.
+pub const parent_agent = "parent";
+
 pub const MessageInput = struct {
     agent: []const u8,
     instructions: ?[]const u8 = null,
     message: []const u8,
+    report: ?[]const u8 = null,
     model: ?[]const u8 = null,
     effort: ?[]const u8 = null,
     profile: ?[]const u8 = null,
 };
 pub const RequestInput = union(Action) {
-    run: RunInput,
     message: MessageInput,
+    wait,
+    status: struct { agent: ?[]const u8 = null },
+    stop: struct { agent: []const u8 },
 };
 
 /// Creation-time overrides carried by a request. Model and effort default to
@@ -139,27 +141,27 @@ pub const Override = struct {
 };
 
 pub const Request = union(Action) {
-    run: struct {
-        task: []u8,
-        model: ?[]u8 = null,
-        effort: ?types.ReasoningEffort = null,
-        profile: ?[]u8 = null,
-    },
+    /// Starts a subagent, or sends one a message. Returns at once; the
+    /// subagent reports back on its own.
     message: struct {
         agent: []u8,
         instructions: ?[]u8 = null,
         message: []u8,
+        /// When the subagent reports back on its own; null keeps its rule.
+        report: ?reports.Rule = null,
         model: ?[]u8 = null,
         effort: ?types.ReasoningEffort = null,
         profile: ?[]u8 = null,
     },
+    /// Waits until a report or a message arrives.
+    wait,
+    /// Lists the caller's subagents, or one of them.
+    status: struct { agent: ?[]u8 = null },
+    /// Ends a subagent's running turn and drops what waits for it.
+    stop: struct { agent: []u8 },
+
     pub fn deinit(self: *Request, alloc: Allocator) void {
         switch (self.*) {
-            .run => |value| {
-                alloc.free(value.task);
-                if (value.model) |model| alloc.free(model);
-                if (value.profile) |profile| alloc.free(profile);
-            },
             .message => |value| {
                 alloc.free(value.agent);
                 if (value.instructions) |instructions| alloc.free(instructions);
@@ -167,6 +169,9 @@ pub const Request = union(Action) {
                 if (value.model) |model| alloc.free(model);
                 if (value.profile) |profile| alloc.free(profile);
             },
+            .wait => {},
+            .status => |value| if (value.agent) |agent| alloc.free(agent),
+            .stop => |value| alloc.free(value.agent),
         }
         self.* = undefined;
     }
@@ -178,28 +183,37 @@ pub const Request = union(Action) {
     pub fn agentName(self: Request) ?[]const u8 {
         return switch (self) {
             .message => |value| value.agent,
-            .run => null,
+            .wait => null,
+            .status => |value| value.agent,
+            .stop => |value| value.agent,
         };
+    }
+
+    /// Whether the request messages the caller's own parent.
+    pub fn toParent(self: Request) bool {
+        return self == .message and std.mem.eql(u8, self.message.agent, parent_agent);
     }
 
     /// Borrows from the request; the request must outlive the returned value.
     pub fn override(self: Request) Override {
         return switch (self) {
-            .run => |value| .{ .model = value.model, .effort = value.effort, .profile = value.profile },
             .message => |value| .{ .model = value.model, .effort = value.effort, .profile = value.profile },
+            .wait, .status, .stop => .{},
         };
     }
 };
 
 pub const ValidationError = error{
     OutOfMemory,
-    InvalidTask,
     InvalidAgent,
     InvalidInstructions,
     InvalidMessage,
+    InvalidReport,
     InvalidModel,
     InvalidEffort,
     InvalidProfile,
+    /// A message to the parent names only the message.
+    InvalidParentMessage,
 };
 
 pub fn validateRequest(
@@ -207,23 +221,13 @@ pub fn validateRequest(
     input: RequestInput,
 ) ValidationError!Request {
     return switch (input) {
-        .run => |value| blk: {
-            try validateText(value.task, domain.max_prompt_bytes, error.InvalidTask);
-            const effort = try validateOverrideText(value.model, value.effort);
-            try validateProfile(value.profile);
-            const task = try alloc.dupe(u8, value.task);
-            errdefer alloc.free(task);
-            const model = try dupeOptional(alloc, value.model);
-            errdefer if (model) |owned| alloc.free(owned);
-            break :blk .{ .run = .{
-                .task = task,
-                .model = model,
-                .effort = effort,
-                .profile = try dupeOptional(alloc, value.profile),
-            } };
-        },
         .message => |value| blk: {
             if (!domain.validAgentName(value.agent)) return error.InvalidAgent;
+            if (std.mem.eql(u8, value.agent, parent_agent) and (value.instructions != null or value.report != null or
+                value.model != null or value.effort != null or value.profile != null))
+            {
+                return error.InvalidParentMessage;
+            }
             if (value.instructions) |instructions| {
                 if (instructions.len == 0 or
                     !domain.validInstructions(instructions))
@@ -232,6 +236,10 @@ pub fn validateRequest(
                 }
             }
             try validateText(value.message, domain.max_message_bytes, error.InvalidMessage);
+            const report: ?reports.Rule = if (value.report) |raw|
+                std.meta.stringToEnum(reports.Rule, raw) orelse return error.InvalidReport
+            else
+                null;
             const effort = try validateOverrideText(value.model, value.effort);
             try validateProfile(value.profile);
             const agent = try alloc.dupe(u8, value.agent);
@@ -249,10 +257,20 @@ pub fn validateRequest(
                 .agent = agent,
                 .instructions = instructions,
                 .message = message,
+                .report = report,
                 .model = model,
                 .effort = effort,
                 .profile = try dupeOptional(alloc, value.profile),
             } };
+        },
+        .wait => .wait,
+        .status => |value| blk: {
+            if (value.agent) |agent| if (!domain.validAgentName(agent)) return error.InvalidAgent;
+            break :blk .{ .status = .{ .agent = try dupeOptional(alloc, value.agent) } };
+        },
+        .stop => |value| blk: {
+            if (!domain.validAgentName(value.agent) or std.mem.eql(u8, value.agent, parent_agent)) return error.InvalidAgent;
+            break :blk .{ .stop = .{ .agent = try alloc.dupe(u8, value.agent) } };
         },
     };
 }
@@ -305,27 +323,29 @@ pub const RejectCode = enum {
 };
 
 pub const Plan = union(enum) {
-    create_one_off,
     create_persistent,
     continue_persistent,
+    /// The child is working: the message joins its turn, or waits for its
+    /// next one.
     steer_persistent,
     reject: RejectCode,
 };
 
+/// What a `message` to an agent with `snapshot`, or none, does. A one-off
+/// child from an older session can still be listed but takes no messages.
 pub fn plan(request: Request, snapshot: ?Snapshot) Plan {
-    return switch (request) {
-        .run => .create_one_off,
-        .message => if (snapshot) |child| switch (child.kind) {
-            .one_off => .{ .reject = .child_not_persistent },
-            .persistent => switch (child.phase) {
-                .idle, .interrupted => .continue_persistent,
-                .running, .awaiting_approval => if (request.message.instructions != null)
-                    .{ .reject = .child_busy }
-                else
-                    .steer_persistent,
-                .finished => .{ .reject = .child_unavailable },
-            },
-        } else .create_persistent,
+    std.debug.assert(request == .message);
+    const child = snapshot orelse return .create_persistent;
+    return switch (child.kind) {
+        .one_off => .{ .reject = .child_not_persistent },
+        .persistent => switch (child.phase) {
+            .idle, .interrupted => .continue_persistent,
+            .running, .awaiting_approval => if (request.message.instructions != null)
+                .{ .reject = .child_busy }
+            else
+                .steer_persistent,
+            .finished => .{ .reject = .child_unavailable },
+        },
     };
 }
 
@@ -335,7 +355,7 @@ pub fn requestFingerprint(request: Request) [32]u8 {
     hash.update(@tagName(request.action()));
     hash.update("\x00");
     switch (request) {
-        .run => |value| hash.update(value.task),
+        .wait, .status, .stop => return hash.finalResult(),
         .message => |value| {
             hash.update(value.agent);
             hash.update("\x00");
@@ -377,10 +397,13 @@ pub fn requestFingerprint(request: Request) [32]u8 {
             hash.update(profile);
         }
     }
+    // A report rule adds its own section, as a profile does.
+    if (request.message.report) |rule| {
+        hash.update("\x00\x03");
+        hash.update(@tagName(rule));
+    }
     return hash.finalResult();
 }
-
-pub const steering_pending_result = "The subagent is still running. Handle the user's steering now. Its result will arrive automatically; do not delegate again to poll for it.";
 
 pub const Result = struct {
     ok: bool,
@@ -395,9 +418,9 @@ pub fn feedbackResult(delivery: types.SteeringDelivery) Result {
         .ok = delivery != .not_applied,
         .delivery = delivery,
         .result = switch (delivery) {
-            .queued => "Feedback queued for the running child. Its result will arrive automatically.",
-            .applied => "Feedback consumed at the child's safe boundary. This is not a task-completion result.",
-            .not_applied => "Feedback was not applied before the child stopped.",
+            .queued => "Sent into the subagent's running turn. Its report arrives on its own when its work ends.",
+            .applied => "The subagent took the message into its running turn. This is not its report.",
+            .not_applied => "The message was not taken in before the subagent stopped.",
         },
         .error_code = if (delivery == .not_applied) "feedback_not_applied" else null,
     };
@@ -429,13 +452,20 @@ fn writeOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
     }
 }
 
-test "minimal request validation owns one-off and persistent intent" {
+test "minimal request validation owns each action's intent" {
     const alloc = std.testing.allocator;
-    try std.testing.expectEqual(@as(usize, 2), @typeInfo(Action).@"enum".field_names.len);
-    var run = try validateRequest(alloc, .{ .run = .{ .task = "review this" } });
-    defer run.deinit(alloc);
-    try std.testing.expectEqual(Action.run, run.action());
-    try std.testing.expectEqual(Plan.create_one_off, plan(run, null));
+    try std.testing.expectEqual(@as(usize, 4), @typeInfo(Action).@"enum".field_names.len);
+    var wait = try validateRequest(alloc, .wait);
+    defer wait.deinit(alloc);
+    try std.testing.expectEqual(Action.wait, wait.action());
+    var status = try validateRequest(alloc, .{ .status = .{} });
+    defer status.deinit(alloc);
+    try std.testing.expect(status.agentName() == null);
+    var stop = try validateRequest(alloc, .{ .stop = .{ .agent = "reviewer" } });
+    defer stop.deinit(alloc);
+    try std.testing.expectEqualStrings("reviewer", stop.agentName().?);
+    try std.testing.expectError(error.InvalidAgent, validateRequest(alloc, .{ .stop = .{ .agent = "parent" } }));
+    try std.testing.expectError(error.InvalidAgent, validateRequest(alloc, .{ .status = .{ .agent = "Bad Name" } }));
 
     var message = try validateRequest(alloc, .{ .message = .{
         .agent = "reviewer",
@@ -495,25 +525,31 @@ test "persistent instruction updates participate in operation identity" {
 
 test "creation overrides validate and participate in operation identity" {
     const alloc = std.testing.allocator;
-    var plain = try validateRequest(alloc, .{ .run = .{ .task = "review this" } });
+    var plain = try validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "review this" } });
     defer plain.deinit(alloc);
-    var routed = try validateRequest(alloc, .{ .run = .{
-        .task = "review this",
+    var routed = try validateRequest(alloc, .{ .message = .{
+        .agent = "reviewer",
+        .message = "review this",
         .model = "gpt-5.6-sol-fast",
         .effort = "medium",
     } });
     defer routed.deinit(alloc);
-    try std.testing.expectEqualStrings("gpt-5.6-sol-fast", routed.run.model.?);
-    try std.testing.expectEqualStrings("medium", routed.run.effort.?.label());
+    try std.testing.expectEqualStrings("gpt-5.6-sol-fast", routed.message.model.?);
+    try std.testing.expectEqualStrings("medium", routed.message.effort.?.label());
     try std.testing.expect(plain.override().present() == false);
     try std.testing.expect(routed.override().present());
-    // Override-less requests keep their pre-override fingerprint.
+    // A message without overrides or a report rule keeps the fingerprint
+    // older sessions saved for it.
     const plain_digest = requestFingerprint(plain);
     const expected_plain = comptime blk: {
         @setEvalBranchQuota(100_000);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("fx.subagent.request.v1\x00");
-        hash.update("run");
+        hash.update("message");
+        hash.update("\x00");
+        hash.update("reviewer");
+        hash.update("\x00");
+        hash.update("\x00");
         hash.update("\x00");
         hash.update("review this");
         break :blk hash.finalResult();
@@ -533,12 +569,36 @@ test "creation overrides validate and participate in operation identity" {
 
     try std.testing.expectError(
         error.InvalidModel,
-        validateRequest(alloc, .{ .run = .{ .task = "t", .model = "" } }),
+        validateRequest(alloc, .{ .message = .{ .agent = "a", .message = "t", .model = "" } }),
     );
     try std.testing.expectError(
         error.InvalidEffort,
-        validateRequest(alloc, .{ .run = .{ .task = "t", .effort = "not an effort!" } }),
+        validateRequest(alloc, .{ .message = .{ .agent = "a", .message = "t", .effort = "not an effort!" } }),
     );
+}
+
+test "a report rule validates and changes the fingerprint only when present" {
+    const alloc = std.testing.allocator;
+    var plain = try validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "go" } });
+    defer plain.deinit(alloc);
+    var every = try validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "go", .report = "every_turn" } });
+    defer every.deinit(alloc);
+    try std.testing.expect(plain.message.report == null);
+    try std.testing.expectEqual(reports.Rule.every_turn, every.message.report.?);
+    try std.testing.expect(!std.mem.eql(u8, &requestFingerprint(plain), &requestFingerprint(every)));
+    try std.testing.expectError(error.InvalidReport, validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "go", .report = "sometimes" } }));
+}
+
+test "a message to the parent names only the message" {
+    const alloc = std.testing.allocator;
+    var up = try validateRequest(alloc, .{ .message = .{ .agent = "parent", .message = "found it" } });
+    defer up.deinit(alloc);
+    try std.testing.expect(up.toParent());
+    try std.testing.expectError(error.InvalidParentMessage, validateRequest(alloc, .{ .message = .{ .agent = "parent", .message = "x", .report = "never" } }));
+    try std.testing.expectError(error.InvalidParentMessage, validateRequest(alloc, .{ .message = .{ .agent = "parent", .message = "x", .instructions = "Be brief." } }));
+    var down = try validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "x" } });
+    defer down.deinit(alloc);
+    try std.testing.expect(!down.toParent());
 }
 
 test "model override catalog matching resolves, rejects, and suggests" {
@@ -629,10 +689,10 @@ test "terminal result omits scheduler identities and phases" {
 
 test "a subagent request's profile is checked and changes its fingerprint only when present" {
     const alloc = std.testing.allocator;
-    try std.testing.expectError(error.InvalidProfile, validateRequest(alloc, .{ .run = .{ .task = "review", .profile = "Bad Name" } }));
-    var plain = try validateRequest(alloc, .{ .run = .{ .task = "review" } });
+    try std.testing.expectError(error.InvalidProfile, validateRequest(alloc, .{ .message = .{ .agent = "a", .message = "review", .profile = "Bad Name" } }));
+    var plain = try validateRequest(alloc, .{ .message = .{ .agent = "a", .message = "review" } });
     defer plain.deinit(alloc);
-    var profiled = try validateRequest(alloc, .{ .run = .{ .task = "review", .profile = "reviewer" } });
+    var profiled = try validateRequest(alloc, .{ .message = .{ .agent = "a", .message = "review", .profile = "reviewer" } });
     defer profiled.deinit(alloc);
     var named = try validateRequest(alloc, .{ .message = .{ .agent = "lead", .message = "go", .profile = "reviewer" } });
     defer named.deinit(alloc);

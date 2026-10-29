@@ -1603,6 +1603,12 @@ fn sendUserHistoryTurn(
     if (std.mem.eql(u8, user.text, session_runtime.resumed_request_prompt)) {
         return sendAgentHistoryChunk(state, alloc, session_id, session_runtime.resumed_request_notice.body);
     }
+    // A turn a subagent's report or message started is not the user's
+    // words, so it never replays as theirs; the agent's reply still does.
+    if (user.author != .user) {
+        debug_trace.logf("acp", "history replay skipped non-user prompt author={s} bytes={d}", .{ @tagName(user.author), user.text.len });
+        return;
+    }
     var message_id: acp_types.MessageIdBuffer = undefined;
     const stable_message_id = acp_types.generateMessageId(&message_id);
     if (user.text.len > 0) {

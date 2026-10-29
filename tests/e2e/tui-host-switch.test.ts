@@ -190,13 +190,18 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         const main = await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_FINAL"), 15_000);
         expect(main).toContain("SWITCH_USER");
         expect(main).not.toContain("SWITCH_CHILD_REPLY");
-        expect(main).not.toContain("reviewer \u00b7 ");
+        // The footer names main, not the subagent.
+        expect(main).not.toMatch(/^reviewer \u00b7 /m);
+        // The subagent's report of main's message shows as a card.
+        expect(main).toContain("Report from reviewer: completed (ctrl+o to view)");
       });
 
-      // Main's model never sees the answer to a message it did not send.
+      // Main's model never sees the answer to a message it did not send: its
+      // call, the turn after the receipt, and the turn the report started.
       const mainBodies = bodies.filter(isMainRequest);
-      expect(mainBodies.length).toBe(2);
+      expect(mainBodies.length).toBe(3);
       for (const body of mainBodies) expect(body).not.toContain("SWITCH_CHILD_REPLY");
+      expect(mainBodies.filter((body) => body.includes("SWITCH_CHILD_ANSWER"))).toHaveLength(1);
       expect(bodies.some((body) => !isMainRequest(body) && latestUserText(body).includes("SWITCH_TYPED"))).toBe(true);
     },
     TIMEOUT,
@@ -420,7 +425,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendKeys("BTab");
         await session.waitForText("auto ·", 10_000);
         first.release();
-        await session.waitForText("SWITCH_MAIN_DONE", 30_000);
+        // Main's turn ended with the receipt; the report comes once the
+        // subagent's write is done.
+        await session.waitForText("Report from follower: completed", 30_000);
         expect(readFileSync(join(workspace, "followed.txt"), "utf8")).toBe("FOLLOWED\n");
         expect(await session.captureFullScrollback()).not.toContain("needs permission");
 
