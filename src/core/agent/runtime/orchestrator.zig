@@ -186,7 +186,8 @@ fn observe_steering_boundary(
 
 /// Adds each boundary message to the turn, framed by who wrote it: the
 /// user's as a live user update, a parent agent's as that agent's feedback,
-/// never the user's.
+/// and a subagent's as the untrusted report it already is, never the
+/// user's.
 fn append_steering_guidance(
     arena: Allocator,
     within_turn_suffix: *std.ArrayList(ChatMessage),
@@ -247,6 +248,8 @@ fn framedMessage(arena: Allocator, author: worker_runtime.MessageAuthor, text: [
     return switch (author) {
         .user => runtime_execution_memory.steeringMessage(arena, text),
         .parent => runtime_execution_memory.parentSteeringMessage(arena, text),
+        // Framed by the sender, as an untrusted report.
+        .child => arena.dupe(u8, text),
     };
 }
 
@@ -3838,7 +3841,7 @@ fn appendRunningToolCalls(
     const issuing = current_turn_messages[current_turn_messages.len - 1];
     std.debug.assert(issuing.role == .assistant and issuing.tool_calls.len == calls.len);
     try append(deps.ctx, .{
-        .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id },
+        .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author },
         .execution = try finalization.persistedExecution(arena, execution),
         .running_calls = running,
         .running_assistant = issuing.content,
@@ -3941,7 +3944,7 @@ fn persistRecoveryCheckpointWithAction(
         current_turn_messages,
     );
     const projected = try finalization.persistedExecution(arena, execution);
-    const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id };
+    const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author };
     // Every completed piece reaches the session before the next request.
     if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = projected, .recovery_record = record });
     const effect = deps.recovery_checkpoint orelse return;
@@ -4062,7 +4065,7 @@ const CompactionSource = struct {
         const execution = try runtime_execution_memory.buildExecutionMemory(self.arena, self.current_turn_messages);
         try effect.set(deps.ctx, .{
             .turn_id = job.turn_id,
-            .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id },
+            .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author },
             .assistant_source = @constCast(""),
             .execution = try self.finalization.persistedExecution(self.arena, execution),
             .cause = .compaction_prepared,
@@ -7501,7 +7504,7 @@ fn processQueuedPromptLoop(
                 } else {
                     // The pending user is source too, even before the first tool.
                     const active_prefix: types.AssistantHistoryTurn = .{
-                        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id },
+                        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
                         .assistant = @constCast(""),
                         .execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items[compacted_suffix_len..]),
                     };
@@ -8950,7 +8953,7 @@ fn processQueuedPromptLoop(
             const finish_execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items);
             const completed_summary = summary_accumulator.finish();
             var turn: HistoryTurn = .{ .assistant = .{
-                .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id },
+                .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
                 .assistant = @constCast(assistant_text),
                 .execution = try finalization.persistedExecution(arena, finish_execution),
             } };
@@ -12015,7 +12018,7 @@ fn finishFailedTurnWithNotice(
     );
     const completed_summary = summary_accumulator.finish();
     var turn: HistoryTurn = .{ .assistant = .{
-        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id },
+        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
         .assistant = @constCast(notice),
         .execution = try finalization.persistedExecution(arena, execution_memory),
     } };

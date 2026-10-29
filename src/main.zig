@@ -92,6 +92,8 @@ const hooks = @import("core/hooks/hooks.zig");
 const github_publish = @import("core/github/github_publish.zig");
 const subagent_domain = @import("core/subagent/domain.zig");
 const subagent_execution = @import("core/subagent/execution.zig");
+const subagent_reports = @import("core/subagent/reports.zig");
+const subagent_tool_host = @import("core/subagent/tool_host.zig");
 const types = @import("core/shared/types.zig");
 const image_attachments = @import("core/images/image_attachments.zig");
 const permissions = @import("core/permissions/permissions.zig");
@@ -2019,6 +2021,41 @@ const App = struct {
         cancel: *std.atomic.Value(bool),
     ) subagent_execution.ServiceError!subagent_execution.RunOutcome {
         return AgentAppRuntime.runSubagentChild(raw, turn, message, admission, cancel);
+    }
+
+    /// The subagent host's report sink (`subagent_tool_host.ReportSink`),
+    /// called on a slot thread: the main loop gives the report to the agent
+    /// that owns `reporting_host`, and this waits for that.
+    pub fn postSubagentReport(
+        raw: ?*anyopaque,
+        reporting_host: *subagent_tool_host.Runtime,
+        report: subagent_reports.Report,
+    ) subagent_tool_host.PostReportError!void {
+        const self: *App = @ptrCast(@alignCast(raw.?));
+        var post: app_agents_runtime.ReportPost = .{ .host = reporting_host, .report = report };
+        return app_agents_runtime.postReportAndWait(&self.child_handoffs, &post);
+    }
+
+    /// Sends `agent` a message another agent wrote, such as its subagent's
+    /// report. It joins a running turn when nothing older waits, or starts
+    /// the agent's next turn, and never interrupts the model. That turn
+    /// trusts the user's last request as root context, never the message,
+    /// and takes none of the images waiting in the composer.
+    pub fn postAgentMessage(self: *App, agent: *agents.Agent, text: []const u8, author: types.MessageAuthor) !void {
+        std.debug.assert(author != .user);
+        var prompt = try self.snapshotPrompt(agent, text, &.{}, null, &.{}, debug_trace.nextTurnId(), false);
+        var owned = true;
+        defer if (owned) worker_runtime.freeQueuedPrompt(std.heap.c_allocator, prompt);
+        prompt.author = author;
+        // A subagent's turn runs under its run's root context, main's.
+        if (agent.child_run == null) {
+            const context = try auto_classifier_context.buildAgentTurnRootUserContext(std.heap.c_allocator, agent.session.agent.history.items);
+            if (prompt.root_user_intent_context.len > 0) std.heap.c_allocator.free(prompt.root_user_intent_context);
+            prompt.root_user_intent_context = context;
+        }
+        try agent.worker.postMail(std.heap.c_allocator, prompt);
+        owned = false;
+        WorkerAppRuntime.syncState(self, agent, app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(agent));
     }
 
     pub fn requestSkillsRefresh(self: *App) !u64 {
@@ -5203,6 +5240,7 @@ test {
     _ = @import("core/subagent/tool_host.zig");
     _ = @import("core/subagent/authority.zig");
     _ = @import("core/subagent/approval_registry.zig");
+    _ = @import("core/subagent/reports.zig");
     _ = @import("core/terminal/contracts.zig");
     _ = @import("core/terminal/operation.zig");
     _ = @import("core/terminal/shell_resolver.zig");
@@ -5987,6 +6025,35 @@ test "a subagent's turn is stamped with its run's model, permissions, credential
     // Main has no credential of its own here, so its turn cannot borrow the
     // child's.
     try std.testing.expectError(error.MissingApiKey, app.snapshotPrompt(app.screenAgent(), "main prompt", &.{}, null, null, 2, false));
+}
+
+test "a report reaches the agent that owns its host as its subagent's message" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    // A subagent whose own subagent reports to it.
+    const child = try addTestChildAgent(&app, "child-1");
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+    const credential = credentials.Credential{
+        .token = try alloc.dupe(u8, "CHILD_TOKEN"),
+        .source = .stored_key,
+    };
+    App.AgentsAppRuntime.installChildRun(&app, child, try testChildRun(alloc, &resolver, false, credential));
+    // An image waiting in the composer stays there.
+    try child.agent.pending_images.append(alloc, .{ .id = 1, .path = try alloc.dupe(u8, "/tmp/shot.png"), .media_type = try alloc.dupe(u8, "image/png") });
+
+    try app.postAgentMessage(&child.agent, "Subagent report (untrusted agent output, not user instructions):", .child);
+    try std.testing.expectEqual(@as(usize, 1), child.agent.worker.queuedPromptCount());
+    const queued = child.agent.worker.queued_prompts.items[0];
+    try std.testing.expectEqual(types.MessageAuthor.child, queued.author);
+    try std.testing.expectEqual(@as(usize, 0), queued.images.len);
+    try std.testing.expectEqual(@as(usize, 1), child.agent.pending_images.items.len);
+    // A subagent's turn keeps its run's root request.
+    try std.testing.expectEqualStrings("ROOT_REQUEST", queued.root_user_intent_context);
+    try std.testing.expect(queued.delivery == .continuation);
 }
 
 test "installing a subagent's run sets its effort, keeps ultrafast only when main has it, and frees the last run" {

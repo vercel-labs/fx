@@ -2,6 +2,7 @@ const std = @import("std");
 const execution_observation = @import("../agent/runtime/observation.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const approval_registry = @import("approval_registry.zig");
+const reports = @import("reports.zig");
 const agents = @import("../agents/agents.zig");
 const authority = @import("authority.zig");
 const child_state = @import("child_state.zig");
@@ -81,6 +82,23 @@ test "managed execution receipts retain the pending contract" {
     }
 }
 
+/// Delivers a child's report to the agent that owns this host. Each runtime
+/// supplies its own, since only it can build that agent's next turn: the
+/// report joins a running turn, or wakes the idle agent with the user's last
+/// request as root context. It never interrupts the model.
+pub const ReportSink = struct {
+    context: ?*anyopaque = null,
+    /// Called on the slot thread that ran the child's turn, with the host
+    /// whose owner the report is for.
+    post_fn: *const fn (?*anyopaque, *Runtime, reports.Report) PostReportError!void,
+
+    pub fn post(self: ReportSink, host: *Runtime, report: reports.Report) PostReportError!void {
+        return self.post_fn(self.context, host, report);
+    }
+};
+
+pub const PostReportError = error{ OutOfMemory, AgentGone };
+
 pub const ProgressSink = struct {
     context: *anyopaque,
     publish_fn: *const fn (*anyopaque, types.SubagentStatus) void,
@@ -144,6 +162,8 @@ pub const Runtime = struct {
     root_id: []u8,
     host_authority: authority.HostResolver,
     child_runner: ChildRunner,
+    /// Where this host's children report, set by its runtime.
+    report_sink: ?ReportSink = null,
     approvals: approval_registry.Registry,
     authority_resolver: authority.Resolver,
     /// The profile each child started in, for its authority and prompt.

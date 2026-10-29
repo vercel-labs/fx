@@ -23,6 +23,7 @@ const app_process_runtime = @import("app_process_runtime.zig");
 const subagent_execution = @import("../subagent/execution.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_authority = @import("../subagent/authority.zig");
+const subagent_reports = @import("../subagent/reports.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const io_mod = @import("../shared/io.zig");
@@ -182,12 +183,51 @@ pub const Handoffs = struct {
     /// every slot thread waiting for a hand-off is released.
     closed: bool = false,
     posts: std.ArrayList(*Post) = .empty,
+    /// Children's reports for the agents that own their hosts, in the order
+    /// they were posted.
+    reports: std.ArrayList(*ReportPost) = .empty,
 
     pub fn deinit(self: *Handoffs) void {
         self.posts.deinit(handoff_alloc);
+        self.reports.deinit(handoff_alloc);
         self.* = .{};
     }
 };
+
+/// A child's report on its way from a slot thread to the main loop, which
+/// gives it to the agent that owns `host`. On the posting slot thread's
+/// stack until the loop settles it.
+pub const ReportPost = struct {
+    host: *subagent_tool_host.Runtime,
+    /// Borrowed from the poster, which waits.
+    report: subagent_reports.Report,
+    state: std.atomic.Value(Post.State) = .init(.posted),
+    settled: std.Io.Event = .unset,
+
+    /// As `Post.settle`: nothing touches the post afterwards.
+    pub fn settle(self: *ReportPost, state: Post.State) void {
+        self.settled.set(io_mod.getIo());
+        self.state.store(state, .release);
+    }
+};
+
+/// Posts a report and waits until the main loop has given it to the agent
+/// that owns its host. `AgentGone` when that agent has closed, or the app is
+/// shutting down, so the report stays owed.
+pub fn postReportAndWait(handoffs: *Handoffs, post: *ReportPost) subagent_tool_host.PostReportError!void {
+    {
+        handoffs.mutex.lockUncancelable(io_mod.getIo());
+        defer handoffs.mutex.unlock(io_mod.getIo());
+        if (handoffs.closed) return error.AgentGone;
+        try handoffs.reports.append(handoff_alloc, post);
+    }
+    post.settled.waitUncancelable(io_mod.getIo());
+    return switch (post.state.load(.acquire)) {
+        .taken => {},
+        .posted => unreachable,
+        .failed, .closed => error.AgentGone,
+    };
+}
 
 /// One hand-off, on the posting slot thread's stack until the loop takes it.
 pub const Post = struct {
@@ -1271,11 +1311,45 @@ pub fn Runtime(comptime App: type) type {
             app.child_handoffs.closed = true;
             for (app.child_handoffs.posts.items) |post| post.settle(.closed);
             app.child_handoffs.posts.clearRetainingCapacity();
+            for (app.child_handoffs.reports.items) |post| post.settle(.closed);
+            app.child_handoffs.reports.clearRetainingCapacity();
+        }
+
+        /// Gives each posted report to the agent that owns its host, in the
+        /// order they were posted (`App.postAgentMessage`). A report whose
+        /// host no agent owns anymore fails, and stays owed.
+        fn deliverReports(app: *App) void {
+            var posted: std.ArrayList(*ReportPost) = .empty;
+            {
+                app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
+                defer app.child_handoffs.mutex.unlock(io_mod.getIo());
+                if (app.child_handoffs.closed) return;
+                std.mem.swap(std.ArrayList(*ReportPost), &posted, &app.child_handoffs.reports);
+            }
+            defer posted.deinit(handoff_alloc);
+            for (posted.items) |post| {
+                deliverReport(app, post) catch |err| {
+                    debug_trace.eventf("host", "child_report_failed", .{}, "child={s} work_id={s} reason={s}", .{ post.report.child_id, post.report.work_id, @errorName(err) });
+                    post.settle(.failed);
+                    continue;
+                };
+                post.settle(.taken);
+            }
+        }
+
+        fn deliverReport(app: *App, post: *ReportPost) !void {
+            const owner = ownerOf(app, post.host) orelse return error.AgentGone;
+            const limit = owner.worker.effectiveAgentTurnSettings().max_tool_result_bytes;
+            const text = try subagent_reports.message(app.alloc, post.report, limit);
+            defer app.alloc.free(text);
+            try app.postAgentMessage(owner, text, .child);
+            debug_trace.eventf("host", "child_report_posted", .{}, "child={s} work_id={s} outcome={s}", .{ post.report.child_id, post.report.work_id, @tagName(post.report.outcome) });
         }
 
         /// Takes every waiting hand-off. Runs on the main loop each pass,
         /// before the children's events are handled.
         pub fn takePosts(app: *App) void {
+            deliverReports(app);
             var posts: std.ArrayList(*Post) = .empty;
             {
                 app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());

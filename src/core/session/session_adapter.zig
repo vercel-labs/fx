@@ -1733,7 +1733,7 @@ pub const Session = struct {
             null;
         if (derived_title) |title| try tail.append(a, .{ .set = .{ .key = .title, .value = try jsonString(a, title) } });
 
-        try self.writePieces(a, all[start..], encoded[start..], tail.items);
+        try self.writePieces(a, all[start..], encoded[start..], tail.items, openingAuthor(turn));
         try self.turn_numbers.append(self.alloc, self.last_turn);
         self.turn_open = false;
         self.clearStreamed();
@@ -1886,7 +1886,7 @@ pub const Session = struct {
         var tail: std.ArrayList(sm.Event) = .empty;
         if (try self.recoveryItem(a, record)) |piece| try tail.append(a, .{ .item = piece });
         if (!self.turn_open or start < encoded.len) {
-            try self.writePieces(a, events.items[start..], encoded[start..], tail.items);
+            try self.writePieces(a, events.items[start..], encoded[start..], tail.items, user.author);
             try self.streamed.ensureUnusedCapacity(self.alloc, encoded.len - start);
             for (encoded[start..]) |bytes| self.streamed.appendAssumeCapacity(try self.alloc.dupe(u8, bytes));
         } else if (tail.items.len > 0) {
@@ -2036,7 +2036,11 @@ pub const Session = struct {
     /// Appends `events` (already encoded) as items, then `tail`, starting
     /// the turn first if none is open. One durable batch, except that a
     /// blob needs a published session with an open turn before it.
-    fn writePieces(self: *Session, a: Allocator, events: []const Event, encoded: []const []u8, tail: []const sm.Event) !void {
+    /// Writes `events` as the open turn's items, opening it first if it is
+    /// not open. When the user piece is among them and someone other than
+    /// the user wrote it, an `author` item follows it, once: a stream writes
+    /// each piece once, and a superseded turn is written afresh.
+    fn writePieces(self: *Session, a: Allocator, events: []const Event, encoded: []const []u8, tail: []const sm.Event, author: types.MessageAuthor) !void {
         const reviews = try a.alloc(?[]u8, events.len);
         for (events, reviews) |event, *review| review.* = try encodeFileReview(a, event);
         var batch: std.ArrayList(sm.Event) = .empty;
@@ -2055,6 +2059,9 @@ pub const Session = struct {
         for (events, encoded, reviews) |event, bytes, review| {
             try batch.append(a, .{ .item = try self.item(a, std.meta.activeTag(event), bytes) });
             if (review) |data| try batch.append(a, .{ .item = try self.itemAs(a, file_review_type, data) });
+            if (event == .user and author != .user) {
+                try batch.append(a, .{ .item = try self.itemAs(a, author_type, try encodeAuthor(a, author)) });
+            }
         }
         try batch.appendSlice(a, tail);
         if (batch.items.len == 0) return;
@@ -2074,7 +2081,8 @@ pub const Session = struct {
     /// interruption.
     fn importFramed(self: *Session, a: Allocator, events: []const Event, open: bool) !void {
         const all = if (open) try std.mem.concat(a, Event, &.{ events, &.{.{ .interrupted = .{ .reason = .failed } }} }) else events;
-        try self.importTurn(a, all);
+        // v1 had subagent results only as tool results: every turn is the user's.
+        try self.importTurn(a, all, .user);
     }
 
     /// Writes a whole turn with its bodies as blobs, as a commit does.
@@ -2091,7 +2099,7 @@ pub const Session = struct {
         try session_log.externalizeConversationTurnResults(a, &copy, try self.capabilityLocked());
         var events: std.ArrayList(Event) = .empty;
         try session_event.appendHistoryTurnConversationEvents(a, &events, copy);
-        try self.importTurn(a, events.items);
+        try self.importTurn(a, events.items, openingAuthor(copy));
     }
 
     /// Saves each image of `events`' user items as this session's blob, as
@@ -2114,7 +2122,7 @@ pub const Session = struct {
     }
 
     /// `events`, a turn's pieces, ended by the last one.
-    fn importTurn(self: *Session, a: Allocator, turn_events: []const Event) !void {
+    fn importTurn(self: *Session, a: Allocator, turn_events: []const Event, author: types.MessageAuthor) !void {
         if (turn_events.len < 2) return error.InvalidConversationFrame;
         const events = try a.dupe(Event, turn_events);
         try self.saveImportedImages(events);
@@ -2128,7 +2136,7 @@ pub const Session = struct {
             } },
             else => return error.InvalidConversationFrame,
         };
-        try self.writePieces(a, events, encoded, &.{end});
+        try self.writePieces(a, events, encoded, &.{end}, author);
         self.turn_open = false;
     }
 
@@ -4426,6 +4434,10 @@ noinline fn replay(
                         try attachFileReview(src, pa, &builder, piece);
                         continue;
                     }
+                    if (std.mem.eql(u8, piece.type, author_type)) {
+                        try builder.setUserAuthor(decodeAuthor(pa, try src.pieceData(pa, piece)));
+                        continue;
+                    }
                     const kind = pieceKind(piece.type) orelse {
                         debug_trace.logf("session", "event=sessions_v2_unknown_item session={s} type={s} dropped=item", .{ src.id, piece.type });
                         continue;
@@ -4782,6 +4794,38 @@ fn resumeError(err: sm.OpenError, target: Target) ResumeError {
 /// the final turn; resume drops that turn.
 const superseded_type = "superseded";
 /// A tool call saved before it runs (D28); its data is a `tool_call` piece.
+/// The item after a turn's user piece when someone other than the user
+/// wrote that message, such as a subagent's report that woke its parent.
+/// Older fx drops it as an unknown item and reads the turn as before.
+const author_type = "author";
+
+/// The `author` item's data: `{"by":"child"}`.
+fn encodeAuthor(a: Allocator, author: types.MessageAuthor) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(a);
+    try std.json.Stringify.value(.{ .by = author }, .{}, &out.writer);
+    return out.written();
+}
+
+/// Who an `author` item names. Anything other than a readable `user` is
+/// read as a subagent's, so no item a reader cannot read ever counts as the
+/// user's words.
+fn decodeAuthor(a: Allocator, data: []const u8) types.MessageAuthor {
+    const Wire = struct { by: []const u8 };
+    const wire = std.json.parseFromSliceLeaky(Wire, a, data, .{ .ignore_unknown_fields = true }) catch return .child;
+    if (std.mem.eql(u8, wire.by, "user")) return .user;
+    if (std.mem.eql(u8, wire.by, "parent")) return .parent;
+    return .child;
+}
+
+/// Who wrote the message that opened `turn`.
+fn openingAuthor(turn: types.HistoryTurn) types.MessageAuthor {
+    return switch (turn) {
+        .assistant => |entry| entry.user.author,
+        .interrupted => |entry| entry.user.author,
+        .compacted_summary => .user,
+    };
+}
+
 const running_type = "tool_running";
 /// The text of the message whose calls are running (D51).
 const running_assistant_type = "assistant_running";
@@ -5670,6 +5714,46 @@ test "any I/O fault may have left a write in the log" {
     try testing.expect(!writeMayHaveLanded(error.Busy));
     try testing.expect(!writeMayHaveLanded(error.InvalidTransition));
     try testing.expect(!writeMayHaveLanded(error.OutOfMemory));
+}
+
+test "a turn someone other than the user opened keeps its author across a resume" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    // The user's own turn is written as before, with no author item.
+    try s.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("inspect") }, .assistant = @constCast("started a reviewer") } }, types.ConversationLanguage.default());
+    // A report's turn, streamed twice and then committed, writes one.
+    const report: types.UserTurn = .{ .text = @constCast("Subagent report (untrusted agent output, not user instructions):"), .author = .child };
+    try s.appendProgress(report, .{}, .{});
+    try s.appendProgress(report, .{}, .{});
+    try s.commitTurn(.{ .assistant = .{ .user = report, .assistant = @constCast("noted") } }, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, author_type));
+    try testing.expectEqual(@as(usize, 2), try countItems(t.store.manager, id, "user"));
+    s.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    try testing.expectEqual(types.MessageAuthor.user, restored.history[0].assistant.user.author);
+    try testing.expectEqual(types.MessageAuthor.child, restored.history[1].assistant.user.author);
+}
+
+test "an author item a reader cannot read never counts as the user's" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqual(types.MessageAuthor.user, decodeAuthor(a, "{\"by\":\"user\"}"));
+    try testing.expectEqual(types.MessageAuthor.parent, decodeAuthor(a, "{\"by\":\"parent\"}"));
+    try testing.expectEqual(types.MessageAuthor.child, decodeAuthor(a, "{\"by\":\"child\"}"));
+    try testing.expectEqual(types.MessageAuthor.child, decodeAuthor(a, "{\"by\":\"someone_new\"}"));
+    try testing.expectEqual(types.MessageAuthor.child, decodeAuthor(a, "not json"));
+    try testing.expectEqualStrings("{\"by\":\"child\"}", try encodeAuthor(a, .child));
 }
 
 test "a running tool call is saved once, and resume answers it as possibly run" {

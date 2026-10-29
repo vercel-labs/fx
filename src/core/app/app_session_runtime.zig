@@ -4255,6 +4255,10 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             agent.session_persistence.v2_children = children;
+            // Its children report to this agent, through the main loop.
+            if (comptime @hasDecl(App, "postSubagentReport")) {
+                agent.session_persistence.subagent_host.?.report_sink = .{ .context = app, .post_fn = App.postSubagentReport };
+            }
         }
 
         fn subagentAuthorityResolver(app: *App) subagent_authority.HostResolver {
