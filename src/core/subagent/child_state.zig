@@ -1,6 +1,7 @@
 const std = @import("std");
 const domain = @import("domain.zig");
 const profiles = @import("../profiles/profiles.zig");
+const reports = @import("reports.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session_adapter = @import("../session/session_adapter.zig");
@@ -134,6 +135,9 @@ pub const Child = struct {
     /// Whether the last finished work owes the parent a report, recorded
     /// on its `child_finished` line.
     last_report_owed: bool = false,
+    /// When the child reports back on its own. Set by its parent's
+    /// messages, and recorded on each spawn line.
+    report_rule: reports.Rule = .final,
     /// The agent profile the child started in, or null for fx's `agent`.
     /// Fixed when the child is created. Owned.
     profile: ?[]u8 = null,
@@ -177,6 +181,7 @@ pub const Child = struct {
             .last_outcome = self.last_outcome,
             .last_failure = self.last_failure,
             .last_report_owed = self.last_report_owed,
+            .report_rule = self.report_rule,
         };
     }
 
@@ -245,6 +250,13 @@ pub const Registry = struct {
         const child = self.findById(child_id) orelse return error.InvalidState;
         if (child.profile != null) return error.InvalidState;
         child.profile = try alloc.dupe(u8, name);
+    }
+
+    pub fn setReportRule(self: *Registry, child_id: []const u8, rule: reports.Rule) !void {
+        const child = self.findById(child_id) orelse return error.InvalidState;
+        if (child.report_rule == rule) return;
+        child.report_rule = rule;
+        self.generation +|= 1;
     }
 
     pub fn findPersistent(self: *Registry, agent: []const u8) ?*Child {
@@ -637,7 +649,21 @@ const SpawnData = struct {
     fingerprint: []const u8,
     /// The agent profile the child started in; null for fx's `agent`.
     profile: ?[]const u8 = null,
+    /// Its report rule, written only when it is not `final`. Older fx
+    /// skips it; a name this fx does not know reads as `final`.
+    report: ?[]const u8 = null,
 };
+
+/// A spawn line's data. The default report rule writes no field, so the
+/// line is written as before report rules existed.
+fn spawnData(arena: Allocator, agent: ?[]const u8, fingerprint: []const u8, profile: ?[]const u8, rule: reports.Rule) ![]const u8 {
+    if (rule == .final) return stringifyAlloc(arena, struct { agent: ?[]const u8, fingerprint: []const u8, profile: ?[]const u8 }{
+        .agent = agent,
+        .fingerprint = fingerprint,
+        .profile = profile,
+    });
+    return stringifyAlloc(arena, SpawnData{ .agent = agent, .fingerprint = fingerprint, .profile = profile, .report = @tagName(rule) });
+}
 
 /// fx's data on a `child_finished` line. Older fx skips `report`, and a
 /// line without it owes nothing, so an upgrade wakes no parent.
@@ -733,6 +759,7 @@ fn childFromFolded(alloc: Allocator, entry: session_adapter.Child) !Child {
         .last_outcome = last_outcome,
         .last_failure = if (finish.failure) |text| types.ModelFailureDiagnostic.init(text) else null,
         .last_report_owed = finish.report orelse false,
+        .report_rule = if (spawn.report) |name| std.meta.stringToEnum(reports.Rule, name) orelse .final else .final,
     };
 }
 
@@ -765,7 +792,7 @@ fn planLines(arena: Allocator, old: Registry, next: Registry) ![]session_adapter
                 try lines.append(arena, .{ .spawned = .{
                     .child = after.id,
                     .work_id = work_id,
-                    .data = try stringifyAlloc(arena, SpawnData{ .agent = after.agentName(), .fingerprint = &fingerprint, .profile = after.profile }),
+                    .data = try spawnData(arena, after.agentName(), &fingerprint, after.profile, after.report_rule),
                 } });
             }
         }
@@ -799,7 +826,7 @@ pub fn v1ImportLines(arena: Allocator, registry: Registry, has_log: []const bool
         try lines.append(arena, .{ .spawned = .{
             .child = child.id,
             .work_id = work_id,
-            .data = try stringifyAlloc(arena, SpawnData{ .agent = child.agentName(), .fingerprint = fingerprint }),
+            .data = try spawnData(arena, child.agentName(), fingerprint, null, .final),
         } });
         try lines.append(arena, .{ .finished = .{
             .child = child.id,

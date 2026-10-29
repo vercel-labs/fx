@@ -1152,9 +1152,6 @@ pub fn Runtime(comptime App: type) type {
             defer agent.worker.endActivePromptSnapshots(&snapshot_ownership);
             agent.worker.active_context_snapshot = &job.context_snapshot;
             defer agent.worker.active_context_snapshot = null;
-            defer if (comptime !@import("builtin").single_threaded) {
-                if (agent.session_persistence.subagent_host) |child_host| child_host.cancelYielded();
-            };
             agent.worker.setActiveAgentTurnSettings(job.agent_settings);
             defer agent.worker.clearActiveAgentTurnSettings();
             var preflight_context_notices: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
@@ -2830,7 +2827,7 @@ test "subagent labels show named request and reply" {
     try std.testing.expectEqualStrings("● reviewer working\x1b[0m \x1b[38;5;245m· Check replay\x1b[0m", active);
 
     const completed = try app.describeToolActionCompleted(app.agent(), arena, subagent_call);
-    try std.testing.expectEqualStrings("● reviewer replied\x1b[0m \x1b[38;5;245m· Check replay\x1b[0m", completed);
+    try std.testing.expectEqualStrings("● sent to reviewer\x1b[0m \x1b[38;5;245m· Check replay\x1b[0m", completed);
 }
 
 test "app agent runtime refreshes enabled project context through registry" {

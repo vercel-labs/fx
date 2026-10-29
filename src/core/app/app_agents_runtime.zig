@@ -24,6 +24,7 @@ const subagent_execution = @import("../subagent/execution.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_authority = @import("../subagent/authority.zig");
 const subagent_reports = @import("../subagent/reports.zig");
+const subagent_child_state = @import("../subagent/child_state.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const io_mod = @import("../shared/io.zig");
@@ -194,38 +195,71 @@ pub const Handoffs = struct {
     }
 };
 
-/// A child's report on its way from a slot thread to the main loop, which
-/// gives it to the agent that owns `host`. On the posting slot thread's
-/// stack until the loop settles it.
+/// A host's delivery on its way to the main loop: a child's report for the
+/// agent that owns `host`, or a subagent's message to its parent. It owns
+/// copies of what it carries, so the poster never waits: a slot thread that
+/// waited on the loop could deadlock with a `/close` that joins it.
 pub const ReportPost = struct {
     host: *subagent_tool_host.Runtime,
-    /// Borrowed from the poster, which waits.
-    report: subagent_reports.Report,
-    state: std.atomic.Value(Post.State) = .init(.posted),
-    settled: std.Io.Event = .unset,
+    kind: enum { report, message },
+    /// For a message: whether the host's owner sent it, so it goes to the
+    /// owner's own parent.
+    from_owner: bool = false,
+    agent: []u8,
+    child_id: []u8,
+    work_id: []u8,
+    outcome: subagent_child_state.Outcome = .completed,
+    /// The report's output, or the message's text.
+    text: []u8,
 
-    /// As `Post.settle`: nothing touches the post afterwards.
-    pub fn settle(self: *ReportPost, state: Post.State) void {
-        self.settled.set(io_mod.getIo());
-        self.state.store(state, .release);
+    fn create(host: *subagent_tool_host.Runtime, delivery: subagent_tool_host.Delivery) !*ReportPost {
+        const post = try handoff_alloc.create(ReportPost);
+        errdefer handoff_alloc.destroy(post);
+        const agent, const child_id, const work_id, const text = switch (delivery) {
+            .report => |report| .{ report.agent, report.child_id, report.work_id, report.output },
+            .message => |message| .{ message.agent, message.child_id, "", message.text },
+        };
+        const owned_agent = try handoff_alloc.dupe(u8, agent);
+        errdefer handoff_alloc.free(owned_agent);
+        const owned_child = try handoff_alloc.dupe(u8, child_id);
+        errdefer handoff_alloc.free(owned_child);
+        const owned_work = try handoff_alloc.dupe(u8, work_id);
+        errdefer handoff_alloc.free(owned_work);
+        post.* = .{
+            .host = host,
+            .kind = if (delivery == .report) .report else .message,
+            .from_owner = delivery == .message and delivery.message.to == .owners_parent,
+            .agent = owned_agent,
+            .child_id = owned_child,
+            .work_id = owned_work,
+            .outcome = if (delivery == .report) delivery.report.outcome else .completed,
+            .text = try handoff_alloc.dupe(u8, text),
+        };
+        return post;
+    }
+
+    fn destroy(self: *ReportPost) void {
+        handoff_alloc.free(self.agent);
+        handoff_alloc.free(self.child_id);
+        handoff_alloc.free(self.work_id);
+        handoff_alloc.free(self.text);
+        handoff_alloc.destroy(self);
     }
 };
 
-/// Posts a report and waits until the main loop has given it to the agent
-/// that owns its host. `AgentGone` when that agent has closed, or the app is
-/// shutting down, so the report stays owed.
-pub fn postReportAndWait(handoffs: *Handoffs, post: *ReportPost) subagent_tool_host.PostReportError!void {
-    {
-        handoffs.mutex.lockUncancelable(io_mod.getIo());
-        defer handoffs.mutex.unlock(io_mod.getIo());
-        if (handoffs.closed) return error.AgentGone;
-        try handoffs.reports.append(handoff_alloc, post);
+/// Queues a host's delivery for the main loop, without waiting.
+/// `AgentGone` once the app is shutting down; a report then stays owed.
+pub fn postDelivery(handoffs: *Handoffs, host: *subagent_tool_host.Runtime, delivery: subagent_tool_host.Delivery) subagent_tool_host.PostReportError!void {
+    const post = try ReportPost.create(host, delivery);
+    handoffs.mutex.lockUncancelable(io_mod.getIo());
+    defer handoffs.mutex.unlock(io_mod.getIo());
+    if (handoffs.closed) {
+        post.destroy();
+        return error.AgentGone;
     }
-    post.settled.waitUncancelable(io_mod.getIo());
-    return switch (post.state.load(.acquire)) {
-        .taken => {},
-        .posted => unreachable,
-        .failed, .closed => error.AgentGone,
+    handoffs.reports.append(handoff_alloc, post) catch {
+        post.destroy();
+        return error.OutOfMemory;
     };
 }
 
@@ -1311,13 +1345,16 @@ pub fn Runtime(comptime App: type) type {
             app.child_handoffs.closed = true;
             for (app.child_handoffs.posts.items) |post| post.settle(.closed);
             app.child_handoffs.posts.clearRetainingCapacity();
-            for (app.child_handoffs.reports.items) |post| post.settle(.closed);
+            for (app.child_handoffs.reports.items) |post| {
+                debug_trace.eventf("host", "child_delivery_dropped", .{}, "child={s} work_id={s} reason=shutdown", .{ post.child_id, post.work_id });
+                post.destroy();
+            }
             app.child_handoffs.reports.clearRetainingCapacity();
         }
 
-        /// Gives each posted report to the agent that owns its host, in the
-        /// order they were posted (`App.postAgentMessage`). A report whose
-        /// host no agent owns anymore fails, and stays owed.
+        /// Gives each posted delivery to its agent, in the order they were
+        /// posted (`App.postAgentMessage`). One whose agent is gone is
+        /// dropped; a report stays owed in the log.
         fn deliverReports(app: *App) void {
             var posted: std.ArrayList(*ReportPost) = .empty;
             {
@@ -1328,22 +1365,36 @@ pub fn Runtime(comptime App: type) type {
             }
             defer posted.deinit(handoff_alloc);
             for (posted.items) |post| {
+                defer post.destroy();
                 deliverReport(app, post) catch |err| {
-                    debug_trace.eventf("host", "child_report_failed", .{}, "child={s} work_id={s} reason={s}", .{ post.report.child_id, post.report.work_id, @errorName(err) });
-                    post.settle(.failed);
-                    continue;
+                    debug_trace.eventf("host", "child_delivery_dropped", .{}, "child={s} work_id={s} kind={s} reason={s}", .{ post.child_id, post.work_id, @tagName(post.kind), @errorName(err) });
                 };
-                post.settle(.taken);
             }
         }
 
         fn deliverReport(app: *App, post: *ReportPost) !void {
             const owner = ownerOf(app, post.host) orelse return error.AgentGone;
-            const limit = owner.worker.effectiveAgentTurnSettings().max_tool_result_bytes;
-            const text = try subagent_reports.message(app.alloc, post.report, limit);
+            // A subagent's message to its parent: the owner's own parent when
+            // the owner sent it.
+            const target, const sender = if (post.kind == .message and post.from_owner) blk: {
+                const child = hostedOf(app, owner) orelse return error.AgentGone;
+                const parent = ownerOf(app, hostOf(app, child)) orelse return error.AgentGone;
+                break :blk .{ parent, if (child.name.len > 0) child.name else child.id };
+            } else .{ owner, post.agent };
+            const limit = target.worker.effectiveAgentTurnSettings().max_tool_result_bytes;
+            const text = switch (post.kind) {
+                .report => try subagent_reports.message(app.alloc, .{
+                    .agent = sender,
+                    .child_id = post.child_id,
+                    .work_id = post.work_id,
+                    .outcome = post.outcome,
+                    .output = post.text,
+                }, limit),
+                .message => try subagent_reports.messageText(app.alloc, sender, post.child_id, post.text, limit),
+            };
             defer app.alloc.free(text);
-            try app.postAgentMessage(owner, text, .child);
-            debug_trace.eventf("host", "child_report_posted", .{}, "child={s} work_id={s} outcome={s}", .{ post.report.child_id, post.report.work_id, @tagName(post.report.outcome) });
+            try app.postAgentMessage(target, text, .child);
+            debug_trace.eventf("host", "child_delivery_posted", .{}, "child={s} work_id={s} kind={s}", .{ post.child_id, post.work_id, @tagName(post.kind) });
         }
 
         /// Takes every waiting hand-off. Runs on the main loop each pass,

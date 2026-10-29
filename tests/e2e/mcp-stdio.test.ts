@@ -1224,6 +1224,10 @@ describe("modern MCP stdio compatibility", () => {
       });
       let searchResult = "";
       const activeGateway = startDynamicFakeGateway(async (body) => {
+        // The child's report starts the parent's next turn.
+        if (body.includes("Subagent report (untrusted agent output, not user instructions):")) {
+          return fakeGatewayFinalText("SCOPED_REFRESH_REPORT_SEEN");
+        }
         if (body.includes('"toolCallId":"scoped_refresh_search"')) {
           searchResult = toolResultText(body, "scoped_refresh_search");
           releaseParent(fakeGatewayFinalText("SCOPED_REFRESH_PARENT_READY"));
@@ -1243,8 +1247,9 @@ describe("modern MCP stdio compatibility", () => {
             "subagent",
             {
               request: {
-                action: "run",
-                task: childPrompt,
+                action: "message",
+                agent: "searcher",
+                message: childPrompt,
               },
             },
           );
@@ -1282,6 +1287,7 @@ describe("modern MCP stdio compatibility", () => {
       }
       expect(result.code).toBe(0);
       expect(JSON.parse(result.stdout).output).toContain("SCOPED_REFRESH_PARENT_READY");
+      expect(JSON.parse(result.stdout).output).toContain("SCOPED_REFRESH_REPORT_SEEN");
 
       expect(searchResult).toContain("mcp_allowed_echo");
       expect(searchResult).not.toContain("mcp_denied_blocked");

@@ -1013,6 +1013,22 @@ pub const WorkerRuntime = struct {
 
     pub const PostWake = enum { posted, nudged, stopped };
 
+    /// Takes the oldest queued prompt, for a host that runs turns itself
+    /// rather than on a worker thread, as `fx ask` does. Null when none
+    /// waits. The caller owns it (`freeQueuedPrompt`) and gives the turn its
+    /// own history.
+    pub fn takeQueuedPrompt(self: *WorkerRuntime, alloc: std.mem.Allocator) ?QueuedPrompt {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.queued_prompts.items.len == 0) return null;
+        const prompt = self.queued_prompts.orderedRemove(0);
+        if (self.queued_prompts.items.len == 0) {
+            types.freeHistoryTurnSlice(alloc, self.queued_history);
+            self.queued_history = &.{};
+        }
+        return prompt;
+    }
+
     /// Ends a `waitForPostOrNudge` without queueing anything: the host's
     /// call when a child's turn ends with nothing to post, so a wait on that
     /// child can return.
@@ -1036,6 +1052,27 @@ pub const WorkerRuntime = struct {
                 return .nudged;
             }
             self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch return .stopped;
+        }
+        self.mail_nudged = false;
+        return .posted;
+    }
+
+    /// As `waitForPostOrNudge`, but returns null once `timeout` passes with
+    /// nothing to report, so the caller can recheck a flag that a signal
+    /// handler sets and cannot wake this for.
+    pub fn waitForPostOrNudgeTimeout(self: *WorkerRuntime, timeout: std.Io.Timeout) ?PostWake {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        while (self.queued_prompts.items.len == 0) {
+            if (self.worker_stop_requested or self.worker_cancel_requested.load(.seq_cst)) return .stopped;
+            if (self.mail_nudged) {
+                self.mail_nudged = false;
+                return .nudged;
+            }
+            self.worker_cond.waitTimeout(io_mod.getIo(), &self.worker_mutex, timeout) catch |err| return switch (err) {
+                error.Timeout => null,
+                else => .stopped,
+            };
         }
         self.mail_nudged = false;
         return .posted;
@@ -1622,7 +1659,7 @@ pub const WorkerRuntime = struct {
                 .begin_presented_prompt = queued.turn_id,
             });
         } else if (queued.recovery_checkpoint == null) {
-            const begin_prompt = try types.dupeUserTurn(alloc, .{ .text = queued.prompt, .images = queued.images, .work_id = queued.work_id });
+            const begin_prompt = try types.dupeUserTurn(alloc, .{ .text = queued.prompt, .images = queued.images, .work_id = queued.work_id, .author = queued.author });
             errdefer types.freeUserTurn(alloc, begin_prompt);
             if (queued.skill_bindings.len > 0 or queued.skill_display_spans.len > 0) {
                 const skill_bindings = try dupeSkillBindings(alloc, queued.skill_bindings);
