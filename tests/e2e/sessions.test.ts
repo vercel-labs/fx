@@ -3066,7 +3066,8 @@ test.skipIf(!tmuxAvailable())("the app talks to the user while a child runs, and
     // The report turn is saved as the child's, never the user's.
     expect(logLines(fixture.home, parent).filter((line: any) => line.kind === "item" && line.type === "author")).toHaveLength(1);
     const trace = readFileSync(tracePath, "utf8");
-    expect(trace).toContain("event=deliver to=main ");
+    // Traced when main takes the report into its history.
+    expect(trace).toMatch(/\[mailbox\] event=deliver (?:turn_id=\d+ )?from=\S+ kind=report /);
     expectWholeLog(fixture, parent);
   } finally {
     held.dispose();

@@ -1686,6 +1686,9 @@ pub const WorkerRuntime = struct {
         self.worker_processing = true;
         self.active_turn_id = job.turn_id;
         self.tool_phase_step_id = null;
+        // The last turn's final boundary closed it to messages; this one
+        // starts open, as a direct turn does.
+        self.direct_steering_closed = false;
         // A turn takes in the messages waiting right behind it, in order, up
         // to the first prompt that needs a turn of its own, so none passes it.
         var absorbed: usize = 0;
@@ -5454,6 +5457,28 @@ test "an agent's posted message joins the running turn, waits behind older work,
     defer freeQueuedPrompt(alloc, job);
     try std.testing.expectEqualStrings("wakes", job.prompt);
     try std.testing.expect(job.delivery.isContinuation());
+}
+
+test "a posted message joins a turn the worker started after an earlier turn closed" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    // The first turn ends at a final boundary with nothing to take, which
+    // closes it to messages.
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "first", "model"));
+    const first = (try runtime.tryTakeNextPrompt(alloc)).?;
+    freeQueuedPrompt(alloc, first);
+    try std.testing.expect(try runtime.takeSteeringBoundary(alloc, runtime.active_turn_id, .finalizing) == .none);
+    runtime.finishProcessing();
+
+    // The worker starts the next turn, and a report posted while it runs
+    // joins it instead of waiting for a third turn.
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "second", "model"));
+    const second = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, second);
+    try runtime.postMail(alloc, try makePrompt(alloc, "report", "model"));
+    try std.testing.expectEqual(@as(?u64, second.turn_id), runtime.queued_prompts.items[0].delivery.activeTurnId());
 }
 
 test "waiting for a post returns on a post, on a nudge sent before it, and on a cancel" {
