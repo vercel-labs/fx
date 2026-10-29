@@ -741,15 +741,40 @@ pub fn Runtime(comptime App: type) type {
         /// restart can be shown too. One added here starts its
         /// worker on its first run.
         fn syncChildList(app: *App) !void {
-            const host = app_session_runtime.Runtime(App).subagentHost(app) orelse return;
-            const listing = try host.listChildren(app.alloc);
-            defer subagent_tool_host.Runtime.freeChildListing(app.alloc, listing);
-            for (listing) |entry| {
-                const child = findChild(app, entry.id) orelse try addChild(app, entry.id);
-                if (child.name.len == 0 and entry.name.len > 0) child.name = try app.alloc.dupe(u8, entry.name);
-                if (child.parent_host == null) setParentHost(app, child, host);
+            // Every instance's tree, a restored one's too (decision 20): the
+            // first instance's host, then each later instance's own. Taken
+            // first, since adding a child grows the list.
+            var hosts: std.ArrayList(*subagent_tool_host.Runtime) = .empty;
+            defer hosts.deinit(app.alloc);
+            if (app_session_runtime.Runtime(App).subagentHost(app)) |host| try hosts.append(app.alloc, host);
+            if (comptime agents.hasAgentField(App, "session_persistence")) {
+                for (app.child_agents.items) |hosted| {
+                    if (hosted.agent.role != .instance) continue;
+                    if (hosted.agent.session_persistence.subagent_host) |host| try hosts.append(app.alloc, host);
+                }
             }
-            orderByListing(app.child_agents.items, listing);
+            const Listed = struct { id: []const u8 };
+            var order: std.ArrayList(Listed) = .empty;
+            defer order.deinit(app.alloc);
+            var listings: std.ArrayList([]subagent_tool_host.Runtime.ChildListing) = .empty;
+            defer {
+                for (listings.items) |listing| subagent_tool_host.Runtime.freeChildListing(app.alloc, listing);
+                listings.deinit(app.alloc);
+            }
+            for (hosts.items) |host| {
+                const listing = try host.listChildren(app.alloc);
+                listings.append(app.alloc, listing) catch |err| {
+                    subagent_tool_host.Runtime.freeChildListing(app.alloc, listing);
+                    return err;
+                };
+                for (listing) |entry| {
+                    const child = findChild(app, entry.id) orelse try addChild(app, entry.id);
+                    if (child.name.len == 0 and entry.name.len > 0) child.name = try app.alloc.dupe(u8, entry.name);
+                    if (child.parent_host == null) setParentHost(app, child, host);
+                    try order.append(app.alloc, .{ .id = entry.id });
+                }
+            }
+            orderByListing(app.child_agents.items, order.items);
         }
 
         /// The agent list's rows, in order: the instances in launch order,

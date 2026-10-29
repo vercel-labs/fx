@@ -6855,6 +6855,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         writeFileSync(join(root.workspace, "follow-up.txt"), "FOLLOW_UP_FACT\n");
         let compactions = 0;
         let diagnosticHandle = "";
+        let restartReport = "";
         const gateway = startDynamicFakeGateway((body) => {
           const request = JSON.parse(body);
           if (request.tools.length === 0) {
@@ -6868,6 +6869,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           // A subagent never carries main's first prompt.
           if (!body.includes("Run the requested subagent.")) return held.response;
           const latest = latestUserText(body);
+          // The child was still working when fx quit, which ended its turn,
+          // so after the restart its owed report reaches main once.
+          if (latestUserIsReport(body)) {
+            restartReport = latest;
+            return fakeGatewayFinalText("WAITER_REPORT_NOTED");
+          }
           if (latest.includes("Continue without repeating cancelled work.")) {
             expect(body).toContain("compacted_conversation");
             expect(body).toContain(`Its diagnostic is ${diagnosticHandle}.`);
@@ -6939,10 +6946,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(readFileSync(stderrPath, "utf8")).toBe("");
           await tui.kill();
           tui = await TmuxSession.create({ cmd: `${FX_BIN} --resume ${sessionId}`, cwd: root.workspace, env, stderrPath, remainOnExit: true });
-          await tui.waitForComposer(15000);
+          await tui.waitForPane((text) => hasEmptyComposer(text) && text.includes("WAITER_REPORT_NOTED"), 15000);
+          expect(restartReport).toMatch(/\\"outcome\\":\\"cancelled\\"/);
           await tui.sendText("Continue without repeating cancelled work.");
           await tui.waitForPane((text) => hasEmptyComposer(text) && text.includes("CANCEL_RESTART_COMPLETE"), 15000);
-          expect(gateway.requests).toHaveLength(7);
+          // One more for the report turn the restart owed.
+          expect(gateway.requests).toHaveLength(8);
           const history = (await savedSession(root.home, sessionId)).history;
           const calls = savedToolCallIds(history);
           expect(calls.filter((id) => id === "cancelled-history-child")).toHaveLength(1);

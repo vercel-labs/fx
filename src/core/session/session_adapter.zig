@@ -41,6 +41,7 @@ const sm = @import("session_manager");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
+const agent_frame = @import("../shared/agent_frame.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const image_data = @import("../images/image_data.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
@@ -112,6 +113,14 @@ fn freeChild(alloc: Allocator, child: Child) void {
     if (child.spawn_data) |data| alloc.free(data);
     if (child.finish_data) |data| alloc.free(data);
 }
+
+/// One fact about a subagent's report in its parent's log (`reportLines`).
+pub const ReportLine = union(enum) {
+    spawned: struct { child: []const u8, work_id: []const u8, data: ?[]const u8 },
+    finished: struct { child: []const u8, work_id: []const u8, outcome: ChildOutcome, data: ?[]const u8 },
+    /// The parent took the report for this work into its history.
+    taken: struct { child: []const u8, work_id: []const u8 },
+};
 
 /// A line about a child, appended through its parent.
 pub const ChildLine = union(enum) {
@@ -1257,6 +1266,8 @@ pub const Session = struct {
     /// only these.
     root: bool = true,
     titled: bool = false,
+    /// Set once this open handed out its owed reports (`pendingReportLines`).
+    reports_handed_out: bool = false,
     /// A resumed session with no title: the title its first prompt gives,
     /// owned, written with its next turn end (D52).
     first_title: ?[]u8 = null,
@@ -2062,6 +2073,9 @@ pub const Session = struct {
             if (event == .user and author != .user) {
                 try batch.append(a, .{ .item = try self.itemAs(a, author_type, try encodeAuthor(a, author)) });
             }
+            if (try takenReportData(a, event, author)) |data| {
+                try batch.append(a, .{ .item = try self.itemAs(a, child_report_type, data) });
+            }
         }
         try batch.appendSlice(a, tail);
         if (batch.items.len == 0) return;
@@ -2494,6 +2508,61 @@ pub const Session = struct {
         };
         var sink: Sink = .{ .alloc = alloc, .visitor = visitor };
         try replay(self.source(), alloc, alloc, .start, null, ReplaySink.init(&sink));
+    }
+
+    /// This open's report lines, the first time it is asked, so the reports
+    /// a restart left owed are posted once however often its subagent host
+    /// is enabled again. Null after that, and when the session has no
+    /// subagents. Strings live in `arena`.
+    pub fn pendingReportLines(self: *Session, arena: Allocator) !?[]ReportLine {
+        if (self.reports_handed_out) return null;
+        self.reports_handed_out = true;
+        const folded = try self.children(arena);
+        if (folded.len == 0) return null;
+        return try self.reportLines(arena);
+    }
+
+    /// What this session's log says about its subagents' reports, oldest
+    /// first: every work spawned and finished, with fx's data, and every
+    /// report it took (`child_report`). Read from the start, past any
+    /// compaction, since a report can stay owed across one. Strings live in
+    /// `arena`.
+    pub fn reportLines(self: *Session, arena: Allocator) ![]ReportLine {
+        const src = self.source();
+        var lines: std.ArrayList(ReportLine) = .empty;
+        var from: sm.From = .start;
+        while (true) {
+            var page = try src.read(arena, from, replay_page_lines);
+            defer page.deinit();
+            for (page.entries) |entry| {
+                const body = entry.body orelse continue;
+                switch (body) {
+                    .child_spawned => |line| try lines.append(arena, .{ .spawned = .{
+                        .child = try arena.dupe(u8, line.child),
+                        .work_id = try arena.dupe(u8, line.work_id),
+                        .data = if (line.data) |data| try arena.dupe(u8, data) else null,
+                    } }),
+                    .child_finished => |line| try lines.append(arena, .{ .finished = .{
+                        .child = try arena.dupe(u8, line.child),
+                        .work_id = try arena.dupe(u8, line.work_id),
+                        .outcome = line.outcome,
+                        .data = if (line.data) |data| try arena.dupe(u8, data) else null,
+                    } }),
+                    .item => |piece| {
+                        if (!std.mem.eql(u8, piece.type, child_report_type)) continue;
+                        const data = try src.pieceData(arena, piece);
+                        const taken = std.json.parseFromSliceLeaky(ChildReportData, arena, data, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch {
+                            debug_trace.logf("session", "event=sessions_v2_child_report_unreadable session={s}", .{src.id});
+                            continue;
+                        };
+                        try lines.append(arena, .{ .taken = .{ .child = taken.child, .work_id = taken.work_id } });
+                    },
+                    else => {},
+                }
+            }
+            from = .{ .at = page.next orelse break };
+        }
+        return lines.toOwnedSlice(arena);
     }
 
     /// A prompt a fork can start before: the turn it opened and its text.
@@ -4438,6 +4507,8 @@ noinline fn replay(
                         try builder.setUserAuthor(decodeAuthor(pa, try src.pieceData(pa, piece)));
                         continue;
                     }
+                    // A mark for `reportLines`, not part of the conversation.
+                    if (std.mem.eql(u8, piece.type, child_report_type)) continue;
                     const kind = pieceKind(piece.type) orelse {
                         debug_trace.logf("session", "event=sessions_v2_unknown_item session={s} type={s} dropped=item", .{ src.id, piece.type });
                         continue;
@@ -4798,6 +4869,29 @@ const superseded_type = "superseded";
 /// wrote that message, such as a subagent's report that woke its parent.
 /// Older fx drops it as an unknown item and reads the turn as before.
 const author_type = "author";
+
+/// The item after a piece that carries a subagent's report into this
+/// session's history, `{"child":…,"work_id":…}`: the opening message of a
+/// turn the report started, or the steering a boundary took. It marks the
+/// report taken (`reportLines`). Older fx drops it as an unknown item.
+const child_report_type = "child_report";
+
+const ChildReportData = struct { child: []const u8, work_id: []const u8 };
+
+/// The `child_report` item's data for `event`, or null when the piece
+/// carries no subagent report.
+fn takenReportData(a: Allocator, event: Event, author: types.MessageAuthor) !?[]u8 {
+    const text = switch (event) {
+        .user => |user| if (author == .child) user.text else return null,
+        .steering => |steering| steering.text,
+        else => return null,
+    };
+    const sender = (try agent_frame.reportSender(a, text)) orelse return null;
+    defer sender.deinit();
+    var out: std.Io.Writer.Allocating = .init(a);
+    try std.json.Stringify.value(ChildReportData{ .child = sender.value.child_id, .work_id = sender.value.work_id }, .{}, &out.writer);
+    return out.written();
+}
 
 /// The `author` item's data: `{"by":"child"}`.
 fn encodeAuthor(a: Allocator, author: types.MessageAuthor) ![]u8 {
@@ -5742,6 +5836,68 @@ test "a turn someone other than the user opened keeps its author across a resume
     try testing.expectEqual(@as(usize, 2), restored.history.len);
     try testing.expectEqual(types.MessageAuthor.user, restored.history[0].assistant.user.author);
     try testing.expectEqual(types.MessageAuthor.child, restored.history[1].assistant.user.author);
+}
+
+test "a report taken into a turn is marked once, and the report lines read it back in log order" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const child = "01J00000000000000000000002";
+    try s.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("inspect") }, .assistant = @constCast("started a reviewer") } }, types.ConversationLanguage.default());
+    try s.appendChildLines(&.{
+        .{ .spawned = .{ .child = child, .work_id = "w1", .data = "{\"fingerprint\":\"ab\",\"report\":\"final\"}" } },
+        .{ .finished = .{ .child = child, .work_id = "w1", .outcome = .ok, .data = "{\"report\":true}" } },
+    });
+    // A turn the report opened, streamed twice and committed, marks it once.
+    const opened_text = agent_frame.report_header ++ "{\"agent\":\"reviewer\",\"child_id\":\"" ++ child ++ "\",\"work_id\":\"w1\"}\n";
+    const opened: types.UserTurn = .{ .text = @constCast(opened_text), .author = .child };
+    try s.appendProgress(opened, .{}, .{});
+    try s.appendProgress(opened, .{}, .{});
+    try s.commitTurn(.{ .assistant = .{ .user = opened, .assistant = @constCast("noted") } }, types.ConversationLanguage.default());
+    // A report a boundary took rides in the turn's steering.
+    try s.appendChildLines(&.{
+        .{ .spawned = .{ .child = child, .work_id = "w2", .data = "{\"fingerprint\":\"ab\",\"report\":\"final\"}" } },
+        .{ .finished = .{ .child = child, .work_id = "w2", .outcome = .interrupted } },
+    });
+    var steering = [_]types.PersistedSteering{.{
+        .text = @constCast(agent_frame.report_header ++ "{\"agent\":\"reviewer\",\"child_id\":\"" ++ child ++ "\",\"work_id\":\"w2\"}\n"),
+        .after_tool_step_count = 0,
+    }};
+    try s.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("keep going") },
+        .assistant = @constCast("both seen"),
+        .execution = .{ .steering = &steering },
+    } }, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    try testing.expectEqual(@as(usize, 2), try countItems(t.store.manager, id, child_report_type));
+
+    const lines = try s.reportLines(a);
+    try testing.expectEqual(@as(usize, 6), lines.len);
+    try testing.expectEqualStrings("w1", lines[0].spawned.work_id);
+    try testing.expectEqualStrings("w1", lines[1].finished.work_id);
+    try testing.expectEqualStrings("w1", lines[2].taken.work_id);
+    try testing.expectEqualStrings(child, lines[2].taken.child);
+    try testing.expectEqualStrings("w2", lines[3].spawned.work_id);
+    try testing.expect(lines[4].finished.data == null);
+    try testing.expectEqualStrings("w2", lines[5].taken.work_id);
+    // Handed out once per open.
+    try testing.expect((try s.pendingReportLines(a)) != null);
+    try testing.expect((try s.pendingReportLines(a)) == null);
+    s.close();
+
+    // The mark is not part of the conversation.
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), restored.history.len);
+    try testing.expectEqual(@as(usize, 1), restored.history[2].assistant.execution.steering.len);
 }
 
 test "an author item a reader cannot read never counts as the user's" {

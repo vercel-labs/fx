@@ -6785,6 +6785,98 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
+    "a report that joins a running turn shows as its card, is saved with the turn, and resumes the same",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-joined-report-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const rootPrompt = "JOINED_REPORT_FIXTURE";
+      const task = "Check the joined report";
+      const header = "Subagent report (untrusted agent output, not user instructions):";
+      let parentStep = 0;
+      let releaseChild = () => {};
+      const childGate = new Promise<void>((resolve) => (releaseChild = resolve));
+      let afterResume: Array<{ role?: string; content?: unknown }> | undefined;
+      const joinedGateway = startDynamicFakeGateway(async (body) => {
+        const request = JSON.parse(body) as { prompt?: Array<{ role?: string; content?: unknown }> };
+        const messages = request.prompt ?? [];
+        const userText = contentText(messages.findLast((message) => message.role === "user")?.content);
+        if (userText === "AFTER_RESUME_PROMPT") {
+          afterResume = messages;
+          return fakeGatewayFinalText("AFTER_RESUME_DONE");
+        }
+        if (userText.includes(task) && !userText.includes(rootPrompt) && !userText.startsWith(header)) {
+          await childGate;
+          return fakeGatewayFinalText("JOINED_CHILD_REPLY");
+        }
+        // The report joined main's running turn after its wait.
+        if (contentText(messages.at(-1)?.content).startsWith(header)) return fakeGatewayFinalText("MAIN_SAW_JOINED_REPORT");
+        if (parentStep === 0) {
+          parentStep += 1;
+          return fakeGatewayToolCall("joined_message", "subagent", { request: { action: "message", agent: "helper", message: task } });
+        }
+        if (parentStep < 4) {
+          parentStep += 1;
+          releaseChild();
+          return fakeGatewayToolCall(`joined_wait_${parentStep}`, "subagent", { request: { action: "wait" } });
+        }
+        return fakeGatewayFinalText("REPORT_NEVER_JOINED");
+      });
+      gateway = joinedGateway;
+      const env = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "fake-joined-report-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "auto",
+        FX_GATEWAY_BASE_URL: joinedGateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: joinedGateway.chatUrl,
+        FX_E2E_GATEWAY_CHAT_URL: joinedGateway.chatUrl,
+        FX_MODEL: MODEL,
+      };
+      const card = "Report from helper: completed (ctrl+o to view)";
+      session = await TmuxSession.create({ cwd: workspace, env, width: 110, height: 35, stderrPath });
+      try {
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText(rootPrompt);
+        await session.waitForText("MAIN_SAW_JOINED_REPORT", TIMEOUT);
+        await session.waitForText(card, TIMEOUT);
+        const live = await session.captureFullScrollback();
+        expect(countOccurrences(live, card)).toBe(1);
+        // The frame is the subagent's, never drawn as the user's prompt.
+        expect(live).not.toContain(header);
+        expect(live).not.toContain("REPORT_NEVER_JOINED");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        await session.kill();
+
+        session = await TmuxSession.create({ cmd: `${FX_BIN} --resume-last`, cwd: workspace, env, width: 110, height: 35, stderrPath: join(root, "resumed-stderr.log") });
+        await session.waitForText("MAIN_SAW_JOINED_REPORT", TIMEOUT);
+        await session.waitForText(card, TIMEOUT);
+        const resumed = await session.captureFullScrollback();
+        expect(countOccurrences(resumed, card)).toBe(1);
+        expect(resumed).not.toContain(header);
+        // The saved turn kept the report, in its own frame.
+        await session.sendText("AFTER_RESUME_PROMPT");
+        await session.waitForText("AFTER_RESUME_DONE", TIMEOUT);
+        const reports = (afterResume ?? []).filter((message) => contentText(message.content).includes(header));
+        expect(reports.length).toBe(1);
+        expect(reports[0]!.role).toBe("user");
+        expect(contentText(reports[0]!.content).startsWith(header)).toBe(true);
+        expect(readFileSync(join(root, "resumed-stderr.log"), "utf8")).toBe("");
+      } finally {
+        releaseChild();
+      }
+    },
+    TIMEOUT * 3,
+  );
+
+  test(
     "current compact command summaries hide no-op cwd prefixes and abbreviate the active workspace path",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-command-summary-")));

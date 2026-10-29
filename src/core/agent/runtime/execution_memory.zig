@@ -1,4 +1,5 @@
 const std = @import("std");
+const agent_frame = @import("../../shared/agent_frame.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const types = @import("../../shared/types.zig");
 const image_data = @import("../../images/image_data.zig");
@@ -56,6 +57,23 @@ test "steering message tells the model to apply the update and continue" {
     try std.testing.expect(std.mem.find(u8, message, "live user update") != null);
     try std.testing.expect(std.mem.find(u8, message, "Continue working") != null);
     try std.testing.expectEqualStrings("focus on rendering", steeringText(message).?);
+}
+
+test "a subagent's report a boundary took is saved whole and replayed as it was" {
+    const alloc = std.testing.allocator;
+    const report = agent_frame.report_header ++ "{\"agent\":\"reviewer\",\"child_id\":\"c1\",\"work_id\":\"w1\"}\n";
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = report }};
+    const memory = try buildExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, memory);
+    try std.testing.expectEqual(@as(usize, 1), memory.steering.len);
+    try std.testing.expectEqualStrings(report, memory.steering[0].text);
+
+    // Restored, it keeps its frame rather than becoming the user's update.
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const restored = [_]types.ChatMessage{.{ .role = .user, .content = report, .restored_steering = true }};
+    const replayed = try rewrapRestoredSteering(arena_state.allocator(), &restored);
+    try std.testing.expectEqualStrings(report, replayed[0].content.?);
 }
 
 test "parent steering preserves its sender in persisted execution text" {
@@ -591,6 +609,9 @@ fn isSteering(message: ChatMessage) bool {
 }
 
 fn steeringText(content: []const u8) ?[]const u8 {
+    // A subagent's report or message a boundary took keeps its frame, which
+    // names it as untrusted agent output wherever it is replayed.
+    if (agent_frame.isFrame(content)) return content;
     if (std.mem.startsWith(u8, content, parent_steering_open) and std.mem.endsWith(u8, content, parent_steering_close)) {
         // Keep the sender label in persisted text and ordinary history replay.
         return content[parent_steering_open.len .. content.len - parent_steering_close.len];

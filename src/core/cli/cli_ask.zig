@@ -1027,6 +1027,8 @@ const AskContext = struct {
         };
         self.v2_children = children;
         self.subagent_host.?.report_sink = .{ .context = self, .post_fn = postAskReport };
+        // What a restart left owed runs as this run's next turns.
+        self.subagent_host.?.resumeReports(v2);
     }
 
     fn toolContext(self: *AskContext) tool_runtime.Context {

@@ -649,20 +649,47 @@ const SpawnData = struct {
     fingerprint: []const u8,
     /// The agent profile the child started in; null for fx's `agent`.
     profile: ?[]const u8 = null,
-    /// Its report rule, written only when it is not `final`. Older fx
-    /// skips it; a name this fx does not know reads as `final`.
+    /// Its report rule. This fx writes it on every spawn, which also marks
+    /// the work as one whose end owes its parent a report, so a crash that
+    /// repair closes as interrupted still reports (`spawnNamesRule`). Older
+    /// fx and converted v1 sessions never write it; a name this fx does not
+    /// know reads as `final`.
     report: ?[]const u8 = null,
 };
 
-/// A spawn line's data. The default report rule writes no field, so the
-/// line is written as before report rules existed.
-fn spawnData(arena: Allocator, agent: ?[]const u8, fingerprint: []const u8, profile: ?[]const u8, rule: reports.Rule) ![]const u8 {
-    if (rule == .final) return stringifyAlloc(arena, struct { agent: ?[]const u8, fingerprint: []const u8, profile: ?[]const u8 }{
+/// A spawn line's data. `rule` is null only for a converted v1 session,
+/// whose works owe no report, and then the line is written as before
+/// report rules existed.
+fn spawnData(arena: Allocator, agent: ?[]const u8, fingerprint: []const u8, profile: ?[]const u8, rule: ?reports.Rule) ![]const u8 {
+    return stringifyAlloc(arena, SpawnData{
         .agent = agent,
         .fingerprint = fingerprint,
         .profile = profile,
+        .report = if (rule) |value| @tagName(value) else null,
     });
-    return stringifyAlloc(arena, SpawnData{ .agent = agent, .fingerprint = fingerprint, .profile = profile, .report = @tagName(rule) });
+}
+
+/// Whether a `child_spawned` line's data names a report rule: the work was
+/// started by fx that owes reports. Unreadable data names none.
+pub fn spawnNamesRule(data: ?[]const u8) bool {
+    const bytes = data orelse return false;
+    var buf: [256]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const Wire = struct { report: ?[]const u8 = null };
+    const wire = std.json.parseFromSliceLeaky(Wire, fba.allocator(), bytes, .{ .ignore_unknown_fields = true }) catch return false;
+    return wire.report != null;
+}
+
+/// A `child_finished` line's `report` flag: true when its work owes a
+/// report, false when the line says it owes none, and null when the line
+/// carries no fx data, as a finish the manager's crash repair writes.
+pub fn finishOwesFlag(data: ?[]const u8) ?bool {
+    const bytes = data orelse return null;
+    var buf: [256]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const Wire = struct { report: ?bool = null };
+    const wire = std.json.parseFromSliceLeaky(Wire, fba.allocator(), bytes, .{ .ignore_unknown_fields = true }) catch return false;
+    return wire.report orelse false;
 }
 
 /// fx's data on a `child_finished` line. Older fx skips `report`, and a
@@ -826,7 +853,7 @@ pub fn v1ImportLines(arena: Allocator, registry: Registry, has_log: []const bool
         try lines.append(arena, .{ .spawned = .{
             .child = child.id,
             .work_id = work_id,
-            .data = try spawnData(arena, child.agentName(), fingerprint, null, .final),
+            .data = try spawnData(arena, child.agentName(), fingerprint, null, null),
         } });
         try lines.append(arena, .{ .finished = .{
             .child = child.id,
@@ -855,7 +882,7 @@ fn stringifyAlloc(arena: Allocator, value: anytype) ![]const u8 {
     return out.written();
 }
 
-fn fxOutcome(outcome: session_adapter.ChildOutcome) Outcome {
+pub fn fxOutcome(outcome: session_adapter.ChildOutcome) Outcome {
     return switch (outcome) {
         .ok => .completed,
         .failed => .failed,

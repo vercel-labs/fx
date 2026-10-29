@@ -511,6 +511,9 @@ pub const WorkerEvent = union(enum) {
     /// Its prompt is fx's note to the model, so no user card is written.
     begin_resumed_prompt: u64,
     append_user_feedback: []u8,
+    /// A subagent's report or message a boundary took into the running
+    /// turn. The screen shows it as the subagent's card, never as the user's.
+    append_agent_message: []u8,
     assistant_presentation: assistant_presentation.Event,
     notification: notification_contract.Notification,
     question_requested,
@@ -1358,9 +1361,11 @@ pub const WorkerRuntime = struct {
             messages[copied] = .{ .text = try result_alloc.dupe(u8, prompt.prompt), .author = prompt.author };
             copied += 1;
             if (prompt.steering_receipt == null) {
-                events[event_count] = .{
-                    .append_user_feedback = try alloc.dupe(u8, prompt.prompt),
-                };
+                const text = try alloc.dupe(u8, prompt.prompt);
+                events[event_count] = if (prompt.author == .child)
+                    .{ .append_agent_message = text }
+                else
+                    .{ .append_user_feedback = text };
                 event_count += 1;
             }
         }
@@ -4109,6 +4114,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
         .begin_presented_prompt => |turn_id| .{ .begin_presented_prompt = turn_id },
         .begin_resumed_prompt => |turn_id| .{ .begin_resumed_prompt = turn_id },
         .append_user_feedback => |text| .{ .append_user_feedback = try alloc.dupe(u8, text) },
+        .append_agent_message => |text| .{ .append_agent_message = try alloc.dupe(u8, text) },
         .assistant_presentation => |presentation| .{
             .assistant_presentation = try presentation.clone(alloc),
         },
@@ -4203,7 +4209,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
             freeSkillDisplaySpans(alloc, begin.skill_display_spans);
         },
         .begin_presented_prompt, .begin_resumed_prompt => {},
-        .append_user_feedback => |text| alloc.free(text),
+        .append_user_feedback, .append_agent_message => |text| alloc.free(text),
         .assistant_presentation => |presentation| {
             var owned = presentation;
             owned.deinit(alloc);
@@ -5408,6 +5414,24 @@ test "a parent's message joins the running turn only while nothing older waits" 
     try std.testing.expect(!(try runtime.admitActiveSteering(alloc, late)));
     freeQueuedPrompt(alloc, late);
     try std.testing.expectEqual(@as(usize, 2), runtime.queuedPromptCount());
+}
+
+test "a subagent's message a boundary takes shows as the subagent's, not as the user's feedback" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+
+    try runtime.postMail(alloc, try makePrompt(alloc, "a report", "model"));
+    runtime.queued_prompts.items[0].author = .child;
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "a steer", "model"));
+    runtime.queued_prompts.items[1].delivery = .{ .active_turn = 9 };
+    const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, 9, .model));
+    defer freeSteeringMessages(alloc, guidance);
+    try std.testing.expectEqual(types.MessageAuthor.child, guidance[0].author);
+    try std.testing.expectEqualStrings("a report", runtime.worker_events.items[0].append_agent_message);
+    try std.testing.expectEqualStrings("a steer", runtime.worker_events.items[1].append_user_feedback);
 }
 
 test "a boundary takes the turn's messages in one pass and keeps the rest in order" {
