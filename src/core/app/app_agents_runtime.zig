@@ -558,6 +558,10 @@ pub fn Runtime(comptime App: type) type {
             var run = try app_agent_runtime.Runtime(App).prepareOwnTurnRun(app, child.id, host.authorityResolver(), admitted.instructions, admitted.admission);
             errdefer run.deinit(app.alloc);
             try setUserRequests(app, agent, &run);
+            // A user turn the last run opened and never saw end ends now.
+            if (child.agent.child_run) |*previous| endUserWork(app.alloc, host, previous, .cancelled, "");
+            // The turn is a work in the parent's log, as every child turn is.
+            if (host.beginUserWork(app.alloc, child.id)) |work_id| run.user_work_id = work_id;
             installChildRun(app, child, run);
             debug_trace.eventf("host", "own_turn_admitted", .{}, "agent={s} model={s} permission_mode={s}", .{
                 child.id,
@@ -1761,7 +1765,11 @@ pub fn Runtime(comptime App: type) type {
             for (tree.items) |entry| {
                 if (entry.agent.worker_thread) |thread| thread.join();
                 entry.agent.worker_thread = null;
-                if (entry.agent.child_run) |*run| finishRun(run, .cancelled);
+                if (entry.agent.child_run) |*run| {
+                    finishRun(run, .cancelled);
+                    // A turn the user started ends with the tree, owing nothing.
+                    if (hostOf(app, entry)) |host| endUserWork(app.alloc, host, run, .cancelled, "");
+                }
             }
             root.worker.requestCancel();
             debug_trace.eventf("host", "instance_closed", .{}, "agent={s} subagents={d}", .{ label, tree.items.len });
@@ -1837,13 +1845,23 @@ pub fn Runtime(comptime App: type) type {
         /// after the save, on the main loop in the child's context. Only the
         /// turn carrying the run's work id ends it: the parent finds its
         /// answer by that id, and a turn the user started carries none.
-        pub fn commitChildTurn(_: *App, agent: *AppAgent, finished: types.FinishedPrompt) void {
+        pub fn commitChildTurn(app: *App, agent: *AppAgent, finished: types.FinishedPrompt) void {
             if (comptime !@hasField(App, "screen_owner")) return;
             if (agent.role != .subagent) return;
             // A subagent never runs a turn without a run installed.
             const run = if (agent.child_run) |*value| value else return;
             const saved_work = session_mod.historyTurnWorkId(finished.turn);
             debug_trace.eventf("host", "child_turn_saved", .{}, "agent={s} work_id={s}", .{ run.child_id, saved_work orelse "none" });
+            if (saved_work == null and run.user_work_id.len > 0) {
+                const host = hostOf(app, hostedOf(app, agent) orelse return) orelse return;
+                const reply = switch (finished.turn) {
+                    .assistant => |value| value.assistant,
+                    .interrupted => |value| value.assistant orelse "",
+                    .compacted_summary => "",
+                };
+                endAndFollowUserWork(app.alloc, host, run, userWorkOutcome(run, finished.terminal_outcome orelse .completed), reply);
+                return;
+            }
             if (!run.inFlight()) return;
             if (!std.mem.eql(u8, saved_work orelse return, run.work_id)) return;
             const outcome = finished.terminal_outcome orelse .completed;
@@ -1869,7 +1887,7 @@ pub fn Runtime(comptime App: type) type {
         /// on its way, held by the pacer or not yet drained, so the run ends
         /// when it is saved, or in `settleChildRuns` once nothing is left.
         pub fn noteChildTurnFinished(app: *App, agent: *AppAgent, finished: types.TurnFinished) void {
-            const run = runInFlight(app, agent) orelse return;
+            const run = runInFlight(app, agent) orelse userWorkRun(app, agent) orelse return;
             run.ended_as = finished.outcome;
             if (finished.outcome == .interrupted and agent.worker.handedOff(finished.turn_id)) {
                 run.handed_off = true;
@@ -1884,11 +1902,56 @@ pub fn Runtime(comptime App: type) type {
         pub fn settleChildRuns(app: *App) void {
             for (app.child_agents.items) |child| {
                 const run = if (child.agent.child_run) |*value| value else continue;
-                if (!run.inFlight()) continue;
                 const outcome = run.ended_as orelse continue;
                 if (hasPendingWork(child) or child.agent.worker.isProcessing()) continue;
+                if (run.user_work_id.len > 0) {
+                    const host = hostOf(app, child) orelse continue;
+                    endAndFollowUserWork(app.alloc, host, run, userWorkOutcome(run, outcome), "");
+                    continue;
+                }
+                if (!run.inFlight()) continue;
                 endRun(run, outcome);
             }
+        }
+
+        /// The run of a turn the user started on a subagent's screen, while
+        /// the work it opened in the parent's log is open.
+        fn userWorkRun(app: *App, agent: *AppAgent) ?*agents.ChildRun {
+            if (agent == &app.main_agent) return null;
+            const run = if (agent.child_run) |*value| value else return null;
+            return if (run.user_work_id.len > 0) run else null;
+        }
+
+        fn userWorkOutcome(run: *const agents.ChildRun, outcome: types.TurnPresentationOutcome) subagent_child_state.Outcome {
+            return switch (outcome) {
+                .completed => .completed,
+                .failed => .failed,
+                .interrupted => if (run.handed_off) .completed else .cancelled,
+                .paused => .cancelled,
+            };
+        }
+
+        /// Ends a user's turn's work. When the turn handed off to the user's
+        /// image or `$skill`, that prompt runs next as the user's own turn,
+        /// so it opens the next work.
+        fn endAndFollowUserWork(alloc: std.mem.Allocator, host: *subagent_tool_host.Runtime, run: *agents.ChildRun, outcome: subagent_child_state.Outcome, reply: []const u8) void {
+            const handed_off = run.handed_off;
+            endUserWork(alloc, host, run, outcome, reply);
+            if (handed_off) if (host.beginUserWork(alloc, run.child_id)) |work_id| {
+                run.user_work_id = work_id;
+            };
+        }
+
+        /// Ends the work a user's turn opened, once.
+        fn endUserWork(alloc: std.mem.Allocator, host: *subagent_tool_host.Runtime, run: *agents.ChildRun, outcome: subagent_child_state.Outcome, reply: []const u8) void {
+            if (run.user_work_id.len == 0) return;
+            const work_id = run.user_work_id;
+            run.user_work_id = &.{};
+            run.ended_as = null;
+            run.handed_off = false;
+            defer alloc.free(work_id);
+            debug_trace.eventf("host", "user_work_ended", .{}, "agent={s} work_id={s} outcome={s}", .{ run.child_id, work_id, @tagName(outcome) });
+            host.endUserWork(run.child_id, work_id, outcome, reply);
         }
 
         /// Keeps a child's terminal provider error for the parent.

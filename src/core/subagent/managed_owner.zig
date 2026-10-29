@@ -96,6 +96,9 @@ pub const WorkEnd = struct {
     outcome: child_state.Outcome,
     failure: ?types.ModelFailureDiagnostic = null,
     report_owed: bool,
+    /// The work's reply, for a work the host can't find by its id: a turn
+    /// the user started carries none in the child's log. Borrowed.
+    reply: ?[]const u8 = null,
 };
 
 /// The host's hook for a work's end, called on the child's slot thread with
@@ -314,6 +317,13 @@ pub const Owner = struct {
         self.tree_closed = true;
     }
 
+    /// Finishes the work a turn the user started on the child's own screen
+    /// opened (`tool_host.Runtime.beginUserWork`). Whether it owes the parent
+    /// a report follows the child's rule for the user's turns.
+    pub fn finishUserWork(self: *Owner, child_id: []const u8, work_id: []const u8, outcome: child_state.Outcome) bool {
+        return self.finish(child_id, work_id, outcome, null, false, .user).report_owed;
+    }
+
     /// The parent's `stop`: ends the child's running turn, which owes no
     /// report, since the stop call answers it. False when nothing runs.
     pub fn stop(self: *Owner, child_id: []const u8) bool {
@@ -453,8 +463,8 @@ pub const Owner = struct {
     const Finished = struct { observation: ?Observation, report_owed: bool };
 
     /// Finishes the work in the registry, recording whether its end owes
-    /// the parent a report: work the parent gave the child, under the
-    /// child's report rule, unless the parent stopped it.
+    /// the parent a report under the child's report rule and who started
+    /// it, unless the parent stopped it or the tree closed.
     fn finish(
         self: *Owner,
         child_id: []const u8,
@@ -462,6 +472,7 @@ pub const Owner = struct {
         outcome: child_state.Outcome,
         failure: ?types.ModelFailureDiagnostic,
         stopped_by_parent: bool,
+        started_by: reports.StartedBy,
     ) Finished {
         var lock = self.state_store.acquireLock();
         defer lock.release();
@@ -471,7 +482,7 @@ pub const Owner = struct {
         };
         defer registry.deinit(self.alloc);
         const rule = if (registry.findById(child_id)) |child| child.report_rule else .final;
-        const owed = !self.tree_closed and reports.reportable(rule, .parent, outcome, stopped_by_parent);
+        const owed = !self.tree_closed and reports.reportable(rule, started_by, outcome, stopped_by_parent);
         registry.finishWithReport(self.alloc, child_id, work_id, outcome, failure, owed) catch |err| {
             debugFailure(child_id, "state_finish", err);
             return .{ .observation = null, .report_owed = false };
@@ -567,7 +578,7 @@ fn slotMain(slot: *Slot) void {
         // Startup must not inspect the old slot between saved and in-memory completion.
         // Take owner before registry, matching cancellation and approval lock ordering.
         owner.mutex.lockUncancelable(io_mod.getIo());
-        const finished = owner.finish(slot.child_id, outcome.work_id, outcome.outcome, outcome.failure, slot.stopped_by_parent);
+        const finished = owner.finish(slot.child_id, outcome.work_id, outcome.outcome, outcome.failure, slot.stopped_by_parent, .parent);
         const closing = owner.closed or slot.shutdown.load(.seq_cst);
         owner.mutex.unlock(io_mod.getIo());
         const next = if (owner.on_end) |hook| hook.end_fn(hook.context, .{
